@@ -21,7 +21,7 @@
  */
 
 import { existsSync, readdirSync, statSync } from 'node:fs';
-import { join, relative, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 
 const [distArg, ...requiredFiles] = process.argv.slice(2);
 
@@ -52,7 +52,9 @@ function countJsFiles(dir) {
 
 const recovery = [
   'How to recover:',
-  `  rm -rf ${relative(cwd, distDir) || distArg} *.tsbuildinfo`,
+  // Both globs on purpose: the buildinfo files here are dotfiles, and a shell `*` does
+  // not match those. `rm -rf dist *.tsbuildinfo` alone leaves the stale state in place.
+  `  rm -rf ${distArg} .*tsbuildinfo *.tsbuildinfo`,
   '  pnpm run build',
   '',
   'If that produces JavaScript, the tree had stale incremental state: tsc believed',
