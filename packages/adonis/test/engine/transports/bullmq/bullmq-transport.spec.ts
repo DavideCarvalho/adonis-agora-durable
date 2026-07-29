@@ -359,6 +359,25 @@ describe('BullMQTransport', () => {
       await Promise.resolve();
       expect(received).toEqual([beat]);
     });
+
+    it('a beating step handler run through `handle()` delivers at least one heartbeat for its own stepId (regression: #runTask must pass the emitBeat callback to runStepHandler)', async () => {
+      const received: Heartbeat[] = [];
+      transport.onHeartbeat(async (b) => {
+        received.push(b);
+      });
+      transport.handle('proc', async (_input, log) => {
+        log.heartbeat({ done: 1 });
+        return 'ok';
+      });
+      const w = broker.workers.get('durable-tasks-proc')!;
+      await w.process({ data: task({ name: 'proc', group: 'proc' }) });
+      // The heartbeat publish is fire-and-forget (protocol.ts's `beat` wraps it in `void
+      // Promise.resolve(...).catch(...)`), so give the microtask queue a turn before asserting.
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(received.length).toBeGreaterThanOrEqual(1);
+      expect(received[0]).toMatchObject({ runId: 'r1', seq: 2, stepId: 'r1:2' });
+    });
   });
 
   describe('worker-health registry', () => {

@@ -305,7 +305,9 @@ export class BullMQTransport implements Transport {
   async #runTask(task: RemoteTask): Promise<void> {
     let result: StepResult;
     try {
-      result = await runStepHandler(task, this.#handlers.get(task.name));
+      result = await runStepHandler(task, this.#handlers.get(task.name), (beat) =>
+        this.heartbeat(beat),
+      );
     } catch (err) {
       // runStepHandler is pure (a handler throw becomes a failed StepResult), so reaching here is a
       // bug — guard anyway so a future refactor can't turn it into an unsettled `pending` checkpoint.
