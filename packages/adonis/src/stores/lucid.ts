@@ -6,6 +6,7 @@ import type {
 import type {
   AttributeFilter,
   RunQuery,
+  RunStatus,
   SignalWaiter,
   StateStore,
   StepCheckpoint,
@@ -97,6 +98,41 @@ export class LucidStateStore implements StateStore {
       if ('searchAttributes' in patch) {
         await this.reindexAttributes(trx, runId, patch.searchAttributes);
       }
+    });
+  }
+
+  async updateRunIf(
+    runId: string,
+    expectedStatuses: RunStatus[],
+    patch: Partial<WorkflowRun>,
+  ): Promise<boolean> {
+    const row = runPatchToRow(patch);
+    return this.client().transaction(async (trx) => {
+      let applied: boolean;
+      if (Object.keys(row).length) {
+        // The status predicate lives IN the UPDATE's WHERE clause, alongside `updateRun`'s existing
+        // structure — the database arbitrates, not a prior JS read. Two racing writers can never both
+        // report `true` for the same row.
+        const affected = await trx
+          .from(DURABLE_TABLES.runs)
+          .where('id', runId)
+          .whereIn('status', expectedStatuses)
+          .update(row);
+        applied = rowsAffected(affected) === 1;
+      } else {
+        // Knex throws on an empty `.update({})`. Nothing to write, but the predicate's outcome is
+        // still observable: report whether it would have matched, without mutating anything.
+        const current = await trx
+          .from(DURABLE_TABLES.runs)
+          .where('id', runId)
+          .whereIn('status', expectedStatuses)
+          .first();
+        applied = !!current;
+      }
+      if (applied && 'searchAttributes' in patch) {
+        await this.reindexAttributes(trx, runId, patch.searchAttributes);
+      }
+      return applied;
     });
   }
 

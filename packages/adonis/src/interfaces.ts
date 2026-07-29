@@ -266,6 +266,28 @@ export interface StateStore {
 
   createRun(run: WorkflowRun): Promise<void>;
   updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void>;
+
+  /**
+   * Conditional (compare-and-set) variant of {@link updateRun}: apply `patch` ONLY IF the run's
+   * CURRENTLY PERSISTED `status` is one of `expectedStatuses` at write time. Returns `true` when the
+   * write was applied, `false` when the predicate did not match — a non-match is a normal outcome,
+   * never a throw.
+   *
+   * The predicate MUST be evaluated atomically with the write — part of the same UPDATE statement for
+   * a SQL store, or the same synchronous check (no `await` between read and mutate) for an in-process
+   * store. A JS read-then-write is a TOCTOU race, not a substitute: two racing callers could both
+   * observe a matching status before either writes.
+   *
+   * Exists so a terminal-status write (settling a run `completed`/`failed`, or re-suspending it) can't
+   * silently clobber a state change — e.g. an operator's `cancelled` — that landed while the write's
+   * outcome was still being computed from a now-stale run snapshot.
+   */
+  updateRunIf(
+    runId: string,
+    expectedStatuses: RunStatus[],
+    patch: Partial<WorkflowRun>,
+  ): Promise<boolean>;
+
   getRun(runId: string): Promise<WorkflowRun | null>;
 
   /**

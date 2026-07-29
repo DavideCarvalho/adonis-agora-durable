@@ -1,5 +1,6 @@
 import type {
   RunQuery,
+  RunStatus,
   SignalWaiter,
   StateStore,
   StepCheckpoint,
@@ -64,6 +65,16 @@ export class CodecStateStore implements StateStore {
     if ('input' in patch) next.input = this.enc(patch.input);
     if ('output' in patch) next.output = this.enc(patch.output);
     return this.inner.updateRun(runId, next);
+  }
+  updateRunIf(
+    runId: string,
+    expectedStatuses: RunStatus[],
+    patch: Partial<WorkflowRun>,
+  ): Promise<boolean> {
+    const next = { ...patch };
+    if ('input' in patch) next.input = this.enc(patch.input);
+    if ('output' in patch) next.output = this.enc(patch.output);
+    return this.inner.updateRunIf(runId, expectedStatuses, next);
   }
   async getRun(runId: string): Promise<WorkflowRun | null> {
     return this.decRun(await this.inner.getRun(runId));

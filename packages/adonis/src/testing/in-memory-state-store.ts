@@ -1,5 +1,6 @@
 import type {
   RunQuery,
+  RunStatus,
   SignalWaiter,
   StateStore,
   StepCheckpoint,
@@ -65,6 +66,21 @@ export class InMemoryStateStore implements StateStore {
     const next = { ...existing, ...patch };
     this.runs.set(runId, next);
     if ('searchAttributes' in patch) this.reindexAttributes(runId, next.searchAttributes);
+  }
+
+  async updateRunIf(
+    runId: string,
+    expectedStatuses: RunStatus[],
+    patch: Partial<WorkflowRun>,
+  ): Promise<boolean> {
+    // No `await` between the check and the mutation — atomic within this single-threaded store, the
+    // same reasoning tryLockRun/renewRunLock already rely on for their compare-and-set.
+    const existing = this.runs.get(runId);
+    if (!existing || !expectedStatuses.includes(existing.status)) return false;
+    const next = { ...existing, ...patch };
+    this.runs.set(runId, next);
+    if ('searchAttributes' in patch) this.reindexAttributes(runId, next.searchAttributes);
+    return true;
   }
 
   async getRun(runId: string): Promise<WorkflowRun | null> {
