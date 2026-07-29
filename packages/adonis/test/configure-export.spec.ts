@@ -15,9 +15,14 @@ describe('configure hook export (built artifact)', () => {
   if (!existsSync(distIndexPath)) {
     it.skip('dist/ does not exist — run `pnpm --filter @adonis-agora/durable build` first', () => {});
   } else {
+    // ESM-importing the real dist artifact pulls in the whole package graph for the first time;
+    // that takes ~0.5s alone but ~2s+ under full-suite load, so the default 5s testTimeout flakes.
+    // 60s is a ceiling, not a target: loose enough that load never fails it, tight enough that a
+    // genuinely hung import still fails the run. `pnpm test` is a release gate — a flake here
+    // blocks publishes at random.
     it('the built package main exports configure as a function', async () => {
       const mod = (await import(distIndexUrl.href)) as Record<string, unknown>;
       expect(typeof mod.configure).toBe('function');
-    });
+    }, 60_000);
   }
 });
