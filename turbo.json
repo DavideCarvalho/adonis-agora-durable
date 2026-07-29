@@ -15,7 +15,7 @@
     },
     "typecheck": {
       "dependsOn": ["^build"],
-      "outputs": ["*.tsbuildinfo"]
+      "outputs": [".typecheck.tsbuildinfo"]
     }
   }
 }

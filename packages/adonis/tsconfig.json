@@ -1,9 +1,17 @@
 {
+  // The typecheck/editor config. `tsconfig.build.json` is the emitting build; it extends
+  // this one and turns `incremental` off.
+  //
+  // The two must not share a buildinfo. They are separate turbo tasks with different
+  // `outputs` declarations, so sharing one file means racing on it — and an incremental
+  // *emitting* build records what it already wrote to `dist/`, so deleting `dist/` and
+  // leaving the buildinfo makes tsc emit nothing and exit 0. Turbo then caches the empty
+  // `dist/`. `turbo.json`'s `typecheck` task declares the path below as its output.
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "rootDir": ".",
     "outDir": "dist",
-    "tsBuildInfoFile": ".tsbuildinfo",
+    "tsBuildInfoFile": ".typecheck.tsbuildinfo",
     "types": ["node"],
     "experimentalDecorators": true
   },

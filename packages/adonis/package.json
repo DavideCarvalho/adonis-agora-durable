@@ -102,7 +102,9 @@
   "files": ["dist/", "README.md", "CHANGELOG.md"],
   "sideEffects": false,
   "scripts": {
-    "build": "tsc -p tsconfig.json && pnpm run copy:stubs",
+    "build": "pnpm run clean && tsc -p tsconfig.build.json && pnpm run copy:stubs && pnpm run check:dist",
+    "check:dist": "node ../../scripts/assert-build-output.mjs dist src/index.js",
+    "clean": "rm -rf dist",
     "copy:stubs": "mkdir -p dist/stubs/config dist/stubs/database/migrations dist/stubs/make/workflow dist/assets && cp stubs/config/durable.stub dist/stubs/config/durable.stub && cp stubs/config/durable_dashboard.stub dist/stubs/config/durable_dashboard.stub && cp -r stubs/database/migrations/. dist/stubs/database/migrations/ && cp stubs/make/workflow/main.stub dist/stubs/make/workflow/main.stub && cp assets/dashboard.html dist/assets/dashboard.html",
     "prepack": "pnpm run build",
     "test": "vitest run --passWithNoTests",

@@ -22,7 +22,9 @@
   "files": ["dist/", "README.md", "CHANGELOG.md"],
   "sideEffects": false,
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "pnpm run clean && tsc -p tsconfig.build.json && pnpm run check:dist",
+    "check:dist": "node ../../scripts/assert-build-output.mjs dist src/index.js",
+    "clean": "rm -rf dist",
     "test": "vitest run --passWithNoTests",
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.json --noEmit"
