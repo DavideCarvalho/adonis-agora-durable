@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
+  type RunStatus,
   type StateStore,
   type StepCheckpoint,
   WorkflowEngine,
@@ -216,6 +217,67 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         expect(r?.lockedBy).toBe('owner-2');
         expect(r?.wakeAt).toBe(123_456);
         expect(r?.lockedUntil).toBe(222_222);
+      },
+    );
+
+    // ---- updateRunIf (conditional / compare-and-set) ----------------------------------------
+
+    t(
+      'updateRunIf applies the patch and returns true when the current status is expected',
+      async () => {
+        await store.createRun(run({ status: 'running' }));
+        const applied = await store.updateRunIf('r1', ['running', 'suspended'] as RunStatus[], {
+          status: 'completed',
+          output: { ok: true },
+          updatedAt: at,
+        });
+        expect(applied).toBe(true);
+        const after = await store.getRun('r1');
+        expect(after?.status).toBe('completed');
+        expect(after?.output).toEqual({ ok: true });
+      },
+    );
+
+    t(
+      'updateRunIf returns false and leaves the row untouched when the status is not expected',
+      async () => {
+        await store.createRun(run({ status: 'cancelled', error: { message: 'cancelled' } }));
+        const applied = await store.updateRunIf('r1', ['running', 'suspended'] as RunStatus[], {
+          status: 'completed',
+          output: { ok: true },
+          updatedAt: at,
+        });
+        expect(applied).toBe(false);
+        const after = await store.getRun('r1');
+        // Untouched: still cancelled, with its original error, no output written.
+        expect(after?.status).toBe('cancelled');
+        expect(after?.error).toEqual({ message: 'cancelled' });
+        expect(after?.output).toBeUndefined();
+      },
+    );
+
+    t(
+      'two sequential updateRunIf calls: once the first transitions the run out of the expected set, the second returns false',
+      async () => {
+        await store.createRun(run({ status: 'running' }));
+        const first = await store.updateRunIf('r1', ['running', 'suspended'] as RunStatus[], {
+          status: 'cancelled',
+          error: { message: 'cancelled' },
+          updatedAt: at,
+        });
+        expect(first).toBe(true);
+
+        // A second write computed from a stale "running" snapshot must NOT clobber the cancel that
+        // just landed — this is the exact property the whole contract addition exists for.
+        const second = await store.updateRunIf('r1', ['running', 'suspended'] as RunStatus[], {
+          status: 'completed',
+          output: { ok: true },
+          updatedAt: at,
+        });
+        expect(second).toBe(false);
+        const after = await store.getRun('r1');
+        expect(after?.status).toBe('cancelled');
+        expect(after?.output).toBeUndefined();
       },
     );
 
