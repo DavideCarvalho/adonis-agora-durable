@@ -128,3 +128,8 @@ export * from './handshake/descriptor.js';
 export * from './handshake/negotiate.js';
 export * from './handshake/routing.js';
 export * from './dispatch-routing.js';
+
+// Re-export the configure hook from the package root so `node ace configure` finds it.
+// AdonisJS imports the package MAIN and reads `configure` off the module namespace —
+// the `./configure` subpath alone is never consulted.
+export { configure } from '../configure.js';
