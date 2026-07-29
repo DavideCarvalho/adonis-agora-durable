@@ -131,6 +131,31 @@ const BREAKPOINT = 'breakpoint';
 const isBreakpoint = (cp: { status: string; name: string }): boolean =>
   cp.status === 'pending' && cp.name.startsWith(BREAKPOINT);
 
+/**
+ * Every `RunStatus` from which a turn's outcome (`completed` / `failed` / `suspended` / `blocked`) is a
+ * LEGITIMATE transition — i.e. every status EXCEPT the three `resume()` itself refuses to re-execute
+ * (`cancelled`, `completed`, `dead` — see its own admission guard and comment). `failed` is
+ * deliberately included even though it reads as terminal: `resume()`'s comment is explicit that
+ * "`failed` is intentionally NOT terminal here: retry resumes a failed run", so a retried turn starts
+ * from a persisted `failed` status and can legitimately land on any of these outcomes again. `pending`
+ * and `running`/`suspended`/`blocked` cover the normal first-turn and every resumed-turn starting
+ * point (the pending→running flip always lands before a turn runs, so `pending` is never actually
+ * observed here, but it is harmless to include since it isn't one of the three genuinely-final
+ * statuses either).
+ *
+ * This is the expected-status set for every `updateRunIf` call this engine makes on a turn's outcome:
+ * the write is legitimate precisely when the run has not ALREADY reached `cancelled`/`completed`/`dead`
+ * through some other path (an operator's cancel, a timeout sweep, a dead-letter) while this turn's
+ * outcome was being computed from a possibly-stale snapshot.
+ */
+const SETTLE_ELIGIBLE_STATUSES: RunStatus[] = [
+  'pending',
+  'running',
+  'suspended',
+  'blocked',
+  'failed',
+];
+
 interface RegisteredWorkflow {
   name: string;
   version: string;
@@ -1189,7 +1214,16 @@ export class WorkflowEngine {
       for (const run of inflight) {
         if (run.createdAt.getTime() > deadline) continue;
         const error = { message: 'execution timeout', code: 'execution_timeout' };
-        await this.store.updateRun(run.id, { status: 'cancelled', error, updatedAt: new Date() });
+        // Conditional on the exact statuses just queried: an await separates this loop's iterations
+        // (and the listRuns calls above it), so this run could have settled on its own — via its own
+        // in-flight turn, an operator cancel, or another sweep — in the gap. Only clobber it into
+        // `cancelled` if it's still genuinely `running`/`suspended`.
+        const applied = await this.store.updateRunIf(run.id, ['running', 'suspended'], {
+          status: 'cancelled',
+          error,
+          updatedAt: new Date(),
+        });
+        if (!applied) continue;
         this.emit({
           type: 'run.failed',
           runId: run.id,
@@ -2171,13 +2205,19 @@ export class WorkflowEngine {
   private async settleRun(run: WorkflowRun, outcome: RunOutcome): Promise<RunResult> {
     const updatedAt = new Date();
     if (outcome.kind === 'completed') {
-      // Clear any error from an earlier failed-then-retried attempt — a completed run is a success.
-      await this.store.updateRun(run.id, {
+      // This outcome was computed by a turn that started from a possibly-stale run snapshot. If the
+      // run reached `cancelled`/`completed`/`dead` WHILE that turn was still executing (e.g. an
+      // operator's `cancel`, or `sweepTimeouts`), this now-stale "completed" outcome must not
+      // resurrect/clobber it — the conditional write (status still one of SETTLE_ELIGIBLE_STATUSES) is
+      // the guard; the database, not a prior JS read, arbitrates. Also clears any error from an
+      // earlier failed-then-retried attempt — a completed run is a success.
+      const applied = await this.store.updateRunIf(run.id, SETTLE_ELIGIBLE_STATUSES, {
         status: 'completed',
         output: outcome.output,
         error: undefined,
         updatedAt,
       });
+      if (!applied) return this.echoCurrentStatus(run.id);
       this.emit({
         type: 'run.completed',
         runId: run.id,
@@ -2189,7 +2229,13 @@ export class WorkflowEngine {
       return { runId: run.id, status: 'completed', output: outcome.output };
     }
     if (outcome.kind === 'failed') {
-      await this.store.updateRun(run.id, { status: 'failed', error: outcome.error, updatedAt });
+      // Same race as the `completed` branch above — guard identically.
+      const applied = await this.store.updateRunIf(run.id, SETTLE_ELIGIBLE_STATUSES, {
+        status: 'failed',
+        error: outcome.error,
+        updatedAt,
+      });
+      if (!applied) return this.echoCurrentStatus(run.id);
       this.emit({
         type: 'run.failed',
         runId: run.id,
@@ -2203,17 +2249,16 @@ export class WorkflowEngine {
     // This outcome was computed by a turn that started from a possibly-stale run snapshot. If the run
     // was cancelled WHILE that turn was still executing (e.g. `ctx.all`'s failFast cancelling a
     // sibling mid-turn — plain `cancel()` writes `cancelled` directly, without waiting for the target's
-    // in-flight turn to notice), this now-stale "suspended" outcome must not resurrect it: re-check the
-    // CURRENT persisted status right before writing and echo it instead of clobbering a real cancel.
-    const latest = await this.store.getRun(run.id);
-    if (latest?.status === 'cancelled') {
-      return { runId: run.id, status: 'cancelled', error: latest.error };
-    }
-    await this.store.updateRun(run.id, {
+    // in-flight turn to notice), this now-stale "suspended" outcome must not resurrect it. The
+    // conditional write IS the guard — it subsumes the read-then-write this branch used to do (that
+    // was itself a narrower, TOCTOU-prone version of the same check, and only looked for `cancelled`;
+    // this now also catches `completed`/`dead` reached via any other path mid-turn).
+    const applied = await this.store.updateRunIf(run.id, SETTLE_ELIGIBLE_STATUSES, {
       status: 'suspended',
       wakeAt: this.reconcileWakeAt(outcome.wakeAt),
       updatedAt,
     });
+    if (!applied) return this.echoCurrentStatus(run.id);
     this.emit({
       type: 'run.suspended',
       runId: run.id,
@@ -2221,6 +2266,26 @@ export class WorkflowEngine {
       namespace: run.namespace,
     });
     return { runId: run.id, status: 'suspended' };
+  }
+
+  /**
+   * Re-read a run's CURRENT persisted state and report it as a `RunResult` — called when an
+   * `updateRunIf` write lost the race (the run reached a terminal state via a different path while
+   * this turn's outcome was being computed from a stale snapshot). No emit, no `notifyParent`: the
+   * path that actually won the race already did its own emit/notify when it wrote.
+   */
+  private async echoCurrentStatus(runId: string): Promise<RunResult> {
+    const latest = await this.store.getRun(runId);
+    // A store only reports `updateRunIf` as non-applied for a row that still exists (the predicate
+    // just didn't match its status) OR a row that's gone — the latter isn't reachable via any path
+    // this engine takes concurrently with an in-flight turn, but report the safest terminal reading
+    // (never a fabricated success) rather than throw out of a settle path.
+    return {
+      runId,
+      status: latest?.status ?? 'cancelled',
+      output: latest?.output,
+      error: latest?.error,
+    };
   }
 
   /**
@@ -2917,22 +2982,23 @@ export class WorkflowEngine {
    * `blocked` status with a human reason + a `wakeAt` so the blocked-recovery poll re-drives it, emits
    * the LOUD structured `capability.unavailable`/`protocol.incompatible` diagnostics event (carrying
    * both descriptors + the precise delta), and releases the run lease so any instance can re-drive it.
-   * Re-checks the persisted status first so a concurrent `cancel` is never clobbered.
+   * Conditional on the same {@link SETTLE_ELIGIBLE_STATUSES} set `settleRun` uses — this used to
+   * re-check only `cancelled`/`completed` (a narrower, TOCTOU-prone read-then-write), silently missing
+   * `failed`→retry-in-flight and `dead`; the conditional write closes both gaps atomically.
    */
   private async parkBlocked(run: WorkflowRun, blocked: BlockedDispatch): Promise<RunResult> {
-    const latest = await this.store.getRun(run.id);
-    if (latest && (latest.status === 'cancelled' || latest.status === 'completed')) {
-      await this.store.releaseRunLock(run.id);
-      return { runId: run.id, status: latest.status, output: latest.output, error: latest.error };
-    }
     const error = { message: blocked.reason, retryable: true };
     const wakeAt = this.clock() + this.blockedPollMs;
-    await this.store.updateRun(run.id, {
+    const applied = await this.store.updateRunIf(run.id, SETTLE_ELIGIBLE_STATUSES, {
       status: 'blocked',
       error,
       wakeAt,
       updatedAt: new Date(),
     });
+    if (!applied) {
+      await this.store.releaseRunLock(run.id);
+      return this.echoCurrentStatus(run.id);
+    }
     this.emit({
       type: blocked.code,
       runId: run.id,
