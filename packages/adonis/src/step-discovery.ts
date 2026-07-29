@@ -5,6 +5,7 @@ import type { StepLogger } from './interfaces.js';
 import type { StepHandler } from './protocol.js';
 import { DURABLE_STEP_NAME } from './step-name-symbol.js';
 import { type DurableStepMeta, stepMetaOf } from './step-ref.js';
+import { pickModuleExt } from './workflow-discovery.js';
 
 /** The narrow serve surface step discovery registers handlers on — satisfied by every transport
  *  (`InMemoryTransport`, `EventEmitterTransport`, `QueueTransport`, `DbTransport`). */
@@ -94,13 +95,11 @@ export function registerSteps(server: StepServer, exports: Iterable<unknown>): D
   return registered;
 }
 
-/** Same module-extension gate the workflow scanner uses (`.ts` from source, `.js` from `dist`). */
-const MODULE_EXT = extname(import.meta.url || '') === '.ts' ? '.ts' : '.js';
-
 /**
  * Scan `dir` RECURSIVELY for modules and register every exported `@Step` class / `defineStep`
- * handler on `server` — the `app/steps` convention, mirroring `app/workflows` discovery. Missing
- * directory → no-op (the convention is opt-in). Returns the registered metadata.
+ * handler on `server` — the `app/steps` convention, mirroring `app/workflows` discovery. Only the
+ * extension present in `dir` is imported (see {@link pickModuleExt}). Missing directory → no-op
+ * (the convention is opt-in). Returns the registered metadata.
  */
 export async function registerStepsFromDir(
   server: StepServer,
@@ -113,10 +112,12 @@ export async function registerStepsFromDir(
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
     throw err;
   }
+  const moduleExt = pickModuleExt(entries);
   const registered: DurableStepMeta[] = [];
+  if (moduleExt === null) return registered;
   const seen = new Set<string>();
   for (const entry of entries.sort()) {
-    if (extname(entry) !== MODULE_EXT || entry.endsWith(`.d${MODULE_EXT}`)) continue;
+    if (extname(entry) !== moduleExt || entry.endsWith(`.d${moduleExt}`)) continue;
     const mod = (await import(pathToFileURL(join(dir, entry)).href)) as Record<string, unknown>;
     for (const meta of registerSteps(server, Object.values(mod))) {
       if (seen.has(meta.name)) continue;

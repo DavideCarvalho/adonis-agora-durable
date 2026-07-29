@@ -48,19 +48,43 @@ export function registerWorkflowClass(engine: WorkflowEngine, cls: unknown): boo
 }
 
 /**
- * Pick the module extension for the running environment so a built app (`.js`) and a dev/ts app
- * (`.ts`, run under a loader) never double-register the same workflow. We import only files whose
- * extension matches `import.meta.url`'s own (`.ts` when running from source, `.js` from `dist`),
- * which keeps scanner and `make:workflow` (it scaffolds `.ts`) in agreement under both setups.
+ * Pick the module extension a directory scan should import, from the `readdir` entries already in
+ * hand — NOT from this library's own compiled file. A consuming app resolves this library as built
+ * `.js` from `node_modules`, but its own `app/workflows` / `app/steps` are `.ts` in dev; deriving the
+ * extension from `import.meta.url` (the old bug) always picked `.js` in that setup and silently
+ * discovered nothing, because every entry was then skipped.
+ *
+ * Rules, in order:
+ * 1. `.d.ts` entries are never importable modules — ignored entirely.
+ * 2. If any remaining entry ends in `.ts`, the scan imports `.ts` files.
+ * 3. Otherwise, if any entry ends in `.js`, the scan imports `.js` files.
+ * 4. If neither is present, returns `null` (the scan registers nothing).
+ *
+ * This preserves the original de-duplication intent: a directory containing both a built `foo.js`
+ * and its source `foo.ts` resolves to `.ts` only, so the same module is never registered twice.
+ * Shared with {@link import('./step-discovery.js').registerStepsFromDir} so the two scanners can't
+ * drift apart again.
  */
-const MODULE_EXT = extname(import.meta.url || '') === '.ts' ? '.ts' : '.js';
+export function pickModuleExt(entries: readonly string[]): '.ts' | '.js' | null {
+  let hasTs = false;
+  let hasJs = false;
+  for (const entry of entries) {
+    if (entry.endsWith('.d.ts')) continue;
+    const ext = extname(entry);
+    if (ext === '.ts') hasTs = true;
+    else if (ext === '.js') hasJs = true;
+  }
+  if (hasTs) return '.ts';
+  if (hasJs) return '.js';
+  return null;
+}
 
 /**
  * Scan a directory RECURSIVELY for modules and collect every exported workflow class — a
  * `BaseWorkflow` subclass (the default export and any named export are considered) — so nested
  * conventions like
  * `app/workflows/billing/charge_workflow.ts` are found, matching `make:workflow`'s nested-path
- * scaffolding. Only the environment-appropriate extension is imported (see {@link MODULE_EXT}), and
+ * scaffolding. Only the extension present in `dir` is imported (see {@link pickModuleExt}), and
  * each module path is visited once, so a built `.js` and a dev `.ts` of the same module never both
  * register. Missing directory → empty list (the convention is opt-in: no `app/workflows`, nothing to
  * register).
@@ -74,10 +98,12 @@ export async function discoverWorkflows(dir: string): Promise<DiscoveredWorkflow
     throw err;
   }
 
+  const moduleExt = pickModuleExt(entries);
   const found: DiscoveredWorkflow[] = [];
+  if (moduleExt === null) return found;
   const seen = new Set<unknown>();
   for (const entry of entries.sort()) {
-    if (extname(entry) !== MODULE_EXT || entry.endsWith(`.d${MODULE_EXT}`)) continue;
+    if (extname(entry) !== moduleExt || entry.endsWith(`.d${moduleExt}`)) continue;
     const mod = (await import(pathToFileURL(join(dir, entry)).href)) as Record<string, unknown>;
     for (const exported of Object.values(mod)) {
       if (seen.has(exported)) continue;
