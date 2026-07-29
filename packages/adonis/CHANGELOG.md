@@ -1,5 +1,21 @@
 # @adonis-agora/durable
 
+## 0.20.0
+
+### Minor Changes
+
+- [#43](https://github.com/DavideCarvalho/adonis-durable/pull/43) [`b4ba291`](https://github.com/DavideCarvalho/adonis-durable/commit/b4ba2916c3e8cdb198e86c60b7aac403df4df3d2) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - New `@Scheduled(...)` class decorator — the decorator form of the colocated `static schedule`. It only stamps `static schedule` on the class; normalization (key defaults, `workflow` fill-in, the `static workflow` requirement) stays in `workflowSchedules`, so both authoring forms behave identically:
+
+  ```ts
+  @Scheduled({ cron: '0 4 * * *', timezone: 'America/Sao_Paulo' })
+  export default class CrawlWorkflow extends BaseWorkflow {
+    static workflow = { name: 'crawl' }
+    async run(ctx: WorkflowCtx) { … }
+  }
+  ```
+
+  Repeated applications and an existing `static schedule` literal compose, accumulating in source order (top decorator first, then the literal). With several schedules on one class, prefer explicit `key`s over the positional `${name}:${i}` defaults — the key is part of the deterministic run id, and reordering declarations would silently re-key them.
+
 ## 0.19.2
 
 ### Patch Changes

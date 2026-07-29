@@ -1,5 +1,5 @@
 /** Keep in sync with this package's `version` in package.json. */
-export const VERSION = '0.19.2';
+export const VERSION = '0.20.0';
 
 // --- engine + core primitives -----------------------------------------------
 export * from './admission.js';
