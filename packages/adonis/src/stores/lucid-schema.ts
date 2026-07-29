@@ -15,6 +15,42 @@ export const DURABLE_TABLES = {
 } as const;
 
 /**
+ * Where {@link createDurableTables} reports an APPLIED repair. Structurally satisfied by `console`
+ * (the default) and by AdonisJS's `Logger`, so an app can route the warning into its own log stream
+ * without this module depending on either.
+ */
+export interface DurableSchemaLogger {
+  warn(message: string): void;
+}
+
+export interface CreateDurableTablesOptions {
+  /** Sink for the applied-repair warning. Defaults to `console`. */
+  logger?: DurableSchemaLogger;
+}
+
+/**
+ * The warning {@link createDurableTables} emits when it actually `ALTER`ed something.
+ *
+ * Only on an APPLIED repair — never when every column was already there. Two defensive behaviours
+ * combined to make a wrong migration-managed schema completely undetectable: the heartbeat write is
+ * fire-and-forget (`.catch(() => undefined)` in the engine, which is correct — a lost liveness
+ * update never harms the run) and this function silently added the missing column at every boot. A
+ * warning that fired on every boot regardless would be filtered as noise and would restore exactly
+ * that vacuum, so the discriminator matters more than the wording.
+ */
+function repairWarning(repairs: string[]): string {
+  return [
+    `@adonis-agora/durable: repaired the durable schema in place — added ${repairs.join(', ')}.`,
+    'The database was behind the installed library version, so these columns were added at runtime',
+    'and nothing recorded it in your migration history. To record it (and to stop depending on the',
+    'runtime repair), add a migration that calls `createDurableTables(db, this.db.connectionName)`',
+    "with `db` from '@adonisjs/lucid/services/db' — the same call the generated",
+    'create_durable_tables migration makes. This warning appears only when a repair was actually',
+    'applied; a schema that is already current logs nothing.',
+  ].join(' ');
+}
+
+/**
  * Idempotent DDL for the durable tables, expressed via Lucid's schema builder (Knex). Works across
  * SQLite / Postgres / MySQL. Timestamps and `wake_at` are stored as epoch-ms `bigInteger` columns so
  * the store never depends on a native date type and replay is exact across engines. JSON payloads
@@ -28,12 +64,26 @@ export const DURABLE_TABLES = {
  * Pass `connectionName` to provision the tables on a dedicated Lucid connection — it must match the
  * connection the store reads/writes on, or `ensureSchema` would create the tables where the store
  * never looks. Omit it to use the `Database` default connection.
+ *
+ * Creating tables from scratch is silent. REPAIRING an existing table — adding a column a previous
+ * version of this schema did not have — emits one `warn` naming every column it added, because that
+ * means the caller's migration-managed schema is behind the library and only works thanks to this
+ * repair. Pass `options.logger` to route it; it defaults to `console`.
  */
-export async function createDurableTables(db: Database, connectionName?: string): Promise<void> {
+export async function createDurableTables(
+  db: Database,
+  connectionName?: string,
+  options: CreateDurableTablesOptions = {},
+): Promise<void> {
   // Knex's schema builder is stateful — operations chained on one instance run together. Take a FRESH
   // `db.connection(connectionName).schema` for every hasTable/createTable so each DDL statement executes
   // exactly once, all on the store's own connection.
   const conn = () => db.connection(connectionName).schema;
+
+  // `<table>.<column>` for every ALTER actually issued below. Stays empty on the fresh-install path
+  // (a missing table is CREATEd whole and never reaches a `hasColumn` branch), which is what makes
+  // the warning at the end mean "your schema was wrong" instead of "boot happened".
+  const repairs: string[] = [];
 
   if (!(await conn().hasTable(DURABLE_TABLES.runs))) {
     await conn().createTable(DURABLE_TABLES.runs, (table) => {
@@ -68,6 +118,7 @@ export async function createDurableTables(db: Database, connectionName?: string)
       await conn().alterTable(DURABLE_TABLES.runs, (table) => {
         table.integer('priority');
       });
+      repairs.push(`${DURABLE_TABLES.runs}.priority`);
     }
     if (!(await conn().hasColumn(DURABLE_TABLES.runs, 'namespace'))) {
       // DEFAULT 'default' so every pre-namespace row reads back in the reserved 'default' partition —
@@ -76,6 +127,7 @@ export async function createDurableTables(db: Database, connectionName?: string)
         table.string('namespace').notNullable().defaultTo('default');
         table.index(['namespace', 'status', 'created_at'], 'durable_runs_namespace_idx');
       });
+      repairs.push(`${DURABLE_TABLES.runs}.namespace`);
     }
   }
 
@@ -110,6 +162,7 @@ export async function createDurableTables(db: Database, connectionName?: string)
       await conn().alterTable(DURABLE_TABLES.checkpoints, (table) => {
         table.string('parallel_group');
       });
+      repairs.push(`${DURABLE_TABLES.checkpoints}.parallel_group`);
     }
     if (!(await conn().hasColumn(DURABLE_TABLES.checkpoints, 'last_heartbeat_at'))) {
       // Heartbeat-persistence wave: nullable, so a step whose handler never beats reads back with
@@ -118,6 +171,12 @@ export async function createDurableTables(db: Database, connectionName?: string)
         table.bigInteger('last_heartbeat_at');
         table.text('heartbeat_progress');
       });
+      // Both columns land in one ALTER, so both are reported — the operator needs the column list,
+      // not the statement count.
+      repairs.push(
+        `${DURABLE_TABLES.checkpoints}.last_heartbeat_at`,
+        `${DURABLE_TABLES.checkpoints}.heartbeat_progress`,
+      );
     }
   }
 
@@ -146,6 +205,7 @@ export async function createDurableTables(db: Database, connectionName?: string)
     await conn().alterTable(DURABLE_TABLES.signalWaiters, (table) => {
       table.string('parallel_group');
     });
+    repairs.push(`${DURABLE_TABLES.signalWaiters}.parallel_group`);
   }
 
   if (!(await conn().hasTable(DURABLE_TABLES.bufferedSignals))) {
@@ -169,6 +229,13 @@ export async function createDurableTables(db: Database, connectionName?: string)
       table.bigInteger('published_at').notNullable();
       table.index(['name', 'published_at'], 'durable_buffered_events_name_idx');
     });
+  }
+
+  // ONE warning for the whole call, listing every column added, or none at all. Not one per ALTER:
+  // an operator needs to know their schema was behind and by what, and a burst of lines is easier to
+  // lose than a single one.
+  if (repairs.length > 0) {
+    (options.logger ?? console).warn(repairWarning(repairs));
   }
 }
 
