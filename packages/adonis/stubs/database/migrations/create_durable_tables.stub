@@ -52,6 +52,8 @@ export default class extends BaseSchema {
       table.bigInteger('enqueued_at')
       table.bigInteger('started_at').notNullable()
       table.bigInteger('finished_at').notNullable()
+      table.bigInteger('last_heartbeat_at')
+      table.text('heartbeat_progress')
       table.primary(['run_id', 'seq'])
       table.index(['run_id', 'name'], 'durable_checkpoints_name_idx')
     })
