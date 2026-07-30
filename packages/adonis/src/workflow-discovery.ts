@@ -2,18 +2,25 @@ import { readdir } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { WorkflowEngine } from './engine.js';
-import {
-  type WorkflowClass,
-  type WorkflowMeta,
-  workflowMeta,
-  workflowSchedules,
-} from './workflow-ref.js';
+import { type WorkflowMeta, workflowMeta, workflowSchedules } from './workflow-ref.js';
+
+/**
+ * The constructor shape discovery hands back. Deliberately **not** {@link WorkflowClass}: that one
+ * is `abstract new` so any `BaseWorkflow` subclass can be *referenced* (`ctx.child(Cls)`,
+ * `engine.start(Cls)`). Discovery loads real, instantiable classes and
+ * {@link registerWorkflowClass} does `new Ctor()` on each one, so typing them as abstract left
+ * consumers unable to instantiate what the API gave them. Concrete constructors stay assignable to
+ * {@link WorkflowClass}, so every existing reference-style use keeps working.
+ */
+export type DiscoveredWorkflowClass = new () => {
+  run(ctx: unknown, input: unknown): Promise<unknown> | unknown;
+};
 
 /** A discovered workflow class plus its resolved {@link WorkflowMeta} — from a `BaseWorkflow`
  *  subclass's `static workflow` config. */
 export interface DiscoveredWorkflow {
   meta: WorkflowMeta;
-  cls: WorkflowClass;
+  cls: DiscoveredWorkflowClass;
 }
 
 /**
@@ -26,7 +33,7 @@ export interface DiscoveredWorkflow {
 export function registerWorkflowClass(engine: WorkflowEngine, cls: unknown): boolean {
   const meta = workflowMeta(cls);
   if (!meta) return false;
-  const Ctor = cls as new () => { run(ctx: unknown, input: unknown): Promise<unknown> | unknown };
+  const Ctor = cls as DiscoveredWorkflowClass;
   const instance = new Ctor();
   engine.register(
     meta.name,
@@ -110,7 +117,7 @@ export async function discoverWorkflows(dir: string): Promise<DiscoveredWorkflow
       const meta = workflowMeta(exported);
       if (!meta) continue;
       seen.add(exported);
-      found.push({ meta, cls: exported as WorkflowClass });
+      found.push({ meta, cls: exported as DiscoveredWorkflowClass });
     }
   }
   return found;

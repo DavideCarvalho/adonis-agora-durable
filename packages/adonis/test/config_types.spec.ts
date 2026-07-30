@@ -7,9 +7,9 @@ import { defineConfig, stores, transports } from '../src/define_config.js';
  *
  * This file has TWO layers:
  *  - **Type-level** assertions in `typeContracts()` — never executed, but type-checked by
- *    `tsconfig.type-test.json` (the package `tsconfig.json` excludes `test/**`, and vitest strips
+ *    `tsconfig.tests.json` (the package `tsconfig.json` excludes `test/**`, and vitest strips
  *    types via swc, so neither would catch a `@ts-expect-error`). Run them with:
- *      `node_modules/.bin/tsc -p tsconfig.type-test.json`
+ *      `pnpm typecheck` (or `node_modules/.bin/tsc -p tsconfig.tests.json`)
  *    Prove-by-mutation: delete `store?: never` from {@link TenantConfig} and the `@ts-expect-error`
  *    on the store-bearing tenant config becomes "unused", failing the type-check.
  *  - **Runtime** assertions in the `describe` block — run by vitest — proving the `role` default.
