@@ -17,9 +17,10 @@ describe('replay recovery — stateless-replay-per-turn execution model', () => 
     let localRuns = 0;
     let remoteDispatches = 0;
 
-    transport.handle('billing.charge-card', async (input: { amount: number }) => {
+    transport.handle('billing.charge-card', async (input) => {
+      const { amount } = input as { amount: number };
       remoteDispatches += 1;
-      return { chargeId: `ch_${input.amount}` };
+      return { chargeId: `ch_${amount}` };
     });
 
     function registerCheckout(engine: WorkflowEngine) {

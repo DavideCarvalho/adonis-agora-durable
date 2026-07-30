@@ -22,9 +22,10 @@ describe('WorkflowEngine — remote steps', () => {
   it('dispatches a remote step over the transport and checkpoints its result', async () => {
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();
-    transport.handle('payments.charge-card', async (input: { amount: number }) => ({
-      chargeId: `ch_${input.amount}`,
-    }));
+    transport.handle('payments.charge-card', async (input) => {
+      const { amount } = input as { amount: number };
+      return { chargeId: `ch_${amount}` };
+    });
 
     const engine = new WorkflowEngine({ store, transport });
     engine.register('checkout', '1', async (ctx) => {
@@ -50,9 +51,10 @@ describe('WorkflowEngine — remote steps', () => {
   it('records queue/processing timing and announces a remote step as it starts', async () => {
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();
-    transport.handle('payments.charge-card', async (input: { amount: number }) => ({
-      chargeId: `ch_${input.amount}`,
-    }));
+    transport.handle('payments.charge-card', async (input) => {
+      const { amount } = input as { amount: number };
+      return { chargeId: `ch_${amount}` };
+    });
 
     const engine = new WorkflowEngine({ store, transport });
     const events: string[] = [];
@@ -89,9 +91,10 @@ describe('WorkflowEngine — remote steps', () => {
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();
     let dispatches = 0;
-    transport.handle('payments.charge-card', async (input: { amount: number }) => {
+    transport.handle('payments.charge-card', async (input) => {
+      const { amount } = input as { amount: number };
       dispatches += 1;
-      return { chargeId: `ch_${input.amount}` };
+      return { chargeId: `ch_${amount}` };
     });
 
     const engine = new WorkflowEngine({ store, transport });

@@ -23,7 +23,7 @@ afterEach(() => setWorkflowEngineResolver(undefined));
 describe('BaseWorkflow — authoring (static workflow)', () => {
   it('resolves name/version/tags from a `static workflow` config', () => {
     class CheckoutWorkflow extends BaseWorkflow {
-      static workflow = { name: 'checkout', version: '2', tags: ['billing'] };
+      static override workflow = { name: 'checkout', version: '2', tags: ['billing'] };
       async run(_ctx: WorkflowCtx, input: { id: string }) {
         return input.id;
       }
@@ -38,7 +38,7 @@ describe('BaseWorkflow — authoring (static workflow)', () => {
 
   it('defaults version to "1" when the static config omits it', () => {
     class BareWorkflow extends BaseWorkflow {
-      static workflow = { name: 'bare' };
+      static override workflow = { name: 'bare' };
       async run() {
         return 'ok';
       }
@@ -60,7 +60,7 @@ describe('BaseWorkflow — authoring (static workflow)', () => {
     const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
 
     class StaticGreet extends BaseWorkflow {
-      static workflow = { name: 'static-greet', version: '1' };
+      static override workflow = { name: 'static-greet', version: '1' };
       async run(_ctx: WorkflowCtx, input: { name: string }) {
         return `hi ${input.name}`;
       }
@@ -81,7 +81,7 @@ describe('BaseWorkflow — OUTSIDE a workflow (engine path)', () => {
 
     let ran = false;
     class Audit extends BaseWorkflow {
-      static workflow = { name: 'outside-audit', version: '1' };
+      static override workflow = { name: 'outside-audit', version: '1' };
       async run() {
         ran = true;
         return 'logged';
@@ -103,7 +103,7 @@ describe('BaseWorkflow — OUTSIDE a workflow (engine path)', () => {
     setWorkflowEngineResolver(() => engine);
 
     class Noop extends BaseWorkflow {
-      static workflow = { name: 'outside-noop', version: '1' };
+      static override workflow = { name: 'outside-noop', version: '1' };
       async run() {
         return 'done';
       }
@@ -121,7 +121,7 @@ describe('BaseWorkflow — OUTSIDE a workflow (engine path)', () => {
     setWorkflowEngineResolver(() => engine);
 
     class Double extends BaseWorkflow {
-      static workflow = { name: 'outside-double', version: '1' };
+      static override workflow = { name: 'outside-double', version: '1' };
       async run(_ctx: WorkflowCtx, input: { n: number }) {
         return input.n * 2;
       }
@@ -138,7 +138,7 @@ describe('BaseWorkflow — OUTSIDE a workflow (engine path)', () => {
     setWorkflowEngineResolver(() => engine);
 
     class Approval extends BaseWorkflow {
-      static workflow = { name: 'outside-approval', version: '1' };
+      static override workflow = { name: 'outside-approval', version: '1' };
       async run(ctx: WorkflowCtx) {
         const decision = await ctx.waitForSignal<string>('approve-decision');
         return `decided:${decision}`;
@@ -175,13 +175,13 @@ describe('BaseWorkflow — INSIDE a running workflow (ctx path)', () => {
     const engine = new WorkflowEngine({ store });
 
     class Inner extends BaseWorkflow {
-      static workflow = { name: 'inner-start', version: '1' };
+      static override workflow = { name: 'inner-start', version: '1' };
       async run(_ctx: WorkflowCtx, input: { n: number }) {
         return input.n + 1;
       }
     }
     class Parent extends BaseWorkflow {
-      static workflow = { name: 'parent-start', version: '1' };
+      static override workflow = { name: 'parent-start', version: '1' };
       async run(_ctx: WorkflowCtx) {
         const childOut = await Inner.start({ n: 41 });
         return { fromChild: childOut };
@@ -208,13 +208,13 @@ describe('BaseWorkflow — INSIDE a running workflow (ctx path)', () => {
 
     let childIdSeen: string | undefined;
     class Side extends BaseWorkflow {
-      static workflow = { name: 'inner-side', version: '1' };
+      static override workflow = { name: 'inner-side', version: '1' };
       async run() {
         return 'side-done';
       }
     }
     class Parent extends BaseWorkflow {
-      static workflow = { name: 'parent-dispatch', version: '1' };
+      static override workflow = { name: 'parent-dispatch', version: '1' };
       async run() {
         const { runId } = await Side.dispatch({});
         childIdSeen = runId;
@@ -242,14 +242,14 @@ describe('BaseWorkflow — determinism / positional slot', () => {
     let innerRuns = 0;
     let parentBodyTurns = 0;
     class Inner extends BaseWorkflow {
-      static workflow = { name: 'det-inner', version: '1' };
+      static override workflow = { name: 'det-inner', version: '1' };
       async run() {
         innerRuns += 1;
         return 'x';
       }
     }
     class Parent extends BaseWorkflow {
-      static workflow = { name: 'det-parent', version: '1' };
+      static override workflow = { name: 'det-parent', version: '1' };
       async run() {
         parentBodyTurns += 1;
         await Inner.start({});
@@ -280,13 +280,13 @@ describe('BaseWorkflow — determinism / positional slot', () => {
     const engineB = new WorkflowEngine({ store: viaCtx });
 
     class Inner extends BaseWorkflow {
-      static workflow = { name: 'slot-inner', version: '1' };
+      static override workflow = { name: 'slot-inner', version: '1' };
       async run() {
         return 'x';
       }
     }
     class ParentViaStart extends BaseWorkflow {
-      static workflow = { name: 'slot-parent', version: '1' };
+      static override workflow = { name: 'slot-parent', version: '1' };
       async run() {
         await Inner.start({});
         return 'ok';
@@ -321,7 +321,9 @@ describe('getCurrentWorkflowCtx — ALS isolation', () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });
 
-    const seen: Record<string, { matches: boolean; ambientRunId?: string }> = {};
+    // `ambientRunId` is always written, but is `undefined` if the ambient ctx went missing — which is
+    // precisely the failure this test would catch, so the type has to be able to hold it.
+    const seen: Record<string, { matches: boolean; ambientRunId: string | undefined }> = {};
     const bodies = ['als-a', 'als-b'];
     for (const name of bodies) {
       engine.register(name, '1', async (ctx) => {

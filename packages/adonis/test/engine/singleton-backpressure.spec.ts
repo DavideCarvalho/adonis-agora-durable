@@ -82,7 +82,7 @@ describe('singleton notify-on-release', () => {
     // waiter has actually run (notify dispatches it asynchronously) before releasing the one after.
     for (let i = 0; i < ids.length - 1; i++) {
       await engine.signal(`go:${ids[i]}`, undefined);
-      const nextId = ids[i + 1];
+      const nextId = ids[i + 1]!;
       for (let tries = 0; tries < 50 && !ran.includes(nextId); tries++) {
         await new Promise((r) => setTimeout(r, 2));
       }

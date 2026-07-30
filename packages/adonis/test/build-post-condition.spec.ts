@@ -98,7 +98,7 @@ describe('build post-condition', () => {
     // `clean` must precede the compile: removing dist/ up front is what stops stale incremental
     // state from existing in the first place. And the compile must use the non-incremental config,
     // so build keeps no buildinfo that could disagree with dist/ or race typecheck's.
-    const build = pkg.scripts.build;
+    const build = pkg.scripts.build!; // asserted present above
     expect(build.indexOf('clean')).toBeLessThan(build.indexOf('tsc'));
     expect(build).toContain('tsconfig.build.json');
   });

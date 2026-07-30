@@ -29,7 +29,7 @@ describe('non-blocking control actions (retry / compensate-cancel)', () => {
     expect((await store.getRun('r1'))?.status).toBe('pending'); // NOT executed inline
 
     const [res] = await engine.runPending(); // a worker picks it up and re-runs the now-passing step
-    expect(res.status).toBe('completed');
+    expect(res!.status).toBe('completed');
   });
 
   it('compensate-cancel returns immediately and runs the undo in the background', async () => {

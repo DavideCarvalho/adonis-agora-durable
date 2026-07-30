@@ -11,8 +11,23 @@ import {
 } from '../../src/dashboard/handlers.js';
 import { InMemoryStateStore, InMemoryTransport, WorkflowEngine } from '../../src/index.js';
 
+/**
+ * What this spec actually drives: the concrete {@link WorkflowEngine}, narrowed to
+ * the {@link Deps} port only when it is handed to a handler.
+ *
+ * `Deps.engine` is deliberately the bounded `DashboardEngine` read/control port,
+ * which does not declare `start`/`waitForRun` — those are engine-only. The spec needs
+ * them to arrange runs, so it holds the concrete type and lets each handler call site
+ * do the narrowing. `extends Deps` is load-bearing: it makes TypeScript re-check that
+ * `WorkflowEngine` really is structurally assignable to the port, which is the claim
+ * `DashboardEngine`'s own doc comment makes.
+ */
+interface TestDeps extends Deps {
+  engine: WorkflowEngine;
+}
+
 /** Build a real in-memory engine and register a couple of workflows. */
-function makeEngine(): Deps {
+function makeEngine(): TestDeps {
   const store = new InMemoryStateStore();
   const engine = new WorkflowEngine({ store, transport: new InMemoryTransport() });
 
@@ -45,7 +60,7 @@ const req = (over: Partial<ApiRequest> = {}): ApiRequest => ({
 });
 
 describe('JSON handlers', () => {
-  let deps: Deps;
+  let deps: TestDeps;
 
   beforeEach(() => {
     deps = makeEngine();

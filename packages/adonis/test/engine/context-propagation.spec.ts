@@ -12,6 +12,7 @@ function task(context?: Record<string, unknown>): RemoteTask {
     stepId: 'r1:0',
     group: 'payments',
     input: { amount: 10 },
+    attempt: 1,
     ...(context ? { context } : {}),
   };
 }

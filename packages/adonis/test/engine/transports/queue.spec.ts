@@ -321,6 +321,7 @@ describe('QueueTransport', () => {
       await adapter.pushOn('durable:results', {
         id: 'res-1',
         name: 'result',
+        attempts: 0,
         payload: JSON.stringify({ stepId: 'r9:1', status: 'completed', output: 1 }),
       });
 
@@ -367,6 +368,7 @@ describe('QueueTransport', () => {
       await adapter.pushOn('durable:results', {
         id: 'res-2',
         name: 'result',
+        attempts: 0,
         payload: JSON.stringify({ stepId: 'r9:2', status: 'completed', output: 1 }),
       });
       await settle();

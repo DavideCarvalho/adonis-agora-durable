@@ -68,7 +68,7 @@ describe('DLQ — maxRecoveryAttempts', () => {
     engine.register('poison', '1', async () => {
       throw new Error('x');
     });
-    const dead: Array<{ id: string; status: string; code?: string }> = [];
+    const dead: Array<{ id: string; status: string; code: string | undefined }> = [];
     engine.onDead((run) => dead.push({ id: run.id, status: run.status, code: run.error?.code }));
 
     await store.createRun(runningRun({ recoveryAttempts: 1 })); // already at the cap

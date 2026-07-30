@@ -109,9 +109,9 @@ describe('DbTransport (unit)', () => {
     await engine.dispatch(task());
     await waitFor(async () => results.length === 1);
 
-    expect(results[0].status).toBe('completed');
-    expect(results[0].stepId).toBe('r1:1');
-    expect(results[0].output).toEqual({ result: 42 });
+    expect(results[0]!.status).toBe('completed');
+    expect(results[0]!.stepId).toBe('r1:1');
+    expect(results[0]!.output).toEqual({ result: 42 });
     // Result row consumed + deleted.
     const left = await db.connection().from(TRANSPORT_TABLES.results).count('* as c');
     expect(Number(left[0].c)).toBe(0);
@@ -131,9 +131,9 @@ describe('DbTransport (unit)', () => {
 
     await engine.dispatch(task());
     await waitFor(async () => results.length === 1);
-    expect(results[0].status).toBe('failed');
-    expect(results[0].error?.message).toBe('declined');
-    expect(results[0].error?.retryable).toBe(false);
+    expect(results[0]!.status).toBe('failed');
+    expect(results[0]!.error?.message).toBe('declined');
+    expect(results[0]!.error?.retryable).toBe(false);
   });
 
   it('polls heartbeat rows and delivers them to the engine', async () => {
@@ -187,8 +187,8 @@ describe('DbTransport (unit)', () => {
 
     await a.publishControl({ kind: 'cancel', runId: 'r1' });
     await waitFor(async () => got.length === 1);
-    expect(got[0].kind).toBe('cancel');
-    expect(got[0].from).toBe('A');
+    expect(got[0]!.kind).toBe('cancel');
+    expect(got[0]!.from).toBe('A');
   });
 
   describe('namespace scoping', () => {

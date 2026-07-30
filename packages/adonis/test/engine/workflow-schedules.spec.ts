@@ -157,7 +157,7 @@ describe('@Scheduled (decorator form of the colocated schedule)', () => {
     }
     @Scheduled({ everyMs: 60_000, key: 'fast' })
     class FastSync extends BaseSync {
-      static workflow = { name: 'fast-sync' };
+      static override workflow = { name: 'fast-sync' };
     }
     // The subclass accumulates (decorator + inherited literal); the base class stays untouched.
     expect(workflowSchedules(FastSync)).toEqual([

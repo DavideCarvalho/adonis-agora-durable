@@ -39,9 +39,10 @@ describe('WorkflowEngine routes flow-control through an injected AdmissionBacken
   it('consults the backend on admit and release for a queued remote step', async () => {
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();
-    transport.handle('payments.charge-card', async (i: { amount: number }) => ({
-      chargeId: `ch_${i.amount}`,
-    }));
+    transport.handle('payments.charge-card', async (input) => {
+      const { amount } = input as { amount: number };
+      return { chargeId: `ch_${amount}` };
+    });
     const backend = new RecordingBackend();
 
     const engine = new WorkflowEngine({ store, transport, admission: backend });

@@ -51,12 +51,10 @@ describe('DashboardProvider — boots inside a real AdonisJS app', () => {
     // Not just "didn't throw" — prove the routes actually made it onto the router before the app
     // is considered booted (registering them any later, e.g. in a provider `ready()` hook, would be
     // too late: the HTTP server commits the router before providers' `ready()` runs).
-    const router = await app.container.make<{
-      commit(): void;
-      toJSON(): { root: Array<{ name?: string }> };
-    }>('router');
+    const router = await app.container.make('router');
     router.commit();
-    const routeNames = router.toJSON().root.map((route) => route.name);
+    // `toJSON()` is keyed by domain; the dashboard registers no domain, so its routes land under `root`.
+    const routeNames = router.toJSON().root!.map((route) => route.name);
 
     expect(routeNames).toEqual(
       expect.arrayContaining([

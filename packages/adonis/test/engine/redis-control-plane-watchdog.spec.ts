@@ -28,9 +28,11 @@ class FakeSub implements RedisPubSub {
   subscribe() {
     return undefined;
   }
-  on(event: string, listener: (...args: unknown[]) => void) {
+  on(event: string, listener: (...args: never[]) => void) {
     const l = this.listeners.get(event) ?? [];
-    l.push(listener);
+    // The port declares `never[]` purely so any listener shape is accepted; `emit` below calls this
+    // back with exactly the args the real ioredis event carries.
+    l.push(listener as (...args: unknown[]) => void);
     this.listeners.set(event, l);
     return undefined;
   }

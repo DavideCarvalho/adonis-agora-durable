@@ -28,7 +28,7 @@ function extractSpecifiers(source: string): string[] {
   for (const re of [fromClause, sideEffectImport]) {
     let match: RegExpExecArray | null;
     // biome-ignore lint/suspicious/noAssignInExpressions: laco padrao de RegExp#exec
-    while ((match = re.exec(source))) specifiers.push(match[1]);
+    while ((match = re.exec(source))) specifiers.push(match[1]!);
   }
   return specifiers;
 }

@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import type { ApplicationService } from '@adonisjs/core/types';
+import type { ApplicationService, ContainerBindings } from '@adonisjs/core/types';
 import { describe, expect, it } from 'vitest';
 import DurableProvider from '../providers/durable_provider.js';
 import type { DurableConfig } from '../src/define_config.js';
@@ -69,12 +69,37 @@ class P4RedisTransport extends P4Transport {
   }
 }
 
+/** Anything the real container accepts as a resolution key here: one of the abstract tokens this package
+ *  publishes into `ContainerBindings` (see `src/role_bindings.ts`), or a class constructor. */
+type BindingKey = keyof ContainerBindings | (abstract new (...args: never[]) => unknown);
+
+/** What a given {@link BindingKey} resolves to — the same mapping the real AdonisJS container applies:
+ *  a published token yields its declared `ContainerBindings` type, a class key yields an instance. */
+type Resolved<K extends BindingKey> = K extends keyof ContainerBindings
+  ? ContainerBindings[K]
+  : K extends abstract new (
+        ...args: never[]
+      ) => infer T
+    ? T
+    : never;
+
 /** A key-aware container/app double — a faithful stand-in for the real AdonisJS container (unlike the
  *  legacy single-factory double in durable_provider.spec): each binding is keyed, and an unbound key
  *  throws on `make`, which is exactly how we prove tenant structural isolation (no store binding). */
 function makeApp(config: DurableConfig, appRoot = '/app') {
   const factories = new Map<unknown, () => unknown>();
   const cache = new Map<unknown, unknown>();
+
+  /** The untyped resolution the double actually performs: build-once, then serve from cache. */
+  async function resolve(key: unknown): Promise<unknown> {
+    if (cache.has(key)) return cache.get(key);
+    const factory = factories.get(key);
+    if (!factory) throw new Error(`no binding for ${String(key)}`);
+    const value = await factory();
+    cache.set(key, value);
+    return value;
+  }
+
   const container = {
     singleton(key: unknown, factory: () => unknown) {
       factories.set(key, factory);
@@ -82,13 +107,14 @@ function makeApp(config: DurableConfig, appRoot = '/app') {
     bind(key: unknown, factory: () => unknown) {
       factories.set(key, factory);
     },
-    async make(key: unknown) {
-      if (cache.has(key)) return cache.get(key);
-      const factory = factories.get(key);
-      if (!factory) throw new Error(`no binding for ${String(key)}`);
-      const value = await factory();
-      cache.set(key, value);
-      return value;
+    /**
+     * Typed exactly like the real container's `make`: the key decides the result type. The single cast
+     * lives here, where the real container also erases its heterogeneous factory map — pushing it out to
+     * the call sites would instead leave every resolved object as `unknown` and hide what the provider
+     * actually bound.
+     */
+    async make<K extends BindingKey>(key: K): Promise<Resolved<K>> {
+      return (await resolve(key)) as Resolved<K>;
     },
     hasBinding(key: unknown) {
       return factories.has(key);

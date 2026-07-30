@@ -67,7 +67,7 @@ describe('DurableProvider', () => {
 
   it('provisions the store schema at boot by default (autoSchema on)', async () => {
     const store = new SchemaSpyStore();
-    const { app, resolve } = fakeApp({ store: 'spy', stores: { spy: () => store } });
+    const { app, resolve } = fakeApp({ store: 'spy', stores: { spy: async () => store } });
     new DurableProvider(app).register();
     await resolve();
     expect(store.ensureSchemaCalls).toBe(1);
@@ -77,7 +77,7 @@ describe('DurableProvider', () => {
     const store = new SchemaSpyStore();
     const { app, resolve } = fakeApp({
       store: 'spy',
-      stores: { spy: () => store },
+      stores: { spy: async () => store },
       autoSchema: false,
     });
     new DurableProvider(app).register();

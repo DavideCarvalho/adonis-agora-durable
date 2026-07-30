@@ -38,9 +38,10 @@ describe('WorkflowEngine + LocalWorkflowTurnExecutor — a TS turn body driven b
   it('dispatches a step then completes — the run advances across turns to `completed`', async () => {
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();
-    transport.handle('charge', async (input: { amount: number }) => ({
-      ref: `ch_${input.amount}`,
-    }));
+    transport.handle('charge', async (input) => {
+      const { amount } = input as { amount: number };
+      return { ref: `ch_${amount}` };
+    });
 
     const engine = new WorkflowEngine({ store, transport });
     const checkout: WorkflowBody = (ctx, input) => {

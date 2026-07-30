@@ -1,6 +1,6 @@
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import type { StepLogger } from '../src/interfaces.js';
+import type { StepLogger, SubProcessHandle } from '../src/interfaces.js';
 import type { StepHandler } from '../src/protocol.js';
 import { type StepServer, registerStepsFromDir } from '../src/step-discovery.js';
 
@@ -12,6 +12,14 @@ const noopLog: StepLogger = {
   heartbeat: () => {},
   sub: () => {},
   subEvent: () => {},
+  subProcess: async (_name, body) => {
+    const handle: SubProcessHandle = {
+      phase: () => handle,
+      skip: () => {},
+      fail: () => {},
+    };
+    return body(handle);
+  },
 };
 
 /**

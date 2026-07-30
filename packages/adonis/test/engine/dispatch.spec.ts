@@ -30,7 +30,7 @@ describe('engine.start dispatches (does not run inline)', () => {
     expect((await store.getRun('r1'))?.status).toBe('pending'); // nobody ran it
 
     const [result] = await engine.runPending();
-    expect(result.status).toBe('completed');
+    expect(result!.status).toBe('completed');
     expect((await store.getRun('r1'))?.output).toBe('done');
   });
 

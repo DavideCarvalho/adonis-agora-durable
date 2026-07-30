@@ -13,8 +13,8 @@ describe('signal buffering + signalWithStart', () => {
     expect(await engine.signal('go', 42)).toBeNull();
 
     const [res] = await engine.runPending(); // worker runs it → waitForSignal consumes the buffer
-    expect(res.status).toBe('completed');
-    expect(res.output).toBe(42);
+    expect(res!.status).toBe('completed');
+    expect(res!.output).toBe(42);
   });
 
   it('signalWithStart drives a long-lived entity run, race-free across many events', async () => {

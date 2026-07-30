@@ -178,6 +178,7 @@ describe('WorkflowEngine — deterministic replay', () => {
       status: 'completed',
       output: 1,
       attempts: 1,
+      enqueuedAt: now,
       startedAt: now,
       finishedAt: now,
     });

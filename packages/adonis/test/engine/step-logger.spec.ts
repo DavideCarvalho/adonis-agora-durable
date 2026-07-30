@@ -96,7 +96,7 @@ describe('createStepLogger', () => {
         group: 'exports',
         status: 'ok',
       });
-      expect((events[0].data as { durationMs: number }).durationMs).toBeGreaterThan(0);
+      expect((events[0]!.data as { durationMs: number }).durationMs).toBeGreaterThan(0);
     });
 
     it('records failed with the error message and re-throws', async () => {

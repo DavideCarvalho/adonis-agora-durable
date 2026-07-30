@@ -101,7 +101,7 @@ describe('WorkflowEngine — remote (polyglot) workflows', () => {
   it('drives a remote workflow end-to-end: local step + remote call → completed', async () => {
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();
-    transport.handle('ingestion', async (input: { key: string }) => ({ ingested: input.key }));
+    transport.handle('ingestion', async (input) => ({ ingested: (input as { key: string }).key }));
 
     const engine = new WorkflowEngine({ store, transport });
     engine.registerRemote('pipeline', '1', { group: 'py-workflows', executor: pipelineExecutor() });

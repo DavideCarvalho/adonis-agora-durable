@@ -19,9 +19,10 @@ describe('ctx.step — dispatched saga compensation', () => {
     const transport = new InMemoryTransport();
 
     const undoCalls: unknown[] = [];
-    transport.handle('billing:charge', async (input: { amount: number }) => ({
-      chargeId: `ch_${input.amount}`,
-    }));
+    transport.handle('billing:charge', async (input) => {
+      const { amount } = input as { amount: number };
+      return { chargeId: `ch_${amount}` };
+    });
     transport.handle('billing:refund', async (undo) => {
       undoCalls.push(undo);
       return { refunded: true };

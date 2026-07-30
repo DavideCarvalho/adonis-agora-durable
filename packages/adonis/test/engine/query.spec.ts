@@ -8,8 +8,18 @@ import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
  * looks like before they implement the new (optional) interface members. The engine must transparently
  * fall back to `listCheckpoints` + an in-JS filter and produce identical results.
  */
-class LegacyStore extends InMemoryStateStore {
+/**
+ * `InMemoryStateStore` MINUS the two optional query members. Extending the class directly can't express
+ * "this member is gone" — the base declares them as concrete methods — so the base constructor is retyped
+ * to the narrowed shape, which is what lets the subclass below legitimately declare them absent.
+ */
+type WithoutTargetedReads<T> = Omit<T, 'getLatestCheckpointByName' | 'listCheckpointsByNamePrefix'>;
+
+const LegacyBase: new () => WithoutTargetedReads<InMemoryStateStore> = InMemoryStateStore;
+
+class LegacyStore extends LegacyBase {
   // Deliberately drop the optional members to emulate a legacy custom store that never implemented them.
+  // The `= undefined` own properties are load-bearing: they shadow the inherited prototype methods.
   getLatestCheckpointByName = undefined;
   listCheckpointsByNamePrefix = undefined;
 }
@@ -42,7 +52,12 @@ describe('ctx.setEvent / engine.getEvent — live query of a running run', () =>
     expect(store.getLatestCheckpointByName).toBeUndefined();
     expect(store.listCheckpointsByNamePrefix).toBeUndefined();
 
-    const engine = new WorkflowEngine({ store });
+    // `StateStore` declares the two members OPTIONAL, and under `exactOptionalPropertyTypes` "absent" and
+    // "present but `undefined`" are different types. A legacy store is the former, so the engine gets the
+    // store through the absent-members view — a plain upcast (no assertion), matching what the shadowing
+    // above achieves at runtime.
+    const legacy: WithoutTargetedReads<LegacyStore> = store;
+    const engine = new WorkflowEngine({ store: legacy });
     engine.register('job', '1', async (ctx) => {
       await ctx.setEvent('progress', 50);
       await ctx.waitForSignal('go');

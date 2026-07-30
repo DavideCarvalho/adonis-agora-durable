@@ -40,9 +40,10 @@ describe('engine wakes admission-blocked runs on a freed-slot signal', () => {
   it('resumes a queued run immediately when onFreed fires (no timer poll)', async () => {
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();
-    transport.handle('payments.charge-card', async (i: { amount: number }) => ({
-      chargeId: `ch_${i.amount}`,
-    }));
+    transport.handle('payments.charge-card', async (input) => {
+      const { amount } = input as { amount: number };
+      return { chargeId: `ch_${amount}` };
+    });
     const backend = new GatedBackend();
 
     // wakeAt is MAX_SAFE_INTEGER, so a timer poller could never resume it — only onFreed can.

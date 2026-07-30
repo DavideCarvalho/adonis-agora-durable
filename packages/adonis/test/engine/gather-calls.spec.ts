@@ -69,7 +69,11 @@ describe('WorkflowEngine — cross-SDK remote fan-out (gather_calls)', () => {
   it('dispatches each gathered call EXACTLY ONCE despite re-emits, tags the fan, resolves in order', async () => {
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();
-    const dispatchCounts: Record<string, number> = { call_a: 0, call_b: 0, call_c: 0 };
+    const dispatchCounts: { call_a: number; call_b: number; call_c: number } = {
+      call_a: 0,
+      call_b: 0,
+      call_c: 0,
+    };
     // Stagger the results (a fast, b medium, c slow) so the run PARTIALLY resumes with b/c still
     // pending — and the executor re-emits them. Count every handler invocation: the engine must not
     // re-dispatch an already-in-flight call, so each count stays at 1.
@@ -117,7 +121,7 @@ describe('WorkflowEngine — cross-SDK remote fan-out (gather_calls)', () => {
     // SAME two completed calls (the engine must skip both), then a final turn completes.
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();
-    const dispatchCounts: Record<string, number> = { call_a: 0, call_b: 0 };
+    const dispatchCounts: { call_a: number; call_b: number } = { call_a: 0, call_b: 0 };
     transport.handle('call_a', () => {
       dispatchCounts.call_a += 1;
       return { r: 'a' };
