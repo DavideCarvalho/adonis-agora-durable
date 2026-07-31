@@ -1,6 +1,6 @@
 {
   "name": "@adonis-agora/durable-eslint-plugin",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "ESLint rules enforcing workflow determinism for @adonis-agora/durable — flags Date.now()/Math.random()/new Date()/crypto.randomUUID() inside workflow bodies. Part of the Agora ecosystem.",
   "license": "MIT",
   "repository": {

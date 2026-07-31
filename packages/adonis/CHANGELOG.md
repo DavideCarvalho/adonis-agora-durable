@@ -1,5 +1,84 @@
 # @adonis-agora/durable
 
+## 0.21.0
+
+### Minor Changes
+
+- [`fd02d95`](https://github.com/DavideCarvalho/adonis-durable/commit/fd02d955599d85c0daa4787e80bbf7fc6ff2c471) - `RedisPubSub` can now actually be satisfied by the two clients it advertises. Its docblock claimed "BOTH a raw `ioredis` instance and an `@adonisjs/redis` connection satisfy it structurally". Against the real typings, **neither did** — passing either one to `RedisControlPlane`/`defineConfig`'s `connection` was a compile error, on an API whose own feature detection is built on the assumption that callers can:
+
+  - A real `Redis` failed on `subscribe`. The port declared `subscribe(channel, handler?)` — that is the `@adonisjs/redis` shape. ioredis's real overloads are `(...channels: (string | Buffer)[], callback?)`, where `callback` is a node-style `(err, result)` _completion_ callback, not a per-message handler; the two are not structurally compatible in either direction.
+  - A real `RedisConnection` failed on `on`. The port declared `on?(event: string, listener)`; `@adonisjs/redis`'s is emittery-style `<Name extends keyof ConnectionEvents>(eventName, listener, options?)`, which a plain `string` event does not satisfy.
+
+  It survived because every unit test hands the driver a hand-written fake, and the one spec that used a real client cast the mismatch away at the seam.
+
+  `RedisPubSub` is now a union of the two real shapes — `IoredisPubSub | AdonisRedisPubSub` (both newly exported, along with `IoredisSubscriber`, the narrower surface of the `duplicate()`d subscriber, which cannot publish or re-duplicate). A named type guard maps the existing runtime feature test (`duplicate()` present ⇒ raw ioredis) onto the right arm, so the call sites narrow instead of casting. The three per-event `on` overloads also let the driver drop the `as never` it needed on every listener.
+
+  No runtime behaviour changed: the detection, the channel name, the payload and the watchdog are all untouched, and the suite is unmoved at 984 passing.
+
+  Marked minor rather than patch because `RedisPubSub` stops being an `interface`: a consumer writing `class MyFake implements RedisPubSub` no longer compiles (a class cannot implement a union) and must pick the arm it models. Values assignable to the old shape generally still are — this repo's own fakes needed only that one-word change.
+
+- [`96f2ddf`](https://github.com/DavideCarvalho/adonis-durable/commit/96f2ddf4de29faa7b873bd640196f53c894c01ac) - The generated migration no longer copies the durable schema, and the schema self-heal is no longer silent.
+
+  **Do you need to do anything?** Only if you want the repair recorded in your migration history — nothing is broken today, and nothing breaks on upgrade.
+
+  - **You are on `autoSchema: true` (the default) and your app boots fine.** You may now see one new warning at boot, naming columns like `durable_step_checkpoints.last_heartbeat_at`. That is not a new fault — it is the library finally saying out loud something it has been doing silently at every boot: your database is missing columns the installed version writes, and `ensureSchema()` is adding them for you. Your data is fine and the columns are correct. To make it stop (and to stop depending on a runtime repair for your schema), add one migration:
+
+    ```ts
+    import { BaseSchema } from "@adonisjs/lucid/schema";
+    import db from "@adonisjs/lucid/services/db";
+    import { createDurableTables } from "@adonis-agora/durable";
+
+    export default class extends BaseSchema {
+      static disableTransactions = true;
+      async up() {
+        await createDurableTables(db, this.db.connectionName);
+      }
+      async down() {} // convergence only — it did not create these tables
+    }
+    ```
+
+    It is idempotent, additive-only, and a no-op where the self-heal already ran. `static disableTransactions = true` is required: the DDL runs on a connection the `Database` manager checks out itself, so on a `pool: { max: 1 }` connection the migrator's transaction would hold the only connection and the migration would hang.
+
+  - **You see no warning.** Nothing to do. Your migrations are current — the warning fires only on an applied repair, never on a schema that is already right, and never on a fresh database.
+
+  - **You are on `autoSchema: false`.** You are the case that could actually be broken, because nothing repairs your schema at boot. If your `durable_step_checkpoints` lacks `last_heartbeat_at` / `heartbeat_progress`, step heartbeats have been silently discarded (the engine's heartbeat write is fire-and-forget, so it never surfaced). Run the migration above.
+
+  **Why the change.** The migration stub reproduced the DDL that `createDurableTables` already produces, and the copy drifted twice — most recently missing `last_heartbeat_at` and `heartbeat_progress`, which `LucidStateStore.recordStepHeartbeat` writes on every beat. Fixing the stub did not help anyone who had already run `node ace configure`: their migration file is a frozen copy of the old DDL, and their app only worked because `ensureSchema()` patched the database at every boot with nothing recorded anywhere. A consumer audit found an app in exactly that state, byte-identical to the published stub, for eleven minor versions.
+
+  So the schema now lives in one place. `node ace configure @adonis-agora/durable` generates a migration that calls `createDurableTables(db, this.db.connectionName)` (with `db` from `@adonisjs/lucid/services/db`) and `dropDurableTables` in `down()`, instead of a DDL snapshot that can go stale. The trade, taken deliberately: a migration that calls the library is not a frozen snapshot, so a fresh database follows the installed version rather than the version you generated under. That is what already happened at boot via `autoSchema`, `createDurableTables` only ever adds tables and nullable/defaulted columns, and the schema belongs to the library — hand-versioning it is what drifted in the first place.
+
+  `createDurableTables(db, connectionName?, options?)` takes an optional third argument, `{ logger }`, to route the applied-repair warning into your own logger instead of `console`. Existing two-argument calls are unaffected. No exports moved and no signature broke; the DDL itself is unchanged.
+
+  Not changed on purpose: `autoSchema`'s default (the repair stays on, and apps in production depend on it), the repair itself (it warns, it does not throw), and the engine's fire-and-forget heartbeat write (a lost liveness update genuinely never harms a run).
+
+- [`e3a1a5e`](https://github.com/DavideCarvalho/adonis-durable/commit/e3a1a5ec5bc7c6f49a8f36982aab89d61695fefd) - Fix: an operator's `cancel` (or a timeout sweep, or crash-recovery's dead-letter) landing WHILE a run's in-flight turn was still executing used to be silently undone. `settleRun`'s `completed`/`failed` branches wrote the run's terminal status with an unconditional blind patch — no status predicate at all — so a turn that started from a snapshot taken before the cancel would finish and overwrite `cancelled` back to `completed`, and the waiting parent workflow would be told the child succeeded. The `suspended` branch had a narrower guard (re-reading the run and checking only for `cancelled`), but that read-then-write was itself a TOCTOU race across the same `await`.
+
+  All three branches — plus `sweepTimeouts` (an unconditional `cancelled` write in a loop with awaits between iterations) and `parkBlocked` (a read-then-write guard that checked only `cancelled`/`completed`, missing `failed`/`dead`) — now go through a new atomic compare-and-set: the write applies only if the run's currently persisted status is still one it's legitimate to transition from, and the predicate is evaluated in the same statement as the write (the database, not a prior JS read, arbitrates), so two racing writers can never both apply.
+
+  **`StateStore` implementers must add `updateRunIf(runId, expectedStatuses, patch): Promise<boolean>`** — a new required method on the contract, alongside the existing `updateRun`. It applies `patch` only if the run's current status is one of `expectedStatuses`, returning whether the write applied (never throwing on a non-match). For a SQL-backed store the predicate must be part of the `UPDATE ... WHERE` clause; a read-then-write in application code does not provide the same guarantee and reintroduces the exact race this fixes. `@adonis-agora/durable`'s own `LucidStateStore` and `InMemoryStateStore` (and the `CodecStateStore` payload-encryption decorator) already implement it; a custom `StateStore` adapter needs the same addition to keep conforming to the shared `runStateStoreContract` test kit.
+
+### Patch Changes
+
+- [`878a628`](https://github.com/DavideCarvalho/adonis-durable/commit/878a628b3bd83b9f2e69f57e23e0af4a8d402988) - Build: `pnpm build` can no longer exit 0 having emitted no JavaScript. `tsc` ran with `incremental: true` against a `.tsbuildinfo` that records what it already wrote to `dist/`, so removing `dist/` and leaving the buildinfo behind (a plain `rm -rf dist`, then a build) made the compiler conclude every output was current and emit nothing. The `copy:stubs` half is a plain `cp`, so it still ran: the result was a `dist/` holding `assets/` and `stubs/` and zero `.js` files, from a build that reported success. Turbo then wrote that empty directory into its cache as a successful `build` and replayed it — `>>> FULL TURBO` — on every later run, including from an otherwise clean tree, so one such build poisoned the cache for good.
+
+  The build now removes `dist/` before compiling and compiles through a `tsconfig.build.json` with `incremental: false`, so it keeps no state that can disagree with `dist/`, and a new post-condition fails the build outright if `dist/` ends up without JavaScript or without the package entrypoint. That check runs inside the `build` script rather than in CI, which is what makes it cover `prepack` — the path a manual `pnpm publish` takes, and the one place turbo was never involved. `build` and `typecheck` also stop sharing a single buildinfo file, so the two turbo tasks can no longer race on it or restore each other's incremental state from cache.
+
+  No published version is known to be affected. CI builds from a cold checkout, so the trigger (removing `dist/` from a tree that already had a buildinfo) does not arise there, and `@adonis-agora/durable`'s spec that imports the built `dist/src/index.js` hard-fails under CI when the build is missing — both release workflows run the suite before publishing. The exposure was a developer machine and any cache shared from one. There is nothing to re-install or re-publish because of this.
+
+- [`809cd9e`](https://github.com/DavideCarvalho/adonis-durable/commit/809cd9ef732dbb9fd30c62dca79bae54e8458945) - Fix(bullmq): on the BullMQ transport, steps with a `timeoutMs` no longer false-timeout and get re-dispatched while still running. `#runTask` never passed the heartbeat callback to `runStepHandler`, even though `heartbeat()` and `onHeartbeat` were fully wired — so a healthy, actively-progressing long step emitted no beats, `engine.awaitWithHeartbeat` never rearmed its liveness window, and at `timeoutMs` the engine concluded the worker was dead and re-dispatched the same `stepId` while the original worker was still executing it. The transport now emits step heartbeats the engine's liveness window depends on, matching the `db` and `queue` transports.
+
+- [`6bbcf6a`](https://github.com/DavideCarvalho/adonis-durable/commit/6bbcf6ac9eea3bbd3b070b6784edc9f5139c83e7) - `discoverWorkflows` now hands back a constructor you can actually call. `DiscoveredWorkflow.cls` was typed as `WorkflowClass`, which is deliberately `abstract new (...) => ...` — that shape exists so any `BaseWorkflow` subclass can be _referenced_ (`ctx.child(Cls)`, `engine.start(Cls)`), and an abstract constructor type is by definition not newable. So `new (await discoverWorkflows(dir))[0]!.cls()` failed to compile with `TS2511: Cannot create an instance of an abstract class`, even though the value is a real, instantiable class and `registerWorkflowClass` does exactly that `new Ctor()` internally, through a local cast that quietly asserted the concrete shape the public type withheld.
+
+  `cls` is now a new exported `DiscoveredWorkflowClass` — the concrete `new () => { run(ctx, input) }` shape the module already relied on. Concrete constructor types stay assignable to `WorkflowClass`, so every reference-style use of a discovered class keeps compiling; the change only removes an error. Type-level only: no runtime behaviour changed, and the same `registerWorkflowClass` cast is now expressed in terms of the exported type instead of an inline duplicate.
+
+- [`6be2a47`](https://github.com/DavideCarvalho/adonis-durable/commit/6be2a4791f9591a8db28e4744aa867b6cf998e12) - Fix: directory discovery of `app/workflows` and `app/steps` now finds `.ts` modules in a dev app instead of silently registering nothing. Both scanners derived the extension to import from this library's own compiled file (`import.meta.url`) rather than from the directory being scanned — resolved as `.js` from `node_modules` in a consuming app, so every `.ts` entry in `app/workflows` / `app/steps` was skipped with no warning. The extension is now derived from the scanned directory's own entries, preferring `.ts` when both a built `.js` and its `.ts` source are present (so a module is never registered twice).
+
+- [`1359fea`](https://github.com/DavideCarvalho/adonis-durable/commit/1359fea60ecd1ce0df332006f5a1757c83c04e93) - Fix: `node ace add @adonis-agora/durable` now actually configures the package. The `configure` hook was only reachable through the `./configure` subpath, which AdonisJS never reads — it imports the package main and looks for `configure` there, so the command silently warned and did nothing (`Cannot configure module ... does not export the configure hook`). The package main now re-exports `configure`, so `node ace add` registers the provider, publishes `config/durable.ts` + `config/durable_dashboard.ts`, and publishes the migration stubs as documented.
+
+- [`3e202d3`](https://github.com/DavideCarvalho/adonis-durable/commit/3e202d3e4c033ea1e708ed7c46c6b75794575a05) - Fix: the published migration stub (`node ace configure @adonis-agora/durable` → `migration:run`) now creates `last_heartbeat_at` and `heartbeat_progress` on `durable_step_checkpoints`. Those columns were only ever created by the `autoSchema: true` auto-schema path, never by the migration — so an app provisioned via `migration:run` (the documented path, and the only one when `autoSchema: false`) silently lost step-level heartbeat persistence: `LucidStateStore.recordStepHeartbeat` writes both columns on every beat, the engine swallows the resulting UPDATE error, and no heartbeat data ever showed up in the dashboard or in `durable:runs --stale`.
+
+  Upgrade note for existing installs: apps on `autoSchema: true` (the default) pick up the two columns automatically on next boot — `createDurableTables` carries an in-place auto-migration for them. Apps on `autoSchema: false` need a follow-up migration adding `last_heartbeat_at` (bigInteger, nullable) and `heartbeat_progress` (text, nullable) to `durable_step_checkpoints`.
+
 ## 0.20.0
 
 ### Minor Changes
