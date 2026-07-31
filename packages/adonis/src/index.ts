@@ -88,6 +88,9 @@ export type {
   RedisControlPlaneConfig,
 } from './control-planes/factory.js';
 export {
+  type AdonisRedisPubSub,
+  type IoredisPubSub,
+  type IoredisSubscriber,
   RedisControlPlane,
   type RedisControlPlaneOptions,
   type RedisPubSub,

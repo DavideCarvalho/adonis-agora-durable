@@ -1,7 +1,6 @@
 import { Redis } from 'ioredis';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { RedisControlPlane } from '../../src/control-plane-redis/index.js';
-import type { RedisPubSub } from '../../src/control-plane-redis/redis-control-plane.js';
 import { WorkflowEngine } from '../../src/engine.js';
 import { startRun } from '../../src/test-helpers.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
@@ -49,11 +48,10 @@ describe.skipIf(!REDIS_URL)('RedisControlPlane (real Redis)', () => {
 
   /** A control plane on its own connection, sharing the test's channel prefix. */
   function plane(prefix: string) {
-    // ioredis types `subscribe` as a variadic `(...channels, callback)` overload pair, which is not
-    // structurally assignable to the port's `(channel, handler?)` even though the control plane only ever
-    // drives it in ioredis mode (channel only, messages via `on('message')`). A typings artifact, not a
-    // runtime mismatch — so assert the port at this one seam rather than reshaping a real client.
-    const p = new RedisControlPlane({ connection: client() as unknown as RedisPubSub, prefix });
+    // A real ioredis client goes in unassisted: the port's ioredis arm declares `subscribe(channel)`
+    // only, matching ioredis's variadic-channels overload. This used to need a cast — see
+    // `test/types/redis-pubsub-assignability.ts`, which fails the build if that regresses.
+    const p = new RedisControlPlane({ connection: client(), prefix });
     planes.push(p);
     return p;
   }

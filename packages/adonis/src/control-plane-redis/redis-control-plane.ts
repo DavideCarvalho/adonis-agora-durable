@@ -1,43 +1,96 @@
 import type { ControlMessage, ControlPlane } from '../index.js';
 
 /**
- * The minimal Redis pub/sub surface this control plane needs. BOTH a raw `ioredis` instance and an
- * `@adonisjs/redis` connection satisfy it structurally, so we depend on the surface rather than a
- * concrete type — keeping the peer coupling minimal and the driver testable.
+ * The raw-`ioredis` half of {@link RedisPubSub}. A real `Redis` instance is assignable to this.
  *
- * The two clients differ in how a subscriber is obtained:
- * - **raw ioredis**: a subscriber connection can't run normal commands, so `duplicate()` a dedicated
- *   one, `subscribe(channel)` on it, and receive via `.on('message', (channel, message) => ...)`.
- * - **`@adonisjs/redis` connection**: `subscribe(channel, (message) => ...)` manages its own
- *   subscriber connection internally — no duplicate needed; the handler receives the message directly.
+ * A subscriber connection can't run normal commands, so the driver `duplicate()`s a dedicated one,
+ * calls `subscribe(channel)` on it, and receives payloads via `on('message', (channel, message))`.
+ * `subscribe` therefore takes the channel and NOTHING else here: ioredis's real overloads are
+ * `(...channels, callback?)` where `callback` is a node-style `(err, result)` completion callback —
+ * *not* a per-message handler. Declaring a per-message handler parameter on this arm is what made
+ * the old single-interface port unsatisfiable by a real client (see {@link RedisPubSub}).
  *
- * We detect which one we have by feature: a raw ioredis client exposes `duplicate()`; the
- * `@adonisjs/redis` connection does not (it hides its `ioConnection`).
+ * This is the surface of the *subscriber* half specifically — see {@link IoredisPubSub} for the
+ * command connection a caller actually passes in.
  */
-export interface RedisPubSub {
-  /** Publish a message to a channel (both clients return a promise-ish here). */
-  publish(channel: string, message: string): unknown;
+export interface IoredisSubscriber {
+  /** Subscribe to a channel. Payloads arrive on `on('message')`, never through an argument here. */
+  subscribe(channel: string): unknown;
+  /** A payload on a channel this connection is subscribed to. */
+  on?(event: 'message', listener: (channel: string, message: string) => void): unknown;
+  /** A connection-level failure — the driver logs one line per reconnect burst. */
+  on?(event: 'error', listener: (err: Error) => void): unknown;
+  /** The connection (re)established — the driver re-arms its error logging. */
+  on?(event: 'ready', listener: () => void): unknown;
   /**
-   * Subscribe to a channel. ioredis takes only the channel (messages arrive via `on('message')`);
-   * the `@adonisjs/redis` connection takes a channel + a per-message handler.
-   */
-  subscribe(channel: string, handler?: (message: string, channel: string) => void): unknown;
-  /**
-   * ioredis-only: connection events. `message` delivers a payload on a duplicated subscriber;
-   * `error`/`ready`/`subscribe` are used by the watchdog (see {@link RedisControlPlaneOptions.pingIntervalMs}).
-   */
-  on?(event: string, listener: (...args: never[]) => void): unknown;
-  /** ioredis-only: build a dedicated subscriber connection (pub/sub can't share a command client). */
-  duplicate?(): RedisPubSub;
-  /**
-   * ioredis-only: tear down the duplicated subscriber connection. `disconnect(true)` reconnects
-   * (ioredis's `retryStrategy` + `autoResubscribe`) rather than closing for good.
+   * Tear down this subscriber connection. `disconnect(true)` reconnects (ioredis's `retryStrategy`
+   * + `autoResubscribe`) rather than closing for good.
    */
   disconnect?(reconnect?: boolean): void;
-  /** ioredis-only: liveness probe. Legal in subscriber mode (ioredis's `VALID_IN_SUBSCRIBER_MODE`). */
+  /** Liveness probe. Legal in subscriber mode (ioredis's `VALID_IN_SUBSCRIBER_MODE`). */
   ping?(): Promise<unknown>;
-  /** ioredis-only: connection state — the watchdog skips anything that isn't `'ready'`. */
+  /** Connection state — the watchdog skips anything that isn't `'ready'`. */
   status?: string;
+}
+
+/**
+ * The raw-ioredis **command** connection the caller hands us: a subscriber surface plus the two
+ * things only a command connection can do — `publish`, and `duplicate()` to mint the subscriber.
+ * `duplicate()` returns an {@link IoredisSubscriber} rather than another `IoredisPubSub` on purpose:
+ * a connection in subscriber mode can't run normal commands, so nothing may publish or re-duplicate
+ * through it.
+ */
+export interface IoredisPubSub extends IoredisSubscriber {
+  /** Publish a message to a channel (returns a promise; the driver only awaits it). */
+  publish(channel: string, message: string): unknown;
+  /** Build a dedicated subscriber connection (pub/sub can't share a command client). */
+  duplicate(): IoredisSubscriber;
+}
+
+/**
+ * The `@adonisjs/redis` half of {@link RedisPubSub}. A `RedisConnection` is assignable to this.
+ *
+ * This client manages its own subscriber connection internally — no `duplicate()` needed — and hands
+ * the payload straight to the handler. Its handler is `(data: string) => …`: it receives the message
+ * ONLY, never the channel, which is why no channel parameter is declared here.
+ *
+ * It deliberately declares no `on`/`ping`/`status`/`disconnect`. `RedisConnection#on` is an
+ * emittery-style `<Name extends keyof ConnectionEvents>(eventName, listener, options?)`, which is
+ * not assignable to a plain `(event: string, listener)` — declaring one here (as the old port did)
+ * made a real `@adonisjs/redis` connection unassignable too. The driver never needs it: every
+ * `on`/`ping`/`status`/`disconnect` call happens on the *duplicated* subscriber, which only exists
+ * on the ioredis path.
+ */
+export interface AdonisRedisPubSub {
+  /** Publish a message to a channel (returns a promise; the driver only awaits it). */
+  publish(channel: string, message: string): unknown;
+  /** Subscribe to a channel; the handler receives each payload directly. */
+  subscribe(channel: string, handler: (message: string) => void): unknown;
+}
+
+/**
+ * The minimal Redis pub/sub surface this control plane needs: EITHER a raw `ioredis` instance
+ * ({@link IoredisPubSub}) OR an `@adonisjs/redis` connection ({@link AdonisRedisPubSub}). We depend
+ * on the surface rather than the concrete types so the peer coupling stays optional.
+ *
+ * It is a union, not one wide interface, because the two clients' `subscribe` signatures are
+ * genuinely incompatible and no single signature covers both: ioredis is variadic channels plus an
+ * optional **node-style `(err, result)`** callback, while `@adonisjs/redis` is `(channel, handler)`
+ * with a per-message handler. A single `subscribe(channel, handler?)` describes only the second, so
+ * a real `Redis` was NOT assignable — passing one to `defineConfig` was a compile error, even though
+ * the driver's own feature detection assumes callers can. Modelling the two arms separately is the
+ * honest fix; {@link isIoredisClient} maps the runtime feature test onto the right arm.
+ */
+export type RedisPubSub = IoredisPubSub | AdonisRedisPubSub;
+
+/**
+ * Which of the two clients are we holding? Detected by feature: a raw ioredis client exposes
+ * `duplicate()`, the `@adonisjs/redis` connection does not (it hides its `ioConnection`). That is
+ * the same test the driver has always used; expressing it as a type predicate is what lets the two
+ * call shapes of `subscribe` be told apart without a cast.
+ */
+function isIoredisClient(connection: RedisPubSub): connection is IoredisPubSub {
+  return 'duplicate' in connection && typeof connection.duplicate === 'function';
 }
 
 export interface RedisControlPlaneOptions {
@@ -97,7 +150,8 @@ function normalizePingInterval(value: number | false | undefined): number | fals
 export class RedisControlPlane implements ControlPlane {
   private readonly connection: RedisPubSub;
   private readonly channel: string;
-  private subscriber: RedisPubSub | undefined;
+  /** Only ever set on the raw-ioredis path — it is the `duplicate()`d subscriber connection. */
+  private subscriber: IoredisSubscriber | undefined;
   private subscribed = false;
   private readonly pingIntervalMs: number | false;
   private pingWatchdogTimer: ReturnType<typeof setInterval> | undefined;
@@ -127,12 +181,12 @@ export class RedisControlPlane implements ControlPlane {
       handler(msg);
     };
 
-    if (typeof this.connection.duplicate === 'function') {
+    if (isIoredisClient(this.connection)) {
       // raw ioredis: a subscriber connection can't run normal commands → use a dedicated dup.
       const sub = this.connection.duplicate();
       this.subscriber = sub;
       void sub.subscribe(this.channel);
-      sub.on?.('message', ((_channel: string, payload: string) => deliver(payload)) as never);
+      sub.on?.('message', (_channel, payload) => deliver(payload));
       this.trackSubscriber(sub);
     } else {
       // `@adonisjs/redis` connection: manages its own subscriber connection; handler gets the message.
@@ -146,16 +200,16 @@ export class RedisControlPlane implements ControlPlane {
    * ioredis instance crashes the process in some setups, and a dead/reconnecting subscriber emits
    * them in bursts — so this connection, which nothing else listens to, would take the app down.
    */
-  private trackSubscriber(sub: RedisPubSub): void {
+  private trackSubscriber(sub: IoredisSubscriber): void {
     let loggedSinceReady = false;
-    sub.on?.('error', ((err: Error) => {
+    sub.on?.('error', (err) => {
       if (loggedSinceReady) return; // one line per reconnect burst, not one per retry
       loggedSinceReady = true;
       console.warn(`[adonis-durable] control-plane subscriber error: ${err.message}`);
-    }) as never);
-    sub.on?.('ready', (() => {
+    });
+    sub.on?.('ready', () => {
       loggedSinceReady = false;
-    }) as never);
+    });
     this.startPingWatchdog(sub);
   }
 
@@ -163,7 +217,7 @@ export class RedisControlPlane implements ControlPlane {
    * Start the watchdog interval, unless it's disabled or already running (idempotent). Unref'd so
    * it never keeps the process alive on its own; cleared in {@link close}.
    */
-  private startPingWatchdog(sub: RedisPubSub): void {
+  private startPingWatchdog(sub: IoredisSubscriber): void {
     if (this.pingWatchdogTimer || this.pingIntervalMs === false) return;
     if (typeof sub.ping !== 'function') return; // not an ioredis-shaped connection — nothing to probe
     this.pingWatchdogTimer = setInterval(() => {
@@ -182,7 +236,7 @@ export class RedisControlPlane implements ControlPlane {
    * each other, and it lets a short interval shrink the whole detect → reconnect cycle instead of
    * always eating the full multi-second default.
    */
-  private async pingSubscriber(sub: RedisPubSub): Promise<void> {
+  private async pingSubscriber(sub: IoredisSubscriber): Promise<void> {
     if (sub.status !== undefined && sub.status !== 'ready') return;
     const timeoutMs =
       this.pingIntervalMs === false

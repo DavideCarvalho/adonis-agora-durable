@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { RedisControlPlane } from '../../src/control-plane-redis/index.js';
-import type { RedisPubSub } from '../../src/control-plane-redis/redis-control-plane.js';
+import type {
+  IoredisSubscriber,
+  RedisPubSub,
+} from '../../src/control-plane-redis/redis-control-plane.js';
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function until(cond: () => boolean, budgetMs = 1000) {
@@ -13,7 +16,7 @@ async function until(cond: () => boolean, budgetMs = 1000) {
  * server-free: the watchdog's whole contract is "PING, and on rejection/timeout disconnect(true)",
  * none of which needs a real Redis.
  */
-class FakeSub implements RedisPubSub {
+class FakeSub implements IoredisSubscriber {
   status = 'ready';
   pings = 0;
   /** Every `disconnect()` call, recording its `reconnect` argument. */
@@ -30,8 +33,8 @@ class FakeSub implements RedisPubSub {
   }
   on(event: string, listener: (...args: never[]) => void) {
     const l = this.listeners.get(event) ?? [];
-    // The port declares `never[]` purely so any listener shape is accepted; `emit` below calls this
-    // back with exactly the args the real ioredis event carries.
+    // One untyped bucket stands in for the port's three per-event `on` overloads; `emit` below calls
+    // each listener back with exactly the args the corresponding real ioredis event carries.
     l.push(listener as (...args: unknown[]) => void);
     this.listeners.set(event, l);
     return undefined;
