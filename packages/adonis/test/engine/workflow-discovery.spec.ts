@@ -237,7 +237,7 @@ describe('workflow class factory (constructor injection)', () => {
     const ok = await registerWorkflowClass(
       engine,
       InjectWorkflow,
-      (Ctor) => new (Ctor as new (s: { label: string }) => InjectWorkflow)(service),
+      (Ctor) => new (Ctor as unknown as new (s: { label: string }) => InjectWorkflow)(service),
     );
     expect(ok).toBe(true);
     expect(make).toHaveBeenCalledWith(InjectWorkflow);
