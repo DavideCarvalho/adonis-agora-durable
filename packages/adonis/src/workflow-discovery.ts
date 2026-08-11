@@ -34,7 +34,9 @@ export type WorkflowClassFactory = (
   ctor: DiscoveredWorkflowClass,
 ) => DiscoveredWorkflowClass['prototype'] | Promise<DiscoveredWorkflowClass['prototype']>;
 
-function defaultWorkflowFactory(ctor: DiscoveredWorkflowClass): DiscoveredWorkflowClass['prototype'] {
+function defaultWorkflowFactory(
+  ctor: DiscoveredWorkflowClass,
+): DiscoveredWorkflowClass['prototype'] {
   return new ctor();
 }
 
