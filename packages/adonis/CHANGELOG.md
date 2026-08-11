@@ -1,5 +1,18 @@
 # @adonis-agora/durable
 
+## 0.21.1
+
+### Patch Changes
+
+- [`940f85b`](https://github.com/DavideCarvalho/adonis-durable/commit/940f85b1ed60717ebde2b1bb3c38abe40504ec8b) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Workflow classes can now use constructor dependency injection
+
+  `registerWorkflowClass`/`registerWorkflowsFromDir`/`registerWorkflowsFromBarrel` accept an optional
+  **workflow class factory**. The `durable_provider` passes `(Ctor) => app.container.make(Ctor)`, so a
+  workflow's constructor is resolved by the AdonisJS IoC container — constructor parameters are
+  injected just like `@adonisjs/queue` jobs. Without a factory (library/tests), the class is still
+  instantiated with `new Ctor()` as before. The factory may return a promise (the container's `make`
+  is async), so the registration functions are now async.
+
 ## 0.21.0
 
 ### Minor Changes
