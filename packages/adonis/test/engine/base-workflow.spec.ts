@@ -66,7 +66,7 @@ describe('BaseWorkflow — authoring (static workflow)', () => {
       }
     }
 
-    expect(registerWorkflowClass(engine, StaticGreet)).toBe(true);
+    expect(await registerWorkflowClass(engine, StaticGreet)).toBe(true);
 
     const a = await startRun(engine, 'static-greet', { name: 'davi' }, 's1');
     expect(a.output).toBe('hi davi');
@@ -87,7 +87,7 @@ describe('BaseWorkflow — OUTSIDE a workflow (engine path)', () => {
         return 'logged';
       }
     }
-    registerWorkflowClass(engine, Audit);
+    await registerWorkflowClass(engine, Audit);
 
     const { runId } = await Audit.dispatch({});
     expect(typeof runId).toBe('string');
@@ -108,7 +108,7 @@ describe('BaseWorkflow — OUTSIDE a workflow (engine path)', () => {
         return 'done';
       }
     }
-    registerWorkflowClass(engine, Noop);
+    await registerWorkflowClass(engine, Noop);
 
     const { runId } = await Noop.dispatch({}, { runId: 'my-fixed-id' });
     expect(runId).toBe('my-fixed-id');
@@ -126,7 +126,7 @@ describe('BaseWorkflow — OUTSIDE a workflow (engine path)', () => {
         return input.n * 2;
       }
     }
-    registerWorkflowClass(engine, Double);
+    await registerWorkflowClass(engine, Double);
 
     const result = await Double.start({ n: 21 });
     expect(result).toBe(42); // resolved only after the run settled
@@ -144,7 +144,7 @@ describe('BaseWorkflow — OUTSIDE a workflow (engine path)', () => {
         return `decided:${decision}`;
       }
     }
-    registerWorkflowClass(engine, Approval);
+    await registerWorkflowClass(engine, Approval);
 
     // Fixed runId so the test can address the run for signalling / status polling.
     const startPromise = Approval.start({}, { runId: 'appr-1' });
@@ -187,8 +187,8 @@ describe('BaseWorkflow — INSIDE a running workflow (ctx path)', () => {
         return { fromChild: childOut };
       }
     }
-    registerWorkflowClass(engine, Inner);
-    registerWorkflowClass(engine, Parent);
+    await registerWorkflowClass(engine, Inner);
+    await registerWorkflowClass(engine, Parent);
 
     const first = await startRun(engine, 'parent-start', {}, 'p1');
     expect(first.status).toBe('suspended'); // parent parked on the child
@@ -221,8 +221,8 @@ describe('BaseWorkflow — INSIDE a running workflow (ctx path)', () => {
         return 'parent-done';
       }
     }
-    registerWorkflowClass(engine, Side);
-    registerWorkflowClass(engine, Parent);
+    await registerWorkflowClass(engine, Side);
+    await registerWorkflowClass(engine, Parent);
 
     const res = await startRun(engine, 'parent-dispatch', {}, 'p1');
     expect(res.status).toBe('completed'); // parent did NOT wait on the child
@@ -256,8 +256,8 @@ describe('BaseWorkflow — determinism / positional slot', () => {
         return 'ok';
       }
     }
-    registerWorkflowClass(engine, Inner);
-    registerWorkflowClass(engine, Parent);
+    await registerWorkflowClass(engine, Inner);
+    await registerWorkflowClass(engine, Parent);
 
     await startRun(engine, 'det-parent', {}, 'p1');
     await poll(async () => (await store.getRun('p1'))?.status === 'completed');
@@ -292,8 +292,8 @@ describe('BaseWorkflow — determinism / positional slot', () => {
         return 'ok';
       }
     }
-    registerWorkflowClass(engineA, Inner);
-    registerWorkflowClass(engineA, ParentViaStart);
+    await registerWorkflowClass(engineA, Inner);
+    await registerWorkflowClass(engineA, ParentViaStart);
 
     engineB.register('slot-inner', '1', async () => 'x');
     engineB.register('slot-parent', '1', async (ctx) => {

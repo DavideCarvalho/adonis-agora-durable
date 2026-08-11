@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WorkflowEngine } from '../../src/engine.js';
 import { startRun } from '../../src/test-helpers.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
@@ -124,7 +124,7 @@ describe('app/workflows auto-discovery', () => {
 });
 
 describe('registerWorkflowClass colocated schedules', () => {
-  it('registers a class`s `static schedule` on the engine (derived key = workflow name)', () => {
+  it('registers a class`s `static schedule` on the engine (derived key = workflow name)', async () => {
     class ReportWorkflow {
       static workflow = { name: 'report' };
       static schedule = { cron: '0 4 * * *', timezone: 'America/Sao_Paulo' };
@@ -133,32 +133,32 @@ describe('registerWorkflowClass colocated schedules', () => {
       }
     }
     const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
-    expect(registerWorkflowClass(engine, ReportWorkflow)).toBe(true);
+    expect(await registerWorkflowClass(engine, ReportWorkflow)).toBe(true);
     expect(engine.discoveredSchedules).toEqual([
       { workflow: 'report', key: 'report', cron: '0 4 * * *', timezone: 'America/Sao_Paulo' },
     ]);
   });
 
-  it('registers nothing for a workflow class without `static schedule`', () => {
+  it('registers nothing for a workflow class without `static schedule`', async () => {
     class PlainWorkflow {
       static workflow = { name: 'plain' };
       async run() {}
     }
     const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
-    registerWorkflowClass(engine, PlainWorkflow);
+    await registerWorkflowClass(engine, PlainWorkflow);
     expect(engine.discoveredSchedules).toEqual([]);
   });
 
-  it('dedupes on key across repeated registration (first wins, idempotent)', () => {
+  it('dedupes on key across repeated registration (first wins, idempotent)', async () => {
     class ReportWorkflow {
       static workflow = { name: 'report' };
       static schedule = { everyMs: 60_000 };
       async run() {}
     }
     const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
-    registerWorkflowClass(engine, ReportWorkflow);
+    await registerWorkflowClass(engine, ReportWorkflow);
     // Re-scan of the same class (both discovery paths funnel through here) must not double-register.
-    registerWorkflowClass(engine, ReportWorkflow);
+    await registerWorkflowClass(engine, ReportWorkflow);
     expect(engine.discoveredSchedules).toEqual([
       { workflow: 'report', key: 'report', everyMs: 60_000 },
     ]);
@@ -190,7 +190,7 @@ describe('registerWorkflowClass colocated singleton', () => {
       }
     }
     const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
-    expect(registerWorkflowClass(engine, MutexedWorkflow)).toBe(true);
+    expect(await registerWorkflowClass(engine, MutexedWorkflow)).toBe(true);
 
     // A takes the slot and holds it on its signal wait; B shares the key so it must gate.
     await startRun(engine, 'mutexed', { id: 'A' }, 'a');
@@ -215,5 +215,34 @@ describe('registerWorkflowClass colocated singleton', () => {
       async run() {}
     }
     expect(workflowMeta(Limited)?.singleton).toBe(singleton);
+  });
+});
+
+describe('workflow class factory (constructor injection)', () => {
+  it('uses the provided factory to instantiate the workflow (default is new Ctor())', async () => {
+    const service = { label: 'injected' };
+    const make = vi.fn();
+    class InjectWorkflow {
+      static workflow = { name: 'inject' };
+      constructor(public injected: { label: string }) {
+        // O container resolveria; aqui simulamos `app.container.make(Ctor)`.
+        make(this.constructor);
+      }
+      async run(_ctx: unknown) {
+        return this.injected.label;
+      }
+    }
+
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
+    const ok = await registerWorkflowClass(
+      engine,
+      InjectWorkflow,
+      (Ctor) => new (Ctor as new (s: { label: string }) => InjectWorkflow)(service),
+    );
+    expect(ok).toBe(true);
+    expect(make).toHaveBeenCalledWith(InjectWorkflow);
+
+    const res = await startRun(engine, 'inject', undefined, 'inj1');
+    expect(res.output).toBe('injected');
   });
 });

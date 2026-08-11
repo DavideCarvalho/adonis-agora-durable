@@ -330,13 +330,17 @@ export default class DurableProvider {
     if (config.workflowsPath === false) return;
     const engine = await this.app.container.make(WorkflowEngine);
 
+    // Instancia workflows via container (injeção de dependência no constructor, como o
+    // `@adonisjs/queue` faz com jobs). Fallback: `new Ctor()` sem args (comportamento anterior).
+    const workflowFactory = (ctor: { new (): unknown }) => this.app.container.make(ctor);
+
     const barrel = await this.#loadGeneratedWorkflowsBarrel();
     if (barrel) {
-      await registerWorkflowsFromBarrel(engine, barrel);
+      await registerWorkflowsFromBarrel(engine, barrel, workflowFactory);
     } else {
       // Fallback: no generated barrel — scan the configured directory at runtime.
       const dir = this.app.makePath(config.workflowsPath ?? 'app/workflows');
-      await registerWorkflowsFromDir(engine, dir);
+      await registerWorkflowsFromDir(engine, dir, workflowFactory);
     }
 
     // Embedded worker: only `standalone` serves step bodies in-process (design §3). A `control-plane` is

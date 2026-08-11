@@ -30,9 +30,15 @@ function fakeApp(config: DurableConfig = {}, appRoot = '/app', environment = 'we
       singleton: (_key: unknown, f: () => unknown) => {
         factory = f;
       },
-      make: async () => {
-        if (!singletonInstance) singletonInstance = await factory?.();
-        return singletonInstance as WorkflowEngine;
+      make: async (key: unknown) => {
+        // O container real: `make(WorkflowEngine)` resolve o singleton registrado; `make(Ctor)`
+        // (usado pelo workflow factory para injeção) instancia a classe.
+        if (key === WorkflowEngine) {
+          if (!singletonInstance) singletonInstance = await factory?.();
+          return singletonInstance as WorkflowEngine;
+        }
+        const Ctor = key as new () => unknown;
+        return new Ctor();
       },
     },
   } as unknown as ApplicationService;

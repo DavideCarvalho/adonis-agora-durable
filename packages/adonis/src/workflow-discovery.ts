@@ -24,17 +24,40 @@ export interface DiscoveredWorkflow {
 }
 
 /**
+ * A factory that instantiates a workflow class. When provided, it replaces the default `new Ctor()` —
+ * the AdonisJS provider passes `(Ctor) => app.container.make(Ctor)` so the container resolves the
+ * constructor and dependency injection (constructor params) works, like the `@adonisjs/queue` job
+ * factory. May return the instance or a Promise (the container's `make` is async). Defaults to
+ * `(Ctor) => new Ctor()` for library-level/tests use.
+ */
+export type WorkflowClassFactory = (
+  ctor: DiscoveredWorkflowClass,
+) => DiscoveredWorkflowClass['prototype'] | Promise<DiscoveredWorkflowClass['prototype']>;
+
+function defaultWorkflowFactory(ctor: DiscoveredWorkflowClass): DiscoveredWorkflowClass['prototype'] {
+  return new ctor();
+}
+
+/**
  * Register a single workflow class on the engine — a `BaseWorkflow` subclass (its `static workflow`
  * config), resolved via {@link workflowMeta}. Instantiates it once and binds its `run(ctx, input)`
  * as the workflow body via `engine.register`. The low-level `engine.register(name, version, fn)`
  * stays the escape hatch — this is the convenience the `app/workflows` convention builds on. No-op
  * (returns `false`) for a non-workflow class (no `static workflow` config).
+ *
+ * `factory` lets the host resolve the instance via the IoC container (constructor injection); when
+ * omitted, the class is instantiated directly with `new Ctor()` (no args). The factory may be async
+ * (the Adonis container's `make` resolves async), so this function is async.
  */
-export function registerWorkflowClass(engine: WorkflowEngine, cls: unknown): boolean {
+export async function registerWorkflowClass(
+  engine: WorkflowEngine,
+  cls: unknown,
+  factory: WorkflowClassFactory = defaultWorkflowFactory,
+): Promise<boolean> {
   const meta = workflowMeta(cls);
   if (!meta) return false;
   const Ctor = cls as DiscoveredWorkflowClass;
-  const instance = new Ctor();
+  const instance = await factory(Ctor);
   engine.register(
     meta.name,
     meta.version,
@@ -131,9 +154,10 @@ export async function discoverWorkflows(dir: string): Promise<DiscoveredWorkflow
 export async function registerWorkflowsFromDir(
   engine: WorkflowEngine,
   dir: string,
+  factory?: WorkflowClassFactory,
 ): Promise<WorkflowMeta[]> {
   const discovered = await discoverWorkflows(dir);
-  for (const { cls } of discovered) registerWorkflowClass(engine, cls);
+  for (const { cls } of discovered) await registerWorkflowClass(engine, cls, factory);
   return discovered.map((d) => d.meta);
 }
 
@@ -157,6 +181,7 @@ export type WorkflowsBarrel = Record<string, () => Promise<Record<string, unknow
 export async function registerWorkflowsFromBarrel(
   engine: WorkflowEngine,
   barrel: WorkflowsBarrel,
+  factory?: WorkflowClassFactory,
 ): Promise<WorkflowMeta[]> {
   const registered: WorkflowMeta[] = [];
   const seen = new Set<unknown>();
@@ -167,7 +192,7 @@ export async function registerWorkflowsFromBarrel(
       const meta = workflowMeta(exported);
       if (!meta) continue;
       seen.add(exported);
-      registerWorkflowClass(engine, exported);
+      await registerWorkflowClass(engine, exported, factory);
       registered.push(meta);
     }
   }
