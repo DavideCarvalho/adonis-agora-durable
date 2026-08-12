@@ -11,7 +11,7 @@
   "author": "Davi Carvalho <davi@goflip.ai>",
   "packageManager": "pnpm@11.17.0",
   "engines": {
-    "node": ">=20.6.0"
+    "node": "v26.7.0"
   },
   "scripts": {
     "build": "turbo run build",
@@ -26,7 +26,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",
-    "@changesets/changelog-github": "^0.7.0",
+    "@changesets/changelog-github": "0.7.0",
     "@changesets/cli": "2.31.1",
     "@swc/core": "1.15.47",
     "turbo": "2.10.9",
