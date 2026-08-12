@@ -12,7 +12,7 @@ importers:
         specifier: 1.9.4
         version: 1.9.4
       '@changesets/changelog-github':
-        specifier: ^0.7.0
+        specifier: 0.7.0
         version: 0.7.0
       '@changesets/cli':
         specifier: 2.31.1
@@ -43,7 +43,7 @@ importers:
         specifier: workspace:*
         version: link:../dashboard
       '@adonisjs/assembler':
-        specifier: ^8.4.0
+        specifier: 8.4.0
         version: 8.4.0(typescript@5.9.3)
       '@adonisjs/core':
         specifier: 7.4.0
@@ -55,7 +55,7 @@ importers:
         specifier: 0.6.2
         version: 0.6.2(@adonisjs/assembler@8.4.0(typescript@5.9.3))(@adonisjs/core@7.4.0(@adonisjs/assembler@8.4.0(typescript@5.9.3))(supports-color@10.2.2)(youch@4.1.1))(@adonisjs/lucid@22.4.2(@adonisjs/assembler@8.4.0(typescript@5.9.3))(@adonisjs/core@7.4.0(@adonisjs/assembler@8.4.0(typescript@5.9.3))(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@11.10.0)(luxon@3.7.2)(supports-color@10.2.2))(@adonisjs/redis@9.2.0(@adonisjs/core@7.4.0(@adonisjs/assembler@8.4.0(typescript@5.9.3))(supports-color@10.2.2)(youch@4.1.1))(supports-color@10.2.2))(@opentelemetry/api@1.9.1)(@opentelemetry/core@1.30.1(@opentelemetry/api@1.9.1))(ioredis@5.11.1(supports-color@10.2.2))(knex@3.2.10(better-sqlite3@11.10.0)(supports-color@10.2.2))
       '@adonisjs/redis':
-        specifier: ^9.2.0
+        specifier: 9.2.0
         version: 9.2.0(@adonisjs/core@7.4.0(@adonisjs/assembler@8.4.0(typescript@5.9.3))(supports-color@10.2.2)(youch@4.1.1))(supports-color@10.2.2)
       '@opentelemetry/api':
         specifier: 1.9.1
@@ -79,7 +79,7 @@ importers:
         specifier: 5.81.3
         version: 5.81.3(supports-color@10.2.2)
       cron-parser:
-        specifier: ^4.9.0
+        specifier: 4.9.0
         version: 4.9.0
       ioredis:
         specifier: 5.11.1
@@ -4741,7 +4741,7 @@ snapshots:
       cli-truncate: 5.2.0
       log-update: 7.2.0
       pretty-hrtime: 1.0.3
-      string-width: 8.2.1
+      string-width: 8.2.2
       supports-color: 10.2.2
       terminal-size: 4.0.1
 
@@ -5496,7 +5496,7 @@ snapshots:
   cli-truncate@5.2.0:
     dependencies:
       slice-ansi: 8.0.0
-      string-width: 8.2.1
+      string-width: 8.2.2
 
   clsx@2.1.1: {}
 
@@ -7246,7 +7246,7 @@ snapshots:
   wrap-ansi@10.0.0:
     dependencies:
       ansi-styles: 6.2.3
-      string-width: 8.2.1
+      string-width: 8.2.2
       strip-ansi: 7.2.0
 
   wrappy@1.0.2: {}
