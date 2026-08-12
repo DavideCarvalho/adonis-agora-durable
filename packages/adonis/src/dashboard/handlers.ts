@@ -1,4 +1,5 @@
 import type {
+  EngineEvent,
   GroupHealth,
   RunQuery,
   RunResult,
@@ -6,6 +7,7 @@ import type {
   StepCheckpoint,
   WorkflowRun,
 } from '../index.js';
+import { parseAttrFilters } from './attr-filter.js';
 
 /**
  * Framework-light JSON handlers over a {@link DashboardEngine}.
@@ -19,16 +21,25 @@ import type {
  * leak in, so the handlers are unit-testable against a real in-memory engine
  * with no HTTP server. The provider adapts an AdonisJS `HttpContext` to these
  * shapes.
+ *
+ * `listRuns`/`getRun`/`retryRun`/`redispatchPendingRun`/`cancelRun`/`health` are the original
+ * handlers this file always had (kept response-shape compatible with the legacy static
+ * `assets/dashboard.html`, still served as a compat fallback — see `compat.ts`/`compat-view.ts`).
+ * `workers`, `topology`, `retryWithInputRun`, `continueRun`, and `bulkAction` are additions that give
+ * the new `@adonis-agora/durable-dashboard` React SPA parity with `@dudousxd/nestjs-durable-dashboard`'s
+ * `DurableApiController` (fix-and-replay, bulk retry/cancel, breakpoint continue, full worker
+ * heartbeats, topology badge). The SSE `runs/:id/stream` route is wired directly in
+ * `providers/dashboard_provider.ts` since streaming needs the raw HTTP response, not a JSON `ApiResponse`.
  */
 
 /**
  * The bounded read/control surface the JSON handlers drive — declared STRUCTURALLY (a port), not by
  * importing the concrete `WorkflowEngine` class, so the same handlers serve BOTH durable topologies
- * (design §8): a store role passes the real {@link import('../engine.js').WorkflowEngine} (structurally
- * assignable — it has every method here); a store-less `tenant` pod passes an adapter over its
- * {@link import('../run-gateway/interface.js').RunGateway} (see `gatewayDashboardEngine`). Store presence
- * is therefore invisible to the handlers. Mirrors the `RunGatewayEngine` port pattern already used by
- * `StoreRunGateway`.
+ * (design §8): a store role passes an adapter over the real {@link
+ * import('../engine.js').WorkflowEngine} (`storeDashboardEngine`); a store-less `tenant` pod passes an
+ * adapter over its {@link import('../run-gateway/interface.js').RunGateway} (`gatewayDashboardEngine`).
+ * Store presence is therefore invisible to the handlers. Mirrors the `RunGatewayEngine` port pattern
+ * already used by `StoreRunGateway`.
  */
 export interface DashboardEngine {
   getRun(runId: string): Promise<WorkflowRun | null>;
@@ -39,6 +50,15 @@ export interface DashboardEngine {
   redispatchPending(runId: string): Promise<RunResult | null>;
   cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null>;
   workerHealth(extra?: string[]): Promise<GroupHealth[]>;
+  /** Fix-and-replay: start a fresh linked run from `runId`'s workflow with a corrected `input`. Returns
+   *  the new run's id, or `null` if `runId` is unknown. Degrades to `null` on a topology that can't
+   *  perform it yet (a store-less `tenant` pod — see `gateway-adapter.ts`). */
+  retryWithInput(runId: string, input: unknown): Promise<{ runId: string } | null>;
+  /** Resume a run paused at a `ctx.breakpoint()`. Returns `null` if the run isn't paused at one, or on
+   *  a topology that can't perform it yet (see `retryWithInput`). */
+  continue(runId: string): Promise<RunResult | null>;
+  /** Live lifecycle events for ONE run; returns an unsubscribe fn. */
+  subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void;
 }
 
 /** The read/control port the handlers operate over (a store engine or a tenant gateway adapter). */
@@ -68,11 +88,18 @@ const notFound = (message: string): ApiResponse => ({
   status: 404,
   body: { error: message },
 });
+const badRequest = (message: string): ApiResponse => ({
+  status: 400,
+  body: { error: message },
+});
 
+/** The full status union (`interfaces.ts`'s `RunStatus`) — kept in sync so filters/facets never drop a
+ *  state; a previous version of this list was missing `'blocked'`. */
 const RUN_STATUSES: readonly RunStatus[] = [
   'pending',
   'running',
   'suspended',
+  'blocked',
   'completed',
   'failed',
   'cancelled',
@@ -100,21 +127,32 @@ function parseStatus(value: string | undefined): RunStatus | undefined {
   return undefined;
 }
 
-/** `GET /runs` — list runs filtered by status/workflow/tag, paginated. */
+/** Build a {@link RunQuery} from the query params shared by `listRuns` and `bulkAction` — status, tag,
+ *  attribute predicates (`attr=key:op:value`, repeatable/ANDed), namespace. `origin` is intentionally
+ *  NOT a query predicate (the engine has no `origin` column — see `durable-client.ts`'s module doc);
+ *  it is read but ignored, so a client that always sends it (parity with the NestJS API) never 400s. */
+function runFilterFromQuery(query: ApiRequest['query']): Omit<RunQuery, 'limit' | 'offset'> {
+  const status = parseStatus(firstQuery(query.status));
+  const workflow = firstQuery(query.workflow);
+  const tag = firstQuery(query.tag);
+  const namespace = firstQuery(query.namespace);
+  const attributes = parseAttrFilters(query.attr as string | string[] | undefined);
+  const filter: Omit<RunQuery, 'limit' | 'offset'> = {};
+  if (status) filter.status = status;
+  if (workflow) filter.workflow = workflow;
+  if (tag) filter.tag = tag;
+  if (namespace) filter.namespace = namespace;
+  if (attributes) filter.attributes = attributes;
+  return filter;
+}
+
+/** `GET /runs` — list runs filtered by status/workflow/tag/namespace/search-attributes, paginated. */
 export async function listRuns(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
   const { engine } = deps;
   const limit = Math.min(intQuery(req.query.limit, 50), 200);
   const offset = intQuery(req.query.offset, 0);
-  const status = parseStatus(firstQuery(req.query.status));
-  const workflow = firstQuery(req.query.workflow);
-  const tag = firstQuery(req.query.tag);
 
-  // Build the query with only the predicates that are set — exactOptionalPropertyTypes
-  // forbids passing an explicit `undefined`.
-  const query: RunQuery = { limit, offset };
-  if (status) query.status = status;
-  if (workflow) query.workflow = workflow;
-  if (tag) query.tag = tag;
+  const query: RunQuery = { limit, offset, ...runFilterFromQuery(req.query) };
 
   const runs = await engine.listRuns(query);
   return ok({
@@ -182,7 +220,68 @@ export async function cancelRun(deps: Deps, req: ApiRequest): Promise<ApiRespons
   return ok({ result });
 }
 
-/** `GET /health` — per-group worker health (queue backlog + live worker heartbeats). */
+/**
+ * `POST /runs/:id/retry-with-input` — fix-and-replay: start a fresh linked run of `runId`'s workflow
+ * with a corrected `input`. Body: `{ input: unknown }`. Returns the new run's id; the ORIGINAL run is
+ * left untouched (mirrors `@dudousxd/nestjs-durable-dashboard`'s `retryWithInput`).
+ */
+export async function retryWithInputRun(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
+  const id = req.params.id;
+  if (!id) return notFound('run id is required');
+  const body = (req.body ?? {}) as { input?: unknown };
+  const result = await deps.engine.retryWithInput(id, body.input);
+  if (!result) return notFound(`run ${id} not found`);
+  return ok({ result });
+}
+
+/**
+ * `POST /runs/:id/continue` — resume a run paused at a {@link import('../interfaces.js').WorkflowCtx}
+ * breakpoint (the dashboard's "continue" button). `404` if the run isn't paused at one.
+ */
+export async function continueRun(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
+  const id = req.params.id;
+  if (!id) return notFound('run id is required');
+  const result = await deps.engine.continue(id);
+  if (!result) return notFound(`run ${id} is not paused at a breakpoint`);
+  return ok({ result });
+}
+
+/**
+ * `POST /bulk/:action` (`action` = `retry`|`cancel`) — apply an action to every run matching the same
+ * filter `listRuns` accepts (status/workflow/tag/namespace/attr), capped at 500 matches. Skips (does
+ * not abort on) a run that can't take the action (e.g. already terminal). Mirrors
+ * `@dudousxd/nestjs-durable-dashboard`'s `DashboardService.bulk`.
+ */
+export async function bulkAction(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
+  const action = req.params.action;
+  if (action !== 'retry' && action !== 'cancel') {
+    return badRequest("action must be 'retry' or 'cancel'");
+  }
+  const compensate = firstQuery(req.query.compensate) === 'true';
+  const filter = runFilterFromQuery(req.query);
+  const runs = await deps.engine.listRuns({ ...filter, limit: 500 });
+  let applied = 0;
+  for (const run of runs) {
+    try {
+      if (action === 'retry') {
+        const result = await deps.engine.requeue(run.id);
+        if (result) applied += 1;
+      } else {
+        const result = await deps.engine.cancel(
+          run.id,
+          compensate ? { compensate: true } : undefined,
+        );
+        if (result) applied += 1;
+      }
+    } catch {
+      // Skip a run that can't take the action (e.g. already terminal) — matched still counts it.
+    }
+  }
+  return ok({ matched: runs.length, applied });
+}
+
+/** `GET /health` — per-group worker health (queue backlog + live worker heartbeats), reduced to a
+ *  compact shape. Kept for the legacy static dashboard (`assets/dashboard.html`, compat fallback). */
 export async function health(deps: Deps): Promise<ApiResponse> {
   const groups: GroupHealth[] = await deps.engine.workerHealth();
   return ok({
@@ -196,6 +295,25 @@ export async function health(deps: Deps): Promise<ApiResponse> {
   });
 }
 
+/** `GET /workers` — full per-group worker health (every live worker's heartbeat, not just a count),
+ *  for the new SPA's Workers panel (`pivot-by-worker.ts`/`group-by-partition.ts` need per-instance
+ *  `instanceId`/`lastBeatAt`). Raw `GroupHealth[]`, unwrapped — matches
+ *  `@dudousxd/nestjs-durable-dashboard`'s `GET /workers` shape byte for byte (minus the `status`
+ *  telemetry field, which the AdonisJS engine's heartbeat doesn't carry — see `durable-client.ts`). */
+export async function workers(deps: Deps): Promise<ApiResponse> {
+  const groups = await deps.engine.workerHealth();
+  return ok(groups);
+}
+
+/** `GET /topology` — this deployment's durable role, for the header badge. Pure/local (no engine
+ *  round-trip): the role is already known by `dashboard_provider.ts` from `config/durable.ts`. */
+export function topology(
+  role: 'standalone' | 'control-plane' | 'tenant',
+  tenant?: string,
+): ApiResponse {
+  return ok(tenant !== undefined ? { role, tenant } : { role });
+}
+
 /** Compact run shape for the list view. */
 function summarizeRun(run: WorkflowRun) {
   return {
@@ -203,6 +321,7 @@ function summarizeRun(run: WorkflowRun) {
     workflow: run.workflow,
     workflowVersion: run.workflowVersion,
     status: run.status,
+    namespace: run.namespace,
     tags: run.tags ?? [],
     createdAt: run.createdAt.toISOString(),
     updatedAt: run.updatedAt.toISOString(),
@@ -241,9 +360,13 @@ function summarizeCheckpoint(cp: StepCheckpoint) {
     status: cp.status,
     attempts: cp.attempts,
     workerGroup: cp.workerGroup,
+    input: cp.input,
     output: cp.output,
     error: cp.error,
     events: cp.events ?? [],
+    // Set only on parallel-fan siblings (`ctx.all`/`ctx.gather`) — the new SPA's `group-parallel-spans`
+    // helper needs this to collapse a fan-out into one timeline row.
+    parallelGroup: cp.parallelGroup,
     enqueuedAt: cp.enqueuedAt.toISOString(),
     startedAt: cp.startedAt.toISOString(),
     finishedAt: cp.finishedAt.toISOString(),

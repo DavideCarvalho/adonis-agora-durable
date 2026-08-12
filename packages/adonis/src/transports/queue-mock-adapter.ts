@@ -158,6 +158,7 @@ export class MockAdapter implements Adapter {
   pushMany = this.#unsupported('pushMany');
   pushManyOn = this.#unsupported('pushManyOn');
   getJob = this.#unsupported('getJob');
+  renewJobs = this.#unsupported('renewJobs');
   upsertSchedule = this.#unsupported('upsertSchedule');
   createSchedule = this.#unsupported('createSchedule');
   getSchedule = this.#unsupported('getSchedule');

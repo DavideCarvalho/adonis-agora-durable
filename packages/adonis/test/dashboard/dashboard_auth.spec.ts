@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   type ResolvedDashboardAuth,
   performLogin,
+  performSession,
   readSession,
   resolveDashboardAuth,
   sanitizeReturnTo,
@@ -19,7 +20,22 @@ describe('resolveDashboardAuth', () => {
   it('resolves a valid config with the default 8h ttl', () => {
     const login = () => null;
     const resolved = resolveDashboardAuth({ secret: 'x'.repeat(32), login });
-    expect(resolved).toEqual({ secret: 'x'.repeat(32), ttlMs: 8 * 60 * 60 * 1000, login });
+    expect(resolved).toEqual({
+      secret: 'x'.repeat(32),
+      ttlMs: 8 * 60 * 60 * 1000,
+      modes: ['login'],
+      login,
+    });
+  });
+
+  it('resolves Mode A (session) alone, and both modes together', () => {
+    const session = () => null;
+    const login = () => null;
+    expect(resolveDashboardAuth({ secret: 's', session })?.modes).toEqual(['session']);
+    expect(resolveDashboardAuth({ secret: 's', session, login })?.modes).toEqual([
+      'session',
+      'login',
+    ]);
   });
 
   it('parses a custom ttl string', () => {
@@ -42,11 +58,10 @@ describe('resolveDashboardAuth', () => {
     );
   });
 
-  it('throws (fail closed) when login is missing', () => {
-    expect(() =>
-      // @ts-expect-error: exercising the missing-login boot guard (a non-TS caller could omit it)
-      resolveDashboardAuth({ secret: 's' }),
-    ).toThrow(/login is required/);
+  it('throws (fail closed) when neither login nor session is configured', () => {
+    expect(() => resolveDashboardAuth({ secret: 's' })).toThrow(
+      /needs at least one of `login` or `session`/,
+    );
   });
 });
 
@@ -147,6 +162,49 @@ describe('performLogin', () => {
     expect(verifySessionCookie(outcome.cookieValue, { secret: SECRET })).toMatchObject({
       sub: 'admin',
     });
+  });
+});
+
+describe('performSession (Mode A — host-app SSO)', () => {
+  it('mints a cookie when the session hook accepts the raw request', async () => {
+    const auth = resolveDashboardAuth({
+      secret: SECRET,
+      session: (request) => ((request as { isAdmin?: boolean }).isAdmin ? { id: 'ops' } : null),
+    }) as ResolvedDashboardAuth;
+
+    const outcome = await performSession(auth, { isAdmin: true });
+    expect(outcome.kind).toBe('ok');
+    if (outcome.kind !== 'ok') return;
+    expect(verifySessionCookie(outcome.cookieValue, { secret: SECRET })).toMatchObject({
+      sub: 'ops',
+    });
+  });
+
+  it('is a uniform 401 (unauthorized) on denial or a throwing hook', async () => {
+    const denies = resolveDashboardAuth({
+      secret: SECRET,
+      session: () => null,
+    }) as ResolvedDashboardAuth;
+    expect((await performSession(denies, {})).kind).toBe('unauthorized');
+
+    const throwing = resolveDashboardAuth({
+      secret: SECRET,
+      session: () => {
+        throw new Error('boom');
+      },
+    }) as ResolvedDashboardAuth;
+    const outcome = await performSession(throwing, {});
+    expect(outcome.kind).toBe('unauthorized');
+    if (outcome.kind !== 'unauthorized') return;
+    expect(outcome.hookError).toBeInstanceOf(Error);
+  });
+
+  it('404-shaped (unauthorized, no cookie) when Mode A is not configured on this auth', async () => {
+    const loginOnly = resolveDashboardAuth({
+      secret: SECRET,
+      login: () => null,
+    }) as ResolvedDashboardAuth;
+    expect((await performSession(loginOnly, {})).kind).toBe('unauthorized');
   });
 });
 

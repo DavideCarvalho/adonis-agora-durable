@@ -11,9 +11,14 @@ export {
   listRuns,
   getRun,
   retryRun,
+  retryWithInputRun,
+  continueRun,
   redispatchPendingRun,
   cancelRun,
+  bulkAction,
   health,
+  workers,
+  topology,
   ok,
 } from './handlers.js';
 export type { ApiRequest, ApiResponse, Deps, DashboardEngine } from './handlers.js';
@@ -34,15 +39,19 @@ export type { DashboardContainer } from './gateway-adapter.js';
 export {
   resolveDashboardAuth,
   performLogin,
+  performSession,
   readSession,
   sanitizeReturnTo,
   SESSION_COOKIE_NAME,
 } from './auth.js';
 export type {
+  AuthMode,
   DashboardAuthOptions,
   ResolvedDashboardAuth,
   LoginHook,
   LoginOutcome,
+  SessionHook,
+  SessionOutcome,
 } from './auth.js';
 export {
   signSessionCookie,

@@ -1,11 +1,41 @@
 import { describe, expect, it } from 'vitest';
 import {
+  type StoreEngineLike,
   dashboardEngineForRole,
   gatewayDashboardEngine,
+  storeDashboardEngine,
 } from '../../src/dashboard/gateway-adapter.js';
 import { WorkflowEngine } from '../../src/engine.js';
 import { DURABLE_RUN_GATEWAY } from '../../src/role_bindings.js';
 import type { RunGateway } from '../../src/run-gateway/interface.js';
+
+/** A `StoreEngineLike` spy — records which verbs `storeDashboardEngine` routes to it. */
+function storeEngineSpy(): StoreEngineLike & { calls: string[] } {
+  const calls: string[] = [];
+  const track = <T>(label: string, value: T): T => {
+    calls.push(label);
+    return value;
+  };
+  return {
+    calls,
+    getRun: async (id) => track(`getRun:${id}`, null),
+    listRuns: async () => track('listRuns', []),
+    listCheckpoints: async (id) => track(`listCheckpoints:${id}`, []),
+    getRunChildren: async (id) => track(`getRunChildren:${id}`, []),
+    requeue: async (id) => track(`requeue:${id}`, null),
+    cancel: async (id) => track(`cancel:${id}`, null),
+    workerHealth: async () => track('workerHealth', []),
+    retryWithInput: async (id) => track(`retryWithInput:${id}`, null),
+    continue: async (id) => track(`continue:${id}`, null),
+    // The engine's own `subscribe` is GLOBAL (every run) — the adapter narrows it to one run.
+    subscribe: (listener) => {
+      calls.push('subscribe');
+      listener({ type: 'run.started', runId: 'other-run', at: new Date() });
+      listener({ type: 'run.started', runId: 'run-1', at: new Date() });
+      return () => calls.push('unsubscribe');
+    },
+  };
+}
 
 /** A RunGateway spy that records which verbs the adapter routes to it. */
 function gatewaySpy(): RunGateway & { calls: string[] } {
@@ -57,6 +87,77 @@ describe('gatewayDashboardEngine — RunGateway → DashboardEngine port', () =>
     expect(await engine.getRunChildren('run-1')).toEqual(['child-a', 'child-b']);
     expect(gw.calls).toContain('getRunChildren:run-1');
   });
+
+  it('degrades retryWithInput/continue to null — no gateway verb exists yet for either', async () => {
+    const gw = gatewaySpy();
+    const engine = gatewayDashboardEngine(gw);
+    expect(await engine.retryWithInput('run-1', {})).toBeNull();
+    expect(await engine.continue('run-1')).toBeNull();
+  });
+
+  it('subscribe delegates straight to the gateway (already run-scoped, no filtering needed)', async () => {
+    const gw = gatewaySpy();
+    const engine = gatewayDashboardEngine(gw);
+    let called = false;
+    const unsubscribe = engine.subscribe('run-1', () => {
+      called = true;
+    });
+    expect(called).toBe(false); // the gateway spy's subscribe never fires on its own
+    unsubscribe();
+  });
+});
+
+describe('storeDashboardEngine — WorkflowEngine → DashboardEngine port', () => {
+  it('forwards every verb 1:1, including retryWithInput/continue', async () => {
+    const raw = storeEngineSpy();
+    const engine = storeDashboardEngine(raw);
+
+    await engine.getRun('run-1');
+    await engine.listRuns({ limit: 5, offset: 0 });
+    await engine.listCheckpoints('run-1');
+    await engine.getRunChildren('run-1');
+    await engine.requeue('run-1');
+    await engine.cancel('run-1');
+    await engine.workerHealth();
+    await engine.retryWithInput('run-1', { fixed: true });
+    await engine.continue('run-1');
+
+    expect(raw.calls).toEqual(
+      expect.arrayContaining([
+        'getRun:run-1',
+        'listRuns',
+        'listCheckpoints:run-1',
+        'getRunChildren:run-1',
+        'requeue:run-1',
+        'cancel:run-1',
+        'workerHealth',
+        'retryWithInput:run-1',
+        'continue:run-1',
+      ]),
+    );
+  });
+
+  it('subscribe narrows the engine-global listener to one run', async () => {
+    const raw = storeEngineSpy();
+    const engine = storeDashboardEngine(raw);
+
+    const seen: string[] = [];
+    const unsubscribe = engine.subscribe('run-1', (event) => seen.push(event.runId));
+    unsubscribe();
+
+    // The spy's `subscribe` fires for BOTH 'other-run' and 'run-1' — only 'run-1' should reach here.
+    expect(seen).toEqual(['run-1']);
+    expect(raw.calls).toContain('subscribe');
+    expect(raw.calls).toContain('unsubscribe');
+  });
+
+  it('redispatchPending degrades to null when the underlying engine lacks the method', async () => {
+    const raw = storeEngineSpy();
+    // biome-ignore lint/performance/noDelete: simulating an engine build without redispatchPending.
+    delete raw.redispatchPending;
+    const engine = storeDashboardEngine(raw);
+    expect(await engine.redispatchPending('run-1')).toBeNull();
+  });
 });
 
 /** A key-aware container double: an unbound key throws — exactly how we prove a tenant dashboard never
@@ -89,12 +190,17 @@ describe('dashboardEngineForRole — role-branched resolution', () => {
     expect(container.touched).not.toContain(WorkflowEngine);
   });
 
-  it('store role: resolves WorkflowEngine directly (behavior unchanged)', async () => {
-    const fakeEngine = { marker: 'engine' };
+  it('store role: resolves WorkflowEngine and adapts it via storeDashboardEngine (verbs still forward 1:1)', async () => {
+    const fakeEngine = storeEngineSpy();
     const container = containerWith(new Map<unknown, unknown>([[WorkflowEngine, fakeEngine]]));
 
     const resolved = await dashboardEngineForRole('standalone', container, WorkflowEngine);
-    expect(resolved).toBe(fakeEngine);
+    // Not the same reference (an explicit adapter, not a raw cast — see storeDashboardEngine's doc),
+    // but delegation is still 1:1: calling through the port reaches the real engine's methods.
+    expect(resolved).not.toBe(fakeEngine);
+    await resolved.getRun('run-1');
+    expect(fakeEngine.calls).toContain('getRun:run-1');
+
     expect(container.touched).toContain(WorkflowEngine);
     expect(container.touched).not.toContain(DURABLE_RUN_GATEWAY);
   });

@@ -1,0 +1,211 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Aviary console tokens ──────────────────────────────────────────────────────────────────────
+   Source of truth: `AVIARY-UI.md` (repo root of the nestjs libs checkout — this file is copied
+   verbatim from `@dudousxd/nestjs-durable-dashboard`'s `src/app/index.css` so the AdonisJS console
+   matches its NestJS sibling pixel-for-pixel). The neutrals, the status hues and the spacing are
+   IDENTICAL across every Aviary console in the ecosystem (NestJS: agent, durable, media, telescope;
+   AdonisJS: durable, and any sibling console that follows); `--accent` is the single per-console
+   variable. If you change anything here, change it in `AVIARY-UI.md` and in every other console in
+   the same session — a token that lands in one console only is invisible until someone puts two
+   screenshots side by side.
+   ──────────────────────────────────────────────────────────────────────────────────────────────── */
+:root {
+  /* Shared. Identical in all four consoles. Do not tune per console. */
+  --bg: #09090b;
+  --panel: #0c0c0f;
+  --panel-2: #101017; /* elevated surface: modal/dialog, drawer, popover, menu */
+  --line: #1c1c22;
+  --line-soft: #16161a;
+  --text: #e7e7ea;
+  --muted: #76767f;
+
+  /* Status. Semantic, never decorative — the `.s-*` hues below are built from these. */
+  --good: #34d399;
+  --warn: #fbbf24;
+  --bad: #f87171;
+  --live: #60a5fa; /* in flight: a workflow mid-execution, a step a worker is running now */
+
+  /* Per console. This is the ONLY line that differs between them.
+     NOTE: durable's accent is currently the SAME value as `--good`, so green carries two meanings
+     here (healthy AND interactive). AVIARY-UI.md flags this as an open brand decision; it is left
+     as-is deliberately rather than silently re-picked. */
+  /* Lime, not the emerald this used to be: emerald IS `--good`, so the same hue meant both
+     "this step succeeded" and "this is interactive". Durable picked last and had the least room —
+     bad 0, its own no-worker 25, warn 45, good 160, media cyan 187, live 217, its own sleeping 239,
+     agent violet 258, telescope magenta 300, its own dead 347. Lime sits mid-arc at 82: 37 from
+     --warn, 78 from --good. Pink separates further but a pink primary action shares a row with a
+     red FAILED badge and borrows an alarm it does not mean. See AVIARY-UI.md. */
+  --accent: #a3e635;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Faint blueprint grid + top glow — atmosphere, not noise. */
+.app-bg {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image: radial-gradient(
+      900px 400px at 78% -8%,
+      color-mix(in srgb, var(--accent) 8%, transparent),
+      transparent 70%
+    ), linear-gradient(to right, var(--line-soft) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--line-soft) 1px, transparent 1px);
+  background-size: 100% 100%, 44px 44px, 44px 44px;
+  mask-image: linear-gradient(to bottom, black, black 60%, transparent);
+  opacity: 0.5;
+}
+
+.mono {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+}
+
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Status hues */
+.s-running {
+  color: var(--live);
+}
+.s-suspended {
+  color: var(--warn);
+}
+/* Display-only refinements of `suspended` (see runDisplayStatus): a run actively running a remote
+   step renders as `s-running`; these cover the genuinely-parked reasons. */
+.s-sleeping {
+  /* Parked on a durable timer — a calm indigo, distinct from the active blue of `running`. */
+  color: #818cf8;
+}
+.s-awaiting {
+  /* Waiting on an external signal — amber, like the suspended state it refines. */
+  color: var(--warn);
+}
+.s-completed {
+  color: var(--good);
+}
+.s-failed {
+  color: var(--bad);
+}
+/* Compensating cancel in progress: a transient, in-flight amber — distinct from the grey terminal
+   `cancelled` it flips to once the rollback completes. */
+.s-cancelling {
+  color: #f59e0b;
+}
+.s-cancelled {
+  color: #71717a;
+}
+/* Dead-letter: recovery gave up (poison pill). A starker red than a normal failure. */
+.s-dead {
+  color: #e11d48;
+}
+/* Queued: a run enqueued by `start` awaiting a worker, or a remote step dispatched and awaiting its
+   worker result (in-flight). A calmer slate than the amber of a durably-suspended run. */
+.s-pending {
+  color: #94a3b8;
+}
+/* Blocked: waiting on a handler that has NO live worker — it can't progress until one rejoins. A warm
+   orange that reads as "act on this", distinct from the terminal red of `failed`/`dead`. */
+.s-no-worker {
+  color: #fb923c;
+}
+/* Queued behind a singleton leader: fine, just waiting its turn — a muted violet, not an alarm. */
+.s-queued {
+  color: #a78bfa;
+}
+/* Stale pending step: a remote step dispatched and still awaiting its worker result well past
+   STALE_PENDING_MS — likely a lost dispatch (crashed worker / dropped job) that needs a manual
+   re-dispatch. Same warm orange as `s-no-worker` (both read "act on this"). */
+.s-stale {
+  color: #fb923c;
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: currentColor;
+  box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 18%, transparent);
+}
+
+.pulse {
+  animation: pulse 1.6s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.rise {
+  animation: rise 0.32s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+/* react-flow dark surfaces */
+.react-flow {
+  --xy-background-color: transparent;
+  --xy-edge-stroke-default: var(--line);
+  --xy-attribution-background-color: transparent;
+}
+.react-flow__edge-path {
+  stroke-width: 1.5;
+}
+.react-flow__controls {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: none;
+}
+.react-flow__controls-button {
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  fill: var(--muted);
+}
+.react-flow__controls-button:hover {
+  background: #18181b;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: #26262c;
+  border: 3px solid var(--bg);
+  border-radius: 999px;
+}

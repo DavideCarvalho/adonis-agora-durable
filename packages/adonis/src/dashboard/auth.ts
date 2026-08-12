@@ -18,19 +18,38 @@ import {
  * session guard).
  */
 
-/** Host hook validating submitted credentials from the built-in login page. */
+/** Host hook validating submitted credentials from the built-in login page (Mode B — standalone). */
 export type LoginHook = (
   username: string,
   password: string,
 ) => Promise<DashboardSessionUser | null> | DashboardSessionUser | null;
 
 /**
+ * Host hook validating the HOST APP's own auth off the raw request (Mode A — SSO / "open from your
+ * app"). Receives the underlying platform request object (an AdonisJS `Request['request']`, i.e. the
+ * raw Node `IncomingMessage`) rather than an AdonisJS type, so this module stays framework-light and
+ * unit-testable with no `HttpContext` — the provider passes it through untouched. Mirrors the NestJS
+ * sibling console's `SessionHook` byte-for-byte (same two-mode split).
+ */
+export type SessionHook = (
+  request: unknown,
+) => Promise<DashboardSessionUser | null> | DashboardSessionUser | null;
+
+/**
  * Author-facing `dashboardAuth` option on `config/durable_dashboard.ts`. Gates the dashboard behind
- * a signed session cookie via the built-in server-rendered login page (`GET <path>/login`) — the
- * bundled dashboard SPA stays untouched.
+ * a signed session cookie, minted by whichever mode(s) are configured:
  *
- * Nest needed a `forRootAsync` to reach app services from the `login` hook; AdonisJS does not — the
- * config module is a plain file and `login` is just a function that may be `async` and close over
+ * - Mode B (`login`) — the built-in server-rendered login page (`GET <path>/login`), for a
+ *   standalone console with its own credentials.
+ * - Mode A (`session`) — `POST <path>/session`, for a host app that's already authenticated the
+ *   operator itself and wants a one-shot "open the console" button (see `client/console-session.ts`).
+ *
+ * Both may be configured together; at least one is required. The bundled dashboard SPA is unaware of
+ * which mode(s) are active — it only reacts to a 401's `{ auth: { modes } }` body (see
+ * `durable-client.ts`).
+ *
+ * Nest needed a `forRootAsync` to reach app services from these hooks; AdonisJS does not — the config
+ * module is a plain file and each hook is just a function that may be `async` and close over
  * `app.container`/services (import them at the top of `config/durable_dashboard.ts`), so there is
  * nothing extra to build for the async case.
  */
@@ -41,14 +60,24 @@ export interface DashboardAuthOptions {
   ttl?: string;
   /** Validates submitted username/password; return the session user, or `null` to deny. Thrown
    *  errors are treated as a denial (logged once, never surfaced to the client). May be async. */
-  login: LoginHook;
+  login?: LoginHook;
+  /** Validates the host app's own auth off the raw request; return the session user, or `null` to
+   *  deny. Thrown errors are treated as a denial. May be async. */
+  session?: SessionHook;
 }
 
-/** Resolved, validated `dashboardAuth` config shared by the guard, the login handler, and the page. */
+/** Which auth surface(s) are active — carried on an API 401's `{ auth: { modes } }` body so the SPA
+ *  knows whether to offer the login page or just report "not authenticated". */
+export type AuthMode = 'session' | 'login';
+
+/** Resolved, validated `dashboardAuth` config shared by the guard, the login/session handlers, and
+ *  the page. */
 export interface ResolvedDashboardAuth {
   secret: string;
   ttlMs: number;
-  login: LoginHook;
+  modes: AuthMode[];
+  login?: LoginHook;
+  session?: SessionHook;
 }
 
 /** Cookie name carrying the signed dashboard session. */
@@ -75,7 +104,8 @@ function durationToMs(ttl: string): number {
 /**
  * Validate + resolve the `dashboardAuth` option. Returns `null` when unconfigured (today's
  * unauthenticated behavior, unchanged). Throws at boot (fail closed) when configured but missing a
- * secret or a `login` hook — the host learns immediately rather than shipping an un-mintable gate.
+ * secret, or neither `login` nor `session` is a function — the host learns immediately rather than
+ * shipping an un-mintable gate.
  */
 export function resolveDashboardAuth(
   options: DashboardAuthOptions | undefined,
@@ -87,13 +117,23 @@ export function resolveDashboardAuth(
         '(HMAC-SHA256 signing key, 32+ bytes recommended). Failing closed.',
     );
   }
-  if (typeof options.login !== 'function') {
-    throw new Error('durable_dashboard: dashboardAuth.login is required (a login hook).');
+  const hasLogin = typeof options.login === 'function';
+  const hasSession = typeof options.session === 'function';
+  if (!hasLogin && !hasSession) {
+    throw new Error(
+      'durable_dashboard: dashboardAuth needs at least one of `login` or `session` (a login hook or ' +
+        'a host-session hook).',
+    );
   }
+  const modes: AuthMode[] = [];
+  if (hasSession) modes.push('session');
+  if (hasLogin) modes.push('login');
   return {
     secret: options.secret,
     ttlMs: durationToMs(options.ttl ?? DEFAULT_TTL),
-    login: options.login,
+    modes,
+    ...(hasLogin ? { login: options.login } : {}),
+    ...(hasSession ? { session: options.session } : {}),
   };
 }
 
@@ -138,17 +178,16 @@ export type LoginOutcome =
 const UNAUTHORIZED_MESSAGE = 'Invalid username or password.';
 
 /**
- * Run the host's `login` hook defensively: a throw is treated as a denial (uniform failure) so a
- * buggy hook never 500s the endpoint into a stack-trace leak. The thrown error is surfaced on the
- * outcome (`hookError`) so the provider can warn-log it once, but it never reaches the client.
+ * Run a host hook (`login` or `session`) defensively: a throw is treated as a denial (uniform
+ * failure) so a buggy hook never 500s the endpoint into a stack-trace leak. The thrown error is
+ * surfaced on the outcome (`hookError`) so the provider can warn-log it once, but it never reaches
+ * the client.
  */
-async function runLoginHook(
-  auth: ResolvedDashboardAuth,
-  username: string,
-  password: string,
+async function runHook(
+  hook: () => Promise<DashboardSessionUser | null> | DashboardSessionUser | null,
 ): Promise<{ user: DashboardSessionUser | null; error?: unknown }> {
   try {
-    return { user: (await auth.login(username, password)) ?? null };
+    return { user: (await hook()) ?? null };
   } catch (error) {
     return { user: null, error };
   }
@@ -158,7 +197,8 @@ async function runLoginHook(
  * Decide a login attempt end-to-end (validate body → run hook → mint cookie) with no HTTP types.
  * On success returns the signed cookie value to set plus the sanitized `redirectTo`; the password
  * is forwarded to the hook AS-IS (empty string when blank), so the hook alone decides whether a
- * password is required.
+ * password is required. `404`-worthy (Mode B not configured) is the provider's call, not this
+ * function's — it only runs once the provider has confirmed `auth.login` exists.
  */
 export async function performLogin(
   auth: ResolvedDashboardAuth,
@@ -170,7 +210,13 @@ export async function performLogin(
   if (!isString(parsed.username) || !isString(parsed.password)) {
     return { kind: 'bad-request', message: 'Body must include string `username` and `password`.' };
   }
-  const { user, error } = await runLoginHook(auth, parsed.username, parsed.password);
+  const login = auth.login;
+  if (!login) {
+    return { kind: 'unauthorized', message: UNAUTHORIZED_MESSAGE };
+  }
+  const { user, error } = await runHook(() =>
+    login(parsed.username as string, parsed.password as string),
+  );
   if (!user) {
     return error !== undefined
       ? { kind: 'unauthorized', message: UNAUTHORIZED_MESSAGE, hookError: error }
@@ -182,6 +228,41 @@ export async function performLogin(
     ...(now !== undefined ? { now } : {}),
   });
   return { kind: 'ok', cookieValue, redirectTo: sanitizeReturnTo(parsed.returnTo, basePath) };
+}
+
+/**
+ * The framework-light outcome of a Mode A session-mint attempt (`POST <path>/session`), mapped to
+ * HTTP by the provider: `ok` → set the cookie, reply `204`; `unauthorized` → uniform `401` (the
+ * `session` hook returned/threw a denial).
+ */
+export type SessionOutcome =
+  | { kind: 'ok'; cookieValue: string }
+  | { kind: 'unauthorized'; hookError?: unknown };
+
+/**
+ * Decide a Mode A session-mint attempt end-to-end: run the host's `session` hook against the raw
+ * platform request, and mint the cookie on success. No body to validate — the hook reads whatever it
+ * needs directly off `request` (its own cookie/JWT/header).
+ */
+export async function performSession(
+  auth: ResolvedDashboardAuth,
+  request: unknown,
+  now?: number,
+): Promise<SessionOutcome> {
+  const session = auth.session;
+  if (!session) return { kind: 'unauthorized' };
+  const { user, error } = await runHook(() => session(request));
+  if (!user) {
+    return error !== undefined
+      ? { kind: 'unauthorized', hookError: error }
+      : { kind: 'unauthorized' };
+  }
+  const cookieValue = signSessionCookie(user, {
+    secret: auth.secret,
+    ttlMs: auth.ttlMs,
+    ...(now !== undefined ? { now } : {}),
+  });
+  return { kind: 'ok', cookieValue };
 }
 
 /**

@@ -16,6 +16,9 @@ allowBuilds:
 # its build is intentional" so `pnpm install --frozen-lockfile` stays green.
 ignoredBuiltDependencies:
   - msgpackr-extract
+minimumReleaseAgeExclude:
+  - '@xyflow/react@12.11.3'
+  - '@xyflow/system@0.0.80'
 # pnpm >=10.4 reads build-allowlist config from HERE (not package.json) in a workspace.
 # Setting onlyBuiltDependencies makes it the exclusive allowlist, so it lists every dep whose
 # script must run — the 4 that pnpm allowed by default PLUS msgpackr-extract (bullmq transitive).

@@ -9,9 +9,28 @@ import { defineConfig } from '@adonis-agora/durable/dashboard'
  * By default the dashboard is open OUTSIDE production, and in production it
  * requires a bearer token equal to `DURABLE_DASHBOARD_TOKEN` (deny if unset).
  * Replace `authorize` with your own guard (session, role, IP allow-list, …).
+ *
+ * `dashboardAuth` is an ADDITIVE, optional session gate on top of `authorize` —
+ * a signed cookie minted via a built-in login page (Mode B: `login`) and/or a
+ * "open the console from your app" endpoint (Mode A: `session`). At least one
+ * of the two is required when `dashboardAuth` is set; either or both may be
+ * configured. See `docs/observability/dashboard-auth.mdx`.
  */
 export default defineConfig({
   // enabled: true,
   // path: '/durable',
   // authorize: (ctx) => ctx.auth.user?.isAdmin === true,
+  // dashboardAuth: {
+  //   secret: env.get('DURABLE_DASHBOARD_SECRET'),
+  //   ttl: '8h',
+  //   // Mode B — standalone login page.
+  //   login: async (username, password) => {
+  //     if (username === 'admin' && password === env.get('DURABLE_DASHBOARD_PASSWORD')) {
+  //       return { id: 'admin', name: 'Admin' }
+  //     }
+  //     return null
+  //   },
+  //   // Mode A — mint a session for an already-authenticated host request.
+  //   // session: async (request) => (request.user?.isAdmin ? { id: request.user.id } : null),
+  // },
 })
