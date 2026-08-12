@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/DavideCarvalho/adonis-durable.git"
+    "url": "git+https://github.com/DavideCarvalho/adonis-agora-durable.git"
   },
   "author": "Davi Carvalho <davi@goflip.ai>",
   "packageManager": "pnpm@11.17.0",

@@ -5,7 +5,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/DavideCarvalho/adonis-durable.git",
+    "url": "git+https://github.com/DavideCarvalho/adonis-agora-durable.git",
     "directory": "packages/eslint-plugin"
   },
   "author": "Davi Carvalho <davi@goflip.ai>",
