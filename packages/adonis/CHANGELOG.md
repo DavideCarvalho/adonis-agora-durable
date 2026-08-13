@@ -1,5 +1,13 @@
 # @adonis-agora/durable
 
+## 0.23.0
+
+### Minor Changes
+
+- [`7742d2f`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/7742d2fada29de36f083be95394b3c9a805838fa) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `GET /runs` (the dashboard's runs list) now stamps `waiting` on a `suspended` run parked on a signal/webhook/child-await/breakpoint, resolved from one bulk `listSignalWaiters` scan — matching `@dudousxd/nestjs-durable-dashboard`'s list rows. Verified by running both dashboards side by side with live data: a run suspended on `ctx.waitForSignal` previously showed a generic "RUNNING" badge in the runs list (the underlying `listSignalWaiters` primitive existed on the store, but nothing wired it into the dashboard's list endpoint); it now shows "AWAITING / signal `<name>`" the same as the NestJS console. The single-run detail view was unaffected (it already derives this from the run's timeline).
+
+- [`7cbd668`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/7cbd668a3462f801fd0ef9fd516a54b88d19e8c4) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The `durableTelescopeExtension()` now contributes `entryTypes` (`{ id: 'durable', label: 'Workflows', dot: 'bg-amber-400' }`), matching `nestjs-durable`'s extension — the "Workflows" nav badge now shows up in the Telescope dashboard's entry-type navigation.
+
 ## 0.22.0
 
 ### Minor Changes
