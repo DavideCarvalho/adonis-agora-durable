@@ -33,6 +33,7 @@ import type { TelescopeExtension } from './telescope-sdk.js';
 export function durableTelescopeExtension(opts: DurableDashboardOptions = {}): TelescopeExtension {
   return {
     name: 'durable',
+    entryTypes: () => [{ id: 'durable', label: 'Workflows', dot: 'bg-amber-400' }],
     dashboards: () => [durableDashboard(opts)],
     dataProviders: () => [
       durableStateProvider(),
