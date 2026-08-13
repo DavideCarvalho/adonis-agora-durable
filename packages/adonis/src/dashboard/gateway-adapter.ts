@@ -1,4 +1,4 @@
-import type { EngineEvent, RunResult } from '../interfaces.js';
+import type { EngineEvent, RunResult, SignalWaiter } from '../interfaces.js';
 import { DURABLE_RUN_GATEWAY } from '../role_bindings.js';
 import type { RunGateway } from '../run-gateway/interface.js';
 import type { DashboardEngine } from './handlers.js';
@@ -29,6 +29,9 @@ export interface StoreEngineLike {
   /** The engine's GLOBAL listener (every run) — {@link storeDashboardEngine} filters it to one run,
    *  same as `StoreRunGateway.subscribe` does. */
   subscribe(listener: (event: EngineEvent) => void): () => void;
+  /** Bulk signal-waiter scan — forwarded 1:1 to power `listRuns`' `waiting` stamp (see
+   *  `DashboardEngine.listSignalWaiters`'s doc). Every real `WorkflowEngine` has it. */
+  listSignalWaiters?(prefix: string): Promise<SignalWaiter[]>;
 }
 
 /**
@@ -59,6 +62,12 @@ export function storeDashboardEngine(engine: StoreEngineLike): DashboardEngine {
       engine.subscribe((event) => {
         if (event.runId === runId) onEvent(event);
       }),
+    ...(engine.listSignalWaiters
+      ? {
+          listSignalWaiters: (prefix: string) =>
+            engine.listSignalWaiters?.(prefix) as Promise<SignalWaiter[]>,
+        }
+      : {}),
   };
 }
 

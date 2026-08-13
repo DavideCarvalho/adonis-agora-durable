@@ -1953,6 +1953,18 @@ export class WorkflowEngine {
     return [...childIds];
   }
 
+  /**
+   * Bulk-list current signal waiters by token prefix (`''` for every waiter) — a thin passthrough to
+   * the store, exposed so a caller with no store reference of its own (e.g. the dashboard's
+   * `storeDashboardEngine` adapter) can do the SAME bulk scan {@link getRunChildren} already does for
+   * `child:` waiters, but for `run-waiting.ts`'s `resolveRunWaiting`/`indexWaitersByRun` — naming what
+   * a `suspended` run in a list row is parked on (signal/webhook/child/breakpoint) without a per-run
+   * timeline fetch.
+   */
+  listSignalWaiters(prefix: string): Promise<SignalWaiter[]> {
+    return this.store.listSignalWaiters(prefix);
+  }
+
   /** The worker groups this engine dispatches to: every registered remote workflow's group, plus any
    *  `extra` the caller declares. Local-step groups (a group consumed by in-process `@DurableStep`
    *  workers, e.g. `pipeline`) aren't derivable from registrations — pass them via `extra` so a group

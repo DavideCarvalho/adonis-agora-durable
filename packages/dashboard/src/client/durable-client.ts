@@ -6,12 +6,14 @@
  * This is a from-scratch port of `@dudousxd/nestjs-durable-dashboard`'s `durable-client.ts`, kept
  * behaviourally identical wherever the AdonisJS engine exposes the same data (deliberate: every UI
  * component under `src/app/` was ported unedited and imports these exact names/shapes). Divergences
- * from the NestJS client are called out inline — the two known gaps are:
+ * from the NestJS client are called out inline — the remaining known gaps are:
  *
- * 1. `WorkflowRun.origin` / `RunWaiting` — the AdonisJS engine has no `origin` column and no bulk
- *    signal-waiter listing, so `origin` and `waiting` are always `undefined` here. The origin facet UI
- *    (`OriginFacets.tsx`) still renders — every run just buckets under "unknown" until a future engine
- *    change adds the column.
+ * 1. `WorkflowRun.origin` — the AdonisJS engine has no `origin` column, so `origin` is always
+ *    `undefined` here. The origin facet UI (`OriginFacets.tsx`) still renders — every run just buckets
+ *    under "unknown" until a future engine change adds the column. (`RunWaiting`/`waiting` is NO LONGER
+ *    in this gap: the engine's `listSignalWaiters` bulk scan is wired into `GET /runs` — see
+ *    `packages/adonis/src/dashboard/handlers.ts`'s `listRuns` — so a suspended run's list row DOES
+ *    carry `waiting` the same as the NestJS console's, once the server is new enough.)
  * 2. `WorkerHeartbeat.status` (rss/cpu/concurrency telemetry) — the AdonisJS engine's heartbeat carries
  *    no `WorkerStatus` payload (only `group`/`instanceId`/`lastBeatAt`), so worker cards never show the
  *    resource-usage details the NestJS console can. The types are kept so a future engine addition
@@ -82,8 +84,10 @@ export interface StepCheckpoint {
   finishedAt: string;
 }
 
-/** What a suspended run is parked on. NOTE: never populated today (see module doc, gap #1) — kept so
- *  the "awaiting" detail line lights up automatically once the server gains signal-waiter listing. */
+/** What a suspended run is parked on — populated on `GET /runs` list rows via the server's bulk
+ *  signal-waiter scan (see module doc). Absent on a server too old to have it (or a store-less
+ *  `tenant` pod that can't do the scan), in which case `deriveRunState` falls back to its other
+ *  signals (timeline, worker health) instead of the "awaiting" detail line. */
 export interface RunWaiting {
   on: 'signal' | 'webhook' | 'child' | 'breakpoint';
   name: string;

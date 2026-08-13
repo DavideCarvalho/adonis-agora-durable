@@ -28,6 +28,7 @@ export * from './step-discovery.js';
 export * from './codec-state-store.js';
 export * from './diagnostics-bridge.js';
 export * from './events.js';
+export * from './run-waiting.js';
 export * from './metrics.js';
 export * from './pollers.js';
 export * from './scheduler.js';

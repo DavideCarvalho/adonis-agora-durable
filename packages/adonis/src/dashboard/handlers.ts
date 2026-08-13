@@ -4,9 +4,11 @@ import type {
   RunQuery,
   RunResult,
   RunStatus,
+  SignalWaiter,
   StepCheckpoint,
   WorkflowRun,
 } from '../index.js';
+import { indexWaitersByRun, resolveRunWaiting } from '../run-waiting.js';
 import { parseAttrFilters } from './attr-filter.js';
 
 /**
@@ -59,6 +61,16 @@ export interface DashboardEngine {
   continue(runId: string): Promise<RunResult | null>;
   /** Live lifecycle events for ONE run; returns an unsubscribe fn. */
   subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void;
+  /**
+   * Bulk-list current signal waiters by token prefix (`''` for every waiter) — powers `listRuns`'
+   * `waiting` stamp (see `run-waiting.ts`'s `resolveRunWaiting`), naming what a `suspended` run is
+   * parked on (signal/webhook/child/breakpoint) without a per-row timeline fetch. Optional: absent on
+   * a topology that can't do the bulk scan yet (a store-less `tenant` pod — see `gateway-adapter.ts`,
+   * mirrors `retryWithInput`/`continue`'s degrade-to-unavailable convention); `listRuns` simply skips
+   * the `waiting` stamp when this is undefined, same as `@dudousxd/nestjs-durable-dashboard` skips it
+   * for a gateway that can't do the scan.
+   */
+  listSignalWaiters?(prefix: string): Promise<SignalWaiter[]>;
 }
 
 /** The read/control port the handlers operate over (a store engine or a tenant gateway adapter). */
@@ -154,9 +166,17 @@ export async function listRuns(deps: Deps, req: ApiRequest): Promise<ApiResponse
 
   const query: RunQuery = { limit, offset, ...runFilterFromQuery(req.query) };
 
-  const runs = await engine.listRuns(query);
+  const [runs, waiters] = await Promise.all([
+    engine.listRuns(query),
+    // ONE bulk scan of the signal-waiter table (indexed by runId) resolves what each suspended run
+    // is parked on — signal / webhook / child / breakpoint — with no per-run timeline fetch. Absent
+    // on a topology that can't do the scan yet (see `DashboardEngine.listSignalWaiters`'s doc); the
+    // `waiting` stamp is simply skipped then, same as `@dudousxd/nestjs-durable-dashboard`.
+    engine.listSignalWaiters?.('') ?? Promise.resolve(undefined),
+  ]);
+  const waiterByRun = waiters ? indexWaitersByRun(waiters) : undefined;
   return ok({
-    runs: runs.map(summarizeRun),
+    runs: runs.map((run) => summarizeRun(run, waiterByRun)),
     page: { limit, offset, count: runs.length },
     statuses: RUN_STATUSES,
   });
@@ -314,8 +334,10 @@ export function topology(
   return ok(tenant !== undefined ? { role, tenant } : { role });
 }
 
-/** Compact run shape for the list view. */
-function summarizeRun(run: WorkflowRun) {
+/** Compact run shape for the list view. `waiterByRun`, when given, stamps `waiting` on a `suspended`
+ *  run parked on a signal/webhook/child/breakpoint (see `listRuns`' bulk waiter scan). */
+function summarizeRun(run: WorkflowRun, waiterByRun?: ReadonlyMap<string, SignalWaiter>) {
+  const waiting = waiterByRun ? resolveRunWaiting(run, waiterByRun) : undefined;
   return {
     id: run.id,
     workflow: run.workflow,
@@ -333,6 +355,7 @@ function summarizeRun(run: WorkflowRun) {
     // (an N+1 the list view doesn't currently pay), whereas `GET /runs/:id` already returns the full
     // checkpoint `timeline` a client can scan for it.
     recoveryAttempts: run.recoveryAttempts ?? 0,
+    ...(waiting ? { waiting } : {}),
   };
 }
 

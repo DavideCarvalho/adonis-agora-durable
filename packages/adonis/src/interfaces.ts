@@ -80,6 +80,22 @@ export interface WorkflowRun {
   updatedAt: Date;
 }
 
+/**
+ * WHAT an event-parked suspended run is waiting on, resolved for display — the engine keeps one
+ * generic `suspended` status (it's what drives recovery/timers/queries), but to a human "waiting on
+ * signal `approve`" reads very differently from "waiting on webhook `stripe-cb`". Computed by
+ * {@link resolveRunWaiting} (`run-waiting.ts`) from the run's signal waiters (`listSignalWaiters`, ONE
+ * bulk scan), so the dashboard can NAME the wait in a list row without fetching each run's timeline.
+ * `on` is derived from the waiter token's prefix (see `classifyWaiterToken`): `wh:<runId>:<seq>` ⇒
+ * `webhook`, `child:<id>` ⇒ `child`, `bp:<runId>:<seq>` ⇒ `breakpoint`, `event:<name>:…` ⇒ `signal`
+ * (name decoded), anything else ⇒ `signal` (the token IS the signal name). Mirrors
+ * `@dudousxd/nestjs-durable-core`'s `RunWaiting` byte-for-byte.
+ */
+export interface RunWaiting {
+  on: 'signal' | 'webhook' | 'child' | 'breakpoint';
+  name: string;
+}
+
 export type StepKind = 'local' | 'remote' | 'sleep' | 'signal';
 
 /**
