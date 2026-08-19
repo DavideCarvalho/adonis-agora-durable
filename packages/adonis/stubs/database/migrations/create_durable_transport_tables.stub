@@ -4,11 +4,11 @@
 import { BaseSchema } from '@adonisjs/lucid/schema'
 
 /**
- * Transport tables for the @adonis-agora/durable `db` transport: the point-to-point work channels (tasks /
- * results / heartbeats / control) that let durable remote steps run cross-process over the database
- * alone. JSON payloads are stored as TEXT (the transport (de)serializes them) and timestamps as
- * epoch-ms integers, so the schema is portable across SQLite / Postgres / MySQL. Only needed when you
- * select the `db` transport in config/durable.ts.
+ * Transport tables for the @adonis-agora/durable 'db' transport: the point-to-point work channels
+ * (tasks / results / heartbeats / control) that let durable remote steps run cross-process over the
+ * database alone. JSON payloads are stored as TEXT (the transport (de)serializes them) and timestamps
+ * as epoch-ms integers, so the schema is portable across SQLite / Postgres / MySQL. Only needed when
+ * you select the 'db' transport in config/durable.ts.
  */
 export default class extends BaseSchema {
   async up() {

@@ -5,8 +5,8 @@ import { stubsRoot } from './stubs/main.js';
  * `node ace configure @adonis-agora/durable` — auto-wires the package:
  *
  * 1. registers the core service provider in `adonisrc.ts`;
- * 2. registers the ace commands barrel (four commands: `durable:work`,
- *    `durable:runs`, `durable:retry`, `make:workflow`);
+ * 2. registers the ace commands barrel (five commands: `durable:work`,
+ *    `durable:worker`, `durable:runs`, `durable:retry`, `make:workflow`);
  * 3. registers the optional dashboard provider;
  * 4. registers the Assembler `init` hooks that generate the typed `app/workflows`
  *    and `app/steps` barrels at build/dev time (the provider imports them instead
