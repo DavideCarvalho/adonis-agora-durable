@@ -12,11 +12,17 @@ Transports are **config-driven drivers**: list the ones you use under `transport
 
 ## The drivers
 
-| Driver | Crosses a process boundary? | Use it for |
-| --- | --- | --- |
-| `transports.memory()` | No (in-process) | The zero-infra default: handlers registered with `transport.handle(...)` run in the **same process**, decoupled from the workflow. No broker. |
-| [`transports.queue(...)`](/docs/durable/transports/queue) | Yes | True **cross-process** steps over [`@adonisjs/queue`](https://github.com/adonisjs/queue) — a separate worker, on Redis or a database adapter. |
-| [`transports.db(...)`](/docs/durable/transports/db) | Yes (shared DB) | Broker-less, DBOS-style: steps are **rows** in the database you already run, via `@adonisjs/lucid`. |
+| Driver | Infrastructure | Crosses a process boundary? | Use it for |
+| --- | --- | --- | --- |
+| `transports.memory()` | none | No (in-process) | **Tests.** Drives a dispatch straight into the handler, so a test is deterministic with no polling and no timers. |
+| `transports.eventEmitter()` | none | No (in-process) | **Single-process production.** Handlers run in this process over a Node `EventEmitter`, but dispatch → worker → result is decoupled across the event loop, the way a real broker behaves. |
+| [`transports.queue(...)`](/docs/durable/transports/queue) | whatever `config/queue.ts` uses | Yes | True **cross-process** steps over [`@adonisjs/queue`](https://github.com/adonisjs/queue) — a separate worker fleet, on Redis or a database adapter. |
+| [`transports.db(...)`](/docs/durable/transports/db) | the database you already run | Yes (shared DB) | Broker-less, DBOS-style: steps are **rows** in your own database, via `@adonisjs/lucid`. No new infrastructure at all. |
+| `transports.bullmq(...)` | Redis + the `bullmq` package | Yes | **Cross-ecosystem**: byte-compatible with the NestJS `nestjs-durable` BullMQ transport and its Python worker, so an AdonisJS engine and a Python or NestJS worker interoperate on one Redis. See [Python interop](/docs/durable/python). |
+
+<Callout type="warn" title="memory is for tests; eventEmitter is the single-process production driver">
+The two look interchangeable and are not. `transports.memory()` executes the handler **inline in the dispatch call**, which is exactly what makes a test deterministic — and exactly what makes it a poor model of production, since a real dispatch is always asynchronous. `transports.eventEmitter()` delivers the result on a later tick, so a workflow that behaves correctly on it behaves correctly on a broker too. Reach for `eventEmitter` for any single-process app you actually deploy.
+</Callout>
 
 ## Selecting a transport in config
 
@@ -38,18 +44,33 @@ export default defineConfig({
 
 Switching transports is a one-line change to `transport` — the workflow code never changes.
 
-## In-process (default)
+## Single-process production — `eventEmitter`
 
-`transports.memory()` routes tasks to handlers registered in the same process with `transport.handle(name, fn)`. It's the default when `config/durable.ts` sets no `transport`:
+`transports.eventEmitter()` runs real durable workflows with **nothing else to deploy**: no broker, no Redis, no extra database. Step handlers under `app/steps` are served in this same process, and a dispatch travels to them over a Node `EventEmitter`:
 
-```ts title="start/durable.ts"
-import { InMemoryTransport } from '@adonis-agora/durable'
-
-const transport = new InMemoryTransport()
-transport.handle('payments:charge-card', async (input) => ({ chargeId: await charge(input) }))
+```ts title="config/durable.ts"
+export default defineConfig({
+  transport: 'event-emitter',
+  transports: {
+    'event-emitter': transports.eventEmitter(),
+  },
+  store: 'lucid',
+  stores: { lucid: stores.lucid() },
+})
 ```
 
-Great for splitting a workflow across modules in one app, and for [tests](/docs/durable/testing). When you need the step to run elsewhere, select the `queue` or `db` driver in `config/durable.ts`.
+| Option | Default | Description |
+| --- | --- | --- |
+| `group` | — | Accepted for parity with the broker drivers. Handlers match by step name in-process, so it does not affect routing. |
+| `instanceId` | random | Stable id for this process, stamped on control messages. |
+
+Pair it with the [Lucid store](/docs/durable/stores/lucid) and the durability guarantees are the real ones: a crash mid-run resumes from the last checkpoint, because the checkpoints are in Postgres even though the steps never left the process.
+
+What you do **not** get is a second process. It also doubles as a local control plane, broadcasting to every subscriber in this process — correct for a single instance, but it does not fan out across pods. The moment you run two replicas, move to `queue` or `db` and add a [control plane](/docs/durable/transports/control-plane).
+
+## In-process for tests — `memory`
+
+`transports.memory()` is the default when `config/durable.ts` sets no `transport`, and it is what [`createTestEngine()`](/docs/durable/testing) uses. It routes a dispatch straight into the handler registered for that name, so a test never waits on a poll interval.
 
 <CodeFlow scene="transport-dispatch" />
 
@@ -85,5 +106,7 @@ Omit it and the engine is **local-only**: events and cancellation reach subscrib
 Every transport carries the same JSON `RemoteTask` (dispatch) and `StepResult` (reply). The task also carries an optional `transport` (the pool id it was dispatched on) and an optional `traceparent` (see [distributed tracing](/docs/durable/observability/otel#distributed-tracing-across-workers)).
 
 <Callout type="info">
-A worker process is the [`durable:work`](/docs/durable/cli) command plus your handler registrations for its `group`. Run one engine-side process (consumes results) and one per worker group (registers handlers).
+A worker process is the [`durable:work`](/docs/durable/cli) command plus the step handlers it serves (from `app/steps`, discovered automatically). Run one engine-side process, which consumes results, and one or more worker processes.
+
+Note that a `node ace` console or REPL process deliberately does **not** consume from the broker — see [`consumers`](/docs/durable/transports/queue#consumers-why-a-node-ace-script-does-not-drain-the-queue).
 </Callout>

@@ -80,32 +80,37 @@ The `@adonis-agora/durable/admission-redis` subpath replaces the per-instance ad
 npm i @adonisjs/redis
 ```
 
-Construct a `RedisAdmissionBackend` with a Redis connection (an `ioredis` instance or an `@adonisjs/redis` connection both satisfy its `RedisLike` surface) and pass it to the engine as `admission` in `config/durable.ts`:
+Select it by name in `config/durable.ts` with the `admissions` factory — a lazy thunk, so `@adonisjs/redis` is imported only when this backend is actually the one in use:
 
 ```ts title="config/durable.ts"
-import redis from '@adonisjs/redis/services/main'
-import { defineConfig } from '@adonis-agora/durable'
-import { RedisAdmissionBackend } from '@adonis-agora/durable/admission-redis'
-
-const admission = new RedisAdmissionBackend({ connection: redis.connection() })
-admission.register({ name: 'emails', concurrency: 10, rateLimit: { limit: 1000, periodMs: 3_600_000 } })
+import { admissions, defineConfig } from '@adonis-agora/durable'
 
 export default defineConfig({
   // … plus your transport/store (see Getting Started)
-  admission,
+  admission: admissions.redis({ connection: 'main' }),
 })
 ```
 
-Options on `RedisAdmissionBackend`:
+`connection` names an `@adonisjs/redis` connection from `config/redis.ts`, exactly like `controlPlanes.redis(...)` and `stores.lucid(...)` — the host and credentials live in one place. The queues themselves are still declared with `engine.registerQueue(...)`; the backend only changes where the accounting happens.
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `connection` | — | An `ioredis` instance or `@adonisjs/redis` connection (reused for every queue). |
+| `connection` | `'main'` | The `@adonisjs/redis` connection whose keys hold the slots and waiter queue. |
 | `prefix` | `'durable'` | Key prefix namespacing the admission keys. |
 | `instanceId` | random uuid | Stable id for this engine instance ("pod"). |
 | `instanceTtlMs` | `30_000` | Liveness TTL for this pod's heartbeat key (refreshed at a third of the TTL). |
 | `waiterTtlMs` | `retryMs * 3` | How long a blocked waiter's place is kept after its last `tryAdmit`. |
 | `retryMs` | `1000` | Delay a blocked call is told to wait before re-trying admission. |
+
+Need a backend of your own — a database counter, a different broker? Implement `AdmissionBackend` (`register`, `handles`, `tryAdmit`, `release`, and optionally `onFreed` to wake blocked runs early instead of making them wait out a retry tick), prove it against `runAdmissionBackendContract` from [the conformance kit](/docs/durable/testing#conformance-kits), and pass the instance straight through:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  admission: new MyAdmissionBackend(Date.now),
+})
+```
+
+Either form works: `admission` accepts a ready backend or a lazy thunk that builds one at boot.
 
 <Callout type="info">
 **How it stays correct under contention.** Each admit is a single atomic Lua script that reclaims dead-instance slots, prunes abandoned waiters, enforces the rate window and the concurrency cap, then selects the rightful next waiter by **priority desc → fairness round-robin → arrival (FIFO/LIFO)** — all server-side, so concurrent pods can't race past the cap.

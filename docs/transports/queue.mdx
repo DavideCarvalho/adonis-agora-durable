@@ -70,9 +70,49 @@ Both the engine and the `durable:work` worker resolve the adapter from the `conn
 | `adapter` | — | Escape hatch: a raw `@adonisjs/queue` adapter factory, used instead of resolving from `config/queue.ts`. Takes precedence over `connection`. |
 | `group` | — | **Deprecated.** Steps route by handler name, so an instance serves whatever names it registers — no group to declare. Accepted for back-compat and otherwise ignored; use `partition` for isolation. |
 | `partition` | — | Optional isolation partition suffixing every per-handler task queue this worker subscribes to (`<name>@<partition>`), matching a dispatch's `partition` — so one backend can host several pools serving the same handler name without their tasks crossing. |
+| `namespace` | from the engine | Worker-pool namespace folded into every queue name. Setting it here is explicit and wins over the engine's propagation of `config.namespace` — see [Namespaces](#namespaces--sharing-one-broker-across-pools). |
 | `prefix` | `'durable'` | Namespaces the queues (`<prefix>:tasks:<token>`, `<prefix>:results`, …). |
 | `pollIntervalMs` | `200` | Poll interval in ms between queue reads. |
+| `stalledCheckIntervalMs` | `30_000` | How often the stalled-claim reclaim sweep runs. `0` disables it entirely. |
+| `stalledThresholdMs` | `1_800_000` (30min) | How old a claim must be before the sweep presumes its worker dead and re-delivers the job. |
+| `maxStalledCount` | `3` | How many times one job may be reclaimed before the adapter fails it permanently — the bound on a poison job. |
+| `onError` | `console.error` | Where a poll-loop failure is reported. Point it at your app's logger. |
 | `instanceId` | random uuid | Stable process id stamped on heartbeats and control messages. |
+
+### Stalled-job reclaim
+
+A worker that throws is easy: the job is redelivered a poll interval later. A worker that *vanishes* — killed mid-step, its pod evicted — throws nothing and leaves a claim that nobody will ever complete. The reclaim sweep is the net for that case: every `stalledCheckIntervalMs`, claims older than `stalledThresholdMs` are re-delivered.
+
+The default threshold of **30 minutes** looks absurdly generous until you see why: a claim is **never renewed while the worker processes it**, so its age is the step's elapsed time, not a heartbeat gap. A threshold below your longest step re-delivers a job whose worker is merely slow — which double-runs the step.
+
+So the rule is: **raise `stalledThresholdMs` above your longest legitimate step**, and make those steps idempotent. If you want tighter detection than a claim's age can give you, use a per-step `timeoutMs` instead — that one *is* heartbeat-aware.
+
+```ts
+transports.queue({
+  connection: 'redis',
+  stalledThresholdMs: 2 * 60 * 60 * 1000, // our longest import takes ~90 minutes
+  maxStalledCount: 3,
+  onError: (err) => logger.error({ err }, 'durable queue transport'),
+})
+```
+
+Set `stalledCheckIntervalMs: 0` to switch the sweep off — reasonable when an adapter already redelivers stalled jobs itself. Adapters that cannot report stalled jobs are detected and skipped silently, in which case [`engine.redispatchPending(runId)`](/docs/durable/reliability/failure-modes#lost-remote-dispatch-the-run-suspends-and-nothing-auto-redrives-it) is the recovery path.
+
+### `consumers` — why a `node ace` script does not drain the queue
+
+Broker queues are point-to-point: a job goes to exactly one consumer. That makes a short-lived process subscribing to them actively harmful — it claims step jobs it then dies holding, steals results addressed to the long-lived engine, and, with jobs queued, never exits because the drain loop keeps feeding it.
+
+So by default a **`console` or `repl` process does not start the broker consumer loops**. It can still dispatch runs and read the store — it is a pure producer. `durable:work` re-enables consumption for itself, so the worker command behaves identically either way, and web and test processes always consume eagerly.
+
+What this changes in practice: a `node ace` script that starts a run and waits for a remote step to come back will wait forever, because nothing in that process is listening for the result. Either let the worker fleet do the work (start the run and exit), or opt the process back in:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  consumers: 'always', // every booted process consumes eagerly
+})
+```
+
+Reach for `'always'` only for a script that genuinely must round-trip a remote step inline, and be aware it competes with the real worker fleet for jobs while it runs. In-process transports (`memory`, `event-emitter`) are unaffected — there is no broker to compete for.
 
 `transports.queue(config)` returns the lazy driver thunk used in `config/durable.ts`; the underlying class is `QueueTransport`, also exported from `@adonis-agora/durable` for constructing a worker-side instance directly.
 

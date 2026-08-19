@@ -116,3 +116,26 @@ export const renderVideo = defineStep(
 ```
 
 The crucial difference between the two paths: the durable path retries on a worker **reporting a failure** and suspends between attempts (crash-safe, not in memory); the liveness path retries on a worker **going silent** and awaits the result in memory between attempts. Reach for `timeoutMs` only when you genuinely need to detect and replace a stuck worker; otherwise leave it off and get the durable, crash-safe path.
+
+### Queue wait vs. silence while running — `pickupTimeoutMs`
+
+A single window has to cover two very different stretches of a step's life, and they want very different numbers:
+
+1. **Waiting in the queue.** Nobody has claimed the job yet, so nobody is beating for it. During a backlog this can legitimately run into minutes.
+2. **Running on a worker.** Somebody owns it and is expected to beat. Silence here is genuinely suspicious within seconds.
+
+Set `timeoutMs` tight enough to catch a wedged worker and a queue backlog trips it; set it loose enough to survive the backlog and a wedged worker goes unnoticed for just as long. `pickupTimeoutMs` splits the two:
+
+```ts
+await ctx.step(harvestBatch, input, {
+  timeoutMs: 30_000,        // once running: 30s of silence means the worker is gone
+  pickupTimeoutMs: 600_000, // before pickup: 10 minutes of queue wait is fine
+  retries: 3,
+})
+```
+
+A worker emits an automatic beat the moment it claims the task, and **that first beat is what switches the window** from `pickupTimeoutMs` to `timeoutMs`. So the two read as: `pickupTimeoutMs` is *"how long may it stay queued"*, `timeoutMs` is *"maximum silence while running"*.
+
+It defaults to `timeoutMs`, so leaving it off preserves the single-window behaviour. It is only consulted when `timeoutMs` is set — on a step with no `timeoutMs` there is no in-memory window at all, and `pickupTimeoutMs` does nothing.
+
+An expiry of either window raises the same retryable `RemoteStepTimeout`, so `retries` and `backoff` apply identically. To make either window meaningful, have the handler call [`log.heartbeat(progress?)`](/docs/durable/concepts/workflows-and-steps#reporting-liveness-from-inside-a-long-step) as it works.
