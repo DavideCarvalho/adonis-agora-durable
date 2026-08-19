@@ -1,82 +1,56 @@
 /**
- * Type-checks every PUBLISHED stub the way a consumer app does: a scratch AdonisJS-shaped app that
- * depends on `@adonis-agora/durable` and `@adonisjs/*` by NAME, with each stub rendered into the file
- * it actually generates, compiled by a real `tsc --noEmit` under NodeNext + strict.
+ * Type-checks every PUBLISHED stub the way a consumer app receives it: rendered by the REAL Adonis
+ * stubs pipeline into a scratch app that depends on `@adonis-agora/durable` and `@adonisjs/*` by
+ * NAME, then compiled by a real `tsc --noEmit` under NodeNext + strict.
  *
  * WHY THIS EXISTS. A `.stub` is a template that no tsconfig `include` reaches, so it is invisible to
- * every other gate in this repo. The package's own typecheck compiles `src/` against the library's
- * OWN types, which are trivially happy with themselves. The sibling stub specs assert that the
- * migration stub delegates (`migration-stub-schema`) and that it runs (`migration-stub-runs`), but
- * both operate on JavaScript, so neither can see a type error. That leaves a stub free to reference a
- * shape the real `@adonisjs/lucid` types reject while the whole suite stays green — which is exactly
- * how `@adonis-agora/agent` shipped a migration whose `up()` did not compile: its structural
- * `rawQuery` declared `bindings?: unknown[]`, not assignable in either direction to Lucid's
- * `RawQueryBindings`, so no per-connection client satisfied it.
+ * every other gate here. The package's own typecheck compiles `src/` against the library's own types,
+ * which are trivially happy with themselves. The sibling stub specs assert that the migration stub
+ * delegates (`migration-stub-schema`) and that it runs (`migration-stub-runs`), but both operate on
+ * JavaScript, so neither can see a type error.
  *
- * Durable does not have that defect — `createDurableTables(db: Database, connectionName?: string)`
- * imports Lucid's real `Database` type rather than mirroring it structurally, so there is no variance
- * mismatch to hit. This harness is the gate that keeps it that way: it compiles against the shipped
- * `dist/**\/*.d.ts`, so changing that signature tomorrow fails here instead of in a consumer's app.
+ * WHY THE REAL RENDERER. This harness first shipped with a hand-written regex renderer, and that made
+ * it worse than useless: it reported five green stubs for a package whose `configure` could not write
+ * a single file. Adonis compiles a stub body with Tempura, into a JavaScript template literal — so a
+ * backtick or a `${` in the body terminates that literal early and the stub throws at generation
+ * time. Four of the five stubs did exactly that. A regex renderer does not model Tempura, so it
+ * sailed past the defect and type-checked text no user could ever obtain.
  *
- * Resolution matters as much as compilation. The scratch app reaches the package through its
- * `exports` map, so what is checked is the PUBLISHED declarations a consumer installs — not `src/`,
- * which a check run inside this repo would otherwise pick up.
+ * A gate that renders differently from the generator is not testing the generator. So this drives
+ * `app.stubs.create()` → `build()` → `prepare()` — the same pipeline `codemods.makeUsingStub` runs
+ * from `configure.ts` — and writes each result at the very path the stub declares.
  *
- * Exits 0 on success; on failure prints tsc's diagnostics and exits non-zero.
+ * Resolution matters as much as compilation: the scratch app reaches the package through its
+ * `exports` map, so what is checked is the PUBLISHED `dist/**\/*.d.ts` a consumer installs, not
+ * `src/`, which a check run inside this repo would otherwise pick up.
+ *
+ * Exits 0 on success; on failure prints the diagnostics and exits non-zero.
  * Driven by `stub-typecheck.spec.ts`.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { AppFactory } from '@adonisjs/core/factories/app';
 
 const pkgRoot = fileURLToPath(new URL('../../../', import.meta.url));
 const repoRoot = fileURLToPath(new URL('../../../../../', import.meta.url));
+const stubsRoot = join(pkgRoot, 'stubs');
 
 /**
- * Every stub that generates TYPED TypeScript, with the path `configure` / `make:workflow` writes it
- * to. A stub that emits no type-bearing code has nothing to check; all five of these import from the
- * package and would break a consumer's build if their signatures drifted.
+ * Every stub that generates TYPED TypeScript. The four `configure` publishes, plus the
+ * `make:workflow` output — all five import from the package and would break a consumer's build if
+ * their signatures drifted. `state` is what the generator passes: only `make:workflow` needs an
+ * entity, exactly as its command supplies one.
  */
 const STUBS = [
-  { stub: 'database/migrations/create_durable_tables.stub', to: 'database/migrations/1785200000000_create_durable_tables.ts' },
-  { stub: 'database/migrations/create_durable_transport_tables.stub', to: 'database/migrations/1785200000001_create_durable_transport_tables.ts' },
-  { stub: 'config/durable.stub', to: 'config/durable.ts' },
-  { stub: 'config/durable_dashboard.stub', to: 'config/durable_dashboard.ts' },
-  { stub: 'make/workflow/main.stub', to: 'app/workflows/order_workflow.ts', entity: 'order' },
+  { path: 'config/durable.stub' },
+  { path: 'config/durable_dashboard.stub' },
+  { path: 'database/migrations/create_durable_tables.stub' },
+  { path: 'database/migrations/create_durable_transport_tables.stub' },
+  { path: 'make/workflow/main.stub', entity: 'order' },
 ];
-
-/**
- * Render a stub the way the generator does. Two template constructs appear in these stubs: the
- * `{{{ exports(...) }}}` destination header, and (in `make:workflow` only) `{{#var name = ... }}`
- * declarations plus `{{ name }}` interpolations.
- *
- * Deliberately strict: anything left unrendered is a hard failure rather than a silent pass. A stub
- * that grows a template construct this renderer does not model would otherwise reach `tsc` with
- * literal braces in it — which reads as a compile error nobody can explain, or worse, gets "fixed"
- * by loosening the check until it stops looking at anything.
- */
-function render({ stub, entity }) {
-  const source = readFileSync(join(pkgRoot, 'stubs', stub), 'utf8');
-
-  let out = source.replace(/^\{\{#var[^\n]*\n/gm, '');
-  const withoutHeader = out.replace(/\{\{\{[\s\S]*?\}\}\}\n/, '');
-  if (withoutHeader === out) throw new Error(`no {{{ exports() }}} header in ${stub} — render assumption broken`);
-  out = withoutHeader;
-
-  if (entity) {
-    // What `make:workflow <entity>` computes for the three `{{#var}}` bindings above.
-    const pascal = entity.replace(/(^|[_-])(\w)/g, (_, __, c) => c.toUpperCase());
-    out = out
-      .replaceAll('{{ workflowName }}', pascal)
-      .replaceAll('{{ registeredName }}', entity);
-  }
-
-  const leftover = out.match(/\{\{.*?\}\}/);
-  if (leftover) throw new Error(`unrendered template syntax ${leftover[0]} left in ${stub}`);
-  return out;
-}
 
 /**
  * Mirror the package's `node_modules` into the scratch app, entry by entry, so the stubs resolve
@@ -118,10 +92,32 @@ try {
   );
   linkDependencies(appRoot);
 
-  for (const spec of STUBS) {
-    const target = join(appRoot, spec.to);
-    mkdirSync(join(target, '..'), { recursive: true });
-    writeFileSync(target, render(spec));
+  // The real pipeline, rooted at the scratch app — so each stub's own `exports({ to })` resolves to a
+  // path inside it and the file lands exactly where `configure` would put it.
+  const app = new AppFactory().create(pathToFileURL(`${appRoot}/`));
+  await app.init();
+  const stubs = await app.stubs.create();
+
+  for (const { path, entity } of STUBS) {
+    let prepared;
+    try {
+      const stub = await stubs.build(path, { source: stubsRoot });
+      const state = entity ? { entity: app.generators.createEntity(entity) } : {};
+      prepared = await stub.prepare(state);
+    } catch (error) {
+      // A stub that cannot RENDER never reaches tsc. Report it as the generator failure it is —
+      // this is the exact message a user would get from `node ace configure`.
+      console.error(`stub typecheck: FAILED — ${path} does not render at all`);
+      console.error(`  ${error.message}`);
+      console.error('  A backtick or a ${ } in the stub BODY ends Tempura\'s template literal.');
+      process.exit(1);
+    }
+
+    if (!prepared.attributes.to) throw new Error(`${path} declared no destination`);
+    if (prepared.contents.length === 0) throw new Error(`${path} rendered to nothing`);
+
+    mkdirSync(dirname(prepared.attributes.to), { recursive: true });
+    writeFileSync(prepared.attributes.to, prepared.contents);
   }
 
   /**
