@@ -126,7 +126,7 @@ The stream sends no keepalive comments and has no server-side idle timeout — i
 | `POST` | `/durable/api/runs/:id/retry` | re-enqueue the run (→ `pending`, a worker resumes it) |
 | `POST` | `/durable/api/runs/:id/retry-with-input` | **fix and replay**: start a new run from a corrected input |
 | `POST` | `/durable/api/runs/:id/continue` | resume a run parked at a `ctx.breakpoint()` |
-| `POST` | `/durable/api/runs/:id/cancel` | cancel the run (body `{ compensate: true }` to undo the saga first) |
+| `POST` | `/durable/api/runs/:id/cancel` | cancel the run — ask for the saga undo with `?compensate=true` or a `{ compensate: true }` body |
 | `POST` | `/durable/api/runs/:id/redispatch` | re-enqueue every remote step still `pending` on this run |
 | `POST` | `/durable/api/bulk/:action` | apply `retry` or `cancel` to everything a filter matches |
 
@@ -167,6 +167,16 @@ POST /durable/api/bulk/cancel?status=suspended&tag=stuck&compensate=true
 ```
 
 `?compensate=true` runs the [saga compensations](/docs/durable/reliability/sagas) and is honoured for `cancel` only.
+
+#### Asking for the saga undo
+
+Both cancel routes read `compensate` from **either** the query string or the JSON body, so `?compensate=true` and `{ "compensate": true }` are equivalent. A value spelled `true` / `1` / `yes` / `on` (or the bare `?compensate`) means yes; `false` / `0` / `no` / `off` means no; absent means no.
+
+Anything else is a `400`. That is deliberate: the two ways to guess at an unreadable value are "skip an undo the operator asked for" and "run an undo they did not", and both would be silent. An explicit rejection is the only answer that cannot mislead.
+
+<Callout type="info">
+A compensating cancel answers with the run's **pre-cancel** status, not `cancelled`. The undo replays the workflow's saga in the background so the HTTP request never blocks on it, and the run reaches `cancelled` once the compensations finish — watch the run's [stream](#live-tailing-one-run) or poll it rather than reading the response body as the final state. A plain cancel is terminal in the response itself.
+</Callout>
 
 The response is `{ matched, applied }`. `matched` is how many runs the filter returned; `applied` is how many the action actually changed. They differ when a run has already moved on — a run that throws or answers "nothing to do" is skipped rather than aborting the batch.
 

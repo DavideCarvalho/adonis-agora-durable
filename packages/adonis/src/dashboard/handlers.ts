@@ -105,6 +105,11 @@ const badRequest = (message: string): ApiResponse => ({
   body: { error: message },
 });
 
+/** Rejecting an unreadable `compensate` beats guessing: the two guesses are "skip an undo the
+ *  operator asked for" and "run an undo they did not", and both are silent. */
+const INVALID_COMPENSATE =
+  "compensate must be a boolean — 'true'/'1'/'yes'/'on' or 'false'/'0'/'no'/'off'";
+
 /** The full status union (`interfaces.ts`'s `RunStatus`) — kept in sync so filters/facets never drop a
  *  state; a previous version of this list was missing `'blocked'`. */
 const RUN_STATUSES: readonly RunStatus[] = [
@@ -129,6 +134,53 @@ function intQuery(value: string | string[] | undefined, fallback: number): numbe
   if (raw === undefined) return fallback;
   const n = Number.parseInt(raw, 10);
   return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+/** Spellings accepted as `true` for a boolean flag. An empty value counts (a bare `?flag` is the
+ *  usual "presence means on" convention). */
+const TRUE_FLAGS = new Set(['', 'true', '1', 'yes', 'on']);
+/** Spellings accepted as `false`. */
+const FALSE_FLAGS = new Set(['false', '0', 'no', 'off']);
+
+/**
+ * Coerce one boolean flag, or `undefined` when it was not supplied at all. Deliberately an ALLOWLIST
+ * rather than a truthiness test: `?compensate=false` and `?compensate=0` are how a client spells
+ * "no", and a plain `Boolean(raw)` would read both as yes — silently running a saga undo nobody
+ * asked for. An unrecognised spelling returns {@link INVALID_FLAG} so the caller can reject it
+ * loudly instead of guessing.
+ */
+const INVALID_FLAG = Symbol('invalid-flag');
+function parseFlag(raw: unknown): boolean | undefined | typeof INVALID_FLAG {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw === 'boolean') return raw;
+  if (typeof raw === 'string') {
+    const value = raw.trim().toLowerCase();
+    if (TRUE_FLAGS.has(value)) return true;
+    if (FALSE_FLAGS.has(value)) return false;
+  }
+  return INVALID_FLAG;
+}
+
+/**
+ * Read a boolean action flag from EITHER the JSON body or the query string, defaulting to `false`.
+ *
+ * Both channels are read because both are in use: the bundled React console sends
+ * `POST .../cancel?compensate=true` (no body at all), while the documented `{ compensate: true }`
+ * body is what a hand-written client and the legacy page send. Reading only one of them meant a
+ * "Cancel + Undo" from the console performed a plain cancel and reported success — a silent wrong
+ * answer, worse than an error. The body wins when it carries the key, so every existing body-based
+ * caller keeps its exact behaviour and the query is purely additive.
+ *
+ * Returns {@link INVALID_FLAG} when a supplied value is not a recognised spelling, so the handler
+ * can answer `400` rather than fall back to a default the caller did not choose.
+ */
+function readFlag(req: ApiRequest, key: string): boolean | typeof INVALID_FLAG {
+  if (typeof req.body === 'object' && req.body !== null) {
+    const fromBody = parseFlag((req.body as Record<string, unknown>)[key]);
+    if (fromBody !== undefined) return fromBody;
+  }
+  const fromQuery = parseFlag(firstQuery(req.query[key]));
+  return fromQuery ?? false;
 }
 
 /** Validate that a string is a known {@link RunStatus}, else `undefined`. */
@@ -227,14 +279,15 @@ export async function redispatchPendingRun(deps: Deps, req: ApiRequest): Promise
   return ok({ result });
 }
 
-/** `POST /runs/:id/cancel` — cancel a run. Pass `{ compensate: true }` to undo the saga first. */
+/**
+ * `POST /runs/:id/cancel` — cancel a run. Ask for the saga undo with either `{ compensate: true }`
+ * in the body or `?compensate=true` on the query string; see {@link readFlag} for why both.
+ */
 export async function cancelRun(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
   const id = req.params.id;
   if (!id) return notFound('run id is required');
-  const compensate =
-    typeof req.body === 'object' &&
-    req.body !== null &&
-    (req.body as Record<string, unknown>).compensate === true;
+  const compensate = readFlag(req, 'compensate');
+  if (compensate === INVALID_FLAG) return badRequest(INVALID_COMPENSATE);
   const result = await deps.engine.cancel(id, compensate ? { compensate: true } : undefined);
   if (!result) return notFound(`run ${id} not found`);
   return ok({ result });
@@ -277,7 +330,8 @@ export async function bulkAction(deps: Deps, req: ApiRequest): Promise<ApiRespon
   if (action !== 'retry' && action !== 'cancel') {
     return badRequest("action must be 'retry' or 'cancel'");
   }
-  const compensate = firstQuery(req.query.compensate) === 'true';
+  const compensate = readFlag(req, 'compensate');
+  if (compensate === INVALID_FLAG) return badRequest(INVALID_COMPENSATE);
   const filter = runFilterFromQuery(req.query);
   const runs = await deps.engine.listRuns({ ...filter, limit: 500 });
   let applied = 0;

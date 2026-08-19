@@ -474,9 +474,12 @@ export const durableClient = {
       status?: RunStatus | undefined;
       tag?: string | undefined;
       attr?: string[] | undefined;
+      /** `cancel` only — run each matched run's saga compensations before cancelling it. */
+      compensate?: boolean | undefined;
     },
   ): Promise<{ matched: number; applied: number }> {
     const q = new URLSearchParams();
+    if (filter.compensate) q.set('compensate', 'true');
     if (filter.status) q.set('status', filter.status);
     if (filter.tag) q.set('tag', filter.tag);
     for (const a of filter.attr ?? []) q.append('attr', a);
