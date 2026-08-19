@@ -6,33 +6,33 @@ import db from '@adonisjs/lucid/services/db'
 import { createDurableTables, dropDurableTables } from '@adonis-agora/durable'
 
 /**
- * Durable workflow tables for the @adonis-agora/durable 'lucid' state store: runs, step checkpoints,
+ * Durable workflow tables for the @adonis-agora/durable \`lucid\` state store: runs, step checkpoints,
  * the search-attribute side-table, signal waiters, buffered signals and buffered events.
  *
  * This migration DELEGATES to the library instead of reproducing its DDL. The schema belongs to the
- * library — LucidStateStore decides what columns it reads and writes — so a hand-copied snapshot
+ * library — \`LucidStateStore\` decides what columns it reads and writes — so a hand-copied snapshot
  * here can only ever be right until the next release. It was wrong before: the stub shipped without
- * last_heartbeat_at / heartbeat_progress, which the store writes on every step beat, and nothing
- * failed only because the provider's boot-time ensureSchema() silently ALTERed them in. Calling
- * createDurableTables makes that drift impossible rather than merely tested for.
+ * \`last_heartbeat_at\` / \`heartbeat_progress\`, which the store writes on every step beat, and nothing
+ * failed only because the provider's boot-time \`ensureSchema()\` silently \`ALTER\`ed them in. Calling
+ * \`createDurableTables\` makes that drift impossible rather than merely tested for.
  *
- * createDurableTables is idempotent (hasTable / hasColumn guarded) and additive-only, so it is
+ * \`createDurableTables\` is idempotent (\`hasTable\` / \`hasColumn\` guarded) and additive-only, so it is
  * safe to run against a database that already has some or all of the tables.
  *
- * It takes db (the Database manager from @adonisjs/lucid/services/db) rather than this.db:
- * createDurableTables needs db.connection(name).schema, and the this.db a migration gets is a
- * QueryClientContract — one already-resolved client, with no .connection() of its own. this.db still
- * supplies the connection NAME, so "node ace migration:run --connection=x" provisions the tables on
- * connection x and not on the default.
+ * \`db\` (the \`Database\` manager from \`@adonisjs/lucid/services/db\`) rather than \`this.db\`:
+ * \`createDurableTables\` needs \`db.connection(name).schema\`, and the \`this.db\` a migration gets is a
+ * \`QueryClientContract\` — one already-resolved client, with no \`.connection()\`. \`this.db\` still
+ * supplies the connection NAME, so \`node ace migration:run --connection=x\` provisions the tables on
+ * connection \`x\` and not on the default.
  */
 export default class extends BaseSchema {
   /**
-   * REQUIRED, not a preference. The DDL below runs through the Database manager, which checks out
+   * REQUIRED, not a preference. The DDL below runs through the \`Database\` manager, which checks out
    * its OWN connection from the pool — it is not part of the transaction the migrator would otherwise
-   * open for this migration. With a pool capped at 1 connection (Adonis's own SQLite guidance) that
-   * transaction would hold the only connection while createDurableTables waited for a free one, and
-   * the migration would hang until the acquire timeout. Nothing is lost by opting out: the statements
-   * were never inside that transaction anyway, and re-running an interrupted createDurableTables is a
+   * open for this migration. With \`pool: { max: 1 }\` (Adonis's own SQLite guidance) that transaction
+   * would hold the only connection while \`createDurableTables\` waited for a free one, and the
+   * migration would hang until the acquire timeout. Nothing is lost by opting out: the statements were
+   * never inside that transaction anyway, and re-running an interrupted \`createDurableTables\` is a
    * no-op.
    */
   static disableTransactions = true

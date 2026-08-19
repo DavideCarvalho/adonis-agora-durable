@@ -4,33 +4,35 @@
 import { defineConfig, transports } from '@adonis-agora/durable'
 
 /**
- * Configuration for @adonis-agora/durable. Pick a transport (and optionally a store) by name from the
+ * Configuration for @adonis-agora/durable. Pick a \`transport\` (and optionally a \`store\`) by name from the
  * maps below; each driver's peer dependency is imported lazily, only when selected. The default is
- * the in-process 'memory' transport + the in-memory store — single-process, no extra infrastructure.
+ * the in-process \`memory\` transport + the in-memory store — single-process, no extra infrastructure.
  *
- * For a single-process PRODUCTION app with NO external infra, select the 'event-emitter' transport:
+ * For a single-process PRODUCTION app with NO external infra, select the \`event-emitter\` transport:
  * step handlers run in this same process over a Node EventEmitter (no DB, no Redis, no broker). The
- * 'memory' transport is test-only.
+ * \`memory\` transport is test-only.
  *
- * For cross-process / production, select the 'queue' (@adonisjs/queue) or 'db' (@adonisjs/lucid)
- * transport, and the 'lucid' store, then run: node ace migration:run
+ * For cross-process / production, select the \`queue\` (@adonisjs/queue) or \`db\` (@adonisjs/lucid)
+ * transport, and the \`lucid\` store, then run \`node ace migration:run\`:
  *
- *     import { defineConfig, transports, stores } from '@adonis-agora/durable'
+ * \`\`\`ts
+ * import { defineConfig, transports, stores } from '@adonis-agora/durable'
  *
- *     export default defineConfig({
- *       transport: 'queue',
- *       transports: {
- *         // single-process production, no external infra:
- *         'event-emitter': transports.eventEmitter(),
- *         // connection names an adapter from config/queue.ts (configure @adonisjs/queue first):
- *         queue: transports.queue({ connection: 'redis', group: 'durable' }),
- *         db: transports.db(),
- *       },
- *       store: 'lucid',
- *       stores: {
- *         lucid: stores.lucid(),
- *       },
- *     })
+ * export default defineConfig({
+ *   transport: 'queue',
+ *   transports: {
+ *     // single-process production, no external infra:
+ *     'event-emitter': transports.eventEmitter(),
+ *     // \`connection\` names an adapter from config/queue.ts (configure @adonisjs/queue first):
+ *     queue: transports.queue({ connection: 'redis', group: 'durable' }),
+ *     db: transports.db(),
+ *   },
+ *   store: 'lucid',
+ *   stores: {
+ *     lucid: stores.lucid(),
+ *   },
+ * })
+ * \`\`\`
  */
 export default defineConfig({
   transport: 'memory',
@@ -41,18 +43,18 @@ export default defineConfig({
 
   /**
    * Opt-in self-heal net for a remote step whose dispatched job was LOST (worker crashed mid-step, or
-   * the transport dropped it) and has no per-step timeoutMs. Off by default — turn it on only once
-   * remoteRedispatchMs comfortably exceeds the longest legitimate run of any such step, and every
+   * the transport dropped it) and has no per-step \`timeoutMs\`. Off by default — turn it on only once
+   * \`remoteRedispatchMs\` comfortably exceeds the longest legitimate run of any such step, and every
    * step is idempotent (a re-dispatch can double-run a step whose original job was merely slow).
    */
   // remoteRedispatchMs: 5 * 60 * 1000,
   // remoteRedispatchMax: 10,
 
   /**
-   * Recurring workflows fired by the durable:work worker loop on every tick. Each window starts
+   * Recurring workflows fired by the \`durable:work\` worker loop on every tick. Each window starts
    * exactly once even with several worker instances racing (idempotent by the schedule's time-bucket
-   * run id). Use everyMs for a fixed interval, or cron + timezone for a calendar schedule (cron
-   * needs the optional cron-parser peer dependency). See docs/authoring/scheduling.
+   * run id). Use \`everyMs\` for a fixed interval, or \`cron\` + \`timezone\` for a calendar schedule (cron
+   * needs the optional \`cron-parser\` peer dependency). See docs/authoring/scheduling.
    */
   // schedules: [
   //   { key: 'nightly-report', workflow: 'daily-report', cron: '0 2 * * *', timezone: 'America/Sao_Paulo' },
