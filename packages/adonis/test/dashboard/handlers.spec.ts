@@ -23,7 +23,7 @@ import { InMemoryStateStore, InMemoryTransport, WorkflowEngine } from '../../src
  * handlers under test actually receive — the same wiring `gateway-adapter.ts`'s
  * `dashboardEngineForRole` does for a store role in production.
  */
-function makeEngine(): { raw: WorkflowEngine; deps: Deps } {
+function makeEngine(): { raw: WorkflowEngine; undone: string[]; deps: Deps } {
   const store = new InMemoryStateStore();
   const raw = new WorkflowEngine({ store, transport: new InMemoryTransport() });
 
@@ -46,7 +46,19 @@ function makeEngine(): { raw: WorkflowEngine; deps: Deps } {
     return 'done';
   });
 
-  return { raw, deps: { engine: storeDashboardEngine(raw) } };
+  // Completes a compensable step, then parks on a signal — so it is cancellable AND has a saga to
+  // undo. `undone` is the observable proof that compensation actually ran: a plain cancel leaves it
+  // empty, which is exactly the silent failure this fixture exists to catch.
+  const undone: string[] = [];
+  raw.register('compensable', '1', async (ctx) => {
+    await ctx.localStep('charge', async () => 'charged', {
+      compensate: async () => void undone.push('charge'),
+    });
+    await ctx.waitForSignal('go');
+    return 'done';
+  });
+
+  return { raw, undone, deps: { engine: storeDashboardEngine(raw) } };
 }
 
 const req = (over: Partial<ApiRequest> = {}): ApiRequest => ({
@@ -55,12 +67,29 @@ const req = (over: Partial<ApiRequest> = {}): ApiRequest => ({
   ...over,
 });
 
+/** Wait for `fn` to hold, or throw. A compensating cancel drives the saga in the BACKGROUND (see
+ *  `engine.cancel`) so the handler can answer without replaying the workflow inside the HTTP
+ *  request — which means the undo lands after the response, not before it. */
+async function poll(fn: () => Promise<boolean>, timeoutMs = 2000): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (await fn()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error('poll timed out');
+}
+
+/** Give any background work a few macrotasks to land. Used to assert a NEGATIVE (no compensation
+ *  ran) fairly — otherwise the assertion could pass simply by being early. */
+const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
+
 describe('JSON handlers', () => {
   let raw: WorkflowEngine;
   let deps: Deps;
+  let undone: string[];
 
   beforeEach(() => {
-    ({ raw, deps } = makeEngine());
+    ({ raw, undone, deps } = makeEngine());
   });
 
   it('listRuns returns started runs with status badges', async () => {
@@ -252,6 +281,206 @@ describe('JSON handlers', () => {
   it('bulkAction 400s on an unknown action', async () => {
     const res = await bulkAction(deps, req({ params: { action: 'nuke' }, query: {} }));
     expect(res.status).toBe(400);
+  });
+
+  /**
+   * The bundled React console sends `POST /runs/:id/cancel?compensate=true` with NO body (see
+   * `durable-client.ts`'s `cancel`), while the handler used to read the flag only from the JSON body.
+   * The result was the worst possible shape of failure: "Cancel + Undo" returned `200 cancelled`, the
+   * UI reported success, and no compensation ran. These cases pin BOTH channels down.
+   */
+  describe('cancel: the compensate flag', () => {
+    /** Arrange a run that has completed a compensable step and is parked on a signal. */
+    async function arrangeCompensable(runId: string) {
+      await raw.start('compensable', {}, runId);
+      await raw.waitForRun(runId);
+      expect(undone).toEqual([]);
+    }
+
+    it('compensates when the flag arrives on the QUERY STRING (the console path)', async () => {
+      await arrangeCompensable('run-comp-query');
+
+      const res = await cancelRun(
+        deps,
+        req({ params: { id: 'run-comp-query' }, query: { compensate: 'true' } }),
+      );
+
+      expect(res.status).toBe(200);
+      await poll(async () => undone.length === 1);
+      expect(undone).toEqual(['charge']);
+      expect((await raw.getRun('run-comp-query'))?.status).toBe('cancelled');
+    });
+
+    it('still compensates when the flag arrives in the BODY (the documented path)', async () => {
+      await arrangeCompensable('run-comp-body');
+
+      const res = await cancelRun(
+        deps,
+        req({ params: { id: 'run-comp-body' }, body: { compensate: true } }),
+      );
+
+      expect(res.status).toBe(200);
+      await poll(async () => undone.length === 1);
+      expect(undone).toEqual(['charge']);
+    });
+
+    it('does NOT compensate when the flag is absent', async () => {
+      await arrangeCompensable('run-comp-none');
+
+      const res = await cancelRun(deps, req({ params: { id: 'run-comp-none' } }));
+
+      expect(res.status).toBe(200);
+      // A plain cancel is terminal in the response itself — no background saga to wait for.
+      expect((res.body as { result: { status: string } }).result.status).toBe('cancelled');
+      await settle();
+      expect(undone).toEqual([]);
+    });
+
+    // The coercion trap: every one of these is a non-empty string, so a `Boolean(raw)` test would
+    // read them all as "yes" and run an undo the operator explicitly declined.
+    for (const spelling of ['false', '0', 'no', 'off', 'FALSE', ' false ']) {
+      it(`treats ?compensate=${JSON.stringify(spelling)} as false`, async () => {
+        const runId = `run-comp-false-${spelling.trim().toLowerCase()}`;
+        await arrangeCompensable(runId);
+
+        const res = await cancelRun(
+          deps,
+          req({ params: { id: runId }, query: { compensate: spelling } }),
+        );
+
+        expect(res.status).toBe(200);
+        // Answered `cancelled` outright: the compensating path would have returned `suspended` and
+        // finished in the background, so this alone proves the undo was never scheduled.
+        expect((res.body as { result: { status: string } }).result.status).toBe('cancelled');
+        await settle();
+        expect(undone).toEqual([]);
+      });
+    }
+
+    for (const spelling of ['true', '1', 'yes', 'on', 'TRUE', '']) {
+      it(`treats ?compensate=${JSON.stringify(spelling)} as true`, async () => {
+        const runId = `run-comp-true-${spelling || 'bare'}`;
+        await arrangeCompensable(runId);
+
+        const res = await cancelRun(
+          deps,
+          req({ params: { id: runId }, query: { compensate: spelling } }),
+        );
+
+        expect(res.status).toBe(200);
+        await poll(async () => undone.length === 1);
+        expect(undone).toEqual(['charge']);
+      });
+    }
+
+    it('lets an explicit body value win over the query string', async () => {
+      await arrangeCompensable('run-comp-precedence');
+
+      const res = await cancelRun(
+        deps,
+        req({
+          params: { id: 'run-comp-precedence' },
+          query: { compensate: 'true' },
+          body: { compensate: false },
+        }),
+      );
+
+      expect(res.status).toBe(200);
+      expect((res.body as { result: { status: string } }).result.status).toBe('cancelled');
+      await settle();
+      expect(undone).toEqual([]);
+    });
+
+    it('400s on an unreadable value instead of guessing', async () => {
+      await arrangeCompensable('run-comp-garbage');
+
+      const res = await cancelRun(
+        deps,
+        req({ params: { id: 'run-comp-garbage' }, query: { compensate: 'maybe' } }),
+      );
+
+      expect(res.status).toBe(400);
+      await settle();
+      expect(undone).toEqual([]);
+      // The run must be untouched — a rejected request cancels nothing.
+      expect((await raw.getRun('run-comp-garbage'))?.status).not.toBe('cancelled');
+    });
+  });
+
+  describe('bulk cancel: the compensate flag', () => {
+    async function arrangeCompensable(runId: string) {
+      await raw.start('compensable', {}, runId);
+      await raw.waitForRun(runId);
+    }
+
+    it('compensates every matched run on ?compensate=true', async () => {
+      await arrangeCompensable('bulk-comp-1');
+      await arrangeCompensable('bulk-comp-2');
+
+      const res = await bulkAction(
+        deps,
+        req({
+          params: { action: 'cancel' },
+          query: { status: 'suspended', compensate: 'true' },
+        }),
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ matched: 2, applied: 2 });
+      await poll(async () => undone.length === 2);
+      expect(undone).toEqual(['charge', 'charge']);
+    });
+
+    it('reads the flag from the body too', async () => {
+      await arrangeCompensable('bulk-comp-body');
+
+      const res = await bulkAction(
+        deps,
+        req({
+          params: { action: 'cancel' },
+          query: { status: 'suspended' },
+          body: { compensate: true },
+        }),
+      );
+
+      expect(res.status).toBe(200);
+      await poll(async () => undone.length === 1);
+      expect(undone).toEqual(['charge']);
+    });
+
+    it('treats ?compensate=false as false', async () => {
+      await arrangeCompensable('bulk-comp-off');
+
+      const res = await bulkAction(
+        deps,
+        req({
+          params: { action: 'cancel' },
+          query: { status: 'suspended', compensate: 'false' },
+        }),
+      );
+
+      expect(res.status).toBe(200);
+      expect((await raw.getRun('bulk-comp-off'))?.status).toBe('cancelled');
+      await settle();
+      expect(undone).toEqual([]);
+    });
+
+    it('400s on an unreadable value before touching a single run', async () => {
+      await arrangeCompensable('bulk-comp-garbage');
+
+      const res = await bulkAction(
+        deps,
+        req({
+          params: { action: 'cancel' },
+          query: { status: 'suspended', compensate: 'sure' },
+        }),
+      );
+
+      expect(res.status).toBe(400);
+      await settle();
+      expect(undone).toEqual([]);
+      expect((await raw.getRun('bulk-comp-garbage'))?.status).not.toBe('cancelled');
+    });
   });
 
   it('health returns a groups array', async () => {
