@@ -31,7 +31,7 @@
     "@swc/core": "1.15.47",
     "turbo": "2.10.9",
     "typescript": "5.9.3",
-    "unplugin-swc": "1.5.10",
+    "unplugin-swc": "1.5.11",
     "vitest": "3.2.7"
   }
 }
