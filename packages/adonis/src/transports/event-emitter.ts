@@ -145,7 +145,7 @@ export class EventEmitterTransport implements Transport, ControlPlane {
     // Another subscriber may own this step name — stay silent, don't synthesize a "no handler" failure.
     if (!handler) return;
     const result = await runStepHandler(task, handler, (beat) => this.heartbeat(beat));
-    // Emit the result on a LATER tick: a durable `ctx.call` suspends the run right after dispatch, so
+    // Emit the result on a LATER tick: a durable `ctx.step` suspends the run right after dispatch, so
     // the result must land AFTER that unwinds (else the resume re-enters mid-suspend). Real brokers
     // deliver asynchronously; this mirrors them.
     setImmediate(() => this.#emitter.emit(`${RESULT_EVENT}${this.#suffix()}`, result));

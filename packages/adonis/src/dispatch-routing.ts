@@ -99,7 +99,7 @@ export interface BlockedDispatch {
 export type DispatchPlan = RoutableDispatch | BlockedDispatch;
 
 /**
- * Thrown from deep in a `ctx.step`/`ctx.call` dispatch when {@link planDispatch} returns `blocked`, so
+ * Thrown from deep in a `ctx.step` dispatch when {@link planDispatch} returns `blocked`, so
  * the engine's run-execution catch can park the run `blocked` (with the carried plan) instead of
  * writing a `pending` checkpoint + dispatching into a queue no live worker consumes. Distinct from
  * `WorkflowSuspended` — a blocked run is re-driven by the blocked-recovery poll, not a durable timer.

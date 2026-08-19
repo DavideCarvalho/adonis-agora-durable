@@ -221,7 +221,7 @@ export interface WorkflowEngineDeps {
   transport?: Transport | undefined;
   /**
    * An ordered pool of named transports. The engine dispatches on the first and fails over to the
-   * next on a dispatch error; a step pins one via `ctx.call(step, input, { transport: id })`. Use
+   * next on a dispatch error; a step pins one via `ctx.step(step, input, { transport: id })`. Use
    * this instead of `transport` for failover / multi-broker setups.
    */
   transports?: NamedTransport[] | undefined;
@@ -246,7 +246,7 @@ export interface WorkflowEngineDeps {
   /** Recovery lease duration in ms — how long this instance owns a run it picked up. Default 30s. */
   leaseMs?: number | undefined;
   /**
-   * Flow-control admission backend for `ctx.call(step, input, { queue })`. Defaults to an in-process
+   * Flow-control admission backend for `ctx.step(step, input, { queue })`. Defaults to an in-process
    * {@link InMemoryAdmissionBackend} (per-instance caps). Inject a store/Redis-backed backend to make
    * the concurrency/rate/ordering caps GLOBAL across engine replicas.
    */

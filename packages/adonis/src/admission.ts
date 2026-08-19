@@ -1,7 +1,7 @@
 import { type Admission, type AdmissionItem, type QueueConfig, QueueController } from './queue.js';
 
 /**
- * Pluggable backend for the remote-step flow-control gate (`ctx.call(step, input, { queue })`). The
+ * Pluggable backend for the remote-step flow-control gate (`ctx.step(step, input, { queue })`). The
  * engine asks it whether a queued call may be admitted now (concurrency / rate / ordering) and tells
  * it when an admitted slot is released.
  *
