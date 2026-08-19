@@ -1,9 +1,11 @@
 import { pathToFileURL } from 'node:url';
 import type { ApplicationService } from '@adonisjs/core/types';
+import type { AdmissionContext } from '../src/admissions/factory.js';
 import type { ControlPlaneConfig, TenantConfig } from '../src/config_types.js';
 import type { ControlPlaneContext } from '../src/control-planes/factory.js';
 import type { DurableConfig } from '../src/define_config.js';
 import {
+  type AdmissionBackend,
   type ControlPlane,
   InMemoryStateStore,
   InMemoryTransport,
@@ -172,7 +174,9 @@ export default class DurableProvider {
         | (() => string | undefined)
         | undefined;
 
-      const ctx: TransportContext & StoreContext & ControlPlaneContext = { app: this.app };
+      const ctx: TransportContext & StoreContext & ControlPlaneContext & AdmissionContext = {
+        app: this.app,
+      };
       const store = await this.#resolveStore(config, ctx);
       const transport = await this.#resolveTransport(config, ctx);
       // Console/REPL processes must not become broker consumers (`consumers: 'auto'`, the default):
@@ -192,6 +196,7 @@ export default class DurableProvider {
       const controlPlane = await this.#resolveControlPlane(config, ctx);
       // Hold the control plane so `shutdown()` can tear down its subscriber connection cleanly.
       this.#controlPlane = controlPlane;
+      const admission = await this.#resolveAdmission(config, ctx);
 
       const deps: WorkflowEngineDeps = {
         store,
@@ -206,6 +211,12 @@ export default class DurableProvider {
         ...(config.compensationRetries !== undefined
           ? { compensationRetries: config.compensationRetries }
           : {}),
+        // Fleet-wide flow control: the configured admission backend replaces the engine's in-process
+        // default, so `{ queue }` caps count across every replica instead of per pod.
+        ...(admission ? { admission } : {}),
+        // Public callback URL builder for `ctx.webhook()` tokens.
+        ...(config.webhookUrl ? { webhookUrl: config.webhookUrl } : {}),
+        ...(config.trackStepStart !== undefined ? { trackStepStart: config.trackStepStart } : {}),
         // The store-driven lost-dispatch net (see BaseDurableConfig.remoteRedispatchMs) — off by
         // default, since re-dispatch can double-run a step whose original job is merely slow.
         ...(config.remoteRedispatchMs !== undefined
@@ -226,8 +237,13 @@ export default class DurableProvider {
         // carrier through verbatim. The carrier is producer-owned and shape-opaque; the worker's
         // scope slot round-trips the whole snapshot via Context.run, so no field-picking is needed.
         ...(accessor ? { context: () => accessor.get() } : {}),
-        // Best-effort OTel trace continuation from @adonis-agora/diagnostics-otel (no hard dep).
-        ...(otelTraceparent ? { traceparent: otelTraceparent } : {}),
+        // Trace continuation on dispatched remote tasks. An explicit `config.traceparent` wins;
+        // otherwise best-effort from @adonis-agora/diagnostics-otel's global slot (no hard dep).
+        ...(config.traceparent
+          ? { traceparent: config.traceparent }
+          : otelTraceparent
+            ? { traceparent: otelTraceparent }
+            : {}),
       };
 
       return new WorkflowEngine(deps);
@@ -330,8 +346,9 @@ export default class DurableProvider {
     if (config.workflowsPath === false) return;
     const engine = await this.app.container.make(WorkflowEngine);
 
-    // Instancia workflows via container (injeção de dependência no constructor, como o
-    // `@adonisjs/queue` faz com jobs). Fallback: `new Ctor()` sem args (comportamento anterior).
+    // Instantiate workflows through the container, so a workflow class gets constructor dependency
+    // injection exactly like an `@adonisjs/queue` job. A class with no dependencies is unaffected —
+    // the container simply calls `new Ctor()`.
     const workflowFactory = (ctor: { new (): unknown }) => this.app.container.make(ctor);
 
     const barrel = await this.#loadGeneratedWorkflowsBarrel();
@@ -454,6 +471,20 @@ export default class DurableProvider {
       );
     }
     return factory(ctx);
+  }
+
+  /**
+   * Resolve the configured admission backend. `config.admission` may be a ready
+   * {@link AdmissionBackend} (used as-is) or an {@link AdmissionFactory} thunk (called at boot so its
+   * peer dependency loads lazily). Omitted → `null`, and the engine keeps its in-process default.
+   */
+  async #resolveAdmission(
+    config: DurableConfig,
+    ctx: AdmissionContext,
+  ): Promise<AdmissionBackend | null> {
+    const admission = config.admission;
+    if (!admission) return null;
+    return typeof admission === 'function' ? admission(ctx) : admission;
   }
 
   /**

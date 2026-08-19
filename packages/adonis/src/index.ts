@@ -81,6 +81,14 @@ export type { StoreContext, StoreFactory, LucidStoreConfig } from './stores/fact
 export { LucidStateStore, type LucidStateStoreOptions } from './stores/lucid.js';
 export { DURABLE_TABLES, createDurableTables, dropDurableTables } from './stores/lucid-schema.js';
 
+// --- config-driven admission drivers ----------------------------------------
+export { admissions } from './admissions/factory.js';
+export type {
+  AdmissionContext,
+  AdmissionFactory,
+  RedisAdmissionConfig,
+} from './admissions/factory.js';
+
 // --- config-driven control-plane drivers ------------------------------------
 export { controlPlanes } from './control-planes/factory.js';
 export type {
