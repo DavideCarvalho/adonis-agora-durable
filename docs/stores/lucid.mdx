@@ -29,6 +29,33 @@ node ace configure @adonis-agora/durable
 node ace migration:run
 ```
 
+The published migration **delegates to the library** rather than carrying a snapshot of the DDL:
+
+```ts title="database/migrations/…_create_durable_tables.ts"
+import { BaseSchema } from '@adonisjs/lucid/schema'
+import db from '@adonisjs/lucid/services/db'
+import { createDurableTables, dropDurableTables } from '@adonis-agora/durable'
+
+export default class extends BaseSchema {
+  static disableTransactions = true
+
+  async up() {
+    await createDurableTables(db, this.db.connectionName)
+  }
+
+  async down() {
+    await dropDurableTables(db, this.db.connectionName)
+  }
+}
+```
+
+Two details are load-bearing rather than stylistic:
+
+- **`static disableTransactions = true` is required.** `createDurableTables` goes through the `Database` manager, which checks out its own connection from the pool — the statements were never inside the migrator's transaction to begin with. On a `pool: { max: 1 }` setup (Adonis's own SQLite guidance) that transaction would hold the single connection while `createDurableTables` waited for a free one, and the migration would hang until the acquire timeout. Nothing is lost by opting out: re-running an interrupted `createDurableTables` is a no-op.
+- **`db` from `@adonisjs/lucid/services/db`, not `this.db`.** `createDurableTables` needs `db.connection(name).schema`, and the `this.db` a migration receives is a single already-resolved `QueryClientContract` with no `.connection()`. `this.db.connectionName` still supplies the name, so `node ace migration:run --connection=reporting` provisions the tables on that connection rather than the default.
+
+The schema belongs to the library — `LucidStateStore` decides which columns it reads and writes — so a hand-copied snapshot is only ever right until the next release. Delegating makes that drift impossible instead of merely testable.
+
 </Step>
 <Step>
 
@@ -71,9 +98,55 @@ The migration creates six tables (default names, from the `DURABLE_TABLES` const
 
 The runs table is indexed on `status` and on `(status, wake_at)` so the worker's `listPendingRuns` and `listDueTimers` scans stay fast; checkpoints are keyed `(run_id, seq)` with a `(run_id, name)` index for targeted reads; and the attributes table is indexed per `(key, value)` so [search-attribute](/docs/durable/concepts/workflows-and-steps#tags) filters push down to SQL.
 
-<Callout type="info">
-Prefer to own the schema yourself? `@adonis-agora/durable` exports `createDurableTables(db)` and `dropDurableTables(db)` (plus `DURABLE_TABLES`), so you can build the tables from your own migration or a setup hook instead of the published stub. The store's `ensureSchema()` is also idempotent — calling it twice is safe.
+## Who provisions the schema: `autoSchema`
+
+By default the provider provisions the store's schema at boot by calling `ensureSchema()`, which for the Lucid driver is exactly the `createDurableTables(db, connection)` the migration runs. It is idempotent — every table is `hasTable`-guarded and every column `hasColumn`-guarded — so it is safe on a database that already has some or all of the tables. The library managing its own tables is the ecosystem convention, shared with `@adonis-agora/agent`, `@adonis-agora/authz` and `@adonis-agora/telescope`.
+
+Turn it off to own the schema entirely through migrations:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  store: 'lucid',
+  stores: { lucid: stores.lucid() },
+
+  // No DDL at boot. The published migration is now the ONLY thing that
+  // creates or repairs these tables.
+  autoSchema: false,
+})
+```
+
+Reach for `autoSchema: false` when the app's database user may not run DDL at boot, or when every schema change must be an explicit, reviewed migration. The in-memory store has no schema, so the flag is a no-op for it.
+
+<Callout type="warn" title="autoSchema: false means nothing repairs the schema for you">
+With the boot-time provisioning off, a database that is behind the installed library version stays behind. Run `node ace migration:run` after every upgrade — the migration calls the same `createDurableTables`, so it brings the schema forward.
 </Callout>
+
+## The repair warning
+
+`createDurableTables` is additive-only. When it finds a table that exists but is missing a column the current library writes, it adds the column with an `ALTER TABLE` — every added column is nullable or defaulted, so existing rows read back unchanged. When at least one such repair is actually applied, it logs a single warning:
+
+```
+@adonis-agora/durable: repaired the durable schema in place — added
+durable_step_checkpoints.last_heartbeat_at, durable_step_checkpoints.heartbeat_progress.
+The database was behind the installed library version, so these columns were added at
+runtime and nothing recorded it in your migration history. …
+```
+
+Read it as: **the database was behind, the library caught up silently, and your migration history does not know.** Fix it by running `node ace migration:run` so the change is recorded the same way every other schema change is.
+
+The warning only fires when a repair was genuinely applied. A fresh create says nothing, and so does a boot against an already-current schema — which is the point: a warning on every boot would be filtered as noise, and that noise is exactly what let a wrong migration-managed schema go undetected before.
+
+Pass your own sink to route it into the app's log stream instead of `console`:
+
+```ts title="database/migrations/…_create_durable_tables.ts"
+import logger from '@adonisjs/core/services/logger'
+
+async up() {
+  await createDurableTables(db, this.db.connectionName, { logger })
+}
+```
+
+The logger only needs a `warn(message: string)` method, which both `console` (the default) and AdonisJS's `Logger` satisfy.
 
 ## Read API for dashboards & tooling
 
