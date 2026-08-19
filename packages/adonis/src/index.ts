@@ -79,7 +79,13 @@ export {
 export { stores } from './stores/factory.js';
 export type { StoreContext, StoreFactory, LucidStoreConfig } from './stores/factory.js';
 export { LucidStateStore, type LucidStateStoreOptions } from './stores/lucid.js';
-export { DURABLE_TABLES, createDurableTables, dropDurableTables } from './stores/lucid-schema.js';
+export {
+  type CreateDurableTablesOptions,
+  DURABLE_TABLES,
+  type DurableSchemaLogger,
+  createDurableTables,
+  dropDurableTables,
+} from './stores/lucid-schema.js';
 
 // --- config-driven admission drivers ----------------------------------------
 export { admissions } from './admissions/factory.js';
@@ -104,6 +110,30 @@ export {
   type RedisControlPlaneOptions,
   type RedisPubSub,
 } from './control-plane-redis/redis-control-plane.js';
+
+// --- ace command building blocks --------------------------------------------
+// The pieces `durable:work` / `durable:runs` / `durable:retry` are built from, exported so an app can
+// compose its own command or scheduler on top of them without re-implementing the loop.
+export {
+  DEFAULT_STALE_MS,
+  type ListRunsOptions,
+  type RunLister,
+  type RunLiveness,
+  type StalePendingStep,
+  type TickOptions,
+  type TickResult,
+  type WorkerLogger,
+  type WorkerLoopOptions,
+  attachLiveness,
+  filterStale,
+  listRuns,
+  parseDurationMs,
+  renderRunsTable,
+  retryRun,
+  runTick,
+  runWorkerLoop,
+  staleHint,
+} from './commands/index.js';
 
 // --- AdonisJS integration ---------------------------------------------------
 export { defineConfig } from './define_config.js';
