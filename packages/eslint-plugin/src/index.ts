@@ -1,7 +1,7 @@
 import { noNondeterminism } from './no-nondeterminism.js';
 
 /** Keep in sync with this package's `version` in package.json (guarded by `test/version.spec.ts`). */
-export const VERSION = '0.2.1';
+export const VERSION = '0.2.2';
 
 export const rules = {
   'no-nondeterminism': noNondeterminism,
