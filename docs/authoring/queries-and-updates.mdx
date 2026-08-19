@@ -167,7 +167,7 @@ Unlike a free-form `setEvent` value, attributes are **typed and queryable**: SQL
 There are two moments to set them. At **start time**, pass `searchAttributes` in the start options (or the class `dispatch` options):
 
 ```ts
-import { CheckoutWorkflow } from '#workflows/checkout_workflow'
+import CheckoutWorkflow from '#workflows/checkout_workflow'
 
 await CheckoutWorkflow.dispatch(order, {
   runId: `checkout:${order.id}`,

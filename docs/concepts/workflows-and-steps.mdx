@@ -19,7 +19,7 @@ engine.register('checkout', '1', async (ctx: WorkflowCtx, order: Order) => {
 })
 ```
 
-`register(name, version, fn, opts?)` takes an options object for `tags`, an `executionTimeout` (`'30s'` or ms), a `singleton` config, input validation, and event triggers. Start runs with `engine.start('checkout', input, runId)` — pass the registered **name** and a stable `runId`. (Starting the same `runId` twice is a no-op, which is what makes [scheduling](/docs/durable/authoring/scheduling) and webhooks idempotent.)
+`register(name, version, fn, opts?)` takes an options object for `tags`, an `executionTimeout` (`'30s'` or ms), a [`singleton`](#singleton-workflows-one-run-per-key) config, input validation, and event triggers. Start runs with `engine.start('checkout', input, runId)` — pass the registered **name** and a stable `runId`. (Starting the same `runId` twice is a no-op, which is what makes [scheduling](/docs/durable/authoring/scheduling) and webhooks idempotent.)
 
 <Callout type="info" title="The idiomatic form">
 `engine.register` is the low-level primitive. The recommended way to author is a `BaseWorkflow` class under
@@ -29,7 +29,11 @@ the run settles → result). See [app/workflows](/docs/durable/authoring/app-wor
 </Callout>
 
 <Callout type="info">
-Need dependency injection in a step? Resolve services from the container, or close over them at registration time. The workflow body must stay deterministic — do the I/O inside a step, not in the orchestration prefix.
+Need dependency injection? Author the workflow as a class under `app/workflows/` and declare what it needs
+as constructor parameters — the container builds it, exactly like an `@adonisjs/queue` job. See
+[constructor injection](/docs/durable/authoring/app-workflows#dependency-injection-in-the-constructor).
+The workflow body must still stay deterministic: reach an injected service through a step, never from the
+orchestration prefix.
 </Callout>
 
 <CodeFlow scene="checkout" />
@@ -107,13 +111,29 @@ Step schemas are **optional** — a bare `@Step()` or `defineStep(name, fn)` car
 
 ### Dispatch options
 
-`ctx.step` accepts a third `StepDispatchOpts` argument to route the call and override the step's declared policy field-by-field: `{ queue, priority, fairnessKey, transport, retries, backoff, backoffMs, backoffMaxMs, jitter, timeoutMs }`.
+`ctx.step` accepts a third `StepDispatchOpts` argument to route the call and override the step's declared policy field-by-field: `{ queue, priority, fairnessKey, transport, requires, retries, backoff, backoffMs, backoffMaxMs, jitter, timeoutMs, pickupTimeoutMs }`.
 
 ```ts
 await ctx.step(chargeCard, input, { queue: 'payments', priority: 10, retries: 5 })
 ```
 
-See [Retries & backoff](/docs/durable/reliability/retries) for the durable-retry and `timeoutMs` liveness semantics, [Flow control](/docs/durable/reliability/flow-control) for queues, and [Transports](/docs/durable/transports#pinning-a-transport-per-step-failover-pools) for pinning `transport`.
+See [Retries & timeouts](/docs/durable/reliability/retries) for the durable-retry, `timeoutMs` and `pickupTimeoutMs` liveness semantics, [Flow control](/docs/durable/reliability/flow-control) for queues, and [Transports](/docs/durable/transports#pinning-a-transport-per-step-failover-pools) for pinning `transport`.
+
+#### `requires` — refuse to dispatch into a queue nobody serves
+
+`requires` names the capabilities a live worker must advertise to run this call:
+
+```ts
+await ctx.step('billing.charge', input, { requires: ['saga'] })
+```
+
+If no live worker advertises **every** name — or none is protocol-compatible — the run parks as `blocked`
+with a precise reason (which capability is missing, how many live workers were considered) instead of
+dispatching into a queue that will never be drained. Nothing is thrown into the workflow body; the run waits
+for a capable worker to appear and is visible as blocked in the [dashboard](/docs/durable/observability/dashboard).
+
+Omit it and the step runs anywhere, which is the default. A per-call `requires` replaces the one declared on
+the `@Step` — it does not merge with it. See [capability-aware routing](/docs/durable/cluster/handshake#capability-aware-routing).
 
 ### Serving a step handler
 
@@ -142,7 +162,75 @@ The body receives a [step logger](#steps-vs-sub-process-events) as its argument,
 
 When a local step's body begins, the engine emits a `step.started` lifecycle event and (by default) writes a `running` checkpoint, so a long step shows up in the [dashboard](/docs/durable/observability/dashboard) the moment it starts — not only once it finishes. The `running` checkpoint is a placeholder overwritten by the step's `completed`/`failed` result; it never short-circuits [replay](/docs/durable/concepts/durability) (only a `completed` checkpoint does), so a crash mid-body simply re-runs the step.
 
-Toggle this with the engine's `trackStepStart` option (default `true`). The `step.started` event fires either way; the flag only gates the extra checkpoint write. Set it to `false` on hot paths with many short local steps to halve their checkpoint writes, at the cost of reload-survivable in-flight visibility.
+Toggle it in `config/durable.ts`:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  trackStepStart: false, // default true
+})
+```
+
+The `step.started` event fires either way; the flag only gates the extra checkpoint write. Set it to `false`
+on hot paths with many short local steps to halve their checkpoint writes, at the cost of in-flight
+visibility that survives a page reload.
+
+## Singleton workflows: one run per key
+
+Some workflows must not run concurrently *for the same subject*. Two syncs for one shop racing each other
+produce interleaved writes; two "recompute this tenant's billing" runs at once double-charge. A **singleton**
+workflow serializes runs by a key derived from the input:
+
+```ts title="app/workflows/sync_shop_workflow.ts"
+export default class SyncShopWorkflow extends BaseWorkflow {
+  static workflow = {
+    name: 'sync-shop',
+    version: '1',
+    singleton: {
+      key: (input) => (input as { shopId: string }).shopId,
+      limit: 1,
+      maxQueueDepth: 20,
+    },
+  }
+
+  async run(ctx: WorkflowCtx, input: { shopId: string }) {
+    /* ... */
+  }
+}
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `key` | required | Derives the serialization key from the run's input. Runs sharing a key are serialized against each other; different keys never contend. |
+| `limit` | `1` | How many runs may be in flight per key. `1` is a mutex; a higher number is a per-key concurrency cap. |
+| `maxQueueDepth` | unbounded | How many runs may **queue** behind the in-flight ones before `start` is rejected. |
+
+Start a run whose key is already at its limit and nothing fails — the run is created, parked as `suspended`,
+and admitted the moment a slot frees. Admission is **FIFO by creation time** and race-free across engine
+instances (the ordering comes from the store, not from in-memory state), and a settling run wakes the next
+in line immediately rather than making it wait out a poll tick.
+
+### Back-pressure
+
+Without `maxQueueDepth`, a producer that outruns the workflow simply builds an unbounded queue of suspended
+runs — the failure surfaces late, as a store full of runs that will not finish for hours. Setting
+`maxQueueDepth` turns that into an immediate, visible rejection:
+
+```ts
+import { SingletonQueueFullError } from '@adonis-agora/durable'
+
+try {
+  await SyncShopWorkflow.dispatch({ shopId })
+} catch (error) {
+  if (error instanceof SingletonQueueFullError) {
+    // error.workflow, error.key, error.maxQueueDepth
+    return response.tooManyRequests({ retryAfter: 60 })
+  }
+  throw error
+}
+```
+
+The cap is `limit + maxQueueDepth` — in the example above, one running plus twenty queued. The check happens
+**before the run is created**, so a rejected `start` leaves nothing behind to clean up.
 
 ## Fan-out (parallel steps)
 
@@ -213,7 +301,40 @@ await ctx.localStep('process-batch', async (log) => {
 })
 ```
 
-The step logger also offers `log.debug/info/warn/error(message, data?)` for leveled logs and `log.subProcess(name, body)` for nested, phased sub-work. Rule of thumb: if you want each unit to **retry or replay independently**, make it a **step** (or a [child workflow](/docs/durable/authoring/child-workflows)). If you only want to **see** what happened inside one durable unit, emit **sub-process events**.
+The step logger also offers `log.debug/info/warn/error(message, data?)` for leveled logs, `log.subProcess(name, body)` for nested, phased sub-work, and `log.subEvent({ ... })` for a fully-specified sub-process entry (its own `id`, `group`, `phase`, `status`, `message` and `data`) when `log.sub`'s three arguments are not enough. Rule of thumb: if you want each unit to **retry or replay independently**, make it a **step** (or a [child workflow](/docs/durable/authoring/child-workflows)). If you only want to **see** what happened inside one durable unit, emit **sub-process events**.
+
+### Reporting liveness from inside a long step
+
+A step that runs for minutes has a problem the logger cannot solve: from the engine's side, "working hard"
+and "the worker died" look identical. `log.heartbeat(progress?)` is the signal that separates them:
+
+```ts
+@Step()
+async reindexCatalog(input: { shopId: string }, log: StepLogger) {
+  const pages = await catalog.pageCount(input.shopId)
+
+  for (let page = 1; page <= pages; page += 1) {
+    await catalog.reindexPage(input.shopId, page)
+    log.heartbeat({ page, pages })
+  }
+
+  return { pages }
+}
+```
+
+Each beat does three things:
+
+- **It rearms the step's `timeoutMs`.** That window means "maximum silence", not "maximum duration" — so a
+  step that beats every few seconds can run for an hour under a `timeoutMs: 30_000` and never time out,
+  while a worker that dies is caught within the window. See [Retries & timeouts](/docs/durable/reliability/retries#queue-wait-vs-silence-while-running-pickuptimeoutms).
+- **It persists the `progress` payload on the step's checkpoint**, so `durable:runs` and the
+  [dashboard](/docs/durable/observability/dashboard) can show *where* a long step is, not just that it is running.
+- **It costs almost nothing.** Beats are throttled — at most one every 5 seconds leaves the worker, and the
+  engine persists at most one every 10 seconds per step, with an exemption so the first beat carrying a
+  `progress` payload always lands. Call it as often as is convenient; the throttles do the rationing.
+
+Beat from a **dispatched** step, where there is a worker whose silence is meaningful. Inside `ctx.localStep`
+the body runs in the engine itself, so there is nothing to report liveness to and `log.heartbeat` is a no-op.
 
 ## Deterministic sources — `ctx.now` & `ctx.sideEffect`
 
@@ -225,7 +346,7 @@ const nonce = await ctx.sideEffect(() => crypto.randomUUID()) // any generated v
 const sampled = (await ctx.sideEffect(() => Math.random())) < 0.1
 ```
 
-`ctx.now()` is the deterministic wall-clock. `ctx.sideEffect(fn)` is the general **deterministic capture**: it runs `fn` once, checkpoints the result, and returns that same value on every replay without re-running `fn` — wrap **any** non-determinism you control (a UUID/ULID, `Math.random()`, a config/env read) in it. (It replaces the removed `ctx.random()` and `ctx.uuid()`.) For real work with side effects — a DB write, an API call — use a [step](#steps) instead, since `sideEffect`'s `fn` must be effectively pure (it runs only once and is not re-executed on replay).
+`ctx.now()` is the deterministic wall-clock. `ctx.sideEffect(fn)` is the general **deterministic capture**: it runs `fn` once, checkpoints the result, and returns that same value on every replay without re-running `fn` — wrap **any** non-determinism you control (a UUID/ULID, `Math.random()`, a config/env read) in it. For real work with side effects — a DB write, an API call — use a [step](#steps) instead, since `sideEffect`'s `fn` must be effectively pure (it runs only once and is not re-executed on replay).
 
 See [Versioning & determinism](/docs/durable/authoring/versioning) for why and how the runtime guard works.
 

@@ -48,7 +48,73 @@ optional `tags` / `onEvent` / `executionTimeout`.
 
 At boot the provider scans the configured directory (default `app/workflows`), imports each module, and
 registers every exported workflow class from its `static workflow` config — including the version,
-`tags`, `executionTimeout` and `onEvent` from its options.
+`tags`, `executionTimeout`, `onEvent` and `singleton` from its options, plus any
+[colocated schedule](/docs/durable/authoring/scheduling#colocate-the-schedule-with-the-workflow).
+
+## Dependency injection in the constructor
+
+Workflow classes are instantiated **through the AdonisJS container**, exactly like an `@adonisjs/queue`
+job. Decorate the class with `@inject()` and declare what it needs as constructor parameters — the
+container resolves them:
+
+```ts title="app/workflows/order_workflow.ts"
+import { inject } from '@adonisjs/core'
+import { BaseWorkflow } from '@adonis-agora/durable'
+import type { WorkflowCtx } from '@adonis-agora/durable'
+import BillingService from '#services/billing_service'
+import NotificationService from '#services/notification_service'
+
+interface OrderInput {
+  orderId: string
+  amount: number
+}
+
+@inject()
+export default class OrderWorkflow extends BaseWorkflow {
+  static workflow = { name: 'order', version: '1' }
+
+  constructor(
+    private billing: BillingService,
+    private notifications: NotificationService,
+  ) {
+    super()
+  }
+
+  async run(ctx: WorkflowCtx, input: OrderInput) {
+    const charge = await ctx.step(this.billing.charge, {
+      orderId: input.orderId,
+      amount: input.amount,
+    })
+
+    await ctx.step(this.notifications.orderConfirmed, {
+      orderId: input.orderId,
+      receiptUrl: charge.receiptUrl,
+    })
+
+    return { charged: charge.id }
+  }
+}
+```
+
+Two things follow from this, and they are the reason to prefer it over reaching for the container inside
+`run`:
+
+- **The step reference is typed.** `this.billing.charge` is a `@Step`-decorated method, so `ctx.step`
+  infers both its input and its output — no generic to write, and renaming the method is a compile error
+  rather than a runtime "no handler for …".
+- **The body stays a pure composition.** Resolving services is construction, not workflow logic, so the
+  deterministic `run` reads as the sequence of steps it is.
+
+The instance is built **once**, at registration, and reused for every run — so treat the constructor as
+wiring and keep per-run state in the workflow's input and step outputs, never on `this`.
+
+A class with no constructor dependencies is unaffected: the container simply builds it with no arguments.
+
+<Callout type="warn">
+Injected services are for **composing** the workflow, not for doing its work. Calling `this.billing.charge(...)`
+directly from `run` performs I/O outside a step, so it re-executes on every replay and is never checkpointed.
+Always reach a service through `ctx.step` / `ctx.localStep`.
+</Callout>
 
 ## Running a workflow
 

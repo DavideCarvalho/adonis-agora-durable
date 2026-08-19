@@ -1,6 +1,6 @@
 ---
 title: Child workflows
-description: Compose workflows by calling other workflows — await a child's result with Inner.start (or ctx.child), or kick one off fire-and-forget with Inner.dispatch (or ctx.startChild). The same statics work at the top level, context-aware.
+description: Compose workflows by calling other workflows — await a child's result with Inner.start (or ctx.child), kick one off fire-and-forget with Inner.dispatch (or ctx.startChild), or fan out over a list with ctx.all. The same statics work at the top level, context-aware.
 icon: GitBranch
 ---
 
@@ -107,9 +107,77 @@ The dispatch is checkpointed (replay-safe — it won't re-fire on resume) and id
 
 <CodeFlow scene="start-child" />
 
-### Scatter-gather: start many, then join
+## `ctx.all` — fan out over one workflow
 
-Because `startChild` returns the child id and the start is idempotent by that id, you can fan out with `startChild` and later join with `ctx.child` using the **same id** — the child runs exactly once, and the second call just attaches to it:
+Running the same child workflow across a list of inputs is common enough to have its own primitive.
+`ctx.all(workflow, inputs, opts?)` starts one child per input, suspends the parent while they run
+concurrently, and resumes with their outputs **in input order**:
+
+```ts
+engine.register('batch', '1', async (ctx, batch: Batch) => {
+  const results = await ctx.all(ProcessItemWorkflow, batch.items)
+  //    ^? the return type of ProcessItemWorkflow.run, as an array
+
+  return { processed: results.length }
+})
+```
+
+Pass a registered **name** string instead of the class when you have no class to import, with the output type
+as a generic: `ctx.all<ItemResult>('process-item', batch.items)`.
+
+The child ids are derived from the parent and the position the fan-out occupies — `<parentRunId>.all.<seq>.<i>`
+— so they are stable across replay without you inventing them. Every sibling is also tagged with the same
+parallel group, which is what lets the [dashboard](/docs/durable/observability/dashboard) render one fan-out as
+a single unit rather than N unrelated children. An empty `inputs` array returns `[]` immediately and starts
+nothing.
+
+### `waitAll` vs `failFast`
+
+`opts.mode` decides what a failing sibling does to the rest:
+
+```ts
+const results = await ctx.all(ProcessItemWorkflow, batch.items, { mode: 'failFast' })
+```
+
+| Mode | Behaviour |
+| --- | --- |
+| `waitAll` (default) | Every child runs to a terminal state. If any failed, the call then throws — nothing is cancelled, so a partial batch is fully recorded and inspectable. |
+| `failFast` | The first observed failure cancels every sibling that has not completed, then throws. |
+
+Either way the error is a `GatherError` carrying which items failed:
+
+```ts
+import { GatherError } from '@adonis-agora/durable'
+
+try {
+  await ctx.all(ProcessItemWorkflow, batch.items)
+} catch (error) {
+  if (error instanceof GatherError) {
+    // error.failures: [{ index, id, error }, ...]
+    const failed = error.failures.map((f) => batch.items[f.index].id)
+    await ctx.step(reportPartialBatch, { batchId: batch.id, failed })
+  }
+  throw error
+}
+```
+
+Choose `waitAll` when each item is independent and you want the whole picture — a nightly import where three
+bad rows should not hide the other nine hundred. Choose `failFast` when the items are facets of one operation
+and finishing the rest is wasted work.
+
+<Callout type="warn">
+`failFast` cancellation is best-effort and carries **no saga compensation**: it is a plain cancel, and a
+sibling in the middle of a step only observes it at its next checkpoint. If a partially-run child needs to be
+undone, give the child its own [compensations](/docs/durable/reliability/sagas) and cancel it with
+`{ compensate: true }` yourself instead.
+</Callout>
+
+### Fanning out by hand
+
+`ctx.all` covers one workflow over N inputs. When the fan-out is heterogeneous — different workflows, or work
+interleaved between starting and joining — build it from `startChild` + `child`. Because `startChild` returns
+the child id and the start is idempotent by that id, you can fan out first and join later with the **same
+id**: the child runs exactly once and the second call just attaches to it.
 
 ```ts
 engine.register('batch', '1', async (ctx, batch: Batch) => {
@@ -132,11 +200,11 @@ engine.register('batch', '1', async (ctx, batch: Batch) => {
 
 ## When to use which
 
-| | `ctx.child` | `ctx.startChild` |
-| --- | --- | --- |
-| Parent waits for the result | ✅ suspends until the child finishes | ❌ returns the id immediately |
-| Child failure affects the parent | ✅ throws in the parent | ❌ independent (inspect/retry the child run) |
-| Typical use | a sub-task whose output you need | side work; scatter-gather (then join with `child`) |
+| | `ctx.child` | `ctx.startChild` | `ctx.all` |
+| --- | --- | --- | --- |
+| Parent waits for the result | ✅ suspends until the child finishes | ❌ returns the id immediately | ✅ suspends until every child finishes |
+| Child failure affects the parent | ✅ throws in the parent | ❌ independent (inspect/retry the child run) | ✅ throws a `GatherError` |
+| Typical use | one sub-task whose output you need | side work; heterogeneous fan-out | the same workflow over a list of inputs |
 
 `Inner.start(input)` and `Inner.dispatch(input)` are the ergonomic equivalents of `ctx.child(Inner, input)` and
 `ctx.startChild(Inner, input)` — same behavior, they just resolve the ambient `ctx` for you.
