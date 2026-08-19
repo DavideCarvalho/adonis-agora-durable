@@ -2,5 +2,5 @@
   "title": "Cluster",
   "description": "Split the API from the engine, run store-less thin pods, route per tenant, and share one control plane across languages.",
   "icon": "Network",
-  "pages": ["index", "roles-and-config", "handshake", "interop"]
+  "pages": ["index", "roles-and-config", "thin-workers", "handshake", "interop"]
 }

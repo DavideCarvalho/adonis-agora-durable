@@ -1,12 +1,12 @@
 ---
 title: CLI
-description: Ace commands for durable — durable:work runs the worker loop, durable:runs lists runs, durable:retry re-enqueues a run, and make:workflow scaffolds a workflow, all resolving the engine bound by @adonis-agora/durable.
+description: Ace commands for durable — durable:work runs the store-backed worker loop, durable:worker runs a store-less thin worker, durable:runs lists runs (including the --stale view), durable:retry re-enqueues a run, and make:workflow scaffolds a workflow.
 icon: SquareTerminal
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
-`@adonis-agora/durable` ships four ace commands: a long-running **worker loop**, a run **lister**, a **retry**, and a **workflow generator**. They all resolve the [`WorkflowEngine`](/docs/durable/concepts/workflows-and-steps) bound by the provider, so they operate on the same engine (and store) your app is configured with.
+`@adonis-agora/durable` ships five ace commands: two long-running workers (`durable:work` for a store-backed pod, `durable:worker` for a [store-less thin pod](/docs/durable/cluster/roles-and-config)), a run **lister**, a **retry**, and a **workflow generator**. Except for `durable:worker`, they all resolve the [`WorkflowEngine`](/docs/durable/concepts/workflows-and-steps) bound by the provider, so they operate on the same engine (and store) your app is configured with.
 
 ```bash
 node ace configure @adonis-agora/durable
@@ -28,11 +28,21 @@ node ace durable:work --interval=500 --drainTimeout=15000
 | `--interval` | `1000` | poll interval in ms between ticks |
 | `--drainTimeout` | `10000` | drain timeout in ms on shutdown |
 
-Each tick runs `engine.runPending()` → `engine.recoverIncomplete()` → `engine.resumeDueTimers()` → `engine.sweepTimeouts()` → fire due [schedules](/docs/durable/authoring/scheduling). Run this as a dedicated process (or several) when you split web from worker; in a single-process app the in-process dispatcher already runs workflows, so this is optional but recommended for [recovery and timers](/docs/durable/concepts/durability#self-healing-recovery).
+Each tick runs `engine.runPending()` → `engine.recoverIncomplete()` → `engine.resumeDueTimers()` → `engine.sweepTimeouts()` → fire due [schedules](/docs/durable/authoring/scheduling). Run this as a dedicated process (or several) when you split web from worker; in a single-process app the in-process dispatcher already runs workflows, so this is optional but recommended for [recovery and timers](/docs/durable/concepts/durability#consequences).
 
 <Callout type="info">
 Any [scheduled workflows](/docs/durable/authoring/scheduling) registered under `schedules` in `config/durable.ts` are fired by this loop (the tick's 5th phase) — so you need at least one `durable:work` process running for them to start. This is also where a [queue](/docs/durable/transports/queue) or [DB](/docs/durable/transports/db) transport worker registers its handlers for a group.
 </Callout>
+
+## `durable:worker` — the store-less worker
+
+The worker for a `role: 'tenant'` pod: it serves step bodies and never touches a state store. It boots the container-bound `WorkerRuntime`, registers every handler under `app/steps`, advertises its descriptor and heartbeat so the control plane can route to it, and drains on `SIGINT`/`SIGTERM`.
+
+```bash
+node ace durable:worker
+```
+
+It takes no flags — everything comes from `config/durable.ts` (`partition`, `namespace`, `transport`, `stepsPath`). Running it on a store-backed role logs a warning and points you at `durable:work`; see [Thin workers](/docs/durable/cluster/thin-workers) for the full topology.
 
 ## `durable:runs` — list runs
 
@@ -46,9 +56,21 @@ node ace durable:runs --workflow=checkout --limit=100
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--status` | — | filter: `pending` / `running` / `suspended` / `completed` / `failed` / `cancelled` / `dead` |
+| `--status` | — | filter: `pending` / `running` / `suspended` / `blocked` / `completed` / `failed` / `cancelled` / `dead` |
 | `--workflow` | — | filter by workflow name |
 | `--limit` | `50` | max runs to list |
+| `--stale` | — | show only runs that look stranded. Bare `--stale` uses the 15-minute default; `--stale=1h` or `--stale=90s` sets your own threshold. |
+
+Every row also carries liveness signals — how long ago the run was updated, how many times recovery has picked it up, and the age of its oldest `pending` remote step. That matters because `suspended` alone cannot tell a run mid-step apart from a run whose dispatch was lost.
+
+`--stale` is the query that separates them. It narrows the listing to `running`/`suspended` runs whose oldest pending remote step is older than the threshold — [the stranded signature](/docs/durable/reliability/failure-modes#the-stranded-signature) — and prints the `durable:retry` hint for each one:
+
+```bash
+# What has been sitting on a remote step for over an hour?
+node ace durable:runs --stale=1h
+```
+
+Set the threshold above your longest legitimate step, or a slow-but-healthy run shows up as stranded.
 
 For the listing to show runs across processes, the engine must be backed by a [persistent store](/docs/durable/stores/lucid) (`config/durable.ts`) — the default in-memory store only sees this process's runs.
 
@@ -72,4 +94,41 @@ node ace make:workflow order
 
 ## Building your own
 
-The package also exports the building blocks — `runWorkerLoop`, `runTick`, `listRuns`, `renderRunsTable`, `retryRun` — so you can compose a custom worker process or admin script around the engine instead of (or alongside) the bundled commands.
+The pieces these commands are made of are exported from `@adonis-agora/durable`, so a custom worker process or admin script composes them instead of re-implementing the loop:
+
+| Export | What it does |
+| --- | --- |
+| `runWorkerLoop(engine, opts)` | the whole `durable:work` loop, including graceful drain |
+| `runTick(engine, opts)` | one tick of it — pending, recovery, timers, timeouts, schedules |
+| `listRuns(source, opts)` | the `durable:runs` query |
+| `attachLiveness(engine, runs)` | annotate runs with update age, recovery attempts and pending-step age |
+| `filterStale(liveRuns, thresholdMs)` / `DEFAULT_STALE_MS` | the `--stale` predicate and its 15-minute default |
+| `renderRunsTable(liveRuns)` / `staleHint(runId)` | the terminal table and the per-run retry hint |
+| `retryRun(engine, runId)` | the `durable:retry` action |
+| `parseDurationMs(input)` | parse `'1h'` / `'90s'` the way `--stale` does |
+
+For example, an ops endpoint that reports stranded runs without shelling out to ace:
+
+```ts title="app/controllers/ops_controller.ts"
+import { inject } from '@adonisjs/core'
+import type { HttpContext } from '@adonisjs/core/http'
+import {
+  DEFAULT_STALE_MS,
+  WorkflowEngine,
+  attachLiveness,
+  filterStale,
+  listRuns,
+} from '@adonis-agora/durable'
+
+@inject()
+export default class OpsController {
+  constructor(private engine: WorkflowEngine) {}
+
+  async strandedRuns({ response }: HttpContext) {
+    const runs = await listRuns(this.engine, { statuses: ['running', 'suspended'], limit: 200 })
+    const stale = filterStale(await attachLiveness(this.engine, runs), DEFAULT_STALE_MS)
+
+    return response.ok({ stranded: stale.map(({ run }) => run.id) })
+  }
+}
+```

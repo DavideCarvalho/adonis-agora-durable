@@ -1,0 +1,117 @@
+---
+title: Thin workers
+description: The @adonis-agora/durable/worker subpath — WorkerRuntime, the descriptor registry, and the turn/step runners that let a worker pod execute steps and workflow turns without ever importing Lucid or owning a state store.
+icon: Boxes
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+A **thin worker** executes work and stores nothing. It has no state store, no Lucid, no schema and no migrations — it consumes tasks from a broker, runs bodies, and publishes results. Everything durable about the run lives on the control plane.
+
+That matters for more than tidiness. A worker with no store cannot read another tenant's runs, cannot be pointed at the wrong database, and cannot be the thing that runs a migration by accident. The isolation is structural rather than a rule to remember.
+
+The `@adonis-agora/durable/worker` subpath is the whole worker surface, and importing it pulls in no store code at all — that exclusion is enforced by a test that walks the module's import graph, so it cannot regress by accident.
+
+## The usual path: `durable:worker`
+
+Most worker pods need no code from this subpath. Configure the pod as a [`tenant` role](/docs/durable/cluster/roles-and-config#tenant-store-less-thin-pod), write your step handlers under `app/steps` as usual, and run the command:
+
+```bash
+node ace durable:worker
+```
+
+It resolves the container-bound runtime, registers every handler under `app/steps`, advertises the workflow names it can serve, starts heartbeating, and drains on `SIGINT`/`SIGTERM`. Read [the CLI page](/docs/durable/cli#durableworker-the-store-less-worker) for the flags and the full sequence.
+
+Reach for the subpath directly when you are building the worker **outside** an AdonisJS app — a standalone Node service, a container whose whole job is one step handler, or a test that drives a runtime by hand.
+
+## `WorkerRuntime`
+
+`WorkerRuntime` is the worker's whole lifecycle in one object: the handlers it serves, the descriptor it advertises, and the heartbeat that keeps it visible to the control plane.
+
+```ts title="worker.ts"
+import { RedisWorkerRegistry, WorkerRuntime } from '@adonis-agora/durable/worker'
+import { transports } from '@adonis-agora/durable'
+import { Redis } from 'ioredis'
+
+const transport = await transports.bullmq({ connection: process.env.REDIS_URL })({ app })
+const redis = new Redis(process.env.REDIS_URL!)
+
+const runtime = new WorkerRuntime({
+  transport,
+  partition: 'acme-corp',
+  registry: new RedisWorkerRegistry(redis, { ownsConnection: true }),
+})
+
+runtime.registerStep('billing.charge', async (input, log) => {
+  const charge = await stripe.charge(input as ChargeInput)
+  log.info('charged', { id: charge.id })
+  return { chargeId: charge.id }
+})
+
+await runtime.start()
+
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  process.once(signal, () => void runtime.stop())
+}
+```
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `transport` | required | The broker transport. It must be able to serve handlers; `handleWorkflow` and `dispatchStepEvent` are optional capabilities layered on top. |
+| `partition` | required | The tenant this worker serves. Every routing token becomes `<name>@<partition>`, so two pools serving the same step name never cross. |
+| `namespace` | — | Worker-pool namespace, folded into the descriptor and key names. |
+| `prefix` | `'durable'` | Key prefix for the descriptor and heartbeat keys. |
+| `instanceId` | `ts-<host>-<pid>` | Stable id for this process. |
+| `capabilities` | `[]` | Extra capabilities to advertise beyond the handler names — what a step's [`requires`](/docs/durable/cluster/handshake#capability-aware-routing) is matched against. |
+| `registry` | no-op | Where the descriptor and heartbeat are published. |
+| `heartbeatIntervalMs` | `10_000` | How often it re-advertises and beats. |
+| `ttlSeconds` | `35` | TTL on those keys, so a dead worker disappears within roughly three missed beats. |
+| `logger` / `onError` | silent | Lifecycle logging, and where advertise/beat failures go (they never throw). |
+
+`start()` and `stop()` are both idempotent. `stop()` removes the descriptor and heartbeat keys before closing, so a graceful shutdown disappears from the fleet view immediately instead of waiting out the TTL — which is the difference between a rolling deploy looking clean and looking like a partial outage.
+
+Registering a handler after `start()` re-advertises automatically, so late registration is safe.
+
+## Publishing the descriptor: the registry
+
+A worker is only routable if the control plane can see it. `WorkerRegistry` is where the descriptor and heartbeat go:
+
+- **`RedisWorkerRegistry(redis, { ownsConnection })`** — the real one. It writes the descriptor and each heartbeat as TTL'd keys. Pass `ownsConnection: true` when the runtime should disconnect the client on `stop()`.
+- **`NoopWorkerRegistry`** — the default. The descriptor is still built and observable through `runtime.descriptor()`, just not published. A worker on it executes fine but is invisible to [capability-aware routing](/docs/durable/cluster/handshake#capability-aware-routing), so a step with `requires` will never be dispatched to it.
+
+The descriptor carries the runtime (`node` or `python`), the SDK name and version, the protocol version and the range it can speak, the step and workflow names it serves, its capabilities, and its partition — the input to the [handshake](/docs/durable/cluster/handshake).
+
+## Executing workflow turns
+
+A thin worker can also execute **workflow bodies**, not just steps, when the transport carries turns. That is the store-less execution model: the control plane sends the workflow's history, the worker replays the body against it and returns the commands it wants issued.
+
+```ts
+runtime.registerWorkflow('checkout', (ctx, input) => {
+  const order = input as { amount: number }
+  const paid = ctx.step('billing.charge', { amount: order.amount })
+  const shipped = ctx.step('shipping.dispatch', { charge: paid })
+
+  return { paid, shipped }
+})
+```
+
+The body is synchronous, and that is deliberate rather than a limitation. `ctx.step` either returns the value already recorded in the history or ends the turn by throwing — so a turn is a pure replay that produces a decision, never a long-lived process holding state in memory. `WorkflowTurnCtx` offers `step`, `sleep`, `waitSignal`, `startChild`, `gatherCalls`, `gatherChildren`, `now` and `sideEffect`.
+
+<Callout type="warn">
+`node ace durable:worker` registers workflow **names** from `app/workflows` (so routing works) but not their bodies. A pod that must execute turns registers them with `runtime.registerWorkflow(name, body)` explicitly.
+</Callout>
+
+## The lower-level runners
+
+Two functions sit under the runtime, exported for the cases where you own the loop:
+
+- **`runStepHandler(task, handler, emitBeat?)`** turns a `RemoteTask` into a `StepResult`: it restores the propagated context, runs the handler with a step logger, collects the events it emitted, wires `log.heartbeat` to `emitBeat`, and converts a throw into a structured `error`. An unregistered name comes back as a non-retryable failure rather than an exception.
+- **`runWorkflowTurn(bodies, task, opts)`** replays one workflow turn and returns its decision — `completed` with an output, `continue` with the commands to issue, `failed` with the error, or `cancelled`.
+
+Reach for these when you are writing a transport of your own, or bridging durable into a runtime that is not Node.
+
+## Next steps
+
+- **[Roles & config](/docs/durable/cluster/roles-and-config)** — how a `tenant` pod is declared, and the `runGateway` its API side uses.
+- **[Handshake & capability negotiation](/docs/durable/cluster/handshake)** — what the descriptor is matched against.
+- **[Cross-ecosystem interop](/docs/durable/cluster/interop)** — the same contract, spoken by a Python worker.

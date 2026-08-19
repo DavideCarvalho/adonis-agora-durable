@@ -105,6 +105,50 @@ Mount the [dashboard](/docs/durable/observability/dashboard) and it works unchan
 
 Run both processes on one pod if you want (less isolated; usually kept separate).
 
+## Reading and steering runs: `runGateway`
+
+Every role exposes the same read/control surface, the `RunGateway`, from `services/main`:
+
+```ts title="app/controllers/runs_controller.ts"
+import { runGateway } from '@adonis-agora/durable/services/main'
+import type { HttpContext } from '@adonisjs/core/http'
+
+export default class RunsController {
+  async show({ params, response }: HttpContext) {
+    const run = await runGateway.getRun(params.id)
+    if (!run) return response.notFound()
+
+    return response.ok({ run, timeline: await runGateway.getCheckpoints(params.id) })
+  }
+
+  async approve({ params, response }: HttpContext) {
+    await runGateway.signal(params.id, `approve:${params.id}`, { by: 'ops' })
+    return response.accepted({})
+  }
+}
+```
+
+**This is what makes application code portable across the three roles.** On a store role the gateway reads the store directly; on a store-less `tenant` pod the identical call becomes a wire request answered by the control plane. The controller above is byte-identical either way — you never branch on `role`, and moving a pod from `standalone` to `tenant` changes only `config/durable.ts`.
+
+The full surface:
+
+| Verb | Purpose |
+| --- | --- |
+| `topology()` | this pod's `role`, plus its `tenant` on a store-less pod. Synchronous — no round-trip. |
+| `getRun(runId)` | one run, or `null` |
+| `listRuns(query)` | a filtered listing (status, workflow, tag, namespace, search attributes) |
+| `getCheckpoints(runId)` | the run's step timeline |
+| `getRunChildren(runId)` | the ids of the run's child workflows |
+| `getSearchAttributes(runId)` | the run's [search attributes](/docs/durable/authoring/queries-and-updates) |
+| `start(workflow, input, opts?)` | start a run; `opts.runId` is the idempotency key, and omitting it mints one |
+| `signal(runId, signal, payload?)` | deliver a [signal](/docs/durable/concepts/sleep-and-signals) |
+| `cancel(runId, opts?)` | cancel a run, with `{ compensate: true }` to run its [saga undo](/docs/durable/reliability/sagas) first |
+| `redispatchPending(runId)` | re-enqueue every remote step still `pending` — [the operator escape hatch](/docs/durable/reliability/failure-modes) |
+| `workerHealth()` | queue depth and live workers per group |
+| `subscribe(runId, onEvent)` | live-tail one run's lifecycle events; returns the unsubscribe |
+
+On a store role, `engine` (the default export of `services/main`) is still there for everything the gateway does not cover — registering workflows, driving poll loops, `continue`, `retryWithInput`. On a `tenant` pod there is no engine to resolve, which is exactly the point: reach for `runGateway` in anything that must run on more than one role.
+
 ## Layered tenant authentication
 
 The `tenant` on a wire request is a **claim**. Without authentication, the isolation boundary is meaningless — any pod could ask for any tenant's runs. Durable stacks **two** layers (spec-driven; use one or both):
@@ -143,5 +187,6 @@ The `RunRequestResponder` is the **trust boundary**. Beyond checking the token, 
 
 ## Next steps
 
+- **[Thin workers](/docs/durable/cluster/thin-workers)** — the store-less worker runtime, from `durable:worker` down to the turn runner.
 - **[Handshake & capability negotiation](/docs/durable/cluster/handshake)** — keep a mixed fleet version-safe.
 - **[Cross-ecosystem interop](/docs/durable/cluster/interop)** — add Python and NestJS workers.
