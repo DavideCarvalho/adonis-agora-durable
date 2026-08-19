@@ -12,9 +12,9 @@
  * WHY THE REAL RENDERER. This harness first shipped with a hand-written regex renderer, and that made
  * it worse than useless: it reported five green stubs for a package whose `configure` could not write
  * a single file. Adonis compiles a stub body with Tempura, into a JavaScript template literal — so a
- * backtick or a `${` in the body terminates that literal early and the stub throws at generation
- * time. Four of the five stubs did exactly that. A regex renderer does not model Tempura, so it
- * sailed past the defect and type-checked text no user could ever obtain.
+ * UNESCAPED backtick or `${` in the body terminates that literal early and the stub throws at
+ * generation time. Four of the five stubs did exactly that. A regex renderer does not model Tempura,
+ * so it sailed past the defect and type-checked text no user could ever obtain.
  *
  * A gate that renders differently from the generator is not testing the generator. So this drives
  * `app.stubs.create()` → `build()` → `prepare()` — the same pipeline `codemods.makeUsingStub` runs
@@ -109,7 +109,8 @@ try {
       // this is the exact message a user would get from `node ace configure`.
       console.error(`stub typecheck: FAILED — ${path} does not render at all`);
       console.error(`  ${error.message}`);
-      console.error('  A backtick or a ${ } in the stub BODY ends Tempura\'s template literal.');
+      console.error('  An UNESCAPED backtick or ${ } in the body ends Tempura\'s template literal.');
+      console.error('  Escape them (\\` and \\${) — escaped forms render to the literal characters.');
       process.exit(1);
     }
 
