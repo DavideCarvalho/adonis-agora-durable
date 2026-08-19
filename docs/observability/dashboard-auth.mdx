@@ -1,18 +1,28 @@
 ---
-title: Dashboard login
-description: The dashboard's optional built-in login screen (dashboardAuth) — a server-rendered sign-in page backed by a signed HMAC session cookie, gating the HTML shell (302 to /login) and the JSON API (401) behind a host-supplied login hook. Opt-in, additive to authorize, fails closed at boot.
+title: Dashboard auth
+description: The console's optional session layer (dashboardAuth) — sign operators in at a built-in login page, or mint a session straight from your already-authenticated app. A signed HMAC cookie gates the pages (302 or 401) and the JSON API (401). Opt-in, additive to authorize, fails closed at boot.
 icon: KeyRound
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
-By default the [dashboard](/docs/durable/observability/dashboard) is gated only by the per-request `authorize` guard — fine when you already have a bearer token or your own session middleware. When you'd rather hand operators a real **sign-in page**, opt into `dashboardAuth`: a built-in, server-rendered login screen backed by a signed session cookie. It ships in `@adonis-agora/durable` — nothing extra to install, and the bundled dashboard SPA is untouched.
+By default the [console](/docs/durable/observability/dashboard) is gated only by the per-request `authorize` guard — fine when you already have a bearer token or your own session middleware. When you'd rather operators arrive with a real session, opt into `dashboardAuth`: a signed session cookie minted through a hook you supply. It ships in `@adonis-agora/durable` — nothing extra to install.
 
-`dashboardAuth` is **additive**. It composes *with* `authorize` (both must pass) — it does not replace it. Omit it and the dashboard behaves exactly as before: no `/login` or `/logout` routes, no session cookie.
+`dashboardAuth` is **additive**. It composes *with* `authorize` (both must pass) — it does not replace it. Omit it and the console behaves exactly as before: no auth routes, no session cookie.
+
+## Two ways to get a session
+
+There are two hooks, and you may configure either one or both.
+
+**Mode A — `session`: open the console from your app.** The operator is already signed in to your application. Your app calls the console's session endpoint, which hands your hook the raw request so it can read whatever it already trusts — your own cookie, a JWT, a header — and returns the operator's identity. No second password, no second login page. This is the right shape when the console is a page inside a product an admin is already using.
+
+**Mode B — `login`: a standalone sign-in page.** The console serves its own server-rendered username/password page and calls your hook to verify the credentials. The right shape when the console stands alone, with no host app in front of it.
+
+Configuring both gives operators a login page *and* a way in from the host app.
 
 ## Enable it
 
-Add a `dashboardAuth` block to `config/durable_dashboard.ts`. Two fields are required — a signing `secret` and a `login` hook that validates credentials:
+Add a `dashboardAuth` block to `config/durable_dashboard.ts`. `secret` is always required, plus **at least one** of `session` / `login`:
 
 ```ts title="config/durable_dashboard.ts"
 import { defineConfig } from '@adonis-agora/durable/dashboard'
@@ -23,6 +33,8 @@ export default defineConfig({
   dashboardAuth: {
     secret: env.get('DURABLE_DASHBOARD_SECRET'), // HMAC-SHA256 signing key, 32+ bytes
     ttl: '8h',
+
+    // Mode B — the built-in sign-in page.
     login: async (username, password) => {
       const user = await User.verifyCredentials(username, password).catch(() => null)
       if (!user || !user.isAdmin) return null // return null to deny
@@ -32,42 +44,127 @@ export default defineConfig({
 })
 ```
 
-The `login` hook is just a function — it may be `async` and close over your app's services (import them at the top of the config file), so there's nothing extra to wire for the "reach a DB / auth service" case.
+Both hooks are plain functions — they may be `async` and close over your app's services (import them at the top of the config file), so there's nothing extra to wire for the "reach a DB or auth service" case.
 
 | Field | Required | Default | Description |
 | --- | --- | --- | --- |
-| `secret` | yes | — | HMAC-SHA256 key the session cookie is signed with. Missing/empty fails closed at boot. |
-| `login` | yes | — | `(username, password) => DashboardSessionUser \| null` (may be async). Return the session user to allow, `null` to deny. A thrown error is treated as a denial (logged once, never surfaced). |
+| `secret` | yes | — | HMAC-SHA256 key the session cookie is signed with. Missing or empty fails closed at boot. |
+| `session` | one of the two | — | `(request) => DashboardSessionUser \| null` (may be async). Receives the raw Node request. Mode A. |
+| `login` | one of the two | — | `(username, password) => DashboardSessionUser \| null` (may be async). Mode B. |
 | `ttl` | no | `'8h'` | Cookie lifetime as a duration string (`'30m'`, `'8h'`, `'7d'`). |
 
-The `login` hook returns a session user shaped `{ id: string; name?: string; roles?: string[] }`. The password is forwarded **as-is** (empty string when blank) and the page marks it optional, so an email-only host (gate on username, ignore password) works with the same page — your hook alone decides whether a password matters.
+A hook returns a session user shaped `{ id: string; name?: string; roles?: string[] }`, or `null` to deny. `roles` is carried in the cookie for your own use — the console does not interpret it.
 
-<Callout type="warn">
-`secret` and `login` are validated at **boot**: a missing secret or a missing `login` hook throws immediately (fail closed), so you can't accidentally ship an un-mintable gate. Keep `secret` out of source — read it from an env var.
+<Callout type="warn" title="Validated at boot, so a mis-wired gate cannot ship">
+Two conditions throw at boot rather than at the first request: an absent or empty `secret`, and **neither** `session` nor `login` being a function. Keep `secret` out of source — read it from an env var.
 </Callout>
 
 ## What it adds
 
-When `dashboardAuth` is configured, the provider mounts three **public** endpoints (they mint or clear the session the guard checks for, so they sit in front of the guard) under the dashboard's `path`:
+When `dashboardAuth` is configured, the provider mounts up to four **public** endpoints under the console's `path`. They mint or clear the session the guard checks for, so they sit in front of it — and, importantly, in front of `authorize` too.
 
-| Method | Route | Purpose |
-| --- | --- | --- |
-| `GET` | `<path>/login` | the server-rendered sign-in page (`durable_dashboard.login.page`) |
-| `POST` | `<path>/login` | verifies credentials via your `login` hook and sets the session cookie (`durable_dashboard.login.submit`) |
-| `GET` | `<path>/logout` | clears the cookie and redirects back to `/login` (`durable_dashboard.logout`) |
+| Method | Route | Mounted when | Purpose |
+| --- | --- | --- | --- |
+| `POST` | `<path>/session` | `session` is configured | hands the raw request to your `session` hook and sets the cookie |
+| `GET` | `<path>/login` | `login` is configured | the server-rendered sign-in page |
+| `POST` | `<path>/login` | `login` is configured | verifies credentials via your `login` hook and sets the cookie |
+| `GET` | `<path>/logout` | always | clears the cookie and redirects |
 
-And it stamps a **session guard** onto every dashboard route:
+And it stamps a **session guard** onto every console route. Without a valid cookie:
 
-- an unauthenticated **page** navigation is redirected `302` to `<path>/login` (carrying a sanitized `returnTo`), and
-- an unauthenticated **API** request gets a plain `401`.
+- a **page** navigation is redirected `302` to `<path>/login` (carrying a sanitized `returnTo`) when `login` is configured, and answered with a short `401` page reading *"Open this console from your application."* when only `session` is;
+- an **API** request gets `401 { "error": "unauthorized", "auth": { "modes": [...] } }`. The `modes` array tells a client which way in exists — the console reads it to decide between redirecting to the login page and bouncing to the console root.
 
-The session is a stateless, signed HMAC-SHA256 cookie (`durable_dashboard_session`) — no server-side session store. It carries the user id, optional name, and roles, plus issued-at/expiry, and is rejected once tampered or expired.
+`logout` redirects to `<path>/login` when a login page exists, and to the console root otherwise.
+
+The session is a stateless, signed HMAC-SHA256 cookie (`durable_dashboard_session`) — no server-side session store. It carries the user id, optional name and roles, plus issued-at and expiry, and is rejected once tampered with or expired. It is `httpOnly`, `sameSite=lax`, scoped to `/`, and `secure` on an HTTPS request.
 
 <Callout type="info">
-Every credential failure — unknown user, wrong password, or a throwing hook — returns the **same** uniform `401` ("Invalid username or password."), so the endpoint doesn't leak whether a username exists. A throwing hook is warn-logged once server-side but never changes the client-visible response.
+Every credential failure — unknown user, wrong password, or a throwing hook — returns the **same** uniform `401` ("Invalid username or password."), so the endpoint does not leak whether a username exists. A throwing hook is warn-logged once per process server-side, but never changes the client-visible response.
 </Callout>
+
+## Mode A: opening the console from your app
+
+This is the flow where the operator never sees a second login. Your app already knows who they are; the console's job is to accept that.
+
+<Callout type="warn" title="Your integration point is the route, not a helper">
+The supported, stable contract is **`POST <path>/session`**. The console's SPA package ships a browser helper that calls it, and you are welcome to use it, but it is a convenience wrapper — an internal detail of the bundled client, not the API. Anything that can issue an HTTP request can open the console.
+</Callout>
+
+### 1. Write the `session` hook
+
+The hook receives the raw Node `IncomingMessage` for the `POST <path>/session` request, so it can read whatever your app already trusts on it. Return the operator's identity, or `null` to deny:
+
+```ts title="config/durable_dashboard.ts"
+import { defineConfig } from '@adonis-agora/durable/dashboard'
+import { parse as parseCookie } from 'node:querystring'
+import env from '#start/env'
+import { verifyAppSession } from '#services/app_session'
+
+export default defineConfig({
+  dashboardAuth: {
+    secret: env.get('DURABLE_DASHBOARD_SECRET'),
+    ttl: '8h',
+
+    session: async (request) => {
+      const req = request as import('node:http').IncomingMessage
+
+      // Read whatever your app already trusts — here, its own session cookie.
+      const raw = req.headers.cookie ?? ''
+      const token = parseCookie(raw.replaceAll('; ', '&')).app_session
+      if (typeof token !== 'string') return null
+
+      const user = await verifyAppSession(token)
+      if (!user || !user.roles.includes('ops')) return null
+
+      return { id: user.id, name: user.name, roles: user.roles }
+    },
+  },
+})
+```
+
+Note that the request reaches your hook exactly as the browser sent it, so a cross-origin call must include credentials for your app's cookie to be there at all.
+
+### 2. Mint the session, then navigate
+
+From your already-authenticated app, `POST` to the session route and only then send the operator to the console. The `POST` sets the cookie the console's guard checks for; the navigation that follows arrives authenticated:
+
+```ts title="resources/js/open_console.ts"
+export async function openDurableConsole() {
+  const res = await fetch('/durable/session', {
+    method: 'POST',
+    credentials: 'include', // your app's cookie must ride along
+    redirect: 'manual',     // an auth middleware answering 3xx is a failure, not a session
+  })
+
+  if (res.type === 'opaqueredirect' || (res.status >= 300 && res.status < 400)) {
+    throw new Error('Session mint was redirected — the operator is not signed in.')
+  }
+  if (!res.ok) {
+    throw new Error(`Could not open the durable console (HTTP ${res.status}).`)
+  }
+
+  window.location.assign('/durable')
+}
+```
+
+A successful mint answers `204` with an empty body. It takes **no request body** — everything your hook needs is already on the request.
+
+Handle the redirect case deliberately: if your own auth middleware turns an unauthenticated `POST` into a `302` to your sign-in page, `fetch` would follow it and report a cheerful `200` for an HTML login form. `redirect: 'manual'` turns that into the failure it actually is.
+
+### 3. Give operators a way out
+
+`GET <path>/logout` clears the cookie. In a Mode-A-only setup it redirects to the console root, which the guard then answers with the "open this console from your application" page — the console has no sign-in of its own to return to. A plain link is enough, since the route is idempotent and only clears the caller's own session:
+
+```html
+<a href="/durable/logout">Sign out of the console</a>
+```
 
 ## Choosing between the guards
 
-- Machine-to-machine or you already have app auth in front of the dashboard → keep the default `authorize` (or your own guard) and skip `dashboardAuth`. See [Authorization](/docs/durable/observability/dashboard#authorization).
-- You want operators to sign in with a username/password at a real page → add `dashboardAuth`. It layers on top of `authorize`, so you can still keep an IP allow-list or environment gate in `authorize` and require a login on top of it.
+- Machine-to-machine, or you already have app auth in front of the console → keep the default `authorize` (or your own guard) and skip `dashboardAuth` entirely. See [Authorization](/docs/durable/observability/dashboard#authorization).
+- Operators are already signed in to your app and should reach the console in one click → **Mode A**, the `session` hook.
+- The console stands alone and operators need somewhere to type a username and password → **Mode B**, the `login` hook.
+- Both, when some operators arrive from the app and others go straight to the console.
+
+All of these layer on top of `authorize`, so you can keep an IP allow-list or an environment gate there and require a session on top of it.

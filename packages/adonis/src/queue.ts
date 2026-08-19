@@ -1,5 +1,5 @@
 /**
- * Flow control for remote steps. A queue caps how much work `ctx.call(step, input, { queue })`
+ * Flow control for remote steps. A queue caps how much work `ctx.step(step, input, { queue })`
  * admits at once — a concurrency limit and/or a fixed-window rate limit. When a call can't be
  * admitted it doesn't dispatch: the run re-suspends with a near-future wake time, and the timer
  * poller re-tries admission later — so flow control is durable (survives crashes) without holding
@@ -23,7 +23,7 @@
  * blocked, and on a later retry only admits the one that is rightful-next under the policy.
  */
 export interface QueueConfig {
-  /** Queue name, referenced by `ctx.call(step, input, { queue: name })`. */
+  /** Queue name, referenced by `ctx.step(step, input, { queue: name })`. */
   name: string;
   /** Max steps in flight at once for this queue (this instance). Omit for unlimited. */
   concurrency?: number;

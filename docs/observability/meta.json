@@ -1,5 +1,5 @@
 {
   "title": "Observability",
   "icon": "Telescope",
-  "pages": ["dashboard", "dashboard-auth", "otel", "telescope"]
+  "pages": ["dashboard", "dashboard-auth", "events-and-interceptors", "otel", "telescope"]
 }

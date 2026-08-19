@@ -26,10 +26,66 @@ interface ScheduledWorkflow {
   paused?: boolean
   /** `'skip'` won't start a window while the previous run is still in-flight; `'allow'` (default) does. */
   overlap?: 'allow' | 'skip'
+  /** Random pre-dispatch delay (ms), to spread a fleet's simultaneous fires. */
+  jitter?: number
+  /** Opt in to firing missed windows: at most `maxCatchup` of them. */
+  backfill?: { maxCatchup: number }
 }
 ```
 
 Every schedule has a stable `key`, the `workflow` name to start, and an optional `input`. The cadence is either `everyMs` (a fixed interval) **or** `cron` + `timezone` (a calendar expression) — they are mutually exclusive.
+
+## Colocate the schedule with the workflow
+
+A cadence is usually a property *of* the workflow, not of the deployment — and keeping it next to the class means renaming or deleting the workflow cannot leave an orphaned entry in a config file across the repo. Declare it as a `static schedule` on the class:
+
+```ts title="app/workflows/daily_report_workflow.ts"
+import { BaseWorkflow } from '@adonis-agora/durable'
+import type { WorkflowCtx } from '@adonis-agora/durable'
+
+export default class DailyReportWorkflow extends BaseWorkflow {
+  static workflow = { name: 'daily-report', version: '1' }
+  static schedule = { cron: '0 2 * * *', timezone: 'America/Sao_Paulo' }
+
+  async run(ctx: WorkflowCtx) {
+    const rows = await ctx.localStep('gather', () => reports.gatherYesterday())
+    await ctx.localStep('email', () => reports.email(rows))
+    return { rows: rows.length }
+  }
+}
+```
+
+`make:workflow` already scaffolds this line, commented out. Two fields are filled in for you, since the class already knows them: `workflow` is the registered name, and `key` defaults to that same name (or `<name>:<i>` when a class declares several). Everything else — `everyMs`, `cron`, `timezone`, `paused`, `overlap`, `jitter`, `backfill`, `input` — works exactly as above.
+
+Declare several cadences by passing an array:
+
+```ts
+static schedule = [
+  { key: 'sync-fast', everyMs: 60_000 },
+  { key: 'sync-full', cron: '0 3 * * *', timezone: 'UTC' },
+]
+```
+
+### The `@Scheduled` decorator
+
+`@Scheduled(...)` is the decorator form of the same thing — reach for it when you prefer the cadence to read as an annotation above the class rather than as a field inside it:
+
+```ts title="app/workflows/crawl_workflow.ts"
+import { BaseWorkflow, Scheduled } from '@adonis-agora/durable'
+
+@Scheduled({ cron: '0 4 * * *', timezone: 'America/Sao_Paulo' })
+export default class CrawlWorkflow extends BaseWorkflow {
+  static workflow = { name: 'crawl', version: '1' }
+
+  async run(ctx: WorkflowCtx) {
+    /* ... */
+  }
+}
+```
+
+It stamps the very same `static schedule`, so the two forms are interchangeable and can be combined — stacked decorators and a `static schedule` field all accumulate, in source order. A decorated class with no `static workflow` is not a registrable workflow, so its schedules are ignored.
+
+Colocated schedules are picked up by `app/workflows` auto-discovery and merged with the config list below. Registration is idempotent by `key`: a duplicate key is ignored with a warning, and the first registration wins.
 
 ## Registering schedules — `config/durable.ts`
 
@@ -51,6 +107,19 @@ export default defineConfig({
 ```
 
 Then run the worker: `node ace durable:work`. The loop fires the schedules each tick on **worker** instances; the idempotent time-bucket run id (below) keeps each window to exactly one run no matter how many workers tick at once.
+
+### Config wins over a colocated schedule
+
+The two sources are merged by `key`, and **an entry in `config/durable.ts` wins**. That is the deliberate override: the colocated cadence is the workflow's own default, and the config file is where a specific deployment overrules it — pausing a job in staging, or running a five-minute sync hourly on a small instance:
+
+```ts title="config/durable.ts"
+schedules: [
+  // The class says `cron: '0 2 * * *'`; this environment says "not at all".
+  { key: 'daily-report', workflow: 'daily-report', cron: '0 2 * * *', paused: true },
+]
+```
+
+Match the `key` exactly — a config entry under a different key does not override, it adds a second schedule.
 
 <Callout type="info">
 Schedules only fire from the `durable:work` loop. A dashboard-/dispatch-only instance that never runs the worker loop will not start them — run at least one worker.
@@ -95,11 +164,39 @@ Cron parsing uses `cron-parser`. Install it where you run the engine: `npm i cro
 ## Pausing and overlap
 
 - `paused: true` skips a schedule entirely while it's set — handy for disabling a job without removing it.
-- `overlap: 'skip'` won't start a new window while the previous run for that schedule is still in-flight (`pending`/`running`/`suspended`). The default, `'allow'`, starts each window regardless.
+- `overlap: 'skip'` won't start a new window while the previous run for that schedule is still in-flight (`pending`/`running`/`suspended`). The default, `'allow'`, starts each window regardless. It applies to fixed-interval schedules only.
 
 ```ts
 { key: 'slow-sync', workflow: 'slow-sync', everyMs: 60_000, overlap: 'skip' }
 ```
+
+## Spreading the fleet — `jitter`
+
+Every worker ticks on its own clock, but a schedule's window is shared, so a fleet firing the same due window at the same instant hits downstream systems in one spike. `jitter` delays each dispatch by a random amount up to that many milliseconds:
+
+```ts
+{ key: 'tenant-sync', workflow: 'tenant-sync', everyMs: 60_000, jitter: 5_000 }
+```
+
+The delay never changes the run id — the window still maps to the same time bucket, so the exactly-once guarantee is untouched. Off by default; a schedule with no `jitter` fires immediately.
+
+## Catching up after downtime — `backfill`
+
+By default only the **current** window fires: if the worker fleet was down for six hours, an hourly schedule starts one run when it comes back, not six. That is usually right — six identical syncs racing on restart is rarely what anyone wanted.
+
+When each window is genuinely distinct work (one report per day, one billing cycle per month), opt in to firing the missed ones, bounded so a long outage cannot stampede:
+
+```ts
+{
+  key: 'daily-report',
+  workflow: 'daily-report',
+  cron: '0 2 * * *',
+  timezone: 'America/Sao_Paulo',
+  backfill: { maxCatchup: 7 }, // at most a week of missed days
+}
+```
+
+Each backfilled window has its own time-bucket run id, so it is started exactly once just like a live window — and re-running the worker does not re-fire it.
 
 ## Exactly-once across instances
 

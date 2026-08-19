@@ -8,7 +8,7 @@ import { Cards, Card } from 'fumadocs-ui/components/card';
 
 A durable workflow's whole reason to exist is that the world it talks to is unreliable: APIs time out, workers crash mid-step, downstream systems rate-limit you, and the occasional run is a poison pill that takes the process down with it. The engine treats each of those as a first-class concern rather than something you hand-roll on top.
 
-A worker crashing mid-run is handled automatically by **self-healing recovery**: while a run executes its worker renews a recovery lease, and a crashed worker stops renewing, so its lease expires. Recovery (`engine.recoverIncomplete()`) runs both on boot **and periodically** — the [`durable:work`](/docs/durable/cli) loop calls it every tick — so an orphaned `running` run is reclaimed by another instance within ~`leaseMs`, not only on the next deploy. See [Durability & replay](/docs/durable/concepts/durability#deploys-versioning--multiple-instances).
+A worker crashing mid-run is handled automatically by **self-healing recovery**: while a run executes its worker renews a recovery lease, and a crashed worker stops renewing, so its lease expires. Recovery (`engine.recoverIncomplete()`) runs both on boot **and periodically** — the [`durable:work`](/docs/durable/cli) loop calls it every tick — so an orphaned `running` run is reclaimed by another instance within ~`leaseMs`, not only on the next deploy. See [Durability & replay](/docs/durable/concepts/durability#deploys-versioning-multiple-instances).
 
 The building blocks compose: a remote step can retry with backoff, register a compensation to undo itself, be admitted through a rate-limited queue, and — if recovery can never make it past a crash — land in the dead-letter state for a handler to deal with.
 

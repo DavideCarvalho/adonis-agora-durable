@@ -60,7 +60,7 @@ export default defineConfig({
 
 The provider is just `() => string | undefined`, so you can supply your own context reader instead of the OTel one. Omit it and no `traceparent` is sent (the worker starts its own trace). The stamped value travels in the `RemoteTask.traceparent` field, so any worker that honours W3C trace context picks it up automatically.
 
-> When [`@adonis-agora/diagnostics-otel`](/docs/diagnostics) is installed, the `@adonis-agora/durable` provider auto-wires this `traceparent` provider for you (read structurally from a global slot, no hard dependency) — so distributed tracing works with zero config in that setup.
+> When [`@adonis-agora/diagnostics-otel`](/docs/diagnostics) is installed, the `@adonis-agora/durable` provider auto-wires this `traceparent` provider for you (read structurally from a global slot, no hard dependency) — so distributed tracing works with zero config in that setup. An explicit `traceparent` in `config/durable.ts` **overrides** that auto-wiring, which is how you bridge a tracer durable does not know about.
 
 ## Context propagation is automatic
 

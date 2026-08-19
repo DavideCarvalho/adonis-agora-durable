@@ -113,6 +113,59 @@ engine.register('fraud-check', '1', async (ctx, payment) => { /* … */ }, {
 
 `match` also bounds a wait in time — pass `{ timeoutMs }`, and if the deadline passes first the call throws `SignalTimeoutError`, exactly like `waitForSignal`.
 
+### Idempotent publishing — `opts.id`
+
+An upstream that delivers at-least-once will publish the same real-world fact twice, and by default each publish starts its own `onEvent` run. Give the publish the upstream's own event id and the second delivery becomes a no-op:
+
+```ts title="app/controllers/webhooks_controller.ts"
+async paymentSettled({ request, response }: HttpContext) {
+  const event = request.body() as { id: string; data: Payment }
+
+  // The provider's event id — redelivering it starts no second run.
+  await this.engine.publishEvent('payment.settled', event.data, { id: event.id })
+
+  return response.ok({})
+}
+```
+
+The id becomes part of the run id each subscriber is started with, and starting a run id twice is a no-op — so the guarantee is the same one that makes [scheduling](/docs/durable/authoring/scheduling) and webhooks idempotent. Omit it and each publish gets a fresh id, meaning each publish triggers.
+
+Two limits worth knowing: it deduplicates the `onEvent` *start* half only, not the fan-out to runs already parked on `ctx.waitForEvent`; and the buffered copy is stored under its own id, so a publish that reached nobody is still buffered.
+
+### Coalescing bursty triggers — `eventBatch`
+
+`onEvent` starts one run per publish, which is wrong for a chatty source. A hundred `activity` events in a minute should not become a hundred runs.
+
+`eventBatch` coalesces them, in one of two modes:
+
+```ts
+// Debounce: one run with the LAST payload, once the source goes quiet for 5s.
+engine.register('reindex', '1', async (ctx, activity) => { /* … */ }, {
+  onEvent: ['activity'],
+  eventBatch: { mode: 'debounce', windowMs: 5_000 },
+})
+
+// Batch: one run per 50 events, or per minute, whichever comes first.
+engine.register('flush-metrics', '1', async (ctx, input) => {
+  const { events } = input as { events: MetricEvent[] }
+  /* … */
+}, {
+  onEvent: ['metric'],
+  eventBatch: { mode: 'batch', maxSize: 50, windowMs: 60_000 },
+})
+```
+
+The two modes differ in what the run receives, and that is the thing to decide on:
+
+| Mode | Fires when | Input to the run |
+| --- | --- | --- |
+| `debounce` | the source has been quiet for `windowMs` | the **last** payload — earlier ones are discarded |
+| `batch` | `maxSize` events accumulate, or `windowMs` elapses from the first | `{ events: [...] }` — every payload, in order |
+
+Pick `debounce` when only the latest state matters (reindex a document that was edited eleven times). Pick `batch` when every event is a fact you must not lose (flush metrics, write an audit trail).
+
+The accumulation itself runs as a long-lived durable workflow, so the pending window survives a restart rather than losing the events buffered in it. Note that a publish routed into an accumulator counts as delivered, so it is never additionally buffered.
+
 ### Reliable (buffered) events
 
 A publish that reaches **no** live recipient — no `waitForEvent` matched *and* no `onEvent` subscriber exists — is **buffered** rather than silently dropped: exactly **one** copy is kept, and the **first** future `ctx.waitForEvent(name, { match })` whose `match` accepts its payload consumes it. Redelivery is point-to-point — the buffered copy goes to one waiter, never to a later-registered `onEvent` subscriber. This is the events analog of signal buffering, and like signals it survives the register/publish race in both directions.

@@ -50,6 +50,7 @@ Trade-off vs a real broker: throughput is bounded by polling + row contention �
 | --- | --- | --- |
 | `group` | — | **Deprecated.** Steps route by handler name, so an instance serves whatever names it registers — no group to declare. Accepted for back-compat and otherwise ignored; use `partition` for isolation. |
 | `partition` | — | Optional isolation partition suffixing every per-handler routing token (`<name>@<partition>`) this worker serves, matching a dispatch's `partition`. |
+| `namespace` | from the engine | Worker-pool namespace stamped on every row this instance writes and required on every row it claims, so one set of tables can host several pools. Setting it here is explicit and wins over the engine's propagation of `config.namespace`. |
 | `connection` | Lucid default | The Lucid connection to use. |
 | `pollIntervalMs` | `200` | Poll interval in ms. |
 | `leaseMs` | `30000` | Claim lease duration for crash recovery — a row whose worker died is reclaimed after this. |

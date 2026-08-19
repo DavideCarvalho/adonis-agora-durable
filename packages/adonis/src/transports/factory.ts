@@ -59,14 +59,52 @@ export interface QueueTransportConfig {
    * precedence over `connection`.
    */
   adapter?: AdapterFactory;
-  /** Worker group this instance serves (required on a worker process to register handlers). */
+  /**
+   * @deprecated Steps route BY HANDLER NAME, so this instance serves whatever names it registers.
+   * Accepted for back-compat and otherwise ignored. Use {@link partition} for isolation.
+   */
   group?: string;
+  /**
+   * Isolation partition suffixing every per-handler task queue this worker subscribes to
+   * (`<name>@<partition>`), matched against the `partition` a dispatch carries — so one backend can
+   * host several worker pools serving the same handler name without their tasks crossing. Unset (or
+   * `'default'`) subscribes to the bare handler-name queue.
+   */
+  partition?: string;
+  /**
+   * Logical deployment namespace folded into every queue name, so one backend can host several
+   * worker-pool namespaces without their tasks/results crossing. `'default'` (and absent) keeps queue
+   * names byte-identical to the un-namespaced scheme. Setting it here is explicit and wins over the
+   * engine's propagation of `config.namespace`.
+   */
+  namespace?: string;
   /** Queue-name prefix so several apps can share one backend without colliding. Default `durable`. */
   prefix?: string;
   /** Poll interval (ms) for the result/task/heartbeat/control loops. Default 200ms. */
   pollIntervalMs?: number;
+  /**
+   * How often (ms) the stalled-job reclaim sweep runs. On by default (30s); set `0` to disable it.
+   * A coarse background check, not run on every poll tick.
+   */
+  stalledCheckIntervalMs?: number;
+  /**
+   * How old (ms) a claim must be before the reclaim sweep presumes its worker dead and re-delivers the
+   * job. Default 30min — deliberately generous, because the claim is never renewed while the worker
+   * processes: raise it above your longest step, or a slow step gets double-run.
+   */
+  stalledThresholdMs?: number;
+  /**
+   * How many times one job may be reclaimed before the adapter fails it permanently instead of
+   * re-delivering — the bound on a poison job. Default 3.
+   */
+  maxStalledCount?: number;
   /** Stable id for this process (stamped on heartbeats / control `from`). Default a random id. */
   instanceId?: string;
+  /**
+   * Where a poll-loop failure is reported — a job whose handler threw, or a throwing tick. Default
+   * `console.error`. Point it at your app's logger to route transport failures into your logs.
+   */
+  onError?: (err: unknown) => void;
 }
 
 /** Options for the aviary-compatible BullMQ transport (the cross-ecosystem interop path). */
@@ -95,8 +133,24 @@ export interface BullMQTransportConfig {
 
 /** Options for the DB-table-backed (`@adonisjs/lucid`) transport. */
 export interface DbTransportConfig {
-  /** Worker group this instance serves (required on a worker process to register handlers). */
+  /**
+   * @deprecated Steps route BY HANDLER NAME, so this instance serves whatever names it registers.
+   * Accepted for back-compat and otherwise ignored. Use {@link partition} for isolation.
+   */
   group?: string;
+  /**
+   * Isolation partition suffixing every per-handler routing token this worker claims
+   * (`<name>@<partition>`), matched against the `partition` a dispatch carries. Unset (or `'default'`)
+   * claims the bare handler-name tokens.
+   */
+  partition?: string;
+  /**
+   * Logical deployment namespace stamped on every row this instance writes and required on every row
+   * it claims, so one set of tables can host several worker-pool namespaces without their
+   * tasks/results crossing. `'default'` (and absent) stamps `'default'`. Setting it here is explicit
+   * and wins over the engine's propagation of `config.namespace`.
+   */
+  namespace?: string;
   /** Lucid connection name to use. Defaults to the `Database` default connection. */
   connection?: string;
   /** Poll interval (ms) for the result/task/heartbeat/control loops. Default 200ms. */
@@ -200,9 +254,21 @@ export const transports = {
       return new QueueTransport({
         adapter,
         ...(config.group !== undefined ? { group: config.group } : {}),
+        ...(config.partition !== undefined ? { partition: config.partition } : {}),
+        ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
         ...(config.prefix !== undefined ? { prefix: config.prefix } : {}),
         ...(config.pollIntervalMs !== undefined ? { pollIntervalMs: config.pollIntervalMs } : {}),
+        ...(config.stalledCheckIntervalMs !== undefined
+          ? { stalledCheckIntervalMs: config.stalledCheckIntervalMs }
+          : {}),
+        ...(config.stalledThresholdMs !== undefined
+          ? { stalledThresholdMs: config.stalledThresholdMs }
+          : {}),
+        ...(config.maxStalledCount !== undefined
+          ? { maxStalledCount: config.maxStalledCount }
+          : {}),
         ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+        ...(config.onError !== undefined ? { onError: config.onError } : {}),
       });
     };
   },
@@ -237,6 +303,8 @@ export const transports = {
       return new DbTransport({
         db,
         ...(config.group !== undefined ? { group: config.group } : {}),
+        ...(config.partition !== undefined ? { partition: config.partition } : {}),
+        ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
         ...(config.connection !== undefined ? { connectionName: config.connection } : {}),
         ...(config.pollIntervalMs !== undefined ? { pollIntervalMs: config.pollIntervalMs } : {}),
         ...(config.leaseMs !== undefined ? { leaseMs: config.leaseMs } : {}),

@@ -68,7 +68,7 @@ export async function runStepHandler(
   const withEvents = (result: StepResult): StepResult =>
     events.length > 0 ? { ...result, events } : result;
   // Run the handler INSIDE the originating request's context (userRef/tenant/traceId), restored from
-  // the task snapshot, so cross-process propagation is automatic — `ctx.call(remoteStep, input)`
+  // the task snapshot, so cross-process propagation is automatic — `ctx.step(remoteStep, input)`
   // carries the caller's context with zero manual serialize/deserialize, and each task runs in its
   // own scope (no cross-task bleed on a long-lived worker). No-op without `@adonis-agora/context`.
   // Wire `log.heartbeat(progress)` to the transport's heartbeat lane (fire-and-forget — a lost beat

@@ -145,7 +145,7 @@ export default class PayoutWorkflow extends BaseWorkflow {
 
 ## Human-in-the-loop pauses — `ctx.breakpoint`
 
-`ctx.breakpoint(label?)` pauses a run at a point and waits for a human to resume it — the durable equivalent of a debugger breakpoint. It records a **visible `pending` checkpoint** (so the pause shows up in the run's timeline in the [dashboard](/docs/durable/observability/dashboard)), then suspends with zero compute. An operator resumes it from the dashboard, or you call `engine.continue(runId)` — the run replays past the breakpoint and carries on.
+`ctx.breakpoint(label?)` pauses a run at a point and waits for a human to resume it — the durable equivalent of a debugger breakpoint. It records a **visible `pending` checkpoint** (so the pause shows up in the run's timeline in the [dashboard](/docs/durable/observability/dashboard)), then suspends with zero compute. An operator resumes it from the [dashboard](/docs/durable/observability/dashboard#continuing-a-breakpoint) (or that page's `POST <path>/api/runs/:id/continue`), or you call `engine.continue(runId)` yourself — the run replays past the breakpoint and carries on.
 
 ```ts
 ctx.breakpoint(label?: string): Promise<void>
@@ -161,7 +161,9 @@ export default class ImportWorkflow extends BaseWorkflow {
   static workflow = { name: 'import', version: '1' }
 
   async run(ctx: WorkflowCtx, job: { id: string; dryRun: boolean }) {
-    const extracted = await ctx.step('extract', { jobId: job.id })
+    // The string form returns `unknown`, so name the payload with a generic (or pass a
+    // @Step reference, which infers it).
+    const extracted = await ctx.step<{ rows: Row[] }>('extract', { jobId: job.id })
     await ctx.setEvent('preview', extracted) // publish so a reviewer can inspect it
 
     // On a supervised import, park here until a human approves from the dashboard.

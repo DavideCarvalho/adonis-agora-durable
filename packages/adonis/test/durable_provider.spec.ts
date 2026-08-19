@@ -6,7 +6,24 @@ import type { ApplicationService } from '@adonisjs/core/types';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import DurableProvider from '../providers/durable_provider.js';
 import type { DurableConfig } from '../src/define_config.js';
-import { InMemoryStateStore, WorkflowEngine } from '../src/index.js';
+import {
+  InMemoryAdmissionBackend,
+  InMemoryStateStore,
+  type StepCheckpoint,
+  WorkflowEngine,
+} from '../src/index.js';
+
+/** In-memory store recording every checkpoint write, so a skipped write is observable. */
+class CheckpointSpyStore extends InMemoryStateStore {
+  readonly writes: { name: string; status: string }[] = [];
+  override async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
+    this.writes.push({ name: checkpoint.name, status: checkpoint.status });
+    await super.saveCheckpoint(checkpoint);
+  }
+  statusesFor(name: string): string[] {
+    return this.writes.filter((w) => w.name === name).map((w) => w.status);
+  }
+}
 
 /** In-memory store that records `ensureSchema()` calls, to assert boot-time provisioning. */
 class SchemaSpyStore extends InMemoryStateStore {
@@ -134,6 +151,104 @@ describe('DurableProvider', () => {
     const deps = engine as unknown as { remoteRedispatchMs?: number; remoteRedispatchMax?: number };
     expect(deps.remoteRedispatchMs).toBe(5 * 60 * 1000);
     expect(deps.remoteRedispatchMax).toBe(3);
+  });
+
+  it('forwards config.webhookUrl so ctx.webhook() gets a public url', async () => {
+    const { app, resolve } = fakeApp({
+      webhookUrl: (token) => `https://api.example.com/durable/webhooks/${token}`,
+    });
+    new DurableProvider(app).register();
+    const engine = await resolve();
+    let url: string | undefined;
+    engine.register('wf', '1', async (ctx) => {
+      url = ctx.webhook().url;
+      return 'ok';
+    });
+    await engine.start('wf', {}, 'hook-run');
+    await engine.waitForRun('hook-run');
+    expect(url).toMatch(/^https:\/\/api\.example\.com\/durable\/webhooks\/.+/);
+  });
+
+  it('leaves the webhook url undefined when config.webhookUrl is omitted', async () => {
+    const { app, resolve } = fakeApp();
+    new DurableProvider(app).register();
+    const engine = await resolve();
+    let url: string | undefined = 'unset';
+    engine.register('wf', '1', async (ctx) => {
+      url = ctx.webhook().url;
+      return 'ok';
+    });
+    await engine.start('wf', {}, 'hook-run-2');
+    await engine.waitForRun('hook-run-2');
+    expect(url).toBeUndefined();
+  });
+
+  it('forwards a ready admission backend instance', async () => {
+    const backend = new InMemoryAdmissionBackend(() => Date.now());
+    const { app, resolve } = fakeApp({ admission: backend });
+    new DurableProvider(app).register();
+    const engine = await resolve();
+    engine.registerQueue({ name: 'billing', concurrency: 1 });
+    // The engine registered the queue on OUR backend, not on its own in-process default.
+    expect(backend.handles('billing')).toBe(true);
+  });
+
+  it('calls an admission factory thunk at boot and forwards what it builds', async () => {
+    const backend = new InMemoryAdmissionBackend(() => Date.now());
+    let calls = 0;
+    const { app, resolve } = fakeApp({
+      admission: async () => {
+        calls += 1;
+        return backend;
+      },
+    });
+    new DurableProvider(app).register();
+    const engine = await resolve();
+    engine.registerQueue({ name: 'billing', concurrency: 1 });
+    expect(calls).toBe(1);
+    expect(backend.handles('billing')).toBe(true);
+  });
+
+  it('forwards trackStepStart: false so a local step skips its `running` checkpoint write', async () => {
+    const store = new CheckpointSpyStore();
+    const { app, resolve } = fakeApp({
+      trackStepStart: false,
+      store: 'spy',
+      stores: { spy: async () => store },
+    });
+    new DurableProvider(app).register();
+    const engine = await resolve();
+    engine.register('wf', '1', async (ctx) => ctx.localStep('a', async () => 1));
+    await engine.start('wf', {}, 'track-off');
+    await engine.waitForRun('track-off');
+    // Only the settled write — the extra in-flight `running` checkpoint is skipped.
+    expect(store.statusesFor('a')).toEqual(['completed']);
+  });
+
+  it('keeps the `running` checkpoint write when trackStepStart is omitted (default on)', async () => {
+    const store = new CheckpointSpyStore();
+    const { app, resolve } = fakeApp({ store: 'spy', stores: { spy: async () => store } });
+    new DurableProvider(app).register();
+    const engine = await resolve();
+    engine.register('wf', '1', async (ctx) => ctx.localStep('a', async () => 1));
+    await engine.start('wf', {}, 'track-on');
+    await engine.waitForRun('track-on');
+    expect(store.statusesFor('a')).toEqual(['running', 'completed']);
+  });
+
+  it('lets config.traceparent win over the @agora/otel:traceparent global slot', async () => {
+    const OTEL_TRACEPARENT = Symbol.for('@agora/otel:traceparent');
+    const g = globalThis as Record<symbol, unknown>;
+    g[OTEL_TRACEPARENT] = () => 'from-global';
+    try {
+      const { app, resolve } = fakeApp({ traceparent: () => 'from-config' });
+      new DurableProvider(app).register();
+      const engine = await resolve();
+      const thunk = (engine as unknown as { traceparent?: () => string | undefined }).traceparent;
+      expect(thunk?.()).toBe('from-config');
+    } finally {
+      delete g[OTEL_TRACEPARENT];
+    }
   });
 
   it('leaves the engine defaults when remoteRedispatchMs/Max are omitted (net off by default)', async () => {

@@ -78,6 +78,46 @@ All assertions read the store, so they work against any run the engine produced:
 | `assertStepAttempts(store, runId, name, n)` | the step took `n` attempts |
 | `recordedSteps(store, runId)` | returns the recorded step names |
 
-## Conformance suites
+## Conformance kits
 
-The package also ships conformance test suites — `state-store-conformance`, `transport-conformance`, and `admission-backend-conformance` — so if you write a **custom** [store](/docs/durable/stores), [transport](/docs/durable/transports), or admission backend, you can run the same battery of behavioral tests the built-in adapters pass against it. There's a `replay` helper too, for asserting a workflow body replays deterministically.
+Write a **custom** [store](/docs/durable/stores#writing-a-custom-store), [transport](/docs/durable/transports), or [admission backend](/docs/durable/reliability/flow-control) and you can run the exact battery of behavioural tests the bundled adapters pass. That is the definition of "correct" for an adapter — the prose in these docs is a summary of it.
+
+They live on **two different subpaths**, and which one a kit is on is not arbitrary:
+
+| Kit | Import from | For |
+| --- | --- | --- |
+| `assertTransportConformance(transport, idPrefix?)` | `@adonis-agora/durable/testing` | a custom `Transport` |
+| `runStateStoreContract(name, factory)` | `@adonis-agora/durable/testing/conformance` | a custom `StateStore` |
+| `runAdmissionBackendContract(name, factory)` | `@adonis-agora/durable/testing/conformance` | a custom `AdmissionBackend` |
+
+The two on `/conformance` **generate** their suite with vitest's `describe` / `it`, so they genuinely require vitest at import time. Keeping them on their own subpath is what lets `createTestEngine` and the assertions above stay importable from a Japa suite — a barrel re-exports everything, so a single subpath would have forced vitest on everyone. `assertTransportConformance` stays on `/testing` because it is a plain async function with no test-runner bindings, so it never needed vitest to begin with.
+
+```ts title="tests/my_transport.spec.ts"
+import { assertTransportConformance } from '@adonis-agora/durable/testing'
+import { MyTransport } from '../src/my_transport.js'
+
+// Throws on the first contract violation — call it from whichever runner you use.
+await assertTransportConformance(new MyTransport({ group: 'conformance' }))
+```
+
+```ts title="tests/my_store.spec.ts"
+import { runStateStoreContract } from '@adonis-agora/durable/testing/conformance'
+import { MyStateStore } from '../src/my_state_store.js'
+
+// Registers its own describe/it — this call IS the suite.
+runStateStoreContract('MyStateStore', async () => {
+  const store = new MyStateStore(/* connection */)
+  await store.ensureSchema?.()
+  return { store, cleanup: () => store.close() }
+})
+```
+
+```ts title="tests/my_admission.spec.ts"
+import { runAdmissionBackendContract } from '@adonis-agora/durable/testing/conformance'
+import { MyAdmissionBackend } from '../src/my_admission_backend.js'
+
+// The factory receives a TEST clock, so rate-limit windows are deterministic.
+runAdmissionBackendContract('MyAdmissionBackend', (clock) => new MyAdmissionBackend(clock))
+```
+
+There is also `assertReplayable` (on `/testing`) for asserting a workflow body replays deterministically.

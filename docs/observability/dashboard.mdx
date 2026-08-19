@@ -1,12 +1,12 @@
 ---
 title: Dashboard
-description: The embedded dashboard — a self-contained HTML page plus a JSON API, mounted into your AdonisJS routes. Lists runs, renders each run's step timeline, and exposes retry and cancel actions, all behind a configurable authorize guard.
+description: The embedded operations console — a React SPA plus a JSON API mounted into your AdonisJS routes. Filter runs, live-tail a run's timeline, fix-and-replay a bad input, act on runs in bulk, and read the worker fleet's health.
 icon: LayoutDashboard
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
-The dashboard mounts a control plane into your AdonisJS app: a self-contained HTML page plus its JSON API. It reads straight from the [state store](/docs/durable/stores) through the engine's read API, so it works without an OpenTelemetry collector. It ships in the main `@adonis-agora/durable` package — no extra install.
+The dashboard mounts an operations console into your AdonisJS app: a React single-page app plus the JSON API it runs on. It reads straight from the [state store](/docs/durable/stores) through the engine's read API, so it works without an OpenTelemetry collector. It ships in the main `@adonis-agora/durable` package — no extra install.
 
 ```bash
 node ace configure @adonis-agora/durable
@@ -30,9 +30,10 @@ export default defineConfig({
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `enabled` | `true` | When `false`, no routes are registered. |
-| `path` | `'/durable'` | Route prefix the dashboard mounts under. |
+| `enabled` | `true` | When `false`, no routes are registered at all. |
+| `path` | `'/durable'` | Route prefix the console mounts under. `'/'` mounts at the root. |
 | `authorize` | see below | Per-request guard: `(ctx: HttpContext) => boolean \| Promise<boolean>`. |
+| `dashboardAuth` | absent | Opt-in [session layer](/docs/durable/observability/dashboard-auth) on top of `authorize`. |
 
 ### Authorization
 
@@ -48,51 +49,196 @@ export default defineConfig({
 ```
 
 <Callout type="warn">
-The dashboard exposes retry and cancel actions that mutate runs. Always front it with a real guard in production — the default token gate is a floor, not a substitute for your app's auth.
+The console exposes retry, cancel, replay and bulk actions that mutate runs. Always front it with a real guard in production — the default token gate is a floor, not a substitute for your app's auth.
 </Callout>
 
-Prefer a real sign-in page over a bearer token? Opt into the built-in [dashboard login](/docs/durable/observability/dashboard-auth) (`dashboardAuth`) — a server-rendered login screen and signed session cookie that layers on top of `authorize`.
+Prefer a real sign-in page, or to open the console from an app where the operator is already signed in? Opt into the built-in [dashboard auth](/docs/durable/observability/dashboard-auth) (`dashboardAuth`), which layers a signed session cookie on top of `authorize`.
 
 ## Where it mounts
 
-All routes are relative to `path` (default `/durable`), each behind the `authorize` guard:
+All routes are relative to `path` (default `/durable`), and every one of them runs behind the `authorize` guard.
+
+### Pages
 
 | Method | Route | Purpose |
 | --- | --- | --- |
-| `GET` | `/durable` | the self-contained HTML dashboard |
-| `GET` | `/durable/api/runs` | list runs (`?status=`, `?workflow=`, `?tag=`, paged) |
-| `GET` | `/durable/api/runs/:id` | run detail — run + step timeline + children |
-| `POST` | `/durable/api/runs/:id/retry` | re-enqueue the run (→ `pending`, a worker resumes it) |
-| `POST` | `/durable/api/runs/:id/cancel` | cancel the run (body `{ compensate?: boolean }` to undo the saga first) |
-| `GET` | `/durable/api/health` | worker-group health |
+| `GET` | `/durable` | the React console (`index.html`, with the base path and API base injected) |
+| `GET` | `/durable/assets/:file` | the console's hashed JS/CSS bundle, served immutable |
+| `GET` | `/durable/legacy` | the original dependency-free HTML page |
 
-The routes are named (`durable_dashboard.index`, `durable_dashboard.runs.show`, …), so you can reference them from your own code or wrap them in middleware.
+`/durable/legacy` is the single-file page the console used to be: no build step, no JavaScript bundle, just a table and a handful of `fetch` calls. Keep it in mind for an environment where the SPA bundle cannot be served, or as a fallback while debugging the console itself.
+
+The console routes client-side on the URL hash (`#/run/<id>`), so a deep link needs no server-side rewrite.
+
+### Reading runs
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `GET` | `/durable/api/runs` | list runs — see the filters below |
+| `GET` | `/durable/api/runs/:id` | run detail: the run, its step `timeline`, and its `children` |
+| `GET` | `/durable/api/runs/:id/stream` | Server-Sent Events: this run's lifecycle events, live |
+
+`GET /api/runs` accepts:
+
+| Param | Meaning |
+| --- | --- |
+| `status` | one of `pending`, `running`, `suspended`, `blocked`, `completed`, `failed`, `cancelled`, `dead`. An unrecognised value is ignored, not rejected. |
+| `workflow` | exact workflow-name match |
+| `tag` | exact match against the run's tags |
+| `namespace` | exact match against the run's [worker-pool namespace](/docs/durable/cluster/roles-and-config) — omit it and the listing spans every namespace |
+| `attr` | a [search-attribute](/docs/durable/authoring/queries-and-updates) filter, `key:op:value`. Repeatable, and repeats are ANDed. |
+| `limit` | page size, default `50`, capped at `200` |
+| `offset` | page offset, default `0` |
+
+The `attr` ops are `eq`, `ne`, `gt`, `gte`, `lt`, `lte`. Values are coerced: `true`/`false` become booleans, anything numeric becomes a number, everything else stays a string. Only the first two colons delimit, so a value may contain colons of its own.
+
+```
+GET /durable/api/runs?namespace=eu-west&attr=amount:gte:5000&attr=tier:eq:enterprise&status=failed
+```
+
+The response is `{ runs, page: { limit, offset, count }, statuses }`. `page.count` is how many rows this page returned, not a total — `count === limit` is the "there may be more" signal.
+
+There is no separate checkpoints route: a run's step timeline comes back as the `timeline` array of `GET /api/runs/:id`, each entry carrying `seq`, `name`, `kind`, `status`, `attempts`, `workerGroup`, input/output/error, `events`, `parallelGroup`, and the derived `durationMs` / `queueMs`.
+
+#### Live-tailing one run
+
+`GET /api/runs/:id/stream` is an SSE endpoint. Each frame is a default `message` event whose `data` is one serialized engine lifecycle event for that run:
+
+```ts
+const source = new EventSource(`/durable/api/runs/${runId}/stream`)
+
+source.onmessage = (msg) => {
+  const event = JSON.parse(msg.data)
+  // event.type is one of run.started / run.completed / run.failed / run.suspended /
+  // step.started / step.completed / step.failed / capability.unavailable / protocol.incompatible
+  console.log(event.type, event.name, event.durationMs)
+}
+```
+
+<Callout type="info">
+The stream sends no keepalive comments and has no server-side idle timeout — it ends when the client disconnects. Behind a proxy that closes idle connections, reconnect from the client (`EventSource` does this on its own by default). The response carries `x-accel-buffering: no` so nginx does not buffer it.
+</Callout>
+
+### Acting on runs
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `POST` | `/durable/api/runs/:id/retry` | re-enqueue the run (→ `pending`, a worker resumes it) |
+| `POST` | `/durable/api/runs/:id/retry-with-input` | **fix and replay**: start a new run from a corrected input |
+| `POST` | `/durable/api/runs/:id/continue` | resume a run parked at a `ctx.breakpoint()` |
+| `POST` | `/durable/api/runs/:id/cancel` | cancel the run (body `{ compensate: true }` to undo the saga first) |
+| `POST` | `/durable/api/runs/:id/redispatch` | re-enqueue every remote step still `pending` on this run |
+| `POST` | `/durable/api/bulk/:action` | apply `retry` or `cancel` to everything a filter matches |
+
+Every one of these is **non-blocking**: they enqueue work and return, never replaying a workflow inline in the HTTP request.
+
+#### Fix and replay
+
+A run that failed on a bad input cannot be "retried" into success — a retry replays the same input. `retry-with-input` instead **starts a brand-new run** with a corrected input:
+
+```ts
+const res = await fetch(`/durable/api/runs/${runId}/retry-with-input`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', ...headers },
+  body: JSON.stringify({ input: { orderId: 'ord_42', amount: 1999 } }),
+})
+
+const { result } = await res.json()
+result.runId // 'run-abc~retry~1f4c9e02'
+```
+
+The new run inherits the original's workflow, tags and namespace, and starts with a clean history — no checkpoints are replayed. **The original run is left completely intact**, keeping its status, its error and its full timeline as the record of what went wrong.
+
+The link between the two is the run id itself: the new id is `<originalRunId>~retry~<short-uuid>`, and the console parses that suffix to draw the lineage between them. There is no separate parent column.
+
+#### Continuing a breakpoint
+
+`ctx.breakpoint()` parks a run indefinitely at a known point, with a visible `breakpoint` checkpoint in its timeline and no wake timer — a deliberate manual gate rather than a failure. `POST /api/runs/:id/continue` releases it, which is the console's counterpart to calling [`engine.continue(runId)`](/docs/durable/authoring/external-tasks#human-in-the-loop-pauses-ctxbreakpoint) from code.
+
+It answers `404` with `run <id> is not paused at a breakpoint` when the run has no pending breakpoint checkpoint, so the call is safe to fire blindly.
+
+#### Bulk actions
+
+`POST /api/bulk/:action` applies one action to **everything a filter matches**, where `:action` is `retry` or `cancel` (anything else is a `400`). The selection comes from the query string, using the same `status` / `workflow` / `tag` / `namespace` / `attr` filters as `GET /api/runs` — there is no id list to assemble:
+
+```
+POST /durable/api/bulk/retry?status=failed&workflow=charge-order&namespace=eu-west
+POST /durable/api/bulk/cancel?status=suspended&tag=stuck&compensate=true
+```
+
+`?compensate=true` runs the [saga compensations](/docs/durable/reliability/sagas) and is honoured for `cancel` only.
+
+The response is `{ matched, applied }`. `matched` is how many runs the filter returned; `applied` is how many the action actually changed. They differ when a run has already moved on — a run that throws or answers "nothing to do" is skipped rather than aborting the batch.
+
+<Callout type="warn" title="Bulk acts on at most 500 runs per call">
+The filter is evaluated with a hard cap of 500 and no paging. A filter matching more than that silently acts on the first 500 — narrow the filter (a tighter `namespace`, a time-bounded `attr`) and repeat, rather than assuming one call drained the backlog. Compare `matched` against `500` to tell.
+</Callout>
+
+### Fleet and topology
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `GET` | `/durable/api/workers` | per-worker heartbeats, grouped by routing token |
+| `GET` | `/durable/api/health` | the compact legacy shape: queue depth and a `stalled` flag per group |
+| `GET` | `/durable/api/topology` | this pod's `role`, plus its `tenant` when it is a store-less pod |
+| `GET` | `/durable/api/compat` | protocol/capability negotiation across the fleet, plus blocked runs |
+
+`GET /api/workers` returns the raw `GroupHealth[]` — for each routing token, its queue `depth` and the **individual live workers** with their `instanceId` and `lastBeatAt`. That is what tells "one worker is wedged" apart from "the whole group is down".
+
+`GET /api/health` is the older, compact view of the same data: it collapses `liveWorkers` to a count and adds `stalled: depth > 0 && liveWorkers === 0`. The legacy page still uses it; prefer `/api/workers` for anything new.
+
+`GET /api/compat` powers the compatibility panel described below: per group, each pod's protocol range and capabilities with a `compatible` / `degraded` / `incompatible` outcome and the exact reason, alongside every `blocked` run and why it parked.
+
+The routes are all named (`durable_dashboard.index`, `durable_dashboard.runs.show`, `durable_dashboard.runs.retry_with_input`, `durable_dashboard.bulk`, …), so you can reference them from your own code or wrap them in middleware.
 
 ## What it shows
 
-- **Runs** — every run with its status (**pending** / running / suspended / completed / failed / cancelled / **dead**), filterable. `pending` is a run that's been created and enqueued but not yet picked up by a worker. A `dead` run carries a distinct badge so a [poison pill](/docs/durable/reliability/dead-letter) is easy to spot.
-- **Step timeline** — the selected run's steps rendered in order: start through each step to the terminal state, tagged by kind (local / remote / sleep / signal), with worker group and duration. In-flight steps show up here while they run, not only on completion — a remote step in flight reads as `pending` and a local step's executing body as `running` (the engine's [`trackStepStart`](/docs/durable/concepts/workflows-and-steps#in-flight-visibility) option).
-- **Children** — a run's [child workflows](/docs/durable/authoring/child-workflows) are linked from its detail.
-- **Actions** — retry a failed/suspended/dead run, cancel a running one, and **cancel + undo** (cancel with [saga compensation](/docs/durable/reliability/sagas)). These are **non-blocking**: retry re-enqueues the run and cancel + undo runs the saga in the background — neither replays the workflow inline in the HTTP request, so the action returns immediately and a worker does the work.
+- **Runs** — every run with its status, filterable by status, workflow, tag, namespace and search attribute. `pending` is a run created and enqueued but not yet picked up; a `dead` run carries a distinct badge so a [poison pill](/docs/durable/reliability/dead-letter) is easy to spot.
+- **What a suspended run is waiting on** — a `suspended` run parked on a signal, a webhook callback, a child run or a breakpoint is surfaced as **waiting**, with what it is blocked on right in the row (`signal approve`, `child ord-42.child.0`, `breakpoint`). See below.
+- **Step timeline** — the selected run's steps in order, tagged by kind (local / remote / sleep / signal), with worker group, queue wait and duration. In-flight steps appear while they run, not only on completion — a remote step in flight reads as `pending`, and a local step's executing body as `running` (the [`trackStepStart`](/docs/durable/concepts/workflows-and-steps#in-flight-visibility) option).
+- **Live tail** — the open run streams its events over SSE, so a long run updates without a reload.
+- **Children and lineage** — a run's [child workflows](/docs/durable/authoring/child-workflows) are linked from its detail, as is the original of a fix-and-replay run.
+- **Actions** — retry, cancel, cancel + undo ([saga compensation](/docs/durable/reliability/sagas)), fix-and-replay, redispatch, continue, and the bulk equivalents of retry and cancel.
+
+### The `waiting` state
+
+`waiting` is not a ninth run status — it is a **derived view** of a `suspended` run. The engine records one generic `suspended` status; the listing joins it against the signal-waiter table (`listSignalWaiters`) and reports what the run is parked on:
+
+| `waiting.on` | The run is parked on |
+| --- | --- |
+| `signal` | a [`ctx.waitForSignal`](/docs/durable/concepts/sleep-and-signals) or `ctx.waitForEvent`; `name` is the signal or event name |
+| `webhook` | a [`ctx.webhook().wait()`](/docs/durable/authoring/webhooks) callback |
+| `child` | a [child run](/docs/durable/authoring/child-workflows); `name` is the child's run id |
+| `breakpoint` | a `ctx.breakpoint()` — a human has to release it |
+
+A `suspended` run with no waiter gets no `waiting` value, and that absence is itself informative: a bare `ctx.sleep`, an in-flight remote step and a run whose wake was lost all fall into that bucket. Use [`durable:runs --stale`](/docs/durable/cli) to separate the last one from the first two.
+
+`waiting` appears on the rows of `GET /api/runs` only, and only when the store exposes `listSignalWaiters` — a store-less `tenant` pod skips it silently.
 
 ## Fleet health
 
-When you run a [split or polyglot cluster](/docs/durable/cluster), the dashboard grows a **health / compatibility panel** fed by the [handshake](/docs/durable/cluster/handshake) descriptors and diagnostics events:
+When you run a [split or polyglot cluster](/docs/durable/cluster), the console grows a **health and compatibility panel** fed by the [handshake](/docs/durable/cluster/handshake) descriptors and diagnostics events:
 
-- **Per pod** — its protocol version, negotiated level (**compatible** / **degraded** / **incompatible**), and a red flag with the exact reason on a mismatch (e.g. *"worker speaks protocol 2, control-plane speaks 1 → stopped"*).
-- **Blocked runs** — runs parked because no live worker advertises a [required capability](/docs/durable/cluster/handshake#capability-aware-routing) (*"requires capability X, no worker"*), so a stuck fleet is diagnosable at a glance rather than a silent hang.
+- **Per pod** — its protocol version, negotiated level (**compatible** / **degraded** / **incompatible**), and a red flag with the exact reason on a mismatch (e.g. *"no common protocol major: local speaks [1, 1], remote speaks [2, 2]"*).
+- **Blocked runs** — runs parked because no live worker advertises a [required capability](/docs/durable/cluster/handshake#capability-aware-routing), so a stuck fleet is diagnosable at a glance rather than a silent hang.
 
-A store-less `tenant` api/dashboard pod serves this same view — its reads proxy to the control plane over the wire, so the panel looks identical whether or not the pod owns a store.
+A store-less `tenant` api/dashboard pod serves this same view — its reads proxy to the control plane over the wire, so the panel looks identical whether or not the pod owns a store. Two verbs have no wire equivalent yet and always answer `404` on such a pod: `retry-with-input` and `continue`.
 
 ## Calling the API directly
 
-The JSON API is a small, framework-light surface (`listRuns`, `getRun`, `retryRun`, `cancelRun`, `health` in the package's `handlers`), so you can also build your own UI or scripts on top of the same routes:
+The JSON API is a small, framework-light surface — `listRuns`, `getRun`, `retryRun`, `retryWithInputRun`, `continueRun`, `redispatchPendingRun`, `cancelRun`, `bulkAction`, `health`, `workers`, `topology` and `compat`, all exported from `@adonis-agora/durable/dashboard` — so you can build your own UI or operational scripts on the same routes:
 
 ```ts
-// list failed runs, then retry the first
-const res = await fetch('/durable/api/runs?status=failed', { headers })
-const { runs } = await res.json()
-await fetch(`/durable/api/runs/${runs[0].id}/retry`, { method: 'POST', headers })
+// Retry every run that failed on a transient charge error, in one call.
+const res = await fetch('/durable/api/bulk/retry?status=failed&workflow=charge-order', {
+  method: 'POST',
+  headers,
+})
+
+const { matched, applied } = await res.json()
+if (matched === 500) {
+  // The cap was hit — narrow the filter and repeat.
+}
 ```
 
 For deep operational health views (success rate, throughput, top failures) inside your existing observability UI, see the [Telescope](/docs/durable/observability/telescope) integration.

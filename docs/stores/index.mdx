@@ -36,11 +36,129 @@ export default defineConfig({
 
 A `StateStore` persists runs and checkpoints and exposes the primitives the engine needs for durability:
 
-- **Runs & checkpoints** — `createRun`, `updateRun`, `getRun`, `saveCheckpoint`, `getCheckpoint`, `listCheckpoints`.
-- **Recovery & leasing** — `listIncompleteRuns`, `listPendingRuns(limit)` (so workers poll for `pending` runs), `listDueTimers(nowMs)`, and the atomic `tryLockRun` / `renewRunLock` / `releaseRunLock` that make [one-instance-per-run](/docs/durable/concepts/durability#deploys-versioning--multiple-instances) leasing work.
-- **Signals** — `putSignalWaiter` / `takeSignalWaiter` and `bufferSignal` / `takeBufferedSignal` for the [signal](/docs/durable/concepts/sleep-and-signals) machinery.
-- **Querying** — `listRuns(query)` (status/workflow/tag/attribute filters) for the dashboard and CLI.
+- **Runs & checkpoints** — `createRun`, `updateRun`, `updateRunIf`, `getRun`, `deleteRun`, `saveCheckpoint`, `getCheckpoint`, `listCheckpoints`.
+- **Recovery & leasing** — `listIncompleteRuns`, `listPendingRuns(limit)` (so workers poll for `pending` runs), `listDueTimers(nowMs)`, and the atomic `tryLockRun` / `renewRunLock` / `releaseRunLock` that make [one-instance-per-run](/docs/durable/concepts/durability#deploys-versioning-multiple-instances) leasing work.
+- **Signals** — `putSignalWaiter` / `takeSignalWaiter` / `listSignalWaiters` / `removeSignalWaiter`, plus `bufferSignal` / `takeBufferedSignal` for the [signal](/docs/durable/concepts/sleep-and-signals) machinery.
+- **Events** — `bufferEvent` / `listBufferedEvents` / `removeBufferedEvent`, so a published event that matched no live waiter is still consumed by a later `ctx.waitForEvent`.
+- **Querying** — `listRuns(query)` (status/workflow/tag/namespace/attribute filters) for the dashboard and CLI.
+
+Five members are **optional**, and the engine works without every one of them:
+
+| Optional member | What you lose by omitting it |
+| --- | --- |
+| `ensureSchema()` | Boot-time provisioning. A store with nothing to provision (in-memory) simply has no schema to create. |
+| `transaction(work)` | `ctx.transaction` — the exactly-once "business write and checkpoint commit together" primitive — throws on a store without it. |
+| `recordStepHeartbeat(...)` | Step heartbeats are discarded, so a long remote step shows no liveness in the dashboard or `durable:runs`. |
+| `getLatestCheckpointByName(...)` | A fast path only. The engine falls back to `listCheckpoints` plus an in-JS filter. |
+| `listCheckpointsByNamePrefix(...)` | Same — a fast path, with the same fallback. |
+
+Everything else is **required**, including `updateRunIf`.
+
+## `updateRunIf` — the compare-and-set write
+
+```ts
+updateRunIf(
+  runId: string,
+  expectedStatuses: RunStatus[],
+  patch: Partial<WorkflowRun>,
+): Promise<boolean>
+```
+
+Apply `patch` **only if** the run's currently persisted `status` is one of `expectedStatuses` at write time. It returns `true` when the write landed and `false` when the predicate did not match. A non-match is a normal outcome, never a throw.
+
+<Callout type="warn" title="The predicate must be atomic with the write">
+For a SQL store the predicate belongs in the `UPDATE … WHERE` clause. For an in-process store it must be a synchronous check with no `await` between reading the status and mutating the row. A read-then-write in application code is a TOCTOU race, not a substitute: two racing callers can both observe a matching status before either writes.
+</Callout>
+
+### Why it exists
+
+A workflow turn computes its outcome from a run snapshot loaded when the turn began — and a turn can run for minutes across remote steps. Meanwhile the run's persisted status can change through a completely different path: an operator cancels it, the execution-timeout sweep marks it `cancelled`, a poison run is dead-lettered, or `ctx.all` in `failFast` mode cancels a sibling.
+
+With a plain `updateRun`, the turn's now-stale terminal write lands last and **resurrects a terminal run**: a cancelled run silently reports `completed`, its output is written, its parent is notified, and a `run.completed` event fires. `updateRunIf` moves the "is this run still eligible?" test into the same atomic write, so the loser of the race gets `false`, emits nothing, and reports the run's true current status instead.
+
+The engine leans on it in five places — the execution-timeout sweep, all three terminal/suspend transitions of a settling turn, and parking a run as `blocked` — and the conformance kit covers it in three cases, including the two-sequential-writes race directly.
+
+Here is the Lucid driver's implementation, as the shape to copy:
+
+```ts
+const affected = await trx
+  .from(DURABLE_TABLES.runs)
+  .where('id', runId)
+  .whereIn('status', expectedStatuses)
+  .update(row)
+
+return rowsAffected(affected) === 1
+```
+
+## Writing a custom store
+
+Implement every required member above, then run the shared conformance contract against it — that is the definition of "correct", not the prose here:
+
+```ts title="tests/my_store.spec.ts"
+import { runStateStoreContract } from '@adonis-agora/durable/testing/conformance'
+import { MyStateStore } from '../src/my_state_store.js'
+
+runStateStoreContract('MyStateStore', async () => {
+  const store = new MyStateStore(/* connection */)
+  await store.ensureSchema?.()
+
+  return {
+    store,
+    cleanup: async () => {
+      await store.close()
+    },
+  }
+})
+```
+
+The factory runs once per test case, so each case gets a fresh store. Two escape hatches exist for drivers that genuinely cannot satisfy a slice of the contract: `supportsAsyncTransaction: false` (a synchronous driver) and `supportsTagFilter: false`. If the backing infrastructure is not available — no Docker for a testcontainers store — throw `StateStoreUnavailableError` from the factory and the suite skips instead of failing.
 
 <Callout type="info">
-Writing a **custom store?** Implement the interface above; the optional `getLatestCheckpointByName` / `listCheckpointsByNamePrefix` are nice-to-have fast paths — the engine transparently falls back to `listCheckpoints` + an in-JS filter when they're absent, so a minimal store still works.
+The conformance kit lives on the `@adonis-agora/durable/testing/conformance` subpath rather than `@adonis-agora/durable/testing`, because it generates the suite with vitest's `describe`/`it`. See [Testing](/docs/durable/testing#conformance-kits).
+</Callout>
+
+## Encrypting payloads at rest
+
+`CodecStateStore` decorates any store and runs run/step **payloads** through a `PayloadCodec` — encoded on write, decoded on read — so inputs and outputs are never stored in the clear. Searchable metadata (id, status, workflow, tags, namespace, timestamps) and the structured `error` are left untouched, so the dashboard, queries and recovery keep working.
+
+```ts title="config/durable.ts"
+import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
+import { CodecStateStore, LucidStateStore, defineConfig, type PayloadCodec } from '@adonis-agora/durable'
+import db from '@adonisjs/lucid/services/db'
+import env from '#start/env'
+
+const key = Buffer.from(env.get('DURABLE_PAYLOAD_KEY'), 'base64') // 32 bytes
+
+const aesCodec: PayloadCodec = {
+  encode(value) {
+    const iv = randomBytes(12)
+    const cipher = createCipheriv('aes-256-gcm', key, iv)
+    const body = Buffer.concat([cipher.update(JSON.stringify(value), 'utf8'), cipher.final()])
+    return {
+      iv: iv.toString('base64'),
+      tag: cipher.getAuthTag().toString('base64'),
+      body: body.toString('base64'),
+    }
+  },
+  decode(value) {
+    const { iv, tag, body } = value as { iv: string; tag: string; body: string }
+    const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(iv, 'base64'))
+    decipher.setAuthTag(Buffer.from(tag, 'base64'))
+    const plain = Buffer.concat([decipher.update(Buffer.from(body, 'base64')), decipher.final()])
+    return JSON.parse(plain.toString('utf8'))
+  },
+}
+
+export default defineConfig({
+  store: 'encrypted',
+  stores: {
+    encrypted: async () => new CodecStateStore(new LucidStateStore(db), aesCodec),
+  },
+})
+```
+
+`encode` and `decode` are synchronous and `decode` must be the exact inverse of `encode` — wrap an async KMS behind a local cache yourself. Beyond run and checkpoint payloads the decorator also encodes buffered signal and event payloads.
+
+<Callout type="warn">
+`CodecStateStore` does not implement the optional `recordStepHeartbeat`, so wrapping a store trades persisted step heartbeats for encryption at rest. The live `step.started` event still fires.
 </Callout>

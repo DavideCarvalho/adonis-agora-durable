@@ -33,7 +33,7 @@ engine.register('invoice', '1', async (ctx, order: Order) => {
 })
 ```
 
-`ctx.now()` is the deterministic wall-clock; `ctx.sideEffect(fn)` runs `fn` once, checkpoints its result, and replays that same value without re-running `fn` — wrap **any** non-determinism you control (a UUID/ULID, `Math.random()`, a config/env read) in it. (It replaces the removed `ctx.random()` and `ctx.uuid()`.) Each is captured the first time and returned from the checkpoint on every replay. Reach for a raw `Date.now()`/`Math.random()`/`crypto.randomUUID()` only *inside* a step body (whose whole result is checkpointed) — never in the deterministic prefix of the workflow body.
+`ctx.now()` is the deterministic wall-clock; `ctx.sideEffect(fn)` runs `fn` once, checkpoints its result, and replays that same value without re-running `fn` — wrap **any** non-determinism you control (a UUID/ULID, `Math.random()`, a config/env read) in it. Each is captured the first time and returned from the checkpoint on every replay. Reach for a raw `Date.now()`/`Math.random()`/`crypto.randomUUID()` only *inside* a step body (whose whole result is checkpointed) — never in the deterministic prefix of the workflow body.
 
 <Callout type="warn">
 Enable the [`@adonis-agora/durable-eslint-plugin`](/docs/durable/tooling/linting) so these mistakes are caught at author time, in your editor and CI, rather than at replay time.

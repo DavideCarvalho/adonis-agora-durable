@@ -42,7 +42,7 @@ engine.register('checkout', '1', async (ctx, order) => {
 })
 ```
 
-`ctx.now()` covers timestamps; `ctx.sideEffect(fn)` captures any other generated value once and replays it verbatim (it replaces the removed `ctx.random()`/`ctx.uuid()` — pass your own generator).
+`ctx.now()` covers timestamps; `ctx.sideEffect(fn)` captures any other generated value once and replays it verbatim — pass your own generator.
 
 ## What it knows about a workflow body
 

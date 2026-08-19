@@ -1,3 +1,10 @@
+import type { AdmissionBackend } from './admission.js';
+import { admissions } from './admissions/factory.js';
+import type {
+  AdmissionContext,
+  AdmissionFactory,
+  RedisAdmissionConfig,
+} from './admissions/factory.js';
 import type {
   ControlPlaneConfig,
   StandaloneConfig,
@@ -91,6 +98,36 @@ export interface BaseDurableConfig {
    * dependency (`@adonisjs/redis`) is imported lazily, only when selected.
    */
   controlPlane?: ControlPlane | ControlPlaneFactory;
+  /**
+   * Backend for the remote-step flow-control gate (`ctx.step(name, input, { queue })`). Omit for the
+   * in-process default, whose concurrency/rate caps count **per engine instance**. Either a ready
+   * {@link AdmissionBackend}, or an {@link AdmissionFactory} built with the {@link admissions} factory
+   * (e.g. `admissions.redis({ connection: 'main' })`) so the peer dependency (`@adonisjs/redis`) is
+   * imported lazily, only when selected — which makes the caps GLOBAL across every replica.
+   */
+  admission?: AdmissionBackend | AdmissionFactory;
+  /**
+   * Build the public callback URL for a `ctx.webhook()` token, e.g.
+   * ``(token) => `https://api.example.com/durable/webhooks/${token}` ``. It populates the `url` field
+   * of the object `ctx.webhook()` returns, so a step can hand a third party a ready callback address.
+   * Omit to leave `url` undefined and build it yourself from the token.
+   */
+  webhookUrl?: (token: string) => string;
+  /**
+   * Supply the current W3C `traceparent` to stamp on every dispatched remote task, so a worker (the
+   * Python SDK included) continues the same distributed trace. When `@adonis-agora/diagnostics-otel`
+   * is installed the provider wires this automatically from the active span — set it here only to
+   * override that, or to bridge a tracer durable does not know about. Omit to send none.
+   */
+  traceparent?: () => string | undefined;
+  /**
+   * Persist a `running` checkpoint the moment a **local** step's body begins, so an in-flight step is
+   * visible in the dashboard and the REST/CLI listings before it finishes — not only once it settles.
+   * Default `true`. Set `false` on hot paths with many short local steps to halve their checkpoint
+   * writes; the live `step.started` event still fires either way, so you only lose the visibility that
+   * survives a page reload.
+   */
+  trackStepStart?: boolean;
   /** Recovery lease duration in ms. Default 30s. */
   leaseMs?: number;
   /** Unique id for this engine instance. Defaults to a random id. */
@@ -196,8 +233,11 @@ export function defineConfig(config: DurableConfig = { role: 'standalone' }): Du
   return { role: 'standalone', ...config } as DurableConfig;
 }
 
-export { transports, stores, controlPlanes };
+export { transports, stores, controlPlanes, admissions };
 export type {
+  AdmissionContext,
+  AdmissionFactory,
+  RedisAdmissionConfig,
   StandaloneConfig,
   ControlPlaneConfig,
   TenantConfig,

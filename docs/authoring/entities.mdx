@@ -205,7 +205,7 @@ engine.getEntityState<S>(name: string, key: string): Promise<S | undefined>
 …plus the two `ctx` verbs inside a workflow: `ctx.callEntity<R>(name, key, op, arg?)` (call + await result) and `ctx.signalEntity(name, key, op, arg?)` (fire-and-forget).
 
 <Callout type="info">
-**The `Entities` class.** `registerEntity`/`signalEntity`/`getEntityState` are thin delegators to an exported [`Entities`](https://github.com/adonis-agora) instance the engine constructs at boot (over an `EntityHost` — the small slice of the engine the subsystem needs). You rarely touch it directly; the engine methods are the supported surface. It exists as a standalone module so the entity runner (`__entity`) can register itself without the engine hard-coding the feature.
+Under the hood an entity is an ordinary durable run like any other, so everything else in these docs applies to it unchanged: it appears in the [dashboard](/docs/durable/observability/dashboard), it can be inspected and cancelled, and its per-operation checkpoints are the same checkpoints a workflow writes. The five methods above are the supported surface — you never register or start the underlying run yourself.
 </Callout>
 
 ## A note on longevity and history

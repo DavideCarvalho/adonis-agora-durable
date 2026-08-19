@@ -39,11 +39,37 @@ interface DurableWebhook<TPayload = unknown> {
   /** Public callback URL for `token`, built by the engine's webhookUrl option. */
   readonly url?: string
   /** Suspend until the callback arrives, then resume with its payload. */
-  wait(): Promise<TPayload>
+  wait(opts?: { timeoutMs?: number }): Promise<TPayload>
 }
 ```
 
 The shape matters: minting the handle and **waiting** on it are separate steps. You mint it (which fixes the `token`/`url`), hand the url to the third party inside a `ctx.step` so that handoff is itself checkpointed, and only then `await hook.wait()`. `wait()` parks the run on the same logical position the mint reserved — so it suspends with **zero compute** until the callback lands, and is replay-safe.
+
+### Not waiting forever
+
+With no `timeoutMs`, `wait()` suspends **indefinitely**. That is the right default for a callback that is guaranteed to arrive eventually, but it is a trap for anything else: a third party that quietly drops the request leaves a run parked with no wake timer, invisible to both the timer poller and crash recovery until someone goes looking.
+
+Give the wait a deadline and handle the timeout as the business outcome it is:
+
+```ts
+import { SignalTimeoutError } from '@adonis-agora/durable'
+
+const hook = ctx.webhook<{ status: 'settled' | 'rejected' }>()
+await ctx.step(requestSettlement, { orderId, callbackUrl: hook.url })
+
+try {
+  const result = await hook.wait({ timeoutMs: 30 * 60 * 1000 }) // 30 minutes
+  return { status: result.status }
+} catch (error) {
+  if (!(error instanceof SignalTimeoutError)) throw error
+
+  // The provider never called back. Reconcile instead of hanging.
+  const settlement = await ctx.step(pollSettlementStatus, { orderId })
+  return { status: settlement.status }
+}
+```
+
+The deadline is computed **once** and checkpointed, so a replay reuses the recorded wake time rather than restarting the clock — a run resumed after a crash still times out when it originally would have. Note that passing `timeoutMs` claims an extra logical position for the deadline, so add or remove it as a [versioned change](/docs/durable/authoring/versioning) on a workflow with runs in flight.
 
 ## Full example — a payment that calls back
 

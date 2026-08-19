@@ -1,11 +1,14 @@
 import { noNondeterminism } from './no-nondeterminism.js';
 
+/** Keep in sync with this package's `version` in package.json (guarded by `test/version.spec.ts`). */
+export const VERSION = '0.2.1';
+
 export const rules = {
   'no-nondeterminism': noNondeterminism,
 };
 
 const plugin = {
-  meta: { name: '@adonis-agora/durable-eslint-plugin', version: '0.1.0' },
+  meta: { name: '@adonis-agora/durable-eslint-plugin', version: VERSION },
   rules,
   configs: {} as Record<string, unknown>,
 };
