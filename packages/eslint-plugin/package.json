@@ -44,7 +44,7 @@
     "vitest": "3.2.7"
   },
   "engines": {
-    "node": "v26.7.0"
+    "node": ">=20.6.0"
   },
   "keywords": ["eslint", "eslint-plugin", "durable", "workflow", "determinism", "agora"]
 }

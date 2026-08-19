@@ -4,6 +4,11 @@
   "rangeStrategy": "pin",
   "packageRules": [
     {
+      "description": "Never touch `engines.node`. It declares the range of runtimes a package SUPPORTS, not a dependency to pin: the global `rangeStrategy: pin` rewrote it to the exact output of `node -v`, which warns on every consumer install and fails hard under `engine-strict`.",
+      "matchDepTypes": ["engines"],
+      "enabled": false
+    },
+    {
       "matchDepTypes": ["dependencies", "devDependencies"],
       "matchUpdateTypes": ["patch", "minor"],
       "automerge": true
