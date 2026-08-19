@@ -1,0 +1,128 @@
+---
+title: Events & interceptors
+description: The two programmatic hooks into a running engine — engine.subscribe for the lifecycle event stream (every EngineEvent type and its payload), and engine.use for onion middleware around a local step. Plus collectMetrics for a Prometheus endpoint and attachDurableDiagnostics for the diagnostics bus.
+icon: Radio
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+The [dashboard](/docs/durable/observability/dashboard), [OpenTelemetry](/docs/durable/observability/otel) and [Telescope](/docs/durable/observability/telescope) integrations are all built on the same two hooks, and both are public. Reach for them when you need something none of those give you: a metric with your own labels, an audit trail in your own tables, per-step tracing your tracer understands.
+
+## `engine.subscribe` — the lifecycle event stream
+
+`subscribe(listener)` receives every lifecycle event the engine emits, and returns the function that detaches it:
+
+```ts title="start/durable.ts"
+import engine from '@adonis-agora/durable/services/main'
+import logger from '@adonisjs/core/services/logger'
+
+const unsubscribe = engine.subscribe((event) => {
+  if (event.type !== 'run.failed') return
+
+  logger.error(
+    { runId: event.runId, workflow: event.workflow, err: event.error },
+    'durable run failed',
+  )
+})
+```
+
+A listener that throws cannot break workflow execution — the engine isolates each delivery — but it can still slow the run down, so keep the body cheap and hand anything expensive to a queue.
+
+### The event types
+
+`EngineEvent.type` is one of nine values. Every event carries `runId` and `at`; the rest of the payload depends on the type:
+
+| Type | Also carries | Emitted when |
+| --- | --- | --- |
+| `run.started` | `workflow`, `namespace` | a run begins executing (not when it is created — a `pending` run has not started) |
+| `run.completed` | `workflow`, `namespace`, `output` | a run finishes successfully |
+| `run.failed` | `workflow`, `namespace`, `error` | a run reaches a terminal failure, including a dead-letter |
+| `run.suspended` | `workflow`, `namespace` | a run parks — on a sleep, a signal, a child, a remote step, or singleton back-pressure |
+| `step.started` | `seq`, `name`, `kind` | a step's body begins |
+| `step.completed` | `seq`, `name`, `kind`, `output`, `durationMs`, `queueMs` | a step settles successfully |
+| `step.failed` | `seq`, `name`, `kind`, `error`, `durationMs`, `queueMs` | a step attempt fails (each retry emits its own) |
+| `capability.unavailable` | `workflow`, `namespace`, `error`, `diagnostics` | a dispatch is refused because no live worker advertises a [required capability](/docs/durable/cluster/handshake#capability-aware-routing) |
+| `protocol.incompatible` | `workflow`, `namespace`, `error`, `diagnostics` | a dispatch is refused because no live worker speaks a compatible protocol |
+
+`kind` is `local`, `remote`, `sleep` or `signal`. `queueMs` is how long a remote step waited before a worker picked it up, and `durationMs` how long it then ran — the pair that separates "the step is slow" from "the fleet is saturated".
+
+The two block events carry a `diagnostics` payload with everything needed to explain the block without guessing: the routing `token`, what the step `requires`, which capabilities were `missing`, how many live workers were considered, and the descriptors of both the control plane and the workers.
+
+<Callout type="warn">
+`run.suspended` fires on every park, and a run that sleeps in a loop parks many times. Never count `run.started` against `run.completed` to infer "runs in flight" — subtract terminal events from starts instead, or read the store.
+</Callout>
+
+<Callout type="info">
+A `step.progress` type is declared in the union but no engine path emits it today. Treat it as reserved: handle it defensively if you switch exhaustively, but do not build on it.
+</Callout>
+
+### Prometheus counters, for free
+
+`collectMetrics(engine)` subscribes for you and keeps counters you can scrape:
+
+```ts title="start/durable.ts"
+import router from '@adonisjs/core/services/router'
+import engine from '@adonis-agora/durable/services/main'
+import { collectMetrics } from '@adonis-agora/durable'
+
+const metrics = collectMetrics(engine)
+
+router.get('/metrics/durable', ({ response }) => {
+  response.header('content-type', 'text/plain; version=0.0.4')
+  return metrics.prometheus()
+})
+```
+
+The exposition carries `durable_runs_total{event}`, `durable_steps_total{event}`, `durable_runs_by_workflow_total{workflow,event}`, and `durable_step_duration_ms_sum` / `durable_step_duration_count` for an average step duration. `metrics.snapshot()` returns the same numbers as a plain object, and `metrics.stop()` detaches.
+
+Counters are **per process** and reset when it restarts, so scrape every instance and aggregate in Prometheus rather than expecting one pod to know the fleet's totals.
+
+### Bridging to the diagnostics bus
+
+If your app uses [`@adonis-agora/diagnostics`](/docs/diagnostics), every engine event is already on that bus — the provider calls `attachDurableDiagnostics(engine)` at boot whenever diagnostics is installed, with no configuration. Call it yourself only when you are running the engine outside the AdonisJS provider:
+
+```ts
+import { attachDurableDiagnostics } from '@adonis-agora/durable'
+
+const detach = attachDurableDiagnostics(engine)
+```
+
+## `engine.use` — middleware around a local step
+
+`use(interceptor)` wraps the **real execution** of every local step in an onion, and returns the function that removes it:
+
+```ts title="start/durable.ts"
+import engine from '@adonis-agora/durable/services/main'
+import logger from '@adonisjs/core/services/logger'
+
+engine.use(async (invocation, next) => {
+  const startedAt = performance.now()
+
+  try {
+    return await next()
+  } catch (error) {
+    logger.warn(
+      { workflow: invocation.workflow, step: invocation.stepName, attempt: invocation.attempt },
+      'durable step threw',
+    )
+    throw error
+  } finally {
+    histogram.observe(
+      { workflow: invocation.workflow, step: invocation.stepName },
+      performance.now() - startedAt,
+    )
+  }
+})
+```
+
+The interceptor receives the step's `runId`, `workflow`, `stepName`, `seq` and 1-based `attempt`, plus `next()`. Whatever it returns becomes the step's result — so an interceptor can transform an output — and whatever it throws fails the step, which then follows its normal retry policy.
+
+Three properties matter more than the signature:
+
+- **First registered is outermost.** Interceptors compose as an onion in registration order, so a logging interceptor registered first wraps a caching one registered second.
+- **They never fire on replay.** A replayed step returns its recorded output without executing, so the interceptor is not called. That is what makes timings measured here *real* execution timings rather than replay artefacts — and it is also why an interceptor is the wrong place to enforce an invariant that must hold on every turn.
+- **They wrap local steps only.** A dispatched `ctx.step` executes on a worker, in a different process, so there is no local body to wrap. To wrap those, register an interceptor on the worker's engine.
+
+<Callout type="warn">
+An interceptor runs **inside** the deterministic execution of a step, so it must not do anything that changes the checkpointed result between runs. Read the invocation, time it, log it, retry-classify its error — but do not make the returned value depend on wall-clock time, randomness or external state, or a replay will disagree with the recorded checkpoint.
+</Callout>
