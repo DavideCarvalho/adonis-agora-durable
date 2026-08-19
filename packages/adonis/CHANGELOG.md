@@ -1,5 +1,42 @@
 # @adonis-agora/durable
 
+## 0.24.0
+
+### Minor Changes
+
+- [#63](https://github.com/DavideCarvalho/adonis-agora-durable/pull/63) [`62a44a4`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/62a44a44b99c58d60fdb6d24767478e0c3cf19e5) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Export the ace-command building blocks and the schema-logger types from the package root.
+
+  `runWorkerLoop`, `runTick`, `listRuns`, `retryRun`, `renderRunsTable`, `attachLiveness`, `filterStale`, `staleHint`, `parseDurationMs` and `DEFAULT_STALE_MS` back `durable:work` / `durable:runs` / `durable:retry` and were documented as composable, but lived in an internal barrel with no `exports` entry — importing any of them failed. `CreateDurableTablesOptions` and `DurableSchemaLogger` are exported too, so the third argument of `createDurableTables(db, connection, { logger })` is nameable in a migration.
+
+- [#63](https://github.com/DavideCarvalho/adonis-agora-durable/pull/63) [`62a44a4`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/62a44a44b99c58d60fdb6d24767478e0c3cf19e5) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `config/durable.ts` now accepts `webhookUrl`, `admission`, `traceparent` and `trackStepStart`.
+
+  All four existed only as `WorkflowEngineDeps`, reachable solely by constructing a `WorkflowEngine` by hand — so there was no supported way to configure a webhook callback URL or a fleet-wide flow-control backend from an AdonisJS app, and passing them in `defineConfig({ ... })` was an excess-property error (or, once cast away, a silent no-op). The provider now reads and forwards each one:
+
+  - `webhookUrl: (token) => string` — populates the `url` on the object `ctx.webhook()` returns.
+  - `admission: AdmissionBackend | AdmissionFactory` — a ready backend, or a lazy thunk built with the new `admissions` factory namespace. `admissions.redis({ connection })` resolves an `@adonisjs/redis` connection by name and makes every `{ queue }` concurrency/rate cap fleet-wide instead of per-pod, importing the peer dependency only when selected.
+  - `traceparent: () => string | undefined` — an explicit builder wins over the `@adonis-agora/diagnostics-otel` global slot the provider already consumed, so a tracer durable does not know about can be bridged.
+  - `trackStepStart: boolean` — turn off the extra in-flight `running` checkpoint on hot paths with many short local steps.
+
+- [#63](https://github.com/DavideCarvalho/adonis-agora-durable/pull/63) [`62a44a4`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/62a44a44b99c58d60fdb6d24767478e0c3cf19e5) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `transports.queue(...)` and `transports.db(...)` now forward the isolation and reclaim options their transports already supported.
+
+  Both factories silently dropped everything the underlying `QueueTransport` / `DbTransport` accepted beyond a handful of fields, so documented knobs were unreachable from `config/durable.ts`: there was no way to run two worker pools on one backend (`partition`), to segment a namespace explicitly, to tune the stalled-job reclaim sweep (`stalledCheckIntervalMs`, `stalledThresholdMs`, `maxStalledCount`), or to route poll-loop failures into the app logger (`onError`). All of them now pass through, and `group` is marked deprecated on both configs to match the transports, which route by handler name.
+
+### Patch Changes
+
+- [#64](https://github.com/DavideCarvalho/adonis-agora-durable/pull/64) [`81bc949`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/81bc949c007dd691aec1a361615e629ec6925841) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Fix "Cancel + Undo" in the dashboard silently performing a plain cancel.
+
+  The console sends `POST /api/runs/:id/cancel?compensate=true` on the query string with no request body, but the handler read `compensate` from the JSON body only. The flag was therefore dropped on every cancel issued from the console: the request answered `200`, the UI reported success, and **the saga compensations never ran**. An operator who clicked a button labelled "Cancel and run saga compensations (undo completed steps in reverse)" was told it worked while completed steps were left in place — a wrong answer delivered silently, which is worse than a failed request.
+
+  `cancelRun` and `bulkAction` now read the flag from either channel. An explicit body value still wins, so every existing body-based caller behaves exactly as before and the query string is purely additive.
+
+  The coercion is an allowlist rather than a truthiness test — `?compensate=false` and `?compensate=0` mean **no**, where `Boolean(raw)` would have read both as yes and run an undo nobody asked for. Accepted: `true`/`1`/`yes`/`on` (and a bare `?compensate`) for yes, `false`/`0`/`no`/`off` for no, case- and whitespace-insensitive. An unrecognised value is now a `400` instead of falling back to a default the caller did not choose; previously `bulk` read any non-`'true'` value as no.
+
+  Also on the client: `durableClient.bulk(...)` accepts `compensate`, so the bulk endpoint's documented `?compensate=true` is reachable from the SPA client at all — it previously had no way to send it.
+
+- [#63](https://github.com/DavideCarvalho/adonis-agora-durable/pull/63) [`62a44a4`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/62a44a44b99c58d60fdb6d24767478e0c3cf19e5) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Declare `engines.node` as a supported RANGE again, and stop Renovate from re-pinning it.
+
+  All three packages shipped an exact runtime string (`"node": "v22.23.2"` / `"node": "v26.7.0"`) instead of a range. `engines.node` states which runtimes a package supports, so an exact value warns on every consumer install on any other Node and fails hard under `engine-strict`. The values were rewritten by Renovate's global `rangeStrategy: "pin"`, so `renovate.json` now disables updates for the `engines` dep type — otherwise the fix is undone on the next cycle.
+
 ## 0.23.0
 
 ### Minor Changes

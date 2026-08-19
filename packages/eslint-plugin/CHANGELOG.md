@@ -1,5 +1,17 @@
 # @adonis-agora/durable-eslint-plugin
 
+## 0.2.2
+
+### Patch Changes
+
+- [#63](https://github.com/DavideCarvalho/adonis-agora-durable/pull/63) [`62a44a4`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/62a44a44b99c58d60fdb6d24767478e0c3cf19e5) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Report the real package version in the plugin's `meta`.
+
+  `meta.version` was frozen at `0.1.0` while the package shipped `0.2.x`. ESLint surfaces `meta.version` in `--print-config` and in bug-report output, so a stale literal misidentifies which build produced a report. The version now comes from an exported `VERSION` constant, guarded by a new `test/version.spec.ts` that compares it against `package.json` (mirroring the one in `@adonis-agora/durable`), and `scripts/sync-version-literals.mjs` keeps it in sync on release.
+
+- [#63](https://github.com/DavideCarvalho/adonis-agora-durable/pull/63) [`62a44a4`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/62a44a44b99c58d60fdb6d24767478e0c3cf19e5) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Declare `engines.node` as a supported RANGE again, and stop Renovate from re-pinning it.
+
+  All three packages shipped an exact runtime string (`"node": "v22.23.2"` / `"node": "v26.7.0"`) instead of a range. `engines.node` states which runtimes a package supports, so an exact value warns on every consumer install on any other Node and fails hard under `engine-strict`. The values were rewritten by Renovate's global `rangeStrategy: "pin"`, so `renovate.json` now disables updates for the `engines` dep type — otherwise the fix is undone on the next cycle.
+
 ## 0.2.1
 
 ### Patch Changes
