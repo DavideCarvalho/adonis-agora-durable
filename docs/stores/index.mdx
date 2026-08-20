@@ -37,7 +37,7 @@ export default defineConfig({
 A `StateStore` persists runs and checkpoints and exposes the primitives the engine needs for durability:
 
 - **Runs & checkpoints** — `createRun`, `updateRun`, `updateRunIf`, `getRun`, `deleteRun`, `saveCheckpoint`, `getCheckpoint`, `listCheckpoints`.
-- **Recovery & leasing** — `listIncompleteRuns`, `listPendingRuns(limit)` (so workers poll for `pending` runs), `listDueTimers(nowMs)`, and the atomic `tryLockRun` / `renewRunLock` / `releaseRunLock` that make [one-instance-per-run](/docs/durable/concepts/durability#deploys-versioning-multiple-instances) leasing work.
+- **Recovery & leasing** — `listIncompleteRuns`, `listPendingRuns(limit)` (so workers poll for `pending` runs), `listDueTimers(nowMs)`, and the atomic `tryLockRun` / `renewRunLock` / `releaseRunLock` that make [one-instance-per-run](/docs/durable/concepts/durability#deploys-versioning--multiple-instances) leasing work.
 - **Signals** — `putSignalWaiter` / `takeSignalWaiter` / `listSignalWaiters` / `removeSignalWaiter`, plus `bufferSignal` / `takeBufferedSignal` for the [signal](/docs/durable/concepts/sleep-and-signals) machinery.
 - **Events** — `bufferEvent` / `listBufferedEvents` / `removeBufferedEvent`, so a published event that matched no live waiter is still consumed by a later `ctx.waitForEvent`.
 - **Querying** — `listRuns(query)` (status/workflow/tag/namespace/attribute filters) for the dashboard and CLI.

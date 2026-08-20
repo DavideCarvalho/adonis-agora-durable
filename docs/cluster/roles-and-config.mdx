@@ -60,7 +60,7 @@ export default defineConfig({
   role: 'tenant',
   transport: 'bullmq',
   transports: { bullmq: transports.bullmq({ connection: process.env.REDIS_URL }) },
-  partition: 'acme-corp',            // which tenant this pod serves (required)
+  partition: 'acme-corp',            // which tenant this pod serves (required) — see Tenancy
   tenant: { token: process.env.DURABLE_TENANT_TOKEN }, // its signed claim
   requestTimeoutMs: 10_000,          // ProxyRunGateway round-trip timeout
   // store: 'lucid'                  // ❌ compile error — a tenant pod may not name a store
@@ -187,6 +187,7 @@ The `RunRequestResponder` is the **trust boundary**. Beyond checking the token, 
 
 ## Next steps
 
+- **[Tenancy](/docs/durable/concepts/tenancy)** — what `namespace` and `partition` actually partition, and the rules that decide which namespace a new run gets.
 - **[Thin workers](/docs/durable/cluster/thin-workers)** — the store-less worker runtime, from `durable:worker` down to the turn runner.
 - **[Handshake & capability negotiation](/docs/durable/cluster/handshake)** — keep a mixed fleet version-safe.
 - **[Cross-ecosystem interop](/docs/durable/cluster/interop)** — add Python and NestJS workers.

@@ -20,7 +20,7 @@ Most worker pods need no code from this subpath. Configure the pod as a [`tenant
 node ace durable:worker
 ```
 
-It resolves the container-bound runtime, registers every handler under `app/steps`, advertises the workflow names it can serve, starts heartbeating, and drains on `SIGINT`/`SIGTERM`. Read [the CLI page](/docs/durable/cli#durableworker-the-store-less-worker) for the flags and the full sequence.
+It resolves the container-bound runtime, registers every handler under `app/steps`, advertises the workflow names it can serve, starts heartbeating, and drains on `SIGINT`/`SIGTERM`. Read [the CLI page](/docs/durable/cli#durableworker--the-store-less-worker) for the flags and the full sequence.
 
 Reach for the subpath directly when you are building the worker **outside** an AdonisJS app — a standalone Node service, a container whose whole job is one step handler, or a test that drives a runtime by hand.
 

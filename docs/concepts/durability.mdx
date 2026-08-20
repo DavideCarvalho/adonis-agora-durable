@@ -88,7 +88,7 @@ The [`@adonis-agora/durable-eslint-plugin`](/docs/durable/tooling/linting) catch
 ## Consequences
 
 - **Idempotency.** The engine guarantees logical exactly-once, but if the process dies *after* a remote worker ran and *before* its result was recorded, the step may physically run twice. Steps receive a stable `stepId` (`runId:seq`) — make handlers idempotent or dedupe on it.
-- **Retries.** Configure per step: `ctx.localStep(name, fn, { retries: 3, backoff: 'exp' })` for an in-process step, or `ctx.step(ref, input, { retries: 3, backoff: 'exp' })` for a dispatched one. Throw a [`FatalError`](/docs/durable/reliability/retries#fatalerror-never-retried) to stop retrying a business failure outright. See [Retries & backoff](/docs/durable/reliability/retries).
+- **Retries.** Configure per step: `ctx.localStep(name, fn, { retries: 3, backoff: 'exp' })` for an in-process step, or `ctx.step(ref, input, { retries: 3, backoff: 'exp' })` for a dispatched one. Throw a [`FatalError`](/docs/durable/reliability/retries#fatalerror--never-retried) to stop retrying a business failure outright. See [Retries & backoff](/docs/durable/reliability/retries).
 - **Self-healing recovery.** The engine resumes every run a previous process left `running` (`engine.recoverIncomplete()`, called every tick by the `durable:work` loop). This runs both on boot **and periodically** — so a run orphaned by a crashed worker is reclaimed within ~`leaseMs`, not only on the next deploy. While a run executes, its worker **renews the recovery lease**, so a live worker keeps a long-running run while a crashed worker's lease still expires and another instance takes over.
 
 ## Deploys, versioning & multiple instances

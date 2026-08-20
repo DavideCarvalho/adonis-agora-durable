@@ -33,7 +33,7 @@ Reach for a split topology when you have a concrete driver — not by default. `
 
 - **Scale the executor pool independently.** CPU-heavy steps shouldn't compete with the coordinator. `control-plane` + N `tenant` workers lets you scale the workers without touching the coordinator.
 - **Isolation & security.** A `tenant` worker pod has **no database credentials and no store binding at all** — a compromised worker cannot read or corrupt durable state. Isolation here is a structural fact, enforced at compile time (a `tenant` config *cannot name a store* — see [Roles & config](/docs/durable/cluster/roles-and-config)), not a runtime check.
-- **Per-tenant routing.** Route each tenant's runs to its own pool of pods with a `<name>@<tenant>` queue suffix, sharing one control plane and one store.
+- **Per-tenant routing.** Route each tenant's runs to its own pool of pods with a `<name>@<tenant>` queue suffix, sharing one control plane and one store. See [Tenancy](/docs/durable/concepts/tenancy) for the `namespace` vs `partition` axes and the isolation boundary.
 - **Polyglot / thin workers.** Because the wire is byte-compatible with the aviary (`nestjs-durable`) engine, a **Python worker** or a **NestJS worker** can execute your workflows' steps against the *same* Adonis control plane. See [Cross-ecosystem interop](/docs/durable/cluster/interop).
 
 ## What splits, and what doesn't
@@ -49,5 +49,6 @@ Your application code — `BaseWorkflow` subclasses in `app/workflows`, `@Step` 
 ## Next steps
 
 - **[Roles & config](/docs/durable/cluster/roles-and-config)** — the role-discriminated `config/durable.ts`, the worker vs api entrypoints, and layered tenant authentication.
+- **[Tenancy](/docs/durable/concepts/tenancy)** — what `namespace` and `partition` partition, and the boundary that keeps a store-less pod to its own runs.
 - **[Handshake & capability negotiation](/docs/durable/cluster/handshake)** — how a mixed fleet stays version-safe: descriptors, negotiation, capability-aware routing, and blocked runs.
 - **[Cross-ecosystem interop](/docs/durable/cluster/interop)** — run Adonis, NestJS, and Python workers on one control plane.

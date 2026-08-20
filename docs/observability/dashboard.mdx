@@ -153,7 +153,7 @@ The link between the two is the run id itself: the new id is `<originalRunId>~re
 
 #### Continuing a breakpoint
 
-`ctx.breakpoint()` parks a run indefinitely at a known point, with a visible `breakpoint` checkpoint in its timeline and no wake timer — a deliberate manual gate rather than a failure. `POST /api/runs/:id/continue` releases it, which is the console's counterpart to calling [`engine.continue(runId)`](/docs/durable/authoring/external-tasks#human-in-the-loop-pauses-ctxbreakpoint) from code.
+`ctx.breakpoint()` parks a run indefinitely at a known point, with a visible `breakpoint` checkpoint in its timeline and no wake timer — a deliberate manual gate rather than a failure. `POST /api/runs/:id/continue` releases it, which is the console's counterpart to calling [`engine.continue(runId)`](/docs/durable/authoring/external-tasks#human-in-the-loop-pauses--ctxbreakpoint) from code.
 
 It answers `404` with `run <id> is not paused at a breakpoint` when the run has no pending breakpoint checkpoint, so the call is safe to fire blindly.
 

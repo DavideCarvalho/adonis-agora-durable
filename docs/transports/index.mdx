@@ -108,5 +108,5 @@ Every transport carries the same JSON `RemoteTask` (dispatch) and `StepResult` (
 <Callout type="info">
 A worker process is the [`durable:work`](/docs/durable/cli) command plus the step handlers it serves (from `app/steps`, discovered automatically). Run one engine-side process, which consumes results, and one or more worker processes.
 
-Note that a `node ace` console or REPL process deliberately does **not** consume from the broker — see [`consumers`](/docs/durable/transports/queue#consumers-why-a-node-ace-script-does-not-drain-the-queue).
+Note that a `node ace` console or REPL process deliberately does **not** consume from the broker — see [`consumers`](/docs/durable/transports/queue#consumers--why-a-node-ace-script-does-not-drain-the-queue).
 </Callout>

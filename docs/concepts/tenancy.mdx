@@ -1,0 +1,161 @@
+---
+title: Tenancy
+description: The two isolation axes — namespace on the engine and partition on the transport — what each one actually partitions, and the boundary that keeps a store-less pod to its own runs.
+icon: Building2
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+Tenancy answers one question: **whose runs are these, and which pool executes them.** It is
+independent of how many processes you run — [Topologies](/docs/durable/cluster) covers that. This page
+is what the isolation axes mean once you reach for them.
+
+There are exactly two, they take the same kind of value, and they are not interchangeable:
+
+| Axis | Set on | Partitions |
+| --- | --- | --- |
+| **`namespace`** | the engine, in `config/durable.ts` | the **store**: which runs this engine polls, recovers and resumes. Also prefixes the transport's keys. |
+| **`partition`** | the transport (and a `tenant` pod's config) | the **queues**: the `<name>@<partition>` routing token a dispatch targets and a worker serves. |
+
+A useful shorthand: `namespace` is what a control plane **polls**; `partition` is what a worker
+**subscribes to**.
+
+## `namespace` — the store poll scope
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  namespace: 'blue',      // this engine's pool
+  transport: 'bullmq',
+  transports: { bullmq: transports.bullmq({ connection: process.env.REDIS_URL }) },
+  store: 'lucid',
+  stores: { lucid: stores.lucid({ connection: 'pg' }) },
+})
+```
+
+It isolates two things at once:
+
+- **The store.** Every run this engine creates is stamped with its namespace, and the poll paths —
+  driving pending runs, recovering incomplete ones, resuming due timers, waking blocked runs — only
+  act on runs carrying it. `resume` of a run from another namespace throws `NamespaceMismatch` and
+  releases the lock rather than replaying someone else's history.
+- **The transport.** A non-default namespace segments the key prefix: `durable` becomes
+  `durable-<namespace>` across every queue and key the pool uses.
+
+Both follow one **default-is-bare** rule: `'default'` (the default value) leaves every name
+byte-identical to a single-pool deployment. Only a real, non-default namespace prefixes anything.
+
+<Callout type="warn">
+`namespace` is a **scope, not a wildcard**. Unlike some cluster designs, there is no "operator with no
+namespace drives everyone" mode here — an engine polls exactly one namespace, and `'default'` is just
+another one. A run stamped `acme` is invisible to a control plane on `'default'`.
+</Callout>
+
+## `partition` — the queue suffix
+
+Where `namespace` decides *which runs a control plane owns*, `partition` decides *which pool of
+workers executes them*. It is set on the transport, and both sides must agree:
+
+```ts
+// Dispatch side — this engine's steps route to `<name>@acme`
+transports.bullmq({ connection: process.env.REDIS_URL, partition: 'acme' })
+
+// Worker side — a store-less pod declares the tenant it serves
+export default defineConfig({
+  role: 'tenant',
+  transport: 'bullmq',
+  transports: { bullmq: transports.bullmq({ connection: process.env.REDIS_URL }) },
+  partition: 'acme',
+})
+```
+
+Every routing token becomes `<name>@<partition>`, so two pools serving the same step name never cross.
+A worker on no partition serves the bare token — which is the same queue every un-partitioned process
+in the deployment is on.
+
+Inside a thin worker's own workflow turn, `ctx.step(name, input, { group })` overrides the token for
+one step; omitted, it inherits the worker's partition, so a workflow and the steps it dispatches stay
+in the same pool by default. The same suffix is what a
+[Python worker](/docs/durable/python) matches with `run_redis_worker(worker, partition=...)`.
+
+## The isolation boundary
+
+A store-less pod holds no database credentials, so every read, control action and run-start it
+performs is a wire request answered by the control plane's `RunRequestResponder`. That responder — not
+the client — is the boundary, and it enforces:
+
+- **`listRuns` is namespace-forced** to the tenant it derived. The client's `namespace` is
+  *discarded*, never merely validated, so a tenant cannot widen its query into another's.
+- **Every runId-bearing verb** (`getRun`, `getCheckpoints`, `getSearchAttributes`, `signal`, `cancel`,
+  `redispatch`) loads the run **first** and rejects with `cross-tenant` when `run.namespace` isn't the
+  derived tenant — anti-IDOR, before anything mutates.
+- **`workerHealth` is group-scoped** to the tenant's own `@<tenant>` queues; the operator's bare groups
+  and every other tenant's are dropped.
+- **`start` forces the run's namespace** to the derived tenant, so a run a tenant starts is owned by,
+  and later only reachable by, that tenant.
+- **Unknown verbs are rejected** rather than silently ignored.
+
+The guarantee therefore holds even against a misbehaving client.
+
+<Callout type="warn">
+It is only as strong as the claim it reads. The `tenant` on a wire request is asserted by the caller.
+Pair this with
+[layered tenant authentication](/docs/durable/cluster/roles-and-config#layered-tenant-authentication):
+network/prefix segmentation, plus a signed token the control plane derives the tenant *from* instead of
+trusting the body.
+</Callout>
+
+## Which namespace a new run gets
+
+- **A top-level `start`** is stamped with the starting engine's namespace, unless the call passes
+  `opts.namespace` explicitly.
+- **A run started by a store-less pod** is stamped with the tenant the responder verified — the pod
+  cannot choose.
+- **A retry** (`retryWithInput`) re-stamps the new run with the **original run's** namespace, so a
+  fix-and-replay of a tenant's run stays that tenant's instead of falling back to the engine's own.
+- **A child run** is stamped by the engine that starts it, not by the parent run's record. Keep a
+  parent and its children in one namespace, or pass the namespace explicitly when starting a child, so
+  a fan-out doesn't land in a pool nothing is polling.
+
+## Sharing one store and one broker
+
+Because the two axes are independent, one Redis/Postgres pair can host several non-interchangeable
+pools:
+
+- **Per-tenant worker pools, one control plane.** Keep every run in the control plane's namespace and
+  route execution with `partition`. The control plane polls and recovers everything; each tenant's
+  workers only ever see `<name>@<their tenant>`. This is the shape the
+  [cluster docs](/docs/durable/cluster) describe.
+- **Fully separate pools.** Give each pool its own `namespace` — and its own control plane, since an
+  engine polls only its own. Runs, queues and keys are all prefixed, so a dev cluster and a developer's
+  laptop can share infrastructure without either driving the other's runs.
+
+<Callout type="info">
+The two combine, and they answer different questions. Reach for `partition` when the runs are the same
+system's but the *execution* must be isolated. Reach for `namespace` when the *runs themselves* belong
+to different deployments.
+</Callout>
+
+## Pitfalls
+
+- **A worker on no partition claims the shared pool's work.** An un-partitioned worker is on the bare
+  `<name>` tokens — the exact queues every un-partitioned process in the deployment is on. A local
+  process left running against a shared broker is not "another consumer"; it competes for, and steals,
+  the deployed fleet's tasks. Give it a real partition.
+- **A run stamped into a namespace nothing polls sits pending forever.** Passing `opts.namespace` (or
+  starting from a tenant pod whose tenant differs from the control plane's namespace) routes the run to
+  a pool that must actually have an engine polling it. There is no fallback owner.
+- **A stale local worker with an old build can misroute a run even when partitioned.** A process left
+  running after a step or workflow rename can pick up a run with code that no longer matches its
+  history — a `NonDeterminismError` or a hung run. Kill stale processes; a distinct partition is not
+  protection against a stale build.
+- **`listRuns`'s namespace is enforced server-side.** A tenant cannot widen its query by passing a
+  different `namespace` — the responder overwrites it unconditionally. Don't build a client-side filter
+  and call it isolation; there isn't one to bypass in the first place.
+
+## Next steps
+
+- **[Topologies](/docs/durable/cluster)** — the deployment shapes these axes ride on.
+- **[Roles & config](/docs/durable/cluster/roles-and-config)** — the role-discriminated config, the
+  `runGateway` surface, and layered tenant authentication.
+- **[Thin workers](/docs/durable/cluster/thin-workers)** — the store-less runtime that serves a
+  partition.

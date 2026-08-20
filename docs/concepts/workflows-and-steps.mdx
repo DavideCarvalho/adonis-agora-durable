@@ -326,7 +326,7 @@ Each beat does three things:
 
 - **It rearms the step's `timeoutMs`.** That window means "maximum silence", not "maximum duration" — so a
   step that beats every few seconds can run for an hour under a `timeoutMs: 30_000` and never time out,
-  while a worker that dies is caught within the window. See [Retries & timeouts](/docs/durable/reliability/retries#queue-wait-vs-silence-while-running-pickuptimeoutms).
+  while a worker that dies is caught within the window. See [Retries & timeouts](/docs/durable/reliability/retries#queue-wait-vs-silence-while-running--pickuptimeoutms).
 - **It persists the `progress` payload on the step's checkpoint**, so `durable:runs` and the
   [dashboard](/docs/durable/observability/dashboard) can show *where* a long step is, not just that it is running.
 - **It costs almost nothing.** Beats are throttled — at most one every 5 seconds leaves the worker, and the
