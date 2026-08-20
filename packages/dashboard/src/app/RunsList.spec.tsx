@@ -137,6 +137,89 @@ describe('<RunsList> virtualization', () => {
   });
 });
 
+describe('<RunsList> row identity across reorders', () => {
+  /** Heights that vary BY RUN rather than by position — the condition the bug needs. A row whose
+   *  workflow name marks it tall measures TALL_ROW_HEIGHT; every other row measures FAKE_ROW_HEIGHT.
+   *  Keyed on rendered text, so a measurement can only follow the run, never the slot. */
+  function stubHeightByContent() {
+    const heightDesc = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetHeight');
+    const widthDesc = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetWidth');
+    Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
+      configurable: true,
+      get(this: HTMLElement) {
+        return this.textContent?.includes(TALL_WORKFLOW) ? TALL_ROW_HEIGHT : FAKE_ROW_HEIGHT;
+      },
+    });
+    Object.defineProperty(HTMLElement.prototype, 'offsetWidth', {
+      configurable: true,
+      value: FAKE_VIEWPORT_WIDTH,
+    });
+    return () => {
+      if (heightDesc) Object.defineProperty(HTMLElement.prototype, 'offsetHeight', heightDesc);
+      if (widthDesc) Object.defineProperty(HTMLElement.prototype, 'offsetWidth', widthDesc);
+    };
+  }
+
+  const TALL_WORKFLOW = 'checkout-tall';
+  const TALL_ROW_HEIGHT = 200;
+  let restore: () => void;
+
+  beforeEach(() => {
+    vi.stubGlobal('ResizeObserver', NoopResizeObserver);
+    restore = stubHeightByContent();
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    restore();
+  });
+
+  function run(id: string, workflow: string, second: number): WorkflowRun {
+    return {
+      id,
+      workflow,
+      workflowVersion: '1',
+      status: 'completed' as const,
+      createdAt: new Date(2026, 0, 1, 0, 0, second).toISOString(),
+      updatedAt: new Date(2026, 0, 1, 0, 0, second).toISOString(),
+    };
+  }
+
+  function trackHeight(container: HTMLElement): number {
+    const style = container.querySelector('ul')?.getAttribute('style') ?? '';
+    return Number(style.match(/height:\s*([\d.]+)px/)?.[1] ?? 0);
+  }
+
+  const listProps = {
+    health: [],
+    onSelect: noop,
+    onSelectTag: noop,
+    onSelectNamespace: noop,
+    onSelectOrigin: noop,
+    emptyNotice,
+  };
+
+  it("a run's measured height follows the run when the poll pushes it down an index", async () => {
+    // The live poll reorders this list in place: a new run arrives at the top and every existing row
+    // moves down one index WITHOUT remounting, so the list `key` that covers filter changes does
+    // nothing here. Keyed by index, the tall run's height would stay behind at the slot it left.
+    const tall = run('run-tall', TALL_WORKFLOW, 1);
+    const before = [tall, run('run-b', 'checkout', 2), run('run-c', 'checkout', 3)];
+
+    const { container, rerender } = render(
+      <RunsList runs={before} allRuns={before} {...listProps} />,
+    );
+    await waitFor(() => expect(trackHeight(container)).toBe(TALL_ROW_HEIGHT + FAKE_ROW_HEIGHT * 2));
+
+    const after = [run('run-new', 'checkout', 4), ...before];
+    rerender(<RunsList runs={after} allRuns={after} {...listProps} />);
+
+    // The tall run still measures tall from its new index, and the newcomer measures short — so the
+    // track grows by exactly one short row. Under index keying the tall height stays at index 0,
+    // where the newcomer now sits, and the total comes out one row's difference short.
+    await waitFor(() => expect(trackHeight(container)).toBe(TALL_ROW_HEIGHT + FAKE_ROW_HEIGHT * 3));
+  });
+});
+
 describe('<RunsList> infinite-scroll pagination', () => {
   beforeEach(() => {
     vi.stubGlobal('ResizeObserver', NoopResizeObserver);

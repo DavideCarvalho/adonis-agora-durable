@@ -796,10 +796,20 @@ export function RunsList({
   onLoadMore?: () => void;
 }) {
   const parentRef = useRef<HTMLDivElement>(null);
+  // React keys these rows by run id, so the virtualiser has to key its size and element caches by the
+  // same thing. Under its default key — the array index — a surviving run that moves to a different
+  // index does not remount, so its measurement is never re-attributed and each index keeps the height
+  // of whoever sat there before, putting every row offset and `getTotalSize()` out by that difference.
+  // The list's `key` covers filter changes by remounting; this covers what a remount cannot, which is
+  // the poll reordering the list in place as one new run arrives and pushes every row down an index.
+  // Depends on `runs` on purpose: a contents change under an unchanged count has to invalidate the
+  // memoised measurements, and this callback's identity is what does that.
+  const getItemKey = useCallback((index: number) => runs[index]?.id ?? index, [runs]);
   const rowVirtualizer = useVirtualizer({
     count: runs.length,
     getScrollElement: () => parentRef.current,
     estimateSize: () => RUN_ROW_ESTIMATE_PX,
+    getItemKey,
     overscan: 10,
     // Seeds a non-zero size before the real ResizeObserver measurement lands, so the very first paint
     // (and a jsdom/happy-dom test harness with no real layout engine) still renders a bounded window
