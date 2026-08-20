@@ -183,6 +183,23 @@ interface RegisteredWorkflow {
 
 const versionKey = (name: string, version: string): string => `${name}@${version}`;
 
+/**
+ * The routing token a dispatched step lands on: the step's own (broker-safe) name, suffixed by the
+ * tenant the RUN belongs to. `runNamespace` — not the executing engine's namespace — is the tenant
+ * axis, because an operator (namespace unset) drives runs of EVERY tenant: deriving the token from
+ * the engine would send a tenant's work to the operator's own bare pool.
+ *
+ * An explicit {@link StepDef.partition} still wins, so a step pinned to a dedicated pool stays pinned.
+ * `tenantGroup` maps `undefined`/`''`/`'default'` to the BARE token, so a single-pool deployment (and
+ * every `default`-namespace run) keeps byte-identical wire names.
+ */
+function stepGroup(
+  step: { name: string; partition?: string | undefined },
+  runNamespace?: string | undefined,
+): string {
+  return tenantGroup(sanitizeQueueToken(step.name), step.partition ?? runNamespace);
+}
+
 /** The id for the next continuation of a run: `r` → `r~1` → `r~2` … (stable, traceable lineage). */
 function nextContinuationId(runId: string): string {
   const m = runId.match(/^(.*)~(\d+)$/);
@@ -238,9 +255,14 @@ export interface WorkflowEngineDeps {
   /**
    * Worker-pool partition for this engine. Stamped on every run it creates; the poll paths
    * (`runPending` / `recoverIncomplete` / `resumeDueTimers` / `sweepTimeouts`) only act on runs in
-   * this namespace, and `resume` of a foreign run throws {@link NamespaceMismatch}. Default
-   * `'default'` — byte-identical to a single-pool deployment. Set distinct values to safely share ONE
-   * state store across non-interchangeable pools (e.g. local dev vs a cluster).
+   * this namespace, and `resume` of a foreign run throws {@link NamespaceMismatch}.
+   *
+   * **Leaving it UNSET makes this engine an operator**: it drives, recovers and resumes runs of EVERY
+   * namespace (the store's poll filters no-op on `undefined`) and leaves its transports on their bare
+   * prefix. That is what lets one control plane serve many tenant pools — the queue a step lands on
+   * is derived from the RUN's namespace, not this engine's. Set a value to scope the instance to one
+   * pool instead, so ONE state store can be shared across non-interchangeable pools (e.g. local dev
+   * vs a cluster). `'default'` and `''` are the bare pool, byte-identical to a single-pool deployment.
    */
   namespace?: string | undefined;
   /** Recovery lease duration in ms — how long this instance owns a run it picked up. Default 30s. */
@@ -394,8 +416,9 @@ export class WorkflowEngine {
   private readonly controlPlane?: ControlPlane | undefined;
   private readonly clock: () => number;
   private readonly instanceId: string;
-  /** Worker-pool partition stamped on created runs and used to scope the poll/resume paths. */
-  private readonly namespace: string;
+  /** Worker-pool partition stamped on created runs and used to scope the poll/resume paths.
+   *  `undefined` is the OPERATOR: it scopes nothing and belongs to every namespace. */
+  private readonly namespace: string | undefined;
   private readonly leaseMs: number;
   private readonly maxRecoveryAttempts?: number | undefined;
   private readonly reconcileMs: number | undefined;
@@ -490,7 +513,7 @@ export class WorkflowEngine {
     // instead of waiting for their retry tick. Best-effort (the retry tick remains the guarantee).
     this.admission.onFreed?.((queue) => this.wakeQueueWaiters(queue));
     this.instanceId = deps.instanceId ?? globalThis.crypto.randomUUID();
-    this.namespace = deps.namespace ?? 'default';
+    this.namespace = deps.namespace;
     // The control-plane's own handshake descriptor — the side negotiated AGAINST each worker so a
     // protocol-incompatible fleet is detected before dispatch (design §7.3). Scoped to this engine's
     // namespace/partition; capabilities/protocol are config-driven (default: current single major).
@@ -500,13 +523,17 @@ export class WorkflowEngine {
         ? { capabilities: deps.controlPlaneCapabilities }
         : {}),
       ...(deps.controlPlaneProtocol !== undefined ? { protocol: deps.controlPlaneProtocol } : {}),
-      ...(this.namespace !== 'default' ? { namespace: this.namespace } : {}),
+      ...(this.namespace !== undefined && this.namespace !== 'default'
+        ? { namespace: this.namespace }
+        : {}),
     });
     this.blockedPollMs = deps.blockedPollMs ?? 5000;
     // Propagate the engine's namespace to its transport(s) so the SAME namespace that partitions the
     // store also partitions the transport's queues/keys — set once on the engine, applied everywhere.
     // The transport makes "default" a no-op (byte-identical names); an empty pool is a no-op too.
-    this.pool.useNamespace(this.namespace);
+    // An operator (no namespace) skips this entirely: not calling `useNamespace` IS the bare prefix,
+    // which is what it must stay on to reach every tenant's queues.
+    if (this.namespace !== undefined) this.pool.useNamespace(this.namespace);
     this.leaseMs = deps.leaseMs ?? 30_000;
     this.maxRecoveryAttempts = deps.maxRecoveryAttempts;
     // Default 5min; an explicit 0 disables the fallback (opt back into wake-forever-on-lost-event).
@@ -1115,8 +1142,13 @@ export class WorkflowEngine {
     // Namespace guard: release the lock and bail when this run belongs to a different worker pool.
     // Piggybacked on the existing store.getRun above — no extra async step on the happy path. An
     // undefined namespace (a store row created before the field existed) is treated as "belongs to
-    // everyone" for back-compat: don't skip it.
-    if (run.namespace !== undefined && run.namespace !== this.namespace) {
+    // everyone" for back-compat: don't skip it. An operator (this.namespace undefined) belongs to
+    // every namespace too, so the guard never applies to it — that is the whole point of the role.
+    if (
+      this.namespace !== undefined &&
+      run.namespace !== undefined &&
+      run.namespace !== this.namespace
+    ) {
       await this.store.releaseRunLock(runId);
       throw new NamespaceMismatch();
     }
@@ -2497,8 +2529,9 @@ export class WorkflowEngine {
         if (await this.store.getCheckpoint(run.id, cmd.seq)) continue;
         // Route this cross-SDK-worker `call` by the SAME name-based token a native `ctx.step`
         // dispatches with (and a worker subscribes to per handler name), so a decision-driven remote
-        // step and an in-process one land on the identical queue. The command carries no partition.
-        const callToken = tenantGroup(sanitizeQueueToken(cmd.name), undefined);
+        // step and an in-process one land on the identical queue. The command's own `group` is not a
+        // routing input; the run's namespace is, so a tenant's fan-out stays on the tenant's pool.
+        const callToken = tenantGroup(sanitizeQueueToken(cmd.name), run.namespace);
         await this.store.saveCheckpoint(
           stepCheckpoint({
             runId: run.id,
@@ -2609,7 +2642,9 @@ export class WorkflowEngine {
           parallelGroup: cmd.parallelGroup,
         });
         if (!(await this.store.getRun(childId))) {
-          this.startChildDeferred(cmd.workflow, cmd.input, childId);
+          // Same inheritance rule as the in-process `ctx.child` path: the child belongs to the run
+          // that spawned it, not to whichever engine happened to advance that run.
+          this.startChildDeferred(cmd.workflow, cmd.input, childId, { namespace: run.namespace });
         }
       } else {
         throw new Error(
@@ -2663,7 +2698,12 @@ export class WorkflowEngine {
     const snapshot = await this.store.listCheckpoints(run.id);
     const replay = new Map<number, StepCheckpoint>();
     for (const cp of snapshot) replay.set(cp.seq, cp);
-    const ctx = createWorkflowCtx(this.ctxHostFor(replay), run.id, compensations, run.workflow);
+    const ctx = createWorkflowCtx(
+      this.ctxHostFor(replay, run.namespace),
+      run.id,
+      compensations,
+      run.workflow,
+    );
     try {
       // Establish the ambient ctx for the duration of this body turn so context-aware statics
       // (`BaseWorkflow.start`/`dispatch`) reachable from `fn` route through this run's `ctx.child`/
@@ -2800,7 +2840,7 @@ export class WorkflowEngine {
     attempt: number,
   ): Promise<void> {
     if (this.pool.size === 0) throw new Error('dispatched compensation requires a Transport');
-    const token = tenantGroup(sanitizeQueueToken(def.name), def.partition);
+    const token = stepGroup(def, run.namespace);
     const validInput = def.input ? def.input.parse(args) : args;
     const id = `${run.id}:compensate:${def.name}:${attempt}`;
     const resultPromise = new Promise<RemoteResolution>((resolve, reject) => {
@@ -2830,7 +2870,10 @@ export class WorkflowEngine {
   /** The seam handed to {@link createWorkflowCtx}: the authoring API reaches durability + lifecycle
    *  (checkpointing, dispatch, child start) through this, so the ctx primitives live in their own
    *  module and the engine stays the orchestrator. */
-  private ctxHostFor(replay?: Map<number, StepCheckpoint>): CtxHost {
+  private ctxHostFor(
+    replay?: Map<number, StepCheckpoint>,
+    runNamespace?: string | undefined,
+  ): CtxHost {
     return {
       store: this.store,
       replay,
@@ -2840,10 +2883,12 @@ export class WorkflowEngine {
       completeStep: (s) => this.completeStep(s),
       failStep: (s) => this.failStep(s),
       callRemote: (runId, seq, step, input, queue, transport, admission) =>
-        this.callRemote(runId, seq, step, input, queue, transport, replay, admission),
-      // Defer so a fast child can't reentrantly resume a still-running parent.
+        this.callRemote(runId, seq, step, input, queue, transport, replay, admission, runNamespace),
+      // Defer so a fast child can't reentrantly resume a still-running parent. The child inherits the
+      // PARENT RUN's namespace, not this engine's: an operator legitimately executes every tenant's
+      // parents, and without this the child would fall to the operator's own pool.
       startChild: (workflow, input, id, priority) => {
-        this.startChildDeferred(workflow, input, id, { priority });
+        this.startChildDeferred(workflow, input, id, { priority, namespace: runNamespace });
       },
       // Deferred for the same reentrancy reason as `startChild` above. `cancel()` is already
       // idempotent on a terminal/cancelled run (returns its existing status without side effects), so
@@ -3030,9 +3075,14 @@ export class WorkflowEngine {
    *  capable+compatible worker has appeared, else re-parks with a fresh `wakeAt` (design §7.5). */
   private async dueBlockedRuns(nowMs: number): Promise<WorkflowRun[]> {
     const blocked = await this.store.listRuns({ statuses: ['blocked'] });
+    // Unlike the store-side poll paths, this filters in memory, so the operator case is explicit:
+    // an engine with no namespace drives every pool's blocked runs, exactly as it drives their
+    // pending and due ones.
     return blocked.filter(
       (r) =>
-        (r.namespace === undefined || r.namespace === this.namespace) &&
+        (this.namespace === undefined ||
+          r.namespace === undefined ||
+          r.namespace === this.namespace) &&
         r.wakeAt !== undefined &&
         r.wakeAt <= nowMs,
     );
@@ -3047,6 +3097,7 @@ export class WorkflowEngine {
     transport?: string,
     replay?: Map<number, StepCheckpoint>,
     admission?: { priority?: number | undefined; fairnessKey?: string | undefined },
+    runNamespace?: string | undefined,
   ): Promise<TOutput> {
     // Read the prefix from the per-execution snapshot (avoids the O(N²) replay SELECTs); a seq absent
     // from the snapshot — not yet dispatched, or written after the snapshot — falls back to the store.
@@ -3060,7 +3111,8 @@ export class WorkflowEngine {
     // presumed-dead worker). Without one, the call SUSPENDS DURABLY: dispatch, persist a `pending`
     // checkpoint, and let the result resume the run on whichever instance receives it — so a worker
     // pod can scale down or crash mid-step without losing the run or re-running completed work.
-    if (step.timeoutMs) return this.callRemoteInMemory(runId, seq, step, input, transport);
+    if (step.timeoutMs)
+      return this.callRemoteInMemory(runId, seq, step, input, transport, runNamespace);
     if (existing?.status === 'pending') {
       // Dispatched; normally we just keep waiting for the result to resume the run. But a LOST dispatch
       // (worker crashed with no result, or the transport dropped the job) would hang here forever — a
@@ -3102,7 +3154,7 @@ export class WorkflowEngine {
         seq,
         name: step.name,
         stepId: existing.stepId ?? stepId(runId, seq),
-        group: existing.workerGroup ?? tenantGroup(sanitizeQueueToken(step.name), step.partition),
+        group: existing.workerGroup ?? stepGroup(step, runNamespace),
         input: existing.input,
         priority: admission?.priority,
         attempt: reAttempt,
@@ -3160,7 +3212,7 @@ export class WorkflowEngine {
     // Routing token: BY NAME (sanitized for brokers), optionally partition-suffixed. Computed once and
     // used at BOTH the checkpoint's workerGroup and the dispatched task's routing `group`, so the same
     // token the worker subscribes to per handler name serves this step.
-    const token = tenantGroup(sanitizeQueueToken(step.name), step.partition);
+    const token = stepGroup(step, runNamespace);
     // Capability/protocol guard (design §7.5): if the live fleet on this token can't run the step,
     // throw WorkflowBlocked BEFORE the pending checkpoint + dispatch — so the run parks `blocked`
     // (recovered by the blocked poll) instead of writing a `pending` row a `WorkflowSuspended` re-drive
@@ -3336,10 +3388,11 @@ export class WorkflowEngine {
     step: StepDef<TInput, TOutput>,
     input: TInput,
     transport?: string,
+    runNamespace?: string | undefined,
   ): Promise<TOutput> {
     if (this.pool.size === 0) throw new Error('remote steps require a Transport');
     const validInput = step.input ? step.input.parse(input) : input;
-    const token = tenantGroup(sanitizeQueueToken(step.name), step.partition);
+    const token = stepGroup(step, runNamespace);
     // Capability/protocol guard (design §7.5) — same as the durable path, before the `step.started`
     // emit + dispatch, so a step nobody can run parks `blocked` instead of awaiting a phantom worker.
     await this.ensureRoutable(token, step.requires);
