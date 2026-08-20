@@ -44,10 +44,16 @@ It isolates two things at once:
 Both follow one **default-is-bare** rule: `'default'` (the default value) leaves every name
 byte-identical to a single-pool deployment. Only a real, non-default namespace prefixes anything.
 
-<Callout type="warn">
-`namespace` is a **scope, not a wildcard**. Unlike some cluster designs, there is no "operator with no
-namespace drives everyone" mode here — an engine polls exactly one namespace, and `'default'` is just
-another one. A run stamped `acme` is invisible to a control plane on `'default'`.
+**Leaving `namespace` unset makes the engine an operator.** It then scopes nothing: the store's poll
+filters no-op, so it drives, recovers and resumes runs of *every* namespace, and its transports stay on
+the bare prefix. "Seeing everyone" is the absence of a namespace, not a wildcard value — `'default'` is
+an ordinary namespace like any other, and an engine set to it sees only its own runs.
+
+<Callout type="info">
+The engine's namespace and a run's namespace are not the same kind of value. The engine's may be
+`undefined` (the operator). A **stored run's** never is: every store normalizes it to `'default'` on
+write, matching the SQL column default. So "an engine with no namespace" and "a run with no namespace"
+mean different things, and only the first one means *all*.
 </Callout>
 
 ## `partition` — the queue suffix
@@ -71,6 +77,11 @@ export default defineConfig({
 Every routing token becomes `<name>@<partition>`, so two pools serving the same step name never cross.
 A worker on no partition serves the bare token — which is the same queue every un-partitioned process
 in the deployment is on.
+
+On the dispatch side the suffix comes from **the run's namespace**, not from the engine doing the
+dispatching (a step's own `partition` still wins when it names one). That is what lets a single operator
+serve many pools: it drives every namespace's runs, and each one's steps still land on that namespace's
+queues rather than being pulled onto the operator's bare tokens.
 
 Inside a thin worker's own workflow turn, `ctx.step(name, input, { group })` overrides the token for
 one step; omitted, it inherits the worker's partition, so a workflow and the steps it dispatches stay
@@ -112,9 +123,10 @@ trusting the body.
   cannot choose.
 - **A retry** (`retryWithInput`) re-stamps the new run with the **original run's** namespace, so a
   fix-and-replay of a tenant's run stays that tenant's instead of falling back to the engine's own.
-- **A child run** lands in the parent's namespace, because an engine only ever executes runs of its
-  own: `resume` refuses a run from another namespace outright, and the poll paths never hand it one.
-  So the engine starting the child is already the parent's, and a fan-out cannot escape its pool.
+- **A child run** inherits the **parent run's** namespace, not the namespace of whichever engine
+  happens to execute that parent. This matters precisely because an operator legitimately executes every
+  namespace's parents: without the rule, a recovery-resumed parent's child would fall back to the
+  operator's own pool instead of the tenant's.
 
 ## Sharing one store and one broker
 
@@ -125,9 +137,10 @@ pools:
   route execution with `partition`. The control plane polls and recovers everything; each tenant's
   workers only ever see `<name>@<their tenant>`. This is the shape the
   [cluster docs](/docs/durable/cluster) describe.
-- **Fully separate pools.** Give each pool its own `namespace` — and its own control plane, since an
-  engine polls only its own. Runs, queues and keys are all prefixed, so a dev cluster and a developer's
-  laptop can share infrastructure without either driving the other's runs.
+- **Fully separate pools.** Give each pool its own `namespace`. Runs, queues and keys are all prefixed,
+  so a dev cluster and a developer's laptop can share infrastructure without either driving the other's
+  runs. Each namespaced engine drives only its own; an operator alongside them drives all of them, which
+  is what lets one deployed control plane orchestrate work that executes on many pools.
 
 <Callout type="info">
 The two combine, and they answer different questions. Reach for `partition` when the runs are the same
@@ -142,8 +155,9 @@ to different deployments.
   process left running against a shared broker is not "another consumer"; it competes for, and steals,
   the deployed fleet's tasks. Give it a real partition.
 - **A run stamped into a namespace nothing polls sits pending forever.** Passing `opts.namespace` (or
-  starting from a tenant pod whose tenant differs from the control plane's namespace) routes the run to
-  a pool that must actually have an engine polling it. There is no fallback owner.
+  starting from a tenant pod) routes the run to a pool that must actually have someone polling it —
+  either an engine on that namespace, or an operator. Between namespaced engines there is no fallback
+  owner, so a namespace with no operator above it and no engine of its own is a dead end.
 - **A stale local worker with an old build can misroute a run even when partitioned.** A process left
   running after a step or workflow rename can pick up a run with code that no longer matches its
   history — a `NonDeterminismError` or a hung run. Kill stale processes; a distinct partition is not
