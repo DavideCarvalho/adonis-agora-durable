@@ -25,10 +25,18 @@ describe('engine → transport namespace propagation', () => {
     expect(transport.namespaces).toEqual(['dev-alice']);
   });
 
-  it('propagates "default" too (the transport itself makes default a no-op)', () => {
+  it('propagates an explicit "default" (the transport itself makes default a no-op)', () => {
+    const transport = new SpyTransport();
+    new WorkflowEngine({ store: new InMemoryStateStore(), transport, namespace: 'default' });
+    expect(transport.namespaces).toEqual(['default']);
+  });
+
+  it('propagates NOTHING for an operator — not propagating IS the bare prefix', () => {
     const transport = new SpyTransport();
     new WorkflowEngine({ store: new InMemoryStateStore(), transport });
-    expect(transport.namespaces).toEqual(['default']);
+    // An engine with no namespace drives every pool, so it has to reach every pool's queues. Leaving
+    // the transport untouched is what keeps it on the bare names those queues are derived from.
+    expect(transport.namespaces).toEqual([]);
   });
 
   it('propagates the namespace to every transport in a pool', () => {
