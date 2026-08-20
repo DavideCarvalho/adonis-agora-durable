@@ -112,9 +112,9 @@ trusting the body.
   cannot choose.
 - **A retry** (`retryWithInput`) re-stamps the new run with the **original run's** namespace, so a
   fix-and-replay of a tenant's run stays that tenant's instead of falling back to the engine's own.
-- **A child run** is stamped by the engine that starts it, not by the parent run's record. Keep a
-  parent and its children in one namespace, or pass the namespace explicitly when starting a child, so
-  a fan-out doesn't land in a pool nothing is polling.
+- **A child run** lands in the parent's namespace, because an engine only ever executes runs of its
+  own: `resume` refuses a run from another namespace outright, and the poll paths never hand it one.
+  So the engine starting the child is already the parent's, and a fan-out cannot escape its pool.
 
 ## Sharing one store and one broker
 
