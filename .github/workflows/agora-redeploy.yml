@@ -1,0 +1,28 @@
+name: Agora redeploy
+
+# When this library's docs change, tell the Agora site (DavideCarvalho/agora) to
+# rebuild — it pulls each library's docs at build time, so without this a docs
+# edit waits for the 3-hourly schedule. No-ops gracefully until
+# AGORA_DISPATCH_TOKEN (a PAT that can POST dispatches to the agora repo) is set.
+on:
+  push:
+    branches: [master]
+    paths:
+      - "docs/**"
+      - ".github/workflows/agora-redeploy.yml"
+  workflow_dispatch:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch lib-docs-updated to Agora
+        env:
+          GH_TOKEN: ${{ secrets.AGORA_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "AGORA_DISPATCH_TOKEN not set — skipping (set the secret to enable instant Agora redeploys)."
+            exit 0
+          fi
+          gh api -X POST repos/DavideCarvalho/agora/dispatches -f event_type=lib-docs-updated
+          echo "Dispatched lib-docs-updated to DavideCarvalho/agora."
