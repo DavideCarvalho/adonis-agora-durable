@@ -99,7 +99,7 @@
       "default": "./dist/commands/*.js"
     }
   },
-  "files": ["dist/", "README.md", "CHANGELOG.md"],
+  "files": ["dist/", "skills", "README.md", "CHANGELOG.md"],
   "sideEffects": false,
   "scripts": {
     "build": "pnpm run clean && tsc -p tsconfig.build.json && pnpm run copy:stubs && pnpm run check:dist",
@@ -171,6 +171,7 @@
     "bullmq": "5.81.3",
     "cron-parser": "4.9.0",
     "ioredis": "5.11.1",
+    "@tanstack/intent": "^0.3.2",
     "typescript": "5.9.3",
     "vitest": "3.2.7",
     "zod": "3.25.76"
@@ -189,6 +190,7 @@
     "opentelemetry",
     "telescope",
     "testing",
+    "tanstack-intent",
     "agora"
   ]
 }

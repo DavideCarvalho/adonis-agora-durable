@@ -1,0 +1,150 @@
+# Skill tree for adonis-durable. Flat structure (skills/<name>/SKILL.md), no router.
+# Every skill is type `core`. Each entry carries its owning `package`.
+
+structure: flat
+router: false
+
+library:
+  name: '@adonis-agora/durable'
+  version: '0.25.0'
+  repository: 'https://github.com/DavideCarvalho/adonis-agora-durable'
+  description: >-
+    Durable cross-app workflows for AdonisJS — deterministic replay engine with
+    checkpointed steps, durable sleeps/signals/events, sagas, DLQ, cluster
+    roles, dashboard, OTel and Telescope views.
+
+generated_from:
+  domain_map: '_artifacts/domain_map.yaml'
+  skill_spec: '_artifacts/skill_spec.md'
+
+generated_at: '2026-07-19'
+
+skills:
+  - name: durable-setup
+    slug: durable-setup
+    type: core
+    domain: setup-config
+    package: '@adonis-agora/durable'
+    path: 'packages/adonis/skills/durable-setup/SKILL.md'
+    description: >-
+      Install/configure @adonis-agora/durable: node ace add, defineConfig,
+      driver-by-name transports/stores maps, WorkflowEngine singleton,
+      dispatch vs start, where runs execute, production swap from the dev
+      defaults.
+    sources:
+      - 'DavideCarvalho/adonis-durable:docs/getting-started.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/concepts/durability.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/transports/index.mdx'
+      - 'DavideCarvalho/adonis-durable:README.md'
+
+  - name: durable-workflows
+    slug: durable-workflows
+    type: core
+    domain: authoring
+    package: '@adonis-agora/durable'
+    path: 'packages/adonis/skills/durable-workflows/SKILL.md'
+    description: >-
+      Author workflows and steps: BaseWorkflow classes under app/workflows,
+      @Step/defineStep/localStep, sleeps, signals, events, webhooks, tasks,
+      child workflows, ctx.all, continue-as-new, singletons, entities,
+      scheduling, queries/updates/search attributes.
+    sources:
+      - 'DavideCarvalho/adonis-durable:docs/authoring/app-workflows.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/concepts/workflows-and-steps.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/concepts/sleep-and-signals.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/authoring/child-workflows.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/authoring/webhooks.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/authoring/entities.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/authoring/scheduling.mdx'
+
+  - name: durable-determinism
+    slug: durable-determinism
+    type: core
+    domain: determinism
+    package: '@adonis-agora/durable'
+    path: 'packages/adonis/skills/durable-determinism/SKILL.md'
+    description: >-
+      Keep replay safe: ctx.now/ctx.sideEffect capture, NonDeterminismError,
+      version bumps for breaking shape changes, ctx.patched surgical guards,
+      and the @adonis-agora/durable-eslint-plugin no-nondeterminism rule.
+    sources:
+      - 'DavideCarvalho/adonis-durable:docs/concepts/durability.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/authoring/versioning.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/tooling/linting.mdx'
+
+  - name: durable-transports-stores
+    slug: durable-transports-stores
+    type: core
+    domain: transports-stores
+    package: '@adonis-agora/durable'
+    path: 'packages/adonis/skills/durable-transports-stores/SKILL.md'
+    description: >-
+      Wire drivers: memory/eventEmitter/queue/db/bullmq transports, per-step
+      pinning, controlPlanes.redis, the lucid state store (migration
+      delegation, autoSchema, updateRunIf), CodecStateStore encryption,
+      namespace vs partition isolation.
+    sources:
+      - 'DavideCarvalho/adonis-durable:docs/transports/queue.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/transports/db.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/transports/control-plane.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/stores/lucid.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/stores/index.mdx'
+
+  - name: durable-reliability
+    slug: durable-reliability
+    type: core
+    domain: reliability
+    package: '@adonis-agora/durable'
+    path: 'packages/adonis/skills/durable-reliability/SKILL.md'
+    description: >-
+      Recover failing runs: retries/backoff/FatalError/retryable:false,
+      timeoutMs liveness vs the durable suspend path, saga compensation,
+      flow-control queues + redis admission, dead-letter queue, the stuck-run
+      playbook (stranded signature, redispatchPending), CLI ops, testing
+      harness and conformance kits.
+    sources:
+      - 'DavideCarvalho/adonis-durable:docs/reliability/retries.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/reliability/sagas.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/reliability/dead-letter.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/reliability/flow-control.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/reliability/failure-modes.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/cli.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/testing.mdx'
+
+  - name: durable-cluster
+    slug: durable-cluster
+    type: core
+    domain: cluster
+    package: '@adonis-agora/durable'
+    path: 'packages/adonis/skills/durable-cluster/SKILL.md'
+    description: >-
+      Scale out: role-discriminated config (standalone/control-plane/tenant),
+      thin WorkerRuntime pods, worker descriptors and handshake negotiation,
+      requires-capability routing and blocked runs, signed tenant auth,
+      Python/NestJS interop over the bullmq wire.
+    sources:
+      - 'DavideCarvalho/adonis-durable:docs/cluster/index.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/cluster/roles-and-config.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/cluster/thin-workers.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/cluster/handshake.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/cluster/interop.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/python.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/concepts/tenancy.mdx'
+
+  - name: durable-observability
+    slug: durable-observability
+    type: core
+    domain: observability
+    package: '@adonis-agora/durable-dashboard'
+    path: 'packages/dashboard/skills/durable-observability/SKILL.md'
+    description: >-
+      Operate and observe runs: the embedded dashboard (config, authorize,
+      dashboardAuth sessions, JSON API, SSE tail, bulk actions, fix-and-replay),
+      lifecycle events, interceptors, collectMetrics, OpenTelemetry tracing,
+      and the Telescope Workflows view.
+    sources:
+      - 'DavideCarvalho/adonis-durable:docs/observability/dashboard.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/observability/dashboard-auth.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/observability/events-and-interceptors.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/observability/otel.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/observability/telescope.mdx'

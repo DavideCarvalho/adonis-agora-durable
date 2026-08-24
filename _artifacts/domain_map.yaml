@@ -1,0 +1,974 @@
+# Domain map for adonis-durable (TanStack Intent agent skills)
+# Generated autonomously by mining README.md, docs/** (every narrative file),
+# packages/*/package.json, and source stubs. NO maintainer interview was run
+# (fully-autonomous constraint) — open questions are recorded under `gaps`.
+#
+# ONE domain map for the whole monorepo; skills are co-located with the
+# client-facing packages (@adonis-agora/durable, @adonis-agora/durable-dashboard).
+
+library:
+  name: '@adonis-agora/durable'
+  version: '0.25.0'
+  repository: 'https://github.com/DavideCarvalho/adonis-agora-durable'
+  description: >-
+    Durable cross-app workflows for AdonisJS — deterministic replay engine,
+    AdonisJS binding (BaseWorkflow / @Step / defineStep), config-driven
+    transports (memory / eventEmitter / queue / db / bullmq) and state stores
+    (in-memory / lucid), cluster roles, dashboard, OTel, Telescope, testing
+    harness, ace CLI, and an ESLint determinism plugin. Port of
+    @dudousxd/nestjs-durable-core.
+  primary_framework: AdonisJS
+
+versions:
+  '@adonis-agora/durable': '0.25.0'
+  '@adonis-agora/durable-dashboard': '0.2.1'
+  '@adonis-agora/durable-eslint-plugin': '0.2.2'
+
+primary_packages:
+  - name: '@adonis-agora/durable'
+    dir: packages/adonis
+    role: The whole engine shipped as one package — subpaths ./services/main,
+      ./worker, ./otel, ./telescope, ./dashboard (+ ./dashboard_provider),
+      ./testing (+ ./testing/conformance), ./admission-redis,
+      ./control-plane-redis, ./commands, ./hooks/*.
+  - name: '@adonis-agora/durable-dashboard'
+    dir: packages/dashboard
+    role: React SPA console (runs list, timeline, graph, retry/cancel/
+      fix-and-replay) served by the thin provider inside the main package.
+
+secondary_packages:
+  # Summarized inside durable-determinism; intentionally no dedicated skill.
+  - '@adonis-agora/durable-eslint-plugin'
+
+domains:
+  - id: setup-config
+    title: Install, configure, first run
+    slug: setup-config
+    description: >-
+      node ace add/configure, config/durable.ts driver-by-name selection
+      (transports/stores maps), the WorkflowEngine container singleton,
+      execution model (start enqueues; in-process dispatcher vs durable:work).
+  - id: authoring
+    title: Authoring workflows & steps
+    slug: authoring
+    description: >-
+      BaseWorkflow classes under app/workflows (auto-registration, constructor
+      DI, dispatch/start statics), step handlers (@Step / defineStep /
+      string-name / transport.handle), ctx.localStep, durable sleeps, signals,
+      named events, signalWithStart, webhooks, external tasks,
+      ctx.transaction, breakpoints, child workflows, ctx.all fan-out,
+      continue-as-new, singletons, entities, scheduling, tags, search
+      attributes, queries (setEvent/getEvent) and updates (onUpdate/update).
+  - id: determinism
+    title: Determinism, replay & versioning
+    slug: determinism
+    description: >-
+      Checkpoint-and-replay model, the one rule (no non-determinism in the
+      body), ctx.now / ctx.sideEffect capture, NonDeterminismError guard,
+      workflow versions, ctx.patched, the eslint-plugin author-time net.
+  - id: transports-stores
+    title: Transports, stores & topology plumbing
+    slug: transports-stores
+    description: >-
+      The five transport drivers, per-step transport pinning, the Redis
+      control plane, the Lucid state store (migration delegation, autoSchema,
+      repairs, updateRunIf CAS), CodecStateStore encryption, namespace/partition.
+  - id: reliability
+    title: Reliability & operations
+    slug: reliability
+    description: >-
+      Retries/backoff/FatalError/retryable:false, timeoutMs liveness vs the
+      durable suspend path, pickupTimeoutMs, sagas/compensations, flow-control
+      queues + Redis admission, DLQ (maxRecoveryAttempts/onDead), the stuck-run
+      playbook (stranded signature, redispatchPending, remoteRedispatchMs),
+      ace CLI ops commands, testing harness + conformance kits.
+  - id: cluster
+    title: Cluster topologies & interop
+    slug: cluster
+    description: >-
+      role-discriminated config (standalone / control-plane / tenant), thin
+      WorkerRuntime, worker descriptors + handshake negotiation, capability
+      routing (`requires`) and blocked runs, layered tenant auth, Python and
+      NestJS workers over the BullMQ wire.
+  - id: observability
+    title: Observability & operations UI
+    slug: observability
+    description: >-
+      The embedded dashboard (config, authorize, dashboardAuth session layer,
+      JSON API, SSE live tail, bulk actions, fix-and-replay), engine.subscribe
+      lifecycle events, engine.use interceptors, collectMetrics, OTel tracing
+      + traceparent propagation, Telescope extension.
+
+skills:
+  - name: durable-setup
+    slug: durable-setup
+    domain: setup-config
+    package: '@adonis-agora/durable'
+    type: core
+    description: >-
+      Install and configure @adonis-agora/durable: defineConfig, transports/
+      stores driver maps, engine singleton, dispatch-vs-start execution model.
+    covers:
+      - 'node ace add / configure'
+      - defineConfig
+      - 'transports.memory/eventEmitter/queue/db/bullmq'
+      - stores.lucid
+      - leaseMs
+      - trackStepStart
+      - consumers
+      - WorkflowEngine binding
+      - services/main
+      - Wf.dispatch / Wf.start
+    tasks:
+      - Set up durable in an AdonisJS app for the first time
+      - Move from dev defaults to production infrastructure
+      - Decide where runs execute (API pod vs dedicated worker)
+    failure_modes:
+      - mistake: shipping on the in-memory default store
+        mechanism: >-
+          With no `store` selected the engine uses the in-memory store — zero
+          errors, but every run/checkpoint vanishes on process restart.
+        wrong_pattern: |
+          export default defineConfig({ transport: 'memory', transports: { memory: transports.memory() } })
+          // deployed to production as-is
+        correct_pattern: |
+          export default defineConfig({
+            transport: 'event-emitter',
+            transports: { 'event-emitter': transports.eventEmitter() },
+            store: 'lucid',
+            stores: { lucid: stores.lucid() },
+          })
+        source: 'DavideCarvalho/adonis-durable:docs/stores/index.mdx'
+        priority: CRITICAL
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-setup']
+      - mistake: using the memory transport for production single-process apps
+        mechanism: >-
+          transports.memory() executes handlers inline inside the dispatch
+          call; eventEmitter delivers on a later tick like a real broker, so
+          only eventEmitter models production semantics.
+        wrong_pattern: |
+          transport: 'memory' // "single process anyway"
+        correct_pattern: |
+          transport: 'event-emitter',
+          transports: { 'event-emitter': transports.eventEmitter() }
+        source: 'DavideCarvalho/adonis-durable:docs/transports/index.mdx'
+        priority: HIGH
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-setup']
+      - mistake: letting workflows share the API pod event loop
+        mechanism: >-
+          The default in-process dispatcher executes bodies on the instance
+          that called start(), competing with HTTP traffic and the DB pool;
+          pass NOOP_RUN_DISPATCHER to an API-only engine and run durable:work.
+        wrong_pattern: |
+          // API/dashboard pod with default config — heavy runs starve requests
+          export default defineConfig({ transport: 'queue', transports: { /* … */ } })
+        correct_pattern: |
+          import { NOOP_RUN_DISPATCHER } from '@adonis-agora/durable'
+          export default defineConfig({
+            transport: 'queue', transports: { /* … */ }, runDispatcher: NOOP_RUN_DISPATCHER,
+          })
+          // plus: node ace durable:work as a separate process
+        source: 'DavideCarvalho/adonis-durable:docs/reliability/failure-modes.mdx'
+        priority: HIGH
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-setup']
+      - mistake: expecting an ace script to await a remote step result
+        mechanism: >-
+          A `node ace` console/repl process does not start broker consumer
+          loops, so it never receives results; use consumers:'always' or let
+          the worker fleet do the work.
+        wrong_pattern: |
+          const { runId } = await OrderWorkflow.dispatch(input)
+          const result = await engine.waitForRun(runId) // hangs forever in `node ace`
+        correct_pattern: |
+          export default defineConfig({ /* … */ consumers: 'always' })
+          // or: start the run, exit, let durable:work finish it
+        source: 'DavideCarvalho/adonis-durable:docs/transports/queue.mdx'
+        priority: MEDIUM
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-setup']
+
+  - name: durable-workflows
+    slug: durable-workflows
+    domain: authoring
+    package: '@adonis-agora/durable'
+    type: core
+    description: >-
+      Author durable workflows and steps with BaseWorkflow, @Step, defineStep,
+      ctx.localStep/step, sleeps, signals, events, webhooks, tasks, children,
+      singletons, entities and schedules.
+    covers:
+      - BaseWorkflow
+      - static workflow
+      - make:workflow
+      - '@Step'
+      - defineStep
+      - ctx.localStep
+      - ctx.step
+      - ctx.sleep/sleepUntil
+      - ctx.waitForSignal
+      - ctx.waitForEvent
+      - signalWithStart
+      - publishEvent
+      - eventBatch
+      - ctx.webhook
+      - ctx.task
+      - completeTask/failTask
+      - ctx.transaction
+      - ctx.breakpoint
+      - ctx.child/startChild/all
+      - continueAsNew
+      - singleton
+      - SingletonQueueFullError
+      - registerEntity/callEntity
+      - ScheduledWorkflow
+      - static schedule
+      - '@Scheduled'
+      - setEvent/getEvent
+      - onUpdate/update
+      - upsertSearchAttributes
+      - GatherError
+      - tags
+    tasks:
+      - Write the first workflow class and start it from a controller
+      - Pause a run for human approval or a third-party callback
+      - Fan out work and compose parent/child workflows
+      - Model long-lived keyed state or recurring cadences
+    failure_modes:
+      - mistake: calling injected services directly inside run()
+        mechanism: >-
+          I/O performed outside ctx.step/localStep is never checkpointed and
+          re-executes on every replay; reach a service through a step ref.
+        wrong_pattern: |
+          async run(ctx, input) {
+            const receipt = await this.billing.charge(input) // ✗ re-runs on replay
+            return { receipt }
+          }
+        correct_pattern: |
+          async run(ctx, input) {
+            const receipt = await ctx.step(this.billing.charge, input)
+            return { receipt }
+          }
+        source: 'DavideCarvalho/adonis-durable:docs/authoring/app-workflows.mdx'
+        priority: HIGH
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-workflows', 'durable-determinism']
+      - mistake: swallowing control-flow signals in a hand-rolled try/catch
+        mechanism: >-
+          ctx.sleep/waitForSignal/continueAsNew unwind by THROWING; catching
+          one records extra history a replay never produces → NonDeterminismError.
+        wrong_pattern: |
+          try { await ctx.step('chargeCard', input) } catch (e) { await ctx.step('refund', input) }
+        correct_pattern: |
+          import { isWorkflowControlFlowSignal } from '@adonis-agora/durable'
+          try { await ctx.step('chargeCard', input) } catch (e) {
+            if (isWorkflowControlFlowSignal(e)) throw e
+            await ctx.step('refund', input); throw e
+          }
+        source: 'DavideCarvalho/adonis-durable:docs/concepts/workflows-and-steps.mdx'
+        priority: HIGH
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-workflows']
+      - mistake: generating child ids randomly inside a workflow
+        mechanism: >-
+          Inside a body, child ids must derive from the call position; a fresh
+          random id breaks replay dedup and re-fires the child.
+        wrong_pattern: |
+          await ctx.startChild('reindex', item, crypto.randomUUID())
+        correct_pattern: |
+          await ctx.startChild('reindex', item) // deterministic positional id
+        source: 'DavideCarvalho/adonis-durable:docs/authoring/child-workflows.mdx'
+        priority: HIGH
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-workflows', 'durable-determinism']
+      - mistake: blocking a hot HTTP path on Wf.start()
+        mechanism: >-
+          .start resolves only when the run settles (terminal or suspended);
+          on a long-running workflow the request hangs — dispatch and respond
+          with the runId instead.
+        wrong_pattern: |
+          const result = await CheckoutWorkflow.start(order) // request held open
+        correct_pattern: |
+          const { runId } = await CheckoutWorkflow.dispatch(order, { runId: `checkout:${order.id}` })
+          return response.accepted({ runId })
+        source: 'DavideCarvalho/adonis-durable:docs/getting-started.mdx'
+        priority: MEDIUM
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-workflows']
+      - mistake: awaiting a webhook with no timeout
+        mechanism: >-
+          hook.wait() without timeoutMs suspends indefinitely; a third party
+          that never calls back leaves the run parked with no wake timer.
+        wrong_pattern: |
+          const result = await hook.wait()
+        correct_pattern: |
+          try { const r = await hook.wait({ timeoutMs: 30 * 60_000 }) }
+          catch (e) { if (!(e instanceof SignalTimeoutError)) throw e /* reconcile */ }
+        source: 'DavideCarvalho/adonis-durable:docs/authoring/webhooks.mdx'
+        priority: MEDIUM
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-workflows']
+      - mistake: throwing business rejections from entity handlers
+        mechanism: >-
+          A throwing handler fails the immortal entity run, stranding every
+          caller suspended on ctx.callEntity; return a discriminated result.
+        wrong_pattern: |
+          withdraw: (state, amountCents) => {
+            if (amountCents > state.balanceCents) throw new Error('insufficient funds')
+            /* … */
+          }
+        correct_pattern: |
+          withdraw: (state, amountCents) => {
+            if (amountCents > state.balanceCents)
+              return { ok: false as const, reason: 'insufficient_funds', balanceCents: state.balanceCents }
+            /* … */ return { ok: true as const, balanceCents: state.balanceCents }
+          }
+        source: 'DavideCarvalho/adonis-durable:docs/authoring/entities.mdx'
+        priority: MEDIUM
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-workflows']
+
+  - name: durable-determinism
+    slug: durable-determinism
+    domain: determinism
+    package: '@adonis-agora/durable'
+    type: core
+    description: >-
+      Keep in-flight runs replay-safe: the determinism rule, ctx.now and
+      ctx.sideEffect, NonDeterminismError, workflow versions, ctx.patched, and
+      @adonis-agora/durable-eslint-plugin (no-nondeterminism rule).
+    covers:
+      - ctx.now
+      - ctx.sideEffect
+      - NonDeterminismError
+      - workflow versions
+      - ctx.patched
+      - eslint-plugin
+      - no-nondeterminism
+      - recommended preset
+    tasks:
+      - Make a workflow body replay-safe before shipping
+      - Change a live workflow without corrupting in-flight runs
+      - Wire the determinism linter into CI
+    failure_modes:
+      - mistake: reading clocks or randomness in the workflow body
+        mechanism: >-
+          Date.now/Math.random/new Date/crypto.randomUUID return different
+          values each replay; the diverged path silently corrupts the run
+          until NonDeterminismError fires far from the cause.
+        wrong_pattern: |
+          const startedAt = Date.now()
+          const key = crypto.randomUUID()
+          const jitter = Math.random()
+        correct_pattern: |
+          const startedAt = await ctx.now()
+          const key = await ctx.sideEffect(() => crypto.randomUUID())
+          const jitter = await ctx.sideEffect(() => Math.random())
+        source: 'DavideCarvalho/adonis-durable:docs/tooling/linting.mdx'
+        priority: CRITICAL
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-determinism', 'durable-workflows']
+      - mistake: reshaping a live workflow without a version bump
+        mechanism: >-
+          Replay is positional; inserting, removing or reordering steps while
+          runs are in flight pairs old checkpoints with new positions and
+          throws NonDeterminismError — bump the version and drain on both.
+        wrong_pattern: |
+          // v1 had [quote, charge]; edited in place to [quote, fraudCheck, charge]
+          static workflow = { name: 'checkout', version: '1' }
+        correct_pattern: |
+          static workflow = { name: 'checkout', version: '2' } // register alongside v1 until drained
+        source: 'DavideCarvalho/adonis-durable:docs/authoring/versioning.mdx'
+        priority: HIGH
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-determinism']
+      - mistake: adding timeoutMs to a webhook wait as an unversioned edit
+        mechanism: >-
+          A deadline claims its own logical position, so toggling timeoutMs
+          shifts positions for in-flight runs — treat it as a versioned change.
+        wrong_pattern: |
+          const r = await hook.wait({ timeoutMs: 1_800_000 }) // edited onto a live workflow
+        correct_pattern: |
+          // ship under version+1, or gate with ctx.patched('add-wait-deadline')
+          const r = await hook.wait({ timeoutMs: 1_800_000 })
+        source: 'DavideCarvalho/adonis-durable:docs/authoring/webhooks.mdx'
+        priority: MEDIUM
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-determinism', 'durable-workflows']
+      - mistake: reading env or config directly in the orchestration prefix
+        mechanism: >-
+          An env value changed between runs makes the body take a different
+          path on replay; wrap the read in ctx.sideEffect so it is captured once.
+        wrong_pattern: |
+          const region = env.get('REGION') // may differ between original run and replay
+        correct_pattern: |
+          const region = await ctx.sideEffect(() => env.get('REGION'))
+        source: 'DavideCarvalho/adonis-durable:docs/authoring/versioning.mdx'
+        priority: MEDIUM
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-determinism']
+
+  - name: durable-transports-stores
+    slug: durable-transports-stores
+    domain: transports-stores
+    package: '@adonis-agora/durable'
+    type: core
+    description: >-
+      Pick and wire transports (memory/eventEmitter/queue/db/bullmq), the Redis
+      control plane, and the Lucid state store — migrations, autoSchema, repair
+      warnings, updateRunIf, CodecStateStore encryption, namespaces/partitions.
+    covers:
+      - transports.queue
+      - transports.db
+      - transports.bullmq
+      - transports.eventEmitter
+      - DbTransport
+      - QueueTransport
+      - controlPlanes.redis
+      - RedisControlPlane
+      - stores.lucid
+      - LucidStateStore
+      - createDurableTables
+      - autoSchema
+      - updateRunIf
+      - CodecStateStore
+      - PayloadCodec
+      - namespace
+      - partition
+      - stalledThresholdMs
+      - maxStalledCount
+    tasks:
+      - Move steps to another process (queue/db/bullmq)
+      - Persist runs durably with the Lucid store
+      - Share one broker/database between isolated pools
+      - Encrypt payload columns at rest
+    failure_modes:
+      - mistake: setting stalledThresholdMs below the longest legitimate step
+        mechanism: >-
+          The queue claim is never renewed while a worker processes, so its
+          age equals elapsed runtime; a threshold below the longest step
+          redelivers jobs from merely-slow workers and double-runs the step.
+        wrong_pattern: |
+          transports.queue({ connection: 'redis', stalledThresholdMs: 60_000 }) // steps take ~90min
+        correct_pattern: |
+          transports.queue({ connection: 'redis', stalledThresholdMs: 2 * 60 * 60 * 1000, maxStalledCount: 3 })
+        source: 'DavideCarvalho/adonis-durable:docs/transports/queue.mdx'
+        priority: HIGH
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-transports-stores', 'durable-reliability']
+      - mistake: snapshotting the DDL into the migration instead of delegating
+        mechanism: >-
+          createDurableTables is the schema owner; a hand-copied snapshot
+          drifts on the next release, and missing disableTransactions/db-from-
+          -services hangs or crashes migration:run on small pools.
+        wrong_pattern: |
+          export default class extends BaseSchema {
+            async up() { this.schema.createTable('durable_workflow_runs', (t) => { /* copied DDL */ }) }
+          }
+        correct_pattern: |
+          export default class extends BaseSchema {
+            static disableTransactions = true
+            async up() { await createDurableTables(db, this.db.connectionName) }
+            async down() { await dropDurableTables(db, this.db.connectionName) }
+          }
+        source: 'DavideCarvalho/adonis-durable:docs/stores/lucid.mdx'
+        priority: HIGH
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-transports-stores']
+      - mistake: leaving autoSchema false with no migration discipline
+        mechanism: >-
+          With autoSchema:false nothing repairs the schema at boot; a database
+          behind the installed version stays behind until migration:run brings
+          it forward (the runtime repair warning is the tell).
+        wrong_pattern: |
+          export default defineConfig({ store: 'lucid', stores: { lucid: stores.lucid() }, autoSchema: false })
+          // …and migrations never updated after upgrading the package
+        correct_pattern: |
+          export default defineConfig({ store: 'lucid', stores: { lucid: stores.lucid() }, autoSchema: false })
+          // + run `node ace migration:run` after every package upgrade
+        source: 'DavideCarvalho/adonis-durable:docs/stores/lucid.mdx'
+        priority: MEDIUM
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-transports-stores']
+      - mistake: expecting the deprecated group option to isolate workers
+        mechanism: >-
+          `group` is accepted but ignored on queue/db transports — routing is
+          by handler name; isolation comes from `partition` (queues) and
+          `namespace` (store poll scope).
+        wrong_pattern: |
+          transports.db({ group: 'tenant-a' }) // silently ignored
+        correct_pattern: |
+          transports.db({ partition: 'tenant-a' })
+        source: 'DavideCarvalho/adonis-durable:docs/transports/db.mdx'
+        priority: MEDIUM
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-transports-stores', 'durable-cluster']
+      - mistake: wrapping a store in CodecStateStore and losing heartbeats
+        mechanism: >-
+          CodecStateStore does not implement recordStepHeartbeat, so encrypted
+          stores drop persisted step-heartbeat liveness in the dashboard/CLI.
+        wrong_pattern: |
+          stores: { encrypted: async () => new CodecStateStore(new LucidStateStore(db), aesCodec) }
+          // then wondering why long steps show no heartbeat progress
+        correct_pattern: |
+          // Accept the trade-off explicitly, or contribute a codec-aware store that
+          // implements recordStepHeartbeat; the live step.started event still fires.
+        source: 'DavideCarvalho/adonis-durable:docs/stores/index.mdx'
+        priority: MEDIUM
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-transports-stores']
+
+  - name: durable-reliability
+    slug: durable-reliability
+    domain: reliability
+    package: '@adonis-agora/durable'
+    type: core
+    description: >-
+      Heal failing runs: retries/backoff/FatalError, timeoutMs vs the durable
+      suspend path, sagas, flow-control queues + Redis admission, dead-letter,
+      the stuck-run playbook (stranded signature, redispatchPending,
+      remoteRedispatchMs), CLI ops, and the testing harness/conformance kits.
+    covers:
+      - retries/backoff/jitter
+      - FatalError
+      - retryable:false
+      - timeoutMs/pickupTimeoutMs
+      - log.heartbeat
+      - compensate
+      - UndoOf
+      - compensationRetries
+      - cancel(compensate:true)/cancelWhere
+      - registerQueue
+      - fairnessKey
+      - admissions.redis
+      - maxRecoveryAttempts
+      - onDead
+      - retryWithInput
+      - redispatchPending
+      - remoteRedispatchMs/Max
+      - durable:runs --stale
+      - createTestEngine
+      - assertReplayable
+      - runStateStoreContract
+      - assertTransportConformance
+      - failOnce/failTimes
+    tasks:
+      - Retry transient failures without double-running side effects
+      - Undo completed steps when a run fails (saga)
+      - Throttle third-party APIs durably
+      - Diagnose and recover a stuck suspended/running run
+      - Unit-test a workflow with a controllable clock
+    failure_modes:
+      - mistake: assuming a lost remote dispatch self-heals
+        mechanism: >-
+          By design a pending checkpoint whose job was dropped cycles
+          suspended→reconcile→suspended forever; pick one of the three nets
+          (timeoutMs, remoteRedispatchMs, redispatchPending).
+        wrong_pattern: |
+          // deploy and hope: the run stays suspended with a pending remote step
+        correct_pattern: |
+          export default defineConfig({ remoteRedispatchMs: 30 * 60_000, remoteRedispatchMax: 10 })
+          // or per-step timeoutMs, or `engine.redispatchPending(runId)` right now
+        source: 'DavideCarvalho/adonis-durable:docs/reliability/failure-modes.mdx'
+        priority: CRITICAL
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-reliability']
+      - mistake: tuning remoteRedispatchMs below the slowest real step
+        mechanism: >-
+          Re-dispatch fires once a pending checkpoint ages past the window;
+          below the longest legitimate step it double-executes steps on
+          slow-but-live workers — the window must exceed them and steps must
+          be idempotent.
+        wrong_pattern: |
+          export default defineConfig({ remoteRedispatchMs: 60_000 }) // imports legitimately take ~20min
+        correct_pattern: |
+          export default defineConfig({ remoteRedispatchMs: 30 * 60_000, remoteRedispatchMax: 10 })
+        source: 'DavideCarvalho/adonis-durable:docs/reliability/failure-modes.mdx'
+        priority: HIGH
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-reliability', 'durable-transports-stores']
+      - mistake: inferring in-flight runs from run.started minus run.completed
+        mechanism: >-
+          run.suspended fires on EVERY park (each sleep, signal, child wait),
+          so naive start/complete counting wildly overcounts; subtract terminal
+          events from starts or read the store.
+        wrong_pattern: |
+          const inFlight = counts['run.started'] - counts['run.completed']
+        correct_pattern: |
+          const inFlight = counts['run.started'] - (counts['run.completed'] + counts['run.failed'])
+          // or query listRuns({ status: ['running','suspended'] }) from the store
+        source: 'DavideCarvalho/adonis-durable:docs/observability/events-and-interceptors.mdx'
+        priority: HIGH
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-reliability', 'durable-observability']
+      - mistake: reading an empty workerHealth as a healthy fleet
+        mechanism: >-
+          Group health is BullMQ-only; on queue/db/eventEmitter
+          engine.workerHealth() returns [] rather than erroring — use the
+          stranded-signature query (durable:runs --stale) instead.
+        wrong_pattern: |
+          const ok = (await engine.workerHealth()).length === 0 ? true : true // always "healthy"
+        correct_pattern: |
+          const stale = filterStale(await attachLiveness(engine, await listRuns(engine, {
+            statuses: ['running', 'suspended'], limit: 200,
+          })), DEFAULT_STALE_MS)
+        source: 'DavideCarvalho/adonis-durable:docs/reliability/failure-modes.mdx'
+        priority: MEDIUM
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-reliability', 'durable-observability']
+      - mistake: writing non-idempotent saga compensations
+        mechanism: >-
+          Compensations may run more than once (compensationRetries) and are
+          reconstructed from history on replay; refund/release must no-op when
+          already applied or a retry double-refunds.
+        wrong_pattern: |
+          { compensate: () => payments.refund(order.customerId, order.totalCents) } // refunds again on retry
+        correct_pattern: |
+          { compensate: () => payments.refundOnce(order.customerId, order.totalCents) } // keyed/idempotent
+        source: 'DavideCarvalho/adonis-durable:docs/reliability/sagas.mdx'
+        priority: MEDIUM
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-reliability']
+      - mistake: expecting failFast fan-out to undo siblings
+        mechanism: >-
+          failFast cancellation is a plain best-effort cancel with NO saga;
+          a partially-run child needs its own compensations and an explicit
+          cancel(runId, { compensate: true }).
+        wrong_pattern: |
+          await ctx.all(ProcessItemWorkflow, items, { mode: 'failFast' }) // assumes cleanup
+        correct_pattern: |
+          // give ProcessItemWorkflow internal compensations, and cancel with
+          await engine.cancel(childId, { compensate: true })
+        source: 'DavideCarvalho/adonis-durable:docs/authoring/child-workflows.mdx'
+        priority: MEDIUM
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-reliability', 'durable-workflows']
+
+  - name: durable-cluster
+    slug: durable-cluster
+    domain: cluster
+    package: '@adonis-agora/durable'
+    type: core
+    description: >-
+      Scale out with cluster roles (standalone/control-plane/tenant), thin
+      store-less workers, descriptor handshake and capability routing
+      (requires → blocked), signed tenant auth, Python/NestJS interop over the
+      BullMQ wire.
+    covers:
+      - role standalone/control-plane/tenant
+      - durable:worker
+      - WorkerRuntime
+      - RedisWorkerRegistry
+      - registerStep/registerWorkflow
+      - WorkerDescriptor
+      - requires
+      - blocked runs
+      - signTenantToken/hmacTenantVerifier
+      - verifyTenant
+      - runGateway
+      - ProxyRunGateway
+      - transports.bullmq
+      - durable-worker (python)
+      - run_redis_worker/run_workers
+    tasks:
+      - Split the control plane from worker pools
+      - Run a store-less tenant worker pod safely
+      - Add Python or NestJS workers to one control plane
+      - Route capability-gated steps and diagnose blocked runs
+    failure_modes:
+      - mistake: launching durable:worker on a store-backed role
+        mechanism: >-
+          durable:worker is the store-less tenant loop; on a role that owns a
+          store it warns and refuses — the store-backed loop is durable:work.
+        wrong_pattern: |
+          node ace durable:worker   # on a standalone/control-plane pod
+        correct_pattern: |
+          node ace durable:work     # store-backed loop (pending, recovery, timers, sweeps, schedules)
+        source: 'DavideCarvalho/adonis-durable:docs/cli.mdx'
+        priority: HIGH
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-cluster']
+      - mistake: assuming durable:worker pods carry workflow bodies
+        mechanism: >-
+          The command registers workflow NAMES from app/workflows for routing
+          but not their bodies; a pod that must execute turns needs explicit
+          runtime.registerWorkflow(name, body).
+        wrong_pattern: |
+          node ace durable:worker # expects it to also run workflow turns
+        correct_pattern: |
+          runtime.registerWorkflow('checkout', (ctx, input) => {
+            const paid = ctx.step('billing.charge', input)
+            return { paid }
+          })
+        source: 'DavideCarvalho/adonis-durable:docs/cluster/thin-workers.mdx'
+        priority: HIGH
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-cluster']
+      - mistake: building a WorkerRuntime on the default NoopWorkerRegistry
+        mechanism: >-
+          Without a registry the worker executes fine but advertises nothing,
+          so capability-requiring steps are never routed to it — runs park
+          blocked instead.
+        wrong_pattern: |
+          const runtime = new WorkerRuntime({ transport, partition: 'acme' }) // registry defaults to noop
+        correct_pattern: |
+          const runtime = new WorkerRuntime({
+            transport, partition: 'acme',
+            registry: new RedisWorkerRegistry(redis, { ownsConnection: true }),
+          })
+        source: 'DavideCarvalho/adonis-durable:docs/cluster/thin-workers.mdx'
+        priority: MEDIUM
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-cluster']
+      - mistake: letting a partition-less local process join a shared broker
+        mechanism: >-
+          A worker on no partition serves the bare <name> tokens — the exact
+          queues the deployed fleet consumes — so a laptop dev process steals
+          production tasks; give it a real partition.
+        wrong_pattern: |
+          transports.bullmq({ connection: REDIS_URL }) // local dev against prod Redis
+        correct_pattern: |
+          transports.bullmq({ connection: REDIS_URL, partition: 'david-dev' })
+        source: 'DavideCarvalho/adonis-durable:docs/concepts/tenancy.mdx'
+        priority: MEDIUM
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-cluster', 'durable-setup']
+      - mistake: stamping runs into a namespace nothing polls
+        mechanism: >-
+          opts.namespace routes a run to a pool that must have an engine or
+          operator polling it; a namespace with neither is a dead end where
+          runs sit pending forever.
+        wrong_pattern: |
+          await engine.start('checkout', order, id, { namespace: 'eu-west' }) // nobody polls eu-west
+        correct_pattern: |
+          // run an engine on 'eu-west' or an operator above it before starting into it
+        source: 'DavideCarvalho/adonis-durable:docs/concepts/tenancy.mdx'
+        priority: MEDIUM
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-cluster', 'durable-setup']
+
+  - name: durable-observability
+    slug: durable-observability
+    domain: observability
+    package: '@adonis-agora/durable-dashboard'
+    type: core
+    description: >-
+      Operate and observe runs: the embedded dashboard (config/authorize/
+      dashboardAuth, JSON API, SSE tail, bulk actions, fix-and-replay),
+      lifecycle events, interceptors, collectMetrics, OpenTelemetry tracing,
+      and the Telescope Workflows view.
+    covers:
+      - config/durable_dashboard.ts
+      - authorize
+      - dashboardAuth
+      - session/login hooks
+      - retry-with-input
+      - bulk actions
+      - EventSource stream
+      - engine.subscribe
+      - engine.use
+      - collectMetrics
+      - attachDurableOtel
+      - otelTraceparent
+      - attachDurableMetrics
+      - durableTelescopeExtension
+    tasks:
+      - Mount and secure the operations console
+      - Fix-and-replay a failed run or act on runs in bulk
+      - Bridge engine events to logs, metrics or your own tracer
+      - Surface workflow golden signals in Telescope
+    failure_modes:
+      - mistake: trusting the default authorize gate with no token set
+        mechanism: >-
+          In production the default authorize requires a bearer token equal to
+          DURABLE_DASHBOARD_TOKEN and FAILS CLOSED when unset — the whole
+          console 403s and looks broken rather than leaking.
+        wrong_pattern: |
+          export default defineConfig({}) // prod, DURABLE_DASHBOARD_TOKEN unset
+        correct_pattern: |
+          export default defineConfig({
+            authorize: async (ctx) => { await ctx.auth.check(); return ctx.auth.user?.isAdmin === true },
+          })
+        source: 'DavideCarvalho/adonis-durable:docs/observability/dashboard.mdx'
+        priority: HIGH
+        status: active
+        version_context: '0.2.1'
+        skills: ['durable-observability']
+      - mistake: making interceptor outputs depend on wall clock or randomness
+        mechanism: >-
+          Interceptors run INSIDE the deterministic execution of a local step;
+          a returned value derived from time/random/external state makes
+          replay disagree with the recorded checkpoint.
+        wrong_pattern: |
+          engine.use(async (invocation, next) => next().then((r) => ({ ...r, at: Date.now() })))
+        correct_pattern: |
+          engine.use(async (invocation, next) => {
+            const r = await next(); logger.info({ step: invocation.stepName }); return r
+          })
+        source: 'DavideCarvalho/adonis-durable:docs/observability/events-and-interceptors.mdx'
+        priority: HIGH
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-observability', 'durable-determinism']
+      - mistake: expecting interceptors to fire on replay or dispatched steps
+        mechanism: >-
+          Interceptors wrap LOCAL steps' real execution only — replays return
+          recorded output without executing, and dispatched steps run on
+          workers in another process.
+        wrong_pattern: |
+          engine.use(enforceInvariant) // "runs every turn" — it does not
+        correct_pattern: |
+          // enforce invariants inside the workflow body/step handlers; register
+          // interceptors on the WORKER's engine to observe dispatched steps
+        source: 'DavideCarvalho/adonis-durable:docs/observability/events-and-interceptors.mdx'
+        priority: MEDIUM
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-observability']
+      - mistake: reading a compensating cancel's response as the final status
+        mechanism: >-
+          Cancel-with-compensate answers with the PRE-cancel status and runs
+          the undo in the background; the run reaches cancelled only after the
+          saga finishes — watch the stream or poll.
+        wrong_pattern: |
+          const { run } = await cancel(runId, { compensate: true })
+          if (run.status !== 'cancelled') throw new Error('cancel failed') // premature
+        correct_pattern: |
+          await cancel(runId, { compensate: true })
+          // then poll getRun / subscribe to the SSE stream until status === 'cancelled'
+        source: 'DavideCarvalho/adonis-durable:docs/observability/dashboard.mdx'
+        priority: MEDIUM
+        status: active
+        version_context: '0.2.1'
+        skills: ['durable-observability', 'durable-reliability']
+      - mistake: scraping one pod's collectMetrics counters as fleet totals
+        mechanism: >-
+          Counters are per process and reset on restart; aggregating one pod
+          undercounts and restarts zero them — scrape every instance and
+          aggregate in Prometheus.
+        wrong_pattern: |
+          // one Grafana target pointed at a single web pod
+        correct_pattern: |
+          // add /metrics/durable on every engine-bearing pod; aggregate in Prometheus
+        source: 'DavideCarvalho/adonis-durable:docs/observability/events-and-interceptors.mdx'
+        priority: MEDIUM
+        status: active
+        version_context: '0.25.0'
+        skills: ['durable-observability']
+
+tensions:
+  - name: zero-config defaults vs production durability
+    skills: ['durable-setup', 'durable-reliability']
+    description: >-
+      The in-memory store/memory transport make first runs effortless but are
+      explicitly non-production; agents copy the happy-path config verbatim.
+    implication: >-
+      Agents ship configs that work locally and silently lose state on restart;
+      setup must always pair defaults with their production swap.
+  - name: liveness detection vs long-but-healthy steps
+    skills: ['durable-reliability', 'durable-transports-stores']
+    description: >-
+      Tight timeouts/stalled thresholds catch wedged workers fast but
+      double-run merely-slow steps; loose settings hide real deaths.
+    implication: >-
+      Agents tune detection windows below the longest legitimate step and
+      cause duplicate executions; every window must exceed the slowest step.
+  - name: store-less isolation vs operational convenience
+    skills: ['durable-cluster', 'durable-observability']
+    description: >-
+      Tenant pods gain structural isolation by giving up direct store access;
+      some verbs have no wire equivalent yet.
+    implication: >-
+      Agents assume the full dashboard API everywhere; retry-with-input and
+      continue answer 404 on a store-less pod — route them to the control plane.
+  - name: class-based ergonomics vs the determinism rule
+    skills: ['durable-workflows', 'durable-determinism']
+    description: >-
+      Constructor-injected services invite calling them directly from run(),
+      which performs unchecked I/O outside steps.
+    implication: >-
+      Agents generate this.billing.charge(...) calls in the body that
+      re-execute on replay; every service touch must go through a step ref.
+
+cross_references:
+  - from: durable-setup
+    to: durable-transports-stores
+    reason: Setup ends where driver choice begins — production swap lives here.
+  - from: durable-workflows
+    to: durable-determinism
+    reason: Every authoring decision is constrained by the replay rule.
+  - from: durable-determinism
+    to: durable-reliability
+    reason: NonDeterminismError and poison-pill runs surface in the DLQ playbook.
+  - from: durable-reliability
+    to: durable-cluster
+    reason: Lost-dispatch recovery depends on which workers/transports exist.
+  - from: durable-reliability
+    to: durable-observability
+    reason: The stranded signature is queried through the dashboard/CLI surfaces.
+  - from: durable-workflows
+    to: durable-observability
+    reason: breakpoint/setEvent pair with dashboard continue and progress reads.
+
+gaps:
+  - skill: all
+    question: >-
+      Real-world failure frequencies (which misconfiguration dominates issue
+      reports) could not be confirmed — GitHub issues were not mined this
+      session.
+    context: >-
+      Priorities were inferred from doc emphasis (callouts/warnings) and the
+      operator-facing failure-modes page, which is unusually explicit.
+    status: open
+  - skill: durable-setup
+    question: >-
+      Whether NOOP_RUN_DISPATCHER + durable:work is the recommended split or
+      whether most users stay standalone was not confirmed with the maintainer.
+    context: >-
+      Docs present both as supported; the failure-modes page argues strongly
+      for splitting CPU-heavy work off API pods.
+    status: open
+  - skill: durable-transports-stores
+    question: >-
+      Relative adoption of the db transport vs the queue transport in
+      production is unknown.
+    context: >-
+      Both are documented as first-class; skills treat them equally.
+    status: open
+  - skill: durable-observability
+    question: >-
+      Whether teams prefer dashboardAuth Mode A or B in practice is unknown.
+    context: Docs describe both symmetrically; both are covered.
+    status: open
