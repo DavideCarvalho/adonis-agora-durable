@@ -1,7 +1,6 @@
 ---
 '@adonis-agora/durable': patch
 '@adonis-agora/durable-dashboard': patch
-'@adonis-agora/durable-eslint-plugin': patch
 ---
 
 Add TanStack Intent AI-agent skills
