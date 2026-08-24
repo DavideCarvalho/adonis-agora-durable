@@ -31,7 +31,7 @@ importers:
         version: 1.5.11(@swc/core@1.15.47)(esbuild@0.21.5)(rollup@4.62.2)(vite@5.4.21(@types/node@20.19.43))
       vitest:
         specifier: 3.2.7
-        version: 3.2.7(@types/node@20.19.43)(happy-dom@20.11.2)(jsdom@25.0.1(supports-color@10.2.2))(supports-color@10.2.2)
+        version: 3.2.7(@types/node@20.19.43)(happy-dom@20.11.6)(jsdom@25.0.1(supports-color@10.2.2))(supports-color@10.2.2)
 
   packages/adonis:
     dependencies:
@@ -92,7 +92,7 @@ importers:
         version: 5.9.3
       vitest:
         specifier: 3.2.7
-        version: 3.2.7(@types/node@20.19.43)(happy-dom@20.11.2)(jsdom@25.0.1(supports-color@10.2.2))(supports-color@10.2.2)
+        version: 3.2.7(@types/node@20.19.43)(happy-dom@20.11.6)(jsdom@25.0.1(supports-color@10.2.2))(supports-color@10.2.2)
 
   packages/dashboard:
     devDependencies:
@@ -139,8 +139,8 @@ importers:
         specifier: 2.1.1
         version: 2.1.1
       happy-dom:
-        specifier: 20.11.2
-        version: 20.11.2
+        specifier: 20.11.6
+        version: 20.11.6
       jsdom:
         specifier: 25.0.1
         version: 25.0.1(supports-color@10.2.2)
@@ -167,7 +167,7 @@ importers:
         version: 5.4.21(@types/node@20.19.43)
       vitest:
         specifier: 3.2.7
-        version: 3.2.7(@types/node@20.19.43)(happy-dom@20.11.2)(jsdom@25.0.1(supports-color@10.2.2))(supports-color@10.2.2)
+        version: 3.2.7(@types/node@20.19.43)(happy-dom@20.11.6)(jsdom@25.0.1(supports-color@10.2.2))(supports-color@10.2.2)
 
   packages/eslint-plugin:
     dependencies:
@@ -192,7 +192,7 @@ importers:
         version: 5.9.3
       vitest:
         specifier: 3.2.7
-        version: 3.2.7(@types/node@20.19.43)(happy-dom@20.11.2)(jsdom@25.0.1(supports-color@10.2.2))(supports-color@10.2.2)
+        version: 3.2.7(@types/node@20.19.43)(happy-dom@20.11.6)(jsdom@25.0.1(supports-color@10.2.2))(supports-color@10.2.2)
 
 packages:
 
@@ -2424,8 +2424,8 @@ packages:
   graceful-fs@4.2.11:
     resolution: {integrity: sha512-RbJ5/jmFcNNCcDV5o9eTnBLJ/HszWV0P73bc+Ff4nS/rJj+YaS6IGyiOL0VoBYX+l1Wrl3k63h/KrH+nhJ0XvQ==}
 
-  happy-dom@20.11.2:
-    resolution: {integrity: sha512-7MB+bJLkxu3SowAfBJbjW+c55kNz5tkR45gu2qzrxznezhLeN5YIlJbwUgSzlGc+qWoZ8Ykg71H5ezz69xixrw==}
+  happy-dom@20.11.6:
+    resolution: {integrity: sha512-Hldbg8AdAa5a5oDcZpjqnGitp7JB0hqWmfv/8qr+kft4vzSD8BHsbdRfzYvL/0QcbKcURC/yyoygbeDQarPvYg==}
     engines: {node: '>=20.0.0'}
 
   has-flag@4.0.0:
@@ -6058,7 +6058,7 @@ snapshots:
 
   graceful-fs@4.2.11: {}
 
-  happy-dom@20.11.2:
+  happy-dom@20.11.6:
     dependencies:
       '@types/node': 20.19.43
       '@types/whatwg-mimetype': 3.0.2
@@ -7230,7 +7230,7 @@ snapshots:
       '@types/node': 20.19.43
       fsevents: 2.3.3
 
-  vitest@3.2.7(@types/node@20.19.43)(happy-dom@20.11.2)(jsdom@25.0.1(supports-color@10.2.2))(supports-color@10.2.2):
+  vitest@3.2.7(@types/node@20.19.43)(happy-dom@20.11.6)(jsdom@25.0.1(supports-color@10.2.2))(supports-color@10.2.2):
     dependencies:
       '@types/chai': 5.2.3
       '@vitest/expect': 3.2.7
@@ -7257,7 +7257,7 @@ snapshots:
       why-is-node-running: 2.3.0
     optionalDependencies:
       '@types/node': 20.19.43
-      happy-dom: 20.11.2
+      happy-dom: 20.11.6
       jsdom: 25.0.1(supports-color@10.2.2)
     transitivePeerDependencies:
       - less
