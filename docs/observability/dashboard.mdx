@@ -48,6 +48,23 @@ export default defineConfig({
 })
 ```
 
+If you use `@adonis-agora/authz` for RBAC, the shared `authorizeByRoles` helper reads
+your user and roles for you — same semantics as the `requireRole` middleware, no ctx
+narrowing:
+
+```ts
+import { authorizeByRoles } from '@adonis-agora/authz'
+
+export default defineConfig({
+  authorize: authorizeByRoles({ roles: ['ADMIN'] }),
+})
+```
+
+The user is resolved from `ctx.auth.getUser()` (authkit) or `ctx.auth.user` (any guard);
+`roles` is any-of over `effectiveRoles` (token claims ∪ DB roles). Anonymous requests are
+denied (`false`). The same helper works across every `@adonis-agora` dashboard — durable,
+telescope, media and agent — so one RBAC gate config reads the same everywhere.
+
 <Callout type="warn">
 The console exposes retry, cancel, replay and bulk actions that mutate runs. Always front it with a real guard in production — the default token gate is a floor, not a substitute for your app's auth.
 </Callout>
