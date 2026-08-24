@@ -1,5 +1,29 @@
 # @adonis-agora/durable-dashboard
 
+## 0.2.2
+
+### Patch Changes
+
+- [#77](https://github.com/DavideCarvalho/adonis-agora-durable/pull/77) [`f69eeb7`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/f69eeb73f1b9474d9ee96cc4dbfbd03dbb77dff5) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Fix the console's run list drifting out of alignment as new runs arrive
+
+  The run list's virtualiser cached row heights under its default key, the array index, while React
+  reconciled the rows by `run.id`. The list `key` already remounts on a filter change, but the live poll
+  reorders it in place — a newly started run arriving at the top pushes every existing row down an index
+  with no remount at all — and a reused row is never re-measured. Each index therefore kept the height of
+  whoever sat there before, putting every row offset and the scroll track's total height out by the
+  difference, so rows gradually overlapped or left gaps as runs came in.
+
+  The size and element caches are now keyed by `run.id`, so a measurement follows the row it belongs to.
+
+- [#78](https://github.com/DavideCarvalho/adonis-agora-durable/pull/78) [`bb587ec`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/bb587ec36d9bf0742b72eb74abd653fe349dd9ea) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Add TanStack Intent AI-agent skills
+
+  Ships seven `SKILL.md` agent skills co-located with their packages and published in the npm tarballs via a new `"skills/"` entry in each package's `files` array:
+
+  - `packages/adonis/skills/` — durable-setup, durable-workflows, durable-determinism, durable-transports-stores, durable-reliability, durable-cluster
+  - `packages/dashboard/skills/` — durable-observability
+
+  Each package also gains the `tanstack-intent` keyword and a devDependency on `@tanstack/intent`. Discovery artifacts (`_artifacts/domain_map.yaml`, `skill_spec.md`, `skill_tree.yaml`) live at the repo root, and `.github/workflows/check-skills.yml` validates skills on PRs.
+
 ## 0.2.1
 
 ### Patch Changes
