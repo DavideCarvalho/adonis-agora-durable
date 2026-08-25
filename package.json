@@ -9,7 +9,7 @@
     "url": "git+https://github.com/DavideCarvalho/adonis-agora-durable.git"
   },
   "author": "Davi Carvalho <davi@goflip.ai>",
-  "packageManager": "pnpm@11.17.0",
+  "packageManager": "pnpm@11.24.0",
   "engines": {
     "node": ">=20.6.0"
   },
