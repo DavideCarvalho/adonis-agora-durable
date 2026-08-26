@@ -8,6 +8,8 @@ import { Callout } from 'fumadocs-ui/components/callout';
 
 A scheduled workflow is just a normal workflow that you **start on a recurring cadence** — a nightly report, an hourly sync, a cleanup every five minutes. You describe the cadence with a `ScheduledWorkflow` and register it under `schedules` in `config/durable.ts`; the `durable:work` worker loop then fires any due windows on every tick. The interesting part is the exactly-once guarantee: even with several worker instances racing on the same tick, each schedule window starts **exactly once**.
 
+Schedules trigger by **time**. To trigger a workflow when an **event** happens instead — an Adonis emitter event or a `@adonis-agora/diagnostics` channel — see [Event-triggered workflows](./event-triggers).
+
 ## Describing a schedule — `ScheduledWorkflow`
 
 ```ts

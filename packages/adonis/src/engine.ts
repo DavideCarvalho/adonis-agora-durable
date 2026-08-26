@@ -60,6 +60,7 @@ import { breakpointToken, stepId } from './protocol.js';
 import type { QueueConfig } from './queue.js';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor.js';
 import type { ScheduledWorkflow } from './scheduler.js';
+import type { NormalizedEventTrigger } from './workflow-events.js';
 import { SingletonGate } from './singleton-gate.js';
 import { sanitizeQueueToken, tenantGroup } from './tenant-group.js';
 import { TransportPool } from './transport-pool.js';
@@ -659,6 +660,19 @@ export class WorkflowEngine {
   /** Colocated schedules discovered from `static schedule`, for the worker loop to merge with config. */
   get discoveredSchedules(): readonly ScheduledWorkflow[] {
     return this.#discoveredSchedules;
+  }
+
+  /** Colocated event triggers discovered from `static on`, for the provider's bridge. */
+  private readonly colocatedEventTriggers: NormalizedEventTrigger[] = [];
+
+  /** Record event triggers collected from discovered workflow classes (`static on`). */
+  registerEventTriggers(triggers: readonly NormalizedEventTrigger[]): void {
+    for (const trigger of triggers) this.colocatedEventTriggers.push(trigger);
+  }
+
+  /** The event triggers discovered from `static on`, for the event-source bridge to attach. */
+  get discoveredEventTriggers(): readonly NormalizedEventTrigger[] {
+    return this.colocatedEventTriggers;
   }
 
   /** Send an operation to an entity (fire-and-forget). Ordered + exactly-once per key. */

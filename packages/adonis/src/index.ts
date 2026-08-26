@@ -35,6 +35,8 @@ export * from './scheduler.js';
 export * from './search-attributes.js';
 export * from './tokens.js';
 export * from './workflow-ref.js';
+export * from './workflow-events.js';
+export * from './event-trigger-bridge.js';
 export * from './workflow-discovery.js';
 export {
   BaseWorkflow,

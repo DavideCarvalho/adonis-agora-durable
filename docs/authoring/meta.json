@@ -9,6 +9,7 @@
     "webhooks",
     "external-tasks",
     "versioning",
-    "scheduling"
+    "scheduling",
+    "event-triggers"
   ]
 }

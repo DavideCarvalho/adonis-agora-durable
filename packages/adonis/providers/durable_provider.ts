@@ -1,5 +1,6 @@
 import { pathToFileURL } from 'node:url';
 import type { ApplicationService } from '@adonisjs/core/types';
+import { attachEventTriggerBridge, type EmitterLike } from '../src/event-trigger-bridge.js';
 import type { AdmissionContext } from '../src/admissions/factory.js';
 import type { ControlPlaneConfig, TenantConfig } from '../src/config_types.js';
 import type { ControlPlaneContext } from '../src/control-planes/factory.js';
@@ -360,12 +361,36 @@ export default class DurableProvider {
       await registerWorkflowsFromDir(engine, dir, workflowFactory);
     }
 
+    // Event-triggered workflows (`static on` / `@OnEvent` / `@OnDiagnostic`): bridge the
+    // Adonis emitter + the diagnostics bus into the engine. Registered AFTER discovery so
+    // every trigger (incl. the engine's `onEvent` subscribers) is in place.
+    const triggers = engine.discoveredEventTriggers;
+    if (triggers.length > 0) {
+      const emitter = await this.#resolveEmitter();
+      this.#detachEventTriggers = attachEventTriggerBridge(triggers, {
+        engine,
+        ...(emitter !== undefined ? { emitter } : {}),
+      });
+    }
+
     // Embedded worker: only `standalone` serves step bodies in-process (design §3). A `control-plane` is
     // a pure coordinator — its step bodies run on separate tenant worker pods — so it does NOT serve
     // app/steps.
     if (role === 'standalone') await this.#registerSteps(config);
 
     await this.#startResponder();
+  }
+
+  /** The bridge disposer, released on shutdown so a hot-reload doesn't leak listeners. */
+  #detachEventTriggers: (() => void) | undefined;
+
+  /** The AdonisJS app emitter, when resolvable (missing = emitter triggers are inert). */
+  async #resolveEmitter(): Promise<EmitterLike | undefined> {
+    try {
+      return (await this.app.container.make('emitter')) as EmitterLike;
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -524,6 +549,8 @@ export default class DurableProvider {
     this.#responder = null;
     this.#detachDiagnostics?.();
     this.#detachDiagnostics = null;
+    this.#detachEventTriggers?.();
+    this.#detachEventTriggers = undefined;
     // Release the transport's broker workers / queues / connections so a deploy hands off cleanly.
     await this.#transport?.close?.();
     this.#transport = null;

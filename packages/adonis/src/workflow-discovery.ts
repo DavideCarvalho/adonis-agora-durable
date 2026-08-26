@@ -3,6 +3,7 @@ import { extname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { WorkflowEngine } from './engine.js';
 import { type WorkflowMeta, workflowMeta, workflowSchedules } from './workflow-ref.js';
+import { eventTriggerCanonicalName, workflowEvents } from './workflow-events.js';
 
 /**
  * The constructor shape discovery hands back. Deliberately **not** {@link WorkflowClass}: that one
@@ -60,6 +61,14 @@ export async function registerWorkflowClass(
   if (!meta) return false;
   const Ctor = cls as DiscoveredWorkflowClass;
   const instance = await factory(Ctor);
+  // Colocated `static on` event triggers: exact-string ones register under the engine's
+  // `onEvent` (the bridge publishes the canonical name); regex/any ones are started
+  // directly by the bridge. Both are recorded so the provider can attach the bridge.
+  const events = workflowEvents(cls);
+  if (events.length > 0) engine.registerEventTriggers(events);
+  const exactNames = events
+    .map(eventTriggerCanonicalName)
+    .filter((name): name is string => name !== null);
   engine.register(
     meta.name,
     meta.version,
@@ -67,7 +76,9 @@ export async function registerWorkflowClass(
     {
       ...(meta.tags ? { tags: meta.tags } : {}),
       ...(meta.executionTimeout !== undefined ? { executionTimeout: meta.executionTimeout } : {}),
-      ...(meta.onEvent ? { onEvent: meta.onEvent } : {}),
+      ...(meta.onEvent || exactNames.length > 0
+        ? { onEvent: [...(meta.onEvent ?? []), ...exactNames] }
+        : {}),
       ...(meta.singleton ? { singleton: meta.singleton } : {}),
     },
   );

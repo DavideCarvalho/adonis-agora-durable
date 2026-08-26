@@ -1,0 +1,75 @@
+---
+title: Event-triggered workflows
+description: Start a workflow when an external event fires — an AdonisJS emitter event (`@OnEvent`) or a `@adonis-agora/diagnostics` channel (`@OnDiagnostic`) — with the event payload as the run input.
+icon: Radio
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+A scheduled workflow starts on time; an **event-triggered workflow** starts when something happens — a payment succeeded, a webhook arrived, a document changed. Instead of you wiring "event → `engine.start(...)`" by hand, the workflow class declares its triggers and the durable provider bridges the event source into the engine for you.
+
+Two sources are supported:
+
+- the **AdonisJS emitter** (`@OnEvent`) — exact event names,
+- the **`@adonis-agora/diagnostics` bus** (`@OnDiagnostic`) — `agora:<lib>:<event>` channels, exact or regex, plus "every event of a lib".
+
+## Authoring — decorators and `static on`
+
+```ts
+import { BaseWorkflow, OnEvent, OnDiagnostic } from '@adonis-agora/durable'
+
+@OnDiagnostic({ lib: 'payments', event: 'payment.succeeded' })
+@OnEvent({ event: 'agora:payments:payment.succeeded' })
+export class ProcessPaymentWorkflow extends BaseWorkflow {
+  static workflow = { name: 'process-payment' }
+  async run(ctx: WorkflowCtx, input: { externalReference: string }) {
+    // input is the event payload
+  }
+}
+```
+
+Both forms are supported, exactly like schedules:
+
+- `@OnEvent({ event })` / `@OnDiagnostic({ lib, event? })` — named-parameter decorators, and
+- a colocated `static on = [...]` literal (the decorators only stamp `static on`):
+
+```ts
+static on = [
+  { source: 'emitter', event: 'agora:payments:payment.succeeded' },
+  { source: 'diagnostics', lib: 'payments', event: 'payment.succeeded' },
+  { source: 'diagnostics', lib: 'payments', event: /^payment\./ }, // regex over events
+  { source: 'diagnostics', lib: 'payments' },                       // every event of the lib
+]
+```
+
+Repeated decorators and an existing `static on` accumulate (decorators prepend, top-first).
+
+<Callout type="info" title="Source capabilities">
+The Adonis emitter has no wildcard, so `@OnEvent` matches **exact names only**. Regex / "every event" is available on the diagnostics bus, whose channel registry the bridge subscribes to (current and future channels).
+</Callout>
+
+## How it fires
+
+- **Exact triggers** route through `engine.publishEvent(canonical, payload)` — a fresh run of every workflow registered with that canonical `onEvent` name, with the payload as input. Idempotent by `evt:<id>:<workflow>` (durable's own dedup for redelivered events).
+- **Regex / any triggers** start the workflow directly with the event payload (the concrete channel name isn't known at registration time).
+
+The diagnostics channel envelope's `payload` becomes the run input. The payload type is whatever the emitting library published (e.g. `@adonis-agora/payments`' `payment.succeeded` payload with `externalReference`).
+
+## Wiring
+
+No config needed. The provider reads the triggers from discovered workflow classes (`static on`) and bridges the app's emitter (when resolvable) + the diagnostics channels at boot. If the emitter is unavailable, emitter triggers are inert; diagnostics triggers work regardless (they use `node:diagnostics_channel` directly).
+
+## Event payloads → workflow input
+
+The webhook-style flow that motivated this: a payment provider publishes `payment.succeeded` on `agora:payments:payment.succeeded` (via its diagnostics bridge); the workflow below runs once per event, with the payment's `externalReference` — no controller, no manual `engine.start`:
+
+```ts
+@OnDiagnostic({ lib: 'payments', event: 'payment.succeeded' })
+export class ProcessPaymentWorkflow extends BaseWorkflow {
+  static workflow = { name: 'process-payment' }
+  async run(ctx: WorkflowCtx, input: { externalReference?: string }) {
+    if (!input.externalReference) return
+    // grant the purchased credits / activate the subscription — durable owns retry + exactly-once
+  }
+}
+```
