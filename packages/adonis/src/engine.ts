@@ -60,7 +60,6 @@ import { breakpointToken, stepId } from './protocol.js';
 import type { QueueConfig } from './queue.js';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor.js';
 import type { ScheduledWorkflow } from './scheduler.js';
-import type { NormalizedEventTrigger } from './workflow-events.js';
 import { SingletonGate } from './singleton-gate.js';
 import { sanitizeQueueToken, tenantGroup } from './tenant-group.js';
 import { TransportPool } from './transport-pool.js';
@@ -71,6 +70,7 @@ import {
   type StepRecord,
   createWorkflowCtx,
 } from './workflow-ctx.js';
+import type { NormalizedEventTrigger } from './workflow-events.js';
 import {
   type WorkflowClass,
   type WorkflowInputOf,

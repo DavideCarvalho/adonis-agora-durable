@@ -1,4 +1,4 @@
-import { workflowMeta, type WorkflowClass } from './workflow-ref.js';
+import { type WorkflowClass, workflowMeta } from './workflow-ref.js';
 
 /**
  * Event-triggered workflows: a workflow class declares which **external** events start a
@@ -55,9 +55,7 @@ export type NormalizedEventTrigger =
  * - diagnostics: the channel name `agora:<lib>:<event>`.
  * Returns `null` for regex/any triggers (the bridge starts those directly).
  */
-export function eventTriggerCanonicalName(
-  trigger: NormalizedEventTrigger,
-): string | null {
+export function eventTriggerCanonicalName(trigger: NormalizedEventTrigger): string | null {
   if (trigger.source === 'emitter') return trigger.event;
   if (trigger.event === undefined) return null;
   return typeof trigger.event === 'string' ? `agora:${trigger.lib}:${trigger.event}` : null;
@@ -74,10 +72,7 @@ export function workflowEvents(target: unknown): NormalizedEventTrigger[] {
 }
 
 /** Stamp `static on` (prepend, mirroring {@link Scheduled}). */
-function stampOn(
-  target: unknown,
-  config: WorkflowEventTrigger | WorkflowEventTrigger[],
-): void {
+function stampOn(target: unknown, config: WorkflowEventTrigger | WorkflowEventTrigger[]): void {
   const cls = target as { on?: WorkflowEventTrigger | WorkflowEventTrigger[] };
   const existing = cls.on === undefined ? [] : Array.isArray(cls.on) ? cls.on : [cls.on];
   const added = Array.isArray(config) ? config : [config];

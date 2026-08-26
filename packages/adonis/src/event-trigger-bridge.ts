@@ -1,6 +1,6 @@
 import diagnostics_channel from 'node:diagnostics_channel';
 import type { WorkflowEngine } from './engine.js';
-import { eventTriggerCanonicalName, type NormalizedEventTrigger } from './workflow-events.js';
+import { type NormalizedEventTrigger, eventTriggerCanonicalName } from './workflow-events.js';
 
 /** The `@adonis-agora/diagnostics` channel registry, read STRUCTURALLY (durable never imports it). */
 const DIAGNOSTICS_REGISTRY_KEY = Symbol.for('@agora/diagnostics:registry');

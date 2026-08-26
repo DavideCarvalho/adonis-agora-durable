@@ -1,15 +1,15 @@
 import { channel } from 'node:diagnostics_channel';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WorkflowEngine } from '../src/engine.js';
+import { type EmitterLike, attachEventTriggerBridge } from '../src/event-trigger-bridge.js';
 import { InMemoryStateStore } from '../src/testing/in-memory-state-store.js';
 import { InMemoryTransport } from '../src/testing/in-memory-transport.js';
 import {
-  OnEvent,
   OnDiagnostic,
+  OnEvent,
   eventTriggerCanonicalName,
   workflowEvents,
 } from '../src/workflow-events.js';
-import { attachEventTriggerBridge, type EmitterLike } from '../src/event-trigger-bridge.js';
 
 function makeEngine() {
   const store = new InMemoryStateStore();
@@ -51,7 +51,12 @@ function makeEmitter() {
       return emitter;
     },
   };
-  return { emitter, emit: (event: string, payload: unknown) => handlers.get(event)?.forEach((h) => h(payload)) };
+  return {
+    emitter,
+    emit: (event: string, payload: unknown) => {
+      for (const h of handlers.get(event) ?? []) h(payload);
+    },
+  };
 }
 
 describe('event-triggered workflows', () => {
@@ -64,14 +69,32 @@ describe('event-triggered workflows', () => {
     }
     const triggers = workflowEvents(W);
     expect(triggers).toHaveLength(2);
-    expect(triggers[0]).toMatchObject({ source: 'emitter', event: 'agora:payments:payment.succeeded', workflow: 'process-payment' });
-    expect(triggers[1]).toMatchObject({ source: 'diagnostics', lib: 'payments', event: 'payment.succeeded', workflow: 'process-payment' });
+    expect(triggers[0]).toMatchObject({
+      source: 'emitter',
+      event: 'agora:payments:payment.succeeded',
+      workflow: 'process-payment',
+    });
+    expect(triggers[1]).toMatchObject({
+      source: 'diagnostics',
+      lib: 'payments',
+      event: 'payment.succeeded',
+      workflow: 'process-payment',
+    });
   });
 
   it('derives the canonical engine event name for exact triggers', () => {
     expect(eventTriggerCanonicalName({ source: 'emitter', event: 'x', workflow: 'w' })).toBe('x');
-    expect(eventTriggerCanonicalName({ source: 'diagnostics', lib: 'payments', event: 'payment.succeeded', workflow: 'w' })).toBe('agora:payments:payment.succeeded');
-    expect(eventTriggerCanonicalName({ source: 'diagnostics', lib: 'payments', workflow: 'w' })).toBeNull();
+    expect(
+      eventTriggerCanonicalName({
+        source: 'diagnostics',
+        lib: 'payments',
+        event: 'payment.succeeded',
+        workflow: 'w',
+      }),
+    ).toBe('agora:payments:payment.succeeded');
+    expect(
+      eventTriggerCanonicalName({ source: 'diagnostics', lib: 'payments', workflow: 'w' }),
+    ).toBeNull();
   });
 
   it('bridges an exact Adonis emitter event into a fresh run (payload as input)', async () => {
@@ -79,9 +102,14 @@ describe('event-triggered workflows', () => {
     const { emitter, emit } = makeEmitter();
 
     const seen: Array<{ input: unknown }> = [];
-    engine.register('on-x', '1', async (_ctx, input: unknown) => {
-      seen.push({ input });
-    }, { onEvent: ['x'] });
+    engine.register(
+      'on-x',
+      '1',
+      async (_ctx, input: unknown) => {
+        seen.push({ input });
+      },
+      { onEvent: ['x'] },
+    );
     engine.registerEventTriggers([{ source: 'emitter', event: 'x', workflow: 'on-x' }]);
     disposers.push(attachEventTriggerBridge(engine.discoveredEventTriggers, { engine, emitter }));
 
@@ -94,11 +122,21 @@ describe('event-triggered workflows', () => {
   it('bridges an exact diagnostics channel event via publishEvent', async () => {
     const { store, engine } = makeEngine();
     const seen: Array<{ input: unknown }> = [];
-    engine.register('on-payment', '1', async (_ctx, input: unknown) => {
-      seen.push({ input });
-    }, { onEvent: ['agora:payments:payment.succeeded'] });
+    engine.register(
+      'on-payment',
+      '1',
+      async (_ctx, input: unknown) => {
+        seen.push({ input });
+      },
+      { onEvent: ['agora:payments:payment.succeeded'] },
+    );
     engine.registerEventTriggers([
-      { source: 'diagnostics', lib: 'payments', event: 'payment.succeeded', workflow: 'on-payment' },
+      {
+        source: 'diagnostics',
+        lib: 'payments',
+        event: 'payment.succeeded',
+        workflow: 'on-payment',
+      },
     ]);
     disposers.push(attachEventTriggerBridge(engine.discoveredEventTriggers, { engine }));
 
@@ -119,8 +157,10 @@ describe('event-triggered workflows', () => {
     const registry = (globalThis as Record<symbol, unknown>)[registryKey] as
       | { channels: Set<string>; listeners: Set<(name: string) => void> }
       | undefined;
-    const seeded =
-      registry ?? { channels: new Set<string>(), listeners: new Set<(name: string) => void>() };
+    const seeded = registry ?? {
+      channels: new Set<string>(),
+      listeners: new Set<(name: string) => void>(),
+    };
     (globalThis as Record<symbol, unknown>)[registryKey] = seeded;
     seeded.channels.add('agora:payments:payment.succeeded');
     seeded.channels.add('agora:payments:charge.created');
@@ -156,9 +196,14 @@ describe('event-triggered workflows', () => {
     const { store, engine } = makeEngine();
     const { emitter, emit } = makeEmitter();
     const seen: Array<{ input: unknown }> = [];
-    engine.register('on-x', '1', async (_ctx, input: unknown) => {
-      seen.push({ input });
-    }, { onEvent: ['x'] });
+    engine.register(
+      'on-x',
+      '1',
+      async (_ctx, input: unknown) => {
+        seen.push({ input });
+      },
+      { onEvent: ['x'] },
+    );
     engine.registerEventTriggers([{ source: 'emitter', event: 'x', workflow: 'on-x' }]);
     const dispose = attachEventTriggerBridge(engine.discoveredEventTriggers, { engine, emitter });
     dispose();

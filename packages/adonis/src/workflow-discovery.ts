@@ -2,8 +2,8 @@ import { readdir } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { WorkflowEngine } from './engine.js';
-import { type WorkflowMeta, workflowMeta, workflowSchedules } from './workflow-ref.js';
 import { eventTriggerCanonicalName, workflowEvents } from './workflow-events.js';
+import { type WorkflowMeta, workflowMeta, workflowSchedules } from './workflow-ref.js';
 
 /**
  * The constructor shape discovery hands back. Deliberately **not** {@link WorkflowClass}: that one

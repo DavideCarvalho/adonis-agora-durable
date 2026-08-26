@@ -1,10 +1,10 @@
 import { pathToFileURL } from 'node:url';
 import type { ApplicationService } from '@adonisjs/core/types';
-import { attachEventTriggerBridge, type EmitterLike } from '../src/event-trigger-bridge.js';
 import type { AdmissionContext } from '../src/admissions/factory.js';
 import type { ControlPlaneConfig, TenantConfig } from '../src/config_types.js';
 import type { ControlPlaneContext } from '../src/control-planes/factory.js';
 import type { DurableConfig } from '../src/define_config.js';
+import { type EmitterLike, attachEventTriggerBridge } from '../src/event-trigger-bridge.js';
 import {
   type AdmissionBackend,
   type ControlPlane,
