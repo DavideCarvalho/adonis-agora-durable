@@ -1,13 +1,13 @@
 import { channel } from 'node:diagnostics_channel';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WorkflowEngine } from '../src/engine.js';
-import { type EmitterLike, attachEventTriggerBridge } from '../src/event-trigger-bridge.js';
+import { attachEventTriggerBridge, type EmitterLike } from '../src/event-trigger-bridge.js';
 import { InMemoryStateStore } from '../src/testing/in-memory-state-store.js';
 import { InMemoryTransport } from '../src/testing/in-memory-transport.js';
 import {
+  eventTriggerCanonicalName,
   OnDiagnostic,
   OnEvent,
-  eventTriggerCanonicalName,
   workflowEvents,
 } from '../src/workflow-events.js';
 

@@ -1,7 +1,7 @@
 import { describe, it } from 'vitest';
 import { assertTransportConformance } from '../../../src/testing-kit/index.js';
-import { makeMemoryDb } from '../../../src/transports/db-helpers.js';
 import { DbTransport } from '../../../src/transports/db.js';
+import { makeMemoryDb } from '../../../src/transports/db-helpers.js';
 
 /**
  * Run the shared Transport contract against the DB-table-backed transport (one instance acting as

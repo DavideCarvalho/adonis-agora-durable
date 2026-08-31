@@ -12,68 +12,65 @@
  * `step-discovery` helpers, then `runtime.start()`. The `node ace durable:worker` command wires exactly
  * this from `config/durable.ts`.
  */
-export {
-  WorkerRuntime,
-  WORKER_SDK,
-  type WorkerRuntimeOptions,
-  type WorkerTransport,
-  type WorkerRuntimeLogger,
-} from './worker-runtime.js';
-export {
-  NoopWorkerRegistry,
-  RedisWorkerRegistry,
-  type WorkerRegistry,
-  type DescriptorRedis,
-} from './registry.js';
-export {
-  workerDescriptorKey,
-  workerDescriptorKeyPrefix,
-  workerHeartbeatKey,
-  effectivePrefix,
-  routingToken,
-} from './naming.js';
 
 // The handshake descriptor surface (design §7) — re-exported for worker authors; itself Lucid-free.
 export {
   CURRENT_PROTOCOL_VERSION,
   descriptorHash,
+  type HeartbeatStatus,
   heartbeatStatus,
   normalizeDescriptor,
   type WorkerDescriptor,
-  type HeartbeatStatus,
   type WorkerLifecycle,
 } from '../handshake/descriptor.js';
-
-// Step registration/discovery helpers (the `app/steps` convention) — Lucid-free (fs + pure metadata).
-export {
-  registerStep,
-  registerSteps,
-  registerStepsFromDir,
-  registerStepsFromBarrel,
-  collectSteps,
-  type StepServer,
-  type DiscoveredStep,
-  type StepsBarrel,
-} from '../step-discovery.js';
-
 // The shared pure worker body + step-handler type (the transport funnels tasks through it).
 export { runStepHandler, type StepHandler } from '../protocol.js';
-
+// Step registration/discovery helpers (the `app/steps` convention) — Lucid-free (fs + pure metadata).
+export {
+  collectSteps,
+  type DiscoveredStep,
+  registerStep,
+  registerSteps,
+  registerStepsFromBarrel,
+  registerStepsFromDir,
+  type StepServer,
+  type StepsBarrel,
+} from '../step-discovery.js';
 // The shared pure WORKFLOW-TURN body (replay history → decision) + its authoring surface — what lets a
 // store-less worker execute workflow turns (design §4). Itself Lucid-free (imports only interface types).
 export {
-  runWorkflowTurn,
-  isWorkflowTask,
-  WorkflowStepFailedError,
-  WorkflowGatherFailedError,
-  WorkflowNondeterminismError,
-  WorkflowTurnCancelled,
-  type WorkflowTurnCtx,
-  type WorkflowBody,
-  type WorkflowBodyResolver,
-  type WorkflowTurnHandler,
-  type RunWorkflowTurnOptions,
-  type GatherMode,
   type GatherCall,
   type GatherItemError,
+  type GatherMode,
+  isWorkflowTask,
+  type RunWorkflowTurnOptions,
+  runWorkflowTurn,
+  type WorkflowBody,
+  type WorkflowBodyResolver,
+  WorkflowGatherFailedError,
+  WorkflowNondeterminismError,
+  WorkflowStepFailedError,
+  WorkflowTurnCancelled,
+  type WorkflowTurnCtx,
+  type WorkflowTurnHandler,
 } from '../workflow-turn.js';
+export {
+  effectivePrefix,
+  routingToken,
+  workerDescriptorKey,
+  workerDescriptorKeyPrefix,
+  workerHeartbeatKey,
+} from './naming.js';
+export {
+  type DescriptorRedis,
+  NoopWorkerRegistry,
+  RedisWorkerRegistry,
+  type WorkerRegistry,
+} from './registry.js';
+export {
+  WORKER_SDK,
+  WorkerRuntime,
+  type WorkerRuntimeLogger,
+  type WorkerRuntimeOptions,
+  type WorkerTransport,
+} from './worker-runtime.js';

@@ -1,66 +1,64 @@
 /** Keep in sync with this package's `version` in package.json. */
 export const VERSION = '0.26.0';
 
-export { defineConfig, defaultAuthorize, resolveConfig } from './define_config.js';
+export type {
+  AuthMode,
+  DashboardAuthOptions,
+  LoginHook,
+  LoginOutcome,
+  ResolvedDashboardAuth,
+  SessionHook,
+  SessionOutcome,
+} from './auth.js';
+// Built-in `dashboardAuth` login screen (optional; opt-in via `config/durable_dashboard.ts`).
+export {
+  performLogin,
+  performSession,
+  readSession,
+  resolveDashboardAuth,
+  SESSION_COOKIE_NAME,
+  sanitizeReturnTo,
+} from './auth.js';
+export type { CompatSource, FleetGroup, FleetTransport } from './compat.js';
+// Fleet health / protocol-compatibility panel (design §7.6, §10).
+export { compat, enumerateLiveFleet, mergeFleets } from './compat.js';
+export { formatProtocolRange, outcomeClass, outcomeLabel } from './compat-view.js';
 export type {
   AuthorizeHook,
   DurableDashboardConfig,
   ResolvedDurableDashboardConfig,
 } from './define_config.js';
-export {
-  listRuns,
-  getRun,
-  retryRun,
-  retryWithInputRun,
-  continueRun,
-  redispatchPendingRun,
-  cancelRun,
-  bulkAction,
-  health,
-  workers,
-  topology,
-  ok,
-} from './handlers.js';
-export type { ApiRequest, ApiResponse, Deps, DashboardEngine } from './handlers.js';
-export { renderDashboard } from './html.js';
-
-// Fleet health / protocol-compatibility panel (design §7.6, §10).
-export { compat, enumerateLiveFleet, mergeFleets } from './compat.js';
-export type { CompatSource, FleetGroup, FleetTransport } from './compat.js';
+export { defaultAuthorize, defineConfig, resolveConfig } from './define_config.js';
+export type { EngineEventSource, RecordedBlock } from './diagnostics-recorder.js';
 export { BlockedDiagnosticsRecorder } from './diagnostics-recorder.js';
-export type { RecordedBlock, EngineEventSource } from './diagnostics-recorder.js';
-export { outcomeClass, outcomeLabel, formatProtocolRange } from './compat-view.js';
-
-// Store-less `tenant` dashboard: adapt the RunGateway to the handlers' read/control port (design §8).
-export { gatewayDashboardEngine, dashboardEngineForRole } from './gateway-adapter.js';
 export type { DashboardContainer } from './gateway-adapter.js';
 
-// Built-in `dashboardAuth` login screen (optional; opt-in via `config/durable_dashboard.ts`).
+// Store-less `tenant` dashboard: adapt the RunGateway to the handlers' read/control port (design §8).
+export { dashboardEngineForRole, gatewayDashboardEngine } from './gateway-adapter.js';
+export type { ApiRequest, ApiResponse, DashboardEngine, Deps } from './handlers.js';
 export {
-  resolveDashboardAuth,
-  performLogin,
-  performSession,
-  readSession,
-  sanitizeReturnTo,
-  SESSION_COOKIE_NAME,
-} from './auth.js';
-export type {
-  AuthMode,
-  DashboardAuthOptions,
-  ResolvedDashboardAuth,
-  LoginHook,
-  LoginOutcome,
-  SessionHook,
-  SessionOutcome,
-} from './auth.js';
-export {
-  signSessionCookie,
-  verifySessionCookie,
-} from './session_cookie.js';
+  bulkAction,
+  cancelRun,
+  continueRun,
+  getRun,
+  health,
+  listRuns,
+  ok,
+  redispatchPendingRun,
+  retryRun,
+  retryWithInputRun,
+  topology,
+  workers,
+} from './handlers.js';
+export { renderDashboard } from './html.js';
+export { renderLoginPage } from './login_page.js';
 export type {
   DashboardSession,
   DashboardSessionUser,
   SignOptions,
   VerifyOptions,
 } from './session_cookie.js';
-export { renderLoginPage } from './login_page.js';
+export {
+  signSessionCookie,
+  verifySessionCookie,
+} from './session_cookie.js';

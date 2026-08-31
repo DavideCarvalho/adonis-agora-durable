@@ -4,15 +4,20 @@ import type { AdmissionContext } from '../src/admissions/factory.js';
 import type { ControlPlaneConfig, TenantConfig } from '../src/config_types.js';
 import type { ControlPlaneContext } from '../src/control-planes/factory.js';
 import type { DurableConfig } from '../src/define_config.js';
-import { type EmitterLike, attachEventTriggerBridge } from '../src/event-trigger-bridge.js';
+import { attachEventTriggerBridge, type EmitterLike } from '../src/event-trigger-bridge.js';
 import {
   type AdmissionBackend,
+  attachDurableDiagnostics,
   type ControlPlane,
   InMemoryStateStore,
   InMemoryTransport,
   ProxyRunGateway,
   type RunGateway,
   RunRequestResponder,
+  registerStepsFromBarrel,
+  registerStepsFromDir,
+  registerWorkflowsFromBarrel,
+  registerWorkflowsFromDir,
   type StateStore,
   type StepServer,
   type StepsBarrel,
@@ -23,21 +28,16 @@ import {
   WorkflowEngine,
   type WorkflowEngineDeps,
   type WorkflowsBarrel,
-  attachDurableDiagnostics,
-  registerStepsFromBarrel,
-  registerStepsFromDir,
-  registerWorkflowsFromBarrel,
-  registerWorkflowsFromDir,
 } from '../src/index.js';
 import {
   DURABLE_RUN_GATEWAY,
   DURABLE_RUN_REQUEST_RESPONDER,
   DURABLE_TRANSPORT,
   DURABLE_WORKER_RUNTIME,
-  NOOP_RUN_DISPATCHER,
   descriptorRedisFrom,
   hasProxyCapability,
   hasResponderCapability,
+  NOOP_RUN_DISPATCHER,
 } from '../src/role_bindings.js';
 import { setBootedApp } from '../src/services/booted_app.js';
 import {

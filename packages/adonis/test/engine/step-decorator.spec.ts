@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { WorkflowEngine } from '../../src/engine.js';
 import { collectSteps, registerStep, registerSteps } from '../../src/step-discovery.js';
 import { stepConfigOf, stepNameOf } from '../../src/step-name-symbol.js';
-import { Step, defineStep, stepMetaOf } from '../../src/step-ref.js';
+import { defineStep, Step, stepMetaOf } from '../../src/step-ref.js';
 import { startRun } from '../../src/test-helpers.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
 import { InMemoryTransport } from '../../src/testing/in-memory-transport.js';

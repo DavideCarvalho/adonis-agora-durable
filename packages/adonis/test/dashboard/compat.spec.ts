@@ -4,7 +4,6 @@ import { BlockedDiagnosticsRecorder } from '../../src/dashboard/diagnostics-reco
 import { WorkflowEngine } from '../../src/engine.js';
 import type { WorkerDescriptor } from '../../src/handshake/descriptor.js';
 import type {
-  EngineEvent,
   Heartbeat,
   RemoteTask,
   StepResult,

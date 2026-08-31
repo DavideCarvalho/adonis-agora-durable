@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { assertTransportConformance } from '../../../src/testing-kit/index.js';
-import { MockAdapter } from '../../../src/transports/queue-mock-adapter.js';
 import { QueueTransport } from '../../../src/transports/queue.js';
+import { MockAdapter } from '../../../src/transports/queue-mock-adapter.js';
 
 /**
  * Run the shared Transport contract against the @adonisjs/queue-backed transport (one instance acting

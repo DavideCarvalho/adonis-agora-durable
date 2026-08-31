@@ -6,9 +6,9 @@
  */
 
 import {
+  normalizeDescriptor,
   type RawWorkerDescriptor,
   type WorkerDescriptor,
-  normalizeDescriptor,
 } from './descriptor.js';
 
 /**

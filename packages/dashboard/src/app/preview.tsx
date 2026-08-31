@@ -3,8 +3,8 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import type { RunDetail, StepCheckpoint } from '../client/durable-client';
 import { App } from './App';
-import { RunSpans } from './SpansTimeline';
 import { installMockConsoleApi } from './mock-console';
+import { RunSpans } from './SpansTimeline';
 // Same two stylesheets `main.tsx` loads, in the same order — without react-flow's own CSS the
 // console's workflow graph renders unstyled, which would make any screenshot taken here a lie.
 import '@xyflow/react/dist/style.css';

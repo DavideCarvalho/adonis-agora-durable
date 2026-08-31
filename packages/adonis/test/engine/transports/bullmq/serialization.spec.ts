@@ -1,14 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
-  TASK_FAILED_RETENTION_SECONDS,
-  WORKER_HEARTBEAT_INTERVAL_MS,
-  WORKER_HEARTBEAT_TTL_SECONDS,
   buildInstanceId,
   heartbeatKeyValue,
   jobOptions,
   parseHeartbeatValue,
+  TASK_FAILED_RETENTION_SECONDS,
   taskJobOptions,
   toBrokerPriority,
+  WORKER_HEARTBEAT_INTERVAL_MS,
+  WORKER_HEARTBEAT_TTL_SECONDS,
 } from '../../../../src/transports/bullmq/serialization.js';
 
 describe('bullmq serialization', () => {

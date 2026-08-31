@@ -1,5 +1,5 @@
-import { makeStoreDb } from '../../../src/stores/lucid-helpers.js';
 import { LucidStateStore } from '../../../src/stores/lucid.js';
+import { makeStoreDb } from '../../../src/stores/lucid-helpers.js';
 import { runStateStoreContract } from '../../../src/testing-kit/conformance.js';
 
 /**

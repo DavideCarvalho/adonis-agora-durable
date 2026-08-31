@@ -2,6 +2,8 @@ import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tansta
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  deriveRunState,
+  durableClient,
   type GroupHealth,
   type RunDetail as RunDetailData,
   type RunDisplayStatus,
@@ -9,23 +11,21 @@ import {
   type StepCheckpoint,
   type WorkerStatus,
   type WorkflowRun,
-  deriveRunState,
-  durableClient,
 } from '../client/durable-client';
-import { type PartitionView, groupByPartition } from '../client/group-by-partition';
+import { groupByPartition, type PartitionView } from '../client/group-by-partition';
 import { mergeLiveEvents } from '../client/merge-live-events';
-import { type WorkerView, pivotByWorker } from '../client/pivot-by-worker';
+import { pivotByWorker, type WorkerView } from '../client/pivot-by-worker';
 import { partitionOf } from '../client/queue-partition';
 import {
   ALL_ORIGINS,
-  type OriginFilter,
-  UNKNOWN_ORIGIN,
-  UNKNOWN_ORIGIN_TITLE,
   emptyRunsNotice,
   filterByOrigin,
   knownOrigin,
+  type OriginFilter,
   originFilterKey,
   originLabel,
+  UNKNOWN_ORIGIN,
+  UNKNOWN_ORIGIN_TITLE,
   unknownOriginCount,
 } from '../client/run-origin';
 import {
@@ -34,14 +34,13 @@ import {
   splitCompensations,
 } from '../client/split-compensations';
 import { type HealthSummary, summarizeHealth } from '../client/summarize-health';
+import { BoltIcon, PlayIcon, RetryIcon, XIcon } from './icons';
 import { OriginFacets } from './OriginFacets';
 import { RunInfoPanel } from './RunInfoPanel';
+import { parentRunIdOf, retryOriginOf } from './run-lineage';
 import { SpansTimeline } from './SpansTimeline';
 import { StepDetailPanel } from './StepDetailPanel';
-import { WorkflowGraph } from './WorkflowGraph';
-import { BoltIcon, PlayIcon, RetryIcon, XIcon } from './icons';
-import { parentRunIdOf, retryOriginOf } from './run-lineage';
-import { Badge as Chip, badgeVariants } from './ui/badge';
+import { badgeVariants, Badge as Chip } from './ui/badge';
 import { Button } from './ui/button';
 import { cn } from './ui/cn';
 import { Dialog } from './ui/dialog';
@@ -49,6 +48,7 @@ import { InputField } from './ui/input';
 import { Popover, PopoverContent, PopoverTrigger } from './ui/popover';
 import { Tabs, TabsList, TabsPanel, TabsTab } from './ui/tabs';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
+import { WorkflowGraph } from './WorkflowGraph';
 
 /** The durable brand mark — a workflow glyph: a rounded diamond with three connected nodes (a step
  *  flowing into the next), in currentColor so it inherits the `--accent` token. Replaces the bare `◆`. */
@@ -729,6 +729,7 @@ function RunRow({
         <div className="flex flex-wrap gap-1">
           {r.tags.map((t) => (
             // biome-ignore lint/a11y/useKeyWithClickEvents: a nested <button> is invalid inside the row's own button — the row stays the keyboard target, the tag is a pointer shortcut for the same filter the sidebar field applies
+            // biome-ignore lint/a11y/noStaticElementInteractions: same reason — the enclosing row button is the interactive element; this span only adds a pointer shortcut
             <span
               key={t}
               onClick={(e) => {

@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Heartbeat, RemoteTask, StepResult } from '../../../src/interfaces.js';
 import { sanitizeQueueToken } from '../../../src/tenant-group.js';
-import { MockAdapter } from '../../../src/transports/queue-mock-adapter.js';
 import { QueueTransport, toBrokerPriority } from '../../../src/transports/queue.js';
+import { MockAdapter } from '../../../src/transports/queue-mock-adapter.js';
 
 const POLL = 5;
 
@@ -182,8 +182,8 @@ describe('QueueTransport', () => {
     const queue = 'durable:tasks:ext.echo';
     const first = await adapter.popFrom(queue);
     const second = await adapter.popFrom(queue);
-    expect((first?.payload as RemoteTask).stepId).toBe('r1:high');
-    expect((second?.payload as RemoteTask).stepId).toBe('r1:low');
+    expect((first!.payload as RemoteTask).stepId).toBe('r1:high');
+    expect((second!.payload as RemoteTask).stepId).toBe('r1:low');
   });
 
   describe('namespace queue segmentation', () => {

@@ -20,15 +20,15 @@ import {
 } from '../search-attributes.js';
 import {
   type CheckpointRow,
-  type RunRow,
   checkpointToRow,
+  type RunRow,
   rowToCheckpoint,
   rowToRun,
   rowToSignalWaiter,
   runPatchToRow,
   runToRow,
 } from './lucid-mappers.js';
-import { DURABLE_TABLES, createDurableTables } from './lucid-schema.js';
+import { createDurableTables, DURABLE_TABLES } from './lucid-schema.js';
 
 /** A Lucid query client — either the connection client or a transaction client. */
 type Client = QueryClientContract | TransactionClientContract;

@@ -1,14 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
   CURRENT_PROTOCOL_VERSION,
-  LEGACY_V1_CAPABILITIES,
-  LEGACY_V1_PROTOCOL,
-  type RawWorkerDescriptor,
-  type WorkerDescriptor,
   descriptorHash,
   heartbeatStatus,
   isLegacyDescriptor,
+  LEGACY_V1_CAPABILITIES,
+  LEGACY_V1_PROTOCOL,
   normalizeDescriptor,
+  type RawWorkerDescriptor,
+  type WorkerDescriptor,
 } from '../../src/handshake/descriptor.js';
 
 /** A fully-specified modern descriptor. */

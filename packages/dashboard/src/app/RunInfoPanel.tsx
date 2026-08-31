@@ -1,6 +1,6 @@
 import type { WorkflowRun } from '../client/durable-client';
-import { Json } from './StepDetailPanel';
 import { XIcon } from './icons';
+import { Json } from './StepDetailPanel';
 
 /** Slide-over for the run as a whole — its input, output and (when failed) error. */
 export function RunInfoPanel({ run, onClose }: { run: WorkflowRun; onClose: () => void }) {

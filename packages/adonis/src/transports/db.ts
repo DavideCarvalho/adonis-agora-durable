@@ -12,10 +12,10 @@ import {
   type StepResult,
   type Transport,
 } from '../interfaces.js';
-import { type PollLoop, Pollers } from '../pollers.js';
-import { type StepHandler, runStepHandler } from '../protocol.js';
+import { Pollers, type PollLoop } from '../pollers.js';
+import { runStepHandler, type StepHandler } from '../protocol.js';
 import { sanitizeQueueToken, tenantGroup } from '../tenant-group.js';
-import { TRANSPORT_TABLES, createDurableTransportTables } from './db-schema.js';
+import { createDurableTransportTables, TRANSPORT_TABLES } from './db-schema.js';
 
 /**
  * The wire payloads carried in the DB transport's table rows. Everything crossing the DB is plain

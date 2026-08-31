@@ -1,5 +1,5 @@
 import type { RunResult, WorkflowEngine } from '../index.js';
-import { type ScheduledWorkflow, runSchedules } from '../scheduler.js';
+import { runSchedules, type ScheduledWorkflow } from '../scheduler.js';
 
 /** A minimal logger the worker loop writes progress to (the ace command's `this.logger` fits). */
 export interface WorkerLogger {

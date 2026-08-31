@@ -6,7 +6,7 @@ import defaultHook, {
 } from '../../src/hooks/workflows.js';
 import { startRun } from '../../src/test-helpers.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
-import { type WorkflowsBarrel, registerWorkflowsFromBarrel } from '../../src/workflow-discovery.js';
+import { registerWorkflowsFromBarrel, type WorkflowsBarrel } from '../../src/workflow-discovery.js';
 
 /** A minimal stand-in for the Assembler IndexGenerator: records the `add(name, config)` calls. */
 function fakeIndexGenerator() {

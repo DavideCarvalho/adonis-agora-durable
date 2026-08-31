@@ -25,9 +25,9 @@ import type { Redis } from 'ioredis';
 import type {
   AdonisRedisPubSub,
   IoredisPubSub,
+  RedisControlPlaneOptions,
   RedisPubSub,
 } from '../../src/control-plane-redis/redis-control-plane.js';
-import type { RedisControlPlaneOptions } from '../../src/control-plane-redis/redis-control-plane.js';
 
 declare const rawIoredis: Redis;
 declare const adonisConnection: RedisConnection;

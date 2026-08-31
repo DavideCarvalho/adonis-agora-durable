@@ -4,10 +4,7 @@ import { defaultAuthorize, resolveConfig } from '../../src/dashboard/define_conf
 
 /** Minimal HttpContext stand-in exposing the bits the guard reads. */
 function fakeCtx(
-  opts: {
-    headers?: Record<string, string>;
-    qs?: Record<string, string>;
-  } = {},
+  opts: { headers?: Record<string, string>; qs?: Record<string, string> } = {},
 ): HttpContext {
   const headers = opts.headers ?? {};
   return {

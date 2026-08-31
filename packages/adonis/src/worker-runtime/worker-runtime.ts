@@ -1,18 +1,17 @@
 import {
   CURRENT_PROTOCOL_VERSION,
+  heartbeatStatus,
   type WorkerDescriptor,
   type WorkerLifecycle,
-  descriptorHash,
-  heartbeatStatus,
 } from '../handshake/descriptor.js';
 import type { WorkflowStepEvent } from '../interfaces.js';
 import type { StepHandler } from '../protocol.js';
 import {
+  buildInstanceId,
   WORKER_HEARTBEAT_INTERVAL_MS,
   WORKER_HEARTBEAT_TTL_SECONDS,
-  buildInstanceId,
 } from '../transports/bullmq/serialization.js';
-import { type WorkflowBody, type WorkflowTurnHandler, runWorkflowTurn } from '../workflow-turn.js';
+import { runWorkflowTurn, type WorkflowBody, type WorkflowTurnHandler } from '../workflow-turn.js';
 import {
   effectivePrefix,
   routingToken,

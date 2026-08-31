@@ -1,7 +1,7 @@
 import type { Database } from '@adonisjs/lucid/database';
 import { afterEach, describe, expect, it } from 'vitest';
 import { makeMemoryDb } from '../../../src/stores/lucid-helpers.js';
-import { DURABLE_TABLES, createDurableTables } from '../../../src/stores/lucid-schema.js';
+import { createDurableTables, DURABLE_TABLES } from '../../../src/stores/lucid-schema.js';
 
 /**
  * `createDurableTables` self-heals: on an existing table missing a column a newer library writes, it

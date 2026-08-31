@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { WorkflowEngine } from '../../../src/engine.js';
 import { InMemoryStateStore } from '../../../src/testing/in-memory-state-store.js';
-import { MockAdapter } from '../../../src/transports/queue-mock-adapter.js';
 import { QueueTransport } from '../../../src/transports/queue.js';
+import { MockAdapter } from '../../../src/transports/queue-mock-adapter.js';
 
 /**
  * The proof the transport actually satisfies the contract: a real `WorkflowEngine` runs a workflow

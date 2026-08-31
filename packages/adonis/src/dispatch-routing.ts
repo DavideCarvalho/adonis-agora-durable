@@ -11,9 +11,9 @@
 
 import {
   CURRENT_PROTOCOL_VERSION,
+  normalizeDescriptor,
   type RawWorkerDescriptor,
   type WorkerDescriptor,
-  normalizeDescriptor,
 } from './handshake/descriptor.js';
 import { negotiate } from './handshake/negotiate.js';
 import { canRoute, requiredCapabilities } from './handshake/routing.js';

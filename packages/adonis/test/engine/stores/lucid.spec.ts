@@ -1,8 +1,8 @@
 import type { Database } from '@adonisjs/lucid/database';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { StepCheckpoint, WorkflowRun } from '../../../src/interfaces.js';
-import { makeStoreDb } from '../../../src/stores/lucid-helpers.js';
 import { LucidStateStore } from '../../../src/stores/lucid.js';
+import { makeStoreDb } from '../../../src/stores/lucid-helpers.js';
 
 let db: Database;
 let store: LucidStateStore;

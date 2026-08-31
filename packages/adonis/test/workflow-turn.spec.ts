@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { WorkflowStepEvent, WorkflowTask } from '../src/interfaces.js';
-import { type WorkflowBody, isWorkflowTask, runWorkflowTurn } from '../src/workflow-turn.js';
+import { isWorkflowTask, runWorkflowTurn, type WorkflowBody } from '../src/workflow-turn.js';
 
 /** Build a workflow task with sensible defaults; override `history`/`input`/etc per turn. */
 function task(overrides: Partial<WorkflowTask> = {}): WorkflowTask {

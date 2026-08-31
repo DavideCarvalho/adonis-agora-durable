@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { WorkflowEngine } from '../../../src/engine.js';
 import { InMemoryStateStore } from '../../../src/testing/in-memory-state-store.js';
-import { makeTransportDb } from '../../../src/transports/db-helpers.js';
 import { DbTransport } from '../../../src/transports/db.js';
+import { makeTransportDb } from '../../../src/transports/db-helpers.js';
 
 /**
  * The proof the transport satisfies the contract: a real `WorkflowEngine` runs a workflow whose only

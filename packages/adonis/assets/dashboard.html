@@ -194,7 +194,7 @@
       <h1><span class="dot">●</span> Durable</h1>
       <span class="muted mono" id="crumb">runs</span>
       <nav class="nav">
-        <a href="#" id="nav-runs">Runs</a>
+        <a href="#/" id="nav-runs">Runs</a>
         <a href="#/health" id="nav-health">Fleet health</a>
       </nav>
       <span class="spacer"></span>
@@ -260,7 +260,7 @@
         dead: 'var(--red)',
       };
 
-      let state = { status: '', workflow: '' };
+      const state = { status: '', workflow: '' };
 
       async function refreshHealth() {
         try {
@@ -488,7 +488,7 @@
             el('td', {}, el('code', {}, b.id)),
             el('td', {}, b.workflow || '—'),
             el('td', { class: 'flag-reason' }, b.reason),
-            el('td', { class: 'muted' }, (b.requires && b.requires.length) ? b.requires.join(', ') : '—'),
+            el('td', { class: 'muted' }, (b.requires?.length) ? b.requires.join(', ') : '—'),
             el('td', { class: 'muted mono' }, fmt(b.updatedAt)),
           ]));
         const blockedPanel = el('div', { class: 'panel' + (data.blocked.length ? ' flagged-panel' : '') }, [

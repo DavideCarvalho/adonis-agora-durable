@@ -2,12 +2,12 @@ import { describe, expect, it } from 'vitest';
 import type { WorkflowRun } from './durable-client.js';
 import {
   ALL_ORIGINS,
-  type OriginFilter,
   emptyRunsNotice,
   filterByOrigin,
   isUnknownOrigin,
   knownOrigin,
   matchesOrigin,
+  type OriginFilter,
   originFacets,
   originFilterKey,
   originLabel,

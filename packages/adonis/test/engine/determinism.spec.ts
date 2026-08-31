@@ -63,6 +63,6 @@ describe('WorkflowEngine — determinism', () => {
     expect(observed).toHaveLength(2);
     expect(observed[0]).toEqual(observed[1]);
     expect(observed[0]?.now).toBe(1000);
-    expect((done?.output as { now: number }).now).toBe(1000);
+    expect((done!.output as { now: number }).now).toBe(1000);
   });
 });

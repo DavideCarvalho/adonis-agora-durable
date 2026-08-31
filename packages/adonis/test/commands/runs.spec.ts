@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
-  DEFAULT_STALE_MS,
   attachLiveness,
+  DEFAULT_STALE_MS,
   filterStale,
   listRuns,
   parseDurationMs,

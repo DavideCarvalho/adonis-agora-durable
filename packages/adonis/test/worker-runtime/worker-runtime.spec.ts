@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  descriptorHash,
   type HeartbeatStatus,
   type WorkerDescriptor,
-  descriptorHash,
 } from '../../src/handshake/descriptor.js';
 import type {
   RemoteTask,

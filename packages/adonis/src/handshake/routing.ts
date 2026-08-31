@@ -8,9 +8,9 @@
  */
 
 import {
+  normalizeDescriptor,
   type RawWorkerDescriptor,
   type WorkerDescriptor,
-  normalizeDescriptor,
 } from './descriptor.js';
 
 /** A handler's capability demand — either a bare list, or anything carrying a `requires` array

@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
-  type WorkerLogger,
   mergeSchedules,
   runTick,
   runWorkerLoop,
+  type WorkerLogger,
 } from '../../src/commands/worker.js';
 import {
   InMemoryStateStore,

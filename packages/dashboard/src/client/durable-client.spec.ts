@@ -205,7 +205,6 @@ describe('durableClient: 401 handling (session gone mid-console)', () => {
   });
 
   afterEach(() => {
-    // biome-ignore lint/performance/noDelete: test cleanup restoring the real (jsdom) window.
     delete (globalThis as { window?: FakeWindow }).window;
     vi.unstubAllGlobals();
   });
@@ -256,7 +255,6 @@ describe('durableClient: 401 handling (session gone mid-console)', () => {
 
 describe('durableClient: root-mounted base (path: "")', () => {
   afterEach(() => {
-    // biome-ignore lint/performance/noDelete: test cleanup.
     delete (globalThis as { window?: FakeWindow }).window;
     vi.unstubAllGlobals();
   });

@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   type CompatSource,
-  type FleetGroup,
-  type FleetTransport,
   compat,
   enumerateLiveFleet,
+  type FleetGroup,
+  type FleetTransport,
   mergeFleets,
 } from '../../src/dashboard/compat.js';
 import type { WorkerDescriptor } from '../../src/handshake/descriptor.js';

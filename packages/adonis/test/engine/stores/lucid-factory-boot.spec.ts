@@ -4,8 +4,8 @@ import { Database } from '@adonisjs/lucid/database';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { WorkflowRun } from '../../../src/interfaces.js';
 import { stores } from '../../../src/stores/factory.js';
-import { makeStoreDb } from '../../../src/stores/lucid-helpers.js';
 import type { LucidStateStore } from '../../../src/stores/lucid.js';
+import { makeStoreDb } from '../../../src/stores/lucid-helpers.js';
 
 /**
  * The store factory thunk (`stores.lucid()`) and the Lucid store's connection handling — the two boot
