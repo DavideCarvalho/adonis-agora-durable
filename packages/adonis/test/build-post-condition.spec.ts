@@ -50,8 +50,8 @@ describe('build post-condition', () => {
     // What the defect produced: `copy:stubs` is a plain `cp`, so it ran even when `tsc` emitted
     // nothing, leaving a dist/ that looks built and contains no code.
     mkdirSync(join(workDir, 'dist', 'stubs'), { recursive: true });
-    mkdirSync(join(workDir, 'dist', 'assets'), { recursive: true });
-    writeFileSync(join(workDir, 'dist', 'assets', 'dashboard.html'), '<html></html>');
+    mkdirSync(join(workDir, 'dist', 'assets', 'spa'), { recursive: true });
+    writeFileSync(join(workDir, 'dist', 'assets', 'spa', 'index.html'), '<html></html>');
 
     const { status, stderr } = runGuard('dist', 'src/index.js');
 

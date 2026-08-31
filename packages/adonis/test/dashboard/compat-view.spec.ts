@@ -5,7 +5,7 @@ import {
   outcomeLabel,
 } from '../../src/dashboard/compat-view.js';
 
-describe('compat-view — pure presentation helpers (mirrored by dashboard.html)', () => {
+describe('compat-view — pure presentation helpers', () => {
   it('maps each negotiation outcome to its badge class', () => {
     expect(outcomeClass('compatible')).toBe('c-ok');
     expect(outcomeClass('degraded')).toBe('c-degraded');

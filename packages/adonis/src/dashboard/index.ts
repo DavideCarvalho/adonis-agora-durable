@@ -50,7 +50,6 @@ export {
   topology,
   workers,
 } from './handlers.js';
-export { renderDashboard } from './html.js';
 export { renderLoginPage } from './login_page.js';
 export type {
   DashboardSession,

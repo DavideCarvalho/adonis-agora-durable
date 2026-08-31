@@ -42,7 +42,6 @@ import {
   topology,
   workers,
 } from '../src/dashboard/handlers.js';
-import { renderDashboard } from '../src/dashboard/html.js';
 import { renderLoginPage } from '../src/dashboard/login_page.js';
 import { contentTypeFor, renderIndexHtml } from '../src/dashboard/spa.js';
 import type { DurableConfig } from '../src/define_config.js';
@@ -65,13 +64,11 @@ function spaDirectory(): string {
 /**
  * Mounts the durable dashboard into an AdonisJS app: the `@adonis-agora/durable-dashboard` React SPA
  * (a JSON API over the {@link WorkflowEngine}'s read/control surface, served under a configurable
- * path) plus, for backward compatibility, the original hand-rolled `assets/dashboard.html` at
- * `<path>/legacy`.
+ * path).
  *
  * Routes (relative to the configured `path`, default `/durable`):
  * - `GET  /`                          -> the dashboard SPA's `index.html`
  * - `GET  /assets/:file`              -> the SPA's hashed JS/CSS bundle
- * - `GET  /legacy`                    -> the original static dashboard (compat fallback)
  * - `GET  /api/runs`                  -> list runs (status/workflow/tag/namespace/attr filters, paged)
  * - `GET  /api/runs/:id`              -> run detail (run + step timeline + children)
  * - `GET  /api/runs/:id/stream`       -> SSE live-tail of one run's lifecycle events
@@ -81,7 +78,7 @@ function spaDirectory(): string {
  * - `POST /api/runs/:id/cancel`       -> cancel the run
  * - `POST /api/runs/:id/continue`     -> resume a run paused at a breakpoint
  * - `POST /api/bulk/:action`          -> bulk retry/cancel every run matching a filter
- * - `GET  /api/health`                -> worker-group health (compact; legacy HTML)
+ * - `GET  /api/health`                -> worker-group health (compact shape)
  * - `GET  /api/workers`               -> worker-group health (full heartbeats; SPA)
  * - `GET  /api/topology`              -> this deployment's durable role
  * - `GET  /api/compat`                -> fleet health / protocol-compatibility panel
@@ -238,11 +235,7 @@ export default class DashboardProvider {
       .as('durable_dashboard.compat');
   }
 
-  /**
-   * Mount the React SPA at `config.path` (default) plus a `<path>/legacy` fallback serving the
-   * original hand-rolled `assets/dashboard.html` — kept for any bookmark/integration built against it,
-   * but no longer the default (per the SPA rollout, the built React console is now `GET <path>`).
-   */
+  /** Mount the React SPA at `config.path` plus its hashed asset bundle. */
   private registerSpaRoutes(
     router: HttpRouterService,
     config: ResolvedDurableDashboardConfig,
@@ -289,14 +282,6 @@ export default class DashboardProvider {
           .send(bytes);
       })
       .as('durable_dashboard.assets');
-
-    router
-      .get(`${config.path}/legacy`, async (ctx: HttpContext) => {
-        if (!(await this.enforce(config, ctx, 'page'))) return;
-        ctx.response.header('content-type', 'text/html; charset=utf-8');
-        return ctx.response.send(renderDashboard(apiBase));
-      })
-      .as('durable_dashboard.legacy');
   }
 
   /**
