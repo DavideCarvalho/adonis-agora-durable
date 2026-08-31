@@ -1,5 +1,30 @@
 # @adonis-agora/durable
 
+## 0.28.0
+
+### Minor Changes
+
+- [#84](https://github.com/DavideCarvalho/adonis-agora-durable/pull/84) [`5f8c6bd`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/5f8c6bd7dbd9e9afd723ce5dd0a0f29a706059b2) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Remove the `GET <path>/legacy` route and the `renderDashboard` export behind it.
+  
+  `/legacy` served the console as it was before the React SPA: one self-contained page whose whole
+  UI was an inline `<script>`. It was kept "for an environment where the SPA bundle cannot be
+  served", but it could not have worked under the CSP a shield-hardened host runs
+  (`script-src 'self' 'nonce-…'` drops that script whole, leaving a blank page behind a live,
+  guarded route). The JSON API it called is unchanged — `GET /api/health` in particular stays — so
+  a hand-written client keeps working; only the page is gone.
+
+### Patch Changes
+
+- [#84](https://github.com/DavideCarvalho/adonis-agora-durable/pull/84) [`5f8c6bd`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/5f8c6bd7dbd9e9afd723ce5dd0a0f29a706059b2) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Dashboard: every API request 404 under a nonce CSP — fixed.
+  
+  The provider used to hand the SPA its mount/API base as an inline `<script>` setting
+  `window.__DURABLE_BASE__`/`__DURABLE_API__`. A host with `script-src 'self' 'nonce-…'`
+  (`@adonisjs/shield`'s `@nonce`, the recommended setup) drops that script silently; the SPA then fell
+  back to `/durable/api`, and on any other mount path every request from a console that rendered
+  perfectly well answered 404. The config now travels as a `<script type="application/json">` data
+  block, which is never executed and so cannot be refused. Nothing to change on the host; the globals
+  are still honoured as a fallback for tests and hand-embedding.
+
 ## 0.27.0
 
 ### Minor Changes
