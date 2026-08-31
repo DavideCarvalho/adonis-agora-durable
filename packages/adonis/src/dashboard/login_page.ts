@@ -1,27 +1,63 @@
+import { escapeHtml } from './access_denied_page.js';
+import { sanitizeReturnTo } from './auth.js';
+
 /**
  * The built-in `dashboardAuth` login page (`GET <basePath>/login`). Deliberately a small,
  * dependency-free, hand-authored HTML page — NOT part of the bundled dashboard SPA — so gating the
- * dashboard shell doesn't require rebuilding the SPA bundle.
+ * dashboard shell doesn't require rebuilding or extending the bundled SPA.
  *
- * `returnTo` and any error state are read CLIENT-SIDE from `location.search` (never server-echoed
- * into the HTML), so this function's only per-request-ish input is `basePath` — a developer-
- * controlled config value, not user input — and the page body is otherwise a static template.
- * This sidesteps HTML-escaping entirely: there is no reflected query-param interpolation surface
- * to get wrong.
+ * It works WITHOUT JavaScript: the markup is a classic `<form method="post">` carrying `returnTo`
+ * in a hidden field, and the provider answers a form-encoded `POST` with a redirect (to `returnTo`
+ * on success, back here with `?error` on failure). The inline `<script>` is progressive
+ * enhancement only — it swaps the full-page round trip for a JSON `fetch` and shows the error in
+ * place — and it carries the request's CSP nonce when the provider hands one over, so a host
+ * running `@adonisjs/shield`'s `script-src 'self' @nonce` keeps the enhancement instead of a
+ * dead form. The `<style>` takes the same nonce.
+ *
+ * The only per-request values interpolated are `returnTo` (already passed through
+ * {@link sanitizeReturnTo}, so it is a root-relative path) and the `error` flag; both go through
+ * {@link escapeHtml} (and `JSON.stringify` inside the script) so nothing in the query string can
+ * break out of an attribute or the script. `basePath` is developer-controlled config.
  *
  * The visual language (dark zinc card, mono type, emerald accent) mirrors the Agora consoles so
- * they feel like one family. The submit flow POSTs JSON via `fetch` and follows the JSON
- * `redirectTo` it gets back (rather than a classic form POST + server redirect), which is why the
- * markup keeps its own `<script>`.
+ * they feel like one family.
  *
  * The password input has NO `required` attribute and the value is forwarded AS-IS (empty string
  * when blank): the host's `login` hook — not this page — decides whether a password matters, so an
  * email-only host (gate on username, ignore password) works with the same page as a host with real
  * passwords.
  */
-export function renderLoginPage(basePath: string): string {
+export interface LoginPageOptions {
+  /** The request's CSP nonce, applied to the inline `<style>` and `<script>`. */
+  nonce?: string;
+  /** Render the "Invalid username or password." notice (the no-JS failure round trip). */
+  error?: boolean;
+  /** Where to send the operator after a successful sign-in. Sanitized here; default `basePath`. */
+  returnTo?: unknown;
+}
+
+/**
+ * JSON for embedding INSIDE an inline `<script>`: `JSON.stringify` alone leaves `</script>` (and
+ * `<!--`) untouched, and the HTML parser ends the script element on the first `</script>` it sees
+ * regardless of JavaScript string boundaries — so a `returnTo` of `/x</script><script>…` would run.
+ * Escaping the angle brackets (and `&`, plus the two line terminators JSON allows but JS doesn't)
+ * as `\uXXXX` keeps the value byte-identical once parsed and inert to the HTML parser.
+ */
+function jsonForScript(value: string): string {
+  return JSON.stringify(value)
+    .replaceAll('<', '\\u003c')
+    .replaceAll('>', '\\u003e')
+    .replaceAll('&', '\\u0026')
+    .replaceAll('\u2028', '\\u2028')
+    .replaceAll('\u2029', '\\u2029');
+}
+
+export function renderLoginPage(basePath: string, options: LoginPageOptions = {}): string {
   const loginAction = `${basePath}/login`;
   const defaultReturnTo = basePath === '' ? '/' : basePath;
+  const returnTo = sanitizeReturnTo(options.returnTo, defaultReturnTo);
+  const nonceAttr = options.nonce !== undefined ? ` nonce="${escapeHtml(options.nonce)}"` : '';
+  const errorStyle = options.error ? ' style="display:block"' : '';
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -29,7 +65,7 @@ export function renderLoginPage(basePath: string): string {
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="robots" content="noindex, nofollow" />
 <title>Sign in — Durable</title>
-<style>
+<style${nonceAttr}>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body {
@@ -104,7 +140,8 @@ export function renderLoginPage(basePath: string): string {
 <body>
   <div class="card">
     <p class="brand">Durable</p>
-    <form id="login-form" autocomplete="on">
+    <form id="login-form" method="post" action="${escapeHtml(loginAction)}" autocomplete="on">
+      <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}" />
       <label>
         <span class="field-label">Username</span>
         <input id="username" name="username" type="text" autocomplete="username" required autofocus />
@@ -113,41 +150,29 @@ export function renderLoginPage(basePath: string): string {
         <span class="field-label">Password</span>
         <input id="password" name="password" type="password" autocomplete="current-password" />
       </label>
-      <p id="error" role="alert">Invalid username or password.</p>
+      <p id="error" role="alert"${errorStyle}>Invalid username or password.</p>
       <button id="submit" type="submit">Sign in</button>
     </form>
   </div>
-<script>
+<script${nonceAttr}>
 (function () {
-  var LOGIN_ACTION = ${JSON.stringify(loginAction)};
-  var DEFAULT_RETURN_TO = ${JSON.stringify(defaultReturnTo)};
-  var params = new URLSearchParams(window.location.search);
+  var LOGIN_ACTION = ${jsonForScript(loginAction)};
+  var RETURN_TO = ${jsonForScript(returnTo)};
   var errorBox = document.getElementById('error');
-  if (params.get('error')) errorBox.style.display = 'block';
-
-  function sameOriginReturnTo(value) {
-    if (typeof value !== 'string' || value === '') return DEFAULT_RETURN_TO;
-    if (value.charAt(0) !== '/' || value.charAt(1) === '/' || value.indexOf('://') !== -1) {
-      return DEFAULT_RETURN_TO;
-    }
-    return value;
-  }
-
   var form = document.getElementById('login-form');
   var submitButton = document.getElementById('submit');
   form.addEventListener('submit', function (event) {
     event.preventDefault();
     submitButton.disabled = true;
     errorBox.style.display = 'none';
-    var returnTo = sameOriginReturnTo(params.get('returnTo'));
     fetch(LOGIN_ACTION, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
       credentials: 'same-origin',
       body: JSON.stringify({
         username: document.getElementById('username').value,
         password: document.getElementById('password').value,
-        returnTo: returnTo,
+        returnTo: RETURN_TO,
       }),
     })
       .then(function (response) {
@@ -155,7 +180,7 @@ export function renderLoginPage(basePath: string): string {
         return response.json();
       })
       .then(function (data) {
-        window.location.href = data.redirectTo || DEFAULT_RETURN_TO;
+        window.location.href = data.redirectTo || RETURN_TO;
       })
       .catch(function () {
         errorBox.style.display = 'block';

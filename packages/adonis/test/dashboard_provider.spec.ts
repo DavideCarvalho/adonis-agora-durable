@@ -84,26 +84,38 @@ describe('DashboardProvider — authorize hook owns its denial response', () => 
         state.body = body;
         return response;
       },
+      header(name: string, value: string) {
+        state.headers.set(name.toLowerCase(), value);
+        return response;
+      },
+      send(body: unknown) {
+        state.body = body;
+      },
       redirect: (path: string) => {
         state.status = 302;
         state.headers.set('location', path);
       },
     };
-    return { ctx: { response } as never, state };
+    const request = { plainCookie: () => undefined, url: () => '/durable' };
+    return { ctx: { response, request } as never, state };
   }
 
-  async function runEnforce(authorize: (ctx: unknown) => boolean | Promise<boolean>) {
+  async function runEnforce(
+    authorize: (ctx: unknown) => boolean | Promise<boolean>,
+    mode: 'page' | 'api' = 'page',
+    extra: Record<string, unknown> = {},
+  ) {
     const { default: DashboardProvider } = await import('../providers/dashboard_provider.js');
     const { resolveConfig } = await import('../src/dashboard/define_config.js');
     const provider = new DashboardProvider({} as never);
-    const config = resolveConfig({ authorize: authorize as never });
+    const config = resolveConfig({ authorize: authorize as never, ...extra });
     const { ctx, state } = fakeCtx();
     // `enforce` is TS-private (compile-time only) — reached via index access on purpose.
     const allowed = await (
       provider as unknown as {
         enforce(c: unknown, x: unknown, m: 'page' | 'api'): Promise<boolean>;
       }
-    ).enforce(config, ctx, 'page');
+    ).enforce(config, ctx, mode);
     return { allowed, state };
   }
 
@@ -118,10 +130,52 @@ describe('DashboardProvider — authorize hook owns its denial response', () => 
     expect(state.body).toBeUndefined(); // the uniform 403 body was NOT written over it
   });
 
-  it('a hook that just returns false still gets the uniform 403', async () => {
-    const { allowed, state } = await runEnforce(() => false);
+  it('a hook that just returns false gets the uniform 403 JSON on an API request', async () => {
+    const { allowed, state } = await runEnforce(() => false, 'api');
     expect(allowed).toBe(false);
     expect(state.status).toBe(403);
     expect(state.body).toEqual({ error: 'forbidden' });
+  });
+
+  it('a hook that just returns false gets the access-denied PAGE on a page request', async () => {
+    const { allowed, state } = await runEnforce(() => false, 'page');
+    expect(allowed).toBe(false);
+    expect(state.status).toBe(403);
+    expect(state.headers.get('content-type')).toBe('text/html; charset=utf-8');
+    expect(state.headers.get('cache-control')).toBe('no-store, must-revalidate');
+    expect(state.body).toContain('<!doctype html>');
+    expect(state.body).toContain('<h1>Access denied</h1>');
+    expect(state.body).toContain('Durable');
+  });
+
+  it('the page honours the accessDenied options and renderer', async () => {
+    const tweaked = await runEnforce(() => false, 'page', {
+      accessDenied: { title: 'Sem acesso', homeHref: '/admin' },
+    });
+    expect(tweaked.state.body).toContain('<h1>Sem acesso</h1>');
+    expect(tweaked.state.body).toContain('href="/admin"');
+
+    const custom = await runEnforce(() => false, 'page', {
+      accessDenied: (info: { status: number }) => `<p>custom ${info.status}</p>`,
+    });
+    expect(custom.state.body).toBe('<p>custom 403</p>');
+
+    const redirected = await runEnforce(() => false, 'page', {
+      accessDenied: (_info: unknown, ctx: { response: { redirect(p: string): void } }) => {
+        ctx.response.redirect('/entrar');
+      },
+    });
+    expect(redirected.state.status).toBe(302);
+    expect(redirected.state.headers.get('location')).toBe('/entrar');
+    expect(redirected.state.body).toBeUndefined();
+  });
+
+  it('Mode-A-only with no session gets the "open from your app" page', async () => {
+    const { allowed, state } = await runEnforce(() => true, 'page', {
+      dashboardAuth: { secret: 's'.repeat(32), session: () => null },
+    });
+    expect(allowed).toBe(false);
+    expect(state.status).toBe(401);
+    expect(state.body).toContain('<h1>Open this console from your app</h1>');
   });
 });

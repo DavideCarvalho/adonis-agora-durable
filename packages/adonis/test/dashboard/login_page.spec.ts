@@ -23,8 +23,49 @@ describe('renderLoginPage', () => {
     expect(html).toContain('ui-monospace');
   });
 
-  it('posts to `<basePath>/login`', () => {
+  it('posts to `<basePath>/login`, as a real form AND from the script', () => {
+    expect(html).toContain('<form id="login-form" method="post" action="/durable/login"');
     expect(html).toContain('"/durable/login"');
+  });
+
+  it('works without JavaScript: returnTo rides in a hidden field, defaulting to the base path', () => {
+    expect(html).toContain('<input type="hidden" name="returnTo" value="/durable" />');
+    expect(renderLoginPage('')).toContain('name="returnTo" value="/"');
+    const deep = renderLoginPage('/durable', { returnTo: '/durable/runs/42' });
+    expect(deep).toContain('name="returnTo" value="/durable/runs/42"');
+    expect(deep).toContain(JSON.stringify('/durable/runs/42'));
+  });
+
+  it('refuses an open-redirect returnTo and escapes what it echoes', () => {
+    for (const bad of ['//evil.com', 'https://evil.com/x', 'runs', 42, undefined]) {
+      expect(renderLoginPage('/durable', { returnTo: bad })).toContain(
+        'name="returnTo" value="/durable"',
+      );
+    }
+    const quoted = renderLoginPage('/durable', {
+      returnTo: '/durable/x"><script>alert(1)</script>',
+    });
+    expect(quoted).not.toContain('<script>alert(1)');
+    expect(quoted).toContain('value="/durable/x&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"');
+    // Inside the inline script the value is JSON with `<`/`>` escaped, so the HTML parser cannot
+    // see a premature `</script>`: the page still has exactly one closing script tag.
+    expect(quoted).toContain('\\u003c/script\\u003e');
+    expect(quoted.split('</script>')).toHaveLength(2);
+  });
+
+  it('shows the error notice server-side for the no-JS round trip', () => {
+    expect(html).toContain('<p id="error" role="alert">');
+    expect(renderLoginPage('/durable', { error: true })).toContain(
+      '<p id="error" role="alert" style="display:block">',
+    );
+  });
+
+  it('carries the CSP nonce on both the <style> and the <script>', () => {
+    const nonced = renderLoginPage('/durable', { nonce: 'n0nce"x' });
+    expect(nonced).toContain('<style nonce="n0nce&quot;x">');
+    expect(nonced).toContain('<script nonce="n0nce&quot;x">');
+    expect(html).toContain('<style>');
+    expect(html).toContain('<script>');
   });
 
   it('embeds basePath via JSON so a quote in it cannot break out of the script', () => {

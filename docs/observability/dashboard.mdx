@@ -37,7 +37,7 @@ export default defineConfig({
 
 ### Authorization
 
-The default `authorize` is **open outside production**, and in production requires a bearer token equal to the `DURABLE_DASHBOARD_TOKEN` env var (it fails closed if the var is unset). The token is accepted from an `Authorization: Bearer <token>` header, an `x-durable-token` header, or a `?token=` query param. Override `authorize` with your own session/role/IP guard — a denied request gets a `403`:
+The default `authorize` is **open outside production**, and in production requires a bearer token equal to the `DURABLE_DASHBOARD_TOKEN` env var (it fails closed if the var is unset). The token is accepted from an `Authorization: Bearer <token>` header, an `x-durable-token` header, or a `?token=` query param. Override `authorize` with your own session/role/IP guard — a denied request gets a `403`: JSON for an API call, the [access-denied page](#the-access-denied-page) for a browser:
 
 ```ts
 export default defineConfig({
@@ -70,6 +70,43 @@ The console exposes retry, cancel, replay and bulk actions that mutate runs. Alw
 </Callout>
 
 Prefer a real sign-in page, or to open the console from an app where the operator is already signed in? Opt into the built-in [dashboard auth](/docs/durable/observability/dashboard-auth) (`dashboardAuth`), which layers a signed session cookie on top of `authorize`.
+
+### The access-denied page
+
+A refused **API** request gets JSON (`403 { "error": "forbidden" }`, or `401 { "error": "unauthorized", "auth": { "modes": [...] } }` without a session) — that is what the console's own `fetch` calls expect. A refused **page** navigation — the console shell, its assets, or the Mode-A-only "open this from your app" case — gets a real page instead: a dark card in the console's visual language showing the status, a sentence explaining the refusal, a "Back to app" link and, when `dashboardAuth.login` is configured, a "Sign in" button. It carries no inline script, so a nonce'd `script-src` CSP cannot break it (its one inline `<style>` picks up `@adonisjs/shield`'s request nonce).
+
+Tweak it with `accessDenied` — every field optional:
+
+```ts title="config/durable_dashboard.ts"
+export default defineConfig({
+  accessDenied: {
+    brand: 'Entre Textos',           // eyebrow + <title>; default "Durable"
+    title: 'Sem acesso',             // default depends on the refusal
+    message: 'Peça ao admin para liberar o console de workflows.',
+    homeHref: '/admin',              // "Back to app"; default "/", `false` hides it
+    homeLabel: 'Voltar',
+    loginHref: '/entrar',            // default: the built-in login page when one exists
+    loginLabel: 'Entrar',
+    accent: '#f59e0b',               // any CSS colour; default: the console's lime
+  },
+})
+```
+
+Or replace it. Pass a function and it receives the refusal (`status`, `reason` — `'forbidden'`, `'unauthenticated'` or `'session-required'` — `basePath`, `loginHref`, and the CSP `nonce` when there is one) plus the `HttpContext`. Return an HTML string to have it served with the right status; answer the request yourself and return nothing to make the provider stand down:
+
+```ts title="config/durable_dashboard.ts"
+export default defineConfig({
+  accessDenied: (info, ctx) => {
+    if (info.reason === 'unauthenticated') {
+      ctx.response.redirect(`/login?next=${encodeURIComponent(info.basePath)}`)
+      return
+    }
+    return `<!doctype html><title>${info.status}</title><h1>Sem acesso</h1>`
+  },
+})
+```
+
+An `authorize` hook that already wrote a redirect still wins — the provider never overwrites a `location` header, with or without `accessDenied`.
 
 ## Where it mounts
 

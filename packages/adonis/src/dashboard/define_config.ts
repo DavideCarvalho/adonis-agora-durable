@@ -1,10 +1,26 @@
 import { timingSafeEqual } from 'node:crypto';
 import type { HttpContext } from '@adonisjs/core/http';
+import type {
+  AccessDeniedOption as GenericAccessDeniedOption,
+  AccessDeniedRenderer as GenericAccessDeniedRenderer,
+} from './access_denied_page.js';
 import {
   type DashboardAuthOptions,
   type ResolvedDashboardAuth,
   resolveDashboardAuth,
 } from './auth.js';
+
+/**
+ * The function form of {@link DurableDashboardConfig.accessDenied}: render (or answer) a refused
+ * page navigation yourself. Receives the refusal ({@link AccessDeniedInfo}) and the AdonisJS
+ * {@link HttpContext}. Return an HTML string to have it served; answer the request yourself (a
+ * redirect, most commonly) and return nothing to make the provider stand down; return nothing
+ * WITHOUT answering and the built-in page is served.
+ */
+export type AccessDeniedRenderer = GenericAccessDeniedRenderer<HttpContext>;
+
+/** `accessDenied` in either form — an options object for the built-in page, or a renderer. */
+export type AccessDeniedOption = GenericAccessDeniedOption<HttpContext>;
 
 /**
  * Authorization guard for the dashboard. Runs before every dashboard route
@@ -49,6 +65,20 @@ export interface DurableDashboardConfig {
    * closed at boot.
    */
   dashboardAuth?: DashboardAuthOptions;
+  /**
+   * What a BROWSER sees when the guard refuses a page navigation (the SPA shell, its assets, or —
+   * Mode A only — a session-less visit). API requests are unaffected:
+   * they keep getting the JSON the SPA relies on (`403 { error: 'forbidden' }` /
+   * `401 { error: 'unauthorized', auth }`).
+   *
+   * Omit it for the built-in page — a dark card in the console's own visual language, with the
+   * status, a sentence explaining the refusal, a "Back to app" link and, when `dashboardAuth.login`
+   * exists, a "Sign in" button. Pass an object to tweak that page (`brand`, `title`, `message`,
+   * `homeHref`, `loginHref`, `accent`, …), or a function to render/answer it yourself — see
+   * {@link AccessDeniedRenderer}. Either way, an `authorize` hook that already wrote a redirect
+   * still wins: the provider never overwrites a `location` header.
+   */
+  accessDenied?: AccessDeniedOption;
 }
 
 /** A fully-resolved config — every field present (defaults applied). */
@@ -58,6 +88,8 @@ export interface ResolvedDurableDashboardConfig {
   authorize: AuthorizeHook;
   /** Resolved built-in login config, or `null` when `dashboardAuth` is unconfigured. */
   dashboardAuth: ResolvedDashboardAuth | null;
+  /** The host's `accessDenied` option as given, or `null` for the built-in page with defaults. */
+  accessDenied: AccessDeniedOption | null;
 }
 
 /**
@@ -127,6 +159,7 @@ export function resolveConfig(config: DurableDashboardConfig = {}): ResolvedDura
     // Validate + resolve now so a misconfigured secret/login fails closed at boot,
     // not on the first login attempt. `null` when `dashboardAuth` is omitted.
     dashboardAuth: resolveDashboardAuth(config.dashboardAuth),
+    accessDenied: config.accessDenied ?? null,
   };
 }
 

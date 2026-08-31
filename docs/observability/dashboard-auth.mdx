@@ -72,10 +72,12 @@ When `dashboardAuth` is configured, the provider mounts up to four **public** en
 
 And it stamps a **session guard** onto every console route. Without a valid cookie:
 
-- a **page** navigation is redirected `302` to `<path>/login` (carrying a sanitized `returnTo`) when `login` is configured, and answered with a short `401` page reading *"Open this console from your application."* when only `session` is;
+- a **page** navigation is redirected `302` to `<path>/login` (carrying a sanitized `returnTo`) when `login` is configured, and answered with the `401` [access-denied page](/docs/durable/observability/dashboard#the-access-denied-page) (*"Open this console from your app"*) when only `session` is;
 - an **API** request gets `401 { "error": "unauthorized", "auth": { "modes": [...] } }`. The `modes` array tells a client which way in exists — the console reads it to decide between redirecting to the login page and bouncing to the console root.
 
 `logout` redirects to `<path>/login` when a login page exists, and to the console root otherwise.
+
+The login page is a plain HTML form that works without JavaScript: a form submit is answered with a redirect — to the page the operator came from (`returnTo`, same-origin only), or back to the form with the error shown. Its inline script (which upgrades the submit to a `fetch`) and style carry `@adonisjs/shield`'s request nonce, so a `script-src 'self' @nonce` policy keeps the page working.
 
 The session is a stateless, signed HMAC-SHA256 cookie (`durable_dashboard_session`) — no server-side session store. It carries the user id, optional name and roles, plus issued-at and expiry, and is rejected once tampered with or expired. It is `httpOnly`, `sameSite=lax`, scoped to `/`, and `secure` on an HTTPS request.
 

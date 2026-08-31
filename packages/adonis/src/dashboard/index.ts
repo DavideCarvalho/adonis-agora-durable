@@ -2,6 +2,18 @@
 export const VERSION = '0.28.0';
 
 export type {
+  AccessDeniedInfo,
+  AccessDeniedPageOptions,
+  AccessDeniedReason,
+} from './access_denied_page.js';
+// The built-in "access denied" page (what a browser sees on a refused page navigation).
+export {
+  CONSOLE as ACCESS_DENIED_CONSOLE,
+  escapeHtml,
+  renderAccessDeniedPage,
+  resolveAccessDeniedPage,
+} from './access_denied_page.js';
+export type {
   AuthMode,
   DashboardAuthOptions,
   LoginHook,
@@ -24,6 +36,8 @@ export type { CompatSource, FleetGroup, FleetTransport } from './compat.js';
 export { compat, enumerateLiveFleet, mergeFleets } from './compat.js';
 export { formatProtocolRange, outcomeClass, outcomeLabel } from './compat-view.js';
 export type {
+  AccessDeniedOption,
+  AccessDeniedRenderer,
   AuthorizeHook,
   DurableDashboardConfig,
   ResolvedDurableDashboardConfig,
