@@ -1,5 +1,12 @@
 # @adonis-agora/durable-dashboard
 
+## 0.2.3
+
+### Patch Changes
+
+- [#82](https://github.com/DavideCarvalho/adonis-agora-durable/pull/82) [`fd47f0f`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/fd47f0f042f92872c5bf928efe8aaaedd3c2a604) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Dashboard rebuilt on Tailwind 4, React 19 and Vite 8 — same tokens and layout; opacity
+  modifiers now resolve through `color-mix` instead of the old colour-function trick.
+
 ## 0.2.2
 
 ### Patch Changes
