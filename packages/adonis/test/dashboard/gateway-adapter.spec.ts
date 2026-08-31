@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
-  type StoreEngineLike,
   dashboardEngineForRole,
   gatewayDashboardEngine,
+  type StoreEngineLike,
   storeDashboardEngine,
 } from '../../src/dashboard/gateway-adapter.js';
 import { WorkflowEngine } from '../../src/engine.js';
@@ -153,7 +153,6 @@ describe('storeDashboardEngine — WorkflowEngine → DashboardEngine port', () 
 
   it('redispatchPending degrades to null when the underlying engine lacks the method', async () => {
     const raw = storeEngineSpy();
-    // biome-ignore lint/performance/noDelete: simulating an engine build without redispatchPending.
     delete raw.redispatchPending;
     const engine = storeDashboardEngine(raw);
     expect(await engine.redispatchPending('run-1')).toBeNull();

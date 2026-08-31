@@ -76,19 +76,76 @@ export function scheduledRunId(key: string, everyMs: number, nowMs: number): str
   return `sched:${key}:${Math.floor(nowMs / everyMs)}`;
 }
 
-type CronParser = typeof import('cron-parser');
-let cronParser: CronParser | undefined;
-function loadCronParser(): CronParser {
-  if (cronParser) return cronParser;
+/**
+ * The one thing the scheduler needs from `cron-parser`: parse an expression anchored at
+ * `currentDate` in `tz`, then step to the previous fire. Both supported majors expose it:
+ *
+ * - v4: `parseExpression(expr, opts)` (the CJS `module.exports` is the parser class with statics)
+ * - v5: `CronExpressionParser.parse(expr, opts)` (named export; also the `default` export)
+ *
+ * Both return an iterator whose `prev()`/`next()` yield a `CronDate` with `toDate()`.
+ */
+export type CronParse = (
+  expr: string,
+  opts: { currentDate: Date; tz: string },
+) => { prev(): { toDate(): Date }; next(): { toDate(): Date } };
+
+interface CronParserV5Shape {
+  CronExpressionParser?: { parse?: unknown };
+}
+interface CronParserV4Shape {
+  parseExpression?: unknown;
+}
+
+/**
+ * Normalize whatever `require('cron-parser')` returned into a {@link CronParse}, whichever major
+ * (v4 or v5) is installed and however the loader wrapped it (plain CJS namespace or an interop
+ * object with the namespace under `default`). Returns `undefined` when the shape is unrecognized.
+ *
+ * @internal Exported for tests, which feed it the real v4 and v5 modules side by side.
+ */
+export function resolveCronParse(mod: unknown, depth = 0): CronParse | undefined {
+  if (mod === null || (typeof mod !== 'object' && typeof mod !== 'function')) return undefined;
+  const v5 = (mod as CronParserV5Shape).CronExpressionParser;
+  if (v5 !== undefined && typeof v5.parse === 'function') {
+    // Method-call syntax keeps `this` bound to the class (it is a static method).
+    return (expr, opts) => (v5 as { parse: CronParse }).parse(expr, opts);
+  }
+  const v4 = (mod as CronParserV4Shape).parseExpression;
+  if (typeof v4 === 'function') {
+    return (expr, opts) => (mod as { parseExpression: CronParse }).parseExpression(expr, opts);
+  }
+  // v5's `default` export is the `CronExpressionParser` class itself (a `parse` static, no
+  // `CronExpressionParser` property), so check the class shape before descending into `default`.
+  const parse = (mod as { parse?: unknown }).parse;
+  if (typeof parse === 'function') {
+    return (expr, opts) => (mod as { parse: CronParse }).parse(expr, opts);
+  }
+  const dflt = (mod as { default?: unknown }).default;
+  if (depth === 0 && dflt !== undefined && dflt !== mod) return resolveCronParse(dflt, depth + 1);
+  return undefined;
+}
+
+let cronParse: CronParse | undefined;
+function loadCronParser(): CronParse {
+  if (cronParse) return cronParse;
+  let mod: unknown;
   try {
     // Lazy + optional: core stays dependency-free; only users who schedule by cron need this.
-    cronParser = nodeRequire('cron-parser') as CronParser;
+    mod = nodeRequire('cron-parser');
   } catch {
     throw new Error(
       'cron schedules need the optional peer dependency "cron-parser" — install it (e.g. `npm i cron-parser`).',
     );
   }
-  return cronParser;
+  const resolved = resolveCronParse(mod);
+  if (resolved === undefined) {
+    throw new Error(
+      'the installed "cron-parser" exposes neither `parseExpression` (v4) nor `CronExpressionParser.parse` (v5) — supported versions are ^4.0.0 || ^5.0.0.',
+    );
+  }
+  cronParse = resolved;
+  return cronParse;
 }
 
 /**
@@ -97,9 +154,9 @@ function loadCronParser(): CronParser {
  * interval resolves to the same fire time — and thus the same idempotent run id.
  */
 export function prevCronFireMs(expr: string, nowMs: number, timezone = 'UTC'): number {
-  const parser = loadCronParser();
+  const parse = loadCronParser();
   // `+1` makes a fire landing exactly on `nowMs` count as "at or before now", not the prior one.
-  const it = parser.parseExpression(expr, { currentDate: new Date(nowMs + 1), tz: timezone });
+  const it = parse(expr, { currentDate: new Date(nowMs + 1), tz: timezone });
   return it.prev().toDate().getTime();
 }
 

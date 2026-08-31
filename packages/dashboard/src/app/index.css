@@ -1,6 +1,78 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+/* Tailwind 4 scans the package directory for class names by default (respecting .gitignore); pin the
+   sources explicitly so the previously-configured `content` globs stay the contract. */
+@source "../../index.html";
+@source "../../preview.html";
+@source "./";
+
+/* ── Aviary token → Tailwind colour (Tailwind 4 edition of the former `tailwind.config.ts`) ────────
+   `@theme inline` makes each utility emit `var(--token)` directly (not a copy of its value), and
+   Tailwind 4 applies opacity modifiers to ANY colour via `color-mix` — so `bg-brand/10` is
+   `color-mix(in oklab, var(--accent) 10%, transparent)`. That is exactly what the Tailwind 3 config
+   had to hand-roll with colour *functions* ("The Tailwind 3 opacity trap" in AVIARY-UI.md); the trap
+   no longer exists in v4, so the mapping is plain aliases.
+
+   shadcn's semantic names → Aviary tokens (the mapping table in AVIARY-UI.md), rather than shadcn's
+   default palette. This is what makes a vendored `bg-background` / `text-muted-foreground` primitive
+   land on this console's own neutrals with no edit. Three of these are traps, because the two
+   systems use the same word for different things:
+     · shadcn `accent` is a subtle HOVER SURFACE, not a brand hue → `--panel-2`
+     · shadcn `muted` is a SURFACE → `--panel-2`
+     · Aviary `--muted` is dim TEXT → `muted-foreground`
+   The Aviary brand hue gets its own name (`brand`, below) so the two can never be confused. */
+@theme inline {
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-background: var(--bg);
+  --color-foreground: var(--text);
+  --color-card: var(--panel);
+  --color-card-foreground: var(--text);
+  --color-popover: var(--panel-2);
+  --color-popover-foreground: var(--text);
+  --color-primary: var(--accent);
+  --color-primary-foreground: var(--bg);
+  --color-secondary: var(--panel-2);
+  --color-secondary-foreground: var(--text);
+  --color-muted: var(--panel-2);
+  --color-muted-foreground: var(--muted);
+  --color-accent: var(--panel-2);
+  --color-accent-foreground: var(--text);
+  --color-destructive: var(--bad);
+  --color-destructive-foreground: var(--bg);
+  --color-border: var(--line);
+  --color-input: var(--line);
+  --color-ring: var(--accent);
+
+  /* Aviary's own names, for this console's hand-written classes. */
+  --color-brand: var(--accent);
+  --color-panel: var(--panel);
+  --color-panel-2: var(--panel-2);
+  --color-line: var(--line);
+  --color-line-soft: var(--line-soft);
+  --color-good: var(--good);
+  --color-warn: var(--warn);
+  --color-bad: var(--bad);
+  --color-live: var(--live);
+}
+
+/* Tailwind 3 preflight parity: v4 changed two defaults this console relied on implicitly. */
+@layer base {
+  /* v4 defaults `border-color` to `currentColor`; v3 used the neutral-200 grey. Keep borders on the
+     console's line token unless a class says otherwise. */
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--line);
+  }
+  /* v4 makes buttons `cursor: default`; v3 kept `pointer`. */
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+}
 
 /* ── Aviary console tokens ──────────────────────────────────────────────────────────────────────
    Source of truth: `AVIARY-UI.md` (repo root of the nestjs libs checkout — this file is copied
@@ -65,13 +137,18 @@ body {
   inset: 0;
   z-index: 0;
   pointer-events: none;
-  background-image: radial-gradient(
+  background-image:
+    radial-gradient(
       900px 400px at 78% -8%,
       color-mix(in srgb, var(--accent) 8%, transparent),
       transparent 70%
-    ), linear-gradient(to right, var(--line-soft) 1px, transparent 1px),
+    ),
+    linear-gradient(to right, var(--line-soft) 1px, transparent 1px),
     linear-gradient(to bottom, var(--line-soft) 1px, transparent 1px);
-  background-size: 100% 100%, 44px 44px, 44px 44px;
+  background-size:
+    100% 100%,
+    44px 44px,
+    44px 44px;
   mask-image: linear-gradient(to bottom, black, black 60%, transparent);
   opacity: 0.5;
 }

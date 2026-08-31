@@ -93,7 +93,7 @@ class FakeRedis implements RedisLike {
     this.store.set(key, value);
     return 'OK';
   }
-  async scan(cursor: string | number, ...args: (string | number)[]): Promise<[string, string[]]> {
+  async scan(_cursor: string | number, ...args: (string | number)[]): Promise<[string, string[]]> {
     // args = ['MATCH', pattern, 'COUNT', n]
     const pattern = String(args[1] ?? '*');
     const prefix = pattern.endsWith('*') ? pattern.slice(0, -1) : pattern;

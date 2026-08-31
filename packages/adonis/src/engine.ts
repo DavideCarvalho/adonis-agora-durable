@@ -4,23 +4,21 @@ import { instantCheckpoint, stepCheckpoint } from './checkpoints.js';
 import { type Completion } from './completion.js';
 import {
   type BlockedDispatch,
-  type DispatchPlan,
-  WorkflowBlocked,
   controlPlaneDescriptor,
+  type DispatchPlan,
   planDispatch,
+  WorkflowBlocked,
 } from './dispatch-routing.js';
 import { parseDuration } from './duration.js';
 import { Entities, type EntityConfig } from './entities.js';
 import {
   ContinueAsNew,
-  FatalError,
   NonDeterminismError,
   RemoteStepTimeout,
-  SignalTimeoutError,
   WorkflowSuspended,
 } from './errors.js';
 import { EventAccumulators, type EventBatchConfig } from './event-accumulators.js';
-import { eventMatchOf, eventMatches, eventPrefix } from './events.js';
+import { eventMatches, eventMatchOf, eventPrefix } from './events.js';
 import type { WorkerDescriptor } from './handshake/descriptor.js';
 import type {
   ControlPlane,
@@ -28,6 +26,7 @@ import type {
   EngineListener,
   GroupHealth,
   Heartbeat,
+  HistoryEvent,
   NamedTransport,
   RemoteTask,
   RunDispatcher,
@@ -55,7 +54,6 @@ import type {
   WorkflowRun,
   WorkflowStepEvent,
 } from './interfaces.js';
-import type { HistoryEvent } from './interfaces.js';
 import { breakpointToken, stepId } from './protocol.js';
 import type { QueueConfig } from './queue.js';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor.js';
@@ -67,8 +65,8 @@ import { workflowAls } from './workflow-als.js';
 import {
   type Compensation,
   type CtxHost,
-  type StepRecord,
   createWorkflowCtx,
+  type StepRecord,
 } from './workflow-ctx.js';
 import type { NormalizedEventTrigger } from './workflow-events.js';
 import {

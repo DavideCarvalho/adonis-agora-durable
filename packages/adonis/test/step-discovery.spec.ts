@@ -2,7 +2,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import type { StepLogger, SubProcessHandle } from '../src/interfaces.js';
 import type { StepHandler } from '../src/protocol.js';
-import { type StepServer, registerStepsFromDir } from '../src/step-discovery.js';
+import { registerStepsFromDir, type StepServer } from '../src/step-discovery.js';
 
 const noopLog: StepLogger = {
   debug: () => {},

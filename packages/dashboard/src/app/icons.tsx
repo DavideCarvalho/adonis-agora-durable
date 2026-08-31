@@ -1,4 +1,4 @@
-import type { SVGProps } from 'react';
+import type { ReactElement, SVGProps } from 'react';
 
 /** Crisp 1.6px-stroke line icons — no icon-font dependency, tuned for the control-plane aesthetic. */
 const base = {
@@ -99,7 +99,7 @@ export function ChildIcon(p: SVGProps<SVGSVGElement>) {
   );
 }
 
-const KIND_ICON: Record<string, (p: SVGProps<SVGSVGElement>) => JSX.Element> = {
+const KIND_ICON: Record<string, (p: SVGProps<SVGSVGElement>) => ReactElement> = {
   local: CpuIcon,
   remote: GlobeIcon,
   sleep: TimerIcon,
@@ -108,7 +108,7 @@ const KIND_ICON: Record<string, (p: SVGProps<SVGSVGElement>) => JSX.Element> = {
 };
 
 /** The icon for a step kind, always defined (unknown kinds fall back to the local/cpu glyph). */
-export function iconFor(kind: string): (p: SVGProps<SVGSVGElement>) => JSX.Element {
+export function iconFor(kind: string): (p: SVGProps<SVGSVGElement>) => ReactElement {
   return KIND_ICON[kind] ?? CpuIcon;
 }
 

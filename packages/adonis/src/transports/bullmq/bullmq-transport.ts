@@ -14,9 +14,9 @@ import type {
   WorkflowStepEvent,
   WorkflowTask,
 } from '../../interfaces.js';
-import { type StepHandler, runStepHandler } from '../../protocol.js';
-import { type WorkflowTurnHandler, isWorkflowTask } from '../../workflow-turn.js';
-import type { BullMQDeps, JobLike, QueueLike, RedisLike, WorkerLike } from './deps.js';
+import { runStepHandler, type StepHandler } from '../../protocol.js';
+import { isWorkflowTask, type WorkflowTurnHandler } from '../../workflow-turn.js';
+import type { BullMQDeps, QueueLike, RedisLike, WorkerLike } from './deps.js';
 import {
   decisionsName,
   effectivePrefix,
@@ -34,13 +34,13 @@ import {
   workerHeartbeatKeyPrefix,
 } from './naming.js';
 import {
-  WORKER_HEARTBEAT_INTERVAL_MS,
-  WORKER_HEARTBEAT_TTL_SECONDS,
   buildInstanceId,
   heartbeatKeyValue,
   jobOptions,
   parseHeartbeatValue,
   taskJobOptions,
+  WORKER_HEARTBEAT_INTERVAL_MS,
+  WORKER_HEARTBEAT_TTL_SECONDS,
 } from './serialization.js';
 
 export interface BullMQTransportOptions {

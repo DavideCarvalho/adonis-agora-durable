@@ -8,8 +8,8 @@ import {
   type StepResult,
   type Transport,
 } from '../interfaces.js';
-import { type PollLoop, Pollers } from '../pollers.js';
-import { type StepHandler, runStepHandler } from '../protocol.js';
+import { Pollers, type PollLoop } from '../pollers.js';
+import { runStepHandler, type StepHandler } from '../protocol.js';
 import { sanitizeQueueToken, tenantGroup } from '../tenant-group.js';
 
 /**

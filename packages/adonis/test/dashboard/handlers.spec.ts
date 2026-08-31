@@ -2,10 +2,10 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { storeDashboardEngine } from '../../src/dashboard/gateway-adapter.js';
 import {
   type ApiRequest,
-  type Deps,
   bulkAction,
   cancelRun,
   continueRun,
+  type Deps,
   getRun,
   health,
   listRuns,

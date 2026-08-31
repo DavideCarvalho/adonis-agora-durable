@@ -1,8 +1,8 @@
 import { BaseCommand, flags } from '@adonisjs/core/ace';
 import type { CommandOptions } from '@adonisjs/core/types/ace';
 import {
-  DEFAULT_STALE_MS,
   attachLiveness,
+  DEFAULT_STALE_MS,
   filterStale,
   listRuns,
   parseDurationMs,

@@ -16,9 +16,8 @@ import { defineConfig, stores, transports } from '../src/define_config.js';
  */
 
 // --- minimal type-equality helpers (no vitest `expectTypeOf` dependency) ---
-type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2
-  ? true
-  : false;
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
 type Expect<T extends true> = T;
 
 /**
@@ -71,14 +70,12 @@ function typeContracts(): void {
   // @ts-expect-error — `store` is forbidden on a tenant config (store?: never — compile-time isolation)
   defineConfig({ role: 'tenant', partition: 'acme', transport: 'bull', store: 'lucid' });
 
-  // ...and it may not carry a `stores` map either.
+  // ...and it may not carry a `stores` map either. (Kept on ONE line: TypeScript >= 7 reports the
+  // overload error at the first object-literal property, so a multi-line literal would put the
+  // diagnostic on a different line than the directive.)
+  const lucidStores = { lucid: stores.lucid() };
   // @ts-expect-error — `stores` is forbidden on a tenant config (stores?: never)
-  defineConfig({
-    role: 'tenant',
-    partition: 'acme',
-    transport: 'bull',
-    stores: { lucid: stores.lucid() },
-  });
+  defineConfig({ role: 'tenant', partition: 'acme', transport: 'bull', stores: lucidStores });
 
   // `partition` is required on a tenant config.
   // @ts-expect-error — missing required `partition`

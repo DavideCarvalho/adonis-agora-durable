@@ -6,7 +6,7 @@ import type {
   WorkflowRun,
   WorkflowTask,
 } from './interfaces.js';
-import { type WorkflowBodyResolver, runWorkflowTurn } from './workflow-turn.js';
+import { runWorkflowTurn, type WorkflowBodyResolver } from './workflow-turn.js';
 
 let taskCounter = 0;
 

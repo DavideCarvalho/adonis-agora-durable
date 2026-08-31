@@ -8,7 +8,7 @@ import {
   type StepResult,
   type Transport,
 } from '../interfaces.js';
-import { type StepHandler, runStepHandler } from '../protocol.js';
+import { runStepHandler, type StepHandler } from '../protocol.js';
 
 /** Event names the transport multiplexes over a single in-process emitter. */
 export const TASK_EVENT = 'durable.task';

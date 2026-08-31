@@ -2,12 +2,12 @@ import type { Database } from '@adonisjs/lucid/database';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Heartbeat, RemoteTask, StepResult } from '../../../src/interfaces.js';
 import { sanitizeQueueToken } from '../../../src/tenant-group.js';
+import { DbTransport } from '../../../src/transports/db.js';
 import { makeMemoryDb, makeTransportDb } from '../../../src/transports/db-helpers.js';
 import {
-  TRANSPORT_TABLES,
   createDurableTransportTables,
+  TRANSPORT_TABLES,
 } from '../../../src/transports/db-schema.js';
-import { DbTransport } from '../../../src/transports/db.js';
 
 // Routing is now BY HANDLER NAME: a dispatched task's `group` is the name's routing token
 // (`sanitizeQueueToken(name)`), which is also the token a worker's `handle(name)` claims rows for.

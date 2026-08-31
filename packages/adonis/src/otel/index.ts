@@ -1,11 +1,11 @@
 export {
-  type DurableOtelOptions,
-  attachDurableOtel,
-} from './durable-otel.js';
-export {
+  attachDurableMetrics,
   type DurableMetrics,
   type DurableMetricsSnapshot,
   type DurationStats,
-  attachDurableMetrics,
 } from './durable-metrics.js';
+export {
+  attachDurableOtel,
+  type DurableOtelOptions,
+} from './durable-otel.js';
 export { otelTraceparent } from './traceparent.js';

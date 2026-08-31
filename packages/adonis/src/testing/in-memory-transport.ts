@@ -7,7 +7,7 @@ import type {
   Transport,
   WorkflowStepEvent,
 } from '../interfaces.js';
-import { type StepHandler, runStepHandler } from '../protocol.js';
+import { runStepHandler, type StepHandler } from '../protocol.js';
 
 /**
  * An in-process `Transport` (and `ControlPlane`) for tests and local development: registered

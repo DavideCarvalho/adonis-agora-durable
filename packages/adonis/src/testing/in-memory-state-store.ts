@@ -1,4 +1,5 @@
 import type {
+  AttributeFilter,
   RunQuery,
   RunStatus,
   SignalWaiter,
@@ -6,8 +7,7 @@ import type {
   StepCheckpoint,
   WorkflowRun,
 } from '../interfaces.js';
-import type { AttributeFilter } from '../interfaces.js';
-import { type RunAttributeRow, normalizeAttributeRows } from '../search-attributes.js';
+import { normalizeAttributeRows, type RunAttributeRow } from '../search-attributes.js';
 
 /**
  * A non-durable, in-process `StateStore` for tests and local development.

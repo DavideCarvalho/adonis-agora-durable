@@ -1,10 +1,10 @@
 import type { AdmissionBackend } from './admission.js';
-import { admissions } from './admissions/factory.js';
 import type {
   AdmissionContext,
   AdmissionFactory,
   RedisAdmissionConfig,
 } from './admissions/factory.js';
+import { admissions } from './admissions/factory.js';
 import type {
   ControlPlaneConfig,
   StandaloneConfig,
@@ -12,17 +12,16 @@ import type {
   TenantVerifier,
   VerifiedTenant,
 } from './config_types.js';
-import { controlPlanes } from './control-planes/factory.js';
 import type {
   ControlPlaneContext,
   ControlPlaneFactory,
   RedisControlPlaneConfig,
 } from './control-planes/factory.js';
+import { controlPlanes } from './control-planes/factory.js';
 import type { ControlPlane, RunDispatcher } from './interfaces.js';
 import type { ScheduledWorkflow } from './scheduler.js';
-import { stores } from './stores/factory.js';
 import type { LucidStoreConfig, StoreContext, StoreFactory } from './stores/factory.js';
-import { transports } from './transports/factory.js';
+import { stores } from './stores/factory.js';
 import type {
   DbTransportConfig,
   EventEmitterTransportConfig,
@@ -31,6 +30,7 @@ import type {
   TransportContext,
   TransportFactory,
 } from './transports/factory.js';
+import { transports } from './transports/factory.js';
 
 /**
  * The **shared** fields of `config/durable.ts`, common to every {@link DurableConfig} role. Everything
@@ -233,26 +233,26 @@ export function defineConfig(config: DurableConfig = { role: 'standalone' }): Du
   return { role: 'standalone', ...config } as DurableConfig;
 }
 
-export { transports, stores, controlPlanes, admissions };
 export type {
   AdmissionContext,
   AdmissionFactory,
-  RedisAdmissionConfig,
-  StandaloneConfig,
   ControlPlaneConfig,
-  TenantConfig,
-  TenantVerifier,
-  VerifiedTenant,
-  TransportContext,
-  TransportFactory,
-  MemoryTransportConfig,
-  EventEmitterTransportConfig,
-  QueueTransportConfig,
-  DbTransportConfig,
-  StoreContext,
-  StoreFactory,
-  LucidStoreConfig,
   ControlPlaneContext,
   ControlPlaneFactory,
+  DbTransportConfig,
+  EventEmitterTransportConfig,
+  LucidStoreConfig,
+  MemoryTransportConfig,
+  QueueTransportConfig,
+  RedisAdmissionConfig,
   RedisControlPlaneConfig,
+  StandaloneConfig,
+  StoreContext,
+  StoreFactory,
+  TenantConfig,
+  TenantVerifier,
+  TransportContext,
+  TransportFactory,
+  VerifiedTenant,
 };
+export { admissions, controlPlanes, stores, transports };

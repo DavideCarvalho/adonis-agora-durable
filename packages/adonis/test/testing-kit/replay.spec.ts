@@ -1,6 +1,5 @@
-import { WorkflowEngine } from '../../src/index.js';
-import { InMemoryStateStore } from '../../src/index.js';
-import { type RunHistory, assertReplayable } from '../../src/testing-kit/replay.js';
+import { InMemoryStateStore, WorkflowEngine } from '../../src/index.js';
+import { assertReplayable, type RunHistory } from '../../src/testing-kit/replay.js';
 
 // Capture a real run's history the way a CI fixture would.
 async function recordHistory(register: (e: WorkflowEngine) => void): Promise<RunHistory> {

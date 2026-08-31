@@ -1,9 +1,9 @@
 import {
+  context,
   type Span,
   SpanStatusCode,
   type Tracer,
   type TracerProvider,
-  context,
   trace,
 } from '@opentelemetry/api';
 import type { EngineEvent, WorkflowEngine } from '../index.js';

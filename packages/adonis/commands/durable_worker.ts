@@ -4,9 +4,12 @@ import type { DurableConfig } from '../src/define_config.js';
 import type { ControlPlane, Transport } from '../src/interfaces.js';
 import { DURABLE_WORKER_RUNTIME } from '../src/role_bindings.js';
 import { InMemoryTransport } from '../src/testing/in-memory-transport.js';
-import { NoopWorkerRegistry } from '../src/worker-runtime/index.js';
-import { registerStepsFromDir } from '../src/worker-runtime/index.js';
-import { WorkerRuntime, type WorkerTransport } from '../src/worker-runtime/index.js';
+import {
+  NoopWorkerRegistry,
+  registerStepsFromDir,
+  WorkerRuntime,
+  type WorkerTransport,
+} from '../src/worker-runtime/index.js';
 import { discoverWorkflows } from '../src/workflow-discovery.js';
 
 /**

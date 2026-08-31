@@ -281,7 +281,7 @@ describe('StoreRunGateway (store-backed RunGateway)', () => {
       await new StoreRunGateway(engine).start('wf', {});
       expect(calls[0]?.method).toBe('start');
       expect(typeof calls[0]?.args[2]).toBe('string');
-      expect((calls[0]?.args[2] as string).length).toBeGreaterThan(0);
+      expect((calls[0]!.args[2] as string).length).toBeGreaterThan(0);
     });
 
     it('signal -> engine.signal(signal, payload) (token delegation)', async () => {

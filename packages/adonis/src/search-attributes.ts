@@ -1,5 +1,10 @@
-import type { AttributeFilter, AttributeOp, RunQuery, WorkflowRun } from './interfaces.js';
-import type { SearchAttributes } from './interfaces.js';
+import type {
+  AttributeFilter,
+  AttributeOp,
+  RunQuery,
+  SearchAttributes,
+  WorkflowRun,
+} from './interfaces.js';
 
 /** Compare one attribute value against a filter operand. Range ops need both sides comparable. */
 function compare(actual: unknown, op: AttributeOp, expected: string | number | boolean): boolean {

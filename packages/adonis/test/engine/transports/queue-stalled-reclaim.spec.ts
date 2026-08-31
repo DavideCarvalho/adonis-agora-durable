@@ -2,8 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { RemoteTask, StepResult } from '../../../src/interfaces.js';
 import { sanitizeQueueToken } from '../../../src/tenant-group.js';
-import { MockAdapter } from '../../../src/transports/queue-mock-adapter.js';
 import { QueueTransport, toJson } from '../../../src/transports/queue.js';
+import { MockAdapter } from '../../../src/transports/queue-mock-adapter.js';
 
 // The transport bypasses the broker's `Worker` class (see queue.ts header), so nothing called the
 // adapter's `recoverStalledJobs` — a claim whose worker died between `popFrom` and `completeJob` sat

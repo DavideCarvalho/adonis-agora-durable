@@ -533,28 +533,28 @@ export {
   durableConsoleSessionUrl,
   durableConsoleUrl,
   mintDurableConsoleSession,
-  openDurableConsole,
   type OpenConsoleOptions,
+  openDurableConsole,
 } from './console-session.js';
 
-export { type SubProcess, groupSubProcesses } from './group-subprocesses.js';
+export { groupSubProcesses, type SubProcess } from './group-subprocesses.js';
 
 export {
   ALL_ORIGINS,
   type EmptyRunsNotice,
-  type OriginFacet,
-  type OriginFilter,
-  UNKNOWN_ORIGIN,
-  UNKNOWN_ORIGIN_TITLE,
   emptyRunsNotice,
   filterByOrigin,
   isUnknownOrigin,
   knownOrigin,
   matchesOrigin,
+  type OriginFacet,
+  type OriginFilter,
   originFacets,
   originFilterKey,
   originLabel,
   sameOriginFilter,
+  UNKNOWN_ORIGIN,
+  UNKNOWN_ORIGIN_TITLE,
   unknownOriginCount,
 } from './run-origin.js';
 

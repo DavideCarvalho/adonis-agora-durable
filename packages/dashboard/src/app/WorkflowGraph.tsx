@@ -12,16 +12,16 @@ import {
 } from '@xyflow/react';
 import { useCallback, useMemo } from 'react';
 import {
+  durableClient,
   type RunDetail,
   type RunDisplayStatus,
+  runDisplayStatus,
   type StepCheckpoint,
   type WorkflowRun,
-  durableClient,
-  runDisplayStatus,
 } from '../client/durable-client';
 import { groupParallelSpans } from '../client/group-parallel-spans';
 import { childRunIdOf } from './child-link';
-import { BoltIcon, CheckIcon, ChildIcon, KIND_LABEL, XIcon, iconFor } from './icons';
+import { BoltIcon, CheckIcon, ChildIcon, iconFor, KIND_LABEL, XIcon } from './icons';
 
 /** Stable empty set so a graph with no `expanded` prop doesn't re-run the layout memo each render. */
 const EMPTY_EXPANDED: Set<string> = new Set();

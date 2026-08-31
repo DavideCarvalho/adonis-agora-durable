@@ -1,8 +1,8 @@
 import type { Database } from '@adonisjs/lucid/database';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { WorkflowEngine } from '../../../src/engine.js';
-import { makeStoreDb } from '../../../src/stores/lucid-helpers.js';
 import { LucidStateStore } from '../../../src/stores/lucid.js';
+import { makeStoreDb } from '../../../src/stores/lucid-helpers.js';
 
 /**
  * Drive a real `WorkflowEngine` over the Lucid store and run end-to-end workflows — the strongest

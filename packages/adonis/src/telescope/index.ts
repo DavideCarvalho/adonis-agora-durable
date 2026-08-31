@@ -1,5 +1,4 @@
 export { type DurableDashboardOptions, durableDashboard } from './dashboard.js';
-export { durableTelescopeExtension } from './extension.js';
 export {
   durableDurationProvider,
   durableRecentFailuresProvider,
@@ -11,6 +10,7 @@ export {
   durableTimeseriesProvider,
   durableWorkerHealthProvider,
 } from './data-providers.js';
+export { durableTelescopeExtension } from './extension.js';
 export type {
   ContainerLike,
   DataProvider,

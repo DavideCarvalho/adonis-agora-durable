@@ -9,7 +9,7 @@
     "url": "git+https://github.com/DavideCarvalho/adonis-agora-durable.git"
   },
   "author": "Davi Carvalho <davi@goflip.ai>",
-  "packageManager": "pnpm@11.17.0",
+  "packageManager": "pnpm@11.24.0",
   "engines": {
     "node": ">=20.6.0"
   },
@@ -25,13 +25,13 @@
     "version-packages": "changeset version && node scripts/sync-version-literals.mjs && biome check --write ."
   },
   "devDependencies": {
-    "@biomejs/biome": "1.9.4",
-    "@changesets/changelog-github": "0.7.0",
-    "@changesets/cli": "2.31.1",
-    "@swc/core": "1.15.47",
-    "turbo": "2.10.9",
-    "typescript": "5.9.3",
+    "@biomejs/biome": "2.5.11",
+    "@changesets/changelog-github": "1.0.0",
+    "@changesets/cli": "3.0.1",
+    "@swc/core": "1.16.1",
+    "turbo": "2.10.12",
+    "typescript": "7.0.2",
     "unplugin-swc": "1.5.11",
-    "vitest": "3.2.7"
+    "vitest": "4.1.11"
   }
 }

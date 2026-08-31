@@ -1,11 +1,11 @@
 import { useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
-import { durableClient } from '../client/durable-client';
 import type { StepCheckpoint, StepEvent, WorkflowRun } from '../client/durable-client';
-import { type SubProcess, groupSubProcesses } from '../client/group-subprocesses';
-import { RunSpans } from './SpansTimeline';
+import { durableClient } from '../client/durable-client';
+import { groupSubProcesses, type SubProcess } from '../client/group-subprocesses';
 import { childRunIdOf } from './child-link';
-import { BoltIcon, CheckIcon, CopyIcon, KIND_LABEL, XIcon, iconFor } from './icons';
+import { BoltIcon, CheckIcon, CopyIcon, iconFor, KIND_LABEL, XIcon } from './icons';
+import { RunSpans } from './SpansTimeline';
 
 function fmtMs(ms: number): string {
   if (ms < 1000) return `${Math.round(ms)}ms`;
@@ -102,6 +102,7 @@ function SubProcessRow({ sub, showGroup = true }: { sub: SubProcess; showGroup?:
           {sub.phases.length > 0 && (
             <ul className="mono mb-2 flex flex-col gap-0.5 text-[10.5px]">
               {sub.phases.map((p, i) => (
+                // biome-ignore lint/suspicious/noArrayIndexKey: phases are an append-only log with no id; (at, phase) can repeat
                 <li key={`${p.at}-${p.phase}-${i}`} className="flex gap-2">
                   <span className="shrink-0 text-zinc-600 tnum">{clockMs(p.at)}</span>
                   <span className="text-zinc-400">{p.phase}</span>
@@ -126,6 +127,7 @@ function SubProcessRow({ sub, showGroup = true }: { sub: SubProcess; showGroup?:
           {sub.logs.length > 0 && (
             <div className="mono flex flex-col gap-0.5 text-[11px]">
               {sub.logs.map((e, i) => (
+                // biome-ignore lint/suspicious/noArrayIndexKey: log lines are append-only with no id; timestamps can repeat
                 <LogLine key={`${e.at}-${i}`} e={e} />
               ))}
             </div>
@@ -200,6 +202,7 @@ function StepEvents({ events }: { events: StepEvent[] }) {
           </div>
           <div className="mono max-h-64 overflow-auto rounded-lg border border-line bg-black/40 p-2.5 text-[11px] leading-relaxed">
             {stepLogs.map((e, i) => (
+              // biome-ignore lint/suspicious/noArrayIndexKey: log lines are append-only with no id; timestamps can repeat
               <LogLine key={`${e.at}-${i}`} e={e} />
             ))}
           </div>

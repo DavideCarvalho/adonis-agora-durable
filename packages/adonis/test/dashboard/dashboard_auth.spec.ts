@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
-  type ResolvedDashboardAuth,
   performLogin,
   performSession,
+  type ResolvedDashboardAuth,
   readSession,
   resolveDashboardAuth,
   sanitizeReturnTo,

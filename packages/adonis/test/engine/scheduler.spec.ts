@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from '../../src/engine.js';
-import { type ScheduledWorkflow, runSchedules } from '../../src/scheduler.js';
+import { runSchedules, type ScheduledWorkflow } from '../../src/scheduler.js';
 import { startRun } from '../../src/test-helpers.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
 

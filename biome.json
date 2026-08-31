@@ -1,17 +1,19 @@
 {
-  "$schema": "https://biomejs.dev/schemas/1.9.0/schema.json",
+  "$schema": "https://biomejs.dev/schemas/2.5.11/schema.json",
   "vcs": { "enabled": true, "clientKind": "git", "useIgnoreFile": true },
   "files": {
     "ignoreUnknown": false,
-    "ignore": [
-      "dist/**",
-      "node_modules/**",
-      ".turbo/**",
-      "coverage/**",
-      "**/*.stub",
-      "**/test/fixtures/**"
+    "includes": [
+      "**",
+      "!**/dist",
+      "!**/node_modules",
+      "!**/.turbo",
+      "!**/coverage",
+      "!**/*.stub",
+      "!**/test/fixtures"
     ]
   },
+  "css": { "parser": { "tailwindDirectives": true } },
   "formatter": { "enabled": true, "indentStyle": "space", "indentWidth": 2, "lineWidth": 100 },
   "javascript": {
     "formatter": { "quoteStyle": "single", "semicolons": "always", "trailingCommas": "all" }
@@ -19,7 +21,7 @@
   "linter": {
     "enabled": true,
     "rules": {
-      "recommended": true,
+      "preset": "recommended",
       "complexity": { "noBannedTypes": "off", "noStaticOnlyClass": "off" },
       "style": { "noNonNullAssertion": "off", "useImportType": "off" },
       "suspicious": { "noExplicitAny": "error", "noEmptyInterface": "off" }
@@ -27,7 +29,7 @@
   },
   "overrides": [
     {
-      "include": ["**/test/**", "**/*.spec.ts", "**/*.test.ts"],
+      "includes": ["**/test/**", "**/*.spec.ts", "**/*.test.ts"],
       "linter": { "rules": { "suspicious": { "noExplicitAny": "off" } } }
     }
   ]
