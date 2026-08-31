@@ -25,8 +25,8 @@ import { parseAttrFilters } from './attr-filter.js';
  * shapes.
  *
  * `listRuns`/`getRun`/`retryRun`/`redispatchPendingRun`/`cancelRun`/`health` are the original
- * handlers this file always had (kept response-shape compatible with the legacy static
- * `assets/dashboard.html`, still served as a compat fallback — see `compat.ts`/`compat-view.ts`).
+ * handlers this file always had (response shapes unchanged, so a hand-written client over the
+ * JSON API keeps working — see `compat.ts`/`compat-view.ts`).
  * `workers`, `topology`, `retryWithInputRun`, `continueRun`, and `bulkAction` are additions that give
  * the new `@adonis-agora/durable-dashboard` React SPA parity with `@dudousxd/nestjs-durable-dashboard`'s
  * `DurableApiController` (fix-and-replay, bulk retry/cancel, breakpoint continue, full worker
@@ -166,7 +166,7 @@ function parseFlag(raw: unknown): boolean | undefined | typeof INVALID_FLAG {
  *
  * Both channels are read because both are in use: the bundled React console sends
  * `POST .../cancel?compensate=true` (no body at all), while the documented `{ compensate: true }`
- * body is what a hand-written client and the legacy page send. Reading only one of them meant a
+ * body is what a hand-written client sends. Reading only one of them meant a
  * "Cancel + Undo" from the console performed a plain cancel and reported success — a silent wrong
  * answer, worse than an error. The body wins when it carries the key, so every existing body-based
  * caller keeps its exact behaviour and the query is purely additive.
@@ -355,7 +355,7 @@ export async function bulkAction(deps: Deps, req: ApiRequest): Promise<ApiRespon
 }
 
 /** `GET /health` — per-group worker health (queue backlog + live worker heartbeats), reduced to a
- *  compact shape. Kept for the legacy static dashboard (`assets/dashboard.html`, compat fallback). */
+ *  compact shape. Kept as a public endpoint for hand-written clients; the console uses `/workers`. */
 export async function health(deps: Deps): Promise<ApiResponse> {
   const groups: GroupHealth[] = await deps.engine.workerHealth();
   return ok({

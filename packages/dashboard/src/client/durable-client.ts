@@ -308,17 +308,44 @@ export function runDisplayStatus(run: WorkflowRun, timeline?: StepCheckpoint[]):
 
 declare global {
   interface Window {
-    /** UI mount base (e.g. `/durable`) injected by the provider; falls back to `/durable`. */
+    /** UI mount base (e.g. `/durable`). Test/escape-hatch override; see {@link readConfig}. */
     __DURABLE_BASE__?: string;
-    /** JSON API base (e.g. `/durable/api`) injected by the provider; falls back to `<base>/api`. */
+    /** JSON API base (e.g. `/durable/api`). Test/escape-hatch override; see {@link readConfig}. */
     __DURABLE_API__?: string;
   }
 }
 
+/** `id` of the JSON data block the provider injects into `index.html` (`spa.ts`'s `CONFIG_ELEMENT_ID`). */
+export const CONFIG_ELEMENT_ID = 'durable-dashboard-config';
+
+/**
+ * The deployment config the provider handed this page: `{ base, api }` in a
+ * `<script type="application/json">` DATA block, not globals set by an inline script. The
+ * difference is the whole bug it fixes: a host Content-Security-Policy of
+ * `script-src 'self' 'nonce-…'` (shield's `@nonce`) refuses an un-nonced inline script without a
+ * word, so the globals were never set, the URLs below fell back to `/durable/api`, and a console
+ * mounted anywhere else answered 404 to all of its own requests while rendering perfectly. A data
+ * block is never executed, so no policy can refuse it. The `window.__DURABLE_*__` globals are still
+ * honoured, AFTER the block, so a test or a hand-embedding host can set them.
+ */
+function readConfig(): { base?: unknown; api?: unknown } {
+  if (typeof document === 'undefined') return {};
+  const element = document.getElementById(CONFIG_ELEMENT_ID);
+  if (element === null) return {};
+  try {
+    const parsed: unknown = JSON.parse(element.textContent ?? '');
+    return typeof parsed === 'object' && parsed !== null ? (parsed as { base?: unknown }) : {};
+  } catch {
+    return {};
+  }
+}
+
 function uiBase(): string {
-  // Checked with `typeof ... === 'string'` (not a truthy check): the provider injects `''` for a
+  // Checked with `typeof ... === 'string'` (not a truthy check): the provider sends `''` for a
   // root-mounted dashboard (`path: ''`), which is a deliberate, valid base — a truthy check would
   // silently fall through to the `/durable` default instead of honoring it.
+  const injected = readConfig().base;
+  if (typeof injected === 'string') return injected;
   if (typeof window !== 'undefined' && typeof window.__DURABLE_BASE__ === 'string') {
     return window.__DURABLE_BASE__;
   }
@@ -326,6 +353,8 @@ function uiBase(): string {
 }
 
 function apiBase(): string {
+  const injected = readConfig().api;
+  if (typeof injected === 'string') return injected;
   if (typeof window !== 'undefined' && typeof window.__DURABLE_API__ === 'string') {
     return window.__DURABLE_API__;
   }

@@ -6,7 +6,7 @@ import type { NegotiationOutcome } from '../handshake/negotiate.js';
  * Kept here — not inline in the HTML — so the mapping is unit-testable and can't silently drift.
  */
 
-/** CSS class for a negotiation outcome's badge (mirrors the `.c-*` classes in `dashboard.html`). */
+/** CSS class for a negotiation outcome's badge (`c-<outcome>`). */
 export function outcomeClass(outcome: NegotiationOutcome): string {
   switch (outcome) {
     case 'compatible':

@@ -1,7 +1,7 @@
 /**
  * The built-in `dashboardAuth` login page (`GET <basePath>/login`). Deliberately a small,
  * dependency-free, hand-authored HTML page — NOT part of the bundled dashboard SPA — so gating the
- * dashboard shell doesn't require rebuilding or extending the bundled `assets/dashboard.html`.
+ * dashboard shell doesn't require rebuilding the SPA bundle.
  *
  * `returnTo` and any error state are read CLIENT-SIDE from `location.search` (never server-echoed
  * into the HTML), so this function's only per-request-ish input is `basePath` — a developer-

@@ -81,9 +81,6 @@ All routes are relative to `path` (default `/durable`), and every one of them ru
 | --- | --- | --- |
 | `GET` | `/durable` | the React console (`index.html`, with the base path and API base injected) |
 | `GET` | `/durable/assets/:file` | the console's hashed JS/CSS bundle, served immutable |
-| `GET` | `/durable/legacy` | the original dependency-free HTML page |
-
-`/durable/legacy` is the single-file page the console used to be: no build step, no JavaScript bundle, just a table and a handful of `fetch` calls. Keep it in mind for an environment where the SPA bundle cannot be served, or as a fallback while debugging the console itself.
 
 The console routes client-side on the URL hash (`#/run/<id>`), so a deep link needs no server-side rewrite.
 
@@ -206,13 +203,13 @@ The filter is evaluated with a hard cap of 500 and no paging. A filter matching 
 | Method | Route | Purpose |
 | --- | --- | --- |
 | `GET` | `/durable/api/workers` | per-worker heartbeats, grouped by routing token |
-| `GET` | `/durable/api/health` | the compact legacy shape: queue depth and a `stalled` flag per group |
+| `GET` | `/durable/api/health` | the compact shape: queue depth and a `stalled` flag per group |
 | `GET` | `/durable/api/topology` | this pod's `role`, plus its `tenant` when it is a store-less pod |
 | `GET` | `/durable/api/compat` | protocol/capability negotiation across the fleet, plus blocked runs |
 
 `GET /api/workers` returns the raw `GroupHealth[]` — for each routing token, its queue `depth` and the **individual live workers** with their `instanceId` and `lastBeatAt`. That is what tells "one worker is wedged" apart from "the whole group is down".
 
-`GET /api/health` is the older, compact view of the same data: it collapses `liveWorkers` to a count and adds `stalled: depth > 0 && liveWorkers === 0`. The legacy page still uses it; prefer `/api/workers` for anything new.
+`GET /api/health` is the older, compact view of the same data: it collapses `liveWorkers` to a count and adds `stalled: depth > 0 && liveWorkers === 0`. It stays for hand-written clients and probes; prefer `/api/workers` for anything new.
 
 `GET /api/compat` powers the compatibility panel described below: per group, each pod's protocol range and capabilities with a `compatible` / `degraded` / `incompatible` outcome and the exact reason, alongside every `blocked` run and why it parked.
 
