@@ -1,6 +1,6 @@
 {
   "name": "@adonis-agora/durable",
-  "version": "0.28.0",
+  "version": "0.29.0",
   "description": "Durable cross-app workflows for AdonisJS — deterministic replay engine, AdonisJS binding, ace commands, dashboard, OpenTelemetry, Telescope, testing harness and Redis admission, all in one package. Part of the Agora ecosystem.",
   "license": "MIT",
   "repository": {
