@@ -1,5 +1,20 @@
 # @adonis-agora/durable
 
+## 0.31.3
+
+### Patch Changes
+
+- [#97](https://github.com/DavideCarvalho/adonis-agora-durable/pull/97) [`3a84725`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/3a847258404174446ff2e553ad230ac934246c1f) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - O link "abrir este run" do dashboard do telescope levava a um 404.
+  
+  O default era `/durable/runs/{runId}`, errado em duas coisas: o console é um SPA roteado
+  por **hash** (`App.tsx` casa `window.location.hash` contra `#/run/<id>`), então um caminho
+  comum nunca chega nele — quem responde é o router do app, com 404 — e o segmento estava no
+  **plural** contra o singular que o SPA espera.
+  
+  Agora o default é `/durable#/run/{runId}`. Quem monta o console em outro path continua
+  passando o seu via `runHref`, porque o template precisa carregar o mount path e este
+  módulo não tem como sabê-lo.
+
 ## 0.31.2
 
 ### Patch Changes
