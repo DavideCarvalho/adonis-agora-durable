@@ -1,7 +1,7 @@
 import { pathToFileURL } from 'node:url';
 import type { ApplicationService } from '@adonisjs/core/types';
 import type { AdmissionContext } from '../src/admissions/factory.js';
-import { type WorkerLogger, mergeSchedules, runWorkerLoop } from '../src/commands/worker.js';
+import { mergeSchedules, runWorkerLoop, type WorkerLogger } from '../src/commands/worker.js';
 import type { ControlPlaneConfig, TenantConfig } from '../src/config_types.js';
 import type { ControlPlaneContext } from '../src/control-planes/factory.js';
 import type { DurableConfig } from '../src/define_config.js';

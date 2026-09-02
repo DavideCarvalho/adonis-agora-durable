@@ -101,17 +101,48 @@ describe('DurableProvider — embedded worker', () => {
     await provider.shutdown();
   });
 
-  it('shutdown stops the loop and awaits it, so no tick lands after shutdown returns', async () => {
-    const { provider, runs } = await scheduledApp({ embedded: true, intervalMs: 5 });
+  it('shutdown blocks until the in-flight run drains (never closes the transport under a live tick)', async () => {
+    // The previous shape of this test — "assert no tick lands after shutdown" — could not fail:
+    // an `everyMs` window is idempotent, so the schedule cannot fire twice regardless of whether the
+    // loop is still alive. Removing the `await` in shutdown() left it green. This asserts the await
+    // directly: with a run parked mid-execution, shutdown() must not resolve.
+    const runs: string[] = [];
+    let release!: () => void;
+    const parked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const { app, resolve: resolveEngine } = fakeApp(
+      {
+        worker: { embedded: true, intervalMs: 5, drainTimeoutMs: 5000 },
+        schedules: [{ key: 'sync', workflow: 'sync', everyMs: 60_000 }],
+      },
+      'web',
+    );
+    const provider = new DurableProvider(app);
+    provider.register();
+    const engine = await resolveEngine();
+    engine.register('sync', '1', async () => {
+      runs.push('started');
+      await parked;
+      return null;
+    });
+
     await provider.ready();
     expect(await waitFor(() => runs.length > 0)).toBe(true);
 
-    await provider.shutdown();
-    const afterShutdown = runs.length;
-    // If shutdown returned while the loop was still live, a later tick would keep appending.
+    let settled = false;
+    const shutdown = provider.shutdown().then(() => {
+      settled = true;
+    });
     await new Promise((r) => setTimeout(r, 100));
 
-    expect(runs.length).toBe(afterShutdown);
+    // Still parked: shutdown is waiting on the drain rather than tearing down underneath it.
+    expect(settled).toBe(false);
+
+    release();
+    await shutdown;
+    expect(settled).toBe(true);
   });
 
   it('shutdown is safe when no embedded loop was started', async () => {
