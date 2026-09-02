@@ -1,5 +1,19 @@
 # @adonis-agora/durable
 
+## 0.31.1
+
+### Patch Changes
+
+- [#98](https://github.com/DavideCarvalho/adonis-agora-durable/pull/98) [`4d61da2`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/4d61da2cb0bf977706bdd62382cdd8f49bf7ee0f) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Fix the assembler codegen hooks, which broke the build of every app that ran `node ace configure @adonis-agora/durable`. The configure step writes both hooks into `adonisrc.ts` by itself, and the build then died with:
+  
+  ```
+  TypeError: handler.handle is not a function
+  ```
+  
+  `@poppinss/hooks` — the runner the assembler drives its `init` hooks with — invokes a handler as `typeof handler === 'function' ? handler(...data) : handler.handle(action, ...data)`, so a non-function handler must expose `handle`. Both hooks exported `{ run }`. The same shape also mismatched the assembler's own `DefineHook` type, so a consumer's typecheck failed too.
+  
+  `workflowsHook()` / `stepsHook()` and the default exports of `@adonis-agora/durable/hooks/workflows` and `/hooks/steps` are now plain functions. If you called `workflowsHook().run(...)` directly, call the returned value itself; the wiring in `adonisrc.ts` is unchanged, and it now works instead of throwing.
+
 ## 0.31.0
 
 ### Minor Changes
