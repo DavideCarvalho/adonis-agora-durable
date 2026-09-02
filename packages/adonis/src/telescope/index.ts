@@ -18,3 +18,4 @@ export type {
   TelescopeExtension,
   TelescopeStoreLike,
 } from './telescope-sdk.js';
+export { durableSchedules } from './schedules.js';

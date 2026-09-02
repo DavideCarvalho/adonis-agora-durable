@@ -10,6 +10,7 @@ import {
   durableTimeseriesProvider,
   durableWorkerHealthProvider,
 } from './data-providers.js';
+import { durableSchedules } from './schedules.js';
 import type { TelescopeExtension } from './telescope-sdk.js';
 
 /**
@@ -46,5 +47,6 @@ export function durableTelescopeExtension(opts: DurableDashboardOptions = {}): T
       durableThroughputProvider(),
       durableStateBreakdownProvider(),
     ],
+    schedules: (ctx) => durableSchedules(ctx),
   };
 }

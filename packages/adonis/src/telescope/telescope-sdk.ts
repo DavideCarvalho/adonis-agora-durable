@@ -32,6 +32,17 @@ export interface ExtensionContext {
   readonly config: unknown;
 }
 
+/**
+ * A scheduled task contributed to telescope's Live Schedules screen. Mirror of
+ * telescope's `ScheduleContribution` / `ScheduleRegistration`.
+ */
+export interface ScheduleContribution {
+  name: string;
+  schedule?: string | null;
+  kind?: 'cron' | 'interval' | 'custom';
+  timezone?: string | null;
+}
+
 export interface ExtensionEntryType {
   id: string;
   label: string;
@@ -121,4 +132,6 @@ export interface TelescopeExtension {
   entryTypes?(ctx: ExtensionContext): ExtensionEntryType[];
   dashboards?(ctx: ExtensionContext): DashboardSpec[];
   dataProviders?(ctx: ExtensionContext): DataProvider[];
+  /** Contribute known scheduled tasks to telescope's Live Schedules screen. */
+  schedules?(ctx: ExtensionContext): ScheduleContribution[] | Promise<ScheduleContribution[]>;
 }
