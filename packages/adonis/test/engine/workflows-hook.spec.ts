@@ -1,3 +1,4 @@
+import Hooks from '@poppinss/hooks';
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from '../../src/engine.js';
 import defaultHook, {
@@ -23,15 +24,31 @@ function fakeIndexGenerator() {
 }
 
 describe('workflows assembler init hook', () => {
-  it('the module loads and the default export is a runnable hook (smoke)', () => {
-    expect(typeof defaultHook.run).toBe('function');
+  it('the default export is a FUNCTION, which is what the hook runner calls', () => {
+    expect(typeof defaultHook).toBe('function');
     expect(GENERATED_WORKFLOWS_OUTPUT).toBe('.adonisjs/durable/workflows.ts');
+  });
+
+  it('runs through @poppinss/hooks — the runner the assembler actually drives it with', async () => {
+    // This is the test that was missing. The old suite called `defaultHook.run(...)` itself, which
+    // proved nothing about how the hook is invoked in an app: @poppinss/hooks calls a handler as
+    // `typeof handler === 'function' ? handler(...data) : handler.handle(action, ...data)`, so the
+    // previous `{ run }` export made every `node ace build` die with
+    // `TypeError: handler.handle is not a function` while this suite stayed green.
+    const fake = fakeIndexGenerator();
+    const hooks = new Hooks();
+    hooks.add('init', defaultHook as never);
+
+    await hooks.runner('init').run(undefined, undefined, fake.generator as never);
+
+    expect(fake.calls).toHaveLength(1);
+    expect(fake.calls[0]?.name).toBe('workflows');
   });
 
   it('registers a `workflows` barrelFile source with the expected defaults', () => {
     const fake = fakeIndexGenerator();
     // run(parent, hooks, indexGenerator) — only the third arg matters here.
-    defaultHook.run(undefined, undefined, fake.generator as never);
+    defaultHook(undefined, undefined, fake.generator as never);
 
     expect(fake.calls).toHaveLength(1);
     const { name, config } = fake.calls[0]!;
@@ -52,7 +69,7 @@ describe('workflows assembler init hook', () => {
       source: 'app/flows',
       importAlias: '#flows',
       output: '.adonisjs/custom/flows.ts',
-    }).run(undefined, undefined, fake.generator as never);
+    })(undefined, undefined, fake.generator as never);
 
     expect(fake.calls[0]?.config).toMatchObject({
       source: 'app/flows',
