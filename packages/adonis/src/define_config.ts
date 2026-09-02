@@ -59,6 +59,20 @@ import { transports } from './transports/factory.js';
  * })
  * ```
  */
+/**
+ * Opt-in embedded worker loop — see {@link BaseDurableConfig.worker}. A dedicated `durable:work` pod
+ * stays the right shape for a fleet that scales workers independently of web traffic; this is for the
+ * app whose background work does not justify a second container.
+ */
+export interface EmbeddedWorkerConfig {
+  /** Start the worker loop in this process (web environment only). Default `false`. */
+  embedded?: boolean;
+  /** Poll interval in ms between ticks. Default 1000 — the same default as `durable:work`. */
+  intervalMs?: number;
+  /** Drain timeout in ms applied on shutdown, passed to `engine.drain`. Default 10_000. */
+  drainTimeoutMs?: number;
+}
+
 export interface BaseDurableConfig {
   /**
    * Which topology this engine runs as (spec §3): `'standalone'` (default — control-plane + embedded
@@ -190,6 +204,24 @@ export interface BaseDurableConfig {
    * On a `key` collision, an entry here **wins** (an explicit config override of the colocated one).
    */
   schedules?: ScheduledWorkflow[];
+  /**
+   * Run the worker loop **inside this process** instead of a separate `node ace durable:work` pod.
+   * The loop is the same one the command drives (pending, recovery, timers, timeouts, schedules), so
+   * an app that only needs a cadence — a nightly sync, an hourly cleanup — ships one image and one
+   * process rather than a second container idling 24h to fire it.
+   *
+   * The loop starts in `ready()` and **only in the `web` environment**. That gate is what keeps a
+   * console process from silently becoming a worker: without it, `node ace migration:run` would spin
+   * up a loop, and `node ace durable:work` would run *two* — the command's and the embedded one — in
+   * the same process, double-ticking every phase.
+   *
+   * Shutdown is wired to the provider, not to `process`: the web environment already turns SIGTERM
+   * into `app.terminate()`, which stops the loop, drains in-flight executions, and only then closes
+   * the transport and control plane. A deploy hands off exactly as it does for a dedicated worker.
+   *
+   * Omit for the default: no embedded loop, schedules fire only from `durable:work`.
+   */
+  worker?: EmbeddedWorkerConfig;
   /**
    * Directory (relative to the app root) the provider scans at boot for workflow classes
    * (`BaseWorkflow` subclasses) to auto-register on the engine — the

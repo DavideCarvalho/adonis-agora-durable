@@ -124,7 +124,38 @@ schedules: [
 Match the `key` exactly — a config entry under a different key does not override, it adds a second schedule.
 
 <Callout type="info">
-Schedules only fire from the `durable:work` loop. A dashboard-/dispatch-only instance that never runs the worker loop will not start them — run at least one worker.
+Schedules only fire from a worker loop — either the `durable:work` command or the [embedded worker](#running-the-loop-in-the-web-process) below. A dashboard-/dispatch-only instance that runs neither will not start them.
+</Callout>
+
+## Running the loop in the web process
+
+A dedicated `durable:work` pod is the right shape when workers scale independently of web traffic. It is the wrong shape when the app's entire background workload is one nightly sync: a second container idles 24h to fire a job that takes a minute.
+
+For that case, run the loop **inside the web process**:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  worker: { embedded: true },
+  schedules: [
+    { key: 'daily-report', workflow: 'daily-report', cron: '0 2 * * *', timezone: 'America/Sao_Paulo' },
+  ],
+})
+```
+
+That is the whole change — one image, one process, one `CMD`. The loop is the same one the command drives, with the same five phases and the same exactly-once guarantee.
+
+| Option | Default | |
+|---|---|---|
+| `embedded` | `false` | Start the loop in this process |
+| `intervalMs` | `1000` | Poll interval between ticks |
+| `drainTimeoutMs` | `10_000` | Drain timeout applied on shutdown |
+
+**The loop starts only in the `web` environment.** Without that gate, `node ace migration:run` would quietly become a worker, and `node ace durable:work` would run *two* loops in one process — the command's and the embedded one — ticking every phase twice. The gate is also what lets you keep `embedded: true` in config while still running dedicated worker pods: the command runs in the `console` environment, so no embedded loop competes with it.
+
+Shutdown hangs off the provider, not a `process` signal handler: the web environment already turns SIGTERM into `app.terminate()`. The loop is stopped and awaited — draining in-flight executions — **before** the transport and control plane close, so a deploy hands off exactly as it does for a dedicated worker.
+
+<Callout type="warn">
+Every web instance that boots with `embedded: true` ticks. That is safe — the idempotent time-bucket run id keeps each window to exactly one run no matter how many instances race — but each one polls the store. On a fleet of any size, prefer dedicated workers and add `jitter` to spread the dispatch.
 </Callout>
 
 The referenced workflows are ordinary registered workflows:

@@ -1,6 +1,7 @@
 import { pathToFileURL } from 'node:url';
 import type { ApplicationService } from '@adonisjs/core/types';
 import type { AdmissionContext } from '../src/admissions/factory.js';
+import { mergeSchedules, runWorkerLoop, type WorkerLogger } from '../src/commands/worker.js';
 import type { ControlPlaneConfig, TenantConfig } from '../src/config_types.js';
 import type { ControlPlaneContext } from '../src/control-planes/factory.js';
 import type { DurableConfig } from '../src/define_config.js';
@@ -97,6 +98,10 @@ export default class DurableProvider {
   #responder: RunRequestResponder | null = null;
   /** Memoized tenant transport so the ProxyRunGateway + WorkerRuntime share ONE broker connection. */
   #tenantTransportPromise: Promise<Transport & { close?: () => Promise<void> }> | null = null;
+  /** Resolves the embedded loop's stop signal on shutdown. Null when no embedded worker runs. */
+  #stopEmbeddedWorker: (() => void) | null = null;
+  /** The embedded loop itself, awaited on shutdown so it drains before the transport closes. */
+  #embeddedWorkerLoop: Promise<unknown> | null = null;
 
   constructor(protected app: ApplicationService) {}
 
@@ -394,6 +399,72 @@ export default class DurableProvider {
   }
 
   /**
+   * Start the opt-in embedded worker loop (`config.worker.embedded`) inside THIS process, so an app
+   * whose only background work is a cadence ships one image and one process instead of a second
+   * container idling to fire it. The loop is the same one `node ace durable:work` drives.
+   *
+   * Two gates, both load-bearing:
+   *
+   *   1. **`web` environment only.** `ready()` runs in every environment. Without this, `node ace
+   *      migration:run` would quietly become a worker, and `node ace durable:work` would run the
+   *      command's loop AND an embedded one in the same process — every phase ticked twice.
+   *   2. **Not a `tenant`.** A tenant pod owns no engine; `ready()` has already returned for it.
+   *
+   * Deliberately NOT awaited: `runWorkerLoop` only returns when the loop stops, so awaiting it here
+   * would block app boot forever. The promise is kept on the instance and awaited in `shutdown()`.
+   */
+  async #startEmbeddedWorker(config: DurableConfig) {
+    if (!config.worker?.embedded) return;
+    // `getEnvironment` is called optionally: naive test doubles of ApplicationService may not carry
+    // it, and an app double without it is not a web process worth starting a loop in.
+    if (this.app.getEnvironment?.() !== 'web') return;
+
+    const engine = await this.app.container.make(WorkflowEngine);
+    // Same merge the command performs: `config.schedules` wins over a colocated `static schedule`
+    // on a `key` collision.
+    const schedules = mergeSchedules(config.schedules ?? [], engine.discoveredSchedules);
+    const logger = await this.#resolveLogger();
+
+    let stop!: () => void;
+    const stopSignal = new Promise<void>((resolve) => {
+      stop = resolve;
+    });
+    this.#stopEmbeddedWorker = stop;
+
+    logger.info(
+      `durable: embedded worker started (interval ${config.worker.intervalMs ?? 1000}ms, ${schedules.length} schedule(s))`,
+    );
+    this.#embeddedWorkerLoop = runWorkerLoop(engine, {
+      intervalMs: config.worker.intervalMs ?? 1000,
+      drainTimeoutMs: config.worker.drainTimeoutMs ?? 10_000,
+      stopSignal,
+      schedules,
+      logger,
+    }).catch((error: unknown) => {
+      // `runWorkerLoop` collects per-phase errors itself, so reaching here means the loop died
+      // outright. Surface it — a silently dead loop means schedules simply stop firing.
+      logger.error(`durable: embedded worker loop stopped with an error: ${String(error)}`);
+    });
+  }
+
+  /**
+   * The app's logger for the embedded loop. Falls back to a console-backed logger when the container
+   * has no `logger` binding (a bare test double): loop errors are never swallowed, but the per-tick
+   * info line stays quiet outside a real app.
+   */
+  async #resolveLogger(): Promise<WorkerLogger> {
+    try {
+      const logger = (await this.app.container.make('logger')) as Partial<WorkerLogger>;
+      if (typeof logger?.info === 'function' && typeof logger?.error === 'function') {
+        return logger as WorkerLogger;
+      }
+    } catch {
+      // No `logger` binding — fall through to the console-backed logger below.
+    }
+    return { info: () => {}, error: (message: string) => console.error(message) };
+  }
+
+  /**
    * Bring up the operator-side {@link RunRequestResponder} so tenant pods can round-trip read/control/
    * start to this control plane — but only when the transport actually carries the P4 methods (in-process
    * transports do not). The capability gate here means the responder binding is never resolved on a
@@ -537,6 +608,9 @@ export default class DurableProvider {
   async ready() {
     const config = this.app.config.get<DurableConfig>('durable', {});
     if ((config.role ?? 'standalone') === 'tenant') return;
+    // Before the diagnostics gate below: the embedded worker must start whether or not
+    // `@adonis-agora/diagnostics` is installed, and that gate returns early when it is not.
+    await this.#startEmbeddedWorker(config);
     const emit = (globalThis as Record<symbol, unknown>)[DIAGNOSTICS_EMIT];
     if (typeof emit !== 'function') return;
     const engine = await this.app.container.make(WorkflowEngine);
@@ -544,6 +618,12 @@ export default class DurableProvider {
   }
 
   async shutdown() {
+    // The embedded loop goes first and is AWAITED: it drains in-flight executions, and a tick
+    // still running would otherwise find the transport closed underneath it a few lines below.
+    this.#stopEmbeddedWorker?.();
+    this.#stopEmbeddedWorker = null;
+    await this.#embeddedWorkerLoop;
+    this.#embeddedWorkerLoop = null;
     // Stop republishing tenant events before the transport connections drop.
     this.#responder?.stop();
     this.#responder = null;
