@@ -39,22 +39,30 @@ export function stepsHook(options: StepsHookOptions = {}) {
   const importAlias = options.importAlias ?? '#steps';
   const output = options.output ?? GENERATED_STEPS_OUTPUT;
 
-  return {
-    run(_parent: unknown, _hooks: unknown, indexGenerator: IndexGenerator): void {
-      indexGenerator.add('steps', {
-        source,
-        as: 'barrelFile',
-        exportName: 'steps',
-        importAlias,
-        removeSuffix: 'step',
-        skipSegments: ['steps'],
-        output,
-        comment: true,
-      });
-    },
+  // A FUNCTION, not an object with a `run` method. `@poppinss/hooks` — the runner the
+  // assembler drives its `init` hooks with — invokes a handler as
+  //   `typeof handler === 'function' ? handler(...data) : handler.handle(action, ...data)`
+  // so a non-function handler must expose `handle`. Exporting `{ run }` made every app that
+  // ran `node ace configure` fail its build with `handler.handle is not a function`, and it
+  // also mismatched the assembler's own `DefineHook` type, which is a plain function.
+  return function generateStepsBarrel(
+    _parent: unknown,
+    _hooks: unknown,
+    indexGenerator: IndexGenerator,
+  ): void {
+    indexGenerator.add('steps', {
+      source,
+      as: 'barrelFile',
+      exportName: 'steps',
+      importAlias,
+      removeSuffix: 'step',
+      skipSegments: ['steps'],
+      output,
+      comment: true,
+    });
   };
 }
 
-/** The default export is the hook object itself, so `() => import('@adonis-agora/durable/hooks/steps')`
- *  in `adonisrc.ts` resolves to a ready hook (the assembler calls its `run`). */
+/** The default export is the hook function itself, so `() => import('@adonis-agora/durable/hooks/steps')`
+ *  in `adonisrc.ts` resolves to a handler the assembler can call directly. */
 export default stepsHook();
