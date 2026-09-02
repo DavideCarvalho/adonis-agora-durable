@@ -2,7 +2,17 @@ import type { DashboardSpec } from './telescope-sdk.js';
 
 /** Options for the durable "Workflows" dashboard. */
 export interface DurableDashboardOptions {
-  /** URL template for deep-linking a run to the durable dashboard. Default `/durable/runs/{runId}`. */
+  /**
+   * URL template for deep-linking a run into the durable console.
+   * Default `/durable#/run/{runId}`.
+   *
+   * Pass this when the console is mounted somewhere other than `/durable` (the
+   * `path` in `config/durable_dashboard.ts`) — the template has to carry the mount
+   * path, and this module cannot know it.
+   *
+   * The `#/run/...` shape is not cosmetic: the console is a hash-routed SPA, so a
+   * plain path is served by the app's router, not the console, and 404s.
+   */
   runHref?: string;
   /** Window (ms) bounding the "Stuck runs" table. Default 24h; pass `0` to show all. */
   recentFailuresWindowMs?: number;
@@ -14,7 +24,13 @@ export interface DurableDashboardOptions {
  * `durable.*` data providers by name.
  */
 export function durableDashboard(opts: DurableDashboardOptions = {}): DashboardSpec {
-  const runHref = opts.runHref ?? '/durable/runs/{runId}';
+  // `/durable#/run/{runId}` — hash, and SINGULAR "run".
+  //
+  // The old default was `/durable/runs/{runId}`, wrong in both: the console routes on
+  // `window.location.hash` matching `#/run/<id>`, so a path never reaches it and the
+  // app's own router answers 404. Every "open this run" link from the telescope
+  // dashboard was dead.
+  const runHref = opts.runHref ?? '/durable#/run/{runId}';
   const windowMs = opts.recentFailuresWindowMs ?? 24 * 60 * 60 * 1000;
   return {
     id: 'durable.workflows',
