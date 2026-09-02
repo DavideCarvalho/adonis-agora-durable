@@ -1,4 +1,6 @@
+import { readFile, writeFile } from 'node:fs/promises';
 import type Configure from '@adonisjs/core/commands/configure';
+import { mergeSubpathImports } from './src/configure-imports.js';
 import { stubsRoot } from './stubs/main.js';
 
 /**
@@ -12,8 +14,11 @@ import { stubsRoot } from './stubs/main.js';
  *    and `app/steps` barrels at build/dev time (the provider imports them instead
  *    of scanning at runtime; each falls back to the runtime scan when its barrel
  *    is absent);
- * 5. publishes `config/durable.ts` + `config/durable_dashboard.ts`;
- * 6. publishes the Lucid migrations for the optional `lucid` store and `db`
+ * 5. adds the `#workflows/*` and `#steps/*` subpath imports to the app's `package.json`,
+ *    which the generated barrels import through (without them the app boots into
+ *    `ERR_PACKAGE_IMPORT_NOT_DEFINED`);
+ * 6. publishes `config/durable.ts` + `config/durable_dashboard.ts`;
+ * 7. publishes the Lucid migrations for the optional `lucid` store and `db`
  *    transport drivers (run `node ace migration:run`, and delete the transport
  *    migration if you don't use the `db` transport).
  */
@@ -30,6 +35,8 @@ export async function configure(command: Configure) {
     rcFile.addAssemblerHook('init', '@adonis-agora/durable/hooks/steps');
   });
 
+  await addSubpathImports(command);
+
   await codemods.makeUsingStub(stubsRoot, 'config/durable.stub', {});
   await codemods.makeUsingStub(stubsRoot, 'config/durable_dashboard.stub', {});
   await codemods.makeUsingStub(stubsRoot, 'database/migrations/create_durable_tables.stub', {});
@@ -38,4 +45,33 @@ export async function configure(command: Configure) {
     'database/migrations/create_durable_transport_tables.stub',
     {},
   );
+}
+
+/**
+ * Add the subpath imports the generated barrels resolve through. There is no codemod for the
+ * `imports` map, so this edits `package.json` directly — and only when something is missing, so a
+ * second `configure` run neither rewrites the file nor logs a change it did not make.
+ */
+async function addSubpathImports(command: Configure) {
+  const path = command.app.makePath('package.json');
+
+  let raw: string;
+  try {
+    raw = await readFile(path, 'utf-8');
+  } catch {
+    command.logger.warning(
+      'could not read package.json — add "#workflows/*": "./app/workflows/*.js" and "#steps/*": "./app/steps/*.js" to its "imports" by hand',
+    );
+    return;
+  }
+
+  const pkg = JSON.parse(raw) as { imports?: Record<string, string> };
+  const { imports, added } = mergeSubpathImports(pkg.imports);
+  if (added.length === 0) return;
+
+  pkg.imports = imports;
+  // Two-space JSON with a trailing newline: what `create-adonisjs` writes, so the diff stays to
+  // the added lines instead of reformatting the whole file.
+  await writeFile(path, `${JSON.stringify(pkg, null, 2)}\n`);
+  command.logger.action(`update package.json (imports: ${added.join(', ')})`).succeeded();
 }
