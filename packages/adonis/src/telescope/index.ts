@@ -11,6 +11,7 @@ export {
   durableWorkerHealthProvider,
 } from './data-providers.js';
 export { durableTelescopeExtension } from './extension.js';
+export { durableSchedules } from './schedules.js';
 export type {
   ContainerLike,
   DataProvider,
@@ -18,4 +19,3 @@ export type {
   TelescopeExtension,
   TelescopeStoreLike,
 } from './telescope-sdk.js';
-export { durableSchedules } from './schedules.js';

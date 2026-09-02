@@ -56,9 +56,7 @@ describe('durableSchedules', () => {
   it('schedule pausado AINDA aparece', async () => {
     // Omitir um job pausado é como alguém perde uma tarde procurando um cron que
     // "sumiu": o console mostra o que existe, não o que está rodando agora.
-    const engine = engineWith([
-      { key: 'pausado', workflow: 'P', cron: '0 * * * *', paused: true },
-    ]);
+    const engine = engineWith([{ key: 'pausado', workflow: 'P', cron: '0 * * * *', paused: true }]);
     expect((await durableSchedules(makeCtx(engine))).map((s) => s.name)).toEqual(['pausado']);
   });
 
