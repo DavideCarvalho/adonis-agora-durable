@@ -172,10 +172,14 @@ describe('runSchedules — jitter', () => {
   });
 
   it('keeps the jittered delay within [0, jitter) for any random value', async () => {
-    const store = new InMemoryStateStore();
-    const engine = new WorkflowEngine({ store });
-    engine.register('beat', '1', async () => 'tick');
     for (const rnd of [0, 0.1, 0.9, 0.999999]) {
+      // Engine NOVO a cada iteração. Todas usam o mesmo `nowMs`, ou seja, a mesma
+      // janela: reusando o engine, só a primeira teria algo a disparar, e o jitter
+      // (que existe para espalhar disparos) corretamente não aconteceria nas outras.
+      // O que este teste mede é a FAIXA do atraso, não a frequência dele.
+      const store = new InMemoryStateStore();
+      const engine = new WorkflowEngine({ store });
+      engine.register('beat', '1', async () => 'tick');
       const sleeps: number[] = [];
       await runSchedules(
         engine,
@@ -287,5 +291,93 @@ describe('runSchedules — backfill', () => {
     const yest = Date.UTC(2026, 0, 9, 0, 0, 0);
     const before = Date.UTC(2026, 0, 8, 0, 0, 0);
     expect(ids.sort()).toEqual([`sched:n:${today}`, `sched:n:${yest}`, `sched:n:${before}`].sort());
+  });
+});
+
+/**
+ * O tick do worker roda a cada segundo, e o run id de um schedule é derivado da
+ * JANELA de disparo — constante durante toda ela. Antes, cada tick perguntava ao
+ * store por um id cuja resposta não podia ter mudado desde o tick anterior.
+ *
+ * Em produção isso deu ~28 `select … where id = ?` por SEGUNDO (14 schedules × 2
+ * lookups × 2 pods), todos devolvendo a linha que o processo já tinha buscado.
+ */
+describe('runSchedules — custo por tick', () => {
+  /** Um engine que conta os `getRun`, para medir I/O em vez de adivinhar. */
+  function countingEngine(store: InMemoryStateStore) {
+    const engine = new WorkflowEngine({ store });
+    engine.register('beat', '1', async () => 'tick');
+    let getRuns = 0;
+    const original = engine.getRun.bind(engine);
+    (engine as unknown as { getRun: typeof original }).getRun = async (id: string) => {
+      getRuns += 1;
+      return original(id);
+    };
+    return { engine, reads: () => getRuns };
+  }
+
+  it('tick seguinte na MESMA janela não vai ao store', async () => {
+    const store = new InMemoryStateStore();
+    const { engine, reads } = countingEngine(store);
+    const schedules: ScheduledWorkflow[] = [{ key: 'b', workflow: 'beat', everyMs: 60_000 }];
+
+    await runSchedules(engine, schedules, 60_000);
+    const afterFirst = reads();
+    expect(afterFirst).toBeGreaterThan(0);
+
+    // Mais cinco ticks dentro da mesma janela de 60s.
+    for (const t of [61_000, 62_000, 70_000, 80_000, 119_000]) {
+      await runSchedules(engine, schedules, t);
+    }
+    expect(reads()).toBe(afterFirst);
+  });
+
+  it('janela NOVA volta a consultar o store', async () => {
+    const store = new InMemoryStateStore();
+    const { engine, reads } = countingEngine(store);
+    const schedules: ScheduledWorkflow[] = [{ key: 'b', workflow: 'beat', everyMs: 60_000 }];
+
+    await runSchedules(engine, schedules, 60_000);
+    const afterFirst = reads();
+    await runSchedules(engine, schedules, 120_000); // bucket seguinte
+    expect(reads()).toBeGreaterThan(afterFirst);
+  });
+
+  it('processo NOVO consulta o store — é lá que a corrida entre workers é decidida', async () => {
+    // A memoização só pode pular trabalho que ESTE processo viu acontecer. Um segundo
+    // worker (engine novo sobre o mesmo store) não herda esse conhecimento, então ele
+    // pergunta, descobre que a janela já rodou, e não dispara de novo.
+    const store = new InMemoryStateStore();
+    const first = countingEngine(store);
+    const schedules: ScheduledWorkflow[] = [{ key: 'b', workflow: 'beat', everyMs: 60_000 }];
+
+    const started = await runSchedules(first.engine, schedules, 60_000);
+    expect(started).toHaveLength(1);
+
+    const second = countingEngine(store);
+    const again = await runSchedules(second.engine, schedules, 60_000);
+    expect(again).toEqual([]);
+    expect(second.reads()).toBeGreaterThan(0);
+  });
+
+  it('schedule pausado não custa I/O nenhum', async () => {
+    const store = new InMemoryStateStore();
+    const { engine, reads } = countingEngine(store);
+    await runSchedules(engine, [{ key: 'b', workflow: 'beat', everyMs: 1000, paused: true }], 1000);
+    expect(reads()).toBe(0);
+  });
+
+  it('overlap:skip só consulta a janela anterior quando há o que disparar', async () => {
+    // Essa checagem custava um read por schedule por tick, mesmo sem nada para iniciar.
+    const store = new InMemoryStateStore();
+    const { engine, reads } = countingEngine(store);
+    const schedules: ScheduledWorkflow[] = [
+      { key: 'b', workflow: 'beat', everyMs: 60_000, overlap: 'skip' },
+    ];
+
+    await runSchedules(engine, schedules, 60_000);
+    const afterFirst = reads();
+    await runSchedules(engine, schedules, 61_000);
+    expect(reads()).toBe(afterFirst);
   });
 });
