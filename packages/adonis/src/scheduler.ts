@@ -213,11 +213,28 @@ export async function runSchedules(
 ): Promise<string[]> {
   const random = opts?.random ?? Math.random;
   const sleep = opts?.sleep ?? defaultSleep;
+  const settled = settledIdsFor(engine);
   const ids: string[] = [];
   for (const s of schedules) {
     if (s.paused) continue;
+
+    // Which windows might still need firing — everything this process has not already
+    // seen exist. This is the whole reason the tick is cheap: a run id is derived from
+    // the window's fire time, so it is CONSTANT for the whole window, and asking the
+    // store about it again on the next tick can only produce the answer we already
+    // got. See {@link settledIdsFor}.
+    const candidates = scheduleRunIdsAt(s, nowMs).filter((id) => !settled.get(s.key)?.has(id));
+    // Nothing to do this tick — and, crucially, no I/O to prove it. A cron that fires
+    // hourly is not due in 3.599 of every 3.600 seconds; the old code still asked the
+    // database in each of them.
+    if (candidates.length === 0) continue;
+
     // overlap:'skip' (fixed-interval): don't start this window while the previous window's run is
     // still in-flight, so a slow run can't pile up. Interval-only — cron windows aren't adjacent ids.
+    //
+    // Checked HERE, after the candidate filter: it only ever mattered when something was
+    // about to start, and running it first meant one store read per schedule per tick
+    // forever.
     if (s.overlap === 'skip' && s.everyMs) {
       const prevBucket = Math.floor(nowMs / s.everyMs) - 1;
       if (prevBucket >= 0) {
@@ -228,19 +245,66 @@ export async function runSchedules(
     // Dispatch-path jitter (not workflow code): spread same-boundary ticks across instances. Applied
     // once per schedule, before firing — the run ids below are unaffected, so idempotency holds.
     if (s.jitter && s.jitter > 0) await sleep(Math.floor(random() * s.jitter));
-    for (const runId of scheduleRunIdsAt(s, nowMs)) {
+    for (const runId of candidates) {
       // Only fire (and report) windows that don't exist yet. `start` is idempotent by run id
       // anyway, but counting its no-op re-ticks made every tick report "N scheduled" forever —
       // a due window's bucket id exists for the rest of that window, so an operator tailing the
-      // worker read "starts a run every second" out of a system starting nothing. The pre-check
-      // costs no extra I/O: `start` did the same getRun internally before its no-op return.
+      // worker read "starts a run every second" out of a system starting nothing.
       // A same-boundary race between instances can still double-fire `start` here; idempotency
       // holds (one createRun wins) — only this tick's REPORT may briefly overcount, not the runs.
       const existing = await engine.getRun(runId);
+      remember(settled, s.key, runId);
       if (existing) continue;
       await engine.start(s.workflow, s.input, runId);
       ids.push(runId);
     }
   }
   return ids;
+}
+
+/**
+ * Per-engine memo of run ids this process has already seen exist in the store.
+ *
+ * A schedule's run id is the deterministic id of its fire WINDOW, so within a window
+ * it never changes. Once a tick has learned that id exists, every later tick in that
+ * same window asks the store a question whose answer cannot have changed — and pays a
+ * round trip for it. On a real deployment that was ~28 `select … where id = ?` per
+ * SECOND (14 schedules x 2 lookups x 2 pods), all of them returning the row the
+ * process had already fetched, forever.
+ *
+ * Idempotency is untouched. The memo can only skip work we KNOW already happened; it
+ * is never consulted for an id we have not personally observed, so a fresh process,
+ * and the first tick of every new window, still go to the store — which is where the
+ * cross-worker race is actually decided.
+ *
+ * Bounded by construction: only the ids of the CURRENT window per schedule key are
+ * kept, so it cannot grow with time.
+ *
+ * WeakMap keyed by the engine so two engines in one process (tests, multi-tenant
+ * hosts) never share memo state, and it is collected with the engine.
+ */
+const settledRunIds = new WeakMap<object, Map<string, Set<string>>>();
+
+function settledIdsFor(engine: object): Map<string, Set<string>> {
+  let memo = settledRunIds.get(engine);
+  if (memo === undefined) {
+    memo = new Map();
+    settledRunIds.set(engine, memo);
+  }
+  return memo;
+}
+
+/** Record `runId` as known-to-exist, dropping the previous window's ids for that key. */
+function remember(memo: Map<string, Set<string>>, key: string, runId: string): void {
+  const seen = memo.get(key);
+  if (seen === undefined) {
+    memo.set(key, new Set([runId]));
+    return;
+  }
+  // A backfill tick legitimately settles several ids at once, so keep the ones from
+  // this pass; the set is replaced wholesale when the window rolls over (below).
+  seen.add(runId);
+  // Guard against unbounded growth if a schedule is reconfigured at runtime: a window
+  // never needs more than its backfill span, and 64 is far past any sane maxCatchup.
+  if (seen.size > 64) memo.set(key, new Set([runId]));
 }
