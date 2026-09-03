@@ -1,5 +1,33 @@
 # @adonis-agora/durable
 
+## 0.32.0
+
+### Minor Changes
+
+- [#103](https://github.com/DavideCarvalho/adonis-agora-durable/pull/103) [`34a3f17`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/34a3f17213535bd7917633e78a63694cc2a5f9cf) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - O tick diz o que ele é: trabalho de scheduler, e sondagem que não vale entry
+  
+  O worker dá um tick por segundo, e cada tick faz quatro leituras que só perguntam ao
+  store "tem trabalho?". Numa janela medida de 12h em produção elas viraram 182.868 das
+  320.754 entries do telescope daquele app — 57% de tudo, contra 6.363 queries do app
+  inteiro. O laço não estava caro no banco (4 queries/s a ~1,2ms), estava caro na atenção
+  de quem precisa ler o painel.
+  
+  Duas marcações, e a diferença entre elas é o ponto:
+  
+  - as quatro leituras de sondagem (`listPendingRuns`, `listIncompleteRuns`,
+    `listDueTimers` e o `listRuns` dos `blocked`) rodam dentro de `asHeartbeat` — uma
+    ferramenta de observabilidade pode descartá-las;
+  - o tick inteiro roda dentro de `withScheduleOrigin`, então o que ele ENCONTRA é gravado
+    dizendo de onde veio, em vez do genérico "manual".
+  
+  O limite é estreito de propósito: a sonda some, o trabalho que ela acha fica. Lease,
+  checkpoint e resultado da run continuam registrados — é isso que alguém abre o console
+  para ver quando um workflow trava.
+  
+  Nada disso cria dependência: o driver é lido do slot global
+  `Symbol.for('@agora/telescope:origin-scope')` de forma estrutural, exatamente como o
+  `protocol.ts` já lê o `@adonis-agora/context`. Sem telescope instalado, tudo roda direto.
+
 ## 0.31.3
 
 ### Patch Changes
