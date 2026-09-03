@@ -1,4 +1,5 @@
 import type { RunResult, WorkflowEngine } from '../index.js';
+import { withScheduleOrigin } from '../observability-scope.js';
 import { runSchedules, type ScheduledWorkflow } from '../scheduler.js';
 
 /** A minimal logger the worker loop writes progress to (the ace command's `this.logger` fits). */
@@ -60,6 +61,15 @@ export async function runTick(
   engine: WorkflowEngine,
   options: TickOptions = {},
 ): Promise<TickResult> {
+  // Everything a tick does is scheduler-driven. Labelling the whole tick means the
+  // entries an observability tool records for the work it PICKS UP say where they came
+  // from ("a schedule fired this", not the `manual` default that told you nothing). The
+  // probe reads inside the engine mark themselves separately, as heartbeat, and are
+  // dropped — see `observability-scope.ts` for why those are two different questions.
+  return withScheduleOrigin(() => runTickInScope(engine, options));
+}
+
+async function runTickInScope(engine: WorkflowEngine, options: TickOptions): Promise<TickResult> {
   const now = options.now;
   const schedules = options.schedules;
   const result: TickResult = { pending: 0, recovered: 0, timers: 0, scheduled: 0, errors: [] };

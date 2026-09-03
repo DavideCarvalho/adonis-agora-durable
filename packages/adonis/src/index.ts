@@ -85,6 +85,7 @@ export * from './handshake/negotiate.js';
 export * from './handshake/routing.js';
 export * from './interfaces.js';
 export * from './metrics.js';
+export { asHeartbeat, withScheduleOrigin } from './observability-scope.js';
 export * from './pollers.js';
 export * from './protocol.js';
 export * from './queue.js';

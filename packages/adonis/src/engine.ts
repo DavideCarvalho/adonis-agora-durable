@@ -54,6 +54,7 @@ import type {
   WorkflowRun,
   WorkflowStepEvent,
 } from './interfaces.js';
+import { asHeartbeat } from './observability-scope.js';
 import { breakpointToken, stepId } from './protocol.js';
 import type { QueueConfig } from './queue.js';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor.js';
@@ -1286,7 +1287,8 @@ export class WorkflowEngine {
   async recoverIncomplete(nowMs: number = this.clock()): Promise<RunResult[]> {
     if (this.draining) return [];
     const results: RunResult[] = [];
-    for (const run of await this.store.listIncompleteRuns(this.namespace)) {
+    const incomplete = await asHeartbeat(() => this.store.listIncompleteRuns(this.namespace));
+    for (const run of incomplete) {
       // A live worker renews its lease, so an acquirable lease means the run is genuinely orphaned
       // (its worker crashed). Skip the ones still owned.
       const acquired = await this.store.tryLockRun(
@@ -1349,7 +1351,7 @@ export class WorkflowEngine {
    * not due re-suspends cheaply without running new work.
    */
   async resumeDueTimers(nowMs: number = this.clock()): Promise<RunResult[]> {
-    const due = await this.store.listDueTimers(nowMs, this.namespace);
+    const due = await asHeartbeat(() => this.store.listDueTimers(nowMs, this.namespace));
     const blocked = await this.dueBlockedRuns(nowMs);
     return this.resumeLeased([...due, ...blocked], nowMs);
   }
@@ -1545,7 +1547,8 @@ export class WorkflowEngine {
   async runPending(nowMs: number = this.clock()): Promise<RunResult[]> {
     // Oldest-first (FIFO), capped per call so a backlog drains over several polls without one sweep
     // fetching unboundedly. A run not picked up this tick is picked up the next.
-    return this.resumeLeased(await this.store.listPendingRuns(100, this.namespace), nowMs);
+    const pending = await asHeartbeat(() => this.store.listPendingRuns(100, this.namespace));
+    return this.resumeLeased(pending, nowMs);
   }
 
   /**
@@ -3086,7 +3089,7 @@ export class WorkflowEngine {
    *  {@link resumeDueTimers}. Re-driving one re-checks the live fleet: it dispatches if a
    *  capable+compatible worker has appeared, else re-parks with a fresh `wakeAt` (design §7.5). */
   private async dueBlockedRuns(nowMs: number): Promise<WorkflowRun[]> {
-    const blocked = await this.store.listRuns({ statuses: ['blocked'] });
+    const blocked = await asHeartbeat(() => this.store.listRuns({ statuses: ['blocked'] }));
     // Unlike the store-side poll paths, this filters in memory, so the operator case is explicit:
     // an engine with no namespace drives every pool's blocked runs, exactly as it drives their
     // pending and due ones.
