@@ -1,5 +1,15 @@
 # @adonis-agora/durable
 
+## 0.33.0
+
+### Minor Changes
+
+- [#107](https://github.com/DavideCarvalho/adonis-agora-durable/pull/107) [`5722157`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/5722157a3861d4203412317287405ca66cedec1d) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Adiciona `consumers: 'never'`: o processo vira um produtor puro — despacha runs e lê o store, mas nunca inicia os consumer loops do broker, em qualquer ambiente. Para frotas web que dividem um Redis com o `durable:work`, eliminando a corrida por entregas ponto-a-ponto (tasks, resultados, heartbeats); o worker reabilita o consumo para si via `engine.startConsumers()`.
+
+### Patch Changes
+
+- [#107](https://github.com/DavideCarvalho/adonis-agora-durable/pull/107) [`5722157`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/5722157a3861d4203412317287405ca66cedec1d) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Salva timeout espúrio de step remoto cujo resultado já foi gravado: no vencimento da janela de liveness, o engine re-lê o checkpoint — concluído, resolve com o output gravado em vez de estourar `RemoteStepTimeout`. Cobre o caso de fila de resultados compartilhada (web+worker), onde outra instância consome o resultado e completa o checkpoint sem resolver o await in-memory de quem despachou.
+
 ## 0.32.1
 
 ### Patch Changes
