@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 0.32.1
+
+### Patch Changes
+
+- [#105](https://github.com/DavideCarvalho/adonis-agora-durable/pull/105) [`af1d790`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/af1d790aacc52528ba3b06b7e395ef3e0ff74358) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Salva timeout espúrio de step remoto cujo resultado já foi gravado: no vencimento da janela de liveness, o engine re-lê o checkpoint — concluído, resolve com o output gravado em vez de estourar `RemoteStepTimeout`. Cobre o caso de fila de resultados compartilhada (web+worker), onde outra instância consome o resultado e completa o checkpoint sem resolver o await in-memory de quem despachou.
+
 ## 0.32.0
 
 ### Minor Changes
