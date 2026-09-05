@@ -352,4 +352,18 @@ describe('DurableProvider: consumer deferral by environment', () => {
     const { calls } = await resolveWith('console', { consumers: 'always' });
     expect(calls).toEqual([]);
   });
+
+  it("consumers: 'never' defers in every environment (pure producer)", async () => {
+    for (const environment of ['web', 'test', 'console', 'repl']) {
+      expect((await resolveWith(environment, { consumers: 'never' })).calls).toEqual(['defer']);
+    }
+  });
+
+  it("engine.startConsumers() after 'never' flushes (the durable:work path)", async () => {
+    const { engine, calls } = await resolveWith('web', { consumers: 'never' });
+    expect(calls).toEqual(['defer']);
+    // What durable:work's loop does before its first tick.
+    engine.startConsumers();
+    expect(calls).toEqual(['defer', 'start']);
+  });
 });

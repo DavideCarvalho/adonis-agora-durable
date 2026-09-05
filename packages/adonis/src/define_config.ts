@@ -167,10 +167,15 @@ export interface BaseDurableConfig {
    * results addressed to the long-lived engine, and (with jobs queued) never exits. `durable:work`
    * re-enables consumption for itself via `engine.startConsumers()`, so the worker command behaves
    * identically under either value. `'always'`: every booted process consumes eagerly (the pre-0.17
-   * behavior) — for a console script that must round-trip remote steps inline. Web and test
-   * processes always consume eagerly; in-process transports (memory/event-emitter) are unaffected.
+   * behavior) — for a console script that must round-trip remote steps inline. `'never'`: no booted
+   * process consumes — a pure producer that can dispatch runs and read the store but never claims
+   * broker jobs — for processes that never execute steps (e.g. a web fleet sharing one Redis with
+   * `durable:work`), so deliveries stop racing the worker fleet. `durable:work` re-enables
+   * consumption for itself via `engine.startConsumers()`, so the worker command behaves identically
+   * under every value. Web and test processes consume eagerly (unless `'never'`); in-process
+   * transports (memory/event-emitter) are unaffected.
    */
-  consumers?: 'auto' | 'always';
+  consumers?: 'auto' | 'always' | 'never';
   /**
    * Opt-in self-heal window (ms) for a remote step with no `timeoutMs` whose dispatched job was LOST
    * — the worker crashed mid-step, or the transport dropped the job (a store flush/eviction, or a
