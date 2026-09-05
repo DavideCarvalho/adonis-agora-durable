@@ -191,8 +191,11 @@ export default class DurableProvider {
       // command with queued jobs never exits (the burst-drain loop keeps feeding it). Deferring keeps
       // such a process a pure producer; `durable:work` re-enables consumption for itself via
       // `engine.startConsumers()`. Web/test processes keep today's eager behavior, as does
-      // `consumers: 'always'`. Transports without `deferConsumers` (in-process) are unaffected.
-      if ((config.consumers ?? 'auto') === 'auto') {
+      // `consumers: 'always'`, while `consumers: 'never'` defers unconditionally — a pure producer
+      // in every environment. Transports without `deferConsumers` (in-process) are unaffected.
+      if (config.consumers === 'never') {
+        transport.deferConsumers?.();
+      } else if ((config.consumers ?? 'auto') === 'auto') {
         // Optional call: naive test doubles of ApplicationService may not carry getEnvironment.
         const environment = this.app.getEnvironment?.();
         if (environment === 'console' || environment === 'repl') transport.deferConsumers?.();

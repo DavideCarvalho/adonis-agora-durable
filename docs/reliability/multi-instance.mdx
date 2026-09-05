@@ -20,3 +20,7 @@ Regras práticas:
    pendente, falha como antes.
 3. Nunca assuma que "heartbeat no banco = timer rearmado": o pulso persiste
    em qualquer instância, mas só rearma em quem despachou.
+4. Processos que nunca executam steps devem usar `consumers: 'never'`
+   (produtor puro): nenhuma entrega ponto-a-ponto cai neles, então a
+   corrida com o worker acaba. O `durable:work` reabilita o consumo para
+   si via `engine.startConsumers()`.
