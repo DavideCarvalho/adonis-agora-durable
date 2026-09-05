@@ -1,5 +1,13 @@
 {
   "title": "Reliability",
   "icon": "ShieldCheck",
-  "pages": ["index", "retries", "sagas", "flow-control", "dead-letter", "failure-modes"]
+  "pages": [
+    "index",
+    "retries",
+    "sagas",
+    "flow-control",
+    "dead-letter",
+    "failure-modes",
+    "multi-instance"
+  ]
 }

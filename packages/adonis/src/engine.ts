@@ -3464,32 +3464,82 @@ export class WorkflowEngine {
         const resolution = step.timeoutMs
           ? await this.awaitWithHeartbeat(id, resultPromise, step.timeoutMs, step.pickupTimeoutMs)
           : await resultPromise;
-        const output = (
-          step.output ? step.output.parse(resolution.output) : resolution.output
-        ) as TOutput;
-        // The worker reports when it actually picked the task up; fall back to dispatch time if a
-        // transport doesn't carry it (queue-wait then reads as zero rather than going negative).
-        const startedAt = resolution.startedAt ? new Date(resolution.startedAt) : enqueuedAt;
-        await this.completeStep({
+        return await this.settleRemoteAttempt(
           runId,
           seq,
-          name: step.name,
-          kind: 'remote',
-          input: validInput,
-          output,
-          events: resolution.events,
-          attempts: attempt,
-          workerGroup: token,
+          step,
+          validInput,
+          resolution,
+          attempt,
+          token,
           enqueuedAt,
-          startedAt,
-        });
-        return output;
+        );
       } catch (err) {
         this.pending.delete(id);
-        if (err instanceof RemoteStepTimeout && attempt < maxAttempts) continue;
+        if (err instanceof RemoteStepTimeout) {
+          // SPURIOUS-TIMEOUT SALVAGE (prod 09/2026): the result may already be
+          // recorded — a second engine instance sharing the results queue can
+          // consume it first, completing the checkpoint without resolving THIS
+          // instance's in-memory await. Failing the run over a recorded
+          // result is pure waste (the work is done and paid for): re-read the
+          // checkpoint and settle from it. Still pending → genuinely lost, keep
+          // the historical behavior (retry-or-throw below). Deterministic:
+          // replay converges on the recorded output either way.
+          const late = await this.store.getCheckpoint(runId, seq);
+          if (late?.status === 'completed') {
+            return await this.settleRemoteAttempt(
+              runId,
+              seq,
+              step,
+              validInput,
+              {
+                output: late.output,
+                startedAt: late.startedAt instanceof Date ? late.startedAt.getTime() : undefined,
+                events: late.events,
+              },
+              attempt,
+              token,
+              enqueuedAt,
+            );
+          }
+          if (attempt < maxAttempts) continue;
+        }
         throw err;
       }
     }
+  }
+
+  /** Shared finalization for a remote resolution, however it arrived (live await or salvaged). */
+  private async settleRemoteAttempt<TInput, TOutput>(
+    runId: string,
+    seq: number,
+    step: StepDef<TInput, TOutput>,
+    input: TInput,
+    resolution: RemoteResolution,
+    attempt: number,
+    token: string,
+    enqueuedAt: Date,
+  ): Promise<TOutput> {
+    const output = (
+      step.output ? step.output.parse(resolution.output) : resolution.output
+    ) as TOutput;
+    // The worker reports when it actually picked the task up; fall back to dispatch time if a
+    // transport doesn't carry it (queue-wait then reads as zero rather than going negative).
+    const startedAt = resolution.startedAt ? new Date(resolution.startedAt) : enqueuedAt;
+    await this.completeStep({
+      runId,
+      seq,
+      name: step.name,
+      kind: 'remote',
+      input,
+      output,
+      events: resolution.events,
+      attempts: attempt,
+      workerGroup: token,
+      enqueuedAt,
+      startedAt,
+    });
+    return output;
   }
 
   /**

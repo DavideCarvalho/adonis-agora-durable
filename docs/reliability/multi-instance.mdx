@@ -1,0 +1,22 @@
+# Entrega sob múltiplas instâncias
+
+Web + workers consomem as MESMAS filas de resultados e heartbeats, em
+competição. Cada entrega cai em exatamente uma instância:
+
+- Caiu em quem despachou: caminho rápido in-memory (resolve/rearma direto).
+- Caiu em outra: ela grava o checkpoint (`completeRemoteResult`) e tenta
+  retomar o run — o que falha se o despachador ainda segura o lease (o lease
+  cobre a execução inteira). O despachador segue surdo até o timer.
+
+Regras práticas:
+
+1. Steps SEM `timeoutMs` suspendem de forma durável: qualquer instância
+   retoma pelo checkpoint. É o modo à prova de pod morto (scale/crash/deploy).
+   Combine com `remoteRedispatchMs` + `remoteRedispatchMax` contra dispatch
+   perdido, e com `reconcileMs` (default 5min) contra wake perdido.
+2. Steps COM `timeoutMs` ganham detecção rápida de worker morto, mas dependem
+   do rearme in-memory: use para steps CURTOS (minutos). No vencimento, o
+   engine re-lê o checkpoint — concluído, resolve com o output gravado;
+   pendente, falha como antes.
+3. Nunca assuma que "heartbeat no banco = timer rearmado": o pulso persiste
+   em qualquer instância, mas só rearma em quem despachou.
