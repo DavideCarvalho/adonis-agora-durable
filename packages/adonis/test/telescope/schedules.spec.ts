@@ -38,8 +38,25 @@ describe('durableSchedules', () => {
         kind: 'cron',
         schedule: '*/2 * * * *',
         timezone: 'America/Sao_Paulo',
+        pool: null,
       },
     ]);
+  });
+
+  it('pin de namespace vira a coluna `pool` do console', async () => {
+    // O console precisa revelar PARA QUAL POOL a agenda manda seus runs — é o que
+    // denuncia o pin que evita o incidente do pool sem capacidade (ex.: chat sem Chrome).
+    const engine = engineWith([
+      { key: 'bula-harvest', workflow: 'BulaHarvest', cron: '0 3 * * *', namespace: 'bulas' },
+    ]);
+    const [row] = await durableSchedules(makeCtx(engine));
+    expect(row?.pool).toBe('bulas');
+  });
+
+  it('intervalo com pin também reporta o pool', async () => {
+    const engine = engineWith([{ key: 'a', workflow: 'A', everyMs: 120_000, namespace: 'gpu' }]);
+    const [row] = await durableSchedules(makeCtx(engine));
+    expect(row?.pool).toBe('gpu');
   });
 
   it('traduz everyMs para intervalo legível', async () => {

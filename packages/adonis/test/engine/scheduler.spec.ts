@@ -381,3 +381,79 @@ describe('runSchedules — custo por tick', () => {
     expect(reads()).toBe(afterFirst);
   });
 });
+
+describe('runSchedules — namespace pinning (pool routing)', () => {
+  it('schedule com `namespace` carimba o pool-alvo mesmo quando outro pool dispara a janela', async () => {
+    // O cenário do incidente: dois `durable:work` (pools diferentes) tickam a MESMA
+    // schedule colocada; o pool sem a capacidade (aqui, o "chat") ganha a corrida. Com
+    // o pin, o run nasce carimbado pro pool certo e NENHUM compute acontece no errado.
+    const store = new InMemoryStateStore();
+    let ranInTicker = 0;
+    let ranInTarget = 0;
+    const ticker = new WorkflowEngine({
+      store,
+      namespace: 'default',
+      runDispatcher: { dispatch: () => {} }, // deixa o run `pending` pra inspecionar a linha
+    });
+    ticker.register('beat', '1', async () => {
+      ranInTicker += 1;
+      return 'nope';
+    });
+    const target = new WorkflowEngine({ store, namespace: 'bulas' });
+    target.register('beat', '1', async () => {
+      ranInTarget += 1;
+      return 'ok';
+    });
+
+    const ids = await runSchedules(
+      ticker,
+      [{ key: 'beat', workflow: 'beat', everyMs: 1000, namespace: 'bulas' }],
+      1000,
+    );
+    expect(ids).toEqual(['sched:beat:1']);
+    const run = await store.getRun('sched:beat:1');
+    expect(run?.namespace).toBe('bulas');
+    expect(run?.status).toBe('pending');
+
+    // O pool que disparou NÃO serve o que não consegue: poll é particionado por namespace.
+    await ticker.runPending();
+    expect(ranInTicker).toBe(0);
+
+    await target.runPending();
+    expect(ranInTarget).toBe(1);
+    expect((await store.getRun('sched:beat:1'))?.status).toBe('completed');
+  });
+
+  it('sem pin, o run herda o pool do engine que disparou (comportamento histórico)', async () => {
+    const store = new InMemoryStateStore();
+    const alpha = new WorkflowEngine({
+      store,
+      namespace: 'alpha',
+      runDispatcher: { dispatch: () => {} },
+    });
+    alpha.register('beat', '1', async () => 'ok');
+
+    const ids = await runSchedules(alpha, [{ key: 'b2', workflow: 'beat', everyMs: 1000 }], 1000);
+    expect(ids).toEqual(['sched:b2:1']);
+    expect((await store.getRun('sched:b2:1'))?.namespace).toBe('alpha');
+  });
+
+  it('dois pools correndo a mesma janela produzem UM run, no pool pinado', async () => {
+    const store = new InMemoryStateStore();
+    const mk = (namespace: string) =>
+      new WorkflowEngine({ store, namespace, runDispatcher: { dispatch: () => {} } });
+    const chat = mk('default');
+    const bulas = mk('bulas');
+    chat.register('beat', '1', async () => 'ok');
+    bulas.register('beat', '1', async () => 'ok');
+    const schedules: ScheduledWorkflow[] = [
+      { key: 'duel', workflow: 'beat', everyMs: 1000, namespace: 'bulas' },
+    ];
+
+    const first = await runSchedules(chat, schedules, 1000);
+    const second = await runSchedules(bulas, schedules, 1000); // mesmo bucket, outro processo
+    expect(first).toEqual(['sched:duel:1']);
+    expect(second).toEqual([]); // idempotência pelo run-id determinístico da janela
+    expect((await store.getRun('sched:duel:1'))?.namespace).toBe('bulas');
+  });
+});
