@@ -1,27 +1,43 @@
 import type {
   AttributeFilter,
   AttributeOp,
+  AttributeValue,
   RunQuery,
   SearchAttributes,
   WorkflowRun,
 } from './interfaces.js';
 
 /** Compare one attribute value against a filter operand. Range ops need both sides comparable. */
-function compare(actual: unknown, op: AttributeOp, expected: string | number | boolean): boolean {
+function compare(
+  actual: unknown,
+  op: AttributeOp,
+  expected: AttributeValue | AttributeValue[],
+): boolean {
   switch (op) {
     case 'eq':
       return actual === expected;
     case 'ne':
       return actual !== expected;
     case 'gt':
-      return actual != null && actual > expected;
+      return actual != null && actual > (expected as AttributeValue);
     case 'gte':
-      return actual != null && actual >= expected;
+      return actual != null && actual >= (expected as AttributeValue);
     case 'lt':
-      return actual != null && actual < expected;
+      return actual != null && actual < (expected as AttributeValue);
     case 'lte':
-      return actual != null && actual <= expected;
+      return actual != null && actual <= (expected as AttributeValue);
+    case 'in':
+      return (
+        Array.isArray(expected) &&
+        expected.length > 0 &&
+        (expected as AttributeValue[]).some((v) => actual === v)
+      );
   }
+}
+
+/** The operand(s) one attribute predicate compares against — a singleton, or the `in` set. */
+function operandsOf(f: AttributeFilter): AttributeValue | AttributeValue[] {
+  return f.op === 'in' ? f.values : f.value;
 }
 
 /**
@@ -36,7 +52,9 @@ export function matchesAttributes(
 ): boolean {
   if (!filters?.length) return true;
   if (!attributes) return false;
-  return filters.every((f) => f.key in attributes && compare(attributes[f.key], f.op, f.value));
+  return filters.every(
+    (f) => f.key in attributes && compare(attributes[f.key], f.op, operandsOf(f)),
+  );
 }
 
 /**
@@ -95,6 +113,7 @@ export function normalizeAttributeRows(
 export function sqlComparator(op: AttributeOp): string {
   switch (op) {
     case 'eq':
+    case 'in':
       return '=';
     case 'ne':
       return '<>';
@@ -112,14 +131,29 @@ export function sqlComparator(op: AttributeOp): string {
 /**
  * Which side-table column an attribute filter compares against: numeric operands (and range ops on
  * numbers) hit `numValue`; everything else hits `strValue` (booleans are stored as `"true"`/`"false"`).
+ * For `in`, the column follows the set: all numbers hit `numValue`, anything else `strValue`.
  * Keeping this in core means every SQL adapter pushes predicates down identically.
  */
 export function attributeColumnFor(filter: AttributeFilter): 'numValue' | 'strValue' {
+  if (filter.op === 'in') {
+    return filter.values.length > 0 && filter.values.every((v) => typeof v === 'number')
+      ? 'numValue'
+      : 'strValue';
+  }
   return typeof filter.value === 'number' ? 'numValue' : 'strValue';
 }
 
 /** The literal a side-table predicate compares against (booleans → `"true"`/`"false"` strings). */
 export function attributeOperand(filter: AttributeFilter): string | number {
+  if (filter.op === 'in') {
+    throw new Error('attributeOperand is scalar-only — use attributeOperands for an `in` filter');
+  }
   if (typeof filter.value === 'boolean') return filter.value ? 'true' : 'false';
   return filter.value;
+}
+
+/** The literals an `in` side-table predicate matches against (same boolean normalization). */
+export function attributeOperands(filter: AttributeFilter): Array<string | number> {
+  const values = filter.op === 'in' ? filter.values : [filter.value];
+  return values.map((v) => (typeof v === 'boolean' ? (v ? 'true' : 'false') : v));
 }

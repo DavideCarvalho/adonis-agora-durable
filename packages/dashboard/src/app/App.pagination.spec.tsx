@@ -48,6 +48,7 @@ vi.mock('../client/durable-client', async (importOriginal) => {
     durableClient: {
       ...actual.durableClient,
       runsPage: (...args: Parameters<typeof runsPage>) => runsPage(...args),
+      values: vi.fn().mockResolvedValue([]),
       workers: vi.fn().mockResolvedValue([]),
       topology: vi.fn().mockResolvedValue({ role: 'standalone' }),
     },
@@ -113,18 +114,22 @@ describe('App: real pagination wiring (useInfiniteQuery over durableClient.runsP
     runsPage.mockClear();
     runsPage.mockResolvedValue(page([run('r2', 'tier:pro')], { limit: 100, offset: 0, count: 1 }));
 
-    const tagInput = screen.getByLabelText('filter by tag');
-    fireEvent.change(tagInput, { target: { value: 'tier:pro' } });
+    // The tag filter is a value picker now: open it, type the tag, take it as typed.
+    fireEvent.click(screen.getByLabelText('filter by tag'));
+    fireEvent.change(screen.getByPlaceholderText('search, or type a value…'), {
+      target: { value: 'tier:pro' },
+    });
+    fireEvent.click(await screen.findByLabelText('use tier:pro as typed'));
 
     await waitFor(() => expect(runsPage).toHaveBeenCalled());
     const [, tagArg, , , pageArg] = runsPage.mock.calls[0] as unknown as [
       unknown,
-      string | undefined,
+      string[] | undefined,
       unknown,
       unknown,
       { limit?: number; offset?: number },
     ];
-    expect(tagArg).toBe('tier:pro');
+    expect(tagArg).toEqual(['tier:pro']);
     // A fresh query for the new tag — starts at offset 0, not wherever the old (untagged) query had
     // scrolled to.
     expect(pageArg.offset).toBe(0);

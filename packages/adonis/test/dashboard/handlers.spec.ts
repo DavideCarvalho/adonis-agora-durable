@@ -12,6 +12,7 @@ import {
   redispatchPendingRun,
   retryRun,
   retryWithInputRun,
+  runValues,
   workers,
 } from '../../src/dashboard/handlers.js';
 import { InMemoryStateStore, InMemoryTransport, WorkflowEngine } from '../../src/index.js';
@@ -281,6 +282,182 @@ describe('JSON handlers', () => {
   it('bulkAction 400s on an unknown action', async () => {
     const res = await bulkAction(deps, req({ params: { action: 'nuke' }, query: {} }));
     expect(res.status).toBe(400);
+  });
+
+  describe('runValues: the picker enumeration', () => {
+    type FacetRow = { value: string | null; count: number };
+
+    /** A few runs spread across workflows, tenants, tags and attributes. */
+    async function seed() {
+      await raw.start('greet', {}, 'v-a', {
+        tags: ['etl', 'nightly'],
+        namespace: 'acme',
+        searchAttributes: { tier: 'pro', amount: 200 },
+      });
+      await raw.start('greet', {}, 'v-b', {
+        tags: ['etl'],
+        namespace: 'acme',
+        searchAttributes: { tier: 'pro', amount: 500 },
+      });
+      await raw.start('boom', {}, 'v-c', {
+        tags: ['nightly'],
+        namespace: 'globex',
+        searchAttributes: { tier: 'free' },
+      });
+      await raw.waitForRun('v-a');
+      await raw.waitForRun('v-b');
+      await raw.waitForRun('v-c');
+    }
+
+    it('enumerates tag values with counts, most common first', async () => {
+      await seed();
+      const res = await runValues(deps, req({ query: { field: 'tag' } }));
+      expect(res.status).toBe(200);
+      expect(res.body as FacetRow[]).toEqual([
+        { value: 'etl', count: 2 },
+        { value: 'nightly', count: 2 },
+      ]);
+    });
+
+    it('enumerates attribute keys (attr) and the values under one key (attr.<key>)', async () => {
+      await seed();
+      const keys = await runValues(deps, req({ query: { field: 'attr' } }));
+      expect(keys.body as FacetRow[]).toEqual([
+        { value: 'tier', count: 3 },
+        { value: 'amount', count: 2 },
+      ]);
+      const tiers = await runValues(deps, req({ query: { field: 'attr.tier' } }));
+      expect(tiers.body as FacetRow[]).toEqual([
+        { value: 'pro', count: 2 },
+        { value: 'free', count: 1 },
+      ]);
+    });
+
+    it('scopes the enumeration by the other filters, searches and pages server-side', async () => {
+      await seed();
+      // Under one tenant, only that tenant's tags are offered.
+      const scoped = await runValues(deps, req({ query: { field: 'tag', namespace: 'globex' } }));
+      expect(scoped.body as FacetRow[]).toEqual([{ value: 'nightly', count: 1 }]);
+
+      // Search narrows before the bound.
+      const searched = await runValues(deps, req({ query: { field: 'tag', search: 'IGHT' } }));
+      expect(searched.body as FacetRow[]).toEqual([{ value: 'nightly', count: 2 }]);
+
+      // Paging walks the fixed order.
+      const first = await runValues(deps, req({ query: { field: 'tag', limit: '1' } }));
+      expect((first.body as FacetRow[]).map((r) => r.value)).toEqual(['etl']);
+      const second = await runValues(
+        deps,
+        req({ query: { field: 'tag', limit: '1', offset: '1' } }),
+      );
+      expect((second.body as FacetRow[]).map((r) => r.value)).toEqual(['nightly']);
+    });
+
+    it('drops status from the scope so pickers stay usable under a status chip', async () => {
+      await seed();
+      // `v-c` is the only failed run, but the tag picker still offers every tenant's tags: status
+      // is the axis being viewed, not a scope for the other axes.
+      const res = await runValues(deps, req({ query: { field: 'tag', status: 'failed' } }));
+      expect(res.status).toBe(200);
+      expect(res.body as FacetRow[]).toEqual([
+        { value: 'etl', count: 2 },
+        { value: 'nightly', count: 2 },
+      ]);
+    });
+
+    it('400s on a missing or unknown field', async () => {
+      expect((await runValues(deps, req({ query: {} }))).status).toBe(400);
+      expect((await runValues(deps, req({ query: { field: 'nope' } }))).status).toBe(400);
+      expect((await runValues(deps, req({ query: { field: 'attr.' } }))).status).toBe(400);
+    });
+
+    it('listRuns accepts repeated tag params as a set (union) and attr in-sets', async () => {
+      await seed();
+      const union = await listRuns(deps, req({ query: { tag: ['etl', 'nope'] } }));
+      expect((union.body as { runs: Array<{ id: string }> }).runs.map((r) => r.id).sort()).toEqual([
+        'v-a',
+        'v-b',
+      ]);
+
+      const inSet = await listRuns(deps, req({ query: { attr: 'tier:in:pro|free' } }));
+      expect((inSet.body as { runs: Array<{ id: string }> }).runs.map((r) => r.id).sort()).toEqual([
+        'v-a',
+        'v-b',
+        'v-c',
+      ]);
+    });
+
+    it('falls back to a bounded listRuns scan on a port without runValueFacets', async () => {
+      await seed();
+      // A store-less tenant pod's adapter has no native enumeration — the handler still answers by
+      // counting a scan, same shape.
+      const scanDeps: Deps = {
+        engine: { listRuns: (q) => raw.listRuns(q) } as Deps['engine'],
+      };
+      const res = await runValues(scanDeps, req({ query: { field: 'tag' } }));
+      expect(res.status).toBe(200);
+      expect(res.body as FacetRow[]).toEqual([
+        { value: 'etl', count: 2 },
+        { value: 'nightly', count: 2 },
+      ]);
+    });
+
+    it('reads the structured filter envelope through the same class', async () => {
+      await seed();
+      const scoped = await runValues(
+        deps,
+        req({ query: { field: 'tag', filter: { namespace: 'globex' } } }),
+      );
+      expect(scoped.status).toBe(200);
+      expect(scoped.body as FacetRow[]).toEqual([{ value: 'nightly', count: 1 }]);
+
+      const listed = await listRuns(
+        deps,
+        req({ query: { filter: { tag: ['etl'], namespace: ['acme', 'globex'] } } }),
+      );
+      expect((listed.body as { runs: Array<{ id: string }> }).runs.map((r) => r.id).sort()).toEqual(
+        ['v-a', 'v-b'],
+      );
+    });
+
+    it('reads the groupByCount envelope block for the axis and its bounds', async () => {
+      await seed();
+      const res = await runValues(
+        deps,
+        req({
+          query: {
+            filter: { namespace: 'globex' },
+            groupByCount: { field: 'tag', limit: '1' },
+          },
+        }),
+      );
+      expect(res.status).toBe(200);
+      expect(res.body as FacetRow[]).toEqual([{ value: 'nightly', count: 1 }]);
+    });
+
+    it('400s a refused structured filter instead of silently widening', async () => {
+      await seed();
+      const unknown = await listRuns(deps, req({ query: { filter: { nope: 'x' } } }));
+      expect(unknown.status).toBe(400);
+      const ored = await listRuns(
+        deps,
+        req({
+          query: {
+            where: [
+              {
+                field: '',
+                operator: 'equals',
+                OR: [{ field: 'tag', operator: 'equals', value: 'etl' }],
+              },
+            ],
+          },
+        }),
+      );
+      expect(ored.status).toBe(400);
+      // …while the legacy spelling stays lenient: unknown bare keys are ignored.
+      const lenient = await listRuns(deps, req({ query: { whatever: 'x' } }));
+      expect(lenient.status).toBe(200);
+    });
   });
 
   /**

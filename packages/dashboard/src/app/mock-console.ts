@@ -282,21 +282,138 @@ const workers: GroupHealth[] = [
 
 const topology: DurableTopology = { role: 'control-plane' };
 
+/** The full status union, mirroring the server's `GET /runs` envelope. */
+const STATUSES: WorkflowRun['status'][] = [
+  'pending',
+  'running',
+  'suspended',
+  'blocked',
+  'completed',
+  'failed',
+  'cancelled',
+  'dead',
+];
+
+/** Coerce a query-string operand the way the server does: booleans, numbers, else the raw string. */
+function coerceOperand(raw: string): string | number | boolean {
+  if (raw === 'true') return true;
+  if (raw === 'false') return false;
+  if (raw !== '' && !Number.isNaN(Number(raw))) return Number(raw);
+  return raw;
+}
+
+/** One `attr=key:op:value` predicate against a run's search attributes (mirror of the server). */
+function matchesAttr(run: WorkflowRun, entry: string): boolean {
+  const [key, op, ...rest] = entry.split(':');
+  if (!key || !op || rest.length === 0) return true;
+  const attrs = run.searchAttributes;
+  if (!attrs || !(key in attrs)) return false;
+  const actual = attrs[key] as string | number | boolean;
+  const operand = rest.join(':');
+  switch (op) {
+    case 'eq':
+      return actual === coerceOperand(operand);
+    case 'ne':
+      return actual !== coerceOperand(operand);
+    case 'gt':
+      return actual > coerceOperand(operand);
+    case 'gte':
+      return actual >= coerceOperand(operand);
+    case 'lt':
+      return actual < coerceOperand(operand);
+    case 'lte':
+      return actual <= coerceOperand(operand);
+    case 'in':
+      return operand
+        .split('|')
+        .filter((part) => part !== '')
+        .map(coerceOperand)
+        .some((v) => actual === v);
+    default:
+      return true;
+  }
+}
+
+/** The server-side predicates the console can send: exact match, ANDed, absent = don't narrow. */
+function scopedRuns(params: URLSearchParams, dropStatus: boolean): WorkflowRun[] {
+  const status = dropStatus ? null : params.get('status');
+  return runs.filter(
+    (r) =>
+      (!status || r.status === status) &&
+      // A repeated param is the union; a run with NO origin matches no origin value.
+      (!params.get('origin') || r.origin === params.get('origin')) &&
+      (params.getAll('tag').length === 0 ||
+        params.getAll('tag').some((t) => r.tags?.includes(t))) &&
+      (params.getAll('namespace').length === 0 ||
+        params.getAll('namespace').some((n) => (r.namespace ?? 'default') === n)) &&
+      params.getAll('attr').every((entry) => matchesAttr(r, entry)),
+  );
+}
+
+/** The values one snapshot run contributes to a picker axis. */
+function valuesOf(run: WorkflowRun, field: string): Array<string | null> {
+  if (field === 'tag') return run.tags ?? [];
+  if (field === 'namespace') return run.namespace === undefined ? [] : [run.namespace];
+  if (field === 'workflow') return [run.workflow];
+  if (field === 'status') return [run.status];
+  if (field === 'attr') return Object.keys(run.searchAttributes ?? {});
+  if (field.startsWith('attr.')) {
+    const value = run.searchAttributes?.[field.slice('attr.'.length)];
+    return value === undefined ? [] : [String(value)];
+  }
+  return [];
+}
+
 function body(path: string): unknown | undefined {
   const [route, search] = path.split('?');
+  const params = new URLSearchParams(search ?? '');
   if (route === '/runs') {
-    // Honour the two server-side facets the console can send, the way a real store applies them
-    // (exact match, ANDed, absent = don't narrow) — otherwise the tenant box in the preview would
-    // look broken, and a screenshot of it would be a lie.
-    const params = new URLSearchParams(search ?? '');
-    const namespace = params.get('namespace');
-    const origin = params.get('origin');
-    return runs.filter(
-      (r) =>
-        (!namespace || r.namespace === namespace) &&
-        // A run with NO origin matches no origin value — the same asymmetry core documents.
-        (!origin || r.origin === origin),
+    // The real envelope (`{ runs, page, statuses}`), with the same predicate semantics as the
+    // server — otherwise the tenant/tag/attr boxes in the preview would look broken, and a
+    // screenshot of them would be a lie.
+    const limit = Math.min(Math.max(Number(params.get('limit') ?? 50) || 0, 0), 200);
+    const offset = Math.max(Number(params.get('offset') ?? 0) || 0, 0);
+    const matching = scopedRuns(params, false).sort((a, b) =>
+      b.createdAt.localeCompare(a.createdAt),
     );
+    return {
+      runs: matching.slice(offset, offset + limit),
+      page: { limit, offset, count: Math.min(limit, Math.max(matching.length - offset, 0)) },
+      statuses: STATUSES,
+    };
+  }
+  if (route === '/runs/values') {
+    // What the pickers list: distinct values over the runs matching every OTHER predicate, with
+    // counts — most common first, engine-minted tags last, searched before the bound.
+    const field = params.get('groupByCount[field]') ?? params.get('field') ?? '';
+    const needle = (params.get('groupByCount[search]') ?? params.get('search') ?? '')
+      .trim()
+      .toLowerCase();
+    const limit = Math.min(
+      Math.max(Number(params.get('groupByCount[limit]') ?? params.get('limit') ?? 100) || 0, 0),
+      200,
+    );
+    const offset = Math.max(
+      Number(params.get('groupByCount[offset]') ?? params.get('offset') ?? 0) || 0,
+      0,
+    );
+    const counts = new Map<string | null, number>();
+    for (const run of scopedRuns(params, true)) {
+      for (const value of valuesOf(run, field)) counts.set(value, (counts.get(value) ?? 0) + 1);
+    }
+    return [...counts]
+      .map(([value, count]) => ({ value, count }))
+      .filter((row) => !needle || row.value?.toLowerCase().includes(needle))
+      .sort((a, b) => {
+        const engineA = a.value?.startsWith('singleton:') ?? false;
+        const engineB = b.value?.startsWith('singleton:') ?? false;
+        if (engineA !== engineB) return engineA ? 1 : -1;
+        if (b.count !== a.count) return b.count - a.count;
+        if (a.value === null) return 1;
+        if (b.value === null) return -1;
+        return (a.value ?? '').localeCompare(b.value ?? '');
+      })
+      .slice(offset, offset + limit);
   }
   if (route === '/workers') return workers;
   if (route === '/topology') return topology;

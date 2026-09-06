@@ -44,6 +44,7 @@ import {
   redispatchPendingRun,
   retryRun,
   retryWithInputRun,
+  runValues,
   topology,
   workers,
 } from '../src/dashboard/handlers.js';
@@ -75,6 +76,7 @@ function spaDirectory(): string {
  * - `GET  /`                          -> the dashboard SPA's `index.html`
  * - `GET  /assets/:file`              -> the SPA's hashed JS/CSS bundle
  * - `GET  /api/runs`                  -> list runs (status/workflow/tag/namespace/attr filters, paged)
+ * - `GET  /api/runs/values`           -> distinct values of one filter axis, with counts (pickers)
  * - `GET  /api/runs/:id`              -> run detail (run + step timeline + children)
  * - `GET  /api/runs/:id/stream`       -> SSE live-tail of one run's lifecycle events
  * - `POST /api/runs/:id/retry`        -> re-enqueue the run
@@ -175,6 +177,8 @@ export default class DashboardProvider {
     };
 
     router.get(`${apiBase}/runs`, json(listRuns)).as('durable_dashboard.runs.index');
+    // Registered BEFORE `/runs/:id` so `values` isn't captured as a run id.
+    router.get(`${apiBase}/runs/values`, json(runValues)).as('durable_dashboard.runs.values');
     router.get(`${apiBase}/runs/:id`, json(getRun)).as('durable_dashboard.runs.show');
     router.post(`${apiBase}/runs/:id/retry`, json(retryRun)).as('durable_dashboard.runs.retry');
     router

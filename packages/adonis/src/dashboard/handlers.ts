@@ -1,15 +1,26 @@
+import {
+  applyCustomFilter,
+  groupByCountFromRequest,
+  InvalidColumnFilterError,
+} from '@adonis-agora/filter';
 import type {
   EngineEvent,
   GroupHealth,
+  RunFacetQuery,
   RunQuery,
   RunResult,
-  RunStatus,
+  RunValueAxis,
+  RunValueFacetOptions,
+  RunValueFacetRow,
   SignalWaiter,
   StepCheckpoint,
   WorkflowRun,
 } from '../index.js';
+import { RUN_VALUE_FACET_LIMIT } from '../run-value-facets.js';
 import { indexWaitersByRun, resolveRunWaiting } from '../run-waiting.js';
-import { parseAttrFilters } from './attr-filter.js';
+import { RUN_STATUSES, RunFilter } from './run-filter.js';
+import { RunQueryDraft } from './run-query-draft.js';
+import { runValueAdapter } from './run-values.js';
 
 /**
  * Framework-light JSON handlers over a {@link DashboardEngine}.
@@ -27,10 +38,10 @@ import { parseAttrFilters } from './attr-filter.js';
  * `listRuns`/`getRun`/`retryRun`/`redispatchPendingRun`/`cancelRun`/`health` are the original
  * handlers this file always had (response shapes unchanged, so a hand-written client over the
  * JSON API keeps working — see `compat.ts`/`compat-view.ts`).
- * `workers`, `topology`, `retryWithInputRun`, `continueRun`, and `bulkAction` are additions that give
- * the new `@adonis-agora/durable-dashboard` React SPA parity with `@dudousxd/nestjs-durable-dashboard`'s
- * `DurableApiController` (fix-and-replay, bulk retry/cancel, breakpoint continue, full worker
- * heartbeats, topology badge). The SSE `runs/:id/stream` route is wired directly in
+ * `workers`, `topology`, `retryWithInputRun`, `continueRun`, `runValues`, and `bulkAction` are
+ * additions that give the new `@adonis-agora/durable-dashboard` React SPA parity with
+ * `@dudousxd/nestjs-durable-dashboard`'s `DurableApiController` (fix-and-replay, bulk retry/cancel,
+ * breakpoint continue, full worker heartbeats, topology badge, value pickers). The SSE `runs/:id/stream` route is wired directly in
  * `providers/dashboard_provider.ts` since streaming needs the raw HTTP response, not a JSON `ApiResponse`.
  */
 
@@ -71,6 +82,17 @@ export interface DashboardEngine {
    * for a gateway that can't do the scan.
    */
   listSignalWaiters?(prefix: string): Promise<SignalWaiter[]>;
+  /**
+   * The distinct values of ONE filter axis over the runs matching `query`, with counts — what a
+   * console's pickers list. Optional: absent on a port that can't do the scan yet (a store-less
+   * `tenant` pod — see `gateway-adapter.ts`); {@link runValues} then counts a bounded
+   * {@link listRuns} scan in-process instead, same answer shape, bounded approximation.
+   */
+  runValueFacets?(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]>;
 }
 
 /** The read/control port the handlers operate over (a store engine or a tenant gateway adapter). */
@@ -82,8 +104,9 @@ export interface Deps {
 export interface ApiRequest {
   /** Route params, e.g. `{ id: 'run-1' }`. */
   params: Record<string, string | undefined>;
-  /** Parsed query string, e.g. `{ status: 'failed', limit: '20' }`. */
-  query: Record<string, string | string[] | undefined>;
+  /** Decoded query string — nested when the client sends the filter envelope
+   *  (`filter[where][0][field]`), flat for the legacy spelling. */
+  query: Record<string, unknown>;
   /** Parsed JSON body (for POST actions). */
   body?: unknown;
 }
@@ -110,26 +133,16 @@ const badRequest = (message: string): ApiResponse => ({
 const INVALID_COMPENSATE =
   "compensate must be a boolean — 'true'/'1'/'yes'/'on' or 'false'/'0'/'no'/'off'";
 
-/** The full status union (`interfaces.ts`'s `RunStatus`) — kept in sync so filters/facets never drop a
- *  state; a previous version of this list was missing `'blocked'`. */
-const RUN_STATUSES: readonly RunStatus[] = [
-  'pending',
-  'running',
-  'suspended',
-  'blocked',
-  'completed',
-  'failed',
-  'cancelled',
-  'dead',
-];
-
-function firstQuery(value: string | string[] | undefined): string | undefined {
-  if (Array.isArray(value)) return value[0];
-  return value;
+function firstQuery(value: unknown): string | undefined {
+  if (Array.isArray(value)) {
+    const first = value[0];
+    return typeof first === 'string' ? first : undefined;
+  }
+  return typeof value === 'string' ? value : undefined;
 }
 
 /** Parse a positive integer query param, falling back to `fallback` when absent/invalid. */
-function intQuery(value: string | string[] | undefined, fallback: number): number {
+function intQuery(value: unknown, fallback: number): number {
   const raw = firstQuery(value);
   if (raw === undefined) return fallback;
   const n = Number.parseInt(raw, 10);
@@ -183,31 +196,66 @@ function readFlag(req: ApiRequest, key: string): boolean | typeof INVALID_FLAG {
   return fromQuery ?? false;
 }
 
-/** Validate that a string is a known {@link RunStatus}, else `undefined`. */
-function parseStatus(value: string | undefined): RunStatus | undefined {
-  if (value && (RUN_STATUSES as readonly string[]).includes(value)) {
-    return value as RunStatus;
-  }
-  return undefined;
+/** Build a {@link RunQuery} from the query params shared by `listRuns`, `bulkAction` and the
+ *  `runValues` scope — by running the console's {@link RunFilter} class over them (the filter
+ *  lib's unified class form, with a draft in place of a Lucid builder).
+ *
+ *  Both spellings feed the same class: the flat form the console has always sent
+ *  (`?status=failed&tag=etl`, repeatable for a set, `attr=key:op:value` repeats) and the structured
+ *  `filter[...]` envelope `@adonis-agora/filter-client` builds. A refused filter
+ *  (`InvalidColumnFilterError` — unknown field, unsupported operator, a group the draft cannot
+ *  express) throws, and every caller maps it to `400` — a typo'd filter fails loudly instead of
+ *  silently widening.
+ *
+ *  `limit`/`offset` never enter the draft (no method owns those endpoint mechanics — the caller
+ *  reads them), and neither does `origin`: the engine has no `origin` column, so the class reads
+ *  but ignores it and a client that always sends it never 400s. */
+async function runFilterQuery(
+  query: ApiRequest['query'],
+): Promise<Omit<RunQuery, 'limit' | 'offset'>> {
+  const draft = new RunQueryDraft();
+  await applyCustomFilter(draft, RunFilter, { request: { qs: () => ({ ...query }) } });
+  return draft.query;
 }
 
-/** Build a {@link RunQuery} from the query params shared by `listRuns` and `bulkAction` — status, tag,
- *  attribute predicates (`attr=key:op:value`, repeatable/ANDed), namespace. `origin` is intentionally
- *  NOT a query predicate (the engine has no `origin` column — see `durable-client.ts`'s module doc);
- *  it is read but ignored, so a client that always sends it (parity with the NestJS API) never 400s. */
-function runFilterFromQuery(query: ApiRequest['query']): Omit<RunQuery, 'limit' | 'offset'> {
-  const status = parseStatus(firstQuery(query.status));
-  const workflow = firstQuery(query.workflow);
-  const tag = firstQuery(query.tag);
-  const namespace = firstQuery(query.namespace);
-  const attributes = parseAttrFilters(query.attr as string | string[] | undefined);
-  const filter: Omit<RunQuery, 'limit' | 'offset'> = {};
-  if (status) filter.status = status;
-  if (workflow) filter.workflow = workflow;
-  if (tag) filter.tag = tag;
-  if (namespace) filter.namespace = namespace;
-  if (attributes) filter.attributes = attributes;
-  return filter;
+/** Map a refused run filter to `400` (see {@link runFilterQuery}); rethrow anything else. */
+function filterRejection(error: unknown): ApiResponse {
+  if (error instanceof InvalidColumnFilterError) return badRequest(error.message);
+  throw error;
+}
+
+/**
+ * `GET /runs/values` — the distinct values one filter axis takes across the runs matching every
+ * OTHER active predicate, with counts — what the console's pickers list instead of asking an
+ * operator to type a value blind. Served through the filter lib's `groupByCountFromRequest` with
+ * the console's adapter: the scope rides the same params as `listRuns`, and `field`/`limit`/
+ * `offset`/`search` ride top-level (with the `groupByCount[field]` envelope as fallback).
+ *
+ * A picker pages as it scrolls and narrows as the operator types, both against the whole matching
+ * set rather than the fetched page.
+ */
+export async function runValues(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
+  const qs = req.query;
+  const field = firstQuery(qs.field);
+  const search = firstQuery(qs.search)?.trim();
+  try {
+    return ok(
+      await groupByCountFromRequest(
+        new RunQueryDraft(),
+        RunFilter,
+        { request: { qs: () => ({ ...qs }) } },
+        {
+          adapter: runValueAdapter(deps.engine),
+          ...(field !== undefined && { field }),
+          ...(qs.limit !== undefined && { limit: intQuery(qs.limit, RUN_VALUE_FACET_LIMIT) }),
+          ...(qs.offset !== undefined && { offset: intQuery(qs.offset, 0) }),
+          ...(search ? { search } : {}),
+        },
+      ),
+    );
+  } catch (error) {
+    return filterRejection(error);
+  }
 }
 
 /** `GET /runs` — list runs filtered by status/workflow/tag/namespace/search-attributes, paginated. */
@@ -216,7 +264,13 @@ export async function listRuns(deps: Deps, req: ApiRequest): Promise<ApiResponse
   const limit = Math.min(intQuery(req.query.limit, 50), 200);
   const offset = intQuery(req.query.offset, 0);
 
-  const query: RunQuery = { limit, offset, ...runFilterFromQuery(req.query) };
+  let filter: Omit<RunQuery, 'limit' | 'offset'>;
+  try {
+    filter = await runFilterQuery(req.query);
+  } catch (error) {
+    return filterRejection(error);
+  }
+  const query: RunQuery = { limit, offset, ...filter };
 
   const [runs, waiters] = await Promise.all([
     engine.listRuns(query),
@@ -332,7 +386,12 @@ export async function bulkAction(deps: Deps, req: ApiRequest): Promise<ApiRespon
   }
   const compensate = readFlag(req, 'compensate');
   if (compensate === INVALID_FLAG) return badRequest(INVALID_COMPENSATE);
-  const filter = runFilterFromQuery(req.query);
+  let filter: Omit<RunQuery, 'limit' | 'offset'>;
+  try {
+    filter = await runFilterQuery(req.query);
+  } catch (error) {
+    return filterRejection(error);
+  }
   const runs = await deps.engine.listRuns({ ...filter, limit: 500 });
   let applied = 0;
   for (const run of runs) {

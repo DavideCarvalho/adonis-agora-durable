@@ -35,6 +35,9 @@ importers:
 
   packages/adonis:
     dependencies:
+      '@adonis-agora/filter':
+        specifier: 0.9.0
+        version: 0.9.0(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(@adonisjs/lucid@22.4.2(@adonisjs/assembler@8.5.0(typescript@7.0.2))(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.0.3)(luxon@3.7.2)(supports-color@10.2.2))
       zod:
         specifier: 4.5.4
         version: 4.5.4
@@ -102,6 +105,9 @@ importers:
 
   packages/dashboard:
     devDependencies:
+      '@adonis-agora/filter-client':
+        specifier: 0.3.0
+        version: 0.3.0
       '@base-ui/react':
         specifier: 1.7.0
         version: 1.7.0(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
@@ -198,6 +204,25 @@ importers:
         version: 4.1.11(@opentelemetry/api@1.9.1)(@types/node@26.4.0)(happy-dom@20.12.0)(jsdom@30.0.1)(vite@8.2.2(@types/node@26.4.0)(jiti@2.7.0)(yaml@2.9.0))
 
 packages:
+
+  '@adonis-agora/filter-client@0.3.0':
+    resolution: {integrity: sha512-pwXvJkSWnD8R6CvoWiLiNs7Z7vCOkevsgiw4DzeaAhdKIDx4adqTbKjPFPe57CJPZ6OSga0youxksHoUe0vnwA==}
+    engines: {node: '>=20.6.0'}
+    peerDependencies:
+      '@tanstack/table-core': '>=8.0.0'
+    peerDependenciesMeta:
+      '@tanstack/table-core':
+        optional: true
+
+  '@adonis-agora/filter@0.9.0':
+    resolution: {integrity: sha512-XCrWrQqI/Sa5smONMiTTV5TUxJCVnnKSoaMbyRee6vt1orQT1ONmYB7ei7tDqTSEM2VvtcG2QW6CMBQo2z3eCQ==}
+    engines: {node: '>=20.6.0'}
+    peerDependencies:
+      '@adonisjs/core': ^7.3.0
+      '@adonisjs/lucid': ^22.0.0
+    peerDependenciesMeta:
+      '@adonisjs/lucid':
+        optional: true
 
   '@adonisjs/ace@14.1.1':
     resolution: {integrity: sha512-6MP2eZicAP8hd1US1PR2b6hEzWVaNlEbbAxanwDAyTOMW8PysefQam7b59ipbxw4+ADTJsgIyQWVt815W9f6WQ==}
@@ -3546,6 +3571,14 @@ packages:
         optional: true
 
 snapshots:
+
+  '@adonis-agora/filter-client@0.3.0': {}
+
+  '@adonis-agora/filter@0.9.0(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(@adonisjs/lucid@22.4.2(@adonisjs/assembler@8.5.0(typescript@7.0.2))(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.0.3)(luxon@3.7.2)(supports-color@10.2.2))':
+    dependencies:
+      '@adonisjs/core': 7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1)
+    optionalDependencies:
+      '@adonisjs/lucid': 22.4.2(@adonisjs/assembler@8.5.0(typescript@7.0.2))(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.0.3)(luxon@3.7.2)(supports-color@10.2.2)
 
   '@adonisjs/ace@14.1.1(youch@4.1.1)':
     dependencies:

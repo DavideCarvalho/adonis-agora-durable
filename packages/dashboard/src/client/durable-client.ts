@@ -402,10 +402,17 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export interface RunFilterOptions {
-  namespace?: string | undefined;
+  namespace?: string | string[] | undefined;
   /** See module doc gap #1 — cannot select unattributed runs, and no run carries an origin today. */
   origin?: string | undefined;
 }
+
+import type { RunPredicates, RunValueField, RunValueRow } from './run-query-string.js';
+// The console's filter shapes live in `run-query-string.ts` (built on the filter lib's builder
+// classes); re-exported here because `./client` resolves to this file.
+import { runQueryString } from './run-query-string.js';
+
+export type { RunPredicates, RunValueField, RunValueRow } from './run-query-string.js';
 
 /** `offset`/`limit` for a `/runs` page request — mirrors `handlers.ts`'s `listRuns` query params
  *  (server caps `limit` at 200). Both optional; the server defaults `limit` to 50, `offset` to 0. */
@@ -439,7 +446,7 @@ interface RetryWithInputResponse {
 export const durableClient = {
   async runs(
     status?: RunStatus,
-    tag?: string,
+    tag?: string | string[],
     attr?: string[],
     opts?: RunFilterOptions,
   ): Promise<WorkflowRun[]> {
@@ -451,22 +458,34 @@ export const durableClient = {
    *  list) can tell whether another page might exist. */
   async runsPage(
     status?: RunStatus,
-    tag?: string,
+    tag?: string | string[],
     attr?: string[],
     opts?: RunFilterOptions,
     page?: RunPageOptions,
   ): Promise<RunsPage> {
-    const q = new URLSearchParams();
-    if (status) q.set('status', status);
-    if (tag) q.set('tag', tag);
-    for (const a of attr ?? []) q.append('attr', a);
-    if (opts?.namespace) q.set('namespace', opts.namespace);
-    if (opts?.origin) q.set('origin', opts.origin);
-    if (page?.limit !== undefined) q.set('limit', String(page.limit));
-    if (page?.offset !== undefined) q.set('offset', String(page.offset));
-    const qs = q.toString();
+    const qs = runQueryString({ status, tag, attr, ...opts }, page ?? {});
     const res = await http<RunsListResponse>(qs ? `/runs?${qs}` : '/runs');
     return { runs: res.runs, page: res.page };
+  },
+  /**
+   * The distinct values one filter field takes across the runs matching the OTHER active predicates,
+   * most common first — what a value picker lists instead of asking an operator to type blind.
+   *
+   * Scoped by the rest of the filter on purpose: pick a tenant, and the tag picker offers that
+   * tenant's tags. `limit` bounds the answer, which matters rather than being a nicety — tag and
+   * search-attribute cardinality grows with the data, so the unbounded answer is a listing.
+   *
+   * `offset` walks that bound (the picker loads as it scrolls) and `search` narrows it, both over
+   * the WHOLE matching set. Searching the fetched page instead would make the values the bound cut
+   * unfindable — which is exactly when an operator starts typing.
+   */
+  async values(
+    field: RunValueField,
+    scope: RunPredicates = {},
+    opts?: { limit?: number; offset?: number; search?: string },
+  ): Promise<RunValueRow[]> {
+    const qs = runQueryString(scope, {}, { field, ...opts });
+    return http<RunValueRow[]>(`/runs/values?${qs}`);
   },
   run(id: string): Promise<RunDetail> {
     return http<RunDetail>(`/runs/${encodeURIComponent(id)}`);
@@ -501,23 +520,21 @@ export const durableClient = {
     action: 'retry' | 'cancel',
     filter: RunFilterOptions & {
       status?: RunStatus | undefined;
-      tag?: string | undefined;
+      tag?: string | string[] | undefined;
       attr?: string[] | undefined;
       /** `cancel` only — run each matched run's saga compensations before cancelling it. */
       compensate?: boolean | undefined;
     },
   ): Promise<{ matched: number; applied: number }> {
-    const q = new URLSearchParams();
-    if (filter.compensate) q.set('compensate', 'true');
-    if (filter.status) q.set('status', filter.status);
-    if (filter.tag) q.set('tag', filter.tag);
-    for (const a of filter.attr ?? []) q.append('attr', a);
-    if (filter.namespace) q.set('namespace', filter.namespace);
-    if (filter.origin) q.set('origin', filter.origin);
-    const qs = q.toString();
-    return http<{ matched: number; applied: number }>(`/bulk/${action}${qs ? `?${qs}` : ''}`, {
-      method: 'POST',
-    });
+    const { compensate, ...predicates } = filter;
+    const qs = runQueryString(predicates);
+    const withCompensate = compensate ? `${qs ? `${qs}&` : ''}compensate=true` : qs;
+    return http<{ matched: number; applied: number }>(
+      `/bulk/${action}${withCompensate ? `?${withCompensate}` : ''}`,
+      {
+        method: 'POST',
+      },
+    );
   },
   async cancel(id: string, opts?: { compensate?: boolean }): Promise<RunResult> {
     const qs = opts?.compensate ? '?compensate=true' : '';

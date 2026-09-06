@@ -1,4 +1,12 @@
-import type { EngineEvent, RunResult, SignalWaiter } from '../interfaces.js';
+import type {
+  EngineEvent,
+  RunFacetQuery,
+  RunResult,
+  RunValueAxis,
+  RunValueFacetOptions,
+  RunValueFacetRow,
+  SignalWaiter,
+} from '../interfaces.js';
 import { DURABLE_RUN_GATEWAY } from '../role_bindings.js';
 import type { RunGateway } from '../run-gateway/interface.js';
 import type { DashboardEngine } from './handlers.js';
@@ -32,6 +40,12 @@ export interface StoreEngineLike {
   /** Bulk signal-waiter scan — forwarded 1:1 to power `listRuns`' `waiting` stamp (see
    *  `DashboardEngine.listSignalWaiters`'s doc). Every real `WorkflowEngine` has it. */
   listSignalWaiters?(prefix: string): Promise<SignalWaiter[]>;
+  /** Value enumeration for the console's pickers — forwarded 1:1 when the engine has it. */
+  runValueFacets?(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]>;
 }
 
 /**
@@ -66,6 +80,20 @@ export function storeDashboardEngine(engine: StoreEngineLike): DashboardEngine {
       ? {
           listSignalWaiters: (prefix: string) =>
             engine.listSignalWaiters?.(prefix) as Promise<SignalWaiter[]>,
+        }
+      : {}),
+    ...(engine.runValueFacets
+      ? {
+          runValueFacets: (
+            axis: RunValueAxis,
+            query: RunFacetQuery,
+            opts?: RunValueFacetOptions,
+          ): Promise<RunValueFacetRow[]> =>
+            (engine.runValueFacets as NonNullable<StoreEngineLike['runValueFacets']>)(
+              axis,
+              query,
+              opts,
+            ),
         }
       : {}),
   };

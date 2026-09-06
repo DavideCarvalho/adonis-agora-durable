@@ -1,11 +1,16 @@
 import type {
+  RunFacetQuery,
   RunQuery,
   RunStatus,
+  RunValueAxis,
+  RunValueFacetOptions,
+  RunValueFacetRow,
   SignalWaiter,
   StateStore,
   StepCheckpoint,
   WorkflowRun,
 } from './interfaces.js';
+import { scanRunValueFacets } from './run-value-facets.js';
 
 /**
  * Transforms a payload value as it crosses the store boundary — e.g. encrypt-at-rest, compress, or
@@ -159,6 +164,19 @@ export class CodecStateStore implements StateStore {
   }
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     return (await this.inner.listRuns(query)).map((r) => this.decRun(r));
+  }
+  async runValueFacets(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]> {
+    // Forward when the inner store implements it; otherwise count a bounded scan in-process. Facet
+    // rows carry no encrypted payload (values are workflow names, tags, attribute keys/values as
+    // stored), so no decrypt pass is needed either way.
+    if (this.inner.runValueFacets) {
+      return this.inner.runValueFacets(axis, query, opts);
+    }
+    return scanRunValueFacets(this, axis, query, opts);
   }
   async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {
     return (await this.inner.listCheckpoints(runId)).map((c) => this.decCp(c));
