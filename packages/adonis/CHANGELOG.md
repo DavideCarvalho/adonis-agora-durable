@@ -1,5 +1,19 @@
 # @adonis-agora/durable
 
+## 0.34.0
+
+### Minor Changes
+
+- [#109](https://github.com/DavideCarvalho/adonis-agora-durable/pull/109) [`f1e2194`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/f1e21949fb5c1f4e1139513cc9dde4c18561fe0c) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Adiciona `consumers: 'never'`: o processo vira um produtor puro — despacha runs e lê o store, mas nunca inicia os consumer loops do broker, em qualquer ambiente. Para frotas web que dividem um Redis com o `durable:work`, eliminando a corrida por entregas ponto-a-ponto (tasks, resultados, heartbeats); o worker reabilita o consumo para si via `engine.startConsumers()`.
+
+- [#109](https://github.com/DavideCarvalho/adonis-agora-durable/pull/109) [`f1e2194`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/f1e21949fb5c1f4e1139513cc9dde4c18561fe0c) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Filtros do console sobre o `@adonis-agora/filter` no estilo unificado: a listagem, os pickers e o bulk falam o envelope `filter[...]` construído com as classes do `filter-client` (`new FilterQueryBuilder()`, pickers via `.groupByCount()`), e o servidor os serve com a classe `RunFilter` (`BaseFilter<RunQueryDraft>`, um método por chave) — listagem via `applyCustomFilter`, valores via `groupByCountFromRequest` com o adapter do console. A grafia plana (`?tag=&attr=key:op:value`) continua valendo pelo mesmo pipeline; atributos viajam opacos (`filter[attr]=key:op:value`) porque as chaves são dinâmicas. Filtro estruturado recusado responde `400` em vez de alargar em silêncio. Requer `@adonis-agora/filter@0.9.0` e `@adonis-agora/filter-client@0.3.0`.
+
+- [#109](https://github.com/DavideCarvalho/adonis-agora-durable/pull/109) [`f1e2194`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/f1e21949fb5c1f4e1139513cc9dde4c18561fe0c) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Console passa a filtrar por selects com autocomplete e texto: os filtros de tag, tenant e atributos do dashboard viram value pickers — listam o que os runs realmente contêm (contados no servidor, com busca e paginação), aceitam vários valores por eixo e aceitam valor digitado. Inclui o endpoint `GET /runs/values`, filtros multi-valor em `RunQuery` (`workflows`/`tags`/`namespaces`, operador `in` nos atributos) e a enumeração `runValueFacets` nos stores Lucid e in-memory — o mesmo comportamento do console do nestjs-durable.
+
+### Patch Changes
+
+- [#109](https://github.com/DavideCarvalho/adonis-agora-durable/pull/109) [`f1e2194`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/f1e21949fb5c1f4e1139513cc9dde4c18561fe0c) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Salva timeout espúrio de step remoto cujo resultado já foi gravado: no vencimento da janela de liveness, o engine re-lê o checkpoint — concluído, resolve com o output gravado em vez de estourar `RemoteStepTimeout`. Cobre o caso de fila de resultados compartilhada (web+worker), onde outra instância consome o resultado e completa o checkpoint sem resolver o await in-memory de quem despachou.
+
 ## 0.33.0
 
 ### Minor Changes

@@ -1,5 +1,5 @@
 /** Keep in sync with this package's `version` in package.json. */
-export const VERSION = '0.33.0';
+export const VERSION = '0.34.0';
 
 export type {
   AccessDeniedInfo,
