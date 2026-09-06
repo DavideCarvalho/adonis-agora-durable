@@ -1,5 +1,13 @@
 # @adonis-agora/durable-dashboard
 
+## 0.3.0
+
+### Minor Changes
+
+- [#109](https://github.com/DavideCarvalho/adonis-agora-durable/pull/109) [`f1e2194`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/f1e21949fb5c1f4e1139513cc9dde4c18561fe0c) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Filtros do console sobre o `@adonis-agora/filter` no estilo unificado: a listagem, os pickers e o bulk falam o envelope `filter[...]` construído com as classes do `filter-client` (`new FilterQueryBuilder()`, pickers via `.groupByCount()`), e o servidor os serve com a classe `RunFilter` (`BaseFilter<RunQueryDraft>`, um método por chave) — listagem via `applyCustomFilter`, valores via `groupByCountFromRequest` com o adapter do console. A grafia plana (`?tag=&attr=key:op:value`) continua valendo pelo mesmo pipeline; atributos viajam opacos (`filter[attr]=key:op:value`) porque as chaves são dinâmicas. Filtro estruturado recusado responde `400` em vez de alargar em silêncio. Requer `@adonis-agora/filter@0.9.0` e `@adonis-agora/filter-client@0.3.0`.
+
+- [#109](https://github.com/DavideCarvalho/adonis-agora-durable/pull/109) [`f1e2194`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/f1e21949fb5c1f4e1139513cc9dde4c18561fe0c) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Console passa a filtrar por selects com autocomplete e texto: os filtros de tag, tenant e atributos do dashboard viram value pickers — listam o que os runs realmente contêm (contados no servidor, com busca e paginação), aceitam vários valores por eixo e aceitam valor digitado. Inclui o endpoint `GET /runs/values`, filtros multi-valor em `RunQuery` (`workflows`/`tags`/`namespaces`, operador `in` nos atributos) e a enumeração `runValueFacets` nos stores Lucid e in-memory — o mesmo comportamento do console do nestjs-durable.
+
 ## 0.2.4
 
 ### Patch Changes
