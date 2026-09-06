@@ -428,6 +428,27 @@ export interface StateStore {
   listCheckpoints(runId: string): Promise<StepCheckpoint[]>;
 
   /**
+   * The distinct values of ONE filter axis over the runs matching `query`, with counts — what a
+   * console's workflow/tenant/tag/attribute pickers list instead of asking an operator to type a
+   * value blind.
+   *
+   * Scoped by the SAME predicates the list is under (`query`), so the options narrow as the operator
+   * narrows: picking a tenant leaves the tag picker offering only tags that tenant's runs actually
+   * carry, and a picker never offers a value that would return an empty list.
+   *
+   * Bounded by {@link RunValueFacetOptions} — read its `scan` note before trusting a `tag` count.
+   *
+   * Optional: a store that omits it still works — callers fall back to counting a bounded
+   * {@link listRuns} scan in-process (see `run-value-facets.ts`), which is correct but approximate
+   * on the non-column axes.
+   */
+  runValueFacets?(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]>;
+
+  /**
    * Persist the latest worker heartbeat for the step at (`runId`, `seq`) — see
    * {@link StepCheckpoint.lastHeartbeatAt}. Optional: the engine calls it best-effort and throttled
    * (a store without it simply has no persisted step liveness; nothing else degrades). A no-matching-
@@ -464,17 +485,33 @@ export interface StateStore {
 /** Typed, queryable per-run data — exact values for `eq`/`ne`, numbers/strings for range ops. */
 export type SearchAttributes = Record<string, string | number | boolean>;
 
-export type AttributeOp = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte';
+export type AttributeOp = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' | 'in';
 
-/** One predicate over a run's {@link SearchAttributes}; a {@link RunQuery} ANDs them all. */
-export interface AttributeFilter {
-  key: string;
-  op: AttributeOp;
-  value: string | number | boolean;
-}
+/** One value a search attribute can hold, and so one operand a predicate compares against. */
+export type AttributeValue = string | number | boolean;
+
+/**
+ * One predicate over a run's {@link SearchAttributes}; a {@link RunQuery} ANDs them all.
+ *
+ * The scalar ops carry a single `value`. `in` carries a SET of values matched as OR, and it needs to
+ * exist as its own op because ORing inside ONE predicate is the only way to express "tier is pro or
+ * enterprise": two `eq` predicates on the same key are ANDed like every other pair, which no run can
+ * satisfy. An empty `values` matches nothing, mirroring {@link RunQuery.statuses}.
+ */
+export type AttributeFilter =
+  | { key: string; op: Exclude<AttributeOp, 'in'>; value: AttributeValue; values?: never }
+  | { key: string; op: 'in'; values: AttributeValue[]; value?: never };
+
+/** The single-operand members of {@link AttributeFilter} — every op except the `in` set. */
+export type ScalarAttributeFilter = Exclude<AttributeFilter, { op: 'in' }>;
 
 export interface RunQuery {
   workflow?: string | undefined;
+  /**
+   * Match any of these workflows (`workflow IN (...)`). ORed with each other, ANDed with everything
+   * else, and further narrowed by a concurrent single `workflow`. Empty array = matches nothing.
+   */
+  workflows?: string[] | undefined;
   status?: RunStatus | undefined;
   /**
    * Restrict to runs in this worker-pool partition (exact match against {@link WorkflowRun.namespace}),
@@ -493,6 +530,17 @@ export interface RunQuery {
   /** Only runs carrying this tag (exact match against {@link WorkflowRun.tags}). */
   tag?: string | undefined;
   /**
+   * Only runs carrying ANY of these tags. A run's tags are already a set, so the useful multi-value
+   * question is "in this set", not "has all of them" — an operator picking `etl` and `nightly` from a
+   * facet list means the union. ANDed with a concurrent single `tag`; empty = matches nothing.
+   */
+  tags?: string[] | undefined;
+  /**
+   * Restrict to runs in ANY of these namespaces (`namespace IN (...)`), so a console can compare a
+   * few tenants side by side. ANDed with a concurrent single `namespace`; empty = matches nothing.
+   */
+  namespaces?: string[] | undefined;
+  /**
    * Typed/range predicates over {@link WorkflowRun.searchAttributes}, ANDed together (e.g. `amount`
    * >= 200 and `tier` = 'pro'). Applied in-process after the coarse filters, so pair with
    * `workflow`/`status`/`tag` to bound the scan on large stores.
@@ -500,6 +548,66 @@ export interface RunQuery {
   attributes?: AttributeFilter[] | undefined;
   limit?: number | undefined;
   offset?: number | undefined;
+}
+
+/**
+ * The predicates a value enumeration is taken over — a {@link RunQuery} minus the status axes and
+ * minus paging. A console narrows by workflow/tag/tenant/attribute, and the one call back tells it
+ * which values the matching runs take on ONE axis. Keeping status out of the type is what lets a
+ * picker stay usable while a status chip is lit: the offered values don't collapse to the one status
+ * being viewed. (The AdonisJS engine has no `origin` column, so unlike the NestJS twin there is no
+ * origin member to exclude here.)
+ */
+export type RunFacetQuery = Omit<RunQuery, 'status' | 'statuses' | 'limit' | 'offset'>;
+
+/**
+ * Which axis {@link StateStore.runValueFacets} enumerates the distinct VALUES of. Every member is an
+ * axis {@link RunQuery} can then filter by, which is the point: the answer to "what can I pick here"
+ * has to be spendable as a predicate, or a console is offering choices that return nothing.
+ *
+ * `attributeKey` lists the search-attribute keys in use (the left-hand side of a predicate);
+ * `attributeValue` lists the values recorded under ONE key (its right-hand side).
+ */
+export type RunValueAxis =
+  | { field: 'workflow' | 'status' | 'namespace' | 'tag' | 'attributeKey' }
+  | { field: 'attributeValue'; key: string };
+
+/**
+ * One distinct value of a {@link RunValueAxis} and how many of the matching runs carry it — the rows
+ * behind a console's value picker. `value` is `null` only where the axis itself has an absent bucket;
+ * a count is never zero, since a value with no runs produces no row.
+ */
+export interface RunValueFacetRow {
+  value: string | null;
+  count: number;
+}
+
+/**
+ * How much of the store {@link StateStore.runValueFacets} may read to answer.
+ *
+ * `limit` bounds the ROWS RETURNED (highest count first): tag and attribute-value cardinality is
+ * unbounded in principle — a run tagged `singleton:<key>` mints a new tag per key — so a picker asks
+ * for the top slice rather than the whole domain, and keeps free text for everything else.
+ *
+ * `scan` bounds the RUNS READ, for a store that cannot group an axis in the database and has to
+ * count it in memory instead. Those axes report over the newest `scan` matching runs rather than
+ * over all of them — a bounded, deliberately approximate answer, where the alternative is a full
+ * scan on every keystroke.
+ *
+ * `offset` skips rows, for a picker that pages as it scrolls. Meaningful only because the ordering
+ * is fixed (most runs first, ties alphabetical, engine-minted tags last), so page two continues page
+ * one instead of re-shuffling it.
+ *
+ * `search` narrows to values CONTAINING this text, case-insensitively — what a picker's search box
+ * sends. Server-side on purpose: a picker that filters an already-fetched page can only search what
+ * it happened to receive, so a rare value is unfindable precisely when searching is the only way to
+ * reach it.
+ */
+export interface RunValueFacetOptions {
+  limit?: number | undefined;
+  scan?: number | undefined;
+  offset?: number | undefined;
+  search?: string | undefined;
 }
 
 /** The transaction handle `StateStore.transaction` hands to its work callback. */

@@ -99,13 +99,13 @@ describe('durableClient: the run-list / bulk query string', () => {
     expect(calls[0]).toBe('/durable/api/runs');
   });
 
-  it('sends the tag/namespace/attr the operator chose', async () => {
+  it('sends the tag/namespace/attr the operator chose, as a filter envelope', async () => {
     const { calls } = captureUrl();
     await durableClient.runs(undefined, 'tier:pro', ['amount:gte:200'], { namespace: 'acme' });
     const query = new URLSearchParams(calls[0]?.split('?')[1] ?? '');
-    expect(query.get('tag')).toBe('tier:pro');
-    expect(query.get('namespace')).toBe('acme');
-    expect(query.getAll('attr')).toEqual(['amount:gte:200']);
+    expect(query.get('filter[tag]')).toBe('tier:pro');
+    expect(query.get('filter[namespace]')).toBe('acme');
+    expect(query.get('filter[attr]')).toBe('amount:gte:200');
   });
 
   it('scopes a bulk action by the same facets, so it cannot reach wider than the list', async () => {
@@ -113,8 +113,8 @@ describe('durableClient: the run-list / bulk query string', () => {
     await durableClient.bulk('cancel', { status: 'dead', namespace: 'acme' });
     expect(calls[0]).toMatch(/^\/durable\/api\/bulk\/cancel\?/);
     const query = new URLSearchParams(calls[0]?.split('?')[1] ?? '');
-    expect(query.get('status')).toBe('dead');
-    expect(query.get('namespace')).toBe('acme');
+    expect(query.get('filter[status]')).toBe('dead');
+    expect(query.get('filter[namespace]')).toBe('acme');
   });
 });
 
@@ -178,11 +178,11 @@ describe('durableClient.runsPage: real pagination (unlike runs(), keeps the page
       { limit: 25, offset: 50 },
     );
     const query = new URLSearchParams(calls[0]?.split('?')[1] ?? '');
-    expect(query.get('status')).toBe('failed');
-    expect(query.get('tag')).toBe('tier:pro');
-    expect(query.getAll('attr')).toEqual(['amount:gte:200']);
-    expect(query.get('namespace')).toBe('acme');
-    expect(query.get('origin')).toBe('@scope/pkg');
+    expect(query.get('filter[status]')).toBe('failed');
+    expect(query.get('filter[tag]')).toBe('tier:pro');
+    expect(query.get('filter[attr]')).toBe('amount:gte:200');
+    expect(query.get('filter[namespace]')).toBe('acme');
+    expect(query.get('filter[origin]')).toBe('@scope/pkg');
     expect(query.get('limit')).toBe('25');
     expect(query.get('offset')).toBe('50');
   });
@@ -193,6 +193,62 @@ describe('durableClient.runsPage: real pagination (unlike runs(), keeps the page
     const query = new URLSearchParams(calls[0]?.split('?')[1] ?? '');
     expect(query.get('limit')).toBeNull();
     expect(query.get('offset')).toBeNull();
+  });
+
+  it('sends a tag/namespace SET as a filter in-list, so a multi-select filters to the union', async () => {
+    const { calls } = captureUrl();
+    await durableClient.runs(undefined, ['etl', 'nightly'], undefined, {
+      namespace: ['acme', 'globex'],
+    });
+    const query = new URLSearchParams(calls[0]?.split('?')[1] ?? '');
+    expect(query.getAll('filter[tag][]')).toEqual(['etl', 'nightly']);
+    expect(query.getAll('filter[namespace][]')).toEqual(['acme', 'globex']);
+  });
+});
+
+describe('durableClient.values: the picker enumeration', () => {
+  function captureRows(): { calls: string[] } {
+    const calls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string) => {
+        calls.push(url);
+        return Promise.resolve(
+          new Response(JSON.stringify([{ value: 'etl', count: 2 }]), { status: 200 }),
+        );
+      }),
+    );
+    return { calls };
+  }
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('asks for the field scoped by the OTHER filters, with search/limit/offset', async () => {
+    const { calls } = captureRows();
+    const rows = await durableClient.values(
+      'tag',
+      { namespace: ['acme'], attr: ['tier:eq:pro'] },
+      { limit: 50, offset: 50, search: 'et' },
+    );
+    expect(rows).toEqual([{ value: 'etl', count: 2 }]);
+    const query = new URLSearchParams(calls[0]?.split('?')[1] ?? '');
+    expect(calls[0]).toMatch(/^\/durable\/api\/runs\/values\?/);
+    expect(query.get('groupByCount[field]')).toBe('tag');
+    expect(query.get('filter[namespace]')).toBe('acme');
+    expect(query.get('filter[attr]')).toBe('tier:eq:pro');
+    expect(query.get('groupByCount[search]')).toBe('et');
+    expect(query.get('groupByCount[limit]')).toBe('50');
+    expect(query.get('groupByCount[offset]')).toBe('50');
+  });
+
+  it('omits paging/search when the picker did not ask for them', async () => {
+    const { calls } = captureRows();
+    await durableClient.values('attr.tier', {});
+    const query = new URLSearchParams(calls[0]?.split('?')[1] ?? '');
+    expect(query.get('groupByCount[field]')).toBe('attr.tier');
+    expect(query.get('groupByCount[limit]')).toBeNull();
+    expect(query.get('groupByCount[offset]')).toBeNull();
+    expect(query.get('groupByCount[search]')).toBeNull();
   });
 });
 

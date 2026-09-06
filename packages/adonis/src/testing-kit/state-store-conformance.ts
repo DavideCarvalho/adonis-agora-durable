@@ -573,6 +573,170 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
           await store.listRuns({ attributes: [{ key: 'missing', op, value: 1 }] }),
         ).toHaveLength(0);
       }
+      expect(
+        await store.listRuns({ attributes: [{ key: 'missing', op: 'in', values: [1] }] }),
+      ).toHaveLength(0);
+    });
+
+    t('matches an attribute value set with the in operator (OR inside one predicate)', async () => {
+      await store.createRun(run({ id: 'a', searchAttributes: { tier: 'free', amount: 30 } }));
+      await store.createRun(run({ id: 'b', searchAttributes: { tier: 'pro', amount: 200 } }));
+      await store.createRun(
+        run({ id: 'c', searchAttributes: { tier: 'enterprise', amount: 500 } }),
+      );
+      await store.createRun(run({ id: 'd', searchAttributes: { other: 1 } })); // no `tier`
+
+      // Two `eq`s on one key are ANDed (no run has two tiers) — `in` is the set spelling.
+      expect(
+        (
+          await store.listRuns({
+            attributes: [{ key: 'tier', op: 'in', values: ['pro', 'enterprise'] }],
+          })
+        )
+          .map((r) => r.id)
+          .sort(),
+      ).toEqual(['b', 'c']);
+      // A single value under `in` is just `eq`.
+      expect(
+        (await store.listRuns({ attributes: [{ key: 'tier', op: 'in', values: ['pro'] }] })).map(
+          (r) => r.id,
+        ),
+      ).toEqual(['b']);
+      // Numeric and boolean members compare in their own column.
+      expect(
+        (await store.listRuns({ attributes: [{ key: 'amount', op: 'in', values: [30, 500] }] }))
+          .map((r) => r.id)
+          .sort(),
+      ).toEqual(['a', 'c']);
+      // An empty set matches nothing (mirrors `statuses: []`).
+      expect(
+        await store.listRuns({ attributes: [{ key: 'tier', op: 'in', values: [] }] }),
+      ).toHaveLength(0);
+      // Runs missing the key never match, even under `in`.
+      expect(
+        (await store.listRuns({ attributes: [{ key: 'tier', op: 'in', values: ['free'] }] })).map(
+          (r) => r.id,
+        ),
+      ).toEqual(['a']);
+    });
+
+    t('filters listRuns by workflow / tag / namespace sets (IN ...)', async () => {
+      if (!supportsTagFilter) return; // Prisma + SQLite: array_contains is unsupported there (see flag doc)
+      await store.createRun(
+        run({ id: 'a', workflow: 'checkout', namespace: 'acme', tags: ['etl', 'nightly'] }),
+      );
+      await store.createRun(
+        run({ id: 'b', workflow: 'refund', namespace: 'acme', tags: ['nightly'] }),
+      );
+      await store.createRun(
+        run({ id: 'c', workflow: 'checkout', namespace: 'globex', tags: ['etl-foo'] }),
+      );
+
+      expect((await store.listRuns({ workflows: ['checkout'] })).map((r) => r.id).sort()).toEqual([
+        'a',
+        'c',
+      ]);
+      // Tags are a set per run: the set predicate is the union, not the intersection.
+      expect((await store.listRuns({ tags: ['etl', 'refund'] })).map((r) => r.id)).toEqual(['a']);
+      expect((await store.listRuns({ tags: ['etl', 'nightly'] })).map((r) => r.id).sort()).toEqual([
+        'a',
+        'b',
+      ]);
+      expect(
+        (await store.listRuns({ namespaces: ['acme', 'globex'] })).map((r) => r.id).sort(),
+      ).toEqual(['a', 'b', 'c']);
+      // Single + set are ANDed (the narrower set wins).
+      expect((await store.listRuns({ tag: 'nightly', tags: ['etl'] })).map((r) => r.id)).toEqual([
+        'a',
+      ]);
+      // Empty sets match nothing.
+      expect(await store.listRuns({ workflows: [] })).toHaveLength(0);
+      expect(await store.listRuns({ tags: [] })).toHaveLength(0);
+      expect(await store.listRuns({ namespaces: [] })).toHaveLength(0);
+    });
+
+    t('enumerates value facets for the column axes (workflow / status / namespace)', async () => {
+      if (!store.runValueFacets) return; // optional store method — callers fall back to a scan
+      await store.createRun(run({ id: 'a', workflow: 'checkout', status: 'completed' }));
+      await store.createRun(run({ id: 'b', workflow: 'checkout', status: 'failed' }));
+      await store.createRun(
+        run({ id: 'c', workflow: 'refund', status: 'completed', namespace: 'acme' }),
+      );
+
+      expect(await store.runValueFacets({ field: 'workflow' }, {})).toEqual([
+        { value: 'checkout', count: 2 },
+        { value: 'refund', count: 1 },
+      ]);
+      expect(await store.runValueFacets({ field: 'status' }, {})).toEqual([
+        { value: 'completed', count: 2 },
+        { value: 'failed', count: 1 },
+      ]);
+      // The scope narrows the enumeration: only `checkout` runs are counted here.
+      expect(await store.runValueFacets({ field: 'status' }, { workflow: 'checkout' })).toEqual([
+        { value: 'completed', count: 1 },
+        { value: 'failed', count: 1 },
+      ]);
+      // Search narrows server-side, before the bound — a match outside the top slice stays reachable.
+      expect(await store.runValueFacets({ field: 'workflow' }, {}, { search: 'FUND' })).toEqual([
+        { value: 'refund', count: 1 },
+      ]);
+      // Paging walks the fixed order (count desc, value asc).
+      expect(await store.runValueFacets({ field: 'workflow' }, {}, { limit: 1 })).toEqual([
+        { value: 'checkout', count: 2 },
+      ]);
+      expect(
+        await store.runValueFacets({ field: 'workflow' }, {}, { limit: 1, offset: 1 }),
+      ).toEqual([{ value: 'refund', count: 1 }]);
+    });
+
+    t('enumerates value facets for tag and attribute axes, engine tags last', async () => {
+      if (!store.runValueFacets) return; // optional store method — callers fall back to a scan
+      if (!supportsTagFilter) return; // Prisma + SQLite: array_contains is unsupported there (see flag doc)
+      await store.createRun(
+        run({
+          id: 'a',
+          tags: ['etl', 'singleton:abc'],
+          searchAttributes: { tier: 'pro', amount: 200 },
+        }),
+      );
+      await store.createRun(
+        run({ id: 'b', tags: ['etl'], searchAttributes: { tier: 'pro', amount: 500 } }),
+      );
+      await store.createRun(
+        run({
+          id: 'c',
+          tags: ['singleton:abc', 'singleton:def'],
+          searchAttributes: { tier: 'free' },
+        }),
+      );
+
+      // Engine-minted per-key tags rank after human tags, however common they are.
+      expect(await store.runValueFacets({ field: 'tag' }, {})).toEqual([
+        { value: 'etl', count: 2 },
+        { value: 'singleton:abc', count: 2 },
+        { value: 'singleton:def', count: 1 },
+      ]);
+      // `attr` lists the keys in use; `attr.<key>` lists the values under one key.
+      expect(await store.runValueFacets({ field: 'attributeKey' }, {})).toEqual([
+        { value: 'tier', count: 3 },
+        { value: 'amount', count: 2 },
+      ]);
+      expect(await store.runValueFacets({ field: 'attributeValue', key: 'tier' }, {})).toEqual([
+        { value: 'pro', count: 2 },
+        { value: 'free', count: 1 },
+      ]);
+      // A key no run carries enumerates to nothing (not an error).
+      expect(await store.runValueFacets({ field: 'attributeValue', key: 'nope' }, {})).toEqual([]);
+      // Scoped by the rest of the filter: under `tier=pro`, only pro runs are counted.
+      expect(
+        await store.runValueFacets(
+          { field: 'tag' },
+          { attributes: [{ key: 'tier', op: 'eq', value: 'pro' }] },
+        ),
+      ).toEqual([
+        { value: 'etl', count: 2 },
+        { value: 'singleton:abc', count: 1 },
+      ]);
     });
 
     t(

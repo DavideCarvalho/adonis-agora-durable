@@ -34,6 +34,7 @@ import {
   splitCompensations,
 } from '../client/split-compensations';
 import { type HealthSummary, summarizeHealth } from '../client/summarize-health';
+import { AttributeFilters } from './AttributeFilters';
 import { BoltIcon, PlayIcon, RetryIcon, XIcon } from './icons';
 import { OriginFacets } from './OriginFacets';
 import { RunInfoPanel } from './RunInfoPanel';
@@ -44,10 +45,10 @@ import { badgeVariants, Badge as Chip } from './ui/badge';
 import { Button } from './ui/button';
 import { cn } from './ui/cn';
 import { Dialog } from './ui/dialog';
-import { InputField } from './ui/input';
 import { Popover, PopoverContent, PopoverTrigger } from './ui/popover';
 import { Tabs, TabsList, TabsPanel, TabsTab } from './ui/tabs';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
+import { ValuePicker } from './ValuePicker';
 import { WorkflowGraph } from './WorkflowGraph';
 
 /** The durable brand mark — a workflow glyph: a rounded diamond with three connected nodes (a step
@@ -1500,11 +1501,14 @@ function runIdFromHash(): string | undefined {
 
 export function App() {
   const [filter, setFilter] = useState<RunStatus | 'all'>('all');
-  const [tagFilter, setTagFilter] = useState('');
-  const [attrFilter, setAttrFilter] = useState('');
+  // Arrays, not strings: each of these controls takes SEVERAL values, ORed within the axis and
+  // ANDed across them — comparing two tenants, or two tags, is one query rather than two views.
+  const [tagFilter, setTagFilter] = useState<string[]>([]);
+  // `key:op:value` predicates (e.g. `amount:gte:200`, `tier:in:pro|enterprise`), ANDed server-side.
+  const [attrFilter, setAttrFilter] = useState<string[]>([]);
   // Empty = EVERY tenant, and that default is deliberate: core keeps read paths namespace-unscoped,
   // so an operator who has always seen every tenant's runs keeps seeing them until they narrow.
-  const [namespaceFilter, setNamespaceFilter] = useState('');
+  const [namespaceFilter, setNamespaceFilter] = useState<string[]>([]);
   // Origin is faceted in the browser (see OriginFacets) — it is the only filter here that must be
   // able to select ABSENCE, which an exact-match `RunQuery.origin` cannot express.
   const [originFilter, setOriginFilter] = useState<OriginFilter>(ALL_ORIGINS);
@@ -1528,11 +1532,8 @@ export function App() {
     };
   }, []);
   const qc = useQueryClient();
-  // Comma-separated `key:op:value` predicates (e.g. `amount:gte:200, tier:eq:pro`), ANDed server-side.
-  const attrPredicates = attrFilter
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
+  // `key:op:value` predicates (e.g. `amount:gte:200`, `tier:in:pro|enterprise`), ANDed server-side.
+  const attrPredicates = attrFilter;
   const {
     data: runsPages,
     isPending: runsPending,
@@ -1548,10 +1549,10 @@ export function App() {
     queryFn: ({ pageParam }) =>
       durableClient.runsPage(
         undefined,
-        tagFilter || undefined,
+        tagFilter.length ? tagFilter : undefined,
         attrPredicates.length ? attrPredicates : undefined,
-        // An empty box sends NO `namespace` param — all tenants, the historical default.
-        { namespace: namespaceFilter || undefined },
+        // An empty selection sends NO `namespace` param — all tenants, the historical default.
+        { namespace: namespaceFilter.length ? namespaceFilter : undefined },
         { limit: RUNS_PAGE_SIZE, offset: pageParam },
       ),
     initialPageParam: 0,
@@ -1580,9 +1581,9 @@ export function App() {
     mutationFn: (action: 'retry' | 'cancel') =>
       durableClient.bulk(action, {
         status: filter !== 'all' ? filter : undefined,
-        tag: tagFilter || undefined,
+        tag: tagFilter.length ? tagFilter : undefined,
         attr: attrPredicates.length ? attrPredicates : undefined,
-        namespace: namespaceFilter || undefined,
+        namespace: namespaceFilter.length ? namespaceFilter : undefined,
         // Only a CONCRETE origin can be pushed to the server; `unknown` has no `RunQuery` spelling,
         // which is exactly why the bulk buttons are disabled while it is selected (below) — sending
         // no param there would quietly widen a destructive action to every origin.
@@ -1604,10 +1605,37 @@ export function App() {
   const unattributed = unknownOriginCount(runs);
   const anyFilter =
     filter !== 'all' ||
-    Boolean(tagFilter) ||
-    Boolean(namespaceFilter) ||
+    tagFilter.length > 0 ||
+    namespaceFilter.length > 0 ||
     attrPredicates.length > 0 ||
     originFilter.kind !== 'all';
+  // What each picker OFFERS: the values these runs actually carry, counted server-side.
+  //
+  // Each picker's scope EXCLUDES its own axis. Including it would make the list collapse to what is
+  // already selected the moment an operator picks a value — a control that can only ever be narrowed
+  // once. Every other axis is included, so the offered values are the ones that would return runs.
+  // Status stays out of every scope (it is a client-side chip here, not a server predicate), and so
+  // does origin (the engine has no `origin` column — the server ignores it).
+  const tagScope = useMemo(
+    () => ({ namespace: namespaceFilter, attr: attrFilter }),
+    [namespaceFilter, attrFilter],
+  );
+  const namespaceScope = useMemo(
+    () => ({ tag: tagFilter, attr: attrFilter }),
+    [tagFilter, attrFilter],
+  );
+  const attrScope = useMemo(
+    () => ({ tag: tagFilter, namespace: namespaceFilter }),
+    [tagFilter, namespaceFilter],
+  );
+  // Clicking a run row's tag/tenant chip narrows by it — adding to the set rather than replacing it,
+  // so comparing two tags is one click, not a re-typing exercise.
+  const addTag = useCallback((tag: string) => {
+    setTagFilter((prev) => (prev.includes(tag) ? prev : [...prev, tag]));
+  }, []);
+  const addNamespace = useCallback((namespace: string) => {
+    setNamespaceFilter((prev) => (prev.includes(namespace) ? prev : [...prev, namespace]));
+  }, []);
   // Why "retry all"/"cancel all" are off, or `undefined` when they're fine. The `unknown` facet is
   // the one filter the server cannot be told about, so a bulk action launched under it would act on
   // runs that are NOT on screen. Refusing loudly beats acting wider than the operator can see.
@@ -1626,7 +1654,7 @@ export function App() {
   ];
   // Identity for the run list's `key` (see the `<RunsList key=…>` usage below) — every filter that
   // changes what `shown` contains, including the client-side-only status/origin ones.
-  const runsListResetKey = `${filter}|${tagFilter}|${attrPredicates.join(',')}|${namespaceFilter}|${originFilterKey(originFilter)}`;
+  const runsListResetKey = `${filter}|${tagFilter.join('|')}|${attrPredicates.join(',')}|${namespaceFilter.join('|')}|${originFilterKey(originFilter)}`;
 
   return (
     <TooltipProvider>
@@ -1648,44 +1676,37 @@ export function App() {
         <div className="grid min-h-0 flex-1 grid-cols-[minmax(300px,360px)_1fr]">
           <aside className="flex min-h-0 flex-col border-r border-line">
             <div className="border-b border-line p-2">
-              <InputField
+              <ValuePicker
+                field="tag"
+                scope={tagScope}
                 glyph="#"
-                value={tagFilter}
-                onChange={(e) => setTagFilter(e.target.value)}
-                onClear={() => setTagFilter('')}
-                clearLabel="clear tag filter"
+                label="filter by tag"
                 placeholder="filter by tag…"
-                aria-label="filter by tag"
+                value={tagFilter}
+                onChange={setTagFilter}
+                title="Tags carried by a run (WorkflowRun.tags). Several match ANY of them."
               />
-              <InputField
-                glyph="⛃"
-                containerClassName="mt-1.5"
-                value={attrFilter}
-                onChange={(e) => setAttrFilter(e.target.value)}
-                onClear={() => setAttrFilter('')}
-                clearLabel="clear attribute filter"
-                placeholder="attrs e.g. amount:gte:200, tier:eq:pro"
-                aria-label="filter by search attribute"
-                title="Typed search attributes: comma-separated key:op:value (ops eq ne gt gte lt lte)"
-              />
-              <InputField
-                glyph="@"
-                containerClassName="mt-1.5"
-                value={namespaceFilter}
-                onChange={(e) => setNamespaceFilter(e.target.value)}
-                onClear={() => setNamespaceFilter('')}
-                clearLabel="clear tenant filter"
-                placeholder="filter by tenant / namespace…"
-                aria-label="filter by tenant"
-                title="Tenant / worker-pool partition (WorkflowRun.namespace). Empty shows every tenant."
-              />
+              <div className="mt-1.5">
+                <ValuePicker
+                  field="namespace"
+                  scope={namespaceScope}
+                  glyph="@"
+                  label="filter by tenant"
+                  placeholder="filter by tenant / namespace…"
+                  value={namespaceFilter}
+                  onChange={setNamespaceFilter}
+                  title="Tenant / worker-pool partition (WorkflowRun.namespace). None selected shows every tenant."
+                />
+              </div>
+              <AttributeFilters value={attrFilter} onChange={setAttrFilter} scope={attrScope} />
             </div>
             <OriginFacets runs={runs} value={originFilter} onChange={setOriginFilter} />
             {anyFilter && shown.length > 0 && (
               <div className="flex items-center gap-2 border-b border-line px-3 py-1.5">
                 <span className="mono text-[10px] text-zinc-500">
-                  {shown.length} {filter !== 'all' ? filter : ''} {tagFilter && `#${tagFilter}`}
-                  {namespaceFilter && ` @${namespaceFilter}`}
+                  {shown.length} {filter !== 'all' ? filter : ''}{' '}
+                  {tagFilter.length > 0 && `#${tagFilter.join(', ')}`}
+                  {namespaceFilter.length > 0 && ` @${namespaceFilter.join(', ')}`}
                   {originFilter.kind === 'origin' && ` ⬡${originLabel(originFilter.origin)}`}
                   {originFilter.kind === 'unknown' && ` ⬡${UNKNOWN_ORIGIN}`}
                   {attrPredicates.length > 0 && ` ⛃${attrPredicates.length}`}
@@ -1727,8 +1748,8 @@ export function App() {
                 loading={runsPending}
                 selected={selected}
                 onSelect={setSelected}
-                onSelectTag={setTagFilter}
-                onSelectNamespace={setNamespaceFilter}
+                onSelectTag={addTag}
+                onSelectNamespace={addNamespace}
                 onSelectOrigin={setOriginFilter}
                 hasMore={hasNextPage}
                 loadingMore={isFetchingNextPage}

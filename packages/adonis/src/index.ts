@@ -108,6 +108,7 @@ export {
   type StoreRunGatewayOptions,
 } from './run-gateway/store-run-gateway.js';
 export { hmacTenantVerifier, signTenantToken } from './run-gateway/tenant-auth.js';
+export * from './run-value-facets.js';
 export * from './run-waiting.js';
 export * from './scheduler.js';
 export * from './search-attributes.js';

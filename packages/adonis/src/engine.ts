@@ -30,9 +30,13 @@ import type {
   NamedTransport,
   RemoteTask,
   RunDispatcher,
+  RunFacetQuery,
   RunQuery,
   RunResult,
   RunStatus,
+  RunValueAxis,
+  RunValueFacetOptions,
+  RunValueFacetRow,
   SearchAttributes,
   SignalWaiter,
   StateStore,
@@ -58,6 +62,7 @@ import { asHeartbeat } from './observability-scope.js';
 import { breakpointToken, stepId } from './protocol.js';
 import type { QueueConfig } from './queue.js';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor.js';
+import { scanRunValueFacets } from './run-value-facets.js';
 import type { ScheduledWorkflow } from './scheduler.js';
 import { SingletonGate } from './singleton-gate.js';
 import { sanitizeQueueToken, tenantGroup } from './tenant-group.js';
@@ -1118,6 +1123,23 @@ export class WorkflowEngine {
    */
   listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     return this.store.listRuns(query);
+  }
+
+  /**
+   * The distinct values of ONE filter axis over the runs matching `query`, with counts — what a
+   * console's pickers list. Delegates to the store when it implements the enumeration, else counts a
+   * bounded scan in-process (see `scanRunValueFacets`). Part of the engine's read API; see
+   * {@link listRuns}.
+   */
+  runValueFacets(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]> {
+    if (this.store.runValueFacets) {
+      return this.store.runValueFacets(axis, query, opts);
+    }
+    return scanRunValueFacets(this.store, axis, query, opts);
   }
 
   /** List a run's step checkpoints (its timeline). Part of the engine's read API; see {@link listRuns}. */

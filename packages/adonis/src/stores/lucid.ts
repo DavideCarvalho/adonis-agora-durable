@@ -5,16 +5,27 @@ import type {
 } from '@adonisjs/lucid/types/database';
 import type {
   AttributeFilter,
+  RunFacetQuery,
   RunQuery,
   RunStatus,
+  RunValueAxis,
+  RunValueFacetOptions,
+  RunValueFacetRow,
   SignalWaiter,
   StateStore,
   StepCheckpoint,
   WorkflowRun,
 } from '../interfaces.js';
 import {
+  axisIsRunColumn,
+  mergeRunValueFacetRows,
+  RUN_VALUE_FACET_LIMIT,
+  scanRunValueFacets,
+} from '../run-value-facets.js';
+import {
   attributeColumnFor,
   attributeOperand,
+  attributeOperands,
   normalizeAttributeRows,
   sqlComparator,
 } from '../search-attributes.js';
@@ -451,24 +462,7 @@ export class LucidStateStore implements StateStore {
   // --- dashboard queries --------------------------------------------------
 
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
-    const q = this.client().from(DURABLE_TABLES.runs);
-
-    if (query.workflow) q.where('workflow', query.workflow);
-    if (query.namespace !== undefined) q.where('namespace', query.namespace);
-    if (query.status) q.where('status', query.status);
-    if (query.statuses) {
-      // `status IN (...)`; an empty set matches nothing (mirrors the in-memory store).
-      if (query.statuses.length) q.whereIn('status', query.statuses);
-      else q.whereRaw('1 = 0');
-    }
-    // `tags` is stored as a JSON array string; match the quoted token so `etl` doesn't match `etl-foo`.
-    if (query.tag) q.where('tags', 'like', `%"${query.tag}"%`);
-
-    // Typed/range attribute predicates push DOWN into SQL via one EXISTS per filter against the
-    // normalized side-table — so the DB filters AND paginates, no full scan + in-process filter.
-    if (query.attributes?.length) {
-      for (const f of query.attributes) this.applyAttributeExists(q, f);
-    }
+    const q = this.scopedRuns(query);
 
     q.orderBy('created_at', 'desc'); // newest first — recent runs on top in the dashboard
     if (query.limit !== undefined) q.limit(query.limit);
@@ -479,13 +473,109 @@ export class LucidStateStore implements StateStore {
   }
 
   /**
+   * The distinct values of ONE filter axis over the runs matching `query`, with counts — what a
+   * console's pickers list.
+   *
+   * Column axes (`workflow`/`status`/`namespace`) are a `GROUP BY` over the whole matching set, so
+   * their counts are exact. `tag` and the attribute axes live in a JSON column and a side table with
+   * no portable expansion across SQLite/Postgres/MySQL, so they are counted in-process over a
+   * bounded scan of the newest matching runs — approximate by design (see `scanRunValueFacets`).
+   */
+  async runValueFacets(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]> {
+    const limit = Math.max(0, opts?.limit ?? RUN_VALUE_FACET_LIMIT);
+    if (limit === 0) return [];
+    if (!axisIsRunColumn(axis)) {
+      return scanRunValueFacets(this, axis, query, opts);
+    }
+    const column = axis.field;
+    const needle = opts?.search?.trim().toLowerCase();
+    const sub = this.scopedRuns(query).select('id');
+    const q = this.client()
+      .from(DURABLE_TABLES.runs)
+      .whereIn('id', sub)
+      .select(`${column} as value`)
+      .count('* as count')
+      .groupBy(column);
+    if (needle) q.andWhereRaw(`lower(${column}) like ?`, [`%${needle}%`]);
+    const rows = (await q) as Array<{ value: string | null; count: number | string }>;
+    return mergeRunValueFacetRows(
+      rows.map((row) => ({ value: row.value, count: Number(row.count) })),
+      { ...opts, search: undefined },
+    );
+  }
+
+  /**
+   * The runs matching `query`'s predicates (no ordering, no paging) — one source of truth shared by
+   * {@link listRuns} and {@link runValueFacets}, so the values a picker offers are counted over
+   * exactly the set the list would show.
+   */
+  private scopedRuns(query: RunFacetQuery & Pick<RunQuery, 'status' | 'statuses'>): AnyQuery {
+    const q: AnyQuery = this.client().from(DURABLE_TABLES.runs);
+
+    if (query.workflow) q.where('workflow', query.workflow);
+    if (query.workflows) {
+      // `workflow IN (...)`; an empty set matches nothing (mirrors the in-memory store).
+      if (query.workflows.length) q.whereIn('workflow', query.workflows);
+      else q.whereRaw('1 = 0');
+    }
+    if (query.namespace !== undefined) q.where('namespace', query.namespace);
+    if (query.namespaces) {
+      if (query.namespaces.length) q.whereIn('namespace', query.namespaces);
+      else q.whereRaw('1 = 0');
+    }
+    if (query.status) q.where('status', query.status);
+    if (query.statuses) {
+      // `status IN (...)`; an empty set matches nothing (mirrors the in-memory store).
+      if (query.statuses.length) q.whereIn('status', query.statuses);
+      else q.whereRaw('1 = 0');
+    }
+    // `tags` is stored as a JSON array string; match the quoted token so `etl` doesn't match `etl-foo`.
+    if (query.tag) q.where('tags', 'like', `%"${query.tag}"%`);
+    if (query.tags) {
+      if (query.tags.length) {
+        q.andWhere((or: AnyQuery) => {
+          for (const tag of query.tags as string[]) or.orWhere('tags', 'like', `%"${tag}"%`);
+        });
+      } else q.whereRaw('1 = 0');
+    }
+
+    // Typed/range attribute predicates push DOWN into SQL via one EXISTS per filter against the
+    // normalized side-table — so the DB filters AND paginates, no full scan + in-process filter.
+    if (query.attributes?.length) {
+      for (const f of query.attributes) this.applyAttributeExists(q, f);
+    }
+    return q;
+  }
+
+  /**
    * Add one attribute predicate as a correlated EXISTS subquery on the side-table. `<>` (ne) also
    * excludes runs where the attribute is absent (the missing-key-never-matches contract): EXISTS
    * already requires the key row present, so EXISTS(... <> ...) is exactly ne-with-present. Numeric
-   * operands compare `num_value`, everything else `str_value`.
+   * operands compare `num_value`, everything else `str_value`. `in` becomes one EXISTS with a
+   * `WHERE IN` over the set — an OR inside a single predicate, which ANDed `eq`s cannot express.
    */
   private applyAttributeExists(q: AnyQuery, f: AttributeFilter): void {
     const col = attributeColumnFor(f) === 'numValue' ? 'num_value' : 'str_value';
+    if (f.op === 'in') {
+      const operands = attributeOperands(f);
+      // An empty set matches nothing — and `WHERE IN ()` is invalid SQL, so spell it directly.
+      if (operands.length === 0) {
+        q.whereRaw('1 = 0');
+        return;
+      }
+      q.whereExists((sub: AnyQuery) => {
+        sub
+          .from(DURABLE_TABLES.attributes)
+          .whereRaw(`${DURABLE_TABLES.attributes}.run_id = ${DURABLE_TABLES.runs}.id`)
+          .andWhere(`${DURABLE_TABLES.attributes}.key`, f.key)
+          .whereIn(`${DURABLE_TABLES.attributes}.${col}`, operands);
+      });
+      return;
+    }
     const cmp = sqlComparator(f.op);
     const operand = attributeOperand(f);
     q.whereExists((sub: AnyQuery) => {

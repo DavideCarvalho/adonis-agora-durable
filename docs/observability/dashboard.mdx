@@ -126,28 +126,41 @@ The console routes client-side on the URL hash (`#/run/<id>`), so a deep link ne
 | Method | Route | Purpose |
 | --- | --- | --- |
 | `GET` | `/durable/api/runs` | list runs — see the filters below |
+| `GET` | `/durable/api/runs/values` | distinct values of one filter axis, with counts — what the pickers list |
 | `GET` | `/durable/api/runs/:id` | run detail: the run, its step `timeline`, and its `children` |
 | `GET` | `/durable/api/runs/:id/stream` | Server-Sent Events: this run's lifecycle events, live |
 
-`GET /api/runs` accepts:
+`GET /api/runs` accepts two spellings of the same filter, both served by the console's
+`RunFilter` class (a `BaseModelFilter` over a run-query draft):
+
+- the flat spelling the console has always sent: `?status=failed&tag=etl` (repeat a key for a
+  set: `?tag=etl&tag=nightly`), `attr` as `key:op:value` repeats;
+- the structured envelope `@adonis-agora/filter-client` builds: `filter[status]=failed`,
+  `filter[tag][]=etl&filter[tag][]=nightly`, `filter[attr]=tier:eq:enterprise`.
 
 | Param | Meaning |
 | --- | --- |
-| `status` | one of `pending`, `running`, `suspended`, `blocked`, `completed`, `failed`, `cancelled`, `dead`. An unrecognised value is ignored, not rejected. |
-| `workflow` | exact workflow-name match |
-| `tag` | exact match against the run's tags |
-| `namespace` | exact match against the run's [worker-pool namespace](/docs/durable/cluster/roles-and-config) — omit it and the listing spans every namespace |
-| `attr` | a [search-attribute](/docs/durable/authoring/queries-and-updates) filter, `key:op:value`. Repeatable, and repeats are ANDed. |
+| `status` | one of `pending`, `running`, `suspended`, `blocked`, `completed`, `failed`, `cancelled`, `dead`. An unrecognised value is ignored, not rejected. Repeat for a set. |
+| `workflow` | exact workflow-name match. Repeatable — repeats match ANY of them. |
+| `tag` | exact match against the run's tags. Repeatable — repeats match runs carrying ANY of them. |
+| `namespace` | exact match against the run's [worker-pool namespace](/docs/durable/cluster/roles-and-config) — omit it and the listing spans every namespace. Repeatable — repeats match ANY of them. |
+| `attr` | a [search-attribute](/docs/durable/authoring/queries-and-updates) filter, `key:op:value`. Repeatable, and repeats are ANDed — opaque in the envelope too (`filter[attr]`), since attribute keys are dynamic; `filter[attr.<key>][<op>]=value` works as well. |
 | `limit` | page size, default `50`, capped at `200` |
 | `offset` | page offset, default `0` |
 
-The `attr` ops are `eq`, `ne`, `gt`, `gte`, `lt`, `lte`. Values are coerced: `true`/`false` become booleans, anything numeric becomes a number, everything else stays a string. Only the first two colons delimit, so a value may contain colons of its own.
+The `attr` ops are `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in` — opaque through both spellings (`filter[attr.<key>]` takes the canonical `equals`/`notEquals`/`in`/`isAnyOf` aliases). Values are coerced: `true`/`false` become booleans, anything numeric becomes a number, everything else stays a string. Only the first two colons delimit, so a value may contain colons of its own. `in` takes a `|`-separated set (`tier:in:pro|enterprise`) and matches it as OR inside the one predicate — two `eq` predicates on one key are ANDed like every other pair, which no run can satisfy.
 
 ```
 GET /durable/api/runs?namespace=eu-west&attr=amount:gte:5000&attr=tier:eq:enterprise&status=failed
 ```
 
+A refused structured filter — unknown field, unsupported operator, a group the draft cannot express — answers `400` instead of silently widening. Unknown flat params stay ignored, so old callers (and endpoint mechanics like `limit`) keep working. (`static throwOnInvalid` on the filter class is what makes the envelope strict.)
+
 The response is `{ runs, page: { limit, offset, count }, statuses }`. `page.count` is how many rows this page returned, not a total — `count === limit` is the "there may be more" signal.
+
+#### The picker enumeration
+
+`GET /api/runs/values` answers what the console's tag, tenant and attribute pickers list: the distinct values one axis takes across the runs matching every OTHER active predicate, with counts — most common first, engine-minted tags (`singleton:<key>`) last. Served through the filter lib's `groupByCountFromRequest` with the console's adapter. The axis rides `groupByCount[field]` (`workflow`, `status`, `namespace`, `tag`, `attr` for the keys in use, `attr.<key>` for the values under one key — top-level `field` works too); the scope rides the same params as `GET /api/runs` (minus `status`, which is deliberately dropped so the offers don't collapse to the status being viewed). `limit` bounds the rows (default `100`, capped at `200`), `offset` pages them, `search` narrows them server-side — a rare value outside the first page stays reachable by typing. The response is a bare `[{ value, count }]` array.
 
 There is no separate checkpoints route: a run's step timeline comes back as the `timeline` array of `GET /api/runs/:id`, each entry carrying `seq`, `name`, `kind`, `status`, `attempts`, `workerGroup`, input/output/error, `events`, `parallelGroup`, and the derived `durationMs` / `queueMs`.
 
@@ -254,7 +267,7 @@ The routes are all named (`durable_dashboard.index`, `durable_dashboard.runs.sho
 
 ## What it shows
 
-- **Runs** — every run with its status, filterable by status, workflow, tag, namespace and search attribute. `pending` is a run created and enqueued but not yet picked up; a `dead` run carries a distinct badge so a [poison pill](/docs/durable/reliability/dead-letter) is easy to spot.
+- **Runs** — every run with its status, filterable by status, workflow, tag, namespace and search attribute. The tag, tenant and attribute filters are value pickers: they list what the runs actually contain (counted server-side over the rest of the active filter, searchable, paged), take several values at once, and still accept a typed value. `pending` is a run created and enqueued but not yet picked up; a `dead` run carries a distinct badge so a [poison pill](/docs/durable/reliability/dead-letter) is easy to spot.
 - **What a suspended run is waiting on** — a `suspended` run parked on a signal, a webhook callback, a child run or a breakpoint is surfaced as **waiting**, with what it is blocked on right in the row (`signal approve`, `child ord-42.child.0`, `breakpoint`). See below.
 - **Step timeline** — the selected run's steps in order, tagged by kind (local / remote / sleep / signal), with worker group, queue wait and duration. In-flight steps appear while they run, not only on completion — a remote step in flight reads as `pending`, and a local step's executing body as `running` (the [`trackStepStart`](/docs/durable/concepts/workflows-and-steps#in-flight-visibility) option).
 - **Live tail** — the open run streams its events over SSE, so a long run updates without a reload.

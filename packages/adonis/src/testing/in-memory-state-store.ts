@@ -1,12 +1,17 @@
 import type {
   AttributeFilter,
+  RunFacetQuery,
   RunQuery,
   RunStatus,
+  RunValueAxis,
+  RunValueFacetOptions,
+  RunValueFacetRow,
   SignalWaiter,
   StateStore,
   StepCheckpoint,
   WorkflowRun,
 } from '../interfaces.js';
+import { scanRunValueFacets } from '../run-value-facets.js';
 import { normalizeAttributeRows, type RunAttributeRow } from '../search-attributes.js';
 
 /**
@@ -274,6 +279,20 @@ export class InMemoryStateStore implements StateStore {
     const byRun = this.attributeIndex.get(f.key);
     const out = new Set<string>();
     if (!byRun) return out;
+    if (f.op === 'in') {
+      // A set predicate is an OR over its members: any row whose normalized value equals any member
+      // qualifies. An empty set matches nothing (mirrors `RunQuery.statuses`).
+      const numeric = f.values.every((v) => typeof v === 'number');
+      const operands = new Set(
+        f.values.map((v) => (typeof v === 'boolean' ? (v ? 'true' : 'false') : v)),
+      );
+      for (const row of byRun.values()) {
+        const actual = numeric ? row.numValue : row.strValue;
+        if (actual == null) continue;
+        if (operands.has(actual)) out.add(row.runId);
+      }
+      return out;
+    }
     const numeric = typeof f.value === 'number';
     const operand = typeof f.value === 'boolean' ? (f.value ? 'true' : 'false') : f.value;
     for (const row of byRun.values()) {
@@ -308,10 +327,30 @@ export class InMemoryStateStore implements StateStore {
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     let runs = [...this.runs.values()];
     if (query.workflow) runs = runs.filter((r) => r.workflow === query.workflow);
+    if (query.workflows) {
+      runs =
+        query.workflows.length === 0
+          ? []
+          : runs.filter((r) => query.workflows?.includes(r.workflow));
+    }
     if (query.namespace !== undefined) runs = runs.filter((r) => r.namespace === query.namespace);
+    if (query.namespaces) {
+      runs =
+        query.namespaces.length === 0
+          ? []
+          : runs.filter(
+              (r) => r.namespace !== undefined && query.namespaces?.includes(r.namespace),
+            );
+    }
     if (query.status) runs = runs.filter((r) => r.status === query.status);
     if (query.statuses) runs = runs.filter((r) => query.statuses?.includes(r.status));
     if (query.tag) runs = runs.filter((r) => r.tags?.includes(query.tag as string));
+    if (query.tags) {
+      runs =
+        query.tags.length === 0
+          ? []
+          : runs.filter((r) => r.tags?.some((t) => query.tags?.includes(t)));
+    }
     if (query.attributes?.length) {
       // Pushdown: intersect per-predicate candidate sets from the key-indexed side-table, so we only
       // ever materialize the runs that already satisfy EVERY attribute filter (no full per-run scan).
@@ -335,6 +374,20 @@ export class InMemoryStateStore implements StateStore {
     const offset = query.offset ?? 0;
     const limit = query.limit ?? runs.length;
     return runs.slice(offset, offset + limit).map((r) => ({ ...r }));
+  }
+
+  /**
+   * The distinct values of ONE filter axis over the runs matching `query`, with counts — what a
+   * console's pickers list. Counted in-process over a bounded scan of the newest matching runs (see
+   * {@link RUN_VALUE_FACET_SCAN}): this store holds everything in memory, so the scan is the whole
+   * answer here rather than an approximation.
+   */
+  async runValueFacets(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]> {
+    return scanRunValueFacets(this, axis, query, opts);
   }
 
   async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {
