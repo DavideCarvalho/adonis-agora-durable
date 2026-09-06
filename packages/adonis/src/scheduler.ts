@@ -47,6 +47,19 @@ export interface ScheduledWorkflow {
    * deterministic bucket run id, so `engine.start` idempotency skips any that already ran.
    */
   backfill?: { maxCatchup: number };
+  /**
+   * The worker-pool namespace this schedule's runs are STAMPED with, overriding the ticking engine's
+   * own namespace. Opt-in; absent = the run inherits the ticker engine's namespace (the historical
+   * behavior).
+   *
+   * Why: a colocated `static schedule` is discovered by EVERY `durable:work` process that loads the
+   * workflow, and the run id is a time bucket, so the pool that wins the race to fire the window is
+   * the pool the run would otherwise land in. When a workflow's steps can only run in one pool (e.g.
+   * a browser step that needs Chrome in a dedicated worker image), a pool WITHOUT that capability can
+   * win the race and produce a run it cannot execute. Pinning `namespace` here makes the fire
+   * deterministic: whoever ticks, the run is stamped for (and thus only polled/resumed by) this pool.
+   */
+  namespace?: string;
 }
 
 /**
@@ -54,7 +67,7 @@ export interface ScheduledWorkflow {
  * {@link ScheduledWorkflow}. `workflow` is derived from the class itself (its `static workflow.name`),
  * so it isn't repeated here; `key` is optional and defaults to the workflow name (or `${name}:${i}`
  * when the class declares several). Every other field (`cron`/`everyMs`/`timezone`/`paused`/`overlap`/
- * `jitter`/`backfill`/`input`) is identical to {@link ScheduledWorkflow}.
+ * `jitter`/`backfill`/`namespace`/`input`) is identical to {@link ScheduledWorkflow}.
  */
 export interface WorkflowScheduleConfig extends Omit<ScheduledWorkflow, 'workflow' | 'key'> {
   /** Stable key identifying this schedule — part of the deterministic run id. Defaults to the
@@ -255,7 +268,11 @@ export async function runSchedules(
       const existing = await engine.getRun(runId);
       remember(settled, s.key, runId);
       if (existing) continue;
-      await engine.start(s.workflow, s.input, runId);
+      // `namespace` pin (when set) stamps the target pool regardless of which engine ticks this
+      // window — so a capability-less pool winning the race can't strand the run in a pool that
+      // can't service it. Unset → `{ namespace: undefined }` → `startCore` falls back to the
+      // ticking engine's own namespace (historical behavior, byte-identical).
+      await engine.start(s.workflow, s.input, runId, { namespace: s.namespace });
       ids.push(runId);
     }
   }

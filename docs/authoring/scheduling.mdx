@@ -32,6 +32,8 @@ interface ScheduledWorkflow {
   jitter?: number
   /** Opt in to firing missed windows: at most `maxCatchup` of them. */
   backfill?: { maxCatchup: number }
+  /** Pin the fired runs to a worker-pool namespace, overriding the ticking engine's own. */
+  namespace?: string
 }
 ```
 
@@ -57,7 +59,7 @@ export default class DailyReportWorkflow extends BaseWorkflow {
 }
 ```
 
-`make:workflow` already scaffolds this line, commented out. Two fields are filled in for you, since the class already knows them: `workflow` is the registered name, and `key` defaults to that same name (or `<name>:<i>` when a class declares several). Everything else — `everyMs`, `cron`, `timezone`, `paused`, `overlap`, `jitter`, `backfill`, `input` — works exactly as above.
+`make:workflow` already scaffolds this line, commented out. Two fields are filled in for you, since the class already knows them: `workflow` is the registered name, and `key` defaults to that same name (or `<name>:<i>` when a class declares several). Everything else — `everyMs`, `cron`, `timezone`, `paused`, `overlap`, `jitter`, `backfill`, `namespace`, `input` — works exactly as above.
 
 Declare several cadences by passing an array:
 
@@ -232,6 +234,26 @@ When each window is genuinely distinct work (one report per day, one billing cyc
 ```
 
 Each backfilled window has its own time-bucket run id, so it is started exactly once just like a live window — and re-running the worker does not re-fire it.
+
+## Pinning the runs to a pool — `namespace`
+
+A colocated `static schedule` is discovered by **every** `durable:work` process that loads the workflow, and a run is stamped with the namespace of the engine that fires it. When a workflow's steps can only be serviced by one pool — browser steps needing Chrome in a dedicated worker image, a GPU pool, a tenant partition — that default is a race you lose: a pool *without* the capability can win the tick and strand the window in a pool that can never run it (the run's remote steps land on queues nobody polls, and it dies in `RemoteStepTimeout` or a missing-binary error).
+
+Pin the pool on the schedule and the fire becomes deterministic — whoever ticks, the run is stamped for (and thus polled and resumed only by) the named pool:
+
+```ts
+static schedule: WorkflowScheduleConfig = {
+  cron: '0 3 * * *',
+  timezone: 'America/Sao_Paulo',
+  namespace: 'bulas', // only the Chrome+Xvfb worker pool services these runs
+}
+```
+
+The pin only sets the run's namespace; it does not change the run id (still the window's time bucket), so the exactly-once guarantee across racing instances is untouched. Unset keeps the historical behavior — the run inherits the ticking engine's namespace.
+
+<Callout type="warning">
+Pin `namespace` to a pool you actually run a `durable:work` in. A pinned schedule whose pool is never started just leaves its windows `pending` forever — the same failure as a missing worker, now decoupled from which pool happened to win the tick.
+</Callout>
 
 ## Exactly-once across instances
 

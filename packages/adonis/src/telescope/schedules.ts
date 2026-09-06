@@ -25,19 +25,26 @@ export async function durableSchedules(ctx: ExtensionContext): Promise<ScheduleC
  * A paused schedule is still REPORTED: the console's job is to show what exists, and
  * silently omitting a paused job is how someone spends an afternoon wondering why
  * their cron "disappeared".
+ *
+ * The schedule's pinned `namespace` is surfaced as telescope's `pool` — the worker pool
+ * that actually services the schedule's runs (a schedule with no pin reports `null`, i.e.
+ * "whichever pool's tick wins fires it").
  */
 function toContribution(schedule: {
   key: string;
   cron?: string;
   everyMs?: number;
   timezone?: string;
+  namespace?: string;
 }): ScheduleContribution {
+  const pool = schedule.namespace ?? null;
   if (typeof schedule.cron === 'string') {
     return {
       name: schedule.key,
       kind: 'cron',
       schedule: schedule.cron,
       timezone: schedule.timezone ?? null,
+      pool,
     };
   }
   return {
@@ -45,6 +52,7 @@ function toContribution(schedule: {
     kind: 'interval',
     schedule: schedule.everyMs !== undefined ? formatInterval(schedule.everyMs) : null,
     timezone: null,
+    pool,
   };
 }
 

@@ -41,6 +41,8 @@ export interface ScheduleContribution {
   schedule?: string | null;
   kind?: 'cron' | 'interval' | 'custom';
   timezone?: string | null;
+  /** Worker pool servicing the schedule's runs (from the schedule's pinned `namespace`). */
+  pool?: string | null;
 }
 
 export interface ExtensionEntryType {
