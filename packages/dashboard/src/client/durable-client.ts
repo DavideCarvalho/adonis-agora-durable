@@ -123,6 +123,50 @@ export interface DurableTopology {
   tenant?: string;
 }
 
+/** One ticked schedule with its live control state — `GET /schedules`' rows, verbatim (the server
+ *  serializes the engine's `ScheduleInfo` as-is: the fire instants stay epoch ms, not ISO strings,
+ *  unlike a run row's `createdAt`). Exactly one of `cron`/`everyMs` is set per schedule. */
+export interface ScheduleInfo {
+  key: string;
+  workflow: string;
+  cron?: string;
+  everyMs?: number;
+  timezone?: string;
+  overlap?: 'allow' | 'skip';
+  namespace?: string;
+  /** Effective pause state: the runtime override when one was issued, else the config's `paused`. */
+  paused: boolean;
+  /** Whether the current pause state came from a runtime (console) override. */
+  pausedAtRuntime: boolean;
+  /** Epoch ms the current window fired (its deterministic bucket). */
+  lastFireAt: number;
+  /** Epoch ms of the next fire. */
+  nextFireAt: number;
+  /** The current window's deterministic run id (what "Run now" would start). */
+  currentWindowRunId: string;
+  /** The current window's run status, when that run exists. */
+  lastRunStatus?: RunStatus;
+}
+
+/** Outcome of `POST /runs/:id/update/:name` — the workflow's registered validator arbitrated
+ *  server-side. The rejected arm never reaches a caller of {@link durableClient.update}: the server
+ *  spells a rejection as a 422 whose body carries it, thrown as a {@link DurableActionError}. */
+export interface UpdateResult {
+  accepted: boolean;
+  reason?: string;
+  /** `null` = accepted and buffered (no live waiter yet — the run consumes it when it reaches
+   *  `ctx.onUpdate`), same reliable-delivery convention as a task completion's `delivered: false`. */
+  run?: RunResult | null;
+}
+
+/** A `ctx.task` completion/failure's answer: `delivered: false` means no waiter was live YET — the
+ *  outcome was BUFFERED and the run consumes it when it reaches the task's wait (reliable delivery,
+ *  see `handlers.ts`'s `completeTaskRun`), which is a success, not a miss. */
+export interface TaskDelivery {
+  result: RunResult | null;
+  delivered: boolean;
+}
+
 // ── Fleet compat (`GET /compat` — `packages/adonis/src/dashboard/compat.ts`'s response, verbatim) ──
 
 /** How one live worker's descriptor negotiated against the control plane (design §7.4). */
@@ -475,6 +519,71 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
+/**
+ * A refusal the console must READ, not just report: the human-in-the-loop verbs answer with
+ * structured bodies — `POST /runs/:id/signal`'s 409 carries `waitingOn` (the tokens the run IS
+ * parked on, offered as choices), `POST /runs/:id/update/:name`'s 422 carries the validator's
+ * `reason`. The plain {@link http} throws a bare status-line `Error` and drops the body; the verbs
+ * below throw this instead, body attached. `message` prefers the body's own `error` copy.
+ */
+export class DurableActionError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+    readonly body: unknown,
+  ) {
+    super(message);
+    this.name = 'DurableActionError';
+  }
+}
+
+/** The 409 body's `waitingOn` token list, when `error` is a {@link DurableActionError} carrying one
+ *  — what the deliver-signal dialog offers as selectable tokens after a typo'd/stale token. */
+export function waitingOnTokens(error: unknown): string[] | undefined {
+  if (!(error instanceof DurableActionError)) return undefined;
+  if (typeof error.body !== 'object' || error.body === null) return undefined;
+  const waitingOn = (error.body as { waitingOn?: unknown }).waitingOn;
+  if (!Array.isArray(waitingOn)) return undefined;
+  return waitingOn.filter((t): t is string => typeof t === 'string');
+}
+
+/** Same transport as {@link http}, but a non-OK answer throws a {@link DurableActionError} with the
+ *  parsed body attached (401 still redirects to the auth surface first, like every other request). */
+async function httpAction<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(apiBase() + path, init);
+  if (res.status === 401) {
+    redirectToAuthSurface(await readAuthModes(res));
+    throw new Error('Session expired; redirecting to sign-in.');
+  }
+  if (!res.ok) {
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch {
+      body = undefined;
+    }
+    const copy =
+      typeof body === 'object' &&
+      body !== null &&
+      typeof (body as { error?: unknown }).error === 'string'
+        ? (body as { error: string }).error
+        : `${res.status} ${res.statusText}`;
+    throw new DurableActionError(res.status, copy, body);
+  }
+  return (await res.json()) as T;
+}
+
+/** `POST` a JSON body (or none) through {@link httpAction}. `JSON.stringify` drops `undefined`
+ *  properties, so an empty payload/arg/result never reaches the wire as `null`. */
+function postAction<T>(path: string, body?: Record<string, unknown>): Promise<T> {
+  return httpAction<T>(path, {
+    method: 'POST',
+    ...(body !== undefined
+      ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+      : {}),
+  });
+}
+
 export interface RunFilterOptions {
   namespace?: string | string[] | undefined;
   /** One workflow narrows; several match ANY of them (the workflow picker's multi-select). */
@@ -647,6 +756,69 @@ export const durableClient = {
     );
     return res.result;
   },
+  /**
+   * Deliver an external signal payload on `token` — the human-in-the-loop verb for a run parked on
+   * `ctx.waitForSignal`. Guarded server-side: unless `force`, the token must be one the run is
+   * CURRENTLY waiting on; the 409 (a {@link DurableActionError}) carries `waitingOn`, the tokens it
+   * IS parked on — see {@link waitingOnTokens}. Omit `payload` to deliver nothing (`undefined`).
+   */
+  async signal(
+    id: string,
+    token: string,
+    payload?: unknown,
+    opts?: { force?: boolean },
+  ): Promise<RunResult> {
+    const res = await postAction<RunResponse>(`/runs/${encodeURIComponent(id)}/signal`, {
+      token,
+      payload,
+      ...(opts?.force ? { force: true } : {}),
+    });
+    return res.result;
+  },
+  /** Deliver a validated update to a run's `ctx.onUpdate(name)` point. The workflow's registered
+   *  validator arbitrates server-side — a rejection throws a 422 {@link DurableActionError} whose
+   *  message is the validator's reason, and nothing is delivered. */
+  async update(id: string, name: string, arg?: unknown): Promise<UpdateResult> {
+    const res = await postAction<{ result: UpdateResult }>(
+      `/runs/${encodeURIComponent(id)}/update/${encodeURIComponent(name)}`,
+      { arg },
+    );
+    return res.result;
+  },
+  /** Complete a `ctx.task` the run dispatched to an external system. `delivered: false` = buffered
+   *  (no live waiter yet — the run consumes it at the task's wait), not a failure. */
+  completeTask(id: string, name: string, result?: unknown): Promise<TaskDelivery> {
+    return postAction<TaskDelivery>(
+      `/runs/${encodeURIComponent(id)}/tasks/${encodeURIComponent(name)}/complete`,
+      { result },
+    );
+  },
+  /** Fail a `ctx.task` with a human reason. Same buffered-delivery semantics as {@link completeTask}. */
+  failTask(id: string, name: string, error: string): Promise<TaskDelivery> {
+    return postAction<TaskDelivery>(
+      `/runs/${encodeURIComponent(id)}/tasks/${encodeURIComponent(name)}/fail`,
+      { error },
+    );
+  },
+  /** The ticked schedules with live control state + fire windows (`GET /schedules`, unwrapped from
+   *  its `{ schedules }` envelope). 404s on a topology without runtime schedule control (a
+   *  store-less `tenant` pod) — the Schedules view gates on the topology role before asking. */
+  async schedules(): Promise<ScheduleInfo[]> {
+    const res = await http<{ schedules: ScheduleInfo[] }>('/schedules');
+    return res.schedules;
+  },
+  /** Pause/resume one schedule fleet-wide at runtime (`POST /schedules/:key/pause|resume`). */
+  setSchedulePaused(key: string, paused: boolean): Promise<{ key: string; paused: boolean }> {
+    return postAction<{ key: string; paused: boolean }>(
+      `/schedules/${encodeURIComponent(key)}/${paused ? 'pause' : 'resume'}`,
+    );
+  },
+  /** Fire a schedule's current window NOW (`POST /schedules/:key/trigger`). Returns the started
+   *  (or already-running deterministic) run, so the console can navigate straight to it. */
+  async triggerSchedule(key: string): Promise<RunResult> {
+    const res = await postAction<RunResponse>(`/schedules/${encodeURIComponent(key)}/trigger`);
+    return res.result;
+  },
   /** Live-tail a run's lifecycle events over SSE. Calls `onEvent` per event; returns a closer. */
   streamRun(id: string, onEvent: (event: EngineEvent) => void): () => void {
     const source = new EventSource(`${apiBase()}/runs/${encodeURIComponent(id)}/stream`);
@@ -671,7 +843,6 @@ export {
 } from './console-session.js';
 
 export { groupSubProcesses, type SubProcess } from './group-subprocesses.js';
-
 export {
   ALL_ORIGINS,
   type EmptyRunsNotice,
@@ -690,10 +861,10 @@ export {
   UNKNOWN_ORIGIN_TITLE,
   unknownOriginCount,
 } from './run-origin.js';
-
 export {
   type CompensationSummary,
   compensationDisplayName,
   compensationSummary,
   splitCompensations,
 } from './split-compensations.js';
+export { classifyWaitToken, type WaitTarget, waitTargetsOf } from './waiting-actions.js';

@@ -3,6 +3,7 @@ import type {
   DurableTopology,
   GroupHealth,
   RunDetail,
+  ScheduleInfo,
   StepCheckpoint,
   WorkflowRun,
 } from '../client/durable-client';
@@ -220,6 +221,37 @@ const runningTimeline: StepCheckpoint[] = [
   },
 ];
 
+/** The suspended run parked on the `approve` signal — the in-flight `signal` checkpoint carries the
+ *  TOKEN as its name (exactly what the engine persists for `ctx.waitForSignal('approve')`), so the
+ *  run detail's human-in-the-loop strip ("Deliver signal") renders and can be exercised end to end
+ *  against the mock's `/runs/:id/signal` below. */
+const suspendedTimeline: StepCheckpoint[] = [
+  {
+    runId: 'rep-8812cd44',
+    seq: 1,
+    name: 'buildReport',
+    kind: 'remote',
+    status: 'completed',
+    attempts: 1,
+    workerGroup: 'reports',
+    enqueuedAt: iso(-5_390_000),
+    startedAt: iso(-5_380_000),
+    finishedAt: iso(-5_310_000),
+    output: { rows: 1_240 },
+  },
+  {
+    runId: 'rep-8812cd44',
+    seq: 2,
+    name: 'approve',
+    kind: 'signal',
+    status: 'pending',
+    attempts: 1,
+    enqueuedAt: iso(-5_300_000),
+    startedAt: iso(-5_300_000),
+    finishedAt: iso(-300_000),
+  },
+];
+
 const detail: Record<string, RunDetail> = {
   'shp-01d4f7c9': { run: runs[3] as WorkflowRun, timeline: runningTimeline, children: [] },
   'ord-9f2c1a4b': {
@@ -227,6 +259,14 @@ const detail: Record<string, RunDetail> = {
     timeline: failedTimeline,
     children: [],
   },
+  'rep-8812cd44': { run: runs[5] as WorkflowRun, timeline: suspendedTimeline, children: [] },
+};
+
+/** Which signal tokens each suspended run is parked on — the mock's stand-in for the server's
+ *  waiter table, so `/runs/:id/signal` can answer the SAME guarded 409 (`waitingOn` attached) the
+ *  real handler does when the token isn't one the run is waiting for. */
+const waitersByRun: Record<string, string[]> = {
+  'rep-8812cd44': ['approve'],
 };
 
 const workers: GroupHealth[] = [
@@ -294,6 +334,53 @@ const workers: GroupHealth[] = [
 ];
 
 const topology: DurableTopology = { role: 'control-plane' };
+
+// Schedule fire windows are anchored to the PAGE LOAD instant, not the frozen T0: `next fire`
+// renders relative to the real clock, and a snapshot frozen weeks in the past would read `due now`
+// on every row — hiding exactly the column the preview exists to show.
+const NOW = Date.now();
+
+/** The `/schedules` snapshot: one cron schedule (whose current window is the suspended
+ *  `rep-8812cd44` above — its `last run` chip links there), one `everyMs` interval with a completed
+ *  window, and one PAUSED at runtime (the runtime-override hint). Mutable on purpose: the mock's
+ *  pause/resume/trigger POSTs below flip it so the preview behaves. */
+const schedules: ScheduleInfo[] = [
+  {
+    key: 'nightly-report',
+    workflow: 'nightlyReport',
+    cron: '0 3 * * *',
+    timezone: 'America/Sao_Paulo',
+    overlap: 'skip',
+    namespace: 'acme',
+    paused: false,
+    pausedAtRuntime: false,
+    lastFireAt: NOW - 6 * 3_600_000,
+    nextFireAt: NOW + 18 * 3_600_000,
+    currentWindowRunId: 'rep-8812cd44',
+    lastRunStatus: 'suspended',
+  },
+  {
+    key: 'ledger-sync',
+    workflow: 'invoiceSettlement',
+    everyMs: 300_000,
+    paused: false,
+    pausedAtRuntime: false,
+    lastFireAt: NOW - 120_000,
+    nextFireAt: NOW + 180_000,
+    currentWindowRunId: 'inv-2b91ee70',
+    lastRunStatus: 'completed',
+  },
+  {
+    key: 'carrier-poll',
+    workflow: 'shipmentSync',
+    everyMs: 30_000,
+    paused: true,
+    pausedAtRuntime: true,
+    lastFireAt: NOW - 45_000,
+    nextFireAt: NOW + 15_000,
+    currentWindowRunId: 'shp-window-0041',
+  },
+];
 
 /** The `/compat` fleet-health snapshot: one healthy negotiated pod, one INCOMPATIBLE pod (protocol
  *  majors that do not overlap), and the blocked run above with its captured capability delta — so
@@ -466,9 +553,98 @@ function valuesOf(run: WorkflowRun, field: string): Array<string | null> {
 /** A route's answer: an HTTP status + JSON payload, or `undefined` to pass through to real fetch. */
 type MockAnswer = { status: number; payload: unknown } | undefined;
 
-function body(path: string): MockAnswer {
+/** Settle a mocked run action: flip the snapshot run terminal and answer the `{ result }` envelope,
+ *  so the preview's list/detail visibly react to a delivered signal/update/task like the real thing. */
+function settleRun(id: string, status: WorkflowRun['status']): MockAnswer {
+  const run = runs.find((r) => r.id === id);
+  if (!run) return { status: 404, payload: { error: `run ${id} not found` } };
+  run.status = status;
+  delete run.waiting;
+  delete waitersByRun[id];
+  const parked = detail[id];
+  if (parked) {
+    for (const step of parked.timeline) {
+      if (step.kind === 'signal' && step.status === 'pending') {
+        step.status = status === 'failed' ? 'failed' : 'completed';
+      }
+    }
+  }
+  return { status: 200, payload: { result: { runId: id, status } } };
+}
+
+/** The mock's POST surface: the human-in-the-loop verbs + runtime schedule control, mirroring
+ *  `handlers.ts`'s guards (the signal 409 with `waitingOn`, the schedule 404) so the dialogs'
+ *  error paths are exercisable in the preview too. */
+function postBody(route: string, payload: Record<string, unknown>): MockAnswer {
+  const signal = route.match(/^\/runs\/([^/]+)\/signal$/);
+  if (signal) {
+    const id = decodeURIComponent(signal[1] as string);
+    const token = typeof payload.token === 'string' ? payload.token : '';
+    if (!token) return { status: 400, payload: { error: 'token is required' } };
+    const waitingOn = waitersByRun[id];
+    if (!runs.some((r) => r.id === id)) {
+      return { status: 404, payload: { error: `run ${id} not found` } };
+    }
+    if (payload.force !== true && waitingOn && !waitingOn.includes(token)) {
+      return {
+        status: 409,
+        payload: {
+          error: `run ${id} is not waiting on "${token}" (pass force: true to buffer it anyway)`,
+          waitingOn,
+        },
+      };
+    }
+    return settleRun(id, 'completed');
+  }
+  const update = route.match(/^\/runs\/([^/]+)\/update\/([^/]+)$/);
+  if (update) {
+    const id = decodeURIComponent(update[1] as string);
+    return settleRun(id, 'completed');
+  }
+  const task = route.match(/^\/runs\/([^/]+)\/tasks\/([^/]+)\/(complete|fail)$/);
+  if (task) {
+    const id = decodeURIComponent(task[1] as string);
+    const settled = settleRun(id, task[3] === 'fail' ? 'failed' : 'completed');
+    if (settled?.status !== 200) return settled;
+    return {
+      status: 200,
+      payload: { ...(settled.payload as Record<string, unknown>), delivered: true },
+    };
+  }
+  const schedule = route.match(/^\/schedules\/([^/]+)\/(pause|resume|trigger)$/);
+  if (schedule) {
+    const key = decodeURIComponent(schedule[1] as string);
+    const action = schedule[2] as 'pause' | 'resume' | 'trigger';
+    const entry = schedules.find((s) => s.key === key);
+    if (!entry) return { status: 404, payload: { error: `schedule ${key} not found` } };
+    if (action === 'trigger') {
+      entry.lastRunStatus = 'running';
+      return {
+        status: 200,
+        payload: { result: { runId: entry.currentWindowRunId, status: 'running' } },
+      };
+    }
+    entry.paused = action === 'pause';
+    entry.pausedAtRuntime = true;
+    return { status: 200, payload: { key, paused: entry.paused } };
+  }
+  return undefined;
+}
+
+function body(path: string, init?: RequestInit): MockAnswer {
   const [route, search] = path.split('?');
   const params = new URLSearchParams(search ?? '');
+  if ((init?.method ?? 'GET').toUpperCase() === 'POST') {
+    let payload: Record<string, unknown> = {};
+    try {
+      const raw = typeof init?.body === 'string' ? JSON.parse(init.body) : undefined;
+      if (typeof raw === 'object' && raw !== null) payload = raw as Record<string, unknown>;
+    } catch {
+      /* an unreadable body just means "no payload" — same leniency as the handlers' `?? {}` */
+    }
+    return postBody(route ?? '', payload);
+  }
+  if (route === '/schedules') return { status: 200, payload: { schedules } };
   if (route === '/runs') {
     // The real envelope (`{ runs, page, statuses}`), with the same predicate semantics as the
     // server — otherwise the tenant/tag/attr boxes in the preview would look broken, and a
@@ -546,7 +722,7 @@ export function installMockConsoleApi(): void {
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
     const match = url.match(/\/durable\/api(\/.*)$/);
-    const answer = match?.[1] ? body(match[1]) : undefined;
+    const answer = match?.[1] ? body(match[1], init) : undefined;
     if (answer === undefined) return real(input as RequestInfo, init);
     return new Response(JSON.stringify(answer.payload), {
       status: answer.status,

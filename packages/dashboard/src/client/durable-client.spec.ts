@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { deriveRunState, durableClient, type WorkflowRun } from './durable-client.js';
+import {
+  DurableActionError,
+  deriveRunState,
+  durableClient,
+  type WorkflowRun,
+  waitingOnTokens,
+} from './durable-client.js';
 
 /** A fake `Window`, just enough of the surface `durable-client.ts` touches. Shadows jsdom's real
  *  `window` for the scope of a test so a `location.href` assignment never triggers a real (jsdom)
@@ -87,6 +93,129 @@ describe('durableClient: unwrapping the AdonisJS backend response envelopes', ()
     );
     await expect(durableClient.compat()).resolves.toEqual(report);
     expect(calls[0]).toBe('/durable/api/compat');
+  });
+});
+
+describe('durableClient: human-in-the-loop verbs (signal / update / task) and schedules', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  function capture(response: () => Response): { calls: { url: string; init?: RequestInit }[] } {
+    const calls: { url: string; init?: RequestInit }[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string, init?: RequestInit) => {
+        calls.push({ url, ...(init !== undefined ? { init } : {}) });
+        return Promise.resolve(response());
+      }),
+    );
+    return { calls };
+  }
+
+  it('signal posts { token, payload } and unwraps the { result } envelope', async () => {
+    const { calls } = capture(() =>
+      jsonResponse({ result: { runId: 'r1', status: 'running' } }, 200),
+    );
+    await expect(durableClient.signal('r1', 'approve', { ok: true })).resolves.toEqual({
+      runId: 'r1',
+      status: 'running',
+    });
+    expect(calls[0]?.url).toBe('/durable/api/runs/r1/signal');
+    expect(JSON.parse(calls[0]?.init?.body as string)).toEqual({
+      token: 'approve',
+      payload: { ok: true },
+    });
+  });
+
+  it('an undefined payload never reaches the wire (JSON.stringify drops it — not sent as null)', async () => {
+    const { calls } = capture(() =>
+      jsonResponse({ result: { runId: 'r1', status: 'running' } }, 200),
+    );
+    await durableClient.signal('r1', 'approve');
+    expect(JSON.parse(calls[0]?.init?.body as string)).toEqual({ token: 'approve' });
+  });
+
+  it("a signal 409 throws a DurableActionError whose body carries the run's waitingOn tokens", async () => {
+    capture(() =>
+      jsonResponse({ error: 'run r1 is not waiting on "typo"', waitingOn: ['approve'] }, 409),
+    );
+    const failure = await durableClient.signal('r1', 'typo').then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(failure).toBeInstanceOf(DurableActionError);
+    expect((failure as DurableActionError).status).toBe(409);
+    expect((failure as DurableActionError).message).toBe('run r1 is not waiting on "typo"');
+    expect(waitingOnTokens(failure)).toEqual(['approve']);
+    // The helper answers undefined for anything that is not a token-carrying refusal.
+    expect(waitingOnTokens(new Error('plain'))).toBeUndefined();
+  });
+
+  it("an update 422 throws with the validator's reason as the message (nothing was delivered)", async () => {
+    const { calls } = capture(() =>
+      jsonResponse(
+        {
+          error: 'limit must be positive',
+          result: { accepted: false, reason: 'limit must be positive' },
+        },
+        422,
+      ),
+    );
+    await expect(durableClient.update('r1', 'set-limit', { limit: -1 })).rejects.toThrow(
+      'limit must be positive',
+    );
+    expect(calls[0]?.url).toBe('/durable/api/runs/r1/update/set-limit');
+  });
+
+  it('completeTask/failTask keep the { result, delivered } envelope — buffered is a success, not a miss', async () => {
+    const { calls } = capture(() => jsonResponse({ result: null, delivered: false }, 200));
+    await expect(durableClient.completeTask('r1', 'qa', { ok: true })).resolves.toEqual({
+      result: null,
+      delivered: false,
+    });
+    await expect(durableClient.failTask('r1', 'qa', 'rejected by reviewer')).resolves.toEqual({
+      result: null,
+      delivered: false,
+    });
+    expect(calls[0]?.url).toBe('/durable/api/runs/r1/tasks/qa/complete');
+    expect(calls[1]?.url).toBe('/durable/api/runs/r1/tasks/qa/fail');
+    expect(JSON.parse(calls[1]?.init?.body as string)).toEqual({ error: 'rejected by reviewer' });
+  });
+
+  it('schedules() unwraps GET /schedules { schedules } to the bare ScheduleInfo[]', async () => {
+    const row = {
+      key: 'nightly',
+      workflow: 'nightlyReport',
+      cron: '0 3 * * *',
+      paused: false,
+      pausedAtRuntime: false,
+      lastFireAt: 1,
+      nextFireAt: 2,
+      currentWindowRunId: 'w1',
+    };
+    const { calls } = capture(() => jsonResponse({ schedules: [row] }, 200));
+    await expect(durableClient.schedules()).resolves.toEqual([row]);
+    expect(calls[0]?.url).toBe('/durable/api/schedules');
+  });
+
+  it('setSchedulePaused posts pause/resume and triggerSchedule unwraps the started run', async () => {
+    const { calls } = capture(() =>
+      jsonResponse(
+        { key: 'nightly', paused: true, result: { runId: 'w1', status: 'running' } },
+        200,
+      ),
+    );
+    await durableClient.setSchedulePaused('nightly', true);
+    await durableClient.setSchedulePaused('nightly', false);
+    await expect(durableClient.triggerSchedule('nightly')).resolves.toEqual({
+      runId: 'w1',
+      status: 'running',
+    });
+    expect(calls.map((c) => c.url)).toEqual([
+      '/durable/api/schedules/nightly/pause',
+      '/durable/api/schedules/nightly/resume',
+      '/durable/api/schedules/nightly/trigger',
+    ]);
+    expect(calls.every((c) => c.init?.method === 'POST')).toBe(true);
   });
 });
 

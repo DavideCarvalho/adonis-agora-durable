@@ -14,6 +14,7 @@ import {
   type StepCheckpoint,
   type WorkerStatus,
   type WorkflowRun,
+  waitTargetsOf,
 } from '../client/durable-client';
 import { groupByPartition, type PartitionView } from '../client/group-by-partition';
 import { mergeLiveEvents } from '../client/merge-live-events';
@@ -43,6 +44,7 @@ import { BoltIcon, PlayIcon, RetryIcon, SearchIcon, UserIcon, XIcon } from './ic
 import { OriginFacets } from './OriginFacets';
 import { RunInfoPanel } from './RunInfoPanel';
 import { parentRunIdOf, retryOriginOf } from './run-lineage';
+import { SchedulesPanel } from './SchedulesPanel';
 import { SpansTimeline } from './SpansTimeline';
 import { StepDetailPanel } from './StepDetailPanel';
 import { badgeVariants, Badge as Chip } from './ui/badge';
@@ -54,7 +56,11 @@ import { Popover, PopoverContent, PopoverTrigger } from './ui/popover';
 import { Tabs, TabsList, TabsPanel, TabsTab } from './ui/tabs';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
 import { ValuePicker } from './ValuePicker';
+import { WaitingActions } from './WaitingActions';
 import { WorkflowGraph } from './WorkflowGraph';
+
+/** The console's top-level views: the runs board (list + detail) and the schedules table. */
+type ConsoleView = 'runs' | 'schedules';
 
 /** The durable brand mark — a workflow glyph: a rounded diamond with three connected nodes (a step
  *  flowing into the next), in currentColor so it inherits the `--accent` token. Replaces the bare `◆`. */
@@ -216,12 +222,16 @@ function Header({
   filter,
   onFilter,
   onOpenRun,
+  view,
+  onView,
 }: {
   /** The non-status predicates active right now — the chip counts are scoped by them. */
   scope: RunPredicates;
   filter: RunStatus | 'all';
   onFilter: (f: RunStatus | 'all') => void;
   onOpenRun: (id: string) => void;
+  view: ConsoleView;
+  onView: (view: ConsoleView) => void;
 }) {
   // Chip counts come from the SERVER (`/runs/values?field=status`, scoped by every other active
   // predicate) rather than a reduce over the loaded pages: the chips now drive a server-side status
@@ -290,10 +300,35 @@ function Header({
           </div>
         </div>
       </div>
-      <div className="ml-2 flex flex-wrap items-center gap-1">
-        {chip('all', 'all', total)}
-        {STATUSES.map((s) => chip(s, s, counts[s] ?? 0))}
-      </div>
+      {/* Top-level view nav, drawn like the status chips (plain pressed buttons, not Tabs — there is
+          no in-header panel to wire, the whole main area swaps). A tenant deployment never sees the
+          schedules entry: its gateway has no runtime schedule control, `GET /schedules` just 404s —
+          same role-is-the-capability-signal gating fix-and-replay uses. */}
+      <nav aria-label="console views" className="ml-2 flex items-center gap-1">
+        {(['runs', ...(isTenant ? [] : ['schedules' as const])] as ConsoleView[]).map((v) => (
+          <Button
+            key={v}
+            variant="ghost"
+            size="chip"
+            aria-pressed={view === v}
+            onClick={() => onView(v)}
+            className={cn(
+              'rounded-md uppercase tracking-wide',
+              view === v && 'border-zinc-600 bg-zinc-900 text-zinc-100 hover:text-zinc-100',
+            )}
+          >
+            {v}
+          </Button>
+        ))}
+      </nav>
+      {/* The status chips are a RUNS predicate — dead controls on the schedules view, so they only
+          render there. Everything else in the header (run-id search, workers, session) is global. */}
+      {view === 'runs' && (
+        <div className="flex flex-wrap items-center gap-1">
+          {chip('all', 'all', total)}
+          {STATUSES.map((s) => chip(s, s, counts[s] ?? 0))}
+        </div>
+      )}
       <RunIdSearch onOpenRun={onOpenRun} />
       <WorkersHealth onOpenRun={onOpenRun} />
       <div className="flex items-center gap-2 text-xs text-zinc-500">
@@ -1304,6 +1339,12 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   // The declaring package, or `undefined` for UNKNOWN — which the header states outright rather
   // than omitting, so "we don't know" never reads as "the app".
   const origin = knownOrigin(run.origin);
+  // What a human can DO about a suspended run's wait (deliver signal / send update / complete or
+  // fail a task). Tokens come from the timeline's in-flight signal checkpoints, with the run's
+  // list-row `waiting` stamp as fallback — the detail response itself carries no `waiting` (only
+  // `GET /runs` runs the bulk waiter scan), and the sibling list is already polled here anyway.
+  const listRowWaiting = siblingRuns.find((r) => r.id === run.id)?.waiting;
+  const waitTargets = run.status === 'suspended' ? waitTargetsOf(body, listRowWaiting) : [];
 
   return (
     <div className="flex h-full flex-col">
@@ -1522,6 +1563,14 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
           </Button>
         </div>
       )}
+      {waitTargets.length > 0 && (
+        <WaitingActions
+          runId={run.id}
+          targets={waitTargets}
+          tenantPod={tenantPod}
+          onDelivered={invalidate}
+        />
+      )}
       {compBanner && (
         <div className="flex items-center gap-3 border-b border-amber-500/30 bg-amber-500/10 px-7 py-3">
           <span
@@ -1667,6 +1716,9 @@ export function App() {
   const [originFilter, setOriginFilter] = useState<OriginFilter>(ALL_ORIGINS);
   // The open run lives in the URL hash so it survives reload and can be shared/linked.
   const [selected, setSelectedState] = useState<string | undefined>(() => runIdFromHash());
+  // Which top-level view fills the main area. Plain state (not the hash): the hash stays the run
+  // deep-link it has always been, and every run navigation below switches back to `runs` anyway.
+  const [view, setView] = useState<ConsoleView>('runs');
   const setSelected = useCallback((id?: string) => {
     setSelectedState(id);
     if (typeof window === 'undefined') return;
@@ -1674,6 +1726,15 @@ export function App() {
     const url = hash || window.location.pathname + window.location.search;
     if (window.location.hash !== hash) window.history.pushState(null, '', url);
   }, []);
+  // Every "open this run" affordance funnels here: opening a run from ANY view (a schedule row's
+  // last-run chip, "Run now", the header search) must land on the runs board, not behind it.
+  const openRun = useCallback(
+    (id?: string) => {
+      setView('runs');
+      setSelected(id);
+    },
+    [setSelected],
+  );
   // Follow back/forward and external hash edits.
   useEffect(() => {
     const sync = () => setSelectedState(runIdFromHash());
@@ -1869,7 +1930,14 @@ export function App() {
     <TooltipProvider>
       <div className="app-bg" />
       <div className="relative z-10 flex h-full flex-col">
-        <Header scope={statusScope} filter={filter} onFilter={setFilter} onOpenRun={setSelected} />
+        <Header
+          scope={statusScope}
+          filter={filter}
+          onFilter={setFilter}
+          onOpenRun={openRun}
+          view={view}
+          onView={setView}
+        />
         {stalledWorkflows.length > 0 && (
           <div className="flex items-center gap-2 border-b border-amber-500/30 bg-amber-500/10 px-4 py-1.5 text-[11px] text-amber-200">
             <span className="s-no-worker inline-flex items-center gap-1.5">
@@ -1882,121 +1950,127 @@ export function App() {
             </span>
           </div>
         )}
-        <div className="grid min-h-0 flex-1 grid-cols-[minmax(300px,360px)_1fr]">
-          <aside className="flex min-h-0 flex-col border-r border-line">
-            <div className="border-b border-line p-2">
-              <ValuePicker
-                field="workflow"
-                scope={workflowScope}
-                glyph="ƒ"
-                label="filter by workflow"
-                placeholder="filter by workflow…"
-                value={workflowFilter}
-                onChange={setWorkflowFilter}
-                title="Workflow handler names (WorkflowRun.workflow). Several match ANY of them."
-              />
-              <div className="mt-1.5">
-                <ValuePicker
-                  field="tag"
-                  scope={tagScope}
-                  glyph="#"
-                  label="filter by tag"
-                  placeholder="filter by tag…"
-                  value={tagFilter}
-                  onChange={setTagFilter}
-                  title="Tags carried by a run (WorkflowRun.tags). Several match ANY of them."
-                />
-              </div>
-              <div className="mt-1.5">
-                <ValuePicker
-                  field="namespace"
-                  scope={namespaceScope}
-                  glyph="@"
-                  label="filter by tenant"
-                  placeholder="filter by tenant / namespace…"
-                  value={namespaceFilter}
-                  onChange={setNamespaceFilter}
-                  title="Tenant / worker-pool partition (WorkflowRun.namespace). None selected shows every tenant."
-                />
-              </div>
-              <AttributeFilters value={attrFilter} onChange={setAttrFilter} scope={attrScope} />
-            </div>
-            <OriginFacets runs={runs} value={originFilter} onChange={setOriginFilter} />
-            {anyFilter && shown.length > 0 && (
-              <div className="flex items-center gap-2 border-b border-line px-3 py-1.5">
-                <span className="mono text-[10px] text-zinc-500">
-                  {shown.length} {filter !== 'all' ? filter : ''}{' '}
-                  {workflowFilter.length > 0 && `ƒ${workflowFilter.join(', ')}`}
-                  {tagFilter.length > 0 && ` #${tagFilter.join(', ')}`}
-                  {namespaceFilter.length > 0 && ` @${namespaceFilter.join(', ')}`}
-                  {originFilter.kind === 'origin' && ` ⬡${originLabel(originFilter.origin)}`}
-                  {originFilter.kind === 'unknown' && ` ⬡${UNKNOWN_ORIGIN}`}
-                  {attrPredicates.length > 0 && ` ⛃${attrPredicates.length}`}
-                </span>
-                <Button
-                  variant="brand"
-                  size="xs"
-                  disabled={bulk.isPending || bulkBlocked !== undefined}
-                  title={bulkBlocked}
-                  onClick={() => setConfirmBulk('retry')}
-                  className="mono ml-auto rounded"
-                >
-                  retry all
-                </Button>
-                <Button
-                  variant="danger"
-                  size="xs"
-                  disabled={bulk.isPending || bulkBlocked !== undefined}
-                  title={bulkBlocked}
-                  onClick={() => setConfirmBulk('cancel')}
-                  className="mono rounded"
-                >
-                  cancel all
-                </Button>
-              </div>
-            )}
-            {/* No `overflow-auto` here — `RunsList`'s virtualized root owns its own scroll container
-                (it needs a ref to the actual scrolling element), this just sizes the box it fills. */}
-            <div className="min-h-0 flex-1">
-              <RunsList
-                // Remounts on any filter change: cheap for this list size, and it's the simplest way
-                // to reset BOTH the virtualizer's scroll position and its row-height cache — a stale
-                // scroll offset from the pre-filter list would otherwise leave the view scrolled deep
-                // into a now much-shorter list.
-                key={runsListResetKey}
-                runs={shown}
-                allRuns={runs}
-                health={health}
-                loading={runsPending}
-                selected={selected}
-                onSelect={setSelected}
-                onSelectTag={addTag}
-                onSelectNamespace={addNamespace}
-                onSelectOrigin={setOriginFilter}
-                hasMore={hasNextPage}
-                loadingMore={isFetchingNextPage}
-                onLoadMore={fetchNextPage}
-                emptyNotice={emptyRunsNotice({
-                  anyFilter,
-                  origin: originFilter,
-                  unknownCount: unattributed,
-                })}
-              />
-            </div>
-          </aside>
-          <main className="min-h-0">
-            {selected ? (
-              <RunDetail key={selected} id={selected} onOpenRun={setSelected} />
-            ) : (
-              <div className="grid h-full place-items-center text-center">
-                <div className="flex flex-col items-center">
-                  <LogoMark className="h-10 w-10 text-zinc-800" />
-                  <p className="mt-3 text-sm text-zinc-600">Select a run to see its timeline.</p>
-                </div>
-              </div>
-            )}
+        {view === 'schedules' ? (
+          <main className="min-h-0 flex-1">
+            <SchedulesPanel onOpenRun={openRun} />
           </main>
-        </div>
+        ) : (
+          <div className="grid min-h-0 flex-1 grid-cols-[minmax(300px,360px)_1fr]">
+            <aside className="flex min-h-0 flex-col border-r border-line">
+              <div className="border-b border-line p-2">
+                <ValuePicker
+                  field="workflow"
+                  scope={workflowScope}
+                  glyph="ƒ"
+                  label="filter by workflow"
+                  placeholder="filter by workflow…"
+                  value={workflowFilter}
+                  onChange={setWorkflowFilter}
+                  title="Workflow handler names (WorkflowRun.workflow). Several match ANY of them."
+                />
+                <div className="mt-1.5">
+                  <ValuePicker
+                    field="tag"
+                    scope={tagScope}
+                    glyph="#"
+                    label="filter by tag"
+                    placeholder="filter by tag…"
+                    value={tagFilter}
+                    onChange={setTagFilter}
+                    title="Tags carried by a run (WorkflowRun.tags). Several match ANY of them."
+                  />
+                </div>
+                <div className="mt-1.5">
+                  <ValuePicker
+                    field="namespace"
+                    scope={namespaceScope}
+                    glyph="@"
+                    label="filter by tenant"
+                    placeholder="filter by tenant / namespace…"
+                    value={namespaceFilter}
+                    onChange={setNamespaceFilter}
+                    title="Tenant / worker-pool partition (WorkflowRun.namespace). None selected shows every tenant."
+                  />
+                </div>
+                <AttributeFilters value={attrFilter} onChange={setAttrFilter} scope={attrScope} />
+              </div>
+              <OriginFacets runs={runs} value={originFilter} onChange={setOriginFilter} />
+              {anyFilter && shown.length > 0 && (
+                <div className="flex items-center gap-2 border-b border-line px-3 py-1.5">
+                  <span className="mono text-[10px] text-zinc-500">
+                    {shown.length} {filter !== 'all' ? filter : ''}{' '}
+                    {workflowFilter.length > 0 && `ƒ${workflowFilter.join(', ')}`}
+                    {tagFilter.length > 0 && ` #${tagFilter.join(', ')}`}
+                    {namespaceFilter.length > 0 && ` @${namespaceFilter.join(', ')}`}
+                    {originFilter.kind === 'origin' && ` ⬡${originLabel(originFilter.origin)}`}
+                    {originFilter.kind === 'unknown' && ` ⬡${UNKNOWN_ORIGIN}`}
+                    {attrPredicates.length > 0 && ` ⛃${attrPredicates.length}`}
+                  </span>
+                  <Button
+                    variant="brand"
+                    size="xs"
+                    disabled={bulk.isPending || bulkBlocked !== undefined}
+                    title={bulkBlocked}
+                    onClick={() => setConfirmBulk('retry')}
+                    className="mono ml-auto rounded"
+                  >
+                    retry all
+                  </Button>
+                  <Button
+                    variant="danger"
+                    size="xs"
+                    disabled={bulk.isPending || bulkBlocked !== undefined}
+                    title={bulkBlocked}
+                    onClick={() => setConfirmBulk('cancel')}
+                    className="mono rounded"
+                  >
+                    cancel all
+                  </Button>
+                </div>
+              )}
+              {/* No `overflow-auto` here — `RunsList`'s virtualized root owns its own scroll container
+                (it needs a ref to the actual scrolling element), this just sizes the box it fills. */}
+              <div className="min-h-0 flex-1">
+                <RunsList
+                  // Remounts on any filter change: cheap for this list size, and it's the simplest way
+                  // to reset BOTH the virtualizer's scroll position and its row-height cache — a stale
+                  // scroll offset from the pre-filter list would otherwise leave the view scrolled deep
+                  // into a now much-shorter list.
+                  key={runsListResetKey}
+                  runs={shown}
+                  allRuns={runs}
+                  health={health}
+                  loading={runsPending}
+                  selected={selected}
+                  onSelect={setSelected}
+                  onSelectTag={addTag}
+                  onSelectNamespace={addNamespace}
+                  onSelectOrigin={setOriginFilter}
+                  hasMore={hasNextPage}
+                  loadingMore={isFetchingNextPage}
+                  onLoadMore={fetchNextPage}
+                  emptyNotice={emptyRunsNotice({
+                    anyFilter,
+                    origin: originFilter,
+                    unknownCount: unattributed,
+                  })}
+                />
+              </div>
+            </aside>
+            <main className="min-h-0">
+              {selected ? (
+                <RunDetail key={selected} id={selected} onOpenRun={openRun} />
+              ) : (
+                <div className="grid h-full place-items-center text-center">
+                  <div className="flex flex-col items-center">
+                    <LogoMark className="h-10 w-10 text-zinc-800" />
+                    <p className="mt-3 text-sm text-zinc-600">Select a run to see its timeline.</p>
+                  </div>
+                </div>
+              )}
+            </main>
+          </div>
+        )}
       </div>
       {/* Confirmation before a bulk action: the action + the exact filter it will be scoped by,
           because it reaches EVERY server-side match (capped at the first 500), not just the loaded
