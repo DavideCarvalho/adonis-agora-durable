@@ -273,11 +273,13 @@ export class LucidStateStore implements StateStore {
     return rowsAffected(affected) === 1;
   }
 
-  async releaseRunLock(runId: string): Promise<void> {
-    await this.client()
-      .from(DURABLE_TABLES.runs)
-      .where('id', runId)
-      .update({ locked_by: null, locked_until: null });
+  async releaseRunLock(runId: string, owner?: string): Promise<void> {
+    // Owner-scoped release (when `owner` is given): the `locked_by` predicate lives in the UPDATE's
+    // WHERE clause, so a stale executor whose lease was taken over matches zero rows and cannot
+    // wipe the new owner's lease — same conditional-write shape as renewRunLock.
+    const q = this.client().from(DURABLE_TABLES.runs).where('id', runId);
+    if (owner !== undefined) q.andWhere('locked_by', owner);
+    await q.update({ locked_by: null, locked_until: null });
   }
 
   async renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {

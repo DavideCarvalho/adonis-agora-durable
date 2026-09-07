@@ -581,7 +581,37 @@ export function createWorkflowCtx(
       );
       return unwrapCompletion<T>(buffered.payload, `child "${id}"`);
     }
-    if (!(await store.getRun(id))) host.startChild(workflowName(workflow), input, id, priority);
+    const childRun = await store.getRun(id);
+    if (!childRun) {
+      host.startChild(workflowName(workflow), input, id, priority);
+    } else if (
+      childRun.status === 'completed' ||
+      childRun.status === 'failed' ||
+      childRun.status === 'cancelled' ||
+      childRun.status === 'dead'
+    ) {
+      // Durable lost-notify recovery: the child is ALREADY terminal but neither a live signal nor a
+      // buffered completion reached this waiter — the child's `notifyParent` write was lost (crash
+      // between the child's terminal write and the signal insert, or a swallowed store error). The
+      // signal was the MESSENGER; the child's run row is the durable source of truth, so re-derive
+      // the exact completion `notifyParent` would have delivered and resolve the wait from it.
+      // Without this, every reconcile re-drive replays back here and re-suspends forever.
+      const completion =
+        childRun.status === 'completed'
+          ? { ok: true as const, value: childRun.output }
+          : { ok: false as const, error: childRun.error?.message ?? childRun.status };
+      await store.removeSignalWaiter({ token: `child:${id}`, runId, seq: current });
+      await writeCheckpoint(
+        instantCheckpoint({
+          runId,
+          seq: current,
+          name: `signal:child:${id}`,
+          kind: 'signal',
+          output: completion,
+        }),
+      );
+      return unwrapCompletion<T>(completion, `child "${id}"`);
+    }
     // Make the awaited child visible in the parent's timeline WHILE it runs: a `running` placeholder
     // at this seq with the same `signal:child:<id>` name the signal resolution later overwrites as
     // `completed`. So the dashboard shows the child node (and can inline-expand it) live, instead of
@@ -651,7 +681,6 @@ export function createWorkflowCtx(
     for (let i = 0; i < inputs.length; i += 1) {
       const cp = existing[i];
       if (cp?.status === 'completed') continue;
-      pending = true;
       const seq = positions[i] as number;
       const childId = id(i);
       // Carry the fan `group` onto the waiter too: the child's terminal `signal:child:` checkpoint is
@@ -659,7 +688,46 @@ export function createWorkflowCtx(
       // placeholder below at the same seq — so without this the resolved checkpoint would lose the
       // group and the dashboard would render the resolved fan as a sequential chain.
       await store.putSignalWaiter({ token: `child:${childId}`, runId, seq, parallelGroup: group });
-      if (!(await store.getRun(childId))) host.startChild(name, inputs[i], childId);
+      // Lost-wake guard (mirrors `child` above): a fan item's completion may have fired while no
+      // waiter was registered (this run replaying after a crash/failure) — consume the BUFFERED copy,
+      // or, if even that was lost, re-derive the completion from the child's own terminal run row.
+      // Without this a re-driven fan re-registers its waiters and waits forever on signals that
+      // already fired.
+      const resolve = async (payload: unknown): Promise<StepCheckpoint> => {
+        await store.removeSignalWaiter({ token: `child:${childId}`, runId, seq });
+        const resolved = instantCheckpoint({
+          runId,
+          seq,
+          name: `signal:child:${childId}`,
+          kind: 'signal',
+          output: payload,
+          parallelGroup: group,
+        });
+        await writeCheckpoint(resolved);
+        return resolved;
+      };
+      const buffered = await store.takeBufferedSignal(`child:${childId}`);
+      if (buffered) {
+        existing[i] = await resolve(buffered.payload);
+        continue;
+      }
+      const childRun = await store.getRun(childId);
+      if (!childRun) {
+        host.startChild(name, inputs[i], childId);
+      } else if (
+        childRun.status === 'completed' ||
+        childRun.status === 'failed' ||
+        childRun.status === 'cancelled' ||
+        childRun.status === 'dead'
+      ) {
+        existing[i] = await resolve(
+          childRun.status === 'completed'
+            ? { ok: true, value: childRun.output }
+            : { ok: false, error: childRun.error?.message ?? childRun.status },
+        );
+        continue;
+      }
+      pending = true;
       if (!cp) {
         await writeCheckpoint(
           instantCheckpoint({

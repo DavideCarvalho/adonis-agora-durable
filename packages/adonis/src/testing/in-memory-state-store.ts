@@ -58,6 +58,11 @@ export class InMemoryStateStore implements StateStore {
   }
 
   async createRun(run: WorkflowRun): Promise<void> {
+    // Duplicate ids throw, mirroring the SQL stores' primary-key violation — the engine relies on
+    // that to make racing `start`s converge on one run instead of silently overwriting the winner.
+    if (this.runs.has(run.id)) {
+      throw new Error(`run ${run.id} already exists`);
+    }
     // Normalize an undefined namespace to 'default', matching the SQL stores' column DEFAULT 'default'
     // — so a run created directly against this store (bypassing the engine, e.g. in tests) is still
     // reachable via a namespace='default' filter and partitions consistently.
@@ -171,12 +176,14 @@ export class InMemoryStateStore implements StateStore {
     return true;
   }
 
-  async releaseRunLock(runId: string): Promise<void> {
+  async releaseRunLock(runId: string, owner?: string): Promise<void> {
     const run = this.runs.get(runId);
-    if (run) {
-      run.lockedBy = undefined;
-      run.lockedUntil = undefined;
-    }
+    if (!run) return;
+    // Owner-scoped release: a stale executor whose lease was taken over must not wipe the new
+    // owner's lease (same single-threaded atomicity reasoning as renewRunLock).
+    if (owner !== undefined && run.lockedBy !== owner) return;
+    run.lockedBy = undefined;
+    run.lockedUntil = undefined;
   }
 
   async renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {

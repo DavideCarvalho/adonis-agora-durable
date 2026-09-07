@@ -220,6 +220,9 @@ export default class DurableProvider {
         ...(config.compensationRetries !== undefined
           ? { compensationRetries: config.compensationRetries }
           : {}),
+        ...(config.compensationTimeoutMs !== undefined
+          ? { compensationTimeoutMs: config.compensationTimeoutMs }
+          : {}),
         // Fleet-wide flow control: the configured admission backend replaces the engine's in-process
         // default, so `{ queue }` caps count across every replica instead of per pod.
         ...(admission ? { admission } : {}),

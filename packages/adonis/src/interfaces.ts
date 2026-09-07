@@ -128,6 +128,13 @@ export interface StepCheckpoint {
   attempts: number;
   /** For remote steps: which worker group ran it. */
   workerGroup?: string | undefined;
+  /**
+   * For a dispatched step admitted through a flow-control queue: the queue whose slot it holds.
+   * Persisted on the `pending` checkpoint so the slot can be released by WHICHEVER instance
+   * receives the result (multi-pod deployments share the results queue — an in-memory map on the
+   * dispatching pod would leak the slot when another pod completes the step).
+   */
+  queue?: string | undefined;
   /** Structured events/logs the step emitted (sub-step outcomes, debug/error lines). */
   events?: StepEvent[] | undefined;
   /** For sleep steps: epoch ms the sleep elapses at. */
@@ -280,6 +287,13 @@ export interface StateStore {
    */
   ensureSchema?(): Promise<void>;
 
+  /**
+   * Persist a NEW run. MUST reject a duplicate id (throw — a SQL store's primary-key violation is
+   * exactly right) rather than overwrite: the engine treats the throw as "someone else already
+   * started this id", re-reads the existing run and returns its state, which is what makes
+   * `start`/`signalWithStart`/scheduler double-fires converge on one run instead of forking or
+   * clobbering the winner's state.
+   */
   createRun(run: WorkflowRun): Promise<void>;
   updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void>;
 
@@ -345,8 +359,18 @@ export interface StateStore {
    */
   tryLockRun(runId: string, owner: string, leaseUntilMs: number, nowMs: number): Promise<boolean>;
 
-  /** Release a run's recovery lease so another instance can pick it up (e.g. once it suspends). */
-  releaseRunLock(runId: string): Promise<void>;
+  /**
+   * Release a run's recovery lease so another instance can pick it up (e.g. once it suspends).
+   *
+   * When `owner` is given, release ONLY if that owner still holds the lease (a conditional write,
+   * atomic like {@link renewRunLock}) — so an executor whose lease was already taken over (its turn
+   * outlived the lease and another instance re-acquired) cannot wipe the NEW owner's lease and open
+   * the door to a third concurrent executor. Omit `owner` only for an operator-style unconditional
+   * clear (e.g. `requeue`'s explicit stale-lease reset). A store implemented against the older
+   * single-argument signature simply ignores `owner` — that degrades to the previous (unfenced)
+   * behavior, never breaks.
+   */
+  releaseRunLock(runId: string, owner?: string): Promise<void>;
 
   /**
    * Extend a run's lease to `leaseUntilMs`, but ONLY if `owner` still holds it — so a live worker

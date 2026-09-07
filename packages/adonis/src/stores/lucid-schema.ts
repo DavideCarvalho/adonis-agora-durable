@@ -145,6 +145,7 @@ export async function createDurableTables(
       table.text('events');
       table.integer('attempts').notNullable();
       table.string('worker_group');
+      table.string('queue');
       table.bigInteger('wake_at');
       table.string('parallel_group');
       table.bigInteger('enqueued_at');
@@ -177,6 +178,15 @@ export async function createDurableTables(
         `${DURABLE_TABLES.checkpoints}.last_heartbeat_at`,
         `${DURABLE_TABLES.checkpoints}.heartbeat_progress`,
       );
+    }
+    if (!(await conn().hasColumn(DURABLE_TABLES.checkpoints, 'queue'))) {
+      // Durable flow-control release: the admitted queue is persisted on the pending checkpoint so
+      // ANY instance receiving the result can free the slot. Nullable — a non-queued step reads back
+      // with no slot to release.
+      await conn().alterTable(DURABLE_TABLES.checkpoints, (table) => {
+        table.string('queue');
+      });
+      repairs.push(`${DURABLE_TABLES.checkpoints}.queue`);
     }
   }
 

@@ -148,6 +148,18 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.getRun('nope')).toBeNull();
     });
 
+    t(
+      'createRun rejects a duplicate id (the engine converges racing starts on the winner)',
+      async () => {
+        await store.createRun(run({ status: 'completed', output: { total: 1 } }));
+        await expect(store.createRun(run())).rejects.toThrow();
+        // The winner's state was not clobbered by the losing insert.
+        const winner = await store.getRun('r1');
+        expect(winner?.status).toBe('completed');
+        expect(winner?.output).toEqual({ total: 1 });
+      },
+    );
+
     t('updates a run (status/output) and round-trips recoveryAttempts + dead status', async () => {
       await store.createRun(run({ recoveryAttempts: 3 }));
       await store.updateRun('r1', {
@@ -438,6 +450,22 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       await store.releaseRunLock('r1');
       expect(await store.tryLockRun('r1', 'C', 9_000, 2_600)).toBe(true);
     });
+
+    t(
+      'releaseRunLock with an owner only releases that owner’s lease (zombie fencing)',
+      async () => {
+        await store.createRun(run({ id: 'r1' }));
+        expect(await store.tryLockRun('r1', 'A', 2_000, 1_000)).toBe(true);
+        // A's lease expires; B takes over.
+        expect(await store.tryLockRun('r1', 'B', 9_000, 2_500)).toBe(true);
+        // Zombie A's owner-scoped release must NOT wipe B's live lease…
+        await store.releaseRunLock('r1', 'A');
+        expect(await store.tryLockRun('r1', 'C', 9_500, 3_000)).toBe(false);
+        // …while B's own owner-scoped release does free it.
+        await store.releaseRunLock('r1', 'B');
+        expect(await store.tryLockRun('r1', 'C', 9_500, 3_100)).toBe(true);
+      },
+    );
 
     t('renewRunLock only succeeds for the current owner', async () => {
       await store.createRun(run({ id: 'r1' }));

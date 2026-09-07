@@ -157,6 +157,12 @@ export interface BaseDurableConfig {
   maxRecoveryAttempts?: number;
   /** Attempts per saga compensation on run failure. Default 1. */
   compensationRetries?: number;
+  /**
+   * Upper bound (ms) on awaiting one dispatched saga compensation's worker result when its step def
+   * has no liveness `timeoutMs`. On timeout the attempt fails like any other undo failure (retried
+   * up to `compensationRetries`, then skipped loudly). Default 300 000 (5 min).
+   */
+  compensationTimeoutMs?: number;
   /** Where a freshly-started run executes. Defaults to in-process (microtask). */
   runDispatcher?: RunDispatcher;
   /**

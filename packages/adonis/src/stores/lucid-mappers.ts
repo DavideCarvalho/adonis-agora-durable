@@ -48,6 +48,9 @@ export interface CheckpointRow {
   events: string | null;
   attempts: number | string;
   worker_group: string | null;
+  /** Nullable + optional: the column arrived in a later schema wave (durable flow-control release);
+   *  rows selected on an un-migrated/older schema simply don't carry it. */
+  queue?: string | null;
   wake_at: number | string | null;
   parallel_group: string | null;
   enqueued_at: number | string | null;
@@ -183,6 +186,7 @@ export function checkpointToRow(cp: StepCheckpoint): CheckpointRow {
     events: toJson(cp.events),
     attempts: cp.attempts,
     worker_group: cp.workerGroup ?? null,
+    queue: cp.queue ?? null,
     wake_at: cp.wakeAt ?? null,
     parallel_group: cp.parallelGroup ?? null,
     enqueued_at: (cp.enqueuedAt ?? cp.startedAt).getTime(),
@@ -212,6 +216,7 @@ export function rowToCheckpoint(row: CheckpointRow): StepCheckpoint {
   const events = fromJson<StepEvent[]>(row.events);
   if (events !== undefined) cp.events = events;
   if (row.worker_group != null) cp.workerGroup = row.worker_group;
+  if (row.queue != null) cp.queue = row.queue;
   const wakeAt = toNum(row.wake_at);
   if (wakeAt !== undefined) cp.wakeAt = wakeAt;
   if (row.parallel_group != null) cp.parallelGroup = row.parallel_group;

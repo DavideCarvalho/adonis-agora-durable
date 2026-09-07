@@ -119,8 +119,8 @@ export class CodecStateStore implements StateStore {
   tryLockRun(runId: string, owner: string, leaseUntilMs: number, nowMs: number): Promise<boolean> {
     return this.inner.tryLockRun(runId, owner, leaseUntilMs, nowMs);
   }
-  releaseRunLock(runId: string): Promise<void> {
-    return this.inner.releaseRunLock(runId);
+  releaseRunLock(runId: string, owner?: string): Promise<void> {
+    return this.inner.releaseRunLock(runId, owner);
   }
   renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {
     return this.inner.renewRunLock(runId, owner, leaseUntilMs);
