@@ -88,6 +88,23 @@ export function PlayIcon(p: SVGProps<SVGSVGElement>) {
   );
 }
 
+export function SearchIcon(p: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...p} aria-hidden="true">
+      <circle cx="11" cy="11" r="7" />
+      <path d="m20 20-4-4" />
+    </svg>
+  );
+}
+export function UserIcon(p: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...p} aria-hidden="true">
+      <circle cx="12" cy="8" r="4" />
+      <path d="M4 20a8 8 0 0 1 16 0" />
+    </svg>
+  );
+}
+
 /** A child-workflow glyph (a branch forking off to a sub-run). */
 export function ChildIcon(p: SVGProps<SVGSVGElement>) {
   return (

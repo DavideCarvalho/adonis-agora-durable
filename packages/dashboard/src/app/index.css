@@ -206,6 +206,13 @@ body {
 .s-no-worker {
   color: #fb923c;
 }
+/* Blocked (first-class engine status): parked because no COMPATIBLE worker exists — a protocol or
+   capability mismatch (see the compat panel), which starting another worker of the same old build
+   cannot fix. Same warm act-on-this orange as `s-no-worker`, and deliberately not the terminal red
+   of `failed`/`dead`: a blocked run resumes on its own once a compatible worker joins. */
+.s-blocked {
+  color: #fb923c;
+}
 /* Queued behind a singleton leader: fine, just waiting its turn — a muted violet, not an alarm. */
 .s-queued {
   color: #a78bfa;

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { durableClient } from './durable-client.js';
+import { deriveRunState, durableClient, type WorkflowRun } from './durable-client.js';
 
 /** A fake `Window`, just enough of the surface `durable-client.ts` touches. Shadows jsdom's real
  *  `window` for the scope of a test so a `location.href` assignment never triggers a real (jsdom)
@@ -67,6 +67,53 @@ describe('durableClient: unwrapping the AdonisJS backend response envelopes', ()
     await expect(durableClient.workers()).resolves.toEqual([
       { group: 'g', depth: 0, liveWorkers: [] },
     ]);
+  });
+
+  it('compat() hits GET /compat and returns the report bare — the server sends it unwrapped', async () => {
+    const report = {
+      controlPlane: { instanceId: 'cp', protocol: 1, protocolRange: [1, 1], capabilities: [] },
+      groups: [],
+      blocked: [],
+      incompatibleCount: 0,
+      blockedCount: 0,
+    };
+    const calls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string) => {
+        calls.push(url);
+        return Promise.resolve(jsonResponse(report, 200));
+      }),
+    );
+    await expect(durableClient.compat()).resolves.toEqual(report);
+    expect(calls[0]).toBe('/durable/api/compat');
+  });
+});
+
+describe('deriveRunState: `blocked` is a first-class display state', () => {
+  const blockedRun: WorkflowRun = {
+    id: 'r1',
+    workflow: 'transcode',
+    workflowVersion: '1',
+    status: 'blocked',
+    error: { message: "no compatible worker: requires capability 'step.stream'" },
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+
+  it('keeps `blocked` instead of folding it into the generic no-worker badge, with the reason as detail', () => {
+    expect(deriveRunState(blockedRun, { runs: [blockedRun], health: [] })).toEqual({
+      status: 'blocked',
+      detail: "no compatible worker: requires capability 'step.stream'",
+    });
+  });
+
+  it('falls back to the workflow name when the run carries no error reason', () => {
+    const { error: _error, ...bare } = blockedRun;
+    expect(deriveRunState(bare, { runs: [bare], health: [] })).toEqual({
+      status: 'blocked',
+      detail: 'transcode',
+    });
   });
 });
 
@@ -203,6 +250,26 @@ describe('durableClient.runsPage: real pagination (unlike runs(), keeps the page
     const query = new URLSearchParams(calls[0]?.split('?')[1] ?? '');
     expect(query.getAll('filter[tag][]')).toEqual(['etl', 'nightly']);
     expect(query.getAll('filter[namespace][]')).toEqual(['acme', 'globex']);
+  });
+
+  it('sends the workflow filter (scalar and set) — the workflow picker rides the same envelope', async () => {
+    const { calls } = captureUrl();
+    await durableClient.runsPage(undefined, undefined, undefined, { workflow: 'checkout' });
+    await durableClient.runsPage(undefined, undefined, undefined, {
+      workflow: ['checkout', 'shipmentSync'],
+    });
+    const scalar = new URLSearchParams(calls[0]?.split('?')[1] ?? '');
+    expect(scalar.get('filter[workflow]')).toBe('checkout');
+    const set = new URLSearchParams(calls[1]?.split('?')[1] ?? '');
+    expect(set.getAll('filter[workflow][]')).toEqual(['checkout', 'shipmentSync']);
+  });
+
+  it('scopes a bulk action by the workflow filter too, so bulk and list can never disagree on it', async () => {
+    const { calls } = captureUrl();
+    await durableClient.bulk('retry', { status: 'failed', workflow: 'checkout' });
+    const query = new URLSearchParams(calls[0]?.split('?')[1] ?? '');
+    expect(query.get('filter[status]')).toBe('failed');
+    expect(query.get('filter[workflow]')).toBe('checkout');
   });
 });
 

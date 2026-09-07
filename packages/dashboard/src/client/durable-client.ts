@@ -23,19 +23,16 @@
 // ── Wire types (independent of `@adonis-agora/durable`'s own `Date`-typed engine interfaces — the
 // dashboard's `handlers.ts` serializes every `Date` to an ISO string before it reaches this client). ──
 
+// NOTE: no `cancelling` here, deliberately. The NestJS console's union carried it (saga
+// compensation in progress), but the AdonisJS engine's `RunStatus` union (`interfaces.ts`) never
+// produces it — `cancel()` settles straight to `cancelled` — and the server's own `RUN_STATUSES`
+// list (`run-filter.ts`) omits it too, so a status the server can never send stayed a dead filter
+// chip in the header. Trimmed rather than kept: re-add it here (and to `App.tsx`'s `STATUSES`)
+// only if a future engine version actually emits a visible compensating status.
 export type RunStatus =
   | 'pending'
   | 'running'
   | 'suspended'
-  /**
-   * Saga compensation in progress. NOTE: the AdonisJS engine's `RunStatus` union (`interfaces.ts`)
-   * does not produce this state today — `cancel()` settles straight to `cancelled` — so no run the
-   * server sends will ever carry it. Kept in the client's own union anyway (rather than trimmed) so
-   * the ported UI (`App.tsx`'s singleton in-flight set, status badges) stays byte-identical to the
-   * NestJS console and lights up for free if a future engine version adds a visible compensating
-   * status.
-   */
-  | 'cancelling'
   | 'blocked'
   | 'completed'
   | 'failed'
@@ -124,6 +121,68 @@ export interface RunDetail {
 export interface DurableTopology {
   role: 'control-plane' | 'standalone' | 'tenant';
   tenant?: string;
+}
+
+// ── Fleet compat (`GET /compat` — `packages/adonis/src/dashboard/compat.ts`'s response, verbatim) ──
+
+/** How one live worker's descriptor negotiated against the control plane (design §7.4). */
+export type CompatOutcome = 'compatible' | 'degraded' | 'incompatible';
+
+/** One live worker pod, negotiated against the control plane. */
+export interface CompatPod {
+  instanceId: string;
+  runtime?: string;
+  sdk?: string;
+  protocol: number;
+  protocolRange: [number, number];
+  capabilities: string[];
+  outcome: CompatOutcome;
+  /** Highest common protocol major, or `null` when the ranges do not overlap (incompatible). */
+  negotiatedProtocol: number | null;
+  incompatible: boolean;
+  /** The red-flag reason — precise, structured copy. Absent when compatible. */
+  reason?: string;
+  missingOnRemote: string[];
+  missingOnLocal: string[];
+}
+
+/** One routing token's live workers, with the group-level rollups the panel colours by. */
+export interface CompatGroup {
+  token: string;
+  pods: CompatPod[];
+  incompatible: boolean;
+  degraded: boolean;
+}
+
+/** A run parked `blocked` (no compatible worker can take it), with its human reason and — when a
+ *  diagnostics event was captured — the structured delta (missing capabilities, protocol ranges). */
+export interface CompatBlockedRun {
+  id: string;
+  workflow: string;
+  namespace?: string;
+  status: RunStatus;
+  reason: string;
+  code?: string;
+  requires: string[];
+  token?: string;
+  missingCapabilities?: string[];
+  controlPlaneRange?: [number, number];
+  workerRanges?: Record<string, [number, number]>;
+  updatedAt: string;
+}
+
+/** The fleet health / protocol-compatibility report: per-group compatibility + blocked runs. */
+export interface CompatReport {
+  controlPlane: {
+    instanceId: string;
+    protocol: number;
+    protocolRange: [number, number];
+    capabilities: string[];
+  };
+  groups: CompatGroup[];
+  blocked: CompatBlockedRun[];
+  incompatibleCount: number;
+  blockedCount: number;
 }
 
 /** How a worker decides its concurrency. NOTE: not carried by the AdonisJS engine's heartbeat today
@@ -218,7 +277,7 @@ export interface RunDisplayState {
   detail?: string;
 }
 
-const SINGLETON_INFLIGHT = new Set<RunStatus>(['running', 'suspended', 'cancelling']);
+const SINGLETON_INFLIGHT = new Set<RunStatus>(['running', 'suspended']);
 
 /** Strip the route-by-handler `@partition` suffix so a run's `workflow` matches its `GroupHealth.group`. */
 export function baseGroup(group: string): string {
@@ -268,8 +327,12 @@ export function deriveRunState(
     if (run.status === 'pending' && groupIsStalled(run.workflow, ctx.health)) {
       return { status: 'no-worker', detail: run.workflow };
     }
+    // `blocked` is first-class, NOT folded into the generic no-worker badge: a blocked run is
+    // parked because no COMPATIBLE worker exists (protocol/capability mismatch — see the server's
+    // `/compat` panel), which starting another worker of the same old build cannot fix. The
+    // human reason lives on `run.error.message`; the workflow name is the fallback detail.
     if (run.status === 'blocked') {
-      return { status: 'no-worker', detail: run.workflow };
+      return { status: 'blocked', detail: run.error?.message ?? run.workflow };
     }
     return { status: run.status };
   }
@@ -352,6 +415,17 @@ function uiBase(): string {
   return '/durable';
 }
 
+/**
+ * The provider's session-logout URL (`GET <base>/logout` — `dashboard_provider.ts`'s
+ * `registerAuthRoutes`): a plain idempotent GET that clears the console's session cookie and
+ * redirects to the login page (Mode B) or the dashboard root, so a simple `<a href>` works. The
+ * route only exists when the host configured `dashboardAuth`; on an unauthenticated deployment
+ * following it just 404s harmlessly (the injected config carries no auth flag to gate on).
+ */
+export function logoutUrl(): string {
+  return `${uiBase()}/logout`;
+}
+
 function apiBase(): string {
   const injected = readConfig().api;
   if (typeof injected === 'string') return injected;
@@ -403,6 +477,8 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
 
 export interface RunFilterOptions {
   namespace?: string | string[] | undefined;
+  /** One workflow narrows; several match ANY of them (the workflow picker's multi-select). */
+  workflow?: string | string[] | undefined;
   /** See module doc gap #1 — cannot select unattributed runs, and no run carries an origin today. */
   origin?: string | undefined;
 }
@@ -434,6 +510,10 @@ interface RunsListResponse {
   page: { limit: number; offset: number; count: number };
   statuses: RunStatus[];
 }
+
+/** Server-side ceiling on a bulk action's matched set (`handlers.ts`'s `bulkAction` lists with
+ *  `limit: 500`). A response whose `matched` equals this cap probably left runs untouched. */
+export const BULK_MATCH_CAP = 500;
 
 interface RunResponse {
   result: RunResult;
@@ -497,6 +577,11 @@ export const durableClient = {
   topology(): Promise<DurableTopology> {
     return http<DurableTopology>('/topology');
   },
+  /** Fleet health / protocol compatibility (per-group negotiation + blocked runs) for the Compat
+   *  panel. Bare `CompatReport`, unwrapped — the server's `compat` handler sends the body as-is. */
+  compat(): Promise<CompatReport> {
+    return http<CompatReport>('/compat');
+  },
   async retry(id: string): Promise<RunResult> {
     const res = await http<RunResponse>(`/runs/${encodeURIComponent(id)}/retry`, {
       method: 'POST',
@@ -515,7 +600,9 @@ export const durableClient = {
     );
     return res.result;
   },
-  /** Bulk retry/cancel every run matching a filter. Returns how many matched + were acted on. */
+  /** Bulk retry/cancel every run matching a filter. Returns how many matched + were acted on.
+   *  The server acts on at most {@link BULK_MATCH_CAP} matches per call — `matched` hitting the
+   *  cap is the "there may be more; run again to continue" signal. */
   bulk(
     action: 'retry' | 'cancel',
     filter: RunFilterOptions & {

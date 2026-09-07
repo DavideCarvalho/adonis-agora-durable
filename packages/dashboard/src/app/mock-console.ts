@@ -1,4 +1,5 @@
 import type {
+  CompatReport,
   DurableTopology,
   GroupHealth,
   RunDetail,
@@ -124,6 +125,18 @@ const runs: WorkflowRun[] = [
     createdAt: iso(-12_000),
     updatedAt: iso(-12_000),
     input: { orderId: 'ord-6650bb91', amount: 78 },
+  },
+  // A run parked `blocked` (no COMPATIBLE worker) — exercises the first-class blocked chip/badge
+  // AND matches the `/compat` snapshot's blocked list below, so the two surfaces agree on screen.
+  {
+    id: 'med-31f0ac55',
+    workflow: 'mediaTranscode',
+    workflowVersion: '2',
+    status: 'blocked',
+    createdAt: iso(-240_000),
+    updatedAt: iso(-180_000),
+    input: { assetId: 'ast-9917' },
+    error: { message: "no compatible worker: requires capability 'step.stream'" },
   },
 ];
 
@@ -282,6 +295,76 @@ const workers: GroupHealth[] = [
 
 const topology: DurableTopology = { role: 'control-plane' };
 
+/** The `/compat` fleet-health snapshot: one healthy negotiated pod, one INCOMPATIBLE pod (protocol
+ *  majors that do not overlap), and the blocked run above with its captured capability delta — so
+ *  the compat tab's red-flag states are all screenshot-able. */
+const compat: CompatReport = {
+  controlPlane: {
+    instanceId: 'control-plane',
+    protocol: 1,
+    protocolRange: [1, 1],
+    capabilities: ['step.remote', 'step.sleep', 'step.signal'],
+  },
+  groups: [
+    {
+      token: 'checkout',
+      pods: [
+        {
+          instanceId: 'api-7f9c4d-2',
+          runtime: 'node',
+          sdk: 'adonis-durable@0.9.0',
+          protocol: 1,
+          protocolRange: [1, 1],
+          capabilities: ['step.remote', 'step.sleep', 'step.signal'],
+          outcome: 'compatible',
+          negotiatedProtocol: 1,
+          incompatible: false,
+          missingOnRemote: [],
+          missingOnLocal: [],
+        },
+      ],
+      incompatible: false,
+      degraded: false,
+    },
+    {
+      token: 'media',
+      pods: [
+        {
+          instanceId: 'worker-media-2e40',
+          runtime: 'python',
+          sdk: 'durable-py@2.0.0',
+          protocol: 2,
+          protocolRange: [2, 2],
+          capabilities: ['step.remote', 'step.stream'],
+          outcome: 'incompatible',
+          negotiatedProtocol: null,
+          incompatible: true,
+          reason: 'no common protocol major: local speaks [1, 1], remote speaks [2, 2]',
+          missingOnRemote: ['step.sleep', 'step.signal'],
+          missingOnLocal: ['step.stream'],
+        },
+      ],
+      incompatible: true,
+      degraded: false,
+    },
+  ],
+  blocked: [
+    {
+      id: 'med-31f0ac55',
+      workflow: 'mediaTranscode',
+      status: 'blocked',
+      reason: "no compatible worker: requires capability 'step.stream'",
+      code: 'capability.unavailable',
+      requires: ['step.stream'],
+      token: 'media',
+      missingCapabilities: ['step.stream'],
+      updatedAt: iso(-180_000),
+    },
+  ],
+  incompatibleCount: 1,
+  blockedCount: 1,
+};
+
 /** The full status union, mirroring the server's `GET /runs` envelope. */
 const STATUSES: WorkflowRun['status'][] = [
   'pending',
@@ -334,19 +417,35 @@ function matchesAttr(run: WorkflowRun, entry: string): boolean {
   }
 }
 
-/** The server-side predicates the console can send: exact match, ANDed, absent = don't narrow. */
-function scopedRuns(params: URLSearchParams, dropStatus: boolean): WorkflowRun[] {
-  const status = dropStatus ? null : params.get('status');
+/** Read one predicate under BOTH spellings the server accepts: the `filter[...]` envelope the
+ *  console's `FilterQueryBuilder` emits (`filter[tag]=x` scalar, `filter[tag][]=a&filter[tag][]=b`
+ *  set) and the flat legacy form a hand-built URL uses (`tag=x`, repeatable). */
+function predicate(params: URLSearchParams, key: string): string[] {
+  return [
+    ...params.getAll(`filter[${key}]`),
+    ...params.getAll(`filter[${key}][]`),
+    ...params.getAll(key),
+  ];
+}
+
+/** The server-side predicates the console can send: exact match, ANDed, absent = don't narrow.
+ *  A repeated value is the union within its axis. */
+function scopedRuns(params: URLSearchParams): WorkflowRun[] {
+  const status = predicate(params, 'status');
+  const workflow = predicate(params, 'workflow');
+  const origin = predicate(params, 'origin');
+  const tag = predicate(params, 'tag');
+  const namespace = predicate(params, 'namespace');
+  const attr = predicate(params, 'attr');
   return runs.filter(
     (r) =>
-      (!status || r.status === status) &&
-      // A repeated param is the union; a run with NO origin matches no origin value.
-      (!params.get('origin') || r.origin === params.get('origin')) &&
-      (params.getAll('tag').length === 0 ||
-        params.getAll('tag').some((t) => r.tags?.includes(t))) &&
-      (params.getAll('namespace').length === 0 ||
-        params.getAll('namespace').some((n) => (r.namespace ?? 'default') === n)) &&
-      params.getAll('attr').every((entry) => matchesAttr(r, entry)),
+      (status.length === 0 || status.includes(r.status)) &&
+      (workflow.length === 0 || workflow.includes(r.workflow)) &&
+      // A run with NO origin matches no origin value.
+      (origin.length === 0 || (r.origin !== undefined && origin.includes(r.origin))) &&
+      (tag.length === 0 || tag.some((t) => r.tags?.includes(t))) &&
+      (namespace.length === 0 || namespace.includes(r.namespace ?? 'default')) &&
+      attr.every((entry) => matchesAttr(r, entry)),
   );
 }
 
@@ -364,7 +463,10 @@ function valuesOf(run: WorkflowRun, field: string): Array<string | null> {
   return [];
 }
 
-function body(path: string): unknown | undefined {
+/** A route's answer: an HTTP status + JSON payload, or `undefined` to pass through to real fetch. */
+type MockAnswer = { status: number; payload: unknown } | undefined;
+
+function body(path: string): MockAnswer {
   const [route, search] = path.split('?');
   const params = new URLSearchParams(search ?? '');
   if (route === '/runs') {
@@ -373,13 +475,14 @@ function body(path: string): unknown | undefined {
     // screenshot of them would be a lie.
     const limit = Math.min(Math.max(Number(params.get('limit') ?? 50) || 0, 0), 200);
     const offset = Math.max(Number(params.get('offset') ?? 0) || 0, 0);
-    const matching = scopedRuns(params, false).sort((a, b) =>
-      b.createdAt.localeCompare(a.createdAt),
-    );
+    const matching = scopedRuns(params).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     return {
-      runs: matching.slice(offset, offset + limit),
-      page: { limit, offset, count: Math.min(limit, Math.max(matching.length - offset, 0)) },
-      statuses: STATUSES,
+      status: 200,
+      payload: {
+        runs: matching.slice(offset, offset + limit),
+        page: { limit, offset, count: Math.min(limit, Math.max(matching.length - offset, 0)) },
+        statuses: STATUSES,
+      },
     };
   }
   if (route === '/runs/values') {
@@ -398,10 +501,12 @@ function body(path: string): unknown | undefined {
       0,
     );
     const counts = new Map<string | null, number>();
-    for (const run of scopedRuns(params, true)) {
+    // The picker's scope already excludes its OWN axis client-side, so the params filter as sent —
+    // exactly what the real `runValues` handler does.
+    for (const run of scopedRuns(params)) {
       for (const value of valuesOf(run, field)) counts.set(value, (counts.get(value) ?? 0) + 1);
     }
-    return [...counts]
+    const rows = [...counts]
       .map(([value, count]) => ({ value, count }))
       .filter((row) => !needle || row.value?.toLowerCase().includes(needle))
       .sort((a, b) => {
@@ -414,19 +519,20 @@ function body(path: string): unknown | undefined {
         return (a.value ?? '').localeCompare(b.value ?? '');
       })
       .slice(offset, offset + limit);
+    return { status: 200, payload: rows };
   }
-  if (route === '/workers') return workers;
-  if (route === '/topology') return topology;
+  if (route === '/workers') return { status: 200, payload: workers };
+  if (route === '/topology') return { status: 200, payload: topology };
+  if (route === '/compat') return { status: 200, payload: compat };
   const run = route?.match(/^\/runs\/(.+)$/)?.[1];
   if (run) {
     const id = decodeURIComponent(run);
-    return (
-      detail[id] ?? {
-        run: runs.find((r) => r.id === id),
-        timeline: [],
-        children: [],
-      }
-    );
+    if (detail[id]) return { status: 200, payload: detail[id] };
+    const listed = runs.find((r) => r.id === id);
+    // A real 404 for an id the snapshot does not hold — the header's run-id search needs the miss
+    // to be honest, not an empty detail that renders as a broken run.
+    if (!listed) return { status: 404, payload: { error: `run ${id} not found` } };
+    return { status: 200, payload: { run: listed, timeline: [], children: [] } };
   }
   return undefined;
 }
@@ -440,10 +546,10 @@ export function installMockConsoleApi(): void {
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
     const match = url.match(/\/durable\/api(\/.*)$/);
-    const payload = match?.[1] ? body(match[1]) : undefined;
-    if (payload === undefined) return real(input as RequestInfo, init);
-    return new Response(JSON.stringify(payload), {
-      status: 200,
+    const answer = match?.[1] ? body(match[1]) : undefined;
+    if (answer === undefined) return real(input as RequestInfo, init);
+    return new Response(JSON.stringify(answer.payload), {
+      status: answer.status,
       headers: { 'content-type': 'application/json' },
     });
   };
