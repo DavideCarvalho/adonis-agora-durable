@@ -1,5 +1,116 @@
 # @adonis-agora/durable
 
+## 0.36.0
+
+### Minor Changes
+
+- [#115](https://github.com/DavideCarvalho/adonis-agora-durable/pull/115) [`19fcf54`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/19fcf5447f5112e51a4c2c701503c691c9f23aff) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Everything durable: every correctness-critical piece of engine state that used to live only in one
+  pod's memory now has a durable anchor in the store, and lease fencing keeps zombie executors from
+  writing over the new owner's work.
+  
+  - **Lease fencing.** `StateStore.releaseRunLock` gained an optional `owner` argument (conditional,
+    atomic — like `renewRunLock`); the engine releases owner-scoped everywhere, so a stale executor
+    can no longer wipe the lease of the instance that took over (which could cascade into a third
+    concurrent executor). A renew that reports takeover — or a `drain()` timeout release — now FENCES
+    the in-flight turn: its settle degrades to a read-only echo and the new owner's writes win.
+    Custom stores implemented against the old single-argument signature keep working (they just skip
+    the fencing).
+  - **Continue-as-new is crash-safe.** The continuation run is persisted BEFORE the parent's terminal
+    write (previously it only existed as an in-memory deferred start — a SIGKILL in the gap lost the
+    chain forever, undetectably). The continuation also inherits the parent run's `namespace` now.
+  - **Child completions re-derive from the store.** If a child's terminal notify signal is lost
+    (crash between the child's settle and the signal write), the parent's `ctx.child` / `ctx.all` /
+    remote `startChild` re-registration reads the child's run row and synthesizes the exact
+    completion the signal would have carried — instead of re-suspending forever. A cancelled child
+    now surfaces to a waiting parent as a failure. `notifyParent` retries once and warns instead of
+    swallowing delivery errors silently.
+  - **Saga compensations are checkpointed.** Each compensation owns a reserved negative checkpoint
+    seq (`-2 - idx`): dispatched undos persist `pending` before dispatch and settle on the outcome,
+    so a worker result consumed by ANOTHER pod (shared results queue) completes the unwind instead of
+    being dropped, a re-driven unwind skips undos already done (no double refunds) and resumes the
+    attempt count, and a dispatched undo with no `timeoutMs` is bounded by the new
+    `compensationTimeoutMs` config (default 5 min) instead of awaiting forever.
+  - **Compensating cancel survives crashes and pod handoffs.** `cancel({ compensate: true })` also
+    persists a durable `cancel:<runId>` marker; whichever pod next drives the run honors it, even if
+    the pod that took the cancel request couldn't run the workflow.
+  - **Flow-control slots release cross-pod.** The admitted queue is persisted on the step's `pending`
+    checkpoint (new nullable `queue` column, auto-repaired on boot), so the instance that receives
+    the result frees the slot — previously an in-memory map on the dispatching pod leaked the slot
+    whenever another pod completed the step, starving `concurrency: N` down to zero. A `{ queue }`
+    on a `timeoutMs` step is no longer silently ignored: the same admission gate now applies.
+  - **Racing starts converge.** `StateStore.createRun` must reject a duplicate id (SQL stores already
+    did via their primary key; the in-memory store now matches, and the conformance suite asserts
+    it). The engine converges a losing `start`/`signalWithStart`/scheduler-tick race on the winner's
+    run instead of surfacing a unique-constraint error (which could abort a scheduler tick or lose a
+    `signalWithStart` signal).
+  - **`recoverIncomplete` can't resurrect a settled run.** The `running → pending` recovery flip is
+    now a conditional write under the held lease, so a redelivered result that settled the run in the
+    gap wins — no more clobbering `completed` back to `pending` and re-executing a finished run.
+  - **`sweepTimeouts` cancels properly.** An execution-timeout sweep now cascades to the child
+    subtree, notifies the owning worker to abort, wakes a waiting parent, frees a singleton slot, and
+    times out each run against the version it started on.
+  - **Small hardening.** Backoff exponents are clamped (no more `Infinity` → hot retry loop past
+    ~attempt 40); liveness windows above Node's `setTimeout` max (≈24.8 days) no longer fire
+    immediately; a transient store error inside `waitForRun`'s check no longer surfaces as an
+    unhandled rejection.
+
+- [#115](https://github.com/DavideCarvalho/adonis-agora-durable/pull/115) [`19fcf54`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/19fcf5447f5112e51a4c2c701503c691c9f23aff) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Performance wave + new features.
+  
+  **Performance** — the poll loops now push their predicates into the store instead of fetching
+  everything and filtering in process:
+  
+  - Recovery asks for ORPHANS only (`listOrphanedRuns`: running + free/expired lease, bounded) —
+    previously every worker fetched every running run once per second and issued one doomed lock-probe
+    UPDATE per row. The execution-timeout sweep and the blocked-run poll each become one bounded query
+    (`createdBefore` / `wakeBefore` pushdown); due-timer polls are capped per tick.
+  - Checkpoint saves and signal-waiter registrations are single native upserts
+    (`INSERT … ON CONFLICT … DO UPDATE`) instead of a read-then-write transaction — the hottest write
+    path drops from 4 round trips to 1.
+  - The dashboard resolves each page's `waiting` column via the indexed `listSignalWaitersByRunIds`
+    instead of scanning the entire signal-waiter table per page load; new `run_id` and `created_at`
+    indexes ship via the schema auto-repair.
+  - Picked-up runs execute with bounded parallelism (8) per tick, so one slow turn no longer
+    serializes the rest; worker-health queries fan out in parallel; the BullMQ worker-descriptor
+    lookup is memoized (5s TTL) and SCAN pages read via MGET.
+  - `deleteRun` sweeps the run's buffered `child:`/`cancel:` signals (previously an unbounded leak —
+    one row per never-joined spawn, forever). Pollers add ±20% sleep jitter (thundering herd) and
+    opt-in idle backoff.
+  - A suspension now records WHICH checkpoint seqs it waits on, and the settle re-checks them — a
+    signal/result that landed mid-turn (whose resume no-oped on the held lease) re-drives immediately
+    instead of waiting out the reconcile interval (or forever with `reconcileMs: 0`).
+  
+  **Features**:
+  
+  - **Console human-in-the-loop**: `POST /api/runs/:id/signal` (guarded to tokens the run actually
+    waits on; `force` to buffer), `POST /api/runs/:id/update/:name` (validator-gated, 422 with the
+    reason), `POST /api/runs/:id/tasks/:name/complete|fail` (honest delivered-vs-buffered reporting).
+  - **Runtime schedule control**: `engine.listSchedules()` (fire windows + effective pause state),
+    `engine.setSchedulePaused(key, paused)` — fleet-wide via a `schedulePause` control-plane message,
+    a runtime override that wins over the config until redeploy — and `engine.triggerSchedule(key)`
+    (idempotent run-now); exposed at `GET /api/schedules` + `POST /api/schedules/:key/:action`.
+  - **Retention**: `retention: { completed: '30d', … }` hard-deletes terminal runs past their age (by
+    last activity) as a throttled worker-tick phase; `engine.onEvict((run, checkpoints) => …)`
+    archives before deletion (a throwing hook skips that run's delete).
+  - **Run origin attribution**: `WorkflowOptions.origin` / `register(…, { origin })` /
+    `StartOptions.origin` stamp which package produced a run; filterable (`RunQuery.origin`),
+    facetable, on the run summary — lighting up the console's origin sidebar.
+  - **Worker telemetry**: BullMQ worker heartbeats carry a `WorkerStatus` payload (concurrency,
+    in-flight, RSS, CPU%, throughput/min, p95) — lighting up the console's worker cards.
+  - **Delayed starts**: `StartOptions.startAt` parks the run on its durable wake timer — no
+    `ctx.sleep` polluting the body or its history.
+  - **Stalled-run pager**: `engine.onStalled(listener)` + `stalledAfter: '15m'` pages once per
+    stranded episode (wake-forever suspensions, old pending remote steps with silent heartbeats).
+  - **Sliding-window rate limit**: `rateLimit: { …, algorithm: 'sliding' }` counts admissions over a
+    rolling window (in-process and Redis-Lua backends) — no 2× burst at window boundaries, precise
+    earliest-retry instants.
+  - **Replay-CI loop**: `node ace durable:export <runId> [--out fixture.json]` + `captureHistory` +
+    `parseRunHistory` feed `assertReplayable`, so a step rename/reorder fails CI before it corrupts an
+    in-flight run on deploy.
+  - **OpenAPI**: `GET <path>/api/openapi.json` serves the dashboard API's machine-readable contract,
+    with a drift-guard spec pinning it to the route table.
+  - **Dashboard API filters**: `createdAfter`/`createdBefore` (epoch ms or ISO) and `origin` now push
+    down server-side.
+
 ## 0.35.1
 
 ### Patch Changes
