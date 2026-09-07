@@ -334,9 +334,11 @@ export class LucidStateStore implements StateStore {
   }
 
   async listSignalWaiters(prefix: string): Promise<SignalWaiter[]> {
+    // The prefix embeds caller-supplied names (event names via eventPrefix) — escape their LIKE
+    // metacharacters so a name containing `%`/`_` can't scan (or match) other tokens.
     const rows = await this.client()
       .from(DURABLE_TABLES.signalWaiters)
-      .where('token', 'like', `${prefix}%`);
+      .whereRaw(`token like ? escape '!'`, [`${escapeLike(prefix)}%`]);
     return (
       rows as Array<{
         token: string;
@@ -501,7 +503,7 @@ export class LucidStateStore implements StateStore {
       .select(`${column} as value`)
       .count('* as count')
       .groupBy(column);
-    if (needle) q.andWhereRaw(`lower(${column}) like ?`, [`%${needle}%`]);
+    if (needle) q.andWhereRaw(`lower(${column}) like ? escape '!'`, [`%${escapeLike(needle)}%`]);
     const rows = (await q) as Array<{ value: string | null; count: number | string }>;
     return mergeRunValueFacetRows(
       rows.map((row) => ({ value: row.value, count: Number(row.count) })),
@@ -536,11 +538,14 @@ export class LucidStateStore implements StateStore {
       else q.whereRaw('1 = 0');
     }
     // `tags` is stored as a JSON array string; match the quoted token so `etl` doesn't match `etl-foo`.
-    if (query.tag) q.where('tags', 'like', `%"${query.tag}"%`);
+    // LIKE metacharacters in the tag VALUE are escaped so `50%_off` matches itself, not a pattern.
+    if (query.tag) q.whereRaw(`tags like ? escape '!'`, [`%"${escapeLike(query.tag)}"%`]);
     if (query.tags) {
       if (query.tags.length) {
         q.andWhere((or: AnyQuery) => {
-          for (const tag of query.tags as string[]) or.orWhere('tags', 'like', `%"${tag}"%`);
+          for (const tag of query.tags as string[]) {
+            or.orWhereRaw(`tags like ? escape '!'`, [`%"${escapeLike(tag)}"%`]);
+          }
         });
       } else q.whereRaw('1 = 0');
     }
@@ -653,6 +658,17 @@ export class LucidStateStore implements StateStore {
       );
     }
   }
+}
+
+/**
+ * Escape LIKE metacharacters (`%`, `_`) — and the escape character itself — using `!` as the ESCAPE
+ * char. `!` because a backslash inside a SQL string literal is dialect-divergent (MySQL treats it as
+ * its own string escape; SQLite has no default LIKE escape at all), while `'!'` is byte-identical
+ * everywhere. Pair every use with `ESCAPE '!'`. Without this, a tag or picker-search value
+ * containing `%`/`_` silently widened (or broke) the match.
+ */
+function escapeLike(value: string): string {
+  return value.replace(/[!%_]/g, (c) => `!${c}`);
 }
 
 /** Knex `.update()` / `.delete()` return the affected row count as a number across dialects. */

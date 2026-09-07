@@ -46,11 +46,23 @@ export interface DurableDashboardConfig {
    */
   path?: string;
   /**
-   * Per-request authorization guard. Defaults to {@link defaultAuthorize}:
-   * allow everything OUTSIDE production, and in production require a bearer
-   * token matching the `DURABLE_DASHBOARD_TOKEN` env var (deny if it is unset).
+   * Per-request authorization guard. Defaults to {@link defaultAuthorize}, which FAILS CLOSED in
+   * EVERY environment: it requires a bearer token matching `DURABLE_DASHBOARD_TOKEN` (denying
+   * everything when that env var is unset) — unless {@link dashboardAuth} is configured (the
+   * session guard is then the gate) or {@link allowUnauthenticated} explicitly opts out.
+   *
+   * (Before 0.37 the default was open outside `NODE_ENV=production` — which left every dev/staging
+   * deployment, and any box where NODE_ENV was unset or spelled differently, with an unauthenticated
+   * console whose destructive endpoints a malicious web page could drive via cross-site POSTs.)
    */
   authorize?: AuthorizeHook;
+  /**
+   * Explicitly serve the dashboard WITHOUT any authentication. This is the loaded footgun the old
+   * "open outside production" default was — now it at least has to be spelled out in config, so a
+   * deploy can grep for it. Only for local development / networks you fully trust. Ignored when
+   * `authorize` or `dashboardAuth` is configured.
+   */
+  allowUnauthenticated?: boolean;
   /**
    * Optional built-in login screen. When set, the provider mounts a
    * server-rendered `GET <path>/login` page plus `POST <path>/login` /
@@ -65,6 +77,24 @@ export interface DurableDashboardConfig {
    * closed at boot.
    */
   dashboardAuth?: DashboardAuthOptions;
+  /**
+   * Audit sink for MUTATING console actions (retry, cancel, bulk, fix-and-replay, signal, update,
+   * task completion, schedule control): called once per attempt with who did what, before the
+   * handler runs. Omit for the default — a structured line on the app logger. The old console had
+   * NO actor attribution at all; an operator bulk-cancelling 500 runs left no trace of who asked.
+   */
+  audit?: (entry: DashboardAuditEntry) => void;
+  /**
+   * Redact what the console SHOWS: hooks over the serialized run / checkpoint shapes, applied to
+   * every list/detail response right before it leaves the API. The store may hold payloads
+   * encrypted (CodecStateStore), but the dashboard reads through the codec and always rendered them
+   * DECODED — this is the knob that keeps a card number or PII out of the operator's browser:
+   * `{ run: (r) => ({ ...r, input: undefined }), checkpoint: (c) => ({ ...c, output: '[redacted]' }) }`.
+   */
+  redact?: {
+    run?: (run: Record<string, unknown>) => Record<string, unknown>;
+    checkpoint?: (checkpoint: Record<string, unknown>) => Record<string, unknown>;
+  };
   /**
    * What a BROWSER sees when the guard refuses a page navigation (the SPA shell, its assets, or —
    * Mode A only — a session-less visit). API requests are unaffected:
@@ -90,13 +120,32 @@ export interface ResolvedDurableDashboardConfig {
   dashboardAuth: ResolvedDashboardAuth | null;
   /** The host's `accessDenied` option as given, or `null` for the built-in page with defaults. */
   accessDenied: AccessDeniedOption | null;
+  /** The host's audit sink, or `null` for the default logger line. */
+  audit: ((entry: DashboardAuditEntry) => void) | null;
+  /** The host's redaction hooks, or `null` to serve shapes as-is. */
+  redact: {
+    run?: (run: Record<string, unknown>) => Record<string, unknown>;
+    checkpoint?: (checkpoint: Record<string, unknown>) => Record<string, unknown>;
+  } | null;
+}
+
+/** One audited mutating console action — who (actor), what (method + path), when. */
+export interface DashboardAuditEntry {
+  at: Date;
+  /** The session user's name/id, `'token'` for a bearer-token caller, else `'anonymous'`. */
+  actor: string;
+  method: string;
+  /** The request path (no query string — a `?token=` must never reach an audit log). */
+  path: string;
 }
 
 /**
  * Whether the process is running in production. Mirrors how AdonisJS reads the
- * environment without taking a hard dependency on its env service.
+ * environment without taking a hard dependency on its env service. No longer an
+ * AUTH decision input (the guard fails closed everywhere) — used only for
+ * cookie hardening defaults.
  */
-function isProduction(): boolean {
+export function isProduction(): boolean {
   return (process.env.NODE_ENV ?? '').toLowerCase() === 'production';
 }
 
@@ -113,8 +162,14 @@ function readToken(ctx: HttpContext): string | undefined {
   }
   const xHeader = ctx.request.header('x-durable-token');
   if (xHeader) return xHeader.trim();
-  const qs = ctx.request.qs().token;
-  if (typeof qs === 'string' && qs.length > 0) return qs;
+  // The query-string channel exists ONLY because EventSource (the SSE live-tail) cannot set
+  // headers. Restricted to read methods: a `?token=` that authorized POSTs turned any leaked/logged
+  // URL (access logs, Referer, browser history) into a destructive-capable magic link.
+  const method = ctx.request.method().toUpperCase();
+  if (method === 'GET' || method === 'HEAD') {
+    const qs = ctx.request.qs().token;
+    if (typeof qs === 'string' && qs.length > 0) return qs;
+  }
   return undefined;
 }
 
@@ -132,13 +187,13 @@ function secretsMatch(a: string, b: string): boolean {
 }
 
 /**
- * The default guard: open outside production; in production it requires a
- * bearer token equal to `DURABLE_DASHBOARD_TOKEN`. If that env var is unset in
- * production the dashboard is denied entirely (fail-closed) — you must opt in
- * by setting a token or supplying your own {@link AuthorizeHook}.
+ * The default guard: FAIL CLOSED in every environment — require a bearer token equal to
+ * `DURABLE_DASHBOARD_TOKEN`, denying everything when that env var is unset. There is no
+ * NODE_ENV branch anymore: "not production" is exactly the set of deployments (dev boxes,
+ * staging, misspelled envs) that used to ship an open console. Opt out explicitly with
+ * `allowUnauthenticated: true`, or configure `dashboardAuth`/your own `authorize`.
  */
 export function defaultAuthorize(ctx: HttpContext): boolean {
-  if (!isProduction()) return true;
   const expected = process.env.DURABLE_DASHBOARD_TOKEN;
   if (!expected) return false;
   const provided = readToken(ctx);
@@ -147,19 +202,50 @@ export function defaultAuthorize(ctx: HttpContext): boolean {
   return secretsMatch(provided, expected);
 }
 
+/** The explicit `allowUnauthenticated: true` guard — allow everything, by conscious opt-in only. */
+const allowAll: AuthorizeHook = () => true;
+
+let warnedOpenDashboard = false;
+
 /** Apply defaults to a partial config, producing a fully-resolved one. */
 export function resolveConfig(config: DurableDashboardConfig = {}): ResolvedDurableDashboardConfig {
   const rawPath = config.path ?? '/durable';
   // Normalize: ensure a single leading slash and no trailing slash (root stays '/').
   const trimmed = `/${rawPath.replace(/^\/+/, '').replace(/\/+$/, '')}`;
+  // Default guard resolution, in order:
+  //  1. a host `authorize` hook wins;
+  //  2. `dashboardAuth` configured -> the session guard IS the gate (the default token guard would
+  //     otherwise 403 every login flow that never set DURABLE_DASHBOARD_TOKEN);
+  //  3. `allowUnauthenticated: true` -> consciously open (warned once at resolve time);
+  //  4. else the fail-closed token guard.
+  const hasDashboardAuth = config.dashboardAuth !== undefined;
+  let authorize: AuthorizeHook;
+  if (config.authorize) {
+    authorize = config.authorize;
+  } else if (hasDashboardAuth) {
+    authorize = allowAll;
+  } else if (config.allowUnauthenticated === true) {
+    if (!warnedOpenDashboard) {
+      warnedOpenDashboard = true;
+      console.warn(
+        '[durable_dashboard] allowUnauthenticated: true — the console (including destructive ' +
+          'endpoints) is served with NO authentication. Never ship this to a reachable network.',
+      );
+    }
+    authorize = allowAll;
+  } else {
+    authorize = defaultAuthorize;
+  }
   return {
     enabled: config.enabled ?? true,
     path: trimmed === '/' ? '' : trimmed,
-    authorize: config.authorize ?? defaultAuthorize,
+    authorize,
     // Validate + resolve now so a misconfigured secret/login fails closed at boot,
     // not on the first login attempt. `null` when `dashboardAuth` is omitted.
     dashboardAuth: resolveDashboardAuth(config.dashboardAuth),
     accessDenied: config.accessDenied ?? null,
+    audit: config.audit ?? null,
+    redact: config.redact ?? null,
   };
 }
 

@@ -93,6 +93,18 @@ export class RunRequestResponder {
     this.#transport = transport;
     this.#gateway = gateway;
     this.#verifyTenant = options.verifyTenant;
+    if (!this.#verifyTenant) {
+      // Loud on purpose: without a verifier the anti-IDOR machinery below is bypassable by simply
+      // CLAIMING another tenant's name in the wire `tenant` field — any process with broker access
+      // can then list/signal/cancel/start runs as any tenant. Prefix/network isolation may be an
+      // acceptable posture (it is the aviary-compatible default), but it must be a CHOSEN one.
+      console.warn(
+        '[adonis-durable] run-request responder started WITHOUT a tenant verifier: the wire ' +
+          '`tenant` claim is trusted verbatim (prefix/network isolation only). Any broker client ' +
+          'can act as any tenant. Configure `verifyTenant` (e.g. hmacTenantVerifier(secret)) and ' +
+          'signed tenant tokens unless your broker is fully isolated per tenant.',
+      );
+    }
     this.#subscribeEngineEvents = options.subscribeEngineEvents;
   }
 

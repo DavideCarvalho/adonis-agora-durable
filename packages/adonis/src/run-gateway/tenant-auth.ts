@@ -34,9 +34,33 @@ function sign(tenant: string, secret: string): string {
  * Put it on the pod's `config/durable.ts` as `tenant.token`; the pod carries only the token (never the
  * secret), and the control plane verifies it with the SAME `secret` via {@link hmacTenantVerifier}.
  */
-export function signTenantToken(tenant: string, secret: string): string {
-  return `${tenant}${TOKEN_SEP}${sign(tenant, secret)}`;
+export function signTenantToken(
+  tenant: string,
+  secret: string,
+  opts?: {
+    /**
+     * Optional lifetime: the claim gains a `.exp<epochMs>` suffix, signed together with the tenant,
+     * and {@link hmacTenantVerifier} rejects the token once that instant passes. Without it the
+     * token never expires — observable broker traffic (an un-ACL'd shared Redis, a dump) then holds
+     * a credential valid FOREVER, and rotation means re-keying the whole fleet at once. Additive:
+     * expiring and legacy tokens verify side by side, and a non-verifying aviary/Python control
+     * plane still treats the whole string as an (unknown) tenant name — a safe failure.
+     * Tenant names ending in `.exp<digits>` are reserved by this scheme.
+     */
+    ttlMs?: number;
+    /** Injectable clock for tests. */
+    now?: number;
+  },
+): string {
+  const claim =
+    opts?.ttlMs !== undefined
+      ? `${tenant}${TOKEN_SEP}exp${(opts.now ?? Date.now()) + opts.ttlMs}`
+      : tenant;
+  return `${claim}${TOKEN_SEP}${sign(claim, secret)}`;
 }
+
+/** The trailing expiry marker an expiring token's claim carries (see signTenantToken). */
+const EXP_SUFFIX = /\.exp(\d+)$/;
 
 /**
  * Build the control-plane-side {@link TenantVerifier} for {@link signTenantToken}-minted tokens under
@@ -48,17 +72,33 @@ export function signTenantToken(tenant: string, secret: string): string {
  * `capabilities`, if given, is a static grant stamped onto every {@link VerifiedTenant} this verifier
  * authenticates (the HMAC token carries no scoped claims of its own); omit for none.
  */
-export function hmacTenantVerifier(secret: string, capabilities?: string[]): TenantVerifier {
+export function hmacTenantVerifier(
+  secret: string | string[],
+  capabilities?: string[],
+): TenantVerifier {
+  // Accepting a LIST of secrets makes rotation a two-step deploy instead of a big bang: verify with
+  // [next, current] everywhere first, then re-mint tenant tokens with `next` at leisure.
+  const secrets = Array.isArray(secret) ? secret : [secret];
   return ({ token }): VerifiedTenant | null => {
     // The signed token travels in the request's `tenant` field, so the responder passes it as `token`.
     if (typeof token !== 'string' || token.length === 0) return null;
     const sep = token.lastIndexOf(TOKEN_SEP);
     if (sep <= 0 || sep === token.length - 1) return null; // no claim or no signature half
-    const tenant = token.slice(0, sep);
+    const claim = token.slice(0, sep);
     const presented = token.slice(sep + 1);
-    const expected = sign(tenant, secret);
-    if (!constantTimeEquals(presented, expected)) return null;
-    return capabilities !== undefined ? { tenant, capabilities } : { tenant };
+    if (!secrets.some((s) => constantTimeEquals(presented, sign(claim, s)))) return null;
+    // Expiring claim (`<tenant>.exp<epochMs>`): the suffix is INSIDE the signature, so an attacker
+    // can neither strip nor extend it. Reject once the instant passes; a legacy claim (no suffix)
+    // is the tenant verbatim, exactly as before.
+    const exp = EXP_SUFFIX.exec(claim);
+    if (exp) {
+      const expiresAt = Number(exp[1]);
+      if (!Number.isFinite(expiresAt) || Date.now() > expiresAt) return null;
+      const tenant = claim.slice(0, claim.length - (exp[0]?.length ?? 0));
+      if (tenant.length === 0) return null;
+      return capabilities !== undefined ? { tenant, capabilities } : { tenant };
+    }
+    return capabilities !== undefined ? { tenant: claim, capabilities } : { tenant: claim };
   };
 }
 

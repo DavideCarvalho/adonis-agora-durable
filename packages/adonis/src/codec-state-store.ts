@@ -22,21 +22,44 @@ export interface PayloadCodec {
   decode(value: unknown): unknown;
 }
 
+/** What {@link CodecStateStore} runs through the codec. */
+export interface CodecStateStoreOptions {
+  /**
+   * `'payloads'` (default, the historical behavior): run/step `input` + `output` only. **Know what
+   * that leaves in the clear**: step `events` (everything step code passes to `ctx.log`), the
+   * structured `error` messages, heartbeat progress, and search attributes — a deployment sold as
+   * "encrypted payloads" still leaks whatever its steps log.
+   *
+   * `'extended'`: also encode step `events`, step/run `error`, and heartbeat progress (search
+   * attributes stay clear — they must remain queryable). ONLY enable on a FRESH table, or with a
+   * codec whose `decode` recognizes its own ciphertext and passes other values through: rows
+   * written before the switch hold those fields as plaintext, and a decode that can't tell would
+   * garble them.
+   */
+  coverage?: 'payloads' | 'extended';
+}
+
 /**
- * A `StateStore` decorator that runs run/step **payloads** (input + output) through a
- * {@link PayloadCodec} — encoded on write, decoded on read — so they're never stored in the clear.
- * Adapter-agnostic: wrap any store. Searchable metadata (id, status, workflow, tags, timestamps) and
- * the structured `error` are left untouched so the dashboard, queries, and recovery still work.
+ * A `StateStore` decorator that runs run/step **payloads** through a {@link PayloadCodec} — encoded
+ * on write, decoded on read — so they're never stored in the clear. Adapter-agnostic: wrap any
+ * store. Searchable metadata (id, status, workflow, tags, timestamps) is left untouched so the
+ * dashboard, queries, and recovery still work. See {@link CodecStateStoreOptions.coverage} for
+ * exactly which fields are covered — the default covers `input`/`output` only.
  *
  * ```ts
- * const store = new CodecStateStore(new TypeOrmStateStore(ds), aesCodec);
+ * const store = new CodecStateStore(new TypeOrmStateStore(ds), aesCodec, { coverage: 'extended' });
  * ```
  */
 export class CodecStateStore implements StateStore {
+  private readonly extended: boolean;
+
   constructor(
     private readonly inner: StateStore,
     private readonly codec: PayloadCodec,
-  ) {}
+    options: CodecStateStoreOptions = {},
+  ) {
+    this.extended = options.coverage === 'extended';
+  }
 
   private enc(v: unknown): unknown {
     return v === undefined ? undefined : this.codec.encode(v);
@@ -46,16 +69,42 @@ export class CodecStateStore implements StateStore {
   }
 
   private encRun(run: WorkflowRun): WorkflowRun {
-    return { ...run, input: this.enc(run.input), output: this.enc(run.output) };
+    const next: WorkflowRun = { ...run, input: this.enc(run.input), output: this.enc(run.output) };
+    if (this.extended && run.error !== undefined) {
+      next.error = this.enc(run.error) as WorkflowRun['error'];
+    }
+    return next;
   }
   private decRun<T extends WorkflowRun | null>(run: T): T {
-    return (run && { ...run, input: this.dec(run.input), output: this.dec(run.output) }) as T;
+    if (!run) return run;
+    const next: WorkflowRun = { ...run, input: this.dec(run.input), output: this.dec(run.output) };
+    if (this.extended && run.error !== undefined) {
+      next.error = this.dec(run.error) as WorkflowRun['error'];
+    }
+    return next as T;
   }
   private encCp(cp: StepCheckpoint): StepCheckpoint {
-    return { ...cp, input: this.enc(cp.input), output: this.enc(cp.output) };
+    const next: StepCheckpoint = { ...cp, input: this.enc(cp.input), output: this.enc(cp.output) };
+    if (this.extended) {
+      if (cp.events !== undefined) next.events = this.enc(cp.events) as StepCheckpoint['events'];
+      if (cp.error !== undefined) next.error = this.enc(cp.error) as StepCheckpoint['error'];
+      if (cp.heartbeatProgress !== undefined) {
+        next.heartbeatProgress = this.enc(cp.heartbeatProgress);
+      }
+    }
+    return next;
   }
   private decCp<T extends StepCheckpoint | null>(cp: T): T {
-    return (cp && { ...cp, input: this.dec(cp.input), output: this.dec(cp.output) }) as T;
+    if (!cp) return cp;
+    const next: StepCheckpoint = { ...cp, input: this.dec(cp.input), output: this.dec(cp.output) };
+    if (this.extended) {
+      if (cp.events !== undefined) next.events = this.dec(cp.events) as StepCheckpoint['events'];
+      if (cp.error !== undefined) next.error = this.dec(cp.error) as StepCheckpoint['error'];
+      if (cp.heartbeatProgress !== undefined) {
+        next.heartbeatProgress = this.dec(cp.heartbeatProgress);
+      }
+    }
+    return next as T;
   }
 
   ensureSchema(): Promise<void> {
@@ -92,6 +141,16 @@ export class CodecStateStore implements StateStore {
   }
   saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
     return this.inner.saveCheckpoint(this.encCp(checkpoint));
+  }
+  /**
+   * Forwarded — previously this wrapper simply didn't implement the optional method, so wrapping a
+   * store with a codec silently DISABLED persisted step liveness entirely. Under `extended`
+   * coverage the progress payload is encoded like every other step payload.
+   */
+  recordStepHeartbeat(runId: string, seq: number, at: Date, progress?: unknown): Promise<void> {
+    if (!this.inner.recordStepHeartbeat) return Promise.resolve();
+    const encoded = this.extended && progress !== undefined ? this.enc(progress) : progress;
+    return this.inner.recordStepHeartbeat(runId, seq, at, encoded);
   }
   transaction<T>(
     work: (tx: {

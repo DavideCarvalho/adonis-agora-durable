@@ -24,7 +24,9 @@ import {
   mergeFleets,
 } from '../src/dashboard/compat.js';
 import {
+  type DashboardAuditEntry,
   type DurableDashboardConfig,
+  isProduction,
   type ResolvedDurableDashboardConfig,
   resolveConfig,
 } from '../src/dashboard/define_config.js';
@@ -110,6 +112,34 @@ export default class DashboardProvider {
   /** Warn once so a throwing `login`/`session` hook doesn't spam the logs on every failed attempt. */
   private warnedOnHookThrow = false;
 
+  /** Login-attempt timestamps per client address — a simple sliding window (10/min) so a brute
+   *  force can't hammer the host's `login` hook at line rate. In-memory per instance: a cluster
+   *  multiplies the budget by pod count, which still reduces the attack by orders of magnitude. */
+  private readonly loginAttempts = new Map<string, number[]>();
+
+  /** True (and reply 429) when this address exhausted its login window. */
+  private loginRateLimited(ctx: HttpContext): boolean {
+    const WINDOW_MS = 60_000;
+    const MAX_ATTEMPTS = 10;
+    const key = ctx.request.ip() || 'unknown';
+    const now = Date.now();
+    const recent = (this.loginAttempts.get(key) ?? []).filter((t) => now - t < WINDOW_MS);
+    if (recent.length >= MAX_ATTEMPTS) {
+      this.loginAttempts.set(key, recent);
+      ctx.response.status(429).json({ error: 'too many login attempts — retry in a minute' });
+      return true;
+    }
+    recent.push(now);
+    this.loginAttempts.set(key, recent);
+    // Bounded: prune other addresses opportunistically so the map can't grow without limit.
+    if (this.loginAttempts.size > 10_000) this.loginAttempts.clear();
+    return false;
+  }
+
+  /** SSE connections currently open, per client address (and in total) — see streamRun. */
+  private readonly sseByAddress = new Map<string, number>();
+  private sseTotal = 0;
+
   /**
    * Captures the engine's `capability.unavailable` / `protocol.incompatible` diagnostics events so the
    * `/compat` health panel can render each blocked run's structured delta + the live-fleet compat view
@@ -164,7 +194,10 @@ export default class DashboardProvider {
     // pod resolves the DURABLE_RUN_GATEWAY token (a ProxyRunGateway) and adapts it — NO engine, NO store.
     const resolveEngine = (): Promise<DashboardEngine> =>
       dashboardEngineForRole(role, this.app.container, WorkflowEngine);
-    const deps = async (): Promise<Deps> => ({ engine: await resolveEngine() });
+    const deps = async (): Promise<Deps> => ({
+      engine: await resolveEngine(),
+      ...(config.redact ? { redact: config.redact } : {}),
+    });
 
     // Built-in `dashboardAuth` (Mode A `session` and/or Mode B `login`, opt-in). Registered ONLY when
     // configured, so omitting `dashboardAuth` leaves route registration byte-for-byte as it was. These
@@ -179,13 +212,17 @@ export default class DashboardProvider {
     const json = (handler: (d: Deps, req: ApiRequest) => Promise<ApiResponse>) => {
       return async (ctx: HttpContext) => {
         if (!(await this.enforce(config, ctx, 'api'))) return;
+        // Attribution for every mutating attempt — BEFORE the handler, so even a failing action is
+        // on record. Reads (GET) are not audited (they'd drown the log).
+        if (isMutatingMethod(ctx)) this.audit(config, ctx);
         try {
           const result = await handler(await deps(), toApiRequest(ctx));
           return ctx.response.status(result.status).json(result.body);
         } catch (error) {
-          return ctx.response
-            .status(500)
-            .json({ error: error instanceof Error ? error.message : 'internal error' });
+          // Generic body on a 500: raw driver/store messages (connection strings, SQL fragments)
+          // must not flow to API callers. The detail goes to the app logger instead.
+          void this.logServerError(error);
+          return ctx.response.status(500).json({ error: 'internal error' });
         }
       };
     };
@@ -276,9 +313,8 @@ export default class DashboardProvider {
           const result = await compat(await this.compatSource(await resolveEngine()));
           return ctx.response.status(result.status).json(result.body);
         } catch (error) {
-          return ctx.response
-            .status(500)
-            .json({ error: error instanceof Error ? error.message : 'internal error' });
+          void this.logServerError(error);
+          return ctx.response.status(500).json({ error: 'internal error' });
         }
       })
       .as('durable_dashboard.compat');
@@ -341,6 +377,18 @@ export default class DashboardProvider {
    * teardown).
    */
   private async streamRun(ctx: HttpContext, engine: DashboardEngine, runId: string): Promise<void> {
+    // Connection budget: each open stream is one listener on the engine's GLOBAL emitter plus one
+    // held socket — uncapped, N tabs (or a leak) made every engine event pay O(N) filtering and
+    // pinned N sockets forever. 100 per instance / 10 per client address is far above any human use.
+    const address = ctx.request.ip() || 'unknown';
+    const perAddress = this.sseByAddress.get(address) ?? 0;
+    if (this.sseTotal >= 100 || perAddress >= 10) {
+      ctx.response.status(429).json({ error: 'too many open event streams' });
+      return;
+    }
+    this.sseTotal += 1;
+    this.sseByAddress.set(address, perAddress + 1);
+
     ctx.response.header('content-type', 'text/event-stream');
     ctx.response.header('cache-control', 'no-cache');
     ctx.response.header('connection', 'keep-alive');
@@ -350,9 +398,24 @@ export default class DashboardProvider {
     const unsubscribe = engine.subscribe(runId, (event) => {
       stream.write(`data: ${JSON.stringify(event)}\n\n`);
     });
+    // Server-side heartbeat: a comment line every 25s keeps intermediaries from silently reaping an
+    // idle stream AND surfaces a dead client to Node (the write errors, `close` fires, we clean up)
+    // instead of holding the subscription forever.
+    const ping = setInterval(() => {
+      stream.write(': ping\n\n');
+    }, 25_000);
+    (ping as { unref?: () => void }).unref?.();
+    let cleaned = false;
     const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      clearInterval(ping);
       unsubscribe();
       stream.end();
+      this.sseTotal -= 1;
+      const left = (this.sseByAddress.get(address) ?? 1) - 1;
+      if (left <= 0) this.sseByAddress.delete(address);
+      else this.sseByAddress.set(address, left);
     };
     ctx.request.request.on('close', cleanup);
     ctx.response.stream(stream);
@@ -423,6 +486,7 @@ export default class DashboardProvider {
       // page with `?error` on failure). Same hook, same cookie, same uniform failure either way.
       router
         .post(loginPath, async (ctx) => {
+          if (this.loginRateLimited(ctx)) return;
           const body = ctx.request.body();
           const outcome = await performLogin(auth, body, config.path);
           const form = isFormPost(ctx);
@@ -456,6 +520,7 @@ export default class DashboardProvider {
     if (auth.session) {
       router
         .post(sessionPath, async (ctx) => {
+          if (this.loginRateLimited(ctx)) return;
           const outcome = await performSession(auth, ctx.request.request);
           if (outcome.kind === 'unauthorized') {
             this.warnHookThrow(outcome.hookError);
@@ -467,12 +532,54 @@ export default class DashboardProvider {
         .as('durable_dashboard.session.mint');
     }
 
-    router
-      .get(logoutPath, async (ctx) => {
-        ctx.response.clearCookie(SESSION_COOKIE_NAME, { path: '/' });
-        return ctx.response.redirect().toPath(auth.login ? loginPath : config.path || '/');
-      })
-      .as('durable_dashboard.logout');
+    const logout = async (ctx: HttpContext) => {
+      ctx.response.clearCookie(SESSION_COOKIE_NAME, { path: '/' });
+      return ctx.response.redirect().toPath(auth.login ? loginPath : config.path || '/');
+    };
+    router.get(logoutPath, logout).as('durable_dashboard.logout');
+    // POST too: the CSRF-proof spelling for clients that prefer it (the GET stays for plain <a>
+    // links — it only ever destroys the caller's own session, so a forced logout is an annoyance,
+    // not a compromise).
+    router.post(logoutPath, logout).as('durable_dashboard.logout.post');
+  }
+
+  /** Record one mutating console action (see DashboardAuditEntry). Never throws into the request. */
+  private audit(config: ResolvedDurableDashboardConfig, ctx: HttpContext): void {
+    try {
+      const auth = config.dashboardAuth;
+      const session = auth ? readSession(auth, this.readSessionCookie(ctx)) : null;
+      const fromToken =
+        ctx.request.header('authorization') !== undefined ||
+        ctx.request.header('x-durable-token') !== undefined;
+      const actor = session?.name ?? session?.sub ?? (fromToken ? 'token' : 'anonymous');
+      const entry: DashboardAuditEntry = {
+        at: new Date(),
+        actor,
+        method: ctx.request.method().toUpperCase(),
+        path: ctx.request.url(false),
+      };
+      if (config.audit) {
+        config.audit(entry);
+        return;
+      }
+      void this.app.container.make('logger').then((logger) => {
+        logger.info(`[durable_dashboard] audit actor=${entry.actor} ${entry.method} ${entry.path}`);
+      });
+    } catch {
+      /* auditing must never break the action */
+    }
+  }
+
+  /** Route a handler 500's detail to the app logger (the client only ever sees a generic body). */
+  private async logServerError(error: unknown): Promise<void> {
+    try {
+      const logger = await this.app.container.make('logger');
+      logger.error(
+        `[durable_dashboard] handler failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+      );
+    } catch {
+      /* logging must never throw into the request */
+    }
   }
 
   private async warnHookThrow(hookError: unknown): Promise<void> {
@@ -503,6 +610,15 @@ export default class DashboardProvider {
     ctx: HttpContext,
     mode: 'page' | 'api',
   ): Promise<boolean> {
+    // CSRF defense-in-depth over the Lax session cookie: a browser-originated CROSS-SITE mutating
+    // request is rejected outright, whatever guard would have passed it. The mutating endpoints
+    // need no body and read flags from the query string, so without this a malicious page could
+    // fire them as SIMPLE cross-origin POSTs (no preflight) against a console the operator's
+    // browser is authenticated to. Non-browser clients send neither header and pass.
+    if (mode === 'api' && isMutatingMethod(ctx) && crossSiteRequest(ctx)) {
+      ctx.response.status(403).json({ error: 'cross-site request rejected' });
+      return false;
+    }
     const allowed = await config.authorize(ctx);
     if (!allowed) {
       if (mode === 'page') {
@@ -517,7 +633,19 @@ export default class DashboardProvider {
     if (!auth) return true;
 
     const session = readSession(auth, this.readSessionCookie(ctx));
-    if (session) return true;
+    if (session) {
+      // Role convention: a session WITHOUT roles keeps full access (back-compat — most host hooks
+      // never set them); a session WITH roles must carry `operator` (or `admin`) to mutate.
+      // Previously every authenticated principal — including a read-only support login — could
+      // bulk-cancel with compensation or fix-and-replay.
+      if (mode === 'api' && isMutatingMethod(ctx) && !sessionCanMutate(session)) {
+        ctx.response
+          .status(403)
+          .json({ error: "this session's roles do not include 'operator' (or 'admin')" });
+        return false;
+      }
+      return true;
+    }
 
     if (mode === 'page') {
       if (auth.login) {
@@ -572,7 +700,9 @@ export default class DashboardProvider {
     ctx.response.plainCookie(SESSION_COOKIE_NAME, value, {
       httpOnly: true,
       sameSite: 'lax',
-      secure: ctx.request.secure(),
+      // Forced on in production even when `request.secure()` reads false (a TLS-terminating proxy
+      // without AdonisJS trustProxy) — exactly the deployments that most need the Secure flag.
+      secure: isProduction() || ctx.request.secure(),
       path: '/',
       maxAge: Math.floor(auth.ttlMs / 1000),
       encode: false,
@@ -591,6 +721,40 @@ export default class DashboardProvider {
  * AdonisJS's `response.hasLazyBody` structurally so a plain-object `ctx` double in a unit test
  * (which has neither) still works.
  */
+/** Whether this request can change state (everything but GET/HEAD/OPTIONS). Exported for tests. */
+export function isMutatingMethod(ctx: HttpContext): boolean {
+  const method = ctx.request.method().toUpperCase();
+  return method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS';
+}
+
+/**
+ * Whether a request is browser-originated CROSS-SITE: `sec-fetch-site` when the browser sends it
+ * (anything but `same-origin`/`none` is cross), else the `Origin` header must match the request
+ * host. Requests carrying neither header (curl, server-side SDKs, same-origin GETs) are not
+ * cross-site. Subdomains (`same-site`) count as cross on purpose — the console has no legitimate
+ * cross-subdomain POST caller, and strict beats sorry here.
+ */
+export function crossSiteRequest(ctx: HttpContext): boolean {
+  const fetchSite = ctx.request.header('sec-fetch-site');
+  if (fetchSite) return fetchSite !== 'same-origin' && fetchSite !== 'none';
+  const origin = ctx.request.header('origin');
+  if (!origin || origin === 'null') return origin === 'null';
+  try {
+    return new URL(origin).host !== ctx.request.header('host');
+  } catch {
+    return true; // an unparseable Origin is not a browser being honest — reject
+  }
+}
+
+/** Role convention (see enforce): no roles = full access; with roles, mutating needs operator/admin. */
+export function sessionCanMutate(session: { roles: string[] }): boolean {
+  if (session.roles.length === 0) return true;
+  return session.roles.some((r) => {
+    const role = r.toLowerCase();
+    return role === 'operator' || role === 'admin';
+  });
+}
+
 function responseAnswered(ctx: HttpContext): boolean {
   if (ctx.response.getHeader('location')) return true;
   const response = ctx.response as unknown as { hasLazyBody?: unknown; headersSent?: unknown };
