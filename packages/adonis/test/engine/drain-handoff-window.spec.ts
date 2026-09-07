@@ -181,11 +181,12 @@ describe('drain timeout on a long / hot continue-as-new chain', () => {
     expect(elapsed).toBeGreaterThanOrEqual(timeoutMs - 30);
     expect(elapsed).toBeLessThan(timeoutMs + 500);
 
-    // No loss: at the timeout the frontier link is PERSISTED and LEASED (running, lockedBy set), i.e.
-    // owned in-flight work a fresh boot's recoverIncomplete() re-drives — not a dropped/vanished run.
+    // No loss: at the timeout the frontier link is PERSISTED with the lease RELEASED (running,
+    // lockedBy cleared), i.e. unowned work a fresh boot's recoverIncomplete() reclaims immediately —
+    // not a dropped/vanished run, and not stuck behind a lease expiry.
     const frontier = await store.getRun('p~6');
     expect(frontier?.status).toBe('running');
-    expect(frontier?.lockedBy).toBeTruthy();
+    expect(frontier?.lockedBy).toBeFalsy();
 
     // And prove the frontier work is genuinely resumable, not stranded: release it and let the chain
     // finish. p~6 hands off to p~7, which is past LIMIT and completes. Nothing was lost to the timeout.
