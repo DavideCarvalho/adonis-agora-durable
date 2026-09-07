@@ -101,6 +101,19 @@ export function attachDurableOtel(
       case 'run.failed':
         endRoot(event, { error: true, message: event.error?.message });
         break;
+      case 'capability.unavailable':
+      case 'protocol.incompatible':
+        // The run parked `blocked` (design §7.5/§7.6) — like a suspend, this is a resting state, not a
+        // fresh execution, so the blocked-recovery poll's eventual resume does NOT re-emit `run.started`
+        // (engine.ts only fires it from `pending`, and a blocked run resumes from `blocked`). Without
+        // closing here, this root would NEVER see another lifecycle event — `run.completed`/`failed`/
+        // `suspended` are the only other cases that end it — leaking the span (and this Map entry) for
+        // as long as the process lives whenever a run blocks on a missing capability/protocol and either
+        // never recovers or recovers on a leg with no further blocking. Mark it error: unlike a normal
+        // suspend, this is the engine's LOUD diagnostic for a fleet that (at least momentarily) can't
+        // serve the run.
+        endRoot(event, { error: true, message: event.error?.message });
+        break;
     }
   });
 }
