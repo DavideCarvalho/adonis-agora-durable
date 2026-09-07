@@ -1,5 +1,11 @@
 # @adonis-agora/durable-eslint-plugin
 
+## 0.3.0
+
+### Minor Changes
+
+- [#115](https://github.com/DavideCarvalho/adonis-agora-durable/pull/115) [`19fcf54`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/19fcf5447f5112e51a4c2c701503c691c9f23aff) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Two new rules, both on in the `recommended` preset: `rethrow-control-flow-signals` reports a `try/catch` inside a workflow body that swallows the engine's control-flow signals (suspend / continue-as-new) — a catch over awaited code must guard with `if (isWorkflowControlFlowSignal(e)) throw e` (offered as an editor suggestion) or rethrow unconditionally; `no-io-in-workflow-body` flags un-checkpointed I/O in the orchestration body — global `fetch(...)` calls and raw `engine.*` calls — which re-executes on every replay. `no-nondeterminism` also got sharper: it now catches bare `randomUUID` imports from `node:crypto` (incl. `import { randomUUID as uuid }` aliases and namespace/default imports), `process.env` reads (deploy-varying branches break replay), plain `Date()` calls, and same-file `const d = Date; d.now()` aliases.
+
 ## 0.2.2
 
 ### Patch Changes
