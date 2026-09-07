@@ -385,14 +385,14 @@ export class QueueTransport implements Transport, ControlPlane {
    * and owns the stop-all bookkeeping. Returns a handle that stops just this loop.
    *
    * A throwing `onJob` did NOT do the job's work, so the job is REDELIVERED (`retryJob`, delayed one
-   * poll interval) rather than destroyed, and the error is reported to `onError`. This matters most
-   * for the results queue, which is point-to-point: every engine instance polls it, so a result can
-   * be popped by one that cannot act on it (a pod mid-rolling-deploy without the workflow registered,
-   * a stale process from an older build). Failing the job there dropped the ONLY copy of the result —
-   * the run stayed `suspended` with no `wakeAt`, unreachable by every recovery path, forever and
-   * silently. Redelivery hands it to an instance that CAN resume it; a job nobody can handle now
-   * loops at the poll rate and says so on every attempt, which is the failure we want — loud, not
-   * invisible.
+   * poll interval) rather than destroyed, and the error is reported to `onError`. For the results
+   * queue, "the job's work" is settling the checkpoint: the engine's result handler persists the
+   * checkpoint BEFORE kicking the run's resume (which runs fire-and-forget, never holding this
+   * loop), so a throw here means the completion was never recorded — the ONLY copy of the result
+   * must stay on the queue. (A pod mid-rolling-deploy without the workflow registered still settles
+   * fine — settling needs no registry — and acks; its background resume fails into the run's
+   * reconcile recovery instead of wedging or losing the result.) A job nobody can settle loops at
+   * the poll rate and says so on every attempt, which is the failure we want — loud, not invisible.
    */
   #startLoop(queue: string, onJob: (job: JobData) => Promise<void>): PollLoop {
     // Deferred consumption (see deferConsumers): park the start; startConsumers() flushes it. The

@@ -9,10 +9,12 @@ import { MockAdapter } from '../../../src/transports/queue-mock-adapter.js';
  * can be popped by ANY pod — including one that cannot resume the run (a pod mid-rolling-deploy that
  * doesn't have the workflow registered yet, or a stale process left over from an earlier build).
  *
- * Before the fix that pod destroyed the result: `completeRemoteResult` wrote the `completed`
- * checkpoint, `resume()` then threw "workflow … is not registered", and the poll loop swallowed the
- * throw into `failJob` — removing the job. The run stayed `suspended` with NO `wakeAt`, so no timer
- * poller, recovery sweep or redelivery could ever advance it: stuck forever, silently.
+ * The checkpoint settle needs no workflow registry, so the stale pod still records the completion —
+ * durably, before acking the job. Its background resume then fails ("is not registered"), and the run
+ * stays `suspended` with its reconcile `wakeAt`: at-least-once resume via run STATE (timer recovery
+ * re-drives it), not by holding the result job — holding it is what wedged the serial results loop
+ * behind a resumed turn awaiting its next step (see results-loop-deadlock.spec.ts). The result is
+ * never lost: the finished step's checkpoint survives, and the next recovery tick replays past it.
  */
 
 /** Poll the store until `runId` reaches a terminal state (the result travels over a poll loop). */
@@ -104,13 +106,16 @@ describe('QueueTransport — a result popped by an instance that cannot resume t
     }, 'the stale pod to complete the first step checkpoint');
     expect((await store.getRun('run-1'))?.status).toBe('suspended');
 
-    // The stale pod is replaced by a healthy one that DOES have the workflow. The result must still
-    // be on the queue for it to pick up — that is the whole contract of a durable remote step.
+    // The stale pod is replaced by a healthy one that DOES have the workflow. The result job is
+    // already acked — what survives is the DURABLE state: a `completed` checkpoint plus a
+    // `suspended` run carrying its reconcile `wakeAt`. Timer recovery (the poller jumping past that
+    // deadline) re-drives it: the replay short-circuits the finished step and the run continues.
     await staleTransport.close();
     const appTransport = track(new QueueTransport({ adapter: () => adapter, pollIntervalMs: 5 }));
     const app = new WorkflowEngine({ store, transport: appTransport, instanceId: 'app' });
     app.register('exam-ingest', '1', body as never);
 
+    await app.resumeDueTimers(Date.now() + 360_000);
     const run = await settle(store, 'run-1');
     expect(run.status).toBe('completed');
     expect(run.output).toEqual({ metrics: 5 });
