@@ -148,6 +148,18 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.getRun('nope')).toBeNull();
     });
 
+    t(
+      'createRun rejects a duplicate id (the engine converges racing starts on the winner)',
+      async () => {
+        await store.createRun(run({ status: 'completed', output: { total: 1 } }));
+        await expect(store.createRun(run())).rejects.toThrow();
+        // The winner's state was not clobbered by the losing insert.
+        const winner = await store.getRun('r1');
+        expect(winner?.status).toBe('completed');
+        expect(winner?.output).toEqual({ total: 1 });
+      },
+    );
+
     t('updates a run (status/output) and round-trips recoveryAttempts + dead status', async () => {
       await store.createRun(run({ recoveryAttempts: 3 }));
       await store.updateRun('r1', {
@@ -438,6 +450,83 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       await store.releaseRunLock('r1');
       expect(await store.tryLockRun('r1', 'C', 9_000, 2_600)).toBe(true);
     });
+
+    t(
+      'listOrphanedRuns returns only running runs with a free/expired lease (when implemented)',
+      async () => {
+        if (!store.listOrphanedRuns) return; // optional — the engine falls back to listIncompleteRuns
+        await store.createRun(run({ id: 'free', status: 'running' }));
+        await store.createRun(run({ id: 'leased', status: 'running' }));
+        await store.createRun(run({ id: 'expired', status: 'running' }));
+        await store.createRun(run({ id: 'idle', status: 'suspended' }));
+        await store.tryLockRun('leased', 'A', 9_000, 1_000);
+        await store.tryLockRun('expired', 'A', 2_000, 1_000);
+        const orphans = await store.listOrphanedRuns(5_000, 10);
+        expect(orphans.map((r) => r.id).sort()).toEqual(['expired', 'free']);
+        // The limit caps the batch.
+        expect((await store.listOrphanedRuns(5_000, 1)).length).toBe(1);
+      },
+    );
+
+    t('listDueTimers honors the optional limit, oldest deadline first (when applied)', async () => {
+      await store.createRun(run({ id: 'later', status: 'suspended', wakeAt: 4_000 }));
+      await store.createRun(run({ id: 'sooner', status: 'suspended', wakeAt: 2_000 }));
+      const capped = await store.listDueTimers(9_000, undefined, 1);
+      // A store may ignore the cap (back-compat); when it applies it, oldest deadline wins.
+      if (capped.length === 1) expect(capped[0]?.id).toBe('sooner');
+      expect((await store.listDueTimers(9_000, undefined, 5)).length).toBe(2);
+    });
+
+    t(
+      'listSignalWaitersByRunIds returns only the given runs’ waiters (when implemented)',
+      async () => {
+        if (!store.listSignalWaitersByRunIds) return;
+        await store.createRun(run({ id: 'w1' }));
+        await store.createRun(run({ id: 'w2' }));
+        await store.putSignalWaiter({ token: 'a', runId: 'w1', seq: 0 });
+        await store.putSignalWaiter({ token: 'b', runId: 'w2', seq: 0 });
+        await store.putSignalWaiter({ token: 'c', runId: 'w1', seq: 1 });
+        const waiters = await store.listSignalWaitersByRunIds(['w1']);
+        expect(waiters.map((w) => w.token).sort()).toEqual(['a', 'c']);
+        expect(await store.listSignalWaitersByRunIds([])).toEqual([]);
+      },
+    );
+
+    t('listRuns pushes createdBefore/createdAfter/wakeBefore down as predicates', async () => {
+      await store.createRun(run({ id: 'old', createdAt: new Date(1_000), updatedAt: at }));
+      await store.createRun(run({ id: 'new', createdAt: new Date(9_000), updatedAt: at }));
+      await store.createRun(
+        run({ id: 'due', status: 'blocked', wakeAt: 2_000, createdAt: new Date(1_000) }),
+      );
+      await store.createRun(
+        run({ id: 'not-due', status: 'blocked', wakeAt: 9_000, createdAt: new Date(1_000) }),
+      );
+      expect((await store.listRuns({ createdBefore: 5_000 })).map((r) => r.id).sort()).toEqual([
+        'due',
+        'not-due',
+        'old',
+      ]);
+      expect((await store.listRuns({ createdAfter: 5_000 })).map((r) => r.id)).toEqual(['new']);
+      expect(
+        (await store.listRuns({ statuses: ['blocked'], wakeBefore: 5_000 })).map((r) => r.id),
+      ).toEqual(['due']);
+    });
+
+    t(
+      'releaseRunLock with an owner only releases that owner’s lease (zombie fencing)',
+      async () => {
+        await store.createRun(run({ id: 'r1' }));
+        expect(await store.tryLockRun('r1', 'A', 2_000, 1_000)).toBe(true);
+        // A's lease expires; B takes over.
+        expect(await store.tryLockRun('r1', 'B', 9_000, 2_500)).toBe(true);
+        // Zombie A's owner-scoped release must NOT wipe B's live lease…
+        await store.releaseRunLock('r1', 'A');
+        expect(await store.tryLockRun('r1', 'C', 9_500, 3_000)).toBe(false);
+        // …while B's own owner-scoped release does free it.
+        await store.releaseRunLock('r1', 'B');
+        expect(await store.tryLockRun('r1', 'C', 9_500, 3_100)).toBe(true);
+      },
+    );
 
     t('renewRunLock only succeeds for the current owner', async () => {
       await store.createRun(run({ id: 'r1' }));

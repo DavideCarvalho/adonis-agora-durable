@@ -51,6 +51,13 @@ vi.mock('../client/durable-client', async (importOriginal) => {
       values: vi.fn().mockResolvedValue([]),
       workers: vi.fn().mockResolvedValue([]),
       topology: vi.fn().mockResolvedValue({ role: 'standalone' }),
+      compat: vi.fn().mockResolvedValue({
+        controlPlane: { instanceId: 'cp', protocol: 1, protocolRange: [1, 1], capabilities: [] },
+        groups: [],
+        blocked: [],
+        incompatibleCount: 0,
+        blockedCount: 0,
+      }),
     },
   };
 });

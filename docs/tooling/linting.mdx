@@ -1,6 +1,6 @@
 ---
 title: Linting for non-determinism
-description: Catch Date.now(), Math.random(), new Date() and crypto.randomUUID() inside a workflow body at author time with @adonis-agora/durable-eslint-plugin — an AST-scoped ESLint rule that knows both the engine.register() function form and a BaseWorkflow class.
+description: Catch Date.now(), Math.random(), process.env, swallowed control-flow signals and direct I/O inside a workflow body at author time with @adonis-agora/durable-eslint-plugin — AST-scoped ESLint rules that know both the engine.register() function form and a BaseWorkflow class.
 icon: SpellCheck
 ---
 
@@ -21,8 +21,15 @@ Inside a workflow body, these are banned, and the fix is the engine's checkpoint
 | `Date.now()` | wall clock, different every replay | `await ctx.now()` |
 | `performance.now()` | monotonic clock, different every replay | `await ctx.now()` |
 | `new Date()` (no args) | wraps `Date.now()` | `new Date(await ctx.now())` |
+| `Date()` (plain call) | the current-time string | `new Date(await ctx.now())` |
 | `Math.random()` | fresh entropy every replay | `await ctx.sideEffect(() => Math.random())` |
 | `crypto.randomUUID()` | fresh entropy every replay | `await ctx.sideEffect(() => crypto.randomUUID())` |
+| imported `randomUUID` from `node:crypto` | fresh entropy every replay | `await ctx.sideEffect(() => randomUUID())` |
+| `process.env` reads | a redeploy changes the value mid-run | `await ctx.sideEffect(() => process.env.X)`, or resolve config outside the workflow |
+
+The rule also sees through the easy disguises: `import { randomUUID as uuid }` aliases, a
+default/namespace `crypto` import, and a same-file `const d = Date; d.now()` alias (simple `const`
+tracking — no data-flow analysis).
 
 ```ts
 // ✗ corrupts the run on replay
@@ -44,14 +51,22 @@ engine.register('checkout', '1', async (ctx, order) => {
 
 `ctx.now()` covers timestamps; `ctx.sideEffect(fn)` captures any other generated value once and replays it verbatim — pass your own generator.
 
+## Two more rules: swallowed signals and direct I/O
+
+Non-determinism isn't the only way a workflow body silently breaks — the plugin ships two companion rules, both on in the recommended preset:
+
+- **`rethrow-control-flow-signals`** — a `try/catch` inside the workflow body must let the engine's control-flow signals through (see [Catching errors](/docs/durable/concepts/workflows-and-steps#catching-errors--rethrow-control-flow-signals)). Suspend-the-run operations unwind the turn by *throwing*; a catch that swallows one breaks suspension silently and the resumed replay dies with a `NonDeterminismError`. The rule reports a catch over awaited code unless it guards with `if (isWorkflowControlFlowSignal(error)) throw error` or rethrows the caught error unconditionally — and offers an editor suggestion inserting the guard as the first statement. A try over purely synchronous code (`try { JSON.parse(raw) } catch { … }`) is left alone: it can never catch a signal.
+
+- **`no-io-in-workflow-body`** — the orchestration body re-executes on every replay, so un-checkpointed I/O runs again each time. The rule flags global `fetch(...)` calls (only the global — `this.fetch(...)` and other receivers are left alone) and raw `engine.*` calls (receiver named exactly `engine`) inside the workflow body. Wrap the I/O in a checkpointed step — `await ctx.localStep('get', () => fetch(url))` — or drive the engine from outside the workflow.
+
 ## What it knows about a workflow body
 
-The `no-nondeterminism` rule is **AST-scoped** — it only fires *inside a workflow body*, recognizing both forms Agora supports:
+Every rule in the plugin is **AST-scoped** — it only fires *inside a workflow body*, recognizing both forms Agora supports:
 
 - **The function form** — the function passed to `engine.register(name, version, fn)` (and `registerRemote` / `registerEntity`), where the receiver reads as a workflow engine (`engine`, `workflowEngine`, `this.engine`, …). An unrelated `someRegistry.register(...)` is left alone.
 - **The class form** — the `run` method of a workflow class: a `BaseWorkflow` subclass, or any class carrying a `static workflow = { name, … }` config.
 
-Crucially, the rule **stops at a `ctx.localStep(...)`, `ctx.task(...)`, or `ctx.sideEffect(...)` callback boundary**: those are the checkpoint-callback primitives whose body runs once and whose whole result is recorded, so a `Date.now()` inside one is fine. (`ctx.step` is **not** a boundary — it is the always-dispatched step whose second argument is data, not a callback.) Only the deterministic orchestration prefix is checked, so you can enable the rule across your whole `**/*.ts` glob without false positives.
+Crucially, the rules **stop at a `ctx.localStep(...)`, `ctx.task(...)`, or `ctx.sideEffect(...)` callback boundary**: those are the checkpoint-callback primitives whose body runs once and whose whole result is recorded, so a `Date.now()`, a `try/catch`, or a `fetch()` inside one is fine. (`ctx.step` is **not** a boundary — it is the always-dispatched step whose second argument is data, not a callback.) Only the deterministic orchestration prefix is checked, so you can enable the rules across your whole `**/*.ts` glob without false positives.
 
 ## ESLint (flat config)
 
@@ -66,12 +81,14 @@ export default [
     plugins: { '@adonis-agora/durable': durable },
     rules: {
       '@adonis-agora/durable/no-nondeterminism': 'error',
+      '@adonis-agora/durable/rethrow-control-flow-signals': 'error',
+      '@adonis-agora/durable/no-io-in-workflow-body': 'error',
     },
   },
 ]
 ```
 
-Or spread the shipped preset, which enables the rule at `error` for you:
+Or spread the shipped preset, which enables every rule at `error` for you:
 
 ```js title="eslint.config.js"
 import durable from '@adonis-agora/durable-eslint-plugin'

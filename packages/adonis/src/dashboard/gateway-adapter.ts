@@ -1,3 +1,4 @@
+import type { ScheduleInfo } from '../engine.js';
 import type {
   EngineEvent,
   RunFacetQuery,
@@ -6,6 +7,7 @@ import type {
   RunValueFacetOptions,
   RunValueFacetRow,
   SignalWaiter,
+  UpdateResult,
 } from '../interfaces.js';
 import { DURABLE_RUN_GATEWAY } from '../role_bindings.js';
 import type { RunGateway } from '../run-gateway/interface.js';
@@ -34,12 +36,23 @@ export interface StoreEngineLike {
     newRunId?: string,
   ): Promise<{ runId: string } | null>;
   continue(runId: string): Promise<RunResult | null>;
+  /** Console human-in-the-loop verbs — every real `WorkflowEngine` has them; forwarded 1:1. */
+  signal(token: string, payload: unknown): Promise<RunResult | null>;
+  update(runId: string, name: string, arg: unknown): Promise<UpdateResult>;
+  completeTask(runId: string, name: string, result: unknown): Promise<RunResult | null>;
+  failTask(runId: string, name: string, error: string): Promise<RunResult | null>;
+  /** Runtime schedule control — every real `WorkflowEngine` has these; forwarded 1:1. */
+  listSchedules(): Promise<ScheduleInfo[]>;
+  setSchedulePaused(key: string, paused: boolean): boolean;
+  triggerSchedule(key: string): Promise<RunResult | null>;
   /** The engine's GLOBAL listener (every run) — {@link storeDashboardEngine} filters it to one run,
    *  same as `StoreRunGateway.subscribe` does. */
   subscribe(listener: (event: EngineEvent) => void): () => void;
   /** Bulk signal-waiter scan — forwarded 1:1 to power `listRuns`' `waiting` stamp (see
    *  `DashboardEngine.listSignalWaiters`'s doc). Every real `WorkflowEngine` has it. */
   listSignalWaiters?(prefix: string): Promise<SignalWaiter[]>;
+  /** Targeted per-page variant (`run_id IN (...)`, indexed) — forwarded when the engine has it. */
+  listSignalWaitersByRunIds?(runIds: string[]): Promise<SignalWaiter[]>;
   /** Value enumeration for the console's pickers — forwarded 1:1 when the engine has it. */
   runValueFacets?(
     axis: RunValueAxis,
@@ -72,6 +85,13 @@ export function storeDashboardEngine(engine: StoreEngineLike): DashboardEngine {
     workerHealth: (extra) => engine.workerHealth(extra),
     retryWithInput: (runId, input) => engine.retryWithInput(runId, input),
     continue: (runId) => engine.continue(runId),
+    signal: (token, payload) => engine.signal(token, payload),
+    update: (runId, name, arg) => engine.update(runId, name, arg),
+    completeTask: (runId, name, result) => engine.completeTask(runId, name, result),
+    failTask: (runId, name, error) => engine.failTask(runId, name, error),
+    listSchedules: () => engine.listSchedules(),
+    setSchedulePaused: (key, paused) => engine.setSchedulePaused(key, paused),
+    triggerSchedule: (key) => engine.triggerSchedule(key),
     subscribe: (runId, onEvent) =>
       engine.subscribe((event) => {
         if (event.runId === runId) onEvent(event);
@@ -80,6 +100,12 @@ export function storeDashboardEngine(engine: StoreEngineLike): DashboardEngine {
       ? {
           listSignalWaiters: (prefix: string) =>
             engine.listSignalWaiters?.(prefix) as Promise<SignalWaiter[]>,
+        }
+      : {}),
+    ...(engine.listSignalWaitersByRunIds
+      ? {
+          listSignalWaitersByRunIds: (runIds: string[]) =>
+            engine.listSignalWaitersByRunIds?.(runIds) as Promise<SignalWaiter[]>,
         }
       : {}),
     ...(engine.runValueFacets

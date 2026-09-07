@@ -362,3 +362,31 @@ await engine.start('pipeline', input, runId, { tags: ['nightly'] })
 ```
 
 The dashboard shows a run's tags and a tag filter. Programmatically, query by tag with `RunQuery.tag` (`engine.listRuns({ tag: 'etl' })`) or the dashboard API's `?tag=` param.
+
+## Delayed starts — `startAt`
+
+Start a run *now* but have it execute *later* by passing `startAt` (epoch ms or a `Date`) to `engine.start`:
+
+```ts
+// Created durably right away; the body first executes at 09:00 tomorrow.
+await engine.start('send-reminder', { orderId }, runId, { startAt: tomorrowAt9am })
+```
+
+The run is created immediately but parked `suspended` with its wake timer set to `startAt`; the ordinary durable-timer poller starts it when due. That makes the delay crash-safe with **no `ctx.sleep` polluting the workflow body or its history** — the body's first checkpoint is its first real step, and a fix-and-replay of the run doesn't re-wait the delay. A `startAt` in the past (or absent) starts immediately. One event-lifecycle nuance: a delayed run skips the `run.started` `pending → running` hop and goes `suspended → …` when it fires.
+
+## Run origin — package attribution
+
+When several packages start workflows on one engine — your app plus a couple of `@adonis-agora/*` libraries — "whose code produced this run?" is worth answering without archaeology. Stamp it with `origin`, at any of three levels (most specific wins):
+
+```ts
+// On the class — every run of this workflow:
+static workflow = { name: 'sync-catalog', version: '1', origin: '@acme/catalog-pipeline' }
+
+// On a manual registration:
+engine.register('sync-catalog', '1', fn, { origin: '@acme/catalog-pipeline' })
+
+// On one start — overriding the registration, for a shared workflow started on another package's behalf:
+await engine.start('sync-catalog', input, runId, { origin: '@acme/billing' })
+```
+
+The origin lands on `run.origin`, is filterable (`engine.listRuns({ origin: '@acme/catalog-pipeline' })`, the dashboard API's `?origin=` param), and powers the console's origin facet — runs with no origin render as "unknown" there. It's attribution, not routing: use [`namespace`](/docs/durable/transports/queue#namespaces--sharing-one-broker-across-pools) to pin *where* a run executes.

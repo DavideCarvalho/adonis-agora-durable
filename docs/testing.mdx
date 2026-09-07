@@ -1,6 +1,6 @@
 ---
 title: Testing
-description: Unit-test workflows with an in-memory engine harness, a clock you control for durable sleep, crash/flaky-step injection, and assertions that read the recorded state — no Postgres, no Redis, no real time.
+description: Unit-test workflows with an in-memory engine harness, a clock you control for durable sleep, crash/flaky-step injection, assertions that read the recorded state, and a replay-CI loop (durable:export → parseRunHistory → assertReplayable) that fails the build on a determinism break — no Postgres, no Redis, no real time.
 icon: FlaskConical
 ---
 
@@ -120,4 +120,33 @@ import { MyAdmissionBackend } from '../src/my_admission_backend.js'
 runAdmissionBackendContract('MyAdmissionBackend', (clock) => new MyAdmissionBackend(clock))
 ```
 
-There is also `assertReplayable` (on `/testing`) for asserting a workflow body replays deterministically.
+## Replay CI — `assertReplayable`
+
+The failure the determinism rules guard against lands on **deploy**: a code change renames, reorders or removes a step at a position an in-flight run's history already recorded, and the replay silently feeds the wrong checkpoint into the wrong step. `assertReplayable` catches that in CI instead — replay a *recorded* run's history against the *current* workflow code, and fail the build on divergence.
+
+The loop is capture → commit → assert:
+
+**1. Capture a fixture** from a real (ideally representative, or in-flight) run. From the terminal, against your running app:
+
+```bash
+node ace durable:export ord-42 --out tests/fixtures/checkout-run.json
+```
+
+Or in code, `captureHistory(engine, runId)` returns the same `RunHistory` (`{ run, checkpoints }`) from any live engine — the [`onEvict`](/docs/durable/reliability/retention#archiving-before-deletion--engineonevict) archival hook receives it too, so an archived run is already a fixture.
+
+**2. Commit the JSON** next to your tests. It is the frozen contract: "code that cannot replay this history cannot be deployed over runs shaped like it."
+
+**3. Assert it in CI.** `parseRunHistory` revives the JSON's date fields; `assertReplayable` seeds a throwaway in-memory engine with the history, registers the workflow **exactly as your app does**, and replays. Nothing is dispatched — there is no transport — so completed steps replay from their checkpoints and any positional mismatch surfaces as a thrown `NonDeterminismError`:
+
+```ts title="tests/replay.spec.ts"
+import { readFileSync } from 'node:fs'
+import { assertReplayable, parseRunHistory } from '@adonis-agora/durable/testing'
+import { checkout } from '../app/workflows/checkout.js'
+
+test('checkout replays its recorded production history', async () => {
+  const fixture = parseRunHistory(readFileSync('tests/fixtures/checkout-run.json', 'utf8'))
+  await assertReplayable((engine) => engine.register('checkout', '1', checkout), fixture)
+})
+```
+
+A passing test means the current code replays the recorded history checkpoint-for-checkpoint. A failing one is the exact break that would have corrupted an in-flight run on deploy — fix it with a [version bump or a `ctx.patched` gate](/docs/durable/authoring/versioning) rather than by re-recording the fixture, unless no runs of the old shape can still be in flight.

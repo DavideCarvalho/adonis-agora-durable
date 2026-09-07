@@ -185,6 +185,8 @@ export class QueueTransport implements Transport, ControlPlane {
    *  engine). Populated by {@link QueueTransport.#startLoop} — the reclaim sweep walks exactly this set,
    *  so it covers whatever loops the instance actually started, worker- or engine-side. */
   readonly #poppedQueues = new Set<string>();
+  /** Jobs popped and still in a handler (`jobId → queue`) — re-delivered by close() if unfinished. */
+  readonly #openJobs = new Map<string, string>();
   /** Drives the stalled-job reclaim sweep on its own (coarse) interval. Absent when reclaim is disabled
    *  (`stalledCheckIntervalMs <= 0`) or the adapter can't `recoverStalledJobs`. Separate from
    *  {@link #pollers} because the sweep cadence is unrelated to the fast job-poll cadence. */
@@ -423,6 +425,10 @@ export class QueueTransport implements Transport, ControlPlane {
         return false;
       }
       if (!job) return false;
+      // Track the popped-but-unfinished job so close() can hand it back to the broker instead of
+      // destroying the adapter under it (which stranded it `active` until the stalled sweep —
+      // every deploy of a busy fleet parked its mid-flight jobs for up to the stalled threshold).
+      this.#openJobs.set(job.id, queue);
       try {
         await onJob(job);
         await this.#adapter.completeJob(job.id, queue);
@@ -433,6 +439,8 @@ export class QueueTransport implements Transport, ControlPlane {
         await this.#adapter
           .retryJob(job.id, queue, new Date(Date.now() + this.#pollIntervalMs))
           .catch((retryErr) => this.#onError(retryErr));
+      } finally {
+        this.#openJobs.delete(job.id);
       }
       return true;
     });
@@ -489,11 +497,24 @@ export class QueueTransport implements Transport, ControlPlane {
     return pollers;
   }
 
-  /** Stop every poll loop and destroy the adapter so the process can exit. */
+  /**
+   * Stop every poll loop, WAIT (bounded) for the job already in a handler's hands, and hand any
+   * still-unfinished job back to the broker before destroying the adapter. Without the wait, a
+   * SIGTERM mid-step neither completed nor retried the popped job — it sat `active` until the
+   * stalled-reclaim threshold (30 min default), or forever on an adapter without
+   * `recoverStalledJobs`.
+   */
   async close(): Promise<void> {
     this.#pollers.stopAll();
     this.#reclaimPollers?.stopAll();
     this.#taskLoops.clear();
+    await this.#pollers.drain(5_000);
+    // Anything still open after the bounded drain (a long step): re-deliver it now so another
+    // worker picks it up immediately instead of waiting out the stalled threshold.
+    for (const [jobId, queue] of [...this.#openJobs]) {
+      this.#openJobs.delete(jobId);
+      await this.#adapter.retryJob(jobId, queue, new Date()).catch((err) => this.#onError(err));
+    }
     await this.#adapter.destroy();
   }
 }

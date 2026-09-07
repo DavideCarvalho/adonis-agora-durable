@@ -43,6 +43,14 @@ export interface WorkflowRun {
   workflowVersion: string;
   status: RunStatus;
   /**
+   * Which package's code produced this run — free-form attribution (e.g.
+   * `@adonis-agora/catalog-pipeline`), stamped at start from the workflow registration's `origin`
+   * (or a per-start override). `undefined` on runs created before the field existed or by an
+   * unattributed registration — the console renders those as "unknown". Powers the console's origin
+   * facet; parity with the NestJS twin's `origin` column.
+   */
+  origin?: string | undefined;
+  /**
    * Worker-pool partition this run belongs to (default `'default'`). A worker only picks up /
    * recovers / resumes-timers-for / times-out runs in its OWN namespace, so one shared state store
    * can host non-interchangeable pools (e.g. local dev vs a cluster) without them stealing each
@@ -128,6 +136,13 @@ export interface StepCheckpoint {
   attempts: number;
   /** For remote steps: which worker group ran it. */
   workerGroup?: string | undefined;
+  /**
+   * For a dispatched step admitted through a flow-control queue: the queue whose slot it holds.
+   * Persisted on the `pending` checkpoint so the slot can be released by WHICHEVER instance
+   * receives the result (multi-pod deployments share the results queue — an in-memory map on the
+   * dispatching pod would leak the slot when another pod completes the step).
+   */
+  queue?: string | undefined;
   /** Structured events/logs the step emitted (sub-step outcomes, debug/error lines). */
   events?: StepEvent[] | undefined;
   /** For sleep steps: epoch ms the sleep elapses at. */
@@ -280,6 +295,13 @@ export interface StateStore {
    */
   ensureSchema?(): Promise<void>;
 
+  /**
+   * Persist a NEW run. MUST reject a duplicate id (throw — a SQL store's primary-key violation is
+   * exactly right) rather than overwrite: the engine treats the throw as "someone else already
+   * started this id", re-reads the existing run and returns its state, which is what makes
+   * `start`/`signalWithStart`/scheduler double-fires converge on one run instead of forking or
+   * clobbering the winner's state.
+   */
   createRun(run: WorkflowRun): Promise<void>;
   updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void>;
 
@@ -327,6 +349,15 @@ export interface StateStore {
   listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]>;
 
   /**
+   * `running` runs whose recovery lease is free (`locked_until` NULL or `<= nowMs`) — the ORPHANS a
+   * periodic recovery pass should reclaim, capped at `limit`. Optional but strongly recommended:
+   * without it the engine falls back to {@link listIncompleteRuns} and filters in process, which on
+   * a busy fleet fetches (and lock-probes) every healthy running run once per tick per worker. When
+   * `namespace` is given, restrict to that worker-pool partition (ANDed).
+   */
+  listOrphanedRuns?(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]>;
+
+  /**
    * The oldest `pending` runs awaiting dispatch (FIFO, by `createdAt`), capped at `limit`. When
    * `namespace` is given, restrict to runs in that worker-pool partition (ANDed); omit it for all.
    */
@@ -334,9 +365,11 @@ export interface StateStore {
 
   /**
    * Suspended runs whose durable timer is due (`wakeAt <= nowMs`), ready to resume. When `namespace`
-   * is given, restrict to runs in that worker-pool partition (ANDed); omit it to return all.
+   * is given, restrict to runs in that worker-pool partition (ANDed); omit it to return all. `limit`
+   * (when given) caps the batch — a backlog drains over several polls; a store may ignore it
+   * (back-compat), the engine tolerates larger batches.
    */
-  listDueTimers(nowMs: number, namespace?: string): Promise<WorkflowRun[]>;
+  listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]>;
 
   /**
    * Atomically acquire the recovery lease on a run for `owner` until `leaseUntilMs`, but only if
@@ -345,8 +378,18 @@ export interface StateStore {
    */
   tryLockRun(runId: string, owner: string, leaseUntilMs: number, nowMs: number): Promise<boolean>;
 
-  /** Release a run's recovery lease so another instance can pick it up (e.g. once it suspends). */
-  releaseRunLock(runId: string): Promise<void>;
+  /**
+   * Release a run's recovery lease so another instance can pick it up (e.g. once it suspends).
+   *
+   * When `owner` is given, release ONLY if that owner still holds the lease (a conditional write,
+   * atomic like {@link renewRunLock}) — so an executor whose lease was already taken over (its turn
+   * outlived the lease and another instance re-acquired) cannot wipe the NEW owner's lease and open
+   * the door to a third concurrent executor. Omit `owner` only for an operator-style unconditional
+   * clear (e.g. `requeue`'s explicit stale-lease reset). A store implemented against the older
+   * single-argument signature simply ignores `owner` — that degrades to the previous (unfenced)
+   * behavior, never breaks.
+   */
+  releaseRunLock(runId: string, owner?: string): Promise<void>;
 
   /**
    * Extend a run's lease to `leaseUntilMs`, but ONLY if `owner` still holds it — so a live worker
@@ -361,6 +404,14 @@ export interface StateStore {
   takeSignalWaiter(token: string): Promise<SignalWaiter | null>;
   /** List waiters whose `token` starts with `prefix` — used to fan out an event to its subscribers. */
   listSignalWaiters(prefix: string): Promise<SignalWaiter[]>;
+
+  /**
+   * All waiters registered BY these runs (`run_id IN (...)`). Optional but strongly recommended:
+   * the dashboard stamps "waiting on X" onto a page of runs and the engine resolves a parent's
+   * children — without this they fall back to `listSignalWaiters('')`, a full-table scan per page
+   * load. Pair the implementation with an index on `run_id`.
+   */
+  listSignalWaitersByRunIds?(runIds: string[]): Promise<SignalWaiter[]>;
 
   /**
    * Delete the EXACT waiter row — `token` AND `runId` AND `seq` must all match — no-op if absent.
@@ -527,6 +578,9 @@ export interface RunQuery {
    * matches nothing.
    */
   statuses?: RunStatus[] | undefined;
+  /** Exact-match origin attribution (see {@link WorkflowRun.origin}). Cannot express "absent" —
+   *  an unknown-origin facet filters client-side over the page it already holds. */
+  origin?: string | undefined;
   /** Only runs carrying this tag (exact match against {@link WorkflowRun.tags}). */
   tag?: string | undefined;
   /**
@@ -546,6 +600,27 @@ export interface RunQuery {
    * `workflow`/`status`/`tag` to bound the scan on large stores.
    */
   attributes?: AttributeFilter[] | undefined;
+  /**
+   * Only runs created at or before this epoch-ms instant (`created_at <= createdBefore`). Lets a
+   * caller push an age predicate into the store — e.g. the execution-timeout sweep asks for "in-
+   * flight runs older than the timeout" instead of fetching every in-flight run and comparing
+   * `createdAt` in process. Also the console's time-range filter.
+   */
+  createdBefore?: number | undefined;
+  /** Only runs created at or after this epoch-ms instant (`created_at >= createdAfter`). */
+  createdAfter?: number | undefined;
+  /**
+   * Only runs last touched at or before this epoch-ms instant (`updated_at <= updatedBefore`) —
+   * what a retention sweep means by "completed 30 days ago" (a run's terminal write bumps
+   * `updatedAt`; its `createdAt` may be much older on a long workflow).
+   */
+  updatedBefore?: number | undefined;
+  /**
+   * Only runs whose durable wake timer is due at this instant (`wake_at IS NOT NULL AND wake_at <=
+   * wakeBefore`). Lets the blocked-run recovery poll ask the store for due rows instead of listing
+   * every blocked run and comparing in process.
+   */
+  wakeBefore?: number | undefined;
   limit?: number | undefined;
   offset?: number | undefined;
 }
@@ -555,8 +630,7 @@ export interface RunQuery {
  * minus paging. A console narrows by workflow/tag/tenant/attribute, and the one call back tells it
  * which values the matching runs take on ONE axis. Keeping status out of the type is what lets a
  * picker stay usable while a status chip is lit: the offered values don't collapse to the one status
- * being viewed. (The AdonisJS engine has no `origin` column, so unlike the NestJS twin there is no
- * origin member to exclude here.)
+ * being viewed.
  */
 export type RunFacetQuery = Omit<RunQuery, 'status' | 'statuses' | 'limit' | 'offset'>;
 
@@ -569,7 +643,7 @@ export type RunFacetQuery = Omit<RunQuery, 'status' | 'statuses' | 'limit' | 'of
  * `attributeValue` lists the values recorded under ONE key (its right-hand side).
  */
 export type RunValueAxis =
-  | { field: 'workflow' | 'status' | 'namespace' | 'tag' | 'attributeKey' }
+  | { field: 'workflow' | 'status' | 'namespace' | 'origin' | 'tag' | 'attributeKey' }
   | { field: 'attributeValue'; key: string };
 
 /**
@@ -1066,6 +1140,40 @@ export interface Transport {
 
 /** One worker's liveness record — a TTL'd heartbeat a worker refreshes while it's consuming. Its
  *  ABSENCE (the key expired) is the signal: a worker that died or stalled stops refreshing. */
+/** How a worker decides its concurrency — part of {@link WorkerStatus}. */
+export interface WorkerConcurrencyStatus {
+  mode: 'fixed' | 'adaptive';
+  limit: number;
+  min?: number | undefined;
+  max?: number | undefined;
+}
+
+/** One recorded concurrency adjustment (adaptive workers) — part of {@link WorkerStatus}. */
+export interface WorkerAdjust {
+  at: number;
+  from: number;
+  to: number;
+  reason: 'ram_ceiling' | 'cpu_ceiling' | 'backpressure' | 'grow' | 'shrink';
+}
+
+/**
+ * A live snapshot of a worker's execution state, carried on its liveness heartbeat so the console's
+ * worker cards show concurrency / in-flight / resource usage — parity with the NestJS fleet's
+ * heartbeat payload (the SPA's `WorkerStatusCells` renders exactly this shape).
+ */
+export interface WorkerStatus {
+  runtime?: 'node' | 'python' | undefined;
+  concurrency: WorkerConcurrencyStatus;
+  inFlight: number;
+  rssBytes?: number | undefined;
+  rssLimitBytes?: number | undefined;
+  rssPct?: number | undefined;
+  cpuPct?: number | undefined;
+  throughputPerMin?: number | undefined;
+  p95Ms?: number | undefined;
+  lastAdjust?: WorkerAdjust | undefined;
+}
+
 export interface WorkerHeartbeat {
   /** The worker group this instance serves (e.g. `pipeline`, `processing-workflows`). */
   group: string;
@@ -1073,6 +1181,8 @@ export interface WorkerHeartbeat {
   instanceId: string;
   /** Epoch ms of the worker's most recent heartbeat. */
   lastBeatAt: number;
+  /** Live execution/resource snapshot, when the worker's heartbeat carries one (see WorkerStatus). */
+  status?: WorkerStatus | undefined;
 }
 
 /** Per-group worker-health snapshot: how much work is queued vs. how many workers are alive to do it.
@@ -1109,6 +1219,9 @@ export type ControlMessage = { from?: string } & (
   | { kind: 'cancel'; runId: string }
   // A run was just enqueued — nudge worker instances to pick it up now instead of on the next poll.
   | { kind: 'enqueued'; runId: string }
+  // A schedule was paused/resumed at runtime (console/API) — every ticking instance applies it.
+  // Runtime-only state: a deploy resets it to the config's `paused`; pin the config for permanence.
+  | { kind: 'schedulePause'; key: string; paused: boolean }
 );
 
 // ---------------------------------------------------------------------------

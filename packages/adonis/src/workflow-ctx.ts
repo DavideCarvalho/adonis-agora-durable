@@ -457,7 +457,7 @@ export function createWorkflowCtx(
         await store.removeSignalWaiter({ token, runId, seq: current });
         return lateBuffered.value;
       }
-      throw new WorkflowSuspended();
+      throw new WorkflowSuspended(undefined, [current]);
     }
     const timeoutMs = opts.timeoutMs;
     const deadlineSeq = pos.next();
@@ -484,7 +484,7 @@ export function createWorkflowCtx(
       await store.removeSignalWaiter({ token, runId, seq: waitSeq });
       return lateBuffered.value;
     }
-    throw new WorkflowSuspended(deadline);
+    throw new WorkflowSuspended(deadline, [waitSeq]);
   };
 
   // Wait for a named event delivered by engine.publishEvent(name, payload). Like waitForSignal, but
@@ -513,7 +513,7 @@ export function createWorkflowCtx(
       await store.putSignalWaiter({ token, runId, seq: current });
       const bufferedHit = await consumeBufferedEvent<T>(name, opts?.match, token, current);
       if (bufferedHit) return bufferedHit.value;
-      throw new WorkflowSuspended();
+      throw new WorkflowSuspended(undefined, [current]);
     }
     const timeoutMs = opts.timeoutMs;
     const deadlineSeq = pos.next();
@@ -531,7 +531,7 @@ export function createWorkflowCtx(
     await store.putSignalWaiter({ token, runId, seq: waitSeq });
     const bufferedHit = await consumeBufferedEvent<T>(name, opts.match, token, waitSeq);
     if (bufferedHit) return bufferedHit.value;
-    throw new WorkflowSuspended(deadline);
+    throw new WorkflowSuspended(deadline, [waitSeq]);
   };
 
   // An external task = a checkpointed dispatch + a wait for its async-completion `Completion`
@@ -581,7 +581,37 @@ export function createWorkflowCtx(
       );
       return unwrapCompletion<T>(buffered.payload, `child "${id}"`);
     }
-    if (!(await store.getRun(id))) host.startChild(workflowName(workflow), input, id, priority);
+    const childRun = await store.getRun(id);
+    if (!childRun) {
+      host.startChild(workflowName(workflow), input, id, priority);
+    } else if (
+      childRun.status === 'completed' ||
+      childRun.status === 'failed' ||
+      childRun.status === 'cancelled' ||
+      childRun.status === 'dead'
+    ) {
+      // Durable lost-notify recovery: the child is ALREADY terminal but neither a live signal nor a
+      // buffered completion reached this waiter — the child's `notifyParent` write was lost (crash
+      // between the child's terminal write and the signal insert, or a swallowed store error). The
+      // signal was the MESSENGER; the child's run row is the durable source of truth, so re-derive
+      // the exact completion `notifyParent` would have delivered and resolve the wait from it.
+      // Without this, every reconcile re-drive replays back here and re-suspends forever.
+      const completion =
+        childRun.status === 'completed'
+          ? { ok: true as const, value: childRun.output }
+          : { ok: false as const, error: childRun.error?.message ?? childRun.status };
+      await store.removeSignalWaiter({ token: `child:${id}`, runId, seq: current });
+      await writeCheckpoint(
+        instantCheckpoint({
+          runId,
+          seq: current,
+          name: `signal:child:${id}`,
+          kind: 'signal',
+          output: completion,
+        }),
+      );
+      return unwrapCompletion<T>(completion, `child "${id}"`);
+    }
     // Make the awaited child visible in the parent's timeline WHILE it runs: a `running` placeholder
     // at this seq with the same `signal:child:<id>` name the signal resolution later overwrites as
     // `completed`. So the dashboard shows the child node (and can inline-expand it) live, instead of
@@ -598,7 +628,7 @@ export function createWorkflowCtx(
         }),
       );
     }
-    throw new WorkflowSuspended();
+    throw new WorkflowSuspended(undefined, [current]);
   };
 
   // Parallel child workflows (wait-all): dispatch N children CONCURRENTLY and wait for ALL their
@@ -648,10 +678,10 @@ export function createWorkflowCtx(
 
     // Dispatch every item not yet completed in history; write its running placeholder once.
     let pending = false;
+    const pendingSeqs: number[] = [];
     for (let i = 0; i < inputs.length; i += 1) {
       const cp = existing[i];
       if (cp?.status === 'completed') continue;
-      pending = true;
       const seq = positions[i] as number;
       const childId = id(i);
       // Carry the fan `group` onto the waiter too: the child's terminal `signal:child:` checkpoint is
@@ -659,7 +689,47 @@ export function createWorkflowCtx(
       // placeholder below at the same seq — so without this the resolved checkpoint would lose the
       // group and the dashboard would render the resolved fan as a sequential chain.
       await store.putSignalWaiter({ token: `child:${childId}`, runId, seq, parallelGroup: group });
-      if (!(await store.getRun(childId))) host.startChild(name, inputs[i], childId);
+      // Lost-wake guard (mirrors `child` above): a fan item's completion may have fired while no
+      // waiter was registered (this run replaying after a crash/failure) — consume the BUFFERED copy,
+      // or, if even that was lost, re-derive the completion from the child's own terminal run row.
+      // Without this a re-driven fan re-registers its waiters and waits forever on signals that
+      // already fired.
+      const resolve = async (payload: unknown): Promise<StepCheckpoint> => {
+        await store.removeSignalWaiter({ token: `child:${childId}`, runId, seq });
+        const resolved = instantCheckpoint({
+          runId,
+          seq,
+          name: `signal:child:${childId}`,
+          kind: 'signal',
+          output: payload,
+          parallelGroup: group,
+        });
+        await writeCheckpoint(resolved);
+        return resolved;
+      };
+      const buffered = await store.takeBufferedSignal(`child:${childId}`);
+      if (buffered) {
+        existing[i] = await resolve(buffered.payload);
+        continue;
+      }
+      const childRun = await store.getRun(childId);
+      if (!childRun) {
+        host.startChild(name, inputs[i], childId);
+      } else if (
+        childRun.status === 'completed' ||
+        childRun.status === 'failed' ||
+        childRun.status === 'cancelled' ||
+        childRun.status === 'dead'
+      ) {
+        existing[i] = await resolve(
+          childRun.status === 'completed'
+            ? { ok: true, value: childRun.output }
+            : { ok: false, error: childRun.error?.message ?? childRun.status },
+        );
+        continue;
+      }
+      pending = true;
+      pendingSeqs.push(seq);
       if (!cp) {
         await writeCheckpoint(
           instantCheckpoint({
@@ -673,8 +743,10 @@ export function createWorkflowCtx(
         );
       }
     }
-    // Any item still outstanding → suspend once; the resume replays this whole block.
-    if (pending) throw new WorkflowSuspended();
+    // Any item still outstanding → suspend once; the resume replays this whole block. Carry only
+    // the STILL-PENDING seqs — a completed one would make the post-settle recheck spuriously
+    // re-drive every partial fan settle.
+    if (pending) throw new WorkflowSuspended(undefined, pendingSeqs);
 
     // All resolved: build outputs in INPUT order, aggregating any failures.
     const outputs: T[] = [];
@@ -728,7 +800,7 @@ export function createWorkflowCtx(
     const reply = `entityreply:${runId}:${current}`;
     await store.putSignalWaiter({ token: reply, runId, seq: current });
     host.signalEntity?.(name, key, op, arg, reply);
-    throw new WorkflowSuspended();
+    throw new WorkflowSuspended(undefined, [current]);
   };
 
   // Send a durable entity op without awaiting a result — dispatched once (checkpointed, replay-safe).
@@ -766,7 +838,7 @@ export function createWorkflowCtx(
       );
       await store.putSignalWaiter({ token: breakpointToken(runId, current), runId, seq: current });
     }
-    throw new WorkflowSuspended();
+    throw new WorkflowSuspended(undefined, [current]);
   };
 
   // Guard an in-place change: a fresh run records a `patch:<id>` marker here and takes the new
@@ -833,7 +905,7 @@ export function createWorkflowCtx(
       if (existing && existing.status === 'completed') return existing.output as T;
       if (timeoutMs == null) {
         await store.putSignalWaiter({ token, runId, seq: current });
-        throw new WorkflowSuspended();
+        throw new WorkflowSuspended(undefined, [current]);
       }
       const deadline = await stampDeadline(deadlineSeq, token, timeoutMs);
       if (host.clock() >= deadline) {
@@ -841,7 +913,7 @@ export function createWorkflowCtx(
         throw new SignalTimeoutError(token, timeoutMs);
       }
       await store.putSignalWaiter({ token, runId, seq: current });
-      throw new WorkflowSuspended(deadline);
+      throw new WorkflowSuspended(deadline, [current]);
     };
     return { token, url: host.webhookUrl?.(token), wait };
   };

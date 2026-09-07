@@ -2,15 +2,19 @@ import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tansta
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  BULK_MATCH_CAP,
   deriveRunState,
   durableClient,
   type GroupHealth,
+  logoutUrl,
   type RunDetail as RunDetailData,
   type RunDisplayStatus,
+  type RunPredicates,
   type RunStatus,
   type StepCheckpoint,
   type WorkerStatus,
   type WorkflowRun,
+  waitTargetsOf,
 } from '../client/durable-client';
 import { groupByPartition, type PartitionView } from '../client/group-by-partition';
 import { mergeLiveEvents } from '../client/merge-live-events';
@@ -35,21 +39,28 @@ import {
 } from '../client/split-compensations';
 import { type HealthSummary, summarizeHealth } from '../client/summarize-health';
 import { AttributeFilters } from './AttributeFilters';
-import { BoltIcon, PlayIcon, RetryIcon, XIcon } from './icons';
+import { CompatHealth } from './CompatPanel';
+import { BoltIcon, PlayIcon, RetryIcon, SearchIcon, UserIcon, XIcon } from './icons';
 import { OriginFacets } from './OriginFacets';
 import { RunInfoPanel } from './RunInfoPanel';
 import { parentRunIdOf, retryOriginOf } from './run-lineage';
+import { SchedulesPanel } from './SchedulesPanel';
 import { SpansTimeline } from './SpansTimeline';
 import { StepDetailPanel } from './StepDetailPanel';
 import { badgeVariants, Badge as Chip } from './ui/badge';
 import { Button } from './ui/button';
 import { cn } from './ui/cn';
 import { Dialog } from './ui/dialog';
+import { InputField } from './ui/input';
 import { Popover, PopoverContent, PopoverTrigger } from './ui/popover';
 import { Tabs, TabsList, TabsPanel, TabsTab } from './ui/tabs';
 import { Tooltip, TooltipProvider } from './ui/tooltip';
 import { ValuePicker } from './ValuePicker';
+import { WaitingActions } from './WaitingActions';
 import { WorkflowGraph } from './WorkflowGraph';
+
+/** The console's top-level views: the runs board (list + detail) and the schedules table. */
+type ConsoleView = 'runs' | 'schedules';
 
 /** The durable brand mark — a workflow glyph: a rounded diamond with three connected nodes (a step
  *  flowing into the next), in currentColor so it inherits the `--accent` token. Replaces the bare `◆`. */
@@ -76,13 +87,16 @@ function LogoMark({ className }: { className?: string }) {
   );
 }
 
+// The server's own `RUN_STATUSES` order (`run-filter.ts`), every state a chip. `blocked` earned its
+// chip (a run parked with no compatible worker — see the compat panel); `cancelling` lost its (the
+// engine never emits it — see the `RunStatus` union's note in `durable-client.ts`).
 const STATUSES: RunStatus[] = [
   'pending',
   'running',
   'suspended',
+  'blocked',
   'completed',
   'failed',
-  'cancelling',
   'cancelled',
   'dead',
 ];
@@ -111,7 +125,7 @@ function durMs(a: string, b: string): string {
 }
 
 function StatusDot({ status }: { status: RunDisplayStatus | StepCheckpoint['status'] }) {
-  const live = status === 'running' || status === 'awaiting' || status === 'cancelling';
+  const live = status === 'running' || status === 'awaiting';
   return <span className={`dot s-${status} ${live ? 'pulse' : ''}`} aria-hidden />;
 }
 
@@ -124,15 +138,114 @@ function Badge({ status }: { status: RunDisplayStatus | StepCheckpoint['status']
   );
 }
 
+/**
+ * Header search: jump straight to a run by id (`GET /runs/:id`). On a hit it navigates to the run's
+ * detail through the SAME hash-based mechanism a list click uses; a miss says so inline instead of
+ * silently doing nothing — an operator pasting an id from a log needs the "it does not exist here"
+ * answer as much as the run itself.
+ */
+function RunIdSearch({ onOpenRun }: { onOpenRun: (id: string) => void }) {
+  const [draft, setDraft] = useState('');
+  const [missing, setMissing] = useState(false);
+  const lookup = useMutation({
+    mutationFn: (id: string) => durableClient.run(id),
+    onSuccess: (detail) => {
+      setDraft('');
+      setMissing(false);
+      onOpenRun(detail.run.id);
+    },
+    // Any failure reads as "not found": the only errors `GET /runs/:id` answers are the 404 and
+    // the 401 the client already turns into a login redirect before this handler runs.
+    onError: () => setMissing(true),
+  });
+  return (
+    <form
+      className="relative"
+      onSubmit={(e) => {
+        e.preventDefault();
+        const id = draft.trim();
+        if (id) lookup.mutate(id);
+      }}
+    >
+      <InputField
+        glyph={<SearchIcon width={12} height={12} />}
+        value={draft}
+        onChange={(e) => {
+          setDraft(e.target.value);
+          setMissing(false);
+        }}
+        onClear={() => {
+          setDraft('');
+          setMissing(false);
+        }}
+        clearLabel="clear run id"
+        placeholder="open run id…"
+        aria-label="open run by id"
+        containerClassName="w-44"
+      />
+      {missing && (
+        <span className="mono absolute left-0 top-full z-20 mt-1 whitespace-nowrap rounded border border-bad/25 bg-panel-2 px-1.5 py-0.5 text-[10px] text-bad">
+          no run with that id
+        </span>
+      )}
+    </form>
+  );
+}
+
+/** The session control: a user icon opening a small menu with the provider's Logout link
+ *  (`GET <base>/logout` — see {@link logoutUrl}). A plain `<a>`: logout is a navigation, and the
+ *  server answers it with a redirect to the login page / dashboard root. */
+function SessionMenu() {
+  return (
+    <Popover>
+      <PopoverTrigger
+        render={
+          <Button variant="quiet" size="icon" aria-label="session menu" title="Session">
+            <UserIcon width={13} height={13} />
+          </Button>
+        }
+      />
+      <PopoverContent className="w-36">
+        <a
+          href={logoutUrl()}
+          className="mono block px-2.5 py-2 text-[11px] text-zinc-300 hover:bg-zinc-800/50 hover:text-zinc-100"
+        >
+          Logout
+        </a>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 function Header({
-  counts,
+  scope,
   filter,
   onFilter,
+  onOpenRun,
+  view,
+  onView,
 }: {
-  counts: Record<string, number>;
+  /** The non-status predicates active right now — the chip counts are scoped by them. */
+  scope: RunPredicates;
   filter: RunStatus | 'all';
   onFilter: (f: RunStatus | 'all') => void;
+  onOpenRun: (id: string) => void;
+  view: ConsoleView;
+  onView: (view: ConsoleView) => void;
 }) {
+  // Chip counts come from the SERVER (`/runs/values?field=status`, scoped by every other active
+  // predicate) rather than a reduce over the loaded pages: the chips now drive a server-side status
+  // filter, so counting only what's been scrolled into memory would both zero the unselected chips
+  // and understate the selected one the moment more than a page matches.
+  const { data: statusRows = [] } = useQuery({
+    queryKey: ['run-values', 'status', scope],
+    queryFn: () => durableClient.values('status', scope),
+    refetchInterval: 5000,
+  });
+  const counts: Record<string, number> = {};
+  for (const row of statusRows) {
+    if (row.value !== null) counts[row.value] = row.count;
+  }
   const total = Object.values(counts).reduce((a, b) => a + b, 0);
   const chip = (key: RunStatus | 'all', label: string, n: number) => (
     <Button
@@ -187,15 +300,42 @@ function Header({
           </div>
         </div>
       </div>
-      <div className="ml-2 flex flex-wrap items-center gap-1">
-        {chip('all', 'all', total)}
-        {STATUSES.map((s) => chip(s, s, counts[s] ?? 0))}
-      </div>
-      <WorkersHealth />
+      {/* Top-level view nav, drawn like the status chips (plain pressed buttons, not Tabs — there is
+          no in-header panel to wire, the whole main area swaps). A tenant deployment never sees the
+          schedules entry: its gateway has no runtime schedule control, `GET /schedules` just 404s —
+          same role-is-the-capability-signal gating fix-and-replay uses. */}
+      <nav aria-label="console views" className="ml-2 flex items-center gap-1">
+        {(['runs', ...(isTenant ? [] : ['schedules' as const])] as ConsoleView[]).map((v) => (
+          <Button
+            key={v}
+            variant="ghost"
+            size="chip"
+            aria-pressed={view === v}
+            onClick={() => onView(v)}
+            className={cn(
+              'rounded-md uppercase tracking-wide',
+              view === v && 'border-zinc-600 bg-zinc-900 text-zinc-100 hover:text-zinc-100',
+            )}
+          >
+            {v}
+          </Button>
+        ))}
+      </nav>
+      {/* The status chips are a RUNS predicate — dead controls on the schedules view, so they only
+          render there. Everything else in the header (run-id search, workers, session) is global. */}
+      {view === 'runs' && (
+        <div className="flex flex-wrap items-center gap-1">
+          {chip('all', 'all', total)}
+          {STATUSES.map((s) => chip(s, s, counts[s] ?? 0))}
+        </div>
+      )}
+      <RunIdSearch onOpenRun={onOpenRun} />
+      <WorkersHealth onOpenRun={onOpenRun} />
       <div className="flex items-center gap-2 text-xs text-zinc-500">
         <span className="dot s-completed pulse" aria-hidden />
         live
       </div>
+      <SessionMenu />
     </header>
   );
 }
@@ -289,28 +429,43 @@ function WorkerRows({ workers }: { workers: GroupHealth['liveWorkers'] }) {
   );
 }
 
-type WorkersPanelView = 'workers' | 'partitions' | 'alerts';
+type WorkersPanelView = 'workers' | 'partitions' | 'alerts' | 'compat';
 
 /**
- * Worker health, three ways (toggle). Route-by-handler makes every `@Step`/`@Workflow` its own queue
+ * Worker health, four ways (toggle). Route-by-handler makes every `@Step`/`@Workflow` its own queue
  * and one worker serves many, so a per-queue list is noise — these views collapse it onto the axes
  * that actually vary: **workers** (each live pod + what it's serving; the default), **partitions**
- * (the tenant-isolation axis), and **alerts** (only starved queues — `depth > 0` with no worker).
- * Polls `/workers`; renders nothing when the transport can't report health.
+ * (the tenant-isolation axis), **alerts** (only starved queues — `depth > 0` with no worker), and
+ * **compat** (protocol/capability negotiation per group + blocked runs — `GET /compat`, see
+ * {@link CompatHealth}). Polls `/workers` and `/compat`; renders nothing when the transport can't
+ * report health AND the compat report has nothing to flag.
  */
-function WorkersHealth() {
+function WorkersHealth({ onOpenRun }: { onOpenRun: (id: string) => void }) {
   const { data } = useQuery({
     queryKey: ['workers'],
     queryFn: () => durableClient.workers(),
     refetchInterval: 10_000,
   });
+  // Slower than the heartbeat poll on purpose: descriptors and blocked runs change on deploys, not
+  // per second. `retry: false` keeps an older server without the endpoint from hammering it.
+  const { data: compat } = useQuery({
+    queryKey: ['compat'],
+    queryFn: () => durableClient.compat(),
+    refetchInterval: 15_000,
+    retry: false,
+  });
   const [view, setView] = useState<WorkersPanelView>('workers');
-  if (!data || data.length === 0) return null;
-  const summary = summarizeHealth(data);
+  // The compat view stays reachable even with no live heartbeats — blocked runs are precisely the
+  // state where "no (compatible) worker" is the whole story.
+  const compatFlags = (compat?.incompatibleCount ?? 0) + (compat?.blockedCount ?? 0);
+  if ((!data || data.length === 0) && compatFlags === 0) return null;
+  const groups = data ?? [];
+  const summary = summarizeHealth(groups);
   const label: Record<WorkersPanelView, string> = {
     workers: 'pods',
     partitions: 'parts',
     alerts: 'alerts',
+    compat: 'compat',
   };
   return (
     <Tabs
@@ -319,12 +474,17 @@ function WorkersHealth() {
       className="ml-auto flex flex-nowrap items-center gap-1.5"
     >
       <TabsList>
-        {(['workers', 'partitions', 'alerts'] as const).map((v) => (
+        {(['workers', 'partitions', 'alerts', 'compat'] as const).map((v) => (
           <TabsTab key={v} value={v}>
             {label[v]}
             {v === 'alerts' && summary.starved.length > 0 && (
               <span className="tnum ml-1 rounded bg-rose-500/80 px-1 text-[9px] text-white">
                 {summary.starved.length}
+              </span>
+            )}
+            {v === 'compat' && compatFlags > 0 && (
+              <span className="tnum ml-1 rounded bg-rose-500/80 px-1 text-[9px] text-white">
+                {compatFlags}
               </span>
             )}
           </TabsTab>
@@ -335,13 +495,16 @@ function WorkersHealth() {
           portalled, so they are no longer at the mercy of this box's overflow. */}
       <div className="flex w-[300px] flex-nowrap items-center justify-end gap-1.5">
         <TabsPanel value="workers" className="flex flex-nowrap items-center gap-1.5">
-          <WorkersByPod workers={pivotByWorker(data)} />
+          <WorkersByPod workers={pivotByWorker(groups)} />
         </TabsPanel>
         <TabsPanel value="partitions" className="flex flex-nowrap items-center gap-1.5">
-          <PartitionsHealth groups={data} />
+          <PartitionsHealth groups={groups} />
         </TabsPanel>
         <TabsPanel value="alerts" className="flex flex-nowrap items-center gap-1.5">
           <StarvationAlerts summary={summary} />
+        </TabsPanel>
+        <TabsPanel value="compat" className="flex flex-nowrap items-center gap-1.5">
+          <CompatHealth compat={compat} onOpenRun={onOpenRun} />
         </TabsPanel>
       </div>
     </Tabs>
@@ -971,6 +1134,17 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
     queryFn: () => durableClient.runs(),
     refetchInterval: 3000,
   });
+  // Shares the header's `['topology']` cache (fetch-once — a deployment's role never changes).
+  // `/topology` carries no capability list, so the role IS the capability signal: a store-less
+  // `tenant` pod's gateway can't perform fix-and-replay or breakpoint-continue — both answer `404`
+  // there (the gateway adapter degrades them to "unknown run") — so their buttons disable with the
+  // reason instead of offering an action that can only fail.
+  const { data: topology } = useQuery({
+    queryKey: ['topology'],
+    queryFn: () => durableClient.topology(),
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+  const tenantPod = topology?.role === 'tenant';
   // Dead-letter link: a `dead` run may have been routed to a `dlq:<id>` handler workflow. Probe for
   // it (retry off so a 404 just hides the link) so we never render a dead link.
   const handlerId =
@@ -1165,6 +1339,12 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   // The declaring package, or `undefined` for UNKNOWN — which the header states outright rather
   // than omitting, so "we don't know" never reads as "the app".
   const origin = knownOrigin(run.origin);
+  // What a human can DO about a suspended run's wait (deliver signal / send update / complete or
+  // fail a task). Tokens come from the timeline's in-flight signal checkpoints, with the run's
+  // list-row `waiting` stamp as fallback — the detail response itself carries no `waiting` (only
+  // `GET /runs` runs the bulk waiter scan), and the sibling list is already polled here anyway.
+  const listRowWaiting = siblingRuns.find((r) => r.id === run.id)?.waiting;
+  const waitTargets = run.status === 'suspended' ? waitTargetsOf(body, listRowWaiting) : [];
 
   return (
     <div className="flex h-full flex-col">
@@ -1292,7 +1472,16 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
             {'{ }'}
           </Button>
           {atBreakpoint && (
-            <Button variant="warn" disabled={cont.isPending} onClick={() => cont.mutate()}>
+            <Button
+              variant="warn"
+              disabled={cont.isPending || tenantPod}
+              onClick={() => cont.mutate()}
+              title={
+                tenantPod
+                  ? 'Not available on a tenant deployment — resuming a breakpoint needs the control plane.'
+                  : undefined
+              }
+            >
               <PlayIcon width={12} height={12} />
               Continue
             </Button>
@@ -1319,9 +1508,13 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
           {(run.status === 'dead' || run.status === 'failed') && (
             <Button
               variant="alt"
-              disabled={fixReplay.isPending}
+              disabled={fixReplay.isPending || tenantPod}
               onClick={onFixReplay}
-              title="Edit the input and re-run as a fresh linked run"
+              title={
+                tenantPod
+                  ? 'Not available on a tenant deployment — fix & replay needs the control plane.'
+                  : 'Edit the input and re-run as a fresh linked run'
+              }
             >
               <RetryIcon width={12} height={12} />
               Fix &amp; replay
@@ -1369,6 +1562,14 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
             {dlqLink.cta}
           </Button>
         </div>
+      )}
+      {waitTargets.length > 0 && (
+        <WaitingActions
+          runId={run.id}
+          targets={waitTargets}
+          tenantPod={tenantPod}
+          onDelivered={invalidate}
+        />
       )}
       {compBanner && (
         <div className="flex items-center gap-3 border-b border-amber-500/30 bg-amber-500/10 px-7 py-3">
@@ -1503,6 +1704,7 @@ export function App() {
   const [filter, setFilter] = useState<RunStatus | 'all'>('all');
   // Arrays, not strings: each of these controls takes SEVERAL values, ORed within the axis and
   // ANDed across them — comparing two tenants, or two tags, is one query rather than two views.
+  const [workflowFilter, setWorkflowFilter] = useState<string[]>([]);
   const [tagFilter, setTagFilter] = useState<string[]>([]);
   // `key:op:value` predicates (e.g. `amount:gte:200`, `tier:in:pro|enterprise`), ANDed server-side.
   const [attrFilter, setAttrFilter] = useState<string[]>([]);
@@ -1514,6 +1716,9 @@ export function App() {
   const [originFilter, setOriginFilter] = useState<OriginFilter>(ALL_ORIGINS);
   // The open run lives in the URL hash so it survives reload and can be shared/linked.
   const [selected, setSelectedState] = useState<string | undefined>(() => runIdFromHash());
+  // Which top-level view fills the main area. Plain state (not the hash): the hash stays the run
+  // deep-link it has always been, and every run navigation below switches back to `runs` anyway.
+  const [view, setView] = useState<ConsoleView>('runs');
   const setSelected = useCallback((id?: string) => {
     setSelectedState(id);
     if (typeof window === 'undefined') return;
@@ -1521,6 +1726,15 @@ export function App() {
     const url = hash || window.location.pathname + window.location.search;
     if (window.location.hash !== hash) window.history.pushState(null, '', url);
   }, []);
+  // Every "open this run" affordance funnels here: opening a run from ANY view (a schedule row's
+  // last-run chip, "Run now", the header search) must land on the runs board, not behind it.
+  const openRun = useCallback(
+    (id?: string) => {
+      setView('runs');
+      setSelected(id);
+    },
+    [setSelected],
+  );
   // Follow back/forward and external hash edits.
   useEffect(() => {
     const sync = () => setSelectedState(runIdFromHash());
@@ -1541,18 +1755,30 @@ export function App() {
     hasNextPage,
     isFetchingNextPage,
   } = useInfiniteQuery({
-    // Same key as before (tag/attr/namespace) — status/origin stay client-side filters over whatever
-    // is loaded (see `originScoped`/`shown` below), so a new tag/attr/namespace is the only thing that
-    // needs a fresh page 1; React Query drops the accumulated pages and starts over automatically the
-    // moment this key changes.
-    queryKey: ['runs', tagFilter, attrPredicates.join('|'), namespaceFilter],
+    // Status is a SERVER-SIDE predicate now, same as workflow/tag/attr/namespace — it used to be a
+    // client-side filter over whatever pages were loaded, which meant the list and the bulk filter
+    // could disagree: "cancel all" acted on every match in the store while the list only showed the
+    // loaded slice of them. With the status in this key (fresh page 1 on every chip click) the list
+    // IS the bulk filter's match set. Only origin stays client-side (see `originScoped` below) — it
+    // has no server-side spelling.
+    queryKey: [
+      'runs',
+      filter,
+      workflowFilter,
+      tagFilter,
+      attrPredicates.join('|'),
+      namespaceFilter,
+    ],
     queryFn: ({ pageParam }) =>
       durableClient.runsPage(
-        undefined,
+        filter !== 'all' ? filter : undefined,
         tagFilter.length ? tagFilter : undefined,
         attrPredicates.length ? attrPredicates : undefined,
-        // An empty selection sends NO `namespace` param — all tenants, the historical default.
-        { namespace: namespaceFilter.length ? namespaceFilter : undefined },
+        // An empty selection sends NO `namespace`/`workflow` param — the historical unscoped default.
+        {
+          namespace: namespaceFilter.length ? namespaceFilter : undefined,
+          workflow: workflowFilter.length ? workflowFilter : undefined,
+        },
         { limit: RUNS_PAGE_SIZE, offset: pageParam },
       ),
     initialPageParam: 0,
@@ -1577,10 +1803,19 @@ export function App() {
     queryFn: () => durableClient.workers(),
     refetchInterval: 5000,
   });
+  // Which bulk action is awaiting confirmation. A bulk action reaches EVERY server-side match, not
+  // just the rows on screen — the dialog states the action and the exact filter before anything runs.
+  const [confirmBulk, setConfirmBulk] = useState<'retry' | 'cancel' | undefined>(undefined);
+  // The last bulk action's `{ matched, applied }`, shown as a result toast — with the cap warning
+  // when `matched` hit the server's 500-match ceiling (runs beyond it were left untouched).
+  const [bulkNotice, setBulkNotice] = useState<
+    { action: 'retry' | 'cancel'; matched: number; applied: number } | undefined
+  >(undefined);
   const bulk = useMutation({
     mutationFn: (action: 'retry' | 'cancel') =>
       durableClient.bulk(action, {
         status: filter !== 'all' ? filter : undefined,
+        workflow: workflowFilter.length ? workflowFilter : undefined,
         tag: tagFilter.length ? tagFilter : undefined,
         attr: attrPredicates.length ? attrPredicates : undefined,
         namespace: namespaceFilter.length ? namespaceFilter : undefined,
@@ -1589,22 +1824,29 @@ export function App() {
         // no param there would quietly widen a destructive action to every origin.
         origin: originFilter.kind === 'origin' ? originFilter.origin : undefined,
       }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['runs'] }),
+    onSuccess: (result, action) => {
+      setBulkNotice({ action, ...result });
+      qc.invalidateQueries({ queryKey: ['runs'] });
+    },
   });
+  // A capped result stays until dismissed — "run again to continue" is an instruction, not a status.
+  // An uncapped one auto-dismisses like any toast.
+  useEffect(() => {
+    if (!bulkNotice || bulkNotice.matched >= BULK_MATCH_CAP) return;
+    const timer = setTimeout(() => setBulkNotice(undefined), 6000);
+    return () => clearTimeout(timer);
+  }, [bulkNotice]);
 
-  // The origin facet is applied FIRST, so the status counts and the list agree with the chip that is
-  // lit. `runs` (unfaceted) still feeds the facet counts and the singleton lineage below.
+  // The origin facet is the one filter still applied client-side (it has no server-side spelling —
+  // see `OriginFacets`); status/workflow/tag/attr/namespace all narrowed the query above.
   const originScoped = filterByOrigin(runs, originFilter);
-  const counts = originScoped.reduce<Record<string, number>>((acc, r) => {
-    acc[r.status] = (acc[r.status] ?? 0) + 1;
-    return acc;
-  }, {});
-  const shown = filter === 'all' ? originScoped : originScoped.filter((r) => r.status === filter);
+  const shown = originScoped;
   // Counted BEFORE the origin facet — the whole point is to be able to say "these N runs cannot be
   // matched by any package filter" at the moment a package filter shows nothing.
   const unattributed = unknownOriginCount(runs);
   const anyFilter =
     filter !== 'all' ||
+    workflowFilter.length > 0 ||
     tagFilter.length > 0 ||
     namespaceFilter.length > 0 ||
     attrPredicates.length > 0 ||
@@ -1613,20 +1855,35 @@ export function App() {
   //
   // Each picker's scope EXCLUDES its own axis. Including it would make the list collapse to what is
   // already selected the moment an operator picks a value — a control that can only ever be narrowed
-  // once. Every other axis is included, so the offered values are the ones that would return runs.
-  // Status stays out of every scope (it is a client-side chip here, not a server predicate), and so
-  // does origin (the engine has no `origin` column — the server ignores it).
+  // once. Every other axis is included — status too, now that the chips are a server predicate — so
+  // the offered values are the ones that would return runs. Only origin stays out of every scope
+  // (the engine has no `origin` column — the server ignores it).
+  const status = filter !== 'all' ? filter : undefined;
+  const workflowScope = useMemo(
+    () => ({ status, tag: tagFilter, namespace: namespaceFilter, attr: attrFilter }),
+    [status, tagFilter, namespaceFilter, attrFilter],
+  );
   const tagScope = useMemo(
-    () => ({ namespace: namespaceFilter, attr: attrFilter }),
-    [namespaceFilter, attrFilter],
+    () => ({ status, workflow: workflowFilter, namespace: namespaceFilter, attr: attrFilter }),
+    [status, workflowFilter, namespaceFilter, attrFilter],
   );
   const namespaceScope = useMemo(
-    () => ({ tag: tagFilter, attr: attrFilter }),
-    [tagFilter, attrFilter],
+    () => ({ status, workflow: workflowFilter, tag: tagFilter, attr: attrFilter }),
+    [status, workflowFilter, tagFilter, attrFilter],
   );
   const attrScope = useMemo(
-    () => ({ tag: tagFilter, namespace: namespaceFilter }),
-    [tagFilter, namespaceFilter],
+    () => ({ status, workflow: workflowFilter, tag: tagFilter, namespace: namespaceFilter }),
+    [status, workflowFilter, tagFilter, namespaceFilter],
+  );
+  // The header's chip-count scope: every server predicate EXCEPT status (its own axis).
+  const statusScope = useMemo(
+    () => ({
+      workflow: workflowFilter,
+      tag: tagFilter,
+      namespace: namespaceFilter,
+      attr: attrFilter,
+    }),
+    [workflowFilter, tagFilter, namespaceFilter, attrFilter],
   );
   // Clicking a run row's tag/tenant chip narrows by it — adding to the set rather than replacing it,
   // so comparing two tags is one click, not a re-typing exercise.
@@ -1653,14 +1910,34 @@ export function App() {
     ),
   ];
   // Identity for the run list's `key` (see the `<RunsList key=…>` usage below) — every filter that
-  // changes what `shown` contains, including the client-side-only status/origin ones.
-  const runsListResetKey = `${filter}|${tagFilter.join('|')}|${attrPredicates.join(',')}|${namespaceFilter.join('|')}|${originFilterKey(originFilter)}`;
+  // changes what `shown` contains, including the client-side-only origin facet.
+  const runsListResetKey = `${filter}|${workflowFilter.join('|')}|${tagFilter.join('|')}|${attrPredicates.join(',')}|${namespaceFilter.join('|')}|${originFilterKey(originFilter)}`;
+  // The current filter, spelled out for the bulk-confirmation dialog: the operator confirms a
+  // sentence naming the scope, not a button that trusts them to remember it.
+  const bulkFilterSummary =
+    [
+      filter !== 'all' ? `status ${filter}` : undefined,
+      workflowFilter.length > 0 ? `workflow ${workflowFilter.join(', ')}` : undefined,
+      tagFilter.length > 0 ? `tag ${tagFilter.join(', ')}` : undefined,
+      namespaceFilter.length > 0 ? `tenant ${namespaceFilter.join(', ')}` : undefined,
+      attrPredicates.length > 0 ? `attr ${attrPredicates.join(' · ')}` : undefined,
+      originFilter.kind === 'origin' ? `origin ${originLabel(originFilter.origin)}` : undefined,
+    ]
+      .filter((part) => part !== undefined)
+      .join(' · ') || 'no filter — every run';
 
   return (
     <TooltipProvider>
       <div className="app-bg" />
       <div className="relative z-10 flex h-full flex-col">
-        <Header counts={counts} filter={filter} onFilter={setFilter} />
+        <Header
+          scope={statusScope}
+          filter={filter}
+          onFilter={setFilter}
+          onOpenRun={openRun}
+          view={view}
+          onView={setView}
+        />
         {stalledWorkflows.length > 0 && (
           <div className="flex items-center gap-2 border-b border-amber-500/30 bg-amber-500/10 px-4 py-1.5 text-[11px] text-amber-200">
             <span className="s-no-worker inline-flex items-center gap-1.5">
@@ -1673,109 +1950,190 @@ export function App() {
             </span>
           </div>
         )}
-        <div className="grid min-h-0 flex-1 grid-cols-[minmax(300px,360px)_1fr]">
-          <aside className="flex min-h-0 flex-col border-r border-line">
-            <div className="border-b border-line p-2">
-              <ValuePicker
-                field="tag"
-                scope={tagScope}
-                glyph="#"
-                label="filter by tag"
-                placeholder="filter by tag…"
-                value={tagFilter}
-                onChange={setTagFilter}
-                title="Tags carried by a run (WorkflowRun.tags). Several match ANY of them."
-              />
-              <div className="mt-1.5">
+        {view === 'schedules' ? (
+          <main className="min-h-0 flex-1">
+            <SchedulesPanel onOpenRun={openRun} />
+          </main>
+        ) : (
+          <div className="grid min-h-0 flex-1 grid-cols-[minmax(300px,360px)_1fr]">
+            <aside className="flex min-h-0 flex-col border-r border-line">
+              <div className="border-b border-line p-2">
                 <ValuePicker
-                  field="namespace"
-                  scope={namespaceScope}
-                  glyph="@"
-                  label="filter by tenant"
-                  placeholder="filter by tenant / namespace…"
-                  value={namespaceFilter}
-                  onChange={setNamespaceFilter}
-                  title="Tenant / worker-pool partition (WorkflowRun.namespace). None selected shows every tenant."
+                  field="workflow"
+                  scope={workflowScope}
+                  glyph="ƒ"
+                  label="filter by workflow"
+                  placeholder="filter by workflow…"
+                  value={workflowFilter}
+                  onChange={setWorkflowFilter}
+                  title="Workflow handler names (WorkflowRun.workflow). Several match ANY of them."
+                />
+                <div className="mt-1.5">
+                  <ValuePicker
+                    field="tag"
+                    scope={tagScope}
+                    glyph="#"
+                    label="filter by tag"
+                    placeholder="filter by tag…"
+                    value={tagFilter}
+                    onChange={setTagFilter}
+                    title="Tags carried by a run (WorkflowRun.tags). Several match ANY of them."
+                  />
+                </div>
+                <div className="mt-1.5">
+                  <ValuePicker
+                    field="namespace"
+                    scope={namespaceScope}
+                    glyph="@"
+                    label="filter by tenant"
+                    placeholder="filter by tenant / namespace…"
+                    value={namespaceFilter}
+                    onChange={setNamespaceFilter}
+                    title="Tenant / worker-pool partition (WorkflowRun.namespace). None selected shows every tenant."
+                  />
+                </div>
+                <AttributeFilters value={attrFilter} onChange={setAttrFilter} scope={attrScope} />
+              </div>
+              <OriginFacets runs={runs} value={originFilter} onChange={setOriginFilter} />
+              {anyFilter && shown.length > 0 && (
+                <div className="flex items-center gap-2 border-b border-line px-3 py-1.5">
+                  <span className="mono text-[10px] text-zinc-500">
+                    {shown.length} {filter !== 'all' ? filter : ''}{' '}
+                    {workflowFilter.length > 0 && `ƒ${workflowFilter.join(', ')}`}
+                    {tagFilter.length > 0 && ` #${tagFilter.join(', ')}`}
+                    {namespaceFilter.length > 0 && ` @${namespaceFilter.join(', ')}`}
+                    {originFilter.kind === 'origin' && ` ⬡${originLabel(originFilter.origin)}`}
+                    {originFilter.kind === 'unknown' && ` ⬡${UNKNOWN_ORIGIN}`}
+                    {attrPredicates.length > 0 && ` ⛃${attrPredicates.length}`}
+                  </span>
+                  <Button
+                    variant="brand"
+                    size="xs"
+                    disabled={bulk.isPending || bulkBlocked !== undefined}
+                    title={bulkBlocked}
+                    onClick={() => setConfirmBulk('retry')}
+                    className="mono ml-auto rounded"
+                  >
+                    retry all
+                  </Button>
+                  <Button
+                    variant="danger"
+                    size="xs"
+                    disabled={bulk.isPending || bulkBlocked !== undefined}
+                    title={bulkBlocked}
+                    onClick={() => setConfirmBulk('cancel')}
+                    className="mono rounded"
+                  >
+                    cancel all
+                  </Button>
+                </div>
+              )}
+              {/* No `overflow-auto` here — `RunsList`'s virtualized root owns its own scroll container
+                (it needs a ref to the actual scrolling element), this just sizes the box it fills. */}
+              <div className="min-h-0 flex-1">
+                <RunsList
+                  // Remounts on any filter change: cheap for this list size, and it's the simplest way
+                  // to reset BOTH the virtualizer's scroll position and its row-height cache — a stale
+                  // scroll offset from the pre-filter list would otherwise leave the view scrolled deep
+                  // into a now much-shorter list.
+                  key={runsListResetKey}
+                  runs={shown}
+                  allRuns={runs}
+                  health={health}
+                  loading={runsPending}
+                  selected={selected}
+                  onSelect={setSelected}
+                  onSelectTag={addTag}
+                  onSelectNamespace={addNamespace}
+                  onSelectOrigin={setOriginFilter}
+                  hasMore={hasNextPage}
+                  loadingMore={isFetchingNextPage}
+                  onLoadMore={fetchNextPage}
+                  emptyNotice={emptyRunsNotice({
+                    anyFilter,
+                    origin: originFilter,
+                    unknownCount: unattributed,
+                  })}
                 />
               </div>
-              <AttributeFilters value={attrFilter} onChange={setAttrFilter} scope={attrScope} />
-            </div>
-            <OriginFacets runs={runs} value={originFilter} onChange={setOriginFilter} />
-            {anyFilter && shown.length > 0 && (
-              <div className="flex items-center gap-2 border-b border-line px-3 py-1.5">
-                <span className="mono text-[10px] text-zinc-500">
-                  {shown.length} {filter !== 'all' ? filter : ''}{' '}
-                  {tagFilter.length > 0 && `#${tagFilter.join(', ')}`}
-                  {namespaceFilter.length > 0 && ` @${namespaceFilter.join(', ')}`}
-                  {originFilter.kind === 'origin' && ` ⬡${originLabel(originFilter.origin)}`}
-                  {originFilter.kind === 'unknown' && ` ⬡${UNKNOWN_ORIGIN}`}
-                  {attrPredicates.length > 0 && ` ⛃${attrPredicates.length}`}
-                </span>
-                <Button
-                  variant="brand"
-                  size="xs"
-                  disabled={bulk.isPending || bulkBlocked !== undefined}
-                  title={bulkBlocked}
-                  onClick={() => bulk.mutate('retry')}
-                  className="mono ml-auto rounded"
-                >
-                  retry all
-                </Button>
-                <Button
-                  variant="danger"
-                  size="xs"
-                  disabled={bulk.isPending || bulkBlocked !== undefined}
-                  title={bulkBlocked}
-                  onClick={() => bulk.mutate('cancel')}
-                  className="mono rounded"
-                >
-                  cancel all
-                </Button>
-              </div>
-            )}
-            {/* No `overflow-auto` here — `RunsList`'s virtualized root owns its own scroll container
-                (it needs a ref to the actual scrolling element), this just sizes the box it fills. */}
-            <div className="min-h-0 flex-1">
-              <RunsList
-                // Remounts on any filter change: cheap for this list size, and it's the simplest way
-                // to reset BOTH the virtualizer's scroll position and its row-height cache — a stale
-                // scroll offset from the pre-filter list would otherwise leave the view scrolled deep
-                // into a now much-shorter list.
-                key={runsListResetKey}
-                runs={shown}
-                allRuns={runs}
-                health={health}
-                loading={runsPending}
-                selected={selected}
-                onSelect={setSelected}
-                onSelectTag={addTag}
-                onSelectNamespace={addNamespace}
-                onSelectOrigin={setOriginFilter}
-                hasMore={hasNextPage}
-                loadingMore={isFetchingNextPage}
-                onLoadMore={fetchNextPage}
-                emptyNotice={emptyRunsNotice({
-                  anyFilter,
-                  origin: originFilter,
-                  unknownCount: unattributed,
-                })}
-              />
-            </div>
-          </aside>
-          <main className="min-h-0">
-            {selected ? (
-              <RunDetail key={selected} id={selected} onOpenRun={setSelected} />
-            ) : (
-              <div className="grid h-full place-items-center text-center">
-                <div className="flex flex-col items-center">
-                  <LogoMark className="h-10 w-10 text-zinc-800" />
-                  <p className="mt-3 text-sm text-zinc-600">Select a run to see its timeline.</p>
+            </aside>
+            <main className="min-h-0">
+              {selected ? (
+                <RunDetail key={selected} id={selected} onOpenRun={openRun} />
+              ) : (
+                <div className="grid h-full place-items-center text-center">
+                  <div className="flex flex-col items-center">
+                    <LogoMark className="h-10 w-10 text-zinc-800" />
+                    <p className="mt-3 text-sm text-zinc-600">Select a run to see its timeline.</p>
+                  </div>
                 </div>
+              )}
+            </main>
+          </div>
+        )}
+      </div>
+      {/* Confirmation before a bulk action: the action + the exact filter it will be scoped by,
+          because it reaches EVERY server-side match (capped at the first 500), not just the loaded
+          rows. Destructive-at-a-distance deserves a sentence, not a single click. */}
+      <Dialog
+        open={confirmBulk !== undefined}
+        onOpenChange={(open) => {
+          if (!open) setConfirmBulk(undefined);
+        }}
+        title={confirmBulk === 'cancel' ? 'Cancel all matching runs' : 'Retry all matching runs'}
+        subtitle={bulkFilterSummary}
+        footer={
+          <>
+            <Button onClick={() => setConfirmBulk(undefined)}>Back</Button>
+            <Button
+              variant={confirmBulk === 'cancel' ? 'danger' : 'brand'}
+              disabled={bulk.isPending}
+              onClick={() => {
+                if (confirmBulk) bulk.mutate(confirmBulk);
+                setConfirmBulk(undefined);
+              }}
+            >
+              {confirmBulk === 'cancel' ? 'cancel all' : 'retry all'}
+            </Button>
+          </>
+        }
+      >
+        <p className="text-[12.5px] leading-relaxed text-zinc-400">
+          This {confirmBulk === 'cancel' ? 'cancels' : 'retries'} <em>every</em> run matching the
+          filter above on the server — including matches beyond the rows loaded on screen. The
+          server acts on at most <span className="mono tnum text-zinc-300">{BULK_MATCH_CAP}</span>{' '}
+          matches per call.
+        </p>
+      </Dialog>
+      {/* Bulk result toast: the server's `{ matched, applied }`, plus the cap warning when the
+          matched set hit the 500-run ceiling and runs beyond it were left untouched. */}
+      {bulkNotice && (
+        <output className="rise fixed bottom-4 right-4 z-50 flex max-w-sm items-start gap-3 rounded-lg border border-line bg-panel-2 px-4 py-3 text-left shadow-2xl">
+          <div className="min-w-0 flex-1 text-[12px]">
+            <div className="text-zinc-200">
+              Bulk {bulkNotice.action}: <span className="mono tnum">{bulkNotice.applied}</span> of{' '}
+              <span className="mono tnum">{bulkNotice.matched}</span> matched{' '}
+              {bulkNotice.matched === 1 ? 'run' : 'runs'}{' '}
+              {bulkNotice.action === 'cancel' ? 'cancelled' : 'retried'}.
+            </div>
+            {bulkNotice.matched >= BULK_MATCH_CAP && (
+              <div className="mt-1 text-[11px] text-amber-300">
+                Matched the {BULK_MATCH_CAP}-run server cap — only the first {BULK_MATCH_CAP} were
+                affected. Run the action again to continue.
               </div>
             )}
-          </main>
-        </div>
-      </div>
+          </div>
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="dismiss"
+            onClick={() => setBulkNotice(undefined)}
+            className="h-5 w-5"
+          >
+            <XIcon width={12} height={12} />
+          </Button>
+        </output>
+      )}
     </TooltipProvider>
   );
 }

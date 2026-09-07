@@ -1,5 +1,5 @@
 import { type AdmissionBackend, InMemoryAdmissionBackend } from './admission.js';
-import { backoffDelay } from './backoff.js';
+import { backoffDelay, MAX_BACKOFF_MS } from './backoff.js';
 import { instantCheckpoint, stepCheckpoint } from './checkpoints.js';
 import { type Completion } from './completion.js';
 import {
@@ -63,7 +63,7 @@ import { breakpointToken, stepId } from './protocol.js';
 import type { QueueConfig } from './queue.js';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor.js';
 import { scanRunValueFacets } from './run-value-facets.js';
-import type { ScheduledWorkflow } from './scheduler.js';
+import { type ScheduledWorkflow, scheduleWindow } from './scheduler.js';
 import { SingletonGate } from './singleton-gate.js';
 import { sanitizeQueueToken, tenantGroup } from './tenant-group.js';
 import { TransportPool } from './transport-pool.js';
@@ -102,6 +102,60 @@ export interface StartOptions {
    * stamped, the run is only picked up / resumed by an engine in the same namespace.
    */
   namespace?: string | undefined;
+  /**
+   * Delay execution until this instant (epoch ms or Date): the run is created durably NOW but parked
+   * `suspended` with its wake timer set, and the ordinary timer poller starts it when due — no
+   * `ctx.sleep` polluting the workflow body or its history. A past/absent instant starts immediately.
+   * (A delayed run skips the `run.started` lifecycle event's `pending → running` hop; it goes
+   * `suspended → …` when it fires.)
+   */
+  startAt?: number | Date | undefined;
+  /**
+   * Package attribution to stamp on THIS run, overriding the registration's `origin`. Rarely needed
+   * — the registration-level origin covers "which package's code produced this run"; pass it here
+   * when one shared workflow is started on behalf of another package.
+   */
+  origin?: string | undefined;
+}
+
+/** One row of {@link WorkflowEngine.listSchedules} — a schedule with its live control state. */
+export interface ScheduleInfo {
+  key: string;
+  workflow: string;
+  cron?: string | undefined;
+  everyMs?: number | undefined;
+  timezone?: string | undefined;
+  overlap?: 'allow' | 'skip' | undefined;
+  namespace?: string | undefined;
+  /** Effective pause state: the runtime override when one was issued, else the config's `paused`. */
+  paused: boolean;
+  /** Whether the current pause state came from a runtime (console) override. */
+  pausedAtRuntime: boolean;
+  /** Epoch ms the current window fired (its deterministic bucket). */
+  lastFireAt: number;
+  /** Epoch ms of the next fire. */
+  nextFireAt: number;
+  /** The current window's deterministic run id (what `triggerSchedule` would start). */
+  currentWindowRunId: string;
+  /** The current window's run status, when that run exists. */
+  lastRunStatus?: RunStatus | undefined;
+}
+
+/** What an {@link WorkflowEngine.onStalled} listener receives — a stranded run and why it looks stranded. */
+export interface StalledRunInfo {
+  run: WorkflowRun;
+  /** Milliseconds since the run's last activity (`updatedAt`). */
+  ageMs: number;
+  /** Suspended with NO wake timer — nothing will re-drive it (the `reconcileMs: 0` hazard). */
+  wakeForever: boolean;
+  /** The oldest silent pending remote step, when that is the stranding signature. */
+  stalePending: {
+    seq: number;
+    name: string;
+    attempts: number;
+    ageMs: number;
+    heartbeatAgeMs: number | null;
+  } | null;
 }
 
 /**
@@ -167,6 +221,8 @@ interface RegisteredWorkflow {
   fn: WorkflowFn;
   /** Static `workflow` config `tags` — merged with per-run tags onto each run at start. */
   tags?: string[] | undefined;
+  /** Package attribution stamped on every run this registration starts (see WorkflowRun.origin). */
+  origin?: string | undefined;
   /** Per-key serialization (a durable mutex). See {@link SingletonConfig}. */
   singleton?: SingletonConfig | undefined;
   /** Max wall-clock lifetime (ms) before a run is cancelled by `sweepTimeouts`. */
@@ -187,6 +243,14 @@ interface RegisteredWorkflow {
 }
 
 const versionKey = (name: string, version: string): string => `${name}@${version}`;
+
+/**
+ * First checkpoint seq reserved for saga compensations: compensation `idx` (registration order)
+ * persists at `COMPENSATION_SEQ_BASE - idx` (-2, -3, …). Negative so it can never collide with the
+ * positional replay's `>= 0` seqs, and starting at -2 so it also never collides with the legacy
+ * un-checkpointed `-1` undo dispatches of older engine versions.
+ */
+const COMPENSATION_SEQ_BASE = -2;
 
 /**
  * The routing token a dispatched step lands on: the step's own (broker-safe) name, suffixed by the
@@ -360,6 +424,30 @@ export interface WorkflowEngineDeps {
    */
   compensationRetries?: number | undefined;
   /**
+   * Upper bound (ms) on awaiting ONE dispatched saga compensation's worker result when its step def
+   * carries no liveness `timeoutMs` of its own. Without a bound, a lost undo result held the failing
+   * run's unwind open FOREVER — `running`, lease renewed, invisible to recovery and the DLQ. On
+   * timeout the attempt fails like any other undo failure (retried up to `compensationRetries`,
+   * then skipped loudly). Default 300 000 (5 min).
+   */
+  compensationTimeoutMs?: number | undefined;
+  /**
+   * Retention policy: hard-delete terminal runs (and their subtrees/checkpoints/waiters) once their
+   * LAST activity (`updatedAt`) is older than the given age in ms, per terminal status. Swept by the
+   * worker tick's `sweepRetention` phase (self-throttled to once a minute). Absent (default) keeps
+   * everything forever — the pre-retention behavior. Register an {@link WorkflowEngine.onEvict}
+   * listener to archive a run before it is deleted; a listener that THROWS skips that run's
+   * deletion (archival failure must never lose data).
+   */
+  retention?: Partial<Record<'completed' | 'failed' | 'cancelled' | 'dead', number>> | undefined;
+  /**
+   * How long an in-flight run must sit untouched — with the stranded signature (a wake-forever
+   * suspension, or an old pending remote step whose worker heartbeat is silent) — before the
+   * {@link WorkflowEngine.onStalled} listeners are notified. Default 900 000 (15 min, matching the
+   * CLI's `--stale`). The sweep only runs when a listener is registered.
+   */
+  stalledAfterMs?: number | undefined;
+  /**
    * Persist a `running` checkpoint when a local step's body begins, so an in-flight step shows up
    * in the dashboard (and a fresh page load / REST query) the moment it starts — not only once it
    * completes. The `step.started` lifecycle event is emitted either way (the live SSE view always
@@ -435,6 +523,22 @@ export class WorkflowEngine {
   /** Establish the originating context ambiently around a local step body (see {@link WorkflowEngineDeps.rehydrate}). Default passthrough. */
   private readonly rehydrate: <T>(carrier: Record<string, unknown> | undefined, fn: () => T) => T;
   private readonly compensationRetries: number;
+  private readonly compensationTimeoutMs: number;
+  private readonly retention:
+    | Partial<Record<'completed' | 'failed' | 'cancelled' | 'dead', number>>
+    | undefined;
+  // -Infinity so the FIRST sweep always runs (a fake/test clock may start near 0).
+  #lastRetentionSweepAt = Number.NEGATIVE_INFINITY;
+  /** Archival hooks run (awaited, in order) before a retention eviction deletes a run. */
+  private readonly evictListeners = new Set<
+    (run: WorkflowRun, checkpoints: StepCheckpoint[]) => void | Promise<void>
+  >();
+  private readonly stalledAfterMs: number;
+  /** Pager hooks for the stranded-run signature (see {@link onStalled}). */
+  private readonly stalledListeners = new Set<(info: StalledRunInfo) => void>();
+  /** `runId → run.updatedAt ms` at last stalled notification, so one episode pages once. */
+  readonly #notifiedStalled = new Map<string, number>();
+  #lastStalledSweepAt = Number.NEGATIVE_INFINITY;
   /** Persist a `running` checkpoint at the start of a local step body (see {@link WorkflowEngineDeps.trackStepStart}). */
   private readonly trackStepStart: boolean;
   /** Where a freshly-started run executes — in-process by default (see {@link RunDispatcher}). */
@@ -484,6 +588,10 @@ export class WorkflowEngine {
   private readonly updateValidators = new Map<string, UpdateValidator>();
   /** Runs being cancelled WITH saga compensation — see `cancel({ compensate: true })`. */
   private readonly cancelRequested = new Set<string>();
+  /** The merged schedule set the worker loop ticks with (see {@link adoptSchedules}). */
+  #allSchedules: readonly ScheduledWorkflow[] = [];
+  /** Runtime pause overrides by schedule key (console-issued; win over the config's `paused`). */
+  readonly #schedulePauseOverrides = new Map<string, boolean>();
   /** Flow-control admission backend for remote steps (see {@link registerQueue}). */
   private readonly admission: AdmissionBackend;
   /** Runs on THIS instance blocked on admission, by queue — woken early on a freed-slot signal. */
@@ -492,6 +600,14 @@ export class WorkflowEngine {
   private readonly stepQueue = new Map<string, string>();
   /** Executions currently in flight, so a graceful shutdown can wait for them to settle. */
   private readonly inflight = new Map<Promise<RunResult>, string>();
+  /**
+   * Runs whose recovery lease this instance LOST while their turn was still executing — a renew
+   * came back false (another instance took over after expiry), or drain released the lease on
+   * timeout. A fenced turn must not settle: its outcome was computed by a now-zombie executor, and
+   * the new owner is (re)executing the same run — writing would clobber/interleave with the owner's
+   * writes. `settleRun` checks this and degrades to an echo; `execute`'s finally clears the mark.
+   */
+  private readonly leaseLostRuns = new Set<string>();
   /**
    * Post-settle side effects (parent notify, singleton wake) fired fire-and-forget AFTER a run's
    * status was persisted. They run OFF the `execute()` path — the caller of `execute()` must never
@@ -552,6 +668,9 @@ export class WorkflowEngine {
     // Default passthrough: with no bridge supplied, a local step body runs exactly as before.
     this.rehydrate = deps.rehydrate ?? ((_carrier, fn) => fn());
     this.compensationRetries = Math.max(1, deps.compensationRetries ?? 1);
+    this.compensationTimeoutMs = Math.max(1_000, deps.compensationTimeoutMs ?? 300_000);
+    this.retention = deps.retention;
+    this.stalledAfterMs = Math.max(60_000, deps.stalledAfterMs ?? 900_000);
     this.trackStepStart = deps.trackStepStart ?? true;
     // Default: execute the run on this instance, asynchronously, so `start` never blocks on the body.
     // A failed pickup is swallowed here (the run stays `pending` for a `runPending` poll to retry);
@@ -615,6 +734,10 @@ export class WorkflowEngine {
         this.deliver({ ...msg.event, at: new Date(msg.event.at) });
       } else if (msg.kind === 'cancel') {
         this.notifyCancelled(msg.runId);
+      } else if (msg.kind === 'schedulePause') {
+        // A console on another instance paused/resumed a schedule — apply it here so THIS ticker
+        // honors it too (runtime-only; a deploy resets to the config).
+        this.#schedulePauseOverrides.set(msg.key, msg.paused);
       } else if (msg.kind === 'enqueued') {
         // A run was enqueued on another instance — let worker subscribers pick it up immediately
         // instead of waiting for the next poll. (Self-broadcasts are already filtered above.)
@@ -647,6 +770,87 @@ export class WorkflowEngine {
    * and fires. Idempotent per `key`: the first schedule registered for a key wins and a later duplicate
    * key is ignored with a warning (so re-scanning, or a config entry overriding it, can't double-fire).
    */
+  /**
+   * Adopt the FULL schedule set the worker loop ticks with (config + discovered, already merged) so
+   * the runtime schedule-control surface (list/pause/resume/trigger) operates on exactly what fires.
+   * Called by `runTick`; idempotent.
+   */
+  adoptSchedules(schedules: readonly ScheduledWorkflow[]): void {
+    this.#allSchedules = schedules;
+  }
+
+  /**
+   * The runtime pause override for a schedule key: `true`/`false` when the console set one (wins
+   * over the config's `paused`), `undefined` when untouched. Runtime-only — a deploy resets it.
+   */
+  schedulePauseOverride(key: string): boolean | undefined {
+    return this.#schedulePauseOverrides.get(key);
+  }
+
+  /**
+   * The schedules this engine ticks, with their live control state and fire windows — what a
+   * console's Schedules tab lists. `paused` reflects the EFFECTIVE state (runtime override, else
+   * config); `lastRunStatus` is the current window's run, when it exists.
+   */
+  async listSchedules(now: number = this.clock()): Promise<ScheduleInfo[]> {
+    const out: ScheduleInfo[] = [];
+    for (const s of [...this.#allSchedules, ...this.#discoveredSchedules]) {
+      if (out.some((x) => x.key === s.key)) continue; // adopted set already contains discovered ones post-merge
+      const window = scheduleWindow(s, now);
+      const currentRun = await this.store.getRun(window.runId).catch(() => null);
+      const override = this.#schedulePauseOverrides.get(s.key);
+      out.push({
+        key: s.key,
+        workflow: s.workflow,
+        cron: s.cron,
+        everyMs: s.everyMs,
+        timezone: s.timezone,
+        overlap: s.overlap,
+        namespace: s.namespace,
+        paused: override ?? s.paused ?? false,
+        pausedAtRuntime: override !== undefined,
+        lastFireAt: window.lastFireAt,
+        nextFireAt: window.nextFireAt,
+        currentWindowRunId: window.runId,
+        lastRunStatus: currentRun?.status,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Pause/resume a schedule at RUNTIME, fleet-wide: applied on this instance and broadcast on the
+   * control plane so every ticking peer applies it too. Runtime-only state — a deploy resets it to
+   * the config's `paused`; pin the config for permanence. Returns false for an unknown key.
+   */
+  setSchedulePaused(key: string, paused: boolean): boolean {
+    const known =
+      this.#allSchedules.some((s) => s.key === key) ||
+      this.#discoveredSchedules.some((s) => s.key === key);
+    if (!known) return false;
+    this.#schedulePauseOverrides.set(key, paused);
+    if (this.controlPlane) {
+      void this.controlPlane
+        .publishControl({ kind: 'schedulePause', key, paused, from: this.instanceId })
+        .catch(() => undefined);
+    }
+    return true;
+  }
+
+  /**
+   * Fire a schedule's CURRENT window now (console "run now"). Idempotent by the window's
+   * deterministic run id — triggering a window that already fired returns the existing run instead
+   * of forking a duplicate. Returns null for an unknown key.
+   */
+  async triggerSchedule(key: string, now: number = this.clock()): Promise<RunResult | null> {
+    const s =
+      this.#allSchedules.find((x) => x.key === key) ??
+      this.#discoveredSchedules.find((x) => x.key === key);
+    if (!s) return null;
+    const window = scheduleWindow(s, now);
+    return this.start(s.workflow, s.input, window.runId, { namespace: s.namespace });
+  }
+
   registerSchedules(schedules: readonly ScheduledWorkflow[]): void {
     const seen = new Set(this.#discoveredSchedules.map((s) => s.key));
     for (const schedule of schedules) {
@@ -727,6 +931,8 @@ export class WorkflowEngine {
       onEvent?: string[] | undefined;
       eventBatch?: EventBatchConfig | undefined;
       requires?: string[] | undefined;
+      /** Package attribution stamped on every run this registration starts (WorkflowRun.origin). */
+      origin?: string | undefined;
     },
   ): void {
     const registered: RegisteredWorkflow = {
@@ -734,6 +940,7 @@ export class WorkflowEngine {
       version,
       fn,
       tags: opts?.tags,
+      origin: opts?.origin,
       singleton: opts?.singleton,
       executionTimeoutMs:
         opts?.executionTimeout != null ? parseDuration(opts.executionTimeout) : undefined,
@@ -1011,6 +1218,13 @@ export class WorkflowEngine {
     // the same id is a no-op, returning the existing run's state instead of starting a duplicate.
     const prior = await this.store.getRun(runId);
     if (prior) {
+      // A PENDING prior still needs an executor: re-nudge the dispatcher so a redelivered trigger —
+      // or a continuation persisted pre-settle (see the ContinueAsNew handoff) picked up by a custom
+      // dispatcher — doesn't sit `pending` until the next poll. Idempotent: execution is leased, so
+      // a duplicate dispatch is a cheap no-op at the worker.
+      if (dispatch && prior.status === 'pending') {
+        await this.runDispatcher.dispatch(runId);
+      }
       return { runId, status: prior.status, output: prior.output, error: prior.error };
     }
     const now = new Date();
@@ -1027,11 +1241,19 @@ export class WorkflowEngine {
     if (registered.singleton) {
       await this.singletons.assertCapacity(name, registered.singleton, input);
     }
+    // Delayed start: park the run on its durable wake timer instead of dispatching now (see
+    // StartOptions.startAt). The timer poller path that wakes sleeps does the rest.
+    const startAtMs = opts?.startAt instanceof Date ? opts.startAt.getTime() : opts?.startAt;
+    // Compared against the ENGINE clock (injectable), not wall time — the same clock the timer
+    // poller will use to decide the run is due.
+    const delayed = startAtMs !== undefined && startAtMs > this.clock();
     const run: WorkflowRun = {
       id: runId,
       workflow: name,
       workflowVersion: registered.version,
-      status: 'pending',
+      status: delayed ? 'suspended' : 'pending',
+      ...(delayed ? { wakeAt: startAtMs } : {}),
+      origin: opts?.origin ?? registered.origin,
       namespace: opts?.namespace ?? this.namespace,
       input,
       tags,
@@ -1040,11 +1262,26 @@ export class WorkflowEngine {
       createdAt: now,
       updatedAt: now,
     };
-    await this.store.createRun(run);
+    try {
+      await this.store.createRun(run);
+    } catch (err) {
+      // Lost a true createRun RACE (two pods scheduler-ticking the same window, concurrent
+      // `signalWithStart`s for one entity id): the read-before-create above saw no prior, but the
+      // store's duplicate-id rejection says someone else won the insert in the gap. Converge on the
+      // winner — re-read and report ITS state, exactly like the prior-run branch — instead of
+      // surfacing a unique-constraint error (which would abort a scheduler tick, or worse, lose the
+      // signal half of a signalWithStart). A re-read that finds nothing means the throw was a real
+      // store failure: rethrow it.
+      const winner = await this.store.getRun(runId);
+      if (winner) {
+        return { runId, status: winner.status, output: winner.output, error: winner.error };
+      }
+      throw err;
+    }
     // The run is durably enqueued; a dispatcher (in-process by default) executes it — `start` does
     // NOT run the body inline. Await the terminal/suspended state with `waitForRun(runId)` if needed.
     // An internal in-process handoff persists with `dispatch: false` and drives the pickup itself.
-    if (dispatch) {
+    if (dispatch && !delayed) {
       await this.runDispatcher.dispatch(runId);
       // Nudge worker instances to pick it up now instead of on their next poll (no-op without a control
       // plane; self-receipt is filtered, so it only helps OTHER pods — e.g. an API pod's enqueue).
@@ -1054,7 +1291,7 @@ export class WorkflowEngine {
           .catch(() => undefined);
       }
     }
-    return { runId, status: 'pending' };
+    return { runId, status: run.status };
   }
 
   /**
@@ -1153,6 +1390,138 @@ export class WorkflowEngine {
    * deleted (the parent→children edge is read from them). Use for retention/cleanup; this is a
    * destructive store operation, not a cancellation — a running run should be {@link cancel}led first.
    */
+  /**
+   * Register a pager hook for STRANDED runs — the failure `docs/reliability/failure-modes.mdx` calls
+   * "the stranded signature": an in-flight run untouched past `stalledAfterMs` that is either
+   * suspended with NO wake timer (wake-forever) or parked on an old pending remote step whose worker
+   * heartbeat has gone silent. The worker tick sweeps for these (throttled to one pass a minute) and
+   * notifies each episode ONCE (re-notifies only after the run progresses and strands again). Wire
+   * your alerting here exactly like {@link onDead}. Returns an unsubscribe fn.
+   */
+  onStalled(listener: (info: StalledRunInfo) => void): () => void {
+    this.stalledListeners.add(listener);
+    return () => this.stalledListeners.delete(listener);
+  }
+
+  /**
+   * Detect stranded in-flight runs and notify {@link onStalled} listeners. Self-throttled to one
+   * pass a minute; a no-op without listeners. Returns the runs notified THIS pass.
+   */
+  async sweepStalled(now: number = this.clock()): Promise<StalledRunInfo[]> {
+    if (this.stalledListeners.size === 0 || this.draining) return [];
+    if (now - this.#lastStalledSweepAt < 60_000) return [];
+    this.#lastStalledSweepAt = now;
+    const candidates = await this.store.listRuns({
+      statuses: ['suspended', 'running'],
+      namespace: this.namespace,
+      updatedBefore: now - this.stalledAfterMs,
+      limit: 100,
+    });
+    const notified: StalledRunInfo[] = [];
+    for (const run of candidates) {
+      // One notification per episode: skip a run we already paged about that hasn't moved since.
+      if (this.#notifiedStalled.get(run.id) === run.updatedAt.getTime()) continue;
+      // The stranded signature, disambiguated from healthy long work:
+      //  (a) suspended with NO wake timer — nothing will ever re-drive it (reconcileMs: 0 deployments);
+      //  (b) an old pending REMOTE step whose worker heartbeat is silent — dispatched and lost.
+      // A long `ctx.sleep` (wakeAt in the future) and a beating long step are NOT stalled.
+      let stalePending: StalledRunInfo['stalePending'] = null;
+      for (const cp of await this.store.listCheckpoints(run.id)) {
+        if (cp.kind !== 'remote' || cp.status !== 'pending') continue;
+        const ageMs = now - cp.enqueuedAt.getTime();
+        const heartbeatAgeMs = cp.lastHeartbeatAt ? now - cp.lastHeartbeatAt.getTime() : null;
+        if (ageMs < this.stalledAfterMs) continue;
+        if (heartbeatAgeMs !== null && heartbeatAgeMs < this.stalledAfterMs) continue; // alive mid-flight
+        if (!stalePending || ageMs > stalePending.ageMs) {
+          stalePending = {
+            seq: cp.seq,
+            name: cp.name,
+            attempts: cp.attempts,
+            ageMs,
+            heartbeatAgeMs,
+          };
+        }
+      }
+      const wakeForever = run.status === 'suspended' && run.wakeAt === undefined;
+      if (!wakeForever && !stalePending) continue;
+      const info: StalledRunInfo = {
+        run,
+        ageMs: now - run.updatedAt.getTime(),
+        stalePending,
+        wakeForever,
+      };
+      this.#notifiedStalled.set(run.id, run.updatedAt.getTime());
+      if (this.#notifiedStalled.size > 1_000) this.#notifiedStalled.clear(); // bounded; re-pages at worst
+      for (const listener of this.stalledListeners) {
+        try {
+          listener(info);
+        } catch {
+          /* a pager hook must not break the sweep */
+        }
+      }
+      notified.push(info);
+    }
+    return notified;
+  }
+
+  /**
+   * Register an archival hook run before a retention eviction deletes a run (it receives the run
+   * and its full checkpoint timeline — e.g. write them to S3/file). Awaited in registration order;
+   * a hook that THROWS skips that run's deletion, so a broken archive never loses data. Returns an
+   * unsubscribe fn.
+   */
+  onEvict(
+    listener: (run: WorkflowRun, checkpoints: StepCheckpoint[]) => void | Promise<void>,
+  ): () => void {
+    this.evictListeners.add(listener);
+    return () => this.evictListeners.delete(listener);
+  }
+
+  /**
+   * Retention sweep: hard-delete terminal runs whose last activity is older than the configured age
+   * (see {@link WorkflowEngineDeps.retention}). Self-throttled to one pass per minute per instance —
+   * call it every tick, it's a no-op most of the time. Returns how many runs were deleted (subtree
+   * counts included). Bounded per pass (100 candidates per status); a large backlog drains across
+   * passes.
+   *
+   * Caveat: eviction cascades DOWN (a deleted run takes its child subtree) but does not know about
+   * a still-live PARENT awaiting a custom-id child — size the ages well beyond your longest-running
+   * parents.
+   */
+  async sweepRetention(now: number = this.clock()): Promise<number> {
+    if (!this.retention || this.draining) return 0;
+    if (now - this.#lastRetentionSweepAt < 60_000) return 0;
+    this.#lastRetentionSweepAt = now;
+    let evicted = 0;
+    for (const status of ['completed', 'failed', 'cancelled', 'dead'] as const) {
+      const maxAgeMs = this.retention[status];
+      if (maxAgeMs == null || maxAgeMs <= 0) continue;
+      const candidates = await this.store.listRuns({
+        statuses: [status],
+        namespace: this.namespace,
+        updatedBefore: now - maxAgeMs,
+        limit: 100,
+      });
+      for (const run of candidates) {
+        try {
+          if (this.evictListeners.size > 0) {
+            const checkpoints = await this.store.listCheckpoints(run.id);
+            for (const listener of this.evictListeners) await listener(run, checkpoints);
+          }
+          evicted += await this.deleteRun(run.id);
+        } catch (err) {
+          // An archival hook (or the delete itself) failed — keep the run; the next sweep retries.
+          console.warn(
+            `[adonis-durable] retention eviction of run ${run.id} skipped: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+      }
+    }
+    return evicted;
+  }
+
   async deleteRun(runId: string): Promise<number> {
     const run = await this.store.getRun(runId);
     if (!run) return 0;
@@ -1162,6 +1531,16 @@ export class WorkflowEngine {
       deleted += await this.deleteRun(childId);
     }
     await this.store.deleteRun(runId);
+    // Sweep this run's token-keyed buffered signals too — they are not run-scoped rows, so the
+    // store's deleteRun can't cascade them. Without this every fire-and-forget child that was never
+    // joined leaks its buffered `child:<id>` completion FOREVER (one row per spawn), and a raced
+    // compensate-cancel can leave a `cancel:<id>` marker behind.
+    for (const token of [`child:${runId}`, `cancel:${runId}`]) {
+      for (;;) {
+        const buffered = await this.store.takeBufferedSignal(token).catch(() => null);
+        if (!buffered) break;
+      }
+    }
     return deleted + 1;
   }
 
@@ -1184,7 +1563,7 @@ export class WorkflowEngine {
       run.namespace !== undefined &&
       run.namespace !== this.namespace
     ) {
-      await this.store.releaseRunLock(runId);
+      await this.store.releaseRunLock(runId, this.instanceId);
       throw new NamespaceMismatch();
     }
     // Pin to the version the run STARTED on — replay is positional, so running a changed
@@ -1203,6 +1582,27 @@ export class WorkflowEngine {
       );
     }
     return this.track(runId, this.execute(run, registered.fn));
+  }
+
+  /**
+   * Deferred re-drive after a suspended settle whose waited checkpoint(s) already settled — the
+   * delivery's own resume no-oped against this turn's still-held lease (see the WorkflowSuspended
+   * catch in runExecution). Deferred one macrotask so the caller's `finally` releases the lease
+   * first; tracked so `drain()` waits for the re-driven turn's writes.
+   */
+  private recheckWaitSeqs(runId: string, seqs: number[]): void {
+    this.trackEffect(
+      (async () => {
+        await new Promise((r) => setTimeout(r, 0));
+        for (const seq of seqs) {
+          const cp = await this.store.getCheckpoint(runId, seq).catch(() => null);
+          if (cp && (cp.status === 'completed' || cp.status === 'failed')) {
+            await this.resume(runId).catch(() => undefined);
+            return;
+          }
+        }
+      })(),
+    );
   }
 
   /** Track an in-flight execution so {@link drain} can wait for it. */
@@ -1274,7 +1674,11 @@ export class WorkflowEngine {
   private async releaseInflightLocks(): Promise<void> {
     for (const runId of [...this.inflight.values()]) {
       try {
-        await this.store.releaseRunLock(runId);
+        // Owner-scoped: only clear leases THIS instance holds. Also fence the still-running turn —
+        // the next pod may re-lease immediately, so this turn's eventual settle must become a no-op
+        // echo instead of clobbering whatever the new owner writes (see settleRun's guard).
+        this.leaseLostRuns.add(runId);
+        await this.store.releaseRunLock(runId, this.instanceId);
       } catch {
         /* best-effort: drain() must never throw because of this */
       }
@@ -1289,21 +1693,25 @@ export class WorkflowEngine {
   async sweepTimeouts(now: number = this.clock()): Promise<void> {
     for (const reg of new Set(this.latest.values())) {
       if (reg.executionTimeoutMs == null) continue;
-      const deadline = now - reg.executionTimeoutMs;
-      const inflight = [
-        ...(await this.store.listRuns({
-          workflow: reg.name,
-          status: 'running',
-          namespace: this.namespace,
-        })),
-        ...(await this.store.listRuns({
-          workflow: reg.name,
-          status: 'suspended',
-          namespace: this.namespace,
-        })),
-      ];
+      // Push the age predicate into the store: only candidates already past the LATEST version's
+      // timeout come back (bounded), instead of every in-flight run of the workflow per tick. A
+      // run pinned to an older version with a SHORTER timeout is swept a little later (when it
+      // crosses this bound) — the per-run check below still applies its own version's timeout.
+      const inflight = await this.store.listRuns({
+        workflow: reg.name,
+        statuses: ['running', 'suspended'],
+        namespace: this.namespace,
+        createdBefore: now - reg.executionTimeoutMs,
+        limit: 200,
+      });
       for (const run of inflight) {
-        if (run.createdAt.getTime() > deadline) continue;
+        // Time out against the version the run STARTED on when that registration is known — a fleet
+        // mid-deploy must not sweep old-version runs by the newest version's (possibly shorter)
+        // timeout. Falls back to the latest registration's timeout for an unknown version.
+        const timeoutMs =
+          this.workflows.get(versionKey(run.workflow, run.workflowVersion))?.executionTimeoutMs ??
+          reg.executionTimeoutMs;
+        if (timeoutMs == null || run.createdAt.getTime() > now - timeoutMs) continue;
         const error = { message: 'execution timeout', code: 'execution_timeout' };
         // Conditional on the exact statuses just queried: an await separates this loop's iterations
         // (and the listRuns calls above it), so this run could have settled on its own — via its own
@@ -1322,6 +1730,20 @@ export class WorkflowEngine {
           namespace: run.namespace,
           error,
         });
+        // A sweep is a cancellation — give it `cancel()`'s full semantics, not just the status write:
+        // cascade to the child subtree (they'd otherwise keep running, orphaned but live), tell the
+        // instance/worker actually executing the run to abort cooperatively, wake a waiting parent
+        // (it consumes this like a failed child instead of hanging to its reconcile), and free a
+        // singleton slot.
+        await this.cancelChildren(run.id, undefined);
+        this.notifyCancelled(run.id);
+        if (this.controlPlane) {
+          void this.controlPlane
+            .publishControl({ kind: 'cancel', runId: run.id, from: this.instanceId })
+            .catch(() => undefined);
+        }
+        this.notifyParent(run.id, { ok: false, error: error.message });
+        this.trackEffect(this.singletons.wakeNext(run));
       }
     }
   }
@@ -1333,7 +1755,19 @@ export class WorkflowEngine {
   async recoverIncomplete(nowMs: number = this.clock()): Promise<RunResult[]> {
     if (this.draining) return [];
     const results: RunResult[] = [];
-    const incomplete = await asHeartbeat(() => this.store.listIncompleteRuns(this.namespace));
+    // Ask the store for ORPHANS only (running + free/expired lease, bounded): on a healthy fleet
+    // that's ~zero rows per tick, instead of fetching every running run and issuing one doomed
+    // lock-probe UPDATE per row per worker per second. Falls back to the old full-list + in-process
+    // filter for a custom store without the optimized method.
+    const incomplete = await asHeartbeat(async () => {
+      const nowMs = this.clock();
+      if (this.store.listOrphanedRuns) {
+        return this.store.listOrphanedRuns(nowMs, 100, this.namespace);
+      }
+      return (await this.store.listIncompleteRuns(this.namespace)).filter(
+        (r) => r.lockedUntil === undefined || r.lockedUntil <= nowMs,
+      );
+    });
     for (const run of incomplete) {
       // A live worker renews its lease, so an acquirable lease means the run is genuinely orphaned
       // (its worker crashed). Skip the ones still owned.
@@ -1352,8 +1786,19 @@ export class WorkflowEngine {
       }
       // Re-enqueue rather than resume inline: recovery must NOT block (boot, or a poll tick) on a
       // long workflow step. A dispatcher/worker re-runs it, replaying its checkpoints.
-      await this.store.releaseRunLock(run.id);
-      await this.store.updateRun(run.id, { status: 'pending', updatedAt: new Date() });
+      //
+      // Conditional on still-`running`, WHILE the lease is held: a redelivered worker result (or any
+      // other resume path) could have driven this run to a terminal state between the listing above
+      // and here — an unconditional write would clobber `completed` back to `pending` and re-execute
+      // the whole run (double `run.completed`, double parent notify). Same reasoning as every settle
+      // path's SETTLE_ELIGIBLE_STATUSES guard. The lock is released only AFTER the flip (owner-scoped,
+      // so a takeover can't be wiped), closing the release→flip gap the old order left open.
+      const applied = await this.store.updateRunIf(run.id, ['running'], {
+        status: 'pending',
+        updatedAt: new Date(),
+      });
+      await this.store.releaseRunLock(run.id, this.instanceId);
+      if (!applied) continue;
       await this.runDispatcher.dispatch(run.id);
       results.push({ runId: run.id, status: 'pending' });
     }
@@ -1373,7 +1818,7 @@ export class WorkflowEngine {
         code: 'max_recovery_attempts',
       };
       await this.store.updateRun(run.id, { status: 'dead', error, updatedAt: new Date() });
-      await this.store.releaseRunLock(run.id);
+      await this.store.releaseRunLock(run.id, this.instanceId);
       this.emit({
         type: 'run.failed',
         runId: run.id,
@@ -1397,7 +1842,8 @@ export class WorkflowEngine {
    * not due re-suspends cheaply without running new work.
    */
   async resumeDueTimers(nowMs: number = this.clock()): Promise<RunResult[]> {
-    const due = await asHeartbeat(() => this.store.listDueTimers(nowMs, this.namespace));
+    // Capped per tick (a backlog drains over several polls) — a store may ignore the cap.
+    const due = await asHeartbeat(() => this.store.listDueTimers(nowMs, this.namespace, 200));
     const blocked = await this.dueBlockedRuns(nowMs);
     return this.resumeLeased([...due, ...blocked], nowMs);
   }
@@ -1639,9 +2085,14 @@ export class WorkflowEngine {
         resolve(toResult(run));
       };
       const check = (): void => {
-        void this.store.getRun(runId).then((run) => {
-          if (run && shouldResolve(run.status)) finish(run);
-        });
+        // Swallow a transient store error: the next settling event re-checks, and the timeout still
+        // bounds the wait. Unhandled, one hiccup here was a process-fatal unhandled rejection.
+        void this.store
+          .getRun(runId)
+          .then((run) => {
+            if (run && shouldResolve(run.status)) finish(run);
+          })
+          .catch(() => undefined);
       };
       // React only to this run's settling events (not its every step event), and subscribe BEFORE the
       // initial read so a run that settles in between isn't missed.
@@ -1668,18 +2119,29 @@ export class WorkflowEngine {
   ): Promise<RunResult[]> {
     if (this.draining) return []; // shutting down — don't pick up new runs
     const results: RunResult[] = [];
-    for (const run of runs) {
-      const acquired = await this.store.tryLockRun(
-        run.id,
-        this.instanceId,
-        nowMs + this.leaseMs,
-        nowMs,
-      );
-      if (!acquired) continue;
-      // A per-run hook (recovery counting / dead-lettering) may settle the run terminally instead.
-      const settled = onLocked ? await onLocked(run) : undefined;
-      results.push(settled ?? (await this.resume(run.id)));
-    }
+    // Bounded parallelism: one slow turn (a long local step) must not serialize the other 99 picked
+    // up this tick behind it. The lease acquire stays inside each task, so exactly-one-executor is
+    // unchanged; 8 concurrent turns is enough to hide one straggler without stampeding the store.
+    const CONCURRENCY = 8;
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const run = runs[next];
+        next += 1;
+        if (!run) return;
+        const acquired = await this.store.tryLockRun(
+          run.id,
+          this.instanceId,
+          nowMs + this.leaseMs,
+          nowMs,
+        );
+        if (!acquired) continue;
+        // A per-run hook (recovery counting / dead-lettering) may settle the run terminally instead.
+        const settled = onLocked ? await onLocked(run) : undefined;
+        results.push(settled ?? (await this.resume(run.id)));
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, runs.length) }, () => worker()));
     return results;
   }
 
@@ -1869,7 +2331,21 @@ export class WorkflowEngine {
   private notifyParent(runId: string, completion: Completion<unknown>): void {
     // Tracked, not bare fire-and-forget: `signal` can wake a suspended parent and resume it, issuing
     // store writes that must be awaited by `drain()` even though the settling child returned already.
-    this.trackEffect(this.signal(`child:${runId}`, completion));
+    // One retry + a warning before giving up: a transiently-failed delivery here used to vanish into
+    // trackEffect's swallow, stranding the parent until its reconcile wake. The parent's `ctx.child`
+    // re-registration now also RE-DERIVES a terminal child's completion from the run row itself, so
+    // a lost notify self-heals — but that costs a reconcile interval; don't lose it silently.
+    const deliver = (token: string): Promise<unknown> =>
+      this.signal(token, completion).catch(() =>
+        this.signal(token, completion).catch((err) => {
+          console.warn(
+            `[adonis-durable] failed to deliver child completion on ${token} (the parent recovers on its next reconcile wake): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }),
+      );
+    this.trackEffect(deliver(`child:${runId}`));
     // A fix-and-replay run (`<origin>~retry~<hash>`) is standalone, but its SUCCESS is the
     // origin's outcome for all practical purposes: deliver it on the ORIGIN's token too, so a
     // parent that failed on that child and is retried later consumes this success (buffered or
@@ -1877,7 +2353,7 @@ export class WorkflowEngine {
     // fix attempt must not poison the origin's token.
     const at = runId.lastIndexOf('~retry~');
     if (at !== -1 && completion.ok) {
-      this.trackEffect(this.signal(`child:${runId.slice(0, at)}`, completion));
+      this.trackEffect(deliver(`child:${runId.slice(0, at)}`));
     }
   }
 
@@ -1932,6 +2408,11 @@ export class WorkflowEngine {
     // (its lease acquire fails and it no-ops); the broadcast tells that worker to abort cooperatively.
     if (opts?.compensate && (run.status === 'suspended' || run.status === 'running')) {
       this.cancelRequested.add(runId);
+      // DURABLE cancel intent: the in-memory flag above only survives on this pod, this boot. The
+      // buffered `cancel:<id>` marker is what lets the compensating unwind survive a crash or be
+      // picked up by ANOTHER pod (its resume replays into the WorkflowSuspended catch, which checks
+      // the marker when the flag is absent). Consumed there once `cancelled` is durably recorded.
+      await this.store.bufferSignal(`cancel:${runId}`, true).catch(() => undefined);
       if (this.controlPlane) {
         void this.controlPlane
           .publishControl({ kind: 'cancel', runId, from: this.instanceId })
@@ -2028,8 +2509,15 @@ export class WorkflowEngine {
    */
   async getRunChildren(parentRunId: string): Promise<string[]> {
     const childIds = new Set<string>();
-    for (const w of await this.store.listSignalWaiters('child:')) {
-      if (w.runId === parentRunId) childIds.add(w.token.slice('child:'.length));
+    // Targeted per-run lookup when the store has it (an indexed `WHERE run_id`); the prefix scan
+    // fallback walks EVERY `child:` waiter row for one parent.
+    const waiters = this.store.listSignalWaitersByRunIds
+      ? await this.store.listSignalWaitersByRunIds([parentRunId])
+      : await this.store.listSignalWaiters('child:');
+    for (const w of waiters) {
+      if (w.runId === parentRunId && w.token.startsWith('child:')) {
+        childIds.add(w.token.slice('child:'.length));
+      }
     }
     // Targeted read: only the `signal:child:` / `spawn:` checkpoints, not the whole history. Falls
     // back to a full listCheckpoints + in-JS prefix scan for a custom store that omits the method.
@@ -2058,6 +2546,20 @@ export class WorkflowEngine {
     return this.store.listSignalWaiters(prefix);
   }
 
+  /**
+   * Targeted per-run waiter lookup (`run_id IN (...)`) for the dashboard's page-scoped `waiting`
+   * stamp. Prefers the store's indexed method; falls back to filtering the full scan for a custom
+   * store without it.
+   */
+  async listSignalWaitersByRunIds(runIds: string[]): Promise<SignalWaiter[]> {
+    if (runIds.length === 0) return [];
+    if (this.store.listSignalWaitersByRunIds) {
+      return this.store.listSignalWaitersByRunIds(runIds);
+    }
+    const ids = new Set(runIds);
+    return (await this.store.listSignalWaiters('')).filter((w) => ids.has(w.runId));
+  }
+
   /** The worker groups this engine dispatches to: every registered remote workflow's group, plus any
    *  `extra` the caller declares. Local-step groups (a group consumed by in-process `@DurableStep`
    *  workers, e.g. `pipeline`) aren't derivable from registrations — pass them via `extra` so a group
@@ -2077,12 +2579,10 @@ export class WorkflowEngine {
    *  (only the BullMQ transport implements `groupHealth`). */
   async workerHealth(extra: string[] = []): Promise<GroupHealth[]> {
     const groups = new Set([...this.knownGroups(extra), ...(await this.pool.listWorkerGroups())]);
-    const out: GroupHealth[] = [];
-    for (const group of groups) {
-      const health = await this.pool.groupHealth(group);
-      if (health) out.push(health);
-    }
-    return out;
+    // One round per group, in parallel — the dashboard polls this, and each group's health is an
+    // independent SCAN + job-count query; serial rounds made /workers latency scale linearly.
+    const healths = await Promise.all([...groups].map((group) => this.pool.groupHealth(group)));
+    return healths.filter((h): h is GroupHealth => h != null);
   }
 
   /**
@@ -2262,8 +2762,16 @@ export class WorkflowEngine {
     }
     const renew = setInterval(
       () => {
+        // A renew that returns FALSE means the lease was taken over (this turn stalled past expiry
+        // and another instance reclaimed the run) — this executor is now a zombie. Fence it: mark
+        // the run so its eventual settle degrades to a no-op echo instead of clobbering the new
+        // owner's writes. A renew that THROWS (transient store error) is not evidence of takeover,
+        // so it stays swallowed — the next interval retries.
         void this.store
           .renewRunLock(run.id, this.instanceId, this.clock() + this.leaseMs)
+          .then((renewed) => {
+            if (!renewed) this.leaseLostRuns.add(run.id);
+          })
           .catch(() => undefined);
       },
       Math.max(50, Math.floor(this.leaseMs / 2)),
@@ -2291,6 +2799,7 @@ export class WorkflowEngine {
       return result;
     } finally {
       clearInterval(renew);
+      this.leaseLostRuns.delete(run.id);
     }
   }
 
@@ -2308,6 +2817,12 @@ export class WorkflowEngine {
    * keeps its own lease handling (the TS executor's `finally`, the remote path's caller).
    */
   private async settleRun(run: WorkflowRun, outcome: RunOutcome): Promise<RunResult> {
+    // Zombie fence: this turn's lease was lost mid-execution (renew returned false, or drain
+    // released it on timeout) — another instance owns and is (re)executing the run. This outcome
+    // was computed by a stale executor; report the store's current state instead of writing. The
+    // status-CAS below would NOT catch this case: the new owner's run is legitimately back in a
+    // settle-eligible status while it executes.
+    if (this.leaseLostRuns.has(run.id)) return this.echoCurrentStatus(run.id);
     const updatedAt = new Date();
     if (outcome.kind === 'completed') {
       // This outcome was computed by a turn that started from a possibly-stale run snapshot. If the
@@ -2334,12 +2849,23 @@ export class WorkflowEngine {
       return { runId: run.id, status: 'completed', output: outcome.output };
     }
     if (outcome.kind === 'failed') {
-      // Same race as the `completed` branch above — guard identically.
-      const applied = await this.store.updateRunIf(run.id, SETTLE_ELIGIBLE_STATUSES, {
-        status: 'failed',
-        error: outcome.error,
-        updatedAt,
-      });
+      // Same race as the `completed` branch above — guard identically. ADDITIONALLY exclude
+      // `failed`: a stray resume of an already-failed run (a redelivered signal, the settle-recheck
+      // re-drive) replays and deterministically re-fails — re-applying the settle would re-emit
+      // `run.failed` and RE-NOTIFY the parent, whose waiter the first notify already consumed, so
+      // the duplicate gets BUFFERED as a stale failure that poisons a later retry's rendezvous
+      // (observed: a cascade-requeued child's fresh success lost to the stale buffered failure). A
+      // legitimate retry always transitions through `pending`/`running` first (requeue flips the
+      // status), so it is unaffected.
+      const applied = await this.store.updateRunIf(
+        run.id,
+        SETTLE_ELIGIBLE_STATUSES.filter((s) => s !== 'failed'),
+        {
+          status: 'failed',
+          error: outcome.error,
+          updatedAt,
+        },
+      );
       if (!applied) return this.echoCurrentStatus(run.id);
       this.emit({
         type: 'run.failed',
@@ -2702,10 +3228,52 @@ export class WorkflowEngine {
           // dashboard renders the fan as one parallel group. Undefined for a lone (non-fan) child.
           parallelGroup: cmd.parallelGroup,
         });
-        if (!(await this.store.getRun(childId))) {
-          // Same inheritance rule as the in-process `ctx.child` path: the child belongs to the run
-          // that spawned it, not to whichever engine happened to advance that run.
-          this.startChildDeferred(cmd.workflow, cmd.input, childId, { namespace: run.namespace });
+        // Lost-wake guard (mirrors the in-process `ctx.child`/`ctx.all`): the child may have ALREADY
+        // finished while no waiter was registered — consume its buffered completion, or re-derive the
+        // completion from the child's own terminal run row when even the buffer was lost (crash
+        // between the child's terminal write and its parent notify). Without this the re-registered
+        // waiter waits forever on a signal that already fired.
+        const deliverChild = async (payload: unknown): Promise<void> => {
+          await this.store.removeSignalWaiter({
+            token: `child:${childId}`,
+            runId: run.id,
+            seq: cmd.seq,
+          });
+          await this.store.saveCheckpoint(
+            instantCheckpoint({
+              runId: run.id,
+              seq: cmd.seq,
+              name: `signal:child:${childId}`,
+              kind: 'signal',
+              output: payload,
+              parallelGroup: cmd.parallelGroup,
+            }),
+          );
+          // Re-drive on a macrotask, AFTER this turn suspends and frees the run lock (same reorder
+          // as the buffered `waitSignal` delivery above).
+          setTimeout(() => void this.resume(run.id).catch(() => undefined), 0);
+        };
+        const bufferedChild = await this.store.takeBufferedSignal(`child:${childId}`);
+        if (bufferedChild) {
+          await deliverChild(bufferedChild.payload);
+        } else {
+          const child = await this.store.getRun(childId);
+          if (!child) {
+            // Same inheritance rule as the in-process `ctx.child` path: the child belongs to the run
+            // that spawned it, not to whichever engine happened to advance that run.
+            this.startChildDeferred(cmd.workflow, cmd.input, childId, { namespace: run.namespace });
+          } else if (
+            child.status === 'completed' ||
+            child.status === 'failed' ||
+            child.status === 'cancelled' ||
+            child.status === 'dead'
+          ) {
+            await deliverChild(
+              child.status === 'completed'
+                ? { ok: true, value: child.output }
+                : { ok: false, error: child.error?.message ?? child.status },
+            );
+          }
         }
       } else {
         throw new Error(
@@ -2746,7 +3314,7 @@ export class WorkflowEngine {
         workflow: run.workflow,
         namespace: run.namespace,
       });
-      await this.store.releaseRunLock(run.id);
+      await this.store.releaseRunLock(run.id, this.instanceId);
       return { runId: run.id, status: 'suspended' };
     }
     // Saga compensations registered by completed steps; run in reverse if the run later fails.
@@ -2773,9 +3341,21 @@ export class WorkflowEngine {
       return this.settleRun(run, { kind: 'completed', output });
     } catch (err) {
       if (err instanceof ContinueAsNew) {
-        // Hand off to a fresh execution with a clean history: complete this run, then start the next
-        // (`<id>~N`) with the new input. Deferred + idempotent by the continuation id, so a crash
-        // mid-handoff re-derives the same next run instead of forking.
+        // Hand off to a fresh execution with a clean history: persist the next run (`<id>~N`), then
+        // complete this one. Zombie fence first — a fenced turn must not fork a continuation either.
+        if (this.leaseLostRuns.has(run.id)) return this.echoCurrentStatus(run.id);
+        const nextId = nextContinuationId(run.id);
+        // Persist the continuation BEFORE the parent's terminal write — the durable ordering that
+        // makes the chain crash-safe. The old order (complete parent, then create the continuation
+        // from an in-memory deferred start) left a window where a hard crash (SIGKILL/OOM) lost the
+        // chain forever: a `completed` parent with no continuation is indistinguishable from a
+        // normally-finished run, and no recovery path re-derives the next link (recoverIncomplete
+        // only scans `running`). With the continuation persisted first, a crash in the gap leaves
+        // the parent `running` — recovery replays it, ContinueAsNew re-throws, and this createRun
+        // converges on the already-persisted continuation (idempotent by the continuation id).
+        // `dispatch: false`: the tracked handoff below owns the pickup. The continuation inherits
+        // the parent RUN's namespace so a tenant's chain stays in its worker-pool partition.
+        await this.startCore(run.workflow, err.input, nextId, { namespace: run.namespace }, false);
         await this.store.updateRun(run.id, {
           status: 'completed',
           output: undefined,
@@ -2789,11 +3369,11 @@ export class WorkflowEngine {
           namespace: run.namespace,
         });
         this.notifyParent(run.id, { ok: true, value: undefined });
-        const nextId = nextContinuationId(run.id);
         // Tracked handoff (see {@link handoffRun}): held in `postSettle` from this settle until the
         // continuation has entered `inflight` and settled, so `drain()` can't return before the next
-        // run's store writes land. Still deferred + idempotent by the continuation id.
-        this.handoffRun(run.workflow, err.input, nextId);
+        // run's store writes land. Still deferred; its startCore call converges on the run persisted
+        // above (prior-run branch) and drives the pickup.
+        this.handoffRun(run.workflow, err.input, nextId, { namespace: run.namespace });
         return { runId: run.id, status: 'completed' };
       }
       if (err instanceof WorkflowBlocked) {
@@ -2805,14 +3385,35 @@ export class WorkflowEngine {
       if (err instanceof WorkflowSuspended) {
         // A compensating cancel resumed this run to reach here: the replay re-registered the saga,
         // so undo the completed steps in reverse and mark it cancelled instead of re-suspending.
-        if (this.cancelRequested.has(run.id)) {
-          this.cancelRequested.delete(run.id);
+        // The intent lives in TWO places: the in-memory `cancelRequested` fast path (same pod, same
+        // boot), and the DURABLE buffered `cancel:<id>` marker `cancel()` persisted — so a crash or
+        // a cross-pod handoff mid-cancellation can't silently forget the cancel and settle the run
+        // back to `suspended` as if nothing happened. Peek the marker (take + re-buffer) rather than
+        // consume it: it must survive a crash mid-unwind; it's drained below once `cancelled` is
+        // durably recorded.
+        let cancelling = this.cancelRequested.delete(run.id);
+        if (!cancelling) {
+          const marker = await this.store.takeBufferedSignal(`cancel:${run.id}`);
+          if (marker) {
+            cancelling = true;
+            await this.store
+              .bufferSignal(`cancel:${run.id}`, marker.payload)
+              .catch(() => undefined);
+          }
+        }
+        if (cancelling) {
           for (let i = compensations.length - 1; i >= 0; i -= 1) {
             const comp = compensations[i];
-            if (comp) await this.runCompensation(run, comp);
+            if (comp) await this.runCompensation(run, comp, i);
           }
           const error = { message: 'cancelled' };
           await this.store.updateRun(run.id, { status: 'cancelled', error, updatedAt: new Date() });
+          // The cancellation is durably recorded — consume the marker(s) so a later retry of this
+          // run id doesn't get spuriously re-cancelled.
+          for (;;) {
+            const m = await this.store.takeBufferedSignal(`cancel:${run.id}`).catch(() => null);
+            if (!m) break;
+          }
           this.emit({
             type: 'run.failed',
             runId: run.id,
@@ -2822,7 +3423,16 @@ export class WorkflowEngine {
           });
           return { runId: run.id, status: 'cancelled', error };
         }
-        return this.settleRun(run, { kind: 'suspended', wakeAt: err.wakeAt });
+        const settled = await this.settleRun(run, { kind: 'suspended', wakeAt: err.wakeAt });
+        // Close the settle-vs-delivery race: a signal/result that landed WHILE this turn was still
+        // executing wrote its checkpoint durably, but its resume no-oped against our held lease —
+        // and this settle just parked the run on nothing but the reconcile fallback (or nothing at
+        // all with reconcileMs: 0). Re-check the seqs this suspension waits on and re-drive if one
+        // already settled.
+        if (settled.status === 'suspended' && err.waitSeqs?.length) {
+          this.recheckWaitSeqs(run.id, err.waitSeqs);
+        }
+        return settled;
       }
       const error = {
         message: err instanceof Error ? err.message : String(err),
@@ -2835,13 +3445,14 @@ export class WorkflowEngine {
       for (let i = compensations.length - 1; i >= 0; i -= 1) {
         const comp = compensations[i];
         if (!comp) continue;
-        await this.runCompensation(run, comp);
+        await this.runCompensation(run, comp, i);
       }
       return this.settleRun(run, { kind: 'failed', error });
     } finally {
       // Release the recovery lease once the run reaches a terminal/suspended state, so the
-      // next instance (or the timer poller) can pick it up promptly.
-      await this.store.releaseRunLock(run.id);
+      // next instance (or the timer poller) can pick it up promptly. Owner-scoped: if this turn's
+      // lease was already taken over (zombie executor), the new owner's lease is left untouched.
+      await this.store.releaseRunLock(run.id, this.instanceId);
     }
   }
 
@@ -2851,16 +3462,39 @@ export class WorkflowEngine {
    * compensation is skipped so it can't mask the original failure. Handles both compensation shapes:
    * a LOCAL `fn` (run in-process) and a DISPATCHED undo (an ordinary step def sent to a worker and
    * awaited inline — the worker serving its name runs it with the {@link StepUndo} envelope).
+   *
+   * DURABLE: each compensation owns a reserved NEGATIVE checkpoint seq (`-2 - idx`, disjoint from
+   * the positional replay's `>= 0` space and the legacy `-1`), written `pending` before a dispatch
+   * and settled on its outcome. A re-driven unwind — crash mid-unwind, a lease takeover replaying
+   * the failing body back into this catch, a worker result consumed by another pod — therefore
+   * SKIPS undos already done and RESUMES the attempt count, instead of re-running the whole unwind
+   * blind from in-memory state that no longer exists.
    */
-  private async runCompensation(run: WorkflowRun, comp: Compensation): Promise<void> {
+  private async runCompensation(run: WorkflowRun, comp: Compensation, idx: number): Promise<void> {
     const name = `compensate:${comp.name}`;
-    for (let attempt = 1; attempt <= this.compensationRetries; attempt += 1) {
+    const seq = COMPENSATION_SEQ_BASE - idx;
+    const existing = await this.store.getCheckpoint(run.id, seq);
+    // Already undone by a previous drive of this unwind (possibly on another pod) — skip.
+    if (existing?.status === 'completed') return;
+    const priorAttempts = existing?.attempts ?? 0;
+    // Permanently failed and already reported — skip (never mask the original failure).
+    if (existing?.status === 'failed' && priorAttempts >= this.compensationRetries) return;
+    // A `pending` row re-enters AT its recorded attempt (await the in-flight dispatch rather than
+    // blindly re-issuing); a `failed` row resumes the count after its recorded attempts.
+    const firstAttempt =
+      existing?.status === 'pending' ? Math.max(1, priorAttempts) : priorAttempts + 1;
+    for (let attempt = firstAttempt; attempt <= this.compensationRetries; attempt += 1) {
       const startedAt = Date.now();
       try {
         if ('fn' in comp) {
           await comp.fn();
+          // Persist the completed undo so a re-driven unwind never re-runs it — crash-safe skipping
+          // instead of leaning solely on the "compensations are idempotent" contract.
+          await this.store.saveCheckpoint(
+            instantCheckpoint({ runId: run.id, seq, name, kind: 'local' }),
+          );
         } else {
-          await this.dispatchCompensation(run, comp.dispatch.def, comp.dispatch.args, attempt);
+          await this.dispatchCompensation(run, comp.dispatch.def, comp.dispatch.args, attempt, seq);
         }
         this.emit({
           type: 'step.completed',
@@ -2872,6 +3506,24 @@ export class WorkflowEngine {
         });
         return;
       } catch (err) {
+        // Record the failed attempt (best-effort) so a re-driven unwind resumes the count.
+        const error = { message: err instanceof Error ? err.message : String(err) };
+        const at = new Date();
+        await this.store
+          .saveCheckpoint({
+            runId: run.id,
+            seq,
+            name,
+            kind: 'fn' in comp ? 'local' : 'remote',
+            stepId: `${run.id}:compensate:${comp.name}:${attempt}`,
+            status: 'failed',
+            attempts: attempt,
+            error,
+            enqueuedAt: existing?.enqueuedAt ?? at,
+            startedAt: at,
+            finishedAt: at,
+          })
+          .catch(() => undefined);
         if (attempt >= this.compensationRetries) {
           this.emit({
             type: 'step.failed',
@@ -2879,7 +3531,7 @@ export class WorkflowEngine {
             workflow: run.workflow,
             name,
             kind: 'local',
-            error: { message: err instanceof Error ? err.message : String(err) },
+            error,
             durationMs: Date.now() - startedAt,
           });
         }
@@ -2888,44 +3540,171 @@ export class WorkflowEngine {
   }
 
   /**
-   * Dispatch a saga undo step to a worker and await its result INLINE (the saga unwind already runs
-   * outside the positional replay, so this is not checkpointed — it's a one-shot dispatch + await).
-   * Routes by the undo def's own name/partition token, applies its own optional input schema, and
-   * honours its own liveness `timeoutMs` via the heartbeat window. Throws on a worker-reported failure
+   * Dispatch a saga undo step to a worker and await its result. Routes by the undo def's own
+   * name/partition token, applies its own optional input schema, and honours its own liveness
+   * `timeoutMs` via the heartbeat window (else the engine's `compensationTimeoutMs` bounds the
+   * wait, so a lost result can't hold the unwind open forever). Throws on a worker-reported failure
    * or timeout so `runCompensation`'s retry/skip logic applies uniformly to both compensation shapes.
+   *
+   * The undo is CHECKPOINTED at its reserved negative `seq` (pending before dispatch, settled on the
+   * outcome), which is what makes the await multi-pod-safe: a result popped by ANOTHER engine
+   * instance sharing the results queue lands in its `completeRemoteResult`, settles this row, and
+   * the checkpoint poll below observes it — the old in-memory-only waiter simply dropped that result
+   * (`getCheckpoint(runId, -1)` → null) and hung the failing run's unwind forever.
    */
   private async dispatchCompensation(
     run: WorkflowRun,
     def: StepDef<unknown, unknown>,
     args: unknown,
     attempt: number,
+    seq: number,
   ): Promise<void> {
     if (this.pool.size === 0) throw new Error('dispatched compensation requires a Transport');
     const token = stepGroup(def, run.namespace);
     const validInput = def.input ? def.input.parse(args) : args;
     const id = `${run.id}:compensate:${def.name}:${attempt}`;
+    const name = `compensate:${def.name}`;
+    const existing = await this.store.getCheckpoint(run.id, seq);
     const resultPromise = new Promise<RemoteResolution>((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
     });
+    const enqueuedAt = new Date();
     try {
-      await this.pool.dispatch({
-        runId: run.id,
-        seq: -1,
-        name: def.name,
-        stepId: id,
-        group: token,
-        input: validInput,
-        traceparent: this.traceparent?.(),
-        context: this.context?.(),
-        attempt: 1,
-      });
-      await (def.timeoutMs
+      // A pending row already at (or past) this attempt means the dispatch itself already happened
+      // (crash after dispatch, or a re-drive while the worker is mid-undo): re-await the in-flight
+      // undo instead of double-issuing it.
+      const alreadyDispatched = existing?.status === 'pending' && existing.attempts >= attempt;
+      if (!alreadyDispatched) {
+        // Persist the pending checkpoint BEFORE dispatching — the durable anchor for the cross-pod
+        // settle and for re-drive resumption.
+        await this.store.saveCheckpoint({
+          runId: run.id,
+          seq,
+          name,
+          kind: 'remote',
+          stepId: id,
+          status: 'pending',
+          input: validInput,
+          attempts: attempt,
+          workerGroup: token,
+          enqueuedAt,
+          startedAt: enqueuedAt,
+          finishedAt: enqueuedAt,
+        });
+        await this.pool.dispatch({
+          runId: run.id,
+          seq,
+          name: def.name,
+          stepId: id,
+          group: token,
+          input: validInput,
+          traceparent: this.traceparent?.(),
+          context: this.context?.(),
+          attempt: 1,
+        });
+      }
+      const awaited = def.timeoutMs
         ? this.awaitWithHeartbeat(id, resultPromise, def.timeoutMs)
-        : resultPromise);
-    } catch (err) {
+        : resultPromise;
+      await this.awaitCompensationOutcome(
+        run.id,
+        seq,
+        name,
+        id,
+        token,
+        attempt,
+        awaited,
+        // With a heartbeat window the def's own liveness handling governs; otherwise bound the wait.
+        def.timeoutMs ? undefined : this.compensationTimeoutMs,
+        enqueuedAt,
+      );
+    } finally {
       this.pending.delete(id);
-      throw err;
     }
+  }
+
+  /**
+   * Resolve one dispatched undo attempt from EITHER source: the in-memory waiter (the result landed
+   * on THIS pod — persist the settled row ourselves, since the waiter path bypasses
+   * `completeRemoteResult`) or the checkpoint row (settled by another instance sharing the results
+   * queue, where the in-memory waiter never fires). Bounded by `timeoutMs` when given. Resolves on a
+   * completed undo; rejects on a worker-reported failure or timeout.
+   */
+  private awaitCompensationOutcome(
+    runId: string,
+    seq: number,
+    name: string,
+    stepId: string,
+    token: string,
+    attempt: number,
+    awaited: Promise<RemoteResolution>,
+    timeoutMs: number | undefined,
+    enqueuedAt: Date,
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      let done = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let poll: ReturnType<typeof setInterval> | undefined;
+      const cleanup = (): void => {
+        if (poll) clearInterval(poll);
+        if (timer) clearTimeout(timer);
+      };
+      const finish = (fn: () => void): void => {
+        if (done) return;
+        done = true;
+        cleanup();
+        fn();
+      };
+      poll = setInterval(() => {
+        void this.store
+          .getCheckpoint(runId, seq)
+          .then((cp) => {
+            if (!cp || cp.attempts < attempt) return;
+            if (cp.status === 'completed') finish(resolve);
+            else if (cp.status === 'failed') {
+              finish(() => reject(new RemoteStepError(cp.error)));
+            }
+          })
+          .catch(() => undefined);
+      }, 1_000);
+      (poll as { unref?: () => void }).unref?.();
+      if (timeoutMs != null) {
+        timer = setTimeout(() => {
+          finish(() =>
+            reject(
+              new RemoteStepError({
+                message: `compensation "${name}" timed out after ${timeoutMs}ms with no worker result`,
+                code: 'compensation_timeout',
+              }),
+            ),
+          );
+        }, timeoutMs);
+        (timer as { unref?: () => void }).unref?.();
+      }
+      awaited.then(
+        (resolution) => {
+          void this.store
+            .saveCheckpoint({
+              runId,
+              seq,
+              name,
+              kind: 'remote',
+              stepId,
+              status: 'completed',
+              output: resolution.output,
+              events: resolution.events,
+              attempts: attempt,
+              workerGroup: token,
+              enqueuedAt,
+              startedAt: resolution.startedAt ? new Date(resolution.startedAt) : enqueuedAt,
+              finishedAt: new Date(),
+            })
+            .catch(() => undefined)
+            .then(() => finish(resolve));
+        },
+        (err) => finish(() => reject(err)),
+      );
+    });
   }
 
   /** The seam handed to {@link createWorkflowCtx}: the authoring API reaches durability + lifecycle
@@ -3135,18 +3914,20 @@ export class WorkflowEngine {
    *  {@link resumeDueTimers}. Re-driving one re-checks the live fleet: it dispatches if a
    *  capable+compatible worker has appeared, else re-parks with a fresh `wakeAt` (design §7.5). */
   private async dueBlockedRuns(nowMs: number): Promise<WorkflowRun[]> {
-    const blocked = await asHeartbeat(() => this.store.listRuns({ statuses: ['blocked'] }));
-    // Unlike the store-side poll paths, this filters in memory, so the operator case is explicit:
-    // an engine with no namespace drives every pool's blocked runs, exactly as it drives their
-    // pending and due ones.
-    return blocked.filter(
-      (r) =>
-        (this.namespace === undefined ||
-          r.namespace === undefined ||
-          r.namespace === this.namespace) &&
-        r.wakeAt !== undefined &&
-        r.wakeAt <= nowMs,
+    // Both predicates push into the store now (`wakeBefore` + namespace + a bound): only DUE
+    // blocked runs come back, instead of every blocked run per tick filtered in memory. An engine
+    // with no namespace still drives every pool's blocked runs (the filter is simply omitted); a
+    // legacy run row without a namespace reads back as 'default' from every shipped store, so the
+    // pushdown matches the old in-memory semantics.
+    const blocked = await asHeartbeat(() =>
+      this.store.listRuns({
+        statuses: ['blocked'],
+        namespace: this.namespace,
+        wakeBefore: nowMs,
+        limit: 200,
+      }),
     );
+    return blocked;
   }
 
   private async callRemote<TInput, TOutput>(
@@ -3173,7 +3954,16 @@ export class WorkflowEngine {
     // checkpoint, and let the result resume the run on whichever instance receives it — so a worker
     // pod can scale down or crash mid-step without losing the run or re-running completed work.
     if (step.timeoutMs)
-      return this.callRemoteInMemory(runId, seq, step, input, transport, runNamespace);
+      return this.callRemoteInMemory(
+        runId,
+        seq,
+        step,
+        input,
+        transport,
+        runNamespace,
+        queue,
+        admission,
+      );
     if (existing?.status === 'pending') {
       // Dispatched; normally we just keep waiting for the result to resume the run. But a LOST dispatch
       // (worker crashed with no result, or the transport dropped the job) would hang here forever — a
@@ -3181,16 +3971,16 @@ export class WorkflowEngine {
       // pending longer than `remoteRedispatchMs`, re-dispatch the same stepId (the idempotent step
       // re-runs, its result resumes the run), bounded by `remoteRedispatchMax` so a never-settling step
       // fails instead of looping. Unset (default) keeps the by-design "re-suspend, never re-dispatch".
-      if (this.remoteRedispatchMs == null) throw new WorkflowSuspended();
+      if (this.remoteRedispatchMs == null) throw new WorkflowSuspended(undefined, [seq]);
       // Stamp a redispatch deadline (clock-space, persisted) the first time we see this pending step,
       // stable across replays and crashes — mirrors the failed-retry backoff below. The run's wakeAt
       // becomes this deadline, so a reconcile re-drive lands exactly when it's due to re-dispatch.
       if (existing.wakeAt == null) {
         const wakeAt = this.clock() + this.remoteRedispatchMs;
         await this.store.saveCheckpoint({ ...existing, wakeAt });
-        throw new WorkflowSuspended(wakeAt);
+        throw new WorkflowSuspended(wakeAt, [seq]);
       }
-      if (this.clock() < existing.wakeAt) throw new WorkflowSuspended(existing.wakeAt);
+      if (this.clock() < existing.wakeAt) throw new WorkflowSuspended(existing.wakeAt, [seq]);
       // Past the deadline with no result — the dispatch is presumed lost. Re-dispatch (bounded by
       // `remoteRedispatchMax` so a step that never settles fails the run instead of looping forever).
       if (existing.attempts >= this.remoteRedispatchMax) {
@@ -3221,7 +4011,7 @@ export class WorkflowEngine {
         attempt: reAttempt,
         transport,
       });
-      throw new WorkflowSuspended(nextDeadline);
+      throw new WorkflowSuspended(nextDeadline, [seq]);
     }
 
     // Durable retry: a failed attempt re-dispatches up to `retries`, spacing attempts by `backoff` —
@@ -3246,6 +4036,7 @@ export class WorkflowEngine {
     // Flow control: a queued call that can't be admitted (concurrency/rate) does NOT dispatch — the
     // run re-suspends with the queue's retry time and the timer poller re-tries admission later, so
     // the limit is durable. The admitted slot is released when the result lands (completeRemoteResult).
+    let admittedQueue: string | undefined;
     if (queue && this.admission.handles(queue)) {
       // Admission carries the per-call priority + fairness key (default the runId so each run is its
       // own fairness bucket), and the stepId as a STABLE waiter id so the backend tracks one waiter
@@ -3265,6 +4056,7 @@ export class WorkflowEngine {
       }
       this.queueWaiters.get(queue)?.delete(runId);
       this.stepQueue.set(id, queue);
+      admittedQueue = queue;
     }
 
     // Optional runtime schema: validate only when the def carries one (a bare `@Step()` / string-name
@@ -3291,6 +4083,10 @@ export class WorkflowEngine {
       input: validInput,
       attempts: attempt,
       workerGroup: token,
+      // Persist which flow-control queue this step's admitted slot belongs to, so the slot is
+      // released by WHICHEVER instance receives the result — the in-memory stepQueue map only
+      // covers the dispatching pod, and a slot released by no one starves the queue fleet-wide.
+      queue: admittedQueue,
       enqueuedAt,
       startedAt: enqueuedAt, // placeholders until the worker result lands
       finishedAt: enqueuedAt,
@@ -3307,7 +4103,7 @@ export class WorkflowEngine {
       transport,
     });
     this.emit({ type: 'step.started', runId, seq, name: step.name, kind: 'remote' });
-    throw new WorkflowSuspended();
+    throw new WorkflowSuspended(undefined, [seq]);
   }
 
   /**
@@ -3376,7 +4172,7 @@ export class WorkflowEngine {
     }
     // A result settling this step frees its flow-control slot (no-op if it wasn't queued). Done
     // before the terminal-run early-returns below, so a cancellation can't leak the slot.
-    await this.releaseQueueSlot(cp.stepId);
+    await this.releaseQueueSlot(cp);
     // Drop a late result for a run that was cancelled/finished meanwhile — don't complete the step
     // or resume (the run is already terminal). This is the engine side of cooperative cancellation.
     if (run && (run.status === 'cancelled' || run.status === 'completed')) return;
@@ -3434,12 +4230,18 @@ export class WorkflowEngine {
     for (const runId of runIds) void this.resume(runId).catch(() => undefined);
   }
 
-  /** Release the flow-control slot a dispatched step held (if any), by its stepId. */
-  private async releaseQueueSlot(id: string): Promise<void> {
-    const queue = this.stepQueue.get(id);
+  /**
+   * Release the flow-control slot a dispatched step held (if any). The queue comes from the
+   * CHECKPOINT (durable — works on whichever instance receives the result), falling back to the
+   * dispatching pod's in-memory map for checkpoints written before the `queue` column existed.
+   * Exactly-once is anchored on the caller's pending→settled transition: only the delivery that
+   * finds the checkpoint still `pending` releases.
+   */
+  private async releaseQueueSlot(cp: StepCheckpoint): Promise<void> {
+    const queue = cp.queue ?? this.stepQueue.get(cp.stepId);
+    this.stepQueue.delete(cp.stepId);
     if (queue === undefined) return;
-    this.stepQueue.delete(id);
-    await this.admission.release(queue, id);
+    await this.admission.release(queue, cp.stepId);
   }
 
   /** In-memory await path for a remote step with a liveness `timeoutMs` (re-dispatch on timeout). */
@@ -3450,6 +4252,8 @@ export class WorkflowEngine {
     input: TInput,
     transport?: string,
     runNamespace?: string | undefined,
+    queue?: string,
+    admission?: { priority?: number | undefined; fairnessKey?: string | undefined },
   ): Promise<TOutput> {
     if (this.pool.size === 0) throw new Error('remote steps require a Transport');
     const validInput = step.input ? step.input.parse(input) : input;
@@ -3458,6 +4262,55 @@ export class WorkflowEngine {
     // emit + dispatch, so a step nobody can run parks `blocked` instead of awaiting a phantom worker.
     await this.ensureRoutable(token, step.requires);
     const id = stepId(runId, seq);
+    // Flow control — the same admission gate the durable path applies. A `{ queue }` on a
+    // `timeoutMs` step used to be SILENTLY ignored (this path branched off before the gate), so the
+    // documented cap simply didn't hold for liveness-timeout steps. The slot spans every retry
+    // attempt of this call and is released in the `finally` below on THIS pod (the await lives
+    // here); it is deliberately NOT persisted on the checkpoint — a cross-pod result consumer
+    // releasing from the row would double-free against this finally.
+    let admittedQueue: string | undefined;
+    if (queue && this.admission.handles(queue)) {
+      const decision = await this.admission.tryAdmit(queue, {
+        priority: admission?.priority,
+        key: admission?.fairnessKey ?? runId,
+        waiterId: id,
+      });
+      if (!decision.ok) {
+        const waiters = this.queueWaiters.get(queue) ?? new Set<string>();
+        waiters.add(runId);
+        this.queueWaiters.set(queue, waiters);
+        throw new WorkflowSuspended(decision.retryAt);
+      }
+      this.queueWaiters.get(queue)?.delete(runId);
+      admittedQueue = queue;
+    }
+    try {
+      return await this.callRemoteInMemoryAdmitted(
+        runId,
+        seq,
+        step,
+        validInput,
+        token,
+        id,
+        transport,
+      );
+    } finally {
+      if (admittedQueue !== undefined) {
+        await this.admission.release(admittedQueue, id).catch(() => undefined);
+      }
+    }
+  }
+
+  /** The dispatch/await/retry body of {@link callRemoteInMemory}, once routable and admitted. */
+  private async callRemoteInMemoryAdmitted<TInput, TOutput>(
+    runId: string,
+    seq: number,
+    step: StepDef<TInput, TOutput>,
+    validInput: TInput,
+    token: string,
+    id: string,
+    transport?: string,
+  ): Promise<TOutput> {
     const enqueuedAt = new Date();
     this.emit({ type: 'step.started', runId, seq, name: step.name, kind: 'remote' });
     // Retry policy differs from a LOCAL step on purpose: a local `ctx.step` retries any non-fatal
@@ -3608,7 +4461,10 @@ export class WorkflowEngine {
       // while RUNNING". Without the split, a dispatch-anchored window false-failed a healthy
       // single-concurrency fleet whose next batch queued ~15min behind the current one.
       let seenBeat = false;
-      const window = () => (seenBeat ? timeoutMs : (pickupTimeoutMs ?? timeoutMs));
+      // Clamp to Node's setTimeout max (2³¹−1 ms): past it Node fires the timer ~immediately, which
+      // would turn a generous liveness window into an instant RemoteStepTimeout.
+      const window = () =>
+        Math.min(seenBeat ? timeoutMs : (pickupTimeoutMs ?? timeoutMs), MAX_BACKOFF_MS);
       const cleanup = () => {
         clearTimeout(timer);
         this.heartbeatResets.delete(id);

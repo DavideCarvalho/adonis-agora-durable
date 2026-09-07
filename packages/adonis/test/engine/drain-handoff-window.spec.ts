@@ -7,12 +7,8 @@ const flush = (): Promise<void> => new Promise<void>((r) => setTimeout(r, 0));
 
 /**
  * Gates the `createRun` write of ONE run id — the durable persist an internal handoff (continue-as-new's
- * next run, a deferred child) issues on the settle path. Holding it open lets a test reproduce the
- * escape window the review flagged: between the parent settling and the handoff's new run entering
- * `inflight` there are microtask hops + this store I/O, and the pre-fix bridge
- * (`queueMicrotask(() => void this.start(...))`) left that write UNtracked, so `drain()` could observe
- * both registries empty and return early — letting the write land after a torn-down connection (a
- * rolled-back Lucid test transaction → "Transaction query already complete").
+ * next run, a deferred child) issues. Holding it open lets a test freeze the handoff mid-flight and
+ * assert what `drain()` / the settle path do around it.
  */
 class GatedCreateStore extends InMemoryStateStore {
   gateRunId: string | null = null;
@@ -57,14 +53,14 @@ describe('drain waits for internal run handoffs (continue-as-new / deferred chil
     await engine.start('chain', { n: 0 }, 'p');
     await flush();
 
-    // Parent settled (continue-as-new completes it), and the handoff has reached the gated persist.
-    expect((await store.getRun('p'))?.status).toBe('completed');
+    // The continuation's persist is ON the settle path now (crash-safe ordering): while it is gated
+    // the parent has NOT completed yet — the chain is never in a "parent done, continuation lost"
+    // state, even transiently.
+    expect((await store.getRun('p'))?.status).toBe('running');
     expect(store.createStarted).toBe(true);
     expect(store.createCompleted).toBe(false);
 
-    // drain() must NOT resolve while the continuation's persist is still open. On the pre-fix engine the
-    // handoff was an untracked `queueMicrotask(start)`, so both registries read empty here and drain
-    // returned immediately → this assertion failed and the continuation's writes escaped the drain.
+    // drain() must NOT resolve while the parent's settle (and the continuation) is still in flight.
     let drained = false;
     const drainP = engine.drain(5_000).then(() => {
       drained = true;
@@ -75,8 +71,9 @@ describe('drain waits for internal run handoffs (continue-as-new / deferred chil
     store.open();
     await drainP;
     expect(drained).toBe(true);
-    // The continuation was persisted AND processed to completion before drain resolved.
+    // Parent settled and the continuation was persisted AND processed before drain resolved.
     expect(store.createCompleted).toBe(true);
+    expect((await store.getRun('p'))?.status).toBe('completed');
     expect((await store.getRun('p~1'))?.status).toBe('completed');
     expect((await store.getRun('p~1'))?.output).toBe('done-1');
   });
@@ -117,53 +114,63 @@ describe('drain waits for internal run handoffs (continue-as-new / deferred chil
     expect((await store.getRun('p'))?.output).toBe('parent:kid-done');
   });
 
-  it('the settle path does NOT block on the handoff (execute returns before the continuation persists)', async () => {
-    const store = new GatedCreateStore();
+  it('the settle path blocks on the continuation PERSIST (crash-safe ordering) but not on its execution', async () => {
+    const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });
+    let releaseContinuation!: () => void;
+    const continuationGate = new Promise<void>((r) => {
+      releaseContinuation = r;
+    });
     engine.register('chain', '1', async (ctx, input) => {
       const { n } = input as { n: number };
       if (n === 0) await ctx.continueAsNew({ n: 1 });
+      // The continuation parks mid-body: the PARENT must still be able to settle `completed` —
+      // proving the settle path waits only for the continuation's durable persist, never for its
+      // execution.
+      await continuationGate;
       return `done-${n}`;
     });
 
-    // Hold the continuation's persist open indefinitely.
-    store.gateRunId = 'p~1';
-
     await engine.start('chain', { n: 0 }, 'p');
-    // The parent reaches `completed` even though the continuation persist is still gated — proving the
-    // handoff is off the execute() critical path (it only holds `drain`, not the settling run).
-    const parent = await engine.waitForRun('p', { timeoutMs: 1_000 });
+    const parent = await engine.waitForRun('p', { timeoutMs: 1_000, terminal: true });
     expect(parent.status).toBe('completed');
-    expect(store.createCompleted).toBe(false);
+    // The continuation IS persisted by the time the parent reads completed (the durable ordering)…
+    expect((await store.getRun('p~1'))?.status).not.toBeUndefined();
+    // …but has not finished executing.
+    expect((await store.getRun('p~1'))?.status).not.toBe('completed');
 
-    store.open();
+    releaseContinuation();
     await engine.drain();
     expect((await store.getRun('p~1'))?.status).toBe('completed');
+    expect((await store.getRun('p~1'))?.output).toBe('done-1');
   });
 });
 
 describe('drain timeout on a long / hot continue-as-new chain', () => {
-  it('consumes the whole timeout, then leaves the frontier link leased for recovery (no loss)', async () => {
+  it('consumes the whole timeout, then leaves the frontier link fenced + unlocked for the next boot (no loss, no zombie settle)', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });
     const FRONTIER = 6; // links p → p~1 → … → p~6
-    const LIMIT = 7; // one link past the frontier, so the chain terminates cleanly once released
+    const LIMIT = 7; // one link past the frontier, so the chain terminates cleanly once recovered
     let releaseFrontier!: () => void;
     const frontierGate = new Promise<void>((r) => {
       releaseFrontier = r;
     });
     const reached: number[] = [];
 
-    engine.register('chain', '1', async (ctx, input) => {
-      const { n } = input as { n: number };
-      reached.push(n);
-      // The frontier link parks mid-execution: it is persisted + leased but never settles, so the
-      // chain can't finish and drain() must lean on its timeout — a stand-in for a perpetually hot
-      // continue-as-new loop that keeps handing off faster than it drains.
-      if (n === FRONTIER) await frontierGate;
-      if (n < LIMIT) await ctx.continueAsNew({ n: n + 1 });
-      return `done-${n}`;
-    });
+    const register = (target: WorkflowEngine): void => {
+      target.register('chain', '1', async (ctx, input) => {
+        const { n } = input as { n: number };
+        reached.push(n);
+        // The frontier link parks mid-execution on the FIRST engine only: it is persisted + leased
+        // but never settles there, so the chain can't finish and drain() must lean on its timeout —
+        // a stand-in for a perpetually hot continue-as-new loop.
+        if (n === FRONTIER && target === engine) await frontierGate;
+        if (n < LIMIT) await ctx.continueAsNew({ n: n + 1 });
+        return `done-${n}`;
+      });
+    };
+    register(engine);
 
     await engine.start('chain', { n: 0 }, 'p');
     // The chain flows across every link through the tracked handoffs until the frontier (p~6) parks.
@@ -182,19 +189,27 @@ describe('drain timeout on a long / hot continue-as-new chain', () => {
     expect(elapsed).toBeLessThan(timeoutMs + 500);
 
     // No loss: at the timeout the frontier link is PERSISTED with the lease RELEASED (running,
-    // lockedBy cleared), i.e. unowned work a fresh boot's recoverIncomplete() reclaims immediately —
-    // not a dropped/vanished run, and not stuck behind a lease expiry.
+    // lockedBy cleared) — unowned work a fresh boot's recoverIncomplete() reclaims immediately.
     const frontier = await store.getRun('p~6');
     expect(frontier?.status).toBe('running');
     expect(frontier?.lockedBy).toBeFalsy();
 
-    // And prove the frontier work is genuinely resumable, not stranded: release it and let the chain
-    // finish. p~6 hands off to p~7, which is past LIMIT and completes. Nothing was lost to the timeout.
+    // The drained process's own frontier turn is now FENCED: releasing it must NOT let the zombie
+    // executor settle the run it no longer owns (the next boot does that). This is the lease-fencing
+    // half of the drain contract — the old engine let both executors run the same link.
     releaseFrontier();
+    await flush();
+    expect((await store.getRun('p~6'))?.status).toBe('running');
+
+    // A fresh boot on the same store recovers the frontier and the chain finishes. Nothing was lost.
+    const nextBoot = new WorkflowEngine({ store });
+    register(nextBoot);
+    await nextBoot.recoverIncomplete();
     for (let i = 0; i < 500 && (await store.getRun('p~7'))?.status !== 'completed'; i += 1) {
       await flush();
     }
     expect((await store.getRun('p~6'))?.status).toBe('completed');
     expect((await store.getRun('p~7'))?.output).toBe('done-7');
+    await nextBoot.drain();
   });
 });

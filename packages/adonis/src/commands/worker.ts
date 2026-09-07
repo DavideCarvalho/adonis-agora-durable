@@ -22,6 +22,8 @@ export interface TickResult {
   timers: number;
   /** Run ids the schedules phase started this tick (due windows fired). */
   scheduled: number;
+  /** Terminal runs (subtrees included) the retention phase deleted this tick — 0 without a policy. */
+  evicted: number;
   /** Phase errors caught during the tick (e.g. a transient store hiccup), keyed by phase name. */
   errors: { phase: string; error: Error }[];
 }
@@ -72,7 +74,17 @@ export async function runTick(
 async function runTickInScope(engine: WorkflowEngine, options: TickOptions): Promise<TickResult> {
   const now = options.now;
   const schedules = options.schedules;
-  const result: TickResult = { pending: 0, recovered: 0, timers: 0, scheduled: 0, errors: [] };
+  // Let the engine's runtime schedule-control surface (list/pause/trigger) see the exact set that
+  // fires — including a console-issued pause applying to the very next tick.
+  if (schedules) engine.adoptSchedules(schedules);
+  const result: TickResult = {
+    pending: 0,
+    recovered: 0,
+    timers: 0,
+    scheduled: 0,
+    evicted: 0,
+    errors: [],
+  };
   const phase = async (name: string, fn: () => Promise<number>): Promise<number> => {
     try {
       return await fn();
@@ -102,6 +114,12 @@ async function runTickInScope(engine: WorkflowEngine, options: TickOptions): Pro
     const ids = await runSchedules(engine, schedules, now ?? Date.now());
     return ids.length;
   });
+  // 6th phase — retention: evict terminal runs past their configured age. Self-throttled inside the
+  // engine (one pass a minute); a no-op without a `retention` config.
+  result.evicted = await phase('sweepRetention', async () => engine.sweepRetention(now));
+  // 7th phase — stalled detection: page onStalled listeners about stranded runs. Self-throttled
+  // inside the engine (one pass a minute); a no-op without listeners.
+  await phase('sweepStalled', async () => (await engine.sweepStalled(now)).length);
   return result;
 }
 

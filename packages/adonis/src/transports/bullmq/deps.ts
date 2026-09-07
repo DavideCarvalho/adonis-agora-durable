@@ -36,6 +36,8 @@ export interface RedisLike {
   set(key: string, value: string, mode: 'EX', ttl: number): Promise<unknown>;
   scan(cursor: string | number, ...args: (string | number)[]): Promise<[string, string[]]>;
   get(key: string): Promise<string | null>;
+  /** Batched read — optional: a client without it falls back to per-key `get`. */
+  mget?(...keys: string[]): Promise<(string | null)[]>;
   disconnect(): void;
 }
 

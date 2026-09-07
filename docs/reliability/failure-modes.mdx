@@ -1,6 +1,6 @@
 ---
 title: Failure modes & recovery
-description: An operator-facing map from symptom to knob — where a run actually executes (runDispatcher), what reclaims a worker that crashed mid-run, why a lost remote dispatch does NOT auto-redrive by design, the three nets that catch it (timeoutMs, remoteRedispatchMs, redispatchPending), queue-transport specifics, namespaces, and how to reproduce each failure in a test.
+description: An operator-facing map from symptom to knob — where a run actually executes (runDispatcher), what reclaims a worker that crashed mid-run, why a lost remote dispatch does NOT auto-redrive by design, the three nets that catch it (timeoutMs, remoteRedispatchMs, redispatchPending), the stalled-run pager (engine.onStalled + stalledAfter), queue-transport specifics, namespaces, and how to reproduce each failure in a test.
 icon: LifeBuoy
 ---
 
@@ -30,6 +30,7 @@ Before diagnosing anything, know which of the three `runDispatcher` modes your a
 | Run stuck `suspended`, one step frozen `pending`, nothing happens for hours | Lost remote dispatch (worker died after claiming the job, or the transport dropped it) | See [the stranded signature](#the-stranded-signature) below | `engine.redispatchPending(runId)` now; `remoteRedispatchMs` to self-heal future ones |
 | Remote step just... never fails or completes, run `running` the whole time, no dashboard `pending` step | `timeoutMs` step whose coordinating process crashed (the liveness timer died with it) | Run's lease is stale (`lockedUntil` passed) — same signature as any crashed leased run | `recoverIncomplete()` reclaims it like any other orphaned run; the step re-dispatches from scratch on replay |
 | `/durable/api/health` shows nothing for a pool you know is stalled | You're on the `queue` or `db` transport — `groupHealth` is BullMQ-only | `engine.workerHealth()` returns `[]` | Use the stranded-signature query instead of the health panel |
+| You learned about a stuck run from a customer, not an alert | Nothing pages on the stranded signature — `suspended` is not an error | Nothing, until you query for it | Wire [`engine.onStalled`](#the-stalled-run-pager--onstalled--stalledafter) to your pager |
 | Two pools sharing one Redis/DB seem to steal each other's runs | No `namespace` set — both engines default to `'default'` | A run started by pool A gets executed by a worker in pool B | Set a distinct `namespace` per pool (see below) |
 
 ## Worker crashes mid-run (leased run)
@@ -58,7 +59,35 @@ Query for this pattern to confirm "lost dispatch" before reaching for `redispatc
 - Its most recent checkpoint has `kind: 'remote'`, `status: 'pending'`, and an `enqueuedAt` far older than the step should ever take.
 - `attempts` on that checkpoint is `1` (never re-dispatched) if `remoteRedispatchMs` is unset, or climbing but still `pending` if it is set and still under `remoteRedispatchMax`.
 
-That combination — suspended run, one `pending` remote checkpoint, old `enqueuedAt`, stale `updatedAt` — is the signature. A run that's merely waiting on a slow-but-live worker looks identical for a while, which is exactly why the engine won't auto-redispatch it; the operator's judgment call ("this has been pending for way longer than the step ever legitimately takes") is what `redispatchPending` exists to encode manually.
+That combination — suspended run, one `pending` remote checkpoint, old `enqueuedAt`, stale `updatedAt` — is the signature. A run that's merely waiting on a slow-but-live worker looks identical for a while, which is exactly why the engine won't auto-redispatch it; the operator's judgment call ("this has been pending for way longer than the step ever legitimately takes") is what `redispatchPending` exists to encode manually. You don't have to run this query by hand, though — the stalled-run pager below watches for exactly this signature and pages you.
+
+### The stalled-run pager — `onStalled` + `stalledAfter`
+
+`engine.onStalled(listener)` turns the stranded signature into an alert instead of a query you remember to run at 2am. Register a listener (exactly like `engine.onDead`) and the worker tick sweeps for stranded in-flight runs — self-throttled to one pass a minute, and a no-op when no listener is registered:
+
+```ts title="start/durable.ts"
+engine.onStalled(({ run, ageMs, wakeForever, stalePending }) => {
+  pager.alert(`durable run ${run.id} (${run.workflow}) stalled for ${Math.round(ageMs / 60_000)}min`, {
+    wakeForever,          // suspended with NO wake timer — nothing will ever re-drive it
+    stalePending,         // the oldest silent pending remote step, when that's the cause
+  })
+})
+```
+
+A run is paged when it has sat untouched past `stalledAfter` (config, duration string or ms, default `'15m'`) **and** matches one of the two stranded shapes — disambiguated from healthy long work:
+
+- **`wakeForever`** — `suspended` with no wake timer at all, so nothing will ever re-drive it (the `reconcileMs: 0` hazard).
+- **`stalePending`** — an old `pending` remote step whose worker heartbeat has gone silent past the threshold; a long step that is still heartbeating is *not* stalled, and neither is a long `ctx.sleep` (its `wakeAt` is in the future).
+
+Each stranded **episode** pages **once**: a run you were already paged about is skipped until it makes progress and strands again, so a wedged run doesn't re-fire your pager every minute. The listener receives a `StalledRunInfo` — the run, its `ageMs` since last activity, the `wakeForever` flag, and the `stalePending` detail (`seq`, `name`, `attempts`, `ageMs`, `heartbeatAgeMs`) when a silent remote step is the cause. A listener that throws never breaks the sweep, and `onStalled` returns an unsubscribe function.
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  stalledAfter: '30m', // page only after 30 minutes of silence — above your longest legitimate step
+})
+```
+
+Set `stalledAfter` above your longest legitimate remote step, for the same reason `--stale` and `remoteRedispatchMs` need headroom: a slow-but-healthy step under the threshold is exactly the case the engine refuses to guess about.
 
 ## Queue-transport specifics
 

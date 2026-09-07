@@ -113,14 +113,27 @@ export class CodecStateStore implements StateStore {
   async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
     return (await this.inner.listPendingRuns(limit, namespace)).map((r) => this.decRun(r));
   }
-  async listDueTimers(nowMs: number, namespace?: string): Promise<WorkflowRun[]> {
-    return (await this.inner.listDueTimers(nowMs, namespace)).map((r) => this.decRun(r));
+  async listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]> {
+    return (await this.inner.listDueTimers(nowMs, namespace, limit)).map((r) => this.decRun(r));
+  }
+  async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
+    // Forward when the inner store implements it; otherwise mirror the engine's own fallback
+    // (filter listIncompleteRuns in-process) so wrapping never REMOVES the optimized path's shape.
+    if (this.inner.listOrphanedRuns) {
+      return (await this.inner.listOrphanedRuns(nowMs, limit, namespace)).map((r) =>
+        this.decRun(r),
+      );
+    }
+    return (await this.inner.listIncompleteRuns(namespace))
+      .filter((r) => r.lockedUntil === undefined || r.lockedUntil <= nowMs)
+      .slice(0, limit)
+      .map((r) => this.decRun(r));
   }
   tryLockRun(runId: string, owner: string, leaseUntilMs: number, nowMs: number): Promise<boolean> {
     return this.inner.tryLockRun(runId, owner, leaseUntilMs, nowMs);
   }
-  releaseRunLock(runId: string): Promise<void> {
-    return this.inner.releaseRunLock(runId);
+  releaseRunLock(runId: string, owner?: string): Promise<void> {
+    return this.inner.releaseRunLock(runId, owner);
   }
   renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {
     return this.inner.renewRunLock(runId, owner, leaseUntilMs);
@@ -133,6 +146,14 @@ export class CodecStateStore implements StateStore {
   }
   listSignalWaiters(prefix: string): Promise<SignalWaiter[]> {
     return this.inner.listSignalWaiters(prefix);
+  }
+  listSignalWaitersByRunIds(runIds: string[]): Promise<SignalWaiter[]> {
+    if (this.inner.listSignalWaitersByRunIds) {
+      return this.inner.listSignalWaitersByRunIds(runIds);
+    }
+    // Fallback scan keeps the optional method PRESENT on the wrapper without requiring it inner.
+    const ids = new Set(runIds);
+    return this.inner.listSignalWaiters('').then((ws) => ws.filter((w) => ids.has(w.runId)));
   }
   removeSignalWaiter(waiter: SignalWaiter): Promise<void> {
     return this.inner.removeSignalWaiter(waiter);

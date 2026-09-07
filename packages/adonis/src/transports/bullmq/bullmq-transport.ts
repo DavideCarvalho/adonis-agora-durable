@@ -10,6 +10,7 @@ import type {
   TenantEvent,
   Transport,
   WorkerHeartbeat,
+  WorkerStatus,
   WorkflowDecision,
   WorkflowStepEvent,
   WorkflowTask,
@@ -109,6 +110,11 @@ export class BullMQTransport implements Transport {
   #workerRedis: RedisLike | undefined;
   #workerHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
   readonly #heartbeatTokens = new Set<string>();
+  // Live execution telemetry carried on the heartbeat (the console's worker cards): jobs currently
+  // in a handler, and a bounded window of recent completions for throughput / p95.
+  #inFlightJobs = 0;
+  readonly #recentCompletions: Array<{ at: number; ms: number }> = [];
+  #lastCpu: { usage: NodeJS.CpuUsage; at: number } | undefined;
 
   // P4 store-less protocol: start-run / run-request queues + consumers, run-reply / tenant-events pub/sub.
   #startRunWorker: WorkerLike | undefined;
@@ -253,8 +259,16 @@ export class BullMQTransport implements Transport {
   /** Route one task job by SHAPE (spec §6.3): a workflow turn runs the replay → decision path, a step
    *  runs the `runStepHandler` → result path. Both kinds share a token's queue but never each other's. */
   async #runJob(data: unknown): Promise<void> {
-    if (isWorkflowTask(data)) return this.#runWorkflowTask(data);
-    return this.#runTask(data as RemoteTask);
+    const startedAt = Date.now();
+    this.#inFlightJobs += 1;
+    try {
+      if (isWorkflowTask(data)) return await this.#runWorkflowTask(data);
+      return await this.#runTask(data as RemoteTask);
+    } finally {
+      this.#inFlightJobs -= 1;
+      this.#recentCompletions.push({ at: Date.now(), ms: Date.now() - startedAt });
+      if (this.#recentCompletions.length > 200) this.#recentCompletions.shift();
+    }
   }
 
   /** Worker side: replay a workflow turn and publish its {@link WorkflowDecision} on `${P}-decisions`
@@ -417,6 +431,45 @@ export class BullMQTransport implements Transport {
   // worker liveness registry — `${P}-worker-heartbeat:${token}:${instanceId}` (SET … EX 35)
   // ---------------------------------------------------------------------------
 
+  /**
+   * The live execution/resource snapshot each heartbeat carries — what lights up the console's
+   * worker cards (concurrency mode, in-flight, RSS/CPU, throughput, p95). Parity with the NestJS
+   * fleet's heartbeat payload; the AdonisJS heartbeat used to carry only the timestamp, leaving the
+   * cards permanently on "no status". Cheap by construction: process-level reads plus a bounded
+   * completions window.
+   */
+  #workerStatus(): WorkerStatus {
+    const now = Date.now();
+    const windowStart = now - 60_000;
+    const recent = this.#recentCompletions.filter((c) => c.at >= windowStart);
+    const durations = [...this.#recentCompletions].map((c) => c.ms).sort((a, b) => a - b);
+    const p95 = durations.length
+      ? durations[Math.min(durations.length - 1, Math.floor(durations.length * 0.95))]
+      : undefined;
+    const mem = process.memoryUsage();
+    // CPU% since the previous beat (user+system µs over wall-clock µs).
+    let cpuPct: number | undefined;
+    const cpuNow = process.cpuUsage();
+    if (this.#lastCpu) {
+      const elapsedUs = (now - this.#lastCpu.at) * 1000;
+      const usedUs =
+        cpuNow.user - this.#lastCpu.usage.user + (cpuNow.system - this.#lastCpu.usage.system);
+      if (elapsedUs > 0) cpuPct = Math.round((usedUs / elapsedUs) * 100);
+    }
+    this.#lastCpu = { usage: cpuNow, at: now };
+    return {
+      runtime: 'node',
+      // One BullMQ Worker per handled routing token, each at the adapter's default concurrency (1)
+      // — so this instance can run up to one job per token simultaneously.
+      concurrency: { mode: 'fixed', limit: Math.max(1, this.#taskWorkers.size) },
+      inFlight: this.#inFlightJobs,
+      rssBytes: mem.rss,
+      ...(cpuPct !== undefined ? { cpuPct } : {}),
+      throughputPerMin: recent.length,
+      ...(p95 !== undefined ? { p95Ms: p95 } : {}),
+    };
+  }
+
   /** Refresh EVERY handled routing token's TTL'd liveness key on ONE shared 10s interval until
    *  `close()`. A newly added token beats immediately so a freshly-registered handler is visible
    *  without waiting a full interval. Best-effort: a failed refresh is swallowed (the key then expires,
@@ -426,7 +479,12 @@ export class BullMQTransport implements Transport {
     const beatOne = (t: string): void => {
       const key = workerHeartbeatKey(this.#effectivePrefix(), t, this.#instanceId);
       void client
-        .set(key, heartbeatKeyValue(), 'EX', WORKER_HEARTBEAT_TTL_SECONDS)
+        .set(
+          key,
+          heartbeatKeyValue(Date.now(), this.#workerStatus()),
+          'EX',
+          WORKER_HEARTBEAT_TTL_SECONDS,
+        )
         .catch((err) => this.#onError(err));
     };
     const isNew = !this.#heartbeatTokens.has(token);
@@ -466,7 +524,16 @@ export class BullMQTransport implements Transport {
    *  missing/unreadable/malformed key is skipped (never throws), so a broker without descriptor
    *  advertisement (or a scan that races a key's expiry) reads as "no descriptors" and the control-plane
    *  falls back to legacy assume-compatible dispatch. Never uses KEYS (it blocks Redis). */
+  /** Fresh-enough descriptor sets by token: fleet capabilities change on the descriptor heartbeat
+   *  cadence (tens of seconds), but `ensureRoutable` asks before EVERY dispatch — without this memo
+   *  a 500-step/s engine ran 500 SCAN cycles/s against Redis for an answer that was identical. */
+  readonly #descriptorCache = new Map<string, { at: number; descriptors: WorkerDescriptor[] }>();
+
   async listWorkerDescriptors(token: string): Promise<WorkerDescriptor[]> {
+    const cached = this.#descriptorCache.get(token);
+    // A short TTL (5s): a fraction of the descriptor heartbeat TTL, so a scaled-down fleet is
+    // noticed within one cache window while the per-dispatch SCAN storm disappears.
+    if (cached && Date.now() - cached.at < 5_000) return cached.descriptors;
     const client = this.#workerRedisClient();
     const prefix = workerDescriptorTokenPrefix(this.#effectivePrefix(), token);
     const descriptors: WorkerDescriptor[] = [];
@@ -475,9 +542,13 @@ export class BullMQTransport implements Transport {
       do {
         const [next, keys] = await client.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', 100);
         cursor = next;
-        for (const key of keys) {
-          const raw = await client.get(key);
-          if (raw == null) continue; // expired between SCAN and GET — just skip it
+        if (keys.length === 0) continue;
+        // One MGET per SCAN page instead of one GET per key (per-key fallback for a client without it).
+        const raws = client.mget
+          ? await client.mget(...keys)
+          : await Promise.all(keys.map((k) => client.get(k)));
+        for (const raw of raws) {
+          if (raw == null) continue; // expired between SCAN and MGET — just skip it
           try {
             descriptors.push(JSON.parse(raw) as WorkerDescriptor);
           } catch {
@@ -491,6 +562,7 @@ export class BullMQTransport implements Transport {
       this.#onError(err);
       return [];
     }
+    this.#descriptorCache.set(token, { at: Date.now(), descriptors });
     return descriptors;
   }
 
@@ -516,12 +588,24 @@ export class BullMQTransport implements Transport {
     do {
       const [next, keys] = await client.scan(cursor, 'MATCH', match, 'COUNT', 100);
       cursor = next;
-      for (const key of keys) {
-        const raw = await client.get(key);
+      if (keys.length === 0) continue;
+      // One MGET per SCAN page instead of one serial GET per key (per-key fallback without mget).
+      const raws = client.mget
+        ? await client.mget(...keys)
+        : await Promise.all(keys.map((k) => client.get(k)));
+      for (let i = 0; i < keys.length; i += 1) {
+        const key = keys[i];
+        if (key === undefined) continue;
+        const parsed = parseHeartbeatValue(raws[i] ?? null);
         workers.push({
           group,
           instanceId: key.slice(keyPrefix.length),
-          lastBeatAt: parseHeartbeatValue(raw).lastBeatAt,
+          lastBeatAt: parsed.lastBeatAt,
+          // Passed through as-is: the payload is worker-authored (this SDK's #workerStatus, or the
+          // NestJS/Python fleet's own shape) and the console renders what it recognizes.
+          ...(parsed.status !== undefined
+            ? { status: parsed.status as unknown as WorkerStatus }
+            : {}),
         });
       }
     } while (cursor !== '0');

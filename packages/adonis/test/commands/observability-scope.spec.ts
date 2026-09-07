@@ -87,7 +87,9 @@ describe('probe reads are marked as heartbeat, and only those', () => {
     const engine = new WorkflowEngine({ store, transport: new InMemoryTransport() });
     await runTick(engine);
 
-    const probes = ['listPendingRuns', 'listIncompleteRuns', 'listDueTimers', 'listRuns'];
+    // `listOrphanedRuns` replaced `listIncompleteRuns` as recovery's probe (the store-side orphan
+    // pushdown); the in-memory store implements it, so that's the read the tick issues now.
+    const probes = ['listPendingRuns', 'listOrphanedRuns', 'listDueTimers', 'listRuns'];
     for (const probe of probes) {
       const calls = seen.filter((c) => c.method === probe);
       expect(calls.length, `${probe} was never called`).toBeGreaterThan(0);

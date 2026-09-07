@@ -1,6 +1,6 @@
 ---
 title: Sagas & compensation
-description: "Undo the side effects of a partially-completed run with per-step compensate callbacks that run in reverse on failure, compensationRetries for transient undos, compensate:<step> events, and compensating cancellation via engine.cancel(runId, { compensate: true })."
+description: "Undo the side effects of a partially-completed run with per-step compensate callbacks that run in reverse on failure, compensationRetries and compensationTimeoutMs for transient/lost undos, checkpointed (crash-safe) unwinds, compensate:<step> events, and compensating cancellation via engine.cancel(runId, { compensate: true })."
 icon: Undo2
 ---
 
@@ -80,6 +80,24 @@ export default defineConfig({
 
 Because a compensation may run more than once, **compensations should be idempotent** — releasing an already-released reservation or refunding an already-refunded charge must be a no-op. A compensation that keeps failing past `compensationRetries` is *skipped* rather than allowed to throw: a permanently-failing undo must not mask the original failure or strand the remaining compensations.
 
+A **dispatched** undo whose step definition carries no liveness `timeoutMs` is additionally bounded by `compensationTimeoutMs` (engine config, default 300 000 — 5 minutes): if the worker produces no result within the window, that attempt fails like any other undo failure — retried up to `compensationRetries`, then skipped loudly — instead of the unwind awaiting a lost job forever.
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  compensationRetries: 5,
+  compensationTimeoutMs: 120_000, // give up on one dispatched undo attempt after 2 minutes
+})
+```
+
+## The unwind itself is durable
+
+Compensations are not just dispatched — they are **checkpointed**, at reserved *negative* sequence numbers (`-2 - idx`, in registration order) so they can never collide with the body's own checkpoints. Each undo persists a `pending` checkpoint before it dispatches and settles it on the outcome, which buys the unwind the same crash-safety as the run body:
+
+- **A crash mid-unwind doesn't restart it from scratch.** A re-driven unwind reads the checkpoints, skips undos already completed (no double refunds), and resumes each remaining undo's attempt count where it left off.
+- **Multi-pod deployments work.** On a shared results queue, a dispatched undo's worker result can land on *another* pod; because the undo is a persisted checkpoint, whichever pod consumes the result completes the unwind instead of dropping it.
+
+You don't configure any of this — it's how the saga executes. It's why the "compensations should be idempotent" rule above is about *your* undo handlers, not about the engine re-running undos it already knows finished.
+
 ## Compensations are visible
 
 Every compensation surfaces as a `compensate:<step>` event, emitted as a `step.completed` (the undo ran) or `step.failed` (it exhausted its retries) lifecycle event. The [dashboard](/docs/durable/observability/dashboard) and the [Telescope](/docs/durable/observability/telescope) view render these, so a stranded undo is *visible* rather than silently swallowed. For the checkout above you'd see `compensate:charge-card` and `compensate:reserve-inventory` appear in the timeline as the saga unwinds.
@@ -97,5 +115,7 @@ await engine.cancel(runId, { compensate: true })
 ```
 
 A compensating cancel returns immediately (non-blocking) and runs the undo in the background: the run is resumed so the replay re-registers the saga from history, the engine runs the compensations in reverse, and marks the run `cancelled`. For the checkout example, cancelling a run that had already charged the card and reserved inventory with `{ compensate: true }` issues the refund and releases the reservation before the run becomes `cancelled` — leaving the world clean, exactly as a failure would.
+
+The request itself is durable: `cancel({ compensate: true })` persists a cancel marker alongside broadcasting the cancellation, so the undo survives a crash or a pod handoff — whichever pod next drives the run honors the marker and runs the saga, even if the pod that took the cancel request couldn't run the workflow (or died before it did).
 
 To cancel many runs at once, `engine.cancelWhere(filter, opts?)` cancels every run matching a [run query](/docs/durable/concepts/workflows-and-steps#tags) (with the same `{ compensate }` option).

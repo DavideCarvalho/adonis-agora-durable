@@ -23,19 +23,16 @@
 // ── Wire types (independent of `@adonis-agora/durable`'s own `Date`-typed engine interfaces — the
 // dashboard's `handlers.ts` serializes every `Date` to an ISO string before it reaches this client). ──
 
+// NOTE: no `cancelling` here, deliberately. The NestJS console's union carried it (saga
+// compensation in progress), but the AdonisJS engine's `RunStatus` union (`interfaces.ts`) never
+// produces it — `cancel()` settles straight to `cancelled` — and the server's own `RUN_STATUSES`
+// list (`run-filter.ts`) omits it too, so a status the server can never send stayed a dead filter
+// chip in the header. Trimmed rather than kept: re-add it here (and to `App.tsx`'s `STATUSES`)
+// only if a future engine version actually emits a visible compensating status.
 export type RunStatus =
   | 'pending'
   | 'running'
   | 'suspended'
-  /**
-   * Saga compensation in progress. NOTE: the AdonisJS engine's `RunStatus` union (`interfaces.ts`)
-   * does not produce this state today — `cancel()` settles straight to `cancelled` — so no run the
-   * server sends will ever carry it. Kept in the client's own union anyway (rather than trimmed) so
-   * the ported UI (`App.tsx`'s singleton in-flight set, status badges) stays byte-identical to the
-   * NestJS console and lights up for free if a future engine version adds a visible compensating
-   * status.
-   */
-  | 'cancelling'
   | 'blocked'
   | 'completed'
   | 'failed'
@@ -124,6 +121,112 @@ export interface RunDetail {
 export interface DurableTopology {
   role: 'control-plane' | 'standalone' | 'tenant';
   tenant?: string;
+}
+
+/** One ticked schedule with its live control state — `GET /schedules`' rows, verbatim (the server
+ *  serializes the engine's `ScheduleInfo` as-is: the fire instants stay epoch ms, not ISO strings,
+ *  unlike a run row's `createdAt`). Exactly one of `cron`/`everyMs` is set per schedule. */
+export interface ScheduleInfo {
+  key: string;
+  workflow: string;
+  cron?: string;
+  everyMs?: number;
+  timezone?: string;
+  overlap?: 'allow' | 'skip';
+  namespace?: string;
+  /** Effective pause state: the runtime override when one was issued, else the config's `paused`. */
+  paused: boolean;
+  /** Whether the current pause state came from a runtime (console) override. */
+  pausedAtRuntime: boolean;
+  /** Epoch ms the current window fired (its deterministic bucket). */
+  lastFireAt: number;
+  /** Epoch ms of the next fire. */
+  nextFireAt: number;
+  /** The current window's deterministic run id (what "Run now" would start). */
+  currentWindowRunId: string;
+  /** The current window's run status, when that run exists. */
+  lastRunStatus?: RunStatus;
+}
+
+/** Outcome of `POST /runs/:id/update/:name` — the workflow's registered validator arbitrated
+ *  server-side. The rejected arm never reaches a caller of {@link durableClient.update}: the server
+ *  spells a rejection as a 422 whose body carries it, thrown as a {@link DurableActionError}. */
+export interface UpdateResult {
+  accepted: boolean;
+  reason?: string;
+  /** `null` = accepted and buffered (no live waiter yet — the run consumes it when it reaches
+   *  `ctx.onUpdate`), same reliable-delivery convention as a task completion's `delivered: false`. */
+  run?: RunResult | null;
+}
+
+/** A `ctx.task` completion/failure's answer: `delivered: false` means no waiter was live YET — the
+ *  outcome was BUFFERED and the run consumes it when it reaches the task's wait (reliable delivery,
+ *  see `handlers.ts`'s `completeTaskRun`), which is a success, not a miss. */
+export interface TaskDelivery {
+  result: RunResult | null;
+  delivered: boolean;
+}
+
+// ── Fleet compat (`GET /compat` — `packages/adonis/src/dashboard/compat.ts`'s response, verbatim) ──
+
+/** How one live worker's descriptor negotiated against the control plane (design §7.4). */
+export type CompatOutcome = 'compatible' | 'degraded' | 'incompatible';
+
+/** One live worker pod, negotiated against the control plane. */
+export interface CompatPod {
+  instanceId: string;
+  runtime?: string;
+  sdk?: string;
+  protocol: number;
+  protocolRange: [number, number];
+  capabilities: string[];
+  outcome: CompatOutcome;
+  /** Highest common protocol major, or `null` when the ranges do not overlap (incompatible). */
+  negotiatedProtocol: number | null;
+  incompatible: boolean;
+  /** The red-flag reason — precise, structured copy. Absent when compatible. */
+  reason?: string;
+  missingOnRemote: string[];
+  missingOnLocal: string[];
+}
+
+/** One routing token's live workers, with the group-level rollups the panel colours by. */
+export interface CompatGroup {
+  token: string;
+  pods: CompatPod[];
+  incompatible: boolean;
+  degraded: boolean;
+}
+
+/** A run parked `blocked` (no compatible worker can take it), with its human reason and — when a
+ *  diagnostics event was captured — the structured delta (missing capabilities, protocol ranges). */
+export interface CompatBlockedRun {
+  id: string;
+  workflow: string;
+  namespace?: string;
+  status: RunStatus;
+  reason: string;
+  code?: string;
+  requires: string[];
+  token?: string;
+  missingCapabilities?: string[];
+  controlPlaneRange?: [number, number];
+  workerRanges?: Record<string, [number, number]>;
+  updatedAt: string;
+}
+
+/** The fleet health / protocol-compatibility report: per-group compatibility + blocked runs. */
+export interface CompatReport {
+  controlPlane: {
+    instanceId: string;
+    protocol: number;
+    protocolRange: [number, number];
+    capabilities: string[];
+  };
+  groups: CompatGroup[];
+  blocked: CompatBlockedRun[];
+  incompatibleCount: number;
+  blockedCount: number;
 }
 
 /** How a worker decides its concurrency. NOTE: not carried by the AdonisJS engine's heartbeat today
@@ -218,7 +321,7 @@ export interface RunDisplayState {
   detail?: string;
 }
 
-const SINGLETON_INFLIGHT = new Set<RunStatus>(['running', 'suspended', 'cancelling']);
+const SINGLETON_INFLIGHT = new Set<RunStatus>(['running', 'suspended']);
 
 /** Strip the route-by-handler `@partition` suffix so a run's `workflow` matches its `GroupHealth.group`. */
 export function baseGroup(group: string): string {
@@ -268,8 +371,12 @@ export function deriveRunState(
     if (run.status === 'pending' && groupIsStalled(run.workflow, ctx.health)) {
       return { status: 'no-worker', detail: run.workflow };
     }
+    // `blocked` is first-class, NOT folded into the generic no-worker badge: a blocked run is
+    // parked because no COMPATIBLE worker exists (protocol/capability mismatch — see the server's
+    // `/compat` panel), which starting another worker of the same old build cannot fix. The
+    // human reason lives on `run.error.message`; the workflow name is the fallback detail.
     if (run.status === 'blocked') {
-      return { status: 'no-worker', detail: run.workflow };
+      return { status: 'blocked', detail: run.error?.message ?? run.workflow };
     }
     return { status: run.status };
   }
@@ -352,6 +459,17 @@ function uiBase(): string {
   return '/durable';
 }
 
+/**
+ * The provider's session-logout URL (`GET <base>/logout` — `dashboard_provider.ts`'s
+ * `registerAuthRoutes`): a plain idempotent GET that clears the console's session cookie and
+ * redirects to the login page (Mode B) or the dashboard root, so a simple `<a href>` works. The
+ * route only exists when the host configured `dashboardAuth`; on an unauthenticated deployment
+ * following it just 404s harmlessly (the injected config carries no auth flag to gate on).
+ */
+export function logoutUrl(): string {
+  return `${uiBase()}/logout`;
+}
+
 function apiBase(): string {
   const injected = readConfig().api;
   if (typeof injected === 'string') return injected;
@@ -401,8 +519,75 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
+/**
+ * A refusal the console must READ, not just report: the human-in-the-loop verbs answer with
+ * structured bodies — `POST /runs/:id/signal`'s 409 carries `waitingOn` (the tokens the run IS
+ * parked on, offered as choices), `POST /runs/:id/update/:name`'s 422 carries the validator's
+ * `reason`. The plain {@link http} throws a bare status-line `Error` and drops the body; the verbs
+ * below throw this instead, body attached. `message` prefers the body's own `error` copy.
+ */
+export class DurableActionError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+    readonly body: unknown,
+  ) {
+    super(message);
+    this.name = 'DurableActionError';
+  }
+}
+
+/** The 409 body's `waitingOn` token list, when `error` is a {@link DurableActionError} carrying one
+ *  — what the deliver-signal dialog offers as selectable tokens after a typo'd/stale token. */
+export function waitingOnTokens(error: unknown): string[] | undefined {
+  if (!(error instanceof DurableActionError)) return undefined;
+  if (typeof error.body !== 'object' || error.body === null) return undefined;
+  const waitingOn = (error.body as { waitingOn?: unknown }).waitingOn;
+  if (!Array.isArray(waitingOn)) return undefined;
+  return waitingOn.filter((t): t is string => typeof t === 'string');
+}
+
+/** Same transport as {@link http}, but a non-OK answer throws a {@link DurableActionError} with the
+ *  parsed body attached (401 still redirects to the auth surface first, like every other request). */
+async function httpAction<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(apiBase() + path, init);
+  if (res.status === 401) {
+    redirectToAuthSurface(await readAuthModes(res));
+    throw new Error('Session expired; redirecting to sign-in.');
+  }
+  if (!res.ok) {
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch {
+      body = undefined;
+    }
+    const copy =
+      typeof body === 'object' &&
+      body !== null &&
+      typeof (body as { error?: unknown }).error === 'string'
+        ? (body as { error: string }).error
+        : `${res.status} ${res.statusText}`;
+    throw new DurableActionError(res.status, copy, body);
+  }
+  return (await res.json()) as T;
+}
+
+/** `POST` a JSON body (or none) through {@link httpAction}. `JSON.stringify` drops `undefined`
+ *  properties, so an empty payload/arg/result never reaches the wire as `null`. */
+function postAction<T>(path: string, body?: Record<string, unknown>): Promise<T> {
+  return httpAction<T>(path, {
+    method: 'POST',
+    ...(body !== undefined
+      ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+      : {}),
+  });
+}
+
 export interface RunFilterOptions {
   namespace?: string | string[] | undefined;
+  /** One workflow narrows; several match ANY of them (the workflow picker's multi-select). */
+  workflow?: string | string[] | undefined;
   /** See module doc gap #1 — cannot select unattributed runs, and no run carries an origin today. */
   origin?: string | undefined;
 }
@@ -434,6 +619,10 @@ interface RunsListResponse {
   page: { limit: number; offset: number; count: number };
   statuses: RunStatus[];
 }
+
+/** Server-side ceiling on a bulk action's matched set (`handlers.ts`'s `bulkAction` lists with
+ *  `limit: 500`). A response whose `matched` equals this cap probably left runs untouched. */
+export const BULK_MATCH_CAP = 500;
 
 interface RunResponse {
   result: RunResult;
@@ -497,6 +686,11 @@ export const durableClient = {
   topology(): Promise<DurableTopology> {
     return http<DurableTopology>('/topology');
   },
+  /** Fleet health / protocol compatibility (per-group negotiation + blocked runs) for the Compat
+   *  panel. Bare `CompatReport`, unwrapped — the server's `compat` handler sends the body as-is. */
+  compat(): Promise<CompatReport> {
+    return http<CompatReport>('/compat');
+  },
   async retry(id: string): Promise<RunResult> {
     const res = await http<RunResponse>(`/runs/${encodeURIComponent(id)}/retry`, {
       method: 'POST',
@@ -515,7 +709,9 @@ export const durableClient = {
     );
     return res.result;
   },
-  /** Bulk retry/cancel every run matching a filter. Returns how many matched + were acted on. */
+  /** Bulk retry/cancel every run matching a filter. Returns how many matched + were acted on.
+   *  The server acts on at most {@link BULK_MATCH_CAP} matches per call — `matched` hitting the
+   *  cap is the "there may be more; run again to continue" signal. */
   bulk(
     action: 'retry' | 'cancel',
     filter: RunFilterOptions & {
@@ -560,6 +756,69 @@ export const durableClient = {
     );
     return res.result;
   },
+  /**
+   * Deliver an external signal payload on `token` — the human-in-the-loop verb for a run parked on
+   * `ctx.waitForSignal`. Guarded server-side: unless `force`, the token must be one the run is
+   * CURRENTLY waiting on; the 409 (a {@link DurableActionError}) carries `waitingOn`, the tokens it
+   * IS parked on — see {@link waitingOnTokens}. Omit `payload` to deliver nothing (`undefined`).
+   */
+  async signal(
+    id: string,
+    token: string,
+    payload?: unknown,
+    opts?: { force?: boolean },
+  ): Promise<RunResult> {
+    const res = await postAction<RunResponse>(`/runs/${encodeURIComponent(id)}/signal`, {
+      token,
+      payload,
+      ...(opts?.force ? { force: true } : {}),
+    });
+    return res.result;
+  },
+  /** Deliver a validated update to a run's `ctx.onUpdate(name)` point. The workflow's registered
+   *  validator arbitrates server-side — a rejection throws a 422 {@link DurableActionError} whose
+   *  message is the validator's reason, and nothing is delivered. */
+  async update(id: string, name: string, arg?: unknown): Promise<UpdateResult> {
+    const res = await postAction<{ result: UpdateResult }>(
+      `/runs/${encodeURIComponent(id)}/update/${encodeURIComponent(name)}`,
+      { arg },
+    );
+    return res.result;
+  },
+  /** Complete a `ctx.task` the run dispatched to an external system. `delivered: false` = buffered
+   *  (no live waiter yet — the run consumes it at the task's wait), not a failure. */
+  completeTask(id: string, name: string, result?: unknown): Promise<TaskDelivery> {
+    return postAction<TaskDelivery>(
+      `/runs/${encodeURIComponent(id)}/tasks/${encodeURIComponent(name)}/complete`,
+      { result },
+    );
+  },
+  /** Fail a `ctx.task` with a human reason. Same buffered-delivery semantics as {@link completeTask}. */
+  failTask(id: string, name: string, error: string): Promise<TaskDelivery> {
+    return postAction<TaskDelivery>(
+      `/runs/${encodeURIComponent(id)}/tasks/${encodeURIComponent(name)}/fail`,
+      { error },
+    );
+  },
+  /** The ticked schedules with live control state + fire windows (`GET /schedules`, unwrapped from
+   *  its `{ schedules }` envelope). 404s on a topology without runtime schedule control (a
+   *  store-less `tenant` pod) — the Schedules view gates on the topology role before asking. */
+  async schedules(): Promise<ScheduleInfo[]> {
+    const res = await http<{ schedules: ScheduleInfo[] }>('/schedules');
+    return res.schedules;
+  },
+  /** Pause/resume one schedule fleet-wide at runtime (`POST /schedules/:key/pause|resume`). */
+  setSchedulePaused(key: string, paused: boolean): Promise<{ key: string; paused: boolean }> {
+    return postAction<{ key: string; paused: boolean }>(
+      `/schedules/${encodeURIComponent(key)}/${paused ? 'pause' : 'resume'}`,
+    );
+  },
+  /** Fire a schedule's current window NOW (`POST /schedules/:key/trigger`). Returns the started
+   *  (or already-running deterministic) run, so the console can navigate straight to it. */
+  async triggerSchedule(key: string): Promise<RunResult> {
+    const res = await postAction<RunResponse>(`/schedules/${encodeURIComponent(key)}/trigger`);
+    return res.result;
+  },
   /** Live-tail a run's lifecycle events over SSE. Calls `onEvent` per event; returns a closer. */
   streamRun(id: string, onEvent: (event: EngineEvent) => void): () => void {
     const source = new EventSource(`${apiBase()}/runs/${encodeURIComponent(id)}/stream`);
@@ -584,7 +843,6 @@ export {
 } from './console-session.js';
 
 export { groupSubProcesses, type SubProcess } from './group-subprocesses.js';
-
 export {
   ALL_ORIGINS,
   type EmptyRunsNotice,
@@ -603,10 +861,10 @@ export {
   UNKNOWN_ORIGIN_TITLE,
   unknownOriginCount,
 } from './run-origin.js';
-
 export {
   type CompensationSummary,
   compensationDisplayName,
   compensationSummary,
   splitCompensations,
 } from './split-compensations.js';
+export { classifyWaitToken, type WaitTarget, waitTargetsOf } from './waiting-actions.js';

@@ -198,29 +198,20 @@ export class LucidStateStore implements StateStore {
       });
   }
 
-  /** Upsert a checkpoint keyed by `(run_id, seq)`, portable across dialects (read-then-write in a tx). */
+  /**
+   * Upsert a checkpoint keyed by `(run_id, seq)` — one native `INSERT … ON CONFLICT … DO UPDATE`
+   * statement (portable: SQLite/Postgres upsert, MySQL `ON DUPLICATE KEY`). This is the hottest
+   * write path in the system (2–3 checkpoint writes per step); the previous read-then-write
+   * transaction cost `BEGIN + SELECT + write + COMMIT` — four round trips — per save.
+   */
   private async upsertCheckpoint(client: Client, checkpoint: StepCheckpoint): Promise<void> {
     const row = checkpointToRow(checkpoint);
-    const run = () =>
-      client.transaction(async (trx) => {
-        const existing = await trx
-          .from(DURABLE_TABLES.checkpoints)
-          .where('run_id', row.run_id)
-          .andWhere('seq', row.seq)
-          .first();
-        if (existing) {
-          await trx
-            .from(DURABLE_TABLES.checkpoints)
-            .where('run_id', row.run_id)
-            .andWhere('seq', row.seq)
-            .update(row);
-        } else {
-          await trx.table(DURABLE_TABLES.checkpoints).insert(row);
-        }
-      });
-    // If we're already inside a transaction client, reuse it (Lucid nests via savepoints); otherwise
-    // open one on the base client.
-    await run();
+    await client
+      .insertQuery()
+      .table(DURABLE_TABLES.checkpoints)
+      .knexQuery.insert(row)
+      .onConflict(['run_id', 'seq'])
+      .merge();
   }
 
   // --- recovery / dispatch queries ----------------------------------------
@@ -229,6 +220,21 @@ export class LucidStateStore implements StateStore {
     const q = this.client().from(DURABLE_TABLES.runs).where('status', 'running');
     if (namespace !== undefined) q.andWhere('namespace', namespace);
     const rows = await q;
+    return (rows as RunRow[]).map(rowToRun);
+  }
+
+  async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
+    // The lease predicate lives IN the query: only genuinely orphaned runs (no lease, or an expired
+    // one) come back, so a healthy fleet's recovery tick fetches ~zero rows instead of every
+    // running run — and issues ~zero lock-probe UPDATEs.
+    const q = this.client()
+      .from(DURABLE_TABLES.runs)
+      .where('status', 'running')
+      .andWhere((sub) => {
+        sub.whereNull('locked_until').orWhere('locked_until', '<=', nowMs);
+      });
+    if (namespace !== undefined) q.andWhere('namespace', namespace);
+    const rows = await q.orderBy('created_at', 'asc').limit(limit);
     return (rows as RunRow[]).map(rowToRun);
   }
 
@@ -242,13 +248,16 @@ export class LucidStateStore implements StateStore {
     return (rows as RunRow[]).map(rowToRun);
   }
 
-  async listDueTimers(nowMs: number, namespace?: string): Promise<WorkflowRun[]> {
+  async listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]> {
     const q = this.client()
       .from(DURABLE_TABLES.runs)
       .where('status', 'suspended')
       .whereNotNull('wake_at')
       .andWhere('wake_at', '<=', nowMs);
     if (namespace !== undefined) q.andWhere('namespace', namespace);
+    // Oldest deadline first, bounded: a backlog drains over several polls instead of one
+    // unbounded fetch (served by the existing (status, wake_at) index).
+    if (limit !== undefined) q.orderBy('wake_at', 'asc').limit(limit);
     const rows = await q;
     return (rows as RunRow[]).map(rowToRun);
   }
@@ -273,11 +282,13 @@ export class LucidStateStore implements StateStore {
     return rowsAffected(affected) === 1;
   }
 
-  async releaseRunLock(runId: string): Promise<void> {
-    await this.client()
-      .from(DURABLE_TABLES.runs)
-      .where('id', runId)
-      .update({ locked_by: null, locked_until: null });
+  async releaseRunLock(runId: string, owner?: string): Promise<void> {
+    // Owner-scoped release (when `owner` is given): the `locked_by` predicate lives in the UPDATE's
+    // WHERE clause, so a stale executor whose lease was taken over matches zero rows and cannot
+    // wipe the new owner's lease — same conditional-write shape as renewRunLock.
+    const q = this.client().from(DURABLE_TABLES.runs).where('id', runId);
+    if (owner !== undefined) q.andWhere('locked_by', owner);
+    await q.update({ locked_by: null, locked_until: null });
   }
 
   async renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {
@@ -293,29 +304,19 @@ export class LucidStateStore implements StateStore {
   // --- signal waiters -----------------------------------------------------
 
   async putSignalWaiter(waiter: SignalWaiter): Promise<void> {
-    await this.client().transaction(async (trx) => {
-      const existing = await trx
-        .from(DURABLE_TABLES.signalWaiters)
-        .where('token', waiter.token)
-        .first();
-      if (existing) {
-        await trx
-          .from(DURABLE_TABLES.signalWaiters)
-          .where('token', waiter.token)
-          .update({
-            run_id: waiter.runId,
-            seq: waiter.seq,
-            parallel_group: waiter.parallelGroup ?? null,
-          });
-      } else {
-        await trx.table(DURABLE_TABLES.signalWaiters).insert({
-          token: waiter.token,
-          run_id: waiter.runId,
-          seq: waiter.seq,
-          parallel_group: waiter.parallelGroup ?? null,
-        });
-      }
-    });
+    // Native upsert keyed by the `token` PK — one statement instead of a read-then-write tx (this
+    // runs once per wait registration, i.e. on every signal/child/event suspension).
+    await this.client()
+      .insertQuery()
+      .table(DURABLE_TABLES.signalWaiters)
+      .knexQuery.insert({
+        token: waiter.token,
+        run_id: waiter.runId,
+        seq: waiter.seq,
+        parallel_group: waiter.parallelGroup ?? null,
+      })
+      .onConflict('token')
+      .merge();
   }
 
   async takeSignalWaiter(token: string): Promise<SignalWaiter | null> {
@@ -336,6 +337,19 @@ export class LucidStateStore implements StateStore {
     const rows = await this.client()
       .from(DURABLE_TABLES.signalWaiters)
       .where('token', 'like', `${prefix}%`);
+    return (
+      rows as Array<{
+        token: string;
+        run_id: string;
+        seq: number | string;
+        parallel_group?: unknown;
+      }>
+    ).map(rowToSignalWaiter);
+  }
+
+  async listSignalWaitersByRunIds(runIds: string[]): Promise<SignalWaiter[]> {
+    if (runIds.length === 0) return [];
+    const rows = await this.client().from(DURABLE_TABLES.signalWaiters).whereIn('run_id', runIds);
     return (
       rows as Array<{
         token: string;
@@ -438,22 +452,9 @@ export class LucidStateStore implements StateStore {
     return this.client().transaction(async (trx) =>
       work({
         raw: trx,
+        // Same native upsert as the standalone path, committed inside THIS transaction.
         saveCheckpoint: async (cp) => {
-          const row = checkpointToRow(cp);
-          const existing = await trx
-            .from(DURABLE_TABLES.checkpoints)
-            .where('run_id', row.run_id)
-            .andWhere('seq', row.seq)
-            .first();
-          if (existing) {
-            await trx
-              .from(DURABLE_TABLES.checkpoints)
-              .where('run_id', row.run_id)
-              .andWhere('seq', row.seq)
-              .update(row);
-          } else {
-            await trx.table(DURABLE_TABLES.checkpoints).insert(row);
-          }
+          await this.upsertCheckpoint(trx, cp);
         },
       }),
     );
@@ -527,6 +528,7 @@ export class LucidStateStore implements StateStore {
       if (query.namespaces.length) q.whereIn('namespace', query.namespaces);
       else q.whereRaw('1 = 0');
     }
+    if (query.origin) q.where('origin', query.origin);
     if (query.status) q.where('status', query.status);
     if (query.statuses) {
       // `status IN (...)`; an empty set matches nothing (mirrors the in-memory store).
@@ -541,6 +543,15 @@ export class LucidStateStore implements StateStore {
           for (const tag of query.tags as string[]) or.orWhere('tags', 'like', `%"${tag}"%`);
         });
       } else q.whereRaw('1 = 0');
+    }
+
+    // Time-range and due-timer predicates push down too (the sweep/recovery poll paths lean on
+    // these instead of fetching every in-flight run and comparing in process).
+    if (query.createdBefore !== undefined) q.where('created_at', '<=', query.createdBefore);
+    if (query.createdAfter !== undefined) q.where('created_at', '>=', query.createdAfter);
+    if (query.updatedBefore !== undefined) q.where('updated_at', '<=', query.updatedBefore);
+    if (query.wakeBefore !== undefined) {
+      q.whereNotNull('wake_at').where('wake_at', '<=', query.wakeBefore);
     }
 
     // Typed/range attribute predicates push DOWN into SQL via one EXISTS per filter against the

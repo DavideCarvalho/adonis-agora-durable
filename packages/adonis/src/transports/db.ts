@@ -293,7 +293,9 @@ export class DbTransport implements Transport, ControlPlane {
 
   async #drainTasks(): Promise<number> {
     if (this.#servedTokens.size === 0) return 0;
-    const rows = await this.#claim<TaskRow>(TRANSPORT_TABLES.tasks, [...this.#servedTokens]);
+    const { rows, token } = await this.#claim<TaskRow>(TRANSPORT_TABLES.tasks, [
+      ...this.#servedTokens,
+    ]);
     for (const row of rows) {
       const task: RemoteTask = {
         runId: row.run_id,
@@ -307,10 +309,32 @@ export class DbTransport implements Transport, ControlPlane {
         ...(row.context != null ? { context: fromJson(row.context) } : {}),
         ...(row.transport != null ? { transport: row.transport } : {}),
       };
-      const result = await runStepHandler(task, this.#handlers.get(task.name), (beat) =>
-        this.heartbeat(beat),
-      );
-      await this.#insertResult(result);
+      // Renew this row's claim NOW (rows after the first have aged while earlier ones ran) and
+      // KEEP renewing while the handler runs — the claim used to be stamped once for the whole
+      // batch and never refreshed, so any step longer than `leaseMs` (30s default) was reclaimed
+      // by a sibling worker mid-flight and GUARANTEED to double-run. A merely-slow worker now
+      // holds its claim for the step's whole duration; a crashed one still expires and is
+      // reclaimed.
+      const renew = (): void => {
+        void this.#client()
+          .knexQuery()
+          .from(TRANSPORT_TABLES.tasks)
+          .where('step_id', task.stepId)
+          .where('claimed_by', token)
+          .update({ claimed_at: this.#now() })
+          .catch(() => undefined);
+      };
+      renew();
+      const renewTimer = setInterval(renew, Math.max(1_000, Math.floor(this.#leaseMs / 2)));
+      (renewTimer as { unref?: () => void }).unref?.();
+      try {
+        const result = await runStepHandler(task, this.#handlers.get(task.name), (beat) =>
+          this.heartbeat(beat),
+        );
+        await this.#insertResult(result);
+      } finally {
+        clearInterval(renewTimer);
+      }
       await this.#client().from(TRANSPORT_TABLES.tasks).where('step_id', task.stepId).delete();
     }
     return rows.length;
@@ -351,34 +375,50 @@ export class DbTransport implements Transport, ControlPlane {
   }
 
   async #drainResults(handler: (result: StepResult) => Promise<void>): Promise<number> {
-    const rows = await this.#claim<ResultRow>(TRANSPORT_TABLES.results);
-    for (const row of rows) {
-      const result: StepResult = {
-        runId: row.run_id,
-        seq: Number(row.seq),
-        stepId: row.step_id,
-        status: row.status as StepResult['status'],
-        output: fromJson(row.output),
-        error: fromJson(row.error),
-        startedAt: row.started_at == null ? undefined : Number(row.started_at),
-        events: fromJson(row.events),
-      };
-      await handler(result);
-      await this.#client().from(TRANSPORT_TABLES.results).where('step_id', result.stepId).delete();
+    const { rows } = await this.#claim<ResultRow>(TRANSPORT_TABLES.results);
+    // Delete each row only AFTER its handler ran (at-least-once), but batch the deletes of a round
+    // into one `WHERE IN` — one round trip instead of one per row.
+    const done: string[] = [];
+    try {
+      for (const row of rows) {
+        const result: StepResult = {
+          runId: row.run_id,
+          seq: Number(row.seq),
+          stepId: row.step_id,
+          status: row.status as StepResult['status'],
+          output: fromJson(row.output),
+          error: fromJson(row.error),
+          startedAt: row.started_at == null ? undefined : Number(row.started_at),
+          events: fromJson(row.events),
+        };
+        await handler(result);
+        done.push(result.stepId);
+      }
+    } finally {
+      if (done.length) {
+        await this.#client().from(TRANSPORT_TABLES.results).whereIn('step_id', done).delete();
+      }
     }
     return rows.length;
   }
 
   async #drainHeartbeats(handler: (beat: Heartbeat) => Promise<void>): Promise<number> {
-    const rows = await this.#claim<HeartbeatRow>(TRANSPORT_TABLES.heartbeats, undefined, 'id');
-    for (const row of rows) {
-      await handler({
-        runId: row.run_id,
-        seq: Number(row.seq),
-        stepId: row.step_id,
-        group: row.grp,
-      });
-      await this.#client().from(TRANSPORT_TABLES.heartbeats).where('id', row.id).delete();
+    const { rows } = await this.#claim<HeartbeatRow>(TRANSPORT_TABLES.heartbeats, undefined, 'id');
+    const done: number[] = [];
+    try {
+      for (const row of rows) {
+        await handler({
+          runId: row.run_id,
+          seq: Number(row.seq),
+          stepId: row.step_id,
+          group: row.grp,
+        });
+        done.push(row.id);
+      }
+    } finally {
+      if (done.length) {
+        await this.#client().from(TRANSPORT_TABLES.heartbeats).whereIn('id', done).delete();
+      }
     }
     return rows.length;
   }
@@ -406,11 +446,18 @@ export class DbTransport implements Transport, ControlPlane {
   }
 
   async #drainControl(handler: (msg: ControlMessage) => void): Promise<number> {
-    const rows = await this.#claim<ControlRow>(TRANSPORT_TABLES.control, undefined, 'id');
-    for (const row of rows) {
-      const msg = fromJson<ControlPayload>(row.payload);
-      if (msg) handler(msg);
-      await this.#client().from(TRANSPORT_TABLES.control).where('id', row.id).delete();
+    const { rows } = await this.#claim<ControlRow>(TRANSPORT_TABLES.control, undefined, 'id');
+    const done: number[] = [];
+    try {
+      for (const row of rows) {
+        const msg = fromJson<ControlPayload>(row.payload);
+        if (msg) handler(msg);
+        done.push(row.id);
+      }
+    } finally {
+      if (done.length) {
+        await this.#client().from(TRANSPORT_TABLES.control).whereIn('id', done).delete();
+      }
     }
     return rows.length;
   }
@@ -434,7 +481,7 @@ export class DbTransport implements Transport, ControlPlane {
     table: string,
     groups?: string[],
     idCol: 'id' | 'step_id' = 'step_id',
-  ): Promise<T[]> {
+  ): Promise<{ rows: T[]; token: string }> {
     await this.#ensureSchema();
     // The raw Knex builder — `onConflict`, the `where(cb)` grouping and `whereIn` are cleaner there
     // than through Lucid's stricter query-builder typings, and we only need plain SQL here.
@@ -461,7 +508,7 @@ export class DbTransport implements Transport, ControlPlane {
       .where((q) => q.whereNull('claimed_at').orWhere('claimed_at', '<', stale))
       .orderBy(idCol === 'id' ? 'id' : 'created_at', 'asc')
       .limit(this.#batchSize)) as Array<Record<string, unknown>>;
-    if (candidates.length === 0) return [];
+    if (candidates.length === 0) return { rows: [], token };
     const ids = candidates.map((c) => c[idCol] as string | number);
 
     // 2) Conditionally claim them — only rows STILL un-leased flip to this round's token. A racing
@@ -481,7 +528,7 @@ export class DbTransport implements Transport, ControlPlane {
       .select('*')
       .where('claimed_by', token)
       .where('claimed_at', at)) as T[];
-    return rows;
+    return { rows, token };
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -499,10 +546,13 @@ export class DbTransport implements Transport, ControlPlane {
     await this.#ensureSchema();
   }
 
-  /** Stop every poll loop. Does not close the shared `Database`. */
+  /** Stop every poll loop and wait (bounded) for in-flight ticks — a claimed task mid-handler gets
+   *  to finish + write its result instead of being abandoned to the lease expiry. Does not close
+   *  the shared `Database`. */
   async stop(): Promise<void> {
     this.#pollers.stopAll();
     this.#taskLoop = undefined;
+    await this.#pollers.drain(5_000);
   }
 
   /** Stop the pollers (alias of {@link stop} for the `Transport.close` contract). */

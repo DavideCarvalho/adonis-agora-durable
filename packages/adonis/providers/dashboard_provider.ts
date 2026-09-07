@@ -35,20 +35,27 @@ import {
   type ApiResponse,
   bulkAction,
   cancelRun,
+  completeTaskRun,
   continueRun,
   type DashboardEngine,
   type Deps,
+  failTaskRun,
   getRun,
   health,
   listRuns,
+  listSchedules,
   redispatchPendingRun,
   retryRun,
   retryWithInputRun,
   runValues,
+  scheduleAction,
+  signalRun,
   topology,
+  updateRun,
   workers,
 } from '../src/dashboard/handlers.js';
 import { renderLoginPage } from '../src/dashboard/login_page.js';
+import { openApiDocument } from '../src/dashboard/openapi.js';
 import { contentTypeFor, renderIndexHtml } from '../src/dashboard/spa.js';
 import type { DurableConfig } from '../src/define_config.js';
 import { WorkflowEngine } from '../src/index.js';
@@ -84,11 +91,18 @@ function spaDirectory(): string {
  * - `POST /api/runs/:id/redispatch`   -> re-dispatch a run's lost pending remote steps
  * - `POST /api/runs/:id/cancel`       -> cancel the run
  * - `POST /api/runs/:id/continue`     -> resume a run paused at a breakpoint
+ * - `POST /api/runs/:id/signal`       -> deliver a signal payload to a waited token
+ * - `POST /api/runs/:id/update/:name` -> deliver a validated update (ctx.onUpdate)
+ * - `POST /api/runs/:id/tasks/:name/complete` -> complete an external ctx.task
+ * - `POST /api/runs/:id/tasks/:name/fail`     -> fail an external ctx.task
+ * - `GET  /api/schedules`             -> ticked schedules with control state + fire windows
+ * - `POST /api/schedules/:key/:action`-> pause / resume / trigger a schedule at runtime
  * - `POST /api/bulk/:action`          -> bulk retry/cancel every run matching a filter
  * - `GET  /api/health`                -> worker-group health (compact shape)
  * - `GET  /api/workers`               -> worker-group health (full heartbeats; SPA)
  * - `GET  /api/topology`              -> this deployment's durable role
  * - `GET  /api/compat`                -> fleet health / protocol-compatibility panel
+ * - `GET  /api/openapi.json`          -> the machine-readable API contract (OpenAPI 3.1)
  */
 export default class DashboardProvider {
   constructor(protected app: ApplicationService) {}
@@ -191,6 +205,32 @@ export default class DashboardProvider {
     router
       .post(`${apiBase}/runs/:id/continue`, json(continueRun))
       .as('durable_dashboard.runs.continue');
+    // Human-in-the-loop verbs: deliver a signal / validated update / task completion from the
+    // console — the runs list already names what a suspended run is waiting on; these let the
+    // operator act on it.
+    router.post(`${apiBase}/runs/:id/signal`, json(signalRun)).as('durable_dashboard.runs.signal');
+    router
+      .post(`${apiBase}/runs/:id/update/:name`, json(updateRun))
+      .as('durable_dashboard.runs.update');
+    router
+      .post(`${apiBase}/runs/:id/tasks/:name/complete`, json(completeTaskRun))
+      .as('durable_dashboard.runs.task_complete');
+    router
+      .post(`${apiBase}/runs/:id/tasks/:name/fail`, json(failTaskRun))
+      .as('durable_dashboard.runs.task_fail');
+    // Runtime schedule control: list the ticked schedules, pause/resume one fleet-wide (runtime
+    // override; a deploy resets to the config), or fire its current window now (idempotent).
+    router.get(`${apiBase}/schedules`, json(listSchedules)).as('durable_dashboard.schedules.index');
+    // The machine-readable API contract (OpenAPI 3.1) — regenerate clients from it, diff it in CI.
+    router
+      .get(`${apiBase}/openapi.json`, async (ctx: HttpContext) => {
+        if (!(await this.enforce(config, ctx, 'api'))) return;
+        return ctx.response.status(200).json(openApiDocument(apiBase));
+      })
+      .as('durable_dashboard.openapi');
+    router
+      .post(`${apiBase}/schedules/:key/:action`, json(scheduleAction))
+      .as('durable_dashboard.schedules.action');
     router.post(`${apiBase}/bulk/:action`, json(bulkAction)).as('durable_dashboard.bulk');
     router
       .get(

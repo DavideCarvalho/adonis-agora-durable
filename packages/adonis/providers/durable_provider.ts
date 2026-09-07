@@ -5,6 +5,7 @@ import { mergeSchedules, runWorkerLoop, type WorkerLogger } from '../src/command
 import type { ControlPlaneConfig, TenantConfig } from '../src/config_types.js';
 import type { ControlPlaneContext } from '../src/control-planes/factory.js';
 import type { DurableConfig } from '../src/define_config.js';
+import { parseDuration } from '../src/duration.js';
 import { attachEventTriggerBridge, type EmitterLike } from '../src/event-trigger-bridge.js';
 import {
   type AdmissionBackend,
@@ -219,6 +220,13 @@ export default class DurableProvider {
           : {}),
         ...(config.compensationRetries !== undefined
           ? { compensationRetries: config.compensationRetries }
+          : {}),
+        ...(config.compensationTimeoutMs !== undefined
+          ? { compensationTimeoutMs: config.compensationTimeoutMs }
+          : {}),
+        ...(config.retention !== undefined ? { retention: parseRetention(config.retention) } : {}),
+        ...(config.stalledAfter !== undefined
+          ? { stalledAfterMs: parseDuration(config.stalledAfter) }
           : {}),
         // Fleet-wide flow control: the configured admission backend replaces the engine's in-process
         // default, so `{ queue }` caps count across every replica instead of per pod.
@@ -642,4 +650,16 @@ export default class DurableProvider {
     await this.#controlPlane?.close?.();
     this.#controlPlane = null;
   }
+}
+
+/** Normalize the config's retention ages (duration strings or ms) into the engine's ms map. */
+function parseRetention(
+  retention: NonNullable<DurableConfig['retention']>,
+): Partial<Record<'completed' | 'failed' | 'cancelled' | 'dead', number>> {
+  const out: Partial<Record<'completed' | 'failed' | 'cancelled' | 'dead', number>> = {};
+  for (const status of ['completed', 'failed', 'cancelled', 'dead'] as const) {
+    const age = retention[status];
+    if (age !== undefined) out[status] = parseDuration(age);
+  }
+  return out;
 }

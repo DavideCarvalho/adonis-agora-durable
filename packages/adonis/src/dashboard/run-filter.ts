@@ -63,6 +63,17 @@ const ATTR_OPERATORS: Record<string, AttributeOp> = {
   isAnyOf: 'in',
 };
 
+/** An instant from the wire: epoch ms (number or numeric string), or an ISO-8601 date string.
+ *  Unparseable/blank values are ignored (never a 400 — same tolerance as the other axes). */
+function parseInstant(value: unknown): number | undefined {
+  const [first] = list(value);
+  if (first === undefined) return undefined;
+  const asNumber = Number(first);
+  if (Number.isFinite(asNumber) && first.trim() !== '') return asNumber;
+  const parsed = Date.parse(first);
+  return Number.isNaN(parsed) ? undefined : parsed;
+}
+
 /** Operators a set-valued axis accepts: one value narrows, several match ANY of them. */
 function assertSetOperator(axis: string, operator: string): void {
   if (operator !== 'equals' && operator !== 'in' && operator !== 'isAnyOf') {
@@ -103,6 +114,20 @@ export class RunFilter extends BaseFilter<RunQueryDraft> {
     this.$query.narrow(values.length === 1 ? { status: values[0] } : { statuses: values });
   }
 
+  /** Time-range floor: only runs created at/after this instant (epoch ms, or an ISO date string). */
+  createdAfter(value: unknown, operator: string): void {
+    assertSetOperator('createdAfter', operator);
+    const ms = parseInstant(value);
+    if (ms !== undefined) this.$query.narrow({ createdAfter: ms });
+  }
+
+  /** Time-range ceiling: only runs created at/before this instant (epoch ms, or an ISO date string). */
+  createdBefore(value: unknown, operator: string): void {
+    assertSetOperator('createdBefore', operator);
+    const ms = parseInstant(value);
+    if (ms !== undefined) this.$query.narrow({ createdBefore: ms });
+  }
+
   /** One workflow narrows; several match ANY of them. */
   workflow(value: unknown, operator: string): void {
     assertSetOperator('workflow', operator);
@@ -127,10 +152,14 @@ export class RunFilter extends BaseFilter<RunQueryDraft> {
     this.$query.narrow(values.length === 1 ? { namespace: values[0] } : { namespaces: values });
   }
 
-  /** The engine has no `origin` column, so origin is read but ignored — a client that always sends
-   *  it (parity with the NestJS API) never 400s. Origin faceting stays client-side. */
-  origin(): void {
-    return;
+  /** Exact-match origin attribution — pushed down now that the engine has an `origin` column.
+   *  The "unknown" bucket (absent origin) still filters client-side: an exact match can't express
+   *  absence, exactly as the NestJS API behaves. */
+  origin(value: unknown, operator: string): void {
+    assertSetOperator('origin', operator);
+    const values = list(value);
+    if (values.length === 0) return;
+    this.$query.narrow({ origin: values[0] });
   }
 
   /**

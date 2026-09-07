@@ -157,6 +157,30 @@ export interface BaseDurableConfig {
   maxRecoveryAttempts?: number;
   /** Attempts per saga compensation on run failure. Default 1. */
   compensationRetries?: number;
+  /**
+   * Upper bound (ms) on awaiting one dispatched saga compensation's worker result when its step def
+   * has no liveness `timeoutMs`. On timeout the attempt fails like any other undo failure (retried
+   * up to `compensationRetries`, then skipped loudly). Default 300 000 (5 min).
+   */
+  compensationTimeoutMs?: number;
+  /**
+   * Retention policy: hard-delete terminal runs once their last activity is older than the given
+   * age, per terminal status — duration strings (`'30d'`) or ms. Swept by the `durable:work` tick
+   * (`sweepRetention`, throttled to one pass a minute). Omit to keep everything forever. Pair with
+   * `engine.onEvict(...)` to archive a run before it is deleted.
+   */
+  retention?: {
+    completed?: string | number;
+    failed?: string | number;
+    cancelled?: string | number;
+    dead?: string | number;
+  };
+  /**
+   * How long an in-flight run must sit untouched, with the stranded signature, before
+   * `engine.onStalled` listeners are paged. Duration string or ms; default `'15m'`. The sweep only
+   * runs when a listener is registered.
+   */
+  stalledAfter?: string | number;
   /** Where a freshly-started run executes. Defaults to in-process (microtask). */
   runDispatcher?: RunDispatcher;
   /**

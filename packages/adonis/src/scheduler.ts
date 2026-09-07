@@ -173,6 +173,43 @@ export function prevCronFireMs(expr: string, nowMs: number, timezone = 'UTC'): n
   return it.prev().toDate().getTime();
 }
 
+/**
+ * Epoch ms of the next cron fire strictly after `nowMs`, evaluated in `timezone` (default UTC) —
+ * what a console's "next fire" column shows.
+ */
+export function nextCronFireMs(expr: string, nowMs: number, timezone = 'UTC'): number {
+  const parse = loadCronParser();
+  const it = parse(expr, { currentDate: new Date(nowMs), tz: timezone });
+  return it.next().toDate().getTime();
+}
+
+/**
+ * The schedule's CURRENT fire window at `nowMs`: its deterministic run id, when that window fired,
+ * and when the next one will — the engine's `listSchedules`/`triggerSchedule` read this.
+ */
+export function scheduleWindow(
+  s: ScheduledWorkflow,
+  nowMs: number,
+): { runId: string; lastFireAt: number; nextFireAt: number } {
+  if (s.cron != null) {
+    const last = prevCronFireMs(s.cron, nowMs, s.timezone);
+    return {
+      runId: `sched:${s.key}:${last}`,
+      lastFireAt: last,
+      nextFireAt: nextCronFireMs(s.cron, nowMs, s.timezone),
+    };
+  }
+  if (s.everyMs != null) {
+    const bucket = Math.floor(nowMs / s.everyMs);
+    return {
+      runId: scheduledRunId(s.key, s.everyMs, nowMs),
+      lastFireAt: bucket * s.everyMs,
+      nextFireAt: (bucket + 1) * s.everyMs,
+    };
+  }
+  throw new Error(`schedule "${s.key}" needs either "everyMs" or "cron"`);
+}
+
 /** The deterministic, idempotent run id for a schedule at `nowMs` — its current fire window. */
 function scheduleRunIdAt(s: ScheduledWorkflow, nowMs: number): string {
   if (s.cron != null) return `sched:${s.key}:${prevCronFireMs(s.cron, nowMs, s.timezone)}`;
@@ -219,7 +256,8 @@ function scheduleRunIdsAt(s: ScheduledWorkflow, nowMs: number): string[] {
  * current windows.
  */
 export async function runSchedules(
-  engine: Pick<WorkflowEngine, 'start' | 'getRun'>,
+  engine: Pick<WorkflowEngine, 'start' | 'getRun'> &
+    Partial<Pick<WorkflowEngine, 'schedulePauseOverride'>>,
   schedules: readonly ScheduledWorkflow[],
   nowMs: number,
   opts?: RunSchedulesOptions,
@@ -229,7 +267,10 @@ export async function runSchedules(
   const settled = settledIdsFor(engine);
   const ids: string[] = [];
   for (const s of schedules) {
-    if (s.paused) continue;
+    // A runtime override from the console (fleet-wide via the control plane) WINS over the config's
+    // `paused` — so an operator can both pause a live schedule and resume a config-paused one until
+    // the next deploy re-reads the config.
+    if (engine.schedulePauseOverride?.(s.key) ?? s.paused) continue;
 
     // Which windows might still need firing — everything this process has not already
     // seen exist. This is the whole reason the tick is cheap: a run id is derived from
