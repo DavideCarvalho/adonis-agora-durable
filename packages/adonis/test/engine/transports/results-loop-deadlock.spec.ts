@@ -85,12 +85,23 @@ describe('QueueTransport results loop — a consumed result never wedges the loo
     expect(run.status).toBe('completed');
     expect(run.output).toBe(42);
 
-    // The second result was consumed and checkpointed (not stranded), and the results queue is
-    // drained: the serial loop only reaches the second result's job after `completeJob` on the
-    // first, and consuming the second result strictly precedes the run's completion — so both are
-    // causally guaranteed here, not timing. (Heartbeats ride their own queue/loop and task acks on
+    // The second result was consumed and checkpointed (not stranded): consuming the second
+    // result strictly precedes the run's completion — so completion/output/checkpoint remain
+    // causally guaranteed here, not timing. The job ack (`completeJob`) runs after the `onResult`
+    // handler returns while the run completes via the turn continuation racing ahead on microtasks,
+    // so the drain is only eventually-consistent: bounded wait, not an immediate assertion.
+    // (Heartbeats ride their own queue/loop and task acks on
     // the worker side are unordered relative to completion, so neither is asserted.)
     expect((await store.getCheckpoint('run-wedge', 1))?.status).toBe('completed');
-    expect(adapter.pending.get('durable:results') ?? []).toHaveLength(0);
+    let leftover = adapter.pending.get('durable:results') ?? [];
+    const drainStart = Date.now();
+    while (leftover.length > 0 && Date.now() - drainStart < 2000) {
+      await new Promise((r) => setTimeout(r, 5));
+      leftover = adapter.pending.get('durable:results') ?? [];
+    }
+    expect(
+      leftover,
+      `results queue did not drain: leftover=${JSON.stringify(leftover)}`,
+    ).toHaveLength(0);
   });
 });
