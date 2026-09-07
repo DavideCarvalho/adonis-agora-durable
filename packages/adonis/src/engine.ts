@@ -491,7 +491,7 @@ export class WorkflowEngine {
   /** Which queue a dispatched step took a slot from, by stepId — so the result can release it. */
   private readonly stepQueue = new Map<string, string>();
   /** Executions currently in flight, so a graceful shutdown can wait for them to settle. */
-  private readonly inflight = new Set<Promise<RunResult>>();
+  private readonly inflight = new Map<Promise<RunResult>, string>();
   /**
    * Post-settle side effects (parent notify, singleton wake) fired fire-and-forget AFTER a run's
    * status was persisted. They run OFF the `execute()` path — the caller of `execute()` must never
@@ -1202,12 +1202,12 @@ export class WorkflowEngine {
         `workflow ${run.workflow}@${run.workflowVersion} is not registered — keep the prior version deployed so in-flight runs can drain (skew protection)`,
       );
     }
-    return this.track(this.execute(run, registered.fn));
+    return this.track(runId, this.execute(run, registered.fn));
   }
 
   /** Track an in-flight execution so {@link drain} can wait for it. */
-  private track(p: Promise<RunResult>): Promise<RunResult> {
-    this.inflight.add(p);
+  private track(runId: string, p: Promise<RunResult>): Promise<RunResult> {
+    this.inflight.set(p, runId);
     void p.finally(() => this.inflight.delete(p));
     return p;
   }
@@ -1235,8 +1235,14 @@ export class WorkflowEngine {
    * resume). A HOT continue-as-new loop — one that hands off to a fresh link faster than it settles —
    * therefore keeps `postSettle`/`inflight` non-empty and consumes the ENTIRE `timeoutMs` before this
    * returns. That is by design (tearing down mid-continuation would orphan the continuation's writes);
-   * on timeout the frontier link is left persisted and leased, so the next boot's recovery re-drives it
+   * on timeout the frontier link is left persisted with the lease released, so the next boot's recovery re-drives it
    * (no loss) — the cost is spending the full timeout on shutdown. Size `timeoutMs` accordingly.
+   *
+   * On return — whether the executions settled or the timeout won — `drain()` releases the recovery
+   * locks of runs still tracked in-flight in this process (best-effort, swallowed per-run). This
+   * process is going away, so a held lease would only delay the next pod's `recoverIncomplete` until
+   * expiry; after release the next pod replays deterministically (a pending step re-dispatches the same
+   * `stepId`, idempotent by the durable contract; a completed step short-circuits).
    */
   async drain(timeoutMs = 10_000): Promise<void> {
     this.draining = true;
@@ -1251,9 +1257,27 @@ export class WorkflowEngine {
     // `Promise<'timeout'>` sentinel is distinguishable from `allSettled`'s array so the race is
     // unambiguous even when everything resolves in the same tick.
     while (this.inflight.size > 0 || this.postSettle.size > 0) {
-      const pending = Promise.allSettled([...this.inflight, ...this.postSettle]);
+      const pending = Promise.allSettled([...this.inflight.keys(), ...this.postSettle]);
       const outcome = await Promise.race([pending, timer]);
-      if (outcome === 'timeout') return;
+      if (outcome === 'timeout') {
+        await this.releaseInflightLocks();
+        return;
+      }
+    }
+    await this.releaseInflightLocks();
+  }
+
+  /**
+   * Best-effort release of the recovery locks still held by in-flight executions. Called on `drain()`
+   * return so a shutting-down process hands off fast. Never throws (swallowed per-run).
+   */
+  private async releaseInflightLocks(): Promise<void> {
+    for (const runId of [...this.inflight.values()]) {
+      try {
+        await this.store.releaseRunLock(runId);
+      } catch {
+        /* best-effort: drain() must never throw because of this */
+      }
     }
   }
 
