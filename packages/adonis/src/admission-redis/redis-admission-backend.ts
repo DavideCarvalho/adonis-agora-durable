@@ -53,7 +53,7 @@ export interface RedisAdmissionOptions {
 const ACQUIRE_LUA = `
 local p=cjson.decode(ARGV[1])
 local now=p.now; local instanceId=p.instanceId; local concurrency=p.concurrency
-local rateLimit=p.rateLimit; local ratePeriodMs=p.ratePeriodMs; local waiterId=p.waiterId
+local rateLimit=p.rateLimit; local ratePeriodMs=p.ratePeriodMs; local rateSliding=p.rateSliding or 0; local waiterId=p.waiterId
 local priority=p.priority; local retryAt=p.retryAt; local hasOrdering=p.hasOrdering
 local fairnessOn=p.fairnessOn; local fairKey=p.fairKey; local instPrefix=p.instPrefix
 local waiterTtl=p.waiterTtl; local instTtl=p.instTtl; local lifo=p.lifo
@@ -76,8 +76,21 @@ for i=1,#stale do
 end
 
 if rateLimit>0 then
-  local used=tonumber(redis.call('GET', KEYS[6]) or '0')
-  if used>=rateLimit then return {0, retryAt} end
+  if rateSliding==1 then
+    -- Rolling window (KEYS[6] is a zset of admission timestamps): prune what aged out, deny until
+    -- the OLDEST admission leaves the window (the precise earliest retry instant).
+    redis.call('ZREMRANGEBYSCORE', KEYS[6], '-inf', now-ratePeriodMs)
+    local used=redis.call('ZCARD', KEYS[6])
+    if used>=rateLimit then
+      local oldest=redis.call('ZRANGE', KEYS[6], 0, 0, 'WITHSCORES')
+      local ra=retryAt
+      if oldest[2] then ra=tonumber(oldest[2])+ratePeriodMs end
+      return {0, ra}
+    end
+  else
+    local used=tonumber(redis.call('GET', KEYS[6]) or '0')
+    if used>=rateLimit then return {0, retryAt} end
+  end
 end
 
 local function register()
@@ -126,7 +139,14 @@ redis.call('ZREM', KEYS[2], waiterId); redis.call('HDEL', KEYS[3], waiterId); re
 if fairnessOn==1 and fairKey~='' then
   local tick=redis.call('INCR', KEYS[8]); redis.call('HSET', KEYS[5], fairKey, tick)
 end
-if rateLimit>0 then redis.call('INCR', KEYS[6]); redis.call('PEXPIRE', KEYS[6], ratePeriodMs) end
+if rateLimit>0 then
+  if rateSliding==1 then
+    redis.call('ZADD', KEYS[6], now, waiterId..':'..now)
+    redis.call('PEXPIRE', KEYS[6], ratePeriodMs*2)
+  else
+    redis.call('INCR', KEYS[6]); redis.call('PEXPIRE', KEYS[6], ratePeriodMs)
+  end
+end
 return {1, 0}
 `;
 
@@ -137,6 +157,8 @@ interface AcquireParams {
   concurrency: number;
   rateLimit: number;
   ratePeriodMs: number;
+  /** 1 = rolling-window algorithm (zset of admission timestamps); 0 = fixed counter window. */
+  rateSliding: number;
   waiterId: string;
   priority: number;
   retryAt: number;
@@ -172,7 +194,8 @@ type RedisWithAcquire = RedisLike & { admissionAcquire: AcquireFn };
  * - **Concurrency** is a hash of slot→owning-instance; a slot is reclaimed only when its owner's
  *   liveness heartbeat lapses, so a live pod holds its slot for the full step duration (no time-lease
  *   false purge) while a crashed pod's slots free within `instanceTtlMs`.
- * - **Rate limit** is a fixed-window counter.
+ * - **Rate limit** is a fixed-window counter, or a rolling window (`algorithm: 'sliding'`) counted
+ *   over a zset of admission timestamps — no 2× burst at a window boundary.
  * - **Ordering** registers blocked callers and, when a slot frees, admits the rightful next under
  *   (priority desc → fairness round-robin by `key` → arrival FIFO/LIFO). Abandoned waiters are pruned
  *   so a cancelled run can't sit as a phantom best-waiter.
@@ -229,15 +252,21 @@ export class RedisAdmissionBackend implements AdmissionBackend {
     // concurrency queue admits blocked waiters by arrival FIFO — identical to the in-process backend.
     const hasOrdering =
       item.waiterId != null || item.priority != null || fairnessOn === 1 || lifo === 1 ? 1 : 0;
-    const rateKey = rate
-      ? this.key(queue, 'rate', Math.floor(now / rate.periodMs))
-      : this.key(queue, 'rate', 0);
+    const rateSliding = rate?.algorithm === 'sliding';
+    // Sliding uses ONE zset key (its own name — never colliding with a fixed window's counter
+    // buckets, so flipping the algorithm on a live queue can't hit a WRONGTYPE).
+    const rateKey = rateSliding
+      ? this.key(queue, 'rate-sliding', 0)
+      : rate
+        ? this.key(queue, 'rate', Math.floor(now / rate.periodMs))
+        : this.key(queue, 'rate', 0);
     const params: AcquireParams = {
       now,
       instanceId: this.instanceId,
       concurrency: config.concurrency ?? 0,
       rateLimit: rate?.limit ?? 0,
       ratePeriodMs: rate?.periodMs ?? 0,
+      rateSliding: rateSliding ? 1 : 0,
       waiterId: item.waiterId ?? `anon:${now}`,
       priority: item.priority ?? 0,
       retryAt: now + this.retryMs,

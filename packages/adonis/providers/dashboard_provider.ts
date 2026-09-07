@@ -55,6 +55,7 @@ import {
   workers,
 } from '../src/dashboard/handlers.js';
 import { renderLoginPage } from '../src/dashboard/login_page.js';
+import { openApiDocument } from '../src/dashboard/openapi.js';
 import { contentTypeFor, renderIndexHtml } from '../src/dashboard/spa.js';
 import type { DurableConfig } from '../src/define_config.js';
 import { WorkflowEngine } from '../src/index.js';
@@ -101,6 +102,7 @@ function spaDirectory(): string {
  * - `GET  /api/workers`               -> worker-group health (full heartbeats; SPA)
  * - `GET  /api/topology`              -> this deployment's durable role
  * - `GET  /api/compat`                -> fleet health / protocol-compatibility panel
+ * - `GET  /api/openapi.json`          -> the machine-readable API contract (OpenAPI 3.1)
  */
 export default class DashboardProvider {
   constructor(protected app: ApplicationService) {}
@@ -219,6 +221,13 @@ export default class DashboardProvider {
     // Runtime schedule control: list the ticked schedules, pause/resume one fleet-wide (runtime
     // override; a deploy resets to the config), or fire its current window now (idempotent).
     router.get(`${apiBase}/schedules`, json(listSchedules)).as('durable_dashboard.schedules.index');
+    // The machine-readable API contract (OpenAPI 3.1) — regenerate clients from it, diff it in CI.
+    router
+      .get(`${apiBase}/openapi.json`, async (ctx: HttpContext) => {
+        if (!(await this.enforce(config, ctx, 'api'))) return;
+        return ctx.response.status(200).json(openApiDocument(apiBase));
+      })
+      .as('durable_dashboard.openapi');
     router
       .post(`${apiBase}/schedules/:key/:action`, json(scheduleAction))
       .as('durable_dashboard.schedules.action');

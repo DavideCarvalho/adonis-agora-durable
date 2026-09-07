@@ -232,3 +232,29 @@ describe('flow control — durable queues', () => {
     expect(transport.dispatched[1]?.runId).toBe('high');
   });
 });
+
+describe('sliding-window rate limit', () => {
+  it('admits smoothly over a rolling window instead of bursting at boundaries', async () => {
+    const { QueueController } = await import('../../src/queue.js');
+    let nowMs = 0;
+    const q = new QueueController(
+      { name: 'api', rateLimit: { limit: 2, periodMs: 1_000, algorithm: 'sliding' } },
+      () => nowMs,
+    );
+    expect(q.tryAdmit().ok).toBe(true); // t=0
+    nowMs = 900;
+    expect(q.tryAdmit().ok).toBe(true); // t=900
+    // Window [−50, 950] holds both admissions — denied, with the PRECISE earliest retry (t=0 ages
+    // out at 1000). A fixed window would already have reset at the boundary and allowed a 2× burst.
+    nowMs = 950;
+    const denied = q.tryAdmit();
+    expect(denied.ok).toBe(false);
+    expect(denied.ok === false && denied.retryAt).toBe(1_000);
+    nowMs = 1_050; // t=0 aged out → one slot free
+    expect(q.tryAdmit().ok).toBe(true);
+    nowMs = 1_100;
+    expect(q.tryAdmit().ok).toBe(false); // t=900 + t=1050 still inside the window
+    nowMs = 1_950; // t=900 aged out
+    expect(q.tryAdmit().ok).toBe(true);
+  });
+});

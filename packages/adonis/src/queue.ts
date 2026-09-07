@@ -27,8 +27,13 @@ export interface QueueConfig {
   name: string;
   /** Max steps in flight at once for this queue (this instance). Omit for unlimited. */
   concurrency?: number;
-  /** Fixed-window rate limit: at most `limit` admissions per `periodMs`. Omit for unlimited. */
-  rateLimit?: { limit: number; periodMs: number };
+  /**
+   * Rate limit: at most `limit` admissions per `periodMs`. Omit for unlimited.
+   * `algorithm: 'sliding'` counts admissions over a rolling window (steady-state smooth — no 2×
+   * burst at a window boundary, which is exactly what a third-party API cap cares about);
+   * `'fixed'` (default, the historical behavior) resets a counter each period.
+   */
+  rateLimit?: { limit: number; periodMs: number; algorithm?: 'fixed' | 'sliding' };
   /** Delay (ms) before a concurrency-blocked call re-checks for a free slot. Default 1000. */
   retryMs?: number;
   /**
@@ -75,6 +80,8 @@ export class QueueController {
   private inFlight = 0;
   private windowStart = 0;
   private windowCount = 0;
+  /** Admission timestamps inside the rolling window (sliding algorithm only; pruned on each check). */
+  private slidingAdmits: number[] = [];
   /** Registered waiters by id (only used when priority/fairness ordering is in play). */
   private readonly waiters = new Map<string, Waiter>();
   /** Monotonic counter stamping each newly-seen waiter for a stable FIFO tiebreak. */
@@ -106,12 +113,24 @@ export class QueueController {
     const rl = this.config.rateLimit;
     // Rate limit is a hard global window — checked first and unaffected by priority/fairness.
     if (rl) {
-      if (now - this.windowStart >= rl.periodMs) {
-        this.windowStart = now;
-        this.windowCount = 0;
+      if (rl.algorithm === 'sliding') {
+        // Rolling window: prune admissions older than the period; deny until the OLDEST one ages
+        // out (the precise earliest retry instant).
+        const cutoff = now - rl.periodMs;
+        while (this.slidingAdmits.length > 0 && (this.slidingAdmits[0] as number) <= cutoff) {
+          this.slidingAdmits.shift();
+        }
+        if (this.slidingAdmits.length >= rl.limit) {
+          return { ok: false, retryAt: (this.slidingAdmits[0] as number) + rl.periodMs };
+        }
+      } else {
+        if (now - this.windowStart >= rl.periodMs) {
+          this.windowStart = now;
+          this.windowCount = 0;
+        }
+        if (this.windowCount >= rl.limit)
+          return { ok: false, retryAt: this.windowStart + rl.periodMs };
       }
-      if (this.windowCount >= rl.limit)
-        return { ok: false, retryAt: this.windowStart + rl.periodMs };
     }
 
     const usingOrder = this.ordered || item?.priority != null || item?.waiterId != null;
@@ -136,7 +155,10 @@ export class QueueController {
     }
 
     // Admit: consume the slot, the rate-window tick, and clear this waiter.
-    if (rl) this.windowCount += 1;
+    if (rl) {
+      if (rl.algorithm === 'sliding') this.slidingAdmits.push(now);
+      else this.windowCount += 1;
+    }
     this.inFlight += 1;
     if (waiterId != null) this.waiters.delete(waiterId);
     if (item?.key != null) this.keyServed.set(item.key, ++this.servedTick);

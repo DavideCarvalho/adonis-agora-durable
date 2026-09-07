@@ -11,6 +11,43 @@ export interface RunHistory {
 }
 
 /**
+ * Capture a run's replayable history from a live engine (or anything with its read API) — the
+ * fixture half of the {@link assertReplayable} loop. Pair with `node ace durable:export <runId>`
+ * to pull one from a running app, commit the JSON, and assert it in CI via {@link parseRunHistory}.
+ */
+export async function captureHistory(
+  source: Pick<WorkflowEngine, 'getRun' | 'listCheckpoints'>,
+  runId: string,
+): Promise<RunHistory | null> {
+  const run = await source.getRun(runId);
+  if (!run) return null;
+  return { run, checkpoints: await source.listCheckpoints(runId) };
+}
+
+/**
+ * Parse a committed history fixture (the JSON `durable:export` writes) back into a {@link
+ * RunHistory}, reviving the Date fields JSON flattened to ISO strings — so
+ * `assertReplayable(register, parseRunHistory(readFileSync('fixture.json', 'utf8')))` just works.
+ */
+export function parseRunHistory(json: string): RunHistory {
+  const raw = JSON.parse(json) as { run: WorkflowRun; checkpoints: StepCheckpoint[] };
+  const date = (v: unknown): Date => new Date(v as string | number | Date);
+  const run: WorkflowRun = {
+    ...raw.run,
+    createdAt: date(raw.run.createdAt),
+    updatedAt: date(raw.run.updatedAt),
+  };
+  const checkpoints = raw.checkpoints.map((cp) => ({
+    ...cp,
+    enqueuedAt: date(cp.enqueuedAt),
+    startedAt: date(cp.startedAt),
+    finishedAt: date(cp.finishedAt),
+    ...(cp.lastHeartbeatAt != null ? { lastHeartbeatAt: date(cp.lastHeartbeatAt) } : {}),
+  }));
+  return { run, checkpoints };
+}
+
+/**
  * Replay a recorded run's history against the CURRENT workflow code and throw if they diverged.
  *
  * Capture a real (ideally in-flight or representative) run from production —
