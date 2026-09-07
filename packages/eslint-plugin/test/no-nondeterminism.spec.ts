@@ -55,6 +55,25 @@ ruleTester.run('no-nondeterminism', noNondeterminism, {
     { code: wfFn('const r = await ctx.sideEffect(() => Math.random());') },
     // A plain register call to something else is not a workflow body.
     { code: "registry.register('x', () => Date.now());" },
+    // An imported randomUUID called OUTSIDE any workflow body.
+    { code: "import { randomUUID } from 'node:crypto'; const id = randomUUID();" },
+    // An imported randomUUID inside a checkpointed sideEffect callback is replay-safe.
+    {
+      code:
+        "import { randomUUID } from 'node:crypto';" +
+        wfFn('const id = await ctx.sideEffect(() => randomUUID());'),
+    },
+    // A randomUUID import from some OTHER module is not the crypto one.
+    { code: `import { randomUUID } from './my-uuid.js';${wfFn('const id = randomUUID();')}` },
+    // `process.env` outside a workflow body, and inside a checkpointed callback, are fine.
+    { code: 'const url = process.env.API_URL;' },
+    { code: wfFn('const url = await ctx.sideEffect(() => process.env.API_URL);') },
+    // `Date()` outside a workflow body.
+    { code: 'const s = Date();' },
+    // Alias tracking is `const`-from-the-global only: an unrelated const is not an alias.
+    { code: wfFn('const d = myClock; d.now();') },
+    // A `let` binding may be reassigned — deliberately not tracked (no data-flow analysis).
+    { code: `let d = Date;${wfFn('d.now();')}` },
   ],
   invalid: [
     // Class form.
@@ -82,6 +101,44 @@ ruleTester.run('no-nondeterminism', noNondeterminism, {
     {
       code: wfFn("await ctx.step('a', { at: Date.now() });"),
       errors: [{ messageId: 'useNow' }],
+    },
+    // A bare `randomUUID` import from node:crypto (both module specifiers), incl. the aliased form.
+    {
+      code: `import { randomUUID } from 'node:crypto';${wfFn('const id = randomUUID();')}`,
+      errors: [{ messageId: 'useUuidImport' }],
+    },
+    {
+      code: `import { randomUUID } from 'crypto';${wfFn('const id = randomUUID();')}`,
+      errors: [{ messageId: 'useUuidImport' }],
+    },
+    {
+      code: `import { randomUUID as uuid } from 'node:crypto';${wfFn('const id = uuid();')}`,
+      errors: [{ messageId: 'useUuidImport' }],
+    },
+    // A namespace/default crypto import resolves like the `crypto` global.
+    {
+      code: `import * as c from 'node:crypto';${wfClass('const id = c.randomUUID();')}`,
+      errors: [{ messageId: 'useUuid' }],
+    },
+    // `process.env` reads — bare, and via a property (flagged once, on the `process.env` read).
+    { code: wfFn('if (process.env.FEATURE_X) { doIt(); }'), errors: [{ messageId: 'useEnv' }] },
+    { code: wfClass('const env = process.env;'), errors: [{ messageId: 'useEnv' }] },
+    // `Date()` called as a plain function returns the current-time string.
+    { code: wfFn('const s = Date();'), errors: [{ messageId: 'useNowDateCall' }] },
+    { code: wfClass('const s = Date();'), errors: [{ messageId: 'useNowDateCall' }] },
+    // Aliased receivers, tracked through a same-file `const` from the banned global.
+    { code: `const d = Date;${wfFn('const t = d.now();')}`, errors: [{ messageId: 'useNow' }] },
+    {
+      code: wfFn('const m = Math; const r = m.random();'),
+      errors: [{ messageId: 'useRandom' }],
+    },
+    {
+      code: `const c = crypto;${wfClass('const id = c.randomUUID();')}`,
+      errors: [{ messageId: 'useUuid' }],
+    },
+    {
+      code: `const d = Date;${wfFn('const at = new d();')}`,
+      errors: [{ messageId: 'useNowDate' }],
     },
   ],
 });
