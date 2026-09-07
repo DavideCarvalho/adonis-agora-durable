@@ -1,12 +1,12 @@
 ---
 title: Flow control
-description: "Durable queues for dispatched steps — cap concurrency and enforce fixed-window rate limits with engine.registerQueue and ctx.step(step, input, { queue }). A blocked call re-suspends and the timer poller retries admission. Scale the cap across processes with @adonis-agora/durable/admission-redis."
+description: "Durable queues for dispatched steps — cap concurrency and enforce fixed- or sliding-window rate limits with engine.registerQueue and ctx.step(step, input, { queue }). A blocked call re-suspends and the timer poller retries admission. Scale the cap across processes with @adonis-agora/durable/admission-redis."
 icon: Gauge
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
-Dispatched steps fan out work to workers, and sometimes you need to *throttle* that fan-out: a third-party API allows only N requests per minute, or a downstream service falls over above some concurrency. Flow-control queues cap how much work `ctx.step` admits at once — a concurrency limit, a fixed-window rate limit, or both — and, crucially, they do it **durably**: a call that can't be admitted doesn't busy-wait or hold the run in memory, it re-suspends and is retried by the timer poller, so the limit survives a crash.
+Dispatched steps fan out work to workers, and sometimes you need to *throttle* that fan-out: a third-party API allows only N requests per minute, or a downstream service falls over above some concurrency. Flow-control queues cap how much work `ctx.step` admits at once — a concurrency limit, a rate limit (fixed or sliding window), or both — and, crucially, they do it **durably**: a call that can't be admitted doesn't busy-wait or hold the run in memory, it re-suspends and is retried by the timer poller, so the limit survives a crash.
 
 <QueueSim />
 
@@ -18,7 +18,7 @@ Register a queue on the engine with `engine.registerQueue`. A `QueueConfig` has:
 
 - `name` — the queue's name, referenced from `ctx.step(step, input, { queue: name })`.
 - `concurrency` — the maximum number of steps in flight at once for this queue. Omit for unlimited.
-- `rateLimit` — a fixed-window rate limit of `{ limit, periodMs }`: at most `limit` admissions per `periodMs`. Omit for unlimited.
+- `rateLimit` — `{ limit, periodMs, algorithm? }`: at most `limit` admissions per `periodMs`. `algorithm` is `'fixed'` (default) or `'sliding'` — see below. Omit for unlimited.
 - `retryMs` — how long (ms) a concurrency-blocked call waits before re-checking for a free slot. Defaults to 1000.
 - `fairness` — `'fifo'` (default) or `'key'` (round-robin by the call's `fairnessKey`).
 - `order` — `'fifo'` (default) or `'lifo'` arrival ordering among same-priority waiters.
@@ -32,7 +32,14 @@ engine.registerQueue({ name: 'pdf-render', concurrency: 5, retryMs: 500 })
 
 // Both at once: at most 10 in flight AND no more than 1000/hour:
 engine.registerQueue({ name: 'emails', concurrency: 10, rateLimit: { limit: 1000, periodMs: 3_600_000 } })
+
+// A third-party cap enforced as a rolling window — never more than 100 in ANY 60s span:
+engine.registerQueue({ name: 'openai', rateLimit: { limit: 100, periodMs: 60_000, algorithm: 'sliding' } })
 ```
+
+### Fixed vs sliding window
+
+`algorithm: 'fixed'` (the default, and the historical behavior) resets a counter each period — simple, but a burst straddling a window boundary can admit up to **2×** `limit` in a `periodMs` span (100 at the end of one window, 100 more the instant the next opens). `algorithm: 'sliding'` counts admissions over a **rolling** window instead: an admission is denied while `limit` admissions already happened in the trailing `periodMs`, and a blocked call is told to retry at the precise instant the oldest one ages out. That steady-state smoothness is exactly what a third-party API cap cares about — the provider is counting a rolling window too. Both algorithms work on the in-process controller and on the [Redis backend](#distributed-admission--redis) (where the rolling count runs inside the same atomic Lua script).
 
 ## Using a queue from a workflow
 

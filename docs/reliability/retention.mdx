@@ -1,0 +1,55 @@
+---
+title: Retention & archival
+description: "Hard-delete terminal runs past a per-status age with the retention config, swept by the durable:work tick (throttled to one pass a minute), and archive each run before deletion with engine.onEvict — a throwing hook skips the delete, so a broken archive never loses data."
+icon: Archive
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+By default the engine keeps every run forever. That is the right default for a workflow engine — a run's history *is* the audit trail — but on a busy deployment the terminal runs (`completed`, `failed`, `cancelled`, `dead`) accumulate without bound, and eventually the runs table is the biggest thing in your database. Retention bounds it: declare how long each terminal status is worth keeping, and the worker tick hard-deletes runs past their age — optionally archiving each one first.
+
+## The `retention` config
+
+Set a maximum age per terminal status in `config/durable.ts` — a duration string (`'30d'`, `'12h'`) or milliseconds. Age is measured from the run's **last activity** (`updatedAt`), not its creation:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  // … plus your transport/store (see Getting Started)
+  retention: {
+    completed: '30d', // the happy path is cheap to keep and cheap to drop
+    cancelled: '30d',
+    failed: '90d',    // failures are evidence — keep them longer
+    dead: '180d',     // a poison pill's post-mortem window
+  },
+})
+```
+
+Every field is optional and an omitted status is kept forever — so `retention: { completed: '7d' }` alone drops old successes and touches nothing else. Omit `retention` entirely (the default) and nothing is ever deleted.
+
+## How the sweep runs
+
+The sweep (`engine.sweepRetention()`) is a phase of the [`durable:work`](/docs/durable/cli) tick — the same loop that drives recovery, timers and schedules — self-throttled to **one pass per minute per instance**, so calling it every tick is a no-op most of the time. Each pass is bounded (100 candidates per status), so a large backlog drains across passes rather than stalling a tick. Deletion is a *hard* delete: the run, its checkpoints, its signal waiters and search-attribute rows, and — cascading down — its entire child subtree go with it. A deleted run's count includes that subtree.
+
+<Callout type="warn" title="Eviction cascades down, not up">
+Deleting a run takes its **children**, but the sweep does not know about a still-live *parent* awaiting a custom-id child — a completed child evicted out from under a suspended parent strands the join. Size the ages well beyond your longest-running parents.
+</Callout>
+
+## Archiving before deletion — `engine.onEvict`
+
+Retention deletes; `onEvict` is how you keep a copy. Register a hook and it runs **before** each run's deletion, receiving the run and its full checkpoint timeline — write them to S3, a cold table, a file:
+
+```ts title="start/durable.ts"
+engine.onEvict(async (run, checkpoints) => {
+  await s3.putObject({
+    Bucket: 'durable-archive',
+    Key: `${run.workflow}/${run.id}.json`,
+    Body: JSON.stringify({ run, checkpoints }),
+  })
+})
+```
+
+Hooks are awaited in registration order, and a hook that **throws skips that run's deletion** — the run stays in the store and the next sweep retries it. A broken archive can therefore never lose data; the failure surfaces as a warning log, not a silent gap in the archive. `onEvict` returns an unsubscribe function, like every other engine listener.
+
+<Callout type="info">
+The archived `{ run, checkpoints }` pair is the same shape the [replay fixture](/docs/durable/testing#replay-ci--assertreplayable) uses — an archived run can be fed back through `parseRunHistory` and `assertReplayable` later.
+</Callout>

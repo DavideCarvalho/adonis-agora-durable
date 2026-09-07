@@ -224,3 +224,5 @@ engine.register('counter', '1', async (ctx, input: { n: number }) => {
 ```
 
 Each generation completes cleanly, so the run never grows without bound — the durable equivalent of tail recursion.
+
+The handoff itself is crash-safe: the continuation run is **persisted before** the parent's terminal write, so a crash in the gap between "generation N completed" and "generation N+1 started" cannot lose the chain — on recovery the already-persisted continuation is simply driven forward. The continuation also inherits the parent run's `namespace`, so a chain pinned to a worker pool stays in it across generations.

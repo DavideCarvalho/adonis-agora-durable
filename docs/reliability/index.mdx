@@ -19,7 +19,8 @@ The building blocks compose: a remote step can retry with backoff, register a co
   <Card title="Sagas & compensation" href="/docs/durable/reliability/sagas" description="Undo the side effects of a partially-completed run with per-step compensate callbacks that run in reverse." />
   <Card title="Flow control" href="/docs/durable/reliability/flow-control" description="Durable queues that cap concurrency and enforce rate limits — per-instance, or distributed with Redis admission." />
   <Card title="Dead-letter queue" href="/docs/durable/reliability/dead-letter" description="Cap crash-recovery with maxRecoveryAttempts so a poison pill moves to the terminal dead status instead of crash-looping." />
-  <Card title="Failure modes & recovery" href="/docs/durable/reliability/failure-modes" description="An operator's symptom → diagnosis → fix map: a stuck suspended run, a lost remote dispatch, queue-transport gaps, and the namespace mistake." />
+  <Card title="Retention & archival" href="/docs/durable/reliability/retention" description="Hard-delete terminal runs past a per-status age, and archive each one first with engine.onEvict — a throwing hook skips the delete." />
+  <Card title="Failure modes & recovery" href="/docs/durable/reliability/failure-modes" description="An operator's symptom → diagnosis → fix map: a stuck suspended run, a lost remote dispatch, the stalled-run pager, queue-transport gaps, and the namespace mistake." />
 </Cards>
 
 ## At a glance
@@ -28,3 +29,5 @@ The building blocks compose: a remote step can retry with backoff, register a co
 - **Sagas** — attach a `compensate` closure to a `ctx.localStep`, or a `compensate` step ref to a dispatched `ctx.step`; the engine runs registered undos in reverse order when the run fails. `compensationRetries` retries a transient undo, and you can trigger the saga deliberately with `engine.cancel(runId, { compensate: true })`.
 - **Flow control** — register a queue with `engine.registerQueue` and reference it from `ctx.step(step, input, { queue })`. A call that can't be admitted re-suspends with a retry time. For a global cross-process cap, use the [`@adonis-agora/durable/admission-redis`](/docs/durable/reliability/flow-control#distributed-admission--redis) backend.
 - **Dead-lettering** — `maxRecoveryAttempts` caps how many times crash-recovery retries a run before moving it to the terminal `dead` status, where it stays inspectable and retriable. `engine.onDead` routes the dead run to a handler.
+- **Retention** — the `retention` config hard-deletes terminal runs past a per-status age, swept by the worker tick; `engine.onEvict` archives each run (with its checkpoints) before deletion, and a throwing hook skips the delete.
+- **The stalled-run pager** — `engine.onStalled` + `stalledAfter` turn [the stranded signature](/docs/durable/reliability/failure-modes#the-stranded-signature) into a page instead of a query you remember to run: once per stranded episode, a listener receives the run and why it looks stuck.

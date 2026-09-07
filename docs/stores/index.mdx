@@ -36,13 +36,13 @@ export default defineConfig({
 
 A `StateStore` persists runs and checkpoints and exposes the primitives the engine needs for durability:
 
-- **Runs & checkpoints** — `createRun`, `updateRun`, `updateRunIf`, `getRun`, `deleteRun`, `saveCheckpoint`, `getCheckpoint`, `listCheckpoints`.
-- **Recovery & leasing** — `listIncompleteRuns`, `listPendingRuns(limit)` (so workers poll for `pending` runs), `listDueTimers(nowMs)`, and the atomic `tryLockRun` / `renewRunLock` / `releaseRunLock` that make [one-instance-per-run](/docs/durable/concepts/durability#deploys-versioning--multiple-instances) leasing work.
+- **Runs & checkpoints** — `createRun`, `updateRun`, `updateRunIf`, `getRun`, `deleteRun`, `saveCheckpoint`, `getCheckpoint`, `listCheckpoints`. `createRun` **must reject a duplicate id** (throw — a SQL primary-key violation is exactly right) rather than overwrite: the engine treats the throw as "someone else already started this id", re-reads the existing run and returns its state, which is what makes `start` / `signalWithStart` / racing scheduler ticks converge on **one** run instead of forking or clobbering the winner.
+- **Recovery & leasing** — `listIncompleteRuns`, `listPendingRuns(limit)` (so workers poll for `pending` runs), `listDueTimers(nowMs, namespace?, limit?)` (the `limit` caps a due-timer batch per poll; a store may ignore it), and the atomic `tryLockRun` / `renewRunLock` / `releaseRunLock` that make [one-instance-per-run](/docs/durable/concepts/durability#deploys-versioning--multiple-instances) leasing work. `releaseRunLock(runId, owner?)` is **owner-fenced**: when `owner` is given, release only if that owner still holds the lease (a conditional write, atomic like `renewRunLock`) — so a stale executor whose lease was taken over can't wipe the new owner's lease and open the door to a third concurrent executor. Omitting `owner` is the operator-style unconditional clear (`requeue`'s stale-lease reset); a store implemented against the older single-argument signature simply ignores `owner` and degrades to the previous unfenced behavior.
 - **Signals** — `putSignalWaiter` / `takeSignalWaiter` / `listSignalWaiters` / `removeSignalWaiter`, plus `bufferSignal` / `takeBufferedSignal` for the [signal](/docs/durable/concepts/sleep-and-signals) machinery.
 - **Events** — `bufferEvent` / `listBufferedEvents` / `removeBufferedEvent`, so a published event that matched no live waiter is still consumed by a later `ctx.waitForEvent`.
-- **Querying** — `listRuns(query)` (status/workflow/tag/namespace/attribute filters) for the dashboard and CLI.
+- **Querying** — `listRuns(query)` for the dashboard and CLI. `RunQuery` carries the status/workflow/tag/namespace/attribute filters plus exact-match `origin` and the epoch-ms range pushdowns `createdBefore` / `createdAfter` / `updatedBefore` / `wakeBefore` — the last two are what let the retention/stalled sweeps and the blocked-run poll ask the store for candidate rows instead of fetching everything and filtering in process.
 
-Five members are **optional**, and the engine works without every one of them:
+Eight members are **optional**, and the engine works without every one of them:
 
 | Optional member | What you lose by omitting it |
 | --- | --- |
@@ -51,6 +51,9 @@ Five members are **optional**, and the engine works without every one of them:
 | `recordStepHeartbeat(...)` | Step heartbeats are discarded, so a long remote step shows no liveness in the dashboard or `durable:runs`. |
 | `getLatestCheckpointByName(...)` | A fast path only. The engine falls back to `listCheckpoints` plus an in-JS filter. |
 | `listCheckpointsByNamePrefix(...)` | Same — a fast path, with the same fallback. |
+| `listOrphanedRuns(nowMs, limit, namespace?)` | The bounded orphan query (`running` + free/expired lease) the periodic recovery pass prefers. Without it the engine falls back to `listIncompleteRuns` and filters in process — correct, but on a busy fleet every worker fetches (and lock-probes) every healthy running run once per tick. Strongly recommended. |
+| `listSignalWaitersByRunIds(runIds)` | The targeted per-page waiter lookup (`run_id IN (...)`, indexed). Without it the dashboard's `waiting` column and the engine's child resolution fall back to `listSignalWaiters('')` — a full-table scan per page load. Pair the implementation with an index on `run_id`. |
+| `runValueFacets(axis, query, opts?)` | Native picker enumeration (distinct values + counts per filter axis). Callers fall back to counting a bounded `listRuns` scan in-process — same shape, bounded approximation on the non-column axes. |
 
 Everything else is **required**, including `updateRunIf`.
 

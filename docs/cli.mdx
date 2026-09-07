@@ -1,12 +1,12 @@
 ---
 title: CLI
-description: Ace commands for durable — durable:work runs the store-backed worker loop, durable:worker runs a store-less thin worker, durable:runs lists runs (including the --stale view), durable:retry re-enqueues a run, and make:workflow scaffolds a workflow.
+description: Ace commands for durable — durable:work runs the store-backed worker loop, durable:worker runs a store-less thin worker, durable:runs lists runs (including the --stale view), durable:retry re-enqueues a run, durable:export captures a replay fixture for CI, and make:workflow scaffolds a workflow.
 icon: SquareTerminal
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
-`@adonis-agora/durable` ships five ace commands: two long-running workers (`durable:work` for a store-backed pod, `durable:worker` for a [store-less thin pod](/docs/durable/cluster/roles-and-config)), a run **lister**, a **retry**, and a **workflow generator**. Except for `durable:worker`, they all resolve the [`WorkflowEngine`](/docs/durable/concepts/workflows-and-steps) bound by the provider, so they operate on the same engine (and store) your app is configured with.
+`@adonis-agora/durable` ships six ace commands: two long-running workers (`durable:work` for a store-backed pod, `durable:worker` for a [store-less thin pod](/docs/durable/cluster/roles-and-config)), a run **lister**, a **retry**, a replay-fixture **exporter**, and a **workflow generator**. Except for `durable:worker`, they all resolve the [`WorkflowEngine`](/docs/durable/concepts/workflows-and-steps) bound by the provider, so they operate on the same engine (and store) your app is configured with.
 
 ```bash
 node ace configure @adonis-agora/durable
@@ -28,7 +28,7 @@ node ace durable:work --interval=500 --drainTimeout=15000
 | `--interval` | `1000` | poll interval in ms between ticks |
 | `--drainTimeout` | `10000` | drain timeout in ms on shutdown |
 
-Each tick runs `engine.runPending()` → `engine.recoverIncomplete()` → `engine.resumeDueTimers()` → `engine.sweepTimeouts()` → fire due [schedules](/docs/durable/authoring/scheduling). Run this as a dedicated process (or several) when you split web from worker; in a single-process app the in-process dispatcher already runs workflows, so this is optional but recommended for [recovery and timers](/docs/durable/concepts/durability#consequences).
+Each tick runs `engine.runPending()` → `engine.recoverIncomplete()` → `engine.resumeDueTimers()` → `engine.sweepTimeouts()` → fire due [schedules](/docs/durable/authoring/scheduling) → `engine.sweepRetention()` ([retention eviction](/docs/durable/reliability/retention), self-throttled to once a minute) → `engine.sweepStalled()` (the [stalled-run pager](/docs/durable/reliability/failure-modes#the-stalled-run-pager--onstalled--stalledafter), same throttle, a no-op without listeners). Run this as a dedicated process (or several) when you split web from worker; in a single-process app the in-process dispatcher already runs workflows, so this is optional but recommended for [recovery and timers](/docs/durable/concepts/durability#consequences).
 
 <Callout type="info">
 Any [scheduled workflows](/docs/durable/authoring/scheduling) registered under `schedules` in `config/durable.ts` are fired by this loop (the tick's 5th phase) — so you need at least one `durable:work` process running for them to start. This is also where a [queue](/docs/durable/transports/queue) or [DB](/docs/durable/transports/db) transport worker registers its handlers for a group.
@@ -83,6 +83,21 @@ node ace durable:retry checkout:1234
 ```
 
 Run `durable:work` (or any worker) to pick it up afterward. This is the terminal equivalent of the dashboard's retry button — handy for replaying a [dead](/docs/durable/reliability/dead-letter) run once you've shipped a fix.
+
+## `durable:export` — capture a replay fixture
+
+Exports a run's replayable history — the run row plus its full checkpoint timeline — as JSON, for the [replay-CI loop](/docs/durable/testing#replay-ci--assertreplayable). Commit the file and assert it with `assertReplayable(register, parseRunHistory(json))`: a code change that renames, reorders or removes a step at a position the history already recorded then fails the build instead of corrupting an in-flight run on deploy.
+
+```bash
+node ace durable:export ord-42                                       # JSON to stdout
+node ace durable:export ord-42 --out tests/fixtures/checkout.json    # or to a file
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--out` | — | write the fixture to this file instead of stdout |
+
+An unknown run id exits `1` with an error. In code, the same capture is `captureHistory(engine, runId)` from `@adonis-agora/durable/testing`.
 
 ## `make:workflow` — scaffold a workflow class
 

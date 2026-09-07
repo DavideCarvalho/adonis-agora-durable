@@ -1,6 +1,6 @@
 ---
 title: Scheduling
-description: Recurring workflows with ScheduledWorkflow — fixed intervals via everyMs or DST-aware cron via cron + timezone — registered under schedules in config/durable.ts and fired by the durable:work worker tick, started exactly once per window by an idempotent time-bucket run id.
+description: Recurring workflows with ScheduledWorkflow — fixed intervals via everyMs or DST-aware cron via cron + timezone — registered under schedules in config/durable.ts and fired by the durable:work worker tick, started exactly once per window by an idempotent time-bucket run id, with runtime pause/resume/trigger control via engine.listSchedules, setSchedulePaused and triggerSchedule.
 icon: CalendarClock
 ---
 
@@ -206,6 +206,32 @@ load time, so whichever one your app (or `@adonis-agora/telescope`) already has 
 ```ts
 { key: 'slow-sync', workflow: 'slow-sync', everyMs: 60_000, overlap: 'skip' }
 ```
+
+## Runtime control — pause, resume, run now
+
+`paused` in config is a deploy-time switch. For the operator's version — "stop the nightly sync *now*, without shipping a config change" — the engine exposes runtime schedule control, and the [dashboard](/docs/durable/observability/dashboard#schedules) drives the same three calls from its Schedules tab:
+
+```ts
+// Every schedule this engine ticks, with its live control state and fire windows:
+const schedules = await engine.listSchedules()
+// [{ key, workflow, cron?, everyMs?, timezone?, overlap?, namespace?,
+//    paused, pausedAtRuntime, lastFireAt, nextFireAt, currentWindowRunId, lastRunStatus? }]
+
+// Pause / resume at runtime — applied fleet-wide:
+engine.setSchedulePaused('nightly-report', true)   // stop firing windows
+engine.setSchedulePaused('nightly-report', false)  // resume
+
+// Fire the CURRENT window right now (the console's "run now"):
+const result = await engine.triggerSchedule('nightly-report')
+```
+
+- **`listSchedules()`** merges the config and colocated schedules and reports each one's *effective* state: `paused` is the runtime override when one was issued, else the config's `paused`, and `pausedAtRuntime` tells you which. `lastFireAt` / `nextFireAt` are the current window's bounds, `currentWindowRunId` is its deterministic run id, and `lastRunStatus` is that run's status when it exists.
+- **`setSchedulePaused(key, paused)`** is **fleet-wide**: it applies on this instance and broadcasts on the [control plane](/docs/durable/transports/control-plane), so every ticking peer applies it too. The override **wins over the config's `paused`** — in either direction — but it is runtime-only state: a deploy resets every schedule to its config. Pin `paused` in config for permanence. Returns `false` for an unknown key.
+- **`triggerSchedule(key)`** starts the schedule's current window immediately. It is idempotent by the window's deterministic run id — triggering a window that already fired returns the existing run instead of forking a duplicate. Returns `null` for an unknown key.
+
+<Callout type="info">
+Because a runtime pause rides the control plane, a fleet without one (a single instance, or in-process transports) still pauses — just only on the instance you called. With several ticking workers, wire a `controlPlane` so a console pause reaches them all.
+</Callout>
 
 ## Spreading the fleet — `jitter`
 

@@ -1,6 +1,6 @@
 ---
 title: Dashboard
-description: The embedded operations console — a React SPA plus a JSON API mounted into your AdonisJS routes. Filter runs, live-tail a run's timeline, fix-and-replay a bad input, act on runs in bulk, and read the worker fleet's health.
+description: The embedded operations console — a React SPA plus a JSON API mounted into your AdonisJS routes. Filter runs, live-tail a run's timeline, fix-and-replay a bad input, deliver signals/updates/task completions, pause and trigger schedules, act on runs in bulk, and read the worker fleet's health — with the whole wire contract published as OpenAPI 3.1.
 icon: LayoutDashboard
 ---
 
@@ -144,6 +144,8 @@ The console routes client-side on the URL hash (`#/run/<id>`), so a deep link ne
 | `workflow` | exact workflow-name match. Repeatable — repeats match ANY of them. |
 | `tag` | exact match against the run's tags. Repeatable — repeats match runs carrying ANY of them. |
 | `namespace` | exact match against the run's [worker-pool namespace](/docs/durable/cluster/roles-and-config) — omit it and the listing spans every namespace. Repeatable — repeats match ANY of them. |
+| `origin` | exact match against the run's [package attribution](/docs/durable/concepts/workflows-and-steps#run-origin--package-attribution). The "unknown" bucket (absent origin) can't be expressed as an exact match — the console filters that one client-side. |
+| `createdAfter` / `createdBefore` | time-range bounds on the run's creation, as epoch ms or an ISO date string — pushed down server-side. |
 | `attr` | a [search-attribute](/docs/durable/authoring/queries-and-updates) filter, `key:op:value`. Repeatable, and repeats are ANDed — opaque in the envelope too (`filter[attr]`), since attribute keys are dynamic; `filter[attr.<key>][<op>]=value` works as well. |
 | `limit` | page size, default `50`, capped at `200` |
 | `offset` | page offset, default `0` |
@@ -192,6 +194,10 @@ The stream sends no keepalive comments and has no server-side idle timeout — i
 | `POST` | `/durable/api/runs/:id/continue` | resume a run parked at a `ctx.breakpoint()` |
 | `POST` | `/durable/api/runs/:id/cancel` | cancel the run — ask for the saga undo with `?compensate=true` or a `{ compensate: true }` body |
 | `POST` | `/durable/api/runs/:id/redispatch` | re-enqueue every remote step still `pending` on this run |
+| `POST` | `/durable/api/runs/:id/signal` | deliver a signal payload on a token the run is waiting on |
+| `POST` | `/durable/api/runs/:id/update/:name` | deliver a validated update to a `ctx.onUpdate` point |
+| `POST` | `/durable/api/runs/:id/tasks/:name/complete` | complete an external `ctx.task` |
+| `POST` | `/durable/api/runs/:id/tasks/:name/fail` | fail an external `ctx.task` |
 | `POST` | `/durable/api/bulk/:action` | apply `retry` or `cancel` to everything a filter matches |
 
 Every one of these is **non-blocking**: they enqueue work and return, never replaying a workflow inline in the HTTP request.
@@ -221,6 +227,16 @@ The link between the two is the run id itself: the new id is `<originalRunId>~re
 
 It answers `404` with `run <id> is not paused at a breakpoint` when the run has no pending breakpoint checkpoint, so the call is safe to fire blindly.
 
+#### Human-in-the-loop: signals, updates and tasks
+
+The runs list already *names* what a suspended run is parked on (the [`waiting`](#the-waiting-state) column); these three verbs let the operator act on it from the console instead of dropping into a REPL:
+
+- **`POST /api/runs/:id/signal`** delivers `{ token, payload? }` to a [`ctx.waitForSignal`](/docs/durable/concepts/sleep-and-signals#signals-human-in-the-loop) rendezvous. It is **guarded**: unless you pass `force: true`, the token must be one the run is *currently waiting on* — a typo'd token would otherwise buffer a stray payload silently instead of resuming anything. A mismatch answers `409` carrying the `waitingOn` token list, so a client can offer the real choices; `force: true` buffers the payload anyway (the reliable-delivery path).
+- **`POST /api/runs/:id/update/:name`** delivers `{ arg? }` to a [`ctx.onUpdate(name)`](/docs/durable/authoring/queries-and-updates#updates) point. The workflow's registered validator arbitrates **server-side**: a rejection answers `422` with the reason, and nothing is delivered.
+- **`POST /api/runs/:id/tasks/:name/complete`** (body `{ result? }`) and **`.../fail`** (body `{ error }`) settle an external [`ctx.task`](/docs/durable/authoring/external-tasks#external-async-completion-tasks--ctxtask) — the console equivalents of `engine.completeTask` / `engine.failTask`. The response is honest about delivery: `{ result, delivered: true }` when a live waiter consumed it, `{ result: null, delivered: false }` when no waiter was live *yet* and the completion was **buffered** for the run to consume when it reaches the task's wait — buffered is success, not a 404.
+
+On a store-less `tenant` pod these verbs answer `404` (like `retry-with-input` and `continue`) — they need the engine's signal surface.
+
 #### Bulk actions
 
 `POST /api/bulk/:action` applies one action to **everything a filter matches**, where `:action` is `retry` or `cancel` (anything else is a `400`). The selection comes from the query string, using the same `status` / `workflow` / `tag` / `namespace` / `attr` filters as `GET /api/runs` — there is no id list to assemble:
@@ -248,6 +264,17 @@ The response is `{ matched, applied }`. `matched` is how many runs the filter re
 The filter is evaluated with a hard cap of 500 and no paging. A filter matching more than that silently acts on the first 500 — narrow the filter (a tighter `namespace`, a time-bounded `attr`) and repeat, rather than assuming one call drained the backlog. Compare `matched` against `500` to tell.
 </Callout>
 
+### Schedules
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `GET` | `/durable/api/schedules` | the ticked schedules with their live control state and fire windows |
+| `POST` | `/durable/api/schedules/:key/pause` | pause the schedule at runtime, fleet-wide |
+| `POST` | `/durable/api/schedules/:key/resume` | resume it |
+| `POST` | `/durable/api/schedules/:key/trigger` | fire the current window now (idempotent) |
+
+These are the console's Schedules tab, riding [`engine.listSchedules` / `setSchedulePaused` / `triggerSchedule`](/docs/durable/authoring/scheduling#runtime-control--pause-resume-run-now). The listing returns `{ schedules }`, each entry carrying the cadence (`cron`/`everyMs`/`timezone`), the *effective* `paused` state with a `pausedAtRuntime` flag telling you whether a console override (which wins over config until the next deploy) is in force, the current window's `lastFireAt`/`nextFireAt`/`currentWindowRunId`, and that run's `lastRunStatus` when it exists. `trigger` is idempotent by the window's deterministic run id — triggering a window that already fired returns the existing run rather than forking a duplicate. An unknown `:key` answers `404`; an action other than `pause`/`resume`/`trigger` is a `400`.
+
 ### Fleet and topology
 
 | Method | Route | Purpose |
@@ -256,8 +283,11 @@ The filter is evaluated with a hard cap of 500 and no paging. A filter matching 
 | `GET` | `/durable/api/health` | the compact shape: queue depth and a `stalled` flag per group |
 | `GET` | `/durable/api/topology` | this pod's `role`, plus its `tenant` when it is a store-less pod |
 | `GET` | `/durable/api/compat` | protocol/capability negotiation across the fleet, plus blocked runs |
+| `GET` | `/durable/api/openapi.json` | the machine-readable API contract (OpenAPI 3.1) |
 
 `GET /api/workers` returns the raw `GroupHealth[]` — for each routing token, its queue `depth` and the **individual live workers** with their `instanceId` and `lastBeatAt`. That is what tells "one worker is wedged" apart from "the whole group is down".
+
+On the [BullMQ transport](/docs/durable/cluster/interop), each worker's heartbeat also carries a live `status` telemetry snapshot (`WorkerStatus`) that the console renders on its worker cards: the concurrency mode and limit (`fixed` or `adaptive`, with `min`/`max`), `inFlight`, RSS (`rssBytes`, plus `rssLimitBytes`/`rssPct` when a ceiling is known), `cpuPct`, `throughputPerMin`, `p95Ms`, and the last adaptive concurrency adjustment with its reason. Workers on other transports simply omit `status` — the cards degrade to liveness only.
 
 `GET /api/health` is the older, compact view of the same data: it collapses `liveWorkers` to a count and adds `stalled: depth > 0 && liveWorkers === 0`. It stays for hand-written clients and probes; prefer `/api/workers` for anything new.
 
@@ -267,12 +297,14 @@ The routes are all named (`durable_dashboard.index`, `durable_dashboard.runs.sho
 
 ## What it shows
 
-- **Runs** — every run with its status, filterable by status, workflow, tag, namespace and search attribute. The tag, tenant and attribute filters are value pickers: they list what the runs actually contain (counted server-side over the rest of the active filter, searchable, paged), take several values at once, and still accept a typed value. `pending` is a run created and enqueued but not yet picked up; a `dead` run carries a distinct badge so a [poison pill](/docs/durable/reliability/dead-letter) is easy to spot.
+- **Runs** — every run with its status, filterable by status, workflow, tag, namespace, [origin](/docs/durable/concepts/workflows-and-steps#run-origin--package-attribution), creation time and search attribute. The tag, tenant and attribute filters are value pickers: they list what the runs actually contain (counted server-side over the rest of the active filter, searchable, paged), take several values at once, and still accept a typed value. `pending` is a run created and enqueued but not yet picked up; a `dead` run carries a distinct badge so a [poison pill](/docs/durable/reliability/dead-letter) is easy to spot.
 - **What a suspended run is waiting on** — a `suspended` run parked on a signal, a webhook callback, a child run or a breakpoint is surfaced as **waiting**, with what it is blocked on right in the row (`signal approve`, `child ord-42.child.0`, `breakpoint`). See below.
 - **Step timeline** — the selected run's steps in order, tagged by kind (local / remote / sleep / signal), with worker group, queue wait and duration. In-flight steps appear while they run, not only on completion — a remote step in flight reads as `pending`, and a local step's executing body as `running` (the [`trackStepStart`](/docs/durable/concepts/workflows-and-steps#in-flight-visibility) option).
 - **Live tail** — the open run streams its events over SSE, so a long run updates without a reload.
 - **Children and lineage** — a run's [child workflows](/docs/durable/authoring/child-workflows) are linked from its detail, as is the original of a fix-and-replay run.
-- **Actions** — retry, cancel, cancel + undo ([saga compensation](/docs/durable/reliability/sagas)), fix-and-replay, redispatch, continue, and the bulk equivalents of retry and cancel.
+- **Actions** — retry, cancel, cancel + undo ([saga compensation](/docs/durable/reliability/sagas)), fix-and-replay, redispatch, continue, the [human-in-the-loop verbs](#human-in-the-loop-signals-updates-and-tasks) (deliver a signal, a validated update, or a task completion), and the bulk equivalents of retry and cancel.
+- **Schedules** — the ticked [scheduled workflows](/docs/durable/authoring/scheduling) with their fire windows and effective pause state, plus pause / resume / run-now controls that apply fleet-wide at runtime.
+- **Worker cards** — on the BullMQ transport, each worker's live telemetry: concurrency, in-flight, RSS/CPU, throughput and p95.
 
 ### The `waiting` state
 
@@ -296,11 +328,11 @@ When you run a [split or polyglot cluster](/docs/durable/cluster), the console g
 - **Per pod** — its protocol version, negotiated level (**compatible** / **degraded** / **incompatible**), and a red flag with the exact reason on a mismatch (e.g. *"no common protocol major: local speaks [1, 1], remote speaks [2, 2]"*).
 - **Blocked runs** — runs parked because no live worker advertises a [required capability](/docs/durable/cluster/handshake#capability-aware-routing), so a stuck fleet is diagnosable at a glance rather than a silent hang.
 
-A store-less `tenant` api/dashboard pod serves this same view — its reads proxy to the control plane over the wire, so the panel looks identical whether or not the pod owns a store. Two verbs have no wire equivalent yet and always answer `404` on such a pod: `retry-with-input` and `continue`.
+A store-less `tenant` api/dashboard pod serves this same view — its reads proxy to the control plane over the wire, so the panel looks identical whether or not the pod owns a store. Some verbs have no wire equivalent yet and always answer `404` on such a pod: `retry-with-input`, `continue`, the [human-in-the-loop verbs](#human-in-the-loop-signals-updates-and-tasks) (`signal`, `update`, `tasks/*`), and the [schedule controls](#schedules).
 
 ## Calling the API directly
 
-The JSON API is a small, framework-light surface — `listRuns`, `getRun`, `retryRun`, `retryWithInputRun`, `continueRun`, `redispatchPendingRun`, `cancelRun`, `bulkAction`, `health`, `workers`, `topology` and `compat`, all exported from `@adonis-agora/durable/dashboard` — so you can build your own UI or operational scripts on the same routes:
+The JSON API is a small, framework-light surface — `listRuns`, `getRun`, `runValues`, `retryRun`, `retryWithInputRun`, `continueRun`, `redispatchPendingRun`, `cancelRun`, `bulkAction`, `health`, `workers`, `topology` and `compat`, all exported from `@adonis-agora/durable/dashboard` — so you can build your own UI or operational scripts on the same routes. The full wire contract, human-in-the-loop and schedule verbs included, is published as [the OpenAPI document](#the-openapi-contract):
 
 ```ts
 // Retry every run that failed on a transient charge error, in one call.
@@ -314,5 +346,9 @@ if (matched === 500) {
   // The cap was hit — narrow the filter and repeat.
 }
 ```
+
+### The OpenAPI contract
+
+`GET /durable/api/openapi.json` serves a hand-written **OpenAPI 3.1** document describing every route above — paths, request bodies, response shapes, the run and checkpoint schemas. It is the single machine-readable statement of the wire contract: generate a typed client from it, diff it in CI to catch a response reshaping, or import it into an API console. It is kept in lockstep with the handlers by a spec that asserts the document matches the registered route table, so it cannot silently drift.
 
 For deep operational health views (success rate, throughput, top failures) inside your existing observability UI, see the [Telescope](/docs/durable/observability/telescope) integration.
