@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 0.38.1
+
+### Patch Changes
+
+- [#128](https://github.com/DavideCarvalho/adonis-agora-durable/pull/128) [`0968a3e`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/0968a3e6512381f2594b642aa0d0bca3e728c15f) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `attachDurableOtel`'s root span now closes (error status, matching `run.failed`) when a run parks `blocked` via `capability.unavailable`/`protocol.incompatible`, instead of leaking — those two events never previously reached `endRoot()`, so a run stuck waiting on a missing capability or an incompatible worker fleet held its root span (and its entry in the bridge's internal `roots` Map) open for the rest of the process's life. Resuming a blocked run doesn't re-emit `run.started`, so no second root span opens for it later.
+
 ## 0.38.0
 
 ### Minor Changes
