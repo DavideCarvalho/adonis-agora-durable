@@ -4159,13 +4159,21 @@ export class WorkflowEngine {
    * workflow registered, a transient store error), `resumeDueTimers` re-drives it. Resuming twice is
    * safe (the run lease admits one executor and replay is positional); dropping the drive is not, so
    * the background resume is tracked (never an untracked floating promise) and its rejection captured
-   * (never an unhandled rejection) — a failure surfaces as a still-`suspended` run that recovery
-   * re-drives, never as a silent strand.
+   * (never an unhandled rejection) — a failure warns and surfaces as a still-`suspended` run that
+   * recovery re-drives, never as a silent strand.
    */
   private async completeRemoteResult(result: StepResult): Promise<void> {
     const runId = await this.settleRemoteCheckpoint(result);
     if (runId === undefined) return;
-    this.trackEffect(this.resume(runId).catch(() => undefined));
+    this.trackEffect(
+      this.resume(runId).catch((err) => {
+        console.warn(
+          `[adonis-durable] background resume of run ${runId} failed (the run recovers on its next reconcile wake): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }),
+    );
   }
 
   /**
@@ -4187,9 +4195,10 @@ export class WorkflowEngine {
     // This does TWO durable things — settle the checkpoint, then resume the run — and only the first
     // is idempotent by its own state. So an already-settled checkpoint does NOT mean the resume half
     // also happened: the instance that settled it may have died in between, or thrown on the resume
-    // (a pod without this workflow registered), and a run suspended on a remote step carries no
-    // `wakeAt` — no timer or recovery sweep would ever pick it up again. A redelivered result must
-    // therefore re-drive the resume rather than be dropped. Resuming twice is safe (the run lease
+    // (a pod without this workflow registered), and the run stays `suspended` with its reconcile
+    // `wakeAt` — so `resumeDueTimers` re-drives it even if that resume never ran. A redelivered
+    // result must therefore re-drive the resume now rather than wait out the reconcile interval.
+    // Resuming twice is safe (the run lease
     // admits one executor and replay is positional); dropping the last copy is not.
     //
     // UNLESS the run is TERMINAL: resuming replays it back to LIFE (observed in production — a late
