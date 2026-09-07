@@ -56,10 +56,10 @@ importers:
         version: 22.4.2(@adonisjs/assembler@8.5.0(typescript@7.0.2))(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.0.3)(luxon@3.7.2)(supports-color@10.2.2)
       '@adonisjs/queue':
         specifier: 0.6.2
-        version: 0.6.2(@adonisjs/assembler@8.5.0(typescript@7.0.2))(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(@adonisjs/lucid@22.4.2(@adonisjs/assembler@8.5.0(typescript@7.0.2))(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.0.3)(luxon@3.7.2)(supports-color@10.2.2))(@adonisjs/redis@10.0.1(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(supports-color@10.2.2))(@opentelemetry/api@1.9.1)(@opentelemetry/core@2.10.0(@opentelemetry/api@1.9.1))(ioredis@6.0.0(supports-color@10.2.2))(knex@3.3.0(better-sqlite3@13.0.3)(supports-color@10.2.2))
+        version: 0.6.2(@adonisjs/assembler@8.5.0(typescript@7.0.2))(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(@adonisjs/lucid@22.4.2(@adonisjs/assembler@8.5.0(typescript@7.0.2))(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.0.3)(luxon@3.7.2)(supports-color@10.2.2))(@adonisjs/redis@11.0.0(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(supports-color@10.2.2))(@opentelemetry/api@1.9.1)(@opentelemetry/core@2.10.0(@opentelemetry/api@1.9.1))(ioredis@6.0.0(supports-color@10.2.2))(knex@3.3.0(better-sqlite3@13.0.3)(supports-color@10.2.2))
       '@adonisjs/redis':
-        specifier: 10.0.1
-        version: 10.0.1(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(supports-color@10.2.2)
+        specifier: 11.0.0
+        version: 11.0.0(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(supports-color@10.2.2)
       '@opentelemetry/api':
         specifier: 1.9.1
         version: 1.9.1
@@ -385,8 +385,8 @@ packages:
       '@adonisjs/redis':
         optional: true
 
-  '@adonisjs/redis@10.0.1':
-    resolution: {integrity: sha512-2CutgR3wtJPOIQZztDgZeZUXpatHA8DDPsdkizxR22/lxP9/uJ6d/K0LlTS3iqfc6xjoB+pPb7Wzt6SMX5P+BQ==}
+  '@adonisjs/redis@11.0.0':
+    resolution: {integrity: sha512-NXPzn8fC7fjRRbuRC9nVIvEQyuZrf45OFH2sp2EU0MUuMO/Y7CSORHeFfe9TxJQOutmeOwwGoyXgWIh6owfi4w==}
     engines: {node: '>=24.0.0'}
     peerDependencies:
       '@adonisjs/core': ^7.0.0-next.0 || ^7.0.0
@@ -3792,14 +3792,14 @@ snapshots:
     optionalDependencies:
       '@adonisjs/assembler': 8.5.0(typescript@7.0.2)
 
-  '@adonisjs/queue@0.6.2(@adonisjs/assembler@8.5.0(typescript@7.0.2))(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(@adonisjs/lucid@22.4.2(@adonisjs/assembler@8.5.0(typescript@7.0.2))(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.0.3)(luxon@3.7.2)(supports-color@10.2.2))(@adonisjs/redis@10.0.1(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(supports-color@10.2.2))(@opentelemetry/api@1.9.1)(@opentelemetry/core@2.10.0(@opentelemetry/api@1.9.1))(ioredis@6.0.0(supports-color@10.2.2))(knex@3.3.0(better-sqlite3@13.0.3)(supports-color@10.2.2))':
+  '@adonisjs/queue@0.6.2(@adonisjs/assembler@8.5.0(typescript@7.0.2))(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(@adonisjs/lucid@22.4.2(@adonisjs/assembler@8.5.0(typescript@7.0.2))(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.0.3)(luxon@3.7.2)(supports-color@10.2.2))(@adonisjs/redis@11.0.0(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(supports-color@10.2.2))(@opentelemetry/api@1.9.1)(@opentelemetry/core@2.10.0(@opentelemetry/api@1.9.1))(ioredis@6.0.0(supports-color@10.2.2))(knex@3.3.0(better-sqlite3@13.0.3)(supports-color@10.2.2))':
     dependencies:
       '@adonisjs/assembler': 8.5.0(typescript@7.0.2)
       '@adonisjs/core': 7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1)
       '@boringnode/queue': 0.6.0(@opentelemetry/api@1.9.1)(@opentelemetry/core@2.10.0(@opentelemetry/api@1.9.1))(ioredis@6.0.0(supports-color@10.2.2))(knex@3.3.0(better-sqlite3@13.0.3)(supports-color@10.2.2))
     optionalDependencies:
       '@adonisjs/lucid': 22.4.2(@adonisjs/assembler@8.5.0(typescript@7.0.2))(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.0.3)(luxon@3.7.2)(supports-color@10.2.2)
-      '@adonisjs/redis': 10.0.1(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(supports-color@10.2.2)
+      '@adonisjs/redis': 11.0.0(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(supports-color@10.2.2)
     transitivePeerDependencies:
       - '@opentelemetry/api'
       - '@opentelemetry/core'
@@ -3807,7 +3807,7 @@ snapshots:
       - ioredis
       - knex
 
-  '@adonisjs/redis@10.0.1(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(supports-color@10.2.2)':
+  '@adonisjs/redis@11.0.0(@adonisjs/core@7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(supports-color@10.2.2)':
     dependencies:
       '@adonisjs/core': 7.5.0(@adonisjs/assembler@8.5.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1)
       '@poppinss/utils': 7.0.1
