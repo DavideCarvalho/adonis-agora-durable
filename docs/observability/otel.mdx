@@ -25,6 +25,8 @@ It creates one root span per run and one child span per step (local / remote / s
 
 It subscribes to the same engine lifecycle events the [dashboard](/docs/durable/observability/dashboard) and the [Telescope](/docs/durable/observability/telescope) view use — three views of one event log. OTel is for **debugging in production** (latency, correlation, alerts); the dashboard is for **operating** the workflow.
 
+> **Already running Telescope?** If your app has [`@adonis-agora/telescope`](/docs/telescope) installed *and* configured with [`otel.enabled: true`](/docs/telescope/packages/otel), you likely don't need to wire `attachDurableOtel` at all. Telescope's generic OTel bridge already turns durable's own `agora:durable:*` diagnostics events (emitted via `diagnostics-bridge.ts` — the same events the [Telescope view](/docs/durable/observability/telescope) uses) into OTLP spans and logs, alongside every other Agora library's events, in one place — zero durable-specific code required. Prefer that route when both libs are present. Reach for durable's own bridge on this page only when Telescope isn't part of the stack, or when you specifically want durable's root-span-per-run / child-span-per-step shape (Telescope's generic bridge parents spans under the resolved trace id only, not under a sibling run span).
+
 ## Lightweight metrics
 
 If you want dependency-free counters and latency percentiles without a full OTel pipeline, `attachDurableMetrics(engine)` collects them from the same events:
