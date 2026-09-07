@@ -709,7 +709,9 @@ export class WorkflowEngine {
           return;
         }
         // Durable path: no in-memory waiter (the step suspended the run, possibly on another
-        // instance) → complete the checkpoint and resume the run here.
+        // instance) → settle the checkpoint and resume the run here. The settle is awaited so the
+        // result isn't acked before it's durable, but the resume is fire-and-forget (see
+        // completeRemoteResult) so a resumed turn awaiting its NEXT step can't wedge this serial loop.
         await this.completeRemoteResult(result);
       },
       // A heartbeat for an in-flight long step resets its liveness window (see callRemote) and is
@@ -4142,10 +4144,47 @@ export class WorkflowEngine {
   /**
    * Complete a durable remote step from its worker result and resume the run — runs on whichever
    * instance receives the result (the dispatching one may be gone), so the run is crash/scale-safe.
+   *
+   * The checkpoint settle is AWAITED, but the resume is FIRE-AND-FOREGET (tracked for `drain`,
+   * rejection-captured). Awaiting the resumed turn here wedged the transport's serial results loop:
+   * the turn can itself await the NEXT remote step in-memory (a `timeoutMs` step dispatches and parks
+   * on its `pending` waiter), whose result arrives on that SAME loop — so the first result's job was
+   * never acked and the awaited second result queued behind it, a self-deadlock broken only when the
+   * step's liveness timer fired. Settling first means the ack (`completeJob` / row delete, which runs
+   * when this handler returns) always lands promptly and the next result is consumed.
+   *
+   * At-least-once resume is preserved via run STATE, not by holding the job: the checkpoint is
+   * durably settled before the resume is kicked, and the run stays `suspended` with its reconcile
+   * `wakeAt` — so if this process dies mid-turn, or the background resume throws (a pod without this
+   * workflow registered, a transient store error), `resumeDueTimers` re-drives it. Resuming twice is
+   * safe (the run lease admits one executor and replay is positional); dropping the drive is not, so
+   * the background resume is tracked (never an untracked floating promise) and its rejection captured
+   * (never an unhandled rejection) — a failure warns and surfaces as a still-`suspended` run that
+   * recovery re-drives, never as a silent strand.
    */
   private async completeRemoteResult(result: StepResult): Promise<void> {
+    const runId = await this.settleRemoteCheckpoint(result);
+    if (runId === undefined) return;
+    this.trackEffect(
+      this.resume(runId).catch((err) => {
+        console.warn(
+          `[adonis-durable] background resume of run ${runId} failed (the run recovers on its next reconcile wake): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }),
+    );
+  }
+
+  /**
+   * The durable half of {@link completeRemoteResult}: settle `result` onto its checkpoint (or re-drive
+   * the resume when a redelivered result finds it already settled). Returns the run to resume, or
+   * `undefined` when no resume is wanted (no checkpoint, or a late result for a terminal run —
+   * terminal is terminal).
+   */
+  private async settleRemoteCheckpoint(result: StepResult): Promise<string | undefined> {
     const cp = await this.store.getCheckpoint(result.runId, result.seq);
-    if (!cp) return;
+    if (!cp) return undefined;
     const run = await this.store.getRun(result.runId);
     const terminal =
       run != null &&
@@ -4156,9 +4195,10 @@ export class WorkflowEngine {
     // This does TWO durable things — settle the checkpoint, then resume the run — and only the first
     // is idempotent by its own state. So an already-settled checkpoint does NOT mean the resume half
     // also happened: the instance that settled it may have died in between, or thrown on the resume
-    // (a pod without this workflow registered), and a run suspended on a remote step carries no
-    // `wakeAt` — no timer or recovery sweep would ever pick it up again. A redelivered result must
-    // therefore re-drive the resume rather than be dropped. Resuming twice is safe (the run lease
+    // (a pod without this workflow registered), and the run stays `suspended` with its reconcile
+    // `wakeAt` — so `resumeDueTimers` re-drives it even if that resume never ran. A redelivered
+    // result must therefore re-drive the resume now rather than wait out the reconcile interval.
+    // Resuming twice is safe (the run lease
     // admits one executor and replay is positional); dropping the last copy is not.
     //
     // UNLESS the run is TERMINAL: resuming replays it back to LIFE (observed in production — a late
@@ -4167,15 +4207,15 @@ export class WorkflowEngine {
     // compensations already ran). Terminal is terminal — recovery of a failed run belongs to an
     // explicit `requeue`/`durable:retry`, never to a stray result.
     if (cp.status !== 'pending') {
-      if (!terminal) await this.resume(result.runId);
-      return;
+      if (!terminal) return result.runId;
+      return undefined;
     }
     // A result settling this step frees its flow-control slot (no-op if it wasn't queued). Done
     // before the terminal-run early-returns below, so a cancellation can't leak the slot.
     await this.releaseQueueSlot(cp);
     // Drop a late result for a run that was cancelled/finished meanwhile — don't complete the step
     // or resume (the run is already terminal). This is the engine side of cooperative cancellation.
-    if (run && (run.status === 'cancelled' || run.status === 'completed')) return;
+    if (run && (run.status === 'cancelled' || run.status === 'completed')) return undefined;
     // A late SUCCESS for a failed/dead run: salvage the finished work onto the checkpoint — an
     // explicit retry's replay then short-circuits this step instead of re-running it (the work may
     // be minutes of real compute) — but never resume. A late FAILURE has nothing to salvage: drop.
@@ -4190,7 +4230,7 @@ export class WorkflowEngine {
           finishedAt: new Date(),
         });
       }
-      return;
+      return undefined;
     }
     const finishedAt = new Date();
     const startedAt = result.startedAt ? new Date(result.startedAt) : cp.startedAt;
@@ -4214,7 +4254,7 @@ export class WorkflowEngine {
       queueMs: startedAt.getTime() - cp.enqueuedAt.getTime(),
       durationMs: finishedAt.getTime() - startedAt.getTime(),
     });
-    await this.resume(result.runId);
+    return result.runId;
   }
 
   /**
