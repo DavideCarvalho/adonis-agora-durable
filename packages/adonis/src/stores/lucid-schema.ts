@@ -41,13 +41,67 @@ export interface CreateDurableTablesOptions {
 function repairWarning(repairs: string[]): string {
   return [
     `@adonis-agora/durable: repaired the durable schema in place — added ${repairs.join(', ')}.`,
-    'The database was behind the installed library version, so these columns were added at runtime',
+    'The database was behind the installed library version, so these were added at runtime',
     'and nothing recorded it in your migration history. To record it (and to stop depending on the',
     'runtime repair), add a migration that calls `createDurableTables(db, this.db.connectionName)`',
     "with `db` from '@adonisjs/lucid/services/db' — the same call the generated",
     'create_durable_tables migration makes. This warning appears only when a repair was actually',
     'applied; a schema that is already current logs nothing.',
   ].join(' ');
+}
+
+/**
+ * Does an index with this name exist in the connection's current schema? Returns `null` for
+ * dialects outside the store's three declared targets (SQLite / Postgres / MySQL), which the
+ * caller handles by falling back to the legacy best-effort create.
+ *
+ * The probe is load-bearing, not an optimization: the index-only repair used to `CREATE INDEX`
+ * blindly and swallow the `already exists` failure in a `try/catch`. That pattern is safe only
+ * in autocommit. INSIDE an open transaction a failed statement aborts the whole transaction
+ * (Postgres' 25P02 "current transaction is aborted") — and the swallowed error leaves the caller
+ * with a poisoned transaction and zero signal: every later statement on it cascades. A read-only
+ * catalog `SELECT` can never fail that way, so the repair never touches the database unless the
+ * index is genuinely missing.
+ */
+async function indexExists(
+  db: Database,
+  connectionName: string | undefined,
+  indexName: string,
+): Promise<boolean | null> {
+  const connection = db.connection(connectionName);
+  switch (connection.dialect.name) {
+    case 'postgres': {
+      const rows = await connection
+        .query()
+        .from('pg_indexes')
+        .where('indexname', indexName)
+        .andWhereRaw('schemaname = current_schema()')
+        .limit(1);
+      return rows.length > 0;
+    }
+    case 'sqlite3':
+    case 'better-sqlite3':
+    case 'libsql': {
+      const rows = await connection
+        .query()
+        .from('sqlite_master')
+        .where('type', 'index')
+        .andWhere('name', indexName)
+        .limit(1);
+      return rows.length > 0;
+    }
+    case 'mysql': {
+      const rows = await connection
+        .query()
+        .from('information_schema.statistics')
+        .where('index_name', indexName)
+        .andWhereRaw('table_schema = database()')
+        .limit(1);
+      return rows.length > 0;
+    }
+    default:
+      return null;
+  }
 }
 
 /**
@@ -80,10 +134,33 @@ export async function createDurableTables(
   // exactly once, all on the store's own connection.
   const conn = () => db.connection(connectionName).schema;
 
-  // `<table>.<column>` for every ALTER actually issued below. Stays empty on the fresh-install path
-  // (a missing table is CREATEd whole and never reaches a `hasColumn` branch), which is what makes
-  // the warning at the end mean "your schema was wrong" instead of "boot happened".
+  // `<table>.<column-or-index>` for every ALTER actually issued below. Stays empty on the
+  // fresh-install path (a missing table is CREATEd whole and never reaches a `hasColumn` branch),
+  // which is what makes the warning at the end mean "your schema was wrong" instead of "boot happened".
   const repairs: string[] = [];
+
+  // Create an index ONLY when the catalog says it is missing (see `indexExists` for why the
+  // probe replaced the old create-and-swallow). On dialects the probe doesn't cover, the legacy
+  // best-effort path stays — still transaction-unsafe, but only outside the store's declared
+  // targets.
+  const ensureIndex = async (
+    table: string,
+    columns: string[],
+    indexName: string,
+  ): Promise<void> => {
+    const known = await indexExists(db, connectionName, indexName);
+    if (known === true) return;
+    if (known === null) {
+      try {
+        await conn().alterTable(table, (indexTable) => indexTable.index(columns, indexName));
+      } catch {
+        /* the index already exists — expected on every boot after the first */
+      }
+      return;
+    }
+    await conn().alterTable(table, (indexTable) => indexTable.index(columns, indexName));
+    repairs.push(`${table}.${indexName}`);
+  };
 
   if (!(await conn().hasTable(DURABLE_TABLES.runs))) {
     await conn().createTable(DURABLE_TABLES.runs, (table) => {
@@ -140,16 +217,9 @@ export async function createDurableTables(
       });
       repairs.push(`${DURABLE_TABLES.runs}.origin`);
     }
-    // Index-only repair (no hasColumn probe works for indexes portably; creating one that already
-    // exists throws, so probe by name via a best-effort create-and-swallow). The dashboard's default
-    // ordering needs it on big tables.
-    try {
-      await conn().alterTable(DURABLE_TABLES.runs, (table) => {
-        table.index(['created_at'], 'durable_runs_created_idx');
-      });
-    } catch {
-      /* the index already exists — expected on every boot after the first */
-    }
+    // Index-only repair: the dashboard's default (unfiltered) listing orders by created_at DESC —
+    // without this a page load over a large table is a full sort.
+    await ensureIndex(DURABLE_TABLES.runs, ['created_at'], 'durable_runs_created_idx');
   }
 
   if (!(await conn().hasTable(DURABLE_TABLES.checkpoints))) {
@@ -243,13 +313,7 @@ export async function createDurableTables(
       });
       repairs.push(`${DURABLE_TABLES.signalWaiters}.parallel_group`);
     }
-    try {
-      await conn().alterTable(DURABLE_TABLES.signalWaiters, (table) => {
-        table.index(['run_id'], 'durable_signal_waiters_run_idx');
-      });
-    } catch {
-      /* the index already exists — expected on every boot after the first */
-    }
+    await ensureIndex(DURABLE_TABLES.signalWaiters, ['run_id'], 'durable_signal_waiters_run_idx');
   }
 
   if (!(await conn().hasTable(DURABLE_TABLES.bufferedSignals))) {

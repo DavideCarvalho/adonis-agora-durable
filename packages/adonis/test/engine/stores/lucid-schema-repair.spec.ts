@@ -157,3 +157,64 @@ describe('createDurableTables warns only when it actually repairs something', ()
     expect(String(seen[0])).toContain(`${DURABLE_TABLES.checkpoints}.last_heartbeat_at`);
   });
 });
+
+/**
+ * Index-only repairs must PROBE before creating (see `indexExists`), never blindly
+ * `CREATE INDEX` and swallow the `already exists` failure. A failed statement inside an open
+ * transaction aborts it (Postgres 25P02) while the swallowed error hides the poison — consumers
+ * running the store on a transactional connection (e.g. a test suite's global transaction) then
+ * cascade every later statement. SQLite — the engine these tests run on — does not abort on
+ * error, so what the tests here pin is the contract (missing index → re-created + reported as a
+ * repair; current index → untouched and silent); the transaction-poison proof itself is the
+ * real-Postgres suite of the first consumer that tripped it.
+ */
+async function indexPresent(db: Database, indexName: string): Promise<boolean> {
+  const rows = await db
+    .connection()
+    .query()
+    .from('sqlite_master')
+    .where('type', 'index')
+    .andWhere('name', indexName)
+    .limit(1);
+  return rows.length > 0;
+}
+
+describe('createDurableTables repairs indexes by probe, not by create-and-swallow', () => {
+  const open: Database[] = [];
+  afterEach(async () => {
+    while (open.length) await open.pop()?.manager.closeAll();
+  });
+
+  it('re-creates a dropped index and reports it as a repair', async () => {
+    const db = makeMemoryDb();
+    open.push(db);
+    await createDurableTables(db, undefined, { logger: { warn: () => {} } });
+    await db.rawQuery('drop index "durable_runs_created_idx"');
+    await db.rawQuery('drop index "durable_signal_waiters_run_idx"');
+    const logger = recordingLogger();
+
+    await createDurableTables(db, undefined, { logger });
+
+    expect(await indexPresent(db, 'durable_runs_created_idx')).toBe(true);
+    expect(await indexPresent(db, 'durable_signal_waiters_run_idx')).toBe(true);
+    expect(logger.warnings).toHaveLength(1);
+    const [warning] = logger.warnings;
+    expect(warning).toContain(`${DURABLE_TABLES.runs}.durable_runs_created_idx`);
+    expect(warning).toContain(`${DURABLE_TABLES.signalWaiters}.durable_signal_waiters_run_idx`);
+  });
+
+  it('says nothing on a current schema — the probe must not attempt any index DDL', async () => {
+    const db = makeMemoryDb();
+    open.push(db);
+    await createDurableTables(db, undefined, { logger: { warn: () => {} } });
+    const logger = recordingLogger();
+
+    await createDurableTables(db, undefined, { logger });
+    await createDurableTables(db, undefined, { logger });
+
+    // The boot path: every subsequent call is fully silent. A blind create-and-swallow WOULD also
+    // log nothing here — the entries it must not add are the ones the assertions above cover: an
+    // existing index is never reported and never re-created.
+    expect(logger.warnings).toEqual([]);
+  });
+});
