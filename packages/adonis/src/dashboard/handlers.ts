@@ -123,6 +123,19 @@ export interface DashboardEngine {
 /** The read/control port the handlers operate over (a store engine or a tenant gateway adapter). */
 export interface Deps {
   engine: DashboardEngine;
+  /** Host redaction hooks over the SERIALIZED run/checkpoint shapes (see the config's `redact`). */
+  redact?: {
+    run?: (run: Record<string, unknown>) => Record<string, unknown>;
+    checkpoint?: (checkpoint: Record<string, unknown>) => Record<string, unknown>;
+  };
+}
+
+/** Apply the host's redaction hook to a serialized shape (identity when unconfigured). */
+function redacted(
+  hook: ((row: Record<string, unknown>) => Record<string, unknown>) | undefined,
+  row: Record<string, unknown>,
+): Record<string, unknown> {
+  return hook ? hook(row) : row;
 }
 
 /** The subset of an HTTP request the handlers read. */
@@ -152,6 +165,21 @@ const badRequest = (message: string): ApiResponse => ({
   status: 400,
   body: { error: message },
 });
+
+/** Library-level ceiling for operator-supplied payloads (fix-and-replay input, signal/update/task
+ *  bodies): 1 MiB of JSON. The host's bodyparser limit still applies first; this guards deployments
+ *  whose global limit is generous — a multi-megabyte payload becomes run history replayed on every
+ *  turn, forever. */
+const MAX_ACTION_PAYLOAD_BYTES = 1024 * 1024;
+const payloadTooLarge = (value: unknown): ApiResponse | null => {
+  if (value === undefined) return null;
+  const bytes = Buffer.byteLength(JSON.stringify(value) ?? '');
+  if (bytes <= MAX_ACTION_PAYLOAD_BYTES) return null;
+  return {
+    status: 413,
+    body: { error: `payload too large (${bytes} bytes; limit ${MAX_ACTION_PAYLOAD_BYTES})` },
+  };
+};
 
 /** Rejecting an unreadable `compensate` beats guessing: the two guesses are "skip an undo the
  *  operator asked for" and "run an undo they did not", and both are silent. */
@@ -308,7 +336,7 @@ export async function listRuns(deps: Deps, req: ApiRequest): Promise<ApiResponse
     : await (engine.listSignalWaiters?.('') ?? Promise.resolve(undefined));
   const waiterByRun = waiters ? indexWaitersByRun(waiters) : undefined;
   return ok({
-    runs: runs.map((run) => summarizeRun(run, waiterByRun)),
+    runs: runs.map((run) => redacted(deps.redact?.run, summarizeRun(run, waiterByRun))),
     page: { limit, offset, count: runs.length },
     statuses: RUN_STATUSES,
   });
@@ -326,8 +354,8 @@ export async function getRun(deps: Deps, req: ApiRequest): Promise<ApiResponse> 
     engine.getRunChildren(id),
   ]);
   return ok({
-    run: detailRun(run),
-    timeline: timeline.map(summarizeCheckpoint),
+    run: redacted(deps.redact?.run, detailRun(run)),
+    timeline: timeline.map((cp) => redacted(deps.redact?.checkpoint, summarizeCheckpoint(cp))),
     children,
   });
 }
@@ -382,6 +410,8 @@ export async function retryWithInputRun(deps: Deps, req: ApiRequest): Promise<Ap
   const id = req.params.id;
   if (!id) return notFound('run id is required');
   const body = (req.body ?? {}) as { input?: unknown };
+  const tooLarge = payloadTooLarge(body.input);
+  if (tooLarge) return tooLarge;
   const result = await deps.engine.retryWithInput(id, body.input);
   if (!result) return notFound(`run ${id} not found`);
   return ok({ result });
@@ -414,6 +444,8 @@ export async function signalRun(deps: Deps, req: ApiRequest): Promise<ApiRespons
   const body = (req.body ?? {}) as { token?: unknown; payload?: unknown; force?: unknown };
   const token = typeof body.token === 'string' && body.token.length > 0 ? body.token : undefined;
   if (!token) return badRequest('token is required');
+  const tooLarge = payloadTooLarge(body.payload);
+  if (tooLarge) return tooLarge;
   const run = await engine.getRun(id);
   if (!run) return notFound(`run ${id} not found`);
   if (body.force !== true) {
@@ -450,6 +482,8 @@ export async function updateRun(deps: Deps, req: ApiRequest): Promise<ApiRespons
   if (!name) return notFound('update name is required');
   if (!engine.update) return notFound('updates are not available on this topology yet');
   const body = (req.body ?? {}) as { arg?: unknown };
+  const tooLarge = payloadTooLarge(body.arg);
+  if (tooLarge) return tooLarge;
   const result = await engine.update(id, name, body.arg);
   if (!result.accepted) {
     return { status: 422, body: { error: result.reason ?? 'update rejected', result } };
@@ -466,6 +500,8 @@ export async function completeTaskRun(deps: Deps, req: ApiRequest): Promise<ApiR
   if (!name) return notFound('task name is required');
   if (!engine.completeTask) return notFound('tasks are not available on this topology yet');
   const body = (req.body ?? {}) as { result?: unknown };
+  const tooLarge = payloadTooLarge(body.result);
+  if (tooLarge) return tooLarge;
   const result = await engine.completeTask(id, name, body.result);
   // A null result means no waiter was live YET — the completion was BUFFERED (reliable delivery:
   // the run consumes it when it reaches the task's wait). Report that instead of pretending a 404.

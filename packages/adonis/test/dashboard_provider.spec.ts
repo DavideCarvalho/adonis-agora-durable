@@ -96,7 +96,13 @@ describe('DashboardProvider — authorize hook owns its denial response', () => 
         state.headers.set('location', path);
       },
     };
-    const request = { plainCookie: () => undefined, url: () => '/durable' };
+    const request = {
+      plainCookie: () => undefined,
+      url: () => '/durable',
+      // enforce() now also classifies the method (cross-site guard) — a GET is the neutral case.
+      method: () => 'GET',
+      header: () => undefined,
+    };
     return { ctx: { response, request } as never, state };
   }
 

@@ -18,7 +18,10 @@ export interface DashboardSession {
   sub: string;
   /** Optional display name. */
   name?: string;
-  /** Free-form role strings; the dashboard does not interpret them. */
+  /** Role strings. The dashboard interprets ONE convention on its mutating API routes: a session
+   *  with a NON-EMPTY roles list must include `operator` (or `admin`) to retry/cancel/bulk/
+   *  fix-and-replay/signal/etc — everything else is a viewer. An EMPTY list keeps full access
+   *  (back-compat with host hooks that never set roles). */
   roles: string[];
   /** Issued-at, epoch milliseconds. */
   iat: number;

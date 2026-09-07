@@ -174,10 +174,18 @@ import { signTenantToken, hmacTenantVerifier } from '@adonis-agora/durable'
 
 // On the tenant pod — mint the token it presents (config.tenant.token):
 const token = signTenantToken('acme-corp', process.env.DURABLE_TENANT_SECRET!)
+// Optionally expiring (the `.exp<epochMs>` suffix is signed, so it can't be stripped/extended);
+// a captured token then stops replaying after the ttl instead of being valid forever:
+const shortLived = signTenantToken('acme-corp', process.env.DURABLE_TENANT_SECRET!, { ttlMs: 24 * 60 * 60 * 1000 })
 
-// On the control plane — verify it (config.verifyTenant):
-verifyTenant: hmacTenantVerifier(process.env.DURABLE_TENANT_SECRET!)
+// On the control plane — verify it (config.verifyTenant). A secret LIST makes rotation a
+// two-step deploy: verify with [next, current] first, then re-mint tokens with `next` at leisure:
+verifyTenant: hmacTenantVerifier([process.env.DURABLE_TENANT_SECRET_NEXT!, process.env.DURABLE_TENANT_SECRET!])
 ```
+
+<Callout type="warn">
+Without `verifyTenant`, the wire `tenant` field is trusted **verbatim** — any process with broker access can list, signal, cancel and start runs as any tenant (prefix/network isolation only). The responder now logs a loud warning at start when no verifier is configured; treat running without one as a conscious choice that your broker is fully isolated per tenant, not a default.
+</Callout>
 
 </Step>
 

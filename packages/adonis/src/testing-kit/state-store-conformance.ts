@@ -492,6 +492,14 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       },
     );
 
+    t('tag values containing LIKE metacharacters match exactly (no pattern widening)', async () => {
+      await store.createRun(run({ id: 'meta', tags: ['50%_off'] }));
+      await store.createRun(run({ id: 'decoy', tags: ['50x_off'] }));
+      // `%`/`_` in a tag VALUE are literals, not wildcards: `50%_off` must not match `50x_off`.
+      expect((await store.listRuns({ tag: '50%_off' })).map((r) => r.id)).toEqual(['meta']);
+      expect((await store.listRuns({ tags: ['50%_off'] })).map((r) => r.id)).toEqual(['meta']);
+    });
+
     t('listRuns pushes createdBefore/createdAfter/wakeBefore down as predicates', async () => {
       await store.createRun(run({ id: 'old', createdAt: new Date(1_000), updatedAt: at }));
       await store.createRun(run({ id: 'new', createdAt: new Date(9_000), updatedAt: at }));

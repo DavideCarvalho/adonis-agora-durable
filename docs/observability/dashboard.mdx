@@ -37,7 +37,22 @@ export default defineConfig({
 
 ### Authorization
 
-The default `authorize` is **open outside production**, and in production requires a bearer token equal to the `DURABLE_DASHBOARD_TOKEN` env var (it fails closed if the var is unset). The token is accepted from an `Authorization: Bearer <token>` header, an `x-durable-token` header, or a `?token=` query param. Override `authorize` with your own session/role/IP guard — a denied request gets a `403`: JSON for an API call, the [access-denied page](#the-access-denied-page) for a browser:
+The default `authorize` **fails closed in every environment**: it requires a bearer token equal to the `DURABLE_DASHBOARD_TOKEN` env var, and denies everything when that var is unset. (Before 0.37 it was open outside `NODE_ENV=production` — which left dev boxes, staging, and any deployment with a misspelled/unset `NODE_ENV` serving an unauthenticated console.) The token is accepted from an `Authorization: Bearer <token>` header or an `x-durable-token` header; the `?token=` query param works on **GET only** (it exists for the SSE live-tail, whose `EventSource` cannot set headers) — never on a mutating route, so a leaked/logged URL can't act as a destructive magic link.
+
+Three ways to open the console up, in order of preference:
+
+1. configure [`dashboardAuth`](/docs/durable/observability/dashboard-auth) — the session guard becomes the gate (the default token guard steps aside);
+2. set `DURABLE_DASHBOARD_TOKEN` (or supply your own `authorize`);
+3. for local development only, `allowUnauthenticated: true` serves the console with **no auth at all** — it exists so the old open-by-default behavior has to be spelled out in config (and greppable at review time). It logs a warning at boot.
+
+Two request-level guards apply on top of whatever gate you pick:
+
+- **Cross-site rejection** — a browser-originated cross-site mutating request (by `Sec-Fetch-Site`, else `Origin` vs `Host`) gets a `403` before any handler runs, closing the drive-by CSRF shape (the mutating endpoints need no body, so they used to be firable as simple cross-origin POSTs). Non-browser clients send neither header and pass.
+- **Session roles** — a `dashboardAuth` session whose `roles` list is **non-empty** must include `operator` (or `admin`) to hit a mutating route; everything else is a viewer (`403`). An empty/absent roles list keeps full access, so existing hooks that never set roles are unchanged.
+
+Every mutating attempt is also **audited** — actor (session name/id, `token`, or `anonymous`), method and path — through the app logger, or your own `audit` hook on the config. Payloads an operator submits (fix-and-replay input, signal/update/task bodies) are capped at 1 MiB (`413`).
+
+Override `authorize` with your own session/role/IP guard — a denied request gets a `403`: JSON for an API call, the [access-denied page](#the-access-denied-page) for a browser:
 
 ```ts
 export default defineConfig({

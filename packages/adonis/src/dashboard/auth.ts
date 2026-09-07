@@ -148,6 +148,9 @@ export function sanitizeReturnTo(candidate: unknown, fallback: string): string {
   if (!candidate.startsWith('/')) return fallback;
   if (candidate.startsWith('//')) return fallback;
   if (candidate.includes('://')) return fallback;
+  // Browsers normalize backslashes to slashes in URLs, so `/\evil.com` survives every check above
+  // yet navigates to `https://evil.com` — reject any backslash outright.
+  if (candidate.includes('\\')) return fallback;
   return candidate;
 }
 

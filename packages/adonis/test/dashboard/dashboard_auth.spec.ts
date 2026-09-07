@@ -77,6 +77,12 @@ describe('sanitizeReturnTo (open-redirect guard)', () => {
     expect(sanitizeReturnTo(undefined, BASE_PATH)).toBe(BASE_PATH);
     expect(sanitizeReturnTo(42, BASE_PATH)).toBe(BASE_PATH);
   });
+
+  it('rejects backslash variants — browsers normalize \\ to / so /\\evil.com escapes origin', () => {
+    expect(sanitizeReturnTo('/\\evil.com', BASE_PATH)).toBe(BASE_PATH);
+    expect(sanitizeReturnTo('/\\/evil.com', BASE_PATH)).toBe(BASE_PATH);
+    expect(sanitizeReturnTo('/durable\\..\\x', BASE_PATH)).toBe(BASE_PATH);
+  });
 });
 
 describe('performLogin', () => {

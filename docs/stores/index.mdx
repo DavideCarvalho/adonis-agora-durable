@@ -122,7 +122,11 @@ The conformance kit lives on the `@adonis-agora/durable/testing/conformance` sub
 
 ## Encrypting payloads at rest
 
-`CodecStateStore` decorates any store and runs run/step **payloads** through a `PayloadCodec` — encoded on write, decoded on read — so inputs and outputs are never stored in the clear. Searchable metadata (id, status, workflow, tags, namespace, timestamps) and the structured `error` are left untouched, so the dashboard, queries and recovery keep working.
+`CodecStateStore` decorates any store and runs run/step **payloads** through a `PayloadCodec` — encoded on write, decoded on read — so inputs and outputs are never stored in the clear. Searchable metadata (id, status, workflow, tags, namespace, timestamps) is left untouched, so the dashboard, queries and recovery keep working.
+
+<Callout type="warn">
+Know what the default coverage leaves **in the clear**: step `events` (everything step code passes to `ctx.log`), the structured `error` messages, and heartbeat progress. A deployment described as "encrypted payloads" still stores whatever its steps log as plaintext. Opt into `new CodecStateStore(inner, codec, { coverage: 'extended' })` to cover those too — but only on a **fresh** table, or with a codec whose `decode` recognizes its own ciphertext and passes other values through, because rows written before the switch hold those fields unencoded. Search attributes always stay clear (they must remain queryable). The wrapper also forwards `recordStepHeartbeat` now (it used to silently drop persisted step liveness). And remember the console renders everything **decoded** — pair the codec with the dashboard config's `redact` hooks to keep PII out of the operator's browser.
+</Callout>
 
 ```ts title="config/durable.ts"
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
