@@ -1,3 +1,4 @@
+import type { ScheduleInfo } from '../engine.js';
 import type {
   EngineEvent,
   RunFacetQuery,
@@ -40,6 +41,10 @@ export interface StoreEngineLike {
   update(runId: string, name: string, arg: unknown): Promise<UpdateResult>;
   completeTask(runId: string, name: string, result: unknown): Promise<RunResult | null>;
   failTask(runId: string, name: string, error: string): Promise<RunResult | null>;
+  /** Runtime schedule control — every real `WorkflowEngine` has these; forwarded 1:1. */
+  listSchedules(): Promise<ScheduleInfo[]>;
+  setSchedulePaused(key: string, paused: boolean): boolean;
+  triggerSchedule(key: string): Promise<RunResult | null>;
   /** The engine's GLOBAL listener (every run) — {@link storeDashboardEngine} filters it to one run,
    *  same as `StoreRunGateway.subscribe` does. */
   subscribe(listener: (event: EngineEvent) => void): () => void;
@@ -84,6 +89,9 @@ export function storeDashboardEngine(engine: StoreEngineLike): DashboardEngine {
     update: (runId, name, arg) => engine.update(runId, name, arg),
     completeTask: (runId, name, result) => engine.completeTask(runId, name, result),
     failTask: (runId, name, error) => engine.failTask(runId, name, error),
+    listSchedules: () => engine.listSchedules(),
+    setSchedulePaused: (key, paused) => engine.setSchedulePaused(key, paused),
+    triggerSchedule: (key) => engine.triggerSchedule(key),
     subscribe: (runId, onEvent) =>
       engine.subscribe((event) => {
         if (event.runId === runId) onEvent(event);

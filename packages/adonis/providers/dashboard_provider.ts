@@ -43,10 +43,12 @@ import {
   getRun,
   health,
   listRuns,
+  listSchedules,
   redispatchPendingRun,
   retryRun,
   retryWithInputRun,
   runValues,
+  scheduleAction,
   signalRun,
   topology,
   updateRun,
@@ -92,6 +94,8 @@ function spaDirectory(): string {
  * - `POST /api/runs/:id/update/:name` -> deliver a validated update (ctx.onUpdate)
  * - `POST /api/runs/:id/tasks/:name/complete` -> complete an external ctx.task
  * - `POST /api/runs/:id/tasks/:name/fail`     -> fail an external ctx.task
+ * - `GET  /api/schedules`             -> ticked schedules with control state + fire windows
+ * - `POST /api/schedules/:key/:action`-> pause / resume / trigger a schedule at runtime
  * - `POST /api/bulk/:action`          -> bulk retry/cancel every run matching a filter
  * - `GET  /api/health`                -> worker-group health (compact shape)
  * - `GET  /api/workers`               -> worker-group health (full heartbeats; SPA)
@@ -212,6 +216,12 @@ export default class DashboardProvider {
     router
       .post(`${apiBase}/runs/:id/tasks/:name/fail`, json(failTaskRun))
       .as('durable_dashboard.runs.task_fail');
+    // Runtime schedule control: list the ticked schedules, pause/resume one fleet-wide (runtime
+    // override; a deploy resets to the config), or fire its current window now (idempotent).
+    router.get(`${apiBase}/schedules`, json(listSchedules)).as('durable_dashboard.schedules.index');
+    router
+      .post(`${apiBase}/schedules/:key/:action`, json(scheduleAction))
+      .as('durable_dashboard.schedules.action');
     router.post(`${apiBase}/bulk/:action`, json(bulkAction)).as('durable_dashboard.bulk');
     router
       .get(

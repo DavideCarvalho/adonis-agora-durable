@@ -610,6 +610,12 @@ export interface RunQuery {
   /** Only runs created at or after this epoch-ms instant (`created_at >= createdAfter`). */
   createdAfter?: number | undefined;
   /**
+   * Only runs last touched at or before this epoch-ms instant (`updated_at <= updatedBefore`) —
+   * what a retention sweep means by "completed 30 days ago" (a run's terminal write bumps
+   * `updatedAt`; its `createdAt` may be much older on a long workflow).
+   */
+  updatedBefore?: number | undefined;
+  /**
    * Only runs whose durable wake timer is due at this instant (`wake_at IS NOT NULL AND wake_at <=
    * wakeBefore`). Lets the blocked-run recovery poll ask the store for due rows instead of listing
    * every blocked run and comparing in process.
@@ -1213,6 +1219,9 @@ export type ControlMessage = { from?: string } & (
   | { kind: 'cancel'; runId: string }
   // A run was just enqueued — nudge worker instances to pick it up now instead of on the next poll.
   | { kind: 'enqueued'; runId: string }
+  // A schedule was paused/resumed at runtime (console/API) — every ticking instance applies it.
+  // Runtime-only state: a deploy resets it to the config's `paused`; pin the config for permanence.
+  | { kind: 'schedulePause'; key: string; paused: boolean }
 );
 
 // ---------------------------------------------------------------------------

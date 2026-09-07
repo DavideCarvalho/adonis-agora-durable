@@ -390,6 +390,10 @@ export class InMemoryStateStore implements StateStore {
       const after = query.createdAfter;
       runs = runs.filter((r) => r.createdAt.getTime() >= after);
     }
+    if (query.updatedBefore !== undefined) {
+      const before = query.updatedBefore;
+      runs = runs.filter((r) => r.updatedAt.getTime() <= before);
+    }
     if (query.wakeBefore !== undefined) {
       const wake = query.wakeBefore;
       runs = runs.filter((r) => r.wakeAt !== undefined && r.wakeAt <= wake);

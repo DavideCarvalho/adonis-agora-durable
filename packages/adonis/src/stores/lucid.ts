@@ -549,6 +549,7 @@ export class LucidStateStore implements StateStore {
     // these instead of fetching every in-flight run and comparing in process).
     if (query.createdBefore !== undefined) q.where('created_at', '<=', query.createdBefore);
     if (query.createdAfter !== undefined) q.where('created_at', '>=', query.createdAfter);
+    if (query.updatedBefore !== undefined) q.where('updated_at', '<=', query.updatedBefore);
     if (query.wakeBefore !== undefined) {
       q.whereNotNull('wake_at').where('wake_at', '<=', query.wakeBefore);
     }

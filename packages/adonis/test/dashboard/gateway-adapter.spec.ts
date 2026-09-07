@@ -31,6 +31,12 @@ function storeEngineSpy(): StoreEngineLike & { calls: string[] } {
     update: async (id, name) => track(`update:${id}:${name}`, { accepted: true, run: null }),
     completeTask: async (id, name) => track(`completeTask:${id}:${name}`, null),
     failTask: async (id, name) => track(`failTask:${id}:${name}`, null),
+    listSchedules: async () => track('listSchedules', []),
+    setSchedulePaused: (key, paused) => {
+      calls.push(`setSchedulePaused:${key}:${paused}`);
+      return true;
+    },
+    triggerSchedule: async (key) => track(`triggerSchedule:${key}`, null),
     // The engine's own `subscribe` is GLOBAL (every run) — the adapter narrows it to one run.
     subscribe: (listener) => {
       calls.push('subscribe');

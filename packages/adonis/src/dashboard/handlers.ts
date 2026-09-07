@@ -3,6 +3,7 @@ import {
   groupByCountFromRequest,
   InvalidColumnFilterError,
 } from '@adonis-agora/filter';
+import type { ScheduleInfo } from '../engine.js';
 import type {
   EngineEvent,
   GroupHealth,
@@ -84,6 +85,10 @@ export interface DashboardEngine {
   /** Complete / fail a `ctx.task` the run dispatched to an external system. Optional — see {@link signal}. */
   completeTask?(runId: string, name: string, result: unknown): Promise<RunResult | null>;
   failTask?(runId: string, name: string, error: string): Promise<RunResult | null>;
+  /** Runtime schedule control (list / pause / resume / trigger-now). Optional — see {@link signal}. */
+  listSchedules?(): Promise<ScheduleInfo[]>;
+  setSchedulePaused?(key: string, paused: boolean): boolean | Promise<boolean>;
+  triggerSchedule?(key: string): Promise<RunResult | null>;
   /** Live lifecycle events for ONE run; returns an unsubscribe fn. */
   subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void;
   /**
@@ -481,6 +486,38 @@ export async function failTaskRun(deps: Deps, req: ApiRequest): Promise<ApiRespo
   const result = await engine.failTask(id, name, error);
   // Null = buffered (no live waiter yet) — same reliable-delivery semantics as completeTaskRun.
   return ok({ result, delivered: result != null });
+}
+
+/** `GET /schedules` — the ticked schedules with live control state and fire windows. */
+export async function listSchedules(deps: Deps, _req: ApiRequest): Promise<ApiResponse> {
+  const { engine } = deps;
+  if (!engine.listSchedules) return notFound('schedules are not available on this topology yet');
+  return ok({ schedules: await engine.listSchedules() });
+}
+
+/** `POST /schedules/:key/:action` — `pause` / `resume` / `trigger` a schedule at runtime. */
+export async function scheduleAction(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
+  const { engine } = deps;
+  const key = req.params.key;
+  const action = req.params.action;
+  if (!key) return notFound('schedule key is required');
+  if (action === 'pause' || action === 'resume') {
+    if (!engine.setSchedulePaused) {
+      return notFound('schedule control is not available on this topology yet');
+    }
+    const applied = await engine.setSchedulePaused(key, action === 'pause');
+    if (!applied) return notFound(`schedule ${key} not found`);
+    return ok({ key, paused: action === 'pause' });
+  }
+  if (action === 'trigger') {
+    if (!engine.triggerSchedule) {
+      return notFound('schedule control is not available on this topology yet');
+    }
+    const result = await engine.triggerSchedule(key);
+    if (!result) return notFound(`schedule ${key} not found`);
+    return ok({ result });
+  }
+  return badRequest("action must be 'pause', 'resume' or 'trigger'");
 }
 
 /**

@@ -63,7 +63,7 @@ import { breakpointToken, stepId } from './protocol.js';
 import type { QueueConfig } from './queue.js';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor.js';
 import { scanRunValueFacets } from './run-value-facets.js';
-import type { ScheduledWorkflow } from './scheduler.js';
+import { type ScheduledWorkflow, scheduleWindow } from './scheduler.js';
 import { SingletonGate } from './singleton-gate.js';
 import { sanitizeQueueToken, tenantGroup } from './tenant-group.js';
 import { TransportPool } from './transport-pool.js';
@@ -103,11 +103,59 @@ export interface StartOptions {
    */
   namespace?: string | undefined;
   /**
+   * Delay execution until this instant (epoch ms or Date): the run is created durably NOW but parked
+   * `suspended` with its wake timer set, and the ordinary timer poller starts it when due — no
+   * `ctx.sleep` polluting the workflow body or its history. A past/absent instant starts immediately.
+   * (A delayed run skips the `run.started` lifecycle event's `pending → running` hop; it goes
+   * `suspended → …` when it fires.)
+   */
+  startAt?: number | Date | undefined;
+  /**
    * Package attribution to stamp on THIS run, overriding the registration's `origin`. Rarely needed
    * — the registration-level origin covers "which package's code produced this run"; pass it here
    * when one shared workflow is started on behalf of another package.
    */
   origin?: string | undefined;
+}
+
+/** One row of {@link WorkflowEngine.listSchedules} — a schedule with its live control state. */
+export interface ScheduleInfo {
+  key: string;
+  workflow: string;
+  cron?: string | undefined;
+  everyMs?: number | undefined;
+  timezone?: string | undefined;
+  overlap?: 'allow' | 'skip' | undefined;
+  namespace?: string | undefined;
+  /** Effective pause state: the runtime override when one was issued, else the config's `paused`. */
+  paused: boolean;
+  /** Whether the current pause state came from a runtime (console) override. */
+  pausedAtRuntime: boolean;
+  /** Epoch ms the current window fired (its deterministic bucket). */
+  lastFireAt: number;
+  /** Epoch ms of the next fire. */
+  nextFireAt: number;
+  /** The current window's deterministic run id (what `triggerSchedule` would start). */
+  currentWindowRunId: string;
+  /** The current window's run status, when that run exists. */
+  lastRunStatus?: RunStatus | undefined;
+}
+
+/** What an {@link WorkflowEngine.onStalled} listener receives — a stranded run and why it looks stranded. */
+export interface StalledRunInfo {
+  run: WorkflowRun;
+  /** Milliseconds since the run's last activity (`updatedAt`). */
+  ageMs: number;
+  /** Suspended with NO wake timer — nothing will re-drive it (the `reconcileMs: 0` hazard). */
+  wakeForever: boolean;
+  /** The oldest silent pending remote step, when that is the stranding signature. */
+  stalePending: {
+    seq: number;
+    name: string;
+    attempts: number;
+    ageMs: number;
+    heartbeatAgeMs: number | null;
+  } | null;
 }
 
 /**
@@ -384,6 +432,22 @@ export interface WorkflowEngineDeps {
    */
   compensationTimeoutMs?: number | undefined;
   /**
+   * Retention policy: hard-delete terminal runs (and their subtrees/checkpoints/waiters) once their
+   * LAST activity (`updatedAt`) is older than the given age in ms, per terminal status. Swept by the
+   * worker tick's `sweepRetention` phase (self-throttled to once a minute). Absent (default) keeps
+   * everything forever — the pre-retention behavior. Register an {@link WorkflowEngine.onEvict}
+   * listener to archive a run before it is deleted; a listener that THROWS skips that run's
+   * deletion (archival failure must never lose data).
+   */
+  retention?: Partial<Record<'completed' | 'failed' | 'cancelled' | 'dead', number>> | undefined;
+  /**
+   * How long an in-flight run must sit untouched — with the stranded signature (a wake-forever
+   * suspension, or an old pending remote step whose worker heartbeat is silent) — before the
+   * {@link WorkflowEngine.onStalled} listeners are notified. Default 900 000 (15 min, matching the
+   * CLI's `--stale`). The sweep only runs when a listener is registered.
+   */
+  stalledAfterMs?: number | undefined;
+  /**
    * Persist a `running` checkpoint when a local step's body begins, so an in-flight step shows up
    * in the dashboard (and a fresh page load / REST query) the moment it starts — not only once it
    * completes. The `step.started` lifecycle event is emitted either way (the live SSE view always
@@ -460,6 +524,21 @@ export class WorkflowEngine {
   private readonly rehydrate: <T>(carrier: Record<string, unknown> | undefined, fn: () => T) => T;
   private readonly compensationRetries: number;
   private readonly compensationTimeoutMs: number;
+  private readonly retention:
+    | Partial<Record<'completed' | 'failed' | 'cancelled' | 'dead', number>>
+    | undefined;
+  // -Infinity so the FIRST sweep always runs (a fake/test clock may start near 0).
+  #lastRetentionSweepAt = Number.NEGATIVE_INFINITY;
+  /** Archival hooks run (awaited, in order) before a retention eviction deletes a run. */
+  private readonly evictListeners = new Set<
+    (run: WorkflowRun, checkpoints: StepCheckpoint[]) => void | Promise<void>
+  >();
+  private readonly stalledAfterMs: number;
+  /** Pager hooks for the stranded-run signature (see {@link onStalled}). */
+  private readonly stalledListeners = new Set<(info: StalledRunInfo) => void>();
+  /** `runId → run.updatedAt ms` at last stalled notification, so one episode pages once. */
+  readonly #notifiedStalled = new Map<string, number>();
+  #lastStalledSweepAt = Number.NEGATIVE_INFINITY;
   /** Persist a `running` checkpoint at the start of a local step body (see {@link WorkflowEngineDeps.trackStepStart}). */
   private readonly trackStepStart: boolean;
   /** Where a freshly-started run executes — in-process by default (see {@link RunDispatcher}). */
@@ -509,6 +588,10 @@ export class WorkflowEngine {
   private readonly updateValidators = new Map<string, UpdateValidator>();
   /** Runs being cancelled WITH saga compensation — see `cancel({ compensate: true })`. */
   private readonly cancelRequested = new Set<string>();
+  /** The merged schedule set the worker loop ticks with (see {@link adoptSchedules}). */
+  #allSchedules: readonly ScheduledWorkflow[] = [];
+  /** Runtime pause overrides by schedule key (console-issued; win over the config's `paused`). */
+  readonly #schedulePauseOverrides = new Map<string, boolean>();
   /** Flow-control admission backend for remote steps (see {@link registerQueue}). */
   private readonly admission: AdmissionBackend;
   /** Runs on THIS instance blocked on admission, by queue — woken early on a freed-slot signal. */
@@ -586,6 +669,8 @@ export class WorkflowEngine {
     this.rehydrate = deps.rehydrate ?? ((_carrier, fn) => fn());
     this.compensationRetries = Math.max(1, deps.compensationRetries ?? 1);
     this.compensationTimeoutMs = Math.max(1_000, deps.compensationTimeoutMs ?? 300_000);
+    this.retention = deps.retention;
+    this.stalledAfterMs = Math.max(60_000, deps.stalledAfterMs ?? 900_000);
     this.trackStepStart = deps.trackStepStart ?? true;
     // Default: execute the run on this instance, asynchronously, so `start` never blocks on the body.
     // A failed pickup is swallowed here (the run stays `pending` for a `runPending` poll to retry);
@@ -649,6 +734,10 @@ export class WorkflowEngine {
         this.deliver({ ...msg.event, at: new Date(msg.event.at) });
       } else if (msg.kind === 'cancel') {
         this.notifyCancelled(msg.runId);
+      } else if (msg.kind === 'schedulePause') {
+        // A console on another instance paused/resumed a schedule — apply it here so THIS ticker
+        // honors it too (runtime-only; a deploy resets to the config).
+        this.#schedulePauseOverrides.set(msg.key, msg.paused);
       } else if (msg.kind === 'enqueued') {
         // A run was enqueued on another instance — let worker subscribers pick it up immediately
         // instead of waiting for the next poll. (Self-broadcasts are already filtered above.)
@@ -681,6 +770,87 @@ export class WorkflowEngine {
    * and fires. Idempotent per `key`: the first schedule registered for a key wins and a later duplicate
    * key is ignored with a warning (so re-scanning, or a config entry overriding it, can't double-fire).
    */
+  /**
+   * Adopt the FULL schedule set the worker loop ticks with (config + discovered, already merged) so
+   * the runtime schedule-control surface (list/pause/resume/trigger) operates on exactly what fires.
+   * Called by `runTick`; idempotent.
+   */
+  adoptSchedules(schedules: readonly ScheduledWorkflow[]): void {
+    this.#allSchedules = schedules;
+  }
+
+  /**
+   * The runtime pause override for a schedule key: `true`/`false` when the console set one (wins
+   * over the config's `paused`), `undefined` when untouched. Runtime-only — a deploy resets it.
+   */
+  schedulePauseOverride(key: string): boolean | undefined {
+    return this.#schedulePauseOverrides.get(key);
+  }
+
+  /**
+   * The schedules this engine ticks, with their live control state and fire windows — what a
+   * console's Schedules tab lists. `paused` reflects the EFFECTIVE state (runtime override, else
+   * config); `lastRunStatus` is the current window's run, when it exists.
+   */
+  async listSchedules(now: number = this.clock()): Promise<ScheduleInfo[]> {
+    const out: ScheduleInfo[] = [];
+    for (const s of [...this.#allSchedules, ...this.#discoveredSchedules]) {
+      if (out.some((x) => x.key === s.key)) continue; // adopted set already contains discovered ones post-merge
+      const window = scheduleWindow(s, now);
+      const currentRun = await this.store.getRun(window.runId).catch(() => null);
+      const override = this.#schedulePauseOverrides.get(s.key);
+      out.push({
+        key: s.key,
+        workflow: s.workflow,
+        cron: s.cron,
+        everyMs: s.everyMs,
+        timezone: s.timezone,
+        overlap: s.overlap,
+        namespace: s.namespace,
+        paused: override ?? s.paused ?? false,
+        pausedAtRuntime: override !== undefined,
+        lastFireAt: window.lastFireAt,
+        nextFireAt: window.nextFireAt,
+        currentWindowRunId: window.runId,
+        lastRunStatus: currentRun?.status,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Pause/resume a schedule at RUNTIME, fleet-wide: applied on this instance and broadcast on the
+   * control plane so every ticking peer applies it too. Runtime-only state — a deploy resets it to
+   * the config's `paused`; pin the config for permanence. Returns false for an unknown key.
+   */
+  setSchedulePaused(key: string, paused: boolean): boolean {
+    const known =
+      this.#allSchedules.some((s) => s.key === key) ||
+      this.#discoveredSchedules.some((s) => s.key === key);
+    if (!known) return false;
+    this.#schedulePauseOverrides.set(key, paused);
+    if (this.controlPlane) {
+      void this.controlPlane
+        .publishControl({ kind: 'schedulePause', key, paused, from: this.instanceId })
+        .catch(() => undefined);
+    }
+    return true;
+  }
+
+  /**
+   * Fire a schedule's CURRENT window now (console "run now"). Idempotent by the window's
+   * deterministic run id — triggering a window that already fired returns the existing run instead
+   * of forking a duplicate. Returns null for an unknown key.
+   */
+  async triggerSchedule(key: string, now: number = this.clock()): Promise<RunResult | null> {
+    const s =
+      this.#allSchedules.find((x) => x.key === key) ??
+      this.#discoveredSchedules.find((x) => x.key === key);
+    if (!s) return null;
+    const window = scheduleWindow(s, now);
+    return this.start(s.workflow, s.input, window.runId, { namespace: s.namespace });
+  }
+
   registerSchedules(schedules: readonly ScheduledWorkflow[]): void {
     const seen = new Set(this.#discoveredSchedules.map((s) => s.key));
     for (const schedule of schedules) {
@@ -1071,11 +1241,18 @@ export class WorkflowEngine {
     if (registered.singleton) {
       await this.singletons.assertCapacity(name, registered.singleton, input);
     }
+    // Delayed start: park the run on its durable wake timer instead of dispatching now (see
+    // StartOptions.startAt). The timer poller path that wakes sleeps does the rest.
+    const startAtMs = opts?.startAt instanceof Date ? opts.startAt.getTime() : opts?.startAt;
+    // Compared against the ENGINE clock (injectable), not wall time — the same clock the timer
+    // poller will use to decide the run is due.
+    const delayed = startAtMs !== undefined && startAtMs > this.clock();
     const run: WorkflowRun = {
       id: runId,
       workflow: name,
       workflowVersion: registered.version,
-      status: 'pending',
+      status: delayed ? 'suspended' : 'pending',
+      ...(delayed ? { wakeAt: startAtMs } : {}),
       origin: opts?.origin ?? registered.origin,
       namespace: opts?.namespace ?? this.namespace,
       input,
@@ -1104,7 +1281,7 @@ export class WorkflowEngine {
     // The run is durably enqueued; a dispatcher (in-process by default) executes it — `start` does
     // NOT run the body inline. Await the terminal/suspended state with `waitForRun(runId)` if needed.
     // An internal in-process handoff persists with `dispatch: false` and drives the pickup itself.
-    if (dispatch) {
+    if (dispatch && !delayed) {
       await this.runDispatcher.dispatch(runId);
       // Nudge worker instances to pick it up now instead of on their next poll (no-op without a control
       // plane; self-receipt is filtered, so it only helps OTHER pods — e.g. an API pod's enqueue).
@@ -1114,7 +1291,7 @@ export class WorkflowEngine {
           .catch(() => undefined);
       }
     }
-    return { runId, status: 'pending' };
+    return { runId, status: run.status };
   }
 
   /**
@@ -1213,6 +1390,138 @@ export class WorkflowEngine {
    * deleted (the parent→children edge is read from them). Use for retention/cleanup; this is a
    * destructive store operation, not a cancellation — a running run should be {@link cancel}led first.
    */
+  /**
+   * Register a pager hook for STRANDED runs — the failure `docs/reliability/failure-modes.mdx` calls
+   * "the stranded signature": an in-flight run untouched past `stalledAfterMs` that is either
+   * suspended with NO wake timer (wake-forever) or parked on an old pending remote step whose worker
+   * heartbeat has gone silent. The worker tick sweeps for these (throttled to one pass a minute) and
+   * notifies each episode ONCE (re-notifies only after the run progresses and strands again). Wire
+   * your alerting here exactly like {@link onDead}. Returns an unsubscribe fn.
+   */
+  onStalled(listener: (info: StalledRunInfo) => void): () => void {
+    this.stalledListeners.add(listener);
+    return () => this.stalledListeners.delete(listener);
+  }
+
+  /**
+   * Detect stranded in-flight runs and notify {@link onStalled} listeners. Self-throttled to one
+   * pass a minute; a no-op without listeners. Returns the runs notified THIS pass.
+   */
+  async sweepStalled(now: number = this.clock()): Promise<StalledRunInfo[]> {
+    if (this.stalledListeners.size === 0 || this.draining) return [];
+    if (now - this.#lastStalledSweepAt < 60_000) return [];
+    this.#lastStalledSweepAt = now;
+    const candidates = await this.store.listRuns({
+      statuses: ['suspended', 'running'],
+      namespace: this.namespace,
+      updatedBefore: now - this.stalledAfterMs,
+      limit: 100,
+    });
+    const notified: StalledRunInfo[] = [];
+    for (const run of candidates) {
+      // One notification per episode: skip a run we already paged about that hasn't moved since.
+      if (this.#notifiedStalled.get(run.id) === run.updatedAt.getTime()) continue;
+      // The stranded signature, disambiguated from healthy long work:
+      //  (a) suspended with NO wake timer — nothing will ever re-drive it (reconcileMs: 0 deployments);
+      //  (b) an old pending REMOTE step whose worker heartbeat is silent — dispatched and lost.
+      // A long `ctx.sleep` (wakeAt in the future) and a beating long step are NOT stalled.
+      let stalePending: StalledRunInfo['stalePending'] = null;
+      for (const cp of await this.store.listCheckpoints(run.id)) {
+        if (cp.kind !== 'remote' || cp.status !== 'pending') continue;
+        const ageMs = now - cp.enqueuedAt.getTime();
+        const heartbeatAgeMs = cp.lastHeartbeatAt ? now - cp.lastHeartbeatAt.getTime() : null;
+        if (ageMs < this.stalledAfterMs) continue;
+        if (heartbeatAgeMs !== null && heartbeatAgeMs < this.stalledAfterMs) continue; // alive mid-flight
+        if (!stalePending || ageMs > stalePending.ageMs) {
+          stalePending = {
+            seq: cp.seq,
+            name: cp.name,
+            attempts: cp.attempts,
+            ageMs,
+            heartbeatAgeMs,
+          };
+        }
+      }
+      const wakeForever = run.status === 'suspended' && run.wakeAt === undefined;
+      if (!wakeForever && !stalePending) continue;
+      const info: StalledRunInfo = {
+        run,
+        ageMs: now - run.updatedAt.getTime(),
+        stalePending,
+        wakeForever,
+      };
+      this.#notifiedStalled.set(run.id, run.updatedAt.getTime());
+      if (this.#notifiedStalled.size > 1_000) this.#notifiedStalled.clear(); // bounded; re-pages at worst
+      for (const listener of this.stalledListeners) {
+        try {
+          listener(info);
+        } catch {
+          /* a pager hook must not break the sweep */
+        }
+      }
+      notified.push(info);
+    }
+    return notified;
+  }
+
+  /**
+   * Register an archival hook run before a retention eviction deletes a run (it receives the run
+   * and its full checkpoint timeline — e.g. write them to S3/file). Awaited in registration order;
+   * a hook that THROWS skips that run's deletion, so a broken archive never loses data. Returns an
+   * unsubscribe fn.
+   */
+  onEvict(
+    listener: (run: WorkflowRun, checkpoints: StepCheckpoint[]) => void | Promise<void>,
+  ): () => void {
+    this.evictListeners.add(listener);
+    return () => this.evictListeners.delete(listener);
+  }
+
+  /**
+   * Retention sweep: hard-delete terminal runs whose last activity is older than the configured age
+   * (see {@link WorkflowEngineDeps.retention}). Self-throttled to one pass per minute per instance —
+   * call it every tick, it's a no-op most of the time. Returns how many runs were deleted (subtree
+   * counts included). Bounded per pass (100 candidates per status); a large backlog drains across
+   * passes.
+   *
+   * Caveat: eviction cascades DOWN (a deleted run takes its child subtree) but does not know about
+   * a still-live PARENT awaiting a custom-id child — size the ages well beyond your longest-running
+   * parents.
+   */
+  async sweepRetention(now: number = this.clock()): Promise<number> {
+    if (!this.retention || this.draining) return 0;
+    if (now - this.#lastRetentionSweepAt < 60_000) return 0;
+    this.#lastRetentionSweepAt = now;
+    let evicted = 0;
+    for (const status of ['completed', 'failed', 'cancelled', 'dead'] as const) {
+      const maxAgeMs = this.retention[status];
+      if (maxAgeMs == null || maxAgeMs <= 0) continue;
+      const candidates = await this.store.listRuns({
+        statuses: [status],
+        namespace: this.namespace,
+        updatedBefore: now - maxAgeMs,
+        limit: 100,
+      });
+      for (const run of candidates) {
+        try {
+          if (this.evictListeners.size > 0) {
+            const checkpoints = await this.store.listCheckpoints(run.id);
+            for (const listener of this.evictListeners) await listener(run, checkpoints);
+          }
+          evicted += await this.deleteRun(run.id);
+        } catch (err) {
+          // An archival hook (or the delete itself) failed — keep the run; the next sweep retries.
+          console.warn(
+            `[adonis-durable] retention eviction of run ${run.id} skipped: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+      }
+    }
+    return evicted;
+  }
+
   async deleteRun(runId: string): Promise<number> {
     const run = await this.store.getRun(runId);
     if (!run) return 0;
