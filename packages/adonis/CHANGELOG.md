@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 0.35.1
+
+### Patch Changes
+
+- [#113](https://github.com/DavideCarvalho/adonis-agora-durable/pull/113) [`e967eb7`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/e967eb77cb5314745fd32f46698e961152462223) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `drain()` now releases the recovery leases of runs still tracked in-flight on return, on both the settled and timeout paths. A shutting-down process hands off fast: the next boot's recovery reclaims the frontier work in seconds instead of waiting out the lease expiry.
+
 ## 0.35.0
 
 ### Minor Changes
