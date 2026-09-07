@@ -40,6 +40,8 @@ export interface StoreEngineLike {
   /** Bulk signal-waiter scan — forwarded 1:1 to power `listRuns`' `waiting` stamp (see
    *  `DashboardEngine.listSignalWaiters`'s doc). Every real `WorkflowEngine` has it. */
   listSignalWaiters?(prefix: string): Promise<SignalWaiter[]>;
+  /** Targeted per-page variant (`run_id IN (...)`, indexed) — forwarded when the engine has it. */
+  listSignalWaitersByRunIds?(runIds: string[]): Promise<SignalWaiter[]>;
   /** Value enumeration for the console's pickers — forwarded 1:1 when the engine has it. */
   runValueFacets?(
     axis: RunValueAxis,
@@ -80,6 +82,12 @@ export function storeDashboardEngine(engine: StoreEngineLike): DashboardEngine {
       ? {
           listSignalWaiters: (prefix: string) =>
             engine.listSignalWaiters?.(prefix) as Promise<SignalWaiter[]>,
+        }
+      : {}),
+    ...(engine.listSignalWaitersByRunIds
+      ? {
+          listSignalWaitersByRunIds: (runIds: string[]) =>
+            engine.listSignalWaitersByRunIds?.(runIds) as Promise<SignalWaiter[]>,
         }
       : {}),
     ...(engine.runValueFacets

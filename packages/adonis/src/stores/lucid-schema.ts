@@ -108,6 +108,9 @@ export async function createDurableTables(
       table.index(['status', 'wake_at'], 'durable_runs_due_idx');
       // Worker-pool partition: scopes the poll/recovery queries (namespace + status + createdAt).
       table.index(['namespace', 'status', 'created_at'], 'durable_runs_namespace_idx');
+      // The dashboard's default (unfiltered) listing orders by created_at DESC — without this a
+      // page load over a large table is a full sort.
+      table.index(['created_at'], 'durable_runs_created_idx');
     });
   } else {
     // Auto-migrate an older runs table by adding any columns introduced after its creation. Each is
@@ -128,6 +131,16 @@ export async function createDurableTables(
         table.index(['namespace', 'status', 'created_at'], 'durable_runs_namespace_idx');
       });
       repairs.push(`${DURABLE_TABLES.runs}.namespace`);
+    }
+    // Index-only repair (no hasColumn probe works for indexes portably; creating one that already
+    // exists throws, so probe by name via a best-effort create-and-swallow). The dashboard's default
+    // ordering needs it on big tables.
+    try {
+      await conn().alterTable(DURABLE_TABLES.runs, (table) => {
+        table.index(['created_at'], 'durable_runs_created_idx');
+      });
+    } catch {
+      /* the index already exists — expected on every boot after the first */
     }
   }
 
@@ -208,14 +221,27 @@ export async function createDurableTables(
       table.string('run_id').notNullable();
       table.integer('seq').notNullable();
       table.string('parallel_group');
+      // Serves the per-run lookups: the dashboard's waiting-on column, a parent's children
+      // resolution, and deleteRun's cascade — all `WHERE run_id` (previously full scans).
+      table.index(['run_id'], 'durable_signal_waiters_run_idx');
     });
-  } else if (!(await conn().hasColumn(DURABLE_TABLES.signalWaiters, 'parallel_group'))) {
-    // Auto-migrate an older signal_waiters table: add the nullable `parallel_group` column in place.
-    // Nullable (no default) so a legacy (non-fan) waiter reads back untagged and the await is unchanged.
-    await conn().alterTable(DURABLE_TABLES.signalWaiters, (table) => {
-      table.string('parallel_group');
-    });
-    repairs.push(`${DURABLE_TABLES.signalWaiters}.parallel_group`);
+  } else {
+    if (!(await conn().hasColumn(DURABLE_TABLES.signalWaiters, 'parallel_group'))) {
+      // Auto-migrate an older signal_waiters table: add the nullable `parallel_group` column in
+      // place. Nullable (no default) so a legacy (non-fan) waiter reads back untagged and the await
+      // is unchanged.
+      await conn().alterTable(DURABLE_TABLES.signalWaiters, (table) => {
+        table.string('parallel_group');
+      });
+      repairs.push(`${DURABLE_TABLES.signalWaiters}.parallel_group`);
+    }
+    try {
+      await conn().alterTable(DURABLE_TABLES.signalWaiters, (table) => {
+        table.index(['run_id'], 'durable_signal_waiters_run_idx');
+      });
+    } catch {
+      /* the index already exists — expected on every boot after the first */
+    }
   }
 
   if (!(await conn().hasTable(DURABLE_TABLES.bufferedSignals))) {

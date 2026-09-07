@@ -466,7 +466,16 @@ export class BullMQTransport implements Transport {
    *  missing/unreadable/malformed key is skipped (never throws), so a broker without descriptor
    *  advertisement (or a scan that races a key's expiry) reads as "no descriptors" and the control-plane
    *  falls back to legacy assume-compatible dispatch. Never uses KEYS (it blocks Redis). */
+  /** Fresh-enough descriptor sets by token: fleet capabilities change on the descriptor heartbeat
+   *  cadence (tens of seconds), but `ensureRoutable` asks before EVERY dispatch — without this memo
+   *  a 500-step/s engine ran 500 SCAN cycles/s against Redis for an answer that was identical. */
+  readonly #descriptorCache = new Map<string, { at: number; descriptors: WorkerDescriptor[] }>();
+
   async listWorkerDescriptors(token: string): Promise<WorkerDescriptor[]> {
+    const cached = this.#descriptorCache.get(token);
+    // A short TTL (5s): a fraction of the descriptor heartbeat TTL, so a scaled-down fleet is
+    // noticed within one cache window while the per-dispatch SCAN storm disappears.
+    if (cached && Date.now() - cached.at < 5_000) return cached.descriptors;
     const client = this.#workerRedisClient();
     const prefix = workerDescriptorTokenPrefix(this.#effectivePrefix(), token);
     const descriptors: WorkerDescriptor[] = [];
@@ -475,9 +484,13 @@ export class BullMQTransport implements Transport {
       do {
         const [next, keys] = await client.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', 100);
         cursor = next;
-        for (const key of keys) {
-          const raw = await client.get(key);
-          if (raw == null) continue; // expired between SCAN and GET — just skip it
+        if (keys.length === 0) continue;
+        // One MGET per SCAN page instead of one GET per key (per-key fallback for a client without it).
+        const raws = client.mget
+          ? await client.mget(...keys)
+          : await Promise.all(keys.map((k) => client.get(k)));
+        for (const raw of raws) {
+          if (raw == null) continue; // expired between SCAN and MGET — just skip it
           try {
             descriptors.push(JSON.parse(raw) as WorkerDescriptor);
           } catch {
@@ -491,6 +504,7 @@ export class BullMQTransport implements Transport {
       this.#onError(err);
       return [];
     }
+    this.#descriptorCache.set(token, { at: Date.now(), descriptors });
     return descriptors;
   }
 
@@ -516,12 +530,18 @@ export class BullMQTransport implements Transport {
     do {
       const [next, keys] = await client.scan(cursor, 'MATCH', match, 'COUNT', 100);
       cursor = next;
-      for (const key of keys) {
-        const raw = await client.get(key);
+      if (keys.length === 0) continue;
+      // One MGET per SCAN page instead of one serial GET per key (per-key fallback without mget).
+      const raws = client.mget
+        ? await client.mget(...keys)
+        : await Promise.all(keys.map((k) => client.get(k)));
+      for (let i = 0; i < keys.length; i += 1) {
+        const key = keys[i];
+        if (key === undefined) continue;
         workers.push({
           group,
           instanceId: key.slice(keyPrefix.length),
-          lastBeatAt: parseHeartbeatValue(raw).lastBeatAt,
+          lastBeatAt: parseHeartbeatValue(raws[i] ?? null).lastBeatAt,
         });
       }
     } while (cursor !== '0');

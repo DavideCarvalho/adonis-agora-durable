@@ -108,12 +108,21 @@ export class GatherError extends Error {
 export class WorkflowSuspended extends Error {
   /** Epoch ms to auto-resume (durable sleep), or undefined when waiting on an external signal. */
   readonly wakeAt?: number | undefined;
+  /**
+   * The checkpoint seq(s) this suspension is parked on (a signal/event/child wait's waiter seq, a
+   * dispatched remote step's seq). Lets the settle path close the lost-wake race: a delivery that
+   * landed WHILE the turn was still executing wrote the checkpoint but its resume no-oped against
+   * the held lease — after suspending, the engine re-checks these seqs and re-drives if one already
+   * completed. Optional: a suspension without it just relies on the reconcile fallback as before.
+   */
+  readonly waitSeqs?: number[] | undefined;
   /** Marks this as a control-flow signal — see {@link isWorkflowControlFlowSignal}. */
   readonly [CONTROL_FLOW_SIGNAL] = true;
-  constructor(wakeAt?: number) {
+  constructor(wakeAt?: number, waitSeqs?: number[]) {
     super('workflow suspended');
     this.name = 'WorkflowSuspended';
     this.wakeAt = wakeAt;
+    this.waitSeqs = waitSeqs;
   }
 }
 

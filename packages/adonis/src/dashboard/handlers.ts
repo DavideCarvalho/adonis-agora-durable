@@ -83,6 +83,12 @@ export interface DashboardEngine {
    */
   listSignalWaiters?(prefix: string): Promise<SignalWaiter[]>;
   /**
+   * Targeted variant: only the waiters registered by these runs (`run_id IN (...)`, indexed) — what
+   * `listRuns` actually needs for one page. Optional; when absent the handlers fall back to the
+   * full `listSignalWaiters('')` scan above.
+   */
+  listSignalWaitersByRunIds?(runIds: string[]): Promise<SignalWaiter[]>;
+  /**
    * The distinct values of ONE filter axis over the runs matching `query`, with counts — what a
    * console's pickers list. Optional: absent on a port that can't do the scan yet (a store-less
    * `tenant` pod — see `gateway-adapter.ts`); {@link runValues} then counts a bounded
@@ -272,14 +278,15 @@ export async function listRuns(deps: Deps, req: ApiRequest): Promise<ApiResponse
   }
   const query: RunQuery = { limit, offset, ...filter };
 
-  const [runs, waiters] = await Promise.all([
-    engine.listRuns(query),
-    // ONE bulk scan of the signal-waiter table (indexed by runId) resolves what each suspended run
-    // is parked on — signal / webhook / child / breakpoint — with no per-run timeline fetch. Absent
-    // on a topology that can't do the scan yet (see `DashboardEngine.listSignalWaiters`'s doc); the
-    // `waiting` stamp is simply skipped then, same as `@dudousxd/nestjs-durable-dashboard`.
-    engine.listSignalWaiters?.('') ?? Promise.resolve(undefined),
-  ]);
+  const runs = await engine.listRuns(query);
+  // Resolve what each suspended run on THIS page is parked on — signal / webhook / child /
+  // breakpoint — with no per-run timeline fetch. Prefers the targeted per-page lookup (`run_id IN
+  // (...)`, indexed) over the legacy full-table waiter scan; absent on a topology that can't do
+  // either yet (see `DashboardEngine.listSignalWaiters`'s doc), where the `waiting` stamp is
+  // simply skipped, same as `@dudousxd/nestjs-durable-dashboard`.
+  const waiters = engine.listSignalWaitersByRunIds
+    ? await engine.listSignalWaitersByRunIds(runs.map((r) => r.id))
+    : await (engine.listSignalWaiters?.('') ?? Promise.resolve(undefined));
   const waiterByRun = waiters ? indexWaitersByRun(waiters) : undefined;
   return ok({
     runs: runs.map((run) => summarizeRun(run, waiterByRun)),

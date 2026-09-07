@@ -457,7 +457,7 @@ export function createWorkflowCtx(
         await store.removeSignalWaiter({ token, runId, seq: current });
         return lateBuffered.value;
       }
-      throw new WorkflowSuspended();
+      throw new WorkflowSuspended(undefined, [current]);
     }
     const timeoutMs = opts.timeoutMs;
     const deadlineSeq = pos.next();
@@ -484,7 +484,7 @@ export function createWorkflowCtx(
       await store.removeSignalWaiter({ token, runId, seq: waitSeq });
       return lateBuffered.value;
     }
-    throw new WorkflowSuspended(deadline);
+    throw new WorkflowSuspended(deadline, [waitSeq]);
   };
 
   // Wait for a named event delivered by engine.publishEvent(name, payload). Like waitForSignal, but
@@ -513,7 +513,7 @@ export function createWorkflowCtx(
       await store.putSignalWaiter({ token, runId, seq: current });
       const bufferedHit = await consumeBufferedEvent<T>(name, opts?.match, token, current);
       if (bufferedHit) return bufferedHit.value;
-      throw new WorkflowSuspended();
+      throw new WorkflowSuspended(undefined, [current]);
     }
     const timeoutMs = opts.timeoutMs;
     const deadlineSeq = pos.next();
@@ -531,7 +531,7 @@ export function createWorkflowCtx(
     await store.putSignalWaiter({ token, runId, seq: waitSeq });
     const bufferedHit = await consumeBufferedEvent<T>(name, opts.match, token, waitSeq);
     if (bufferedHit) return bufferedHit.value;
-    throw new WorkflowSuspended(deadline);
+    throw new WorkflowSuspended(deadline, [waitSeq]);
   };
 
   // An external task = a checkpointed dispatch + a wait for its async-completion `Completion`
@@ -628,7 +628,7 @@ export function createWorkflowCtx(
         }),
       );
     }
-    throw new WorkflowSuspended();
+    throw new WorkflowSuspended(undefined, [current]);
   };
 
   // Parallel child workflows (wait-all): dispatch N children CONCURRENTLY and wait for ALL their
@@ -678,6 +678,7 @@ export function createWorkflowCtx(
 
     // Dispatch every item not yet completed in history; write its running placeholder once.
     let pending = false;
+    const pendingSeqs: number[] = [];
     for (let i = 0; i < inputs.length; i += 1) {
       const cp = existing[i];
       if (cp?.status === 'completed') continue;
@@ -728,6 +729,7 @@ export function createWorkflowCtx(
         continue;
       }
       pending = true;
+      pendingSeqs.push(seq);
       if (!cp) {
         await writeCheckpoint(
           instantCheckpoint({
@@ -741,8 +743,10 @@ export function createWorkflowCtx(
         );
       }
     }
-    // Any item still outstanding → suspend once; the resume replays this whole block.
-    if (pending) throw new WorkflowSuspended();
+    // Any item still outstanding → suspend once; the resume replays this whole block. Carry only
+    // the STILL-PENDING seqs — a completed one would make the post-settle recheck spuriously
+    // re-drive every partial fan settle.
+    if (pending) throw new WorkflowSuspended(undefined, pendingSeqs);
 
     // All resolved: build outputs in INPUT order, aggregating any failures.
     const outputs: T[] = [];
@@ -796,7 +800,7 @@ export function createWorkflowCtx(
     const reply = `entityreply:${runId}:${current}`;
     await store.putSignalWaiter({ token: reply, runId, seq: current });
     host.signalEntity?.(name, key, op, arg, reply);
-    throw new WorkflowSuspended();
+    throw new WorkflowSuspended(undefined, [current]);
   };
 
   // Send a durable entity op without awaiting a result — dispatched once (checkpointed, replay-safe).
@@ -834,7 +838,7 @@ export function createWorkflowCtx(
       );
       await store.putSignalWaiter({ token: breakpointToken(runId, current), runId, seq: current });
     }
-    throw new WorkflowSuspended();
+    throw new WorkflowSuspended(undefined, [current]);
   };
 
   // Guard an in-place change: a fresh run records a `patch:<id>` marker here and takes the new
@@ -901,7 +905,7 @@ export function createWorkflowCtx(
       if (existing && existing.status === 'completed') return existing.output as T;
       if (timeoutMs == null) {
         await store.putSignalWaiter({ token, runId, seq: current });
-        throw new WorkflowSuspended();
+        throw new WorkflowSuspended(undefined, [current]);
       }
       const deadline = await stampDeadline(deadlineSeq, token, timeoutMs);
       if (host.clock() >= deadline) {
@@ -909,7 +913,7 @@ export function createWorkflowCtx(
         throw new SignalTimeoutError(token, timeoutMs);
       }
       await store.putSignalWaiter({ token, runId, seq: current });
-      throw new WorkflowSuspended(deadline);
+      throw new WorkflowSuspended(deadline, [current]);
     };
     return { token, url: host.webhookUrl?.(token), wait };
   };

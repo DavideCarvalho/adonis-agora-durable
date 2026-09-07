@@ -341,6 +341,15 @@ export interface StateStore {
   listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]>;
 
   /**
+   * `running` runs whose recovery lease is free (`locked_until` NULL or `<= nowMs`) — the ORPHANS a
+   * periodic recovery pass should reclaim, capped at `limit`. Optional but strongly recommended:
+   * without it the engine falls back to {@link listIncompleteRuns} and filters in process, which on
+   * a busy fleet fetches (and lock-probes) every healthy running run once per tick per worker. When
+   * `namespace` is given, restrict to that worker-pool partition (ANDed).
+   */
+  listOrphanedRuns?(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]>;
+
+  /**
    * The oldest `pending` runs awaiting dispatch (FIFO, by `createdAt`), capped at `limit`. When
    * `namespace` is given, restrict to runs in that worker-pool partition (ANDed); omit it for all.
    */
@@ -348,9 +357,11 @@ export interface StateStore {
 
   /**
    * Suspended runs whose durable timer is due (`wakeAt <= nowMs`), ready to resume. When `namespace`
-   * is given, restrict to runs in that worker-pool partition (ANDed); omit it to return all.
+   * is given, restrict to runs in that worker-pool partition (ANDed); omit it to return all. `limit`
+   * (when given) caps the batch — a backlog drains over several polls; a store may ignore it
+   * (back-compat), the engine tolerates larger batches.
    */
-  listDueTimers(nowMs: number, namespace?: string): Promise<WorkflowRun[]>;
+  listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]>;
 
   /**
    * Atomically acquire the recovery lease on a run for `owner` until `leaseUntilMs`, but only if
@@ -385,6 +396,14 @@ export interface StateStore {
   takeSignalWaiter(token: string): Promise<SignalWaiter | null>;
   /** List waiters whose `token` starts with `prefix` — used to fan out an event to its subscribers. */
   listSignalWaiters(prefix: string): Promise<SignalWaiter[]>;
+
+  /**
+   * All waiters registered BY these runs (`run_id IN (...)`). Optional but strongly recommended:
+   * the dashboard stamps "waiting on X" onto a page of runs and the engine resolves a parent's
+   * children — without this they fall back to `listSignalWaiters('')`, a full-table scan per page
+   * load. Pair the implementation with an index on `run_id`.
+   */
+  listSignalWaitersByRunIds?(runIds: string[]): Promise<SignalWaiter[]>;
 
   /**
    * Delete the EXACT waiter row — `token` AND `runId` AND `seq` must all match — no-op if absent.
@@ -570,6 +589,21 @@ export interface RunQuery {
    * `workflow`/`status`/`tag` to bound the scan on large stores.
    */
   attributes?: AttributeFilter[] | undefined;
+  /**
+   * Only runs created at or before this epoch-ms instant (`created_at <= createdBefore`). Lets a
+   * caller push an age predicate into the store — e.g. the execution-timeout sweep asks for "in-
+   * flight runs older than the timeout" instead of fetching every in-flight run and comparing
+   * `createdAt` in process. Also the console's time-range filter.
+   */
+  createdBefore?: number | undefined;
+  /** Only runs created at or after this epoch-ms instant (`created_at >= createdAfter`). */
+  createdAfter?: number | undefined;
+  /**
+   * Only runs whose durable wake timer is due at this instant (`wake_at IS NOT NULL AND wake_at <=
+   * wakeBefore`). Lets the blocked-run recovery poll ask the store for due rows instead of listing
+   * every blocked run and comparing in process.
+   */
+  wakeBefore?: number | undefined;
   limit?: number | undefined;
   offset?: number | undefined;
 }

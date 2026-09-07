@@ -150,15 +150,32 @@ export class InMemoryStateStore implements StateStore {
       .map((r) => ({ ...r }));
   }
 
-  async listDueTimers(nowMs: number, namespace?: string): Promise<WorkflowRun[]> {
+  async listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]> {
+    const due = [...this.runs.values()].filter(
+      (r) =>
+        r.status === 'suspended' &&
+        r.wakeAt !== undefined &&
+        r.wakeAt <= nowMs &&
+        (namespace === undefined || r.namespace === namespace),
+    );
+    // Oldest deadline first when capped (mirrors the SQL stores' ORDER BY wake_at LIMIT).
+    if (limit !== undefined) {
+      due.sort((a, b) => (a.wakeAt ?? 0) - (b.wakeAt ?? 0));
+      return due.slice(0, limit).map((r) => ({ ...r }));
+    }
+    return due.map((r) => ({ ...r }));
+  }
+
+  async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
     return [...this.runs.values()]
       .filter(
         (r) =>
-          r.status === 'suspended' &&
-          r.wakeAt !== undefined &&
-          r.wakeAt <= nowMs &&
+          r.status === 'running' &&
+          (r.lockedUntil === undefined || r.lockedUntil <= nowMs) &&
           (namespace === undefined || r.namespace === namespace),
       )
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+      .slice(0, limit)
       .map((r) => ({ ...r }));
   }
 
@@ -208,6 +225,12 @@ export class InMemoryStateStore implements StateStore {
     return [...this.signalWaiters.values()]
       .filter((w) => w.token.startsWith(prefix))
       .map((w) => ({ ...w }));
+  }
+
+  async listSignalWaitersByRunIds(runIds: string[]): Promise<SignalWaiter[]> {
+    if (runIds.length === 0) return [];
+    const ids = new Set(runIds);
+    return [...this.signalWaiters.values()].filter((w) => ids.has(w.runId)).map((w) => ({ ...w }));
   }
 
   async removeSignalWaiter(waiter: SignalWaiter): Promise<void> {
@@ -357,6 +380,18 @@ export class InMemoryStateStore implements StateStore {
         query.tags.length === 0
           ? []
           : runs.filter((r) => r.tags?.some((t) => query.tags?.includes(t)));
+    }
+    if (query.createdBefore !== undefined) {
+      const before = query.createdBefore;
+      runs = runs.filter((r) => r.createdAt.getTime() <= before);
+    }
+    if (query.createdAfter !== undefined) {
+      const after = query.createdAfter;
+      runs = runs.filter((r) => r.createdAt.getTime() >= after);
+    }
+    if (query.wakeBefore !== undefined) {
+      const wake = query.wakeBefore;
+      runs = runs.filter((r) => r.wakeAt !== undefined && r.wakeAt <= wake);
     }
     if (query.attributes?.length) {
       // Pushdown: intersect per-predicate candidate sets from the key-indexed side-table, so we only
