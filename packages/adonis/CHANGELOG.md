@@ -1,5 +1,13 @@
 # @adonis-agora/durable
 
+## 0.37.0
+
+### Minor Changes
+
+- [#120](https://github.com/DavideCarvalho/adonis-agora-durable/pull/120) [`db4386c`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/db4386cbe3596ca4a4d85b29c2f45f52f0fdce09) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Widen the optional `@adonisjs/redis` peer to also accept `^11.0.0` (was `^9.2.0 || ^10.0.0`).
+  
+  `RedisAdmissionBackend` and `RedisControlPlane` duck-type over `ioredis`/`@adonisjs/redis`'s `RedisConnection`, and the compile-time assignability check in `test/types/redis-pubsub-assignability.ts` still passes unchanged against `@adonisjs/redis@11` — its `RedisConnection`/pub-sub shape didn't change in a way that affects this package's surface. No code changes; peer ranges only ever widen.
+
 ## 0.36.0
 
 ### Minor Changes
