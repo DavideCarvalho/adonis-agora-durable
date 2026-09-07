@@ -31,6 +31,12 @@ export interface WorkflowOptions {
    * bypass discovery entirely.
    */
   singleton?: SingletonConfig;
+  /**
+   * Package attribution stamped on every run of this workflow (see `WorkflowRun.origin`) — which
+   * package's code produced it, e.g. `@adonis-agora/catalog-pipeline`. Powers the console's origin
+   * facet; omit for an app-local workflow (renders as "unknown" until attributed).
+   */
+  origin?: string;
 }
 
 /** The metadata read off a workflow class's `static workflow` config for discovery + registration. */

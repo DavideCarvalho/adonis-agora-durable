@@ -43,6 +43,14 @@ export interface WorkflowRun {
   workflowVersion: string;
   status: RunStatus;
   /**
+   * Which package's code produced this run — free-form attribution (e.g.
+   * `@adonis-agora/catalog-pipeline`), stamped at start from the workflow registration's `origin`
+   * (or a per-start override). `undefined` on runs created before the field existed or by an
+   * unattributed registration — the console renders those as "unknown". Powers the console's origin
+   * facet; parity with the NestJS twin's `origin` column.
+   */
+  origin?: string | undefined;
+  /**
    * Worker-pool partition this run belongs to (default `'default'`). A worker only picks up /
    * recovers / resumes-timers-for / times-out runs in its OWN namespace, so one shared state store
    * can host non-interchangeable pools (e.g. local dev vs a cluster) without them stealing each
@@ -570,6 +578,9 @@ export interface RunQuery {
    * matches nothing.
    */
   statuses?: RunStatus[] | undefined;
+  /** Exact-match origin attribution (see {@link WorkflowRun.origin}). Cannot express "absent" —
+   *  an unknown-origin facet filters client-side over the page it already holds. */
+  origin?: string | undefined;
   /** Only runs carrying this tag (exact match against {@link WorkflowRun.tags}). */
   tag?: string | undefined;
   /**
@@ -613,8 +624,7 @@ export interface RunQuery {
  * minus paging. A console narrows by workflow/tag/tenant/attribute, and the one call back tells it
  * which values the matching runs take on ONE axis. Keeping status out of the type is what lets a
  * picker stay usable while a status chip is lit: the offered values don't collapse to the one status
- * being viewed. (The AdonisJS engine has no `origin` column, so unlike the NestJS twin there is no
- * origin member to exclude here.)
+ * being viewed.
  */
 export type RunFacetQuery = Omit<RunQuery, 'status' | 'statuses' | 'limit' | 'offset'>;
 
@@ -627,7 +637,7 @@ export type RunFacetQuery = Omit<RunQuery, 'status' | 'statuses' | 'limit' | 'of
  * `attributeValue` lists the values recorded under ONE key (its right-hand side).
  */
 export type RunValueAxis =
-  | { field: 'workflow' | 'status' | 'namespace' | 'tag' | 'attributeKey' }
+  | { field: 'workflow' | 'status' | 'namespace' | 'origin' | 'tag' | 'attributeKey' }
   | { field: 'attributeValue'; key: string };
 
 /**
@@ -1124,6 +1134,40 @@ export interface Transport {
 
 /** One worker's liveness record — a TTL'd heartbeat a worker refreshes while it's consuming. Its
  *  ABSENCE (the key expired) is the signal: a worker that died or stalled stops refreshing. */
+/** How a worker decides its concurrency — part of {@link WorkerStatus}. */
+export interface WorkerConcurrencyStatus {
+  mode: 'fixed' | 'adaptive';
+  limit: number;
+  min?: number | undefined;
+  max?: number | undefined;
+}
+
+/** One recorded concurrency adjustment (adaptive workers) — part of {@link WorkerStatus}. */
+export interface WorkerAdjust {
+  at: number;
+  from: number;
+  to: number;
+  reason: 'ram_ceiling' | 'cpu_ceiling' | 'backpressure' | 'grow' | 'shrink';
+}
+
+/**
+ * A live snapshot of a worker's execution state, carried on its liveness heartbeat so the console's
+ * worker cards show concurrency / in-flight / resource usage — parity with the NestJS fleet's
+ * heartbeat payload (the SPA's `WorkerStatusCells` renders exactly this shape).
+ */
+export interface WorkerStatus {
+  runtime?: 'node' | 'python' | undefined;
+  concurrency: WorkerConcurrencyStatus;
+  inFlight: number;
+  rssBytes?: number | undefined;
+  rssLimitBytes?: number | undefined;
+  rssPct?: number | undefined;
+  cpuPct?: number | undefined;
+  throughputPerMin?: number | undefined;
+  p95Ms?: number | undefined;
+  lastAdjust?: WorkerAdjust | undefined;
+}
+
 export interface WorkerHeartbeat {
   /** The worker group this instance serves (e.g. `pipeline`, `processing-workflows`). */
   group: string;
@@ -1131,6 +1175,8 @@ export interface WorkerHeartbeat {
   instanceId: string;
   /** Epoch ms of the worker's most recent heartbeat. */
   lastBeatAt: number;
+  /** Live execution/resource snapshot, when the worker's heartbeat carries one (see WorkerStatus). */
+  status?: WorkerStatus | undefined;
 }
 
 /** Per-group worker-health snapshot: how much work is queued vs. how many workers are alive to do it.

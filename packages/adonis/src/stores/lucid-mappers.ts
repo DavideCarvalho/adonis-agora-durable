@@ -21,6 +21,8 @@ export interface RunRow {
   workflow_version: string;
   status: string;
   namespace: string | null;
+  /** Nullable + optional: the column arrived in a later schema wave (origin attribution). */
+  origin?: string | null;
   input: string | null;
   output: string | null;
   error: string | null;
@@ -97,6 +99,7 @@ export function runToRow(run: WorkflowRun): RunRow {
     // Persist the partition, defaulting an absent one to 'default' (matches the column DEFAULT) so
     // every row is reachable by a namespace='default' filter.
     namespace: run.namespace ?? 'default',
+    origin: run.origin ?? null,
     input: toJson(run.input),
     output: toJson(run.output),
     error: toJson(run.error),
@@ -124,6 +127,7 @@ export function runPatchToRow(patch: Partial<WorkflowRun>): Partial<RunRow> {
   if ('workflowVersion' in patch) row.workflow_version = patch.workflowVersion;
   if ('status' in patch) row.status = patch.status;
   if ('namespace' in patch) row.namespace = patch.namespace ?? 'default';
+  if ('origin' in patch) row.origin = patch.origin ?? null;
   if ('input' in patch) row.input = toJson(patch.input);
   if ('output' in patch) row.output = toJson(patch.output);
   if ('error' in patch) row.error = toJson(patch.error);
@@ -156,6 +160,7 @@ export function rowToRun(row: RunRow): WorkflowRun {
   if (error !== undefined) run.error = error;
   const wakeAt = toNum(row.wake_at);
   if (wakeAt !== undefined) run.wakeAt = wakeAt;
+  if (row.origin != null) run.origin = row.origin;
   if (row.locked_by != null) run.lockedBy = row.locked_by;
   const lockedUntil = toNum(row.locked_until);
   if (lockedUntil !== undefined) run.lockedUntil = lockedUntil;

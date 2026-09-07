@@ -35,9 +35,11 @@ import {
   type ApiResponse,
   bulkAction,
   cancelRun,
+  completeTaskRun,
   continueRun,
   type DashboardEngine,
   type Deps,
+  failTaskRun,
   getRun,
   health,
   listRuns,
@@ -45,7 +47,9 @@ import {
   retryRun,
   retryWithInputRun,
   runValues,
+  signalRun,
   topology,
+  updateRun,
   workers,
 } from '../src/dashboard/handlers.js';
 import { renderLoginPage } from '../src/dashboard/login_page.js';
@@ -84,6 +88,10 @@ function spaDirectory(): string {
  * - `POST /api/runs/:id/redispatch`   -> re-dispatch a run's lost pending remote steps
  * - `POST /api/runs/:id/cancel`       -> cancel the run
  * - `POST /api/runs/:id/continue`     -> resume a run paused at a breakpoint
+ * - `POST /api/runs/:id/signal`       -> deliver a signal payload to a waited token
+ * - `POST /api/runs/:id/update/:name` -> deliver a validated update (ctx.onUpdate)
+ * - `POST /api/runs/:id/tasks/:name/complete` -> complete an external ctx.task
+ * - `POST /api/runs/:id/tasks/:name/fail`     -> fail an external ctx.task
  * - `POST /api/bulk/:action`          -> bulk retry/cancel every run matching a filter
  * - `GET  /api/health`                -> worker-group health (compact shape)
  * - `GET  /api/workers`               -> worker-group health (full heartbeats; SPA)
@@ -191,6 +199,19 @@ export default class DashboardProvider {
     router
       .post(`${apiBase}/runs/:id/continue`, json(continueRun))
       .as('durable_dashboard.runs.continue');
+    // Human-in-the-loop verbs: deliver a signal / validated update / task completion from the
+    // console — the runs list already names what a suspended run is waiting on; these let the
+    // operator act on it.
+    router.post(`${apiBase}/runs/:id/signal`, json(signalRun)).as('durable_dashboard.runs.signal');
+    router
+      .post(`${apiBase}/runs/:id/update/:name`, json(updateRun))
+      .as('durable_dashboard.runs.update');
+    router
+      .post(`${apiBase}/runs/:id/tasks/:name/complete`, json(completeTaskRun))
+      .as('durable_dashboard.runs.task_complete');
+    router
+      .post(`${apiBase}/runs/:id/tasks/:name/fail`, json(failTaskRun))
+      .as('durable_dashboard.runs.task_fail');
     router.post(`${apiBase}/bulk/:action`, json(bulkAction)).as('durable_dashboard.bulk');
     router
       .get(

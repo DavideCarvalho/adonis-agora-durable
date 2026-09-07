@@ -27,6 +27,10 @@ function storeEngineSpy(): StoreEngineLike & { calls: string[] } {
     workerHealth: async () => track('workerHealth', []),
     retryWithInput: async (id) => track(`retryWithInput:${id}`, null),
     continue: async (id) => track(`continue:${id}`, null),
+    signal: async (token) => track(`signal:${token}`, null),
+    update: async (id, name) => track(`update:${id}:${name}`, { accepted: true, run: null }),
+    completeTask: async (id, name) => track(`completeTask:${id}:${name}`, null),
+    failTask: async (id, name) => track(`failTask:${id}:${name}`, null),
     // The engine's own `subscribe` is GLOBAL (every run) — the adapter narrows it to one run.
     subscribe: (listener) => {
       calls.push('subscribe');

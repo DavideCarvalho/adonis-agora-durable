@@ -47,10 +47,14 @@ describe('RunFilter — the console run filter as a class', () => {
     });
   });
 
-  it('ignores unknown statuses and the origin in both spellings (no origin column)', async () => {
+  it('ignores unknown statuses; origin now narrows (the engine grew an origin column)', async () => {
     expect(await filter({ status: 'from-the-future' })).toEqual({});
-    expect(await filter({ origin: 'acme', status: 'failed' })).toEqual({ status: 'failed' });
+    expect(await filter({ origin: 'acme', status: 'failed' })).toEqual({
+      origin: 'acme',
+      status: 'failed',
+    });
     expect(await filter({ filter: { origin: 'acme', status: 'failed' } })).toEqual({
+      origin: 'acme',
       status: 'failed',
     });
   });

@@ -14,6 +14,7 @@ import type {
   RunValueFacetRow,
   SignalWaiter,
   StepCheckpoint,
+  UpdateResult,
   WorkflowRun,
 } from '../index.js';
 import { RUN_VALUE_FACET_LIMIT } from '../run-value-facets.js';
@@ -70,6 +71,19 @@ export interface DashboardEngine {
   /** Resume a run paused at a `ctx.breakpoint()`. Returns `null` if the run isn't paused at one, or on
    *  a topology that can't perform it yet (see `retryWithInput`). */
   continue(runId: string): Promise<RunResult | null>;
+  /**
+   * Deliver an external signal payload on `token` (the `ctx.waitForSignal` rendezvous) — the console
+   * side of human-in-the-loop: the runs list already NAMES the token a suspended run is parked on;
+   * this lets the operator act on it. Optional: absent on a topology without the engine's signal
+   * surface yet (a store-less `tenant` pod), where the handler degrades to 404.
+   */
+  signal?(token: string, payload: unknown): Promise<RunResult | null>;
+  /** Deliver a validated update to a run's `ctx.onUpdate(name)` point (the workflow's registered
+   *  validator gates it server-side). Optional — see {@link signal}. */
+  update?(runId: string, name: string, arg: unknown): Promise<UpdateResult>;
+  /** Complete / fail a `ctx.task` the run dispatched to an external system. Optional — see {@link signal}. */
+  completeTask?(runId: string, name: string, result: unknown): Promise<RunResult | null>;
+  failTask?(runId: string, name: string, error: string): Promise<RunResult | null>;
   /** Live lifecycle events for ONE run; returns an unsubscribe fn. */
   subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void;
   /**
@@ -381,6 +395,95 @@ export async function continueRun(deps: Deps, req: ApiRequest): Promise<ApiRespo
 }
 
 /**
+ * `POST /runs/:id/signal` — deliver `{ token, payload? }` to a run's `ctx.waitForSignal` rendezvous.
+ * Guarded: unless `force: true`, the token must be one the run is CURRENTLY waiting on (the same
+ * waiter rows the list's `waiting` column reads) — a typo'd token would otherwise buffer a stray
+ * payload silently instead of resuming anything. The 409 carries the tokens the run IS waiting on,
+ * so the console can offer them.
+ */
+export async function signalRun(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
+  const { engine } = deps;
+  const id = req.params.id;
+  if (!id) return notFound('run id is required');
+  if (!engine.signal) return notFound('signals are not available on this topology yet');
+  const body = (req.body ?? {}) as { token?: unknown; payload?: unknown; force?: unknown };
+  const token = typeof body.token === 'string' && body.token.length > 0 ? body.token : undefined;
+  if (!token) return badRequest('token is required');
+  const run = await engine.getRun(id);
+  if (!run) return notFound(`run ${id} not found`);
+  if (body.force !== true) {
+    const waiters = engine.listSignalWaitersByRunIds
+      ? await engine.listSignalWaitersByRunIds([id])
+      : await engine.listSignalWaiters?.('');
+    if (waiters) {
+      const waitingOn = waiters.filter((w) => w.runId === id).map((w) => w.token);
+      if (!waitingOn.includes(token)) {
+        return {
+          status: 409,
+          body: {
+            error: `run ${id} is not waiting on "${token}" (pass force: true to buffer it anyway)`,
+            waitingOn,
+          },
+        };
+      }
+    }
+  }
+  const result = await engine.signal(token, body.payload);
+  return ok({ result });
+}
+
+/**
+ * `POST /runs/:id/update/:name` — deliver `{ arg? }` to a run's `ctx.onUpdate(name)` point. The
+ * workflow's registered validator arbitrates server-side: a rejection comes back 422 with the
+ * reason, and nothing is delivered.
+ */
+export async function updateRun(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
+  const { engine } = deps;
+  const id = req.params.id;
+  const name = req.params.name;
+  if (!id) return notFound('run id is required');
+  if (!name) return notFound('update name is required');
+  if (!engine.update) return notFound('updates are not available on this topology yet');
+  const body = (req.body ?? {}) as { arg?: unknown };
+  const result = await engine.update(id, name, body.arg);
+  if (!result.accepted) {
+    return { status: 422, body: { error: result.reason ?? 'update rejected', result } };
+  }
+  return ok({ result });
+}
+
+/** `POST /runs/:id/tasks/:name/complete` — complete a `ctx.task` from the console with `{ result? }`. */
+export async function completeTaskRun(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
+  const { engine } = deps;
+  const id = req.params.id;
+  const name = req.params.name;
+  if (!id) return notFound('run id is required');
+  if (!name) return notFound('task name is required');
+  if (!engine.completeTask) return notFound('tasks are not available on this topology yet');
+  const body = (req.body ?? {}) as { result?: unknown };
+  const result = await engine.completeTask(id, name, body.result);
+  // A null result means no waiter was live YET — the completion was BUFFERED (reliable delivery:
+  // the run consumes it when it reaches the task's wait). Report that instead of pretending a 404.
+  return ok({ result, delivered: result != null });
+}
+
+/** `POST /runs/:id/tasks/:name/fail` — fail a `ctx.task` from the console with `{ error }`. */
+export async function failTaskRun(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
+  const { engine } = deps;
+  const id = req.params.id;
+  const name = req.params.name;
+  if (!id) return notFound('run id is required');
+  if (!name) return notFound('task name is required');
+  if (!engine.failTask) return notFound('tasks are not available on this topology yet');
+  const body = (req.body ?? {}) as { error?: unknown };
+  const error =
+    typeof body.error === 'string' && body.error.length > 0 ? body.error : 'failed from console';
+  const result = await engine.failTask(id, name, error);
+  // Null = buffered (no live waiter yet) — same reliable-delivery semantics as completeTaskRun.
+  return ok({ result, delivered: result != null });
+}
+
+/**
  * `POST /bulk/:action` (`action` = `retry`|`cancel`) — apply an action to every run matching the same
  * filter `listRuns` accepts (status/workflow/tag/namespace/attr), capped at 500 matches. Skips (does
  * not abort on) a run that can't take the action (e.g. already terminal). Mirrors
@@ -464,6 +567,7 @@ function summarizeRun(run: WorkflowRun, waiterByRun?: ReadonlyMap<string, Signal
     workflowVersion: run.workflowVersion,
     status: run.status,
     namespace: run.namespace,
+    origin: run.origin,
     tags: run.tags ?? [],
     createdAt: run.createdAt.toISOString(),
     updatedAt: run.updatedAt.toISOString(),

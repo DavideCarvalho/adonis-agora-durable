@@ -372,6 +372,7 @@ export class InMemoryStateStore implements StateStore {
               (r) => r.namespace !== undefined && query.namespaces?.includes(r.namespace),
             );
     }
+    if (query.origin) runs = runs.filter((r) => r.origin === query.origin);
     if (query.status) runs = runs.filter((r) => r.status === query.status);
     if (query.statuses) runs = runs.filter((r) => query.statuses?.includes(r.status));
     if (query.tag) runs = runs.filter((r) => r.tags?.includes(query.tag as string));

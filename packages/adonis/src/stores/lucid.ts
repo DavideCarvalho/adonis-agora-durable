@@ -528,6 +528,7 @@ export class LucidStateStore implements StateStore {
       if (query.namespaces.length) q.whereIn('namespace', query.namespaces);
       else q.whereRaw('1 = 0');
     }
+    if (query.origin) q.where('origin', query.origin);
     if (query.status) q.where('status', query.status);
     if (query.statuses) {
       // `status IN (...)`; an empty set matches nothing (mirrors the in-memory store).

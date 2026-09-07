@@ -102,6 +102,12 @@ export interface StartOptions {
    * stamped, the run is only picked up / resumed by an engine in the same namespace.
    */
   namespace?: string | undefined;
+  /**
+   * Package attribution to stamp on THIS run, overriding the registration's `origin`. Rarely needed
+   * — the registration-level origin covers "which package's code produced this run"; pass it here
+   * when one shared workflow is started on behalf of another package.
+   */
+  origin?: string | undefined;
 }
 
 /**
@@ -167,6 +173,8 @@ interface RegisteredWorkflow {
   fn: WorkflowFn;
   /** Static `workflow` config `tags` — merged with per-run tags onto each run at start. */
   tags?: string[] | undefined;
+  /** Package attribution stamped on every run this registration starts (see WorkflowRun.origin). */
+  origin?: string | undefined;
   /** Per-key serialization (a durable mutex). See {@link SingletonConfig}. */
   singleton?: SingletonConfig | undefined;
   /** Max wall-clock lifetime (ms) before a run is cancelled by `sweepTimeouts`. */
@@ -753,6 +761,8 @@ export class WorkflowEngine {
       onEvent?: string[] | undefined;
       eventBatch?: EventBatchConfig | undefined;
       requires?: string[] | undefined;
+      /** Package attribution stamped on every run this registration starts (WorkflowRun.origin). */
+      origin?: string | undefined;
     },
   ): void {
     const registered: RegisteredWorkflow = {
@@ -760,6 +770,7 @@ export class WorkflowEngine {
       version,
       fn,
       tags: opts?.tags,
+      origin: opts?.origin,
       singleton: opts?.singleton,
       executionTimeoutMs:
         opts?.executionTimeout != null ? parseDuration(opts.executionTimeout) : undefined,
@@ -1065,6 +1076,7 @@ export class WorkflowEngine {
       workflow: name,
       workflowVersion: registered.version,
       status: 'pending',
+      origin: opts?.origin ?? registered.origin,
       namespace: opts?.namespace ?? this.namespace,
       input,
       tags,

@@ -96,8 +96,8 @@ export function taskJobOptions(priority?: number): TaskJobOptions {
  * normalise seconds→ms only as a legacy fallback). Byte-compatible with the Python worker's minimal
  * form and accepted by the aviary reader (which tolerates a missing `status`).
  */
-export function heartbeatKeyValue(nowMs: number = Date.now()): string {
-  return JSON.stringify({ ts: nowMs });
+export function heartbeatKeyValue(nowMs: number = Date.now(), status?: unknown): string {
+  return JSON.stringify(status === undefined ? { ts: nowMs } : { ts: nowMs, status });
 }
 
 /**
@@ -106,7 +106,10 @@ export function heartbeatKeyValue(nowMs: number = Date.now()): string {
  * A bare number or a `ts` below {@link EPOCH_MS_THRESHOLD} is treated as seconds and scaled to ms.
  * Robust to a missing/garbled value (→ `lastBeatAt: 0`).
  */
-export function parseHeartbeatValue(raw: string | null): { lastBeatAt: number } {
+export function parseHeartbeatValue(raw: string | null): {
+  lastBeatAt: number;
+  status?: Record<string, unknown> | undefined;
+} {
   if (raw == null) return { lastBeatAt: 0 };
   const trimmed = raw.trim();
   if (trimmed === '') return { lastBeatAt: 0 };
@@ -118,8 +121,15 @@ export function parseHeartbeatValue(raw: string | null): { lastBeatAt: number } 
   if (!trimmed.startsWith('{')) return { lastBeatAt: toMs(Number(trimmed)) };
 
   try {
-    const parsed = JSON.parse(trimmed) as { ts?: unknown };
-    return { lastBeatAt: typeof parsed.ts === 'number' ? toMs(parsed.ts) : 0 };
+    const parsed = JSON.parse(trimmed) as { ts?: unknown; status?: unknown };
+    const status =
+      parsed.status !== null && typeof parsed.status === 'object'
+        ? (parsed.status as Record<string, unknown>)
+        : undefined;
+    return {
+      lastBeatAt: typeof parsed.ts === 'number' ? toMs(parsed.ts) : 0,
+      ...(status !== undefined ? { status } : {}),
+    };
   } catch {
     // Malformed JSON — fall back to a numeric read so a partially-written value still yields a beat.
     return { lastBeatAt: toMs(Number(trimmed)) };

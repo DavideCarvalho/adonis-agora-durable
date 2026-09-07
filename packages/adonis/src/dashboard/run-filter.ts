@@ -127,10 +127,14 @@ export class RunFilter extends BaseFilter<RunQueryDraft> {
     this.$query.narrow(values.length === 1 ? { namespace: values[0] } : { namespaces: values });
   }
 
-  /** The engine has no `origin` column, so origin is read but ignored — a client that always sends
-   *  it (parity with the NestJS API) never 400s. Origin faceting stays client-side. */
-  origin(): void {
-    return;
+  /** Exact-match origin attribution — pushed down now that the engine has an `origin` column.
+   *  The "unknown" bucket (absent origin) still filters client-side: an exact match can't express
+   *  absence, exactly as the NestJS API behaves. */
+  origin(value: unknown, operator: string): void {
+    assertSetOperator('origin', operator);
+    const values = list(value);
+    if (values.length === 0) return;
+    this.$query.narrow({ origin: values[0] });
   }
 
   /**

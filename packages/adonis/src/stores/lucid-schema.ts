@@ -92,6 +92,7 @@ export async function createDurableTables(
       table.string('workflow_version').notNullable();
       table.string('status').notNullable();
       table.string('namespace').notNullable().defaultTo('default');
+      table.string('origin');
       table.text('input');
       table.text('output');
       table.text('error');
@@ -131,6 +132,13 @@ export async function createDurableTables(
         table.index(['namespace', 'status', 'created_at'], 'durable_runs_namespace_idx');
       });
       repairs.push(`${DURABLE_TABLES.runs}.namespace`);
+    }
+    if (!(await conn().hasColumn(DURABLE_TABLES.runs, 'origin'))) {
+      // Origin attribution wave: nullable, so an unattributed/legacy run reads back as "unknown".
+      await conn().alterTable(DURABLE_TABLES.runs, (table) => {
+        table.string('origin');
+      });
+      repairs.push(`${DURABLE_TABLES.runs}.origin`);
     }
     // Index-only repair (no hasColumn probe works for indexes portably; creating one that already
     // exists throws, so probe by name via a best-effort create-and-swallow). The dashboard's default

@@ -42,8 +42,13 @@ export function isEngineMintedTag(value: string | null): boolean {
  */
 export function axisIsRunColumn(
   axis: RunValueAxis,
-): axis is { field: 'workflow' | 'status' | 'namespace' } {
-  return axis.field === 'workflow' || axis.field === 'status' || axis.field === 'namespace';
+): axis is { field: 'workflow' | 'status' | 'namespace' | 'origin' } {
+  return (
+    axis.field === 'workflow' ||
+    axis.field === 'status' ||
+    axis.field === 'namespace' ||
+    axis.field === 'origin'
+  );
 }
 
 /** The values one run contributes to an axis — several for `tag` (a run carries a set), one for the
@@ -56,6 +61,9 @@ function valuesOf(run: WorkflowRun, axis: RunValueAxis): Array<string | null> {
       return [run.status];
     case 'namespace':
       return run.namespace === undefined ? [] : [run.namespace];
+    case 'origin':
+      // `null` is origin's absent bucket ("unknown") — the console must be able to count it.
+      return [run.origin ?? null];
     case 'tag':
       return run.tags ?? [];
     case 'attributeKey':

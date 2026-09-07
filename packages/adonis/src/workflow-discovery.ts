@@ -80,6 +80,7 @@ export async function registerWorkflowClass(
         ? { onEvent: [...(meta.onEvent ?? []), ...exactNames] }
         : {}),
       ...(meta.singleton ? { singleton: meta.singleton } : {}),
+      ...(meta.origin ? { origin: meta.origin } : {}),
     },
   );
   // Collect any colocated `static schedule` on the class so the worker loop can fire it alongside the
