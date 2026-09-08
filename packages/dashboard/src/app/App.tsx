@@ -953,7 +953,7 @@ export function RunsList({
   /** True while the server may still hold more runs matching the current tag/attr/namespace filter
    *  beyond what's been fetched (the last page came back full — see `RunsPage.page`). */
   hasMore?: boolean;
-  /** True while a scroll-triggered `/runs?offset=…` fetch is in flight. */
+  /** True while a scroll-triggered `/runs?page=…` fetch is in flight. */
   loadingMore?: boolean;
   /** Fetch the next page. Called once the virtualizer scrolls the last loaded row into view — the
    *  virtualizer already tracks exactly which rows are visible, so this composes for free instead of
