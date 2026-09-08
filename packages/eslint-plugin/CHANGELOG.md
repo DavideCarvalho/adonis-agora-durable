@@ -1,5 +1,15 @@
 # @adonis-agora/durable-eslint-plugin
 
+## 0.3.1
+
+### Patch Changes
+
+- [#138](https://github.com/DavideCarvalho/adonis-agora-durable/pull/138) [`4916be2`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/4916be2b7129d6bceba2e7d2fc9c302b00d2c283) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Routine dependency refresh.
+  
+  `@adonis-agora/durable`'s optional `vitest` peer now accepts `^5.0.0` too (`^3.0.0 || ^4.0.0 || ^5.0.0`). The testing kit is exercised against vitest 5 in CI and the range only widens, so nothing that resolved before stops resolving. The package's stale `zod` devDependency (`3.25.76`) is realigned with the `zod@4.5.4` it already declares — and pnpm already resolved — as a runtime dependency; no published dependency range changes.
+  
+  `@adonis-agora/durable-eslint-plugin` picks up `@typescript-eslint/utils@8.69.0`.
+
 ## 0.3.0
 
 ### Minor Changes
