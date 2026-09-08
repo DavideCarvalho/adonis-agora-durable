@@ -157,7 +157,7 @@ describe('JSON handlers', () => {
     const ids = (res: Awaited<ReturnType<typeof listRuns>>): string[] =>
       (res.body as { runs: Array<{ id: string }> }).runs.map((r) => r.id);
     const meta = (res: Awaited<ReturnType<typeof listRuns>>) =>
-      (res.body as { page: { page: number; size: number; count: number } }).page;
+      (res.body as { meta: { page: number; size: number; count: number } }).meta;
 
     it('walks disjoint pages: page 2 of size 2 is the remainder, not a re-read of page 1', async () => {
       await threeRuns();

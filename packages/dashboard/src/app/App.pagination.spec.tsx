@@ -70,8 +70,8 @@ function wrapper({ children }: { children: ReactNode }) {
   return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
 }
 
-function page(runs: RunsPage['runs'], meta: RunsPage['page']): RunsPage {
-  return { runs, page: meta };
+function page(runs: RunsPage['runs'], meta: RunsPage['meta']): RunsPage {
+  return { runs, meta };
 }
 
 function run(id: string, tag?: string) {

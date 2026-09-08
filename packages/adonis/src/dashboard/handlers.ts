@@ -351,7 +351,7 @@ export async function listRuns(deps: Deps, req: ApiRequest): Promise<ApiResponse
   const waiterByRun = waiters ? indexWaitersByRun(waiters) : undefined;
   return ok({
     runs: runs.map((run) => redacted(deps.redact?.run, summarizeRun(run, waiterByRun))),
-    page: { page, size, count: runs.length },
+    meta: { page, size, count: runs.length },
     statuses: RUN_STATUSES,
   });
 }

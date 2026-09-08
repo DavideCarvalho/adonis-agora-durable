@@ -951,7 +951,7 @@ export function RunsList({
    *  "these runs do not exist" when the truth is "this filter cannot match them". */
   emptyNotice: ReturnType<typeof emptyRunsNotice>;
   /** True while the server may still hold more runs matching the current tag/attr/namespace filter
-   *  beyond what's been fetched (the last page came back full — see `RunsPage.page`). */
+   *  beyond what's been fetched (the last page came back full — see `RunsPage.meta`). */
   hasMore?: boolean;
   /** True while a scroll-triggered `/runs?page=…` fetch is in flight. */
   loadingMore?: boolean;
@@ -1786,7 +1786,7 @@ export function App() {
     // The server never returns a total match count (see `RunsPage`'s doc) — a full page is the only
     // signal that more might exist; a short page means the store is exhausted.
     getNextPageParam: (lastPage) => {
-      const { page, size, count } = lastPage.page;
+      const { page, size, count } = lastPage.meta;
       return count === size ? page + 1 : undefined;
     },
     // Keep the run list live. NOTE: on an infinite query this refetches EVERY already-loaded page (not
