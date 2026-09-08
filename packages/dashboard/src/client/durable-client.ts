@@ -609,16 +609,18 @@ export interface RunPageOptions {
 }
 
 /** One page of `/runs`, WITH the pagination metadata the plain {@link durableClient.runs} throws away.
- *  `page.count` is how many runs THIS page returned (not a total) — `count === page.size` is the
+ *  The envelope key is `meta` — AdonisJS/Lucid's own `.paginate()` convention, which is where
+ *  `@adonis-agora/filter`'s offset path lands, so every `@adonis-agora/*` listing spells it the same.
+ *  `meta.count` is how many runs THIS page returned (not a total) — `count === meta.size` is the
  *  server's only "there might be more" signal, since it never counts the full match set. */
 export interface RunsPage {
   runs: WorkflowRun[];
-  page: { page: number; size: number; count: number };
+  meta: { page: number; size: number; count: number };
 }
 
 interface RunsListResponse {
   runs: WorkflowRun[];
-  page: { page: number; size: number; count: number };
+  meta: { page: number; size: number; count: number };
   statuses: RunStatus[];
 }
 
@@ -645,7 +647,7 @@ export const durableClient = {
     return runs;
   },
   /** Same filters as {@link runs}, plus real `page`/`size` paging — and, unlike {@link runs}, keeps
-   *  the server's `page` metadata instead of discarding it, so a caller (the infinite-scrolling runs
+   *  the server's `meta` window instead of discarding it, so a caller (the infinite-scrolling runs
    *  list) can tell whether another page might exist. */
   async runsPage(
     status?: RunStatus,
@@ -656,7 +658,7 @@ export const durableClient = {
   ): Promise<RunsPage> {
     const qs = runQueryString({ status, tag, attr, ...opts }, page ?? {});
     const res = await http<RunsListResponse>(qs ? `/runs?${qs}` : '/runs');
-    return { runs: res.runs, page: res.page };
+    return { runs: res.runs, meta: res.meta };
   },
   /**
    * The distinct values one filter field takes across the runs matching the OTHER active predicates,

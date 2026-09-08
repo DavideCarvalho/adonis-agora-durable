@@ -38,7 +38,7 @@ vi.mock('../client/durable-client', async (importOriginal) => {
       ...actual.durableClient,
       run: (id: string) => getRun(id),
       runs: vi.fn().mockResolvedValue([]),
-      runsPage: vi.fn().mockResolvedValue({ runs: [], page: { page: 1, size: 100, count: 0 } }),
+      runsPage: vi.fn().mockResolvedValue({ runs: [], meta: { page: 1, size: 100, count: 0 } }),
       values: vi.fn().mockResolvedValue([]),
       workers: vi.fn().mockResolvedValue([]),
       topology: vi.fn().mockResolvedValue({ role: 'standalone' }),

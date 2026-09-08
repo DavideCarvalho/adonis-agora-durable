@@ -175,13 +175,14 @@ A refused structured filter — unknown field, unsupported operator, a group the
 
 Paging is the same offset shape every Agora library takes (`@adonis-agora/filter`'s `page`/`size`): a **1-based** page number and a page size, `?page=2&size=100`. The 0-based offset it resolves to is the store's business, never the wire's.
 
-The response is `{ runs, page: { page, size, count }, statuses }`. `page.count` is how many rows this page returned, not a total — `count === size` is the "there may be more" signal.
+The response is `{ runs, meta: { page, size, count }, statuses }`. The envelope key is `meta`, the same name AdonisJS/Lucid's own `.paginate()` uses — every `@adonis-agora/*` listing spells it that way. `meta.count` is how many rows this page returned, not a total — `count === size` is the "there may be more" signal.
 
 <Callout type="warn">
-  **Breaking in 0.39.0.** This endpoint took `?limit=&offset=` (0-based) before. `limit`/`offset` are now
-  ignored like any other unknown flat param — a stale client gets an unpaged first page rather than a
-  `400`, so translate as `page = offset / limit + 1`, `size = limit`. Same rename on `RunQuery`
-  (`engine.listRuns({ page, size })`) and on the cross-pod `listRuns` gateway request.
+  **Breaking in 0.39.0.** This endpoint took `?limit=&offset=` (0-based) before, and answered under a
+  `page` envelope key. `limit`/`offset` are now ignored like any other unknown flat param — a stale
+  client gets an unpaged first page rather than a `400`, so translate as `page = offset / limit + 1`,
+  `size = limit`; and read the window off `body.meta` instead of `body.page`. Same `page`/`size` rename
+  on `RunQuery` (`engine.listRuns({ page, size })`) and on the cross-pod `listRuns` gateway request.
 </Callout>
 
 #### The picker enumeration

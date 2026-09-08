@@ -26,14 +26,14 @@ function jsonResponse(body: unknown, status: number): Response {
 describe('durableClient: unwrapping the AdonisJS backend response envelopes', () => {
   afterEach(() => vi.unstubAllGlobals());
 
-  it('unwraps GET /runs { runs, page, statuses } to a bare WorkflowRun[]', async () => {
+  it('unwraps GET /runs { runs, meta, statuses } to a bare WorkflowRun[]', async () => {
     const run = { id: 'r1', workflow: 'w', workflowVersion: '1', status: 'completed' as const };
     vi.stubGlobal(
       'fetch',
       vi
         .fn()
         .mockResolvedValue(
-          jsonResponse({ runs: [run], page: { page: 1, size: 50, count: 1 }, statuses: [] }, 200),
+          jsonResponse({ runs: [run], meta: { page: 1, size: 50, count: 1 }, statuses: [] }, 200),
         ),
     );
     await expect(durableClient.runs()).resolves.toEqual([run]);
@@ -251,7 +251,7 @@ describe('durableClient: the run-list / bulk query string', () => {
       vi.fn((url: string) => {
         calls.push(url);
         return Promise.resolve(
-          jsonResponse({ runs: [], page: { page: 1, size: 50, count: 0 }, statuses: [] }, 200),
+          jsonResponse({ runs: [], meta: { page: 1, size: 50, count: 0 }, statuses: [] }, 200),
         );
       }),
     );
@@ -291,7 +291,7 @@ describe('durableClient: the run-list / bulk query string', () => {
   });
 });
 
-describe('durableClient.runsPage: real pagination (unlike runs(), keeps the page metadata)', () => {
+describe('durableClient.runsPage: real pagination (unlike runs(), keeps the `meta` envelope)', () => {
   function captureUrl(): { calls: string[] } {
     const calls: string[] = [];
     vi.stubGlobal(
@@ -299,7 +299,7 @@ describe('durableClient.runsPage: real pagination (unlike runs(), keeps the page
       vi.fn((url: string) => {
         calls.push(url);
         return Promise.resolve(
-          jsonResponse({ runs: [], page: { page: 1, size: 50, count: 0 }, statuses: [] }, 200),
+          jsonResponse({ runs: [], meta: { page: 1, size: 50, count: 0 }, statuses: [] }, 200),
         );
       }),
     );
@@ -308,7 +308,7 @@ describe('durableClient.runsPage: real pagination (unlike runs(), keeps the page
 
   afterEach(() => vi.unstubAllGlobals());
 
-  it('sends page/size when given, and returns the page metadata instead of discarding it', async () => {
+  it('sends page/size when given, and returns the `meta` envelope instead of discarding it', async () => {
     const run = { id: 'r1', workflow: 'w', workflowVersion: '1', status: 'completed' as const };
     const calls: string[] = [];
     vi.stubGlobal(
@@ -316,7 +316,7 @@ describe('durableClient.runsPage: real pagination (unlike runs(), keeps the page
       vi.fn((url: string) => {
         calls.push(url);
         return Promise.resolve(
-          jsonResponse({ runs: [run], page: { page: 2, size: 100, count: 1 }, statuses: [] }, 200),
+          jsonResponse({ runs: [run], meta: { page: 2, size: 100, count: 1 }, statuses: [] }, 200),
         );
       }),
     );
@@ -326,7 +326,7 @@ describe('durableClient.runsPage: real pagination (unlike runs(), keeps the page
       size: 100,
     });
 
-    expect(page).toEqual({ runs: [run], page: { page: 2, size: 100, count: 1 } });
+    expect(page).toEqual({ runs: [run], meta: { page: 2, size: 100, count: 1 } });
     const query = new URLSearchParams(calls[0]?.split('?')[1] ?? '');
     expect(query.get('page')).toBe('2');
     expect(query.get('size')).toBe('100');

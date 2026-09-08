@@ -12,8 +12,8 @@ The 0-based offset has not disappeared, it has become internal: `runPageWindow(q
 What changed, concretely:
 
 - `RunQuery.limit`/`.offset` → `RunQuery.page`/`.size`. This is also the cross-pod wire shape, so a `listRuns` gateway request between a proxy pod and a store pod carries `size` where it carried `limit` (the golden wire fixtures moved with it — polyglot SDKs asserting those bytes need the same rename).
-- `GET /durable/api/runs` parses `?page=&size=` and answers `{ runs, page: { page, size, count }, statuses }`. `limit`/`offset` are now ignored like any other unknown flat param, so a stale client gets an unpaged first page rather than a `400`.
-- The console's client (`durableClient.runsPage`, `RunPageOptions`, `runQueryString`) sends `page`/`size` and pages the runs list 1-based.
+- `GET /durable/api/runs` parses `?page=&size=` and answers `{ runs, meta: { page, size, count }, statuses }`. The pagination envelope key is **`meta`** — the name AdonisJS/Lucid's own `.paginate()` uses, and where `@adonis-agora/filter`'s offset path lands, so every `@adonis-agora/*` listing spells it the same (it also spares you `body.page.page`). It replaces the previous `limit`/`offset` echo; read the window off `body.meta`. `limit`/`offset` query params are now ignored like any other unknown flat param, so a stale client gets an unpaged first page rather than a `400`.
+- The console's client (`durableClient.runsPage`, `RunPageOptions`, `runQueryString`) sends `page`/`size` and pages the runs list 1-based; `RunsPage` carries that window as `.meta`.
 
 Deliberately NOT renamed: `GET /durable/api/runs/values` keeps `limit`/`offset`. That endpoint is filter's own group-by-count aggregation (`groupByCount[limit]`/`groupByCount[offset]`, `GroupByCountFromRequestOptions`), not a run listing — `limit`/`offset` IS the aligned spelling there, and respelling it would diverge from the lib rather than match it. The ace `durable:runs --limit` flag also keeps its name: it is a row cap with no page companion, and it maps to `size` internally.
 
@@ -31,6 +31,12 @@ await engine.listRuns({ workflow: 'checkout', page: 3, size: 25 })
 GET /durable/api/runs?status=failed&limit=25&offset=50
 # after
 GET /durable/api/runs?status=failed&page=3&size=25
+```
+
+```ts
+// reading the window back off a /runs response
+- const { limit, offset } = body.page
++ const { page, size, count } = body.meta
 ```
 
 ```ts

@@ -646,7 +646,7 @@ function body(path: string, init?: RequestInit): MockAnswer {
   }
   if (route === '/schedules') return { status: 200, payload: { schedules } };
   if (route === '/runs') {
-    // The real envelope (`{ runs, page, statuses}`), with the same predicate semantics as the
+    // The real envelope (`{ runs, meta, statuses}`), with the same predicate semantics as the
     // server — otherwise the tenant/tag/attr boxes in the preview would look broken, and a
     // screenshot of them would be a lie.
     // Same 1-based `page`/`size` the real endpoint parses, resolved to a 0-based slice here.
@@ -658,7 +658,7 @@ function body(path: string, init?: RequestInit): MockAnswer {
       status: 200,
       payload: {
         runs: matching.slice(offset, offset + size),
-        page: { page, size, count: Math.min(size, Math.max(matching.length - offset, 0)) },
+        meta: { page, size, count: Math.min(size, Math.max(matching.length - offset, 0)) },
         statuses: STATUSES,
       },
     };

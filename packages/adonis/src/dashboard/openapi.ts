@@ -141,7 +141,7 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
               type: 'object',
               properties: {
                 runs: { type: 'array', items: { $ref: '#/components/schemas/RunSummary' } },
-                page: { type: 'object' },
+                meta: { type: 'object' },
                 statuses: { type: 'array', items: { type: 'string' } },
               },
             }),
