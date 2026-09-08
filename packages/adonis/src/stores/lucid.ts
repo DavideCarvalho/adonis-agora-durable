@@ -16,6 +16,7 @@ import type {
   StepCheckpoint,
   WorkflowRun,
 } from '../interfaces.js';
+import { runPageWindow } from '../run-pagination.js';
 import {
   axisIsRunColumn,
   mergeRunValueFacetRows,
@@ -468,8 +469,11 @@ export class LucidStateStore implements StateStore {
     const q = this.scopedRuns(query);
 
     q.orderBy('created_at', 'desc'); // newest first — recent runs on top in the dashboard
-    if (query.limit !== undefined) q.limit(query.limit);
-    if (query.offset !== undefined) q.offset(query.offset);
+    // The 1-based `page`/`size` the caller speaks becomes SQL's 0-based window HERE — the only
+    // place this adapter knows about an offset at all (see `runPageWindow`).
+    const { limit, offset } = runPageWindow(query);
+    if (limit !== undefined) q.limit(limit);
+    if (offset > 0) q.offset(offset);
 
     const rows = await q;
     return (rows as RunRow[]).map(rowToRun);

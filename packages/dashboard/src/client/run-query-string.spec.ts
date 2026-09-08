@@ -44,11 +44,20 @@ describe('runQueryString — the console filter as a filter envelope', () => {
     expect(qs.toString()).not.toContain('filter[attr]');
   });
 
-  it('rides paging outside the filter envelope', () => {
-    const qs = params(runQueryString({ tag: 'etl' }, { limit: 100, offset: 200 }));
+  it('rides paging outside the filter envelope, as the ecosystem 1-based page/size', () => {
+    const qs = params(runQueryString({ tag: 'etl' }, { page: 3, size: 100 }));
     expect(qs.get('filter[tag]')).toBe('etl');
-    expect(qs.get('limit')).toBe('100');
-    expect(qs.get('offset')).toBe('200');
+    expect(qs.get('page')).toBe('3');
+    expect(qs.get('size')).toBe('100');
+    // The pre-0.39 spelling is gone — a server reading `limit`/`offset` would silently page wrong.
+    expect(qs.get('limit')).toBeNull();
+    expect(qs.get('offset')).toBeNull();
+  });
+
+  it('sends only the paging keys it was given, leaving the other to the server default', () => {
+    expect(params(runQueryString({}, { size: 25 })).get('page')).toBeNull();
+    expect(params(runQueryString({}, { size: 25 })).get('size')).toBe('25');
+    expect(params(runQueryString({}, { page: 2 })).get('size')).toBeNull();
   });
 
   it('emits the values-picker envelope: scope plus axis, bound and search', () => {

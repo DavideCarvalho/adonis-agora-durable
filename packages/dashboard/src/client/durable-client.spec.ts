@@ -33,10 +33,7 @@ describe('durableClient: unwrapping the AdonisJS backend response envelopes', ()
       vi
         .fn()
         .mockResolvedValue(
-          jsonResponse(
-            { runs: [run], page: { limit: 50, offset: 0, count: 1 }, statuses: [] },
-            200,
-          ),
+          jsonResponse({ runs: [run], page: { page: 1, size: 50, count: 1 }, statuses: [] }, 200),
         ),
     );
     await expect(durableClient.runs()).resolves.toEqual([run]);
@@ -254,7 +251,7 @@ describe('durableClient: the run-list / bulk query string', () => {
       vi.fn((url: string) => {
         calls.push(url);
         return Promise.resolve(
-          jsonResponse({ runs: [], page: { limit: 50, offset: 0, count: 0 }, statuses: [] }, 200),
+          jsonResponse({ runs: [], page: { page: 1, size: 50, count: 0 }, statuses: [] }, 200),
         );
       }),
     );
@@ -302,7 +299,7 @@ describe('durableClient.runsPage: real pagination (unlike runs(), keeps the page
       vi.fn((url: string) => {
         calls.push(url);
         return Promise.resolve(
-          jsonResponse({ runs: [], page: { limit: 50, offset: 0, count: 0 }, statuses: [] }, 200),
+          jsonResponse({ runs: [], page: { page: 1, size: 50, count: 0 }, statuses: [] }, 200),
         );
       }),
     );
@@ -311,7 +308,7 @@ describe('durableClient.runsPage: real pagination (unlike runs(), keeps the page
 
   afterEach(() => vi.unstubAllGlobals());
 
-  it('sends limit/offset when given, and returns the page metadata instead of discarding it', async () => {
+  it('sends page/size when given, and returns the page metadata instead of discarding it', async () => {
     const run = { id: 'r1', workflow: 'w', workflowVersion: '1', status: 'completed' as const };
     const calls: string[] = [];
     vi.stubGlobal(
@@ -319,26 +316,23 @@ describe('durableClient.runsPage: real pagination (unlike runs(), keeps the page
       vi.fn((url: string) => {
         calls.push(url);
         return Promise.resolve(
-          jsonResponse(
-            { runs: [run], page: { limit: 100, offset: 100, count: 1 }, statuses: [] },
-            200,
-          ),
+          jsonResponse({ runs: [run], page: { page: 2, size: 100, count: 1 }, statuses: [] }, 200),
         );
       }),
     );
 
     const page = await durableClient.runsPage(undefined, undefined, undefined, undefined, {
-      limit: 100,
-      offset: 100,
+      page: 2,
+      size: 100,
     });
 
-    expect(page).toEqual({ runs: [run], page: { limit: 100, offset: 100, count: 1 } });
+    expect(page).toEqual({ runs: [run], page: { page: 2, size: 100, count: 1 } });
     const query = new URLSearchParams(calls[0]?.split('?')[1] ?? '');
-    expect(query.get('limit')).toBe('100');
-    expect(query.get('offset')).toBe('100');
+    expect(query.get('page')).toBe('2');
+    expect(query.get('size')).toBe('100');
   });
 
-  it('omits limit/offset when no paging is given, so the server keeps its own defaults', async () => {
+  it('omits page/size when no paging is given, so the server keeps its own defaults', async () => {
     const { calls } = captureUrl();
     await durableClient.runsPage();
     expect(calls[0]).toBe('/durable/api/runs');
@@ -351,7 +345,7 @@ describe('durableClient.runsPage: real pagination (unlike runs(), keeps the page
       'tier:pro',
       ['amount:gte:200'],
       { namespace: 'acme', origin: '@scope/pkg' },
-      { limit: 25, offset: 50 },
+      { page: 3, size: 25 },
     );
     const query = new URLSearchParams(calls[0]?.split('?')[1] ?? '');
     expect(query.get('filter[status]')).toBe('failed');
@@ -359,16 +353,16 @@ describe('durableClient.runsPage: real pagination (unlike runs(), keeps the page
     expect(query.get('filter[attr]')).toBe('amount:gte:200');
     expect(query.get('filter[namespace]')).toBe('acme');
     expect(query.get('filter[origin]')).toBe('@scope/pkg');
-    expect(query.get('limit')).toBe('25');
-    expect(query.get('offset')).toBe('50');
+    expect(query.get('page')).toBe('3');
+    expect(query.get('size')).toBe('25');
   });
 
   it('runs() is a thin wrapper over runsPage() — same envelope-unwrapping, no page params sent', async () => {
     const { calls } = captureUrl();
     await durableClient.runs('failed', 'tier:pro');
     const query = new URLSearchParams(calls[0]?.split('?')[1] ?? '');
-    expect(query.get('limit')).toBeNull();
-    expect(query.get('offset')).toBeNull();
+    expect(query.get('page')).toBeNull();
+    expect(query.get('size')).toBeNull();
   });
 
   it('sends a tag/namespace SET as a filter in-list, so a multi-select filters to the union', async () => {

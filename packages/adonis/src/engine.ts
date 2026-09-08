@@ -1417,7 +1417,7 @@ export class WorkflowEngine {
       statuses: ['suspended', 'running'],
       namespace: this.namespace,
       updatedBefore: now - this.stalledAfterMs,
-      limit: 100,
+      size: 100,
     });
     const notified: StalledRunInfo[] = [];
     for (const run of candidates) {
@@ -1502,7 +1502,7 @@ export class WorkflowEngine {
         statuses: [status],
         namespace: this.namespace,
         updatedBefore: now - maxAgeMs,
-        limit: 100,
+        size: 100,
       });
       for (const run of candidates) {
         try {
@@ -1704,7 +1704,7 @@ export class WorkflowEngine {
         statuses: ['running', 'suspended'],
         namespace: this.namespace,
         createdBefore: now - reg.executionTimeoutMs,
-        limit: 200,
+        size: 200,
       });
       for (const run of inflight) {
         // Time out against the version the run STARTED on when that registration is known — a fleet
@@ -2470,7 +2470,7 @@ export class WorkflowEngine {
    * their terminal status — `cancel` is a no-op on them, never clobbering a completed/dead run).
    */
   async cancelWhere(
-    filter: Omit<RunQuery, 'limit' | 'offset'>,
+    filter: Omit<RunQuery, 'page' | 'size'>,
     opts?: { compensate?: boolean },
   ): Promise<RunResult[]> {
     const runs = await this.store.listRuns(filter);
@@ -3926,7 +3926,7 @@ export class WorkflowEngine {
         statuses: ['blocked'],
         namespace: this.namespace,
         wakeBefore: nowMs,
-        limit: 200,
+        size: 200,
       }),
     );
     return blocked;

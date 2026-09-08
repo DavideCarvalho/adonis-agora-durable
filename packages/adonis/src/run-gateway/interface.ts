@@ -56,7 +56,7 @@ export interface RunGateway {
   /** Read a run's current persisted state, or null if unknown. */
   getRun(runId: string): Promise<WorkflowRun | null>;
 
-  /** List runs matching `query` (paged via `limit`/`offset`, filtered by workflow/status/tag/search
+  /** List runs matching `query` (paged via 1-based `page`/`size`, filtered by workflow/status/tag/search
    *  attributes), newest activity first per the store's ordering. */
   listRuns(query: RunQuery): Promise<WorkflowRun[]>;
 

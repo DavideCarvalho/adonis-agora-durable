@@ -162,8 +162,8 @@ The console routes client-side on the URL hash (`#/run/<id>`), so a deep link ne
 | `origin` | exact match against the run's [package attribution](/docs/durable/concepts/workflows-and-steps#run-origin--package-attribution). The "unknown" bucket (absent origin) can't be expressed as an exact match — the console filters that one client-side. |
 | `createdAfter` / `createdBefore` | time-range bounds on the run's creation, as epoch ms or an ISO date string — pushed down server-side. |
 | `attr` | a [search-attribute](/docs/durable/authoring/queries-and-updates) filter, `key:op:value`. Repeatable, and repeats are ANDed — opaque in the envelope too (`filter[attr]`), since attribute keys are dynamic; `filter[attr.<key>][<op>]=value` works as well. |
-| `limit` | page size, default `50`, capped at `200` |
-| `offset` | page offset, default `0` |
+| `page` | 1-based page number, default `1` |
+| `size` | page size, default `50`, capped at `200` |
 
 The `attr` ops are `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in` — opaque through both spellings (`filter[attr.<key>]` takes the canonical `equals`/`notEquals`/`in`/`isAnyOf` aliases). Values are coerced: `true`/`false` become booleans, anything numeric becomes a number, everything else stays a string. Only the first two colons delimit, so a value may contain colons of its own. `in` takes a `|`-separated set (`tier:in:pro|enterprise`) and matches it as OR inside the one predicate — two `eq` predicates on one key are ANDed like every other pair, which no run can satisfy.
 
@@ -171,13 +171,22 @@ The `attr` ops are `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in` — opaque through
 GET /durable/api/runs?namespace=eu-west&attr=amount:gte:5000&attr=tier:eq:enterprise&status=failed
 ```
 
-A refused structured filter — unknown field, unsupported operator, a group the draft cannot express — answers `400` instead of silently widening. Unknown flat params stay ignored, so old callers (and endpoint mechanics like `limit`) keep working. (`static throwOnInvalid` on the filter class is what makes the envelope strict.)
+A refused structured filter — unknown field, unsupported operator, a group the draft cannot express — answers `400` instead of silently widening. Unknown flat params stay ignored, so old callers (and endpoint mechanics like `page`) keep working. (`static throwOnInvalid` on the filter class is what makes the envelope strict.)
 
-The response is `{ runs, page: { limit, offset, count }, statuses }`. `page.count` is how many rows this page returned, not a total — `count === limit` is the "there may be more" signal.
+Paging is the same offset shape every Agora library takes (`@adonis-agora/filter`'s `page`/`size`): a **1-based** page number and a page size, `?page=2&size=100`. The 0-based offset it resolves to is the store's business, never the wire's.
+
+The response is `{ runs, page: { page, size, count }, statuses }`. `page.count` is how many rows this page returned, not a total — `count === size` is the "there may be more" signal.
+
+<Callout type="warn">
+  **Breaking in 0.39.0.** This endpoint took `?limit=&offset=` (0-based) before. `limit`/`offset` are now
+  ignored like any other unknown flat param — a stale client gets an unpaged first page rather than a
+  `400`, so translate as `page = offset / limit + 1`, `size = limit`. Same rename on `RunQuery`
+  (`engine.listRuns({ page, size })`) and on the cross-pod `listRuns` gateway request.
+</Callout>
 
 #### The picker enumeration
 
-`GET /api/runs/values` answers what the console's tag, tenant and attribute pickers list: the distinct values one axis takes across the runs matching every OTHER active predicate, with counts — most common first, engine-minted tags (`singleton:<key>`) last. Served through the filter lib's `groupByCountFromRequest` with the console's adapter. The axis rides `groupByCount[field]` (`workflow`, `status`, `namespace`, `tag`, `attr` for the keys in use, `attr.<key>` for the values under one key — top-level `field` works too); the scope rides the same params as `GET /api/runs` (minus `status`, which is deliberately dropped so the offers don't collapse to the status being viewed). `limit` bounds the rows (default `100`, capped at `200`), `offset` pages them, `search` narrows them server-side — a rare value outside the first page stays reachable by typing. The response is a bare `[{ value, count }]` array.
+`GET /api/runs/values` answers what the console's tag, tenant and attribute pickers list: the distinct values one axis takes across the runs matching every OTHER active predicate, with counts — most common first, engine-minted tags (`singleton:<key>`) last. Served through the filter lib's `groupByCountFromRequest` with the console's adapter. The axis rides `groupByCount[field]` (`workflow`, `status`, `namespace`, `tag`, `attr` for the keys in use, `attr.<key>` for the values under one key — top-level `field` works too); the scope rides the same params as `GET /api/runs` (minus `status`, which is deliberately dropped so the offers don't collapse to the status being viewed). `limit` bounds the rows (default `100`, capped at `200`), `offset` pages them, `search` narrows them server-side — this endpoint keeps `limit`/`offset` on purpose: it is filter's own group-by-count aggregation (`groupByCount[limit]`/`groupByCount[offset]`), not a run listing, so `limit`/`offset` IS the aligned spelling here — a rare value outside the first page stays reachable by typing. The response is a bare `[{ value, count }]` array.
 
 There is no separate checkpoints route: a run's step timeline comes back as the `timeline` array of `GET /api/runs/:id`, each entry carrying `seq`, `name`, `kind`, `status`, `attempts`, `workerGroup`, input/output/error, `events`, `parallelGroup`, and the derived `durationMs` / `queueMs`.
 

@@ -953,7 +953,7 @@ export function RunsList({
   /** True while the server may still hold more runs matching the current tag/attr/namespace filter
    *  beyond what's been fetched (the last page came back full — see `RunsPage.page`). */
   hasMore?: boolean;
-  /** True while a scroll-triggered `/runs?offset=…` fetch is in flight. */
+  /** True while a scroll-triggered `/runs?page=…` fetch is in flight. */
   loadingMore?: boolean;
   /** Fetch the next page. Called once the virtualizer scrolls the last loaded row into view — the
    *  virtualizer already tracks exactly which rows are visible, so this composes for free instead of
@@ -1779,14 +1779,15 @@ export function App() {
           namespace: namespaceFilter.length ? namespaceFilter : undefined,
           workflow: workflowFilter.length ? workflowFilter : undefined,
         },
-        { limit: RUNS_PAGE_SIZE, offset: pageParam },
+        { page: pageParam, size: RUNS_PAGE_SIZE },
       ),
-    initialPageParam: 0,
+    // 1-based, matching the server's `?page=` (and the ecosystem's `@adonis-agora/filter` shape).
+    initialPageParam: 1,
     // The server never returns a total match count (see `RunsPage`'s doc) — a full page is the only
     // signal that more might exist; a short page means the store is exhausted.
     getNextPageParam: (lastPage) => {
-      const { limit, offset, count } = lastPage.page;
-      return count === limit ? offset + limit : undefined;
+      const { page, size, count } = lastPage.page;
+      return count === size ? page + 1 : undefined;
     },
     // Keep the run list live. NOTE: on an infinite query this refetches EVERY already-loaded page (not
     // just the first) each interval, so cost grows with how far an operator has scrolled — acceptable

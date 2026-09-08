@@ -260,12 +260,12 @@ function readFlag(req: ApiRequest, key: string): boolean | typeof INVALID_FLAG {
  *  express) throws, and every caller maps it to `400` — a typo'd filter fails loudly instead of
  *  silently widening.
  *
- *  `limit`/`offset` never enter the draft (no method owns those endpoint mechanics — the caller
+ *  `page`/`size` never enter the draft (no method owns those endpoint mechanics — the caller
  *  reads them), and neither does `origin`: the engine has no `origin` column, so the class reads
  *  but ignores it and a client that always sends it never 400s. */
 async function runFilterQuery(
   query: ApiRequest['query'],
-): Promise<Omit<RunQuery, 'limit' | 'offset'>> {
+): Promise<Omit<RunQuery, 'page' | 'size'>> {
   const draft = new RunQueryDraft();
   await applyCustomFilter(draft, RunFilter, { request: { qs: () => ({ ...query }) } });
   return draft.query;
@@ -286,6 +286,12 @@ function filterRejection(error: unknown): ApiResponse {
  *
  * A picker pages as it scrolls and narrows as the operator types, both against the whole matching
  * set rather than the fetched page.
+ *
+ * Note this endpoint keeps `limit`/`offset` while `GET /runs` moved to `page`/`size`: it is not a
+ * listing of runs but filter's own group-by-count aggregation, and `limit`/`offset` IS that
+ * feature's shape in `@adonis-agora/filter` (`groupByCount[limit]`/`groupByCount[offset]`,
+ * `GroupByCountFromRequestOptions`). Matching the lib per surface is the point — respelling this
+ * one as `page`/`size` would diverge from it, not align with it.
  */
 export async function runValues(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
   const qs = req.query;
@@ -311,19 +317,27 @@ export async function runValues(deps: Deps, req: ApiRequest): Promise<ApiRespons
   }
 }
 
-/** `GET /runs` — list runs filtered by status/workflow/tag/namespace/search-attributes, paginated. */
+/**
+ * `GET /runs` — list runs filtered by status/workflow/tag/namespace/search-attributes, paginated.
+ *
+ * Paging is `?page=&size=`: a 1-BASED page number (default `1`) and a page size (default `50`,
+ * capped at `200`) — the same offset-pagination shape `@adonis-agora/filter` takes, so one console
+ * builder spells paging identically against this engine and against a Lucid-backed listing. The
+ * 0-based offset it resolves to never appears on the wire; the store computes it (`runPageWindow`).
+ */
 export async function listRuns(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
   const { engine } = deps;
-  const limit = Math.min(intQuery(req.query.limit, 50), 200);
-  const offset = intQuery(req.query.offset, 0);
+  const size = Math.min(intQuery(req.query.size, 50), 200);
+  // A page below 1 reads as the first page rather than 400ing — same tolerance the other params get.
+  const page = Math.max(1, intQuery(req.query.page, 1));
 
-  let filter: Omit<RunQuery, 'limit' | 'offset'>;
+  let filter: Omit<RunQuery, 'page' | 'size'>;
   try {
     filter = await runFilterQuery(req.query);
   } catch (error) {
     return filterRejection(error);
   }
-  const query: RunQuery = { limit, offset, ...filter };
+  const query: RunQuery = { page, size, ...filter };
 
   const runs = await engine.listRuns(query);
   // Resolve what each suspended run on THIS page is parked on — signal / webhook / child /
@@ -337,7 +351,7 @@ export async function listRuns(deps: Deps, req: ApiRequest): Promise<ApiResponse
   const waiterByRun = waiters ? indexWaitersByRun(waiters) : undefined;
   return ok({
     runs: runs.map((run) => redacted(deps.redact?.run, summarizeRun(run, waiterByRun))),
-    page: { limit, offset, count: runs.length },
+    page: { page, size, count: runs.length },
     statuses: RUN_STATUSES,
   });
 }
@@ -569,13 +583,13 @@ export async function bulkAction(deps: Deps, req: ApiRequest): Promise<ApiRespon
   }
   const compensate = readFlag(req, 'compensate');
   if (compensate === INVALID_FLAG) return badRequest(INVALID_COMPENSATE);
-  let filter: Omit<RunQuery, 'limit' | 'offset'>;
+  let filter: Omit<RunQuery, 'page' | 'size'>;
   try {
     filter = await runFilterQuery(req.query);
   } catch (error) {
     return filterRejection(error);
   }
-  const runs = await deps.engine.listRuns({ ...filter, limit: 500 });
+  const runs = await deps.engine.listRuns({ ...filter, page: 1, size: 500 });
   let applied = 0;
   for (const run of runs) {
     try {

@@ -78,7 +78,7 @@ export function durableStateProvider(): DataProvider {
     async resolve(query, ctx) {
       const engine = await engineOf(ctx);
       const status = (query?.status as RunStatus) ?? 'dead';
-      const runs = await engine.listRuns({ status, limit: STATE_CAP });
+      const runs = await engine.listRuns({ status, size: STATE_CAP });
       return { value: runs.length };
     },
   };
@@ -94,8 +94,8 @@ export function durableRecentFailuresProvider(): DataProvider {
       const windowMs = query?.windowMs === undefined ? 24 * 60 * 60 * 1000 : Number(query.windowMs);
       const cutoff = windowMs > 0 ? Date.now() - windowMs : 0;
       const [failed, dead] = await Promise.all([
-        engine.listRuns({ status: 'failed', limit }),
-        engine.listRuns({ status: 'dead', limit }),
+        engine.listRuns({ status: 'failed', size: limit }),
+        engine.listRuns({ status: 'dead', size: limit }),
       ]);
       const rows = [...failed, ...dead]
         .filter((r) => +new Date(r.updatedAt) >= cutoff)
@@ -149,7 +149,7 @@ export function durableStateBreakdownProvider(): DataProvider {
       const engine = await engineOf(ctx);
       const counts = await Promise.all(
         STATE_BREAKDOWN_STATUSES.map((status) =>
-          engine.listRuns({ status, limit: STATE_CAP }).then((runs) => runs.length),
+          engine.listRuns({ status, size: STATE_CAP }).then((runs) => runs.length),
         ),
       );
       const segments = STATE_BREAKDOWN_STATUSES.map((label, i) => ({

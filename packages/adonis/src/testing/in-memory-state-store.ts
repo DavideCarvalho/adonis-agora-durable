@@ -11,6 +11,7 @@ import type {
   StepCheckpoint,
   WorkflowRun,
 } from '../interfaces.js';
+import { runPageWindow } from '../run-pagination.js';
 import { scanRunValueFacets } from '../run-value-facets.js';
 import { normalizeAttributeRows, type RunAttributeRow } from '../search-attributes.js';
 
@@ -418,9 +419,11 @@ export class InMemoryStateStore implements StateStore {
     }
     // Newest first (matches the store adapters' `createdAt DESC`) — recent runs on top in the dashboard.
     runs.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
-    const offset = query.offset ?? 0;
-    const limit = query.limit ?? runs.length;
-    return runs.slice(offset, offset + limit).map((r) => ({ ...r }));
+    // 1-based `page`/`size` in, 0-based slice out — same resolution the SQL adapters apply.
+    const { limit, offset } = runPageWindow(query);
+    return runs
+      .slice(offset, limit === undefined ? undefined : offset + limit)
+      .map((r) => ({ ...r }));
   }
 
   /**

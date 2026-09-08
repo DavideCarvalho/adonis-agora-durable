@@ -649,14 +649,16 @@ function body(path: string, init?: RequestInit): MockAnswer {
     // The real envelope (`{ runs, page, statuses}`), with the same predicate semantics as the
     // server — otherwise the tenant/tag/attr boxes in the preview would look broken, and a
     // screenshot of them would be a lie.
-    const limit = Math.min(Math.max(Number(params.get('limit') ?? 50) || 0, 0), 200);
-    const offset = Math.max(Number(params.get('offset') ?? 0) || 0, 0);
+    // Same 1-based `page`/`size` the real endpoint parses, resolved to a 0-based slice here.
+    const size = Math.min(Math.max(Number(params.get('size') ?? 50) || 0, 0), 200);
+    const page = Math.max(Number(params.get('page') ?? 1) || 1, 1);
+    const offset = (page - 1) * size;
     const matching = scopedRuns(params).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     return {
       status: 200,
       payload: {
-        runs: matching.slice(offset, offset + limit),
-        page: { limit, offset, count: Math.min(limit, Math.max(matching.length - offset, 0)) },
+        runs: matching.slice(offset, offset + size),
+        page: { page, size, count: Math.min(size, Math.max(matching.length - offset, 0)) },
         statuses: STATUSES,
       },
     };

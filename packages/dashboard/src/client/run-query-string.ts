@@ -59,7 +59,7 @@ function narrow(
  */
 export function runQueryString(
   predicates: RunPredicates,
-  page: { limit?: number | undefined; offset?: number | undefined } = {},
+  paginate: { page?: number | undefined; size?: number | undefined } = {},
   groupByCount?: { field: RunValueField; limit?: number; offset?: number; search?: string },
 ): string {
   // The class, not the `filterQuery()` factory: the console owns query-building (predicates,
@@ -87,12 +87,19 @@ export function runQueryString(
     builder.where('attr', attrPredicates.length === 1 ? attrPredicates[0] : attrPredicates);
   }
 
-  if (page.limit !== undefined) builder.set('limit', page.limit);
-  if (page.offset !== undefined) builder.set('offset', page.offset);
+  // Offset paging as the ecosystem spells it: a 1-based `page` and a `size`, flat on the wire
+  // (`?page=2&size=100`) — the same shape `@adonis-agora/filter` parses into `FilterInput.page`/
+  // `.size`. Sent through `set()` rather than the builder's `page(page, size)` helper so a caller
+  // that names only one of the two doesn't get the helper's own `size` default (25) invented
+  // underneath it — the server owns that default (50), and it must stay the one that applies.
+  if (paginate.page !== undefined) builder.set('page', paginate.page);
+  if (paginate.size !== undefined) builder.set('size', paginate.size);
 
   // The values-picker envelope rides the same builder: the scope above plus the axis it
-  // enumerates. `limit`/`offset`/`search` here bound the offered values, not the run list — the
-  // two never mix because a values call never sends a page window (and vice versa).
+  // enumerates. `limit`/`offset`/`search` here bound the offered VALUES, not the run list — that
+  // is filter's own group-by-count shape, deliberately left as-is while the run listing moved to
+  // `page`/`size`. The two never mix because a values call never sends a page window (and vice
+  // versa).
   if (groupByCount) {
     builder.groupByCount(groupByCount.field, {
       ...(groupByCount.limit !== undefined && { limit: groupByCount.limit }),
