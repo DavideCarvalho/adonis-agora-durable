@@ -598,17 +598,18 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.listRuns({ tag: 'nope' })).toHaveLength(0);
     });
 
-    t('orders listRuns newest-first and paginates with limit/offset', async () => {
+    t('orders listRuns newest-first and paginates with 1-based page/size', async () => {
       await store.createRun(run({ id: 'old', createdAt: new Date('2026-06-11T00:00:00.000Z') }));
       await store.createRun(run({ id: 'mid', createdAt: new Date('2026-06-11T00:00:01.000Z') }));
       await store.createRun(run({ id: 'new', createdAt: new Date('2026-06-11T00:00:02.000Z') }));
 
+      // No `size` means no bound — a store must not invent a default page window.
       expect((await store.listRuns({})).map((r) => r.id)).toEqual(['new', 'mid', 'old']);
-      expect((await store.listRuns({ limit: 2 })).map((r) => r.id)).toEqual(['new', 'mid']);
-      expect((await store.listRuns({ limit: 2, offset: 1 })).map((r) => r.id)).toEqual([
-        'mid',
-        'old',
-      ]);
+      expect((await store.listRuns({ size: 2 })).map((r) => r.id)).toEqual(['new', 'mid']);
+      // `page` is 1-based and defaults to 1: `size: 2` alone and `page: 1, size: 2` are the same page.
+      expect((await store.listRuns({ page: 1, size: 2 })).map((r) => r.id)).toEqual(['new', 'mid']);
+      expect((await store.listRuns({ page: 2, size: 2 })).map((r) => r.id)).toEqual(['old']);
+      expect(await store.listRuns({ page: 3, size: 2 })).toHaveLength(0);
     });
 
     // ---- search-attribute pushdown (range + equality + the missing-key contract) ------------
@@ -872,7 +873,7 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       const res = await store.listRuns({
         status: 'running',
         attributes: [{ key: 'amount', op: 'gte', value: 100 }],
-        limit: 10,
+        size: 10,
       });
       expect(res.map((r) => r.id)).toEqual(['a']);
     });

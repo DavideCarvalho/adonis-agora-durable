@@ -80,7 +80,7 @@ describe('gatewayDashboardEngine — RunGateway → DashboardEngine port', () =>
     await engine.requeue('run-1');
     await engine.cancel('run-1');
     await engine.workerHealth();
-    await engine.listRuns({ limit: 10, offset: 0 });
+    await engine.listRuns({ page: 1, size: 10 });
 
     expect(gw.calls).toContain('getCheckpoints:run-1');
     expect(gw.calls).toContain('redispatch:run-1'); // requeue routed to the proxy recovery verb
@@ -123,7 +123,7 @@ describe('storeDashboardEngine — WorkflowEngine → DashboardEngine port', () 
     const engine = storeDashboardEngine(raw);
 
     await engine.getRun('run-1');
-    await engine.listRuns({ limit: 5, offset: 0 });
+    await engine.listRuns({ page: 1, size: 5 });
     await engine.listCheckpoints('run-1');
     await engine.getRunChildren('run-1');
     await engine.requeue('run-1');
@@ -191,7 +191,7 @@ describe('dashboardEngineForRole — role-branched resolution', () => {
 
     const engine = await dashboardEngineForRole('tenant', container, WorkflowEngine);
     // The returned port delegates to the gateway (proving it IS the proxy, not an engine).
-    await engine.listRuns({ limit: 5, offset: 0 });
+    await engine.listRuns({ page: 1, size: 5 });
     expect(gw.calls).toContain('listRuns');
 
     // The KEY isolation assertion: it resolved the gateway token, and never asked for WorkflowEngine.

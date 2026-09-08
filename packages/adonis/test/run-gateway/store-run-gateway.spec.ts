@@ -70,15 +70,15 @@ describe('StoreRunGateway (store-backed RunGateway)', () => {
       expect(await new StoreRunGateway(engine).getRun('nope')).toBeNull();
     });
 
-    it('listRuns() filters and paginates (limit / offset)', async () => {
+    it('listRuns() filters and paginates (1-based page / size)', async () => {
       const { engine } = makeEngine();
       const gw = new StoreRunGateway(engine);
       for (const id of ['a', 'b', 'c']) await startRun(engine, 'echo', {}, id);
 
       expect((await gw.listRuns({ workflow: 'echo' })).length).toBe(3);
-      const firstPage = await gw.listRuns({ workflow: 'echo', limit: 2 });
+      const firstPage = await gw.listRuns({ workflow: 'echo', size: 2 });
       expect(firstPage.length).toBe(2);
-      const secondPage = await gw.listRuns({ workflow: 'echo', limit: 2, offset: 2 });
+      const secondPage = await gw.listRuns({ workflow: 'echo', page: 2, size: 2 });
       expect(secondPage.length).toBe(1);
       // Disjoint pages — pagination actually walked the set.
       const seen = new Set([...firstPage, ...secondPage].map((r) => r.id));
@@ -228,7 +228,7 @@ describe('StoreRunGateway (store-backed RunGateway)', () => {
 
     it('listRuns -> engine.listRuns(query)', async () => {
       const { engine, calls } = fakeEngine();
-      const query: RunQuery = { workflow: 'w', limit: 5 };
+      const query: RunQuery = { workflow: 'w', size: 5 };
       await new StoreRunGateway(engine).listRuns(query);
       expect(calls).toEqual([{ method: 'listRuns', args: [query] }]);
     });

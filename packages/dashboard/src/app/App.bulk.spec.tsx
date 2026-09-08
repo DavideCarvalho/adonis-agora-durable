@@ -85,7 +85,7 @@ function run(id: string, status: RunStatus = 'failed') {
 async function renderWithFailedFilter() {
   runsPage.mockResolvedValue({
     runs: [run('r-failed')],
-    page: { limit: 100, offset: 0, count: 1 },
+    page: { page: 1, size: 100, count: 1 },
   });
   render(<App />, { wrapper });
   await waitFor(() => expect(runsPage).toHaveBeenCalled());
@@ -115,7 +115,7 @@ describe('App: status chips are a SERVER-side filter (the list and the bulk filt
   });
 
   it('offers a `blocked` chip (first-class engine status) and no `cancelling` one (never emitted)', async () => {
-    runsPage.mockResolvedValue({ runs: [], page: { limit: 100, offset: 0, count: 0 } });
+    runsPage.mockResolvedValue({ runs: [], page: { page: 1, size: 100, count: 0 } });
     render(<App />, { wrapper });
     expect(screen.getByRole('button', { name: 'blocked 0' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'cancelling 0' })).toBeNull();

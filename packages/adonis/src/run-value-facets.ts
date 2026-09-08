@@ -147,6 +147,6 @@ export async function scanRunValueFacets(
   opts?: RunValueFacetOptions,
 ): Promise<RunValueFacetRow[]> {
   const scan = opts?.scan ?? RUN_VALUE_FACET_SCAN;
-  const runs = await store.listRuns({ ...query, limit: scan, offset: 0 });
+  const runs = await store.listRuns({ ...query, page: 1, size: scan });
   return runValueFacetsFromRuns(runs, axis, opts);
 }

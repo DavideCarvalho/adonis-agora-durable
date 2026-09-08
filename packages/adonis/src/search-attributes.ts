@@ -6,6 +6,7 @@ import type {
   SearchAttributes,
   WorkflowRun,
 } from './interfaces.js';
+import { runPageWindow } from './run-pagination.js';
 
 /** Compare one attribute value against a filter operand. Range ops need both sides comparable. */
 function compare(
@@ -58,16 +59,15 @@ export function matchesAttributes(
 }
 
 /**
- * Apply a query's attribute predicates then its `offset`/`limit`, in-process — for store adapters
- * that can't express typed/range predicates in SQL. Pass rows already coarse-filtered (workflow /
- * status / tag) and sorted newest-first; this filters by `attributes` and paginates. Only call it
- * when `query.attributes` is set (otherwise let the DB do `LIMIT`/`OFFSET`).
+ * Apply a query's attribute predicates then its `page`/`size` window, in-process — for store
+ * adapters that can't express typed/range predicates in SQL. Pass rows already coarse-filtered
+ * (workflow / status / tag) and sorted newest-first; this filters by `attributes` and paginates.
+ * Only call it when `query.attributes` is set (otherwise let the DB do `LIMIT`/`OFFSET`).
  */
 export function applyAttributeQuery(rows: WorkflowRun[], query: RunQuery): WorkflowRun[] {
   const filtered = rows.filter((r) => matchesAttributes(r.searchAttributes, query.attributes));
-  const offset = query.offset ?? 0;
-  const limit = query.limit ?? filtered.length;
-  return filtered.slice(offset, offset + limit);
+  const { limit, offset } = runPageWindow(query);
+  return filtered.slice(offset, limit === undefined ? undefined : offset + limit);
 }
 
 /**

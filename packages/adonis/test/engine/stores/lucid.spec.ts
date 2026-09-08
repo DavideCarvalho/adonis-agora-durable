@@ -278,8 +278,8 @@ describe('LucidStateStore — search attributes & queries', () => {
     expect(await store.listRuns({ statuses: [] })).toHaveLength(0);
     // `etl` must not match `etl-foo` (quoted-token match).
     expect((await store.listRuns({ tag: 'etl' })).map((r) => r.id)).toEqual(['a']);
-    expect((await store.listRuns({ limit: 1 })).map((r) => r.id)).toEqual(['c']);
-    expect((await store.listRuns({ limit: 1, offset: 1 })).map((r) => r.id)).toEqual(['b']);
+    expect((await store.listRuns({ size: 1 })).map((r) => r.id)).toEqual(['c']);
+    expect((await store.listRuns({ page: 2, size: 1 })).map((r) => r.id)).toEqual(['b']);
   });
 });
 

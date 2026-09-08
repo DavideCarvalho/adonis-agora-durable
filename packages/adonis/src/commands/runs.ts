@@ -19,7 +19,10 @@ export interface ListRunsOptions {
   statuses?: RunStatus[] | undefined;
   /** Filter by workflow name. */
   workflow?: string | undefined;
-  /** Max rows. Default 50. */
+  /**
+   * Max rows. Default 50. A cap, not a page window: the CLI listing has no `--offset`/`--page`
+   * companion, so this stays spelled `limit` and maps to the query's `size` (page 1) internally.
+   */
   limit?: number | undefined;
 }
 
@@ -35,7 +38,7 @@ export async function listRuns(source: RunLister, opts: ListRunsOptions): Promis
   return source.listRuns({
     ...(opts.status ? { status: opts.status } : opts.statuses ? { statuses: opts.statuses } : {}),
     ...(opts.workflow ? { workflow: opts.workflow } : {}),
-    limit: opts.limit ?? 50,
+    size: opts.limit ?? 50,
   });
 }
 

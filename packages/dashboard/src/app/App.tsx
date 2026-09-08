@@ -1779,14 +1779,15 @@ export function App() {
           namespace: namespaceFilter.length ? namespaceFilter : undefined,
           workflow: workflowFilter.length ? workflowFilter : undefined,
         },
-        { limit: RUNS_PAGE_SIZE, offset: pageParam },
+        { page: pageParam, size: RUNS_PAGE_SIZE },
       ),
-    initialPageParam: 0,
+    // 1-based, matching the server's `?page=` (and the ecosystem's `@adonis-agora/filter` shape).
+    initialPageParam: 1,
     // The server never returns a total match count (see `RunsPage`'s doc) — a full page is the only
     // signal that more might exist; a short page means the store is exhausted.
     getNextPageParam: (lastPage) => {
-      const { limit, offset, count } = lastPage.page;
-      return count === limit ? offset + limit : undefined;
+      const { page, size, count } = lastPage.page;
+      return count === size ? page + 1 : undefined;
     },
     // Keep the run list live. NOTE: on an infinite query this refetches EVERY already-loaded page (not
     // just the first) each interval, so cost grows with how far an operator has scrolled — acceptable

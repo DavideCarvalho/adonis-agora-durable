@@ -129,8 +129,12 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
             'tag(s), namespace(s), origin, createdAfter/createdBefore (epoch ms or ISO), and typed ' +
             'search-attribute predicates (`filter[attr.<key>][<op>]`).',
           parameters: [
-            { name: 'limit', in: 'query', schema: { type: 'integer', maximum: 200 } },
-            { name: 'offset', in: 'query', schema: { type: 'integer' } },
+            { name: 'page', in: 'query', schema: { type: 'integer', minimum: 1, default: 1 } },
+            {
+              name: 'size',
+              in: 'query',
+              schema: { type: 'integer', maximum: 200, default: 50 },
+            },
           ],
           responses: {
             '200': jsonResponse('The page of runs.', {

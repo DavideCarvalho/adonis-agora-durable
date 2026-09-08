@@ -154,7 +154,7 @@ describe('bullmq wire fixtures (byte-compat with aviary)', () => {
       const req: RunRequest = {
         requestId: 'req-1',
         tenant: 'acme',
-        body: { kind: 'listRuns', query: { workflow: 'checkout', status: 'running', limit: 20 } },
+        body: { kind: 'listRuns', query: { workflow: 'checkout', status: 'running', size: 20 } },
       };
       expect(JSON.stringify(req)).toBe(canonical(f));
       expect(req).toEqual(f.value);

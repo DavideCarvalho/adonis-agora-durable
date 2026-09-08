@@ -145,6 +145,68 @@ describe('JSON handlers', () => {
     ]);
   });
 
+  describe("listRuns paging — 1-based `page`/`size`, the ecosystem's offset shape", () => {
+    /** Three runs, newest last-started (the listing is newest-first). */
+    async function threeRuns(): Promise<void> {
+      for (const id of ['r1', 'r2', 'r3']) {
+        await raw.start('greet', {}, id);
+        await raw.waitForRun(id);
+      }
+    }
+
+    const ids = (res: Awaited<ReturnType<typeof listRuns>>): string[] =>
+      (res.body as { runs: Array<{ id: string }> }).runs.map((r) => r.id);
+    const meta = (res: Awaited<ReturnType<typeof listRuns>>) =>
+      (res.body as { page: { page: number; size: number; count: number } }).page;
+
+    it('walks disjoint pages: page 2 of size 2 is the remainder, not a re-read of page 1', async () => {
+      await threeRuns();
+
+      const first = await listRuns(deps, req({ query: { page: '1', size: '2' } }));
+      const second = await listRuns(deps, req({ query: { page: '2', size: '2' } }));
+
+      expect(ids(first)).toHaveLength(2);
+      expect(ids(second)).toHaveLength(1);
+      expect(new Set([...ids(first), ...ids(second)]).size).toBe(3);
+    });
+
+    it('defaults to page 1 and echoes the resolved window back in the envelope', async () => {
+      await threeRuns();
+
+      // `size` alone means the first page — `page` defaults to 1, never 0.
+      expect(meta(await listRuns(deps, req({ query: { size: '2' } })))).toEqual({
+        page: 1,
+        size: 2,
+        count: 2,
+      });
+      expect(meta(await listRuns(deps, req({ query: {} })))).toEqual({
+        page: 1,
+        size: 50,
+        count: 3,
+      });
+    });
+
+    it('caps `size` at 200 and reads a page below 1 as the first page', async () => {
+      await threeRuns();
+
+      expect(meta(await listRuns(deps, req({ query: { size: '5000' } }))).size).toBe(200);
+      expect(meta(await listRuns(deps, req({ query: { page: '0', size: '2' } }))).page).toBe(1);
+      expect(ids(await listRuns(deps, req({ query: { page: '0', size: '2' } })))).toEqual(
+        ids(await listRuns(deps, req({ query: { page: '1', size: '2' } }))),
+      );
+    });
+
+    it('ignores the pre-0.39 `limit`/`offset` spelling instead of 400ing on it', async () => {
+      await threeRuns();
+
+      // Unknown flat params stay lenient (they are how old callers sent endpoint mechanics), so an
+      // un-upgraded client gets an unpaged first page rather than an error.
+      const res = await listRuns(deps, req({ query: { limit: '1', offset: '2' } }));
+      expect(res.status).toBe(200);
+      expect(meta(res)).toEqual({ page: 1, size: 50, count: 3 });
+    });
+  });
+
   it('getRun returns run detail + step timeline', async () => {
     await raw.start('greet', {}, 'run-ok');
     await raw.waitForRun('run-ok');

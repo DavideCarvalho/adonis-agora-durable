@@ -599,29 +599,31 @@ import { runQueryString } from './run-query-string.js';
 
 export type { RunPredicates, RunValueField, RunValueRow } from './run-query-string.js';
 
-/** `offset`/`limit` for a `/runs` page request — mirrors `handlers.ts`'s `listRuns` query params
- *  (server caps `limit` at 200). Both optional; the server defaults `limit` to 50, `offset` to 0. */
+/** `page`/`size` for a `/runs` page request — mirrors `handlers.ts`'s `listRuns` query params, and
+ *  the offset-pagination shape the rest of the Agora ecosystem takes (`@adonis-agora/filter`'s
+ *  `page`/`size`). `page` is 1-BASED; the server defaults it to 1, defaults `size` to 50 and caps
+ *  `size` at 200. Both optional. */
 export interface RunPageOptions {
-  limit?: number;
-  offset?: number;
+  page?: number;
+  size?: number;
 }
 
 /** One page of `/runs`, WITH the pagination metadata the plain {@link durableClient.runs} throws away.
- *  `page.count` is how many runs THIS page returned (not a total) — `count === page.limit` is the
+ *  `page.count` is how many runs THIS page returned (not a total) — `count === page.size` is the
  *  server's only "there might be more" signal, since it never counts the full match set. */
 export interface RunsPage {
   runs: WorkflowRun[];
-  page: { limit: number; offset: number; count: number };
+  page: { page: number; size: number; count: number };
 }
 
 interface RunsListResponse {
   runs: WorkflowRun[];
-  page: { limit: number; offset: number; count: number };
+  page: { page: number; size: number; count: number };
   statuses: RunStatus[];
 }
 
 /** Server-side ceiling on a bulk action's matched set (`handlers.ts`'s `bulkAction` lists with
- *  `limit: 500`). A response whose `matched` equals this cap probably left runs untouched. */
+ *  `size: 500`). A response whose `matched` equals this cap probably left runs untouched. */
 export const BULK_MATCH_CAP = 500;
 
 interface RunResponse {
@@ -642,7 +644,7 @@ export const durableClient = {
     const { runs } = await durableClient.runsPage(status, tag, attr, opts);
     return runs;
   },
-  /** Same filters as {@link runs}, plus real `limit`/`offset` paging — and, unlike {@link runs}, keeps
+  /** Same filters as {@link runs}, plus real `page`/`size` paging — and, unlike {@link runs}, keeps
    *  the server's `page` metadata instead of discarding it, so a caller (the infinite-scrolling runs
    *  list) can tell whether another page might exist. */
   async runsPage(

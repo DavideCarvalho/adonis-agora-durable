@@ -37,7 +37,7 @@ const runsPage =
       tag?: string,
       attr?: string[],
       opts?: { namespace?: string; origin?: string },
-      page?: { limit?: number; offset?: number },
+      page?: { page?: number; size?: number },
     ) => Promise<RunsPage>
   >();
 
@@ -98,8 +98,8 @@ describe('App: real pagination wiring (useInfiniteQuery over durableClient.runsP
     restoreOffsetWidth();
   });
 
-  it('fetches the first page at offset 0 on mount', async () => {
-    runsPage.mockResolvedValue(page([run('r1')], { limit: 100, offset: 0, count: 1 }));
+  it('fetches page 1 on mount (paging is 1-based, like the rest of the ecosystem)', async () => {
+    runsPage.mockResolvedValue(page([run('r1')], { page: 1, size: 100, count: 1 }));
     render(<App />, { wrapper });
 
     await waitFor(() => expect(runsPage).toHaveBeenCalled());
@@ -108,18 +108,18 @@ describe('App: real pagination wiring (useInfiniteQuery over durableClient.runsP
       unknown,
       unknown,
       unknown,
-      { limit?: number; offset?: number },
+      { page?: number; size?: number },
     ];
-    expect(pageArg).toEqual({ limit: 100, offset: 0 });
+    expect(pageArg).toEqual({ page: 1, size: 100 });
   });
 
-  it('resets to offset 0 on a NEW query rather than continuing the old accumulated pages when the tag filter changes', async () => {
-    runsPage.mockResolvedValue(page([run('r1')], { limit: 100, offset: 0, count: 1 }));
+  it('resets to page 1 on a NEW query rather than continuing the old accumulated pages when the tag filter changes', async () => {
+    runsPage.mockResolvedValue(page([run('r1')], { page: 1, size: 100, count: 1 }));
     render(<App />, { wrapper });
     await waitFor(() => expect(runsPage).toHaveBeenCalledTimes(1));
 
     runsPage.mockClear();
-    runsPage.mockResolvedValue(page([run('r2', 'tier:pro')], { limit: 100, offset: 0, count: 1 }));
+    runsPage.mockResolvedValue(page([run('r2', 'tier:pro')], { page: 1, size: 100, count: 1 }));
 
     // The tag filter is a value picker now: open it, type the tag, take it as typed.
     fireEvent.click(screen.getByLabelText('filter by tag'));
@@ -134,19 +134,19 @@ describe('App: real pagination wiring (useInfiniteQuery over durableClient.runsP
       string[] | undefined,
       unknown,
       unknown,
-      { limit?: number; offset?: number },
+      { page?: number; size?: number },
     ];
     expect(tagArg).toEqual(['tier:pro']);
-    // A fresh query for the new tag — starts at offset 0, not wherever the old (untagged) query had
+    // A fresh query for the new tag — starts at page 1, not wherever the old (untagged) query had
     // scrolled to.
-    expect(pageArg.offset).toBe(0);
+    expect(pageArg.page).toBe(1);
   });
 
-  it('requests the next offset once the loaded page came back full (server\'s only "more may exist" signal)', async () => {
-    // A full page (count === limit) at offset 0 — `hasNextPage` should flip true.
+  it('requests the next page once the loaded page came back full (server\'s only "more may exist" signal)', async () => {
+    // A full page (count === size) on page 1 — `hasNextPage` should flip true.
     const firstPage = Array.from({ length: 5 }, (_, i) => run(`r${i}`));
-    runsPage.mockResolvedValueOnce(page(firstPage, { limit: 5, offset: 0, count: 5 }));
-    runsPage.mockResolvedValue(page([run('r5')], { limit: 5, offset: 5, count: 1 }));
+    runsPage.mockResolvedValueOnce(page(firstPage, { page: 1, size: 5, count: 5 }));
+    runsPage.mockResolvedValue(page([run('r5')], { page: 2, size: 5, count: 1 }));
 
     render(<App />, { wrapper });
     await waitFor(() => expect(runsPage).toHaveBeenCalledTimes(1));
@@ -160,9 +160,9 @@ describe('App: real pagination wiring (useInfiniteQuery over durableClient.runsP
         unknown,
         unknown,
         unknown,
-        { limit?: number; offset?: number },
+        { page?: number; size?: number },
       ]
     )[4];
-    expect(secondCallPageArg.offset).toBe(5);
+    expect(secondCallPageArg.page).toBe(2);
   });
 });

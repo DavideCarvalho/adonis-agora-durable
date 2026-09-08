@@ -6,7 +6,7 @@
     "query": {
       "workflow": "checkout",
       "status": "running",
-      "limit": 20
+      "size": 20
     }
   }
 }

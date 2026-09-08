@@ -621,8 +621,24 @@ export interface RunQuery {
    * every blocked run and comparing in process.
    */
   wakeBefore?: number | undefined;
-  limit?: number | undefined;
-  offset?: number | undefined;
+  /**
+   * 1-based page number for offset pagination, defaulting to `1`. Structurally the same paging
+   * shape `@adonis-agora/filter` takes (`FilterInput.page`/`.size`, resolved to its
+   * `ResolvedPagination`), so every Agora listing — this engine's, a Lucid model's — is paged the
+   * same way and a console can drive them with one query-string builder.
+   *
+   * Declared here rather than imported from the filter package on purpose: `RunQuery` is the core
+   * engine contract, implemented by stores that have no Lucid (and no filter) dependency at all,
+   * and filter's barrel re-exports Lucid-typed members. The dashboard layer — the one place that
+   * DOES depend on filter — asserts the two shapes still match (see
+   * `test/dashboard/pagination-shape.spec.ts`).
+   *
+   * Meaningful only together with {@link size}: with no page size there is one unbounded page.
+   * A store resolves the pair to its 0-based window with `runPageWindow`.
+   */
+  page?: number | undefined;
+  /** Page size — how many runs one page returns. Omit for "every matching run" (no bound). */
+  size?: number | undefined;
 }
 
 /**
@@ -632,7 +648,7 @@ export interface RunQuery {
  * picker stay usable while a status chip is lit: the offered values don't collapse to the one status
  * being viewed.
  */
-export type RunFacetQuery = Omit<RunQuery, 'status' | 'statuses' | 'limit' | 'offset'>;
+export type RunFacetQuery = Omit<RunQuery, 'status' | 'statuses' | 'page' | 'size'>;
 
 /**
  * Which axis {@link StateStore.runValueFacets} enumerates the distinct VALUES of. Every member is an
