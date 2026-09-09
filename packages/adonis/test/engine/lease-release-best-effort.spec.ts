@@ -1,69 +1,109 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WorkflowEngine } from '../../src/engine.js';
-import { startRun } from '../../src/test-helpers.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
+import { QueueTransport } from '../../src/transports/queue.js';
+import { MockAdapter } from '../../src/transports/queue-mock-adapter.js';
 
 /**
- * A lease release that fails must not become the run's error.
+ * A lease release that fails must not become an unhandled rejection.
  *
  * The turn's `finally` releases the recovery lease — including on the failure path, where the
- * thing that failed the run is very often the same store the release has to talk to. A step
+ * thing that failed the run is frequently the same store the release has to talk to. A step
  * that violates a DB constraint leaves Postgres refusing every further statement on that
  * connection, so the release throws out of the `finally`.
  *
- * WHAT THESE TESTS PIN, precisely: that the failed release is swallowed and warned instead of
- * escaping the `finally`. They do NOT reproduce the unhandled rejection that led here — that
- * needs the run driven as a background resume against a real aborted transaction, which the
- * in-memory harness has no way to be. The application-level proof is that
- * `exam_ingest.spec.ts` in meuprontoo went from exit 1 (every assertion passing, one
- * unhandled rejection carrying a lease UPDATE) to exit 0 with only this warning in the log.
+ * That matters because of WHERE the turn runs. Since the ack-first change, a remote result
+ * resumes the run in the BACKGROUND (`completeRemoteResult` kicks `resume` and returns so the
+ * results loop can ack). The resume's own rejection is captured, but a throw escaping the
+ * `finally` lands outside it — a process-level rejection nobody owns. The symptom is a test
+ * suite where every assertion passes and the exit code is still 1.
+ *
+ * Reproduced here with the in-memory store and the mock queue adapter: no database is needed,
+ * only a `releaseRunLock` that rejects and a turn driven by the results loop rather than by an
+ * awaited `startRun`. Driving it with `startRun` does NOT reproduce it — that path awaits the
+ * turn, so the throw has an owner. Getting that wrong is how the first version of this test
+ * came out green against the unfixed engine.
  */
 describe('lease release is best-effort', () => {
-  it('keeps the workflow error when releasing the lease throws', async () => {
-    const store = new InMemoryStateStore();
-    // Mirrors the poisoned-connection case: the store answers everything else, but any further
-    // write on this run's lease is refused.
-    vi.spyOn(store, 'releaseRunLock').mockRejectedValue(
-      new Error('current transaction is aborted, commands ignored until end of transaction block'),
-    );
+  const cleanups: Array<() => Promise<void>> = [];
+  afterEach(async () => {
+    await Promise.all(cleanups.splice(0).map((c) => c().catch(() => undefined)));
+  });
+
+  it('a failing release does not become an unhandled rejection', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (err: unknown) => unhandled.push(err);
+    process.on('unhandledRejection', onUnhandled);
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    const engine = new WorkflowEngine({ store });
-    engine.register('poisoned', '1', async (ctx) => {
-      await ctx.localStep('persist', async () => {
+    try {
+      const adapter = new MockAdapter();
+      const store = new InMemoryStateStore();
+      // The poisoned-connection case: the store answers everything else, but the lease write
+      // is refused — exactly what Postgres does for the rest of an aborted transaction.
+      vi.spyOn(store, 'releaseRunLock').mockRejectedValue(
+        new Error(
+          'current transaction is aborted, commands ignored until end of transaction block',
+        ),
+      );
+
+      const track = (t: QueueTransport): QueueTransport => {
+        cleanups.push(() => t.close());
+        return t;
+      };
+      const engineTransport = track(
+        new QueueTransport({ adapter: () => adapter, pollIntervalMs: 5 }),
+      );
+      const workerTransport = track(
+        new QueueTransport({ adapter: () => adapter, pollIntervalMs: 5 }),
+      );
+
+      // The step fails, so the turn takes the failure path — the one whose `finally` then has to
+      // release a lease the store will refuse.
+      workerTransport.handle('persist', async () => {
         throw new Error('null value in column "value" violates not-null constraint');
       });
-      return 'done';
-    });
 
-    const result = await startRun(engine, 'poisoned', {}, 'r1');
+      const engine = new WorkflowEngine({ store, transport: engineTransport });
+      engine.register('poisoned', '1', async (ctx) => {
+        // A DURABLE remote step (no `timeoutMs`): its result arrives on the results loop, so the
+        // resume that runs the failing turn is the background one.
+        await ctx.step('persist', {});
+        return 'done';
+      });
 
-    expect(result.status).toBe('failed');
-    expect(result.error?.message).toContain('not-null constraint');
-    // The assertion that actually distinguishes fixed from unfixed: the release failure is
-    // reported, not propagated. Without the fix this warning never happens.
-    expect(warn.mock.calls.flat().join(' ')).toMatch(/releasing the lease of run r1 failed/);
+      await engine.start('poisoned', {}, 'r1');
+      await settle(store, 'r1');
 
-    warn.mockRestore();
-  });
+      const run = await store.getRun('r1');
+      // The run still reaches its real outcome, with its real cause.
+      expect(run?.status).toBe('failed');
+      expect(run?.error?.message).toContain('not-null constraint');
 
-  it('does not reject when the release fails on a successful run', async () => {
-    const store = new InMemoryStateStore();
-    vi.spyOn(store, 'releaseRunLock').mockRejectedValue(new Error('connection lost'));
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      // The assertion this test exists for. Unfixed, this is 3.
+      expect(unhandled).toEqual([]);
 
-    const engine = new WorkflowEngine({ store });
-    engine.register('happy', '1', async (ctx) => {
-      await ctx.localStep('work', async () => 'ok');
-      return 'done';
-    });
-
-    // A run that DID everything asked of it must not be reported as failed because the
-    // bookkeeping write after it could not land.
-    const result = await startRun(engine, 'happy', {}, 'r2');
-    expect(result.status).toBe('completed');
-    expect(result.output).toBe('done');
-
-    warn.mockRestore();
+      // And the swallowed release stays visible to an operator rather than silent.
+      expect(warn.mock.calls.flat().join(' ')).toMatch(/releasing the lease of run r1 failed/);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      warn.mockRestore();
+    }
   });
 });
+
+/** Poll until `runId` is terminal — results travel over a poll loop, not a promise. */
+async function settle(store: InMemoryStateStore, runId: string, budgetMs = 3000): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < budgetMs) {
+    const run = await store.getRun(runId);
+    if (run && !['pending', 'running', 'suspended'].includes(run.status)) {
+      // The release happens in the turn's `finally`, just after the status flip — give the
+      // microtask that rejects a chance to be seen as unhandled before asserting it was not.
+      await new Promise((r) => setTimeout(r, 100));
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  throw new Error(`run ${runId} did not settle`);
+}
