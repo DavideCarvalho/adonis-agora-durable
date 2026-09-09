@@ -3454,7 +3454,27 @@ export class WorkflowEngine {
       // Release the recovery lease once the run reaches a terminal/suspended state, so the
       // next instance (or the timer poller) can pick it up promptly. Owner-scoped: if this turn's
       // lease was already taken over (zombie executor), the new owner's lease is left untouched.
-      await this.store.releaseRunLock(run.id, this.instanceId);
+      //
+      // BEST-EFFORT, and that matters here more than anywhere else. This `finally` runs on the
+      // failure path too, and the thing that failed the run is frequently the very store this
+      // release has to talk to: a step that violated a DB constraint leaves Postgres refusing
+      // every further statement on that connection ("current transaction is aborted"), so the
+      // release throws. A throwing `finally` REPLACES the workflow's real error with a lease
+      // write nobody asked about, and — because this turn is often driven as a background resume
+      // — surfaces as an unhandled rejection instead of a failed run.
+      //
+      // Letting it go is safe by the same argument `releaseInflightLocks` already makes: the
+      // lease is a lease. It expires, and `recoverIncomplete` re-drives whatever is still held.
+      // A lost release costs one lease window of latency; a masked error costs the diagnosis.
+      try {
+        await this.store.releaseRunLock(run.id, this.instanceId);
+      } catch (releaseErr) {
+        console.warn(
+          `[adonis-durable] releasing the lease of run ${run.id} failed (it expires on its own and recovery re-drives): ${
+            releaseErr instanceof Error ? releaseErr.message : String(releaseErr)
+          }`,
+        );
+      }
     }
   }
 
