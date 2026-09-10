@@ -27,8 +27,8 @@ importers:
         specifier: 7.0.2
         version: 7.0.2
       unplugin-swc:
-        specifier: 1.5.11
-        version: 1.5.11(@swc/core@1.16.2)(rolldown@1.2.6)(rollup@4.62.2)(vite@8.2.2(@types/node@26.4.1)(jiti@2.7.0)(yaml@2.9.0))
+        specifier: 1.6.0
+        version: 1.6.0(@swc/core@1.16.2)(rolldown@1.2.6)(rollup@4.62.2)(vite@8.2.2(@types/node@26.4.1)(jiti@2.7.0)(yaml@2.9.0))
       vitest:
         specifier: 5.0.0
         version: 5.0.0(@opentelemetry/api@1.9.1)(@types/node@26.4.1)(happy-dom@20.14.0)(jsdom@30.0.1)(vite@8.2.2(@types/node@26.4.1)(jiti@2.7.0)(yaml@2.9.0))
@@ -3331,8 +3331,8 @@ packages:
     resolution: {integrity: sha512-pjy2bYhSsufwWlKwPc+l3cN7+wuJlK6uz0YdJEOlQDbl6jo/YlPi4mb8agUkVC8BF7V8NuzeyPNqRksA3hztKQ==}
     engines: {node: '>= 0.8'}
 
-  unplugin-swc@1.5.11:
-    resolution: {integrity: sha512-R7U4GbfrESPnYLn3nXREZrwhKQk3BAmTBoKJ5lmo7btTc/yJpNsDzavBWo+XpQTjDSIogiZEAxC5ig/vfMWxWg==}
+  unplugin-swc@1.6.0:
+    resolution: {integrity: sha512-aOdzxAwJvz1GeQ8vwSNA2N8AreHYBrpwxqnwzxmB7LCdeZiXOBDj0rgjZod+lMxFsJGm8k6lF/1iKF/9wacLbw==}
     peerDependencies:
       '@swc/core': ^1.2.108
 
@@ -6338,7 +6338,7 @@ snapshots:
 
   unpipe@1.0.0: {}
 
-  unplugin-swc@1.5.11(@swc/core@1.16.2)(rolldown@1.2.6)(rollup@4.62.2)(vite@8.2.2(@types/node@26.4.1)(jiti@2.7.0)(yaml@2.9.0)):
+  unplugin-swc@1.6.0(@swc/core@1.16.2)(rolldown@1.2.6)(rollup@4.62.2)(vite@8.2.2(@types/node@26.4.1)(jiti@2.7.0)(yaml@2.9.0)):
     dependencies:
       '@rollup/pluginutils': 5.4.0(rollup@4.62.2)
       '@swc/core': 1.16.2
