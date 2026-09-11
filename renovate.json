@@ -39,6 +39,11 @@
       "enabled": false
     },
     {
+      "description": "`cron-parser-v4` is an npm: alias pinned to cron-parser 4.9.0 so test/engine/cron-parser-compat.spec.ts can exercise the v4 module shape while the default install is v5. The package advertises `^4.0.0 || ^5.0.0` as its peer range, so moving this alias forward does not update anything — it deletes the v4 half of the coverage and leaves the range promising support nothing tests.",
+      "matchPackageNames": ["cron-parser-v4"],
+      "enabled": false
+    },
+    {
       "description": "A peer range is the compatibility window this package advertises. Widen it rather than pinning it, and never without a human deciding the window is really that wide.",
       "matchDepTypes": ["peerDependencies"],
       "rangeStrategy": "widen",
