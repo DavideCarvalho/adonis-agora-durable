@@ -73,7 +73,7 @@ importers:
         specifier: 7.3.1
         version: 7.3.1
       '@tanstack/intent':
-        specifier: ^0.4.0
+        specifier: 0.4.0
         version: 0.4.0
       '@types/better-sqlite3':
         specifier: 9.6.0
@@ -91,7 +91,7 @@ importers:
         specifier: 5.10.0
         version: 5.10.0
       cron-parser-v4:
-        specifier: npm:cron-parser@^4.9.0
+        specifier: npm:cron-parser@4.9.0
         version: cron-parser@4.9.0
       ioredis:
         specifier: 6.0.0
@@ -115,7 +115,7 @@ importers:
         specifier: 4.3.3
         version: 4.3.3
       '@tanstack/intent':
-        specifier: ^0.4.0
+        specifier: 0.4.0
         version: 0.4.0
       '@tanstack/react-query':
         specifier: 5.102.8
