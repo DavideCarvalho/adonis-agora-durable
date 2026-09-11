@@ -193,9 +193,9 @@ For calendar-aligned schedules, use a cron expression evaluated in an IANA `time
 The window for a cron schedule is its most recent fire time at or before now — the deterministic "bucket" the run is keyed on (`sched:<key>:<prevFireMs>`). Polling repeatedly between two fires resolves to the same bucket, and thus the same run id, so the run for a given fire starts once.
 
 <Callout type="info">
-Cron parsing uses `cron-parser`, an optional peer. Install it where you run the engine: `npm i cron-parser`.
-Both major versions work — v4 (`parseExpression`) and v5 (`CronExpressionParser.parse`) are detected at
-load time, so whichever one your app (or `@adonis-agora/telescope`) already has is the one that gets used.
+Cron parsing uses `cron-parser`, an optional peer, version 5 or newer. Install it where you run the
+engine: `npm i cron-parser`. An older major fails at load with a message naming the version it wants,
+rather than being detected and driven with the wrong entry point.
 </Callout>
 
 ## Pausing and overlap
