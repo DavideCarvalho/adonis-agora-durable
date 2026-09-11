@@ -39,6 +39,12 @@
       "enabled": false
     },
     {
+      "description": "typescript-eslint gates the eslint-plugin package's TypeScript. Its latest release, 8.70.0, declares `typescript: >=4.8.4 <6.1.0` and throws `typescript-eslint does not support TS 7.0` at run time, so a TS 7 bump here fails the rule specs no matter what this repo does. The rest of the workspace is already on TS 7; lift this once typescript-eslint ships TS 7 support.",
+      "matchFileNames": ["packages/eslint-plugin/package.json"],
+      "matchPackageNames": ["typescript"],
+      "allowedVersions": "<6.1.0"
+    },
+    {
       "description": "A peer range is the compatibility window this package advertises. Widen it rather than pinning it, and never without a human deciding the window is really that wide.",
       "matchDepTypes": ["peerDependencies"],
       "rangeStrategy": "widen",
