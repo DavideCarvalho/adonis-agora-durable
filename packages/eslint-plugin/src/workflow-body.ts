@@ -83,15 +83,16 @@ export function isWorkflowClass(classNode: TSESTree.Node | undefined): boolean {
  * True when `node` sits lexically inside a workflow's deterministic orchestration body — either the
  * `run` method of a workflow class (`BaseWorkflow` subclass / `static workflow` config), or the
  * function passed to `engine.register(...)`.
- * Returns false the moment the walk crosses a `ctx.step`/`ctx.task` callback boundary, since that body
- * is checkpointed (run once) and so may be non-deterministic.
+ * Returns false the moment the walk crosses a checkpoint-callback boundary — `ctx.localStep`,
+ * `ctx.task` or `ctx.sideEffect` (see `isCheckpointedCallback`) — since that body is checkpointed
+ * (run once) and so may be non-deterministic. `ctx.step` is not one of them.
  */
 export function isInWorkflowBody(node: TSESTree.Node): boolean {
   let cur: TSESTree.Node | undefined = node;
   while (cur) {
     if (cur.type === 'ArrowFunctionExpression' || cur.type === 'FunctionExpression') {
-      // Crossing a `ctx.step`/`ctx.task` callback boundary means the call is inside a checkpointed
-      // step — not the deterministic orchestration body — so don't flag it.
+      // Crossing a checkpoint-callback boundary means the call is inside a checkpointed step — not
+      // the deterministic orchestration body — so don't flag it.
       if (isCheckpointedCallback(cur)) return false;
       // The function form: the body passed to `engine.register(name, version, fn)`.
       if (isRegisterWorkflowBody(cur)) return true;
