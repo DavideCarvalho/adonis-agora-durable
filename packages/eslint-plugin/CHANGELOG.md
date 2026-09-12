@@ -1,5 +1,17 @@
 # @adonis-agora/durable-eslint-plugin
 
+## 0.3.2
+
+### Patch Changes
+
+- [`0260c94`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/0260c9452d1b3f8728c9cb13f8e49adf43096241) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Correct the checkpoint-boundary comments on `isInWorkflowBody`
+  
+  Its doc block and the inline note beside the `isCheckpointedCallback` call named the
+  boundary as `ctx.step`/`ctx.task`. The boundary is `ctx.localStep`, `ctx.task` and
+  `ctx.sideEffect`; `ctx.step` is the dispatched step and deliberately is not one, which the
+  file already says a few lines above and which both rule suites assert. Comments only — no
+  rule behaviour changes.
+
 ## 0.3.1
 
 ### Patch Changes
