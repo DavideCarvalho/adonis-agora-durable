@@ -8,6 +8,24 @@
     "url": "git+https://github.com/DavideCarvalho/adonis-agora-durable.git",
     "directory": "packages/adonis"
   },
+  "homepage": "https://davidecarvalho.github.io/agora/docs/durable",
+  "bugs": {
+    "url": "https://github.com/DavideCarvalho/adonis-agora-durable/issues"
+  },
+  "keywords": [
+    "adonisjs",
+    "adonis",
+    "durable",
+    "workflow",
+    "saga",
+    "replay",
+    "dashboard",
+    "opentelemetry",
+    "telescope",
+    "testing",
+    "tanstack-intent",
+    "agora"
+  ],
   "author": "Davi Carvalho <davi@goflip.ai>",
   "type": "module",
   "main": "./dist/src/index.js",
@@ -185,19 +203,5 @@
   },
   "engines": {
     "node": ">=20.6.0"
-  },
-  "keywords": [
-    "adonisjs",
-    "adonis",
-    "durable",
-    "workflow",
-    "saga",
-    "replay",
-    "dashboard",
-    "opentelemetry",
-    "telescope",
-    "testing",
-    "tanstack-intent",
-    "agora"
-  ]
+  }
 }

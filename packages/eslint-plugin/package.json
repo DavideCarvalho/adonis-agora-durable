@@ -8,6 +8,18 @@
     "url": "git+https://github.com/DavideCarvalho/adonis-agora-durable.git",
     "directory": "packages/eslint-plugin"
   },
+  "homepage": "https://davidecarvalho.github.io/agora/docs/durable",
+  "bugs": {
+    "url": "https://github.com/DavideCarvalho/adonis-agora-durable/issues"
+  },
+  "keywords": [
+    "eslint",
+    "eslint-plugin",
+    "durable",
+    "workflow",
+    "determinism",
+    "agora"
+  ],
   "author": "Davi Carvalho <davi@goflip.ai>",
   "type": "module",
   "main": "./dist/src/index.js",
@@ -49,13 +61,5 @@
   },
   "engines": {
     "node": ">=20.6.0"
-  },
-  "keywords": [
-    "eslint",
-    "eslint-plugin",
-    "durable",
-    "workflow",
-    "determinism",
-    "agora"
-  ]
+  }
 }
