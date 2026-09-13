@@ -3020,7 +3020,18 @@ export class WorkflowEngine {
     // continue: persist any local steps the replay ran, dispatch the blocking ops, then suspend. When
     // those resolve (a result lands, a timer fires) `resume` brings us back for the next turn.
     const wakeAt = await this.applyCommands(run, decision.commands);
-    return this.settleRun(run, { kind: 'suspended', wakeAt });
+    const suspended = await this.settleRun(run, { kind: 'suspended', wakeAt });
+    // The SAME settle-vs-delivery race the local path closes with `recheckWaitSeqs`, on the remote
+    // path: a turn is computed from a snapshot, and the calls it declares can all have settled while
+    // its decision was in flight — the canonical case being a `gather_calls` fan-out whose last call
+    // lands while this turn holds the lease, so its resume no-ops against ours. This settle then
+    // parks the run on a `call` that is already complete, and nothing is left to wake it.
+    const waitSeqs = decision.commands.filter((cmd) => cmd.kind === 'call').map((cmd) => cmd.seq);
+    if (suspended.status === 'suspended' && waitSeqs.length > 0) {
+      this.recheckWaitSeqs(run.id, waitSeqs);
+    }
+
+    return suspended;
   }
 
   /** The run's resolved durable ops as replay inputs: completed/failed steps + elapsed timers. */
