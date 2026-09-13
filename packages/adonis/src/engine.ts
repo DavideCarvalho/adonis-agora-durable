@@ -3021,41 +3021,17 @@ export class WorkflowEngine {
     // those resolve (a result lands, a timer fires) `resume` brings us back for the next turn.
     const wakeAt = await this.applyCommands(run, decision.commands);
     const suspended = await this.settleRun(run, { kind: 'suspended', wakeAt });
-    await this.redriveIfNothingLeftToAwait(run.id, decision.commands);
-    return suspended;
-  }
-
-  /**
-   * Re-drive a run this turn just parked on ops that have ALREADY settled.
-   *
-   * A turn is computed from a SNAPSHOT of history, and the ops it declares can all have finished
-   * while its decision was in flight. The canonical case is a `gather_calls` fan-out whose last call
-   * lands while the turn holding the lease is still deciding: that call's `resume` reaches
-   * {@link WorkflowEngine.execute}, finds the lease contended and returns silently, so its wake is
-   * spent for nothing — and this decision then parks the run on a `call` that is already complete.
-   * Nothing would ever wake it again; only the `reconcileMs` orphan sweep, minutes later.
-   *
-   * Checked AFTER the suspend is written, so the resume it schedules finds a run it can lease. On a
-   * macrotask for the same reason the signal path uses one: the lease this turn holds is released as
-   * it returns, and a re-entrant resume would bail.
-   */
-  private async redriveIfNothingLeftToAwait(
-    runId: string,
-    commands: readonly WorkflowCommand[],
-  ): Promise<void> {
-    const calls = commands.filter((cmd) => cmd.kind === 'call');
-    if (calls.length === 0) return;
-    for (const cmd of calls) {
-      const checkpoint = await this.store.getCheckpoint(runId, cmd.seq);
-      // `pending` is the ordinary case — the op is genuinely outstanding and its result will wake
-      // the run. Anything else is an op that settled behind this turn's back.
-      if (checkpoint && checkpoint.status !== 'pending') {
-        setTimeout(() => {
-          void this.resume(runId).catch(() => undefined);
-        }, 0).unref?.();
-        return;
-      }
+    // The SAME settle-vs-delivery race the local path closes with `recheckWaitSeqs`, on the remote
+    // path: a turn is computed from a snapshot, and the calls it declares can all have settled while
+    // its decision was in flight — the canonical case being a `gather_calls` fan-out whose last call
+    // lands while this turn holds the lease, so its resume no-ops against ours. This settle then
+    // parks the run on a `call` that is already complete, and nothing is left to wake it.
+    const waitSeqs = decision.commands.filter((cmd) => cmd.kind === 'call').map((cmd) => cmd.seq);
+    if (suspended.status === 'suspended' && waitSeqs.length > 0) {
+      this.recheckWaitSeqs(run.id, waitSeqs);
     }
+
+    return suspended;
   }
 
   /** The run's resolved durable ops as replay inputs: completed/failed steps + elapsed timers. */
