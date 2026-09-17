@@ -192,7 +192,9 @@ Three nets, in preference order:
    `pickupTimeoutMs`) — but its timer dies with the coordinating process.
 2. Engine-level `remoteRedispatchMs` / `remoteRedispatchMax` (default bound 10;
    fails the step with `RemoteStepError` code `'remote_step_lost'` beyond it) —
-   must exceed the longest legitimate step; steps must be idempotent.
+   must exceed the longest legitimate step; steps must be idempotent. It leases
+   the pending checkpoint (`wakeAt`), a worker's heartbeat RENEWS that lease, and
+   it covers a polyglot `call` fan-out (`ctx.gather_calls`) as well as `ctx.step`.
 3. `engine.redispatchPending(runId)` — the operator escape hatch, safe on a
    healthy run (only touches already-pending checkpoints).
 

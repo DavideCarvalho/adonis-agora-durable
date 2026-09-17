@@ -1,6 +1,37 @@
 import type { StepCheckpoint, StepError, StepEvent, StepKind } from './interfaces.js';
 import { stepId } from './protocol.js';
 
+/**
+ * The step-event names the lost-dispatch self-heal stamps on a checkpoint's trail, so an operator (and
+ * the dashboard, which renders a step's events under it) can tell a re-drive apart from an ordinary
+ * failure retry WITHOUT a schema change: `step.redispatched` = the dispatched job was presumed lost
+ * (its lease lapsed with no result and no heartbeat) and the step was re-enqueued; `step.lost` = the
+ * re-drive bound (`remoteRedispatchMax`) ran out and the step was failed `remote_step_lost`.
+ */
+export const REDISPATCHED_STEP_EVENT = 'step.redispatched';
+export const LOST_STEP_EVENT = 'step.lost';
+
+/**
+ * A `warn` step event recording a lost-dispatch re-drive (or the give-up at its bound). `attempts` is
+ * the dispatch count AFTER the transition, so the trail reads as the attempt an operator sees on the
+ * checkpoint.
+ */
+export function lostStepEvent(
+  at: number,
+  attempts: number,
+  outcome: 'redispatched' | 'lost',
+): StepEvent {
+  return {
+    at,
+    level: 'warn',
+    name: outcome === 'lost' ? LOST_STEP_EVENT : REDISPATCHED_STEP_EVENT,
+    message:
+      outcome === 'lost'
+        ? `dispatch lost and the re-drive bound is spent after ${attempts} dispatch(es) — failing the step`
+        : `re-dispatched after a lost dispatch (attempt ${attempts}): the step's lease lapsed with no result and no heartbeat`,
+  };
+}
+
 /** Drop an empty events array to `undefined` (the repeated `events?.length ? events : undefined`). */
 function nonEmptyEvents(events: StepEvent[] | undefined): StepEvent[] | undefined {
   return events && events.length > 0 ? events : undefined;
