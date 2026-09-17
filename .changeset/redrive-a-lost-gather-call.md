@@ -37,7 +37,10 @@ in both: the step's LEASE.
   looping.
 - A step-scoped heartbeat now RENEWS that lease durably, so a worker still holding a long step keeps
   it — the in-memory rearm only ever protected a `timeoutMs` step, and only on the instance that
-  dispatched it.
+  dispatched it. The renewal is throttled by the lease itself (a write only once the window is half
+  spent), so a worker beating every few seconds costs one read + one write per half
+  `remoteRedispatchMs`, not one per beat — the same concern that throttles the liveness write in
+  `persistHeartbeat`.
 - Observability: a re-drive emits `step.started` with `redispatched: true` and appends a `warn`
   `step.redispatched` event to the checkpoint's own trail (`step.lost` at the bound), so "re-driven
   after a lost worker" reads differently from a failure retry — in the dashboard and in the database.

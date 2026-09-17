@@ -3141,21 +3141,55 @@ export class WorkflowEngine {
     return reconcile == null ? lease : Math.min(lease, this.clock() + reconcile);
   }
 
+  /** Earliest clock time a step's lease is worth LOOKING at again (`stepId` → clock ms) — the read
+   *  throttle for {@link rearmStepLease}, the sibling of {@link heartbeatPersists}. */
+  private readonly stepLeaseRearms = new Map<string, number>();
+
   /**
    * A step-scoped heartbeat for a durably-suspended remote step: push its LEASE forward so a worker
    * that is still working on it is never presumed dead and double-dispatched. The durable counterpart
    * of the in-memory `heartbeatResets` rearm (which only exists on the instance that dispatched a
    * `timeoutMs` step). No-op unless the lost-dispatch self-heal is on — without `remoteRedispatchMs`
    * nothing ever re-dispatches, so there is no lease to defend.
+   *
+   * THROTTLED, for the same reason {@link persistHeartbeat} is: beats arrive every few seconds from a
+   * hot batch loop, and defending a lease must not turn into a per-beat SELECT + UPDATE storm. The
+   * throttle is the lease itself rather than a fixed interval — a renewal is only WORTH a write once
+   * the window is half spent, because it buys at most one window either way. So:
+   *  - a beat that finds more than half the window still on the clock writes nothing, and records the
+   *    half-spent mark so subsequent beats skip even the `getCheckpoint` READ until then;
+   *  - a beat at or past the half-spent mark renews, leaving a full half-window of headroom — the
+   *    lease can never lapse under a worker whose beats are anywhere near their normal cadence.
+   *
+   * That bounds the cost at ONE read + ONE write per half `remoteRedispatchMs` per in-flight step
+   * (with a 30-minute window: two writes an hour), independent of beat frequency. The in-memory mark
+   * is a pure optimisation — cold on a fresh instance, or on the one that didn't dispatch the step —
+   * and the durable half-spent check below re-derives the same answer from the checkpoint, so nothing
+   * depends on it surviving. Cleared wholesale past 1024 entries: a rare extra read, never a leak.
    */
   private async rearmStepLease(runId: string, seq: number): Promise<void> {
     if (this.remoteRedispatchMs == null) return;
+    const id = stepId(runId, seq);
+    const now = this.clock();
+    const lookAgainAt = this.stepLeaseRearms.get(id);
+    if (lookAgainAt !== undefined && now < lookAgainAt) return;
     const cp = await this.store.getCheckpoint(runId, seq).catch(() => null);
-    if (cp?.kind !== 'remote' || cp.status !== 'pending') return;
-    const renewed = this.clock() + this.remoteRedispatchMs;
-    if (cp.wakeAt != null && cp.wakeAt >= renewed) return;
+    if (cp?.kind !== 'remote' || cp.status !== 'pending') {
+      // Settled (or gone): stop tracking it, so a long-lived worker's stale beats don't keep the entry.
+      this.stepLeaseRearms.delete(id);
+      return;
+    }
+    const halfWindow = Math.ceil(this.remoteRedispatchMs / 2);
+    // More than half the window left: nothing to buy, and nothing to look at until it is half spent.
+    if (cp.wakeAt != null && cp.wakeAt > now + halfWindow) {
+      this.stepLeaseRearms.set(id, cp.wakeAt - halfWindow);
+      return;
+    }
+    const renewed = now + this.remoteRedispatchMs;
     const previous = cp.wakeAt;
     await this.store.saveCheckpoint({ ...cp, wakeAt: renewed });
+    if (this.stepLeaseRearms.size > 1024) this.stepLeaseRearms.clear();
+    this.stepLeaseRearms.set(id, renewed - halfWindow);
     // If the run is parked EXACTLY on this step's old lease, carry its wake forward too — otherwise a
     // beating worker costs one wasted turn per renewal window. Only on an exact match: any other
     // `wakeAt` belongs to some other timer (a sleep, a sibling's shorter lease) and moving it would

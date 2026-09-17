@@ -4,6 +4,7 @@ import type {
   Heartbeat,
   HistoryEvent,
   RemoteTask,
+  StepCheckpoint,
   StepResult,
   Transport,
   WorkflowDecision,
@@ -124,6 +125,23 @@ function fanCallExecutor(): WorkflowExecutor {
   };
 }
 
+/** Counts the durable reads/writes the LOST step's checkpoint costs, so a hot heartbeat loop can be
+ *  held to a bounded number of them (the same concern that throttles `persistHeartbeat`). */
+class CountingStore extends InMemoryStateStore {
+  writes = 0;
+  reads = 0;
+
+  override async getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null> {
+    if (seq === LOST_SEQ) this.reads += 1;
+    return super.getCheckpoint(runId, seq);
+  }
+
+  override async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
+    if (checkpoint.seq === LOST_SEQ) this.writes += 1;
+    return super.saveCheckpoint(checkpoint);
+  }
+}
+
 interface Harness {
   engine: WorkflowEngine;
   store: InMemoryStateStore;
@@ -138,9 +156,9 @@ interface Harness {
 
 function harness(
   opts: { remoteRedispatchMs?: number; remoteRedispatchMax?: number } = {},
+  store: InMemoryStateStore = new InMemoryStateStore(),
 ): Harness {
   let now = 1_000_000;
-  const store = new InMemoryStateStore();
   const transport = new LossyTransport();
   const engine = new WorkflowEngine({
     store,
@@ -329,5 +347,49 @@ describe('WorkflowEngine — a gather_calls step whose worker died is re-driven'
     await h.tick();
     await drain();
     expect(h.transport.dispatchesOf(`leaf_${LOST_SEQ}`)).toBe(2);
+  });
+
+  it('renews on a bounded number of writes, not one per beat (a hot beat loop is not an UPDATE storm)', async () => {
+    // `persistHeartbeat` throttles its liveness write to >=10s apart because beats arrive every few
+    // seconds from a hot batch loop; defending the lease must not undo that. The throttle here is the
+    // LEASE: a renewal only buys one window, so it is only worth a write once the window is half
+    // spent — which bounds the cost at one read + one write per half-window per in-flight step,
+    // whatever the beat cadence, while still leaving half a window of headroom before expiry.
+    const store = new CountingStore();
+    const h = harness({ remoteRedispatchMs: 60_000 }, store);
+    h.transport.loseFirstDispatchOf.add(`leaf_${LOST_SEQ}`);
+
+    await h.start();
+    const dispatched = await checkpointAt(h.store, LOST_SEQ);
+    if (!dispatched?.stepId) throw new Error('expected a dispatched checkpoint');
+    const leaseAtDispatch = dispatched.wakeAt;
+    expect(leaseAtDispatch).toBe(h.now() + 60_000);
+
+    // 120 beats across one full window — a worker beating twice a second.
+    store.reads = 0;
+    store.writes = 0;
+    for (let i = 0; i < 120; i += 1) {
+      h.advance(500);
+      await h.transport.heartbeatHandler?.({
+        runId: 'fan1',
+        seq: LOST_SEQ,
+        stepId: dispatched.stepId,
+        group: `leaf_${LOST_SEQ}`,
+      });
+    }
+
+    // Two half-windows elapsed, so a handful of durable operations — NOT 120 of each. (Observed: 2
+    // writes, and 3 reads — the cold-map look plus one per renewal. Bounded, not pinned, so a later
+    // refactor of the mark is free to cost one more without a spurious failure.)
+    expect(store.writes).toBeGreaterThanOrEqual(1); // it really did renew
+    expect(store.writes).toBeLessThanOrEqual(4);
+    expect(store.reads).toBeLessThanOrEqual(4);
+
+    // And the lease is genuinely ahead of the clock with headroom — never renewed late.
+    const renewed = await checkpointAt(h.store, LOST_SEQ);
+    expect(renewed?.wakeAt).toBeGreaterThan(h.now() + 30_000);
+    // Still not re-driven: the beats kept the step alive the whole time.
+    await h.tick();
+    expect(h.transport.dispatchesOf(`leaf_${LOST_SEQ}`)).toBe(1);
   });
 });
