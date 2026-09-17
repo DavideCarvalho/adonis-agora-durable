@@ -1734,6 +1734,15 @@ export interface EngineEvent {
    *  control-plane descriptor negotiated against — enough to render WHY the run parked. Absent on all
    *  other event types. */
   diagnostics?: DispatchDiagnostics | undefined;
+  /**
+   * On a `step.started`: this dispatch is a lost-dispatch RE-DRIVE, not a first attempt — the step's
+   * lease lapsed with no result and no heartbeat (the worker holding it is presumed gone), so the
+   * engine re-enqueued it (see `WorkflowEngineDeps.remoteRedispatchMs`). Absent on a normal dispatch
+   * and on a failure retry, so a dashboard/alert can tell "re-driven after a lost worker" apart from
+   * "retried after a failure". The step's persisted event trail carries the same fact durably
+   * (`step.redispatched`).
+   */
+  redispatched?: boolean | undefined;
   at: Date;
 }
 

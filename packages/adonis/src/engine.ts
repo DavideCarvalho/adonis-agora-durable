@@ -1,6 +1,6 @@
 import { type AdmissionBackend, InMemoryAdmissionBackend } from './admission.js';
 import { backoffDelay, MAX_BACKOFF_MS } from './backoff.js';
-import { instantCheckpoint, stepCheckpoint } from './checkpoints.js';
+import { instantCheckpoint, lostStepEvent, stepCheckpoint } from './checkpoints.js';
 import { type Completion } from './completion.js';
 import {
   type BlockedDispatch,
@@ -715,9 +715,14 @@ export class WorkflowEngine {
         await this.completeRemoteResult(result);
       },
       // A heartbeat for an in-flight long step resets its liveness window (see callRemote) and is
-      // persisted (throttled) on the step's checkpoint so liveness is visible cross-process.
+      // persisted (throttled) on the step's checkpoint so liveness is visible cross-process. With no
+      // in-memory waiter (the step suspended DURABLY, possibly on another instance) the beat rearms
+      // the step's durable LEASE instead, so a worker still holding a long step is never presumed
+      // lost and double-dispatched (see rearmStepLease).
       async (beat) => {
-        this.heartbeatResets.get(beat.stepId)?.();
+        const reset = this.heartbeatResets.get(beat.stepId);
+        if (reset) reset();
+        else await this.rearmStepLease(beat.runId, beat.seq);
         this.persistHeartbeat(beat);
       },
       // A remote workflow worker streams each local step's lifecycle (running → completed/failed) so
@@ -3019,8 +3024,147 @@ export class WorkflowEngine {
 
     // continue: persist any local steps the replay ran, dispatch the blocking ops, then suspend. When
     // those resolve (a result lands, a timer fires) `resume` brings us back for the next turn.
-    const wakeAt = await this.applyCommands(run, decision.commands);
+    const wakeAt = await this.applyCommands(run, decision.commands, true);
     return this.settleRun(run, { kind: 'suspended', wakeAt });
+  }
+
+  /**
+   * A polyglot workflow's re-emitted `call` whose checkpoint already exists: decide whether the step is
+   * still out for delivery, or whether its dispatch was LOST and has to be re-driven. Returns the
+   * deadline to park the run on (so the next decision lands exactly when it's due), or `undefined` when
+   * there is nothing to wait for.
+   *
+   * WHY THIS EXISTS. A worker process killed mid-step (an OOM kill, exit 137 — a pod's memory ceiling,
+   * not a bug in anyone's code) takes its in-flight job with it, and the transport cannot always put it
+   * back: the `bullmq` transport's terminal-failure bridge (`worker.on('failed')`) only exists inside a
+   * JS consumer, so a first-class Python fleet (see `docs/python.mdx`) has none; the `queue` transport's
+   * reclaim sweep gives up past `maxStalledCount`, and never runs at all on an adapter without
+   * `recoverStalledJobs`. NOTHING then settles the checkpoint. It stays `pending` — "out for delivery" —
+   * and the `applyCommands` idempotency guard, which exists so a `ctx.gather_calls` fan-out doesn't
+   * double-dispatch its still-in-flight siblings on every partial resume, skips it on every later turn.
+   * The run wakes on the reconcile sweep, dispatches a turn, has the call re-emitted, skips it again,
+   * and sleeps. Forever — `pending`, `attempts = 1`, `wakeAt` NULL.
+   *
+   * THE POLICY (mirrors {@link callRemote}'s `ctx.step` self-heal, which this path silently did not
+   * share — so `remoteRedispatchMs` simply did not apply to a fan-out):
+   *  - a SETTLED checkpoint always wins: a step that completed just before the crash is never re-run;
+   *  - `remoteRedispatchMs` unset (the default) keeps the by-design "re-suspend, never re-dispatch";
+   *  - otherwise the pending checkpoint carries a LEASE in `wakeAt` — a result or a step heartbeat
+   *    ({@link rearmStepLease}) renews it, so a live worker still holding the step is never
+   *    double-dispatched — and only a LAPSED lease re-dispatches, bounded by `remoteRedispatchMax`;
+   *  - past the bound the step is failed `remote_step_lost` and the failure enters the run's history
+   *    (see {@link remoteHistory}), so the workflow's own error path surfaces it on the next turn
+   *    instead of the engine looping. The run is parked to wake immediately for exactly that turn.
+   */
+  private async redriveLostCall(run: WorkflowRun, cp: StepCheckpoint): Promise<number | undefined> {
+    // Settled (or a non-remote seq): the checkpoint is the truth, nothing to re-drive.
+    if (cp.kind !== 'remote' || cp.status !== 'pending') return undefined;
+    if (this.remoteRedispatchMs == null) return undefined;
+    // First sight of this pending step under the self-heal: stamp its lease (clock-space, persisted,
+    // stable across replays and crashes) and park the run on it.
+    if (cp.wakeAt == null) {
+      const lease = this.clock() + this.remoteRedispatchMs;
+      await this.store.saveCheckpoint({ ...cp, wakeAt: lease });
+      return this.stepLeaseWakeAt(lease);
+    }
+    if (this.clock() < cp.wakeAt) return this.stepLeaseWakeAt(cp.wakeAt);
+    // The lease lapsed with no result and no heartbeat: the dispatch is presumed lost.
+    if (cp.attempts >= this.remoteRedispatchMax) {
+      const error = {
+        message: `remote step "${cp.name}" lost — no result after ${cp.attempts} dispatch(es)`,
+        code: 'remote_step_lost',
+        retryable: false,
+      };
+      const now = new Date();
+      await this.store.saveCheckpoint({
+        ...cp,
+        status: 'failed',
+        error,
+        wakeAt: undefined,
+        finishedAt: now,
+        events: [...(cp.events ?? []), lostStepEvent(this.clock(), cp.attempts, 'lost')],
+      });
+      this.emit({
+        type: 'step.failed',
+        runId: run.id,
+        seq: cp.seq,
+        name: cp.name,
+        kind: 'remote',
+        error,
+      });
+      // Wake now: the failure is in history, so the very next turn's replay raises it inside the
+      // gather and the run settles on the workflow's own error path.
+      return this.clock();
+    }
+    const attempts = cp.attempts + 1;
+    const lease = this.clock() + this.remoteRedispatchMs;
+    const at = new Date();
+    await this.store.saveCheckpoint({
+      ...cp,
+      attempts,
+      wakeAt: lease,
+      // The re-dispatch restarts the step's wall-clock window; the old one measured a worker that died.
+      enqueuedAt: at,
+      startedAt: at,
+      finishedAt: at,
+      // Observability: the step's own trail says WHY it ran again — a lost worker, not a failure retry.
+      events: [...(cp.events ?? []), lostStepEvent(this.clock(), attempts, 'redispatched')],
+    });
+    await this.dispatchRemoteTask({
+      runId: run.id,
+      seq: cp.seq,
+      name: cp.name,
+      stepId: cp.stepId ?? stepId(run.id, cp.seq),
+      group: cp.workerGroup ?? tenantGroup(sanitizeQueueToken(cp.name), run.namespace),
+      input: cp.input,
+      attempt: attempts,
+    });
+    this.emit({
+      type: 'step.started',
+      runId: run.id,
+      seq: cp.seq,
+      name: cp.name,
+      kind: 'remote',
+      redispatched: true,
+    });
+    return this.stepLeaseWakeAt(lease);
+  }
+
+  /**
+   * The run `wakeAt` a step lease should park on: the lease itself, but never LATER than the
+   * {@link reconcileMs} safety net would have woken the run anyway. A long lease (a fan-out step that
+   * legitimately runs for half an hour) must not stretch the orphan sweep's cadence for this run — an
+   * early wake just re-parks on the un-lapsed lease, which is cheap and convergent.
+   */
+  private stepLeaseWakeAt(lease: number): number {
+    const reconcile = this.reconcileMs;
+    return reconcile == null ? lease : Math.min(lease, this.clock() + reconcile);
+  }
+
+  /**
+   * A step-scoped heartbeat for a durably-suspended remote step: push its LEASE forward so a worker
+   * that is still working on it is never presumed dead and double-dispatched. The durable counterpart
+   * of the in-memory `heartbeatResets` rearm (which only exists on the instance that dispatched a
+   * `timeoutMs` step). No-op unless the lost-dispatch self-heal is on — without `remoteRedispatchMs`
+   * nothing ever re-dispatches, so there is no lease to defend.
+   */
+  private async rearmStepLease(runId: string, seq: number): Promise<void> {
+    if (this.remoteRedispatchMs == null) return;
+    const cp = await this.store.getCheckpoint(runId, seq).catch(() => null);
+    if (cp?.kind !== 'remote' || cp.status !== 'pending') return;
+    const renewed = this.clock() + this.remoteRedispatchMs;
+    if (cp.wakeAt != null && cp.wakeAt >= renewed) return;
+    const previous = cp.wakeAt;
+    await this.store.saveCheckpoint({ ...cp, wakeAt: renewed });
+    // If the run is parked EXACTLY on this step's old lease, carry its wake forward too — otherwise a
+    // beating worker costs one wasted turn per renewal window. Only on an exact match: any other
+    // `wakeAt` belongs to some other timer (a sleep, a sibling's shorter lease) and moving it would
+    // delay that instead.
+    if (previous == null) return;
+    const run = await this.store.getRun(runId);
+    if (run?.status === 'suspended' && run.wakeAt === previous) {
+      await this.store.updateRun(runId, { wakeAt: renewed, updatedAt: new Date() });
+    }
   }
 
   /** The run's resolved durable ops as replay inputs: completed/failed steps + elapsed timers. */
@@ -3067,10 +3211,16 @@ export class WorkflowEngine {
   }
 
   /** Apply a turn's commands: persist recorded local steps, dispatch remote calls, schedule timers.
-   *  Returns the earliest timer deadline to suspend on (or undefined — suspended on a result). */
+   *  Returns the earliest timer deadline to suspend on (or undefined — suspended on a result).
+   *
+   *  `redriveLost` is set only by the `continue` path: a turn that PARKS on its blocking ops is the one
+   *  that may find a re-emitted `call` whose dispatch was lost and needs re-driving (see
+   *  {@link redriveLostCall}). A terminal turn (completed/failed/cancelled) applies its commands only to
+   *  record what already ran, and must never dispatch anything new. */
   private async applyCommands(
     run: WorkflowRun,
     commands: WorkflowCommand[],
+    redriveLost = false,
   ): Promise<number | undefined> {
     let wakeAt: number | undefined;
     for (const cmd of commands) {
@@ -3115,12 +3265,29 @@ export class WorkflowEngine {
         // already exists — pending OR terminal — skip the save + dispatch entirely; its result lands
         // independently via the remote-result path (keyed by seq, so concurrent calls never clobber).
         // Mirrors the `startChild` `getRun(childId)` guard below.
-        if (await this.store.getCheckpoint(run.id, cmd.seq)) continue;
+        //
+        // What that guard must NOT do is treat "a checkpoint exists" as "somebody is still going to
+        // deliver it". A dispatched job can be LOST — the worker was killed mid-step, so the job died
+        // with the process and no result will ever come — and the checkpoint still reads `pending`.
+        // Skipping such a command on every later turn is how a fan-out orphans its run (see
+        // {@link redriveLostCall}, which owns that decision; a settled checkpoint always wins).
+        const existing = await this.store.getCheckpoint(run.id, cmd.seq);
+        if (existing) {
+          const leaseAt = redriveLost ? await this.redriveLostCall(run, existing) : undefined;
+          if (leaseAt != null) wakeAt = wakeAt == null ? leaseAt : Math.min(wakeAt, leaseAt);
+          continue;
+        }
         // Route this cross-SDK-worker `call` by the SAME name-based token a native `ctx.step`
         // dispatches with (and a worker subscribes to per handler name), so a decision-driven remote
         // step and an in-process one land on the identical queue. The command's own `group` is not a
         // routing input; the run's namespace is, so a tenant's fan-out stays on the tenant's pool.
         const callToken = tenantGroup(sanitizeQueueToken(cmd.name), run.namespace);
+        // The dispatched step's LEASE: when the lost-dispatch self-heal is on (`remoteRedispatchMs`),
+        // stamp the deadline by which a result — or a step heartbeat renewing it — must have landed,
+        // and suspend the run ON it, so the re-drive lands when it's due instead of waiting for the
+        // reconcile sweep. Unset (the default) leaves `wakeAt` NULL exactly as before.
+        const lease =
+          this.remoteRedispatchMs == null ? undefined : this.clock() + this.remoteRedispatchMs;
         await this.store.saveCheckpoint(
           stepCheckpoint({
             runId: run.id,
@@ -3130,6 +3297,7 @@ export class WorkflowEngine {
             status: 'pending',
             input: cmd.input,
             attempts: 1,
+            wakeAt: lease,
             workerGroup: callToken,
             enqueuedAt: at,
             startedAt: at,
@@ -3161,6 +3329,10 @@ export class WorkflowEngine {
           name: cmd.name,
           kind: 'remote',
         });
+        if (lease != null) {
+          const leaseWake = this.stepLeaseWakeAt(lease);
+          wakeAt = wakeAt == null ? leaseWake : Math.min(wakeAt, leaseWake);
+        }
       } else if (cmd.kind === 'sleep') {
         const deadline = this.clock() + cmd.ms;
         await this.store.saveCheckpoint(
@@ -4021,6 +4193,12 @@ export class WorkflowEngine {
         enqueuedAt: reEnqueuedAt,
         startedAt: reEnqueuedAt,
         finishedAt: reEnqueuedAt,
+        // Same observable marker the polyglot `call` path stamps (see redriveLostCall): the step's own
+        // trail distinguishes a lost-dispatch re-drive from a failure retry.
+        events: [
+          ...(existing.events ?? []),
+          lostStepEvent(this.clock(), reAttempt, 'redispatched'),
+        ],
       });
       await this.dispatchRemoteTask({
         runId,
@@ -4032,6 +4210,14 @@ export class WorkflowEngine {
         priority: admission?.priority,
         attempt: reAttempt,
         transport,
+      });
+      this.emit({
+        type: 'step.started',
+        runId,
+        seq,
+        name: step.name,
+        kind: 'remote',
+        redispatched: true,
       });
       throw new WorkflowSuspended(nextDeadline, [seq]);
     }
