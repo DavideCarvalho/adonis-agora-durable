@@ -194,7 +194,7 @@
     "@types/better-sqlite3": "9.6.0",
     "@types/node": "26.5.1",
     "better-sqlite3": "13.0.3",
-    "bullmq": "6.3.4",
+    "bullmq": "6.3.5",
     "cron-parser": "5.10.1",
     "ioredis": "6.0.0",
     "typescript": "7.0.2",
