@@ -3164,16 +3164,34 @@ export class WorkflowEngine {
    * That bounds the cost at ONE read + ONE write per half `remoteRedispatchMs` per in-flight step
    * (with a 30-minute window: two writes an hour), independent of beat frequency. The in-memory mark
    * is a pure optimisation — cold on a fresh instance, or on the one that didn't dispatch the step —
-   * and the durable half-spent check below re-derives the same answer from the checkpoint, so nothing
+   * and the durable half-spent check re-derives the same answer from the checkpoint, so nothing
    * depends on it surviving. Cleared wholesale past 1024 entries: a rare extra read, never a leak.
+   *
+   * NEVER REJECTS. This runs on the transport's SERIAL heartbeat handler, so a store hiccup thrown out
+   * of here would take the whole fleet's beat loop with it — and every lease would then lapse at once,
+   * a far worse failure than the write storm the throttle removes. So the entire rearm is best-effort,
+   * exactly like {@link persistHeartbeat}: a missed renewal costs at most one re-drive of a step that
+   * is idempotent by contract, and because the in-memory mark is advanced only AFTER a successful
+   * write, the very next beat retries the renewal rather than waiting out a window.
    */
   private async rearmStepLease(runId: string, seq: number): Promise<void> {
+    if (this.remoteRedispatchMs == null) return;
+    try {
+      await this.renewStepLease(runId, seq);
+    } catch {
+      /* best-effort: a failed renewal must not break the transport's serial heartbeat loop */
+    }
+  }
+
+  /** {@link rearmStepLease}'s body — every durable read/write of the lease renewal, so the caller's one
+   *  guard covers all of them (the read, the checkpoint write, and the run's wake carry-forward). */
+  private async renewStepLease(runId: string, seq: number): Promise<void> {
     if (this.remoteRedispatchMs == null) return;
     const id = stepId(runId, seq);
     const now = this.clock();
     const lookAgainAt = this.stepLeaseRearms.get(id);
     if (lookAgainAt !== undefined && now < lookAgainAt) return;
-    const cp = await this.store.getCheckpoint(runId, seq).catch(() => null);
+    const cp = await this.store.getCheckpoint(runId, seq);
     if (cp?.kind !== 'remote' || cp.status !== 'pending') {
       // Settled (or gone): stop tracking it, so a long-lived worker's stale beats don't keep the entry.
       this.stepLeaseRearms.delete(id);
@@ -3193,7 +3211,8 @@ export class WorkflowEngine {
     // If the run is parked EXACTLY on this step's old lease, carry its wake forward too — otherwise a
     // beating worker costs one wasted turn per renewal window. Only on an exact match: any other
     // `wakeAt` belongs to some other timer (a sleep, a sibling's shorter lease) and moving it would
-    // delay that instead.
+    // delay that instead. Failing HERE (after the checkpoint write landed) is harmless: the run wakes
+    // on the old lease, finds it un-lapsed, and re-parks on the renewed one.
     if (previous == null) return;
     const run = await this.store.getRun(runId);
     if (run?.status === 'suspended' && run.wakeAt === previous) {

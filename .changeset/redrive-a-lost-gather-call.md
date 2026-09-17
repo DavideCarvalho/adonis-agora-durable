@@ -40,7 +40,9 @@ in both: the step's LEASE.
   dispatched it. The renewal is throttled by the lease itself (a write only once the window is half
   spent), so a worker beating every few seconds costs one read + one write per half
   `remoteRedispatchMs`, not one per beat — the same concern that throttles the liveness write in
-  `persistHeartbeat`.
+  `persistHeartbeat`. And it is best-effort end to end: the renewal runs on the transport's SERIAL
+  heartbeat handler, so no read or write of it can reject into that loop — a store hiccup that took the
+  beat loop down would lapse every lease at once.
 - Observability: a re-drive emits `step.started` with `redispatched: true` and appends a `warn`
   `step.redispatched` event to the checkpoint's own trail (`step.lost` at the bound), so "re-driven
   after a lost worker" reads differently from a failure retry — in the dashboard and in the database.

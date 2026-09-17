@@ -142,6 +142,29 @@ class CountingStore extends InMemoryStateStore {
   }
 }
 
+/** A store whose WRITES can be made to throw — a hiccup mid-renewal, which must not escape into the
+ *  transport's serial heartbeat handler. */
+class FlakyStore extends InMemoryStateStore {
+  failCheckpointWrites = 0;
+  failRunUpdates = 0;
+
+  override async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
+    if (checkpoint.seq === LOST_SEQ && this.failCheckpointWrites > 0) {
+      this.failCheckpointWrites -= 1;
+      throw new Error('checkpoint store unavailable');
+    }
+    return super.saveCheckpoint(checkpoint);
+  }
+
+  override async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
+    if (this.failRunUpdates > 0) {
+      this.failRunUpdates -= 1;
+      throw new Error('run store unavailable');
+    }
+    return super.updateRun(runId, patch);
+  }
+}
+
 interface Harness {
   engine: WorkflowEngine;
   store: InMemoryStateStore;
@@ -347,6 +370,50 @@ describe('WorkflowEngine — a gather_calls step whose worker died is re-driven'
     await h.tick();
     await drain();
     expect(h.transport.dispatchesOf(`leaf_${LOST_SEQ}`)).toBe(2);
+  });
+
+  it('a store failure mid-renewal never rejects into the beat loop, and the next beat renews', async () => {
+    // The renewal runs on the transport's SERIAL heartbeat handler. A store hiccup thrown out of it
+    // would take the whole fleet's beat loop down — and then EVERY lease lapses at once, which is
+    // strictly worse than the write storm the throttle removes. So the whole rearm is best-effort,
+    // like `persistHeartbeat`: worst case one re-drive of a step that is idempotent by contract.
+    const store = new FlakyStore();
+    const h = harness({ remoteRedispatchMs: 60_000 }, store);
+    h.transport.loseFirstDispatchOf.add(`leaf_${LOST_SEQ}`);
+
+    await h.start();
+    const dispatched = await checkpointAt(h.store, LOST_SEQ);
+    if (!dispatched?.stepId) throw new Error('expected a dispatched checkpoint');
+    const beat: Heartbeat = {
+      runId: 'fan1',
+      seq: LOST_SEQ,
+      stepId: dispatched.stepId,
+      group: `leaf_${LOST_SEQ}`,
+    };
+    const originalLease = dispatched.wakeAt;
+
+    // Past the half-spent mark, so this beat WOULD write — and the write throws.
+    h.advance(31_000);
+    store.failCheckpointWrites = 1;
+    await expect(h.transport.heartbeatHandler?.(beat)).resolves.toBeUndefined();
+    // Nothing was renewed, and nothing was cached that would suppress the retry.
+    expect((await checkpointAt(h.store, LOST_SEQ))?.wakeAt).toBe(originalLease);
+
+    // The very next beat (store healthy again) renews — the in-memory mark is only advanced after a
+    // write that actually landed, so a transient failure costs one beat, not a whole window.
+    await h.transport.heartbeatHandler?.(beat);
+    expect((await checkpointAt(h.store, LOST_SEQ))?.wakeAt).toBe(h.now() + 60_000);
+    await h.tick();
+    expect(h.transport.dispatchesOf(`leaf_${LOST_SEQ}`)).toBe(1); // still not presumed lost
+
+    // The run's wake carry-forward failing AFTER the checkpoint write is harmless too: the lease is
+    // renewed, the run just wakes on the old one, finds it un-lapsed and re-parks.
+    h.advance(31_000);
+    store.failRunUpdates = 1;
+    await expect(h.transport.heartbeatHandler?.(beat)).resolves.toBeUndefined();
+    expect((await checkpointAt(h.store, LOST_SEQ))?.wakeAt).toBe(h.now() + 60_000);
+    await h.tick();
+    expect(h.transport.dispatchesOf(`leaf_${LOST_SEQ}`)).toBe(1);
   });
 
   it('renews on a bounded number of writes, not one per beat (a hot beat loop is not an UPDATE storm)', async () => {
