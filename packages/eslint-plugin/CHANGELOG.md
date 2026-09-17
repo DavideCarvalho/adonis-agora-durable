@@ -1,5 +1,18 @@
 # @adonis-agora/durable-eslint-plugin
 
+## 0.3.3
+
+### Patch Changes
+
+- [`6627c3b`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/6627c3b3d989b3719df1fb2fabe0b8037f952fc7) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Point the rule docs URL at a page that exists
+  
+  Every rule reported the docs link as `DavideCarvalho/adonis-durable/tree/main/...`. The repo
+  slug redirects, but `main` is not this repo's branch, so the redirect lands on a 404 — the
+  URL shown next to every lint error this plugin emits.
+  
+  Uses `tree/HEAD` rather than naming a branch, so a rename cannot break it the same way
+  again. `.changeset/config.json` carried the same stale slug and is corrected with it.
+
 ## 0.3.2
 
 ### Patch Changes
