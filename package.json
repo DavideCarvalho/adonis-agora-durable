@@ -32,6 +32,6 @@
     "turbo": "2.10.13",
     "typescript": "7.0.2",
     "unplugin-swc": "1.6.0",
-    "vitest": "5.0.0"
+    "vitest": "5.0.1"
   }
 }
