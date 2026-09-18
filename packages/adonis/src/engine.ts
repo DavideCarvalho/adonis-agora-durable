@@ -1775,18 +1775,33 @@ export class WorkflowEngine {
         (r) => r.lockedUntil === undefined || r.lockedUntil <= nowMs,
       );
     });
-    for (const run of incomplete) {
+    for (const listed of incomplete) {
       // A live worker renews its lease, so an acquirable lease means the run is genuinely orphaned
       // (its worker crashed). Skip the ones still owned.
       const acquired = await this.store.tryLockRun(
-        run.id,
+        listed.id,
         this.instanceId,
         nowMs + this.leaseMs,
         nowMs,
       );
       if (!acquired) continue;
+      // Decide on the run as it is NOW that the lease is held, never on the listing. The listing is a
+      // snapshot taken before this loop reached the row, and a live run moves on in between: the turn
+      // that was executing it settles and releases its lease, a fast step result resumes it, it may
+      // even complete. Trusting the listed `running` reads that as a crashed turn — and the code below
+      // counts a recovery attempt (or, past `maxRecoveryAttempts`, writes `dead` over a live or
+      // finished run) and re-enqueues it for a second execution. Only a run that still reads
+      // `running` under the lease is an orphan; release the lease taken just to look at anything else.
+      const run = await this.store.getRun(listed.id);
+      if (run?.status !== 'running') {
+        await this.store.releaseRunLock(listed.id, this.instanceId);
+        continue;
+      }
       // Count the attempt / dead-letter a poison pill past maxRecoveryAttempts.
       const settled = await this.countRecovery(run);
+      // `null`: the run left `running` between the re-read above and the dead-letter write (a
+      // lease-free `cancel()`), so it is not ours to touch — countRecovery already released the lease.
+      if (settled === null) continue;
       if (settled) {
         results.push(settled);
         continue;
@@ -1815,17 +1830,26 @@ export class WorkflowEngine {
   /**
    * Per-recovery bookkeeping (called once the lease is held): count the attempt, or — past
    * `maxRecoveryAttempts` — move a poison pill to the `dead` dead-letter state. Returns a terminal
-   * result to skip the resume, or `undefined` to proceed.
+   * result to skip the resume, `null` to skip it silently (the run is no longer `running`), or
+   * `undefined` to proceed.
    */
-  private async countRecovery(run: WorkflowRun): Promise<RunResult | undefined> {
+  private async countRecovery(run: WorkflowRun): Promise<RunResult | null | undefined> {
     const attempts = (run.recoveryAttempts ?? 0) + 1;
     if (this.maxRecoveryAttempts != null && attempts > this.maxRecoveryAttempts) {
       const error = {
         message: `run exceeded maxRecoveryAttempts (${this.maxRecoveryAttempts}) — moved to dead-letter`,
         code: 'max_recovery_attempts',
       };
-      await this.store.updateRun(run.id, { status: 'dead', error, updatedAt: new Date() });
+      // Conditional on still-`running`, like the `pending` flip in recoverIncomplete: the lease does
+      // not fence `cancel()`, which writes `cancelled` without it, so a cancel landing after the
+      // caller's re-read must not be overwritten with `dead`.
+      const applied = await this.store.updateRunIf(run.id, ['running'], {
+        status: 'dead',
+        error,
+        updatedAt: new Date(),
+      });
       await this.store.releaseRunLock(run.id, this.instanceId);
+      if (!applied) return null;
       this.emit({
         type: 'run.failed',
         runId: run.id,
@@ -3560,17 +3584,24 @@ export class WorkflowEngine {
       compensations,
       run.workflow,
     );
+    // Every settle below is `return await`ed, never a bare `return this.settleRun(...)`: inside
+    // `try … finally` a bare return runs the `finally` — which RELEASES THE LEASE — as soon as the
+    // return expression is evaluated, while the settle's own write is still in flight. A first turn
+    // (the one that flipped `pending` -> `running`) then sits unlocked but still reading `running`,
+    // which is exactly the shape `listOrphanedRuns` returns for a crashed turn: the recovery sweep
+    // counted an attempt (or dead-lettered it), flipped it to `pending` and re-enqueued a second
+    // execution. The lease must outlive the state it protects.
     try {
       // Establish the ambient ctx for the duration of this body turn so context-aware statics
       // (`BaseWorkflow.start`/`dispatch`) reachable from `fn` route through this run's `ctx.child`/
       // `ctx.startChild`. Re-set on every replay turn (each is its own async scope) — correct.
       const output = await workflowAls.run(ctx, () => fn(ctx, run.input));
-      return this.settleRun(run, { kind: 'completed', output });
+      return await this.settleRun(run, { kind: 'completed', output });
     } catch (err) {
       if (err instanceof ContinueAsNew) {
         // Hand off to a fresh execution with a clean history: persist the next run (`<id>~N`), then
         // complete this one. Zombie fence first — a fenced turn must not fork a continuation either.
-        if (this.leaseLostRuns.has(run.id)) return this.echoCurrentStatus(run.id);
+        if (this.leaseLostRuns.has(run.id)) return await this.echoCurrentStatus(run.id);
         const nextId = nextContinuationId(run.id);
         // Persist the continuation BEFORE the parent's terminal write — the durable ordering that
         // makes the chain crash-safe. The old order (complete parent, then create the continuation
@@ -3607,7 +3638,7 @@ export class WorkflowEngine {
         // No live worker can run the next dispatch (capability/protocol) — park `blocked` with the
         // structured reason + diagnostics instead of suspending on a timer that would re-drive into the
         // same void. The blocked-recovery poll re-drives it when a capable+compatible worker appears.
-        return this.parkBlocked(run, err.plan);
+        return await this.parkBlocked(run, err.plan);
       }
       if (err instanceof WorkflowSuspended) {
         // A compensating cancel resumed this run to reach here: the replay re-registered the saga,
@@ -3674,7 +3705,7 @@ export class WorkflowEngine {
         if (!comp) continue;
         await this.runCompensation(run, comp, i);
       }
-      return this.settleRun(run, { kind: 'failed', error });
+      return await this.settleRun(run, { kind: 'failed', error });
     } finally {
       // Release the recovery lease once the run reaches a terminal/suspended state, so the
       // next instance (or the timer poller) can pick it up promptly. Owner-scoped: if this turn's
@@ -4190,7 +4221,16 @@ export class WorkflowEngine {
   ): Promise<TOutput> {
     // Read the prefix from the per-execution snapshot (avoids the O(N²) replay SELECTs); a seq absent
     // from the snapshot — not yet dispatched, or written after the snapshot — falls back to the store.
-    const existing = replay?.get(seq) ?? (await this.store.getCheckpoint(runId, seq));
+    let existing = replay?.get(seq) ?? (await this.store.getCheckpoint(runId, seq));
+    // A `pending` step in the SNAPSHOT may already have its result: the snapshot is taken when this
+    // execution starts, and the result can land any time after. Every branch below that sees
+    // `pending` either suspends on it or WRITES the checkpoint back (`{ ...existing, wakeAt }` stamping
+    // the lost-dispatch lease, or a re-dispatch) — written from a stale row, that overwrites the landed
+    // `completed` result with `pending` and parks the run on a lease an hour out. So a pending step is
+    // re-read from the store before anything acts on it (one read, only at a suspension point).
+    if (existing?.status === 'pending' && replay?.has(seq)) {
+      existing = (await this.store.getCheckpoint(runId, seq)) ?? existing;
+    }
     if (existing && existing.name !== step.name) {
       throw new NonDeterminismError(runId, seq, step.name, existing.name);
     }

@@ -10,7 +10,7 @@ Most failures are transient and recover cleanly. But occasionally a run is a **p
 
 ## Capping recovery: `maxRecoveryAttempts`
 
-Crash-recovery is **self-healing and periodic**: while a run executes its worker renews a recovery lease, so a crashed worker's lease expires and recovery (`engine.recoverIncomplete()`, called every tick by the [`durable:work`](/docs/durable/cli) loop) reclaims the orphaned run within ~`leaseMs` — on any instance, not just on the next boot. That's what makes a genuine poison pill visible: it gets picked up again and again. Every time crash-recovery picks up a still-`running` run, the engine increments that run's `recoveryAttempts` *before* resuming it (so a crash mid-resume still advances the counter).
+Crash-recovery is **self-healing and periodic**: while a run executes its worker renews a recovery lease, so a crashed worker's lease expires and recovery (`engine.recoverIncomplete()`, called every tick by the [`durable:work`](/docs/durable/cli) loop) reclaims the orphaned run within ~`leaseMs` — on any instance, not just on the next boot. That's what makes a genuine poison pill visible: it gets picked up again and again. Every time crash-recovery picks up a run that still reads `running` once it holds the lease (it re-reads the run under the lease, so a run that settled after the orphan listing is left alone and never counted), the engine increments that run's `recoveryAttempts` *before* resuming it (so a crash mid-resume still advances the counter).
 
 Set `maxRecoveryAttempts` in `config/durable.ts`, and once a run exceeds it, instead of resuming yet again the engine moves the run to the terminal **`dead`** status with a `max_recovery_attempts` error, releases its lease, and stops touching it:
 
