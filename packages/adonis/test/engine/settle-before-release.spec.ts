@@ -215,6 +215,71 @@ describe('recoverIncomplete acts on the run it LOCKED, not the one it listed', (
     expect(after?.error).toBeUndefined();
   });
 
+  it('does not dead-letter a run cancelled between the re-read and the dead-letter write', async () => {
+    // `cancel()` writes `cancelled` without taking the lease, so holding it does not fence a cancel
+    // that lands right after the sweep's re-read.
+    class CancelAfterReadStore extends InMemoryStateStore {
+      cancelAfterNextRead = false;
+      override async getRun(runId: string): Promise<WorkflowRun | null> {
+        const run = await super.getRun(runId);
+        if (this.cancelAfterNextRead) {
+          this.cancelAfterNextRead = false;
+          await super.updateRun(runId, { status: 'cancelled', error: { message: 'cancelled' } });
+        }
+        return run;
+      }
+    }
+    const store = new CancelAfterReadStore();
+    const dispatchedRuns: string[] = [];
+    const engine = new WorkflowEngine({
+      store,
+      maxRecoveryAttempts: 0,
+      runDispatcher: { dispatch: (runId: string) => void dispatchedRuns.push(runId) },
+    });
+    engine.register('wf', '1', async () => 'done');
+    await store.createRun({
+      id: 'r1',
+      workflow: 'wf',
+      workflowVersion: '1',
+      status: 'running',
+      input: {},
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    store.cancelAfterNextRead = true;
+
+    const results = await engine.recoverIncomplete();
+
+    const after = await store.getRun('r1');
+    expect(after?.status).toBe('cancelled');
+    expect(after?.lockedBy).toBeUndefined();
+    expect(results).toEqual([]);
+    expect(dispatchedRuns).toEqual([]);
+  });
+
+  it('still dead-letters a genuine poison pill past maxRecoveryAttempts', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store, maxRecoveryAttempts: 0 });
+    engine.register('wf', '1', async () => 'done');
+    await store.createRun({
+      id: 'r1',
+      workflow: 'wf',
+      workflowVersion: '1',
+      status: 'running',
+      input: {},
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const results = await engine.recoverIncomplete();
+
+    const after = await store.getRun('r1');
+    expect(after?.status).toBe('dead');
+    expect(after?.error?.code).toBe('max_recovery_attempts');
+    expect(after?.lockedBy).toBeUndefined();
+    expect(results.map((r) => r.status)).toEqual(['dead']);
+  });
+
   it('still recovers a genuinely orphaned run (a turn that died holding `running`)', async () => {
     const store = new StaleListingStore();
     const dispatchedRuns: string[] = [];

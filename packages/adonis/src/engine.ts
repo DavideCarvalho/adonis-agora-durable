@@ -1799,6 +1799,9 @@ export class WorkflowEngine {
       }
       // Count the attempt / dead-letter a poison pill past maxRecoveryAttempts.
       const settled = await this.countRecovery(run);
+      // `null`: the run left `running` between the re-read above and the dead-letter write (a
+      // lease-free `cancel()`), so it is not ours to touch — countRecovery already released the lease.
+      if (settled === null) continue;
       if (settled) {
         results.push(settled);
         continue;
@@ -1827,17 +1830,26 @@ export class WorkflowEngine {
   /**
    * Per-recovery bookkeeping (called once the lease is held): count the attempt, or — past
    * `maxRecoveryAttempts` — move a poison pill to the `dead` dead-letter state. Returns a terminal
-   * result to skip the resume, or `undefined` to proceed.
+   * result to skip the resume, `null` to skip it silently (the run is no longer `running`), or
+   * `undefined` to proceed.
    */
-  private async countRecovery(run: WorkflowRun): Promise<RunResult | undefined> {
+  private async countRecovery(run: WorkflowRun): Promise<RunResult | null | undefined> {
     const attempts = (run.recoveryAttempts ?? 0) + 1;
     if (this.maxRecoveryAttempts != null && attempts > this.maxRecoveryAttempts) {
       const error = {
         message: `run exceeded maxRecoveryAttempts (${this.maxRecoveryAttempts}) — moved to dead-letter`,
         code: 'max_recovery_attempts',
       };
-      await this.store.updateRun(run.id, { status: 'dead', error, updatedAt: new Date() });
+      // Conditional on still-`running`, like the `pending` flip in recoverIncomplete: the lease does
+      // not fence `cancel()`, which writes `cancelled` without it, so a cancel landing after the
+      // caller's re-read must not be overwritten with `dead`.
+      const applied = await this.store.updateRunIf(run.id, ['running'], {
+        status: 'dead',
+        error,
+        updatedAt: new Date(),
+      });
       await this.store.releaseRunLock(run.id, this.instanceId);
+      if (!applied) return null;
       this.emit({
         type: 'run.failed',
         runId: run.id,
