@@ -198,7 +198,7 @@
     "cron-parser": "5.10.1",
     "ioredis": "6.0.0",
     "typescript": "7.0.2",
-    "vitest": "5.0.0",
+    "vitest": "5.0.1",
     "zod": "4.6.5"
   },
   "engines": {
