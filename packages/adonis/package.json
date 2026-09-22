@@ -192,7 +192,7 @@
     "@poppinss/hooks": "7.3.1",
     "@tanstack/intent": "0.4.0",
     "@types/better-sqlite3": "9.6.0",
-    "@types/node": "26.6.1",
+    "@types/node": "26.6.2",
     "better-sqlite3": "13.0.3",
     "bullmq": "6.3.7",
     "cron-parser": "5.10.1",
