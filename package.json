@@ -29,7 +29,7 @@
     "@changesets/changelog-github": "1.0.1",
     "@changesets/cli": "3.0.3",
     "@swc/core": "1.16.2",
-    "turbo": "2.10.13",
+    "turbo": "2.11.2",
     "typescript": "7.0.2",
     "unplugin-swc": "1.6.0",
     "vitest": "5.0.1"
