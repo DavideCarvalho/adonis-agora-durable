@@ -188,4 +188,23 @@ describe('engine.schedules', () => {
     expect(await a.engine.schedules.delete('sa')).toBe(false);
     expect(await a.engine.schedules.get('sa')).toBeNull();
   });
+
+  it('applies a concurrency quota to the runs it starts, recording an over-limit window', async () => {
+    const { engine, store } = setup();
+    const concurrency = { key: 'tenant:q', limit: 1 };
+    await engine.start('slow', {}, 'busy', { concurrency });
+    await engine.schedules.create({ id: 'q', workflow: 'job', every: '1m', concurrency });
+
+    expect(await engine.schedules.tick(T0 + MIN)).toEqual([]);
+    const s = await engine.schedules.get('q');
+    expect(s?.concurrency).toEqual(concurrency);
+    expect(s?.lastError).toMatch(/concurrency limit/);
+    expect(s?.nextFireAt?.getTime()).toBe(T0 + 2 * MIN);
+
+    await engine.cancel('busy');
+    const [fired] = await engine.schedules.tick(T0 + 2 * MIN);
+    expect(fired).toBe(`sched:q:${T0 + 2 * MIN}`);
+    expect((await store.getRun(fired as string))?.tags).toContain('concurrency:tenant:q');
+    expect((await engine.schedules.get('q'))?.lastError).toBeUndefined();
+  });
 });
