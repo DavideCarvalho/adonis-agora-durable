@@ -15,6 +15,29 @@ export class FatalError extends Error {
 }
 
 /**
+ * Thrown by `start` when a run would exceed its concurrency quota: `active` runs sharing the quota
+ * `key` are already in flight (in the quota's counted statuses) and the limit is `limit`. Nothing was
+ * created — the start is rejected up front, so the caller can shed load or answer "try again in a
+ * moment" (e.g. an HTTP 429). See `StartOptions.concurrency` / `ConcurrencyConfig`.
+ */
+export class ConcurrencyLimitError extends Error {
+  readonly workflow: string;
+  readonly key: string;
+  readonly limit: number;
+  readonly active: number;
+  constructor(workflow: string, key: string, limit: number, active: number) {
+    super(
+      `concurrency limit reached for key "${key}" (${active}/${limit} in flight); ${workflow} was not started — retry later`,
+    );
+    this.name = 'ConcurrencyLimitError';
+    this.workflow = workflow;
+    this.key = key;
+    this.limit = limit;
+    this.active = active;
+  }
+}
+
+/**
  * Thrown by `start` when a singleton workflow's wait queue is full: the count of in-flight + gated
  * runs sharing the key already equals `limit + maxQueueDepth`, so admitting another would let the
  * same-key backlog grow unbounded. Back-pressure — the caller should retry later or shed load. Only

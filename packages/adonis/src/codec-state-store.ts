@@ -245,6 +245,11 @@ export class CodecStateStore implements StateStore {
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     return (await this.inner.listRuns(query)).map((r) => this.decRun(r));
   }
+  /** Forwarded when the inner store counts (a count reads no payload); else counts a listing. */
+  async countRuns(query: Omit<RunQuery, 'page' | 'size'>): Promise<number> {
+    if (this.inner.countRuns) return this.inner.countRuns(query);
+    return (await this.inner.listRuns(query)).length;
+  }
   async runValueFacets(
     axis: RunValueAxis,
     query: RunFacetQuery,

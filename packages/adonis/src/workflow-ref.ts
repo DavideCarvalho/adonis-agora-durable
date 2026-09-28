@@ -6,6 +6,7 @@
  * string stays available for the cross-runtime case.
  */
 
+import type { ConcurrencyConfig } from './concurrency.js';
 import type { SingletonConfig } from './engine.js';
 import type { ScheduledWorkflow, WorkflowScheduleConfig } from './scheduler.js';
 
@@ -31,6 +32,14 @@ export interface WorkflowOptions {
    * bypass discovery entirely.
    */
   singleton?: SingletonConfig;
+  /**
+   * A start-time concurrency QUOTA (see {@link ConcurrencyConfig}): at most `limit` runs sharing a
+   * key in flight, and a start over it is REJECTED (`ConcurrencyLimitError`, nothing created) rather
+   * than queued — e.g. `concurrency: { key: (input) => `tenant:${input.tenantId}`, limit: 8 }`. The
+   * key is shared across workflows; `limit` may be an (async) function of the key; `countStatuses`
+   * narrows what occupies a slot. Use `singleton` when excess runs should wait their turn instead.
+   */
+  concurrency?: ConcurrencyConfig;
   /**
    * Package attribution stamped on every run of this workflow (see `WorkflowRun.origin`) — which
    * package's code produced it, e.g. `@adonis-agora/catalog-pipeline`. Powers the console's origin

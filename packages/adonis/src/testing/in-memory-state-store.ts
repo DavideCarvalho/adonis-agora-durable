@@ -355,6 +355,10 @@ export class InMemoryStateStore implements StateStore {
     return out;
   }
 
+  async countRuns(query: Omit<RunQuery, 'page' | 'size'>): Promise<number> {
+    return (await this.listRuns(query)).length;
+  }
+
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     let runs = [...this.runs.values()];
     if (query.workflow) runs = runs.filter((r) => r.workflow === query.workflow);
