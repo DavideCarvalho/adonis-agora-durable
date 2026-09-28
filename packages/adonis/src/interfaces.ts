@@ -651,6 +651,51 @@ export interface RunQuery {
 export type RunFacetQuery = Omit<RunQuery, 'status' | 'statuses' | 'page' | 'size'>;
 
 /**
+ * The run predicates a bulk operation (a scoped retention policy, `engine.purgeRuns`) is confined
+ * to — the identity axes of a {@link RunQuery}: which tenant (`namespace`), which kind of run
+ * (`workflow`/`tags`), which business entity (`attributes`). Status, time and paging are left out on
+ * purpose: each bulk operation owns its own rule for those.
+ */
+export type RunScope = Pick<
+  RunQuery,
+  'workflow' | 'workflows' | 'tag' | 'tags' | 'namespace' | 'namespaces' | 'attributes'
+>;
+
+/** True when `scope` sets at least one predicate — a bulk delete refuses an empty (match-all) scope. */
+export function isNonEmptyRunScope(scope: RunScope | undefined): boolean {
+  if (!scope) return false;
+  return (
+    scope.workflow !== undefined ||
+    scope.workflows !== undefined ||
+    scope.tag !== undefined ||
+    scope.tags !== undefined ||
+    scope.namespace !== undefined ||
+    scope.namespaces !== undefined ||
+    (scope.attributes !== undefined && scope.attributes.length > 0)
+  );
+}
+
+/** The terminal run statuses — the only ones retention may delete. */
+export type TerminalRunStatus = 'completed' | 'failed' | 'cancelled' | 'dead';
+export const TERMINAL_RUN_STATUSES: readonly TerminalRunStatus[] = [
+  'completed',
+  'failed',
+  'cancelled',
+  'dead',
+];
+
+/**
+ * A retention rule confined to a {@link RunScope}: terminal runs in `statuses` matching `scope` are
+ * hard-deleted once their last activity is older than `maxAgeMs`. Sits next to the per-status
+ * `retention` ages, so e.g. chat turns can age out after a day while everything else keeps 30.
+ */
+export interface ScopedRetentionPolicy {
+  statuses: TerminalRunStatus[];
+  maxAgeMs: number;
+  scope: RunScope;
+}
+
+/**
  * Which axis {@link StateStore.runValueFacets} enumerates the distinct VALUES of. Every member is an
  * axis {@link RunQuery} can then filter by, which is the point: the answer to "what can I pick here"
  * has to be spendable as a predicate, or a console is offering choices that return nothing.

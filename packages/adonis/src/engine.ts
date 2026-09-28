@@ -33,10 +33,12 @@ import type {
   RunFacetQuery,
   RunQuery,
   RunResult,
+  RunScope,
   RunStatus,
   RunValueAxis,
   RunValueFacetOptions,
   RunValueFacetRow,
+  ScopedRetentionPolicy,
   SearchAttributes,
   SignalWaiter,
   StateStore,
@@ -48,6 +50,7 @@ import type {
   StepInvocation,
   StepKind,
   StepResult,
+  TerminalRunStatus,
   Transport,
   UpdateResult,
   UpdateValidator,
@@ -58,6 +61,7 @@ import type {
   WorkflowRun,
   WorkflowStepEvent,
 } from './interfaces.js';
+import { isNonEmptyRunScope, TERMINAL_RUN_STATUSES } from './interfaces.js';
 import { asHeartbeat } from './observability-scope.js';
 import { breakpointToken, stepId } from './protocol.js';
 import type { QueueConfig } from './queue.js';
@@ -441,6 +445,13 @@ export interface WorkflowEngineDeps {
    */
   retention?: Partial<Record<'completed' | 'failed' | 'cancelled' | 'dead', number>> | undefined;
   /**
+   * Scoped retention rules, swept alongside {@link retention} by the same throttled
+   * `sweepRetention`: each deletes terminal runs in its `statuses` that match its `scope` (a tenant's
+   * `namespace`, `tags`, `workflows`, search `attributes`) once older than `maxAgeMs`. The strictest
+   * rule matching a run wins, since every rule is applied.
+   */
+  retentionPolicies?: ScopedRetentionPolicy[] | undefined;
+  /**
    * How long an in-flight run must sit untouched — with the stranded signature (a wake-forever
    * suspension, or an old pending remote step whose worker heartbeat is silent) — before the
    * {@link WorkflowEngine.onStalled} listeners are notified. Default 900 000 (15 min, matching the
@@ -527,6 +538,7 @@ export class WorkflowEngine {
   private readonly retention:
     | Partial<Record<'completed' | 'failed' | 'cancelled' | 'dead', number>>
     | undefined;
+  private readonly retentionPolicies: ScopedRetentionPolicy[];
   // -Infinity so the FIRST sweep always runs (a fake/test clock may start near 0).
   #lastRetentionSweepAt = Number.NEGATIVE_INFINITY;
   /** Archival hooks run (awaited, in order) before a retention eviction deletes a run. */
@@ -670,6 +682,7 @@ export class WorkflowEngine {
     this.compensationRetries = Math.max(1, deps.compensationRetries ?? 1);
     this.compensationTimeoutMs = Math.max(1_000, deps.compensationTimeoutMs ?? 300_000);
     this.retention = deps.retention;
+    this.retentionPolicies = deps.retentionPolicies ?? [];
     this.stalledAfterMs = Math.max(60_000, deps.stalledAfterMs ?? 900_000);
     this.trackStepStart = deps.trackStepStart ?? true;
     // Default: execute the run on this instance, asynchronously, so `start` never blocks on the body.
@@ -1496,19 +1509,37 @@ export class WorkflowEngine {
    * parents.
    */
   async sweepRetention(now: number = this.clock()): Promise<number> {
-    if (!this.retention || this.draining) return 0;
+    if ((!this.retention && this.retentionPolicies.length === 0) || this.draining) return 0;
     if (now - this.#lastRetentionSweepAt < 60_000) return 0;
     this.#lastRetentionSweepAt = now;
     let evicted = 0;
-    for (const status of ['completed', 'failed', 'cancelled', 'dead'] as const) {
-      const maxAgeMs = this.retention[status];
+    const passes: RunQuery[] = [];
+    for (const status of TERMINAL_RUN_STATUSES) {
+      const maxAgeMs = this.retention?.[status];
       if (maxAgeMs == null || maxAgeMs <= 0) continue;
-      const candidates = await this.store.listRuns({
-        statuses: [status],
-        namespace: this.namespace,
-        updatedBefore: now - maxAgeMs,
-        size: 100,
+      passes.push({ statuses: [status], namespace: this.namespace, updatedBefore: now - maxAgeMs });
+    }
+    for (const policy of this.retentionPolicies) {
+      const statuses = policy.statuses.filter((s) => TERMINAL_RUN_STATUSES.includes(s));
+      if (statuses.length === 0 || !(policy.maxAgeMs > 0)) continue;
+      // A namespaced worker only ever prunes its own partition: a scope naming another one is not its
+      // to sweep (the operator, `namespace: undefined`, sweeps every partition).
+      if (
+        this.namespace !== undefined &&
+        policy.scope.namespace !== undefined &&
+        policy.scope.namespace !== this.namespace
+      ) {
+        continue;
+      }
+      passes.push({
+        ...policy.scope,
+        namespace: policy.scope.namespace ?? this.namespace,
+        statuses,
+        updatedBefore: now - policy.maxAgeMs,
       });
+    }
+    for (const pass of passes) {
+      const candidates = await this.store.listRuns({ ...pass, size: 100 });
       for (const run of candidates) {
         try {
           if (this.evictListeners.size > 0) {
@@ -1538,17 +1569,102 @@ export class WorkflowEngine {
       deleted += await this.deleteRun(childId);
     }
     await this.store.deleteRun(runId);
-    // Sweep this run's token-keyed buffered signals too — they are not run-scoped rows, so the
-    // store's deleteRun can't cascade them. Without this every fire-and-forget child that was never
-    // joined leaks its buffered `child:<id>` completion FOREVER (one row per spawn), and a raced
-    // compensate-cancel can leave a `cancel:<id>` marker behind.
+    await this.sweepRunBufferedSignals(runId);
+    return deleted + 1;
+  }
+
+  /**
+   * Sweep a deleted run's token-keyed buffered signals — they are not run-scoped rows, so the store's
+   * deleteRun can't cascade them. Without this every fire-and-forget child that was never joined leaks
+   * its buffered `child:<id>` completion FOREVER (one row per spawn), and a raced compensate-cancel
+   * can leave a `cancel:<id>` marker behind.
+   */
+  private async sweepRunBufferedSignals(runId: string): Promise<void> {
     for (const token of [`child:${runId}`, `cancel:${runId}`]) {
       for (;;) {
         const buffered = await this.store.takeBufferedSignal(token).catch(() => null);
         if (!buffered) break;
       }
     }
-    return deleted + 1;
+  }
+
+  /**
+   * Hard-delete EVERY run matching `scope` — plus, by default, each one's whole child subtree — in
+   * bounded batches: the "forget this tenant" / "drop this feature's history" operation. Where
+   * {@link deleteRun} removes one tree you know the id of, this drains everything a scope selects
+   * (`{ namespace: 'acme' }`, `{ tag: 'tenant:acme' }`, `{ workflows: [...] }`, attribute predicates…)
+   * through the store API.
+   *
+   *  - **Live runs** in the scope are {@link cancel cancelled} first (plain cancel, no saga undo),
+   *    which tells any worker holding one to stop, then deleted. `cancelLive: false` leaves live runs
+   *    (and live descendants of finished ones) alone and deletes terminal history only.
+   *  - **Children** go with their root even when they don't match the scope themselves (children
+   *    inherit `namespace`, not `tags`); `children: false` deletes exactly the matching runs.
+   *  - Each deletion sweeps the run's token-keyed buffered signals like {@link deleteRun}, and the
+   *    {@link onEvict} archival hooks are NOT called (this is an explicit purge, not retention).
+   *
+   * An EMPTY scope is rejected — it would delete every run. Returns how many runs were deleted.
+   */
+  async purgeRuns(
+    scope: RunScope,
+    opts?: { batchSize?: number; cancelLive?: boolean; children?: boolean },
+  ): Promise<number> {
+    if (!isNonEmptyRunScope(scope)) {
+      throw new Error(
+        'purgeRuns: refusing an empty scope (it would delete every run) — pass at least one predicate, e.g. { namespace }',
+      );
+    }
+    const size = Math.max(1, opts?.batchSize ?? 500);
+    const cancelLive = opts?.cancelLive ?? true;
+    const withChildren = opts?.children ?? true;
+    const statuses = cancelLive ? undefined : [...TERMINAL_RUN_STATUSES];
+    let deleted = 0;
+    let previous = '';
+    for (;;) {
+      const batch = await this.store.listRuns({ ...scope, statuses, size });
+      if (batch.length === 0) break;
+      const fingerprint = batch.map((r) => r.id).join('\u0000');
+      // Every listed run is deleted below, so the next page is new rows — the same page twice means
+      // the store is not deleting; stop instead of spinning forever.
+      if (fingerprint === previous) {
+        throw new Error('purgeRuns: the store returned the same runs after deleting them');
+      }
+      previous = fingerprint;
+      const known = new Map<string, RunStatus>(batch.map((r) => [r.id, r.status]));
+      const ids: string[] = [];
+      const seen = new Set<string>();
+      const visit = async (id: string): Promise<void> => {
+        if (seen.has(id)) return;
+        seen.add(id);
+        if (withChildren) for (const child of await this.getRunChildren(id)) await visit(child);
+        ids.push(id); // post-order: children before their parent
+      };
+      for (const run of batch) await visit(run.id);
+      for (const id of ids) {
+        const status = known.has(id) ? known.get(id) : (await this.store.getRun(id))?.status;
+        if (status === undefined) continue; // already gone
+        if (!TERMINAL_RUN_STATUSES.includes(status as TerminalRunStatus)) {
+          if (!cancelLive) continue;
+          await this.cancel(id).catch(() => undefined);
+        }
+        await this.store.deleteRun(id);
+        await this.sweepRunBufferedSignals(id);
+        deleted += 1;
+      }
+      if (batch.length < size) break;
+    }
+    return deleted;
+  }
+
+  /**
+   * {@link purgeRuns} for one namespace — every run (and child) a tenant/partition owns. Children
+   * inherit their parent's namespace, so a namespace purge is complete by construction.
+   */
+  purgeNamespace(
+    namespace: string,
+    opts?: { batchSize?: number; cancelLive?: boolean },
+  ): Promise<number> {
+    return this.purgeRuns({ namespace }, opts);
   }
 
   async resume(runId: string): Promise<RunResult> {

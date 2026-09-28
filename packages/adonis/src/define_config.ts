@@ -18,7 +18,7 @@ import type {
   RedisControlPlaneConfig,
 } from './control-planes/factory.js';
 import { controlPlanes } from './control-planes/factory.js';
-import type { ControlPlane, RunDispatcher } from './interfaces.js';
+import type { ControlPlane, RunDispatcher, RunScope, TerminalRunStatus } from './interfaces.js';
 import type { ScheduledWorkflow } from './scheduler.js';
 import type { LucidStoreConfig, StoreContext, StoreFactory } from './stores/factory.js';
 import { stores } from './stores/factory.js';
@@ -168,12 +168,17 @@ export interface BaseDurableConfig {
    * age, per terminal status — duration strings (`'30d'`) or ms. Swept by the `durable:work` tick
    * (`sweepRetention`, throttled to one pass a minute). Omit to keep everything forever. Pair with
    * `engine.onEvict(...)` to archive a run before it is deleted.
+   *
+   * `policies` adds SCOPED rules next to the per-status ages — each deletes terminal runs in its
+   * `statuses` that match its `scope` (namespace / tags / workflows / search attributes) once older
+   * than `maxAge`: `{ statuses: ['completed'], maxAge: '1d', scope: { tags: ['chat'] } }`.
    */
   retention?: {
     completed?: string | number;
     failed?: string | number;
     cancelled?: string | number;
     dead?: string | number;
+    policies?: Array<{ statuses: TerminalRunStatus[]; maxAge: string | number; scope: RunScope }>;
   };
   /**
    * How long an in-flight run must sit untouched, with the stranded signature, before

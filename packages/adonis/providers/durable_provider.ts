@@ -225,6 +225,15 @@ export default class DurableProvider {
           ? { compensationTimeoutMs: config.compensationTimeoutMs }
           : {}),
         ...(config.retention !== undefined ? { retention: parseRetention(config.retention) } : {}),
+        ...(config.retention?.policies?.length
+          ? {
+              retentionPolicies: config.retention.policies.map((p) => ({
+                statuses: p.statuses,
+                maxAgeMs: parseDuration(p.maxAge),
+                scope: p.scope,
+              })),
+            }
+          : {}),
         ...(config.stalledAfter !== undefined
           ? { stalledAfterMs: parseDuration(config.stalledAfter) }
           : {}),
