@@ -113,6 +113,7 @@ export * from './run-pagination.js';
 export * from './run-value-facets.js';
 export * from './run-waiting.js';
 export * from './scheduler.js';
+export * from './schedules.js';
 export * from './search-attributes.js';
 export * from './step-discovery.js';
 export {

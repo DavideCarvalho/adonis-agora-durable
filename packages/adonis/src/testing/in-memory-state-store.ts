@@ -6,6 +6,8 @@ import type {
   RunValueAxis,
   RunValueFacetOptions,
   RunValueFacetRow,
+  ScheduleQuery,
+  ScheduleRecord,
   SignalWaiter,
   StateStore,
   StepCheckpoint,
@@ -357,6 +359,55 @@ export class InMemoryStateStore implements StateStore {
 
   async countRuns(query: Omit<RunQuery, 'page' | 'size'>): Promise<number> {
     return (await this.listRuns(query)).length;
+  }
+
+  private readonly schedules = new Map<string, ScheduleRecord>();
+
+  async saveSchedule(record: ScheduleRecord): Promise<void> {
+    this.schedules.set(record.id, structuredClone(record));
+  }
+
+  async getSchedule(id: string): Promise<ScheduleRecord | null> {
+    const record = this.schedules.get(id);
+    return record ? structuredClone(record) : null;
+  }
+
+  async updateSchedule(
+    id: string,
+    patch: Partial<Omit<ScheduleRecord, 'id' | 'createdAt'>>,
+    expectedNextFireAt?: number | null,
+  ): Promise<boolean> {
+    const record = this.schedules.get(id);
+    if (!record) return false;
+    if (expectedNextFireAt !== undefined && record.nextFireAt !== expectedNextFireAt) return false;
+    this.schedules.set(id, { ...record, ...structuredClone(patch) });
+    return true;
+  }
+
+  async deleteSchedule(id: string): Promise<boolean> {
+    return this.schedules.delete(id);
+  }
+
+  async listSchedules(query: ScheduleQuery): Promise<ScheduleRecord[]> {
+    const rows = [...this.schedules.values()]
+      .filter((s) => query.namespace === undefined || s.namespace === query.namespace)
+      .filter((s) => query.workflow === undefined || s.workflow === query.workflow)
+      .filter((s) => query.tag === undefined || (s.tags ?? []).includes(query.tag))
+      .filter((s) => query.paused === undefined || s.paused === query.paused)
+      .filter(
+        (s) =>
+          query.dueBy === undefined ||
+          (!s.paused && s.nextFireAt !== null && s.nextFireAt <= query.dueBy),
+      )
+      .sort(
+        (a, b) =>
+          (a.nextFireAt ?? Number.POSITIVE_INFINITY) - (b.nextFireAt ?? Number.POSITIVE_INFINITY) ||
+          a.id.localeCompare(b.id),
+      );
+    const offset = query.offset ?? 0;
+    return rows
+      .slice(offset, query.limit != null ? offset + query.limit : undefined)
+      .map((s) => structuredClone(s));
   }
 
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {

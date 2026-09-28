@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
   type RunStatus,
+  type ScheduleQuery,
+  type ScheduleRecord,
   type StateStore,
   type StepCheckpoint,
   WorkflowEngine,
@@ -634,6 +636,91 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         await engine.drain();
       },
     );
+
+    // ---- persisted schedules ----------------------------------------------------------------
+
+    const NOW = Date.parse('2026-06-20T00:00:00.000Z');
+    const schedule = (over: Partial<ScheduleRecord> = {}): ScheduleRecord => ({
+      id: 's1',
+      namespace: 'default',
+      workflow: 'digest',
+      paused: false,
+      nextFireAt: NOW + 60_000,
+      tags: ['tenant:a'],
+      spec: { v: 1, cron: '0 9 * * *', input: { userId: 'u1', deep: [1, { x: true }] } },
+      state: { window: NOW + 60_000 },
+      createdAt: at,
+      updatedAt: at,
+      ...over,
+    });
+
+    t('saves, reads back, replaces and deletes a schedule', async () => {
+      expect(typeof store.saveSchedule).toBe('function');
+      await store.saveSchedule?.(schedule());
+      const loaded = await store.getSchedule?.('s1');
+      expect(loaded).toMatchObject({
+        id: 's1',
+        namespace: 'default',
+        workflow: 'digest',
+        paused: false,
+        nextFireAt: NOW + 60_000,
+        tags: ['tenant:a'],
+        spec: { v: 1, cron: '0 9 * * *', input: { userId: 'u1', deep: [1, { x: true }] } },
+        state: { window: NOW + 60_000 },
+      });
+      expect(loaded?.createdAt.getTime()).toBe(at.getTime());
+
+      // saveSchedule is an upsert: a second save replaces the row.
+      await store.saveSchedule?.(
+        schedule({ workflow: 'digest2', nextFireAt: null, tags: undefined }),
+      );
+      const replaced = await store.getSchedule?.('s1');
+      expect(replaced?.workflow).toBe('digest2');
+      expect(replaced?.nextFireAt).toBeNull();
+      expect(replaced?.tags ?? []).toEqual([]);
+
+      expect(await store.getSchedule?.('nope')).toBeNull();
+      expect(await store.deleteSchedule?.('s1')).toBe(true);
+      expect(await store.deleteSchedule?.('s1')).toBe(false);
+      expect(await store.getSchedule?.('s1')).toBeNull();
+    });
+
+    t('updateSchedule patches, and compare-and-sets on nextFireAt', async () => {
+      await store.saveSchedule?.(schedule());
+      expect(await store.updateSchedule?.('s1', { paused: true })).toBe(true);
+      expect((await store.getSchedule?.('s1'))?.paused).toBe(true);
+
+      const next = { nextFireAt: NOW + 120_000, state: { window: NOW + 120_000, fires: 1 } };
+      expect(await store.updateSchedule?.('s1', next, NOW + 60_000)).toBe(true);
+      expect(await store.updateSchedule?.('s1', next, NOW + 60_000)).toBe(false);
+      const after = await store.getSchedule?.('s1');
+      expect(after?.nextFireAt).toBe(NOW + 120_000);
+      expect(after?.state).toEqual({ window: NOW + 120_000, fires: 1 });
+
+      await store.updateSchedule?.('s1', { nextFireAt: null });
+      expect(await store.updateSchedule?.('s1', { nextFireAt: NOW }, NOW + 1)).toBe(false);
+      expect(await store.updateSchedule?.('s1', { nextFireAt: NOW }, null)).toBe(true);
+      expect(await store.updateSchedule?.('ghost', { paused: true })).toBe(false);
+    });
+
+    t('lists schedules by namespace/workflow/tag/paused and answers "due by"', async () => {
+      await store.saveSchedule?.(schedule({ id: 'a', nextFireAt: NOW - 10 }));
+      await store.saveSchedule?.(schedule({ id: 'b', nextFireAt: NOW - 20, namespace: 'x' }));
+      await store.saveSchedule?.(schedule({ id: 'c', nextFireAt: NOW - 30, paused: true }));
+      await store.saveSchedule?.(schedule({ id: 'd', nextFireAt: NOW + 10, workflow: 'other' }));
+      await store.saveSchedule?.(schedule({ id: 'e', nextFireAt: null, tags: ['tenant:b'] }));
+      const ids = async (q: ScheduleQuery) =>
+        ((await store.listSchedules?.(q)) ?? []).map((r) => r.id);
+
+      expect(await ids({})).toEqual(['c', 'b', 'a', 'd', 'e']);
+      expect(await ids({ dueBy: NOW })).toEqual(['b', 'a']);
+      expect(await ids({ dueBy: NOW, namespace: 'default' })).toEqual(['a']);
+      expect(await ids({ dueBy: NOW, limit: 1 })).toEqual(['b']);
+      expect(await ids({ workflow: 'other' })).toEqual(['d']);
+      expect(await ids({ paused: true })).toEqual(['c']);
+      if (supportsTagFilter) expect(await ids({ tag: 'tenant:b' })).toEqual(['e']);
+      expect(await ids({ limit: 2, offset: 1 })).toEqual(['b', 'a']);
+    });
 
     t('orders listRuns newest-first and paginates with 1-based page/size', async () => {
       await store.createRun(run({ id: 'old', createdAt: new Date('2026-06-11T00:00:00.000Z') }));

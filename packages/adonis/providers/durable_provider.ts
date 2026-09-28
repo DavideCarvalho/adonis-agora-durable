@@ -234,6 +234,7 @@ export default class DurableProvider {
               })),
             }
           : {}),
+        ...(config.persistedSchedules ? { persistedSchedules: true } : {}),
         ...(config.stalledAfter !== undefined
           ? { stalledAfterMs: parseDuration(config.stalledAfter) }
           : {}),
