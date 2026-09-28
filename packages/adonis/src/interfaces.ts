@@ -476,6 +476,13 @@ export interface StateStore {
 
   // Dashboard queries
   listRuns(query: RunQuery): Promise<WorkflowRun[]>;
+  /**
+   * How many runs match `query` — a single `COUNT(*)` over the same predicates {@link listRuns}
+   * applies, without materializing a row. What the start-time concurrency quota asks on every start
+   * (`tag = concurrency:<key> AND status IN (...)`), so it must stay an aggregate, not a listing.
+   * Optional: without it the engine counts a {@link listRuns} result.
+   */
+  countRuns?(query: Omit<RunQuery, 'page' | 'size'>): Promise<number>;
   listCheckpoints(runId: string): Promise<StepCheckpoint[]>;
 
   /**

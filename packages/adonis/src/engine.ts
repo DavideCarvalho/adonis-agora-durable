@@ -3,6 +3,13 @@ import { backoffDelay, MAX_BACKOFF_MS } from './backoff.js';
 import { instantCheckpoint, lostStepEvent, stepCheckpoint } from './checkpoints.js';
 import { type Completion } from './completion.js';
 import {
+  assertConcurrency,
+  type ConcurrencyConfig,
+  type ConcurrencyQuota,
+  concurrencyTag,
+  resolveConcurrency,
+} from './concurrency.js';
+import {
   type BlockedDispatch,
   controlPlaneDescriptor,
   type DispatchPlan,
@@ -116,6 +123,12 @@ export interface StartOptions {
    * when one shared workflow is started on behalf of another package.
    */
   origin?: string | undefined;
+  /**
+   * A start-time concurrency quota for this start — at most `limit` runs sharing `key` in flight;
+   * over it, `start` throws {@link ConcurrencyLimitError} and creates nothing. Overrides the
+   * workflow's registered `concurrency`. See {@link ConcurrencyQuota}.
+   */
+  concurrency?: ConcurrencyQuota | undefined;
 }
 
 /** One row of {@link WorkflowEngine.listSchedules} — a schedule with its live control state. */
@@ -225,6 +238,8 @@ interface RegisteredWorkflow {
   origin?: string | undefined;
   /** Per-key serialization (a durable mutex). See {@link SingletonConfig}. */
   singleton?: SingletonConfig | undefined;
+  /** Start-time concurrency quota (reject over the limit). See {@link ConcurrencyConfig}. */
+  concurrency?: ConcurrencyConfig | undefined;
   /** Max wall-clock lifetime (ms) before a run is cancelled by `sweepTimeouts`. */
   executionTimeoutMs?: number | undefined;
   /** Validate the input at start; throw to reject before a run is created. Validator-agnostic. */
@@ -933,6 +948,8 @@ export class WorkflowEngine {
     opts?: {
       tags?: string[] | undefined;
       singleton?: SingletonConfig | undefined;
+      /** Start-time concurrency quota — see {@link ConcurrencyConfig}. */
+      concurrency?: ConcurrencyConfig | undefined;
       executionTimeout?: string | number | undefined;
       validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
       onEvent?: string[] | undefined;
@@ -949,6 +966,7 @@ export class WorkflowEngine {
       tags: opts?.tags,
       origin: opts?.origin,
       singleton: opts?.singleton,
+      concurrency: opts?.concurrency,
       executionTimeoutMs:
         opts?.executionTimeout != null ? parseDuration(opts.executionTimeout) : undefined,
       validateInput: opts?.validateInput,
@@ -980,6 +998,7 @@ export class WorkflowEngine {
       executor: WorkflowExecutor;
       tags?: string[];
       singleton?: SingletonConfig;
+      concurrency?: ConcurrencyConfig;
       executionTimeout?: string | number;
       validateInput?: (input: unknown) => void | Promise<void>;
       requires?: string[];
@@ -994,6 +1013,7 @@ export class WorkflowEngine {
       },
       tags: opts.tags,
       singleton: opts.singleton,
+      concurrency: opts.concurrency,
       executionTimeoutMs:
         opts.executionTimeout != null ? parseDuration(opts.executionTimeout) : undefined,
       validateInput: opts.validateInput,
@@ -1234,14 +1254,21 @@ export class WorkflowEngine {
       }
       return { runId, status: prior.status, output: prior.output, error: prior.error };
     }
+    // Start-time concurrency quota (per-start override, else the workflow's): reject BEFORE creating
+    // anything when the key's in-flight runs already reach the limit. See {@link ConcurrencyQuota}.
+    const quota = await resolveConcurrency(opts?.concurrency, registered.concurrency, input);
+    if (quota) await assertConcurrency(this.store, name, quota);
     const now = new Date();
     // A singleton workflow stamps a `singleton:<key>` tag so the admission gate (in execute) can find
-    // the other in-flight runs sharing the key via a tag+status query.
+    // the other in-flight runs sharing the key via a tag+status query; a quota-bearing run stamps
+    // `concurrency:<key>` so the quota can count its siblings the same way.
+    const minted = [
+      ...(registered.singleton ? [this.singletons.tag(registered.singleton, input)] : []),
+      ...(quota ? [concurrencyTag(quota.key)] : []),
+    ];
     const tags = mergeTags(
       registered.tags,
-      registered.singleton
-        ? [...(opts?.tags ?? []), this.singletons.tag(registered.singleton, input)]
-        : opts?.tags,
+      minted.length ? [...(opts?.tags ?? []), ...minted] : opts?.tags,
     );
     // Singleton back-pressure: reject a start that would grow the same-key backlog past
     // `limit + maxQueueDepth` (no-op when no maxQueueDepth is configured).

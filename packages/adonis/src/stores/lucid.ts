@@ -465,6 +465,12 @@ export class LucidStateStore implements StateStore {
 
   // --- dashboard queries --------------------------------------------------
 
+  /** One `COUNT(*)` over the same predicates {@link listRuns} applies. */
+  async countRuns(query: Omit<RunQuery, 'page' | 'size'>): Promise<number> {
+    const rows = await this.scopedRuns(query).count('* as count');
+    return Number((rows as Array<{ count: number | string }>)[0]?.count ?? 0);
+  }
+
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     const q = this.scopedRuns(query);
 

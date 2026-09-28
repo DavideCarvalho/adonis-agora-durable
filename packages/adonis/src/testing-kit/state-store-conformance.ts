@@ -598,6 +598,43 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.listRuns({ tag: 'nope' })).toHaveLength(0);
     });
 
+    t('countRuns counts the same set listRuns returns, without the paging', async () => {
+      expect(typeof store.countRuns).toBe('function');
+      await store.createRun(run({ id: 'n1', status: 'running', namespace: 'a', tags: ['q'] }));
+      await store.createRun(run({ id: 'n2', status: 'pending', namespace: 'a' }));
+      await store.createRun(run({ id: 'n3', status: 'completed', namespace: 'a', tags: ['q'] }));
+      await store.createRun(run({ id: 'n4', status: 'running', namespace: 'b', tags: ['q'] }));
+
+      expect(await store.countRuns?.({})).toBe(4);
+      expect(await store.countRuns?.({ namespace: 'a' })).toBe(3);
+      expect(await store.countRuns?.({ namespace: 'a', statuses: ['pending', 'running'] })).toBe(2);
+      if (supportsTagFilter) {
+        expect(await store.countRuns?.({ tag: 'q', statuses: ['running', 'pending'] })).toBe(2);
+      }
+    });
+
+    t(
+      'engine rejects a start over its concurrency quota and frees the slot once a run settles',
+      async () => {
+        if (!supportsTagFilter) return;
+        const engine = new WorkflowEngine({ store });
+        engine.register('q-wait', '1', async (ctx) => ctx.waitForSignal('never'));
+        const quota = { key: 'tenant:a', limit: 1 };
+
+        await engine.start('q-wait', {}, 'q1', { concurrency: quota });
+        await expect(engine.start('q-wait', {}, 'q2', { concurrency: quota })).rejects.toThrow(
+          /concurrency limit/,
+        );
+        expect(await store.getRun('q2')).toBeNull(); // nothing was created
+        await engine.start('q-wait', {}, 'q3', { concurrency: { ...quota, key: 'tenant:b' } });
+
+        await engine.cancel('q1');
+        await engine.start('q-wait', {}, 'q4', { concurrency: quota });
+        expect(await store.getRun('q4')).not.toBeNull();
+        await engine.drain();
+      },
+    );
+
     t('orders listRuns newest-first and paginates with 1-based page/size', async () => {
       await store.createRun(run({ id: 'old', createdAt: new Date('2026-06-11T00:00:00.000Z') }));
       await store.createRun(run({ id: 'mid', createdAt: new Date('2026-06-11T00:00:01.000Z') }));

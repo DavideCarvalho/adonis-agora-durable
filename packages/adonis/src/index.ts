@@ -44,6 +44,7 @@ export {
   type WorkerLogger,
   type WorkerLoopOptions,
 } from './commands/index.js';
+export * from './concurrency.js';
 export type {
   ControlPlaneConfig,
   StandaloneConfig,
