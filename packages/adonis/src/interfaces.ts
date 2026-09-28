@@ -1715,6 +1715,50 @@ export interface WorkflowCtx {
   upsertSearchAttributes(attrs: SearchAttributes): Promise<void>;
 }
 
+/**
+ * {@link WorkflowCtx} with ONE signature per method: the string-addressed forms of the four overloaded
+ * methods (`step`, `child`, `startChild`, `all`), everything else unchanged.
+ *
+ * For code that drives the ctx DYNAMICALLY — an interpreter that runs a user-defined graph and only
+ * ever knows workflow/step names as strings — and for test fakes. An overloaded method is awkward to
+ * satisfy structurally (a fake must implement every overload, and a hand-written narrow interface has
+ * to guess which overload TS will match), so depend on this instead — or on a `Pick` of it:
+ *
+ * ```ts
+ * type InterpreterCtx = Pick<DynamicWorkflowCtx, 'runId' | 'localStep' | 'child' | 'all' | 'sleep'>;
+ * new Interpreter(ctx); // a WorkflowCtx IS a DynamicWorkflowCtx — no `as unknown as` cast
+ * ```
+ *
+ * Every `WorkflowCtx` is assignable to it (guarded by `test/types/dynamic-workflow-ctx.ts`).
+ */
+export interface DynamicWorkflowCtx
+  extends Omit<WorkflowCtx, 'step' | 'child' | 'startChild' | 'all'> {
+  /** {@link WorkflowCtx.step} by step name. */
+  step<TOutput = unknown>(
+    name: string,
+    input: unknown,
+    opts?: StepDispatchOpts & { compensate?: string },
+  ): Promise<TOutput>;
+  /** {@link WorkflowCtx.child} by workflow name. */
+  child<TOutput = unknown>(
+    workflow: string,
+    input: unknown,
+    options?: string | ChildCallOptions,
+  ): Promise<TOutput>;
+  /** {@link WorkflowCtx.startChild} by workflow name. */
+  startChild(
+    workflow: string,
+    input: unknown,
+    options?: string | ChildCallOptions,
+  ): Promise<string>;
+  /** {@link WorkflowCtx.all} by workflow name. */
+  all<TOutput = unknown>(
+    workflow: string,
+    inputs: unknown[],
+    opts?: { mode?: 'waitAll' | 'failFast' },
+  ): Promise<TOutput[]>;
+}
+
 /** Result of executing or resuming a workflow run. */
 export interface RunResult {
   runId: string;
