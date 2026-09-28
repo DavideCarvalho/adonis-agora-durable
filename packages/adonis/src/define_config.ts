@@ -239,6 +239,13 @@ export interface BaseDurableConfig {
    */
   schedules?: ScheduledWorkflow[];
   /**
+   * Fire the PERSISTED schedules managed at runtime through `engine.schedules` (create / upsert /
+   * pause / resume / delete / list / trigger) on every worker tick. Off by default, so a deployment
+   * that never uses them never touches the `durable_schedules` table. Safe with any number of
+   * workers: each window's run id is deterministic and advancing a schedule is a compare-and-set.
+   */
+  persistedSchedules?: boolean;
+  /**
    * Run the worker loop **inside this process** instead of a separate `node ace durable:work` pod.
    * The loop is the same one the command drives (pending, recovery, timers, timeouts, schedules), so
    * an app that only needs a cadence — a nightly sync, an hourly cleanup — ships one image and one

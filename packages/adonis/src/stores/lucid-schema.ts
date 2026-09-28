@@ -12,6 +12,7 @@ export const DURABLE_TABLES = {
   signalWaiters: 'durable_signal_waiters',
   bufferedSignals: 'durable_buffered_signals',
   bufferedEvents: 'durable_buffered_events',
+  schedules: 'durable_schedules',
 } as const;
 
 /**
@@ -339,6 +340,26 @@ export async function createDurableTables(
     });
   }
 
+  // Persisted schedules (`engine.schedules`): the store filters on the columns; `spec`/`state` are
+  // engine-owned JSON documents it keeps verbatim. `next_fire_at` is epoch ms (NULL = never fires
+  // again), exact, so `updateSchedule`'s compare-and-set on it is reliable on every dialect.
+  if (!(await conn().hasTable(DURABLE_TABLES.schedules))) {
+    await conn().createTable(DURABLE_TABLES.schedules, (table) => {
+      table.string('id').primary();
+      table.string('namespace').notNullable().defaultTo('default');
+      table.string('workflow').notNullable();
+      table.boolean('paused').notNullable().defaultTo(false);
+      table.bigInteger('next_fire_at');
+      table.text('tags');
+      table.text('spec').notNullable();
+      table.text('state').notNullable();
+      table.bigInteger('created_at').notNullable();
+      table.bigInteger('updated_at').notNullable();
+      // The worker tick's "due by T" scan: `paused = false AND next_fire_at <= T`.
+      table.index(['paused', 'next_fire_at'], 'durable_schedules_due_idx');
+    });
+  }
+
   // ONE warning for the whole call, listing every column added, or none at all. Not one per ALTER:
   // an operator needs to know their schema was behind and by what, and a burst of lines is easier to
   // lose than a single one.
@@ -350,6 +371,7 @@ export async function createDurableTables(
 /** Drop every durable table (reverse FK order). Used by tests and migration `down`. */
 export async function dropDurableTables(db: Database, connectionName?: string): Promise<void> {
   const conn = () => db.connection(connectionName).schema;
+  await conn().dropTableIfExists(DURABLE_TABLES.schedules);
   await conn().dropTableIfExists(DURABLE_TABLES.bufferedEvents);
   await conn().dropTableIfExists(DURABLE_TABLES.bufferedSignals);
   await conn().dropTableIfExists(DURABLE_TABLES.signalWaiters);

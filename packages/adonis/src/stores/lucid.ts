@@ -11,6 +11,8 @@ import type {
   RunValueAxis,
   RunValueFacetOptions,
   RunValueFacetRow,
+  ScheduleQuery,
+  ScheduleRecord,
   SignalWaiter,
   StateStore,
   StepCheckpoint,
@@ -471,6 +473,72 @@ export class LucidStateStore implements StateStore {
     return Number((rows as Array<{ count: number | string }>)[0]?.count ?? 0);
   }
 
+  // ---- persisted schedules ----------------------------------------------------------------------
+
+  async saveSchedule(record: ScheduleRecord): Promise<void> {
+    const row = scheduleToRow(record);
+    await this.client()
+      .insertQuery()
+      .table(DURABLE_TABLES.schedules)
+      .knexQuery.insert(row)
+      .onConflict('id')
+      .merge();
+  }
+
+  async getSchedule(id: string): Promise<ScheduleRecord | null> {
+    const row = await this.client().from(DURABLE_TABLES.schedules).where('id', id).first();
+    return row ? rowToSchedule(row as ScheduleRow) : null;
+  }
+
+  /** One conditional UPDATE: the compare-and-set on `next_fire_at` lives in its WHERE clause. */
+  async updateSchedule(
+    id: string,
+    patch: Partial<Omit<ScheduleRecord, 'id' | 'createdAt'>>,
+    expectedNextFireAt?: number | null,
+  ): Promise<boolean> {
+    const set: Record<string, unknown> = {};
+    if (patch.namespace !== undefined) set.namespace = patch.namespace;
+    if (patch.workflow !== undefined) set.workflow = patch.workflow;
+    if (patch.paused !== undefined) set.paused = patch.paused;
+    if ('nextFireAt' in patch) set.next_fire_at = patch.nextFireAt ?? null;
+    if ('tags' in patch) set.tags = patch.tags ? JSON.stringify(patch.tags) : null;
+    if (patch.spec !== undefined) set.spec = JSON.stringify(patch.spec);
+    if (patch.state !== undefined) set.state = JSON.stringify(patch.state);
+    if (patch.updatedAt !== undefined) set.updated_at = patch.updatedAt.getTime();
+    if (!Object.keys(set).length) return (await this.getSchedule(id)) !== null;
+    const q = this.client().from(DURABLE_TABLES.schedules).where('id', id);
+    if (expectedNextFireAt === null) q.whereNull('next_fire_at');
+    else if (expectedNextFireAt !== undefined) q.where('next_fire_at', expectedNextFireAt);
+    return rowsAffected(await q.update(set)) > 0;
+  }
+
+  async deleteSchedule(id: string): Promise<boolean> {
+    const affected = await this.client().from(DURABLE_TABLES.schedules).where('id', id).delete();
+    return rowsAffected(affected) > 0;
+  }
+
+  async listSchedules(query: ScheduleQuery): Promise<ScheduleRecord[]> {
+    const q = this.client().from(DURABLE_TABLES.schedules);
+    if (query.namespace !== undefined) q.where('namespace', query.namespace);
+    if (query.workflow !== undefined) q.where('workflow', query.workflow);
+    if (query.paused !== undefined) q.where('paused', query.paused);
+    if (query.tag !== undefined) {
+      q.whereRaw(`tags like ? escape '!'`, [`%"${escapeLike(query.tag)}"%`]);
+    }
+    if (query.dueBy !== undefined) {
+      q.where('paused', false)
+        .whereNotNull('next_fire_at')
+        .where('next_fire_at', '<=', query.dueBy);
+    }
+    // Soonest-due first, never-firing (NULL) last, id as the stable tie-break.
+    q.orderByRaw('case when next_fire_at is null then 1 else 0 end asc')
+      .orderBy('next_fire_at', 'asc')
+      .orderBy('id', 'asc');
+    if (query.limit != null) q.limit(query.limit);
+    if (query.offset) q.offset(query.offset);
+    return ((await q) as ScheduleRow[]).map(rowToSchedule);
+  }
+
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     const q = this.scopedRuns(query);
 
@@ -686,4 +754,50 @@ function rowsAffected(result: unknown): number {
   if (typeof result === 'number') return result;
   if (Array.isArray(result)) return result.length;
   return 0;
+}
+
+/** A `durable_schedules` row as the driver hands it back. */
+interface ScheduleRow {
+  id: string;
+  namespace: string;
+  workflow: string;
+  paused: boolean | number | string;
+  next_fire_at: number | string | null;
+  tags: string | null;
+  spec: string;
+  state: string;
+  created_at: number | string;
+  updated_at: number | string;
+}
+
+function scheduleToRow(r: ScheduleRecord): Record<string, unknown> {
+  return {
+    id: r.id,
+    namespace: r.namespace,
+    workflow: r.workflow,
+    paused: r.paused,
+    next_fire_at: r.nextFireAt,
+    tags: r.tags?.length ? JSON.stringify(r.tags) : null,
+    spec: JSON.stringify(r.spec),
+    state: JSON.stringify(r.state),
+    created_at: r.createdAt.getTime(),
+    updated_at: r.updatedAt.getTime(),
+  };
+}
+
+function rowToSchedule(row: ScheduleRow): ScheduleRecord {
+  const tags = row.tags ? (JSON.parse(row.tags) as string[]) : undefined;
+  return {
+    id: row.id,
+    namespace: row.namespace,
+    workflow: row.workflow,
+    // SQLite/MySQL hand a boolean column back as 0/1 (some drivers as a string).
+    paused: row.paused === true || row.paused === 1 || row.paused === '1' || row.paused === 'true',
+    nextFireAt: row.next_fire_at == null ? null : Number(row.next_fire_at),
+    ...(tags?.length ? { tags } : {}),
+    spec: row.spec ? (JSON.parse(row.spec) as Record<string, unknown>) : {},
+    state: row.state ? (JSON.parse(row.state) as Record<string, unknown>) : {},
+    createdAt: new Date(Number(row.created_at)),
+    updatedAt: new Date(Number(row.updated_at)),
+  };
 }

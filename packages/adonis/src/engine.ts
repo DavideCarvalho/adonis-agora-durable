@@ -75,6 +75,7 @@ import type { QueueConfig } from './queue.js';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor.js';
 import { scanRunValueFacets } from './run-value-facets.js';
 import { type ScheduledWorkflow, scheduleWindow } from './scheduler.js';
+import { ScheduleClient } from './schedules.js';
 import { SingletonGate } from './singleton-gate.js';
 import { sanitizeQueueToken, tenantGroup } from './tenant-group.js';
 import { TransportPool } from './transport-pool.js';
@@ -509,6 +510,12 @@ export interface WorkflowEngineDeps {
    * faster pickup.
    */
   blockedPollMs?: number | undefined;
+  /**
+   * Fire the PERSISTED schedules managed at runtime through {@link WorkflowEngine.schedules} on every
+   * worker tick (`durable:work` / the embedded worker). Off by default, so a deployment that never
+   * uses them doesn't need the `durable_schedules` table touched.
+   */
+  persistedSchedules?: boolean | undefined;
 }
 
 /** Thrown by {@link WorkflowEngine.resume} when the run belongs to a different namespace. */
@@ -538,6 +545,14 @@ export class WorkflowEngine {
   /** Worker-pool partition stamped on created runs and used to scope the poll/resume paths.
    *  `undefined` is the OPERATOR: it scopes nothing and belongs to every namespace. */
   private readonly namespace: string | undefined;
+  /**
+   * Persisted, runtime-managed schedules: create/upsert/pause/resume/delete/list/trigger them, and
+   * `tick()` fires the due ones (the worker tick does it when `persistedSchedules` is on). Needs a
+   * store that persists schedules — the Lucid and in-memory stores do. See {@link ScheduleClient}.
+   */
+  readonly schedules: ScheduleClient;
+  /** Whether the worker tick fires {@link schedules} (the `persistedSchedules` option). */
+  readonly persistedSchedulesEnabled: boolean;
   private readonly leaseMs: number;
   private readonly maxRecoveryAttempts?: number | undefined;
   private readonly reconcileMs: number | undefined;
@@ -698,6 +713,15 @@ export class WorkflowEngine {
     this.compensationTimeoutMs = Math.max(1_000, deps.compensationTimeoutMs ?? 300_000);
     this.retention = deps.retention;
     this.retentionPolicies = deps.retentionPolicies ?? [];
+    this.persistedSchedulesEnabled = deps.persistedSchedules ?? false;
+    this.schedules = new ScheduleClient(
+      this.store,
+      {
+        start: (workflow, input, runId, opts) => this.start(workflow, input, runId, opts),
+        getRun: (runId) => this.store.getRun(runId),
+      },
+      { namespace: this.namespace, clock: this.clock },
+    );
     this.stalledAfterMs = Math.max(60_000, deps.stalledAfterMs ?? 900_000);
     this.trackStepStart = deps.trackStepStart ?? true;
     // Default: execute the run on this instance, asynchronously, so `start` never blocks on the body.
