@@ -1,5 +1,25 @@
 # @adonis-agora/durable
 
+## 0.42.0
+
+### Minor Changes
+
+- [#221](https://github.com/DavideCarvalho/adonis-agora-durable/pull/221) [`448b3b1`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/448b3b129c0f586b19b35036cf76a4e3982d7a60) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - New `DynamicWorkflowCtx` type — port of nestjs-durable#337: `WorkflowCtx` with ONE string-addressed signature for each of its overloaded methods (`step`, `child`, `startChild`, `all`). Every `WorkflowCtx` is assignable to it, so code that drives the ctx by names (a graph interpreter) and test fakes can depend on it — or on a `Pick` of it — instead of re-declaring a narrow interface and casting `ctx as unknown as …`. A type-test pins the assignability.
+
+- [#219](https://github.com/DavideCarvalho/adonis-agora-durable/pull/219) [`614ca9b`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/614ca9bd259e48710738a88f73dc227d4f9844c2) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Retention can be **scoped**, and a tenant's runs can be **purged** through the engine — port of nestjs-durable#335.
+  
+  - **`retention.policies`** (engine: `retentionPolicies`): scoped rules next to the per-status ages — each deletes terminal runs in its `statuses` that match its `scope` (`namespace(s)`, `workflow(s)`, `tag`/`tags`, search-attribute `attributes` — the new `RunScope` type) once their last activity is older than `maxAge`. Swept by the same throttled `sweepRetention`, with the same `onEvict` archival hooks and subtree cascade. A namespaced worker never sweeps another partition's scope.
+  - **`engine.purgeRuns(scope, { batchSize?, cancelLive?, children? })` / `engine.purgeNamespace(ns)`**: hard-delete every run a scope matches with its child subtree (children inherit `namespace`, not `tags` — they go with their root either way), in bounded batches, sweeping their buffered signals. Live runs are cancelled first (`cancelLive: false` keeps them). An empty scope is rejected.
+  - New exports: `RunScope`, `isNonEmptyRunScope`, `TERMINAL_RUN_STATUSES`, `TerminalRunStatus`, `ScopedRetentionPolicy`.
+
+- [#220](https://github.com/DavideCarvalho/adonis-agora-durable/pull/220) [`0d19781`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/0d1978138af2bb5f7348b49dd618fad77aa4c200) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - **Start-time concurrency quotas** — port of nestjs-durable#336. Cap how many runs sharing a key can be in flight and reject the start that would exceed it ("a tenant can have at most 8 turns executing"), without a hand-rolled count gate.
+  
+  - `static workflow = { concurrency: { key: (input) => …, limit, countStatuses? } }` (also `engine.register` / `registerRemote`), or per start with `StartOptions.concurrency: { key, limit, countStatuses? }` (overrides the workflow's). The key is global, so several workflows can share one quota; `limit` may be an async function of the key; `countStatuses` narrows what occupies a slot (default: every non-terminal status).
+  - Over the limit `start` throws **`ConcurrencyLimitError`** (`key`, `limit`, `active`, `workflow`) and creates nothing; an idempotent re-start of an existing run id is never rejected. Quota-bearing runs carry the engine-minted tag `concurrency:<key>`.
+  - New optional `StateStore.countRuns(query)` — one `COUNT(*)` over the `listRuns` predicates — implemented by the Lucid and in-memory stores and `CodecStateStore`, and covered by the shared contract. The engine falls back to counting a listing for a custom store.
+  
+  A soft cap under a race (count and insert are separate statements); use `singleton` for a strict, queueing per-key limit.
+
 ## 0.41.1
 
 ### Patch Changes
