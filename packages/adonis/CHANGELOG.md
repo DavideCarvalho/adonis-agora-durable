@@ -1,5 +1,18 @@
 # @adonis-agora/durable
 
+## 0.43.0
+
+### Minor Changes
+
+- [#222](https://github.com/DavideCarvalho/adonis-agora-durable/pull/222) [`9540e66`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/9540e66f942c3bbae6440ca6657909ffd6cc3734) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - **Persisted schedules** — port of nestjs-durable#338. Temporal-style schedules managed at runtime and stored next to the runs, alongside the code-declared `schedules` config / `static schedule`.
+  
+  - `engine.schedules`: `create` / `upsert` / `get` / `list` / `pause(note?)` / `resume` / `trigger` / `delete` / `tick`. A schedule starts `workflow` with `input` on a `cron` (+ IANA `timezone`) or a fixed `every` interval, with a stable per-window `jitter`, `overlap` (`allow` / `skip` while the previous run is in flight), `catchup` (`latest` missed window once, or `skip`), `tags` (also stamped on its runs, plus `schedule:<id>`), `searchAttributes`, `priority` and `namespace`. Failed starts are recorded as `lastError`; `get`/`list` report next/last fire, last run and fire count.
+  - **Multi-worker safe without locks**: a window's run id is deterministic (`sched:<id>:<windowMs>`) and advancing a schedule is a compare-and-set on its `next_fire_at`.
+  - `persistedSchedules: true` in `config/durable.ts` makes the worker tick (`durable:work` / the embedded worker) fire due schedules — off by default.
+  - New `durable_schedules` table, created by `createDurableTables` (auto-schema on boot; with `autoSchema: false`, add a migration that calls `createDurableTables` again — it only creates what's missing), and five optional `StateStore` methods (`saveSchedule`, `getSchedule`, `updateSchedule` with CAS, `deleteSchedule`, `listSchedules`) implemented by the Lucid and in-memory stores; `CodecStateStore` forwards them, encoding the schedule input. Covered by the shared contract.
+
+- [#226](https://github.com/DavideCarvalho/adonis-agora-durable/pull/226) [`edab227`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/edab227f547e2804688ec7b8596c085a71240393) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A persisted schedule can carry a **concurrency quota** (port of nestjs-durable#340): `engine.schedules.create/upsert({ …, concurrency: { key, limit, countStatuses? } })` applies it to every run the schedule starts, like `StartOptions.concurrency`. An over-limit window is skipped and recorded as the schedule's `lastError`; the schedule moves on to its next window.
+
 ## 0.42.0
 
 ### Minor Changes
