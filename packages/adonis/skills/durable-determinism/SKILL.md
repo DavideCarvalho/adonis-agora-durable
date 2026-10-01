@@ -255,6 +255,32 @@ the body branch differently, diverging from recorded history; captured via
 `sideEffect`, the value is fixed once. Source: `docs/authoring/versioning.mdx`
 ("a config/env read" belongs behind `ctx.sideEffect`).
 
+### HIGH calling a ctx primitive from inside a step body
+
+Wrong:
+
+```ts
+await ctx.localStep('plan', async () => {
+  const plan = await planner.plan(input)
+  await ExecutePlanWorkflow.dispatch(plan) // NestedWorkflowCallError at this line
+  return plan
+})
+```
+
+Correct:
+
+```ts
+const plan = await ctx.localStep('plan', () => planner.plan(input))
+await ExecutePlanWorkflow.dispatch(plan)
+```
+
+Mechanism: the step replays from its checkpoint without re-running its body, so
+a primitive called inside it claims a journal position that no replay claims
+again. The engine throws `NestedWorkflowCallError` (a `FatalError`) at the call
+site for any primitive, and for the `BaseWorkflow` statics that resolve the
+ambient ctx. Source: `docs/authoring/versioning.mdx` ("Workflow primitives
+inside a step body"), `src/workflow-ctx.ts` (the guard).
+
 See also: `durable-workflows` — the authoring surface these rules constrain.
 See also: `durable-reliability` — poison-pill runs and the DLQ path when
 NonDeterminismError keeps crashing recovery.
