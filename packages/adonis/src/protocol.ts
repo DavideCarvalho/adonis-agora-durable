@@ -1,5 +1,6 @@
 import type { Heartbeat, RemoteTask, StepEvent, StepLogger, StepResult } from './interfaces.js';
 import { createStepLogger } from './step-logger.js';
+import { runOutsideWorkflowCtx } from './workflow-als.js';
 
 /**
  * The scoped-restore slot `@adonis-agora/context` exposes:
@@ -95,7 +96,11 @@ export async function runStepHandler(
   beat?.();
   return withRestoredContext(task.context, async () => {
     try {
-      const output = await handler(task.input, createStepLogger(events, Date.now, beat));
+      // Outside any ambient workflow ctx: an in-process transport runs the handler on the parent
+      // body's async path, but a handler is not the body (see `runOutsideWorkflowCtx`).
+      const output = await runOutsideWorkflowCtx(() =>
+        handler(task.input, createStepLogger(events, Date.now, beat)),
+      );
       return withEvents({ ...base, status: 'completed', output });
     } catch (err) {
       // Carry `code`/`retryable` off the thrown error if present, so the engine's durable retry can

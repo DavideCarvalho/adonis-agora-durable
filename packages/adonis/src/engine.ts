@@ -1718,13 +1718,41 @@ export class WorkflowEngine {
     return this.purgeRuns({ namespace }, opts);
   }
 
-  async resume(runId: string): Promise<RunResult> {
+  /**
+   * Re-execute a run's body (replaying its checkpoints). This is the EXPLICIT entry point: besides
+   * driving a live run, it re-drives a `failed` run — the manual retry (prefer {@link requeue}, which
+   * also resets the failure state so replay re-attempts the failed parts). Completed / cancelled /
+   * dead runs are never re-executed. The engine's own implicit wake-ups (signals, step results,
+   * timers, wait rechecks, redelivered dispatches) go through {@link resumeImplicit}, which treats
+   * `failed` as terminal too.
+   */
+  resume(runId: string): Promise<RunResult> {
+    return this.resumeRun(runId, true);
+  }
+
+  /**
+   * {@link resume} for every IMPLICIT wake-up — a delivered signal/child completion, a late step
+   * result, a due timer, a {@link recheckWaitSeqs} re-drive, a redelivered dispatch, a queue-slot
+   * wake. A `failed` run is terminal to these: only an explicit retry ({@link requeue} /
+   * {@link resume}) may re-drive it. Otherwise a stale waiter or a late result left behind by a
+   * failed run silently re-executes its body.
+   */
+  private resumeImplicit(runId: string): Promise<RunResult> {
+    return this.resumeRun(runId, false);
+  }
+
+  private async resumeRun(runId: string, allowFailed: boolean): Promise<RunResult> {
     const run = await this.store.getRun(runId);
     if (!run) throw new Error(`run ${runId} not found`);
     // A definitively-finished run must not be re-executed (e.g. a worker result landing after the
     // run was cancelled, or a duplicate resume) — that would replay the body and clobber the
-    // terminal state. `failed` is intentionally NOT terminal here: retry resumes a failed run.
-    if (run.status === 'cancelled' || run.status === 'completed' || run.status === 'dead') {
+    // terminal state. `failed` is terminal too unless this is an explicit retry (see `resume`).
+    if (
+      run.status === 'cancelled' ||
+      run.status === 'completed' ||
+      run.status === 'dead' ||
+      (run.status === 'failed' && !allowFailed)
+    ) {
       return { runId, status: run.status, output: run.output, error: run.error };
     }
     // Namespace guard: release the lock and bail when this run belongs to a different worker pool.
@@ -1771,7 +1799,7 @@ export class WorkflowEngine {
         for (const seq of seqs) {
           const cp = await this.store.getCheckpoint(runId, seq).catch(() => null);
           if (cp && (cp.status === 'completed' || cp.status === 'failed')) {
-            await this.resume(runId).catch(() => undefined);
+            await this.resumeImplicit(runId).catch(() => undefined);
             return;
           }
         }
@@ -2075,7 +2103,7 @@ export class WorkflowEngine {
     if (!acquired) return null;
     // resume() checks the namespace and throws NamespaceMismatch when it doesn't match (releasing the
     // lease) — a foreign run leased here is simply skipped rather than run.
-    return this.resume(runId).catch((err) => {
+    return this.resumeImplicit(runId).catch((err) => {
       if (err instanceof NamespaceMismatch) return null;
       throw err;
     });
@@ -2336,7 +2364,7 @@ export class WorkflowEngine {
         if (!acquired) continue;
         // A per-run hook (recovery counting / dead-lettering) may settle the run terminally instead.
         const settled = onLocked ? await onLocked(run) : undefined;
-        results.push(settled ?? (await this.resume(run.id)));
+        results.push(settled ?? (await this.resumeImplicit(run.id)));
       }
     };
     await Promise.all(Array.from({ length: Math.min(CONCURRENCY, runs.length) }, () => worker()));
@@ -2446,7 +2474,7 @@ export class WorkflowEngine {
         parallelGroup: waiter.parallelGroup,
       }),
     );
-    return this.resume(waiter.runId);
+    return this.resumeImplicit(waiter.runId);
   }
 
   /**
@@ -2594,9 +2622,13 @@ export class WorkflowEngine {
   async cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null> {
     const run = await this.store.getRun(runId);
     if (!run) return null;
-    // Already finished — nothing to cancel (and don't clobber a completed/dead run). This also stops
-    // the child cascade below from looping on already-cancelled runs.
-    if (run.status === 'completed' || run.status === 'cancelled' || run.status === 'dead') {
+    // Terminal runs are IMMUTABLE: cancelling one is a no-op that echoes its current state. That
+    // covers EVERY terminal status — `failed` included (a timed-out run is persisted terminal too).
+    // It must never rewrite the run (a `failed` run silently becoming `cancelled` loses its real
+    // outcome) and must never reach the child cascade below: a finished parent's children can be
+    // live, unrelated work — e.g. the next queued chat turn an agent queue already started as a
+    // child of the turn that just failed. This also stops the cascade from looping.
+    if ((TERMINAL_RUN_STATUSES as readonly string[]).includes(run.status)) {
       return { runId, status: run.status, output: run.output, error: run.error };
     }
     // Compensating cancel: resume the run with a cancellation pending — replay re-registers the saga,
@@ -2627,7 +2659,9 @@ export class WorkflowEngine {
       // here an EXISTING run is resumed, whose execution already self-tracks — only the pre-call gap
       // needed covering. The one-microtask defer is preserved; the promise is registered synchronously.
       this.trackEffect(
-        Promise.resolve().then(() => this.resume(runId).then(() => this.notifyCancelled(runId))),
+        Promise.resolve().then(() =>
+          this.resumeImplicit(runId).then(() => this.notifyCancelled(runId)),
+        ),
       );
       await this.cancelChildren(runId, opts);
       return { runId, status: run.status };
@@ -3610,7 +3644,7 @@ export class WorkflowEngine {
               output: payload,
             }),
           );
-          setTimeout(() => void this.resume(run.id).catch(() => undefined), 0);
+          setTimeout(() => void this.resumeImplicit(run.id).catch(() => undefined), 0);
         };
         const buffered = await this.store.takeBufferedSignal(cmd.signal);
         if (buffered) {
@@ -3669,7 +3703,7 @@ export class WorkflowEngine {
           );
           // Re-drive on a macrotask, AFTER this turn suspends and frees the run lock (same reorder
           // as the buffered `waitSignal` delivery above).
-          setTimeout(() => void this.resume(run.id).catch(() => undefined), 0);
+          setTimeout(() => void this.resumeImplicit(run.id).catch(() => undefined), 0);
         };
         const bufferedChild = await this.store.takeBufferedSignal(`child:${childId}`);
         if (bufferedChild) {
@@ -4632,7 +4666,7 @@ export class WorkflowEngine {
     const runId = await this.settleRemoteCheckpoint(result);
     if (runId === undefined) return;
     this.trackEffect(
-      this.resume(runId).catch((err) => {
+      this.resumeImplicit(runId).catch((err) => {
         console.warn(
           `[adonis-durable] background resume of run ${runId} failed (the run recovers on its next reconcile wake): ${
             err instanceof Error ? err.message : String(err)
@@ -4733,7 +4767,7 @@ export class WorkflowEngine {
     if (!waiters || waiters.size === 0) return;
     const runIds = [...waiters];
     waiters.clear();
-    for (const runId of runIds) void this.resume(runId).catch(() => undefined);
+    for (const runId of runIds) void this.resumeImplicit(runId).catch(() => undefined);
   }
 
   /**

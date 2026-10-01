@@ -19,6 +19,25 @@ The engine pairs each replayed step with the checkpoint recorded at that logical
 
 This is a guard, not a fix. It tells you a code change is incompatible with runs that started under the old code. The two tools below let you make the change *anyway* — safely.
 
+### Workflow primitives inside a step body
+
+A step body runs once and is then replayed from its checkpoint *without* re-running. A ctx primitive called from inside one (`ctx.startChild`, `ctx.child`, `ctx.step`, `ctx.sleep`, `ctx.sideEffect`, …, or `BaseWorkflow.start()`/`.dispatch()` resolving the ambient ctx) would claim a journal position that replay never claims again. The engine refuses it at the call site with a `NestedWorkflowCallError` (a `FatalError`, code `nested_workflow_call`):
+
+```ts
+// ✗ throws NestedWorkflowCallError: the step starts a child
+await ctx.localStep('plan', async () => {
+  const plan = await planner.plan(input)
+  await ExecutePlanWorkflow.dispatch(plan)
+  return plan
+})
+
+// ✓ the step computes, the body orchestrates
+const plan = await ctx.localStep('plan', () => planner.plan(input))
+await ExecutePlanWorkflow.dispatch(plan)
+```
+
+Runs journaled before this guard existed (where the nested call is already recorded at that position) keep replaying unchanged. A dispatched step handler never sees the workflow ctx, so `BaseWorkflow.dispatch()` there starts a top-level run, including on in-process transports.
+
 ## Deterministic sources — `now` & `sideEffect`
 
 The most common way to break replay is reading a value that changes every time the body runs. A raw `Date.now()`, `Math.random()`, or `crypto.randomUUID()` returns a different value on each replay, which silently corrupts a durable run. Use the context's deterministic sources instead; each records its value on the first run and **replays the same value** afterwards:
