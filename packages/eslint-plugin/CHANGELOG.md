@@ -1,5 +1,11 @@
 # @adonis-agora/durable-eslint-plugin
 
+## 0.3.4
+
+### Patch Changes
+
+- fix(deps): update typescript-eslint monorepo to v8.71.0 ([#236](https://github.com/DavideCarvalho/adonis-agora-durable/issues/236))
+
 ## 0.3.3
 
 ### Patch Changes
