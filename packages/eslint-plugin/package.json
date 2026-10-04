@@ -57,7 +57,7 @@
     "@typescript-eslint/rule-tester": "8.71.0",
     "eslint": "10.11.0",
     "typescript": "6.0.3",
-    "vitest": "5.0.2"
+    "vitest": "5.0.3"
   },
   "engines": {
     "node": ">=20.6.0"
