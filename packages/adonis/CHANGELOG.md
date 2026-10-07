@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 0.43.3
+
+### Patch Changes
+
+- [#264](https://github.com/DavideCarvalho/adonis-agora-durable/pull/264) [`8b063a4`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/8b063a4c6f4f2a7122a267b9aa38694704eb1b4a) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A run no longer executes twice at once in one process. The run lease is per engine instance, so a resume landing while this same process was still executing the run (a signal delivered while the run was parking, a late step result, a second signal, an explicit `resume()`) went straight past it and ran the body concurrently: a step whose checkpoint was not written yet ran twice. Resumes of a run are now serialized in-process: one landing mid-execution is queued and re-drives the run once that execution has settled and released its lease (resumes queued meanwhile coalesce into it), so the wake is neither doubled nor lost. Across processes the lease still decides, unchanged.
+
 ## 0.43.2
 
 ### Patch Changes
