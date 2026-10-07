@@ -339,7 +339,11 @@ export interface WorkflowEngineDeps {
   controlPlane?: ControlPlane | undefined;
   /** Epoch-ms clock; injectable for tests. Defaults to `Date.now`. */
   clock?: (() => number) | undefined;
-  /** Unique id for this engine instance, used for recovery leases. Defaults to a random id. */
+  /**
+   * Unique id for this engine instance, used for recovery leases. Defaults to a random id. Must be
+   * unique per process: the lease fences instances by this id, so two processes sharing one would
+   * share the lease and could execute the same run at once.
+   */
   instanceId?: string | undefined;
   /**
    * Worker-pool partition for this engine. Stamped on every run it creates; the poll paths
@@ -526,6 +530,14 @@ export class NamespaceMismatch extends Error {
   }
 }
 
+/** See `WorkflowEngine.runGates`. */
+interface RunGate {
+  /** The last execution chained for the run in this process — the one running, or the queued one. */
+  tail: Promise<RunResult>;
+  /** The resume waiting for `tail`'s predecessor; later resumes coalesce into it until it starts. */
+  queued?: { allowFailed: boolean; result: Promise<RunResult> } | undefined;
+}
+
 /**
  * The orchestrator. Owns workflow state and replays runs deterministically: each step's
  * result is checkpointed, so on resume a completed step returns its saved output instead of
@@ -650,6 +662,17 @@ export class WorkflowEngine {
    * writes. `settleRun` checks this and degrades to an echo; `execute`'s finally clears the mark.
    */
   private readonly leaseLostRuns = new Set<string>();
+  /**
+   * The in-process execution gate, by run id: the execution of the run currently in flight in THIS
+   * process (`tail`), and at most one resume queued behind it (`queued`). See {@link resumeRun}.
+   *
+   * The run lease is keyed by engine instance, so it fences OTHER processes only: to the store, a
+   * second execution in this same process holds the very same lease. Without this gate, a resume
+   * landing while this process was still executing the run (a signal delivered while the run parks,
+   * a late step result, an explicit `resume()`, a second wake-up) went straight past the lease and
+   * ran the body concurrently — a not-yet-checkpointed step executed twice.
+   */
+  private readonly runGates = new Map<string, RunGate>();
   /**
    * Post-settle side effects (parent notify, singleton wake) fired fire-and-forget AFTER a run's
    * status was persisted. They run OFF the `execute()` path — the caller of `execute()` must never
@@ -1741,7 +1764,67 @@ export class WorkflowEngine {
     return this.resumeRun(runId, false);
   }
 
-  private async resumeRun(runId: string, allowFailed: boolean): Promise<RunResult> {
+  /**
+   * One execution of a run at a time in this process. A resume that lands while the run executes
+   * here neither joins that execution (the double-run) nor no-ops against its held lease (a lost
+   * wake: its checkpoint may postdate the running turn's snapshot) — it is QUEUED, and re-drives the
+   * run once the running execution has settled and released its lease, re-reading the run then
+   * (terminal → echoed, never re-executed). Resumes landing while one is already queued coalesce
+   * into it: it has not started yet, so it will observe every write they made. Their callers get
+   * the queued execution's result, i.e. the run's state after their own wake was applied.
+   *
+   * Across processes, exclusion stays the lease's job: {@link execute} still `tryLockRun`s when it
+   * does not hold the lease.
+   */
+  private resumeRun(runId: string, allowFailed: boolean): Promise<RunResult> {
+    const gate = this.runGates.get(runId);
+    if (!gate) {
+      const tail = this.resumeRunNow(runId, allowFailed);
+      const fresh: RunGate = { tail };
+      this.runGates.set(runId, fresh);
+      this.closeGateAfter(runId, fresh, tail);
+      return tail;
+    }
+    let queued = gate.queued;
+    if (queued) {
+      queued.allowFailed ||= allowFailed;
+    } else {
+      const entry: { allowFailed: boolean; result?: Promise<RunResult> } = { allowFailed };
+      const result = gate.tail
+        .catch(() => undefined)
+        .then(() => {
+          // Now running: a resume landing from here on queues behind THIS execution.
+          if (gate.queued === entry) gate.queued = undefined;
+          return this.resumeRunNow(runId, entry.allowFailed);
+        });
+      entry.result = result;
+      queued = entry as { allowFailed: boolean; result: Promise<RunResult> };
+      gate.queued = queued;
+      gate.tail = result;
+      this.closeGateAfter(runId, gate, result);
+      // Tracked for `drain()`: between the running execution settling (leaving `inflight`) and this
+      // one re-entering it, nothing else would hold the queued re-drive.
+      this.trackEffect(result);
+    }
+    // A resume issued from INSIDE this run's own execution (its ambient ctx is this run) can only be
+    // satisfied once that execution ends — awaiting it there would deadlock. Queue it, answer now.
+    if (workflowAls.getStore()?.runId === runId) return this.echoCurrentStatus(runId);
+    return queued.result;
+  }
+
+  /** Drop `gate` once `tail` settles, unless another execution queued behind it meanwhile. */
+  private closeGateAfter(runId: string, gate: RunGate, tail: Promise<RunResult>): void {
+    void tail.then(
+      () => {
+        if (this.runGates.get(runId) === gate && gate.tail === tail) this.runGates.delete(runId);
+      },
+      () => {
+        if (this.runGates.get(runId) === gate && gate.tail === tail) this.runGates.delete(runId);
+      },
+    );
+  }
+
+  private async resumeRunNow(runId: string, allowFailed: boolean): Promise<RunResult> {
     const run = await this.store.getRun(runId);
     if (!run) throw new Error(`run ${runId} not found`);
     // A definitively-finished run must not be re-executed (e.g. a worker result landing after the
