@@ -144,7 +144,10 @@ export interface BaseDurableConfig {
   trackStepStart?: boolean;
   /** Recovery lease duration in ms. Default 30s. */
   leaseMs?: number;
-  /** Unique id for this engine instance. Defaults to a random id. */
+  /**
+   * Unique id for this engine instance. Defaults to a random id. Must be unique per process: run
+   * leases are held by this id, so two processes sharing one could execute the same run at once.
+   */
   instanceId?: string;
   /**
    * Worker-pool partition for this engine. Stamped on every run it creates; the poll/recovery paths
