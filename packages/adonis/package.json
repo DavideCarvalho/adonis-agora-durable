@@ -182,7 +182,7 @@
   "devDependencies": {
     "@adonis-agora/durable-dashboard": "workspace:*",
     "@adonisjs/assembler": "8.5.2",
-    "@adonisjs/core": "7.5.2",
+    "@adonisjs/core": "7.6.0",
     "@adonisjs/lucid": "22.4.2",
     "@adonisjs/queue": "0.6.2",
     "@adonisjs/redis": "11.0.0",
