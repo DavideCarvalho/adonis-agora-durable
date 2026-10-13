@@ -44,7 +44,7 @@
   },
   "devDependencies": {
     "@adonis-agora/filter-client": "0.3.1",
-    "@base-ui/react": "1.8.0",
+    "@base-ui/react": "1.9.0",
     "@tailwindcss/postcss": "4.3.3",
     "@tanstack/intent": "0.5.5",
     "@tanstack/react-query": "5.104.1",
