@@ -28,7 +28,7 @@
     "@biomejs/biome": "2.5.15",
     "@changesets/changelog-github": "1.0.1",
     "@changesets/cli": "3.0.3",
-    "@swc/core": "1.16.13",
+    "@swc/core": "1.16.18",
     "turbo": "2.11.7",
     "typescript": "7.0.2",
     "unplugin-swc": "1.6.0",
