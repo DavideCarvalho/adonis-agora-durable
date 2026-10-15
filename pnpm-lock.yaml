@@ -197,8 +197,8 @@ importers:
         specifier: 0.10.0
         version: 0.10.0(@adonisjs/core@7.6.0(@adonisjs/assembler@8.5.2(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(@adonisjs/lucid@22.4.2(@adonisjs/assembler@8.5.2(typescript@7.0.2))(@adonisjs/core@7.6.0(@adonisjs/assembler@8.5.2(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.0.3)(luxon@3.7.2)(supports-color@10.2.2))
       zod:
-        specifier: 4.6.5
-        version: 4.6.5
+        specifier: 4.6.6
+        version: 4.6.6
     devDependencies:
       '@adonis-agora/durable-dashboard':
         specifier: workspace:*
@@ -3892,8 +3892,8 @@ packages:
   youch@4.1.1:
     resolution: {integrity: sha512-mxW3qiSnl+GRxXsaUMzv2Mbada1Y8CDltET9UxejDQe6DBYlSekghl5U5K0ReAikcHDi0G1vKZEmmo/NWAGKLA==}
 
-  zod@4.6.5:
-    resolution: {integrity: sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q==}
+  zod@4.6.6:
+    resolution: {integrity: sha512-4UmzQUF5fxvfcYHlbjBmejU+w+hbDnWFx4aS8kBx7nPBHcO2SqPbpAG8snbdg+Xse4pRefR98hgjFgIMCI/UhA==}
 
   zustand@4.5.7:
     resolution: {integrity: sha512-CHOUy7mu3lbD6o6LJLfllpjkzhHXSBlX8B9+qPddUsIfeF5S/UZ5q0kmCsnRqT1UHFQZchNFDDzMbQsuesHWlw==}
@@ -7072,7 +7072,7 @@ snapshots:
       cookie-es: 3.1.1
       youch-core: 0.3.3
 
-  zod@4.6.5: {}
+  zod@4.6.6: {}
 
   zustand@4.5.7(@types/react@19.3.0)(react@19.3.0):
     dependencies:
