@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 0.43.5
+
+### Patch Changes
+
+- fix(deps): update dependency zod to v4.6.7 ([#291](https://github.com/DavideCarvalho/adonis-agora-durable/issues/291))
+
 ## 0.43.4
 
 ### Patch Changes
