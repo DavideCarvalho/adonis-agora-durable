@@ -1,24 +1,56 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended"],
+  "description": [
+    "minimumReleaseAge mirrors pnpm's own policy. pnpm 11 refuses to install a package published within the last 24 hours, and `--frozen-lockfile` turns that into ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION, so an update proposed sooner than that cannot pass CI no matter what it contains. Three days rather than one because the entries that trip the check are usually the update's siblings, published as a set alongside it, and Renovate ages only the package it names."
+  ],
+  "minimumReleaseAge": "3 days",
   "rangeStrategy": "pin",
   "packageRules": [
     {
-      "description": "Never touch `engines.node`. It declares the range of runtimes a package SUPPORTS, not a dependency to pin: the global `rangeStrategy: pin` rewrote it to the exact output of `node -v`, which warns on every consumer install and fails hard under `engine-strict`.",
+      "description": "Never touch `engines.node`. It declares the range of runtimes a package SUPPORTS, not a dependency to pin: the global `rangeStrategy: pin` rewrites it to the exact version Renovate happened to run on, which warns on install for every consumer on another Node and hard-fails under `engine-strict`.",
       "matchDepTypes": ["engines"],
       "enabled": false
     },
     {
+      "description": "Patch, minor and pin bumps merge on their own once CI is green. These are the ones `release.yml` turns into an automatic patch release. `pin` is its own update type in Renovate rather than a flavour of patch, so it has to be named here or the initial pinning PR sits open forever.",
       "matchDepTypes": ["dependencies", "devDependencies"],
-      "matchUpdateTypes": ["patch", "minor"],
-      "automerge": true
+      "matchUpdateTypes": ["patch", "minor", "pin"],
+      "automerge": true,
+      "automergeStrategy": "squash"
     },
     {
+      "description": "Majors are reviewed by hand, and merging one by hand means no automatic release either.",
       "matchDepTypes": ["dependencies", "devDependencies"],
       "matchUpdateTypes": ["major"],
       "automerge": false
     },
     {
+      "description": "A GitHub Actions bump changes nothing a consumer installs, so it merges on its own and never cuts a release. Its updates arrive under the `github-actions` manager rather than as a dependency depType, so the rules above do not reach them. Majors still wait for a person.",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["patch", "minor", "pin", "pinDigest", "digest"],
+      "automerge": true,
+      "automergeStrategy": "squash"
+    },
+    {
+      "description": "changesets/action v2 refuses to run against Changesets CLI v2, which is what this repo has: it exits with `This version of the Changesets action is designed to work with Changesets CLI v3`. The action major is blocked until `@changesets/cli` is on v3, and a PR for it would look safe because no CI job exercises the release path.",
+      "matchPackageNames": ["changesets/action"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    },
+    {
+      "description": "`ai` and `@ai-sdk/*` ship as one release train, and `@ai-sdk/react` depends on an exact `ai`. Updating either side alone leaves two copies of `ai` in the tree, whose types are not the same types — the inferred return of a hook wrapping `useChat` then cannot be named (TS2742) and the build fails on a version bump that is individually fine. Grouping them keeps the tree at one copy.",
+      "matchPackageNames": ["ai", "@ai-sdk/**"],
+      "groupName": "ai sdk"
+    },
+    {
+      "description": "typescript-eslint gates the TypeScript that adonis-agora-durable's eslint-plugin package can use: its latest release, 8.70.0, declares `typescript: >=4.8.4 <6.1.0` and throws `typescript-eslint does not support TS 7.0` at run time. Scoped by path, so it is inert in every repo without that file. Lift it once typescript-eslint ships TS 7 support.",
+      "matchFileNames": ["packages/eslint-plugin/package.json"],
+      "matchPackageNames": ["typescript"],
+      "allowedVersions": "<6.1.0"
+    },
+    {
+      "description": "A peer range is the compatibility window this package advertises. Widen it rather than pinning it, and never without a human deciding the window is really that wide.",
       "matchDepTypes": ["peerDependencies"],
       "rangeStrategy": "widen",
       "automerge": false
@@ -28,5 +60,5 @@
     "enabled": true,
     "automerge": true
   },
-  "ignorePaths": ["**/dist/**", "**/node_modules/**"]
+  "ignorePaths": ["**/dist/**", "**/node_modules/**", "**/.next/**", "**/build/**"]
 }

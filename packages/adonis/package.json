@@ -1,6 +1,6 @@
 {
   "name": "@adonis-agora/durable",
-  "version": "0.39.1",
+  "version": "0.43.5",
   "description": "Durable cross-app workflows for AdonisJS — deterministic replay engine, AdonisJS binding, ace commands, dashboard, OpenTelemetry, Telescope, testing harness and Redis admission, all in one package. Part of the Agora ecosystem.",
   "license": "MIT",
   "repository": {
@@ -8,6 +8,24 @@
     "url": "git+https://github.com/DavideCarvalho/adonis-agora-durable.git",
     "directory": "packages/adonis"
   },
+  "homepage": "https://davidecarvalho.github.io/agora/docs/durable",
+  "bugs": {
+    "url": "https://github.com/DavideCarvalho/adonis-agora-durable/issues"
+  },
+  "keywords": [
+    "adonisjs",
+    "adonis",
+    "durable",
+    "workflow",
+    "saga",
+    "replay",
+    "dashboard",
+    "opentelemetry",
+    "telescope",
+    "testing",
+    "tanstack-intent",
+    "agora"
+  ],
   "author": "Davi Carvalho <davi@goflip.ai>",
   "type": "module",
   "main": "./dist/src/index.js",
@@ -117,8 +135,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.tests.json"
   },
   "dependencies": {
-    "@adonis-agora/filter": "0.9.0",
-    "zod": "4.5.4"
+    "@adonis-agora/filter": "0.10.0",
+    "zod": "4.6.7"
   },
   "peerDependencies": {
     "@adonisjs/assembler": "^8.4.0",
@@ -128,7 +146,7 @@
     "@adonisjs/redis": "^9.2.0 || ^10.0.0 || ^11.0.0",
     "@opentelemetry/api": "^1.0.0",
     "bullmq": "^5.0.0 || ^6.0.0",
-    "cron-parser": "^4.0.0 || ^5.0.0",
+    "cron-parser": "^5.0.0",
     "ioredis": "^5.0.0 || ^6.0.0",
     "vitest": "^3.0.0 || ^4.0.0 || ^5.0.0"
   },
@@ -163,42 +181,27 @@
   },
   "devDependencies": {
     "@adonis-agora/durable-dashboard": "workspace:*",
-    "@adonisjs/assembler": "8.5.1",
-    "@adonisjs/core": "7.5.0",
+    "@adonisjs/assembler": "8.5.2",
+    "@adonisjs/core": "7.6.0",
     "@adonisjs/lucid": "22.4.2",
     "@adonisjs/queue": "0.6.2",
     "@adonisjs/redis": "11.0.0",
     "@opentelemetry/api": "1.9.1",
-    "@opentelemetry/context-async-hooks": "2.11.0",
-    "@opentelemetry/sdk-trace-base": "2.11.0",
+    "@opentelemetry/context-async-hooks": "2.12.0",
+    "@opentelemetry/sdk-trace-base": "2.12.0",
     "@poppinss/hooks": "7.3.1",
-    "@tanstack/intent": "^0.4.0",
+    "@tanstack/intent": "0.5.5",
     "@types/better-sqlite3": "9.6.0",
-    "@types/node": "26.4.1",
+    "@types/node": "26.6.5",
     "better-sqlite3": "13.0.3",
-    "bullmq": "6.3.4",
-    "cron-parser": "5.10.0",
-    "cron-parser-v4": "npm:cron-parser@^4.9.0",
+    "bullmq": "6.3.14",
+    "cron-parser": "5.10.2",
     "ioredis": "6.0.0",
     "typescript": "7.0.2",
-    "vitest": "5.0.0",
-    "zod": "4.5.4"
+    "vitest": "5.0.4",
+    "zod": "4.6.7"
   },
   "engines": {
     "node": ">=20.6.0"
-  },
-  "keywords": [
-    "adonisjs",
-    "adonis",
-    "durable",
-    "workflow",
-    "saga",
-    "replay",
-    "dashboard",
-    "opentelemetry",
-    "telescope",
-    "testing",
-    "tanstack-intent",
-    "agora"
-  ]
+  }
 }

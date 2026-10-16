@@ -6,6 +6,7 @@ import {
   ContinueAsNew,
   FatalError,
   GatherError,
+  NestedWorkflowCallError,
   NonDeterminismError,
   SignalTimeoutError,
   WorkflowSuspended,
@@ -31,6 +32,7 @@ import type {
 import { breakpointToken } from './protocol.js';
 import { createStepLogger } from './step-logger.js';
 import { type StepConfig, type StepRef, stepConfigOf, stepNameOf } from './step-name-symbol.js';
+import { currentStepScope, runInStepScope } from './workflow-als.js';
 import { type WorkflowRef, workflowName } from './workflow-ref.js';
 
 /**
@@ -160,6 +162,10 @@ class Position {
   rewind(): void {
     this.seq -= 1;
   }
+  /** The position the NEXT primitive would claim, without claiming it. */
+  peek(): number {
+    return this.seq + 1;
+  }
 }
 
 /**
@@ -183,6 +189,9 @@ export function createWorkflowCtx(
 ): InternalWorkflowCtx {
   const { store, replay } = host;
   const pos = new Position();
+  // This ctx's identity in the ambient step scope (see `runInStepScope`): lets a primitive tell "I am
+  // being called from inside one of MY step bodies" apart from another run's body executing inline.
+  const scopeOwner = {};
 
   // Read the checkpoint at `seq`: from the per-execution snapshot when present (no DB round-trip),
   // otherwise from the live store. Absence in the snapshot means "written after the snapshot" (the
@@ -247,7 +256,8 @@ export function createWorkflowCtx(
           seq: current,
           attempt,
         };
-        const body = () => fn(createStepLogger(events, host.clock));
+        const body = () =>
+          runInStepScope(scopeOwner, name, () => fn(createStepLogger(events, host.clock)));
         const output = host.interceptStep
           ? await host.interceptStep(invocation, body)
           : await body();
@@ -305,7 +315,7 @@ export function createWorkflowCtx(
     }
     if (existing && existing.status === 'completed') return existing.output as T;
     return store.transaction(async (tx) => {
-      const output = await fn(tx.raw);
+      const output = await runInStepScope(scopeOwner, name, () => fn(tx.raw));
       const cp = instantCheckpoint({ runId, seq: current, name, kind: 'local', output });
       await tx.saveCheckpoint(cp);
       // Reflect the committed checkpoint in the snapshot, keeping the writeback invariant uniform.
@@ -1016,29 +1026,62 @@ export function createWorkflowCtx(
       });
   }
 
+  // Fail fast when a primitive is called from INSIDE one of this ctx's step bodies (directly, or via
+  // a `BaseWorkflow.start()`/`.dispatch()` static resolving the ambient ctx). The step replays from
+  // its checkpoint without re-running its body, so the nested call's journal position would never be
+  // claimed again and every later position would shift — a NonDeterminismError on the next replay,
+  // far from the cause. See {@link NestedWorkflowCallError}.
+  //
+  // Versioning: a run journaled BEFORE this guard existed may legitimately re-run such a body (its
+  // step never completed) with the nested call already recorded at the position it would claim. That
+  // position being occupied means the history predates the guard — let the call through so the
+  // existing journal keeps replaying exactly as it was written. Only a call that would write NEW
+  // history is refused. Outside a step body the guard is a sync pass-through (timing unchanged).
+  const nestedStep = (): string | undefined => {
+    const scope = currentStepScope();
+    return scope !== undefined && scope.owner === scopeOwner ? scope.step : undefined;
+  };
+  const guard = <F extends (...args: never[]) => Promise<unknown>>(primitive: string, fn: F): F =>
+    ((...args: Parameters<F>) => {
+      const stepName = nestedStep();
+      if (stepName === undefined) return fn(...args);
+      return (async () => {
+        if (await readCheckpoint(pos.peek())) return fn(...args);
+        throw new NestedWorkflowCallError(runId, primitive, stepName);
+      })();
+    }) as F;
+  // `webhook` is synchronous (it returns a handle): same rule, checked against the replay snapshot.
+  const guardedWebhook = <T>(): DurableWebhook<T> => {
+    const stepName = nestedStep();
+    if (stepName !== undefined && !replay?.get(pos.peek())) {
+      throw new NestedWorkflowCallError(runId, 'webhook', stepName);
+    }
+    return webhook<T>();
+  };
+
   return {
     runId,
-    step,
-    localStep,
-    upsertSearchAttributes,
-    transaction,
-    callEntity,
-    signalEntity,
-    sleep,
-    sleepUntil,
+    step: guard('step', step as (...args: never[]) => Promise<unknown>) as typeof step,
+    localStep: guard('localStep', localStep),
+    upsertSearchAttributes: guard('upsertSearchAttributes', upsertSearchAttributes),
+    transaction: guard('transaction', transaction),
+    callEntity: guard('callEntity', callEntity),
+    signalEntity: guard('signalEntity', signalEntity),
+    sleep: guard('sleep', sleep),
+    sleepUntil: guard('sleepUntil', sleepUntil),
     continueAsNew,
-    waitForSignal,
-    waitForEvent,
-    task,
-    child,
-    all,
-    startChild,
-    breakpoint,
-    webhook,
-    setEvent,
-    onUpdate,
-    patched,
-    now,
-    sideEffect,
+    waitForSignal: guard('waitForSignal', waitForSignal),
+    waitForEvent: guard('waitForEvent', waitForEvent),
+    task: guard('task', task),
+    child: guard('child', child),
+    all: guard('all', all),
+    startChild: guard('startChild', startChild),
+    breakpoint: guard('breakpoint', breakpoint),
+    webhook: guardedWebhook,
+    setEvent: guard('setEvent', setEvent),
+    onUpdate: guard('onUpdate', onUpdate),
+    patched: guard('patched', patched),
+    now: guard('now', now),
+    sideEffect: guard('sideEffect', sideEffect),
   };
 }

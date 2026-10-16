@@ -476,6 +476,35 @@ export interface StateStore {
 
   // Dashboard queries
   listRuns(query: RunQuery): Promise<WorkflowRun[]>;
+  /**
+   * How many runs match `query` — a single `COUNT(*)` over the same predicates {@link listRuns}
+   * applies, without materializing a row. What the start-time concurrency quota asks on every start
+   * (`tag = concurrency:<key> AND status IN (...)`), so it must stay an aggregate, not a listing.
+   * Optional: without it the engine counts a {@link listRuns} result.
+   */
+  countRuns?(query: Omit<RunQuery, 'page' | 'size'>): Promise<number>;
+
+  // Persisted schedules (optional) — see {@link ScheduleRecord}. A store implements all five or none;
+  // `engine.schedules` refuses to run on a store without them.
+
+  /** Insert or fully replace the schedule `record.id`. */
+  saveSchedule?(record: ScheduleRecord): Promise<void>;
+  /** The schedule `id`, or null. */
+  getSchedule?(id: string): Promise<ScheduleRecord | null>;
+  /**
+   * Patch the schedule `id`. With `expectedNextFireAt`, a compare-and-set: the patch applies only if
+   * the stored `nextFireAt` still equals it (`null` matching NULL) — how two schedulers racing on the
+   * same due schedule agree on who advanced it. Returns whether a row was updated.
+   */
+  updateSchedule?(
+    id: string,
+    patch: Partial<Omit<ScheduleRecord, 'id' | 'createdAt'>>,
+    expectedNextFireAt?: number | null,
+  ): Promise<boolean>;
+  /** Delete the schedule `id`. Returns whether it existed. Its past runs are left alone. */
+  deleteSchedule?(id: string): Promise<boolean>;
+  /** Schedules matching `query`, ordered by `nextFireAt` ascending (never-firing last), then `id`. */
+  listSchedules?(query: ScheduleQuery): Promise<ScheduleRecord[]>;
   listCheckpoints(runId: string): Promise<StepCheckpoint[]>;
 
   /**
@@ -649,6 +678,51 @@ export interface RunQuery {
  * being viewed.
  */
 export type RunFacetQuery = Omit<RunQuery, 'status' | 'statuses' | 'page' | 'size'>;
+
+/**
+ * The run predicates a bulk operation (a scoped retention policy, `engine.purgeRuns`) is confined
+ * to — the identity axes of a {@link RunQuery}: which tenant (`namespace`), which kind of run
+ * (`workflow`/`tags`), which business entity (`attributes`). Status, time and paging are left out on
+ * purpose: each bulk operation owns its own rule for those.
+ */
+export type RunScope = Pick<
+  RunQuery,
+  'workflow' | 'workflows' | 'tag' | 'tags' | 'namespace' | 'namespaces' | 'attributes'
+>;
+
+/** True when `scope` sets at least one predicate — a bulk delete refuses an empty (match-all) scope. */
+export function isNonEmptyRunScope(scope: RunScope | undefined): boolean {
+  if (!scope) return false;
+  return (
+    scope.workflow !== undefined ||
+    scope.workflows !== undefined ||
+    scope.tag !== undefined ||
+    scope.tags !== undefined ||
+    scope.namespace !== undefined ||
+    scope.namespaces !== undefined ||
+    (scope.attributes !== undefined && scope.attributes.length > 0)
+  );
+}
+
+/** The terminal run statuses — the only ones retention may delete. */
+export type TerminalRunStatus = 'completed' | 'failed' | 'cancelled' | 'dead';
+export const TERMINAL_RUN_STATUSES: readonly TerminalRunStatus[] = [
+  'completed',
+  'failed',
+  'cancelled',
+  'dead',
+];
+
+/**
+ * A retention rule confined to a {@link RunScope}: terminal runs in `statuses` matching `scope` are
+ * hard-deleted once their last activity is older than `maxAgeMs`. Sits next to the per-status
+ * `retention` ages, so e.g. chat turns can age out after a day while everything else keeps 30.
+ */
+export interface ScopedRetentionPolicy {
+  statuses: TerminalRunStatus[];
+  maxAgeMs: number;
+  scope: RunScope;
+}
 
 /**
  * Which axis {@link StateStore.runValueFacets} enumerates the distinct VALUES of. Every member is an
@@ -1663,6 +1737,50 @@ export interface WorkflowCtx {
   upsertSearchAttributes(attrs: SearchAttributes): Promise<void>;
 }
 
+/**
+ * {@link WorkflowCtx} with ONE signature per method: the string-addressed forms of the four overloaded
+ * methods (`step`, `child`, `startChild`, `all`), everything else unchanged.
+ *
+ * For code that drives the ctx DYNAMICALLY — an interpreter that runs a user-defined graph and only
+ * ever knows workflow/step names as strings — and for test fakes. An overloaded method is awkward to
+ * satisfy structurally (a fake must implement every overload, and a hand-written narrow interface has
+ * to guess which overload TS will match), so depend on this instead — or on a `Pick` of it:
+ *
+ * ```ts
+ * type InterpreterCtx = Pick<DynamicWorkflowCtx, 'runId' | 'localStep' | 'child' | 'all' | 'sleep'>;
+ * new Interpreter(ctx); // a WorkflowCtx IS a DynamicWorkflowCtx — no `as unknown as` cast
+ * ```
+ *
+ * Every `WorkflowCtx` is assignable to it (guarded by `test/types/dynamic-workflow-ctx.ts`).
+ */
+export interface DynamicWorkflowCtx
+  extends Omit<WorkflowCtx, 'step' | 'child' | 'startChild' | 'all'> {
+  /** {@link WorkflowCtx.step} by step name. */
+  step<TOutput = unknown>(
+    name: string,
+    input: unknown,
+    opts?: StepDispatchOpts & { compensate?: string },
+  ): Promise<TOutput>;
+  /** {@link WorkflowCtx.child} by workflow name. */
+  child<TOutput = unknown>(
+    workflow: string,
+    input: unknown,
+    options?: string | ChildCallOptions,
+  ): Promise<TOutput>;
+  /** {@link WorkflowCtx.startChild} by workflow name. */
+  startChild(
+    workflow: string,
+    input: unknown,
+    options?: string | ChildCallOptions,
+  ): Promise<string>;
+  /** {@link WorkflowCtx.all} by workflow name. */
+  all<TOutput = unknown>(
+    workflow: string,
+    inputs: unknown[],
+    opts?: { mode?: 'waitAll' | 'failFast' },
+  ): Promise<TOutput[]>;
+}
+
 /** Result of executing or resuming a workflow run. */
 export interface RunResult {
   runId: string;
@@ -1734,6 +1852,15 @@ export interface EngineEvent {
    *  control-plane descriptor negotiated against — enough to render WHY the run parked. Absent on all
    *  other event types. */
   diagnostics?: DispatchDiagnostics | undefined;
+  /**
+   * On a `step.started`: this dispatch is a lost-dispatch RE-DRIVE, not a first attempt — the step's
+   * lease lapsed with no result and no heartbeat (the worker holding it is presumed gone), so the
+   * engine re-enqueued it (see `WorkflowEngineDeps.remoteRedispatchMs`). Absent on a normal dispatch
+   * and on a failure retry, so a dashboard/alert can tell "re-driven after a lost worker" apart from
+   * "retried after a failure". The step's persisted event trail carries the same fact durably
+   * (`step.redispatched`).
+   */
+  redispatched?: boolean | undefined;
   at: Date;
 }
 
@@ -1762,3 +1889,43 @@ export type StepInterceptor = (
   invocation: StepInvocation,
   next: () => Promise<unknown>,
 ) => Promise<unknown>;
+
+/**
+ * A persisted schedule as the STORE sees it: a handful of queryable columns plus two JSON documents
+ * the store keeps verbatim (`spec`, `state`) and never interprets. The engine's schedule client owns
+ * their meaning (cron/interval math, overlap, catch-up) — so a store only persists rows and answers
+ * "which unpaused schedules are due by T".
+ */
+export interface ScheduleRecord {
+  /** Caller-chosen, stable id (e.g. `digest:user-42`) — also part of every run id it starts. */
+  id: string;
+  /** Partition: the namespace its runs are stamped with, and which schedulers fire it. */
+  namespace: string;
+  /** Registered workflow name the schedule starts. */
+  workflow: string;
+  /** A paused schedule is never due. */
+  paused: boolean;
+  /** Epoch ms at which it is next due (jitter included), or null when it will never fire again. */
+  nextFireAt: number | null;
+  /** Labels to list/filter schedules by (also stamped onto the runs it starts). */
+  tags?: string[] | undefined;
+  /** The schedule's definition — opaque to the store. */
+  spec: Record<string, unknown>;
+  /** The schedule's bookkeeping (last fire, last run id, last error…) — opaque to the store. */
+  state: Record<string, unknown>;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/** Filter for {@link StateStore.listSchedules}. Every predicate is ANDed; absent = unrestricted. */
+export interface ScheduleQuery {
+  namespace?: string | undefined;
+  workflow?: string | undefined;
+  /** Only schedules carrying this tag. */
+  tag?: string | undefined;
+  paused?: boolean | undefined;
+  /** Only DUE schedules: unpaused, `nextFireAt <= dueBy`. */
+  dueBy?: number | undefined;
+  limit?: number | undefined;
+  offset?: number | undefined;
+}

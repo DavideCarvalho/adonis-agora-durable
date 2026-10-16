@@ -114,6 +114,12 @@ async function runTickInScope(engine: WorkflowEngine, options: TickOptions): Pro
     const ids = await runSchedules(engine, schedules, now ?? Date.now());
     return ids.length;
   });
+  // …and the PERSISTED schedules (`engine.schedules`), when `persistedSchedules` is on: one indexed
+  // "due by now" query; each window's run id is deterministic and advancing is a compare-and-set, so
+  // racing workers start every window exactly once.
+  result.scheduled += await phase('runPersistedSchedules', async () =>
+    engine.persistedSchedulesEnabled ? (await engine.schedules.tick(now)).length : 0,
+  );
   // 6th phase — retention: evict terminal runs past their configured age. Self-throttled inside the
   // engine (one pass a minute); a no-op without a `retention` config.
   result.evicted = await phase('sweepRetention', async () => engine.sweepRetention(now));

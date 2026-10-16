@@ -4,6 +4,10 @@ name: Release
 # - With pending changesets, opens/updates a "version packages" PR.
 # - With none, publishes any package whose version isn't on npm yet.
 on:
+  # Renovate's automerge of a patch/minor dependency bump lands here; the job below is
+  # fenced so that a push by anyone else still releases nothing on its own.
+  push:
+    branches: [master]
   workflow_dispatch:
 
 concurrency:
@@ -20,17 +24,18 @@ permissions:
 
 jobs:
   release:
+    if: github.event_name == 'workflow_dispatch' || github.actor == 'renovate[bot]'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.4.0
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
-      - uses: pnpm/action-setup@v6.0.10
+      - uses: pnpm/action-setup@v6.1.0
 
-      - uses: actions/setup-node@v4.4.0
+      - uses: actions/setup-node@v7.1.0
         with:
-          node-version: 22.23.2
+          node-version: 24.21.0
           cache: pnpm
           registry-url: 'https://registry.npmjs.org'
 
@@ -52,18 +57,92 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
 
+      # A Renovate patch/minor bump automerges on its own and brings no changeset with it, so
+      # the step below would find nothing to publish and the new dependency would reach npm
+      # only whenever someone next released by hand. This writes the changeset for it and
+      # versions it in place, leaving the release a plain "nothing pending, publish" run.
+      # Majors are merged by a person, so github.actor is not renovate[bot] and none of it runs.
+      - name: Release a Renovate dependency bump
+        if: github.event_name == 'push' && github.actor == 'renovate[bot]'
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          cat > "$RUNNER_TEMP/renovate-release.mjs" <<'NODE'
+          // Writes a patch changeset for a Renovate dependency bump, and only for one: it stays quiet
+          // unless a published package's dependencies or peerDependencies actually moved, so lockfile
+          // maintenance, devDependency bumps and Actions bumps do not each cut a release.
+          import { execFileSync } from "node:child_process";
+          import { existsSync, readdirSync, writeFileSync } from "node:fs";
+
+          const before = process.env.BEFORE;
+          const after = process.env.AFTER || "HEAD";
+          const git = (...args) => execFileSync("git", args, { encoding: "utf8" });
+          const skip = (why) => {
+            console.log("No dependency release: " + why);
+            process.exit(0);
+          };
+
+          // A changeset already waiting means a hand-written release is queued behind it. Versioning now
+          // would drag that unreleased work out under a dependency bump's name.
+          const pending = existsSync(".changeset")
+            ? readdirSync(".changeset").filter((f) => f.endsWith(".md") && f.toLowerCase() !== "readme.md")
+            : [];
+          if (pending.length > 0) skip("changeset(s) already pending (" + pending.join(", ") + ")");
+          if (!before || /^0+$/.test(before)) skip("no previous commit to compare against");
+
+          const changed = git("diff", "--name-only", before + ".." + after)
+            .split("\n")
+            .filter((f) => f === "package.json" || f.endsWith("/package.json"));
+          if (changed.length === 0) skip("no package.json changed");
+
+          const readAt = (rev, path) => {
+            try {
+              return JSON.parse(git("show", rev + ":" + path));
+            } catch {
+              return null;
+            }
+          };
+
+          const bumped = [];
+          for (const path of changed) {
+            const now = readAt(after, path);
+            if (!now || !now.name || now.private === true) continue;
+            const then = readAt(before, path) || {};
+            const moved = ["dependencies", "peerDependencies"].some(
+              (field) => JSON.stringify(now[field] || {}) !== JSON.stringify(then[field] || {}),
+            );
+            if (moved) bumped.push(now.name);
+          }
+          if (bumped.length === 0) skip("no published package changed a runtime dependency");
+
+          const summary = git("log", "-1", "--pretty=%s", after).trim();
+          writeFileSync(
+            ".changeset/renovate-" + after.slice(0, 12) + ".md",
+            ["---", ...bumped.map((name) => '"' + name + '": patch'), "---", "", summary, ""].join("\n"),
+          );
+          console.log("Patch release queued for " + bumped.join(", "));
+          NODE
+          node "$RUNNER_TEMP/renovate-release.mjs"
+          if [ -z "$(git status --porcelain .changeset)" ]; then exit 0; fi
+          pnpm version-packages
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m "chore: version packages"
+          git push origin HEAD:${{ github.ref_name }}
+
       - name: Create release PR or publish
-        uses: changesets/action@v1.9.0
+        uses: changesets/action@v2.1.2
         with:
-          version: pnpm version-packages
-          publish: pnpm release
-          commit: 'chore: version packages'
-          title: 'chore: version packages'
+          version-script: pnpm version-packages
+          publish-script: pnpm release
+          commit-message: 'chore: version packages'
+          pr-title: 'chore: version packages'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Deliberadamente vazio: o setup-node escreve o .npmrc com
           # _authToken=${NODE_AUTH_TOKEN}, e um token de verdade ali GANHA do OIDC -- o npm
           # usa o token e nunca troca o id-token por credencial. Vazio, o npm ve que nao ha
-          # auth e cai no trusted publishing. O secret NPM_TOKEN segue existindo; basta
-          # devolver `${{ secrets.NPM_TOKEN }}` aqui pra reverter pro token.
+          # auth e cai no trusted publishing.
           NODE_AUTH_TOKEN: ''

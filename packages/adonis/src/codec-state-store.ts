@@ -5,6 +5,8 @@ import type {
   RunValueAxis,
   RunValueFacetOptions,
   RunValueFacetRow,
+  ScheduleQuery,
+  ScheduleRecord,
   SignalWaiter,
   StateStore,
   StepCheckpoint,
@@ -53,12 +55,50 @@ export interface CodecStateStoreOptions {
 export class CodecStateStore implements StateStore {
   private readonly extended: boolean;
 
+  /** Schedules persist their run `input` inside `spec` — encoded like any other payload. Bound only
+   *  when the inner store persists schedules, so `engine.schedules` reports absence faithfully. */
+  readonly saveSchedule?: (record: ScheduleRecord) => Promise<void>;
+  readonly getSchedule?: (id: string) => Promise<ScheduleRecord | null>;
+  readonly updateSchedule?: (
+    id: string,
+    patch: Partial<Omit<ScheduleRecord, 'id' | 'createdAt'>>,
+    expectedNextFireAt?: number | null,
+  ) => Promise<boolean>;
+  readonly deleteSchedule?: (id: string) => Promise<boolean>;
+  readonly listSchedules?: (query: ScheduleQuery) => Promise<ScheduleRecord[]>;
+
   constructor(
     private readonly inner: StateStore,
     private readonly codec: PayloadCodec,
     options: CodecStateStoreOptions = {},
   ) {
     this.extended = options.coverage === 'extended';
+    const { saveSchedule, getSchedule, updateSchedule, deleteSchedule, listSchedules } = inner;
+    if (saveSchedule && getSchedule && updateSchedule && deleteSchedule && listSchedules) {
+      this.saveSchedule = (r) => saveSchedule.call(inner, this.encSchedule(r));
+      this.getSchedule = async (id) => this.decSchedule(await getSchedule.call(inner, id));
+      this.updateSchedule = (id, patch, expected) =>
+        updateSchedule.call(
+          inner,
+          id,
+          patch.spec ? { ...patch, spec: this.encSpec(patch.spec) } : patch,
+          expected,
+        );
+      this.deleteSchedule = (id) => deleteSchedule.call(inner, id);
+      this.listSchedules = async (q) =>
+        (await listSchedules.call(inner, q)).map((r) => this.decSchedule(r) as ScheduleRecord);
+    }
+  }
+
+  private encSpec(spec: Record<string, unknown>): Record<string, unknown> {
+    return 'input' in spec ? { ...spec, input: this.enc(spec.input) } : spec;
+  }
+  private encSchedule(r: ScheduleRecord): ScheduleRecord {
+    return { ...r, spec: this.encSpec(r.spec) };
+  }
+  private decSchedule(r: ScheduleRecord | null): ScheduleRecord | null {
+    if (!r || !('input' in r.spec)) return r;
+    return { ...r, spec: { ...r.spec, input: this.dec(r.spec.input) } };
   }
 
   private enc(v: unknown): unknown {
@@ -244,6 +284,11 @@ export class CodecStateStore implements StateStore {
   }
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     return (await this.inner.listRuns(query)).map((r) => this.decRun(r));
+  }
+  /** Forwarded when the inner store counts (a count reads no payload); else counts a listing. */
+  async countRuns(query: Omit<RunQuery, 'page' | 'size'>): Promise<number> {
+    if (this.inner.countRuns) return this.inner.countRuns(query);
+    return (await this.inner.listRuns(query)).length;
   }
   async runValueFacets(
     axis: RunValueAxis,

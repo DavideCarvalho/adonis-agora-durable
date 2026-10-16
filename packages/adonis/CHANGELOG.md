@@ -1,5 +1,153 @@
 # @adonis-agora/durable
 
+## 0.43.5
+
+### Patch Changes
+
+- fix(deps): update dependency zod to v4.6.7 ([#291](https://github.com/DavideCarvalho/adonis-agora-durable/issues/291))
+
+## 0.43.4
+
+### Patch Changes
+
+- fix(deps): update dependency zod to v4.6.6 ([#286](https://github.com/DavideCarvalho/adonis-agora-durable/issues/286))
+
+## 0.43.3
+
+### Patch Changes
+
+- [#264](https://github.com/DavideCarvalho/adonis-agora-durable/pull/264) [`8b063a4`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/8b063a4c6f4f2a7122a267b9aa38694704eb1b4a) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A run no longer executes twice at once in one process. The run lease is per engine instance, so a resume landing while this same process was still executing the run (a signal delivered while the run was parking, a late step result, a second signal, an explicit `resume()`) went straight past it and ran the body concurrently: a step whose checkpoint was not written yet ran twice. Resumes of a run are now serialized in-process: one landing mid-execution is queued and re-drives the run once that execution has settled and released its lease (resumes queued meanwhile coalesce into it), so the wake is neither doubled nor lost. Across processes the lease still decides, unchanged.
+
+## 0.43.2
+
+### Patch Changes
+
+- fix(deps): update dependency @adonis-agora/filter to v0.10.0 ([#243](https://github.com/DavideCarvalho/adonis-agora-durable/issues/243))
+
+## 0.43.1
+
+### Patch Changes
+
+- [#240](https://github.com/DavideCarvalho/adonis-agora-durable/pull/240) [`66600ed`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/66600ed753bf647f282bf08481c493bcce3b8287) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Terminal runs are immutable, and workflow primitives fail fast inside step bodies.
+  
+  - `cancel()` on a `failed` run is now a no-op, like on `completed`/`cancelled`/`dead`: it returns the current state, never rewrites the run to `cancelled`, and never cascades to the run's children. Previously cancelling a failed run relabelled it and cancelled its live children — e.g. the next queued chat turn an agent queue had already started as a child of the turn that failed. `cancelWhere` inherits the fix.
+  - `recheckWaitSeqs` and every other implicit wake-up (a delivered signal or child completion, a late step result, a due timer, a redelivered dispatch, a queue-slot wake) no longer re-drive a `failed` run. Only an explicit retry does: `requeue` (dashboard retry) or a direct `resume(runId)` call.
+  - New `NestedWorkflowCallError` (a `FatalError`, code `nested_workflow_call`): calling a ctx primitive (`ctx.startChild`, `ctx.child`, `ctx.step`, `ctx.sleep`, `ctx.sideEffect`, …, or a `BaseWorkflow.start()`/`.dispatch()` static through the ambient ctx) from inside a `ctx.localStep`/`ctx.transaction`/`ctx.sideEffect`/`ctx.now` body now throws at the call site. Before, the nested call wrote a journal entry that replay never reproduces, and the run failed later with a `NonDeterminismError`. Journals recorded before this change (where the nested entry is already at that position) still replay unchanged.
+  - Dispatched step handlers run outside the ambient workflow ctx, so in-process transports behave like remote workers: `BaseWorkflow.dispatch()` in a handler starts a top-level run and does not write into the suspended parent's journal.
+
+## 0.43.0
+
+### Minor Changes
+
+- [#222](https://github.com/DavideCarvalho/adonis-agora-durable/pull/222) [`9540e66`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/9540e66f942c3bbae6440ca6657909ffd6cc3734) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - **Persisted schedules** — port of nestjs-durable#338. Temporal-style schedules managed at runtime and stored next to the runs, alongside the code-declared `schedules` config / `static schedule`.
+  
+  - `engine.schedules`: `create` / `upsert` / `get` / `list` / `pause(note?)` / `resume` / `trigger` / `delete` / `tick`. A schedule starts `workflow` with `input` on a `cron` (+ IANA `timezone`) or a fixed `every` interval, with a stable per-window `jitter`, `overlap` (`allow` / `skip` while the previous run is in flight), `catchup` (`latest` missed window once, or `skip`), `tags` (also stamped on its runs, plus `schedule:<id>`), `searchAttributes`, `priority` and `namespace`. Failed starts are recorded as `lastError`; `get`/`list` report next/last fire, last run and fire count.
+  - **Multi-worker safe without locks**: a window's run id is deterministic (`sched:<id>:<windowMs>`) and advancing a schedule is a compare-and-set on its `next_fire_at`.
+  - `persistedSchedules: true` in `config/durable.ts` makes the worker tick (`durable:work` / the embedded worker) fire due schedules — off by default.
+  - New `durable_schedules` table, created by `createDurableTables` (auto-schema on boot; with `autoSchema: false`, add a migration that calls `createDurableTables` again — it only creates what's missing), and five optional `StateStore` methods (`saveSchedule`, `getSchedule`, `updateSchedule` with CAS, `deleteSchedule`, `listSchedules`) implemented by the Lucid and in-memory stores; `CodecStateStore` forwards them, encoding the schedule input. Covered by the shared contract.
+
+- [#226](https://github.com/DavideCarvalho/adonis-agora-durable/pull/226) [`edab227`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/edab227f547e2804688ec7b8596c085a71240393) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A persisted schedule can carry a **concurrency quota** (port of nestjs-durable#340): `engine.schedules.create/upsert({ …, concurrency: { key, limit, countStatuses? } })` applies it to every run the schedule starts, like `StartOptions.concurrency`. An over-limit window is skipped and recorded as the schedule's `lastError`; the schedule moves on to its next window.
+
+## 0.42.0
+
+### Minor Changes
+
+- [#221](https://github.com/DavideCarvalho/adonis-agora-durable/pull/221) [`448b3b1`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/448b3b129c0f586b19b35036cf76a4e3982d7a60) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - New `DynamicWorkflowCtx` type — port of nestjs-durable#337: `WorkflowCtx` with ONE string-addressed signature for each of its overloaded methods (`step`, `child`, `startChild`, `all`). Every `WorkflowCtx` is assignable to it, so code that drives the ctx by names (a graph interpreter) and test fakes can depend on it — or on a `Pick` of it — instead of re-declaring a narrow interface and casting `ctx as unknown as …`. A type-test pins the assignability.
+
+- [#219](https://github.com/DavideCarvalho/adonis-agora-durable/pull/219) [`614ca9b`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/614ca9bd259e48710738a88f73dc227d4f9844c2) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Retention can be **scoped**, and a tenant's runs can be **purged** through the engine — port of nestjs-durable#335.
+  
+  - **`retention.policies`** (engine: `retentionPolicies`): scoped rules next to the per-status ages — each deletes terminal runs in its `statuses` that match its `scope` (`namespace(s)`, `workflow(s)`, `tag`/`tags`, search-attribute `attributes` — the new `RunScope` type) once their last activity is older than `maxAge`. Swept by the same throttled `sweepRetention`, with the same `onEvict` archival hooks and subtree cascade. A namespaced worker never sweeps another partition's scope.
+  - **`engine.purgeRuns(scope, { batchSize?, cancelLive?, children? })` / `engine.purgeNamespace(ns)`**: hard-delete every run a scope matches with its child subtree (children inherit `namespace`, not `tags` — they go with their root either way), in bounded batches, sweeping their buffered signals. Live runs are cancelled first (`cancelLive: false` keeps them). An empty scope is rejected.
+  - New exports: `RunScope`, `isNonEmptyRunScope`, `TERMINAL_RUN_STATUSES`, `TerminalRunStatus`, `ScopedRetentionPolicy`.
+
+- [#220](https://github.com/DavideCarvalho/adonis-agora-durable/pull/220) [`0d19781`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/0d1978138af2bb5f7348b49dd618fad77aa4c200) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - **Start-time concurrency quotas** — port of nestjs-durable#336. Cap how many runs sharing a key can be in flight and reject the start that would exceed it ("a tenant can have at most 8 turns executing"), without a hand-rolled count gate.
+  
+  - `static workflow = { concurrency: { key: (input) => …, limit, countStatuses? } }` (also `engine.register` / `registerRemote`), or per start with `StartOptions.concurrency: { key, limit, countStatuses? }` (overrides the workflow's). The key is global, so several workflows can share one quota; `limit` may be an async function of the key; `countStatuses` narrows what occupies a slot (default: every non-terminal status).
+  - Over the limit `start` throws **`ConcurrencyLimitError`** (`key`, `limit`, `active`, `workflow`) and creates nothing; an idempotent re-start of an existing run id is never rejected. Quota-bearing runs carry the engine-minted tag `concurrency:<key>`.
+  - New optional `StateStore.countRuns(query)` — one `COUNT(*)` over the `listRuns` predicates — implemented by the Lucid and in-memory stores and `CodecStateStore`, and covered by the shared contract. The engine falls back to counting a listing for a custom store.
+  
+  A soft cap under a race (count and insert are separate statements); use `singleton` for a strict, queueing per-key limit.
+
+## 0.41.1
+
+### Patch Changes
+
+- [#202](https://github.com/DavideCarvalho/adonis-agora-durable/pull/202) [`573a198`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/573a198ae5e1e69503f3a37d3b9817da07b038c4) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A run is no longer counted, dead-lettered or executed twice when its turn settles while the orphan sweep is looking at it.
+  
+  Port of the same race fixed in the NestJS core (nestjs-durable#331), seen there as intermittently hung durable chat turns where an in-process worker answers a dispatched step in a couple of milliseconds:
+  
+  - **A turn releases its lease only after its settled state is written.** `runExecution` returned `this.settleRun(...)` (and `this.parkBlocked(...)`) without awaiting it inside `try … finally { releaseRunLock }`, so the `finally` ran first: a first turn that completed, failed or parked `blocked` sat unlocked while its row still read `running`, which is what `listOrphanedRuns` returns for a crashed turn. Every settle in that block is now `return await`ed. (The suspend settle was already awaited.)
+  - **`recoverIncomplete` decides on the run it locked, not the one it listed.** It trusted the listed `running` status: a run that settled between the listing and `tryLockRun` got a recovery attempt counted and, past `maxRecoveryAttempts`, an unconditional `dead` written over a completed or suspended run. It now re-reads the run under the lease and releases it again unless it still reads `running`. The dead-letter write is also conditional on `running`, so a lease-free `cancel()` landing after that re-read is not overwritten with `dead`.
+  - **A replay re-reads a `pending` remote step before acting on it.** With `remoteRedispatchMs` set, a replay that found its step pending in its start-of-execution snapshot stamped the lease by writing `{ ...snapshot, wakeAt }` back, overwriting a result that had landed since with `pending` and parking the run on a lease an hour out. The step is now re-read from the store first; a result that has landed is replayed instead.
+
+## 0.41.0
+
+### Minor Changes
+
+- [#198](https://github.com/DavideCarvalho/adonis-agora-durable/pull/198) [`2b74239`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/2b74239efc6defb62d7f978d8df060384791447a) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Re-drive a `gather_calls` step whose worker was killed mid-step, instead of orphaning it forever.
+  
+  A polyglot workflow's turn declares its fan-out as `call` commands; `applyCommands` writes a
+  `pending` checkpoint and dispatches each one. On every later turn the worker's replay RE-EMITS the
+  calls it is still waiting on, and the engine skips a command whose checkpoint already exists — the
+  guard that stops a partially-settled fan-out from double-dispatching its live siblings.
+  
+  That guard had no notion of a LOST job. A worker killed mid-step (an OOM kill) takes its in-flight
+  job with it, and the transport cannot always put it back: the `bullmq` transport's terminal-failure
+  bridge (`worker.on('failed')`) only exists inside a JS consumer, so a first-class Python fleet (see
+  `docs/python.mdx`) has none; the `queue` transport's stalled-claim sweep gives up past
+  `maxStalledCount`, and never runs at all on an adapter without `recoverStalledJobs`. Nothing then
+  publishes a `StepResult`, so the checkpoint stayed `pending` — "out for delivery" — and every turn
+  skipped it: the run woke on the `reconcileMs` sweep, dispatched a turn, had the calls re-emitted,
+  skipped them, and slept. Forever, with `attempts` never leaving 1 and the checkpoint's `wakeAt` NULL.
+  
+  Those two tells named the gap exactly. `callRemote` (the `ctx.step` path) stamps a re-dispatch
+  deadline on the pending checkpoint's `wakeAt` and honours `remoteRedispatchMs`; the `call` path did
+  neither — so the self-heal `docs/reliability/failure-modes.mdx` documents as acting "on the
+  checkpoint regardless of which transport lost the job" **did not exist for a fan-out**, no matter how
+  it was configured.
+  
+  Now the two paths share one policy, and a pending remote checkpoint's `wakeAt` means the same thing
+  in both: the step's LEASE.
+  
+  - A settled checkpoint always wins — a step that completed just before the crash is never re-run.
+  - `remoteRedispatchMs` unset (still the default) keeps the by-design "re-suspend, never
+    re-dispatch": a merely-slow worker is never double-run.
+  - Set it and the dispatched step carries a lease, and the run suspends ON it (never later than the
+    `reconcileMs` sweep would have woken it anyway). Only a LAPSED lease re-dispatches, bounded by
+    `remoteRedispatchMax` (default 10); past the bound the step is failed `remote_step_lost`, which
+    enters the run's history so the workflow's own error path surfaces it rather than the engine
+    looping.
+  - A step-scoped heartbeat now RENEWS that lease durably, so a worker still holding a long step keeps
+    it — the in-memory rearm only ever protected a `timeoutMs` step, and only on the instance that
+    dispatched it. The renewal is throttled by the lease itself (a write only once the window is half
+    spent), so a worker beating every few seconds costs one read + one write per half
+    `remoteRedispatchMs`, not one per beat — the same concern that throttles the liveness write in
+    `persistHeartbeat`. And it is best-effort end to end: the renewal runs on the transport's SERIAL
+    heartbeat handler, so no read or write of it can reject into that loop — a store hiccup that took the
+    beat loop down would lapse every lease at once.
+  - Observability: a re-drive emits `step.started` with `redispatched: true` and appends a `warn`
+    `step.redispatched` event to the checkpoint's own trail (`step.lost` at the bound), so "re-driven
+    after a lost worker" reads differently from a failure retry — in the dashboard and in the database.
+  
+  No schema change and no new config knob: `remoteRedispatchMs` / `remoteRedispatchMax` (already
+  carried through from `config/durable.ts`) now simply mean what they say for a fan-out too.
+
+## 0.40.0
+
+### Minor Changes
+
+- [`b62ce42`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/b62ce428e6262cf78f55ac96ef1433a3197c1878) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Require cron-parser 5
+  
+  The optional `cron-parser` peer narrows from `^4.0.0 || ^5.0.0` to `^5.0.0`, and the
+  scheduler no longer recognises v4's `parseExpression` entry point — an unsupported major
+  now fails at load with a message naming the version it wants, rather than resolving to a
+  parser this code no longer drives correctly.
+  
+  Only projects that schedule workflows by cron are affected, and only those still on
+  cron-parser 4: install cron-parser 5. Nothing about cron expressions, timezones or fire
+  times changes; the scheduler computed identical fires under both majors, which is what
+  the compatibility suite asserted before this.
+
 ## 0.39.1
 
 ### Patch Changes

@@ -18,7 +18,7 @@ import type {
   RedisControlPlaneConfig,
 } from './control-planes/factory.js';
 import { controlPlanes } from './control-planes/factory.js';
-import type { ControlPlane, RunDispatcher } from './interfaces.js';
+import type { ControlPlane, RunDispatcher, RunScope, TerminalRunStatus } from './interfaces.js';
 import type { ScheduledWorkflow } from './scheduler.js';
 import type { LucidStoreConfig, StoreContext, StoreFactory } from './stores/factory.js';
 import { stores } from './stores/factory.js';
@@ -144,7 +144,10 @@ export interface BaseDurableConfig {
   trackStepStart?: boolean;
   /** Recovery lease duration in ms. Default 30s. */
   leaseMs?: number;
-  /** Unique id for this engine instance. Defaults to a random id. */
+  /**
+   * Unique id for this engine instance. Defaults to a random id. Must be unique per process: run
+   * leases are held by this id, so two processes sharing one could execute the same run at once.
+   */
   instanceId?: string;
   /**
    * Worker-pool partition for this engine. Stamped on every run it creates; the poll/recovery paths
@@ -168,12 +171,17 @@ export interface BaseDurableConfig {
    * age, per terminal status — duration strings (`'30d'`) or ms. Swept by the `durable:work` tick
    * (`sweepRetention`, throttled to one pass a minute). Omit to keep everything forever. Pair with
    * `engine.onEvict(...)` to archive a run before it is deleted.
+   *
+   * `policies` adds SCOPED rules next to the per-status ages — each deletes terminal runs in its
+   * `statuses` that match its `scope` (namespace / tags / workflows / search attributes) once older
+   * than `maxAge`: `{ statuses: ['completed'], maxAge: '1d', scope: { tags: ['chat'] } }`.
    */
   retention?: {
     completed?: string | number;
     failed?: string | number;
     cancelled?: string | number;
     dead?: string | number;
+    policies?: Array<{ statuses: TerminalRunStatus[]; maxAge: string | number; scope: RunScope }>;
   };
   /**
    * How long an in-flight run must sit untouched, with the stranded signature, before
@@ -233,6 +241,13 @@ export interface BaseDurableConfig {
    * On a `key` collision, an entry here **wins** (an explicit config override of the colocated one).
    */
   schedules?: ScheduledWorkflow[];
+  /**
+   * Fire the PERSISTED schedules managed at runtime through `engine.schedules` (create / upsert /
+   * pause / resume / delete / list / trigger) on every worker tick. Off by default, so a deployment
+   * that never uses them never touches the `durable_schedules` table. Safe with any number of
+   * workers: each window's run id is deterministic and advancing a schedule is a compare-and-set.
+   */
+  persistedSchedules?: boolean;
   /**
    * Run the worker loop **inside this process** instead of a separate `node ace durable:work` pod.
    * The loop is the same one the command drives (pending, recovery, timers, timeouts, schedules), so

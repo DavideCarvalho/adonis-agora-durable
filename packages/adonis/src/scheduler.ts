@@ -91,12 +91,10 @@ export function scheduledRunId(key: string, everyMs: number, nowMs: number): str
 
 /**
  * The one thing the scheduler needs from `cron-parser`: parse an expression anchored at
- * `currentDate` in `tz`, then step to the previous fire. Both supported majors expose it:
+ * `currentDate` in `tz`, then step to the previous fire. v5 exposes it as
+ * `CronExpressionParser.parse(expr, opts)` — a named export that is also the `default` export.
  *
- * - v4: `parseExpression(expr, opts)` (the CJS `module.exports` is the parser class with statics)
- * - v5: `CronExpressionParser.parse(expr, opts)` (named export; also the `default` export)
- *
- * Both return an iterator whose `prev()`/`next()` yield a `CronDate` with `toDate()`.
+ * Returns an iterator whose `prev()`/`next()` yield a `CronDate` with `toDate()`.
  */
 export type CronParse = (
   expr: string,
@@ -106,16 +104,13 @@ export type CronParse = (
 interface CronParserV5Shape {
   CronExpressionParser?: { parse?: unknown };
 }
-interface CronParserV4Shape {
-  parseExpression?: unknown;
-}
 
 /**
- * Normalize whatever `require('cron-parser')` returned into a {@link CronParse}, whichever major
- * (v4 or v5) is installed and however the loader wrapped it (plain CJS namespace or an interop
- * object with the namespace under `default`). Returns `undefined` when the shape is unrecognized.
+ * Normalize whatever `require('cron-parser')` returned into a {@link CronParse}, however the
+ * loader wrapped it (plain CJS namespace or an interop object with the namespace under
+ * `default`). Returns `undefined` when the shape is unrecognized.
  *
- * @internal Exported for tests, which feed it the real v4 and v5 modules side by side.
+ * @internal Exported for tests, which feed it the real module and hand-built wrappers.
  */
 export function resolveCronParse(mod: unknown, depth = 0): CronParse | undefined {
   if (mod === null || (typeof mod !== 'object' && typeof mod !== 'function')) return undefined;
@@ -123,10 +118,6 @@ export function resolveCronParse(mod: unknown, depth = 0): CronParse | undefined
   if (v5 !== undefined && typeof v5.parse === 'function') {
     // Method-call syntax keeps `this` bound to the class (it is a static method).
     return (expr, opts) => (v5 as { parse: CronParse }).parse(expr, opts);
-  }
-  const v4 = (mod as CronParserV4Shape).parseExpression;
-  if (typeof v4 === 'function') {
-    return (expr, opts) => (mod as { parseExpression: CronParse }).parseExpression(expr, opts);
   }
   // v5's `default` export is the `CronExpressionParser` class itself (a `parse` static, no
   // `CronExpressionParser` property), so check the class shape before descending into `default`.
@@ -154,7 +145,7 @@ function loadCronParser(): CronParse {
   const resolved = resolveCronParse(mod);
   if (resolved === undefined) {
     throw new Error(
-      'the installed "cron-parser" exposes neither `parseExpression` (v4) nor `CronExpressionParser.parse` (v5) — supported versions are ^4.0.0 || ^5.0.0.',
+      'the installed "cron-parser" does not expose `CronExpressionParser.parse` — the supported version is ^5.0.0.',
     );
   }
   cronParse = resolved;

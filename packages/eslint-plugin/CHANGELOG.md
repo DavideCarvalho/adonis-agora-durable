@@ -1,5 +1,48 @@
 # @adonis-agora/durable-eslint-plugin
 
+## 0.3.6
+
+### Patch Changes
+
+- fix(deps): update typescript-eslint monorepo to v8.71.2 ([#292](https://github.com/DavideCarvalho/adonis-agora-durable/issues/292))
+
+## 0.3.5
+
+### Patch Changes
+
+- fix(deps): update typescript-eslint monorepo to v8.71.1 ([#269](https://github.com/DavideCarvalho/adonis-agora-durable/issues/269))
+
+## 0.3.4
+
+### Patch Changes
+
+- fix(deps): update typescript-eslint monorepo to v8.71.0 ([#236](https://github.com/DavideCarvalho/adonis-agora-durable/issues/236))
+
+## 0.3.3
+
+### Patch Changes
+
+- [`6627c3b`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/6627c3b3d989b3719df1fb2fabe0b8037f952fc7) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Point the rule docs URL at a page that exists
+  
+  Every rule reported the docs link as `DavideCarvalho/adonis-durable/tree/main/...`. The repo
+  slug redirects, but `main` is not this repo's branch, so the redirect lands on a 404 — the
+  URL shown next to every lint error this plugin emits.
+  
+  Uses `tree/HEAD` rather than naming a branch, so a rename cannot break it the same way
+  again. `.changeset/config.json` carried the same stale slug and is corrected with it.
+
+## 0.3.2
+
+### Patch Changes
+
+- [`0260c94`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/0260c9452d1b3f8728c9cb13f8e49adf43096241) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Correct the checkpoint-boundary comments on `isInWorkflowBody`
+  
+  Its doc block and the inline note beside the `isCheckpointedCallback` call named the
+  boundary as `ctx.step`/`ctx.task`. The boundary is `ctx.localStep`, `ctx.task` and
+  `ctx.sideEffect`; `ctx.step` is the dispatched step and deliberately is not one, which the
+  file already says a few lines above and which both rule suites assert. Comments only — no
+  rule behaviour changes.
+
 ## 0.3.1
 
 ### Patch Changes

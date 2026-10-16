@@ -1,5 +1,5 @@
 /** Keep in sync with this package's `version` in package.json. */
-export const VERSION = '0.39.1';
+export const VERSION = '0.43.5';
 
 // Re-export the configure hook from the package root so `node ace configure` finds it.
 // AdonisJS imports the package MAIN and reads `configure` off the module namespace —
@@ -44,6 +44,7 @@ export {
   type WorkerLogger,
   type WorkerLoopOptions,
 } from './commands/index.js';
+export * from './concurrency.js';
 export type {
   ControlPlaneConfig,
   StandaloneConfig,
@@ -112,6 +113,7 @@ export * from './run-pagination.js';
 export * from './run-value-facets.js';
 export * from './run-waiting.js';
 export * from './scheduler.js';
+export * from './schedules.js';
 export * from './search-attributes.js';
 export * from './step-discovery.js';
 export {

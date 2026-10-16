@@ -3,7 +3,7 @@
   "changelog": [
     "@changesets/changelog-github",
     {
-      "repo": "DavideCarvalho/adonis-durable"
+      "repo": "DavideCarvalho/adonis-agora-durable"
     }
   ],
   "commit": false,

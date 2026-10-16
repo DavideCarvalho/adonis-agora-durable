@@ -36,12 +36,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7.1.0
         with:
-          node-version: 20
+          node-version: 24.21.0
 
       - name: Install intent
         run: npm install -g @tanstack/intent
@@ -55,14 +55,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7.1.0
         with:
-          node-version: 20
+          node-version: 24.21.0
 
       - name: Install intent
         run: npm install -g @tanstack/intent
@@ -88,7 +88,13 @@ jobs:
           if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
             git checkout -B "$BRANCH" "origin/$BRANCH"
           else
-            git checkout -b "$BRANCH"
+            # Branch off the base, not the checked-out commit. On a `release`
+            # event that commit is the tag, so any workflow file changed since
+            # then would ride along -- and GITHUB_TOKEN may not write under
+            # .github/workflows, which rejects the push. The commit is empty;
+            # the branch exists only to hang the PR on.
+            git fetch origin "$BASE_BRANCH"
+            git checkout -B "$BRANCH" "origin/$BASE_BRANCH"
             git commit --allow-empty -m "chore: review intent skills for ${VERSION}"
             git push origin "$BRANCH"
           fi

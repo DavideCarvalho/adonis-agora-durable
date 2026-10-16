@@ -15,6 +15,29 @@ export class FatalError extends Error {
 }
 
 /**
+ * Thrown by `start` when a run would exceed its concurrency quota: `active` runs sharing the quota
+ * `key` are already in flight (in the quota's counted statuses) and the limit is `limit`. Nothing was
+ * created — the start is rejected up front, so the caller can shed load or answer "try again in a
+ * moment" (e.g. an HTTP 429). See `StartOptions.concurrency` / `ConcurrencyConfig`.
+ */
+export class ConcurrencyLimitError extends Error {
+  readonly workflow: string;
+  readonly key: string;
+  readonly limit: number;
+  readonly active: number;
+  constructor(workflow: string, key: string, limit: number, active: number) {
+    super(
+      `concurrency limit reached for key "${key}" (${active}/${limit} in flight); ${workflow} was not started — retry later`,
+    );
+    this.name = 'ConcurrencyLimitError';
+    this.workflow = workflow;
+    this.key = key;
+    this.limit = limit;
+    this.active = active;
+  }
+}
+
+/**
  * Thrown by `start` when a singleton workflow's wait queue is full: the count of in-flight + gated
  * runs sharing the key already equals `limit + maxQueueDepth`, so admitting another would let the
  * same-key backlog grow unbounded. Back-pressure — the caller should retry later or shed load. Only
@@ -85,6 +108,36 @@ export class NonDeterminismError extends Error {
     this.name = 'NonDeterminismError';
     this.runId = runId;
     this.seq = seq;
+  }
+}
+
+/**
+ * Thrown AT THE CALL SITE when a workflow-ctx primitive (`ctx.startChild`, `ctx.child`, `ctx.step`,
+ * `ctx.sleep`, `ctx.sideEffect`, … — or a `BaseWorkflow.start()`/`.dispatch()` static, which route to
+ * them through the ambient ctx) is called from INSIDE the body of a checkpointed step
+ * (`ctx.localStep`, `ctx.transaction`, `ctx.sideEffect`, `ctx.now`, `ctx.task`'s dispatch).
+ *
+ * A step body runs once and is replayed from its checkpoint WITHOUT re-running, so a primitive it
+ * called claims a journal position on the first run that no replay ever claims again: every later
+ * position shifts and the run dies on its next replay with a `NonDeterminismError` far from the
+ * cause. Failing here instead names the real mistake. Move the call out of the step body (into the
+ * workflow body), or — from a dispatched step handler — start a top-level run.
+ *
+ * A `FatalError` (code `nested_workflow_call`): the step is not retried, the run fails.
+ */
+export class NestedWorkflowCallError extends FatalError {
+  readonly runId: string;
+  readonly primitive: string;
+  readonly step: string;
+  constructor(runId: string, primitive: string, step: string) {
+    super(
+      `ctx.${primitive}() was called inside the body of step "${step}" (run ${runId}). Workflow primitives (child/startChild/step/sleep/signals/sideEffect/…, and BaseWorkflow.start()/.dispatch() via the ambient ctx) must be called from the workflow body, never from inside a step body: the step's checkpoint replays without re-running it, so the nested call would shift every later journal position and corrupt the run on replay. Move the call out of the step.`,
+      'nested_workflow_call',
+    );
+    this.name = 'NestedWorkflowCallError';
+    this.runId = runId;
+    this.primitive = primitive;
+    this.step = step;
   }
 }
 

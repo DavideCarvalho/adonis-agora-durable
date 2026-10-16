@@ -80,6 +80,7 @@ export async function registerWorkflowClass(
         ? { onEvent: [...(meta.onEvent ?? []), ...exactNames] }
         : {}),
       ...(meta.singleton ? { singleton: meta.singleton } : {}),
+      ...(meta.concurrency ? { concurrency: meta.concurrency } : {}),
       ...(meta.origin ? { origin: meta.origin } : {}),
     },
   );

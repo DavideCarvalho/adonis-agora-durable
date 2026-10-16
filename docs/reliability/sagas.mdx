@@ -114,6 +114,10 @@ await engine.cancel(runId)
 await engine.cancel(runId, { compensate: true })
 ```
 
+Terminal runs are immutable: `cancel` on a run that is already `completed`, `failed`, `cancelled` or `dead` is a no-op that returns its current state. It never relabels a failed run as `cancelled` and never cascades to the run's children, which may be unrelated live work (for example the next queued turn an agent queue started as a child of the turn that failed).
+
+Likewise, a `failed` run is only re-driven by an explicit retry (`engine.requeue(runId)` / the dashboard retry, or a direct `engine.resume(runId)`). The engine's implicit wake-ups (a late signal or step result, a wait recheck, a due timer, a redelivered dispatch) leave it failed.
+
 A compensating cancel returns immediately (non-blocking) and runs the undo in the background: the run is resumed so the replay re-registers the saga from history, the engine runs the compensations in reverse, and marks the run `cancelled`. For the checkout example, cancelling a run that had already charged the card and reserved inventory with `{ compensate: true }` issues the refund and releases the reservation before the run becomes `cancelled` — leaving the world clean, exactly as a failure would.
 
 The request itself is durable: `cancel({ compensate: true })` persists a cancel marker alongside broadcasting the cancellation, so the undo survives a crash or a pod handoff — whichever pod next drives the run honors the marker and runs the saga, even if the pod that took the cancel request couldn't run the workflow (or died before it did).
