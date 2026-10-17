@@ -39,6 +39,11 @@ port of `@dudousxd/nestjs-durable-core`.
 Full docs live under [`docs/`](./docs) — if a run is stuck and you need to know which
 knob heals it, start at [Failure modes & recovery](./docs/reliability/failure-modes.mdx).
 
+## Sponsors
+
+Every Agora library is MIT and stays free. The work is funded by partners and
+sponsors — [become one](https://davidecarvalho.github.io/agora/partners).
+
 ## License
 
 MIT © Davi Carvalho
