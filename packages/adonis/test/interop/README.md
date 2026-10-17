@@ -31,7 +31,7 @@ Files:
 
 ## Run it (proven green)
 
-From `packages/adonis`, with **Node 22** and a live Redis. Requires `bullmq` installed in
+From `packages/adonis`, with **Node 24+** and a live Redis. Requires `bullmq` installed in
 `node_modules` (declared in `package.json`; `npm install` / `pnpm install` provides it).
 
 ### 1. Ephemeral Redis (Docker)
@@ -105,7 +105,7 @@ Files:
 
 ### Run it (proven green)
 
-From `packages/adonis`, with **Node 22** and a live Redis.
+From `packages/adonis`, with **Node 24+** and a live Redis.
 
 #### 1. Ephemeral Redis (Docker)
 

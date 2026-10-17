@@ -31,14 +31,15 @@ jobs:
 
       - run: pnpm build
 
-  # The suite runs on every Node line Node itself still maintains (the range `engines.node` promises).
+  # The suite runs on every Node line we support (the range `engines.node` promises): the lines Node
+  # itself still maintains that AdonisJS 7 also accepts (it requires >=24).
   # Lint, typecheck and build stay on the single pinned version above: only the test run is multiplied.
   test:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        node: [22, 24, 26]
+        node: [24, 26]
     name: test (node ${{ matrix.node }})
     steps:
       - uses: actions/checkout@v7.0.1
