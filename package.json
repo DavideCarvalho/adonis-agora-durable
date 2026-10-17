@@ -11,7 +11,7 @@
   "author": "Davi Carvalho <davi@goflip.ai>",
   "packageManager": "pnpm@12.13.0",
   "engines": {
-    "node": ">=20.6.0"
+    "node": ">=22"
   },
   "scripts": {
     "build": "turbo run build",

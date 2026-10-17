@@ -23,8 +23,12 @@ import { describe, expect, it } from 'vitest';
  */
 const PUBLISHED_PACKAGES = ['adonis', 'dashboard', 'eslint-plugin'] as const;
 
-/** The single supported range. Consumers of any Agora durable package see exactly this. */
-const SUPPORTED_NODE = '>=20.6.0';
+/**
+ * The single supported range. Consumers of any Agora durable package see exactly this. The floor
+ * follows the Node lines Node itself still maintains (22, 24, 26 — Node 20 went end-of-life on
+ * 2026-04-30), and CI runs the suite on each of them.
+ */
+const SUPPORTED_NODE = '>=22';
 
 function manifest(pkg: string): { name: string; engines?: { node?: string } } {
   return JSON.parse(
