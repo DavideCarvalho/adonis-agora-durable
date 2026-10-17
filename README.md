@@ -1,5 +1,7 @@
 # `@adonis-agora/durable`
 
+[![npm version](https://img.shields.io/npm/v/@adonis-agora/durable)](https://www.npmjs.com/package/@adonis-agora/durable) [![npm downloads](https://img.shields.io/npm/dm/@adonis-agora/durable)](https://www.npmjs.com/package/@adonis-agora/durable) [![CI](https://github.com/DavideCarvalho/adonis-agora-durable/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/DavideCarvalho/adonis-agora-durable/actions/workflows/ci.yml) [![license](https://img.shields.io/npm/l/@adonis-agora/durable)](https://www.npmjs.com/package/@adonis-agora/durable)
+
 > Durable cross-app workflows for **AdonisJS** — deterministic replay engine.
 > Part of the [Agora](https://github.com/DavideCarvalho) ecosystem.
 
@@ -12,8 +14,8 @@ are installed only when used.
 
 | Package | Status | What |
 |---|---|---|
-| [`@adonis-agora/durable`](./packages/adonis) | ✅ shipped | the whole library — engine + AdonisJS binding (`.`), plus subpaths: `./otel`, `./telescope`, `./dashboard` (+ `./dashboard_provider`), `./commands` (ace commands), `./testing` (+ `./testing/conformance`), `./admission-redis` |
-| [`@adonis-agora/durable-eslint-plugin`](./packages/eslint-plugin) | ✅ shipped | ESLint rules enforcing workflow determinism (resolved by name; kept standalone) |
+| [`@adonis-agora/durable`](./packages/adonis) [![npm](https://img.shields.io/npm/v/@adonis-agora/durable)](https://www.npmjs.com/package/@adonis-agora/durable) | ✅ shipped | the whole library — engine + AdonisJS binding (`.`), plus subpaths: `./otel`, `./telescope`, `./dashboard` (+ `./dashboard_provider`), `./commands` (ace commands), `./testing` (+ `./testing/conformance`), `./admission-redis` |
+| [`@adonis-agora/durable-eslint-plugin`](./packages/eslint-plugin) [![npm](https://img.shields.io/npm/v/@adonis-agora/durable-eslint-plugin)](https://www.npmjs.com/package/@adonis-agora/durable-eslint-plugin) | ✅ shipped | ESLint rules enforcing workflow determinism (resolved by name; kept standalone) |
 
 ### Subpaths
 
