@@ -1,5 +1,7 @@
 # `@adonis-agora/durable`
 
+[![npm version](https://img.shields.io/npm/v/@adonis-agora/durable)](https://www.npmjs.com/package/@adonis-agora/durable) [![npm downloads](https://img.shields.io/npm/dm/@adonis-agora/durable)](https://www.npmjs.com/package/@adonis-agora/durable) [![CI](https://github.com/DavideCarvalho/adonis-agora-durable/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/DavideCarvalho/adonis-agora-durable/actions/workflows/ci.yml) [![license](https://img.shields.io/npm/l/@adonis-agora/durable)](https://www.npmjs.com/package/@adonis-agora/durable)
+
 AdonisJS binding for [`@adonis-agora/durable-core`](https://www.npmjs.com/package/@adonis-agora/durable-core)
 — a container-resolved durable workflow engine.
 
