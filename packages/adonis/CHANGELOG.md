@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 0.44.0
+
+### Minor Changes
+
+- [#301](https://github.com/DavideCarvalho/adonis-agora-durable/pull/301) [`96f9921`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/96f99219266c411820e1f1130fd4878385c6719f) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Drop Node 20, which reached end-of-life on 2026-04-30, and Node 22, which AdonisJS 7 does not support (it requires Node >=24): `engines.node` is now `>=24`. The supported Node lines are 24 and 26, and CI runs the test suite on each of them.
+
 ## 0.43.6
 
 ### Patch Changes
