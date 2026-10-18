@@ -1,4 +1,14 @@
+import { randomUUID } from 'node:crypto';
 import type { AcquiredJob, Adapter, JobData } from '@adonisjs/queue/types';
+
+/** The `{ id, leaseToken }` pair the adapter finalize methods take (`@boringnode/queue` >= 0.8). */
+type JobLease = Pick<AcquiredJob, 'id' | 'leaseToken'>;
+
+/** What `recoverStalledJobs` resolves to on the lease contract. */
+interface StalledJobsRecovery {
+  recovered: number;
+  exceeded: AcquiredJob[];
+}
 
 /**
  * A tiny in-memory `@adonisjs/queue` adapter for tests — implements just the surface the
@@ -6,6 +16,11 @@ import type { AcquiredJob, Adapter, JobData } from '@adonisjs/queue/types';
  * queues, plus throwing stubs for the rest of the contract. No Redis, no Knex. `popFrom` mimics the
  * real adapters' atomic move (pending → active) so two transports sharing one instance never
  * double-consume, and the delayed → pending promotion a `retryJob(…, retryAt)` relies on.
+ *
+ * It follows the `@adonisjs/queue` 0.7 (`@boringnode/queue` 0.9) contract: every claim carries a
+ * `leaseToken`, and `completeJob` / `failJob` / `retryJob` take the `{ id, leaseToken }` lease and only
+ * finalize the job for the CURRENT lease holder (answering `false` otherwise) — exactly what makes a
+ * transport that still passes a bare job id silently finalize nothing.
  */
 export class MockAdapter implements Adapter {
   readonly pending = new Map<string, JobData[]>();
@@ -51,7 +66,7 @@ export class MockAdapter implements Adapter {
     }
     const [job] = list.splice(bestIndex, 1);
     if (!job) return null;
-    const acquired: AcquiredJob = { ...job, acquiredAt: Date.now() };
+    const acquired: AcquiredJob = { ...job, acquiredAt: Date.now(), leaseToken: randomUUID() };
     this.active.set(job.id, acquired);
     this.activeQueue.set(job.id, queue);
     return acquired;
@@ -61,64 +76,91 @@ export class MockAdapter implements Adapter {
     return this.popFrom('default');
   }
 
-  async completeJob(jobId: string): Promise<void> {
-    this.active.delete(jobId);
-    this.activeQueue.delete(jobId);
+  /** Is `lease` the current claim on an active job? A stale (or missing) lease finalizes nothing. */
+  #holds(lease: JobLease): boolean {
+    const job = this.active.get(lease?.id);
+    return job !== undefined && job.leaseToken === lease.leaseToken;
   }
 
-  async failJob(jobId: string): Promise<void> {
-    this.active.delete(jobId);
-    this.activeQueue.delete(jobId);
+  async completeJob(lease: JobLease): Promise<boolean> {
+    if (!this.#holds(lease)) return false;
+    this.active.delete(lease.id);
+    this.activeQueue.delete(lease.id);
+    return true;
+  }
+
+  /** Jobs failed for good, in order — `failJob` keeps them so a test can assert what was failed. */
+  readonly failed: AcquiredJob[] = [];
+
+  async failJob(lease: JobLease): Promise<boolean> {
+    const job = this.active.get(lease?.id);
+    if (!job || !this.#holds(lease)) return false;
+    this.active.delete(lease.id);
+    this.activeQueue.delete(lease.id);
+    this.failed.push(job);
+    return true;
   }
 
   /**
    * Move an active job back for redelivery, counting the attempt — `retryAt` in the future parks it
    * in `delayed` until `popFrom` promotes it, exactly as the real adapters' retry script does. A job
-   * that is no longer active (already completed) is a no-op.
+   * that is no longer active (already completed), or whose lease is stale, is a no-op (`false`).
    */
-  async retryJob(jobId: string, queue: string, retryAt?: Date): Promise<void> {
-    const job = this.active.get(jobId);
-    if (!job) return;
-    this.active.delete(jobId);
-    this.activeQueue.delete(jobId);
-    const { acquiredAt: _acquiredAt, ...data } = job;
+  async retryJob(lease: JobLease, queue: string, retryAt?: Date): Promise<boolean> {
+    const job = this.active.get(lease?.id);
+    if (!job || !this.#holds(lease)) return false;
+    this.active.delete(lease.id);
+    this.activeQueue.delete(lease.id);
+    const { acquiredAt: _acquiredAt, leaseToken: _leaseToken, ...data } = job;
     const next: JobData = { ...data, attempts: (data.attempts ?? 0) + 1 };
     const readyAt = retryAt?.getTime() ?? 0;
     if (readyAt > Date.now()) {
       const waiting = this.delayed.get(queue) ?? [];
       waiting.push({ job: next, readyAt });
       this.delayed.set(queue, waiting);
-      return;
+      return true;
     }
     await this.pushOn(queue, next);
+    return true;
   }
 
   /**
    * Reclaim jobs of `queue` whose claim is older than `stalledThreshold` (the crashed-worker signal):
    * move each back to `pending` with an incremented `stalledCount`, exactly as the real adapters' Lua/SQL
-   * does. A claim younger than the threshold is left active (a slow-but-alive worker). A job whose next
-   * `stalledCount` would exceed `maxStalledCount` is failed permanently (dropped) instead of re-delivered.
-   * Returns the number of jobs re-delivered (not the permanently failed ones).
+   * does. A claim younger than the threshold is left active (a slow-but-alive worker). A job that already
+   * stalled `maxStalledCount` times is NOT re-delivered: as in `@boringnode/queue` >= 0.8 it stays active,
+   * re-leased to the caller (up to `maxExceeded` of them), and comes back in `exceeded` for the caller to
+   * fail through `failJob`.
    */
   async recoverStalledJobs(
     queue: string,
     stalledThreshold: number,
     maxStalledCount: number,
-  ): Promise<number> {
-    const cutoff = Date.now() - stalledThreshold;
+    maxExceeded: number,
+  ): Promise<StalledJobsRecovery> {
+    const now = Date.now();
+    const cutoff = now - stalledThreshold;
     let recovered = 0;
-    for (const [id, job] of this.active) {
+    const exceeded: AcquiredJob[] = [];
+    for (const [id, job] of [...this.active]) {
       if (this.activeQueue.get(id) !== queue) continue;
       if (job.acquiredAt >= cutoff) continue; // fresh claim — not stalled
+      const { acquiredAt: _acquiredAt, leaseToken: _leaseToken, ...data } = job;
+      const stalledCount = data.stalledCount ?? 0;
+      if (stalledCount >= maxStalledCount) {
+        // Exceeded the bound: keep it active under a fresh lease and hand it to the caller to fail.
+        if (exceeded.length >= maxExceeded) continue;
+        const reLeased: AcquiredJob = { ...job, acquiredAt: now, leaseToken: randomUUID() };
+        this.active.set(id, reLeased);
+        exceeded.push(reLeased);
+        continue;
+      }
       this.active.delete(id);
       this.activeQueue.delete(id);
-      const { acquiredAt: _acquiredAt, ...data } = job;
-      const stalledCount = (data.stalledCount ?? 0) + 1;
-      if (stalledCount > maxStalledCount) continue; // exceeded the bound → failed permanently
-      await this.pushOn(queue, { ...data, stalledCount });
+      await this.pushOn(queue, { ...data, stalledCount: stalledCount + 1 });
       recovered += 1;
     }
-    return recovered;
+    return { recovered, exceeded };
   }
 
   /** Promote every delayed job of `queue` whose `readyAt` has passed into `pending` (see popFrom). */
@@ -158,6 +200,7 @@ export class MockAdapter implements Adapter {
   pushMany = this.#unsupported('pushMany');
   pushManyOn = this.#unsupported('pushManyOn');
   getJob = this.#unsupported('getJob');
+  migrate = async (): Promise<void> => {};
   renewJobs = this.#unsupported('renewJobs');
   upsertSchedule = this.#unsupported('upsertSchedule');
   createSchedule = this.#unsupported('createSchedule');

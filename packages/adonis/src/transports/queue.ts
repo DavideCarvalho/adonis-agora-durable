@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { AcquiredJob, Adapter, AdapterFactory, JobData } from '@adonisjs/queue/types';
+import type { AcquiredJob, AdapterFactory, JobData } from '@adonisjs/queue/types';
 import {
   type ControlMessage,
   type ControlPlane,
@@ -56,6 +56,59 @@ const DEFAULT_STALLED_THRESHOLD_MS = 1_800_000;
 /** How many times a single job may be reclaimed before the adapter fails it permanently instead of
  *  re-delivering — bounds a poison job that stalls every worker it touches. */
 const DEFAULT_MAX_STALLED_COUNT = 3;
+/** How many poison jobs (stalled past {@link DEFAULT_MAX_STALLED_COUNT}) one sweep of one queue hands
+ *  back to this instance to fail. Only the `@boringnode/queue` >= 0.8 contract (`@adonisjs/queue` 0.7)
+ *  has this argument: it keeps such jobs `active` and reassigns them to the caller, which must fail
+ *  them itself. Older adapters ignore the extra argument and fail them internally. */
+const MAX_EXCEEDED_PER_SWEEP = 100;
+
+/**
+ * The lease a `@boringnode/queue` >= 0.8 adapter (`@adonisjs/queue` 0.7) hands out with every claim:
+ * `completeJob` / `retryJob` / `failJob` take `{ id, leaseToken }` instead of a bare job id, so only the
+ * execution holding the claim can finalize it. Declared locally (not imported) so this module still
+ * compiles and runs against `@adonisjs/queue` 0.6, whose adapters take the job id.
+ */
+interface JobLeaseLike {
+  id: string;
+  leaseToken: string;
+}
+
+/** What we pass an adapter's finalize methods: the lease on the new contract, the job id on the old. */
+type JobHandle = JobLeaseLike | string;
+
+/**
+ * The slice of the adapter contract this transport drives, typed so it accepts BOTH `@adonisjs/queue`
+ * contracts: 0.6 (`@boringnode/queue` 0.6 — job ids, `void` returns, `recoverStalledJobs` returning a
+ * count) and 0.7 (`@boringnode/queue` 0.9 — leases, `boolean` returns, `recoverStalledJobs` taking a
+ * `maxExceeded` and returning `{ recovered, exceeded }`). Which one we talk to is decided per job by
+ * {@link jobHandle}: a claim that carries a `leaseToken` came from a lease-based adapter.
+ */
+interface CompatAdapter {
+  setWorkerId(workerId: string): void;
+  pushOn(queue: string, jobData: JobData): Promise<unknown>;
+  popFrom(queue: string): Promise<AcquiredJob | null>;
+  completeJob(job: JobHandle, queue: string): Promise<unknown>;
+  failJob(job: JobHandle, queue: string, error?: Error): Promise<unknown>;
+  retryJob(job: JobHandle, queue: string, retryAt?: Date): Promise<unknown>;
+  recoverStalledJobs?(
+    queue: string,
+    stalledThreshold: number,
+    maxStalledCount: number,
+    maxExceeded: number,
+  ): Promise<number | { recovered: number; exceeded: AcquiredJob[] }>;
+  destroy(): Promise<void>;
+}
+
+/**
+ * The value to finalize a claimed job with: its lease (`{ id, leaseToken }`) when the adapter issued
+ * one (`@adonisjs/queue` 0.7+), else its id (`@adonisjs/queue` 0.6). Passing a bare id to a lease-based
+ * adapter finalizes nothing — the job stays `active` until the stalled sweep re-delivers it, so every
+ * step would run twice — which is why this is decided from the claim itself, never assumed.
+ */
+export function jobHandle(job: AcquiredJob): JobHandle {
+  const leaseToken = (job as { leaseToken?: unknown }).leaseToken;
+  return typeof leaseToken === 'string' ? { id: job.id, leaseToken } : job.id;
+}
 
 /** Where a poll-loop failure goes when the caller doesn't supply an `onError`. Mirrors `DbTransport`:
  *  a transport error must never vanish — an invisible one is how a stalled run stays invisible. */
@@ -148,7 +201,7 @@ export interface QueueTransportOptions {
  * queue; the worker side runs the registered handler via {@link runStepHandler} and pushes the
  * {@link StepResult} onto a results queue the engine consumes. Heartbeats ride their own queue.
  *
- * `@adonisjs/queue` v0.6 is a one-directional job queue (dispatch → a separate `Worker` process
+ * `@adonisjs/queue` (0.6 and 0.7) is a one-directional job queue (dispatch → a separate `Worker` process
  * runs `job.execute()`), with no built-in way to await a job's result. This transport instead
  * drives the underlying queue **adapter** directly (`pushOn` / `popFrom` / `completeJob`), so both
  * directions are plain point-to-point queues we fully control. Notably the {@link ControlPlane} here
@@ -163,7 +216,7 @@ export interface QueueTransportOptions {
  * `transports.queue({ ... })` and the provider builds it for you.
  */
 export class QueueTransport implements Transport, ControlPlane {
-  readonly #adapter: Adapter;
+  readonly #adapter: CompatAdapter;
   readonly #partition: string | undefined;
   readonly #prefix: string;
   // Logical deployment namespace folded into every queue name via `#effectivePrefix()`. Mutable so an
@@ -185,8 +238,9 @@ export class QueueTransport implements Transport, ControlPlane {
    *  engine). Populated by {@link QueueTransport.#startLoop} — the reclaim sweep walks exactly this set,
    *  so it covers whatever loops the instance actually started, worker- or engine-side. */
   readonly #poppedQueues = new Set<string>();
-  /** Jobs popped and still in a handler (`jobId → queue`) — re-delivered by close() if unfinished. */
-  readonly #openJobs = new Map<string, string>();
+  /** Jobs popped and still in a handler (`jobId → { queue, handle }`) — re-delivered by close() if
+   *  unfinished. The handle is the claim's lease on a lease-based adapter, needed to finalize it. */
+  readonly #openJobs = new Map<string, { queue: string; handle: JobHandle }>();
   /** Drives the stalled-job reclaim sweep on its own (coarse) interval. Absent when reclaim is disabled
    *  (`stalledCheckIntervalMs <= 0`) or the adapter can't `recoverStalledJobs`. Separate from
    *  {@link #pollers} because the sweep cadence is unrelated to the fast job-poll cadence. */
@@ -198,7 +252,8 @@ export class QueueTransport implements Transport, ControlPlane {
   readonly #deferredStarts: Array<() => void> = [];
 
   constructor(options: QueueTransportOptions) {
-    this.#adapter = options.adapter();
+    // Typed through CompatAdapter so the same code drives the 0.6 (job-id) and 0.7 (lease) contracts.
+    this.#adapter = options.adapter() as unknown as CompatAdapter;
     this.#partition = options.partition;
     this.#prefix = options.prefix ?? 'durable';
     this.#namespace = options.namespace;
@@ -428,16 +483,19 @@ export class QueueTransport implements Transport, ControlPlane {
       // Track the popped-but-unfinished job so close() can hand it back to the broker instead of
       // destroying the adapter under it (which stranded it `active` until the stalled sweep —
       // every deploy of a busy fleet parked its mid-flight jobs for up to the stalled threshold).
-      this.#openJobs.set(job.id, queue);
+      const handle = jobHandle(job);
+      this.#openJobs.set(job.id, { queue, handle });
       try {
         await onJob(job);
-        await this.#adapter.completeJob(job.id, queue);
+        // A lease-based adapter answers `false` when the lease was lost (the reclaim sweep re-delivered
+        // the job meanwhile): nothing to do — the re-delivery runs it again, which is idempotent.
+        await this.#adapter.completeJob(handle, queue);
       } catch (err) {
         this.#onError(err);
         // Delay the redelivery by one poll interval: it keeps a job nobody can handle from spinning
         // the burst-drain loop hot (a ready job makes every tick report work and never sleep).
         await this.#adapter
-          .retryJob(job.id, queue, new Date(Date.now() + this.#pollIntervalMs))
+          .retryJob(handle, queue, new Date(Date.now() + this.#pollIntervalMs))
           .catch((retryErr) => this.#onError(retryErr));
       } finally {
         this.#openJobs.delete(job.id);
@@ -475,19 +533,34 @@ export class QueueTransport implements Transport, ControlPlane {
    * simply gets no sweep — skipped silently, since a missing capability is not a transport error.
    */
   #startReclaimSweep(intervalMs: number): Pollers | undefined {
-    const reclaim = (this.#adapter as { recoverStalledJobs?: unknown }).recoverStalledJobs;
-    if (typeof reclaim !== 'function' || intervalMs <= 0) return undefined;
+    if (typeof this.#adapter.recoverStalledJobs !== 'function' || intervalMs <= 0) return undefined;
     const pollers = new Pollers(intervalMs, this.#onError);
     // Returns `false` every round so {@link Pollers} sleeps the FULL interval between sweeps — the
     // reclaim check is coarse and must not ride the fast burst-drain of the job-poll loops.
     pollers.start(async () => {
       for (const queue of this.#poppedQueues) {
         try {
-          await this.#adapter.recoverStalledJobs(
+          const outcome = await this.#adapter.recoverStalledJobs?.(
             queue,
             this.#stalledThresholdMs,
             this.#maxStalledCount,
+            MAX_EXCEEDED_PER_SWEEP,
           );
+          // `@adonisjs/queue` 0.7 (`@boringnode/queue` >= 0.8) no longer fails a job that stalled too
+          // many times: it keeps it `active`, re-leases it to us and returns it in `exceeded`, so the
+          // caller fails it. Left alone it would stay `active` forever. 0.6 returns a count and has
+          // already failed them — nothing to do.
+          if (outcome && typeof outcome === 'object') {
+            for (const job of outcome.exceeded) {
+              await this.#adapter
+                .failJob(
+                  jobHandle(job),
+                  queue,
+                  new Error(`stalled more than ${this.#maxStalledCount} times`),
+                )
+                .catch((err) => this.#onError(err));
+            }
+          }
         } catch (err) {
           this.#onError(err);
         }
@@ -511,9 +584,9 @@ export class QueueTransport implements Transport, ControlPlane {
     await this.#pollers.drain(5_000);
     // Anything still open after the bounded drain (a long step): re-deliver it now so another
     // worker picks it up immediately instead of waiting out the stalled threshold.
-    for (const [jobId, queue] of [...this.#openJobs]) {
+    for (const [jobId, { queue, handle }] of [...this.#openJobs]) {
       this.#openJobs.delete(jobId);
-      await this.#adapter.retryJob(jobId, queue, new Date()).catch((err) => this.#onError(err));
+      await this.#adapter.retryJob(handle, queue, new Date()).catch((err) => this.#onError(err));
     }
     await this.#adapter.destroy();
   }

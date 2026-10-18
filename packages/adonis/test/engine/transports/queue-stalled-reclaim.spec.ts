@@ -124,8 +124,8 @@ describe('QueueTransport stalled-job reclaim', () => {
     expect(await adapter.sizeOf(TASKS_QUEUE)).toBe(0);
 
     // And the mock's own semantics, deterministically: a large threshold reclaims nothing.
-    const n = await adapter.recoverStalledJobs(TASKS_QUEUE, 10_000, 3);
-    expect(n).toBe(0);
+    const n = await adapter.recoverStalledJobs(TASKS_QUEUE, 10_000, 3, 100);
+    expect(n).toEqual({ recovered: 0, exceeded: [] });
   });
 
   it('an adapter without recoverStalledJobs does not crash — the sweep is skipped', async () => {
