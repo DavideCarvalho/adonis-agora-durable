@@ -174,6 +174,10 @@ export default class DashboardProvider {
 
   private async attachDiagnostics(role: 'standalone' | 'control-plane' | 'tenant'): Promise<void> {
     if (role === 'tenant') return;
+    // A warmed-up app (`node ace codegen`) never starts nor shuts down: resolving the engine would open
+    // the transport/store connections nothing closes, and the command would never exit. The routes are
+    // still registered above (codegen reads them); the engine is resolved per request.
+    if ((this.app as { getMode?: () => string }).getMode?.() === 'warmup') return;
     try {
       const engine = await this.app.container.make(WorkflowEngine);
       this.detachDiagnostics = this.diagnostics.attach(engine);

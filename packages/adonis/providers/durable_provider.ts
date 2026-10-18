@@ -367,6 +367,12 @@ export default class DurableProvider {
    * container-bound {@link WorkerRuntime} from the `durable:worker` command instead).
    */
   async boot() {
+    // A warmed-up app (`node ace codegen` & co. — `app.boot()` + `app.warmUp()`, then `terminate()`)
+    // never starts, so its providers' `shutdown()` never runs. Resolving the engine here would build
+    // the transport and store — opening the broker / Redis / database connections nothing would ever
+    // close — and the command would never exit (`@adonisjs/queue` 0.7 stopped resolving its own manager
+    // in warmup for the same reason). Everything stays bound and lazily resolvable on demand.
+    if (this.#isWarmup()) return;
     const config = this.app.config.get<DurableConfig>('durable', {});
     const role = config.role ?? 'standalone';
     if (role === 'tenant') return;
@@ -405,6 +411,15 @@ export default class DurableProvider {
     if (role === 'standalone') await this.#registerSteps(config);
 
     await this.#startResponder();
+  }
+
+  /**
+   * Whether the app boots only to be assembled and inspected (`warmup` mode, e.g. `node ace codegen`).
+   * `getMode` is called optionally: `@adonisjs/core` releases inside the peer range that predate it (and
+   * naive test doubles of ApplicationService) don't carry it — those always run in `run` mode.
+   */
+  #isWarmup(): boolean {
+    return (this.app as { getMode?: () => string }).getMode?.() === 'warmup';
   }
 
   /** The bridge disposer, released on shutdown so a hot-reload doesn't leak listeners. */
@@ -627,6 +642,7 @@ export default class DurableProvider {
    * is a no-op for it.
    */
   async ready() {
+    if (this.#isWarmup()) return;
     const config = this.app.config.get<DurableConfig>('durable', {});
     if ((config.role ?? 'standalone') === 'tenant') return;
     // Before the diagnostics gate below: the embedded worker must start whether or not

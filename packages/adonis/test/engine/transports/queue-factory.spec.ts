@@ -132,7 +132,7 @@ describe('transports.queue — options reaching the transport', () => {
     const adapter = new MockAdapter();
     adapter.recoverStalledJobs = async (queue, thresholdMs, maxStalledCount) => {
       sweeps.push([queue, thresholdMs, maxStalledCount]);
-      return 0;
+      return { recovered: 0, exceeded: [] };
     };
     const ctx = fakeCtx({ adapters: {} });
     const transport = await transports.queue({
@@ -153,7 +153,7 @@ describe('transports.queue — options reaching the transport', () => {
     const adapter = new MockAdapter();
     adapter.recoverStalledJobs = async () => {
       swept += 1;
-      return 0;
+      return { recovered: 0, exceeded: [] };
     };
     const ctx = fakeCtx({ adapters: {} });
     const transport = await transports.queue({
