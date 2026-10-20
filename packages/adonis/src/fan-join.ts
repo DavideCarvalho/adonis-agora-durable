@@ -73,8 +73,10 @@ export function allWaves(
     throw new Error(`ctx.all: concurrency must be a positive integer, got ${concurrency}`);
   }
   if (concurrency >= size) return undefined;
-  const waveSize = Math.ceil(concurrency / 2);
-  return { waveSize, maxWaves: Math.floor(concurrency / waveSize) };
+  // Two half-size waves in flight: an odd limit runs one child under it, rather than leaving a whole
+  // wave's worth of the window idle.
+  if (concurrency === 1) return { waveSize: 1, maxWaves: 1 };
+  return { waveSize: Math.floor(concurrency / 2), maxWaves: 2 };
 }
 
 const ENGINE_CHILD_ID = /^(.+)\.(?:all\.\d+\.(?:w\d+\.)?\d+|child\.\d+)$/;

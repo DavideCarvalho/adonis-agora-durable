@@ -829,9 +829,9 @@ export interface AllOptions {
   mode?: 'waitAll' | 'failFast';
   /**
    * The most children running at once. Unset sends the whole fan immediately. When set, children go
-   * out in waves of `ceil(concurrency / 2)`, at most `floor(concurrency / waveSize)` of them unsettled
-   * at once: a new wave starts as soon as an earlier one settles, so one slow child does not idle the
-   * rest of the window. Each settled wave costs the parent one turn. Must be a positive integer.
+   * out in waves of `floor(concurrency / 2)`, two at a time (an odd limit runs one child under it):
+   * a new wave starts as soon as an earlier one settles, so one slow child does not idle the rest of
+   * the window. Each settled wave costs the parent one turn. Must be a positive integer.
    *
    * Part of the fan's identity: child ids carry the wave (`<runId>.all.<firstSeq>.w<k>.<i>`), so
    * changing it for an in-flight run is a non-deterministic change like changing `inputs`. A limit

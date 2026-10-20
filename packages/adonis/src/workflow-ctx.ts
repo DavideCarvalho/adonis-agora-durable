@@ -894,7 +894,13 @@ export function createWorkflowCtx(
       for (let i = 0; i < checkpoints.length; i += 1) {
         const cp = checkpoints[i];
         if (!cp?.name.startsWith(FOLDED_PREFIX) || folded[i]) continue;
-        const { from, values } = cp.output as FoldedChildren;
+        const fold = cp.output as Partial<FoldedChildren> | null | undefined;
+        // A malformed fold must stop the replay: treating it as absent would re-dispatch every child
+        // it stands for.
+        if (!fold || typeof fold.from !== 'number' || !Array.isArray(fold.values)) {
+          throw new Error(`ctx.all: folded checkpoint "${cp.name}" at seq ${cp.seq} is malformed`);
+        }
+        const { from, values } = fold as FoldedChildren;
         values.forEach((value, j) => {
           checkpoints[from + j] = {
             ...cp,

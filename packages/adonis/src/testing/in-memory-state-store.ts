@@ -256,7 +256,7 @@ export class InMemoryStateStore implements StateStore {
     into: StepCheckpoint,
   ): Promise<void> {
     for (let seq = fromSeq; seq <= toSeq; seq += 1) this.checkpoints.delete(this.key(runId, seq));
-    this.checkpoints.set(this.key(into.runId, into.seq), { ...into });
+    this.checkpoints.set(this.key(runId, into.seq), { ...into, runId });
   }
 
   async removeSignalWaiter(waiter: SignalWaiter): Promise<void> {

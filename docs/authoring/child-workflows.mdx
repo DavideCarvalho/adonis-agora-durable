@@ -199,7 +199,7 @@ waiter alive together, so pass `concurrency` to cap it:
 const results = await ctx.all(ProcessItemWorkflow, batch.items, { concurrency: 1000 })
 ```
 
-Children then go out in waves of `ceil(concurrency / 2)`, at most two waves at a time, and the parent sends the
+Children then go out in waves of `floor(concurrency / 2)`, two waves at a time (so an odd limit runs one child under it), and the parent sends the
 next wave as soon as one settles. A slow child holds back only its own wave, not the whole window. Each settled
 wave costs the parent one turn, and since settled waves are folded, that turn reads one row per earlier wave
 rather than one per earlier child. `concurrency` must be a positive integer; a limit at or above the fan size

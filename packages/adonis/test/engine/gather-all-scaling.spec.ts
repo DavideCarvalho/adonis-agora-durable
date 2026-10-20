@@ -613,3 +613,60 @@ describe('parentRunIdOf', () => {
     expect(parentRunIdOf('p.all.x.1')).toBeUndefined();
   });
 });
+
+describe('ctx.all review fixes', () => {
+  it('an odd concurrency limit runs one child under it, not half of it', async () => {
+    const { allWaves } = await import('../../src/fan-join.js');
+    expect(allWaves(1000, 101)).toEqual({ waveSize: 50, maxWaves: 2 });
+    expect(allWaves(1000, 3)).toEqual({ waveSize: 1, maxWaves: 2 });
+    expect(allWaves(1000, 1)).toEqual({ waveSize: 1, maxWaves: 1 });
+    expect(allWaves(1000, 4)).toEqual({ waveSize: 2, maxWaves: 2 });
+  });
+
+  it('a malformed folded checkpoint stops the replay with a clear error', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    engine.register('child', '1', async (_ctx, input) => (input as { i: number }).i);
+    engine.register('echo', '1', async (_ctx, input) => input);
+    engine.register('parent', '1', async (ctx) => {
+      const outs = await ctx.all<number>(
+        'child',
+        Array.from({ length: 100 }, (_, i) => ({ i })),
+      );
+      return ctx.child<number>('echo', outs.length);
+    });
+    await startRun(engine, 'parent', {}, 'p');
+    await poll(async () => (await store.getRun('p'))?.status === 'completed');
+    const folded = await store.getCheckpoint('p', 0);
+    expect(folded?.name).toBe('fan:p.all.0.');
+    await store.saveCheckpoint({
+      ...(folded as NonNullable<typeof folded>),
+      output: { broken: true },
+    });
+    await store.updateRun('p', { status: 'failed' });
+    await engine.requeue('p');
+    await poll(async () => (await store.getRun('p'))?.status === 'failed');
+    expect((await store.getRun('p'))?.error?.message).toMatch(
+      /folded checkpoint "fan:p\.all\.0\." at seq 0 is malformed/,
+    );
+  });
+
+  it('the in-memory store writes a fold under the run whose range it replaced', async () => {
+    const store = new InMemoryStateStore();
+    await store.compactCheckpoints('right', 0, 0, {
+      runId: 'wrong',
+      seq: 0,
+      name: 'fan:right.all.0.',
+      kind: 'signal',
+      stepId: 'right:0',
+      status: 'completed',
+      output: { from: 0, values: [1] },
+      attempts: 1,
+      enqueuedAt: new Date(),
+      startedAt: new Date(),
+      finishedAt: new Date(),
+    });
+    expect((await store.getCheckpoint('right', 0))?.runId).toBe('right');
+    expect(await store.getCheckpoint('wrong', 0)).toBeNull();
+  });
+});
