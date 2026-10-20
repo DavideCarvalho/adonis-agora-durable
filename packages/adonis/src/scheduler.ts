@@ -248,7 +248,7 @@ function scheduleRunIdsAt(s: ScheduledWorkflow, nowMs: number): string[] {
  */
 export async function runSchedules(
   engine: Pick<WorkflowEngine, 'start' | 'getRun'> &
-    Partial<Pick<WorkflowEngine, 'schedulePauseOverride'>>,
+    Partial<Pick<WorkflowEngine, 'schedulePauseOverride' | 'isDraining'>>,
   schedules: readonly ScheduledWorkflow[],
   nowMs: number,
   opts?: RunSchedulesOptions,
@@ -258,6 +258,7 @@ export async function runSchedules(
   const settled = settledIdsFor(engine);
   const ids: string[] = [];
   for (const s of schedules) {
+    if (engine.isDraining?.()) break; // shutting down: fire no further windows
     // A runtime override from the console (fleet-wide via the control plane) WINS over the config's
     // `paused` — so an operator can both pause a live schedule and resume a config-paused one until
     // the next deploy re-reads the config.
@@ -291,6 +292,7 @@ export async function runSchedules(
     // once per schedule, before firing — the run ids below are unaffected, so idempotency holds.
     if (s.jitter && s.jitter > 0) await sleep(Math.floor(random() * s.jitter));
     for (const runId of candidates) {
+      if (engine.isDraining?.()) break; // drain began during jitter/await
       // Only fire (and report) windows that don't exist yet. `start` is idempotent by run id
       // anyway, but counting its no-op re-ticks made every tick report "N scheduled" forever —
       // a due window's bucket id exists for the rest of that window, so an operator tailing the

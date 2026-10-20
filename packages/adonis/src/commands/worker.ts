@@ -172,7 +172,7 @@ export async function runWorkerLoop(
   void options.stopSignal.then(() => {
     stopped = true;
     // Stop picking up new runs inside the tick that is still running; drain still waits for it.
-    engine.requestStop();
+    engine.beginDrain();
   });
   let ticks = 0;
   while (!stopped) {

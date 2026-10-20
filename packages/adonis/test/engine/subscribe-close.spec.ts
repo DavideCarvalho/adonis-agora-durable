@@ -187,3 +187,66 @@ describe('BullMQTransport.close() with a wedged worker', () => {
     expect(disconnects()).toBeGreaterThan(0);
   });
 });
+
+describe('BullMQTransport.close() ordering', () => {
+  it('[close-workers-before-queues] an in-flight step publishes its result before the results queue closes', async () => {
+    const events: string[] = [];
+    let queueClosed = false;
+    let taskProcess: ((job: { data: unknown }) => Promise<unknown>) | undefined;
+    let inFlight: Promise<unknown> = Promise.resolve();
+    const deps: BullMQDeps = {
+      makeQueue: (n) =>
+        ({
+          add: async () => {
+            events.push(queueClosed ? `add-after-close:${n}` : `add:${n}`);
+            if (queueClosed) throw new Error('Connection is closed.');
+            return 1;
+          },
+          getJobCounts: async () => ({}),
+          close: async () => {
+            queueClosed = true;
+            events.push(`queue-close:${n}`);
+          },
+        }) as QueueLike,
+      makeWorker: (n, process) => {
+        if (n.includes('tasks')) taskProcess = process as never;
+        return {
+          on: () => undefined,
+          // Like BullMQ: close() resolves only after the current job finished.
+          close: async () => {
+            await inFlight;
+            events.push(`worker-close:${n}`);
+          },
+        } as WorkerLike;
+      },
+      makeRedis: () =>
+        ({
+          subscribe: async () => 1,
+          on: () => undefined,
+          publish: async () => 1,
+          set: async () => 'OK',
+          disconnect: () => undefined,
+        }) as unknown as RedisLike,
+    };
+    const t = new BullMQTransport({ deps, closeTimeoutMs: 2000 });
+    t.handle('slow', async () => {
+      await new Promise((r) => setTimeout(r, 30));
+      return 'ok';
+    });
+    // Warm the results queue with one finished step so it exists (and is closable) when close() runs.
+    await taskProcess!({
+      data: { runId: 'w', seq: 0, stepId: 'warm', name: 'slow', group: 'g', input: null },
+    });
+    events.length = 0;
+    inFlight = taskProcess!({
+      data: { runId: 'r', seq: 1, stepId: 's', name: 'slow', group: 'g', input: null },
+    });
+    await t.close();
+    await inFlight.catch(() => undefined);
+    expect(events.filter((e) => e.startsWith('add'))).toEqual(['add:durable-results']);
+    expect(events).not.toContain('add-after-close:durable-results');
+    expect(events.indexOf('add:durable-results')).toBeLessThan(
+      events.indexOf('queue-close:durable-results'),
+    );
+  });
+});

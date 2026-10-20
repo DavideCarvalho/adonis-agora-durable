@@ -47,9 +47,13 @@ import {
 
 export interface BullMQTransportOptions {
   /**
-   * Ceiling (ms) `close()` gives the graceful worker/queue closes before it stops waiting and drops
-   * the Redis connections anyway. Default `5_000`; `0` skips the wait. BullMQ memoizes `close()`, so
-   * escalating to `close(true)` cannot rescue a wedged graceful close.
+   * Ceiling (ms) `close()` gives the graceful shutdown before it stops waiting and drops the Redis
+   * connections anyway. Workers close first (concurrently), so an in-flight job can still publish its
+   * result; only then do the queues close. Both phases share this one deadline. Default `5_000`; `0`
+   * skips the wait. BullMQ memoizes `close()`, so escalating to `close(true)` cannot rescue a wedged
+   * graceful close. After the deadline the pub/sub, heartbeat and liveness connections are
+   * disconnected, but abandoned BullMQ workers may keep running their jobs on their own connections
+   * until the process exits; an unfinished job is recovered through BullMQ's stalled-job handling.
    */
   closeTimeoutMs?: number | undefined;
   /** The broker factory (real bullmq/ioredis via `createBullMQDeps`, or a fake in tests). */
@@ -98,6 +102,9 @@ export class BullMQTransport implements Transport {
   readonly #explicitNamespace: boolean;
   readonly #instanceId: string;
   readonly #onError: (err: unknown) => void;
+  readonly #hasOnError: boolean;
+  #closing = false;
+  readonly #closeTimeoutMs: number;
 
   readonly #handlers = new Map<string, StepHandler>();
   // Worker-side workflow turn consumers, keyed by workflow name — a `workflow`-shaped job routes here.
@@ -143,11 +150,9 @@ export class BullMQTransport implements Transport {
     this.#explicitNamespace = options.namespace !== undefined;
     this.#instanceId = options.instanceId ?? buildInstanceId();
     this.#onError = options.onError ?? (() => {});
+    this.#hasOnError = options.onError !== undefined;
     this.#closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
   }
-
-  #closing = false;
-  readonly #closeTimeoutMs: number;
 
   /** Stable id stamped on this instance's worker-liveness keys. */
   get instanceId(): string {
@@ -161,6 +166,11 @@ export class BullMQTransport implements Transport {
   useNamespace(namespace: string): void {
     if (this.#explicitNamespace) return;
     this.#namespace = namespace;
+  }
+
+  /** The user's `onError` when supplied, else undefined (so the helper falls back to console.warn). */
+  #subscribeErrorSink(): ((err: unknown) => void) | undefined {
+    return this.#hasOnError ? this.#onError : undefined;
   }
 
   #effectivePrefix(): string {
@@ -432,6 +442,7 @@ export class BullMQTransport implements Transport {
       sub.subscribe(heartbeatChannel(this.#effectivePrefix())),
       () => this.#closing,
       'bullmq heartbeat',
+      this.#subscribeErrorSink(),
     );
     sub.on('message', ((_channel: string, payload: string) => {
       try {
@@ -680,7 +691,12 @@ export class BullMQTransport implements Transport {
     const channel = runReplyChannel(this.#effectivePrefix());
     const sub = this.#deps.makeRedis();
     this.#runReplySub = sub;
-    swallowSubscribe(sub.subscribe(channel), () => this.#closing, 'bullmq run-reply');
+    swallowSubscribe(
+      sub.subscribe(channel),
+      () => this.#closing,
+      'bullmq run-reply',
+      this.#subscribeErrorSink(),
+    );
     sub.on('message', ((msgChannel: string, payload: string) => {
       // Filter by channel: a shared pub/sub connection may also carry other channels' messages.
       if (msgChannel !== channel) return;
@@ -712,7 +728,12 @@ export class BullMQTransport implements Transport {
     const sub = this.#tenantEventSubscriber();
     if (!this.#tenantEventChannels.has(channel)) {
       this.#tenantEventChannels.add(channel);
-      swallowSubscribe(sub.subscribe(channel), () => this.#closing, 'bullmq tenant-event');
+      swallowSubscribe(
+        sub.subscribe(channel),
+        () => this.#closing,
+        'bullmq tenant-event',
+        this.#subscribeErrorSink(),
+      );
     }
     let handlers = this.#tenantEventHandlers.get(channel);
     if (!handlers) {
@@ -753,20 +774,24 @@ export class BullMQTransport implements Transport {
     this.#closing = true;
     if (this.#workerHeartbeatTimer) clearInterval(this.#workerHeartbeatTimer);
     this.#workerHeartbeatTimer = undefined;
-    // Concurrent and bounded: a graceful Worker.close() that never settles (a worker still coming up)
-    // must not strand the other closes or the disconnects below, which is what lets the process exit.
-    const closers: Array<Promise<unknown> | undefined> = [
+    // Workers first (concurrently with each other), THEN queues: a worker's close() waits for its
+    // in-flight job, which publishes its result/decision through a queue, so that queue must still be
+    // open until every worker has settled. One shared deadline bounds both phases: a graceful
+    // Worker.close() that never settles must not strand the disconnects below.
+    const deadline = Date.now() + this.#closeTimeoutMs;
+    const remaining = (): number => Math.max(0, deadline - Date.now());
+    const workers: Array<Promise<unknown> | undefined> = [
       ...[...this.#taskWorkers.values()].map((w) => w.close()),
       this.#resultsWorker?.close(),
       this.#decisionsWorker?.close(),
       this.#stepEventsWorker?.close(),
       this.#startRunWorker?.close(),
       this.#runRequestWorker?.close(),
-      ...[...this.#queues.values()].map((q) => q.close()),
     ];
+    await withTimeout(Promise.allSettled(workers.filter((p) => p !== undefined)), remaining());
     await withTimeout(
-      Promise.allSettled(closers.filter((p) => p !== undefined)),
-      this.#closeTimeoutMs,
+      Promise.allSettled([...this.#queues.values()].map((q) => q.close())),
+      remaining(),
     );
     this.#heartbeatPub?.disconnect();
     this.#heartbeatSub?.disconnect();
@@ -794,8 +819,6 @@ function failedTaskIdentity(
   }
   return { runId, seq, stepId };
 }
-const DEFAULT_CLOSE_TIMEOUT_MS = 5_000;
-
 /** Resolve when `work` settles or `ms` elapses (the loser is abandoned). `ms <= 0` skips the wait. */
 async function withTimeout(work: Promise<unknown>, ms: number): Promise<void> {
   if (ms <= 0) return;
@@ -810,3 +833,4 @@ async function withTimeout(work: Promise<unknown>, ms: number): Promise<void> {
     if (timer) clearTimeout(timer);
   }
 }
+const DEFAULT_CLOSE_TIMEOUT_MS = 5_000;

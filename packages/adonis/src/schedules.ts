@@ -151,6 +151,8 @@ interface StateDoc {
 export interface ScheduleHost {
   start(workflow: string, input: unknown, runId: string, opts?: StartOptions): Promise<RunResult>;
   getRun(runId: string): Promise<WorkflowRun | null>;
+  /** True once the engine began shutting down; `tick` fires nothing more after that. */
+  isDraining?(): boolean;
 }
 
 /** Engine-level knobs for the client. */
@@ -313,12 +315,14 @@ export class ScheduleClient {
     const store = this.requireStore();
     const started: string[] = [];
     for (let round = 0; round < 50; round++) {
+      if (this.host.isDraining?.()) break;
       const due = await store.listSchedules({
         dueBy: nowMs,
         namespace: this.options.namespace,
         limit: TICK_BATCH,
       });
       for (const record of due) {
+        if (this.host.isDraining?.()) return started;
         const runId = await this.fire(record, nowMs);
         if (runId) started.push(runId);
       }
