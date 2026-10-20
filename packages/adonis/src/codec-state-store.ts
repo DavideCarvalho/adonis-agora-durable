@@ -1,4 +1,5 @@
 import type {
+  ChildWait,
   RunFacetQuery,
   RunQuery,
   RunStatus,
@@ -67,12 +68,43 @@ export class CodecStateStore implements StateStore {
   readonly deleteSchedule?: (id: string) => Promise<boolean>;
   readonly listSchedules?: (query: ScheduleQuery) => Promise<ScheduleRecord[]>;
 
+  /** The placeholder checkpoints are encoded like any other checkpoint. The four methods below are
+   *  bound only when the inner store has them: their absence is what turns the engine's barrier,
+   *  batching and folding off, so the wrapper must not fake them. */
+  readonly registerChildWaits?: (entries: ChildWait[]) => Promise<void>;
+  /** The folded checkpoint carries the children's outputs, so it is encoded. */
+  readonly compactCheckpoints?: (
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    into: StepCheckpoint,
+  ) => Promise<void>;
+  /** Forwarded verbatim — a waiter carries no payload. */
+  readonly hasSignalWaiter?: (runId: string, tokenPrefix: string) => Promise<boolean>;
+
   constructor(
     private readonly inner: StateStore,
     private readonly codec: PayloadCodec,
     options: CodecStateStoreOptions = {},
   ) {
     this.extended = options.coverage === 'extended';
+    const registerChildWaits = inner.registerChildWaits;
+    if (registerChildWaits) {
+      this.registerChildWaits = (entries) =>
+        registerChildWaits.call(
+          inner,
+          entries.map((e) => ({ waiter: e.waiter, checkpoint: this.encCp(e.checkpoint) })),
+        );
+    }
+    const compact = inner.compactCheckpoints;
+    if (compact) {
+      this.compactCheckpoints = (runId, fromSeq, toSeq, into) =>
+        compact.call(inner, runId, fromSeq, toSeq, this.encCp(into));
+    }
+    const hasWaiter = inner.hasSignalWaiter;
+    if (hasWaiter) {
+      this.hasSignalWaiter = (runId, tokenPrefix) => hasWaiter.call(inner, runId, tokenPrefix);
+    }
     const { saveSchedule, getSchedule, updateSchedule, deleteSchedule, listSchedules } = inner;
     if (saveSchedule && getSchedule && updateSchedule && deleteSchedule && listSchedules) {
       this.saveSchedule = (r) => saveSchedule.call(inner, this.encSchedule(r));

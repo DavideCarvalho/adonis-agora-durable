@@ -24,6 +24,8 @@ The extension contributes a `durable` entry type (labeled **Workflows** in the n
 
 The durable runs become Telescope entries automatically — the `@adonis-agora/durable` provider bridges engine lifecycle events onto the [`@adonis-agora/diagnostics`](/docs/diagnostics) bus when diagnostics is installed, and Telescope captures from that bus. So you get one entry per lifecycle event (`run.started`, `step.completed`, `run.failed`, …) with zero extra wiring.
 
+An event of a child run started by `ctx.all`, `ctx.child` or `ctx.startChild` (without a caller-chosen id) also carries `parentRunId` in its payload. Each child is its own run, so that field is how you find every child of one parent, a whole `ctx.all` fan included. `parentRunIdOf(runId)` is exported from `@adonis-agora/durable` if you need the same mapping yourself.
+
 ## The Workflows dashboard
 
 The `durable.workflows` dashboard is assembled from these data providers:
@@ -38,7 +40,7 @@ The `durable.workflows` dashboard is assembled from these data providers:
 The panels read from two different places, by design:
 
 - **Rollups** (success rate, throughput, duration, top failures) are computed from the `durable` entries Telescope already captured — the **recent-history** view, bounded by Telescope's prune window.
-- **Current-state gauges** (dead / suspended / running / pending *now*) are read **live** from the durable store via `listRuns`, so they're exact and **not** limited by the prune window.
+- **Current-state gauges** (dead / suspended / running / pending *now*) and the state breakdown are read **live** from the durable store, so they're exact and **not** limited by the prune window. They count through `engine.countRuns`, a `COUNT` on a store that has one (the Lucid store does), which stays exact and cheap when a wide fan puts tens of thousands of runs in one status.
 
 Telescope is the health and visibility view, and deep-links out: **per-run actions** (retry, cancel) and the **step timeline** stay in the [durable dashboard](/docs/durable/observability/dashboard).
 

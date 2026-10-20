@@ -71,6 +71,30 @@ describe('engine-backed providers', () => {
     expect(res.segments.find((s) => s.label === 'failed')?.value).toBe(1);
   });
 
+  it('state counts come from countRuns, exact past the listing cap and without loading rows', async () => {
+    const listed: string[] = [];
+    const engine = {
+      countRuns: async ({ status }: { status?: string }) => (status === 'running' ? 150_000 : 3),
+      listRuns: async ({ status }: { status?: string }) => {
+        listed.push(String(status));
+        return [];
+      },
+    } as unknown as WorkflowEngine;
+    const gauge = (await durableStateProvider().resolve(
+      { status: 'running' },
+      makeCtx(engine),
+    )) as {
+      value: number;
+    };
+    expect(gauge.value).toBe(150_000);
+
+    const pie = (await durableStateBreakdownProvider().resolve(undefined, makeCtx(engine))) as {
+      segments: Array<{ label: string; value: number }>;
+    };
+    expect(pie.segments.find((s) => s.label === 'running')?.value).toBe(150_000);
+    expect(listed).toEqual([]);
+  });
+
   it('durable.recentFailures lists failed/dead runs as rows', async () => {
     const engine = await engineWith();
     const res = (await durableRecentFailuresProvider().resolve({}, makeCtx(engine))) as {

@@ -80,6 +80,7 @@ export * from './errors.js';
 export * from './event-accumulators.js';
 export * from './event-trigger-bridge.js';
 export * from './events.js';
+export { parentRunIdOf } from './fan-join.js';
 // --- store-less cluster: handshake & capability negotiation -----------------
 export * from './handshake/descriptor.js';
 export * from './handshake/negotiate.js';

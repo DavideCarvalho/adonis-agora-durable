@@ -5,6 +5,7 @@ import type {
 } from '@adonisjs/lucid/types/database';
 import type {
   AttributeFilter,
+  ChildWait,
   RunFacetQuery,
   RunQuery,
   RunStatus,
@@ -363,6 +364,74 @@ export class LucidStateStore implements StateStore {
         parallel_group?: unknown;
       }>
     ).map(rowToSignalWaiter);
+  }
+
+  async hasSignalWaiter(runId: string, tokenPrefix: string): Promise<boolean> {
+    // The escaped LIKE makes `%`/`_` literal, but its case sensitivity is the dialect's (SQLite and
+    // MySQL's default collations ignore case), so a hit is confirmed in JS. Only a match that is not
+    // a real prefix match pays for reading the run's whole matching set.
+    const matching = () =>
+      this.client()
+        .from(DURABLE_TABLES.signalWaiters)
+        .select('token')
+        .where('run_id', runId)
+        .andWhereRaw(`token like ? escape '!'`, [`${escapeLike(tokenPrefix)}%`]);
+    const first = (await matching().first()) as { token: string } | null;
+    if (!first) return false;
+    if (first.token.startsWith(tokenPrefix)) return true;
+    const rows = (await matching()) as Array<{ token: string }>;
+    return rows.some((r) => r.token.startsWith(tokenPrefix));
+  }
+
+  async registerChildWaits(entries: ChildWait[]): Promise<void> {
+    if (entries.length === 0) return;
+    // Waiters before placeholders, in one transaction: the engine reads a placeholder as proof its
+    // waiter exists. Split into statements of CHILD_WAIT_ROWS rows to stay under every dialect's
+    // bind-parameter limit.
+    await this.client().transaction(async (trx) => {
+      for (let at = 0; at < entries.length; at += CHILD_WAIT_ROWS) {
+        const chunk = entries.slice(at, at + CHILD_WAIT_ROWS);
+        await trx
+          .insertQuery()
+          .table(DURABLE_TABLES.signalWaiters)
+          .knexQuery.insert(
+            chunk.map(({ waiter }) => ({
+              token: waiter.token,
+              run_id: waiter.runId,
+              seq: waiter.seq,
+              parallel_group: waiter.parallelGroup ?? null,
+            })),
+          )
+          .onConflict('token')
+          .merge();
+      }
+      for (let at = 0; at < entries.length; at += CHILD_WAIT_ROWS) {
+        const chunk = entries.slice(at, at + CHILD_WAIT_ROWS);
+        await trx
+          .insertQuery()
+          .table(DURABLE_TABLES.checkpoints)
+          .knexQuery.insert(chunk.map(({ checkpoint }) => checkpointToRow(checkpoint)))
+          .onConflict(['run_id', 'seq'])
+          .merge();
+      }
+    });
+  }
+
+  async compactCheckpoints(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    into: StepCheckpoint,
+  ): Promise<void> {
+    await this.client().transaction(async (trx) => {
+      await trx
+        .from(DURABLE_TABLES.checkpoints)
+        .where('run_id', runId)
+        .andWhere('seq', '>=', fromSeq)
+        .andWhere('seq', '<=', toSeq)
+        .delete();
+      await this.upsertCheckpoint(trx, into);
+    });
   }
 
   async removeSignalWaiter(waiter: SignalWaiter): Promise<void> {
@@ -745,6 +814,9 @@ export class LucidStateStore implements StateStore {
  * everywhere. Pair every use with `ESCAPE '!'`. Without this, a tag or picker-search value
  * containing `%`/`_` silently widened (or broke) the match.
  */
+/** Rows per multi-row INSERT in {@link LucidStateStore.registerChildWaits}. */
+const CHILD_WAIT_ROWS = 100;
+
 function escapeLike(value: string): string {
   return value.replace(/[!%_]/g, (c) => `!${c}`);
 }

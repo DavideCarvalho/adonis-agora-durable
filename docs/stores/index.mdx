@@ -42,7 +42,7 @@ A `StateStore` persists runs and checkpoints and exposes the primitives the engi
 - **Events** — `bufferEvent` / `listBufferedEvents` / `removeBufferedEvent`, so a published event that matched no live waiter is still consumed by a later `ctx.waitForEvent`.
 - **Querying** — `listRuns(query)` for the dashboard and CLI. `RunQuery` carries the status/workflow/tag/namespace/attribute filters plus exact-match `origin` and the epoch-ms range pushdowns `createdBefore` / `createdAfter` / `updatedBefore` / `wakeBefore` — the last two are what let the retention/stalled sweeps and the blocked-run poll ask the store for candidate rows instead of fetching everything and filtering in process. Paging rides `page` (**1-based**, default `1`) and `size` — the same offset shape `@adonis-agora/filter` takes, so every Agora listing is paged alike. Resolve the pair with the exported `runPageWindow(query)` helper rather than by hand: it returns the `{ limit, offset }` your adapter spends, and it is what the conformance kit asserts against (no `size` means **no bound** — a store must not invent a default window).
 
-Eight members are **optional**, and the engine works without every one of them:
+Eleven members are **optional**, and the engine works without every one of them:
 
 | Optional member | What you lose by omitting it |
 | --- | --- |
@@ -52,7 +52,10 @@ Eight members are **optional**, and the engine works without every one of them:
 | `getLatestCheckpointByName(...)` | A fast path only. The engine falls back to `listCheckpoints` plus an in-JS filter. |
 | `listCheckpointsByNamePrefix(...)` | Same — a fast path, with the same fallback. |
 | `listOrphanedRuns(nowMs, limit, namespace?)` | The bounded orphan query (`running` + free/expired lease) the periodic recovery pass prefers. Without it the engine falls back to `listIncompleteRuns` and filters in process — correct, but on a busy fleet every worker fetches (and lock-probes) every healthy running run once per tick. Strongly recommended. |
-| `listSignalWaitersByRunIds(runIds)` | The targeted per-page waiter lookup (`run_id IN (...)`, indexed). Without it the dashboard's `waiting` column and the engine's child resolution fall back to `listSignalWaiters('')` — a full-table scan per page load. Pair the implementation with an index on `run_id`. |
+| `listSignalWaitersByRunIds(runIds)` | The targeted per-run waiter lookup (`run_id IN (...)`, indexed). Without it the dashboard's `waiting` column and the engine's child resolution (run detail, cancel cascades, `deleteRun`/`purgeRuns` subtree walks) fall back to `listSignalWaiters('')` — a scan of every waiter, which a wide `ctx.all` fan fills with one row per running child. Pair the implementation with an index on `run_id`. |
+| `hasSignalWaiter(runId, tokenPrefix)` | The [`ctx.all`](/docs/durable/authoring/child-workflows) join barrier: whether a run still has a waiter whose token starts with an **exact** prefix (`%`/`_` literal, case-sensitive). It runs once per settled child, so answer it with a bounded, `run_id`-indexed lookup. Without it `ctx.all` stays correct, but the parent replays once per settled child, O(N²) across a fan. |
+| `registerChildWaits(entries)` | Batched fan dispatch: put each entry's waiter and upsert its `running` placeholder checkpoint, in one transaction. A waiter must be durable no later than its placeholder, because the engine reads a placeholder as proof its waiter exists. Without it the waiters and placeholders are written one by one. |
+| `compactCheckpoints(runId, fromSeq, toSeq, into)` | Folding a settled `ctx.all` fan: atomically replace the run's checkpoints in a contiguous seq range by one checkpoint. Without it a settled fan keeps one checkpoint per child. |
 | `runValueFacets(axis, query, opts?)` | Native picker enumeration (distinct values + counts per filter axis). Callers fall back to counting a bounded `listRuns` scan in-process — same shape, bounded approximation on the non-column axes. |
 
 Everything else is **required**, including `updateRunIf`.

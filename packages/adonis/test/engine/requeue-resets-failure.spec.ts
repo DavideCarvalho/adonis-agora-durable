@@ -149,6 +149,59 @@ describe('requeue of a FAILED run resets its failure state so replay re-executes
     expect((await store.getRun('pc'))?.output).toBe('parent saw child-ok');
   });
 
+  it('a ctx.all parent failed by one child: requeue converges on the retried child', async () => {
+    const store = new InMemoryStateStore();
+    let healthy = false;
+    const engine = new WorkflowEngine({ store, reconcileMs: 0 });
+    engine.register('child', '1', async (ctx, input) => {
+      const i = (input as { i: number }).i;
+      if (i === 1 && !healthy) throw new Error('boom');
+      // The retried child settles only once the parent has suspended on it again.
+      if (i === 1) await ctx.waitForSignal('go');
+      return i;
+    });
+    engine.register('parent', '1', async (ctx) =>
+      ctx.all<number>('child', [{ i: 0 }, { i: 1 }, { i: 2 }]),
+    );
+
+    await engine.start('parent', {}, 'p');
+    await poll(async () => (await store.getRun('p'))?.status === 'failed');
+
+    healthy = true;
+    await engine.requeue('p');
+    await poll(async () => (await store.listSignalWaiters('go')).length === 1);
+    await poll(async () => (await store.getRun('p'))?.status === 'suspended');
+    await engine.signal('go', undefined);
+    await poll(async () => (await store.getRun('p'))?.status === 'completed');
+    expect((await store.getRun('p'))?.output).toEqual([0, 1, 2]);
+    expect(await store.listSignalWaiters('child:p.')).toEqual([]);
+  });
+
+  it("a ctx.all parent adopts a fan child's retry-with-input SUCCESS without re-running the origin", async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store, reconcileMs: 0 });
+    engine.register('child', '1', async (_ctx, input) => {
+      const { i, fixed } = input as { i: number; fixed?: boolean };
+      if (i === 1 && !fixed) throw new Error('bad input');
+      return i * 10;
+    });
+    engine.register('parent', '1', async (ctx) =>
+      ctx.all<number>('child', [{ i: 0 }, { i: 1 }, { i: 2 }]),
+    );
+
+    await engine.start('parent', {}, 'pf');
+    await poll(async () => (await store.getRun('pf'))?.status === 'failed');
+    const retried = await engine.retryWithInput('pf.all.0.1', { i: 1, fixed: true });
+    await poll(async () => (await store.getRun(retried?.runId ?? ''))?.status === 'completed');
+
+    await engine.requeue('pf');
+    await poll(async () => (await store.getRun('pf'))?.status === 'completed');
+    expect((await store.getRun('pf'))?.output).toEqual([0, 10, 20]);
+    expect((await store.getRun('pf.all.0.1'))?.status).toBe('failed');
+    expect(await store.listSignalWaiters('child:pf.')).toEqual([]);
+    expect(await store.takeBufferedSignal('child:pf.all.0.1')).toBeNull();
+  });
+
   it('requeue CLEARS the stale run.error while the run re-executes', async () => {
     const store = new InMemoryStateStore();
     const transport = new InMemoryTransport();

@@ -132,3 +132,22 @@ describe('groupParallelSpans', () => {
     expect(nodes[0]).toMatchObject({ kind: 'fan', label: 'parallel ×2' });
   });
 });
+
+describe('groupParallelSpans with folded ctx.all waves', () => {
+  it('labels a fan of folded waves by the child runs they stand for', () => {
+    const folded = (seq: number, values: number[]) =>
+      cp({
+        seq,
+        name: `fan:p.all.0.w${seq}.`,
+        parallelGroup: 'all:0',
+        output: { from: 0, values },
+      });
+    const nodes = groupParallelSpans([
+      folded(0, [1, 2]),
+      folded(2, [3, 4]),
+      cp({ seq: 4, name: 'signal:child:p.all.0.w2.4', parallelGroup: 'all:0' }),
+    ]);
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0]?.kind === 'fan' && nodes[0].label).toBe('child runs ×5');
+  });
+});

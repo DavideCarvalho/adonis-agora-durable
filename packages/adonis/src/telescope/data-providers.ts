@@ -15,6 +15,17 @@ import type { DataProvider, ExtensionContext, TelescopeEntryLike } from './teles
 
 const STATE_CAP = 10_000;
 
+/**
+ * How many runs are in `status`: an exact count through the engine's `countRuns` (a `COUNT` on a
+ * store that has one), or, for an engine without it, the length of a listing capped at
+ * {@link STATE_CAP}. A wide `ctx.all` fan can put tens of thousands of runs in one status, which the
+ * capped listing would both under-count and pay for by loading every row.
+ */
+function countByStatus(engine: WorkflowEngine, status: RunStatus): Promise<number> {
+  if (typeof engine.countRuns === 'function') return engine.countRuns({ status });
+  return engine.listRuns({ status, size: STATE_CAP }).then((runs) => runs.length);
+}
+
 /** The Telescope diagnostic-entry content the durable bridge produces (`payload` is the EngineEvent). */
 interface DurableEntryContent {
   event?: string;
@@ -78,8 +89,7 @@ export function durableStateProvider(): DataProvider {
     async resolve(query, ctx) {
       const engine = await engineOf(ctx);
       const status = (query?.status as RunStatus) ?? 'dead';
-      const runs = await engine.listRuns({ status, size: STATE_CAP });
-      return { value: runs.length };
+      return { value: await countByStatus(engine, status) };
     },
   };
 }
@@ -148,9 +158,7 @@ export function durableStateBreakdownProvider(): DataProvider {
     async resolve(_query, ctx) {
       const engine = await engineOf(ctx);
       const counts = await Promise.all(
-        STATE_BREAKDOWN_STATUSES.map((status) =>
-          engine.listRuns({ status, size: STATE_CAP }).then((runs) => runs.length),
-        ),
+        STATE_BREAKDOWN_STATUSES.map((status) => countByStatus(engine, status)),
       );
       const segments = STATE_BREAKDOWN_STATUSES.map((label, i) => ({
         label,

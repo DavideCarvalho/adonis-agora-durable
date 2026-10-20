@@ -1,3 +1,4 @@
+import { describe, expect, it } from 'vitest';
 import { LucidStateStore } from '../../../src/stores/lucid.js';
 import { makeStoreDb } from '../../../src/stores/lucid-helpers.js';
 import { runStateStoreContract } from '../../../src/testing-kit/conformance.js';
@@ -15,4 +16,19 @@ runStateStoreContract('LucidStateStore', async () => {
       await db.manager.closeAll();
     },
   };
+});
+
+describe('LucidStateStore fan methods', () => {
+  it('implements every optional method the ctx.all join barrier and folding use', async () => {
+    const db = await makeStoreDb();
+    try {
+      const store = new LucidStateStore(db);
+      expect(store.hasSignalWaiter).toBeTypeOf('function');
+      expect(store.registerChildWaits).toBeTypeOf('function');
+      expect(store.compactCheckpoints).toBeTypeOf('function');
+      expect(store.listSignalWaitersByRunIds).toBeTypeOf('function');
+    } finally {
+      await db.manager.closeAll();
+    }
+  });
 });

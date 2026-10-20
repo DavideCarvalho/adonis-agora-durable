@@ -414,6 +414,46 @@ export interface StateStore {
   listSignalWaitersByRunIds?(runIds: string[]): Promise<SignalWaiter[]>;
 
   /**
+   * Whether run `runId` still has at least one waiter whose `token` starts with `tokenPrefix` (an
+   * exact prefix: `%`/`_` in the prefix are literal characters, not wildcards, and the match is
+   * case-sensitive). The `ctx.all` join barrier asks this after each child settles, so it must stay
+   * O(1)-ish however many siblings are still waiting: answer it with a bounded lookup, never by
+   * listing the whole group.
+   *
+   * Optional: a store without it keeps `ctx.all` correct, but the parent replays once per settled
+   * child instead of once per fan.
+   */
+  hasSignalWaiter?(runId: string, tokenPrefix: string): Promise<boolean>;
+
+  /**
+   * Register a batch of awaited children: for each entry, put `waiter` and upsert `checkpoint` (the
+   * parent's `running` placeholder for that child). `ctx.all` calls it once per chunk of a fan, so a
+   * wide fan costs a handful of round trips instead of two per child.
+   *
+   * Every entry's waiter must be durable no later than its checkpoint: the engine reads an existing
+   * placeholder as proof the waiter was put, and never re-puts it. Writing both in one transaction
+   * satisfies that.
+   *
+   * Optional: without it the engine puts each waiter, then saves each checkpoint.
+   */
+  registerChildWaits?(entries: ChildWait[]): Promise<void>;
+
+  /**
+   * Atomically replace run `runId`'s checkpoints with `seq` in `[fromSeq, toSeq]` by the single
+   * checkpoint `into`, whose `seq` lies in that range. `ctx.all` folds a settled group of children
+   * into one checkpoint this way, so every later turn of the parent loads one row instead of one per
+   * child. A delete over a contiguous seq range, served by the `(run_id, seq)` primary key.
+   *
+   * Optional: without it a settled fan keeps one checkpoint per child.
+   */
+  compactCheckpoints?(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    into: StepCheckpoint,
+  ): Promise<void>;
+
+  /**
    * Delete the EXACT waiter row — `token` AND `runId` AND `seq` must all match — no-op if absent.
    * Unlike {@link takeSignalWaiter}, which deletes ANY row for `token` (fine when the caller just won
    * the race to consume it), this is for a caller removing its OWN registration after resolving the
@@ -781,6 +821,29 @@ export interface StoreTransaction {
   readonly raw: unknown;
   /** Persist the step checkpoint inside this transaction. */
   saveCheckpoint(checkpoint: StepCheckpoint): Promise<void>;
+}
+
+/** Options for {@link WorkflowCtx.all}. */
+export interface AllOptions {
+  /** `waitAll` (default) or `failFast` — see {@link WorkflowCtx.all}. */
+  mode?: 'waitAll' | 'failFast';
+  /**
+   * The most children running at once. Unset sends the whole fan immediately. When set, children go
+   * out in waves of `ceil(concurrency / 2)`, at most `floor(concurrency / waveSize)` of them unsettled
+   * at once: a new wave starts as soon as an earlier one settles, so one slow child does not idle the
+   * rest of the window. Each settled wave costs the parent one turn. Must be a positive integer.
+   *
+   * Part of the fan's identity: child ids carry the wave (`<runId>.all.<firstSeq>.w<k>.<i>`), so
+   * changing it for an in-flight run is a non-deterministic change like changing `inputs`. A limit
+   * at or above the fan size keeps the unbounded ids.
+   */
+  concurrency?: number;
+}
+
+/** One child of a fan as {@link StateStore.registerChildWaits} writes it. */
+export interface ChildWait {
+  waiter: SignalWaiter;
+  checkpoint: StepCheckpoint;
 }
 
 /** Binds an external signal `token` to the suspended run/step position waiting for it. */
@@ -1659,16 +1722,18 @@ export interface WorkflowCtx {
    * so a fast sibling can still slip through and complete). Empty `inputs` returns `[]` with no side
    * effects. The wait-all / fan-out counterpart to {@link child}; parity with the Python SDK's
    * `gather_children`.
+   *
+   * `concurrency` caps how many children run at once (see {@link AllOptions.concurrency}).
    */
   all<C extends WorkflowClass>(
     workflow: C,
     inputs: WorkflowInputOf<C>[],
-    opts?: { mode?: 'waitAll' | 'failFast' },
+    opts?: AllOptions,
   ): Promise<WorkflowOutputOf<C>[]>;
   all<TOutput = unknown>(
     workflow: string,
     inputs: unknown[],
-    opts?: { mode?: 'waitAll' | 'failFast' },
+    opts?: AllOptions,
   ): Promise<TOutput[]>;
   /**
    * Pause the run at this point until a human resumes it from the dashboard (or
@@ -1777,7 +1842,7 @@ export interface DynamicWorkflowCtx
   all<TOutput = unknown>(
     workflow: string,
     inputs: unknown[],
-    opts?: { mode?: 'waitAll' | 'failFast' },
+    opts?: AllOptions,
   ): Promise<TOutput[]>;
 }
 
