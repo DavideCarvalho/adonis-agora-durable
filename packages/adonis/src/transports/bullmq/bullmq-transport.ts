@@ -16,6 +16,7 @@ import type {
   WorkflowTask,
 } from '../../interfaces.js';
 import { runStepHandler, type StepHandler } from '../../protocol.js';
+import { swallowSubscribe } from '../../safe-subscribe.js';
 import { isWorkflowTask, type WorkflowTurnHandler } from '../../workflow-turn.js';
 import type { BullMQDeps, QueueLike, RedisLike, WorkerLike } from './deps.js';
 import {
@@ -45,6 +46,12 @@ import {
 } from './serialization.js';
 
 export interface BullMQTransportOptions {
+  /**
+   * Ceiling (ms) `close()` gives the graceful worker/queue closes before it stops waiting and drops
+   * the Redis connections anyway. Default `5_000`; `0` skips the wait. BullMQ memoizes `close()`, so
+   * escalating to `close(true)` cannot rescue a wedged graceful close.
+   */
+  closeTimeoutMs?: number | undefined;
   /** The broker factory (real bullmq/ioredis via `createBullMQDeps`, or a fake in tests). */
   deps: BullMQDeps;
   /**
@@ -136,7 +143,11 @@ export class BullMQTransport implements Transport {
     this.#explicitNamespace = options.namespace !== undefined;
     this.#instanceId = options.instanceId ?? buildInstanceId();
     this.#onError = options.onError ?? (() => {});
+    this.#closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
   }
+
+  #closing = false;
+  readonly #closeTimeoutMs: number;
 
   /** Stable id stamped on this instance's worker-liveness keys. */
   get instanceId(): string {
@@ -417,7 +428,11 @@ export class BullMQTransport implements Transport {
     if (this.#heartbeatSub) return; // one subscription per transport
     const sub = this.#deps.makeRedis();
     this.#heartbeatSub = sub;
-    void sub.subscribe(heartbeatChannel(this.#effectivePrefix()));
+    swallowSubscribe(
+      sub.subscribe(heartbeatChannel(this.#effectivePrefix())),
+      () => this.#closing,
+      'bullmq heartbeat',
+    );
     sub.on('message', ((_channel: string, payload: string) => {
       try {
         void handler(JSON.parse(payload) as Heartbeat);
@@ -665,7 +680,7 @@ export class BullMQTransport implements Transport {
     const channel = runReplyChannel(this.#effectivePrefix());
     const sub = this.#deps.makeRedis();
     this.#runReplySub = sub;
-    void sub.subscribe(channel);
+    swallowSubscribe(sub.subscribe(channel), () => this.#closing, 'bullmq run-reply');
     sub.on('message', ((msgChannel: string, payload: string) => {
       // Filter by channel: a shared pub/sub connection may also carry other channels' messages.
       if (msgChannel !== channel) return;
@@ -697,7 +712,7 @@ export class BullMQTransport implements Transport {
     const sub = this.#tenantEventSubscriber();
     if (!this.#tenantEventChannels.has(channel)) {
       this.#tenantEventChannels.add(channel);
-      void sub.subscribe(channel);
+      swallowSubscribe(sub.subscribe(channel), () => this.#closing, 'bullmq tenant-event');
     }
     let handlers = this.#tenantEventHandlers.get(channel);
     if (!handlers) {
@@ -735,15 +750,24 @@ export class BullMQTransport implements Transport {
 
   /** Close all workers/queues and disconnect pub/sub + heartbeat connections so the process can exit. */
   async close(): Promise<void> {
+    this.#closing = true;
     if (this.#workerHeartbeatTimer) clearInterval(this.#workerHeartbeatTimer);
     this.#workerHeartbeatTimer = undefined;
-    await Promise.all([...this.#taskWorkers.values()].map((w) => w.close()));
-    await this.#resultsWorker?.close();
-    await this.#decisionsWorker?.close();
-    await this.#stepEventsWorker?.close();
-    await this.#startRunWorker?.close();
-    await this.#runRequestWorker?.close();
-    await Promise.all([...this.#queues.values()].map((q) => q.close()));
+    // Concurrent and bounded: a graceful Worker.close() that never settles (a worker still coming up)
+    // must not strand the other closes or the disconnects below, which is what lets the process exit.
+    const closers: Array<Promise<unknown> | undefined> = [
+      ...[...this.#taskWorkers.values()].map((w) => w.close()),
+      this.#resultsWorker?.close(),
+      this.#decisionsWorker?.close(),
+      this.#stepEventsWorker?.close(),
+      this.#startRunWorker?.close(),
+      this.#runRequestWorker?.close(),
+      ...[...this.#queues.values()].map((q) => q.close()),
+    ];
+    await withTimeout(
+      Promise.allSettled(closers.filter((p) => p !== undefined)),
+      this.#closeTimeoutMs,
+    );
     this.#heartbeatPub?.disconnect();
     this.#heartbeatSub?.disconnect();
     this.#workerRedis?.disconnect();
@@ -769,4 +793,20 @@ function failedTaskIdentity(
     return undefined;
   }
   return { runId, seq, stepId };
+}
+const DEFAULT_CLOSE_TIMEOUT_MS = 5_000;
+
+/** Resolve when `work` settles or `ms` elapses (the loser is abandoned). `ms <= 0` skips the wait. */
+async function withTimeout(work: Promise<unknown>, ms: number): Promise<void> {
+  if (ms <= 0) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expiry = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+  try {
+    await Promise.race([work.then(() => undefined), expiry]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }

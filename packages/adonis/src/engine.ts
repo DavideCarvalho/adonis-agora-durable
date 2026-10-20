@@ -685,6 +685,12 @@ export class WorkflowEngine {
    */
   private readonly postSettle = new Set<Promise<unknown>>();
   private draining = false;
+  /**
+   * Set by {@link requestStop} the moment a stop is requested, before {@link drain} runs (the worker
+   * loop awaits its current tick first). Only gates picking up NEW leased runs; in-flight work and
+   * internal handoffs are untouched.
+   */
+  private stopRequested = false;
 
   constructor(deps: WorkflowEngineDeps) {
     this.store = deps.store;
@@ -1911,6 +1917,15 @@ export class WorkflowEngine {
   }
 
   /**
+   * Signal that a stop is coming: from now on no further runs are locked or started by recovery,
+   * timer or pending polls (a run already started finishes). Does not drain — call {@link drain}
+   * after the current tick settles.
+   */
+  requestStop(): void {
+    this.stopRequested = true;
+  }
+
+  /**
    * Graceful shutdown: stop picking up new runs (recovery/timer become no-ops) and wait for
    * in-flight executions to settle, up to `timeoutMs`. Call from your app's shutdown hook so a
    * deploy hands off cleanly instead of leaving runs to the lease timeout.
@@ -2038,7 +2053,7 @@ export class WorkflowEngine {
    * replay from their checkpoints, so only the work that had not finished runs again.
    */
   async recoverIncomplete(nowMs: number = this.clock()): Promise<RunResult[]> {
-    if (this.draining) return [];
+    if (this.draining || this.stopRequested) return [];
     const results: RunResult[] = [];
     // Ask the store for ORPHANS only (running + free/expired lease, bounded): on a healthy fleet
     // that's ~zero rows per tick, instead of fetching every running run and issuing one doomed
@@ -2054,6 +2069,7 @@ export class WorkflowEngine {
       );
     });
     for (const listed of incomplete) {
+      if (this.draining || this.stopRequested) break; // stop requested mid-sweep
       // A live worker renews its lease, so an acquirable lease means the run is genuinely orphaned
       // (its worker crashed). Skip the ones still owned.
       const acquired = await this.store.tryLockRun(
@@ -2426,7 +2442,7 @@ export class WorkflowEngine {
     nowMs: number = this.clock(),
     onLocked?: (run: WorkflowRun) => Promise<RunResult | undefined>,
   ): Promise<RunResult[]> {
-    if (this.draining) return []; // shutting down — don't pick up new runs
+    if (this.draining || this.stopRequested) return []; // shutting down — don't pick up new runs
     const results: RunResult[] = [];
     // Bounded parallelism: one slow turn (a long local step) must not serialize the other 99 picked
     // up this tick behind it. The lease acquire stays inside each task, so exactly-one-executor is
@@ -2438,6 +2454,8 @@ export class WorkflowEngine {
         const run = runs[next];
         next += 1;
         if (!run) return;
+        // Re-check per run: a stop requested mid-tick must not lock/start the rest of the backlog.
+        if (this.draining || this.stopRequested) return;
         const acquired = await this.store.tryLockRun(
           run.id,
           this.instanceId,
