@@ -742,6 +742,7 @@ export class WorkflowEngine {
       {
         start: (workflow, input, runId, opts) => this.start(workflow, input, runId, opts),
         getRun: (runId) => this.store.getRun(runId),
+        isDraining: () => this.draining,
       },
       { namespace: this.namespace, clock: this.clock },
     );
@@ -1911,6 +1912,21 @@ export class WorkflowEngine {
   }
 
   /**
+   * Stop picking up new work without waiting: recovery, timer, pending, schedule and timeout sweeps
+   * (and their per-run lock loops) start nothing once this is called, and {@link runOne} refuses
+   * broker-delivered runs. Runs already started finish. {@link drain} calls it first; the worker loop
+   * calls it the moment a stop is requested, so a tick still in flight stops leasing a backlog.
+   */
+  beginDrain(): void {
+    this.draining = true;
+  }
+
+  /** True once {@link beginDrain} (or {@link drain}) has been called. */
+  isDraining(): boolean {
+    return this.draining;
+  }
+
+  /**
    * Graceful shutdown: stop picking up new runs (recovery/timer become no-ops) and wait for
    * in-flight executions to settle, up to `timeoutMs`. Call from your app's shutdown hook so a
    * deploy hands off cleanly instead of leaving runs to the lease timeout.
@@ -1930,7 +1946,7 @@ export class WorkflowEngine {
    * `stepId`, idempotent by the durable contract; a completed step short-circuits).
    */
   async drain(timeoutMs = 10_000): Promise<void> {
-    this.draining = true;
+    this.beginDrain();
     if (this.inflight.size === 0 && this.postSettle.size === 0) return;
     const timer = new Promise<'timeout'>((resolve) => {
       const t = setTimeout(() => resolve('timeout'), timeoutMs);
@@ -1977,6 +1993,7 @@ export class WorkflowEngine {
    */
   async sweepTimeouts(now: number = this.clock()): Promise<void> {
     for (const reg of new Set(this.latest.values())) {
+      if (this.draining) return;
       if (reg.executionTimeoutMs == null) continue;
       // Push the age predicate into the store: only candidates already past the LATEST version's
       // timeout come back (bounded), instead of every in-flight run of the workflow per tick. A
@@ -1990,6 +2007,7 @@ export class WorkflowEngine {
         size: 200,
       });
       for (const run of inflight) {
+        if (this.draining) return;
         // Time out against the version the run STARTED on when that registration is known — a fleet
         // mid-deploy must not sweep old-version runs by the newest version's (possibly shorter)
         // timeout. Falls back to the latest registration's timeout for an unknown version.
@@ -2054,6 +2072,7 @@ export class WorkflowEngine {
       );
     });
     for (const listed of incomplete) {
+      if (this.draining) break; // stop requested mid-sweep
       // A live worker renews its lease, so an acquirable lease means the run is genuinely orphaned
       // (its worker crashed). Skip the ones still owned.
       const acquired = await this.store.tryLockRun(
@@ -2438,6 +2457,8 @@ export class WorkflowEngine {
         const run = runs[next];
         next += 1;
         if (!run) return;
+        // Re-check per run: a stop requested mid-tick must not lock/start the rest of the backlog.
+        if (this.draining) return;
         const acquired = await this.store.tryLockRun(
           run.id,
           this.instanceId,

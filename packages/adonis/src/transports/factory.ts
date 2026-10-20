@@ -129,6 +129,15 @@ export interface BullMQTransportConfig {
   concurrency?: number;
   /** Stable id for this process (stamped on the worker-liveness keys). Default `ts-<host>-<pid>`. */
   instanceId?: string;
+  /**
+   * Ceiling (ms) `close()` waits for graceful shutdown (workers first, then queues, one shared
+   * deadline) before it disconnects anyway. Default `5000`; `0` skips the wait. After the deadline,
+   * abandoned BullMQ workers may keep running their jobs on their own connections until the process
+   * exits.
+   */
+  closeTimeoutMs?: number;
+  /** Receives transport failures (including pub/sub subscribe failures). Default: swallowed or `console.warn`. */
+  onError?: (err: unknown) => void;
 }
 
 /** Options for the DB-table-backed (`@adonisjs/lucid`) transport. */
@@ -291,6 +300,8 @@ export const transports = {
         ...(config.prefix !== undefined ? { prefix: config.prefix } : {}),
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
         ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+        ...(config.closeTimeoutMs !== undefined ? { closeTimeoutMs: config.closeTimeoutMs } : {}),
+        ...(config.onError !== undefined ? { onError: config.onError } : {}),
       });
     };
   },

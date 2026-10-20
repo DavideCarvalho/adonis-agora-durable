@@ -1,4 +1,5 @@
 import type { ControlMessage, ControlPlane } from '../index.js';
+import { swallowSubscribe } from '../safe-subscribe.js';
 
 /**
  * The raw-`ioredis` half of {@link RedisPubSub}. A real `Redis` instance is assignable to this.
@@ -185,12 +186,16 @@ export class RedisControlPlane implements ControlPlane {
       // raw ioredis: a subscriber connection can't run normal commands → use a dedicated dup.
       const sub = this.connection.duplicate();
       this.subscriber = sub;
-      void sub.subscribe(this.channel);
+      swallowSubscribe(sub.subscribe(this.channel), () => this.closed, 'control-plane');
       sub.on?.('message', (_channel, payload) => deliver(payload));
       this.trackSubscriber(sub);
     } else {
       // `@adonisjs/redis` connection: manages its own subscriber connection; handler gets the message.
-      void this.connection.subscribe(this.channel, (payload) => deliver(payload));
+      swallowSubscribe(
+        this.connection.subscribe(this.channel, (payload) => deliver(payload)),
+        () => this.closed,
+        'control-plane',
+      );
     }
   }
 

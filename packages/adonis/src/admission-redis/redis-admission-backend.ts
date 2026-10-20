@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Admission, AdmissionBackend, AdmissionItem, QueueConfig } from '../index.js';
+import { swallowSubscribe } from '../safe-subscribe.js';
 
 /**
  * The minimal ioredis surface this backend needs. Both a raw `ioredis` instance and an
@@ -299,16 +300,19 @@ export class RedisAdmissionBackend implements AdmissionBackend {
     await this.redis.publish(this.freedChannel(), queue);
   }
 
+  private closing = false;
+
   onFreed(handler: (queue: string) => void): void {
     // A subscriber connection can't run normal commands, so use a dedicated dup of the connection.
     const sub = this.redis.duplicate();
     this.subscriber = sub;
-    void sub.subscribe(this.freedChannel());
+    swallowSubscribe(sub.subscribe(this.freedChannel()), () => this.closing, 'admission freed');
     sub.on('message', (_channel, queue) => handler(queue));
   }
 
   /** Stop the liveness heartbeat + subscriber (held slots lapse within `instanceTtlMs`). */
   async close(): Promise<void> {
+    this.closing = true;
     clearInterval(this.heartbeat);
     this.subscriber?.disconnect();
   }
