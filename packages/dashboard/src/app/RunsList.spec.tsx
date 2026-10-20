@@ -7,34 +7,42 @@ import { RunsList } from './App';
 // No jest-dom in this package (see `OriginFacets.spec.tsx`): every assertion here reads a plain DOM
 // property/attribute rather than a jest-dom matcher.
 
-/** happy-dom has no real layout engine — `offsetWidth`/`offsetHeight` are always `0`, and
- *  `@tanstack/react-virtual` reads them BOTH for the scroll container's viewport size (so it never
- *  keeps the `initialRect` `RunsList` seeds it with — a synchronous measurement on mount overwrites
- *  it with the real, zeroed-out rect) AND per-row via `measureElement`. Stubbing a fixed non-zero
- *  `offsetHeight`/`offsetWidth` for every element makes both measurements deterministic, matching the
+/** happy-dom has no real layout engine — every size reads `0`. `@tanstack/react-virtual` measures the
+ *  scroll container's viewport (overwriting the `initialRect` `RunsList` seeds it with on mount) and
+ *  each row via `measureElement`, so both are stubbed with fixed non-zero sizes, matching the
  *  approach TanStack Virtual's own test suite uses for the same reason. */
-let restoreOffsetHeight: () => void;
-let restoreOffsetWidth: () => void;
+let restoreElementSize: () => void;
 const FAKE_ROW_HEIGHT = 96;
 const FAKE_VIEWPORT_WIDTH = 340;
+const FAKE_VIEWPORT_HEIGHT = 480;
 
-function stubElementSize() {
-  const heightDesc = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetHeight');
-  const widthDesc = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetWidth');
-  Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
-    configurable: true,
-    value: FAKE_ROW_HEIGHT,
-  });
-  Object.defineProperty(HTMLElement.prototype, 'offsetWidth', {
-    configurable: true,
-    value: FAKE_VIEWPORT_WIDTH,
-  });
-  restoreOffsetHeight = () =>
-    heightDesc
-      ? Object.defineProperty(HTMLElement.prototype, 'offsetHeight', heightDesc)
-      : undefined;
-  restoreOffsetWidth = () =>
-    widthDesc ? Object.defineProperty(HTMLElement.prototype, 'offsetWidth', widthDesc) : undefined;
+/** Rows are measured through `offsetHeight`; the scroll viewport through `clientWidth`/`clientHeight`
+ *  (virtual-core >= 3.19.6 measures the visible box). `rowHeight` decides each element's
+ *  `offsetHeight`; the viewport is a fixed 340x480. */
+function stubElementSize(rowHeight: (el: HTMLElement) => number = () => FAKE_ROW_HEIGHT) {
+  const sizes: Record<string, (el: HTMLElement) => number> = {
+    offsetHeight: rowHeight,
+    offsetWidth: () => FAKE_VIEWPORT_WIDTH,
+    clientHeight: () => FAKE_VIEWPORT_HEIGHT,
+    clientWidth: () => FAKE_VIEWPORT_WIDTH,
+  };
+  const originals = Object.keys(sizes).map(
+    (prop) => [prop, Object.getOwnPropertyDescriptor(HTMLElement.prototype, prop)] as const,
+  );
+  for (const [prop, size] of Object.entries(sizes)) {
+    Object.defineProperty(HTMLElement.prototype, prop, {
+      configurable: true,
+      get(this: HTMLElement) {
+        return size(this);
+      },
+    });
+  }
+  restoreElementSize = () => {
+    for (const [prop, desc] of originals) {
+      if (desc) Object.defineProperty(HTMLElement.prototype, prop, desc);
+      else delete (HTMLElement.prototype as unknown as Record<string, unknown>)[prop];
+    }
+  };
 }
 
 class NoopResizeObserver {
@@ -69,8 +77,7 @@ describe('<RunsList> virtualization', () => {
   });
   afterEach(() => {
     vi.unstubAllGlobals();
-    restoreOffsetHeight();
-    restoreOffsetWidth();
+    restoreElementSize();
   });
 
   it('mounts far fewer row buttons than the total run count for a large list', () => {
@@ -138,39 +145,20 @@ describe('<RunsList> virtualization', () => {
 });
 
 describe('<RunsList> row identity across reorders', () => {
-  /** Heights that vary BY RUN rather than by position — the condition the bug needs. A row whose
-   *  workflow name marks it tall measures TALL_ROW_HEIGHT; every other row measures FAKE_ROW_HEIGHT.
-   *  Keyed on rendered text, so a measurement can only follow the run, never the slot. */
-  function stubHeightByContent() {
-    const heightDesc = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetHeight');
-    const widthDesc = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetWidth');
-    Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
-      configurable: true,
-      get(this: HTMLElement) {
-        return this.textContent?.includes(TALL_WORKFLOW) ? TALL_ROW_HEIGHT : FAKE_ROW_HEIGHT;
-      },
-    });
-    Object.defineProperty(HTMLElement.prototype, 'offsetWidth', {
-      configurable: true,
-      value: FAKE_VIEWPORT_WIDTH,
-    });
-    return () => {
-      if (heightDesc) Object.defineProperty(HTMLElement.prototype, 'offsetHeight', heightDesc);
-      if (widthDesc) Object.defineProperty(HTMLElement.prototype, 'offsetWidth', widthDesc);
-    };
-  }
-
   const TALL_WORKFLOW = 'checkout-tall';
   const TALL_ROW_HEIGHT = 200;
-  let restore: () => void;
 
   beforeEach(() => {
     vi.stubGlobal('ResizeObserver', NoopResizeObserver);
-    restore = stubHeightByContent();
+    // Heights vary BY RUN rather than by position — the condition the bug needs. Keyed on rendered
+    // text, so a measurement can only follow the run, never the slot.
+    stubElementSize((el) =>
+      el.textContent?.includes(TALL_WORKFLOW) ? TALL_ROW_HEIGHT : FAKE_ROW_HEIGHT,
+    );
   });
   afterEach(() => {
     vi.unstubAllGlobals();
-    restore();
+    restoreElementSize();
   });
 
   function run(id: string, workflow: string, second: number): WorkflowRun {
@@ -227,8 +215,7 @@ describe('<RunsList> infinite-scroll pagination', () => {
   });
   afterEach(() => {
     vi.unstubAllGlobals();
-    restoreOffsetHeight();
-    restoreOffsetWidth();
+    restoreElementSize();
   });
 
   it('asks for the next page once every loaded run is scrolled into view and more may exist', async () => {
