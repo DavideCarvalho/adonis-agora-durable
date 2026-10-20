@@ -494,6 +494,125 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       },
     );
 
+    t('listSignalWaitersByRunIds round-trips every field of the given runs’ waiters', async () => {
+      if (!store.listSignalWaitersByRunIds) return;
+      await store.putSignalWaiter({
+        token: 'child:a.all.0.0',
+        runId: 'a',
+        seq: 0,
+        parallelGroup: 'all:0',
+      });
+      await store.putSignalWaiter({ token: 'approve-a', runId: 'a', seq: 1 });
+      await store.putSignalWaiter({ token: 'approve-b', runId: 'b', seq: 0 });
+      await store.putSignalWaiter({ token: 'approve-c', runId: 'c', seq: 0 });
+
+      const tokens = async (ids: string[]) =>
+        ((await store.listSignalWaitersByRunIds?.(ids)) ?? []).map((w) => w.token).sort();
+      expect(await tokens(['a', 'b'])).toEqual(['approve-a', 'approve-b', 'child:a.all.0.0']);
+      expect(await tokens(['missing'])).toEqual([]);
+      const fan = (await store.listSignalWaitersByRunIds(['a'])).find((w) => w.seq === 0);
+      expect(fan).toEqual({ token: 'child:a.all.0.0', runId: 'a', seq: 0, parallelGroup: 'all:0' });
+    });
+
+    t('hasSignalWaiter answers by run and exact token prefix (when implemented)', async () => {
+      if (!store.hasSignalWaiter) return;
+      const has = (runId: string, prefix: string) => store.hasSignalWaiter?.(runId, prefix);
+      await store.putSignalWaiter({
+        token: 'child:p_1.all.3.0',
+        runId: 'p_1',
+        seq: 3,
+        parallelGroup: 'all:3',
+      });
+      // A grandchild's waiter shares the token prefix but belongs to another run.
+      await store.putSignalWaiter({
+        token: 'child:p_1.all.4.0.all.0.0',
+        runId: 'p_1.all.4.0',
+        seq: 0,
+      });
+      // Matches `child:p_1.all.3.%` as a LIKE pattern (`_` is a wildcard there) but not as a prefix.
+      await store.putSignalWaiter({ token: 'child:pX1.all.3.0', runId: 'p_1', seq: 9 });
+      // Matches `child:P_1.all.3.%` under a case-insensitive LIKE, but not as a prefix.
+      await store.putSignalWaiter({ token: 'child:P_1.all.5.0', runId: 'p_1', seq: 10 });
+
+      expect(await has('p_1', 'child:p_1.all.3.')).toBe(true);
+      expect(await has('p_1', 'child:p_1.all.4.')).toBe(false);
+      expect(await has('other', 'child:p_1.all.3.')).toBe(false);
+      // `_` and `%` are literal, not wildcards, and the match is case-sensitive.
+      expect(await has('p_1', 'child:p%.all.3.')).toBe(false);
+      expect(await has('p_1', 'child:p_1.all.5.')).toBe(false);
+      expect(await has('p_1', 'CHILD:p_1.all.3.')).toBe(false);
+
+      await store.takeSignalWaiter('child:p_1.all.3.0');
+      expect(await has('p_1', 'child:p_1.all.3.')).toBe(false);
+    });
+
+    t(
+      'registerChildWaits writes every waiter and placeholder, and upserts on repeat (when implemented)',
+      async () => {
+        if (!store.registerChildWaits) return;
+        await store.createRun(run({ id: 'p' }));
+        const entry = (i: number, status: StepCheckpoint['status']) => ({
+          waiter: { token: `child:p.all.0.${i}`, runId: 'p', seq: i, parallelGroup: 'all:0' },
+          checkpoint: checkpoint({
+            runId: 'p',
+            seq: i,
+            stepId: `p:${i}`,
+            name: `signal:child:p.all.0.${i}`,
+            kind: 'signal',
+            status,
+            output: undefined,
+            parallelGroup: 'all:0',
+          }),
+        });
+        // Wider than one statement on stores that split the batch.
+        const entries = Array.from({ length: 250 }, (_, i) => entry(i, 'running'));
+        await store.registerChildWaits(entries);
+
+        const waiters = await store.listSignalWaiters('child:p.all.0.');
+        expect(waiters).toHaveLength(250);
+        expect(waiters.find((w) => w.token === 'child:p.all.0.7')).toEqual(entries[7]?.waiter);
+        const cps = await store.listCheckpoints('p');
+        expect(cps).toHaveLength(250);
+        expect(cps[7]).toMatchObject({ name: 'signal:child:p.all.0.7', status: 'running' });
+        expect(cps[7]?.parallelGroup).toBe('all:0');
+
+        await store.registerChildWaits([entry(7, 'completed')]);
+        expect((await store.getCheckpoint('p', 7))?.status).toBe('completed');
+        expect(await store.listCheckpoints('p')).toHaveLength(250);
+        await expect(store.registerChildWaits([])).resolves.toBeUndefined();
+      },
+    );
+
+    t(
+      'compactCheckpoints replaces a seq range with one checkpoint, atomically (when implemented)',
+      async () => {
+        if (!store.compactCheckpoints) return;
+        await store.createRun(run({ id: 'r' }));
+        await store.createRun(run({ id: 'other' }));
+        for (let seq = 0; seq < 10; seq += 1) {
+          await store.saveCheckpoint(checkpoint({ runId: 'r', seq, stepId: `r:${seq}` }));
+        }
+        await store.saveCheckpoint(checkpoint({ runId: 'other', seq: 3, stepId: 'other:3' }));
+        const into = checkpoint({
+          runId: 'r',
+          seq: 2,
+          stepId: 'r:2',
+          name: 'fan:r.all.2.',
+          kind: 'signal',
+          output: { from: 0, values: [{ n: 1 }, 'two', null] },
+          parallelGroup: 'all:2',
+        });
+
+        await store.compactCheckpoints('r', 2, 7, into);
+
+        const left = await store.listCheckpoints('r');
+        expect(left.map((cp) => cp.seq)).toEqual([0, 1, 2, 8, 9]);
+        expect(left[2]).toMatchObject({ name: 'fan:r.all.2.', parallelGroup: 'all:2' });
+        expect(left[2]?.output).toEqual({ from: 0, values: [{ n: 1 }, 'two', null] });
+        expect(await store.listCheckpoints('other')).toHaveLength(1);
+      },
+    );
+
     t('tag values containing LIKE metacharacters match exactly (no pattern widening)', async () => {
       await store.createRun(run({ id: 'meta', tags: ['50%_off'] }));
       await store.createRun(run({ id: 'decoy', tags: ['50x_off'] }));

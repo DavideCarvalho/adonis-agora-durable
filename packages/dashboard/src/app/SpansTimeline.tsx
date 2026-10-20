@@ -3,6 +3,7 @@ import type React from 'react';
 import { useMemo, useState } from 'react';
 import type { RunDetail, StepCheckpoint, WorkflowRun } from '../client/durable-client';
 import { durableClient, isStalePending } from '../client/durable-client';
+import { stepDisplayName } from '../client/folded-children';
 import { groupParallelSpans } from '../client/group-parallel-spans';
 import { groupSubProcesses } from '../client/group-subprocesses';
 import { childRunIdOf } from './child-link';
@@ -208,7 +209,7 @@ function StepRow({
           <span className="truncate text-[12px] text-zinc-300">
             {childRunId !== undefined
               ? (childRuns[childRunId]?.run.workflow ?? 'child workflow')
-              : step.name}
+              : stepDisplayName(step)}
           </span>
           {isChild && childRunId !== undefined && (
             <button

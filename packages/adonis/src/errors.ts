@@ -169,14 +169,32 @@ export class WorkflowSuspended extends Error {
    * completed. Optional: a suspension without it just relies on the reconcile fallback as before.
    */
   readonly waitSeqs?: number[] | undefined;
+  /** Set when awaited children are what the run is waiting on — see {@link FanJoin}. */
+  readonly fan?: FanJoin | undefined;
   /** Marks this as a control-flow signal — see {@link isWorkflowControlFlowSignal}. */
   readonly [CONTROL_FLOW_SIGNAL] = true;
-  constructor(wakeAt?: number, waitSeqs?: number[]) {
+  constructor(wakeAt?: number, waitSeqs?: number[], fan?: FanJoin) {
     super('workflow suspended');
     this.name = 'WorkflowSuspended';
     this.wakeAt = wakeAt;
     this.waitSeqs = waitSeqs;
+    this.fan = fan;
   }
+}
+
+/**
+ * What a run suspended on when it awaits children (`ctx.all`, `ctx.child`). For each group of
+ * children, every waiter token starts with `waiterPrefix` and every `signal:child:` checkpoint name
+ * with `checkpointPrefix`, so the engine can tell whether the group has settled without knowing the
+ * children's ids.
+ */
+export interface FanJoin {
+  waits: FanWait[];
+}
+
+export interface FanWait {
+  waiterPrefix: string;
+  checkpointPrefix: string;
 }
 
 /**

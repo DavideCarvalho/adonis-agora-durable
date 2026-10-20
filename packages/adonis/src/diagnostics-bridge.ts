@@ -1,3 +1,4 @@
+import { parentRunIdOf } from './fan-join.js';
 import type { EngineEvent } from './interfaces.js';
 
 /** The minimal engine surface the bridge needs: a lifecycle-event subscription. */
@@ -20,13 +21,18 @@ type EmitFn = (lib: string, event: string, payload: unknown) => void;
  * subscribers, the Telescope generic watcher (which auto-captures every channel), the cross-process
  * relays, and the OTel bridge (each event recorded on the active span). `emit` short-circuits on
  * `hasSubscribers`, so an unsubscribed channel costs nothing, and it never throws back into the
- * engine. All event types are forwarded verbatim — filtering is the subscriber's job.
+ * engine. All event types are forwarded — filtering is the subscriber's job. An event of a child run
+ * the engine started (`ctx.all`, `ctx.child`, `ctx.startChild` without a caller-chosen id) also
+ * carries `parentRunId`: each child is its own run, so that field is how a subscriber (a Telescope
+ * search, say) finds every child of one parent, a whole `ctx.all` fan included.
  *
  * @returns an unsubscribe function that detaches the bridge from the engine.
  */
 export function attachDurableDiagnostics(engine: DurableEventSource): () => void {
   return engine.subscribe((event: EngineEvent) => {
     const emit = (globalThis as Record<symbol, unknown>)[EMIT_SLOT] as EmitFn | undefined;
-    if (typeof emit === 'function') emit('durable', event.type, event);
+    if (typeof emit !== 'function') return;
+    const parentRunId = parentRunIdOf(event.runId);
+    emit('durable', event.type, parentRunId ? { ...event, parentRunId } : event);
   });
 }

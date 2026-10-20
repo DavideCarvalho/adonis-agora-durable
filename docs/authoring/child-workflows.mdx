@@ -131,6 +131,24 @@ parallel group, which is what lets the [dashboard](/docs/durable/observability/d
 a single unit rather than N unrelated children. An empty `inputs` array returns `[]` immediately and starts
 nothing.
 
+A fan costs O(N), however wide it is. Settling children do not wake the parent one by one: a join barrier holds
+the wake until the last child settles, so the parent replays the fan about once, not once per child. A
+`failFast` fan is the exception, and wakes on its first failure. The barrier needs the store's
+`hasSignalWaiter`, which the bundled stores implement. A custom store without it still runs `ctx.all`
+correctly, but the parent then replays once per settled child, which is O(N²) across the fan. Sending the fan
+is batched too: children are registered 500 at a time through the store's `registerChildWaits`, one
+transaction per batch.
+
+Once a fan of 100 or more children settles with every child successful, its per-child checkpoints are folded
+into a single `fan:<parentRunId>.all.<seq>.` checkpoint holding the outputs in order. Every later turn of the
+parent then loads one row for the fan instead of one per child. A fan with `concurrency` folds each wave as it
+settles. Folding keeps the outputs, so it saves the per-row overhead and the row count, not the bytes of the
+outputs themselves: have children return small results (ids, counts) and write anything large to your own
+tables. A group with a failed child is not folded, so a retry can still re-run that child. A fan under 100
+children keeps its per-child checkpoints, so the dashboard can show each child. Folding needs the store's
+`compactCheckpoints`, which the bundled stores implement. Cancel cascades, `deleteRun` and `purgeRuns` still
+reach every child of a folded fan.
+
 ### `waitAll` vs `failFast`
 
 `opts.mode` decides what a failing sibling does to the rest:
@@ -171,6 +189,25 @@ sibling in the middle of a step only observes it at its next checkpoint. If a pa
 undone, give the child its own [compensations](/docs/durable/reliability/sagas) and cancel it with
 `{ compensate: true }` yourself instead.
 </Callout>
+
+### Capping how many children run at once — `concurrency`
+
+By default the whole fan is sent at once. For a wide fan that floods the queue and keeps every child run and
+waiter alive together, so pass `concurrency` to cap it:
+
+```ts
+const results = await ctx.all(ProcessItemWorkflow, batch.items, { concurrency: 1000 })
+```
+
+Children then go out in waves of `floor(concurrency / 2)`, two waves at a time (so an odd limit runs one child under it), and the parent sends the
+next wave as soon as one settles. A slow child holds back only its own wave, not the whole window. Each settled
+wave costs the parent one turn, and since settled waves are folded, that turn reads one row per earlier wave
+rather than one per earlier child. `concurrency` must be a positive integer; a limit at or above the fan size
+changes nothing.
+
+`concurrency` is part of the fan's identity: the wave is in each child's id
+(`<parentRunId>.all.<seq>.w<k>.<i>`). Changing it while a run is in flight is a non-deterministic change, the
+same as changing `inputs`.
 
 ### Fanning out by hand
 

@@ -1,4 +1,5 @@
 import type { StepCheckpoint } from './durable-client.js';
+import { foldedChildCount } from './folded-children.js';
 
 /**
  * A timeline rendered as a sequence of nodes: a plain `single` step, or a `fan` — N steps that the
@@ -22,8 +23,13 @@ function commonPrefix(names: string[]): string {
   return prefix.replace(/[\s._:-]+$/, '');
 }
 
-/** A concise summary of a fan: a name-derived label like `handle ×7` (NOT the group prefix). */
+/** A concise summary of a fan: a name-derived label like `handle ×7` (NOT the group prefix). A
+ *  `ctx.all` fan with folded waves counts the child runs each folded wave stands for. */
 function fanLabel(steps: StepCheckpoint[]): string {
+  if (steps.some((s) => foldedChildCount(s) !== undefined)) {
+    const runs = steps.reduce((sum, s) => sum + (foldedChildCount(s) ?? 1), 0);
+    return `child runs ×${runs}`;
+  }
   const prefix = commonPrefix(steps.map((s) => s.name));
   // A single-character shared prefix (e.g. `a`/`b` → ``, but `fA`/`fB` → `f`) reads as noise, not a
   // meaningful label — fall back to `parallel` unless the shared prefix is at least two chars.

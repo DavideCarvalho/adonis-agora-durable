@@ -48,4 +48,29 @@ describe('attachDurableDiagnostics', () => {
     await engine.waitForRun('r3');
     expect(seen).toEqual([]);
   });
+
+  it('stamps parentRunId on the events of a child run the engine started', async () => {
+    const seen: Array<{ runId: string; parentRunId?: string }> = [];
+    slot[EMIT_SLOT] = (_lib: string, _event: string, payload: unknown) =>
+      seen.push(payload as { runId: string; parentRunId?: string });
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    const off = attachDurableDiagnostics(engine);
+    engine.register('item', '1', async () => 'ok');
+    engine.register('batch', '1', async (ctx) => {
+      await ctx.all('item', [{}, {}]);
+      return ctx.child('item', {});
+    });
+    await engine.start('batch', {}, 'p');
+    for (let i = 0; i < 200 && (await store.getRun('p'))?.status !== 'completed'; i += 1) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    off();
+
+    const children = new Set(seen.filter((e) => e.parentRunId === 'p').map((e) => e.runId));
+    expect([...children].sort()).toEqual(['p.all.0.0', 'p.all.0.1', 'p.child.2']);
+    expect(seen.filter((e) => e.runId === 'p').every((e) => e.parentRunId === undefined)).toBe(
+      true,
+    );
+  });
 });

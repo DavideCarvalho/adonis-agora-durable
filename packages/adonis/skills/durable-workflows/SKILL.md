@@ -177,7 +177,10 @@ if (input.n < 3) await ctx.continueAsNew({ n: input.n + 1 }) // clean history pe
 `ctx.all` default mode is `waitAll`: every sibling finishes, then the call throws
 a `GatherError` carrying `.failures`; `{ mode: 'failFast' }` cancels remaining
 siblings (plain cancel — no saga). Child ids derive from the call position and
-are replay-stable; never pass a random one.
+are replay-stable; never pass a random one. `{ concurrency: n }` caps how many
+children run at once (waves of `floor(n / 2)`, two at a time), and the wave goes into each child
+id), so changing it for an in-flight run is non-deterministic, like changing
+`inputs`.
 
 Serialize runs per subject with a singleton — runs sharing a key queue FIFO and
 are race-free across instances:

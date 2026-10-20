@@ -1,12 +1,13 @@
 import { type AdmissionBackend, InMemoryAdmissionBackend } from './admission.js';
 import { backoffDelay, MAX_BACKOFF_MS } from './backoff.js';
 import { instantCheckpoint, lostStepEvent, stepCheckpoint } from './checkpoints.js';
-import { type Completion } from './completion.js';
+import { type Completion, isFailedCompletion } from './completion.js';
 import {
   assertConcurrency,
   type ConcurrencyConfig,
   type ConcurrencyQuota,
   concurrencyTag,
+  countRuns,
   resolveConcurrency,
 } from './concurrency.js';
 import {
@@ -20,12 +21,14 @@ import { parseDuration } from './duration.js';
 import { Entities, type EntityConfig } from './entities.js';
 import {
   ContinueAsNew,
+  type FanJoin,
   NonDeterminismError,
   RemoteStepTimeout,
   WorkflowSuspended,
 } from './errors.js';
 import { EventAccumulators, type EventBatchConfig } from './event-accumulators.js';
 import { eventMatches, eventMatchOf, eventPrefix } from './events.js';
+import { FOLDED_PREFIX, fanOfWaiter, foldedChildIds } from './fan-join.js';
 import type { WorkerDescriptor } from './handshake/descriptor.js';
 import type {
   ControlPlane,
@@ -74,6 +77,7 @@ import { breakpointToken, stepId } from './protocol.js';
 import type { QueueConfig } from './queue.js';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor.js';
 import { scanRunValueFacets } from './run-value-facets.js';
+import { listSignalWaitersOfRuns } from './run-waiting.js';
 import { type ScheduledWorkflow, scheduleWindow } from './scheduler.js';
 import { ScheduleClient } from './schedules.js';
 import { SingletonGate } from './singleton-gate.js';
@@ -1414,11 +1418,13 @@ export class WorkflowEngine {
     runId: string,
     opts?: StartOptions,
     onStartError?: (err: unknown) => void,
+    onAlreadySettled?: (settled: RunResult) => Promise<void>,
   ): void {
     this.trackEffect(
       (async () => {
         // Defer one microtask: never reentrantly resume the parent that is still suspending/settling.
         await Promise.resolve();
+        let result: RunResult | undefined;
         try {
           if (this.usesInProcessDispatch) {
             // Persist WITHOUT the fire-and-forget dispatch, then drive the pickup ourselves so this
@@ -1426,7 +1432,7 @@ export class WorkflowEngine {
             // stays tracked until the run has entered `inflight` and settled. `runOne` no-ops (returns
             // null) on replay (the run already exists) or while draining (the run is left `pending` for
             // recovery) — the durable persist above is what matters on those paths.
-            const result = await this.startCore(workflow, input, runId, opts, false);
+            result = await this.startCore(workflow, input, runId, opts, false);
             // Guard-free pickup: the continuation/child is in-flight work `drain()` is waiting on, so it
             // runs even while draining (a `runOne` here would no-op on `this.draining`, stranding it
             // `pending` after its persist — persisted-but-not-processed). Mirrors a signal-driven resume.
@@ -1434,10 +1440,19 @@ export class WorkflowEngine {
           } else {
             // Custom dispatcher owns execution (possibly on another pod); guarantee the persist + its
             // normal dispatch/broadcast. The in-process rolled-back-transaction hazard doesn't apply.
-            await this.startCore(workflow, input, runId, opts, true);
+            result = await this.startCore(workflow, input, runId, opts, true);
           }
         } catch (err) {
           if (onStartError) onStartError(err);
+          return;
+        }
+        // A new run is never terminal, so a terminal result is a run that already existed.
+        if (
+          onAlreadySettled &&
+          result &&
+          TERMINAL_RUN_STATUSES.includes(result.status as TerminalRunStatus)
+        ) {
+          await onAlreadySettled(result);
         }
       })(),
     );
@@ -2231,8 +2246,8 @@ export class WorkflowEngine {
     // - a `failed` checkpoint becomes retryable-now (attempts 0, wake immediately, `retryable`
     //   forced back on): the durable-retry machinery re-dispatches it as a fresh first attempt;
     // - an awaited-child `signal:child:` checkpoint holding a FAILURE completion returns to its
-    //   live `running` placeholder, so replay re-registers the `child:<id>` waiter — a separately
-    //   retried child's completion (already buffered, or still to come) then resumes this run.
+    //   live `running` placeholder with its `child:<id>` waiter put back — a separately retried
+    //   child's completion (already buffered, or still to come) then resumes this run.
     //   Retry child and parent in either order; signal buffering makes it converge.
     if (run.status === 'failed' || run.status === 'dead') {
       const isFailureCompletion = (v: unknown): boolean =>
@@ -2251,16 +2266,15 @@ export class WorkflowEngine {
           cp.status === 'completed' &&
           isFailureCompletion(cp.output)
         ) {
-          await this.store.saveCheckpoint({ ...cp, status: 'running', output: undefined });
-          // CASCADE: retrying only the parent is useless in a live engine — replay re-registers
-          // the `child:<id>` waiter and the reconciler re-delivers the child's still-FAILED
-          // terminal state within seconds, re-failing the parent with the same error. Requeue the
-          // failed child too so the pair converges: whichever finishes the handshake last (waiter
-          // registered vs completion buffered) resumes the parent.
+          // CASCADE: retrying only the parent is useless in a live engine — the reconciler
+          // re-delivers the child's still-FAILED terminal state within seconds, re-failing the
+          // parent with the same error. Requeue the failed child too so the pair converges:
+          // whichever finishes the handshake last (waiter registered vs completion buffered)
+          // resumes the parent.
           //
           // Exception: a SUCCESS already buffered on this token (a completed `~retry~` fix of the
-          // child — see notifyParent's origin delivery) is the outcome the replay will consume, so
-          // re-running the failed origin would be pure waste. Peek = take + re-buffer.
+          // child — see notifyParent's origin delivery) is the outcome, so re-running the failed
+          // origin would be pure waste: settle the checkpoint with it right here.
           const childId = cp.name.slice('signal:child:'.length);
           // Drain-and-restore keeps relative order (a partial take+re-buffer would rotate it).
           const parked: unknown[] = [];
@@ -2269,13 +2283,28 @@ export class WorkflowEngine {
             if (!buffered) break;
             parked.push(buffered.payload);
           }
-          for (const payload of parked) await this.store.bufferSignal(`child:${childId}`, payload);
-          const bufferedSuccess = parked.some(
+          const successAt = parked.findIndex(
             (payload) =>
               typeof payload === 'object' &&
               payload !== null &&
               (payload as { ok?: unknown }).ok === true,
           );
+          const success = successAt === -1 ? undefined : parked.splice(successAt, 1)[0];
+          for (const payload of parked) await this.store.bufferSignal(`child:${childId}`, payload);
+          const bufferedSuccess = success !== undefined;
+          if (bufferedSuccess) {
+            await this.store.saveCheckpoint({ ...cp, output: success });
+          } else {
+            // Back to a live `running` placeholder. Its waiter goes first: replay reads a
+            // placeholder as proof its waiter exists and never re-puts it.
+            await this.store.putSignalWaiter({
+              token: `child:${childId}`,
+              runId,
+              seq: cp.seq,
+              parallelGroup: cp.parallelGroup,
+            });
+            await this.store.saveCheckpoint({ ...cp, status: 'running', output: undefined });
+          }
           if (!bufferedSuccess) {
             const child = await this.store.getRun(childId);
             if (child && (child.status === 'failed' || child.status === 'dead')) {
@@ -2578,7 +2607,59 @@ export class WorkflowEngine {
         parallelGroup: waiter.parallelGroup,
       }),
     );
+    if (await this.fanStillWaiting(waiter, payload)) {
+      return { runId: waiter.runId, status: 'suspended' };
+    }
     return this.resumeImplicit(waiter.runId);
+  }
+
+  /**
+   * The `ctx.all` join barrier: true when `waiter` was one child of a fan (or of one wave of it)
+   * whose siblings are still out, so waking the parent now would only replay the fan and re-suspend.
+   * Skipping that wake is what keeps a fan of N children at O(N) work instead of N replays of N items.
+   *
+   * Safe because the LAST sibling to settle always wakes the parent: each child consumes its own
+   * waiter before it asks, so whichever asks last sees none left. A failed child of a failFast fan
+   * always wakes it. Anything that is not a `ctx.all` waiter, or a store that cannot answer the
+   * question cheaply, wakes the parent as before.
+   */
+  private async fanStillWaiting(waiter: SignalWaiter, payload: unknown): Promise<boolean> {
+    if (!this.store.hasSignalWaiter) return false;
+    const fan = fanOfWaiter(waiter);
+    if (!fan) return false;
+    if (fan.failFast && isFailedCompletion(payload)) return false;
+    return this.store.hasSignalWaiter(waiter.runId, fan.waiterPrefix);
+  }
+
+  /**
+   * Re-drive a run that just suspended on awaited children (a `ctx.all` fan or wave, a `ctx.child`)
+   * which, by now, have settled.
+   *
+   * A wake that finds the run's lease held is dropped. So if a child settles while the parent is
+   * still executing (the turn that dispatched it, or one woken by an earlier child), that wake is
+   * spent, and the turn suspends on a snapshot that predates the child. With the `ctx.all` barrier
+   * that wake was the only one the fan would get, and nothing would wake the run until the
+   * `reconcileMs` sweep.
+   *
+   * Runs after the turn released its lease, so any child that settles from here on wakes the run
+   * itself. Only re-drives for a group whose checkpoints are all settled, which the next turn is
+   * then guaranteed to see, so it cannot loop. A group that still has a waiter is skipped without
+   * reading its checkpoints.
+   */
+  private async redriveSettledChildren(runId: string, fan: FanJoin): Promise<void> {
+    for (const wait of fan.waits) {
+      if (await this.store.hasSignalWaiter?.(runId, wait.waiterPrefix)) continue;
+      const checkpoints = this.store.listCheckpointsByNamePrefix
+        ? await this.store.listCheckpointsByNamePrefix(runId, [wait.checkpointPrefix])
+        : (await this.store.listCheckpoints(runId)).filter((cp) =>
+            cp.name.startsWith(wait.checkpointPrefix),
+          );
+      const group = checkpoints.filter((cp) => cp.name.startsWith(wait.checkpointPrefix));
+      if (group.length > 0 && group.every((cp) => cp.status === 'completed')) {
+        await this.resumeImplicit(runId);
+        return;
+      }
+    }
   }
 
   /**
@@ -2708,13 +2789,37 @@ export class WorkflowEngine {
     // Tracked handoff (see {@link handoffRun}): the deferral + reentrancy guard are preserved, but the
     // start is now held in `postSettle` so `drain()` waits for the child to enter `inflight` and settle
     // rather than slipping through the gap before the deferred start ran.
-    this.handoffRun(workflow, input, childId, opts, (err: unknown) => {
-      const message = err instanceof Error ? err.message : String(err);
-      this.notifyParent(childId, {
-        ok: false,
-        error: `child workflow "${workflow}" failed to start: ${message}`,
-      });
-    });
+    this.handoffRun(
+      workflow,
+      input,
+      childId,
+      opts,
+      (err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        this.notifyParent(childId, {
+          ok: false,
+          error: `child workflow "${workflow}" failed to start: ${message}`,
+        });
+      },
+      (settled) => this.redeliverSettledChild(childId, settled),
+    );
+  }
+
+  /**
+   * A child start that found the child already terminal: its completion may never reach the waiter
+   * the parent just put (it was buffered before that waiter existed, or lost between the child's
+   * terminal write and its notify). Deliver it again, preferring a buffered copy, so the awaiting
+   * parent does not need a run lookup per child to notice.
+   */
+  private async redeliverSettledChild(childId: string, settled: RunResult): Promise<void> {
+    const token = `child:${childId}`;
+    const buffered = await this.store.takeBufferedSignal(token);
+    const completion: unknown = buffered
+      ? buffered.payload
+      : settled.status === 'completed'
+        ? { ok: true, value: settled.output }
+        : { ok: false, error: settled.error?.message ?? settled.status };
+    await this.signal(token, completion);
   }
 
   /**
@@ -2841,32 +2946,23 @@ export class WorkflowEngine {
    * so a completed parent (or a completed awaited child) would otherwise drop out of the tree. The
    * `signal:child:<id>` checkpoint (the placeholder written when the parent first awaits the child,
    * overwritten as completed/failed when it settles) persists across completion, so we read both and
-   * dedupe — the edge stays stable for a finished run, not just a live one.
+   * dedupe — the edge stays stable for a finished run, not just a live one. A settled `ctx.all`
+   * group folded into one `fan:` checkpoint stands for every child in it.
    */
   async getRunChildren(parentRunId: string): Promise<string[]> {
     const childIds = new Set<string>();
-    // Targeted per-run lookup when the store has it (an indexed `WHERE run_id`); the prefix scan
-    // fallback walks EVERY `child:` waiter row for one parent.
-    const waiters = this.store.listSignalWaitersByRunIds
-      ? await this.store.listSignalWaitersByRunIds([parentRunId])
-      : await this.store.listSignalWaiters('child:');
-    for (const w of waiters) {
-      if (w.runId === parentRunId && w.token.startsWith('child:')) {
-        childIds.add(w.token.slice('child:'.length));
-      }
+    // The parent's own waiters only (an indexed `WHERE run_id` when the store has it).
+    for (const w of await listSignalWaitersOfRuns(this.store, [parentRunId])) {
+      if (w.token.startsWith('child:')) childIds.add(w.token.slice('child:'.length));
     }
-    // Targeted read: only the `signal:child:` / `spawn:` checkpoints, not the whole history. Falls
-    // back to a full listCheckpoints + in-JS prefix scan for a custom store that omits the method.
-    const prefixes = ['signal:child:', 'spawn:'];
+    // Targeted read: only the child-edge checkpoints, not the whole history. Falls back to a full
+    // listCheckpoints + in-JS prefix scan for a custom store that omits the method.
     const childCheckpoints = this.store.listCheckpointsByNamePrefix
-      ? await this.store.listCheckpointsByNamePrefix(parentRunId, prefixes)
+      ? await this.store.listCheckpointsByNamePrefix(parentRunId, CHILD_EDGE_PREFIXES)
       : (await this.store.listCheckpoints(parentRunId)).filter((cp) =>
-          prefixes.some((p) => cp.name.startsWith(p)),
+          CHILD_EDGE_PREFIXES.some((p) => cp.name.startsWith(p)),
         );
-    for (const cp of childCheckpoints) {
-      if (cp.name.startsWith('signal:child:')) childIds.add(cp.name.slice('signal:child:'.length));
-      if (cp.name.startsWith('spawn:') && typeof cp.output === 'string') childIds.add(cp.output);
-    }
+    for (const id of childIdsOf(childCheckpoints)) childIds.add(id);
     return [...childIds];
   }
 
@@ -2887,13 +2983,16 @@ export class WorkflowEngine {
    * stamp. Prefers the store's indexed method; falls back to filtering the full scan for a custom
    * store without it.
    */
-  async listSignalWaitersByRunIds(runIds: string[]): Promise<SignalWaiter[]> {
-    if (runIds.length === 0) return [];
-    if (this.store.listSignalWaitersByRunIds) {
-      return this.store.listSignalWaitersByRunIds(runIds);
-    }
-    const ids = new Set(runIds);
-    return (await this.store.listSignalWaiters('')).filter((w) => ids.has(w.runId));
+  listSignalWaitersByRunIds(runIds: string[]): Promise<SignalWaiter[]> {
+    return listSignalWaitersOfRuns(this.store, runIds);
+  }
+
+  /**
+   * How many runs match `query`: an exact `COUNT` through the store's `countRuns`, or the length of
+   * the full listing for a store without one.
+   */
+  countRuns(query: Omit<RunQuery, 'page' | 'size'>): Promise<number> {
+    return countRuns(this.store, query);
   }
 
   /** The worker groups this engine dispatches to: every registered remote workflow's group, plus any
@@ -3894,6 +3993,7 @@ export class WorkflowEngine {
     const snapshot = await this.store.listCheckpoints(run.id);
     const replay = new Map<number, StepCheckpoint>();
     for (const cp of snapshot) replay.set(cp.seq, cp);
+    let suspendedOnFan: FanJoin | undefined;
     const ctx = createWorkflowCtx(
       this.ctxHostFor(replay, run.namespace),
       run.id,
@@ -4006,6 +4106,7 @@ export class WorkflowEngine {
         if (settled.status === 'suspended' && err.waitSeqs?.length) {
           this.recheckWaitSeqs(run.id, err.waitSeqs);
         }
+        if (settled.status === 'suspended') suspendedOnFan = err.fan;
         return settled;
       }
       const error = {
@@ -4046,6 +4147,10 @@ export class WorkflowEngine {
             releaseErr instanceof Error ? releaseErr.message : String(releaseErr)
           }`,
         );
+      }
+      if (suspendedOnFan) {
+        const fan = suspendedOnFan;
+        this.trackEffect(this.redriveSettledChildren(run.id, fan));
       }
     }
   }
@@ -5161,4 +5266,18 @@ export class RemoteStepError extends Error {
     this.name = 'RemoteStepError';
     this.stepError = stepError;
   }
+}
+
+/** Checkpoint names that record a parent→child edge: an awaited child, a folded group of them, a spawn. */
+const CHILD_EDGE_PREFIXES = ['signal:child:', FOLDED_PREFIX, 'spawn:'];
+
+/** The child run ids a parent's {@link CHILD_EDGE_PREFIXES} checkpoints point at. */
+function childIdsOf(checkpoints: StepCheckpoint[]): string[] {
+  const ids: string[] = [];
+  for (const cp of checkpoints) {
+    if (cp.name.startsWith('signal:child:')) ids.push(cp.name.slice('signal:child:'.length));
+    if (cp.name.startsWith(FOLDED_PREFIX)) ids.push(...foldedChildIds(cp));
+    if (cp.name.startsWith('spawn:') && typeof cp.output === 'string') ids.push(cp.output);
+  }
+  return ids;
 }

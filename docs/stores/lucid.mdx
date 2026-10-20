@@ -96,7 +96,7 @@ The migration creates six tables (default names, from the `DURABLE_TABLES` const
 | `durable_buffered_signals` | signals delivered before the run waited (FIFO per token) |
 | `durable_buffered_events` | [named events](/docs/durable/concepts/sleep-and-signals#reliable-buffered-events) published before any run was waiting, keyed by `name` and indexed `(name, published_at)` for the oldest-first redelivery scan |
 
-The runs table is indexed on `status` and on `(status, wake_at)` so the worker's `listPendingRuns` and `listDueTimers` scans stay fast; checkpoints are keyed `(run_id, seq)` with a `(run_id, name)` index for targeted reads; and the attributes table is indexed per `(key, value)` so [search-attribute](/docs/durable/concepts/workflows-and-steps#tags) filters push down to SQL.
+The runs table is indexed on `status` and on `(status, wake_at)` so the worker's `listPendingRuns` and `listDueTimers` scans stay fast; checkpoints are keyed `(run_id, seq)` with a `(run_id, name)` index for targeted reads; signal waiters are indexed on `run_id` (`durable_signal_waiters_run_idx`), which the [`ctx.all`](/docs/durable/authoring/child-workflows) join barrier's per-child lookup and the run-scoped waiter reads use; and the attributes table is indexed per `(key, value)` so [search-attribute](/docs/durable/concepts/workflows-and-steps#tags) filters push down to SQL.
 
 ## Who provisions the schema: `autoSchema`
 

@@ -175,7 +175,9 @@ export default defineConfig({
 
 Rollups (success rate, throughput, duration percentiles, top failures) come from
 captured entries bounded by Telescope's prune window; current-state gauges
-(dead/suspended/running/pending NOW) read live from the store via `listRuns`.
+(dead/suspended/running/pending NOW) read live from the store via
+`engine.countRuns` (an exact `COUNT`, falling back to a capped `listRuns`
+listing on stores without it).
 Per-run actions stay in the durable dashboard. Source:
 `docs/observability/telescope.mdx`.
 
