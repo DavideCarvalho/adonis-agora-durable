@@ -128,9 +128,9 @@ export default defineConfig({
 ```
 
 Only step durations feed the adaptive window (workflow turns count as in-flight
-work only); a non-finite or out-of-range field falls back to its default, and
-`cpuCeilingPct` is off unless set. In adaptive mode the non-task consumers run
-at 1. Sources: `docs/transports/index.mdx`, `docs/cluster/interop.mdx`.
+work and progress); a non-finite or out-of-range field falls back to its default, and
+`cpuCeilingPct` is off unless set. In adaptive mode the decisions, step-events, start-run and run-request consumers run
+at 1 (results run at `resultConcurrency`). Sources: `docs/transports/index.mdx`, `docs/cluster/interop.mdx`.
 
 ### Pattern 3 — multi-replica fan-out: the control plane
 
