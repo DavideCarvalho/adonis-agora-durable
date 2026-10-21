@@ -31,9 +31,43 @@ export default defineConfig({
 })
 ```
 
+### Workers: `concurrency`
+
+`transports.bullmq({ concurrency })` sets how many tasks each of a worker's task queues runs at once. A number pins it (default `1`; a non-finite or sub-1 value falls back to `1`) and also applies to the decisions, step-events, start-run and run-request consumers.
+
+`'adaptive'`, or an object with `mode: 'adaptive'`, lets the worker move its task-queue limit at runtime. Every `tickMs` it compares the steps' median latency with their no-queuing baseline and the memory and CPU it is using, then:
+
+| Signal | Move |
+|--------|------|
+| RSS at or above `ramCeilingPct` of the memory limit (cgroup v2, then cgroup v1, then host total) | down 20% |
+| CPU at or above `cpuCeilingPct` | down 1 |
+| more than 20% of recent steps failed, or work in flight with no completion for two ticks | down 1 |
+| median latency inflated past 1/0.7 of the baseline (steps are queuing) | down by that ratio |
+| median latency within 1/0.9 of the baseline while in-flight work fills at least 80% of the limit | up 1 |
+
+The limit stays within `[min, max]`. It applies to every task queue of the instance at once, and a task queue registered later starts at the current limit. Only step durations are measured; a workflow turn on the same queue counts as in-flight work and as progress, but its duration never enters the latency window. The decisions, step-events, start-run and run-request consumers run at `1` in adaptive mode.
+
+```ts title="config/durable.ts"
+bullmq: transports.bullmq({
+  connection: { host: '127.0.0.1', port: 6379 },
+  concurrency: { mode: 'adaptive', min: 2, max: 64, start: 8, ramCeilingPct: 80, cpuCeilingPct: 90 },
+}),
+```
+
+| Option | Default |
+|--------|---------|
+| `min` | `1` |
+| `max` | `32` (raised to `min` when lower) |
+| `start` | `min`, clamped into `[min, max]` |
+| `tickMs` | `2000` |
+| `ramCeilingPct` | `85` |
+| `cpuCeilingPct` | off |
+
+A non-finite or out-of-range value falls back to its default, and a non-finite `cpuCeilingPct` turns the CPU ceiling off. This is the same controller as the NestJS BullMQ transport's `concurrency: 'adaptive'`. In both modes the worker heartbeat carries the live limit, in-flight count, RSS, CPU, throughput, p95 and the last adjustment with its reason, which the [console's worker cards](/docs/durable/observability/dashboard) show.
+
 ### Results: `resultConcurrency`
 
-`transports.bullmq({ resultConcurrency })` sets how many step results an instance settles at once from the results queue (default `1`; a non-finite or sub-1 value falls back to `1`). With one at a time, a wide fan's results queue up behind one checkpoint write per pod; the engine still runs one run's turns in order on an instance, so raising it never gives a run two concurrent turns. It is separate from `concurrency`, which sets how many tasks a worker runs at once from each of its task queues (default `1`, with the same fallback for a non-finite or sub-1 value).
+`transports.bullmq({ resultConcurrency })` sets how many step results an instance settles at once from the results queue (default `1`; a non-finite or sub-1 value falls back to `1`). With one at a time, a wide fan's results queue up behind one checkpoint write per pod; the engine still runs one run's turns in order on an instance, so raising it never gives a run two concurrent turns. It is separate from [`concurrency`](#workers-concurrency), which sets how many tasks a worker runs at once from each of its task queues.
 
 ```ts title="config/durable.ts"
 bullmq: transports.bullmq({ connection: { host: '127.0.0.1', port: 6379 }, resultConcurrency: 16 }),

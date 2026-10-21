@@ -145,9 +145,11 @@ export { InMemoryStateStore } from './testing/in-memory-state-store.js';
 export { InMemoryTransport } from './testing/in-memory-transport.js';
 export * from './tokens.js';
 export {
+  type AdaptiveConcurrencyOptions,
   type BullMQDeps,
   BullMQTransport,
   type BullMQTransportOptions,
+  type ConcurrencyOption,
   createBullMQDeps,
 } from './transports/bullmq/index.js';
 export { DbTransport, type DbTransportOptions } from './transports/db.js';

@@ -92,6 +92,8 @@ A step fan does not accept a `queue`: `ctx.all(step, inputs, { queue })` throws.
 
 By default, flow-control accounting is **per engine instance**. For the common single-orchestrator deployment this is exactly what you want, and it's correct without any cross-process coordination. If you run several worker replicas, each enforces the limit independently (so a `concurrency: 5` queue admits up to 5 *per replica*). For a truly global cap, use the Redis backend below.
 
+A queue's `concurrency` caps what the engine admits. How many admitted steps a `bullmq` worker runs at once is a separate knob, the transport's [`concurrency`](/docs/durable/cluster/interop#workers-concurrency), which can also adapt to the worker's latency and memory.
+
 ## Distributed admission — Redis
 
 The `@adonis-agora/durable/admission-redis` subpath replaces the per-instance admission accounting with a Redis-backed one, so a `concurrency` or `rateLimit` cap holds **across every engine instance**. It's the tier you reach for when several worker pods must share one global limit. It ships in the main `@adonis-agora/durable` package; install `@adonisjs/redis` (or `ioredis`) as the extra peer.

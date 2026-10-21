@@ -1,3 +1,13 @@
+export {
+  type AdaptiveConcurrencyOptions,
+  type AdaptiveConfig,
+  AdaptiveController,
+  type AdaptiveControllerOptions,
+  type ConcurrencyOption,
+  type ResolvedConcurrency,
+  readMemoryLimitBytes,
+  resolveConcurrency,
+} from './adaptive-concurrency.js';
 export { BullMQTransport, type BullMQTransportOptions } from './bullmq-transport.js';
 export {
   type BullMQDeps,

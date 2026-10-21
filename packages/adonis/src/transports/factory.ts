@@ -3,6 +3,7 @@ import type { AdapterFactory } from '@adonisjs/queue/types';
 import type { ControlPlane, Transport } from '../interfaces.js';
 import { resolveLucidDatabase } from '../resolve-lucid-db.js';
 import { InMemoryTransport } from '../testing/in-memory-transport.js';
+import type { ConcurrencyOption } from './bullmq/adaptive-concurrency.js';
 import type { WorkerKeyStore } from './worker-keys.js';
 
 /**
@@ -159,9 +160,18 @@ export interface BullMQTransportConfig {
   namespace?: string;
   /**
    * How many tasks a worker runs concurrently from each of its queues (BullMQ `Worker` concurrency).
-   * Default 1. A non-finite or sub-1 value falls back to 1.
+   * A number pins it: default 1, and a non-finite or sub-1 value falls back to 1.
+   *
+   * `'adaptive'`, or `{ mode: 'adaptive', min, max, start, tickMs, ramCeilingPct, cpuCeilingPct }`,
+   * moves each task worker's limit at runtime, every `tickMs`: up by one while steps are saturating
+   * the limit at a steady latency, down by the latency gradient when they queue, down by one on a
+   * >20% error rate, a stall or the CPU ceiling, and down by 20% when RSS reaches `ramCeilingPct` of
+   * the memory limit (cgroup, else host). Defaults: `min` 1, `max` 32, `start` `min`, `tickMs`
+   * 2000, `ramCeilingPct` 85, `cpuCeilingPct` off. A non-finite or out-of-range field falls back to
+   * its default. In adaptive mode the other consumers (decisions, step events, start-run,
+   * run-request) run at 1.
    */
-  concurrency?: number;
+  concurrency?: ConcurrencyOption;
   /**
    * How many step results this instance settles at once from the results queue. Raise it for wide
    * fans; one run's turns still go in order on an instance. Default 1. A non-finite or sub-1 value
@@ -339,9 +349,13 @@ export const transports = {
     return async () => {
       const { BullMQTransport } = await import('./bullmq/bullmq-transport.js');
       const { createBullMQDeps } = await import('./bullmq/deps.js');
-      const deps = await createBullMQDeps(config.connection, config.concurrency ?? 1);
+      const deps = await createBullMQDeps(
+        config.connection,
+        typeof config.concurrency === 'number' ? config.concurrency : 1,
+      );
       return new BullMQTransport({
         deps,
+        ...(config.concurrency !== undefined ? { concurrency: config.concurrency } : {}),
         ...(config.partition !== undefined ? { partition: config.partition } : {}),
         ...(config.prefix !== undefined ? { prefix: config.prefix } : {}),
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
