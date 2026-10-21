@@ -4964,16 +4964,20 @@ export class WorkflowEngine {
       if (!terminal) return result.runId;
       return undefined;
     }
-    // A result settling this step frees its flow-control slot (no-op if it wasn't queued). Done
-    // before the terminal-run early-returns below, so a cancellation can't leak the slot.
-    await this.releaseQueueSlot(cp);
+    // A result settling this step frees its flow-control slot (no-op if it wasn't queued). Released
+    // on every early return below too, so a cancellation can't leak the slot; on the settling path
+    // only by the delivery that claims the row, so a duplicated result can't free it twice.
     // Drop a late result for a run that was cancelled/finished meanwhile — don't complete the step
     // or resume (the run is already terminal). This is the engine side of cooperative cancellation.
-    if (run && (run.status === 'cancelled' || run.status === 'completed')) return undefined;
+    if (run && (run.status === 'cancelled' || run.status === 'completed')) {
+      await this.releaseQueueSlot(cp);
+      return undefined;
+    }
     // A late SUCCESS for a failed/dead run: salvage the finished work onto the checkpoint — an
     // explicit retry's replay then short-circuits this step instead of re-running it (the work may
     // be minutes of real compute) — but never resume. A late FAILURE has nothing to salvage: drop.
     if (run && (run.status === 'failed' || run.status === 'dead')) {
+      await this.releaseQueueSlot(cp);
       if (result.status === 'completed') {
         await this.store.saveCheckpoint({
           ...cp,
@@ -5000,6 +5004,7 @@ export class WorkflowEngine {
       finishedAt,
     });
     if (!claimed) return terminal ? undefined : result.runId;
+    await this.releaseQueueSlot(cp);
     this.emit({
       type: result.status === 'completed' ? 'step.completed' : 'step.failed',
       runId: result.runId,

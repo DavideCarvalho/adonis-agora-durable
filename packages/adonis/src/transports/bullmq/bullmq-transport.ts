@@ -419,11 +419,13 @@ export class BullMQTransport implements Transport {
     );
     this.#resultsWorker.on('failed', (job, err) => {
       if (!job || (job.attemptsMade ?? 0) < (job.opts?.attempts ?? 1)) return;
-      const result = job.data as StepResult;
-      console.error(
-        `[adonis-durable] gave up on the result of step ${result.stepId} (run ${result.runId}) after ${job.attemptsMade} attempts:`,
-        err,
+      const data = job.data as Partial<StepResult> | null | undefined;
+      const giveUp = new Error(
+        `gave up on the result of step ${data?.stepId ?? '?'} (run ${data?.runId ?? '?'}) after ${job.attemptsMade} attempts: ${err.message}`,
+        { cause: err },
       );
+      if (this.#hasOnError) this.#onError(giveUp);
+      else console.error(`[adonis-durable] ${giveUp.message}`);
     });
   }
 
