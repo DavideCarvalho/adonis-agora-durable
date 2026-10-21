@@ -18,9 +18,9 @@ import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
 const PING = 'ext.ping';
 
 class ResultBeforeStampStore extends InMemoryStateStore {
-  landResult?: () => Promise<void>;
+  landResult: (() => Promise<void>) | undefined;
 
-  async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {
+  override async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {
     if (checkpoint.status === 'pending' && checkpoint.wakeAt != null && this.landResult) {
       const land = this.landResult;
       this.landResult = undefined;
@@ -85,7 +85,7 @@ describe('REGRESSION: a redispatch stamp racing the step result', () => {
     const store = new InMemoryStateStore();
     const transport = new HeldTransport();
     const engine = new WorkflowEngine({ store, transports: [{ id: 't', transport }] });
-    const completed: number[] = [];
+    const completed: (number | undefined)[] = [];
     engine.subscribe((e) => {
       if (e.type === 'step.completed') completed.push(e.seq);
     });
