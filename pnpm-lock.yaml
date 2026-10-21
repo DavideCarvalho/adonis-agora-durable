@@ -261,8 +261,8 @@ importers:
   packages/dashboard:
     devDependencies:
       '@adonis-agora/filter-client':
-        specifier: 0.3.1
-        version: 0.3.1
+        specifier: 0.4.0
+        version: 0.4.0
       '@base-ui/react':
         specifier: 1.9.0
         version: 1.9.0(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
@@ -360,9 +360,9 @@ importers:
 
 packages:
 
-  '@adonis-agora/filter-client@0.3.1':
-    resolution: {integrity: sha512-xieMZOg8rWShwdHICIOKZfsgZYbwCPWE3EKgbQGAmt6isXUKHxb6FK244tLh1s7u5nNFO+KZBgwGh4kVw+zA/A==}
-    engines: {node: '>=20.6.0'}
+  '@adonis-agora/filter-client@0.4.0':
+    resolution: {integrity: sha512-qQpyuBJfEQh1T/5bP4ZWf8mnbh+F0/9dAetotpMcdt8lTvUm+kxvm3MSUg2X0Ueq/ue0BsKMeQQ1dyI++5dckw==}
+    engines: {node: '>=24'}
     peerDependencies:
       '@tanstack/table-core': '>=8.0.0'
     peerDependenciesMeta:
@@ -3547,7 +3547,7 @@ packages:
 
 snapshots:
 
-  '@adonis-agora/filter-client@0.3.1': {}
+  '@adonis-agora/filter-client@0.4.0': {}
 
   '@adonis-agora/filter@0.10.0(@adonisjs/core@7.6.0(@adonisjs/assembler@8.5.2(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(@adonisjs/lucid@22.4.2(@adonisjs/assembler@8.5.2(typescript@7.0.2))(@adonisjs/core@7.6.0(@adonisjs/assembler@8.5.2(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.0.3)(luxon@3.7.2)(supports-color@10.2.2))':
     dependencies:
