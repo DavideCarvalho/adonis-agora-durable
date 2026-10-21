@@ -389,7 +389,7 @@ export function deriveRunState(
   const pending = ctx.timeline?.find((s) => s.status === 'pending' || s.status === 'running');
   if (pending) {
     // The run failed and handed its failure to an onError handler, whose name the waiter's input holds.
-    if (pending.name === `signal:child:${run.id}.onError`) {
+    if (pending.name.startsWith(`signal:child:${run.id}.onError.`)) {
       const handler = (pending.input as { workflow?: unknown } | undefined)?.workflow;
       return {
         status: 'awaiting',

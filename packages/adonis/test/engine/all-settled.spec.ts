@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { isWorkflowControlFlowSignal } from '../../src/control-flow-signal.js';
 import { WorkflowEngine } from '../../src/engine.js';
 import { FatalError } from '../../src/errors.js';
 import type { Settled } from '../../src/interfaces.js';
@@ -42,6 +43,55 @@ describe('ctx.allSettled', () => {
       { status: 'rejected', id: 'p.all.0.3', error: expect.stringContaining('bad line 3') },
       { status: 'fulfilled', value: 40 },
     ]);
+  });
+
+  it("carries a failed child's code and details, so the parent can tell failures apart", async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    engine.register('line', '1', async (_ctx, input) => {
+      const { i } = input as { i: number };
+      if (i === 0) throw new FatalError('bad line', 'invalid_line', { field: 'amount' });
+      if (i === 1) throw new Error('DPAS down');
+      return i;
+    });
+    engine.register('file', '1', async (ctx) => ctx.allSettled<number>('line', lines(3)));
+
+    await startRun(engine, 'file', {}, 'p');
+    await until(async () => (await store.getRun('p'))?.status === 'completed');
+
+    const [invalid, down] = (await store.getRun('p'))?.output as Settled<number>[];
+    expect(invalid).toMatchObject({
+      status: 'rejected',
+      code: 'invalid_line',
+      details: { field: 'amount' },
+    });
+    expect(down).toMatchObject({ status: 'rejected', error: expect.stringContaining('DPAS down') });
+    expect(down).not.toHaveProperty('code');
+  });
+
+  it("hands a failed ctx.child's code to the parent's catch", async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    engine.register('line', '1', async () => {
+      throw new FatalError('bad line', 'invalid_line', { field: 'amount' });
+    });
+    engine.register('file', '1', async (ctx) => {
+      try {
+        return await ctx.child('line', {});
+      } catch (err) {
+        if (isWorkflowControlFlowSignal(err)) throw err;
+        const e = err as FatalError;
+        return { code: e.code, details: e.details };
+      }
+    });
+
+    await startRun(engine, 'file', {}, 'p');
+    await until(async () => (await store.getRun('p'))?.status === 'completed');
+
+    expect((await store.getRun('p'))?.output).toEqual({
+      code: 'invalid_line',
+      details: { field: 'amount' },
+    });
   });
 
   it('runs on past the fan, so the parent can act on the failures', async () => {

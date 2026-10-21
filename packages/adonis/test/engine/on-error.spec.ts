@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from '../../src/engine.js';
 import { FatalError } from '../../src/errors.js';
 import type {
+  EngineEvent,
   HistoryEvent,
   WorkflowDecision,
   WorkflowExecutor,
@@ -73,8 +74,8 @@ describe('onError routes', () => {
         }),
       },
     ]);
-    expect((await store.getRun('r.onError'))?.status).toBe('completed');
-    const handoff = (await store.listCheckpoints('r')).find((c) => c.name.endsWith('r.onError'));
+    expect((await store.getRun('r.onError.0'))?.status).toBe('completed');
+    const handoff = (await store.listCheckpoints('r')).find((c) => c.name.endsWith('r.onError.0'));
     expect(handoff).toMatchObject({ kind: 'signal', status: 'completed' });
   });
 
@@ -93,7 +94,7 @@ describe('onError routes', () => {
 
     expect(run?.status).toBe('failed');
     expect(run?.error?.message).toContain('DPAS timed out');
-    expect(await store.getRun('r.onError')).toBeNull();
+    expect(await store.getRun('r.onError.0')).toBeNull();
   });
 
   it('prefers the route for the exact code over the catch-all', async () => {
@@ -194,11 +195,11 @@ describe('onError routes', () => {
     });
 
     await startRun(engine, 'line', {}, 'r');
-    await until(async () => (await store.getRun('r.onError'))?.status === 'suspended');
+    await until(async () => (await store.getRun('r.onError.0'))?.status === 'suspended');
     // Drop the failed run's waiter, as a crash between the handler settling and the wake would.
-    await store.takeSignalWaiter('child:r.onError');
+    await store.takeSignalWaiter('child:r.onError.0');
     await engine.signal('go', undefined);
-    await settled('r.onError');
+    await settled('r.onError.0');
     expect((await store.getRun('r'))?.status).toBe('suspended');
 
     await engine.resume('r');
@@ -228,7 +229,7 @@ describe('onError routes', () => {
     );
 
     await startRun(engine, 'line', {}, 'r');
-    await until(async () => (await store.getRun('r.onError'))?.status === 'suspended');
+    await until(async () => (await store.getRun('r.onError.0'))?.status === 'suspended');
     // A reconcile wake or a manual resume while the handler still runs.
     await engine.resume('r');
     expect((await store.getRun('r'))?.status).toBe('suspended');
@@ -237,6 +238,102 @@ describe('onError routes', () => {
     const run = await settled('r');
     expect(run?.output).toBe('handled');
     expect(parses).toBe(1);
+  });
+
+  it('hands the handler the failure details, tags the run and emits run.routed', async () => {
+    const { engine, handle, settled, store } = setup();
+    handle('validate', async () => {
+      throw new FatalError('line 3 is invalid', 'invalid_line', {
+        issues: [{ path: ['amount'], message: 'Expected number' }],
+      });
+    });
+    const received: OnErrorInput[] = [];
+    engine.register('line.invalid', '1', async (_ctx, input) => {
+      received.push(input as OnErrorInput);
+      return 'handled';
+    });
+    engine.register('line', '1', async (ctx) => ctx.step('validate', {}), {
+      tags: ['dpas'],
+      onError: [{ code: 'invalid_line', workflow: 'line.invalid' }],
+    });
+    const events: EngineEvent[] = [];
+    engine.subscribe((e) => events.push(e));
+
+    await startRun(engine, 'line', {}, 'r');
+    const run = await settled('r');
+
+    expect(received[0]?.error.details).toEqual({
+      issues: [{ path: ['amount'], message: 'Expected number' }],
+    });
+    expect(run?.tags).toEqual(['dpas', 'onError:invalid_line']);
+    expect(events.find((e) => e.type === 'run.routed')).toMatchObject({
+      runId: 'r',
+      name: 'line.invalid',
+      error: expect.objectContaining({ code: 'invalid_line' }),
+    });
+    expect((await store.listCheckpoints('r')).find((c) => c.seq >= 1_000_000_000)?.name).toBe(
+      'signal:child:r.onError.0',
+    );
+  });
+
+  it('a retry runs the body again and retires the failed handoff', async () => {
+    const { engine, settled, store } = setup();
+    let bodies = 0;
+    let handlers = 0;
+    engine.register('line.invalid', '1', async () => {
+      handlers += 1;
+      if (handlers === 1) throw new Error('dead-letter store is down');
+      return 'handled';
+    });
+    engine.register(
+      'line',
+      '1',
+      async () => {
+        bodies += 1;
+        if (bodies < 3) throw new FatalError('bad line', 'invalid_line');
+        return 'ingested';
+      },
+      { onError: [{ code: 'invalid_line', workflow: 'line.invalid' }] },
+    );
+
+    await startRun(engine, 'line', {}, 'r');
+    expect((await settled('r'))?.status).toBe('failed');
+
+    // The body fails again: a fresh handoff, to a fresh handler run.
+    await engine.requeue('r');
+    await until(async () => (await store.getRun('r'))?.status === 'completed');
+    expect((await store.getRun('r'))?.output).toBe('handled');
+    expect(bodies).toBe(2);
+    expect((await store.getRun('r.onError.0'))?.status).toBe('failed');
+    expect((await store.getRun('r.onError.1'))?.status).toBe('completed');
+    expect(
+      (await store.listCheckpoints('r')).filter((c) => c.seq >= 1_000_000_000).map((c) => c.name),
+    ).toEqual(['onError:retried:r.onError.0', 'signal:child:r.onError.1']);
+  });
+
+  it('a retry whose body now succeeds completes with the body output', async () => {
+    const { engine, settled, store } = setup();
+    let bodies = 0;
+    engine.register('line.invalid', '1', async () => {
+      throw new Error('dead-letter store is down');
+    });
+    engine.register(
+      'line',
+      '1',
+      async () => {
+        bodies += 1;
+        if (bodies === 1) throw new FatalError('bad line', 'invalid_line');
+        return 'ingested';
+      },
+      { onError: [{ code: 'invalid_line', workflow: 'line.invalid' }] },
+    );
+
+    await startRun(engine, 'line', {}, 'r');
+    expect((await settled('r'))?.status).toBe('failed');
+    await engine.requeue('r');
+    await until(async () => (await store.getRun('r'))?.status === 'completed');
+
+    expect((await store.getRun('r'))?.output).toBe('ingested');
   });
 
   it('keeps ctx.all over the workflow from failing the parent', async () => {
@@ -295,6 +392,20 @@ describe('onError routes', () => {
     expect(run?.output).toEqual({ deadLettered: 'invalid_line' });
     // One turn: once the failure is handed off, the body is never dispatched again.
     expect(turns).toEqual([[]]);
+  });
+});
+
+describe('unservedOnErrorRoutes', () => {
+  it('lists the routes whose handler nothing here or in the fleet can run', async () => {
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
+    engine.register('line.invalid', '1', async () => 'handled');
+    engine.register('line', '1', async () => 'ok', {
+      onError: [{ code: 'invalid_line', workflow: 'line.invalid' }, { workflow: 'line.typo' }],
+    });
+
+    expect(await engine.unservedOnErrorRoutes()).toEqual([
+      { workflow: 'line', route: { workflow: 'line.typo' } },
+    ]);
   });
 });
 

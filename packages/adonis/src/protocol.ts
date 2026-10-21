@@ -105,13 +105,14 @@ export async function runStepHandler(
     } catch (err) {
       // Carry `code`/`retryable` off the thrown error if present, so the engine's durable retry can
       // honour a worker's "don't retry this" verdict (e.g. a declined card).
-      const e = err as { message?: string; code?: string; retryable?: boolean };
+      const e = err as { message?: string; code?: string; retryable?: boolean; details?: unknown };
       return withEvents({
         ...base,
         status: 'failed',
         error: {
           message: err instanceof Error ? err.message : String(err),
           ...(typeof e?.code === 'string' ? { code: e.code } : {}),
+          ...(e?.details !== undefined ? { details: e.details } : {}),
           ...(typeof e?.retryable === 'boolean' ? { retryable: e.retryable } : {}),
         },
       });

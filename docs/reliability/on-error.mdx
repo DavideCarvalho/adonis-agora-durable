@@ -56,14 +56,33 @@ body, so the same thing happens whether the body ran in-process or on a remote w
 1. The run's body fails with an error carrying `code: 'invalid_line'`. Saga compensations of the body
    run, as for any failure.
 2. Instead of marking the run `failed`, the engine starts the handler as its own run, with the id
-   `<runId>.onError` and an `OnErrorInput` (`{ runId, workflow, input, error }`), and suspends the failed
-   run on it the way a parent waits for a `ctx.child`.
+   `<runId>.onError.<attempt>` and an `OnErrorInput` (`{ runId, workflow, input, error }`), tags the run
+   `onError:<code>`, emits `run.routed`, and suspends the failed run on the handler the way a parent
+   waits for a `ctx.child`.
 3. From then on the run only follows its handler: the body is never run again, not by a recovery wake
    nor by a manual resume. When the handler finishes, the run settles with its outcome: `completed`
    with the handler's output, or `failed` with the handler's error.
 
-The handler is an ordinary durable run: it shows up in the dashboard, its steps are checkpointed and
-retried, and the wait survives a crash like any child wait.
+The handler is an ordinary durable run: it shows up in the dashboard linked to the run it handles, its
+steps are checkpointed and retried, and the wait survives a crash like any child wait. The
+`onError:<code>` tag makes the handled runs a filter away in the console.
+
+## The failure's details
+
+`error` carries the failure's `message`, `code` and `details`. `details` is whatever JSON-serializable
+value the failure was raised with — `new FatalError(message, code, details)` — so a handler can record
+exactly what went wrong (e.g. a schema's validation issues).
+
+## Retrying a run
+
+Retrying a failed run runs its **body** again. A handoff the run made before is retired: it stays in
+the timeline, renamed `onError:retried:<handler id>`, and is never followed again. If the body fails
+again, the engine hands the new failure to a new handler run (`<runId>.onError.1`, then `.2`, …).
+
+## Catching a misnamed handler
+
+At boot, the provider warns about any route whose handler workflow is neither registered in the app nor
+served by a live worker. The same check is `engine.unservedOnErrorRoutes()`.
 
 ## Matching
 

@@ -7,12 +7,16 @@ import { CONTROL_FLOW_SIGNAL, type isWorkflowControlFlowSignal } from './control
  */
 export class FatalError extends Error {
   readonly code?: string | undefined;
+  /** Structured, JSON-serializable detail (e.g. validation issues). It travels with the failure to
+   *  the run's error, a parent's `allSettled` item and an onError handler's input. */
+  readonly details?: unknown;
   /** Read by the step result builders, so a dispatched step's retry policy honours it too. */
   readonly retryable = false;
-  constructor(message: string, code?: string) {
+  constructor(message: string, code?: string, details?: unknown) {
     super(message);
     this.name = 'FatalError';
     this.code = code;
+    this.details = details;
   }
 }
 
@@ -151,9 +155,18 @@ export class NestedWorkflowCallError extends FatalError {
  * and the failing ids — the wait-all/fail-fast counterpart to a single child's FatalError. Mirrors
  * the Python SDK's `GatherFailed`.
  */
+/** One failed item of a fan: its input index, the child run id, and its failure. */
+export interface GatherItemFailure {
+  index: number;
+  id: string;
+  error: string;
+  code?: string | undefined;
+  details?: unknown;
+}
+
 export class GatherError extends Error {
-  readonly failures: { index: number; id: string; error: string }[];
-  constructor(failures: { index: number; id: string; error: string }[], total?: number) {
+  readonly failures: GatherItemFailure[];
+  constructor(failures: GatherItemFailure[], total?: number) {
     const ids = failures.map((f) => f.id).join(', ');
     const denom = total ?? failures.length;
     super(`ctx.all: ${failures.length} of ${denom} child(ren) failed: ${ids}`);

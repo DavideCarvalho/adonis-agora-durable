@@ -392,6 +392,7 @@ export default class DurableProvider {
       const dir = this.app.makePath(config.workflowsPath ?? 'app/workflows');
       await registerWorkflowsFromDir(engine, dir, workflowFactory);
     }
+    void this.#reportUnservedOnErrorRoutes(engine);
 
     // Event-triggered workflows (`static on` / `@OnEvent` / `@OnDiagnostic`): bridge the
     // Adonis emitter + the diagnostics bus into the engine. Registered AFTER discovery so
@@ -411,6 +412,25 @@ export default class DurableProvider {
     if (role === 'standalone') await this.#registerSteps(config);
 
     await this.#startResponder();
+  }
+
+  /**
+   * Says, once at boot, which onError routes name a handler workflow nothing can run yet, so a typo is
+   * caught before the first failure goes nowhere. A handler served by workers that start later also
+   * shows up here; the route still works once they are live.
+   */
+  async #reportUnservedOnErrorRoutes(engine: WorkflowEngine): Promise<void> {
+    const unserved = await engine.unservedOnErrorRoutes().catch(() => []);
+    if (unserved.length === 0) return;
+    const list = unserved
+      .map(({ workflow, route }) => `${workflow} → ${route.workflow} (code ${route.code ?? '*'})`)
+      .join(', ');
+    const message = `durable: ${unserved.length} onError route(s) name a handler workflow that is not registered here and has no live worker: ${list}.`;
+    const logger = (await this.app.container.make('logger').catch(() => undefined)) as
+      | { warn?: (message: string) => void }
+      | undefined;
+    if (typeof logger?.warn === 'function') logger.warn(message);
+    else console.warn(message);
   }
 
   /**
