@@ -76,8 +76,9 @@ The code comes from `FatalError`'s second argument, from a `code` on whatever a 
 from the code a remote worker reported for the failed step. A failure from a step reaches the route once
 the step's retries are spent; a `FatalError` skips them.
 
-Never routed: cancellation, timeouts, dead-lettering, and the failures that mean the deployment is broken
-(non-determinism, a ctx call nested in a step). Those keep their usual meaning.
+Never routed: cancellation (a run past its `executionTimeout` is cancelled too), dead-lettering, and the
+failures that mean the deployment is broken (non-determinism, a ctx call nested in a step). Those keep
+their usual meaning. A step that times out fails like any other step, so its failure is routable.
 
 ## On the engine directly
 

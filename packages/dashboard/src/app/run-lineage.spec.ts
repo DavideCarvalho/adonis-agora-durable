@@ -8,6 +8,12 @@ describe('run lineage from ids', () => {
     expect(parentRunIdOf('abc')).toBeUndefined();
   });
 
+  it("a failed run's onError handler links to the run it handles", () => {
+    expect(parentRunIdOf('abc.onError')).toBe('abc');
+    expect(parentRunIdOf('abc.child.0.onError')).toBe('abc.child.0');
+    expect(parentRunIdOf('abc.onError~retry~8115d923')).toBe('abc');
+  });
+
   it('nested children link one level up', () => {
     expect(parentRunIdOf('abc.child.0.child.3')).toBe('abc.child.0');
   });
