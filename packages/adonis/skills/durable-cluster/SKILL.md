@@ -105,8 +105,18 @@ export default class RunsController {
 ```
 
 Verbs: `getRun`, `listRuns`, `getCheckpoints`, `getRunChildren`,
+`getRunDetail` / `getFanMembers` (optional; summarize and page wide fans),
 `getSearchAttributes`, `start`, `signal`, `cancel`, `redispatchPending`,
 `workerHealth`, `subscribe`, `topology()`. Never branch on `role`.
+
+```ts
+// Each fan of more than 50 members comes back as one FanSummary in `fans`.
+const detail = await runGateway.getRunDetail?.(params.id, { summarizeFansOver: 50 })
+```
+
+A tenant pod's dashboard reads run detail through the `getRunDetail` verb, and
+an older control plane rejects unknown verbs: upgrade the control plane first,
+or with its tenants.
 Source: `docs/cluster/roles-and-config.mdx`.
 
 ### Pattern 2 — capability-aware routing and blocked runs

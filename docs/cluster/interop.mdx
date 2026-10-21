@@ -31,9 +31,15 @@ export default defineConfig({
 })
 ```
 
-### Shutdown: `closeTimeoutMs`
+### Results: `resultConcurrency`
 
-`transports.bullmq({ resultConcurrency })` sets how many step results an instance settles at once from the results queue (default `1`). With one at a time, a wide fan's results queue up behind one checkpoint write per pod; the engine still runs one run's turns in order on an instance, so raising it never gives a run two concurrent turns.
+`transports.bullmq({ resultConcurrency })` sets how many step results an instance settles at once from the results queue (default `1`; a non-finite or sub-1 value falls back to `1`). With one at a time, a wide fan's results queue up behind one checkpoint write per pod; the engine still runs one run's turns in order on an instance, so raising it never gives a run two concurrent turns. It is separate from `concurrency`, which sets how many tasks a worker runs at once from each of its task queues.
+
+```ts title="config/durable.ts"
+bullmq: transports.bullmq({ connection: { host: '127.0.0.1', port: 6379 }, resultConcurrency: 16 }),
+```
+
+### Shutdown: `closeTimeoutMs`
 
 `transports.bullmq({ closeTimeoutMs })` bounds how long `close()` waits for a graceful shutdown (default `5000` ms, `0` skips the wait). Workers close first, concurrently, so a step that is still running can publish its result; the queues close after, and both phases share the one deadline. When it expires the transport disconnects its pub/sub, heartbeat and liveness connections anyway. Abandoned BullMQ workers may keep running their jobs on their own connections until the process exits; a job that did not finish is recovered through BullMQ's stalled-job handling. `onError` receives transport failures, including pub/sub subscribe failures.
 

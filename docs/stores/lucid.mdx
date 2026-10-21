@@ -151,3 +151,10 @@ The logger only needs a `warn(message: string)` method, which both `console` (th
 ## Read API for dashboards & tooling
 
 Beyond the durability primitives, the Lucid store implements the read side the [dashboard](/docs/durable/observability/dashboard) and [CLI](/docs/durable/cli) lean on — `listRuns(query)` with workflow/status/tag/attribute filters, ordering, and pagination; `listCheckpoints(runId)` for a run's timeline; and the targeted-read fast paths `getLatestCheckpointByName` / `listCheckpointsByNamePrefix` used by [queries](/docs/durable/authoring/queries-and-updates) and child-run lookups.
+
+## Wide fans
+
+The store implements the two reads a wide fan leans on, with no schema change:
+
+- **`countCheckpoints(runId, fromSeq, toSeq, statuses)`** is one `COUNT(*)` over the `(run_id, seq)` primary key, filtered by `status`. A [step fan](/docs/durable/authoring/child-workflows#fanning-out-over-a-step)'s join barrier calls it on every result to ask whether any step of the fan is still `pending`, so a 10,000-step fan never loads its 10,000 rows per result.
+- **`listDueTimers(nowMs, namespace?, limit?)`** orders by `wake_at` ascending, most overdue first, whether or not a `limit` is passed, and the `(status, wake_at)` index serves it. The engine's timer pass passes `timerBatchSize` (default 200) as the `limit`.
