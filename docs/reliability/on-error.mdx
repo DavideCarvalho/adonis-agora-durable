@@ -99,10 +99,23 @@ Never routed: cancellation (a run past its `executionTimeout` is cancelled too),
 failures that mean the deployment is broken (non-determinism, a ctx call nested in a step). Those keep
 their usual meaning. A step that times out fails like any other step, so its failure is routable.
 
+## Remote workflows
+
+For a workflow the engine serves by convention (a Python body, or any worker it reaches by its live
+queue name), the routes come from what its workers **announce** in their handshake descriptor. A TS
+worker announces them through `WorkerRuntime.registerWorkflow(name, body, meta)` —
+`workflowAnnouncement(MyWorkflow)` builds that `meta` from a class's `static workflow` — and the Python
+SDK through `@worker.workflow("line", on_error=[{"code": "invalid_line", "workflow": "line-dead-letter"}])`.
+
+The handler can be a workflow of any runtime; the engine only starts a run by name. If the live workers
+announce different routes for the workflow (a rollout in progress), the failure is not routed and the
+engine emits `run.unrouted` with the reason. The engine reuses what it read for a few seconds, so a
+burst of failures costs one read.
+
 ## On the engine directly
 
 `engine.register(name, version, fn, { onError: [{ code?, workflow }] })`, and `engine.registerRemote`
-takes the same option for a workflow whose body runs on another runtime.
+takes the same option for a remote workflow registered by hand rather than served by convention.
 
 ## `onError`, `ctx.allSettled` and the dead-letter queue
 

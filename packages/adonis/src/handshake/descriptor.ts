@@ -6,6 +6,42 @@
  */
 
 /**
+ * One workflow a worker ANNOUNCES it can execute — the richer form of a `workflows` name.
+ *
+ * The rule is "announce only what you can run": a process publishes a registration for a workflow
+ * whose body it holds and whose queue it consumes. It never publishes one for a workflow it merely
+ * knows how to *route to* (an engine's `registerRemote`), because that claim says nothing about a
+ * live executor existing — which is precisely the ambiguity an aggregate registry has to remove.
+ *
+ * Every field but `name` is optional because the SDKs hold different amounts of this. A worker that
+ * knows only names (the Python `@worker.workflow("x")` form, or any pre-registrations SDK) publishes
+ * bare `workflows` names instead and is still a first-class announcer — see {@link WorkerDescriptor.registrations}.
+ * A reader must therefore treat an absent field as "not stated", never as a value: the aggregate in
+ * `./announced` never invents a version, a group or an origin that nobody announced.
+ */
+export interface WorkflowRegistration {
+  /** Registered workflow name — the `workflow` a `WorkflowTask` carries. */
+  name: string;
+  /** Registered version, when the announcer knows one. Absent = unversioned announcement. */
+  version?: string;
+  /** The routing token this workflow's turns are dispatched to (the queue this worker consumes for
+   *  it). Absent = the announcer did not say; a reader must NOT assume the by-convention token. */
+  group?: string;
+  /** Capabilities a worker must advertise to run it (design §7.5), as the announcer declares them. */
+  requires?: string[];
+  /** The package that DECLARED the workflow (see `WorkflowRun.origin`). Absent = unknown; nothing
+   *  ever substitutes a default, because a wrong origin is worse than no origin. */
+  origin?: string;
+  /**
+   * Where the engine routes a failed run of this workflow, by error `code` (`code` absent = the
+   * catch-all): the handler workflow it starts instead of failing the run. The one announced field
+   * the engine ACTS on, for a workflow it serves by convention rather than by local registration.
+   * Absent = not stated, which routes nothing.
+   */
+  onError?: { code?: string; workflow: string }[];
+}
+
+/**
  * A worker's (or control-plane's) advertised identity, wire-protocol support, feature capabilities
  * and registered handlers. Published on startup + on change (design §7.2) and consumed by
  * {@link negotiate} (compat) and the capability-aware router (design §7.5). Exactly the §7.1 shape.
@@ -31,6 +67,19 @@ export interface WorkerDescriptor {
   workflows: string[];
   /** Registered step handler names → routing targets. Order-insensitive (a set). */
   steps: string[];
+  /**
+   * The richer, per-workflow ANNOUNCEMENT of what this instance can execute (name + version + group
+   * + requires + origin). OPTIONAL and purely additive: an SDK that has only names keeps publishing
+   * {@link workflows} and is aggregated all the same, just unversioned. An SDK that publishes this
+   * SHOULD also list the same names in {@link workflows}, so a reader that predates this field still
+   * sees the workflow at all.
+   *
+   * It rides the descriptor rather than a registry of its own so it inherits the whole liveness
+   * story for free: the descriptor key is written with the heartbeat's TTL and refreshed by the same
+   * beat, so an announcement from a worker that has since died EXPIRES instead of offering a choice
+   * that fails at run time.
+   */
+  registrations?: WorkflowRegistration[];
   /** Optional routing partition (queue/group sharding). */
   partition?: string;
   /** Optional tenant namespace this instance serves. */
@@ -111,6 +160,7 @@ export function normalizeDescriptor(raw: RawWorkerDescriptor | WorkerDescriptor)
     capabilities: raw.capabilities ?? [...LEGACY_V1_CAPABILITIES],
     workflows: raw.workflows ?? [],
     steps: raw.steps ?? [],
+    ...(raw.registrations !== undefined ? { registrations: raw.registrations } : {}),
     ...(raw.partition !== undefined ? { partition: raw.partition } : {}),
     ...(raw.namespace !== undefined ? { namespace: raw.namespace } : {}),
     startedAt: raw.startedAt ?? 0,
@@ -138,6 +188,42 @@ export interface HeartbeatStatus {
   descriptorHash: string;
 }
 
+/**
+ * Canonical, order-insensitive projection of the `registrations` announcement: each entry gets a
+ * FIXED key order with absent fields collapsed to `null` (so present-with-undefined and absent
+ * agree), `requires` sorted + de-duplicated, and the entries themselves de-duplicated and sorted by
+ * their own canonical JSON. Announcement order therefore cannot change the hash — only the announced
+ * CONTENT can, which is exactly when a control plane should re-read.
+ */
+function canonicalizeRegistrations(regs: readonly WorkflowRegistration[]): unknown[] {
+  const canonical = regs.map((r) => ({
+    name: r.name,
+    version: r.version ?? null,
+    group: r.group ?? null,
+    requires: r.requires ? [...new Set(r.requires)].sort() : null,
+    origin: r.origin ?? null,
+    // Conditional, so a registration that states no routes keeps the hash it had before routes existed.
+    ...(r.onError !== undefined ? { onError: canonicalRoutes(r.onError) } : {}),
+  }));
+  const byJson = new Map<string, unknown>();
+  for (const entry of canonical) byJson.set(JSON.stringify(entry), entry);
+  return [...byJson.keys()].sort().map((k) => byJson.get(k));
+}
+
+/** Routes in a fixed key order, de-duplicated and sorted, so their order never changes the hash. */
+export function canonicalRoutes(
+  routes: readonly { code?: string; workflow: string }[],
+): { code: string | null; workflow: string }[] {
+  const byJson = new Map<string, { code: string | null; workflow: string }>();
+  for (const r of routes) {
+    const entry = { code: r.code ?? null, workflow: r.workflow };
+    byJson.set(JSON.stringify(entry), entry);
+  }
+  return [...byJson.keys()]
+    .sort()
+    .map((k) => byJson.get(k) as { code: string | null; workflow: string });
+}
+
 /** Canonical, order-insensitive projection of a descriptor used for hashing. The three set-valued
  *  fields are sorted + de-duplicated so member order can never change the hash; scalar fields are
  *  taken verbatim; optional fields collapse to `null` so present-with-undefined and absent agree. */
@@ -153,6 +239,10 @@ function canonicalizeForHash(d: WorkerDescriptor): unknown {
     capabilities: set(d.capabilities),
     workflows: set(d.workflows),
     steps: set(d.steps),
+    // Conditional, so a descriptor that announces nothing keeps the hash it had before this field.
+    ...(d.registrations !== undefined
+      ? { registrations: canonicalizeRegistrations(d.registrations) }
+      : {}),
     partition: d.partition ?? null,
     namespace: d.namespace ?? null,
     startedAt: d.startedAt,
