@@ -10,6 +10,8 @@
 export interface JobLike {
   data: unknown;
   failedReason?: string | undefined;
+  attemptsMade?: number | undefined;
+  opts?: { attempts?: number | undefined } | undefined;
 }
 
 /** The processor a task/result/decision/step-event worker runs per job. */

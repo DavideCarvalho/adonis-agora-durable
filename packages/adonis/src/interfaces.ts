@@ -341,6 +341,16 @@ export interface StateStore {
    * being a single transaction; stores without transactions cannot give the strong guarantee.
    */
   saveCheckpoint(checkpoint: StepCheckpoint): Promise<void>;
+  /**
+   * Overwrite the checkpoint at `(runId, seq)` with `checkpoint`, but only while the stored row is
+   * still `pending`; resolves whether it wrote. The engine writes a dispatched step's row from two
+   * places at once (a turn stamping its redispatch deadline, and the worker's result settling it),
+   * so a blind {@link saveCheckpoint} from a row read a moment earlier can put a `completed` step
+   * back to `pending`. This is the compare-and-set that prevents it.
+   *
+   * Optional: a store that omits it falls back to {@link saveCheckpoint}, which keeps that race.
+   */
+  saveCheckpointIfPending?(checkpoint: StepCheckpoint): Promise<boolean>;
 
   /**
    * Used by recovery on boot to find runs to resume (crashed, left `running`). When `namespace` is

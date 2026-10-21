@@ -297,6 +297,27 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
 
     // ---- checkpoints ------------------------------------------------------------------------
 
+    t('saveCheckpointIfPending writes over a pending row only', async () => {
+      if (!store.saveCheckpointIfPending) return;
+      await store.createRun(run());
+      const pending = checkpoint({ status: 'pending', output: undefined });
+      await store.saveCheckpoint(pending);
+
+      expect(await store.saveCheckpointIfPending({ ...pending, wakeAt: 5_000 })).toBe(true);
+      expect((await store.getCheckpoint('r1', 0))?.wakeAt).toBe(5_000);
+
+      const done = { ...pending, status: 'completed' as const, output: { ok: true } };
+      expect(await store.saveCheckpointIfPending(done)).toBe(true);
+      // A stale pending copy no longer lands on the settled row.
+      expect(await store.saveCheckpointIfPending({ ...pending, wakeAt: 9_000 })).toBe(false);
+      const after = await store.getCheckpoint('r1', 0);
+      expect(after?.status).toBe('completed');
+      expect(after?.output).toEqual({ ok: true });
+      // No row to compare against: nothing is written.
+      expect(await store.saveCheckpointIfPending({ ...pending, seq: 9 })).toBe(false);
+      expect(await store.getCheckpoint('r1', 9)).toBeNull();
+    });
+
     t(
       'upserts checkpoints, reads them by (runId, seq), and lists them ordered by seq',
       async () => {

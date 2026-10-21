@@ -4685,7 +4685,21 @@ export class WorkflowEngine {
       // becomes this deadline, so a reconcile re-drive lands exactly when it's due to re-dispatch.
       if (existing.wakeAt == null) {
         const wakeAt = this.clock() + this.remoteRedispatchMs;
-        await this.store.saveCheckpoint({ ...existing, wakeAt });
+        // The result may have settled the row since it was read: then nothing was written, and the
+        // step is re-read from the store.
+        if (!(await this.savePendingCheckpoint({ ...existing, wakeAt }))) {
+          return this.callRemote(
+            runId,
+            seq,
+            step,
+            input,
+            queue,
+            transport,
+            undefined,
+            admission,
+            runNamespace,
+          );
+        }
         throw new WorkflowSuspended(wakeAt, [seq]);
       }
       if (this.clock() < existing.wakeAt) throw new WorkflowSuspended(existing.wakeAt, [seq]);
@@ -4700,7 +4714,7 @@ export class WorkflowEngine {
       const reAttempt = existing.attempts + 1;
       const nextDeadline = this.clock() + this.remoteRedispatchMs;
       const reEnqueuedAt = new Date();
-      await this.store.saveCheckpoint({
+      const claimed = await this.savePendingCheckpoint({
         ...existing,
         attempts: reAttempt,
         wakeAt: nextDeadline,
@@ -4714,6 +4728,19 @@ export class WorkflowEngine {
           lostStepEvent(this.clock(), reAttempt, 'redispatched'),
         ],
       });
+      if (!claimed) {
+        return this.callRemote(
+          runId,
+          seq,
+          step,
+          input,
+          queue,
+          transport,
+          undefined,
+          admission,
+          runNamespace,
+        );
+      }
       await this.dispatchRemoteTask({
         runId,
         seq,
@@ -4882,6 +4909,13 @@ export class WorkflowEngine {
    * (never an unhandled rejection) — a failure warns and surfaces as a still-`suspended` run that
    * recovery re-drives, never as a silent strand.
    */
+  /** {@link StateStore.saveCheckpointIfPending}, or a plain save on a store without it. */
+  private async savePendingCheckpoint(checkpoint: StepCheckpoint): Promise<boolean> {
+    if (this.store.saveCheckpointIfPending) return this.store.saveCheckpointIfPending(checkpoint);
+    await this.store.saveCheckpoint(checkpoint);
+    return true;
+  }
+
   private async completeRemoteResult(result: StepResult): Promise<void> {
     const runId = await this.settleRemoteCheckpoint(result);
     if (runId === undefined) return;
@@ -4930,16 +4964,20 @@ export class WorkflowEngine {
       if (!terminal) return result.runId;
       return undefined;
     }
-    // A result settling this step frees its flow-control slot (no-op if it wasn't queued). Done
-    // before the terminal-run early-returns below, so a cancellation can't leak the slot.
-    await this.releaseQueueSlot(cp);
+    // A result settling this step frees its flow-control slot (no-op if it wasn't queued). Released
+    // on every early return below too, so a cancellation can't leak the slot; on the settling path
+    // only by the delivery that claims the row, so a duplicated result can't free it twice.
     // Drop a late result for a run that was cancelled/finished meanwhile — don't complete the step
     // or resume (the run is already terminal). This is the engine side of cooperative cancellation.
-    if (run && (run.status === 'cancelled' || run.status === 'completed')) return undefined;
+    if (run && (run.status === 'cancelled' || run.status === 'completed')) {
+      await this.releaseQueueSlot(cp);
+      return undefined;
+    }
     // A late SUCCESS for a failed/dead run: salvage the finished work onto the checkpoint — an
     // explicit retry's replay then short-circuits this step instead of re-running it (the work may
     // be minutes of real compute) — but never resume. A late FAILURE has nothing to salvage: drop.
     if (run && (run.status === 'failed' || run.status === 'dead')) {
+      await this.releaseQueueSlot(cp);
       if (result.status === 'completed') {
         await this.store.saveCheckpoint({
           ...cp,
@@ -4954,7 +4992,9 @@ export class WorkflowEngine {
     }
     const finishedAt = new Date();
     const startedAt = result.startedAt ? new Date(result.startedAt) : cp.startedAt;
-    await this.store.saveCheckpoint({
+    // Claimed, not blindly written: another delivery settled it first, which is the redelivery case
+    // above — re-drive the resume rather than settle twice.
+    const claimed = await this.savePendingCheckpoint({
       ...cp,
       status: result.status,
       output: result.status === 'completed' ? result.output : cp.output,
@@ -4963,6 +5003,8 @@ export class WorkflowEngine {
       startedAt,
       finishedAt,
     });
+    if (!claimed) return terminal ? undefined : result.runId;
+    await this.releaseQueueSlot(cp);
     this.emit({
       type: result.status === 'completed' ? 'step.completed' : 'step.failed',
       runId: result.runId,
