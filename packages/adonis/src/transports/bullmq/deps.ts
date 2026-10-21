@@ -58,6 +58,14 @@ export interface BullMQDeps {
 }
 
 /**
+ * `value` as a BullMQ `Worker` concurrency: a finite number of at least 1, floored. Anything else
+ * (absent, NaN, Infinity, below 1) is `fallback`, since BullMQ throws on a non-finite or sub-1 value.
+ */
+export function workerConcurrency(value: number | undefined, fallback = 1): number {
+  return value !== undefined && Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
+}
+
+/**
  * Build the real bullmq/ioredis-backed {@link BullMQDeps} for `connection` (ioredis `ConnectionOptions`
  * or a `Redis` instance) at a `concurrency`. `bullmq` and `ioredis` are imported LAZILY here — via a
  * non-literal specifier so the package type-checks and unit-tests without them installed — and only
@@ -72,6 +80,7 @@ export interface BullMQDeps {
  * the caller's Redis.
  */
 export async function createBullMQDeps(connection: unknown, concurrency = 1): Promise<BullMQDeps> {
+  const defaultConcurrency = workerConcurrency(concurrency);
   // Non-literal specifiers: keep `tsc` from resolving 'bullmq'/'ioredis' at build time (they are a
   // runtime-only dependency of the selected transport), so the wider package builds without them.
   const bullmqSpecifier = 'bullmq';
@@ -120,7 +129,7 @@ export async function createBullMQDeps(connection: unknown, concurrency = 1): Pr
     makeWorker: (name, process, opts) =>
       new Worker(name, (job) => process(job), {
         connection: workerConnection(),
-        concurrency: opts?.concurrency ?? concurrency,
+        concurrency: workerConcurrency(opts?.concurrency, defaultConcurrency),
       }),
     makeRedis,
   };

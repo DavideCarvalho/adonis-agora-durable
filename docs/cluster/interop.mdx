@@ -33,7 +33,7 @@ export default defineConfig({
 
 ### Results: `resultConcurrency`
 
-`transports.bullmq({ resultConcurrency })` sets how many step results an instance settles at once from the results queue (default `1`; a non-finite or sub-1 value falls back to `1`). With one at a time, a wide fan's results queue up behind one checkpoint write per pod; the engine still runs one run's turns in order on an instance, so raising it never gives a run two concurrent turns. It is separate from `concurrency`, which sets how many tasks a worker runs at once from each of its task queues.
+`transports.bullmq({ resultConcurrency })` sets how many step results an instance settles at once from the results queue (default `1`; a non-finite or sub-1 value falls back to `1`). With one at a time, a wide fan's results queue up behind one checkpoint write per pod; the engine still runs one run's turns in order on an instance, so raising it never gives a run two concurrent turns. It is separate from `concurrency`, which sets how many tasks a worker runs at once from each of its task queues (default `1`, with the same fallback for a non-finite or sub-1 value).
 
 ```ts title="config/durable.ts"
 bullmq: transports.bullmq({ connection: { host: '127.0.0.1', port: 6379 }, resultConcurrency: 16 }),

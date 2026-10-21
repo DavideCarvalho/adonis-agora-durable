@@ -18,7 +18,13 @@ import type {
 import { runStepHandler, type StepHandler } from '../../protocol.js';
 import { swallowSubscribe } from '../../safe-subscribe.js';
 import { isWorkflowTask, type WorkflowTurnHandler } from '../../workflow-turn.js';
-import type { BullMQDeps, QueueLike, RedisLike, WorkerLike } from './deps.js';
+import {
+  type BullMQDeps,
+  type QueueLike,
+  type RedisLike,
+  type WorkerLike,
+  workerConcurrency,
+} from './deps.js';
 import {
   decisionsName,
   effectivePrefix,
@@ -161,9 +167,7 @@ export class BullMQTransport implements Transport {
     this.#onError = options.onError ?? (() => {});
     this.#hasOnError = options.onError !== undefined;
     this.#closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
-    const results = options.resultConcurrency;
-    this.#resultConcurrency =
-      results !== undefined && Number.isFinite(results) && results >= 1 ? Math.floor(results) : 1;
+    this.#resultConcurrency = workerConcurrency(options.resultConcurrency);
   }
 
   /** Stable id stamped on this instance's worker-liveness keys. */
