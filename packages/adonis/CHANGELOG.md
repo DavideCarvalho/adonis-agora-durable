@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 0.46.1
+
+### Patch Changes
+
+- fix(deps): update dependency @adonis-agora/filter to v0.11.0 ([#326](https://github.com/DavideCarvalho/adonis-agora-durable/issues/326))
+
 ## 0.46.0
 
 ### Minor Changes
