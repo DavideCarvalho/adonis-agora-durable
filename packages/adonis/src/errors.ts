@@ -7,6 +7,8 @@ import { CONTROL_FLOW_SIGNAL, type isWorkflowControlFlowSignal } from './control
  */
 export class FatalError extends Error {
   readonly code?: string | undefined;
+  /** Read by the step result builders, so a dispatched step's retry policy honours it too. */
+  readonly retryable = false;
   constructor(message: string, code?: string) {
     super(message);
     this.name = 'FatalError';

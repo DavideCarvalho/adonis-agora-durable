@@ -24,10 +24,12 @@ import {
 } from './fan-join.js';
 import type {
   AllOptions,
+  AllSettledOptions,
   ChildCallOptions,
   ChildWait,
   DurableWebhook,
   SearchAttributes,
+  Settled,
   StateStore,
   StepCheckpoint,
   StepDef,
@@ -672,14 +674,16 @@ export function createWorkflowCtx(
   // With `concurrency`, children go out in waves and the parent wakes once per settled wave to send
   // the next one. When all resolve, outputs are returned in INPUT order (waitAll), or a GatherError
   // is thrown carrying the per-item failures. Parity with the Python SDK's `gather_children`.
-  const all = async <T = unknown>(
+  // `settle` is `ctx.allSettled`: the same waitAll fan, resolving with a `Settled` per item instead.
+  const fan = async (
     workflow: WorkflowRef,
     inputs: unknown[],
-    opts?: AllOptions,
-  ): Promise<T[]> => {
+    opts: AllOptions | undefined,
+    settle: boolean,
+  ): Promise<unknown[]> => {
     // Empty: reserve no positions and produce no side effects (degenerate identity).
     if (inputs.length === 0) return [];
-    const mode = opts?.mode ?? 'waitAll';
+    const mode = settle ? 'waitAll' : (opts?.mode ?? 'waitAll');
     const name = workflowName(workflow);
     const waves = allWaves(inputs.length, opts?.concurrency);
     // Reserve the whole block in list order BEFORE any dispatch — replay re-derives identical seqs.
@@ -866,20 +870,36 @@ export function createWorkflowCtx(
     }
 
     // All resolved: build outputs in INPUT order, aggregating any failures.
-    const outputs: T[] = [];
+    const outputs: unknown[] = [];
+    const results: Settled<unknown>[] = [];
     const failures: { index: number; id: string; error: string }[] = [];
     for (let i = 0; i < inputs.length; i += 1) {
-      const c = existing[i]?.output as { ok?: boolean; value?: T; error?: string } | null;
+      const c = existing[i]?.output as { ok?: boolean; value?: unknown; error?: string } | null;
       if (c && typeof c === 'object' && 'ok' in c && c.ok === false) {
-        failures.push({ index: i, id: id(i), error: c.error ?? 'unknown' });
-        outputs.push(undefined as T);
+        const error = c.error ?? 'unknown';
+        failures.push({ index: i, id: id(i), error });
+        results.push({ status: 'rejected', id: id(i), error });
+        outputs.push(undefined);
       } else {
-        outputs.push((c as { value?: T } | null)?.value as T);
+        const value = (c as { value?: unknown } | null)?.value;
+        results.push({ status: 'fulfilled', value });
+        outputs.push(value);
       }
     }
+    if (settle) return results;
     if (failures.length > 0) throw new GatherError(failures, inputs.length);
     return outputs;
   };
+  const all = <T = unknown>(
+    workflow: WorkflowRef,
+    inputs: unknown[],
+    opts?: AllOptions,
+  ): Promise<T[]> => fan(workflow, inputs, opts, false) as Promise<T[]>;
+  const allSettled = <T = unknown>(
+    workflow: WorkflowRef,
+    inputs: unknown[],
+    opts?: AllSettledOptions,
+  ): Promise<Settled<T>[]> => fan(workflow, inputs, opts, true) as Promise<Settled<T>[]>;
 
   // A fan's checkpoints: from the replay snapshot, plus ONE prefix query for any the snapshot does
   // not hold (on the first dispatch, all of them) instead of a lookup per child. A folded checkpoint
@@ -1248,6 +1268,7 @@ export function createWorkflowCtx(
     task: guard('task', task),
     child: guard('child', child),
     all: guard('all', all),
+    allSettled: guard('allSettled', allSettled),
     startChild: guard('startChild', startChild),
     breakpoint: guard('breakpoint', breakpoint),
     webhook: guardedWebhook,
