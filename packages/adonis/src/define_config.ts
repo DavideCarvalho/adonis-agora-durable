@@ -230,6 +230,12 @@ export interface BaseDurableConfig {
    */
   remoteRedispatchMax?: number;
   /**
+   * The most due timers one timer pass loads and resumes, most overdue first; a larger backlog
+   * drains over the next ticks. Every worker runs the pass each tick, and each walks its batch in a
+   * shuffled order so instances don't contend for the same leases row by row. Default 200.
+   */
+  timerBatchSize?: number;
+  /**
    * Recurring workflows to start on a schedule (fixed interval via `everyMs`, or cron via `cron` +
    * `timezone`). The `durable:work` worker loop fires any due windows on every tick (the 5th phase,
    * after timeouts are swept). `engine.start` is idempotent by each schedule's time-bucket run id, so

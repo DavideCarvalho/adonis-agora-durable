@@ -42,6 +42,7 @@ import {
   type DashboardEngine,
   type Deps,
   failTaskRun,
+  getFanMembers,
   getRun,
   health,
   listRuns,
@@ -86,7 +87,9 @@ function spaDirectory(): string {
  * - `GET  /assets/:file`              -> the SPA's hashed JS/CSS bundle
  * - `GET  /api/runs`                  -> list runs (status/workflow/tag/namespace/attr filters, paged)
  * - `GET  /api/runs/values`           -> distinct values of one filter axis, with counts (pickers)
- * - `GET  /api/runs/:id`              -> run detail (run + step timeline + children)
+ * - `GET  /api/runs/:id`              -> run detail (run + step timeline + children; fans over 50
+ *                                         members summarized unless `?full=true`)
+ * - `GET  /api/runs/:id/fans/:group`  -> one page of a summarized fan's members
  * - `GET  /api/runs/:id/stream`       -> SSE live-tail of one run's lifecycle events
  * - `POST /api/runs/:id/retry`        -> re-enqueue the run
  * - `POST /api/runs/:id/retry-with-input` -> fix-and-replay: start a corrected linked run
@@ -235,6 +238,9 @@ export default class DashboardProvider {
     // Registered BEFORE `/runs/:id` so `values` isn't captured as a run id.
     router.get(`${apiBase}/runs/values`, json(runValues)).as('durable_dashboard.runs.values');
     router.get(`${apiBase}/runs/:id`, json(getRun)).as('durable_dashboard.runs.show');
+    router
+      .get(`${apiBase}/runs/:id/fans/:group`, json(getFanMembers))
+      .as('durable_dashboard.runs.fans');
     router.post(`${apiBase}/runs/:id/retry`, json(retryRun)).as('durable_dashboard.runs.retry');
     router
       .post(`${apiBase}/runs/:id/retry-with-input`, json(retryWithInputRun))

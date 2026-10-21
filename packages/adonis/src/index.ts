@@ -80,7 +80,7 @@ export * from './errors.js';
 export * from './event-accumulators.js';
 export * from './event-trigger-bridge.js';
 export * from './events.js';
-export { parentRunIdOf } from './fan-join.js';
+export { childIdsOf, parentRunIdOf } from './fan-join.js';
 // --- store-less cluster: handshake & capability negotiation -----------------
 export * from './handshake/descriptor.js';
 export * from './handshake/negotiate.js';
@@ -92,6 +92,7 @@ export * from './pollers.js';
 export * from './protocol.js';
 export * from './queue.js';
 export * from './remote-workflow-executor.js';
+export * from './run-detail-summary.js';
 // --- store-less cluster: RunGateway (read/control surface) ------------------
 export type { DurableTopology, RunGateway, StartRunOptions } from './run-gateway/interface.js';
 export {

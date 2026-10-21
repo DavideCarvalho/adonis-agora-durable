@@ -525,3 +525,37 @@ describe('durableClient: root-mounted base (path: "")', () => {
     expect(win.location.href).toBe('/login?returnTo=%2Fruns%2Fabc');
   });
 });
+
+describe('durableClient.fanMembers', () => {
+  function captureUrl(): { calls: string[] } {
+    const calls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string) => {
+        calls.push(url);
+        return Promise.resolve(jsonResponse({ items: [], total: 0 }, 200));
+      }),
+    );
+    return { calls };
+  }
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('encodes the group, whose `:` separators would otherwise read as path syntax', async () => {
+    const { calls } = captureUrl();
+    await durableClient.fanMembers('run 1', 'steps:12:40000');
+    expect(calls[0]).toBe('/durable/api/runs/run%201/fans/steps%3A12%3A40000');
+  });
+
+  it('sends the page window and the failed-only filter', async () => {
+    const { calls } = captureUrl();
+    await durableClient.fanMembers('r1', 'all:3', { offset: 200, limit: 100, failed: true });
+    expect(calls[0]).toBe('/durable/api/runs/r1/fans/all%3A3?offset=200&limit=100&failed=true');
+  });
+
+  it('omits failed=false rather than sending it', async () => {
+    const { calls } = captureUrl();
+    await durableClient.fanMembers('r1', 'g', { offset: 0, failed: false });
+    expect(calls[0]).toBe('/durable/api/runs/r1/fans/g?offset=0');
+  });
+});

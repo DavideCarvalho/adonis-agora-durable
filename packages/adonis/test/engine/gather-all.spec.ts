@@ -70,7 +70,7 @@ describe('ctx.all (parallel child workflows, wait-all)', () => {
     }
     const groups = new Set(placeholders.map((p) => p.parallelGroup));
     expect(groups.size).toBe(1);
-    expect([...groups][0]).toBe('all:0');
+    expect([...groups][0]).toBe('all:0:n2');
   });
 
   it('returns all outputs in input order when all children complete (out of order)', async () => {

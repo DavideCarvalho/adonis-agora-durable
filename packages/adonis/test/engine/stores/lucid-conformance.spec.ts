@@ -19,7 +19,7 @@ runStateStoreContract('LucidStateStore', async () => {
 });
 
 describe('LucidStateStore fan methods', () => {
-  it('implements every optional method the ctx.all join barrier and folding use', async () => {
+  it('implements every optional method the ctx.all join barriers and folding use', async () => {
     const db = await makeStoreDb();
     try {
       const store = new LucidStateStore(db);
@@ -27,6 +27,7 @@ describe('LucidStateStore fan methods', () => {
       expect(store.registerChildWaits).toBeTypeOf('function');
       expect(store.compactCheckpoints).toBeTypeOf('function');
       expect(store.listSignalWaitersByRunIds).toBeTypeOf('function');
+      expect(store.countCheckpoints).toBeTypeOf('function');
     } finally {
       await db.manager.closeAll();
     }

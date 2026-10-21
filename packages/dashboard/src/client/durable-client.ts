@@ -114,6 +114,51 @@ export interface RunDetail {
   run: WorkflowRun;
   timeline: StepCheckpoint[];
   children?: string[];
+  /** The fans drawn as one node each: their members are absent from `timeline`. */
+  fans?: FanSummary[] | undefined;
+  /** How many children the run has, when `children` lists only the first of them. */
+  childCount?: number | undefined;
+}
+
+/**
+ * A parallel fan the server summarized instead of listing (`GET /runs/:id` does it for a fan wider
+ * than 50 members unless asked for `?full=true`): one node, its progress, and its first failures.
+ */
+export interface FanSummary {
+  /** The fan's `parallelGroup`. */
+  group: string;
+  /** The members' common step name, or `child runs` for a fan of child workflows. */
+  label: string;
+  firstSeq: number;
+  lastSeq: number;
+  /** Members started so far: steps, or child runs (a folded checkpoint counts as the children it stands for). */
+  size: number;
+  /** The fan's declared size, when its group carries it — more than `size` while waves are still
+   *  to be sent, and for good when a failFast fan stopped early. */
+  total?: number | undefined;
+  /** `total - size`: members not started yet, or never to start once the run has finished. */
+  notStarted?: number | undefined;
+  /** The fan stops at its first failure. */
+  failFast: boolean;
+  /** Members by status. A child that failed counts as `failed`. */
+  counts: Partial<Record<StepCheckpoint['status'], number>>;
+  startedAt?: string | undefined;
+  finishedAt?: string | undefined;
+  /** The first failed members, so a failure shows without paging. */
+  failures: StepCheckpoint[];
+}
+
+/** One page of a summarized fan's members, in seq order. `total` counts every matching member. */
+export interface FanPage {
+  items: StepCheckpoint[];
+  total: number;
+}
+
+export interface FanPageOptions {
+  offset?: number | undefined;
+  limit?: number | undefined;
+  /** Only failed members (a failed step, or a child that failed). */
+  failed?: boolean | undefined;
 }
 
 /** This deployment's durable role — the AdonisJS engine has three (NestJS's `DurableTopology` only
@@ -682,6 +727,16 @@ export const durableClient = {
   },
   run(id: string): Promise<RunDetail> {
     return http<RunDetail>(`/runs/${encodeURIComponent(id)}`);
+  },
+  /** One page of a summarized fan's members — the ones {@link run} left out of its timeline. */
+  fanMembers(runId: string, group: string, opts: FanPageOptions = {}): Promise<FanPage> {
+    const params = new URLSearchParams();
+    if (opts.offset !== undefined) params.set('offset', String(opts.offset));
+    if (opts.limit !== undefined) params.set('limit', String(opts.limit));
+    if (opts.failed) params.set('failed', 'true');
+    const qs = params.toString();
+    const path = `/runs/${encodeURIComponent(runId)}/fans/${encodeURIComponent(group)}`;
+    return http<FanPage>(qs ? `${path}?${qs}` : path);
   },
   /** Per-group worker health (queue backlog + live worker heartbeats) for the Workers panel. */
   workers(): Promise<GroupHealth[]> {

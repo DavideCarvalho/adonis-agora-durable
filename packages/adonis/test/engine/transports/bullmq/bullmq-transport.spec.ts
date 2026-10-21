@@ -51,6 +51,7 @@ class FakeWorker implements WorkerLike {
   constructor(
     readonly name: string,
     readonly process: ProcessFn,
+    readonly concurrency?: number,
   ) {}
   on(_event: 'failed', listener: (job: JobLike | undefined, err: Error) => void): unknown {
     this.failedListener = listener;
@@ -120,8 +121,8 @@ class FakeBroker implements BullMQDeps {
     }
     return q;
   }
-  makeWorker(name: string, process: ProcessFn): WorkerLike {
-    const w = new FakeWorker(name, process);
+  makeWorker(name: string, process: ProcessFn, opts?: { concurrency?: number }): WorkerLike {
+    const w = new FakeWorker(name, process, opts?.concurrency);
     this.workers.set(name, w);
     return w;
   }
@@ -197,6 +198,18 @@ describe('BullMQTransport', () => {
       const result: StepResult = { runId: 'r1', seq: 2, stepId: 'r1:2', status: 'completed' };
       await w!.process({ data: result });
       expect(handler).toHaveBeenCalledWith(result);
+    });
+
+    it('consumes results at `resultConcurrency`, falling back to 1 for a non-finite value', () => {
+      const wide = new BullMQTransport({ deps: broker, resultConcurrency: 8 });
+      wide.onResult(async () => {});
+      expect(broker.workers.get('durable-results')?.concurrency).toBe(8);
+
+      for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, 0, undefined]) {
+        const other = new FakeBroker();
+        new BullMQTransport({ deps: other, resultConcurrency: bad }).onResult(async () => {});
+        expect(other.workers.get('durable-results')?.concurrency).toBe(1);
+      }
     });
 
     it('onDecision consumes `durable-decisions`; onStepEvent consumes `durable-step-events`', async () => {

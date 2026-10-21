@@ -209,6 +209,33 @@ changes nothing.
 (`<parentRunId>.all.<seq>.w<k>.<i>`). Changing it while a run is in flight is a non-deterministic change, the
 same as changing `inputs`.
 
+### Fanning out over a step
+
+When each item is just one step rather than a workflow of its own, pass the step's reference (a
+`defineStep` ref or a `@Step` method) instead of a workflow. Each input becomes one durable step instead of a child run, which is far cheaper for a
+large batch: a child costs a whole run (its row, a turn, a lease, a completion signal), a step costs a
+checkpoint and a dispatch.
+
+```ts
+// One processRecord step per record, at most 500 in flight. The workflow wakes once per settled
+// wave, not once per record, and the dashboard shows the steps as one fan.
+const results = await ctx.all(processRecord, batch.records, { concurrency: 500 })
+```
+
+Outputs come back in input order. The same `mode` and `GatherError` apply: `waitAll` throws once every
+step has settled, with the failed indexes in `.failures`; `failFast` throws on the first failed step.
+`concurrency` sends the steps in waves of that size, the next once the previous has settled. Every step
+of the fan uses the `@Step`'s retry policy, or the per-call `retries` / `backoff` you pass. A
+flow-control `queue` and a liveness `timeoutMs` are not supported on a step fan.
+
+Prefer it to `Promise.all` over `ctx.step` past a handful of steps: every result of a `Promise.all`
+replays the workflow, which makes a fan of N steps cost O(N²) checkpoint reads. A step fan replays
+once per settled wave, because a result resumes the workflow only when no step of the fan is still
+`pending` (or when one fails). The steps share a `parallelGroup` of `steps:<firstSeq>:<size>`. The
+barrier counts the fan's pending steps through the optional `StateStore.countCheckpoints`, which the
+Lucid and in-memory stores implement; a store without it falls back to loading the run's checkpoints
+on every result.
+
 ### Fanning out by hand
 
 `ctx.all` covers one workflow over N inputs. When the fan-out is heterogeneous — different workflows, or work

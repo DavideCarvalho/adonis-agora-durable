@@ -7,6 +7,14 @@ import type {
   StepCheckpoint,
   WorkflowRun,
 } from '../interfaces.js';
+import {
+  type FanPage,
+  type FanPageQuery,
+  loadFanMembers,
+  loadRunDetail,
+  type RunDetail,
+  type RunDetailOptions,
+} from '../run-detail-summary.js';
 import type { WorkflowRef } from '../workflow-ref.js';
 import type { DurableTopology, RunGateway, StartRunOptions } from './interface.js';
 
@@ -91,6 +99,14 @@ export class StoreRunGateway implements RunGateway {
 
   getRunChildren(runId: string): Promise<string[]> {
     return this.#engine.getRunChildren(runId);
+  }
+
+  getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail | null> {
+    return loadRunDetail(this.#engine, runId, options);
+  }
+
+  getFanMembers(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null> {
+    return loadFanMembers(this.#engine, runId, group, query);
   }
 
   async getSearchAttributes(runId: string): Promise<SearchAttributes | undefined> {

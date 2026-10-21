@@ -9,6 +9,7 @@ import type {
   TenantEvent,
   WorkflowRun,
 } from '../interfaces.js';
+import { loadFanMembers, loadRunDetail, type RunDetailSource } from '../run-detail-summary.js';
 import type { RunGateway } from './interface.js';
 
 /**
@@ -62,9 +63,10 @@ function isTerminalRunEvent(event: EngineEvent): boolean {
  * 2. **`listRuns` is namespace-forced** to the derived tenant — the client's `namespace` is discarded,
  *    never merely validated, so a tenant cannot enumerate another's runs.
  * 3. **`workerHealth` is group-scoped** to the tenant's own `@<tenant>` queues.
- * 4. **Every runId-bearing verb** (`getRun`/`getCheckpoints`/`getSearchAttributes`/`signal`/`cancel`/
- *    `redispatch`) loads the run FIRST and rejects with `cross-tenant` when `run.namespace` isn't the
- *    derived tenant — anti-IDOR, so a tenant can never read OR act on another tenant's run.
+ * 4. **Every runId-bearing verb** (`getRun`/`getCheckpoints`/`getRunDetail`/`getFanMembers`/
+ *    `getSearchAttributes`/`signal`/`cancel`/`redispatch`) loads the run alone FIRST — never its
+ *    timeline — and rejects with `cross-tenant` when `run.namespace` isn't the derived tenant —
+ *    anti-IDOR, so a tenant can never read OR act on another tenant's run.
  * 5. **`start` forces the run's namespace** to the derived tenant, so a started run is owned by, and
  *    later only reachable by, that tenant.
  * 6. **Unknown verbs are rejected** rather than silently ignored.
@@ -202,6 +204,15 @@ export class RunRequestResponder {
         return this.#gateway.getCheckpoints(body.runId);
       case 'getRunChildren':
         return this.#gateway.getRunChildren(body.runId);
+      case 'getRunDetail':
+        return this.#gateway.getRunDetail
+          ? this.#gateway.getRunDetail(body.runId, body.options)
+          : loadRunDetail(this.#detailSource(run), body.runId, body.options);
+      case 'getFanMembers':
+        if (!run) return Promise.resolve(null);
+        return this.#gateway.getFanMembers
+          ? this.#gateway.getFanMembers(body.runId, body.group, body.query)
+          : loadFanMembers(this.#detailSource(run), body.runId, body.group, body.query);
       case 'getSearchAttributes':
         return this.#gateway.getSearchAttributes(body.runId);
       case 'signal':
@@ -216,6 +227,15 @@ export class RunRequestResponder {
           new Error(`unknown run-request verb: ${(body as { kind: string }).kind}`),
         );
     }
+  }
+
+  /** The gateway's reads as a {@link RunDetailSource}, reusing the run the ownership check loaded. */
+  #detailSource(run: WorkflowRun | null): RunDetailSource {
+    return {
+      getRun: () => Promise.resolve(run),
+      listCheckpoints: (runId) => this.#gateway.getCheckpoints(runId),
+      getRunChildren: (runId) => this.#gateway.getRunChildren(runId),
+    };
   }
 
   // ---------------------------------------------------------------------------

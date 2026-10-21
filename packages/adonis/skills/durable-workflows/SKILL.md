@@ -182,6 +182,21 @@ children run at once (waves of `floor(n / 2)`, two at a time), and the wave goes
 id), so changing it for an in-flight run is non-deterministic, like changing
 `inputs`.
 
+For the same step over many inputs, pass the step reference (`defineStep` ref
+or `@Step` method) to `ctx.all`. It
+dispatches one step per input, wakes the workflow once per settled wave instead
+of once per result, and returns the outputs in input order (a `GatherError`
+carries the failed indexes, as for a child fan):
+
+```ts
+const results = await ctx.all(processLine, lines, { concurrency: 500 })
+```
+
+Prefer it to `Promise.all` past a handful of steps (every result of a
+`Promise.all` replays the workflow: O(N²) checkpoint reads), and to a
+child-workflow `ctx.all` when each item is just a step. A `queue` or a
+`timeoutMs` is rejected on a step fan.
+
 Serialize runs per subject with a singleton — runs sharing a key queue FIFO and
 are race-free across instances:
 

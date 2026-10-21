@@ -1,35 +1,36 @@
 import { useQueries, useQuery } from '@tanstack/react-query';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import type React from 'react';
-import { useMemo, useState } from 'react';
-import type { RunDetail, StepCheckpoint, WorkflowRun } from '../client/durable-client';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import type { FanSummary, RunDetail, StepCheckpoint, WorkflowRun } from '../client/durable-client';
 import { durableClient, isStalePending } from '../client/durable-client';
+import { FAN_PAGE_SIZE, fanPagesInView } from '../client/fan-pages';
 import { stepDisplayName } from '../client/folded-children';
-import { groupParallelSpans } from '../client/group-parallel-spans';
+import {
+  fanProgress,
+  fanSizeLabel,
+  fanStatus,
+  groupParallelSpans,
+  runFinished,
+} from '../client/group-parallel-spans';
 import { groupSubProcesses } from '../client/group-subprocesses';
-import { childRunIdOf } from './child-link';
+import { childDetailIds, childFallbackLabel, childRunIdOf, detailsById } from './child-link';
+import { FAN_PROGRESS_SEGMENTS } from './fan-progress-style';
 import { ChildIcon, iconFor } from './icons';
 import { stalePendingView } from './stale-liveness';
 
-/** Fetch the RunDetail of each child-ref step in a timeline, so a row can read the child's real
- *  workflow name (instead of the raw `signal:child:<id>` checkpoint) and its full run duration. */
+/** Stable empty list, so a run without summarized fans keeps the node memo's input identity. */
+const NO_FANS: FanSummary[] = [];
+
+/** Fetch the RunDetail of the first child-ref steps in a timeline (see {@link childDetailIds}), so a
+ *  row can read the child's real workflow name (instead of the raw `signal:child:<id>` checkpoint)
+ *  and its full run duration. */
 function useChildRuns(timeline: StepCheckpoint[]): Record<string, RunDetail> {
-  const ids = useMemo(() => {
-    const set = new Set<string>();
-    for (const step of timeline) {
-      const childId = childRunIdOf(step);
-      if (childId !== undefined) set.add(childId);
-    }
-    return [...set].sort();
-  }, [timeline]);
-  const results = useQueries({
+  const ids = useMemo(() => childDetailIds(timeline), [timeline]);
+  return useQueries({
     queries: ids.map((id) => ({ queryKey: ['run', id], queryFn: () => durableClient.run(id) })),
+    combine: detailsById,
   });
-  const map: Record<string, RunDetail> = {};
-  ids.forEach((id, index) => {
-    const detail = results[index]?.data;
-    if (detail) map[id] = detail;
-  });
-  return map;
 }
 
 /**
@@ -50,12 +51,76 @@ function barWindow(
     return [created, Math.max(end, created)];
   }
   const { subs } = groupSubProcesses(step.events ?? []);
-  const starts = subs.map((s) => s.startedAt).filter((n): n is number => n !== undefined);
-  const ends = subs
-    .map((s) => s.terminal?.at ?? s.startedAt)
-    .filter((n): n is number => n !== undefined);
-  if (starts.length > 0 && ends.length > 0) return [Math.min(...starts), Math.max(...ends)];
+  let start = Number.POSITIVE_INFINITY;
+  let end = Number.NEGATIVE_INFINITY;
+  for (const sub of subs) {
+    if (sub.startedAt !== undefined) start = Math.min(start, sub.startedAt);
+    const subEnd = sub.terminal?.at ?? sub.startedAt;
+    if (subEnd !== undefined) end = Math.max(end, subEnd);
+  }
+  if (start !== Number.POSITIVE_INFINITY && end !== Number.NEGATIVE_INFINITY) return [start, end];
   return [new Date(step.startedAt).getTime(), new Date(step.finishedAt).getTime()];
+}
+
+/** The window every bar of a run's timeline is placed in: `t0` is the left edge, `span` its width. */
+type Frame = { t0: number; span: number; liveNow: number };
+
+/**
+ * The wall-clock frame of a run's timeline: from the run's creation (or its earliest bar) to its
+ * latest bar, or now while it is live. Summarized fans count by their own start/finish.
+ */
+function timelineFrame(
+  run: WorkflowRun,
+  windows: readonly [number, number][],
+  fans: readonly FanSummary[],
+): Frame {
+  const live = run.status === 'running' || run.status === 'suspended';
+  const liveNow = Date.now();
+  let t0 = new Date(run.createdAt).getTime();
+  let tEnd = Number.NEGATIVE_INFINITY;
+  for (const [start, end] of windows) {
+    t0 = Math.min(t0, start);
+    tEnd = Math.max(tEnd, end);
+  }
+  for (const fan of fans) {
+    if (fan.startedAt) t0 = Math.min(t0, new Date(fan.startedAt).getTime());
+    if (fan.finishedAt) tEnd = Math.max(tEnd, new Date(fan.finishedAt).getTime());
+  }
+  tEnd = Math.max(tEnd, live ? liveNow : t0 + 1);
+  return { t0, span: Math.max(tEnd - t0, 1), liveNow };
+}
+
+/** A step's row: its bar placed in `frame`, plus a bar per sub-process at its own window. */
+function prepareRow(
+  step: StepCheckpoint,
+  childRun: RunDetail | undefined,
+  frame: Frame,
+  window: [number, number] = barWindow(step, childRun, frame.liveNow),
+): PreparedRow {
+  const { t0, span } = frame;
+  const [barStart, barEnd] = window;
+  const { subs } = groupSubProcesses(step.events ?? []);
+  const subRows = subs.map((sub) => {
+    const start = sub.startedAt ?? barStart;
+    const end = sub.terminal?.at ?? start;
+    return {
+      key: sub.id,
+      name: sub.name,
+      status: (sub.status ?? 'ok') as SubStatus,
+      left: ((start - t0) / span) * 100,
+      width: Math.max(((end - start) / span) * 100, 0.8),
+      ms: sub.durationMs ?? Math.max(end - start, 0),
+    };
+  });
+  return {
+    step,
+    childId: childRunIdOf(step),
+    childRun,
+    left: ((barStart - t0) / span) * 100,
+    width: Math.max(((barEnd - barStart) / span) * 100, 0.8),
+    ms: barEnd - barStart,
+    subRows,
+  };
 }
 
 function fmtDur(ms: number): string {
@@ -208,7 +273,7 @@ function StepRow({
           </span>
           <span className="truncate text-[12px] text-zinc-300">
             {childRunId !== undefined
-              ? (childRuns[childRunId]?.run.workflow ?? 'child workflow')
+              ? (childRuns[childRunId]?.run.workflow ?? childFallbackLabel(childRunId, run.id))
               : stepDisplayName(step)}
           </span>
           {isChild && childRunId !== undefined && (
@@ -327,7 +392,7 @@ function ParallelFan({
   label: string;
   fanFailed: boolean;
   memberRows: PreparedRow[];
-  rowProps: Omit<React.ComponentProps<typeof StepRow>, 'row'>;
+  rowProps: RowProps;
 }) {
   return (
     <div className="rounded-md bg-zinc-900/30 ring-1 ring-line-soft">
@@ -352,9 +417,271 @@ function ParallelFan({
   );
 }
 
+type RowProps = Omit<React.ComponentProps<typeof StepRow>, 'row'>;
+
+/** A member row's height before it is measured (a row grows when its sub-processes show). */
+const MEMBER_ROW_PX = 28;
+
+/**
+ * A fan too wide to list, drawn from its {@link FanSummary}: a header with its size and time span, a
+ * per-status progress bar, the server's sample of failed members as ordinary rows, and on demand the
+ * full member list ({@link FanMembers}), paged in as it scrolls.
+ */
+function SummarizedFan({
+  fan,
+  frame,
+  rowProps,
+}: {
+  fan: FanSummary;
+  frame: Frame;
+  rowProps: RowProps;
+}) {
+  const [open, setOpen] = useState(false);
+  const [failedOnly, setFailedOnly] = useState(false);
+  const done = runFinished(rowProps.run.status);
+  const progress = fanProgress(fan, done);
+  const status = fanStatus(fan, done);
+  const inFlight = status === 'running' || status === 'pending';
+  const runLive = rowProps.run.status === 'running' || rowProps.run.status === 'suspended';
+  const start = fan.startedAt ? new Date(fan.startedAt).getTime() : undefined;
+  const end = fan.finishedAt
+    ? new Date(fan.finishedAt).getTime()
+    : inFlight && runLive
+      ? frame.liveNow
+      : start;
+  const failureRows = useMemo(
+    () => fan.failures.map((step) => prepareRow(step, undefined, frame)),
+    [fan.failures, frame],
+  );
+  return (
+    <div className="rounded-md bg-zinc-900/30 ring-1 ring-line-soft">
+      <div className="grid grid-cols-[150px_1fr] items-center gap-3 px-2 py-1">
+        <span className="flex items-center gap-1.5 truncate">
+          <button
+            type="button"
+            onClick={() => setOpen((v) => !v)}
+            className="shrink-0 text-zinc-500 transition-colors hover:text-zinc-300"
+            title={open ? 'Hide the members' : `List the ${fan.size} members started`}
+          >
+            <span
+              className="inline-block transition-transform"
+              style={{ transform: open ? 'rotate(90deg)' : 'rotate(0deg)' }}
+            >
+              ▸
+            </span>
+          </button>
+          <span className="text-[11px] text-indigo-300/80" title="parallel fan-out, summarized">
+            ⑃
+          </span>
+          <span
+            className={`truncate text-[12px] ${status === 'failed' ? 'text-red-400' : 'text-zinc-300'}`}
+            title={fan.group}
+          >
+            {fan.label} ×{progress.total}
+          </span>
+        </span>
+        <span className="relative h-5">
+          <span className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-line-soft" />
+          {start !== undefined && end !== undefined && (
+            <>
+              <span
+                className={`absolute top-1/2 h-3.5 -translate-y-1/2 rounded-[3px] ${
+                  status === 'failed'
+                    ? 'bg-red-500/25 ring-1 ring-red-500/40'
+                    : 'bg-indigo-500/20 ring-1 ring-indigo-500/40'
+                } ${inFlight ? 'pulse' : ''}`}
+                style={{
+                  left: `${((start - frame.t0) / frame.span) * 100}%`,
+                  width: `${Math.max(((end - start) / frame.span) * 100, 0.8)}%`,
+                }}
+              />
+              <span
+                className="mono tnum absolute top-1/2 -translate-y-1/2 whitespace-nowrap pl-1 text-[10px] text-zinc-500"
+                style={{
+                  left: `min(${((end - frame.t0) / frame.span) * 100}%, calc(100% - 44px))`,
+                }}
+              >
+                {fmtDur(end - start)}
+              </span>
+            </>
+          )}
+        </span>
+      </div>
+      <div className="flex items-center gap-3 px-2 pb-1.5 pl-[26px]">
+        <span className="flex h-1.5 w-40 shrink-0 overflow-hidden rounded-full bg-zinc-800">
+          {FAN_PROGRESS_SEGMENTS.map((seg) =>
+            progress[seg.key] > 0 ? (
+              <span
+                key={seg.key}
+                className={seg.className}
+                style={{ width: `${(progress[seg.key] / Math.max(progress.total, 1)) * 100}%` }}
+              />
+            ) : null,
+          )}
+        </span>
+        <span className="mono tnum flex flex-wrap gap-2 text-[10px]">
+          {progress.started < progress.total && (
+            <span className="text-zinc-400">{fanSizeLabel(progress)} started</span>
+          )}
+          {FAN_PROGRESS_SEGMENTS.map((seg) =>
+            progress[seg.key] > 0 ? (
+              <span key={seg.key} className={seg.text}>
+                {progress[seg.key]} {seg.label}
+                {seg.key === 'skipped' && fan.failFast ? ' (failFast)' : ''}
+              </span>
+            ) : null,
+          )}
+        </span>
+      </div>
+      {failureRows.length > 0 && !open && (
+        <div className="ml-[10px] border-l border-red-500/30 pl-1">
+          <div className="mono px-2 text-[10px] text-red-300/70">
+            {progress.failed > failureRows.length
+              ? `first ${failureRows.length} of ${progress.failed} failed`
+              : `${failureRows.length} failed`}
+          </div>
+          {failureRows.map((row) => (
+            <StepRow key={row.step.seq} row={row} {...rowProps} />
+          ))}
+        </div>
+      )}
+      {open && (
+        <div className="ml-[10px] border-l border-line-soft pl-1">
+          <div className="flex items-center gap-2 px-2 py-0.5">
+            <button
+              type="button"
+              onClick={() => setFailedOnly((v) => !v)}
+              className={`mono rounded border px-1.5 text-[10px] transition-colors ${
+                failedOnly
+                  ? 'border-red-500/40 bg-red-500/15 text-red-300'
+                  : 'border-line text-zinc-500 hover:text-zinc-300'
+              }`}
+            >
+              failed only
+            </button>
+          </div>
+          <FanMembers
+            key={failedOnly ? 'failed' : 'all'}
+            group={fan.group}
+            failedOnly={failedOnly}
+            live={inFlight && runLive}
+            frame={frame}
+            rowProps={rowProps}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * A summarized fan's members as a virtualized list. Only the pages under the visible rows are
+ * fetched (and, while the fan is in flight, refreshed); a row whose page has not landed yet shows a
+ * placeholder. Members never fetch their child run's detail: a child row reads by id.
+ */
+function FanMembers({
+  group,
+  failedOnly,
+  live,
+  frame,
+  rowProps,
+}: {
+  group: string;
+  failedOnly: boolean;
+  live: boolean;
+  frame: Frame;
+  rowProps: RowProps;
+}) {
+  const runId = rowProps.run.id;
+  const scrollRef = useRef<HTMLDivElement>(null);
+  // Sticky: while a newly scrolled-to page is in flight no result carries a total, and dropping the
+  // count then would collapse the list under the scroll.
+  const [total, setTotal] = useState<number>();
+  const virtualizer = useVirtualizer({
+    count: total ?? 0,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => MEMBER_ROW_PX,
+    measureElement: (el) => el.getBoundingClientRect().height,
+    overscan: 10,
+  });
+  const items = virtualizer.getVirtualItems();
+  const pages = fanPagesInView(items[0]?.index, items[items.length - 1]?.index);
+  const results = useQueries({
+    queries: pages.map((page) => ({
+      queryKey: ['fan', runId, group, failedOnly, page],
+      queryFn: () =>
+        durableClient.fanMembers(runId, group, {
+          offset: page * FAN_PAGE_SIZE,
+          limit: FAN_PAGE_SIZE,
+          failed: failedOnly,
+        }),
+      refetchInterval: live ? 5000 : (false as const),
+    })),
+  });
+  const fetchedTotal = results.find((r) => r.data !== undefined)?.data?.total;
+  useEffect(() => {
+    if (fetchedTotal !== undefined) setTotal(fetchedTotal);
+  }, [fetchedTotal]);
+  const memberAt = (index: number): StepCheckpoint | undefined => {
+    const page = Math.floor(index / FAN_PAGE_SIZE);
+    const at = pages.indexOf(page);
+    return at < 0 ? undefined : results[at]?.data?.items[index % FAN_PAGE_SIZE];
+  };
+
+  const failedPage = results.find((r) => r.isError);
+  if (total === undefined && failedPage) {
+    return (
+      <div className="mono px-2 py-1 text-[10px] text-red-400">
+        couldn't load members:{' '}
+        {failedPage.error instanceof Error ? failedPage.error.message : String(failedPage.error)}
+      </div>
+    );
+  }
+  if (total === undefined) {
+    return <div className="mono px-2 py-1 text-[10px] text-zinc-600">loading members…</div>;
+  }
+  if (total === 0) {
+    return (
+      <div className="mono px-2 py-1 text-[10px] text-zinc-600">
+        {failedOnly ? 'no failed members' : 'no members'}
+      </div>
+    );
+  }
+  return (
+    <div ref={scrollRef} className="max-h-[320px] overflow-auto">
+      <div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
+        {items.map((item) => {
+          const step = memberAt(item.index);
+          return (
+            <div
+              key={item.key}
+              data-index={item.index}
+              ref={virtualizer.measureElement}
+              className="absolute inset-x-0 top-0"
+              style={{ transform: `translateY(${item.start}px)` }}
+            >
+              {step ? (
+                <StepRow row={prepareRow(step, undefined, frame)} {...rowProps} />
+              ) : (
+                <div
+                  className="mono px-2 text-[10px] leading-7 text-zinc-700"
+                  style={{ height: MEMBER_ROW_PX }}
+                >
+                  #{item.index + 1} loading…
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export function RunSpans({
   run,
   timeline,
+  fans = NO_FANS,
   depth,
   selectedKey,
   onSelect,
@@ -364,6 +691,8 @@ export function RunSpans({
 }: {
   run: WorkflowRun;
   timeline: StepCheckpoint[];
+  /** Fans the detail summarized: their members are not in `timeline`. */
+  fans?: FanSummary[] | undefined;
   depth: number;
   selectedKey?: string | undefined;
   onSelect: (step: StepCheckpoint, run: WorkflowRun) => void;
@@ -372,51 +701,27 @@ export function RunSpans({
   onToggleChild: (childRunId: string) => void;
 }) {
   const childRuns = useChildRuns(timeline);
-  const { span, rows } = useMemo(() => {
-    const live = run.status === 'running' || run.status === 'suspended';
-    const liveNow = Date.now();
+  const { frame, rows } = useMemo(() => {
     // Each step's bar window — child run window for a child-ref, sub-process span for a fan-out step,
     // else the step's own window (see barWindow) — so durations match the rest of the UI.
+    const liveNow = Date.now();
     const prepared = timeline.map((s) => {
       const childId = childRunIdOf(s);
       const childRun = childId !== undefined ? childRuns[childId] : undefined;
-      const [barStart, barEnd] = barWindow(s, childRun, liveNow);
-      return { step: s, childId, childRun, barStart, barEnd };
+      return { step: s, childRun, window: barWindow(s, childRun, liveNow) };
     });
-    const t0 = Math.min(new Date(run.createdAt).getTime(), ...prepared.map((p) => p.barStart));
-    const tEnd = Math.max(...prepared.map((p) => p.barEnd), live ? liveNow : t0 + 1);
-    const span = Math.max(tEnd - t0, 1);
-    const rows = prepared.map(({ step: s, childId, childRun, barStart, barEnd }) => {
-      // Each sub-process gets a bar at its own [startedAt, terminal.at] window with its real duration.
-      const { subs } = groupSubProcesses(s.events ?? []);
-      const subRows = subs.map((sub) => {
-        const start = sub.startedAt ?? barStart;
-        const end = sub.terminal?.at ?? start;
-        return {
-          key: sub.id,
-          name: sub.name,
-          status: (sub.status ?? 'ok') as SubStatus,
-          left: ((start - t0) / span) * 100,
-          width: Math.max(((end - start) / span) * 100, 0.8),
-          ms: sub.durationMs ?? Math.max(end - start, 0),
-        };
-      });
-      return {
-        step: s,
-        childId,
-        childRun,
-        left: ((barStart - t0) / span) * 100,
-        width: Math.max(((barEnd - barStart) / span) * 100, 0.8),
-        ms: barEnd - barStart,
-        subRows,
-      };
-    });
-    return { span, rows };
-  }, [run, timeline, childRuns]);
+    const frame = timelineFrame(
+      run,
+      prepared.map((p) => p.window),
+      fans,
+    );
+    const rows = prepared.map((p) => prepareRow(p.step, p.childRun, frame, p.window));
+    return { frame, rows };
+  }, [run, timeline, fans, childRuns]);
 
   // A `ctx.gather`/`ctx.all` fan tags its N siblings with the same `parallelGroup`; group them so the
   // members render at the same indent level under one header (a "ran in parallel" fan), not stacked.
-  const nodes = useMemo(() => groupParallelSpans(timeline), [timeline]);
+  const nodes = useMemo(() => groupParallelSpans(timeline, fans), [timeline, fans]);
   const rowBySeq = useMemo(() => {
     const map = new Map<number, (typeof rows)[number]>();
     for (const row of rows) map.set(row.step.seq, row);
@@ -456,6 +761,16 @@ export function RunSpans({
         if (node.kind === 'single') {
           const row = rowBySeq.get(node.step.seq);
           return row ? <StepRow key={row.step.seq} row={row} {...rowProps} /> : null;
+        }
+        if (node.kind === 'summary') {
+          return (
+            <SummarizedFan
+              key={`fan:${node.fan.group}`}
+              fan={node.fan}
+              frame={frame}
+              rowProps={rowProps}
+            />
+          );
         }
         // A parallel fan: lay its member steps out as siblings under one labelled header, each an
         // ordinary `StepRow`, to read as "these N ran in parallel".
@@ -517,6 +832,7 @@ function ChildSpans({
       <RunSpans
         run={data.run}
         timeline={data.timeline}
+        fans={data.fans}
         depth={depth}
         selectedKey={selectedKey}
         onSelect={onSelect}
@@ -535,6 +851,7 @@ function ChildSpans({
 export function SpansTimeline({
   run,
   timeline,
+  fans,
   selectedKey,
   onSelect,
   onOpenRun,
@@ -543,6 +860,8 @@ export function SpansTimeline({
 }: {
   run: WorkflowRun;
   timeline: StepCheckpoint[];
+  /** Fans the detail summarized: each is one node, its members paged in on demand. */
+  fans?: FanSummary[] | undefined;
   /** `${runId}#${seq}` of the selected step. */
   selectedKey?: string | undefined;
   /** Open a step's detail — the step + the run it belongs to. */
@@ -555,14 +874,18 @@ export function SpansTimeline({
   onToggleChild?: ((id: string) => void) | undefined;
 }) {
   // Compute span total for the top-level run header.
-  const span = useMemo(() => {
-    const starts = timeline.map((s) => new Date(s.startedAt).getTime());
-    const ends = timeline.map((s) => new Date(s.finishedAt).getTime());
-    const t0 = Math.min(new Date(run.createdAt).getTime(), ...starts);
-    const live = run.status === 'running' || run.status === 'suspended';
-    const tEnd = Math.max(...ends, live ? Date.now() : t0 + 1);
-    return Math.max(tEnd - t0, 1);
-  }, [run, timeline]);
+  const span = useMemo(
+    () =>
+      timelineFrame(
+        run,
+        timeline.map((s): [number, number] => [
+          new Date(s.startedAt).getTime(),
+          new Date(s.finishedAt).getTime(),
+        ]),
+        fans ?? NO_FANS,
+      ).span,
+    [run, timeline, fans],
+  );
 
   const resolvedExpanded = expanded ?? new Set<string>();
   const resolvedToggle = onToggleChild ?? (() => {});
@@ -577,6 +900,7 @@ export function SpansTimeline({
         <RunSpans
           run={run}
           timeline={timeline}
+          fans={fans}
           depth={0}
           selectedKey={selectedKey}
           onSelect={onSelect}

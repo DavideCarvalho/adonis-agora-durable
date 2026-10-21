@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import type { StepCheckpoint } from './durable-client.js';
-import { groupParallelSpans } from './group-parallel-spans.js';
+import type { FanSummary, StepCheckpoint } from './durable-client.js';
+import {
+  fanProgress,
+  fanSizeLabel,
+  fanStatus,
+  groupParallelSpans,
+  runFinished,
+} from './group-parallel-spans.js';
 
 function cp(over: Partial<StepCheckpoint> = {}): StepCheckpoint {
   return {
@@ -149,5 +155,130 @@ describe('groupParallelSpans with folded ctx.all waves', () => {
     ]);
     expect(nodes).toHaveLength(1);
     expect(nodes[0]?.kind === 'fan' && nodes[0].label).toBe('child runs ×5');
+  });
+});
+
+function fan(over: Partial<FanSummary> = {}): FanSummary {
+  return {
+    group: 'steps:1:40000',
+    label: 'work',
+    firstSeq: 1,
+    lastSeq: 40000,
+    size: 40000,
+    failFast: false,
+    counts: { completed: 40000 },
+    failures: [],
+    ...over,
+  };
+}
+
+describe('groupParallelSpans with summarized fans', () => {
+  it('places a summary where its first member sat, among the listed steps', () => {
+    const nodes = groupParallelSpans(
+      [cp({ seq: 0, name: 'setup' }), cp({ seq: 40001, name: 'finalize' })],
+      [fan({ firstSeq: 1, lastSeq: 40000 })],
+    );
+    expect(nodes.map((n) => n.kind)).toEqual(['single', 'summary', 'single']);
+    expect(nodes[1]).toMatchObject({ kind: 'summary', fan: { group: 'steps:1:40000' } });
+  });
+
+  it('orders several summaries by firstSeq, whatever order they arrive in', () => {
+    const nodes = groupParallelSpans(
+      [cp({ seq: 0, name: 'a' }), cp({ seq: 100, name: 'b' }), cp({ seq: 200, name: 'c' })],
+      [fan({ group: 'late', firstSeq: 150 }), fan({ group: 'early', firstSeq: 50 })],
+    );
+    expect(nodes.map((n) => (n.kind === 'summary' ? n.fan.group : n.kind))).toEqual([
+      'single',
+      'early',
+      'single',
+      'late',
+      'single',
+    ]);
+  });
+
+  it('a summary before every step leads; one after every step trails', () => {
+    const nodes = groupParallelSpans(
+      [cp({ seq: 10, name: 'mid' })],
+      [fan({ group: 'first', firstSeq: 0 }), fan({ group: 'last', firstSeq: 11 })],
+    );
+    expect(nodes.map((n) => (n.kind === 'summary' ? n.fan.group : n.kind))).toEqual([
+      'first',
+      'single',
+      'last',
+    ]);
+  });
+
+  it('positions a summary against an inline fan by that fan’s first member', () => {
+    const nodes = groupParallelSpans(
+      [
+        cp({ seq: 0, name: 'h_a', parallelGroup: 'g' }),
+        cp({ seq: 1, name: 'h_b', parallelGroup: 'g' }),
+        cp({ seq: 60, name: 'tail' }),
+      ],
+      [fan({ firstSeq: 2 })],
+    );
+    expect(nodes.map((n) => n.kind)).toEqual(['fan', 'summary', 'single']);
+  });
+
+  it('a run that is nothing but a summarized fan is one summary node', () => {
+    expect(groupParallelSpans([], [fan()]).map((n) => n.kind)).toEqual(['summary']);
+  });
+});
+
+describe('fanProgress / fanStatus', () => {
+  it('fills the statuses the server omitted with zero', () => {
+    expect(fanProgress(fan({ size: 5, counts: { completed: 3, failed: 2 } }))).toEqual({
+      completed: 3,
+      failed: 2,
+      running: 0,
+      pending: 0,
+      interrupted: 0,
+      notStarted: 0,
+      skipped: 0,
+      started: 5,
+      total: 5,
+    });
+  });
+
+  it('is in flight while any member is, failed once settled with a failure', () => {
+    expect(fanStatus(fan({ counts: { completed: 1, failed: 1, running: 1 } }))).toBe('running');
+    expect(fanStatus(fan({ counts: { completed: 1, pending: 1 } }))).toBe('pending');
+    expect(fanStatus(fan({ counts: { completed: 1, failed: 1 } }))).toBe('failed');
+    expect(fanStatus(fan({ counts: { completed: 2 } }))).toBe('completed');
+  });
+
+  it('counts the members a live run has not started yet, and stays in flight for them', () => {
+    const waves = fan({ size: 500, total: 40000, notStarted: 39500, counts: { completed: 500 } });
+    const p = fanProgress(waves);
+    expect(p).toMatchObject({ completed: 500, notStarted: 39500, skipped: 0, total: 40000 });
+    expect(fanStatus(waves)).toBe('pending');
+    expect(fanSizeLabel(p)).toBe('500 of 40000');
+  });
+
+  it('once the run finished, still-running members are interrupted and the rest never ran', () => {
+    const stopped = fan({
+      size: 600,
+      total: 40000,
+      notStarted: 39400,
+      failFast: true,
+      counts: { completed: 580, failed: 1, running: 19 },
+    });
+    const p = fanProgress(stopped, true);
+    expect(p).toMatchObject({ running: 0, interrupted: 19, notStarted: 0, skipped: 39400 });
+    expect(fanStatus(stopped, true)).toBe('failed');
+    expect(fanSizeLabel(p)).toBe('600 of 40000');
+  });
+
+  it('shows ×N for a fan that ran whole, or whose group does not carry a size', () => {
+    expect(fanSizeLabel(fanProgress(fan({ size: 3000, total: 3000 })))).toBe('×3000');
+    expect(fanSizeLabel(fanProgress(fan({ size: 3000 })))).toBe('×3000');
+  });
+});
+
+describe('runFinished', () => {
+  it('is false while the run can still start or finish a member', () => {
+    for (const s of ['pending', 'running', 'suspended', 'cancelling'])
+      expect(runFinished(s)).toBe(false);
+    for (const s of ['completed', 'failed', 'cancelled', 'dead']) expect(runFinished(s)).toBe(true);
   });
 });

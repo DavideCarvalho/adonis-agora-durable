@@ -77,6 +77,13 @@ export interface BullMQTransportOptions {
   instanceId?: string | undefined;
   /** Where a background failure (a failed heartbeat refresh, a result-publish error) is reported. */
   onError?: ((err: unknown) => void) | undefined;
+  /**
+   * How many step results this instance settles at once from the results queue. With the default
+   * of 1, a wide fan's results queue up behind one checkpoint write at a time on each pod. The engine
+   * still resumes one run's turns in order on an instance, so a run never gets two concurrent turns
+   * from it. A non-finite or sub-1 value falls back to the default. Default 1.
+   */
+  resultConcurrency?: number | undefined;
 }
 
 /**
@@ -106,6 +113,7 @@ export class BullMQTransport implements Transport {
   readonly #hasOnError: boolean;
   #closing = false;
   readonly #closeTimeoutMs: number;
+  readonly #resultConcurrency: number;
 
   readonly #handlers = new Map<string, StepHandler>();
   // Worker-side workflow turn consumers, keyed by workflow name — a `workflow`-shaped job routes here.
@@ -153,6 +161,9 @@ export class BullMQTransport implements Transport {
     this.#onError = options.onError ?? (() => {});
     this.#hasOnError = options.onError !== undefined;
     this.#closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
+    const results = options.resultConcurrency;
+    this.#resultConcurrency =
+      results !== undefined && Number.isFinite(results) && results >= 1 ? Math.floor(results) : 1;
   }
 
   /** Stable id stamped on this instance's worker-liveness keys. */
@@ -414,8 +425,10 @@ export class BullMQTransport implements Transport {
 
   onResult(handler: (result: StepResult) => Promise<void>): void {
     if (this.#resultsWorker) return;
-    this.#resultsWorker = this.#deps.makeWorker(resultsName(this.#effectivePrefix()), (job) =>
-      handler(job.data as StepResult),
+    this.#resultsWorker = this.#deps.makeWorker(
+      resultsName(this.#effectivePrefix()),
+      (job) => handler(job.data as StepResult),
+      { concurrency: this.#resultConcurrency },
     );
     this.#resultsWorker.on('failed', (job, err) => {
       if (!job || (job.attemptsMade ?? 0) < (job.opts?.attempts ?? 1)) return;

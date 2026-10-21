@@ -1,4 +1,4 @@
-import type { RunDetail } from './durable-client.js';
+import type { RunDetail, StepEvent } from './durable-client.js';
 
 /**
  * Merge a freshly-fetched run with the previously-cached one, preserving the live event trail the SSE
@@ -26,4 +26,22 @@ export function mergeLiveEvents(prev: RunDetail | undefined, fresh: RunDetail): 
       return step;
     }),
   };
+}
+
+/**
+ * Append one streamed event to the cached step it belongs to. A step the detail does not list — a
+ * member of a summarized fan — leaves the detail as it was (same identity, so nothing re-renders).
+ */
+export function appendLiveEvent(
+  prev: RunDetail | undefined,
+  seq: number,
+  event: StepEvent,
+): RunDetail | undefined {
+  if (!prev) return prev;
+  const index = prev.timeline.findIndex((step) => step.seq === seq);
+  const step = prev.timeline[index];
+  if (step === undefined) return prev;
+  const timeline = [...prev.timeline];
+  timeline[index] = { ...step, events: [...(step.events ?? []), event] };
+  return { ...prev, timeline };
 }

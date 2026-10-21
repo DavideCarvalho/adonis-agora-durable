@@ -84,6 +84,13 @@ export class CodecStateStore implements StateStore {
   /** Encodes like {@link saveCheckpoint}. Bound only when the inner store has it, so the engine's
    *  plain-save fallback still kicks in through the wrapper. */
   readonly saveCheckpointIfPending?: (checkpoint: StepCheckpoint) => Promise<boolean>;
+  /** Forwarded verbatim — a count reads no payload. Bound only when the inner store has it. */
+  readonly countCheckpoints?: (
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    statuses: StepCheckpoint['status'][],
+  ) => Promise<number>;
 
   constructor(
     private readonly inner: StateStore,
@@ -94,6 +101,11 @@ export class CodecStateStore implements StateStore {
     const saveIfPending = inner.saveCheckpointIfPending;
     if (saveIfPending) {
       this.saveCheckpointIfPending = (cp) => saveIfPending.call(inner, this.encCp(cp));
+    }
+    const countCheckpoints = inner.countCheckpoints;
+    if (countCheckpoints) {
+      this.countCheckpoints = (runId, fromSeq, toSeq, statuses) =>
+        countCheckpoints.call(inner, runId, fromSeq, toSeq, statuses);
     }
     const registerChildWaits = inner.registerChildWaits;
     if (registerChildWaits) {

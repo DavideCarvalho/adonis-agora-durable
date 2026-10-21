@@ -1,5 +1,5 @@
 import type { FanJoin, FanWait } from './errors.js';
-import type { SignalWaiter } from './interfaces.js';
+import type { SignalWaiter, StepCheckpoint } from './interfaces.js';
 
 /**
  * Naming shared by `ctx.all` (which mints the ids) and the engine's join barrier (which reads them
@@ -14,9 +14,52 @@ export function allChildId(runId: string, firstSeq: number, index: number, wave?
   return `${allBase(runId, firstSeq, wave)}${index}`;
 }
 
-/** The fan's `parallelGroup`. A failFast fan is marked so the barrier wakes it on the first failure. */
-export function allGroup(firstSeq: number, mode: 'waitAll' | 'failFast'): string {
-  return mode === 'failFast' ? `all:${firstSeq}:failFast` : `all:${firstSeq}`;
+/**
+ * The fan's `parallelGroup`: its first seq, its size (so a view can count the children not started
+ * yet), and a failFast mark so the barrier wakes it on the first failure.
+ */
+export function allGroup(firstSeq: number, size: number, mode: 'waitAll' | 'failFast'): string {
+  const group = `all:${firstSeq}:n${size}`;
+  return mode === 'failFast' ? `${group}:failFast` : group;
+}
+
+/**
+ * The `parallelGroup` of a step fan (`ctx.all` over a `@Step`). It carries the fan's position block,
+ * so the engine's join barrier can tell from any one step's checkpoint which steps it waits on.
+ */
+export function stepFanGroup(firstSeq: number, size: number, mode: 'waitAll' | 'failFast'): string {
+  const group = `steps:${firstSeq}:${size}`;
+  return mode === 'failFast' ? `${group}:failFast` : group;
+}
+
+/** The position block a {@link stepFanGroup} names, or undefined for any other group. */
+export function parseStepFanGroup(
+  group: string | undefined,
+): { firstSeq: number; size: number } | undefined {
+  const fan = parseFanGroup(group);
+  if (fan?.kind !== 'steps' || fan.size === undefined) return undefined;
+  return { firstSeq: fan.firstSeq, size: fan.size };
+}
+
+/**
+ * What a fan's `parallelGroup` says about it: a child fan (`all:<seq>[:n<size>][:failFast]`) or a
+ * step fan (`steps:<seq>:<size>[:failFast]`). `size` is absent on a child fan dispatched before the
+ * group carried it.
+ */
+export function parseFanGroup(
+  group: string | undefined,
+):
+  | { kind: 'all' | 'steps'; firstSeq: number; size?: number | undefined; failFast: boolean }
+  | undefined {
+  const m = group ? /^(all|steps):(\d+)(?::n?(\d+))?(:failFast)?$/.exec(group) : null;
+  if (!m) return undefined;
+  if (m[1] === 'steps' && m[3] === undefined) return undefined;
+  return {
+    kind: m[1] as 'all' | 'steps',
+    firstSeq: Number(m[2]),
+    size: m[3] === undefined ? undefined : Number(m[3]),
+    failFast: m[4] !== undefined,
+  };
 }
 
 /** The waiter and checkpoint name prefixes shared by a fan's children, or one wave's. */
@@ -91,7 +134,8 @@ export function parentRunIdOf(runId: string): string | undefined {
   return ENGINE_CHILD_ID.exec(runId)?.[1];
 }
 
-const GROUP = /^all:(\d+)(:failFast)?$/;
+// A waiter stored before the group carried the fan's size has no `:n<size>` segment.
+const GROUP = /^all:(\d+)(?::n\d+)?(:failFast)?$/;
 const REST = /^(?:w(\d+)\.)?\d+$/;
 
 /**
@@ -111,4 +155,18 @@ export function fanOfWaiter(
   if (!rest) return undefined;
   const waiterPrefix = rest[1] === undefined ? base : `${base}w${rest[1]}.`;
   return { waiterPrefix, failFast: group[2] !== undefined };
+}
+
+/**
+ * The child run ids a parent's child-edge checkpoints point at: an awaited child
+ * (`signal:child:<id>`), a folded group of them, a spawn (`spawn:`). Other checkpoints are skipped.
+ */
+export function childIdsOf(checkpoints: StepCheckpoint[]): string[] {
+  const ids: string[] = [];
+  for (const cp of checkpoints) {
+    if (cp.name.startsWith('signal:child:')) ids.push(cp.name.slice('signal:child:'.length));
+    if (cp.name.startsWith(FOLDED_PREFIX)) ids.push(...foldedChildIds(cp));
+    if (cp.name.startsWith('spawn:') && typeof cp.output === 'string') ids.push(cp.output);
+  }
+  return ids;
 }

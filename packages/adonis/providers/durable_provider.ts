@@ -252,6 +252,7 @@ export default class DurableProvider {
         ...(config.remoteRedispatchMax !== undefined
           ? { remoteRedispatchMax: config.remoteRedispatchMax }
           : {}),
+        ...(config.timerBatchSize !== undefined ? { timerBatchSize: config.timerBatchSize } : {}),
         // Where a freshly-started run executes: explicit config wins; else `control-plane` leaves it
         // pending for the poll loop (no inline execution), and `standalone` uses the engine's in-process
         // default (embedded worker).

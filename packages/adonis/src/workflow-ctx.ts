@@ -24,6 +24,7 @@ import {
 } from './fan-join.js';
 import type {
   AllOptions,
+  AllStepsOptions,
   ChildCallOptions,
   ChildWait,
   DurableWebhook,
@@ -150,6 +151,19 @@ export interface CtxHost {
     transport?: string,
     admission?: { priority?: number | undefined; fairnessKey?: string | undefined },
   ): Promise<TOutput>;
+  /** One durable step per input at the reserved `positions`, joined once (`ctx.all` over a step). */
+  callRemoteAll<TInput, TOutput>(
+    runId: string,
+    positions: number[],
+    step: StepDef<TInput, TOutput>,
+    inputs: TInput[],
+    opts: {
+      mode: 'waitAll' | 'failFast';
+      concurrency?: number | undefined;
+      transport?: string | undefined;
+      admission?: { priority?: number | undefined; fairnessKey?: string | undefined };
+    },
+  ): Promise<TOutput[]>;
   /** Start a child run once, deferred so it can't reentrantly resume a still-running parent. */
   startChild(workflow: string, input: unknown, id: string, priority?: number): void;
   /**
@@ -673,19 +687,24 @@ export function createWorkflowCtx(
   // the next one. When all resolve, outputs are returned in INPUT order (waitAll), or a GatherError
   // is thrown carrying the per-item failures. Parity with the Python SDK's `gather_children`.
   const all = async <T = unknown>(
-    workflow: WorkflowRef,
+    workflow: WorkflowRef | StepRef,
     inputs: unknown[],
-    opts?: AllOptions,
+    opts?: AllOptions | AllStepsOptions,
   ): Promise<T[]> => {
     // Empty: reserve no positions and produce no side effects (degenerate identity).
     if (inputs.length === 0) return [];
+    if (stepNameOf(workflow) !== undefined) {
+      return allSteps(workflow as StepRef, inputs, opts as AllStepsOptions | undefined) as Promise<
+        T[]
+      >;
+    }
     const mode = opts?.mode ?? 'waitAll';
-    const name = workflowName(workflow);
+    const name = workflowName(workflow as WorkflowRef);
     const waves = allWaves(inputs.length, opts?.concurrency);
     // Reserve the whole block in list order BEFORE any dispatch — replay re-derives identical seqs.
     const positions = inputs.map(() => pos.next());
     const firstSeq = positions[0] as number;
-    const group = allGroup(firstSeq, mode);
+    const group = allGroup(firstSeq, inputs.length, mode);
     const waveOf = (i: number) => (waves ? Math.floor(i / waves.waveSize) : undefined);
     const id = (i: number) => allChildId(runId, firstSeq, i, waveOf(i));
     const { checkpoints: existing, folded } = await readFan(positions, [
@@ -879,6 +898,27 @@ export function createWorkflowCtx(
     }
     if (failures.length > 0) throw new GatherError(failures, inputs.length);
     return outputs;
+  };
+
+  // `ctx.all` over a `@Step`: one durable step per input. Reserves the whole position block in list
+  // order first, like the child fan, then hands the fan to the engine, which sends it and joins it.
+  const allSteps = async (ref: StepRef, inputs: unknown[], opts?: AllStepsOptions) => {
+    const unsupported = opts as StepDispatchOpts | undefined;
+    if (unsupported?.queue !== undefined) {
+      throw new Error('ctx.all: a flow-control queue is not supported on a step fan');
+    }
+    const name = stepNameOf(ref) as string;
+    const def: StepDef<unknown, unknown> = {
+      name,
+      ...resolveStepPolicy(stepConfigOf(ref), opts),
+    };
+    const positions = inputs.map(() => pos.next());
+    return host.callRemoteAll(runId, positions, def, inputs, {
+      mode: opts?.mode ?? 'waitAll',
+      concurrency: opts?.concurrency,
+      transport: opts?.transport,
+      admission: { priority: opts?.priority, fairnessKey: opts?.fairnessKey },
+    });
   };
 
   // A fan's checkpoints: from the replay snapshot, plus ONE prefix query for any the snapshot does

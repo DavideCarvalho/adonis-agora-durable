@@ -142,7 +142,8 @@ The console routes client-side on the URL hash (`#/run/<id>`), so a deep link ne
 | --- | --- | --- |
 | `GET` | `/durable/api/runs` | list runs — see the filters below |
 | `GET` | `/durable/api/runs/values` | distinct values of one filter axis, with counts — what the pickers list |
-| `GET` | `/durable/api/runs/:id` | run detail: the run, its step `timeline`, and its `children` |
+| `GET` | `/durable/api/runs/:id` | run detail: the run, its step `timeline`, and its `children`; a fan of more than 50 members comes back summarized in `fans` unless `?full=true` |
+| `GET` | `/durable/api/runs/:id/fans/:group` | one page of a summarized fan's members (`offset`, `limit` up to 500, `failed=true`), with the `total` |
 | `GET` | `/durable/api/runs/:id/stream` | Server-Sent Events: this run's lifecycle events, live |
 
 `GET /api/runs` accepts two spellings of the same filter, both served by the console's
@@ -190,6 +191,8 @@ The response is `{ runs, meta: { page, size, count }, statuses }`. The envelope 
 `GET /api/runs/values` answers what the console's tag, tenant and attribute pickers list: the distinct values one axis takes across the runs matching every OTHER active predicate, with counts — most common first, engine-minted tags (`singleton:<key>`) last. Served through the filter lib's `groupByCountFromRequest` with the console's adapter. The axis rides `groupByCount[field]` (`workflow`, `status`, `namespace`, `tag`, `attr` for the keys in use, `attr.<key>` for the values under one key — top-level `field` works too); the scope rides the same params as `GET /api/runs` (minus `status`, which is deliberately dropped so the offers don't collapse to the status being viewed). `limit` bounds the rows (default `100`, capped at `200`), `offset` pages them, `search` narrows them server-side — this endpoint keeps `limit`/`offset` on purpose: it is filter's own group-by-count aggregation (`groupByCount[limit]`/`groupByCount[offset]`), not a run listing, so `limit`/`offset` IS the aligned spelling here — a rare value outside the first page stays reachable by typing. The response is a bare `[{ value, count }]` array.
 
 There is no separate checkpoints route: a run's step timeline comes back as the `timeline` array of `GET /api/runs/:id`, each entry carrying `seq`, `name`, `kind`, `status`, `attempts`, `workerGroup`, input/output/error, `events`, `parallelGroup`, and the derived `durationMs` / `queueMs`.
+
+A fan with more than 50 members (a `ctx.all` over children or over a step, a polyglot gather) is summarized: its members leave `timeline`, and the fan comes back as one entry of `fans` with its `group`, `label`, seq range, `size` (members started so far), `total` (its declared size: a `ctx.all` group carries it as `all:<seq>:n<size>`, a step fan as `steps:<seq>:<size>`), `notStarted`, `failFast`, `counts` by status (a failed child counts as `failed`), start and finish, and its first 20 failed members. A fan declared wider than 50 is summarized even while only a few of its waves have been sent. `children` then lists the first 200 child run ids and `childCount` carries the total. `GET /api/runs/:id/fans/:group` pages the members on demand. `?full=true` returns the detail unsummarized. On a store-less tenant pod the control plane summarizes before the detail crosses the wire.
 
 #### Live-tailing one run
 
@@ -327,6 +330,7 @@ The routes are all named (`durable_dashboard.index`, `durable_dashboard.runs.sho
 - **Step timeline** — the selected run's steps in order, tagged by kind (local / remote / sleep / signal), with worker group, queue wait and duration. In-flight steps appear while they run, not only on completion — a remote step in flight reads as `pending`, and a local step's executing body as `running` (the [`trackStepStart`](/docs/durable/concepts/workflows-and-steps#in-flight-visibility) option).
 - **Live tail** — the open run streams its events over SSE, so a long run updates without a reload.
 - **Children and lineage** — a run's [child workflows](/docs/durable/authoring/child-workflows) are linked from its detail, as is the original of a fix-and-replay run.
+- **Wide fans** — a fan of more than 50 members draws as one node in the graph and one row in the timeline, with its progress against its declared size (`600 of 40000 started`; once the run has finished, members cut short read as `interrupted` and the rest as `never ran`) and its failures. Expanding it lists the members in a virtualized list that pages them in as you scroll, with a failed-only toggle. The run header lists the first 12 children and counts the rest, and only the first 50 children's details are fetched to label their rows.
 - **Actions** — retry, cancel, cancel + undo ([saga compensation](/docs/durable/reliability/sagas)), fix-and-replay, redispatch, continue, the [human-in-the-loop verbs](#human-in-the-loop-signals-updates-and-tasks) (deliver a signal, a validated update, or a task completion), and the bulk equivalents of retry and cancel.
 - **Schedules** — the ticked [scheduled workflows](/docs/durable/authoring/scheduling) with their fire windows and effective pause state, plus pause / resume / run-now controls that apply fleet-wide at runtime.
 - **Worker cards** — on the BullMQ transport, each worker's live telemetry: concurrency, in-flight, RSS/CPU, throughput and p95.

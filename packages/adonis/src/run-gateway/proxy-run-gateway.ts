@@ -12,6 +12,7 @@ import type {
   TenantEvent,
   WorkflowRun,
 } from '../interfaces.js';
+import type { FanPage, FanPageQuery, RunDetail, RunDetailOptions } from '../run-detail-summary.js';
 import type { WorkflowRef } from '../workflow-ref.js';
 import type { DurableTopology, RunGateway, StartRunOptions } from './interface.js';
 
@@ -165,6 +166,18 @@ export class ProxyRunGateway implements RunGateway {
 
   getRunChildren(runId: string): Promise<string[]> {
     return this.#request<string[]>({ kind: 'getRunChildren', runId });
+  }
+
+  getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail | null> {
+    return this.#request<RunDetail | null>(
+      options === undefined
+        ? { kind: 'getRunDetail', runId }
+        : { kind: 'getRunDetail', runId, options },
+    );
+  }
+
+  getFanMembers(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null> {
+    return this.#request<FanPage | null>({ kind: 'getFanMembers', runId, group, query });
   }
 
   getSearchAttributes(runId: string): Promise<SearchAttributes | undefined> {

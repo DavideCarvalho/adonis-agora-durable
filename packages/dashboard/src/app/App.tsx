@@ -5,6 +5,7 @@ import {
   BULK_MATCH_CAP,
   deriveRunState,
   durableClient,
+  type FanSummary,
   type GroupHealth,
   logoutUrl,
   type RunDetail as RunDetailData,
@@ -17,7 +18,7 @@ import {
   waitTargetsOf,
 } from '../client/durable-client';
 import { groupByPartition, type PartitionView } from '../client/group-by-partition';
-import { mergeLiveEvents } from '../client/merge-live-events';
+import { appendLiveEvent, mergeLiveEvents } from '../client/merge-live-events';
 import { pivotByWorker, type WorkerView } from '../client/pivot-by-worker';
 import { partitionOf } from '../client/queue-partition';
 import {
@@ -38,8 +39,10 @@ import {
   splitCompensations,
 } from '../client/split-compensations';
 import { type HealthSummary, summarizeHealth } from '../client/summarize-health';
+import { throttle } from '../client/throttle';
 import { AttributeFilters } from './AttributeFilters';
 import { CompatHealth } from './CompatPanel';
+import { childChips } from './child-link';
 import { BoltIcon, PlayIcon, RetryIcon, SearchIcon, UserIcon, XIcon } from './icons';
 import { OriginFacets } from './OriginFacets';
 import { RunInfoPanel } from './RunInfoPanel';
@@ -1105,6 +1108,9 @@ function CompensationSection({
   );
 }
 
+/** Stable empty list, for a run whose detail summarized no fans. */
+const NO_FANS: FanSummary[] = [];
+
 function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => void }) {
   const qc = useQueryClient();
   const { data } = useQuery({
@@ -1166,7 +1172,10 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   const isLive = liveStatus === 'running' || liveStatus === 'suspended';
   useEffect(() => {
     if (!isLive) return;
-    return durableClient.streamRun(id, (event) => {
+    // A busy fan emits a lifecycle event per member; refetching the detail on each would fetch it
+    // back-to-back. At most one refetch per poll interval, the last event always followed by one.
+    const refetch = throttle(() => qc.invalidateQueries({ queryKey: ['run', id] }), 1500);
+    const stop = durableClient.streamRun(id, (event) => {
       // `step.progress` carries a single live event from a still-running step — merge it straight
       // into the cached step's `events` so a long step's trail streams in line-by-line. Invalidating
       // per event would mean a store refetch per log line (hundreds for a fan-out step) AND would
@@ -1174,20 +1183,18 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
       if (event.type === 'step.progress' && event.event && event.seq != null) {
         const seq = event.seq;
         const live = event.event;
-        qc.setQueryData(['run', id], (prev: RunDetailData | undefined) => {
-          if (!prev) return prev;
-          return {
-            ...prev,
-            timeline: prev.timeline.map((step) =>
-              step.seq === seq ? { ...step, events: [...(step.events ?? []), live] } : step,
-            ),
-          };
-        });
+        qc.setQueryData(['run', id], (prev: RunDetailData | undefined) =>
+          appendLiveEvent(prev, seq, live),
+        );
         return;
       }
       // Lifecycle events (step started/completed, run settled) change authoritative state — refetch.
-      qc.invalidateQueries({ queryKey: ['run', id] });
+      refetch.call();
     });
+    return () => {
+      refetch.cancel();
+      stop();
+    };
   }, [id, isLive, qc]);
   const retry = useMutation({ mutationFn: () => durableClient.retry(id), onSuccess: invalidate });
   const cancel = useMutation({
@@ -1271,6 +1278,12 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   // graph/spans/step-count — split them out once, up front, and feed `body` to everything below that
   // renders the normal flow. `compensations` gets its own section further down.
   const { body, compensations } = splitCompensations(timeline);
+  const fans = data.fans ?? NO_FANS;
+  // A summarized fan's members are not in `body`; the step count and the "anything to draw" checks
+  // count them through the fan.
+  const stepCount = fans.reduce((n, fan) => n + fan.size, body.length);
+  const hasFlow = body.length > 0 || fans.length > 0;
+  const chips = childChips(data.children ?? [], data.childCount);
   const compSummary = compensationSummary(compensations);
   // A dead-letter run is a recovery path, not the normal flow — surface it as a banner. The two ends
   // of the relationship, linked both ways:
@@ -1424,7 +1437,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
             )}
             <Chip className="mono bg-transparent py-0.5 text-zinc-500">v{run.workflowVersion}</Chip>
             <span className="mono tnum text-[11px] text-zinc-600">
-              {body.length} {body.length === 1 ? 'step' : 'steps'}
+              {stepCount} {stepCount === 1 ? 'step' : 'steps'}
             </span>
           </div>
           <div className="mono mt-1 truncate text-[11px] text-zinc-600">{run.id}</div>
@@ -1446,10 +1459,10 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
               ))}
             </div>
           )}
-          {(data as RunDetailData | undefined)?.children?.length ? (
+          {chips.shown.length > 0 ? (
             <div className="mt-1.5 flex flex-wrap items-center gap-1">
               <span className="text-[10px] text-zinc-600">children:</span>
-              {(data as RunDetailData).children?.map((cid) => (
+              {chips.shown.map((cid) => (
                 <Button
                   key={cid}
                   variant="chip"
@@ -1460,6 +1473,9 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
                   {cid}
                 </Button>
               ))}
+              {chips.more > 0 && (
+                <span className="mono text-[10px] text-zinc-500">+{chips.more} more</span>
+              )}
             </div>
           ) : null}
         </div>
@@ -1587,10 +1603,10 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
       )}
       <div
         className="relative grid min-h-0 flex-1"
-        style={{ gridTemplateRows: body.length > 0 ? `1fr ${spanHeight}px` : '1fr' }}
+        style={{ gridTemplateRows: hasFlow ? `1fr ${spanHeight}px` : '1fr' }}
       >
         <div className="relative min-h-0">
-          {body.length === 0 ? (
+          {!hasFlow ? (
             <div className="grid h-full place-items-center text-sm text-zinc-600">
               No steps recorded yet.
             </div>
@@ -1598,6 +1614,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
             <WorkflowGraph
               run={run}
               timeline={body}
+              fans={fans}
               endStatus={detailState.status}
               selectedKey={selKey}
               onSelect={(step, stepRun) => setSelStep({ step, run: stepRun })}
@@ -1613,7 +1630,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
             </div>
           )}
         </div>
-        {body.length > 0 && (
+        {hasFlow && (
           // The spans height lives in the GRID TRACK above (`clamp(...)`), not here — an `auto` track
           // sizes to the tall span content's min-content and collapses the `1fr` WorkflowGraph row to
           // 0. With the track clamped, this wrapper just fills it and clips; SpansTimeline scrolls.
@@ -1627,6 +1644,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
             <SpansTimeline
               run={run}
               timeline={body}
+              fans={fans}
               selectedKey={selKey}
               onSelect={(step, stepRun) => setSelStep({ step, run: stepRun })}
               onOpenRun={onOpenRun}

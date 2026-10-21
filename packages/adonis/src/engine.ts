@@ -22,13 +22,21 @@ import { Entities, type EntityConfig } from './entities.js';
 import {
   ContinueAsNew,
   type FanJoin,
+  GatherError,
   NonDeterminismError,
   RemoteStepTimeout,
+  type StepFanRange,
   WorkflowSuspended,
 } from './errors.js';
 import { EventAccumulators, type EventBatchConfig } from './event-accumulators.js';
 import { eventMatches, eventMatchOf, eventPrefix } from './events.js';
-import { FOLDED_PREFIX, fanOfWaiter, foldedChildIds } from './fan-join.js';
+import {
+  childIdsOf,
+  FOLDED_PREFIX,
+  fanOfWaiter,
+  parseStepFanGroup,
+  stepFanGroup,
+} from './fan-join.js';
 import type { WorkerDescriptor } from './handshake/descriptor.js';
 import type {
   ControlPlane,
@@ -276,6 +284,21 @@ const versionKey = (name: string, version: string): string => `${name}@${version
  */
 const COMPENSATION_SEQ_BASE = -2;
 
+/** How many checkpoint writes / dispatches a step fan sends at once. */
+const STEP_FAN_CHUNK = 200;
+
+/** The default {@link WorkflowEngineDeps.timerBatchSize}. */
+const DEFAULT_TIMER_BATCH = 200;
+
+/** Fisher–Yates, in place. */
+function shuffle<T>(items: T[]): T[] {
+  for (let i = items.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [items[i], items[j]] = [items[j] as T, items[i] as T];
+  }
+  return items;
+}
+
 /**
  * The routing token a dispatched step lands on: the step's own (broker-safe) name, suffixed by the
  * tenant the RUN belongs to. `runNamespace` — not the executing engine's namespace — is the tenant
@@ -389,6 +412,14 @@ export interface WorkflowEngineDeps {
    * for a genuinely-orphaned run. Default 5min; set `0` to disable (the prior wake-forever behavior).
    */
   reconcileMs?: number | undefined;
+  /**
+   * The most due timers one {@link WorkflowEngine.resumeDueTimers} pass loads and drives, most
+   * overdue first. Every driving instance runs that pass each tick, so a wave of thousands of due
+   * runs (a recovery after an outage, a fan's children waking together) is worked through in
+   * batches instead of every instance loading and walking all of it. A non-finite or sub-1 value
+   * falls back to the default. Default 200.
+   */
+  timerBatchSize?: number | undefined;
   /**
    * Opt-in self-heal window (ms) for a remote step with NO `timeoutMs` whose dispatched job was LOST —
    * the worker crashed mid-step leaving no result, or the transport dropped the job (a Redis
@@ -572,6 +603,7 @@ export class WorkflowEngine {
   private readonly leaseMs: number;
   private readonly maxRecoveryAttempts?: number | undefined;
   private readonly reconcileMs: number | undefined;
+  private readonly timerBatchSize: number;
   private readonly remoteRedispatchMs: number | undefined;
   private readonly remoteRedispatchMax: number;
   private readonly webhookUrl?: ((token: string) => string) | undefined;
@@ -728,6 +760,12 @@ export class WorkflowEngine {
     this.maxRecoveryAttempts = deps.maxRecoveryAttempts;
     // Default 5min; an explicit 0 disables the fallback (opt back into wake-forever-on-lost-event).
     this.reconcileMs = deps.reconcileMs === undefined ? 300_000 : deps.reconcileMs || undefined;
+    // A non-finite or sub-1 value falls back to the default: a NaN limit would stall timer recovery.
+    const batch = deps.timerBatchSize;
+    this.timerBatchSize =
+      batch !== undefined && Number.isFinite(batch) && batch >= 1
+        ? Math.floor(batch)
+        : DEFAULT_TIMER_BATCH;
     // Opt-in: unset (or 0) leaves the by-design "re-suspend a lost dispatch, never re-dispatch" behavior.
     this.remoteRedispatchMs = deps.remoteRedispatchMs || undefined;
     this.remoteRedispatchMax = Math.max(1, deps.remoteRedispatchMax ?? 10);
@@ -1906,6 +1944,37 @@ export class WorkflowEngine {
     );
   }
 
+  /**
+   * {@link recheckWaitSeqs} for the step fans a suspended turn waits on: re-drive the run once a fan
+   * has no step left `pending`. The last result of a fan may have opened the join barrier while this
+   * turn held the lease, and its resume no-oped against it. A fan with a step still `pending` is left
+   * to that step's result.
+   */
+  private recheckStepFans(runId: string, fans: StepFanRange[]): void {
+    this.trackEffect(
+      (async () => {
+        await new Promise((r) => setTimeout(r, 0));
+        for (const fan of fans) {
+          const pending = await this.countPendingSteps(runId, fan.from, fan.to).catch(() => 1);
+          if (pending === 0) {
+            await this.resumeImplicit(runId).catch(() => undefined);
+            return;
+          }
+        }
+      })(),
+    );
+  }
+
+  /** {@link StateStore.countCheckpoints} of `pending` steps, or a JS count on a store without it. */
+  private async countPendingSteps(runId: string, from: number, to: number): Promise<number> {
+    if (this.store.countCheckpoints) {
+      return this.store.countCheckpoints(runId, from, to, ['pending']);
+    }
+    return (await this.store.listCheckpoints(runId)).filter(
+      (c) => c.seq >= from && c.seq <= to && c.status === 'pending',
+    ).length;
+  }
+
   /** Track an in-flight execution so {@link drain} can wait for it. */
   private track(runId: string, p: Promise<RunResult>): Promise<RunResult> {
     this.inflight.set(p, runId);
@@ -2185,8 +2254,12 @@ export class WorkflowEngine {
    * not due re-suspends cheaply without running new work.
    */
   async resumeDueTimers(nowMs: number = this.clock()): Promise<RunResult[]> {
-    // Capped per tick (a backlog drains over several polls) — a store may ignore the cap.
-    const due = await asHeartbeat(() => this.store.listDueTimers(nowMs, this.namespace, 200));
+    // Capped per tick (a backlog drains over several polls) — a store may ignore the cap. Shuffled:
+    // every instance loads the same most-overdue batch, and walking it in the same order would have
+    // them all contend for the same leases one row at a time.
+    const due = shuffle(
+      await asHeartbeat(() => this.store.listDueTimers(nowMs, this.namespace, this.timerBatchSize)),
+    );
     const blocked = await this.dueBlockedRuns(nowMs);
     return this.resumeLeased([...due, ...blocked], nowMs);
   }
@@ -4106,6 +4179,9 @@ export class WorkflowEngine {
         if (settled.status === 'suspended' && err.waitSeqs?.length) {
           this.recheckWaitSeqs(run.id, err.waitSeqs);
         }
+        if (settled.status === 'suspended' && err.stepFans?.length) {
+          this.recheckStepFans(run.id, err.stepFans);
+        }
         if (settled.status === 'suspended') suspendedOnFan = err.fan;
         return settled;
       }
@@ -4423,6 +4499,8 @@ export class WorkflowEngine {
       failStep: (s) => this.failStep(s),
       callRemote: (runId, seq, step, input, queue, transport, admission) =>
         this.callRemote(runId, seq, step, input, queue, transport, replay, admission, runNamespace),
+      callRemoteAll: (runId, positions, step, inputs, opts) =>
+        this.callRemoteAll(runId, positions, step, inputs, opts, runNamespace),
       // Defer so a fast child can't reentrantly resume a still-running parent. The child inherits the
       // PARENT RUN's namespace, not this engine's: an operator legitimately executes every tenant's
       // parents, and without this the child would fall to the operator's own pool.
@@ -4639,6 +4717,7 @@ export class WorkflowEngine {
     replay?: Map<number, StepCheckpoint>,
     admission?: { priority?: number | undefined; fairnessKey?: string | undefined },
     runNamespace?: string | undefined,
+    parallelGroup?: string | undefined,
   ): Promise<TOutput> {
     // Read the prefix from the per-execution snapshot (avoids the O(N²) replay SELECTs); a seq absent
     // from the snapshot — not yet dispatched, or written after the snapshot — falls back to the store.
@@ -4698,6 +4777,7 @@ export class WorkflowEngine {
             undefined,
             admission,
             runNamespace,
+            parallelGroup,
           );
         }
         throw new WorkflowSuspended(wakeAt, [seq]);
@@ -4739,6 +4819,7 @@ export class WorkflowEngine {
           undefined,
           admission,
           runNamespace,
+          parallelGroup,
         );
       }
       await this.dispatchRemoteTask({
@@ -4836,6 +4917,7 @@ export class WorkflowEngine {
       // released by WHICHEVER instance receives the result — the in-memory stepQueue map only
       // covers the dispatching pod, and a slot released by no one starves the queue fleet-wide.
       queue: admittedQueue,
+      ...(parallelGroup !== undefined ? { parallelGroup } : {}),
       enqueuedAt,
       startedAt: enqueuedAt, // placeholders until the worker result lands
       finishedAt: enqueuedAt,
@@ -4853,6 +4935,175 @@ export class WorkflowEngine {
     });
     this.emit({ type: 'step.started', runId, seq, name: step.name, kind: 'remote' });
     throw new WorkflowSuspended(undefined, [seq]);
+  }
+
+  /**
+   * `ctx.all` over a `@Step`: one durable step per input, dispatched together, joined once. The ctx
+   * reserves the whole position block up front, so replay re-derives the same seqs.
+   *
+   * Each turn reads the fan's checkpoints fresh, hands every step that already has one to
+   * {@link callRemote} (which owns the completed / pending / failed-retry rules), and sends the steps
+   * nobody has sent yet: all of them, or with `concurrency`, the next wave once the last one has
+   * drained. New steps are written `pending` BEFORE any is dispatched, so a turn that runs after a
+   * fast result finds them already sent instead of sending them again. The suspension carries the
+   * fan's block, not its seqs, so the join barrier ({@link stepFanStillRunning}) and
+   * {@link recheckStepFans} wake the parent once per wave, not once per result.
+   */
+  private async callRemoteAll<TInput, TOutput>(
+    runId: string,
+    positions: number[],
+    step: StepDef<TInput, TOutput>,
+    inputs: TInput[],
+    opts: {
+      mode: 'waitAll' | 'failFast';
+      concurrency?: number | undefined;
+      transport?: string | undefined;
+      admission?: { priority?: number | undefined; fairnessKey?: string | undefined };
+    },
+    runNamespace?: string | undefined,
+  ): Promise<TOutput[]> {
+    if (step.timeoutMs) {
+      throw new Error(
+        `ctx.all: step "${step.name}" has a liveness timeoutMs; a step fan needs durable steps`,
+      );
+    }
+    if (
+      opts.concurrency !== undefined &&
+      (!Number.isInteger(opts.concurrency) || opts.concurrency < 1)
+    ) {
+      throw new Error(`ctx.all: concurrency must be a positive integer, got ${opts.concurrency}`);
+    }
+    if (this.pool.size === 0) throw new Error('remote steps require a Transport');
+    const first = positions[0] as number;
+    const last = positions[positions.length - 1] as number;
+    const group = stepFanGroup(first, positions.length, opts.mode);
+    const bySeq = new Map<number, StepCheckpoint>();
+    for (const cp of await this.store.listCheckpoints(runId)) {
+      if (cp.seq >= first && cp.seq <= last) bySeq.set(cp.seq, cp);
+    }
+
+    const outputs: TOutput[] = new Array(inputs.length);
+    const failures: { index: number; id: string; error: string }[] = [];
+    const unsent: number[] = [];
+    let inFlight = 0;
+    let wakeAt: number | undefined;
+    for (let i = 0; i < inputs.length; i += 1) {
+      const seq = positions[i] as number;
+      const cp = bySeq.get(seq);
+      if (!cp) {
+        unsent.push(i);
+        continue;
+      }
+      if (cp.name !== step.name) throw new NonDeterminismError(runId, seq, step.name, cp.name);
+      if (cp.status === 'completed') {
+        outputs[i] = cp.output as TOutput;
+        continue;
+      }
+      try {
+        outputs[i] = await this.callRemote(
+          runId,
+          seq,
+          step,
+          inputs[i] as TInput,
+          undefined,
+          opts.transport,
+          undefined,
+          opts.admission,
+          runNamespace,
+          group,
+        );
+      } catch (err) {
+        if (err instanceof WorkflowSuspended) {
+          inFlight += 1;
+          if (err.wakeAt !== undefined) wakeAt = Math.min(wakeAt ?? err.wakeAt, err.wakeAt);
+        } else if (err instanceof RemoteStepError) {
+          const failure = { index: i, id: stepId(runId, seq), error: err.message };
+          if (opts.mode === 'failFast') throw new GatherError([failure], inputs.length);
+          failures.push(failure);
+        } else {
+          throw err;
+        }
+      }
+    }
+
+    const batch =
+      inFlight > 0
+        ? []
+        : opts.concurrency === undefined
+          ? unsent
+          : unsent.slice(0, opts.concurrency);
+    if (batch.length > 0) {
+      await this.sendStepFan(runId, positions, step, inputs, batch, group, opts, runNamespace);
+    }
+
+    if (inFlight + batch.length > 0) {
+      throw new WorkflowSuspended(wakeAt, undefined, undefined, [{ from: first, to: last }]);
+    }
+    if (failures.length > 0) throw new GatherError(failures, inputs.length);
+    return outputs;
+  }
+
+  /** Write the `pending` checkpoints of a step fan's new steps, then dispatch them. */
+  private async sendStepFan<TInput, TOutput>(
+    runId: string,
+    positions: number[],
+    step: StepDef<TInput, TOutput>,
+    inputs: TInput[],
+    batch: number[],
+    group: string,
+    opts: {
+      transport?: string | undefined;
+      admission?: { priority?: number | undefined; fairnessKey?: string | undefined };
+    },
+    runNamespace?: string | undefined,
+  ): Promise<void> {
+    const token = stepGroup(step, runNamespace);
+    await this.ensureRoutable(token, step.requires);
+    const input = (i: number): unknown =>
+      step.input ? step.input.parse(inputs[i] as TInput) : inputs[i];
+    const validInputs = new Map(batch.map((i) => [i, input(i)]));
+    const enqueuedAt = new Date();
+    for (let at = 0; at < batch.length; at += STEP_FAN_CHUNK) {
+      await Promise.all(
+        batch.slice(at, at + STEP_FAN_CHUNK).map((i) => {
+          const seq = positions[i] as number;
+          return this.store.saveCheckpoint({
+            runId,
+            seq,
+            name: step.name,
+            kind: 'remote',
+            stepId: stepId(runId, seq),
+            status: 'pending',
+            input: validInputs.get(i),
+            attempts: 1,
+            workerGroup: token,
+            parallelGroup: group,
+            enqueuedAt,
+            startedAt: enqueuedAt,
+            finishedAt: enqueuedAt,
+          });
+        }),
+      );
+    }
+    for (let at = 0; at < batch.length; at += STEP_FAN_CHUNK) {
+      await Promise.all(
+        batch.slice(at, at + STEP_FAN_CHUNK).map(async (i) => {
+          const seq = positions[i] as number;
+          await this.dispatchRemoteTask({
+            runId,
+            seq,
+            name: step.name,
+            stepId: stepId(runId, seq),
+            group: token,
+            input: validInputs.get(i),
+            priority: opts.admission?.priority,
+            attempt: 1,
+            transport: opts.transport,
+          });
+          this.emit({ type: 'step.started', runId, seq, name: step.name, kind: 'remote' });
+        }),
+      );
+    }
   }
 
   /**
@@ -4917,8 +5168,10 @@ export class WorkflowEngine {
   }
 
   private async completeRemoteResult(result: StepResult): Promise<void> {
-    const runId = await this.settleRemoteCheckpoint(result);
-    if (runId === undefined) return;
+    const cp = await this.settleRemoteCheckpoint(result);
+    if (cp === undefined) return;
+    if (await this.stepFanStillRunning(cp, result)) return;
+    const runId = result.runId;
     this.trackEffect(
       this.resumeImplicit(runId).catch((err) => {
         console.warn(
@@ -4931,12 +5184,27 @@ export class WorkflowEngine {
   }
 
   /**
-   * The durable half of {@link completeRemoteResult}: settle `result` onto its checkpoint (or re-drive
-   * the resume when a redelivered result finds it already settled). Returns the run to resume, or
-   * `undefined` when no resume is wanted (no checkpoint, or a late result for a terminal run —
-   * terminal is terminal).
+   * The join barrier of a step fan: a result for one of its steps resumes the parent only once no
+   * step of the fan is still `pending` (a settled wave), or on a failure (failFast surfaces it, and a
+   * retry needs the parent to schedule it). Without it every result would replay the whole parent,
+   * which makes a fan of N steps cost O(N²) checkpoint reads. A redelivered result goes through it
+   * too: its re-driven resume is only owed once the fan has settled.
    */
-  private async settleRemoteCheckpoint(result: StepResult): Promise<string | undefined> {
+  private async stepFanStillRunning(cp: StepCheckpoint, result: StepResult): Promise<boolean> {
+    const fan = parseStepFanGroup(cp.parallelGroup);
+    if (!fan || result.status === 'failed') return false;
+    return (
+      (await this.countPendingSteps(result.runId, fan.firstSeq, fan.firstSeq + fan.size - 1)) > 0
+    );
+  }
+
+  /**
+   * The durable half of {@link completeRemoteResult}: settle `result` onto its checkpoint (or re-drive
+   * the resume when a redelivered result finds it already settled). Returns the step's checkpoint as
+   * read when its run should be resumed, or `undefined` when no resume is wanted (no checkpoint, or a
+   * late result for a terminal run — terminal is terminal).
+   */
+  private async settleRemoteCheckpoint(result: StepResult): Promise<StepCheckpoint | undefined> {
     const cp = await this.store.getCheckpoint(result.runId, result.seq);
     if (!cp) return undefined;
     const run = await this.store.getRun(result.runId);
@@ -4961,7 +5229,7 @@ export class WorkflowEngine {
     // compensations already ran). Terminal is terminal — recovery of a failed run belongs to an
     // explicit `requeue`/`durable:retry`, never to a stray result.
     if (cp.status !== 'pending') {
-      if (!terminal) return result.runId;
+      if (!terminal) return cp;
       return undefined;
     }
     // A result settling this step frees its flow-control slot (no-op if it wasn't queued). Released
@@ -5003,7 +5271,7 @@ export class WorkflowEngine {
       startedAt,
       finishedAt,
     });
-    if (!claimed) return terminal ? undefined : result.runId;
+    if (!claimed) return terminal ? undefined : cp;
     await this.releaseQueueSlot(cp);
     this.emit({
       type: result.status === 'completed' ? 'step.completed' : 'step.failed',
@@ -5016,7 +5284,7 @@ export class WorkflowEngine {
       queueMs: startedAt.getTime() - cp.enqueuedAt.getTime(),
       durationMs: finishedAt.getTime() - startedAt.getTime(),
     });
-    return result.runId;
+    return cp;
   }
 
   /**
@@ -5312,14 +5580,3 @@ export class RemoteStepError extends Error {
 
 /** Checkpoint names that record a parent→child edge: an awaited child, a folded group of them, a spawn. */
 const CHILD_EDGE_PREFIXES = ['signal:child:', FOLDED_PREFIX, 'spawn:'];
-
-/** The child run ids a parent's {@link CHILD_EDGE_PREFIXES} checkpoints point at. */
-function childIdsOf(checkpoints: StepCheckpoint[]): string[] {
-  const ids: string[] = [];
-  for (const cp of checkpoints) {
-    if (cp.name.startsWith('signal:child:')) ids.push(cp.name.slice('signal:child:'.length));
-    if (cp.name.startsWith(FOLDED_PREFIX)) ids.push(...foldedChildIds(cp));
-    if (cp.name.startsWith('spawn:') && typeof cp.output === 'string') ids.push(cp.output);
-  }
-  return ids;
-}

@@ -51,7 +51,8 @@ export interface RedisLike {
  */
 export interface BullMQDeps {
   makeQueue(name: string): QueueLike;
-  makeWorker(name: string, process: ProcessFn): WorkerLike;
+  /** `opts.concurrency` overrides the deps' default worker concurrency for this one worker. */
+  makeWorker(name: string, process: ProcessFn, opts?: { concurrency?: number }): WorkerLike;
   /** A fresh standalone Redis client (pub/sub needs its own connection; the heartbeat registry reuses one). */
   makeRedis(): RedisLike;
 }
@@ -116,8 +117,11 @@ export async function createBullMQDeps(connection: unknown, concurrency = 1): Pr
 
   return {
     makeQueue: (name) => new Queue(name, { connection }),
-    makeWorker: (name, process) =>
-      new Worker(name, (job) => process(job), { connection: workerConnection(), concurrency }),
+    makeWorker: (name, process, opts) =>
+      new Worker(name, (job) => process(job), {
+        connection: workerConnection(),
+        concurrency: opts?.concurrency ?? concurrency,
+      }),
     makeRedis,
   };
 }

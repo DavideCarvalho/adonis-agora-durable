@@ -270,9 +270,10 @@ export class LucidStateStore implements StateStore {
       .whereNotNull('wake_at')
       .andWhere('wake_at', '<=', nowMs);
     if (namespace !== undefined) q.andWhere('namespace', namespace);
-    // Oldest deadline first, bounded: a backlog drains over several polls instead of one
-    // unbounded fetch (served by the existing (status, wake_at) index).
-    if (limit !== undefined) q.orderBy('wake_at', 'asc').limit(limit);
+    // Most overdue first, bounded: a backlog drains over several polls instead of one unbounded
+    // fetch (served by the existing (status, wake_at) index).
+    q.orderBy('wake_at', 'asc');
+    if (limit !== undefined) q.limit(limit);
     const rows = await q;
     return (rows as RunRow[]).map(rowToRun);
   }
@@ -792,6 +793,23 @@ export class LucidStateStore implements StateStore {
       })
       .orderBy('seq', 'asc');
     return (rows as CheckpointRow[]).map(rowToCheckpoint);
+  }
+
+  async countCheckpoints(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    statuses: StepCheckpoint['status'][],
+  ): Promise<number> {
+    if (statuses.length === 0) return 0;
+    const rows = await this.client()
+      .from(DURABLE_TABLES.checkpoints)
+      .where('run_id', runId)
+      .andWhere('seq', '>=', fromSeq)
+      .andWhere('seq', '<=', toSeq)
+      .whereIn('status', statuses)
+      .count('* as count');
+    return Number((rows as Array<{ count: number | string }>)[0]?.count ?? 0);
   }
 
   // --- internals ----------------------------------------------------------
