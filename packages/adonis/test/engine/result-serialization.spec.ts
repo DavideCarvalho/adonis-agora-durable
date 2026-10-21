@@ -72,6 +72,22 @@ describe('step results of one run on one instance', () => {
 });
 
 describe('timerBatchSize', () => {
+  const batchOf = (timerBatchSize?: number): number =>
+    (
+      new WorkflowEngine({
+        store: new InMemoryStateStore(),
+        ...(timerBatchSize !== undefined ? { timerBatchSize } : {}),
+      }) as unknown as { timerBatchSize: number }
+    ).timerBatchSize;
+
+  it('defaults to 500, the same as aviary, and floors a usable value', () => {
+    expect(batchOf()).toBe(500);
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1, 0.5]) {
+      expect(batchOf(bad), String(bad)).toBe(500);
+    }
+    expect(batchOf(120.9)).toBe(120);
+  });
+
   it('falls back to the default for a non-finite value, so due timers still resume', async () => {
     const store = new InMemoryStateStore();
     let now = 1_000;
