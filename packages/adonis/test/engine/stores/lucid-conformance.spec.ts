@@ -28,6 +28,7 @@ describe('LucidStateStore fan methods', () => {
       expect(store.compactCheckpoints).toBeTypeOf('function');
       expect(store.listSignalWaitersByRunIds).toBeTypeOf('function');
       expect(store.countCheckpoints).toBeTypeOf('function');
+      expect(store.saveCheckpointIfPending).toBeTypeOf('function');
     } finally {
       await db.manager.closeAll();
     }

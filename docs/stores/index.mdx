@@ -119,6 +119,8 @@ runStateStoreContract('MyStateStore', async () => {
 })
 ```
 
+The contract requires a few of the optional members above, because the engine's fallback for them is slow or unsafe: `getLatestCheckpointByName`, `listCheckpointsByNamePrefix`, `countCheckpoints` and `saveCheckpointIfPending`. A store that leaves one out fails its case. For the last two it also checks that both seq bounds are inclusive, that a count covers only its own run, that a refused write leaves a `completed` or `failed` row unchanged, and that the settling write replaces the pending row whole, clearing its `wakeAt`.
+
 The factory runs once per test case, so each case gets a fresh store. Two escape hatches exist for drivers that genuinely cannot satisfy a slice of the contract: `supportsAsyncTransaction: false` (a synchronous driver) and `supportsTagFilter: false`. If the backing infrastructure is not available — no Docker for a testcontainers store — throw `StateStoreUnavailableError` from the factory and the suite skips instead of failing.
 
 <Callout type="info">
