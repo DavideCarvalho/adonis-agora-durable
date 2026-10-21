@@ -162,12 +162,9 @@ export function fanSizeLabel(p: FanProgress): string {
   return p.started < p.total ? `${p.started} of ${p.total}` : `×${p.total}`;
 }
 
+const TERMINAL_RUN_STATUSES = new Set(['completed', 'failed', 'cancelled', 'dead']);
+
 /** A run is past its fans once it can no longer start or finish a member. */
 export function runFinished(status: string): boolean {
-  return (
-    status !== 'pending' &&
-    status !== 'running' &&
-    status !== 'suspended' &&
-    status !== 'cancelling'
-  );
+  return TERMINAL_RUN_STATUSES.has(status);
 }

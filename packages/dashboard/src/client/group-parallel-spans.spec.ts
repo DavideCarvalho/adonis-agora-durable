@@ -277,7 +277,7 @@ describe('fanProgress / fanStatus', () => {
 
 describe('runFinished', () => {
   it('is false while the run can still start or finish a member', () => {
-    for (const s of ['pending', 'running', 'suspended', 'cancelling'])
+    for (const s of ['pending', 'running', 'suspended', 'cancelling', 'blocked'])
       expect(runFinished(s)).toBe(false);
     for (const s of ['completed', 'failed', 'cancelled', 'dead']) expect(runFinished(s)).toBe(true);
   });
