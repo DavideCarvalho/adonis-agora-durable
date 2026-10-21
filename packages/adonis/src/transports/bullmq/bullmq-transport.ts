@@ -40,6 +40,7 @@ import {
   heartbeatKeyValue,
   jobOptions,
   parseHeartbeatValue,
+  resultJobOptions,
   taskJobOptions,
   WORKER_HEARTBEAT_INTERVAL_MS,
   WORKER_HEARTBEAT_TTL_SECONDS,
@@ -359,7 +360,11 @@ export class BullMQTransport implements Transport {
       };
     }
     try {
-      await this.#queue(resultsName(this.#effectivePrefix())).add('result', result, jobOptions());
+      await this.#queue(resultsName(this.#effectivePrefix())).add(
+        'result',
+        result,
+        resultJobOptions(),
+      );
     } catch (err) {
       // The results-queue publish itself threw (e.g. Redis blipped). We still hold `task`, so
       // rethrow so the BullMQ job is marked `failed` and the terminal-failure bridge + durable retry
@@ -393,7 +398,11 @@ export class BullMQTransport implements Transport {
       error: { message: `remote step worker failed: ${reason}`, retryable: true },
     };
     try {
-      await this.#queue(resultsName(this.#effectivePrefix())).add('result', result, jobOptions());
+      await this.#queue(resultsName(this.#effectivePrefix())).add(
+        'result',
+        result,
+        resultJobOptions(),
+      );
     } catch (err) {
       this.#onError(err); // best-effort — the engine's reconcile path is the last resort
     }
@@ -408,6 +417,14 @@ export class BullMQTransport implements Transport {
     this.#resultsWorker = this.#deps.makeWorker(resultsName(this.#effectivePrefix()), (job) =>
       handler(job.data as StepResult),
     );
+    this.#resultsWorker.on('failed', (job, err) => {
+      if (!job || (job.attemptsMade ?? 0) < (job.opts?.attempts ?? 1)) return;
+      const result = job.data as StepResult;
+      console.error(
+        `[adonis-durable] gave up on the result of step ${result.stepId} (run ${result.runId}) after ${job.attemptsMade} attempts:`,
+        err,
+      );
+    });
   }
 
   onDecision(handler: (decision: WorkflowDecision) => Promise<void>): void {

@@ -81,6 +81,9 @@ export class CodecStateStore implements StateStore {
   ) => Promise<void>;
   /** Forwarded verbatim — a waiter carries no payload. */
   readonly hasSignalWaiter?: (runId: string, tokenPrefix: string) => Promise<boolean>;
+  /** Encodes like {@link saveCheckpoint}. Bound only when the inner store has it, so the engine's
+   *  plain-save fallback still kicks in through the wrapper. */
+  readonly saveCheckpointIfPending?: (checkpoint: StepCheckpoint) => Promise<boolean>;
 
   constructor(
     private readonly inner: StateStore,
@@ -88,6 +91,10 @@ export class CodecStateStore implements StateStore {
     options: CodecStateStoreOptions = {},
   ) {
     this.extended = options.coverage === 'extended';
+    const saveIfPending = inner.saveCheckpointIfPending;
+    if (saveIfPending) {
+      this.saveCheckpointIfPending = (cp) => saveIfPending.call(inner, this.encCp(cp));
+    }
     const registerChildWaits = inner.registerChildWaits;
     if (registerChildWaits) {
       this.registerChildWaits = (entries) =>

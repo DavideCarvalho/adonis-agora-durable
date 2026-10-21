@@ -183,6 +183,17 @@ export class LucidStateStore implements StateStore {
     await this.upsertCheckpoint(this.client(), checkpoint);
   }
 
+  async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {
+    const { run_id: _runId, seq: _seq, ...row } = checkpointToRow(checkpoint);
+    const affected = await this.client()
+      .from(DURABLE_TABLES.checkpoints)
+      .where('run_id', checkpoint.runId)
+      .andWhere('seq', checkpoint.seq)
+      .andWhere('status', 'pending')
+      .update(row);
+    return rowsAffected(affected) > 0;
+  }
+
   /** Persist the latest worker heartbeat on the step's checkpoint row (see the interface doc).
    *  A targeted two-column UPDATE — never an upsert: a beat racing the checkpoint's own insert (or
    *  outliving a deleted run) matches zero rows and is a silent no-op, by design. */

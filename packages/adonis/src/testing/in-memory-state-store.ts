@@ -123,6 +123,13 @@ export class InMemoryStateStore implements StateStore {
     this.checkpoints.set(this.key(checkpoint.runId, checkpoint.seq), { ...checkpoint });
   }
 
+  async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {
+    const key = this.key(checkpoint.runId, checkpoint.seq);
+    if (this.checkpoints.get(key)?.status !== 'pending') return false;
+    this.checkpoints.set(key, { ...checkpoint });
+    return true;
+  }
+
   /** Mirror of `LucidStateStore.recordStepHeartbeat`: mutate in place, no-op when absent. */
   async recordStepHeartbeat(
     runId: string,

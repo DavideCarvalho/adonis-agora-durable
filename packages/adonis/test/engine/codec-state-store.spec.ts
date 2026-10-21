@@ -12,6 +12,36 @@ const wrapCodec: PayloadCodec = {
 };
 
 describe('CodecStateStore', () => {
+  it('forwards the pending-only checkpoint write, encoding it like a plain save', async () => {
+    const inner = new InMemoryStateStore();
+    const store = new CodecStateStore(inner, wrapCodec);
+    const at = new Date();
+    const pending = {
+      runId: 'r1',
+      seq: 0,
+      name: 'charge',
+      kind: 'remote' as const,
+      stepId: 'r1:0',
+      status: 'pending' as const,
+      input: { card: '4242' },
+      attempts: 1,
+      enqueuedAt: at,
+      startedAt: at,
+      finishedAt: at,
+    };
+    await store.saveCheckpoint(pending);
+
+    const done = { ...pending, status: 'completed' as const, output: { id: 'ch_1' } };
+    expect(await store.saveCheckpointIfPending?.(done)).toBe(true);
+    expect((await inner.getCheckpoint('r1', 0))?.output).toEqual({
+      __enc: JSON.stringify({ id: 'ch_1' }),
+    });
+    expect(await store.saveCheckpointIfPending?.(pending)).toBe(false);
+
+    Object.defineProperty(inner, 'saveCheckpointIfPending', { value: undefined });
+    expect(new CodecStateStore(inner, wrapCodec).saveCheckpointIfPending).toBeUndefined();
+  });
+
   it('encodes payloads at rest and decodes them on read', async () => {
     const inner = new InMemoryStateStore();
     const store = new CodecStateStore(inner, wrapCodec);

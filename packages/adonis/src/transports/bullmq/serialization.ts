@@ -73,6 +73,26 @@ export function jobOptions(priority?: number): JobOptions {
   };
 }
 
+/** BullMQ `add` options for a RESULT job: retried with backoff when the engine's handler throws (a
+ *  store timeout or deadlock at peak load), since a result dropped there leaves its step `pending`
+ *  until the redispatch deadline and runs it again. Retrying is safe: the engine settles a step only
+ *  while it is still `pending`. Failed ones keep the age-bounded retention of a task job. */
+export interface ResultJobOptions {
+  attempts: number;
+  backoff: { type: 'exponential'; delay: number };
+  removeOnComplete: true;
+  removeOnFail: { age: number };
+}
+
+export function resultJobOptions(): ResultJobOptions {
+  return {
+    attempts: 5,
+    backoff: { type: 'exponential', delay: 500 },
+    removeOnComplete: true,
+    removeOnFail: { age: TASK_FAILED_RETENTION_SECONDS },
+  };
+}
+
 /** BullMQ `add` options for a TASK job (step/workflow dispatch): like {@link jobOptions} but
  *  `removeOnFail` is age-bounded retention (`{ age: 86400 }`) so a crashed worker's failed job keeps
  *  its `RemoteTask` payload long enough for the terminal-failure bridge to rebuild a StepResult. */
