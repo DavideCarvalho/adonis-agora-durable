@@ -195,10 +195,12 @@ export default defineConfig({
 
 A custom store should implement `countCheckpoints(runId, fromSeq, toSeq,
 statuses)` as a `COUNT` (the step-fan join barrier calls it on every result;
-without it the engine loads the run's checkpoints per result) and return
+without it the engine loads the run's checkpoints per result), implement
+`saveCheckpointIfPending` as one conditional `UPDATE ... WHERE status = 'pending'`
+(without it a blind save can put a settled step back to `pending`), and return
 `listDueTimers` most overdue first, with or without a `limit`. Run
 `runStateStoreContract` from `@adonis-agora/durable/testing/conformance`, which
-covers both.
+covers all three and fails a store missing either method.
 
 Source: `docs/stores/lucid.mdx`, `docs/stores/index.mdx`.
 
