@@ -246,3 +246,45 @@ describe('workflow class factory (constructor injection)', () => {
     expect(res.output).toBe('injected');
   });
 });
+
+describe('static workflow onError', () => {
+  it('registers the routes, resolving handler classes to names and error classes to codes', async () => {
+    class InvalidLine extends Error {
+      static readonly code = 'invalid_line';
+      readonly code = InvalidLine.code;
+    }
+    class LineDeadLetter {
+      static workflow = { name: 'line-dead-letter' };
+      async run(_ctx: unknown, failure: { input: { n: number }; error: { code?: string } }) {
+        return { failed: failure.input.n, code: failure.error.code };
+      }
+    }
+    class Outage {
+      static workflow = { name: 'outage' };
+      async run() {
+        return 'outage';
+      }
+    }
+    class Line {
+      static workflow = {
+        name: 'line',
+        onError: [{ code: InvalidLine, workflow: LineDeadLetter }, { workflow: Outage as never }],
+      };
+      async run(_ctx: unknown, input: { n: number; amount: string }) {
+        if (input.amount === 'x') throw new InvalidLine('bad line');
+        throw new Error('down');
+      }
+    }
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    for (const cls of [LineDeadLetter, Outage, Line]) await registerWorkflowClass(engine, cls);
+
+    await startRun(engine, 'line', { n: 3, amount: 'x' }, 'r1');
+    await startRun(engine, 'line', { n: 4, amount: 'y' }, 'r2');
+    const r1 = await engine.waitForRun('r1', { terminal: true });
+    const r2 = await engine.waitForRun('r2', { terminal: true });
+
+    expect(r1.output).toEqual({ failed: 3, code: 'invalid_line' });
+    expect(r2.output).toBe('outage');
+  });
+});

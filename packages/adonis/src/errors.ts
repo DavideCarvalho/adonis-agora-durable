@@ -100,6 +100,8 @@ export class RemoteStepTimeout extends Error {
  * breaking changes (old runs finish on the version they started on).
  */
 export class NonDeterminismError extends Error {
+  /** Marks the failure as a broken deploy, which an `onError` route never takes. */
+  readonly code = 'non_determinism';
   readonly runId: string;
   readonly seq: number;
   constructor(runId: string, seq: number, expected: string, recorded: string) {

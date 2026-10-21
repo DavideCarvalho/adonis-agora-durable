@@ -46,6 +46,14 @@ export interface WorkflowOptions {
    * facet; omit for an app-local workflow (renders as "unknown" until attributed).
    */
   origin?: string;
+  /**
+   * Route failed runs to a handler workflow by error `code`, instead of failing them: when a run ends
+   * `failed` with a matching code, the engine starts `workflow` with an `OnErrorInput`
+   * (`{ runId, workflow, input, error }`), the run waits for it, and settles with its outcome. `code`
+   * is a string or an error class with a `static code`; omit it for the catch-all. e.g.
+   * `onError: [{ code: InvalidLine, workflow: LineDeadLetterWorkflow }]`.
+   */
+  onError?: { code?: string | { readonly code: string }; workflow: WorkflowRef }[];
 }
 
 /** The metadata read off a workflow class's `static workflow` config for discovery + registration. */
