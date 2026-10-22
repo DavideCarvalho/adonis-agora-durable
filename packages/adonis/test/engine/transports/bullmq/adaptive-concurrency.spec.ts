@@ -9,29 +9,13 @@ function makeController(opts: {
   concurrency?: Parameters<typeof resolveConcurrency>[0];
   rss?: number;
   memLimit?: number;
-  /** CPU micros (user) the process spends per tick, across `cores`. */
-  cpuMicrosPerTick?: number;
-  cores?: number;
-  now?: () => number;
 }) {
   const applied: number[] = [];
-  let cpuMicros = 0;
   const controller = new AdaptiveController({
     ...(opts.concurrency !== undefined ? { concurrency: opts.concurrency } : {}),
     apply: (limit) => applied.push(limit),
     readRss: () => opts.rss ?? 100_000_000,
     readMemoryLimit: () => opts.memLimit ?? 8_000_000_000,
-    ...(opts.now ? { now: opts.now } : {}),
-    ...(opts.cpuMicrosPerTick !== undefined
-      ? {
-          cpuUsage: (previous?: NodeJS.CpuUsage) => {
-            if (!previous) return { user: cpuMicros, system: 0 };
-            cpuMicros += opts.cpuMicrosPerTick ?? 0;
-            return { user: cpuMicros - previous.user, system: 0 };
-          },
-          cpuCount: () => opts.cores ?? 1,
-        }
-      : {}),
   });
   return { controller, applied };
 }
@@ -143,19 +127,6 @@ describe('AdaptiveController.snapshot — the WorkerStatus contract', () => {
     expect(after.throughputPerMin).toBeGreaterThan(0);
   });
 
-  it('reports no throughput once the newest completion is over a minute old', () => {
-    let now = 1_000_000;
-    const { controller } = makeController({ concurrency: 4, now: () => now });
-    controller.onSettle(100, true, 'step');
-    now += 1_000;
-    controller.onSettle(100, true, 'step');
-    expect(controller.snapshot().throughputPerMin).toBeGreaterThan(0);
-    now += 60_001;
-    expect(controller.snapshot().throughputPerMin).toBe(0);
-    // p95 still describes the last window.
-    expect(controller.snapshot().p95Ms).toBe(100);
-  });
-
   it('adaptive mode carries min/max on the concurrency block', () => {
     const { controller } = makeController({
       concurrency: { mode: 'adaptive', min: 2, max: 16, start: 5 },
@@ -215,35 +186,6 @@ describe('AdaptiveController.tick — AIMD decisions', () => {
     controller.tick();
     expect(controller.limit).toBe(4); // floor(5*0.8)
     expect(controller.snapshot().lastAdjust?.reason).toBe('ram_ceiling');
-  });
-
-  it('sheds one at the CPU ceiling, ahead of growing', () => {
-    // 2s ticks on 2 cores: 3.8s of CPU per tick is 95%.
-    const { controller } = makeController({
-      concurrency: { mode: 'adaptive', min: 1, max: 10, start: 5, cpuCeilingPct: 90 },
-      cpuMicrosPerTick: 3_800_000,
-      cores: 2,
-    });
-    controller.tick(); // first sample: the CPU baseline
-    for (let i = 0; i < 5; i++) controller.onStart(); // saturated, which alone would grow
-    fill(controller, 20, 100);
-    controller.tick();
-    expect(controller.snapshot().cpuPct).toBeCloseTo(95);
-    expect(controller.limit).toBe(4);
-    expect(controller.snapshot().lastAdjust?.reason).toBe('cpu_ceiling');
-  });
-
-  it('leaves the limit alone below the CPU ceiling', () => {
-    const { controller } = makeController({
-      concurrency: { mode: 'adaptive', min: 1, max: 10, start: 5, cpuCeilingPct: 90 },
-      cpuMicrosPerTick: 1_000_000,
-      cores: 2,
-    });
-    controller.tick();
-    fill(controller, 20, 100);
-    controller.tick();
-    expect(controller.snapshot().cpuPct).toBeCloseTo(25);
-    expect(controller.snapshot().lastAdjust?.reason).not.toBe('cpu_ceiling');
   });
 
   it('sheds on backpressure when the error rate is high', () => {

@@ -141,8 +141,6 @@ const WINDOW_SIZE = 100;
 const RTT_LONG_EWMA_ALPHA = 0.2;
 // Consecutive ticks with in-flight work but zero completions before we call the worker stalled.
 const STALL_TICKS = 2;
-// A window whose newest completion is older than this reports no throughput: the worker is idle.
-const THROUGHPUT_STALE_MS = 60_000;
 
 function percentile(sortedAsc: number[], p: number): number {
   if (sortedAsc.length === 0) return 0;
@@ -166,10 +164,6 @@ export interface AdaptiveControllerOptions {
   readRss?: () => number;
   /** Injectable memory-ceiling reader (tests). Defaults to {@link readMemoryLimitBytes} (read once). */
   readMemoryLimit?: () => number;
-  /** Injectable CPU-time reader (tests). Defaults to `process.cpuUsage`. */
-  cpuUsage?: (previous?: NodeJS.CpuUsage) => NodeJS.CpuUsage;
-  /** Injectable core count (tests). Defaults to `os.cpus().length`. */
-  cpuCount?: () => number;
 }
 
 /**
@@ -189,8 +183,6 @@ export class AdaptiveController {
   private readonly readRss: () => number;
   private readonly memoryLimitBytes: number;
   private readonly tickMs: number;
-  private readonly cpuUsage: (previous?: NodeJS.CpuUsage) => NodeJS.CpuUsage;
-  private readonly cpuCount: () => number;
 
   private currentLimit: number;
   private inFlightCount = 0;
@@ -210,8 +202,6 @@ export class AdaptiveController {
     this.now = options.now ?? Date.now;
     this.readRss = options.readRss ?? (() => process.memoryUsage().rss);
     this.memoryLimitBytes = (options.readMemoryLimit ?? readMemoryLimitBytes)();
-    this.cpuUsage = options.cpuUsage ?? ((previous) => process.cpuUsage(previous));
-    this.cpuCount = options.cpuCount ?? (() => cpus().length);
     this.tickMs = this.resolved.adaptive?.tickMs ?? DEFAULT_TICK_MS;
     this.currentLimit =
       this.resolved.mode === 'adaptive'
@@ -237,7 +227,7 @@ export class AdaptiveController {
   /** Start the control loop. The timer is `unref`'d so it never keeps the process alive; idempotent. */
   start(): void {
     if (this.timer) return;
-    this.lastCpuUsage = this.cpuUsage();
+    this.lastCpuUsage = process.cpuUsage();
     this.timer = setInterval(() => this.tick(), this.tickMs);
     this.timer.unref?.();
   }
@@ -295,12 +285,12 @@ export class AdaptiveController {
 
   private sampleCpu(): void {
     if (!this.lastCpuUsage) {
-      this.lastCpuUsage = this.cpuUsage();
+      this.lastCpuUsage = process.cpuUsage();
       return;
     }
-    const delta = this.cpuUsage(this.lastCpuUsage);
-    this.lastCpuUsage = this.cpuUsage();
-    const cores = Math.max(1, this.cpuCount());
+    const delta = process.cpuUsage(this.lastCpuUsage);
+    this.lastCpuUsage = process.cpuUsage();
+    const cores = Math.max(1, cpus().length);
     // delta is microseconds of CPU; the tick spans tickMs ms = tickMs*1000 micros of wall time.
     const micros = delta.user + delta.system;
     this.cpuPct = (micros / (this.tickMs * 1000 * cores)) * 100;
@@ -395,7 +385,6 @@ export class AdaptiveController {
     const first = this.window[0];
     const last = this.window[this.window.length - 1];
     if (!first || !last) return 0;
-    if (this.now() - last.at > THROUGHPUT_STALE_MS) return 0;
     const spanMs = last.at - first.at;
     // A single completion (or all in the same ms) has no measurable span — report the raw count/min.
     if (spanMs <= 0) return this.window.length;
