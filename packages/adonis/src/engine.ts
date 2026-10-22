@@ -94,6 +94,7 @@ import type {
   WorkflowStepEvent,
 } from './interfaces.js';
 import { isNonEmptyRunScope, TERMINAL_RUN_STATUSES } from './interfaces.js';
+import { DEFAULT_NAMESPACE } from './namespaces.js';
 import { asHeartbeat } from './observability-scope.js';
 import {
   assertRoutes,
@@ -912,7 +913,9 @@ export class WorkflowEngine {
     // instead of waiting for their retry tick. Best-effort (the retry tick remains the guarantee).
     this.admission.onFreed?.((queue) => this.wakeQueueWaiters(queue));
     this.instanceId = deps.instanceId ?? globalThis.crypto.randomUUID();
-    this.namespace = deps.namespace;
+    // `''` is the default pool (the transports already treat it as bare): normalize it here so the
+    // runs this engine stamps, and the pool it polls, are the default pool's.
+    this.namespace = deps.namespace === '' ? DEFAULT_NAMESPACE : deps.namespace;
     // The control-plane's own handshake descriptor — the side negotiated AGAINST each worker so a
     // protocol-incompatible fleet is detected before dispatch (design §7.3). Scoped to this engine's
     // namespace/partition; capabilities/protocol are config-driven (default: current single major).

@@ -5,6 +5,7 @@ import type {
   StepEvent,
   WorkflowRun,
 } from '../interfaces.js';
+import { normalizeNamespace } from '../namespaces.js';
 
 /**
  * Row shapes as they live in the durable tables: snake_case columns, JSON payloads stored as TEXT
@@ -166,9 +167,9 @@ export function runToRow(run: WorkflowRun): RunRow {
     workflow: run.workflow,
     workflow_version: run.workflowVersion,
     status: run.status,
-    // Persist the partition, defaulting an absent one to 'default' (matches the column DEFAULT) so
-    // every row is reachable by a namespace='default' filter.
-    namespace: run.namespace ?? 'default',
+    // Persist the partition, defaulting an absent (or '') one to 'default' (matches the column
+    // DEFAULT) so every default-pool row is reachable by a namespace='default' filter.
+    namespace: normalizeNamespace(run.namespace),
     origin: run.origin ?? null,
     input: toJson(run.input),
     output: toJson(run.output),
@@ -201,7 +202,7 @@ export function runPatchToRow(patch: Partial<WorkflowRun>): Partial<RunRow> {
   if ('workflow' in patch) row.workflow = patch.workflow;
   if ('workflowVersion' in patch) row.workflow_version = patch.workflowVersion;
   if ('status' in patch) row.status = patch.status;
-  if ('namespace' in patch) row.namespace = patch.namespace ?? 'default';
+  if ('namespace' in patch) row.namespace = normalizeNamespace(patch.namespace);
   if ('origin' in patch) row.origin = patch.origin ?? null;
   if ('input' in patch) row.input = toJson(patch.input);
   if ('output' in patch) row.output = toJson(patch.output);
@@ -228,7 +229,7 @@ export function rowToRun(row: RunRow): WorkflowRun {
     workflowVersion: row.workflow_version,
     status: row.status as WorkflowRun['status'],
     input: parseJsonColumn(row.input, `${RUNS}.input`, row.id),
-    namespace: row.namespace ?? 'default',
+    namespace: normalizeNamespace(row.namespace),
     createdAt: new Date(toNumOr0(row.created_at)),
     updatedAt: new Date(toNumOr0(row.updated_at)),
   };

@@ -23,6 +23,7 @@ import type {
   StepCheckpoint,
   WorkflowRun,
 } from '../interfaces.js';
+import { namespaceFilterValues, normalizeNamespace } from '../namespaces.js';
 import { mergeRunFacetRows } from '../run-facets.js';
 import { runPageWindow } from '../run-pagination.js';
 import {
@@ -125,7 +126,9 @@ export class LucidStateStore implements StateStore {
 
   /** Fence a runs-table read to the store's scope (no-op for the operator view). */
   private fenced<Q extends { andWhere(column: string, value: unknown): unknown }>(q: Q): Q {
-    if (this.scopeNamespace !== undefined) q.andWhere('namespace', this.scopeNamespace);
+    if (this.scopeNamespace !== undefined) {
+      (q as unknown as AnyQuery).whereIn('namespace', namespaceFilterValues(this.scopeNamespace));
+    }
     return q;
   }
 
@@ -377,7 +380,7 @@ export class LucidStateStore implements StateStore {
 
   async listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]> {
     const q = this.fenced(this.client().from(DURABLE_TABLES.runs).where('status', 'running'));
-    if (namespace !== undefined) q.andWhere('namespace', namespace);
+    if (namespace !== undefined) q.whereIn('namespace', namespaceFilterValues(namespace));
     const rows = await q;
     return (rows as RunRow[]).map(rowToRun);
   }
@@ -394,14 +397,14 @@ export class LucidStateStore implements StateStore {
           sub.whereNull('locked_until').orWhere('locked_until', '<=', nowMs);
         }),
     );
-    if (namespace !== undefined) q.andWhere('namespace', namespace);
+    if (namespace !== undefined) q.whereIn('namespace', namespaceFilterValues(namespace));
     const rows = await q.orderBy('created_at', 'asc').limit(limit);
     return (rows as RunRow[]).map(rowToRun);
   }
 
   async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
     const q = this.fenced(this.client().from(DURABLE_TABLES.runs).where('status', 'pending'));
-    if (namespace !== undefined) q.andWhere('namespace', namespace);
+    if (namespace !== undefined) q.whereIn('namespace', namespaceFilterValues(namespace));
     const rows = await q
       .orderBy('created_at', 'asc') // FIFO dispatch
       .orderBy('id', 'asc') // stable tiebreak, mirrors the in-memory store
@@ -417,7 +420,7 @@ export class LucidStateStore implements StateStore {
         .whereNotNull('wake_at')
         .andWhere('wake_at', '<=', nowMs),
     );
-    if (namespace !== undefined) q.andWhere('namespace', namespace);
+    if (namespace !== undefined) q.whereIn('namespace', namespaceFilterValues(namespace));
     // Most overdue first, bounded: a backlog drains over several polls instead of one unbounded
     // fetch (served by the existing (status, wake_at) index).
     q.orderBy('wake_at', 'asc');
@@ -770,7 +773,7 @@ export class LucidStateStore implements StateStore {
     expectedNextFireAt?: number | null,
   ): Promise<boolean> {
     const set: Record<string, unknown> = {};
-    if (patch.namespace !== undefined) set.namespace = patch.namespace;
+    if (patch.namespace !== undefined) set.namespace = normalizeNamespace(patch.namespace);
     if (patch.workflow !== undefined) set.workflow = patch.workflow;
     if (patch.paused !== undefined) set.paused = patch.paused;
     if ('nextFireAt' in patch) set.next_fire_at = patch.nextFireAt ?? null;
@@ -792,7 +795,9 @@ export class LucidStateStore implements StateStore {
 
   async listSchedules(query: ScheduleQuery): Promise<ScheduleRecord[]> {
     const q = this.client().from(DURABLE_TABLES.schedules);
-    if (query.namespace !== undefined) q.where('namespace', query.namespace);
+    if (query.namespace !== undefined) {
+      q.whereIn('namespace', namespaceFilterValues(query.namespace));
+    }
     if (query.workflow !== undefined) q.where('workflow', query.workflow);
     if (query.paused !== undefined) q.where('paused', query.paused);
     if (query.tag !== undefined) {
@@ -857,7 +862,11 @@ export class LucidStateStore implements StateStore {
     if (needle) q.andWhereRaw(`lower(${column}) like ? escape '!'`, [`%${escapeLike(needle)}%`]);
     const rows = (await q) as Array<{ value: string | null; count: number | string }>;
     return mergeRunValueFacetRows(
-      rows.map((row) => ({ value: row.value, count: Number(row.count) })),
+      rows.map((row) => ({
+        // A legacy '' namespace counts as the default pool, as everywhere else.
+        value: column === 'namespace' ? normalizeNamespace(row.value) : row.value,
+        count: Number(row.count),
+      })),
       { ...opts, search: undefined },
     );
   }
@@ -876,10 +885,13 @@ export class LucidStateStore implements StateStore {
       if (query.workflows.length) q.whereIn('workflow', query.workflows);
       else q.whereRaw('1 = 0');
     }
-    if (query.namespace !== undefined) q.where('namespace', query.namespace);
+    if (query.namespace !== undefined) {
+      q.whereIn('namespace', namespaceFilterValues(query.namespace));
+    }
     if (query.namespaces) {
-      if (query.namespaces.length) q.whereIn('namespace', query.namespaces);
-      else q.whereRaw('1 = 0');
+      if (query.namespaces.length) {
+        q.whereIn('namespace', query.namespaces.flatMap(namespaceFilterValues));
+      } else q.whereRaw('1 = 0');
     }
     if (query.origin) q.where('origin', query.origin);
     if (query.status) q.where('status', query.status);
@@ -1202,7 +1214,7 @@ interface ScheduleRow {
 function scheduleToRow(r: ScheduleRecord): Record<string, unknown> {
   return {
     id: r.id,
-    namespace: r.namespace,
+    namespace: normalizeNamespace(r.namespace),
     workflow: r.workflow,
     paused: r.paused,
     next_fire_at: r.nextFireAt,
@@ -1220,7 +1232,7 @@ function rowToSchedule(row: ScheduleRow): ScheduleRecord {
     : undefined;
   return {
     id: row.id,
-    namespace: row.namespace,
+    namespace: normalizeNamespace(row.namespace),
     workflow: row.workflow,
     // SQLite/MySQL hand a boolean column back as 0/1 (some drivers as a string).
     paused: row.paused === true || row.paused === 1 || row.paused === '1' || row.paused === 'true',

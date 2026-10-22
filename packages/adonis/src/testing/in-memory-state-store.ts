@@ -17,6 +17,7 @@ import type {
   StepCheckpoint,
   WorkflowRun,
 } from '../interfaces.js';
+import { namespaceMatches, normalizeNamespace } from '../namespaces.js';
 import { checkpointStatsOf, queryCheckpointsOf } from '../run-detail-summary.js';
 import { mergeRunFacetRows } from '../run-facets.js';
 import { runPageWindow } from '../run-pagination.js';
@@ -52,6 +53,16 @@ interface InMemoryState {
     checkpointRowsRead: number;
   };
 }
+
+/** A caller's copy of a stored run, with a legacy `''`/absent namespace read as `'default'`. */
+const copyRun = (run: WorkflowRun): WorkflowRun => ({
+  ...run,
+  namespace: normalizeNamespace(run.namespace),
+});
+
+/** A run about to be stored, its namespace normalized (`''` is the default pool). */
+const withNormalizedNamespace = (run: WorkflowRun): WorkflowRun =>
+  run.namespace === undefined || run.namespace === '' ? copyRun(run) : run;
 
 const freshState = (): InMemoryState => ({
   runs: new Map(),
@@ -134,7 +145,9 @@ export class InMemoryStateStore implements StateStore {
   }
 
   private inScope(run: WorkflowRun): boolean {
-    return this.scopeNamespace === undefined || run.namespace === this.scopeNamespace;
+    return (
+      this.scopeNamespace === undefined || namespaceMatches(run.namespace, this.scopeNamespace)
+    );
   }
 
   private visibleRuns(): WorkflowRun[] {
@@ -168,14 +181,18 @@ export class InMemoryStateStore implements StateStore {
     // Normalize an undefined namespace to 'default', matching the SQL stores' column DEFAULT 'default'
     // — so a run created directly against this store (bypassing the engine, e.g. in tests) is still
     // reachable via a namespace='default' filter and partitions consistently.
-    this.runs.set(run.id, { ...run, namespace: run.namespace ?? 'default' });
+    this.runs.set(run.id, { ...run, namespace: normalizeNamespace(run.namespace) });
     this.reindexAttributes(run.id, run.searchAttributes);
   }
 
   async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
     const existing = this.runs.get(runId);
     if (!existing) throw new Error(`run ${runId} not found`);
-    const next = { ...existing, ...patch, ...releasedSlot(existing, patch) };
+    const next = withNormalizedNamespace({
+      ...existing,
+      ...patch,
+      ...releasedSlot(existing, patch),
+    });
     this.runs.set(runId, next);
     if ('searchAttributes' in patch) this.reindexAttributes(runId, next.searchAttributes);
   }
@@ -189,7 +206,11 @@ export class InMemoryStateStore implements StateStore {
     // same reasoning tryLockRun/renewRunLock already rely on for their compare-and-set.
     const existing = this.runs.get(runId);
     if (!existing || !expectedStatuses.includes(existing.status)) return false;
-    const next = { ...existing, ...patch, ...releasedSlot(existing, patch) };
+    const next = withNormalizedNamespace({
+      ...existing,
+      ...patch,
+      ...releasedSlot(existing, patch),
+    });
     this.runs.set(runId, next);
     if ('searchAttributes' in patch) this.reindexAttributes(runId, next.searchAttributes);
     return true;
@@ -217,7 +238,7 @@ export class InMemoryStateStore implements StateStore {
 
   async getRun(runId: string): Promise<WorkflowRun | null> {
     const run = this.runs.get(runId);
-    return run && this.inScope(run) ? { ...run } : null;
+    return run && this.inScope(run) ? copyRun(run) : null;
   }
 
   async deleteRun(runId: string): Promise<void> {
@@ -277,19 +298,23 @@ export class InMemoryStateStore implements StateStore {
   async listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]> {
     return this.visibleRuns()
       .filter(
-        (r) => r.status === 'running' && (namespace === undefined || r.namespace === namespace),
+        (r) =>
+          r.status === 'running' &&
+          (namespace === undefined || namespaceMatches(r.namespace, namespace)),
       )
-      .map((r) => ({ ...r }));
+      .map(copyRun);
   }
 
   async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
     return this.visibleRuns()
       .filter(
-        (r) => r.status === 'pending' && (namespace === undefined || r.namespace === namespace),
+        (r) =>
+          r.status === 'pending' &&
+          (namespace === undefined || namespaceMatches(r.namespace, namespace)),
       )
       .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id))
       .slice(0, limit)
-      .map((r) => ({ ...r }));
+      .map(copyRun);
   }
 
   async listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]> {
@@ -298,11 +323,11 @@ export class InMemoryStateStore implements StateStore {
         r.status === 'suspended' &&
         r.wakeAt !== undefined &&
         r.wakeAt <= nowMs &&
-        (namespace === undefined || r.namespace === namespace),
+        (namespace === undefined || namespaceMatches(r.namespace, namespace)),
     );
     // Most overdue first (mirrors the SQL stores' ORDER BY wake_at).
     due.sort((a, b) => (a.wakeAt ?? 0) - (b.wakeAt ?? 0));
-    return (limit === undefined ? due : due.slice(0, limit)).map((r) => ({ ...r }));
+    return (limit === undefined ? due : due.slice(0, limit)).map(copyRun);
   }
 
   async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
@@ -311,11 +336,11 @@ export class InMemoryStateStore implements StateStore {
         (r) =>
           r.status === 'running' &&
           (r.lockedUntil === undefined || r.lockedUntil <= nowMs) &&
-          (namespace === undefined || r.namespace === namespace),
+          (namespace === undefined || namespaceMatches(r.namespace, namespace)),
       )
       .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
       .slice(0, limit)
-      .map((r) => ({ ...r }));
+      .map(copyRun);
   }
 
   async tryLockRun(
@@ -538,7 +563,10 @@ export class InMemoryStateStore implements StateStore {
   }
 
   async saveSchedule(record: ScheduleRecord): Promise<void> {
-    this.schedules.set(record.id, structuredClone(record));
+    this.schedules.set(record.id, {
+      ...structuredClone(record),
+      namespace: normalizeNamespace(record.namespace),
+    });
   }
 
   async getSchedule(id: string): Promise<ScheduleRecord | null> {
@@ -554,7 +582,8 @@ export class InMemoryStateStore implements StateStore {
     const record = this.schedules.get(id);
     if (!record) return false;
     if (expectedNextFireAt !== undefined && record.nextFireAt !== expectedNextFireAt) return false;
-    this.schedules.set(id, { ...record, ...structuredClone(patch) });
+    const next = { ...record, ...structuredClone(patch) };
+    this.schedules.set(id, { ...next, namespace: normalizeNamespace(next.namespace) });
     return true;
   }
 
@@ -564,7 +593,9 @@ export class InMemoryStateStore implements StateStore {
 
   async listSchedules(query: ScheduleQuery): Promise<ScheduleRecord[]> {
     const rows = [...this.schedules.values()]
-      .filter((s) => query.namespace === undefined || s.namespace === query.namespace)
+      .filter(
+        (s) => query.namespace === undefined || namespaceMatches(s.namespace, query.namespace),
+      )
       .filter((s) => query.workflow === undefined || s.workflow === query.workflow)
       .filter((s) => query.tag === undefined || (s.tags ?? []).includes(query.tag))
       .filter((s) => query.paused === undefined || s.paused === query.paused)
@@ -593,13 +624,16 @@ export class InMemoryStateStore implements StateStore {
           ? []
           : runs.filter((r) => query.workflows?.includes(r.workflow));
     }
-    if (query.namespace !== undefined) runs = runs.filter((r) => r.namespace === query.namespace);
+    if (query.namespace !== undefined) {
+      const namespace = query.namespace;
+      runs = runs.filter((r) => namespaceMatches(r.namespace, namespace));
+    }
     if (query.namespaces) {
       runs =
         query.namespaces.length === 0
           ? []
           : runs.filter(
-              (r) => r.namespace !== undefined && query.namespaces?.includes(r.namespace),
+              (r) => query.namespaces?.some((ns) => namespaceMatches(r.namespace, ns)) ?? false,
             );
     }
     if (query.origin) runs = runs.filter((r) => r.origin === query.origin);
@@ -650,9 +684,7 @@ export class InMemoryStateStore implements StateStore {
     runs.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
     // 1-based `page`/`size` in, 0-based slice out — same resolution the SQL adapters apply.
     const { limit, offset } = runPageWindow(query);
-    return runs
-      .slice(offset, limit === undefined ? undefined : offset + limit)
-      .map((r) => ({ ...r }));
+    return runs.slice(offset, limit === undefined ? undefined : offset + limit).map(copyRun);
   }
 
   /**

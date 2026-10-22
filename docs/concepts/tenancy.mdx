@@ -50,9 +50,10 @@ byte-identical to a single-pool deployment. Only a real, non-default namespace p
 it means `'default'`: the provider gives the engine `namespace: 'default'`, so it drives, recovers and
 resumes only the default pool's runs. That includes legacy rows written before runs carried a
 namespace: the Lucid schema heal adds the column as `NOT NULL DEFAULT 'default'`, and every shipped store
-reads a missing (`NULL`) value back as `'default'`. An empty string is **not** normalized in the store:
-a run stamped `''` (an engine configured with `namespace: ''`) is not `'default'` to the poll, even
-though the transport treats `''` as bare. Leave `namespace` unset instead of setting it to `''`. On a
+reads a missing (`NULL`) value back as `'default'`. An empty string is the default pool too, as it is
+for the transports: an engine configured with `namespace: ''` stamps and polls `'default'`, the stores
+write `''` as `'default'`, and a legacy row stored with `''` reads back as `'default'` and matches every
+`'default'` filter. On a
 `control-plane` it makes the engine the **operator**: it scopes nothing, so the store's poll filters
 no-op, it drives runs of *every* namespace, and its transports stay on the bare prefix. "Seeing
 everyone" is the absence of a namespace on a control plane, not a wildcard value. There is no standalone
