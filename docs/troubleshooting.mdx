@@ -181,7 +181,7 @@ Better still, use the built-in `compensate` option ([Sagas](/docs/durable/reliab
 
 **Cause:** web processes consume eagerly, and the queues are point-to-point, so each delivery lands on whichever process polls first. See [Delivery under multiple instances](/docs/durable/reliability/multi-instance).
 
-**Fix:** set `consumers: 'never'` on the web fleet — `durable:work` re-enables consumption for itself. This gate is implemented by the `queue` transport only; `db` and `bullmq` consume in every process that boots them.
+**Fix:** set `consumers: 'never'` on the web fleet — `durable:work` re-enables consumption for itself. Every broker transport honours this gate — `queue`, `db` and `bullmq` (on `db` and `bullmq` since this release; before it they consumed in every process that booted them).
 
 ## Durable jobs fail under `queue:work`
 

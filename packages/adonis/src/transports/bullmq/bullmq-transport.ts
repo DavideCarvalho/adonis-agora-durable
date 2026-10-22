@@ -21,6 +21,7 @@ import { isWorkflowTask, type WorkflowTurnHandler } from '../../workflow-turn.js
 import { AdaptiveController, type ConcurrencyOption } from './adaptive-concurrency.js';
 import {
   type BullMQDeps,
+  type JobLike,
   type QueueLike,
   type RedisLike,
   type WorkerLike,
@@ -134,6 +135,9 @@ export class BullMQTransport implements Transport {
   // Shared by every task worker: tracks in-flight work and the step-completion window, snapshots the
   // heartbeat status and, in adaptive mode, sets every task worker's `concurrency` on each move.
   #controller: AdaptiveController | undefined;
+  // Deferred consumption (see deferConsumers): worker constructions parked until startConsumers().
+  #consumersDeferred = false;
+  readonly #deferredWorkers: Array<() => void> = [];
 
   readonly #handlers = new Map<string, StepHandler>();
   // Worker-side workflow turn consumers, keyed by workflow name — a `workflow`-shaped job routes here.
@@ -191,6 +195,80 @@ export class BullMQTransport implements Transport {
       });
     }
     return this.#controller;
+  }
+
+  /**
+   * Park every point-to-point consumer registered from now on — the task, results, decisions,
+   * step-events, start-run and run-request workers — until {@link startConsumers}.
+   *
+   * WHY: a BullMQ `Worker` starts fetching the moment it is constructed, and these queues hand each
+   * job to ONE consumer. Any process that registers them competes with the real worker fleet: a
+   * `node ace` command or REPL claims jobs it then dies holding, and steals results addressed to the
+   * long-lived engine (the bug the `queue` transport fixed the same way). Deferring construction makes
+   * such a process a pure producer — it still dispatches and publishes; the jobs stay on the queues.
+   * Pub/sub subscriptions (heartbeats, run replies, tenant events) are broadcast, take nothing from
+   * anyone, and are left alone.
+   *
+   * Call it before any subscription is made (the provider does, right after building the transport);
+   * workers already started are not stopped.
+   */
+  deferConsumers(): void {
+    this.#consumersDeferred = true;
+  }
+
+  /** Construct every worker parked by {@link deferConsumers} and stop deferring — the explicit "this
+   *  process IS a worker" declaration (`durable:work` makes it via `engine.startConsumers()`).
+   *  Idempotent; a no-op when consumption was never deferred. */
+  startConsumers(): void {
+    if (!this.#consumersDeferred) return;
+    this.#consumersDeferred = false;
+    for (const start of this.#deferredWorkers.splice(0)) start();
+  }
+
+  /**
+   * `deps.makeWorker`, unless consumption is deferred: then a stand-in that records `failed` listeners
+   * and `concurrency` assignments (the adaptive controller keeps setting it) and builds the real
+   * worker — replaying both — on {@link startConsumers}. `close()` on a never-started stand-in is a
+   * no-op, so a producer process shuts down without ever touching the broker's consumer side.
+   */
+  #makeWorker(
+    name: string,
+    process: Parameters<BullMQDeps['makeWorker']>[1],
+    opts?: { concurrency?: number },
+  ): WorkerLike {
+    if (!this.#consumersDeferred) return this.#deps.makeWorker(name, process, opts);
+    const listeners: Array<(job: JobLike | undefined, err: Error) => void> = [];
+    let real: WorkerLike | undefined;
+    let closed = false;
+    let concurrency = opts?.concurrency;
+    const standIn: WorkerLike = {
+      get concurrency() {
+        return real ? real.concurrency : concurrency;
+      },
+      set concurrency(limit) {
+        if (real) real.concurrency = limit;
+        else concurrency = limit;
+      },
+      on: (_event, listener) => {
+        if (real) real.on('failed', listener);
+        else listeners.push(listener);
+        return standIn;
+      },
+      close: async () => {
+        closed = true;
+        await real?.close();
+      },
+    };
+    this.#deferredWorkers.push(() => {
+      if (closed) return;
+      real = this.#deps.makeWorker(
+        name,
+        process,
+        concurrency !== undefined ? { ...opts, concurrency } : opts,
+      );
+      for (const listener of listeners) real.on('failed', listener);
+    });
+    return standIn;
   }
 
   /** Stable id stamped on this instance's worker-liveness keys. */
@@ -299,7 +377,7 @@ export class BullMQTransport implements Transport {
     const controller = this.#concurrencyController();
     // A new worker starts at the controller's live limit, so a token registered after an adaptive
     // move joins at the current limit rather than at `start`.
-    const worker = this.#deps.makeWorker(
+    const worker = this.#makeWorker(
       tasksName(this.#effectivePrefix(), token),
       (job) => this.#runJob(job.data),
       this.#concurrency !== undefined ? { concurrency: controller.limit } : undefined,
@@ -468,7 +546,7 @@ export class BullMQTransport implements Transport {
 
   onResult(handler: (result: StepResult) => Promise<void>): void {
     if (this.#resultsWorker) return;
-    this.#resultsWorker = this.#deps.makeWorker(
+    this.#resultsWorker = this.#makeWorker(
       resultsName(this.#effectivePrefix()),
       (job) => handler(job.data as StepResult),
       { concurrency: this.#resultConcurrency },
@@ -487,7 +565,7 @@ export class BullMQTransport implements Transport {
 
   onDecision(handler: (decision: WorkflowDecision) => Promise<void>): void {
     if (this.#decisionsWorker) return;
-    this.#decisionsWorker = this.#deps.makeWorker(decisionsName(this.#effectivePrefix()), (job) =>
+    this.#decisionsWorker = this.#makeWorker(decisionsName(this.#effectivePrefix()), (job) =>
       handler(job.data as WorkflowDecision),
     );
   }
@@ -504,7 +582,7 @@ export class BullMQTransport implements Transport {
 
   onStepEvent(handler: (event: WorkflowStepEvent) => Promise<void>): void {
     if (this.#stepEventsWorker) return;
-    this.#stepEventsWorker = this.#deps.makeWorker(stepEventsName(this.#effectivePrefix()), (job) =>
+    this.#stepEventsWorker = this.#makeWorker(stepEventsName(this.#effectivePrefix()), (job) =>
       handler(job.data as WorkflowStepEvent),
     );
   }
@@ -703,7 +781,7 @@ export class BullMQTransport implements Transport {
   /** control plane ← tenant: consume {@link StartRunMessage}s. Idempotent — a second call is a no-op. */
   onStartRun(handler: (msg: StartRunMessage) => Promise<void>): void {
     if (this.#startRunWorker) return;
-    this.#startRunWorker = this.#deps.makeWorker(startRunName(this.#effectivePrefix()), (job) =>
+    this.#startRunWorker = this.#makeWorker(startRunName(this.#effectivePrefix()), (job) =>
       handler(job.data as StartRunMessage),
     );
   }
@@ -716,7 +794,7 @@ export class BullMQTransport implements Transport {
   /** control plane ← tenant: consume {@link RunRequest}s. Idempotent — a second call is a no-op. */
   onRunRequest(handler: (msg: RunRequest) => Promise<void>): void {
     if (this.#runRequestWorker) return;
-    this.#runRequestWorker = this.#deps.makeWorker(runRequestName(this.#effectivePrefix()), (job) =>
+    this.#runRequestWorker = this.#makeWorker(runRequestName(this.#effectivePrefix()), (job) =>
       handler(job.data as RunRequest),
     );
   }

@@ -193,6 +193,10 @@ export class DbTransport implements Transport, ControlPlane {
   #readWorkerKeys: (() => Promise<{ key: string; value: string }[]>) | undefined;
   readonly #handlers = new Map<string, StepHandler>();
   readonly #pollers: Pollers;
+  /** When set (see {@link deferConsumers}), {@link #startLoop} parks its loop until
+   *  {@link startConsumers}. Dispatching is never deferred; only consumption is. */
+  #consumersDeferred = false;
+  readonly #deferredStarts: Array<() => void> = [];
   #schemaReady: Promise<void> | undefined;
   #taskLoop: PollLoop | undefined;
 
@@ -283,6 +287,43 @@ export class DbTransport implements Transport, ControlPlane {
   // ───────────────────────────────────────────────────────────────────────────
 
   /**
+   * Park every consumer loop registered from now on ({@link handle}, {@link onResult},
+   * {@link onHeartbeat}, {@link onControl}) until {@link startConsumers}. Task, result, heartbeat and
+   * control rows are claimed by ONE consumer each, so a process not built to be a worker — a
+   * `node ace` command, a REPL — would otherwise claim rows it then dies holding (re-delivered only
+   * after the lease expires) and steal results addressed to the long-lived engine. The same gate as
+   * the `queue` and `bullmq` transports; the provider calls it per the `consumers` config.
+   */
+  deferConsumers(): void {
+    this.#consumersDeferred = true;
+  }
+
+  /** Start every loop parked by {@link deferConsumers} and stop deferring (`durable:work` calls it via
+   *  `engine.startConsumers()`). Idempotent; a no-op when consumption was never deferred. */
+  startConsumers(): void {
+    if (!this.#consumersDeferred) return;
+    this.#consumersDeferred = false;
+    for (const start of this.#deferredStarts.splice(0)) start();
+  }
+
+  /** `#pollers.start`, unless consumption is deferred: then park it, returning a handle that still
+   *  stops the loop whether it is started later or never. */
+  #startLoop(tick: () => Promise<boolean>): PollLoop {
+    if (!this.#consumersDeferred) return this.#pollers.start(tick);
+    let cancelled = false;
+    let live: PollLoop | undefined;
+    this.#deferredStarts.push(() => {
+      if (!cancelled) live = this.#pollers.start(tick);
+    });
+    return {
+      stop: () => {
+        cancelled = true;
+        live?.stop();
+      },
+    };
+  }
+
+  /**
    * Register a step handler (worker side). Records this name's routing token
    * (`tenantGroup(sanitizeQueueToken(name), partition)`) as served and starts the shared task poll
    * loop on the first call — it claims task rows for EVERY served token (matching the token the
@@ -292,7 +333,7 @@ export class DbTransport implements Transport, ControlPlane {
     this.#handlers.set(name, fn);
     this.#servedTokens.add(tenantGroup(sanitizeQueueToken(name), this.#partition));
     if (!this.#taskLoop) {
-      this.#taskLoop = this.#pollers.start(async () => (await this.#drainTasks()) > 0);
+      this.#taskLoop = this.#startLoop(async () => (await this.#drainTasks()) > 0);
     }
   }
 
@@ -387,11 +428,11 @@ export class DbTransport implements Transport, ControlPlane {
   // ───────────────────────────────────────────────────────────────────────────
 
   onResult(handler: (result: StepResult) => Promise<void>): void {
-    this.#pollers.start(async () => (await this.#drainResults(handler)) > 0);
+    this.#startLoop(async () => (await this.#drainResults(handler)) > 0);
   }
 
   onHeartbeat(handler: (beat: Heartbeat) => Promise<void>): void {
-    this.#pollers.start(async () => (await this.#drainHeartbeats(handler)) > 0);
+    this.#startLoop(async () => (await this.#drainHeartbeats(handler)) > 0);
   }
 
   async #drainResults(handler: (result: StepResult) => Promise<void>): Promise<number> {
@@ -462,7 +503,7 @@ export class DbTransport implements Transport, ControlPlane {
   }
 
   onControl(handler: (msg: ControlMessage) => void): void {
-    this.#pollers.start(async () => (await this.#drainControl(handler)) > 0);
+    this.#startLoop(async () => (await this.#drainControl(handler)) > 0);
   }
 
   async #drainControl(handler: (msg: ControlMessage) => void): Promise<number> {

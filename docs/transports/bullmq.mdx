@@ -54,7 +54,7 @@ node ace durable:work
 This transport only carries tasks, results and heartbeats. Cross-instance lifecycle events and cancellation go through the [control plane](/docs/durable/transports/control-plane). Use `controlPlanes.redis(...)`, which owns the byte-compatible `<prefix>-control` channel. If you omit it, the engine stays local-only.
 </Callout>
 
-The `consumers` setting in `config/durable.ts` (see [the queue driver](/docs/durable/transports/queue#consumers--why-a-node-ace-script-does-not-drain-the-queue)) has **no effect** on `bullmq`. This transport has no deferred-consumer mode, so any process that boots it starts its result consumer and the task workers for the handlers it registers. That includes a `node ace` console process.
+The `consumers` setting in `config/durable.ts` works on `bullmq` as on [the queue driver](/docs/durable/transports/queue#consumers--why-a-node-ace-script-does-not-drain-the-queue). A BullMQ `Worker` starts fetching as soon as it is built, so a deferred process builds none: its task, results, decisions, step-events, start-run and run-request workers are created only when `durable:work` calls `engine.startConsumers()`. With the default `'auto'`, a `node ace` console or REPL process is a pure producer — it dispatches and publishes, and never claims a job. `'never'` makes every process a producer (for web fleets); `'always'` opts a process in. Pub/sub subscriptions — heartbeats, run replies, tenant events — are broadcast and start regardless.
 
 ## Connection
 
