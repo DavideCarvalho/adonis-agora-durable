@@ -234,15 +234,11 @@ The schema is built with Lucid's schema builder (Knex), so the same DDL runs on 
 
 | Kind | Stored as |
 | --- | --- |
-| JSON payloads (`input`, `context`, `output`, `error`, `events`, `payload`) | `text` — the transport `JSON.stringify`s on write and `JSON.parse`s on read, so only JSON-safe values survive. On MySQL, `text` holds at most 64 KB (see below) |
+| JSON payloads (`input`, `context`, `output`, `error`, `events`, `payload`, the worker keys' `value`) | `text` (`longtext` on MySQL, where `text` stops at 64KB; a table created earlier is widened in place on boot) — the transport `JSON.stringify`s on write and `JSON.parse`s on read, so only JSON-safe values survive |
 | Timestamps (`claimed_at`, `created_at`, `started_at`, `expires_at`) | `bigInteger`, epoch milliseconds |
 | Idempotent insert of a task or result | Knex `onConflict('step_id').ignore()`, which Knex renders per dialect |
 
 There is no dependency on a dialect's native JSON or date type, and no dialect-specific locking clause.
-
-<Callout type="warn" title="MySQL: payloads over 64 KB">
-Unlike the [Lucid store](/docs/durable/stores/lucid), which makes its payload columns `longtext` on MySQL, the transport tables use plain `text` on every dialect. On MySQL that column stops at 65,535 bytes, so a step whose input, output or events serialize larger fails to dispatch or to record its result (or, with MySQL's strict mode off, is truncated and can't be parsed back). On MySQL, either keep step payloads small (pass ids, not documents), or widen the columns yourself in a migration of your own, for example `ALTER TABLE durable_transport_tasks MODIFY input LONGTEXT` (and `context` there; `output`, `error` and `events` on `durable_transport_results`; `payload` on `durable_transport_control` and `durable_transport_messages`). Postgres and SQLite `text` has no such limit.
-</Callout>
 
 ## The claim protocol
 

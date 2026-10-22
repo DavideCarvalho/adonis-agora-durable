@@ -6,9 +6,9 @@ import { BaseSchema } from '@adonisjs/lucid/schema'
 /**
  * Transport tables for the @adonis-agora/durable \`db\` transport: the point-to-point work channels (tasks /
  * results / heartbeats / control) that let durable remote steps run cross-process over the database
- * alone. JSON payloads are stored as TEXT (the transport (de)serializes them) and timestamps as
- * epoch-ms integers, so the schema is portable across SQLite / Postgres / MySQL. Only needed when you
- * select the \`db\` transport in config/durable.ts.
+ * alone. JSON payloads are stored as text (the transport (de)serializes them) — \`longtext\` on MySQL,
+ * where \`text\` stops at 64KB — and timestamps as epoch-ms integers, so the schema is portable across
+ * SQLite / Postgres / MySQL. Only needed when you select the \`db\` transport in config/durable.ts.
  */
 export default class extends BaseSchema {
   async up() {
@@ -19,9 +19,9 @@ export default class extends BaseSchema {
       table.string('name').notNullable()
       table.string('grp').notNullable()
       table.string('namespace').notNullable().defaultTo('default')
-      table.text('input')
+      table.text('input', 'longtext')
       table.string('traceparent')
-      table.text('context')
+      table.text('context', 'longtext')
       table.string('transport')
       table.integer('attempt').notNullable()
       table.integer('reclaims').notNullable().defaultTo(0)
@@ -39,10 +39,10 @@ export default class extends BaseSchema {
       table.integer('seq').notNullable()
       table.string('status').notNullable()
       table.string('namespace').notNullable().defaultTo('default')
-      table.text('output')
-      table.text('error')
+      table.text('output', 'longtext')
+      table.text('error', 'longtext')
       table.bigInteger('started_at')
-      table.text('events')
+      table.text('events', 'longtext')
       table.string('claimed_by')
       table.bigInteger('claimed_at')
       table.bigInteger('created_at').notNullable()
@@ -64,7 +64,7 @@ export default class extends BaseSchema {
 
     this.schema.createTable('durable_transport_control', (table) => {
       table.increments('id').primary()
-      table.text('payload').notNullable()
+      table.text('payload', 'longtext').notNullable()
       table.string('namespace').notNullable().defaultTo('default')
       table.string('claimed_by')
       table.bigInteger('claimed_at')

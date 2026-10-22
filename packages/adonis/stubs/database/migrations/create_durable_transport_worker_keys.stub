@@ -12,7 +12,7 @@ export default class extends BaseSchema {
   async up() {
     this.schema.createTable('durable_transport_worker_keys', (table) => {
       table.string('key', 512).primary()
-      table.text('value').notNullable()
+      table.text('value', 'longtext').notNullable()
       table.bigInteger('expires_at').notNullable()
       table.index(['expires_at'], 'durable_transport_worker_keys_expires_idx')
     })

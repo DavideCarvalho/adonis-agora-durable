@@ -604,7 +604,19 @@ async function healDurableTables(
  * columns it changed.
  */
 async function widenMysqlJsonColumns(client: QueryClientContract): Promise<string[]> {
-  const tables = Object.keys(DURABLE_JSON_COLUMNS);
+  return widenMysqlLongtextColumns(client, DURABLE_JSON_COLUMNS);
+}
+
+/**
+ * MySQL: `MODIFY` to `longtext` every column of `spec` that exists and isn't `longtext` yet, one
+ * `ALTER` per table. Shared by the store schema and the db transport's (`createDurableTransportTables`).
+ * Returns the columns it changed.
+ */
+export async function widenMysqlLongtextColumns(
+  client: QueryClientContract,
+  spec: Record<string, { columns: string[]; notNull?: string[] }>,
+): Promise<string[]> {
+  const tables = Object.keys(spec);
   const rows = (await client
     .query()
     .from('information_schema.columns')
@@ -612,8 +624,8 @@ async function widenMysqlJsonColumns(client: QueryClientContract): Promise<strin
     .whereRaw('table_schema = database()')
     .whereIn('table_name', tables)) as Array<{ t: string; c: string; d: string }>;
   const widened: string[] = [];
-  for (const [table, spec] of Object.entries(DURABLE_JSON_COLUMNS)) {
-    const narrow = spec.columns.filter((column) => {
+  for (const [table, columns] of Object.entries(spec)) {
+    const narrow = columns.columns.filter((column) => {
       const row = rows.find((r) => r.t === table && r.c === column);
       return row !== undefined && row.d.toLowerCase() !== 'longtext';
     });
@@ -621,7 +633,7 @@ async function widenMysqlJsonColumns(client: QueryClientContract): Promise<strin
     const modify = narrow
       .map(
         (column) =>
-          `modify \`${column}\` longtext ${spec.notNull?.includes(column) ? 'not null' : 'null'}`,
+          `modify \`${column}\` longtext ${columns.notNull?.includes(column) ? 'not null' : 'null'}`,
       )
       .join(', ');
     await client.rawQuery(`alter table \`${table}\` ${modify}`);

@@ -1,4 +1,5 @@
 import type { Database } from '@adonisjs/lucid/database';
+import { widenMysqlLongtextColumns } from '../stores/lucid-schema.js';
 
 type AlterTableBuilder = Parameters<
   Parameters<ReturnType<Database['connection']>['schema']['alterTable']>[1]
@@ -68,12 +69,40 @@ export const WORKER_KEYS_TABLE = 'durable_transport_worker_keys';
  * the db transport's other tables.
  */
 export async function createWorkerKeysTable(db: Database): Promise<void> {
-  await createTableIfMissing(db, WORKER_KEYS_TABLE, (table) => {
-    table.string('key', 512).primary();
-    table.text('value').notNullable();
-    table.bigInteger('expires_at').notNullable();
-    table.index(['expires_at'], 'durable_transport_worker_keys_expires_idx');
-  });
+  await createTableIfMissing(db, WORKER_KEYS_TABLE, buildWorkerKeysTable);
+  await widenPayloadColumns(db, [WORKER_KEYS_TABLE]);
+}
+
+/**
+ * The columns that hold free-form JSON payloads (a step's input/output/error/events, the control and
+ * message payloads, a worker key's value). They are `longtext` on MySQL, where `text` stops at 64KB
+ * and a bigger step input or output fails to write (strict mode) or is cut off; an existing `text`
+ * one is widened in place on boot. Postgres and SQLite `text` has no limit and is unchanged.
+ * `notNull` lists the `NOT NULL` ones, which a MySQL `MODIFY` must restate.
+ */
+export const TRANSPORT_JSON_COLUMNS: Record<string, { columns: string[]; notNull?: string[] }> = {
+  durable_transport_tasks: { columns: ['input', 'context'] },
+  durable_transport_results: { columns: ['output', 'error', 'events'] },
+  durable_transport_control: { columns: ['payload'], notNull: ['payload'] },
+  durable_transport_messages: { columns: ['payload'], notNull: ['payload'] },
+  durable_transport_worker_keys: { columns: ['value'], notNull: ['value'] },
+};
+
+/** MySQL only: widen the {@link TRANSPORT_JSON_COLUMNS} of `tables` that are still `text`. */
+async function widenPayloadColumns(db: Database, tables: string[]): Promise<void> {
+  const client = db.connection();
+  if (client.dialect.name !== 'mysql') return;
+  const spec = Object.fromEntries(
+    tables.flatMap((t) => (TRANSPORT_JSON_COLUMNS[t] ? [[t, TRANSPORT_JSON_COLUMNS[t]]] : [])),
+  );
+  await widenMysqlLongtextColumns(client, spec);
+}
+
+function buildWorkerKeysTable(table: CreateTableBuilder): void {
+  table.string('key', 512).primary();
+  table.text('value', 'longtext').notNullable();
+  table.bigInteger('expires_at').notNullable();
+  table.index(['expires_at'], 'durable_transport_worker_keys_expires_idx');
 }
 
 /**
@@ -92,75 +121,14 @@ export async function createDurableTransportTables(db: Database): Promise<void> 
   // Knex's schema builder is stateful — createTableIfMissing takes a FRESH `db.connection().schema`
   // per hasTable/createTable so each DDL statement executes exactly once.
 
-  // ── tasks: engine → worker (a RemoteTask) ──────────────────────────────────
-  await createTableIfMissing(db, TRANSPORT_TABLES.tasks, (table) => {
-    table.string('step_id').primary();
-    table.string('run_id').notNullable();
-    table.integer('seq').notNullable();
-    table.string('name').notNullable();
-    table.string('grp').notNullable();
-    table.string('namespace').notNullable().defaultTo('default');
-    table.text('input');
-    table.string('traceparent');
-    table.text('context');
-    table.string('transport');
-    table.integer('attempt').notNullable();
-    // How many times a lapsed claim on this row was taken over — the poison-task bound.
-    table.integer('reclaims').notNullable().defaultTo(0);
-    // Dispatch priority, higher first (the engine's convention); absent = 0, "normal".
-    table.integer('priority').notNullable().defaultTo(0);
-    // `step` (a RemoteTask) or `workflow` (a remote workflow turn: a WorkflowTask in `input`).
-    table.string('kind', 16).notNullable().defaultTo('step');
-    table.string('claimed_by');
-    table.bigInteger('claimed_at');
-    table.bigInteger('created_at').notNullable();
-    table.index(
-      ['namespace', 'grp', 'claimed_at', 'created_at'],
-      'durable_transport_tasks_grp_idx',
-    );
-  });
-
-  // ── results: worker → engine (a StepResult) ────────────────────────────────
-  await createTableIfMissing(db, TRANSPORT_TABLES.results, (table) => {
-    table.string('step_id').primary();
-    table.string('run_id').notNullable();
-    table.integer('seq').notNullable();
-    table.string('status').notNullable();
-    table.string('namespace').notNullable().defaultTo('default');
-    table.text('output');
-    table.text('error');
-    table.bigInteger('started_at');
-    table.text('events');
-    table.string('claimed_by');
-    table.bigInteger('claimed_at');
-    table.bigInteger('created_at').notNullable();
-    table.index(['namespace', 'claimed_at', 'created_at'], 'durable_transport_results_idx');
-  });
-
-  // ── heartbeats: worker → engine (liveness for a long step) ─────────────────
-  await createTableIfMissing(db, TRANSPORT_TABLES.heartbeats, (table) => {
-    table.increments('id').primary();
-    table.string('run_id').notNullable();
-    table.integer('seq').notNullable();
-    table.string('step_id').notNullable();
-    table.string('grp').notNullable();
-    table.string('namespace').notNullable().defaultTo('default');
-    table.string('claimed_by');
-    table.bigInteger('claimed_at');
-    table.bigInteger('created_at').notNullable();
-    table.index(['namespace', 'claimed_at', 'created_at'], 'durable_transport_heartbeats_idx');
-  });
-
-  // ── control: best-effort control-plane messages (single-consumer) ──────────
-  await createTableIfMissing(db, TRANSPORT_TABLES.control, (table) => {
-    table.increments('id').primary();
-    table.text('payload').notNullable();
-    table.string('namespace').notNullable().defaultTo('default');
-    table.string('claimed_by');
-    table.bigInteger('claimed_at');
-    table.bigInteger('created_at').notNullable();
-    table.index(['namespace', 'claimed_at', 'created_at'], 'durable_transport_control_idx');
-  });
+  for (const table of [
+    TRANSPORT_TABLES.tasks,
+    TRANSPORT_TABLES.results,
+    TRANSPORT_TABLES.heartbeats,
+    TRANSPORT_TABLES.control,
+  ]) {
+    await createTableIfMissing(db, table, TRANSPORT_TABLE_DEFS[table] as TableBuild);
+  }
 
   await createMessagesTable(db);
   await createWorkerKeysTable(db);
@@ -170,6 +138,8 @@ export async function createDurableTransportTables(db: Database): Promise<void> 
   // `hasColumn`, and every added column is `notNullable` with a default, so legacy in-flight rows
   // read exactly as they did before.
   await ensureAddedColumns(db);
+  // MySQL: a table created while the payload columns were `text` gets them widened to `longtext`.
+  await widenPayloadColumns(db, Object.keys(TRANSPORT_JSON_COLUMNS));
 }
 
 /**
@@ -179,21 +149,23 @@ export async function createDurableTransportTables(db: Database): Promise<void> 
  * decision for the engine that dispatched the turn). `reply_to` carries a request's requester.
  */
 export async function createMessagesTable(db: Database): Promise<void> {
-  await createTableIfMissing(db, TRANSPORT_TABLES.messages, (table) => {
-    table.increments('id').primary();
-    table.string('kind', 32).notNullable();
-    table.string('namespace').notNullable().defaultTo('default');
-    table.string('recipient').notNullable().defaultTo('');
-    table.string('reply_to');
-    table.text('payload').notNullable();
-    table.string('claimed_by');
-    table.bigInteger('claimed_at');
-    table.bigInteger('created_at').notNullable();
-    table.index(
-      ['namespace', 'kind', 'recipient', 'claimed_at', 'id'],
-      'durable_transport_messages_idx',
-    );
-  });
+  await createTableIfMissing(db, TRANSPORT_TABLES.messages, buildMessagesTable);
+}
+
+function buildMessagesTable(table: CreateTableBuilder): void {
+  table.increments('id').primary();
+  table.string('kind', 32).notNullable();
+  table.string('namespace').notNullable().defaultTo('default');
+  table.string('recipient').notNullable().defaultTo('');
+  table.string('reply_to');
+  table.text('payload', 'longtext').notNullable();
+  table.string('claimed_by');
+  table.bigInteger('claimed_at');
+  table.bigInteger('created_at').notNullable();
+  table.index(
+    ['namespace', 'kind', 'recipient', 'claimed_at', 'id'],
+    'durable_transport_messages_idx',
+  );
 }
 
 /**
@@ -250,6 +222,87 @@ async function ensureAddedColumns(db: Database): Promise<void> {
     }
   }
 }
+
+type TableBuild = (table: CreateTableBuilder) => void;
+
+/**
+ * The CREATE TABLE body of every transport table (Knex schema builder), shared by
+ * {@link createDurableTransportTables} and the dialect tests. Payload columns are `longtext`, which
+ * Knex emits on MySQL only (Postgres and SQLite get `text`). See {@link TRANSPORT_JSON_COLUMNS}.
+ */
+export const TRANSPORT_TABLE_DEFS: Record<string, TableBuild> = {
+  // ── tasks: engine → worker (a RemoteTask) ──────────────────────────────────
+  [TRANSPORT_TABLES.tasks]: (table) => {
+    table.string('step_id').primary();
+    table.string('run_id').notNullable();
+    table.integer('seq').notNullable();
+    table.string('name').notNullable();
+    table.string('grp').notNullable();
+    table.string('namespace').notNullable().defaultTo('default');
+    table.text('input', 'longtext');
+    table.string('traceparent');
+    table.text('context', 'longtext');
+    table.string('transport');
+    table.integer('attempt').notNullable();
+    // How many times a lapsed claim on this row was taken over — the poison-task bound.
+    table.integer('reclaims').notNullable().defaultTo(0);
+    // Dispatch priority, higher first (the engine's convention); absent = 0, "normal".
+    table.integer('priority').notNullable().defaultTo(0);
+    // `step` (a RemoteTask) or `workflow` (a remote workflow turn: a WorkflowTask in `input`).
+    table.string('kind', 16).notNullable().defaultTo('step');
+    table.string('claimed_by');
+    table.bigInteger('claimed_at');
+    table.bigInteger('created_at').notNullable();
+    table.index(
+      ['namespace', 'grp', 'claimed_at', 'created_at'],
+      'durable_transport_tasks_grp_idx',
+    );
+  },
+
+  // ── results: worker → engine (a StepResult) ────────────────────────────────
+  [TRANSPORT_TABLES.results]: (table) => {
+    table.string('step_id').primary();
+    table.string('run_id').notNullable();
+    table.integer('seq').notNullable();
+    table.string('status').notNullable();
+    table.string('namespace').notNullable().defaultTo('default');
+    table.text('output', 'longtext');
+    table.text('error', 'longtext');
+    table.bigInteger('started_at');
+    table.text('events', 'longtext');
+    table.string('claimed_by');
+    table.bigInteger('claimed_at');
+    table.bigInteger('created_at').notNullable();
+    table.index(['namespace', 'claimed_at', 'created_at'], 'durable_transport_results_idx');
+  },
+
+  // ── heartbeats: worker → engine (liveness for a long step) ─────────────────
+  [TRANSPORT_TABLES.heartbeats]: (table) => {
+    table.increments('id').primary();
+    table.string('run_id').notNullable();
+    table.integer('seq').notNullable();
+    table.string('step_id').notNullable();
+    table.string('grp').notNullable();
+    table.string('namespace').notNullable().defaultTo('default');
+    table.string('claimed_by');
+    table.bigInteger('claimed_at');
+    table.bigInteger('created_at').notNullable();
+    table.index(['namespace', 'claimed_at', 'created_at'], 'durable_transport_heartbeats_idx');
+  },
+
+  // ── control: best-effort control-plane messages (single-consumer) ──────────
+  [TRANSPORT_TABLES.control]: (table) => {
+    table.increments('id').primary();
+    table.text('payload', 'longtext').notNullable();
+    table.string('namespace').notNullable().defaultTo('default');
+    table.string('claimed_by');
+    table.bigInteger('claimed_at');
+    table.bigInteger('created_at').notNullable();
+    table.index(['namespace', 'claimed_at', 'created_at'], 'durable_transport_control_idx');
+  },
+  [TRANSPORT_TABLES.messages]: buildMessagesTable,
+  [WORKER_KEYS_TABLE]: buildWorkerKeysTable,
+};
 
 /** Drop every transport table. Used by tests and the migration `down`. */
 export async function dropDurableTransportTables(db: Database): Promise<void> {
