@@ -2298,7 +2298,8 @@ export class WorkflowEngine {
         typeof v === 'object' && v !== null && (v as { ok?: unknown }).ok === false;
       for (const cp of await this.store.listCheckpoints(runId)) {
         // A retry runs the body again, so a failure it handed to an onError handler is retired: kept in
-        // the timeline under another name, never followed again, and the handler is not retried.
+        // the timeline under another name, never followed again, and the handler is not retried. Its
+        // `onError:<code>` tag goes too: the tag says how the run ended, and that is being redone.
         const handlerId = handoffHandlerId(runId, cp);
         if (handlerId !== undefined) {
           await this.store.takeSignalWaiter(`child:${handlerId}`);
@@ -2307,6 +2308,11 @@ export class WorkflowEngine {
             name: retiredHandoffName(handlerId),
             status: 'completed',
           });
+          const tags = run.tags?.filter((t) => !t.startsWith('onError:'));
+          if (tags && tags.length !== run.tags?.length) {
+            await this.store.updateRun(runId, { tags, updatedAt: new Date() });
+            run.tags = tags;
+          }
           continue;
         }
         if (cp.status === 'failed') {

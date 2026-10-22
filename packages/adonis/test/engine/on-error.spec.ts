@@ -334,6 +334,8 @@ describe('onError routes', () => {
     await until(async () => (await store.getRun('r'))?.status === 'completed');
 
     expect((await store.getRun('r'))?.output).toBe('ingested');
+    // The run no longer ended through a handler, so it no longer carries the handoff's tag.
+    expect((await store.getRun('r'))?.tags ?? []).not.toContain('onError:invalid_line');
   });
 
   it('keeps ctx.all over the workflow from failing the parent', async () => {
