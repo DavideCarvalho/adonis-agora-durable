@@ -231,8 +231,8 @@ importers:
         specifier: 7.3.1
         version: 7.3.1
       '@tanstack/intent':
-        specifier: 0.5.5
-        version: 0.5.5
+        specifier: 0.5.6
+        version: 0.5.6
       '@types/better-sqlite3':
         specifier: 9.6.0
         version: 9.6.0
@@ -270,8 +270,8 @@ importers:
         specifier: 4.3.3
         version: 4.3.3
       '@tanstack/intent':
-        specifier: 0.5.5
-        version: 0.5.5
+        specifier: 0.5.6
+        version: 0.5.6
       '@tanstack/react-query':
         specifier: 5.104.4
         version: 5.104.4(@types/react@19.3.0)(react@19.3.1)
@@ -1472,8 +1472,8 @@ packages:
   '@tailwindcss/postcss@4.3.3':
     resolution: {integrity: sha512-JTSZZGQi1AyKirbLN3azmjVzef92tcX7h+iSqPdaeStyFpGpDlKvvpxeOE8njhbUanbRwr3z8DyzhICWnMtQeg==}
 
-  '@tanstack/intent@0.5.5':
-    resolution: {integrity: sha512-Ei5RqUWgV96HrezTEyDbScy0wZN+17dNo59Am8/3ncv0YIaIxApkiX5LkM488wxe4a1Imdi09nhjFxblxwLMSQ==}
+  '@tanstack/intent@0.5.6':
+    resolution: {integrity: sha512-9Ta/GMGPcqBIqlbrqeYyqBVKEP7XyAXy6nn90bPiE2oHB6KPgjEweUbHNXLQ6Pim01VtMMNf0dmUFMGKKHXmlw==}
     engines: {node: '>=20.12.0'}
     hasBin: true
 
@@ -4562,7 +4562,7 @@ snapshots:
       postcss: 8.5.30
       tailwindcss: 4.3.3
 
-  '@tanstack/intent@0.5.5': {}
+  '@tanstack/intent@0.5.6': {}
 
   '@tanstack/query-core@5.104.4': {}
 
