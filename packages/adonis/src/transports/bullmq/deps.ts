@@ -115,6 +115,13 @@ export function redisUrlToOptions(url: string): Record<string, unknown> {
     }
     options.db = n;
   }
+  // Query parameters (ioredis-style knobs, TLS CA paths…) are not mapped: refuse them rather than drop
+  // them silently — pass `ConnectionOptions` for anything beyond host, port, credentials, db and TLS.
+  if (parsed.search) {
+    throw new Error(
+      `@agora/durable: transports.bullmq() does not read query parameters from a Redis URL (${parsed.search}); pass ConnectionOptions instead.`,
+    );
+  }
   if (parsed.protocol === 'rediss:') options.tls = {};
   return options;
 }

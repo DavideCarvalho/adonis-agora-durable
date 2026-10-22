@@ -61,7 +61,7 @@ The `consumers` setting in `config/durable.ts` works on `bullmq` as on [the queu
 `connection` is required. It is passed directly to BullMQ and ioredis, and accepts:
 
 - ioredis `ConnectionOptions` (`host`, `port`, `password`, `db`, `sentinels`, ...),
-- a connection string, or
+- a `redis://` or `rediss://` URL — host, port, username, password, the db in the path, and TLS for `rediss:`; query parameters are refused (pass `ConnectionOptions` for anything else) — or
 - an existing ioredis `Redis` instance.
 
 BullMQ workers need `maxRetriesPerRequest: null`. When you pass an options object, the transport sets that for its worker connections. A `Redis` instance you pass in is used as-is, so configure it yourself. Pub/sub, heartbeat and liveness clients are `duplicate()`s of a passed instance, or fresh clients with a 10s keep-alive.

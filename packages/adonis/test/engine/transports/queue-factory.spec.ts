@@ -152,6 +152,29 @@ describe('transports.queue — options reaching the transport', () => {
     await transport.close?.();
   });
 
+  it('passes `workerHeartbeatIntervalMs` through to the liveness beat', async () => {
+    const keys = new MemoryWorkerKeys();
+    const puts: number[] = [];
+    const put = keys.put.bind(keys);
+    keys.put = async (key, value, expiresAt) => {
+      puts.push(Date.now());
+      return put(key, value, expiresAt);
+    };
+    const ctx = fakeCtx({ adapters: {} });
+    const transport = await transports.queue({
+      adapter: () => new MockAdapter(),
+      workerKeys: keys,
+      workerHeartbeatIntervalMs: 20,
+    })(ctx);
+    (transport as unknown as { handle(name: string, fn: unknown): void }).handle(
+      'ship',
+      async () => 'ok',
+    );
+    // At the 10s default only the first beat would land within this window.
+    await vi.waitFor(() => expect(puts.length).toBeGreaterThanOrEqual(3), { timeout: 1_000 });
+    await transport.close?.();
+  });
+
   it('offers no groupHealth with `workerKeys: false` (nothing could report liveness)', async () => {
     const ctx = fakeCtx({ adapters: {} });
     const transport = await transports.queue({

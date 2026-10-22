@@ -1309,7 +1309,8 @@ export class DbTransport implements Transport, ControlPlane {
       recipients: () => (this.#consumersDeferred ? [this.#instanceId] : [this.#instanceId, '']),
       idleBackoffMax: 1,
       each: async (decision) => {
-        for (const h of this.#decisionHandlers) await h(decision);
+        // Every handler, concurrently, as on bullmq: one that throws must not starve the rest.
+        await Promise.all([...this.#decisionHandlers].map((h) => h(decision)));
       },
     });
   }

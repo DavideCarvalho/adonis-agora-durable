@@ -914,7 +914,8 @@ export class QueueTransport implements Transport, ControlPlane {
       this.#decisionsQueue(),
       async (job) => {
         const decision = fromJson<WorkflowDecision>(job.payload);
-        for (const h of this.#decisionHandlers) await h(decision);
+        // Every handler, concurrently, as on bullmq: one that throws must not starve the rest.
+        await Promise.all([...this.#decisionHandlers].map((h) => h(decision)));
       },
       { idleBackoffMax: 1 },
     );

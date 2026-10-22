@@ -88,6 +88,8 @@ export interface QueueTransportConfig {
   pollIntervalMs?: number;
   /** How long `close()` waits for in-flight jobs before handing them back (ms). Default 5000. */
   closeTimeoutMs?: number;
+  /** How often (ms) a worker refreshes the liveness key of each step name it serves. Default 10000. */
+  workerHeartbeatIntervalMs?: number;
   /**
    * How many jobs of one step name a worker runs at once. Default 1. More slots share one poll loop,
    * so raising it adds no polling.
@@ -406,6 +408,9 @@ export const transports = {
         ...(config.prefix !== undefined ? { prefix: config.prefix } : {}),
         ...(config.pollIntervalMs !== undefined ? { pollIntervalMs: config.pollIntervalMs } : {}),
         ...(config.closeTimeoutMs !== undefined ? { closeTimeoutMs: config.closeTimeoutMs } : {}),
+        ...(config.workerHeartbeatIntervalMs !== undefined
+          ? { workerHeartbeatIntervalMs: config.workerHeartbeatIntervalMs }
+          : {}),
         ...(config.concurrency !== undefined ? { concurrency: config.concurrency } : {}),
         ...(config.resultConcurrency !== undefined
           ? { resultConcurrency: config.resultConcurrency }

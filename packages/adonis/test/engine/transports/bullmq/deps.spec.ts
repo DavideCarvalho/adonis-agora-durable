@@ -93,6 +93,12 @@ describe('redisUrlToOptions', () => {
     });
   });
 
+  it('refuses query parameters instead of dropping them', () => {
+    expect(() => redisUrlToOptions('redis://localhost:6379?enableReadyCheck=false')).toThrow(
+      /query/,
+    );
+  });
+
   it('rejects a non-numeric db', () => {
     expect(() => redisUrlToOptions('redis://localhost/abc')).toThrow(/db/);
   });
