@@ -8,16 +8,28 @@ import type { WorkerDescriptor } from '../handshake/descriptor.js';
 import {
   type ControlMessage,
   type ControlPlane,
+  type GroupHealth,
   type Heartbeat,
   type RemoteTask,
   type StepResult,
   type Transport,
+  type WorkerHeartbeat,
+  type WorkerStatus,
 } from '../interfaces.js';
-import { Pollers, type PollLoop } from '../pollers.js';
+import { atLeastOne, Pollers, type PollLoop } from '../pollers.js';
 import { runStepHandler, type StepHandler } from '../protocol.js';
 import { sanitizeQueueToken, tenantGroup } from '../tenant-group.js';
 import type { DescriptorRedis } from '../worker-runtime/registry.js';
+import { AdaptiveController, type ConcurrencyOption } from './adaptive-concurrency.js';
+import { effectivePrefix, workerHeartbeatKey } from './bullmq/naming.js';
+import {
+  heartbeatKeyValue,
+  parseHeartbeatValue,
+  WORKER_HEARTBEAT_INTERVAL_MS,
+  WORKER_HEARTBEAT_TTL_SECONDS,
+} from './bullmq/serialization.js';
 import { createDurableTransportTables, TRANSPORT_TABLES } from './db-schema.js';
+import { infrastructureFailure } from './task-failure.js';
 import {
   cachedLiveKeys,
   descriptorsOn,
@@ -51,8 +63,19 @@ type ControlPayload = ControlMessage;
 const DEFAULT_POLL_INTERVAL_MS = 200;
 /** Default lease window (ms): a claimed-but-not-deleted row is reclaimable after this (crash recovery). */
 const DEFAULT_LEASE_MS = 30_000;
-/** Default max rows claimed per poll. */
+/** Default max rows claimed per poll (results / heartbeats / control; the task loop claims only as
+ *  many rows as it has free slots, never more than this). */
 const DEFAULT_BATCH_SIZE = 20;
+/** Idle backoff for the task, heartbeat and control loops (the results loop is exempt): after
+ *  consecutive empty polls the sleep doubles up to this many poll intervals. Same default as the
+ *  queue transport. */
+const DEFAULT_IDLE_BACKOFF_MAX = 4;
+/** How many times a task row's lapsed claim may be taken over before the row is treated as poison
+ *  (its workers keep dying on it) and failed instead of re-run. Same default as the queue transport. */
+const DEFAULT_MAX_STALLED_COUNT = 3;
+/** Key prefix of the worker liveness keys — the one a `WorkerRuntime` uses by default, so both kinds of
+ *  beat land in the same keyspace and `groupHealth` reads them alike. */
+const WORKER_KEY_PREFIX = 'durable';
 
 type Client = QueryClientContract | TransactionClientContract;
 
@@ -68,6 +91,8 @@ interface TaskRow {
   context: string | null;
   transport: string | null;
   attempt: number;
+  /** Absent on a legacy table without the column (and `autoCreate: false`). */
+  reclaims?: number | string | null;
 }
 interface ResultRow {
   step_id: string;
@@ -127,8 +152,51 @@ export interface DbTransportOptions {
   pollIntervalMs?: number;
   /** How long a claimed-but-unfinished row is owned before it's reclaimable (crash recovery). Default 30s. */
   leaseMs?: number;
-  /** Max rows claimed per poll. Default 20. */
+  /**
+   * Max rows claimed per poll by the results, heartbeat and control loops. Default 20. The task loop
+   * claims only as many rows as it has free {@link concurrency} slots (capped by this), so a worker
+   * never hoards tasks an idle sibling could run.
+   */
   batchSize?: number;
+  /**
+   * How many task rows this worker runs at once. Default 1. One poll loop serves every handler name and
+   * keeps up to this many rows in flight — more slots add no polling — claiming only as many rows per
+   * poll as there are free slots, and renewing every held claim.
+   *
+   * `'adaptive'`, or `{ mode: 'adaptive', min, max, start, tickMs, ramCeilingPct, cpuCeilingPct }`,
+   * lets the {@link AdaptiveController} the BullMQ and queue transports use move the limit at runtime
+   * (from step latency, errors/stalls, RSS and optionally CPU). Either way the limit, in-flight count,
+   * RSS, CPU, throughput and p95 ride this worker's liveness key (see {@link DbTransport.groupHealth}).
+   */
+  concurrency?: ConcurrencyOption;
+  /** How many step results the engine side settles at once. Default 1. */
+  resultConcurrency?: number;
+  /**
+   * Idle backoff for the task, heartbeat and control loops, as a multiple of {@link pollIntervalMs}:
+   * after consecutive empty polls the sleep doubles up to `idleBackoffMax × pollIntervalMs`, and any
+   * poll that finds a row resets it. Default 4 (an idle loop polls every 800ms instead of 200ms); `1`
+   * disables it. The results loop never backs off: a result is on the critical path of every step.
+   */
+  idleBackoffMax?: number;
+  /**
+   * How many times a task row's lapsed claim may be taken over (its worker stopped renewing — crashed,
+   * or blocked its event loop past {@link leaseMs}) before the row is treated as poison: deleted, and a
+   * RETRYABLE failed result published for its step so the engine's durable retry decides (re-dispatch
+   * while attempts remain, then fail the step). Default 3, like the queue transport. Needs the tasks
+   * table's `reclaims` column (added by `autoCreate`); without it reclaims are not counted.
+   */
+  maxStalledCount?: number;
+  /**
+   * How often (ms) a worker refreshes the liveness key of each step name it serves. Default 10000;
+   * each key lives at least 35s (three intervals when longer), so a worker that dies drops out of
+   * {@link DbTransport.groupHealth} within that.
+   */
+  workerHeartbeatIntervalMs?: number;
+  /**
+   * Where a transport failure is reported — a throwing poll, a lost claim, a failed liveness write.
+   * Default `console.error`.
+   */
+  onError?: (err: unknown) => void;
   /** Create the transport tables on first use if missing. Default true. */
   autoCreate?: boolean;
   /**
@@ -199,6 +267,29 @@ export class DbTransport implements Transport, ControlPlane {
   readonly #deferredStarts: Array<() => void> = [];
   #schemaReady: Promise<void> | undefined;
   #taskLoop: PollLoop | undefined;
+  /** Fixed or adaptive task concurrency, plus the in-flight/latency/RSS/CPU telemetry the liveness
+   *  key carries. One controller for the task loop of this instance, as on the queue transport. */
+  readonly #controller: AdaptiveController;
+  /** A task loop parked on "every slot busy", woken when an adaptive move raises the limit. */
+  readonly #limitWaiters = new Set<() => void>();
+  /** Every task row still in a handler — the slots in use, and what `stop()` waits for (bounded). */
+  readonly #runningTasks = new Set<Promise<void>>();
+  readonly #resultConcurrency: number;
+  readonly #idleBackoffMax: number;
+  readonly #maxStalledCount: number;
+  readonly #onError: (err: unknown) => void;
+  /** Claims this instance holds, per table: claim token → the row ids still held under it. Every one
+   *  is renewed on {@link #renewTimer}, so no held row ages into another instance's reclaim. */
+  readonly #held = new Map<string, Map<string, Set<string | number>>>();
+  #renewTimer: ReturnType<typeof setInterval> | undefined;
+  /** The renewal round in flight, so a slow database never stacks rounds. */
+  #renewal: Promise<void> | undefined;
+  /** Whether the tasks table has the `reclaims` column (resolved once). */
+  #reclaimsColumn: Promise<boolean> | undefined;
+  /** Routing tokens this instance beats a liveness key for (one per handled step name). */
+  readonly #heartbeatTokens = new Set<string>();
+  readonly #workerHeartbeatIntervalMs: number;
+  #workerHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
 
   constructor(options: DbTransportOptions) {
     this.#db = options.db;
@@ -212,7 +303,25 @@ export class DbTransport implements Transport, ControlPlane {
     this.#autoCreate = options.autoCreate ?? true;
     this.#instanceId = options.instanceId ?? randomUUID();
     this.#workerKeysCacheMs = options.workerKeysCacheMs ?? 5_000;
-    this.#pollers = new Pollers(this.#pollIntervalMs, DEFAULT_LOG);
+    this.#onError = options.onError ?? DEFAULT_LOG;
+    this.#pollers = new Pollers(this.#pollIntervalMs, this.#onError);
+    this.#controller = new AdaptiveController({
+      ...(options.concurrency !== undefined ? { concurrency: options.concurrency } : {}),
+      apply: () => {
+        for (const wake of this.#limitWaiters) wake();
+      },
+    });
+    this.#resultConcurrency = atLeastOne(options.resultConcurrency, 1);
+    this.#idleBackoffMax = atLeastOne(options.idleBackoffMax, DEFAULT_IDLE_BACKOFF_MAX);
+    const maxStalled = options.maxStalledCount;
+    this.#maxStalledCount =
+      maxStalled !== undefined && !Number.isNaN(maxStalled) && maxStalled >= 0
+        ? Math.floor(maxStalled)
+        : DEFAULT_MAX_STALLED_COUNT;
+    this.#workerHeartbeatIntervalMs = atLeastOne(
+      options.workerHeartbeatIntervalMs,
+      WORKER_HEARTBEAT_INTERVAL_MS,
+    );
   }
 
   /** Stable id stamped on heartbeats, control `from`, and `claimed_by`. */
@@ -308,12 +417,12 @@ export class DbTransport implements Transport, ControlPlane {
 
   /** `#pollers.start`, unless consumption is deferred: then park it, returning a handle that still
    *  stops the loop whether it is started later or never. */
-  #startLoop(tick: () => Promise<boolean>): PollLoop {
-    if (!this.#consumersDeferred) return this.#pollers.start(tick);
+  #startLoop(tick: () => Promise<boolean>, idleBackoffMax: number): PollLoop {
+    if (!this.#consumersDeferred) return this.#pollers.start(tick, { idleBackoffMax });
     let cancelled = false;
     let live: PollLoop | undefined;
     this.#deferredStarts.push(() => {
-      if (!cancelled) live = this.#pollers.start(tick);
+      if (!cancelled) live = this.#pollers.start(tick, { idleBackoffMax });
     });
     return {
       stop: () => {
@@ -323,17 +432,32 @@ export class DbTransport implements Transport, ControlPlane {
     };
   }
 
+  /** Run `start` once this instance really consumes: now, or at {@link startConsumers} when deferred. */
+  #whenConsuming(start: () => void): void {
+    if (this.#consumersDeferred) this.#deferredStarts.push(start);
+    else start();
+  }
+
   /**
    * Register a step handler (worker side). Records this name's routing token
    * (`tenantGroup(sanitizeQueueToken(name), partition)`) as served and starts the shared task poll
    * loop on the first call — it claims task rows for EVERY served token (matching the token the
-   * engine dispatches by), runs each through {@link runStepHandler}, and writes the result.
+   * engine dispatches by), runs each through {@link runStepHandler}, and writes the result. The loop
+   * keeps up to {@link DbTransportOptions.concurrency} rows in flight, and each served token gets a
+   * liveness key once the loop consumes (a deferred, producer-only process advertises nothing).
    */
   handle(name: string, fn: StepHandler): void {
     this.#handlers.set(name, fn);
-    this.#servedTokens.add(tenantGroup(sanitizeQueueToken(name), this.#partition));
+    const token = tenantGroup(sanitizeQueueToken(name), this.#partition);
+    const isNew = !this.#servedTokens.has(token);
+    this.#servedTokens.add(token);
     if (!this.#taskLoop) {
-      this.#taskLoop = this.#startLoop(async () => (await this.#drainTasks()) > 0);
+      this.#taskLoop = this.#startLoop(() => this.#taskTick(), this.#idleBackoffMax);
+      this.#whenConsuming(() => {
+        for (const served of this.#servedTokens) this.#beginServing(served);
+      });
+    } else if (isNew) {
+      this.#whenConsuming(() => this.#beginServing(token));
     }
   }
 
@@ -352,57 +476,157 @@ export class DbTransport implements Transport, ControlPlane {
     });
   }
 
-  async #drainTasks(): Promise<number> {
-    if (this.#servedTokens.size === 0) return 0;
-    const { rows, token } = await this.#claim<TaskRow>(TRANSPORT_TABLES.tasks, [
-      ...this.#servedTokens,
-    ]);
+  /**
+   * One task-loop round: claim as many rows as there are free slots (never more — a row claimed but
+   * not running is a row an idle sibling can't run, and one whose lease nobody is using), hand each
+   * to {@link #runTask}, and report work so the loop re-ticks at once. With every slot busy it waits
+   * for one to free (or the adaptive limit to move) instead of polling.
+   */
+  async #taskTick(): Promise<boolean> {
+    if (this.#servedTokens.size === 0) return false;
+    const free = this.#controller.limit - this.#runningTasks.size;
+    if (free <= 0) {
+      await this.#slotFreed();
+      return true;
+    }
+    const { rows, token } = await this.#claim<TaskRow>(
+      TRANSPORT_TABLES.tasks,
+      Math.min(free, this.#batchSize),
+      [...this.#servedTokens],
+      'step_id',
+      await this.#countsReclaims(),
+    );
+    if (rows.length === 0) return false;
+    this.#hold(
+      TRANSPORT_TABLES.tasks,
+      token,
+      rows.map((row) => row.step_id),
+    );
     for (const row of rows) {
-      const task: RemoteTask = {
-        runId: row.run_id,
-        seq: Number(row.seq),
-        stepId: row.step_id,
-        name: row.name,
-        group: row.grp,
-        input: fromJson(row.input),
-        attempt: Number(row.attempt),
-        ...(row.traceparent != null ? { traceparent: row.traceparent } : {}),
-        ...(row.context != null ? { context: fromJson(row.context) } : {}),
-        ...(row.transport != null ? { transport: row.transport } : {}),
-      };
-      // Renew this row's claim NOW (rows after the first have aged while earlier ones ran) and
-      // KEEP renewing while the handler runs — the claim used to be stamped once for the whole
-      // batch and never refreshed, so any step longer than `leaseMs` (30s default) was reclaimed
-      // by a sibling worker mid-flight and GUARANTEED to double-run. A merely-slow worker now
-      // holds its claim for the step's whole duration; a crashed one still expires and is
-      // reclaimed.
-      const renew = (): void => {
-        void this.#client()
-          .knexQuery()
-          .from(TRANSPORT_TABLES.tasks)
-          .where('step_id', task.stepId)
-          .where('claimed_by', token)
-          .update({ claimed_at: this.#now() })
-          .catch(() => undefined);
-      };
-      renew();
-      const renewTimer = setInterval(renew, Math.max(1_000, Math.floor(this.#leaseMs / 2)));
-      (renewTimer as { unref?: () => void }).unref?.();
+      const run = this.#runTask(row, token);
+      this.#runningTasks.add(run);
+      void run.finally(() => this.#runningTasks.delete(run));
+    }
+    return true;
+  }
+
+  /** Resolve when a running task settles or the adaptive controller moves the limit. */
+  async #slotFreed(): Promise<void> {
+    let wake: () => void = () => {};
+    const moved = new Promise<void>((resolve) => {
+      wake = resolve;
+    });
+    this.#limitWaiters.add(wake);
+    try {
+      await Promise.race([...this.#runningTasks, moved]);
+    } finally {
+      this.#limitWaiters.delete(wake);
+    }
+  }
+
+  /**
+   * Run one claimed task row and settle it. A row whose claim lapsed more than
+   * {@link DbTransportOptions.maxStalledCount} times is bridged to a failed result instead of run.
+   * Otherwise the claim is re-checked first (a row is run only while this instance holds it), and the
+   * result is published only by the instance still holding the claim (see {@link #settleTask}).
+   * The claim is renewed for the whole run with every other held claim (see {@link #renewHeld}).
+   */
+  async #runTask(row: TaskRow, token: string): Promise<void> {
+    const task: RemoteTask = {
+      runId: row.run_id,
+      seq: Number(row.seq),
+      stepId: row.step_id,
+      name: row.name,
+      group: row.grp,
+      input: fromJson(row.input),
+      attempt: Number(row.attempt),
+      ...(row.traceparent != null ? { traceparent: row.traceparent } : {}),
+      ...(row.context != null ? { context: fromJson(row.context) } : {}),
+      ...(row.transport != null ? { transport: row.transport } : {}),
+    };
+    try {
+      if (row.reclaims != null && Number(row.reclaims) > this.#maxStalledCount) {
+        // Its workers keep dying on it (or blocking past the lease): running it again would just
+        // stall the next one. Fail it RETRYABLE so the engine's durable retry decides.
+        this.#release(TRANSPORT_TABLES.tasks, token, task.stepId);
+        await this.#settleTask(
+          task.stepId,
+          token,
+          infrastructureFailure(task, `claim lapsed more than ${this.#maxStalledCount} times`),
+        );
+        return;
+      }
+      if (!(await this.#stillHolds(task.stepId, token))) {
+        this.#release(TRANSPORT_TABLES.tasks, token, task.stepId);
+        this.#onError(
+          new Error(
+            `[DbTransport] lost the claim on task ${task.stepId} before running it — another worker took it over; not running it here`,
+          ),
+        );
+        return;
+      }
+      const startedAt = Date.now();
+      this.#controller.onStart();
+      let ok = false;
       try {
         const result = await runStepHandler(task, this.#handlers.get(task.name), (beat) =>
           this.heartbeat(beat),
         );
-        await this.#insertResult(result);
+        ok = result.status === 'completed';
+        // Stop renewing before settling: the settle deletes the row, and a renewal racing it would
+        // count the row as lost.
+        this.#release(TRANSPORT_TABLES.tasks, token, task.stepId);
+        if (!(await this.#settleTask(task.stepId, token, result))) {
+          this.#onError(
+            new Error(
+              `[DbTransport] lost the claim on task ${task.stepId} while running it (this worker went silent past leaseMs) — another worker took it over and may run it too; this run's result was dropped. Raise leaseMs if steps block the event loop`,
+            ),
+          );
+        }
       } finally {
-        clearInterval(renewTimer);
+        this.#controller.onSettle(Date.now() - startedAt, ok, 'step');
       }
-      await this.#client().from(TRANSPORT_TABLES.tasks).where('step_id', task.stepId).delete();
+    } catch (err) {
+      // A database error settling the row: it stays claimed, unrenewed, and is reclaimed after the
+      // lease — at-least-once, like a crash.
+      this.#onError(err);
+    } finally {
+      this.#release(TRANSPORT_TABLES.tasks, token, task.stepId);
     }
-    return rows.length;
   }
 
-  async #insertResult(result: StepResult): Promise<void> {
-    await this.#client()
+  /** Re-stamp the row's claim if this round still holds it; `false` once another instance took it. */
+  async #stillHolds(stepId: string, token: string): Promise<boolean> {
+    const updated = await this.#client()
+      .knexQuery()
+      .from(TRANSPORT_TABLES.tasks)
+      .where('step_id', stepId)
+      .where('claimed_by', token)
+      .update({ claimed_at: this.#now() });
+    return Number(updated) > 0;
+  }
+
+  /**
+   * Delete the task row and publish its result in ONE transaction, and only while `token` still holds
+   * the claim: an instance whose claim was taken over neither deletes the new holder's row nor writes
+   * a second result. Resolves whether this instance settled it.
+   */
+  async #settleTask(stepId: string, token: string, result: StepResult): Promise<boolean> {
+    return this.#client().transaction(async (trx) => {
+      const deleted = await trx
+        .knexQuery()
+        .from(TRANSPORT_TABLES.tasks)
+        .where('step_id', stepId)
+        .where('claimed_by', token)
+        .delete();
+      if (Number(deleted) === 0) return false;
+      await this.#insertResult(result, trx);
+      return true;
+    });
+  }
+
+  async #insertResult(result: StepResult, client: Client = this.#client()): Promise<void> {
+    await client
       .insertQuery()
       .table(TRANSPORT_TABLES.results)
       .knexQuery.insert({
@@ -427,58 +651,80 @@ export class DbTransport implements Transport, ControlPlane {
   // worker → engine — the engine polls results + heartbeats
   // ───────────────────────────────────────────────────────────────────────────
 
+  /** Engine side: settle step results, up to {@link DbTransportOptions.resultConcurrency} at once. The
+   *  results loop never backs off when idle — a result is on the critical path of every step. */
   onResult(handler: (result: StepResult) => Promise<void>): void {
-    this.#startLoop(async () => (await this.#drainResults(handler)) > 0);
+    this.#startLoop(
+      async () =>
+        (await this.#drain<ResultRow>(
+          TRANSPORT_TABLES.results,
+          'step_id',
+          this.#resultConcurrency,
+          async (row) => {
+            await handler({
+              runId: row.run_id,
+              seq: Number(row.seq),
+              stepId: row.step_id,
+              status: row.status as StepResult['status'],
+              output: fromJson(row.output),
+              error: fromJson(row.error),
+              startedAt: row.started_at == null ? undefined : Number(row.started_at),
+              events: fromJson(row.events),
+            });
+          },
+        )) > 0,
+      1,
+    );
   }
 
   onHeartbeat(handler: (beat: Heartbeat) => Promise<void>): void {
-    this.#startLoop(async () => (await this.#drainHeartbeats(handler)) > 0);
+    this.#startLoop(
+      async () =>
+        (await this.#drain<HeartbeatRow>(TRANSPORT_TABLES.heartbeats, 'id', 1, async (row) => {
+          await handler({
+            runId: row.run_id,
+            seq: Number(row.seq),
+            stepId: row.step_id,
+            group: row.grp,
+          });
+        })) > 0,
+      this.#idleBackoffMax,
+    );
   }
 
-  async #drainResults(handler: (result: StepResult) => Promise<void>): Promise<number> {
-    const { rows } = await this.#claim<ResultRow>(TRANSPORT_TABLES.results);
-    // Delete each row only AFTER its handler ran (at-least-once), but batch the deletes of a round
-    // into one `WHERE IN` — one round trip instead of one per row.
-    const done: string[] = [];
+  /**
+   * Claim a batch of `table` rows, hand each to `each` (up to `concurrency` at once), then delete the
+   * handled rows in one `WHERE IN` — only AFTER their handler ran (at-least-once), and only while this
+   * round still holds their claim. The batch's claims are renewed until it is done, so a slow handler
+   * never lets the rows behind it age into another instance's reclaim. A throwing `each` stops the
+   * batch: the rows not handled stay claimed, unrenewed, and are re-delivered after the lease.
+   */
+  async #drain<T extends Record<string, unknown> | object>(
+    table: string,
+    idCol: 'id' | 'step_id',
+    concurrency: number,
+    each: (row: T) => Promise<void>,
+  ): Promise<number> {
+    const { rows, token } = await this.#claim<T>(table, this.#batchSize, undefined, idCol);
+    if (rows.length === 0) return 0;
+    const idOf = (row: T): string | number =>
+      (row as Record<string, string | number>)[idCol] as string | number;
+    this.#hold(table, token, rows.map(idOf));
+    const done: Array<string | number> = [];
     try {
-      for (const row of rows) {
-        const result: StepResult = {
-          runId: row.run_id,
-          seq: Number(row.seq),
-          stepId: row.step_id,
-          status: row.status as StepResult['status'],
-          output: fromJson(row.output),
-          error: fromJson(row.error),
-          startedAt: row.started_at == null ? undefined : Number(row.started_at),
-          events: fromJson(row.events),
-        };
-        await handler(result);
-        done.push(result.stepId);
-      }
+      await eachLimited(rows, concurrency, async (row) => {
+        await each(row);
+        done.push(idOf(row));
+      });
     } finally {
+      this.#releaseToken(table, token);
       if (done.length) {
-        await this.#client().from(TRANSPORT_TABLES.results).whereIn('step_id', done).delete();
-      }
-    }
-    return rows.length;
-  }
-
-  async #drainHeartbeats(handler: (beat: Heartbeat) => Promise<void>): Promise<number> {
-    const { rows } = await this.#claim<HeartbeatRow>(TRANSPORT_TABLES.heartbeats, undefined, 'id');
-    const done: number[] = [];
-    try {
-      for (const row of rows) {
-        await handler({
-          runId: row.run_id,
-          seq: Number(row.seq),
-          stepId: row.step_id,
-          group: row.grp,
-        });
-        done.push(row.id);
-      }
-    } finally {
-      if (done.length) {
-        await this.#client().from(TRANSPORT_TABLES.heartbeats).whereIn('id', done).delete();
+        await this.#client()
+          .knexQuery()
+          .from(table)
+          .whereIn(idCol, done)
+          .where('claimed_by', token)
+          .delete();
       }
     }
     return rows.length;
@@ -503,24 +749,14 @@ export class DbTransport implements Transport, ControlPlane {
   }
 
   onControl(handler: (msg: ControlMessage) => void): void {
-    this.#startLoop(async () => (await this.#drainControl(handler)) > 0);
-  }
-
-  async #drainControl(handler: (msg: ControlMessage) => void): Promise<number> {
-    const { rows } = await this.#claim<ControlRow>(TRANSPORT_TABLES.control, undefined, 'id');
-    const done: number[] = [];
-    try {
-      for (const row of rows) {
-        const msg = fromJson<ControlPayload>(row.payload);
-        if (msg) handler(msg);
-        done.push(row.id);
-      }
-    } finally {
-      if (done.length) {
-        await this.#client().from(TRANSPORT_TABLES.control).whereIn('id', done).delete();
-      }
-    }
-    return rows.length;
+    this.#startLoop(
+      async () =>
+        (await this.#drain<ControlRow>(TRANSPORT_TABLES.control, 'id', 1, async (row) => {
+          const msg = fromJson<ControlPayload>(row.payload);
+          if (msg) handler(msg);
+        })) > 0,
+      this.#idleBackoffMax,
+    );
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -528,25 +764,28 @@ export class DbTransport implements Transport, ControlPlane {
   // ───────────────────────────────────────────────────────────────────────────
 
   /**
-   * Atomically claim up to `batchSize` un-leased rows (optionally narrowed by `where`) and stamp them
-   * with this instance's id + a fresh per-round claim timestamp, then SELECT exactly the rows this
-   * round stamped. The single conditional `UPDATE … WHERE claimed_at IS NULL OR claimed_at < stale`
-   * is the concurrency guard: two instances racing the same rows can't both stamp them (the loser's
-   * UPDATE matches nothing for those rows). A crashed claimer's rows are reclaimed once their lease
-   * expires (`claimed_at < now - leaseMs`).
+   * Atomically claim up to `limit` un-leased rows (optionally narrowed to the routing tokens `groups`)
+   * and stamp them with this instance's id + a fresh per-round claim timestamp, then SELECT exactly the
+   * rows this round stamped. The conditional `UPDATE … WHERE claimed_at IS NULL` /
+   * `… WHERE claimed_at < stale` is the concurrency guard: two instances racing the same rows can't
+   * both stamp them (the loser's UPDATE matches nothing for those rows). A crashed claimer's rows are
+   * reclaimed once their lease expires (`claimed_at < now - leaseMs`) — and with `countReclaims`, each
+   * such takeover bumps the row's `reclaims` count (the poison-task bound).
    *
-   * `claimed_at` is set to a unique, strictly-increasing-per-round value so the SELECT-back is exact
-   * even when the same instance claims several rounds in quick succession.
+   * Fresh and stale candidates are stamped by separate UPDATEs so the increment never depends on how a
+   * dialect orders the `SET` list (MySQL evaluates it left to right against the NEW values).
    */
   async #claim<T>(
     table: string,
+    limit: number,
     groups?: string[],
     idCol: 'id' | 'step_id' = 'step_id',
+    countReclaims = false,
   ): Promise<{ rows: T[]; token: string }> {
     await this.#ensureSchema();
     // The raw Knex builder — `onConflict`, the `where(cb)` grouping and `whereIn` are cleaner there
     // than through Lucid's stricter query-builder typings, and we only need plain SQL here.
-    const knex = this.#client().knexQuery();
+    const client = this.#client();
     const stale = this.#now() - this.#leaseMs;
     // Every claim is namespace-scoped: this instance only ever sees rows stamped with its own
     // namespace, so two engines/workers on different namespaces sharing one table set never
@@ -558,38 +797,245 @@ export class DbTransport implements Transport, ControlPlane {
     const token = `${this.#instanceId}:${process.hrtime.bigint().toString(36)}`;
     const at = this.#now();
 
-    // 1) Pick candidate ids (unclaimed or stale-lease), oldest first, bounded by batchSize.
-    const candidates = (await knex
+    // 1) Pick candidate ids (unclaimed or stale-lease), oldest first, bounded by `limit`.
+    const candidates = (await client
+      .knexQuery()
       .from(table)
-      .select(idCol)
+      .select(idCol, 'claimed_at')
       .where('namespace', namespace)
       .modify((q) => {
         if (groups !== undefined) q.whereIn('grp', groups);
       })
       .where((q) => q.whereNull('claimed_at').orWhere('claimed_at', '<', stale))
       .orderBy(idCol === 'id' ? 'id' : 'created_at', 'asc')
-      .limit(this.#batchSize)) as Array<Record<string, unknown>>;
+      .limit(limit)) as Array<Record<string, unknown>>;
     if (candidates.length === 0) return { rows: [], token };
-    const ids = candidates.map((c) => c[idCol] as string | number);
+    const fresh: Array<string | number> = [];
+    const lapsed: Array<string | number> = [];
+    for (const c of candidates) {
+      (c.claimed_at == null ? fresh : lapsed).push(c[idCol] as string | number);
+    }
 
     // 2) Conditionally claim them — only rows STILL un-leased flip to this round's token. A racing
     //    instance's UPDATE matches nothing for the rows it lost, so no row is claimed twice.
-    await this.#client()
-      .knexQuery()
-      .from(table)
-      .where('namespace', namespace)
-      .whereIn(idCol, ids)
-      .where((q) => q.whereNull('claimed_at').orWhere('claimed_at', '<', stale))
-      .update({ claimed_by: token, claimed_at: at });
+    if (fresh.length) {
+      await client
+        .knexQuery()
+        .from(table)
+        .where('namespace', namespace)
+        .whereIn(idCol, fresh)
+        .whereNull('claimed_at')
+        .update({ claimed_by: token, claimed_at: at });
+    }
+    if (lapsed.length) {
+      await client
+        .knexQuery()
+        .from(table)
+        .where('namespace', namespace)
+        .whereIn(idCol, lapsed)
+        .where('claimed_at', '<', stale)
+        .update({
+          claimed_by: token,
+          claimed_at: at,
+          ...(countReclaims
+            ? { reclaims: client.getWriteClient().raw('?? + 1', ['reclaims']) }
+            : {}),
+        });
+    }
 
     // 3) SELECT back exactly the rows this round won.
-    const rows = (await this.#client()
+    const rows = (await client
       .knexQuery()
       .from(table)
       .select('*')
       .where('claimed_by', token)
       .where('claimed_at', at)) as T[];
     return { rows, token };
+  }
+
+  /**
+   * Whether task reclaims are counted: the tasks table has the `reclaims` column (`autoCreate` adds
+   * it; a table from an older migration with `autoCreate: false` may not). Without it the poison
+   * bound is off — said once through `onError` — and claims behave as before.
+   */
+  #countsReclaims(): Promise<boolean> {
+    this.#reclaimsColumn ??= this.#ensureSchema()
+      .then(() => this.#client().schema.hasColumn(TRANSPORT_TABLES.tasks, 'reclaims'))
+      .then((has) => {
+        if (!has) {
+          this.#onError(
+            new Error(
+              `[DbTransport] ${TRANSPORT_TABLES.tasks} has no "reclaims" column, so poison tasks are not bounded (maxStalledCount is off). Add it — integer, not null, default 0 — or enable autoCreate`,
+            ),
+          );
+        }
+        return has;
+      })
+      .catch((err) => {
+        // Unknown yet (a transient error): don't count this round, ask again next round.
+        this.#reclaimsColumn = undefined;
+        this.#onError(err);
+        return false;
+      });
+    return this.#reclaimsColumn;
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // claim renewal — every claim held, not only the row being run
+  // ───────────────────────────────────────────────────────────────────────────
+
+  /** Start renewing `ids` of `table`, claimed under `token`. */
+  #hold(table: string, token: string, ids: Array<string | number>): void {
+    let byToken = this.#held.get(table);
+    if (!byToken) {
+      byToken = new Map();
+      this.#held.set(table, byToken);
+    }
+    byToken.set(token, new Set(ids));
+    if (this.#renewTimer) return;
+    const intervalMs = Math.max(10, Math.floor(this.#leaseMs / 3));
+    this.#renewTimer = setInterval(() => {
+      if (this.#renewal) return;
+      const round = this.#renewHeld()
+        .catch((err) => this.#onError(err))
+        .finally(() => {
+          if (this.#renewal === round) this.#renewal = undefined;
+        });
+      this.#renewal = round;
+    }, intervalMs);
+    this.#renewTimer.unref?.();
+  }
+
+  /** Stop renewing one row (settled, or no longer ours). Idempotent. */
+  #release(table: string, token: string, id: string | number): void {
+    const ids = this.#held.get(table)?.get(token);
+    if (!ids) return;
+    ids.delete(id);
+    if (ids.size === 0) this.#releaseToken(table, token);
+  }
+
+  /** Stop renewing every row of a claim round. Stops the renewal timer once nothing is held. */
+  #releaseToken(table: string, token: string): void {
+    const byToken = this.#held.get(table);
+    byToken?.delete(token);
+    if (byToken?.size === 0) this.#held.delete(table);
+    if (this.#held.size === 0 && this.#renewTimer) {
+      clearInterval(this.#renewTimer);
+      this.#renewTimer = undefined;
+    }
+  }
+
+  /**
+   * Re-stamp `claimed_at` on every row this instance holds — one UPDATE per table, matched on the
+   * rounds' claim tokens, every `leaseMs / 3`. A slow but alive instance therefore keeps every row it
+   * claimed (running or queued behind a slow one); only one that stopped renewing (crashed, lost the
+   * database, or blocked its event loop past the lease) has its rows reclaimed. Fewer rows renewed
+   * than still held means exactly that happened — reported, since the step may now run twice.
+   */
+  async #renewHeld(): Promise<void> {
+    for (const [table, byToken] of [...this.#held]) {
+      const tokens = [...byToken.keys()];
+      if (tokens.length === 0) continue;
+      const renewed = await this.#client()
+        .knexQuery()
+        .from(table)
+        .whereIn('claimed_by', tokens)
+        .update({ claimed_at: this.#now() });
+      // Rows settled during the round-trip were released, not lost: count only what is still held.
+      let stillHeld = 0;
+      for (const token of tokens) stillHeld += this.#held.get(table)?.get(token)?.size ?? 0;
+      if (Number(renewed) < stillHeld) {
+        this.#onError(
+          new Error(
+            `[DbTransport] lost ${stillHeld - Number(renewed)} of ${stillHeld} claim(s) on ${table} before renewing them — another instance reclaimed them and may process them too; raise leaseMs if this process blocks its event loop`,
+          ),
+        );
+      }
+    }
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // worker liveness + health — `${P}-worker-heartbeat:<token>:<instanceId>` in the worker-key table
+  // ───────────────────────────────────────────────────────────────────────────
+
+  /** The prefix the liveness keys are built from (`durable`, `durable-<namespace>`). */
+  #keyPrefix(): string {
+    return effectivePrefix(WORKER_KEY_PREFIX, this.#namespace);
+  }
+
+  /** The task loop serves `token`: run the concurrency controller and beat its liveness key. */
+  #beginServing(token: string): void {
+    this.#controller.start();
+    this.#startWorkerHeartbeat(token);
+  }
+
+  /**
+   * Refresh every served routing token's liveness key on one shared interval (default 10s, live 35s),
+   * stamped with the controller's {@link WorkerStatus} snapshot — the same `{ ts, status }` value and
+   * key the BullMQ and queue transports write, so the dashboard's worker cards read all three alike.
+   * A new token beats at once. Best-effort: a failed write goes to `onError` and the key expires.
+   */
+  #startWorkerHeartbeat(token: string): void {
+    const ttlMs = Math.max(
+      WORKER_HEARTBEAT_TTL_SECONDS * 1000,
+      this.#workerHeartbeatIntervalMs * 3,
+    );
+    const beatOne = (t: string): void => {
+      const now = this.#now();
+      const key = workerHeartbeatKey(this.#keyPrefix(), t, this.#instanceId);
+      const value = heartbeatKeyValue(now, this.#controller.snapshot());
+      void Promise.resolve()
+        .then(() => this.#workerKeys().put(key, value, now + ttlMs))
+        .catch((err) => this.#onError(err));
+    };
+    if (!this.#heartbeatTokens.has(token)) {
+      this.#heartbeatTokens.add(token);
+      beatOne(token);
+    }
+    if (this.#workerHeartbeatTimer) return;
+    this.#workerHeartbeatTimer = setInterval(() => {
+      for (const t of this.#heartbeatTokens) beatOne(t);
+    }, this.#workerHeartbeatIntervalMs);
+    this.#workerHeartbeatTimer.unref?.();
+  }
+
+  /**
+   * Per-group worker health, for `engine.workerHealth()` and the dashboard/Telescope worker panels.
+   *
+   * - `depth` is every task row of `group` in this namespace — pending AND claimed (running, or held
+   *   by a worker that died and not yet reclaimed): the DB can count both, so it is closer to BullMQ's
+   *   waiting+active than the queue transport's pending-only count.
+   * - `liveWorkers` are the unexpired `${P}-worker-heartbeat:<group>:<instance>` keys in the
+   *   worker-key table, each with the worker's {@link WorkerStatus} when it carries one (this
+   *   transport's own beats do; a `WorkerRuntime`'s compact beat reads as liveness only).
+   */
+  async groupHealth(group: string): Promise<GroupHealth> {
+    await this.#ensureSchema();
+    const [counted, entries] = await Promise.all([
+      this.#client()
+        .knexQuery()
+        .from(TRANSPORT_TABLES.tasks)
+        .where('namespace', this.#namespaceValue())
+        .where('grp', group)
+        .count({ n: '*' })
+        .first() as Promise<{ n?: number | string } | undefined>,
+      this.#liveWorkerKeys(),
+    ]);
+    const marker = workerHeartbeatKey(this.#keyPrefix(), group, '');
+    const liveWorkers: WorkerHeartbeat[] = [];
+    for (const { key, value } of entries) {
+      if (!key.startsWith(marker)) continue;
+      const parsed = parseHeartbeatValue(value);
+      liveWorkers.push({
+        group,
+        instanceId: key.slice(marker.length),
+        lastBeatAt: parsed.lastBeatAt,
+        ...(parsed.status !== undefined
+          ? { status: parsed.status as unknown as WorkerStatus }
+          : {}),
+      });
+    }
+    return { group, depth: Number(counted?.n) || 0, liveWorkers };
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -643,17 +1089,57 @@ export class DbTransport implements Transport, ControlPlane {
     await this.#ensureSchema();
   }
 
-  /** Stop every poll loop and wait (bounded) for in-flight ticks — a claimed task mid-handler gets
-   *  to finish + write its result instead of being abandoned to the lease expiry. Does not close
-   *  the shared `Database`. */
+  /** Stop every poll loop and wait (bounded, 5s in all) for in-flight work — the tasks in a handler
+   *  get to finish + write their result instead of being abandoned to the lease expiry; their claims
+   *  keep being renewed until they settle. Does not close the shared `Database`. */
   async stop(): Promise<void> {
     this.#pollers.stopAll();
     this.#taskLoop = undefined;
+    this.#controller.stop();
+    if (this.#workerHeartbeatTimer) clearInterval(this.#workerHeartbeatTimer);
+    this.#workerHeartbeatTimer = undefined;
+    this.#heartbeatTokens.clear();
+    const deadline = Date.now() + 5_000;
     await this.#pollers.drain(5_000);
+    if (this.#runningTasks.size > 0) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        Promise.allSettled([...this.#runningTasks]),
+        new Promise((resolve) => {
+          timer = setTimeout(resolve, Math.max(deadline - Date.now(), 0));
+        }),
+      ]);
+      clearTimeout(timer);
+    }
   }
 
   /** Stop the pollers (alias of {@link stop} for the `Transport.close` contract). */
   async close(): Promise<void> {
     await this.stop();
   }
+}
+
+/**
+ * Run `fn` over `items` with at most `limit` in flight, in order of start. The first failure stops
+ * starting new items; the ones already running settle, then it rethrows.
+ */
+async function eachLimited<T>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  let failure: { err: unknown } | undefined;
+  const lane = async (): Promise<void> => {
+    while (!failure && next < items.length) {
+      const item = items[next++] as T;
+      try {
+        await fn(item);
+      } catch (err) {
+        failure ??= { err };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, lane));
+  if (failure) throw failure.err;
 }

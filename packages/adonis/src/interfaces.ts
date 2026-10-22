@@ -1312,7 +1312,7 @@ export interface Transport {
   /** engine ← workflow worker: consume streamed {@link WorkflowStepEvent}s. Pair with dispatchStepEvent. */
   onStepEvent?(handler: (event: WorkflowStepEvent) => Promise<void>): void;
   /** Worker-health for a group: queue backlog + live worker heartbeats. Optional — only broker
-   *  transports (BullMQ, queue) that can introspect the task queue and the worker-heartbeat keys
+   *  transports (BullMQ, queue, db) that can introspect the task queue and the worker-heartbeat keys
    *  implement it. The engine aggregates this across its groups in {@link WorkflowEngine.workerHealth}. */
   groupHealth?(group: string): Promise<GroupHealth>;
   /** Distinct groups that currently have a live worker heartbeat — discovered from the heartbeat
@@ -1418,7 +1418,8 @@ export interface WorkerHeartbeat {
 export interface GroupHealth {
   group: string;
   /** Outstanding jobs in the group's task queue (waiting + active + delayed + prioritized on BullMQ;
-   *  pending only on the queue transport, whose adapter contract counts nothing else). */
+   *  pending only on the queue transport, whose adapter contract counts nothing else; pending +
+   *  claimed task rows on the db transport). */
   depth: number;
   /** Workers with a non-expired heartbeat for this group. */
   liveWorkers: WorkerHeartbeat[];

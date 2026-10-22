@@ -1,5 +1,9 @@
 import type { Database } from '@adonisjs/lucid/database';
 
+type AlterTableBuilder = Parameters<
+  Parameters<ReturnType<Database['connection']>['schema']['alterTable']>[1]
+>[0];
+
 /**
  * The DB transport's table names. Distinct from the durable *store* tables (`durable_workflow_runs`
  * etc.) — these carry the point-to-point work channels (tasks / results / heartbeats / control), so
@@ -66,6 +70,8 @@ export async function createDurableTransportTables(db: Database): Promise<void> 
       table.text('context');
       table.string('transport');
       table.integer('attempt').notNullable();
+      // How many times a lapsed claim on this row was taken over — the poison-task bound.
+      table.integer('reclaims').notNullable().defaultTo(0);
       table.string('claimed_by');
       table.bigInteger('claimed_at');
       table.bigInteger('created_at').notNullable();
@@ -126,21 +132,42 @@ export async function createDurableTransportTables(db: Database): Promise<void> 
 
   await createWorkerKeysTable(db);
 
-  // Upgrade path: a deployment created before namespaces existed already has these tables (so the
-  // guards above skipped them) but lacks the `namespace` column. Back-fill it — `notNullable` +
-  // `defaultTo('default')` stamps every legacy in-flight row `'default'`, so a default engine's
-  // `WHERE namespace='default'` claims exactly the rows it did before. Idempotent via `hasColumn`.
-  await ensureNamespaceColumn(db);
+  // Upgrade path: a deployment created by an older version already has these tables (so the guards
+  // above skipped them) but lacks the columns added since. Back-fill them — idempotent via
+  // `hasColumn`, and every added column is `notNullable` with a default, so legacy in-flight rows
+  // read exactly as they did before.
+  await ensureAddedColumns(db);
 }
 
-/** Add the `namespace` column (default `'default'`) to any transport table created before namespaces. */
-async function ensureNamespaceColumn(db: Database): Promise<void> {
-  for (const table of Object.values(TRANSPORT_TABLES)) {
-    const schema = db.connection().schema;
-    if (!(await schema.hasColumn(table, 'namespace'))) {
-      await db.connection().schema.alterTable(table, (t) => {
+/**
+ * Columns added to the transport tables after their first release, with the default that makes a
+ * legacy row behave as before:
+ *
+ * - `namespace` on every channel table, `'default'` — a default engine's `WHERE namespace='default'`
+ *   claims exactly the rows it did before namespaces existed.
+ * - `reclaims` on the tasks table, `0` — the count of lapsed claims taken over (the poison-task
+ *   bound, see `DbTransportOptions.maxStalledCount`); a legacy row starts uncounted.
+ */
+async function ensureAddedColumns(db: Database): Promise<void> {
+  const added: Array<{ table: string; column: string; add: (t: AlterTableBuilder) => void }> = [
+    ...Object.values(TRANSPORT_TABLES).map((table) => ({
+      table,
+      column: 'namespace',
+      add: (t: AlterTableBuilder) => {
         t.string('namespace').notNullable().defaultTo('default');
-      });
+      },
+    })),
+    {
+      table: TRANSPORT_TABLES.tasks,
+      column: 'reclaims',
+      add: (t: AlterTableBuilder) => {
+        t.integer('reclaims').notNullable().defaultTo(0);
+      },
+    },
+  ];
+  for (const { table, column, add } of added) {
+    if (!(await db.connection().schema.hasColumn(table, column))) {
+      await db.connection().schema.alterTable(table, add);
     }
   }
 }
