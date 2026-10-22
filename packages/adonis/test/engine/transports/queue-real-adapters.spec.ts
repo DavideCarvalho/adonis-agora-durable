@@ -508,11 +508,6 @@ describe.each(backends)(
         s1.onTenantEvent(`acme-${tag}`, (e) => got1.push(e));
         s2.onTenantEvent(`acme-${tag}`, (e) => got2.push(e));
         other.onTenantEvent(`globex-${tag}`, (e) => gotOther.push(e));
-        // A subscriber that crashed: advertised, never consuming, never refreshing.
-        const ghost = `ghost-${tag}`;
-        const value = JSON.stringify({ instanceId: ghost });
-        await keys.put(tenantSubscriberKey(prefix, `acme-${tag}`, ghost), value, Date.now() + 200);
-        await keys.put(inboxKey(prefix, ghost), value, Date.now() + 200);
         const recorded = async (tenant: string, instanceId: string) =>
           (await keys.live(Date.now())).some(
             (k) => k.key === tenantSubscriberKey(prefix, tenant, instanceId),
@@ -524,6 +519,13 @@ describe.each(backends)(
             (await recorded(`globex-${tag}`, `o-${tag}`)),
         );
 
+        // A subscriber that crashed: advertised, never consuming, never refreshing. Written right before
+        // the publish (not before the wait above) so a slow CI can't expire it before it is pushed to,
+        // and short-lived (under inboxTtlMs) so the janitor sees it dead and drains its inbox.
+        const ghost = `ghost-${tag}`;
+        const value = JSON.stringify({ instanceId: ghost });
+        await keys.put(tenantSubscriberKey(prefix, `acme-${tag}`, ghost), value, Date.now() + 150);
+        await keys.put(inboxKey(prefix, ghost), value, Date.now() + 150);
         const evt = {
           type: 'run.completed',
           runId: 'r1',
