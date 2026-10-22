@@ -92,6 +92,9 @@ const DIAGNOSTICS_EMIT = Symbol.for('@agora/diagnostics:emit');
  * await engine.start('order', input, runId)
  * ```
  */
+/** How long after boot an onError route unserved at boot is checked again before it is reported. */
+const UNSERVED_ROUTES_RECHECK_MS = 30_000;
+
 export default class DurableProvider {
   #detachDiagnostics: (() => void) | null = null;
   #transport: (Transport & { close?: () => Promise<void> }) | null = null;
@@ -413,11 +416,14 @@ export default class DurableProvider {
   }
 
   /**
-   * Says, once at boot, which onError routes name a handler workflow nothing can run yet, so a typo is
-   * caught before the first failure goes nowhere. A handler served by workers that start later also
-   * shows up here; the route still works once they are live.
+   * Says, once after boot, which onError routes name a handler workflow nothing can run, so a typo is
+   * caught before the first failure goes nowhere. Routes unserved at boot are checked again after
+   * {@link UNSERVED_ROUTES_RECHECK_MS}, so a handler whose workers start after this process is not
+   * reported.
    */
   async #reportUnservedOnErrorRoutes(engine: WorkflowEngine): Promise<void> {
+    if ((await engine.unservedOnErrorRoutes().catch(() => [])).length === 0) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, UNSERVED_ROUTES_RECHECK_MS).unref());
     const unserved = await engine.unservedOnErrorRoutes().catch(() => []);
     if (unserved.length === 0) return;
     const list = unserved

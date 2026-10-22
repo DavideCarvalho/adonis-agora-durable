@@ -788,7 +788,7 @@ export class LucidStateStore implements StateStore {
       .from(DURABLE_TABLES.checkpoints)
       .where('run_id', runId)
       .andWhere((q) => {
-        for (const p of prefixes) q.orWhere('name', 'like', `${p}%`);
+        for (const p of prefixes) q.orWhereRaw(`name like ? escape '!'`, [`${escapeLike(p)}%`]);
       })
       .orderBy('seq', 'asc');
     return (rows as CheckpointRow[]).map(rowToCheckpoint);

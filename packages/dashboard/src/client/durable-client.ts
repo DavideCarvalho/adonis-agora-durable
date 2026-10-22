@@ -44,6 +44,8 @@ export type StepKind = 'local' | 'remote' | 'sleep' | 'signal';
 export interface StepError {
   message: string;
   code?: string;
+  /** Structured, JSON-serializable detail of the failure (e.g. validation issues). */
+  details?: unknown;
   retryable?: boolean;
   stack?: string;
 }
