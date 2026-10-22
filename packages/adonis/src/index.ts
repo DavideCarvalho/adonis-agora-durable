@@ -14,6 +14,7 @@ export type {
 } from './admissions/factory.js';
 // --- config-driven admission drivers ----------------------------------------
 export { admissions } from './admissions/factory.js';
+export { currentStep } from './ambient-step.js';
 export {
   BaseWorkflow,
   setWorkflowEngineResolver,
@@ -90,6 +91,7 @@ export { childIdsOf, parentRunIdOf } from './fan-join.js';
 // --- store-less cluster: handshake & capability negotiation -----------------
 export * from './handshake/announced.js';
 export * from './handshake/descriptor.js';
+export * from './handshake/directory.js';
 export * from './handshake/negotiate.js';
 export * from './handshake/routing.js';
 export * from './interfaces.js';
@@ -99,6 +101,7 @@ export * from './on-error.js';
 export * from './pollers.js';
 export * from './protocol.js';
 export * from './queue.js';
+export { isRemoteEvent } from './remote-event.js';
 export * from './remote-workflow-executor.js';
 export * from './run-detail-summary.js';
 export * from './run-facets.js';
@@ -113,6 +116,7 @@ export {
   type ResponderTransport,
   RunRequestResponder,
   type RunRequestResponderOptions,
+  UNSUPPORTED_RUN_REQUEST,
 } from './run-gateway/run-request-responder.js';
 export {
   type RunGatewayEngine,

@@ -96,13 +96,42 @@ export function durableDashboard(opts: DurableDashboardOptions = {}): DashboardS
           },
           {
             kind: 'table',
-            title: 'Starved worker groups',
+            // Lists EVERY worker group (starved ones first); the Status column flags STARVED (queued
+            // work, zero live workers). "Starved worker groups" read as if every row were starved.
+            title: 'Worker health',
             data: { provider: 'durable.workerHealth' },
             columns: [
               { key: 'group', label: 'Group' },
               { key: 'queued', label: 'Queued' },
               { key: 'liveWorkers', label: 'Workers' },
               { key: 'status', label: 'Status' },
+            ],
+          },
+        ],
+      },
+      {
+        // One row per LIVE worker instance (the group table above has one per group). A heartbeat
+        // with no status reads `n/a`; a status with nothing measured yet (an idle worker) reads `—`.
+        title: 'Workers',
+        panels: [
+          {
+            kind: 'table',
+            title: 'Workers',
+            data: { provider: 'durable.workerStatus' },
+            columns: [
+              { key: 'group', label: 'Group' },
+              { key: 'instanceId', label: 'Instance' },
+              { key: 'mode', label: 'Mode' },
+              { key: 'limit', label: 'Limit' },
+              { key: 'minMax', label: 'Range' },
+              { key: 'saturation', label: 'In flight' },
+              { key: 'queued', label: 'Queued' },
+              { key: 'rssPct', label: 'RAM %' },
+              { key: 'cpuPct', label: 'CPU %' },
+              { key: 'throughputPerMin', label: 'Steps/min' },
+              { key: 'p95Ms', label: 'p95 ms' },
+              { key: 'lastAdjust', label: 'Last adjust' },
+              { key: 'lastBeat', label: 'Last beat' },
             ],
           },
         ],

@@ -228,6 +228,18 @@ export interface BullMQTransportConfig {
   closeTimeoutMs?: number;
   /** Receives transport failures (including pub/sub subscribe failures). Default: swallowed or `console.warn`. */
   onError?: (err: unknown) => void;
+  /**
+   * How often (ms) to PING each pub/sub subscriber connection (heartbeats, run replies, tenant
+   * events) so a connection a VPN/NAT/idle timeout dropped silently is reconnected and resubscribed
+   * instead of sitting deaf until a restart. `0` or `false` disables it. Default `30_000`.
+   */
+  pingIntervalMs?: number | false;
+  /**
+   * Wall-clock ceiling (ms) for one step handler on this worker. A handler still running at the
+   * ceiling is failed RETRYABLE so durable retry re-dispatches the step, instead of a wedged await
+   * holding its job (whose lock keeps renewing) forever. Unset = no ceiling.
+   */
+  stepTimeoutMs?: number;
 }
 
 /** Options for the DB-table-backed (`@adonisjs/lucid`) transport. */
@@ -465,6 +477,8 @@ export const transports = {
           ? { resultConcurrency: config.resultConcurrency }
           : {}),
         ...(config.onError !== undefined ? { onError: config.onError } : {}),
+        ...(config.pingIntervalMs !== undefined ? { pingIntervalMs: config.pingIntervalMs } : {}),
+        ...(config.stepTimeoutMs !== undefined ? { stepTimeoutMs: config.stepTimeoutMs } : {}),
       });
     };
   },

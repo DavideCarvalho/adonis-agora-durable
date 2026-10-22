@@ -185,3 +185,77 @@ export function aggregateAnnouncements(
   }
   return out.sort((a, b) => a.key.localeCompare(b.key));
 }
+
+/** One live worker heartbeat as {@link observedAnnouncements} reads it: the token and who beats. */
+export interface HeartbeatSighting {
+  /** The routing token the beat was published under (already partition-suffixed when partitioned). */
+  group: string;
+  /** The beating process's instance id. */
+  instanceId: string;
+}
+
+/**
+ * The weaker tier: one `'observed'` entry per live routing token that NO descriptor accounts for —
+ * how a worker on an SDK too old to describe itself still appears. `covered` holds every token the
+ * declared announcements already explain (see {@link coveredTokens}); those are dropped, so a fleet
+ * that describes itself gets exactly the registry it got before, and no worker counts twice.
+ *
+ * Everything an observation cannot know stays empty rather than guessed: no version (nothing can be
+ * pinned against it), no origin, no requires, no runtime. The `name` is the token itself, which
+ * equals the workflow name for every name a queue token round-trips (`sanitizeQueueToken` rewrites
+ * `:` to `-`, which is not invertible).
+ */
+export function observedAnnouncements(
+  heartbeats: readonly HeartbeatSighting[],
+  covered: ReadonlySet<string>,
+): AnnouncedWorkflow[] {
+  const byToken = new Map<string, Set<string>>();
+  for (const beat of heartbeats) {
+    if (!beat.group || covered.has(beat.group)) continue;
+    const instances = byToken.get(beat.group);
+    if (instances) instances.add(beat.instanceId);
+    else byToken.set(beat.group, new Set([beat.instanceId]));
+  }
+  return [...byToken.entries()]
+    .map(([group, instances]) => ({
+      evidence: 'observed' as const,
+      key: group,
+      name: group,
+      groups: [group],
+      origins: [],
+      requires: [],
+      onError: [],
+      runtimes: [],
+      instances: [...instances].sort(),
+      disagreements: [],
+    }))
+    .sort((a, b) => a.key.localeCompare(b.key));
+}
+
+/**
+ * Every routing token a live descriptor already accounts for, so it needs no observation: a token
+ * some worker announced as a WORKFLOW (already in the registry, richer than an observation), and a
+ * token some worker declared as a STEP handler (a step is not callable from outside a run, and
+ * route-by-handler gives every step its own queue, so without this the liveness floor would list a
+ * fleet's whole step surface as fake workflows). `sanitize` is the queue-token form of a name.
+ */
+export function coveredTokens(
+  announced: readonly AnnouncedWorkflow[],
+  descriptors: readonly (RawWorkerDescriptor | WorkerDescriptor)[],
+  sanitize: (name: string) => string,
+): Set<string> {
+  const tokens = new Set<string>();
+  for (const entry of announced) {
+    tokens.add(sanitize(entry.name));
+    for (const group of entry.groups) tokens.add(group);
+  }
+  for (const raw of descriptors) {
+    const d = normalizeDescriptor(raw);
+    for (const step of d.steps) {
+      const token = sanitize(step);
+      tokens.add(token);
+      if (d.partition) tokens.add(`${token}@${d.partition}`);
+    }
+  }
+  return tokens;
+}

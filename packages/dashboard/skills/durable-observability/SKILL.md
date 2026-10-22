@@ -156,6 +156,23 @@ export default defineConfig({
 })
 ```
 
+Every bridge (`collectMetrics`, `attachDurableMetrics`, `attachDurableOtel`, the
+diagnostics bridge Telescope reads) handles only the events its own instance
+produced; another pod's events, re-delivered over the control plane, are skipped
+(`isRemoteEvent(event)`), so a fleet counts and traces each event once.
+
+The mounted dashboard also serves `GET <path>/api/metrics` (these counters plus
+`durable_pending_runs` / `durable_running_runs` / `durable_dead_runs` and
+per-group `durable_group_queue_depth` / `durable_group_live_workers` gauges),
+`GET <path>/api/runs/:id/events/:key` (the latest `ctx.setEvent` value, through
+`redact.checkpoint`) and `POST <path>/api/webhooks/:token` (resumes a run parked
+on a `ctx.webhook()`; `wh:` tokens only, only while a run waits on it, and behind
+the console's guard like every route).
+
+Inside a step, a helper that was never handed the logger records through
+`currentStep()?.info(...)` (from `@adonis-agora/durable`; `undefined` outside a
+step).
+
 Live-tail one run over SSE:
 `new EventSource('/durable/api/runs/${runId}/stream')`.
 Source: `docs/observability/events-and-interceptors.mdx`,
@@ -169,7 +186,7 @@ Register the extension once and workflows appear next to requests/queries/jobs:
 import { durableTelescopeExtension } from '@adonis-agora/durable/telescope'
 
 export default defineConfig({
-  extensions: [durableTelescopeExtension({ runHref: '/durable/runs/{runId}' })],
+  extensions: [durableTelescopeExtension({ runHref: '/durable#/run/{runId}' })],
 })
 ```
 
@@ -177,7 +194,11 @@ Rollups (success rate, throughput, duration percentiles, top failures) come from
 captured entries bounded by Telescope's prune window; current-state gauges
 (dead/suspended/running/pending NOW) read live from the store via
 `engine.countRuns` (an exact `COUNT`, falling back to a capped `listRuns`
-listing on stores without it).
+listing on stores without it). The **Worker health** table lists every group
+(STARVED first); the **Workers** table has one row per live instance (mode,
+limit, saturation, RAM/CPU, steps/min, p95, last adjustment; `n/a` = no status
+reported, `—` = nothing measured yet). Copies of one event recorded by several
+pods are collapsed by event + runId + emission instant (`dedupeRunEvents`).
 Per-run actions stay in the durable dashboard. Source:
 `docs/observability/telescope.mdx`.
 
@@ -288,4 +309,5 @@ undercounts the fleet and zeroes on every deploy of that pod. Source:
 See also: `durable-reliability` — what the events mean operationally; bulk
 cancel + compensate semantics.
 See also: `durable-cluster` — which verbs proxy over the wire on store-less pods
-(`retry-with-input` / `continue` answer 404 there).
+(`retry`, `retry-with-input`, `continue` and the value pickers do; signal /
+update / tasks / events / webhooks / schedules answer 404 there).

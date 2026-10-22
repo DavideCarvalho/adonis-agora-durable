@@ -102,6 +102,40 @@ export interface BullMQTransportOptions {
    * each task worker at the deps' default concurrency.
    */
   concurrency?: ConcurrencyOption | undefined;
+  /**
+   * How often (ms) the shared subscriber watchdog PINGs every pub/sub subscriber connection this
+   * transport owns (the long-step heartbeat, run-reply and tenant-event subscribers) to detect, and
+   * recover from, a silent connection loss. A subscriber connection never writes on its own: when a
+   * VPN, NAT or idle timeout drops the TCP connection, no write fails and no timeout fires, so the
+   * connection sits "subscribed" while the server's `PUBSUB NUMSUB` already reads 0. Heartbeats stop
+   * resetting step leases, and a tenant's run-gateway calls time out until the process restarts. A
+   * PING that rejects or times out marks the connection dead: it is `disconnect(true)`ed, ioredis
+   * reconnects and `autoResubscribe` restores its channels. `0` or `false` disables the watchdog.
+   * Default `30_000`.
+   */
+  pingIntervalMs?: number | false | undefined;
+  /**
+   * Wall-clock ceiling (ms) for one step handler on THIS worker. A wedged handler (an await that will
+   * never settle: a dead connection swallowed by a wrapper stream, an external call with no timeout)
+   * otherwise holds its BullMQ job forever, because the job lock renews on a timer whether or not the
+   * handler makes progress, so the job is never reclaimed as stalled. When set, a step still running
+   * after `stepTimeoutMs` publishes a RETRYABLE failed StepResult (the engine's durable retry
+   * re-dispatches it) and the orphaned handler promise is abandoned. Opt-in: pick a value well above
+   * your slowest legitimate step. Unset (the default) = no ceiling.
+   */
+  stepTimeoutMs?: number | undefined;
+}
+
+/** Default {@link BullMQTransportOptions.pingIntervalMs}. */
+const DEFAULT_PING_INTERVAL_MS = 30_000;
+/** How long one watchdog PING may take before its subscriber connection is presumed dead. */
+const SUBSCRIBER_PING_TIMEOUT_MS = 5_000;
+
+/** `undefined` → the default, `0`/`false` → disabled, any other number → itself. */
+function normalizePingInterval(value: number | false | undefined): number | false {
+  if (value === undefined) return DEFAULT_PING_INTERVAL_MS;
+  if (value === false || value === 0) return false;
+  return value;
 }
 
 /**
@@ -172,6 +206,13 @@ export class BullMQTransport implements Transport {
   readonly #tenantEventChannels = new Set<string>();
   readonly #tenantEventHandlers = new Map<string, Set<(evt: TenantEvent) => void>>();
 
+  // Every pub/sub SUBSCRIBER connection, probed by the one shared watchdog interval. Publish-only
+  // connections are not tracked: they write, so a dead one fails its next publish instead of silently.
+  readonly #subscribers = new Set<RedisLike>();
+  readonly #pingIntervalMs: number | false;
+  readonly #stepTimeoutMs: number | undefined;
+  #pingWatchdogTimer: ReturnType<typeof setInterval> | undefined;
+
   constructor(options: BullMQTransportOptions) {
     this.#deps = options.deps;
     this.#partition = options.partition;
@@ -184,6 +225,95 @@ export class BullMQTransport implements Transport {
     this.#closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
     this.#resultConcurrency = workerConcurrency(options.resultConcurrency);
     this.#concurrency = options.concurrency;
+    this.#pingIntervalMs = normalizePingInterval(options.pingIntervalMs);
+    this.#stepTimeoutMs =
+      options.stepTimeoutMs !== undefined &&
+      Number.isFinite(options.stepTimeoutMs) &&
+      options.stepTimeoutMs > 0
+        ? options.stepTimeoutMs
+        : undefined;
+  }
+
+  /**
+   * A subscriber-mode connection: a fresh `makeRedis()` client registered with the ping watchdog and
+   * given an `error` listener. Every pub/sub subscriber goes through here, because a subscriber never
+   * writes on its own and so cannot surface a silent connection loss by itself.
+   */
+  #subscriberRedis(label: string): RedisLike {
+    const sub = this.#deps.makeRedis();
+    this.#trackSubscriber(sub, label);
+    return sub;
+  }
+
+  /**
+   * Attach a de-duplicated `error` listener and register `sub` with the watchdog. The listener is not
+   * hygiene: an `error` emitted with no listener throws on a plain EventEmitter (and a dead,
+   * reconnecting subscriber emits them in bursts), so a connection nothing else listens to could take
+   * the process down. The first error of each reconnect burst goes to `onError` when one is
+   * configured, else to `console.warn`.
+   */
+  #trackSubscriber(sub: RedisLike, label: string): void {
+    this.#subscribers.add(sub);
+    let loggedSinceReady = false;
+    sub.on('error', ((err: Error) => {
+      if (loggedSinceReady) return; // one report per reconnect burst, not one per retry
+      loggedSinceReady = true;
+      if (this.#hasOnError) this.#onError(err);
+      else
+        console.warn(`[adonis-durable] bullmq ${label} subscriber error: ${err?.message ?? err}`);
+    }) as never);
+    sub.on('ready', (() => {
+      loggedSinceReady = false;
+    }) as never);
+    this.#startPingWatchdog();
+  }
+
+  /** Start the ONE shared watchdog interval (idempotent; unref'd; cleared in {@link close}). */
+  #startPingWatchdog(): void {
+    if (this.#pingWatchdogTimer || this.#pingIntervalMs === false) return;
+    this.#pingWatchdogTimer = setInterval(() => {
+      for (const sub of this.#subscribers) void this.#pingSubscriber(sub);
+    }, this.#pingIntervalMs);
+    this.#pingWatchdogTimer.unref?.();
+  }
+
+  /**
+   * PING one subscriber; on rejection or timeout, `disconnect(true)` it so ioredis reconnects and
+   * `autoResubscribe` restores its channels. A connection that is not `'ready'` is already
+   * mid-(re)connect and is skipped. The timeout is capped at the interval, so a short interval
+   * shortens the whole detect-and-reconnect cycle.
+   */
+  async #pingSubscriber(sub: RedisLike): Promise<void> {
+    if (typeof sub.ping !== 'function') return;
+    if (sub.status !== undefined && sub.status !== 'ready') return;
+    const timeoutMs =
+      this.#pingIntervalMs === false
+        ? SUBSCRIBER_PING_TIMEOUT_MS
+        : Math.min(SUBSCRIBER_PING_TIMEOUT_MS, this.#pingIntervalMs);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('ping timed out')), timeoutMs);
+        (sub.ping as () => Promise<unknown>)().then(
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          (err: unknown) => {
+            clearTimeout(timer);
+            reject(err instanceof Error ? err : new Error(String(err)));
+          },
+        );
+      });
+    } catch (err) {
+      // A ping in flight when close() lands must not resurrect the connection close() just dropped:
+      // disconnect(true) reconnects rather than closes.
+      if (this.#closing) return;
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `[adonis-durable] bullmq subscriber connection unresponsive (${message}); reconnecting to restore its subscription`,
+      );
+      sub.disconnect(true);
+    }
   }
 
   /** The shared concurrency controller, created on first use (a task worker, a job or a heartbeat). */
@@ -478,8 +608,9 @@ export class BullMQTransport implements Transport {
   async #runTask(task: RemoteTask): Promise<boolean> {
     let result: StepResult;
     try {
-      result = await runStepHandler(task, this.#handlers.get(task.name), (beat) =>
-        this.heartbeat(beat),
+      result = await this.#withStepTimeout(
+        task,
+        runStepHandler(task, this.#handlers.get(task.name), (beat) => this.heartbeat(beat)),
       );
     } catch (err) {
       // runStepHandler is pure (a handler throw becomes a failed StepResult), so reaching here is a
@@ -510,6 +641,36 @@ export class BullMQTransport implements Transport {
       this.#onError(err);
       throw err;
     }
+  }
+
+  /**
+   * Race a step handler against {@link BullMQTransportOptions.stepTimeoutMs}. At the ceiling, resolve
+   * with a RETRYABLE failed StepResult and abandon the still-pending handler (a wedged await cannot be
+   * cancelled from outside; what matters is that the run stops waiting on it). A rejection settles
+   * through the caller's catch, as before. No ceiling configured: pass-through.
+   */
+  #withStepTimeout(task: RemoteTask, run: Promise<StepResult>): Promise<StepResult> {
+    const ms = this.#stepTimeoutMs;
+    if (ms === undefined) return run;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const ceiling = new Promise<StepResult>((resolve) => {
+      timer = setTimeout(
+        () =>
+          resolve({
+            runId: task.runId,
+            seq: task.seq,
+            stepId: task.stepId,
+            status: 'failed',
+            error: {
+              message: `remote step worker failed: step exceeded stepTimeoutMs (${ms}ms), presumed wedged`,
+              retryable: true,
+            },
+          }),
+        ms,
+      );
+      timer.unref?.();
+    });
+    return Promise.race([run, ceiling]).finally(() => clearTimeout(timer));
   }
 
   /** Worker side: publish a liveness heartbeat for an in-flight long step on the `${P}-heartbeat`
@@ -595,7 +756,7 @@ export class BullMQTransport implements Transport {
 
   onHeartbeat(handler: (beat: Heartbeat) => Promise<void>): void {
     if (this.#heartbeatSub) return; // one subscription per transport
-    const sub = this.#deps.makeRedis();
+    const sub = this.#subscriberRedis('heartbeat');
     this.#heartbeatSub = sub;
     swallowSubscribe(
       sub.subscribe(heartbeatChannel(this.#effectivePrefix())),
@@ -721,6 +882,80 @@ export class BullMQTransport implements Transport {
     return descriptors;
   }
 
+  /** Every live descriptor on every token: SCAN `${P}-worker-descriptor:*`, MGET per page. Degrades
+   *  to `[]` (reported through `onError`) when the keyspace cannot be read. */
+  async readAllWorkerDescriptors(): Promise<WorkerDescriptor[]> {
+    const client = this.#workerRedisClient();
+    const descriptors: WorkerDescriptor[] = [];
+    try {
+      await this.#scanValues(
+        client,
+        `${this.#effectivePrefix()}-worker-descriptor:`,
+        (_key, raw) => {
+          if (raw == null) return;
+          try {
+            descriptors.push(JSON.parse(raw) as WorkerDescriptor);
+          } catch {
+            /* a malformed descriptor reads as absent */
+          }
+        },
+      );
+    } catch (err) {
+      this.#onError(err);
+      return [];
+    }
+    return descriptors;
+  }
+
+  /** Every live worker heartbeat on every token: SCAN `${P}-worker-heartbeat:*`. A key is
+   *  `<prefix><token>:<instance>` and neither segment carries a `:`. Degrades to `[]`. */
+  async readAllWorkerHeartbeats(): Promise<WorkerHeartbeat[]> {
+    const client = this.#workerRedisClient();
+    const prefix = workerHeartbeatKeyPrefix(this.#effectivePrefix());
+    const beats: WorkerHeartbeat[] = [];
+    try {
+      await this.#scanValues(client, prefix, (key, raw) => {
+        const rest = key.slice(prefix.length);
+        const sep = rest.indexOf(':');
+        if (sep <= 0) return;
+        const parsed = parseHeartbeatValue(raw);
+        beats.push({
+          group: rest.slice(0, sep),
+          instanceId: rest.slice(sep + 1),
+          lastBeatAt: parsed.lastBeatAt,
+          ...(parsed.status !== undefined
+            ? { status: parsed.status as unknown as WorkerStatus }
+            : {}),
+        });
+      });
+    } catch (err) {
+      this.#onError(err);
+      return [];
+    }
+    return beats;
+  }
+
+  /** SCAN every key under `prefix` (never KEYS) and hand each key and its value to `visit`. */
+  async #scanValues(
+    client: RedisLike,
+    prefix: string,
+    visit: (key: string, raw: string | null) => void,
+  ): Promise<void> {
+    let cursor = '0';
+    do {
+      const [next, keys] = await client.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', 100);
+      cursor = next;
+      if (keys.length === 0) continue;
+      const raws = client.mget
+        ? await client.mget(...keys)
+        : await Promise.all(keys.map((k) => client.get(k)));
+      for (let i = 0; i < keys.length; i += 1) {
+        const key = keys[i];
+        if (key !== undefined) visit(key, raws[i] ?? null);
+      }
+    } while (cursor !== '0');
+  }
+
   /** Per-group worker-health: queue depth (waiting+active+delayed+prioritized) + live workers (their
    *  non-expired heartbeat keys). `group` is a routing token — the same value a dispatch targets. */
   async groupHealth(group: string): Promise<GroupHealth> {
@@ -818,7 +1053,7 @@ export class BullMQTransport implements Transport {
   onRunReply(handler: (reply: RunReply) => void): void {
     if (this.#runReplySub) return; // one subscription per transport
     const channel = runReplyChannel(this.#effectivePrefix());
-    const sub = this.#deps.makeRedis();
+    const sub = this.#subscriberRedis('run-reply');
     this.#runReplySub = sub;
     swallowSubscribe(
       sub.subscribe(channel),
@@ -878,7 +1113,7 @@ export class BullMQTransport implements Transport {
   /** The ONE shared tenant-events subscriber, created lazily with a single channel-routing listener. */
   #tenantEventSubscriber(): RedisLike {
     if (this.#tenantEventSub) return this.#tenantEventSub;
-    const sub = this.#deps.makeRedis();
+    const sub = this.#subscriberRedis('tenant-event');
     this.#tenantEventSub = sub;
     sub.on('message', ((msgChannel: string, payload: string) => {
       const handlers = this.#tenantEventHandlers.get(msgChannel);
@@ -904,6 +1139,8 @@ export class BullMQTransport implements Transport {
     this.#controller?.stop();
     if (this.#workerHeartbeatTimer) clearInterval(this.#workerHeartbeatTimer);
     this.#workerHeartbeatTimer = undefined;
+    if (this.#pingWatchdogTimer) clearInterval(this.#pingWatchdogTimer);
+    this.#pingWatchdogTimer = undefined;
     // Workers first (concurrently with each other), THEN queues: a worker's close() waits for its
     // in-flight job, which publishes its result/decision through a queue, so that queue must still be
     // open until every worker has settled. One shared deadline bounds both phases: a graceful

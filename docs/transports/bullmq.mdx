@@ -164,6 +164,21 @@ Two gaps remain. The engine's opt-in `remoteRedispatchMs` self-heal covers both 
 
 `engine.redispatchPending(runId)` is the manual fix for a run that is already stuck.
 
+### Wedged steps (`stepTimeoutMs`)
+
+A third gap: a handler that never returns. An `await` that never settles (a dead connection swallowed by a wrapper stream, an HTTP call with no timeout) holds its BullMQ job for good. BullMQ renews the job lock on a timer, whether or not the handler makes progress, so the job never stalls and no peer reclaims it. The run waits until someone kills the worker.
+
+`stepTimeoutMs` puts a wall-clock ceiling on each step handler a worker runs. A step still running at the ceiling publishes a **retryable** failed `StepResult`, so the engine's durable retry re-dispatches it, and the transport stops waiting on the handler. The handler's promise cannot be cancelled from outside: it is abandoned, and anything it does later is ignored.
+
+```ts title="config/durable.ts"
+bullmq: transports.bullmq({
+  connection: { host: '127.0.0.1', port: 6379 },
+  stepTimeoutMs: 15 * 60_000, // well above the slowest legitimate step
+}),
+```
+
+It is off by default. Pick a value comfortably above your slowest legitimate step: a step that is slow but healthy and crosses the ceiling is retried, and its first attempt keeps running in the background. Workflow turns are not covered. This is a per-worker safety net; the per-step `timeoutMs` on `ctx.step` is the engine-side limit, enforced through heartbeats.
+
 ## Worker liveness
 
 Each served routing token gets a liveness key, `<P>-worker-heartbeat:<token>:<instanceId>`. Its value is `{ ts, status }`, where `status` is the live concurrency snapshot. Every token is refreshed on one shared **10s** interval, and the key has a **35s** TTL. A worker that stops refreshing disappears from the registry when its key expires.
@@ -171,6 +186,18 @@ Each served routing token gets a liveness key, `<P>-worker-heartbeat:<token>:<in
 Workers that run the store-less [worker runtime](/docs/durable/cluster/thin-workers) also publish a [handshake](/docs/durable/cluster/handshake) descriptor under `<P>-worker-descriptor:<token>:<instanceId>`. The engine reads these keys with `SCAN` (never `KEYS`) and caches descriptor reads for 5s per token, so routing does not scan Redis on every dispatch. Per-group health, meaning queue depth (waiting + active + delayed + prioritized) plus live workers, comes from the same keys.
 
 `instanceId` defaults to `ts-<hostname>-<pid>`. The Python SDK uses `py-<hostname>-<pid>`, so the fleet view shows which runtime each worker runs.
+
+The transport also reads both keyspaces fleet-wide: `readAllWorkerDescriptors()` and `readAllWorkerHeartbeats()` scan every token at once. They back [`engine.workflowDirectory()`](/docs/durable/cluster/handshake#what-can-i-call), which lists every workflow the live fleet can run.
+
+## Subscriber health (`pingIntervalMs`)
+
+The heartbeat, run-reply and tenant-event channels are Redis pub/sub subscriptions, each on its own connection. A subscriber connection never writes on its own. When a VPN, a NAT gateway or an idle timeout drops its TCP connection without a close, nothing fails: ioredis still reports the connection as ready, while Redis has already dropped the subscription (`PUBSUB NUMSUB` reads 0). Long-step heartbeats stop resetting step leases, and a tenant pod's run-gateway calls time out, until the process restarts.
+
+The transport runs one shared watchdog that `PING`s every subscriber connection each `pingIntervalMs` (default `30_000`). `PING` is allowed in subscriber mode. A ping that fails, or takes longer than the smaller of 5s and the interval, marks the connection dead: the transport disconnects it, ioredis reconnects, and ioredis's `autoResubscribe` restores its channels. A connection that is already reconnecting is skipped. `0` or `false` turns the watchdog off.
+
+Each subscriber connection also gets an `error` listener. The first error of each reconnect burst goes to `onError`, or to `console.warn` without one, instead of surfacing as an unhandled `error` event.
+
+A real close (a Redis restart, `CLIENT KILL`) needs no watchdog: ioredis reconnects and resubscribes by itself. The watchdog is for the silent drop. [`controlPlanes.redis`](/docs/durable/transports/control-plane) runs the same watchdog on the control channel.
 
 ## Beyond steps
 
@@ -197,7 +224,9 @@ The same transport also carries:
 | `partition` | — | Isolation suffix (`@<partition>`) on every per-name task queue this instance subscribes to. |
 | `instanceId` | `ts-<hostname>-<pid>` | Stable id for this process, stamped on its liveness keys. |
 | `closeTimeoutMs` | `5000` | Graceful-shutdown deadline for `close()`. `0` skips the wait. |
-| `onError` | swallowed / `console.warn` | Receives background failures: heartbeat refresh errors, result-publish errors, pub/sub subscribe failures, and a result the transport gave up on. |
+| `pingIntervalMs` | `30_000` | How often the subscriber watchdog pings each pub/sub connection. `0` or `false` disables it. See [Subscriber health](#subscriber-health-pingintervalms). |
+| `stepTimeoutMs` | — (off) | Wall-clock ceiling per step handler; a step past it fails retryable. See [Wedged steps](#wedged-steps-steptimeoutms). |
+| `onError` | swallowed / `console.warn` | Receives background failures: heartbeat refresh errors, result-publish errors, pub/sub subscribe failures and subscriber connection errors, unreadable fleet keyspaces, and a result the transport gave up on. |
 
 `transports.bullmq(config)` returns the lazy driver thunk used in `config/durable.ts`. The underlying `BullMQTransport` class (with `createBullMQDeps`) is also exported from `@adonis-agora/durable` if you want to build one by hand.
 

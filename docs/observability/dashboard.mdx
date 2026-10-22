@@ -290,7 +290,7 @@ The runs list already *names* what a suspended run is parked on (the [`waiting`]
 - **`POST /api/runs/:id/update/:name`** delivers `{ arg? }` to a [`ctx.onUpdate(name)`](/docs/durable/authoring/queries-and-updates#updates) point. The workflow's registered validator arbitrates **server-side**: a rejection answers `422` with the reason, and nothing is delivered.
 - **`POST /api/runs/:id/tasks/:name/complete`** (body `{ result? }`) and **`.../fail`** (body `{ error }`) settle an external [`ctx.task`](/docs/durable/authoring/external-tasks#external-async-completion-tasks--ctxtask) — the console equivalents of `engine.completeTask` / `engine.failTask`. The response is honest about delivery: `{ result, delivered: true }` when a live waiter consumed it, `{ result: null, delivered: false }` when no waiter was live *yet* and the completion was **buffered** for the run to consume when it reaches the task's wait — buffered is success, not a 404.
 
-On a store-less `tenant` pod these verbs answer `404` (like `retry-with-input` and `continue`) — they need the engine's signal surface.
+On a store-less `tenant` pod these verbs answer `404`: they need the engine's signal surface. `retry`, `retry-with-input` and `continue` do work there; they ride the wire to the control plane (see [the gateway verbs](/docs/durable/cluster/roles-and-config#reading-and-steering-runs-rungateway)).
 
 #### Bulk actions
 
@@ -318,6 +318,46 @@ The response is `{ matched, applied }`. `matched` is how many runs the filter re
 <Callout type="warn" title="Bulk acts on at most 500 runs per call">
 The filter is evaluated with a hard cap of 500 and no paging. A filter matching more than that silently acts on the first 500 — narrow the filter (a tighter `namespace`, a time-bounded `attr`) and repeat, rather than assuming one call drained the backlog. Compare `matched` against `500` to tell.
 </Callout>
+
+### Live queries, webhooks and metrics
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `GET` | `/durable/api/runs/:id/events/:key` | the latest value the run published for `key` with `ctx.setEvent` |
+| `POST` | `/durable/api/webhooks/:token` | deliver a `ctx.webhook()` callback; the JSON body resumes the waiting run |
+| `GET` | `/durable/api/metrics` | Prometheus text exposition of this process's counters plus backlog and worker gauges |
+
+**`GET /api/runs/:id/events/:key`** is a side-effect-free read of a live (or finished) run, the HTTP form of [`engine.getEvent(runId, key)`](/docs/durable/authoring/queries-and-updates). It answers `{ value }`, or `{}` when the run never published that key, and `404` for an unknown run. The value goes through your `redact.checkpoint` hook as the `output` of the `event:<key>` checkpoint, since that is where it is stored.
+
+**`POST /api/webhooks/:token`** resumes a run parked on [`ctx.webhook().wait()`](/docs/durable/authoring/webhooks). It only takes webhook tokens (`wh:<runId>:<seq>`), so it is not a second signal endpoint, and only while a run is actually waiting on that token: a duplicate, stale or guessed callback answers `404` and buffers nothing. It answers `{ result }` on delivery and `413` past the 1 MiB payload limit.
+
+<Callout type="warn" title="The webhook route is behind the console's guard">
+Like every route here, `webhooks/:token` runs behind `authorize` (and, with built-in auth, needs a session that may act). A webhook token embeds the run id, which a caller may know, so it is not a secret to rely on. Let the sender through in `authorize`, for example by checking a shared header or a signature for that path, or expose your own public route that verifies the sender and calls `engine.signal(token, body)`. Point `webhookUrl` in `config/durable.ts` at whichever route you choose.
+</Callout>
+
+**`GET /api/metrics`** serves `text/plain; version=0.0.4` for a Prometheus scrape:
+
+```text
+# TYPE durable_runs_total counter
+durable_runs_total{event="completed"} 1284
+durable_runs_total{event="failed"} 7
+# TYPE durable_steps_total counter
+durable_steps_total{event="completed"} 9921
+...
+# TYPE durable_pending_runs gauge
+durable_pending_runs 12
+# TYPE durable_running_runs gauge
+durable_running_runs 3
+# TYPE durable_dead_runs gauge
+durable_dead_runs 0
+# TYPE durable_group_queue_depth gauge
+durable_group_queue_depth{group="reports"} 4
+# TYPE durable_group_live_workers gauge
+durable_group_live_workers{group="reports"} 0
+```
+
+- The **counters** are the [`collectMetrics`](/docs/durable/observability/metrics) counters of the process that served the scrape, started when the dashboard boots. They count only the events that process produced, so scrape every pod and sum: each event is counted once across the fleet. A `tenant` pod has no engine and serves no counters.
+- The **gauges** are read at scrape time: `durable_pending_runs` (the dispatch backlog), `durable_running_runs`, `durable_dead_runs` (the dead-letter queue), and per worker group its queue depth and live-worker count. `depth > 0` with `0` live workers is the alert. On a `tenant` pod the run gauges count the tenant's own runs through the control plane, and are left out when the control plane is too old to answer.
 
 ### Schedules
 
@@ -447,7 +487,7 @@ When you run a [split or polyglot cluster](/docs/durable/cluster), the console g
 - **Per pod** — its protocol version, negotiated level (**compatible** / **degraded** / **incompatible**), and a red flag with the exact reason on a mismatch (e.g. *"no common protocol major: local speaks [1, 1], remote speaks [2, 2]"*).
 - **Blocked runs** — runs parked because no live worker advertises a [required capability](/docs/durable/cluster/handshake#capability-aware-routing), so a stuck fleet is diagnosable at a glance rather than a silent hang.
 
-A store-less `tenant` api/dashboard pod serves this same view — its reads proxy to the control plane over the wire, so the panel looks identical whether or not the pod owns a store. Some verbs have no wire equivalent yet and always answer `404` on such a pod: `retry-with-input`, `continue`, the [human-in-the-loop verbs](#human-in-the-loop-signals-updates-and-tasks) (`signal`, `update`, `tasks/*`), and the [schedule controls](#schedules).
+A store-less `tenant` api/dashboard pod serves this same view — its reads proxy to the control plane over the wire, so the panel looks identical whether or not the pod owns a store. `retry` (an in-place retry), `retry-with-input`, `continue`, the value pickers and the list's `waiting` column all ride the wire too. Against a control plane too old to know those verbs, each falls back to what it did before: `retry` re-dispatches the run's pending steps, `retry-with-input` and `continue` answer `404`, the pickers count a bounded listing, and rows carry no `waiting`. Some verbs have no wire equivalent yet and always answer `404` on such a pod: the [human-in-the-loop verbs](#human-in-the-loop-signals-updates-and-tasks) (`signal`, `update`, `tasks/*`), [`events/:key` and `webhooks/:token`](#live-queries-webhooks-and-metrics), and the [schedule controls](#schedules).
 
 ## Engine health and admin surface
 
@@ -501,7 +541,7 @@ Both return an unsubscribe function. `onEnqueued` is only useful on instances th
 
 ## Calling the API directly
 
-The JSON API is a small, framework-light surface — `listRuns`, `getRun`, `runValues`, `retryRun`, `retryWithInputRun`, `continueRun`, `redispatchPendingRun`, `cancelRun`, `bulkAction`, `health`, `workers`, `topology` and `compat`, all exported from `@adonis-agora/durable/dashboard` — so you can build your own UI or operational scripts on the same routes. The full wire contract, human-in-the-loop and schedule verbs included, is published as [the OpenAPI document](#the-openapi-contract):
+The JSON API is a small, framework-light surface — `listRuns`, `getRun`, `runValues`, `retryRun`, `retryWithInputRun`, `continueRun`, `redispatchPendingRun`, `cancelRun`, `bulkAction`, `getRunEvent`, `deliverWebhook`, `metricsText`, `health`, `workers`, `topology` and `compat`, all exported from `@adonis-agora/durable/dashboard` — so you can build your own UI or operational scripts on the same routes. The full wire contract, human-in-the-loop and schedule verbs included, is published as [the OpenAPI document](#the-openapi-contract):
 
 ```ts
 // Retry every run that failed on a transient charge error, in one call.

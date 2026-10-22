@@ -9,6 +9,7 @@ import {
   durableThroughputProvider,
   durableTimeseriesProvider,
   durableWorkerHealthProvider,
+  durableWorkerStatusProvider,
 } from './data-providers.js';
 import { durableSchedules } from './schedules.js';
 import type { TelescopeExtension } from './telescope-sdk.js';
@@ -41,6 +42,7 @@ export function durableTelescopeExtension(opts: DurableDashboardOptions = {}): T
       durableTimeseriesProvider(),
       durableRecentFailuresProvider(),
       durableWorkerHealthProvider(),
+      durableWorkerStatusProvider(),
       durableDurationProvider(),
       durableRunsOverTimeProvider(),
       durableSuccessRateProvider(),

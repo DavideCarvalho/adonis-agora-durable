@@ -1,3 +1,4 @@
+import { runInStepLogger } from './ambient-step.js';
 import { backoffDelay } from './backoff.js';
 import { instantCheckpoint } from './checkpoints.js';
 import { type Completion, completionError, unwrapCompletion } from './completion.js';
@@ -297,7 +298,10 @@ export function createWorkflowCtx(
           attempt,
         };
         const body = () =>
-          runInStepScope(scopeOwner, name, () => fn(createStepLogger(events, host.clock)));
+          runInStepScope(scopeOwner, name, () => {
+            const logger = createStepLogger(events, host.clock);
+            return runInStepLogger(logger, () => fn(logger));
+          });
         const output = host.interceptStep
           ? await host.interceptStep(invocation, body)
           : await body();

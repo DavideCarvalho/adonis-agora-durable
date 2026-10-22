@@ -65,6 +65,9 @@ describe('DashboardProvider — boots inside a real AdonisJS app', () => {
         'durable_dashboard.runs.cancel',
         'durable_dashboard.health',
         'durable_dashboard.compat',
+        'durable_dashboard.metrics',
+        'durable_dashboard.runs.event',
+        'durable_dashboard.webhooks.deliver',
       ]),
     );
   });

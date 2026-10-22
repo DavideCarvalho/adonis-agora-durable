@@ -1416,10 +1416,11 @@ export interface RunRequest {
 
 /**
  * The discriminated verb + args of a {@link RunRequest}. Mirrors THIS package's tenant-facing
- * {@link RunGateway} — so it diverges from aviary's verb set (aviary has `getRunDetail`/`retry`/
- * `continue`/`retryWithInput`/`waitingFor`; this package has `getRun`/`getCheckpoints`/
- * `getSearchAttributes`/`signal`) while the shared verbs (`listRuns`/`cancel`/`redispatch`/
- * `workerHealth`) keep aviary's EXACT shape, and the request/reply ENVELOPE stays byte-compatible.
+ * {@link RunGateway}: aviary's whole verb set in aviary's EXACT shapes (`getRunDetail`,
+ * `getFanMembers`, `listRuns`, `runFacets`, `runValueFacets`, `workerHealth`, `cancel`, `retry`,
+ * `continue`, `retryWithInput`, `redispatch`, `waitingFor`), plus this package's own
+ * `getRun`/`getCheckpoints`/`getRunChildren`/`getSearchAttributes`/`signal`. The request/reply
+ * ENVELOPE stays byte-compatible.
  * `start` and `subscribe` are NOT here — they ride `${P}-start-run` and `${P}-tenant-events-<tenant>`
  * respectively.
  */
@@ -1442,7 +1443,22 @@ export type RunRequestKind =
   | { kind: 'workerHealth' }
   | { kind: 'signal'; runId: string; signal: string; payload?: unknown }
   | { kind: 'cancel'; runId: string; opts?: { compensate?: boolean } }
-  | { kind: 'redispatch'; runId: string };
+  | { kind: 'redispatch'; runId: string }
+  // Aviary's verbs, in aviary's shapes. `runFacets`/`runValueFacets` are namespace-forced like
+  // `listRuns`; `waitingFor` is bulk and filtered to the requester's own runs; the rest are
+  // runId-bearing and ownership-checked first. Additive: an older control plane answers them with an
+  // unknown-verb error, which `ProxyRunGateway` reports as such.
+  | { kind: 'runFacets'; query: RunFacetQuery }
+  | {
+      kind: 'runValueFacets';
+      axis: RunValueAxis;
+      query: RunFacetQuery;
+      opts?: RunValueFacetOptions | undefined;
+    }
+  | { kind: 'retry'; runId: string }
+  | { kind: 'continue'; runId: string }
+  | { kind: 'retryWithInput'; runId: string; input: unknown }
+  | { kind: 'waitingFor'; runIds: string[] };
 
 /** The control plane's answer to a {@link RunRequest} (or to a start-run, correlated by the minted
  *  runId), keyed by `requestId`. Byte-compatible with aviary's `RunReply`. */
@@ -1535,6 +1551,17 @@ export interface Transport {
    * `[]` (never throw) when the keyspace is empty or unreadable. Pairs with {@link listWorkerGroups}.
    */
   listWorkerDescriptors?(token: string): Promise<WorkerDescriptor[]>;
+  /**
+   * EVERY live worker descriptor, across all routing tokens — the fleet-wide read behind
+   * {@link WorkflowEngine.workflowDirectory}. Optional, and MUST degrade to `[]` when unreadable.
+   */
+  readAllWorkerDescriptors?(): Promise<WorkerDescriptor[]>;
+  /**
+   * EVERY live worker heartbeat, across all routing tokens — the liveness floor of
+   * {@link WorkflowEngine.workflowDirectory}, which is how a worker too old to publish a descriptor
+   * still shows up. Optional, same as {@link readAllWorkerDescriptors}.
+   */
+  readAllWorkerHeartbeats?(): Promise<WorkerHeartbeat[]>;
 
   // -------------------------------------------------------------------------
   // P4 — store-less read/control/start protocol (spec §6.2, §8). All OPTIONAL:
