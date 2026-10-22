@@ -416,7 +416,7 @@ export default defineConfig({
 | `trackStepStart` | `boolean` | `true` | Persist a `running` checkpoint when a local step starts; `false` halves checkpoint writes on hot paths. |
 | `leaseMs` | `number` | `30000` | Recovery lease duration. See [Delivery under multiple instances](/docs/durable/reliability/multi-instance). |
 | `instanceId` | `string` | random | Unique per process; run leases are held by it. |
-| `namespace` | `string` | `'default'` | Worker-pool partition; poll and recovery paths act only on this namespace. See [Tenancy](/docs/durable/concepts/tenancy). |
+| `namespace` | `string` | `'default'` on `standalone`; unset (operator) on `control-plane` | Worker-pool partition; poll and recovery paths act only on this namespace. A `control-plane` with no `namespace` is the operator and drives every pool (before 0.51 an unset namespace meant operator on every role). See [Tenancy](/docs/durable/concepts/tenancy). |
 | `maxRecoveryAttempts` | `number` | unlimited | Crash-recovery pickups before a run moves to `dead`. See [Dead-letter queue](/docs/durable/reliability/dead-letter). |
 | `compensationRetries` | `number` | `1` | Attempts per saga compensation on run failure. See [Retrying a transient undo](/docs/durable/reliability/sagas#retrying-a-transient-undo). |
 | `compensationTimeoutMs` | `number` | `300000` | Upper bound on awaiting one dispatched compensation without its own `timeoutMs`. |
