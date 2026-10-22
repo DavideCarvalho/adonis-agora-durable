@@ -472,6 +472,14 @@ export interface WorkflowEngineDeps {
    */
   remoteRedispatchMs?: number | undefined;
   /**
+   * Minimum gap (ms) between two persisted heartbeats of one step (see `persistHeartbeat`). Default
+   * 10s: beats can arrive every few seconds from a hot loop, and liveness observability must not
+   * become a per-item UPDATE storm. It is also how stale a beat persisted by ANOTHER instance can be
+   * when a step's dispatcher reads it, so the dispatcher allows this much extra silence once it sees
+   * beats landing elsewhere. Mostly a testing knob.
+   */
+  heartbeatPersistThrottleMs?: number | undefined;
+  /**
    * Max times {@link remoteRedispatchMs} re-dispatches one lost remote step before giving up and
    * failing it as a {@link RemoteStepError} (`code: 'remote_step_lost'`), so the run fails / dead-letters
    * instead of re-dispatching forever. Default 10. Ignored when `remoteRedispatchMs` is unset.
@@ -639,6 +647,7 @@ export class WorkflowEngine {
   private readonly leaseMs: number;
   private readonly maxRecoveryAttempts?: number | undefined;
   private readonly reconcileMs: number | undefined;
+  private readonly heartbeatPersistThrottleMs: number;
   private readonly timerBatchSize: number;
   private readonly remoteRedispatchMs: number | undefined;
   private readonly remoteRedispatchMax: number;
@@ -699,8 +708,9 @@ export class WorkflowEngine {
   private readonly accumulators: EventAccumulators;
   /** In-flight remote steps awaiting a worker result, keyed by stepId. */
   private readonly pending = new Map<string, PendingRemote>();
-  /** Per-step "reset the liveness timer" callbacks, called when a heartbeat arrives. */
-  private readonly heartbeatResets = new Map<string, () => void>();
+  /** Per-step "reset the liveness timer" callbacks, called with the beat's worker timestamp when a
+   *  heartbeat arrives. */
+  private readonly heartbeatResets = new Map<string, (at: number | undefined) => void>();
   private readonly listeners = new Set<EngineListener>();
   /** Step interceptors (onion middleware around real local-step execution), first = outermost. */
   private readonly interceptors: StepInterceptor[] = [];
@@ -798,6 +808,11 @@ export class WorkflowEngine {
     this.maxRecoveryAttempts = deps.maxRecoveryAttempts;
     // Default 5min; an explicit 0 disables the fallback (opt back into wake-forever-on-lost-event).
     this.reconcileMs = deps.reconcileMs === undefined ? 300_000 : deps.reconcileMs || undefined;
+    // Validated like `timerBatchSize`: a NaN/negative throttle would silently disable the
+    // cross-instance liveness salvage (`timeoutMs + NaN` never compares true). `0` stays valid.
+    const throttle = deps.heartbeatPersistThrottleMs;
+    this.heartbeatPersistThrottleMs =
+      throttle !== undefined && Number.isFinite(throttle) && throttle >= 0 ? throttle : 10_000;
     // A non-finite or sub-1 value falls back to the default: a NaN limit would stall timer recovery.
     const batch = deps.timerBatchSize;
     this.timerBatchSize =
@@ -877,7 +892,7 @@ export class WorkflowEngine {
       // lost and double-dispatched (see rearmStepLease).
       async (beat) => {
         const reset = this.heartbeatResets.get(beat.stepId);
-        if (reset) reset();
+        if (reset) reset(beat.at);
         else await this.rearmStepLease(beat.runId, beat.seq);
         this.persistHeartbeat(beat);
       },
@@ -1210,7 +1225,7 @@ export class WorkflowEngine {
 
   /**
    * Persist a worker heartbeat on its step's checkpoint (see {@link StepCheckpoint.lastHeartbeatAt}),
-   * best-effort and THROTTLED per step (≥10s between writes) — beats may arrive every few seconds
+   * best-effort and THROTTLED per step (≥ `heartbeatPersistThrottleMs`, default 10s, between writes) — beats may arrive every few seconds
    * from a hot batch loop, and liveness observability must not turn into a per-item UPDATE storm.
    * One exemption: a beat CARRYING progress punches through when the last persisted one had none —
    * the automatic pickup beat lands first (no payload) and must not shadow the handler's first real
@@ -1224,7 +1239,12 @@ export class WorkflowEngine {
     const last = this.heartbeatPersists.get(beat.stepId);
     const upgradesToProgress =
       beat.progress !== undefined && last !== undefined && !last.hadProgress;
-    if (last !== undefined && now - last.at < 10_000 && !upgradesToProgress) return;
+    if (
+      last !== undefined &&
+      now - last.at < this.heartbeatPersistThrottleMs &&
+      !upgradesToProgress
+    )
+      return;
     if (this.heartbeatPersists.size > 1024) this.heartbeatPersists.clear();
     this.heartbeatPersists.set(beat.stepId, { at: now, hadProgress: beat.progress !== undefined });
     void this.store
@@ -4632,7 +4652,7 @@ export class WorkflowEngine {
         });
       }
       const awaited = def.timeoutMs
-        ? this.awaitWithHeartbeat(id, resultPromise, def.timeoutMs)
+        ? this.awaitWithHeartbeat(run.id, seq, id, resultPromise, def.timeoutMs)
         : resultPromise;
       await this.awaitCompensationOutcome(
         run.id,
@@ -5700,7 +5720,14 @@ export class WorkflowEngine {
       );
       try {
         const resolution = step.timeoutMs
-          ? await this.awaitWithHeartbeat(id, resultPromise, step.timeoutMs, step.pickupTimeoutMs)
+          ? await this.awaitWithHeartbeat(
+              runId,
+              seq,
+              id,
+              resultPromise,
+              step.timeoutMs,
+              step.pickupTimeoutMs,
+            )
           : await resultPromise;
         return await this.settleRemoteAttempt(
           runId,
@@ -5786,6 +5813,8 @@ export class WorkflowEngine {
    * window, so a worker that keeps beating stays alive past `timeoutMs`.
    */
   private awaitWithHeartbeat(
+    runId: string,
+    seq: number,
     id: string,
     resultPromise: Promise<RemoteResolution>,
     timeoutMs: number,
@@ -5793,6 +5822,8 @@ export class WorkflowEngine {
   ): Promise<RemoteResolution> {
     return new Promise<RemoteResolution>((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout>;
+      let settled = false;
+      const dispatchedAt = this.clock();
       // Two windows, one timer: until the FIRST beat arrives the job may be sitting in the broker
       // queue behind long work — a stretch that produces no heartbeats by definition, so it gets
       // `pickupTimeoutMs` (default: `timeoutMs`, the historical behavior). The worker's automatic
@@ -5805,20 +5836,59 @@ export class WorkflowEngine {
       const window = () =>
         Math.min(seenBeat ? timeoutMs : (pickupTimeoutMs ?? timeoutMs), MAX_BACKOFF_MS);
       const cleanup = () => {
+        settled = true;
         clearTimeout(timer);
         this.heartbeatResets.delete(id);
       };
-      const arm = () => {
-        const ms = window();
-        timer = setTimeout(() => {
-          cleanup();
-          this.pending.delete(id);
-          reject(new RemoteStepTimeout(id, ms));
-        }, ms);
+      const arm = (ms = window()) => {
+        timer = setTimeout(() => void expire(ms), ms);
         (timer as { unref?: () => void }).unref?.();
       };
-      this.heartbeatResets.set(id, () => {
+      // Worker timestamps of the beats THIS instance heard, to tell its own persisted beats from ones
+      // persisted by another instance. Bounded: a step beating for days must not grow it forever.
+      const localBeats = new Set<number>();
+      // Set once a persisted beat of this attempt turns out to come from another instance.
+      let beatsLandElsewhere = false;
+      // The window ran out with no beat seen HERE. With several engine instances consuming the same
+      // heartbeat queue (the `queue` transport: point-to-point), the beats may have landed on another
+      // instance — which persists them on the checkpoint (`persistHeartbeat`) but cannot reach this
+      // timer. Before declaring the worker dead, read the persisted beat: a recent one (from this
+      // attempt) means the step is alive, so re-arm instead of failing over a healthy step and
+      // re-dispatching it while it still runs.
+      //
+      // "Recent" has to account for the persist throttle: the other instance writes at most one beat
+      // per `heartbeatPersistThrottleMs`, so the newest beat it heard can be up to that much newer
+      // than the one on the checkpoint. Once a persisted beat is known to come from elsewhere (its
+      // timestamp is not one this instance heard), that much extra silence is allowed. A beat this
+      // instance persisted itself gets no allowance — it knows its own beats exactly — so a lone
+      // instance detects a dead worker as fast as before.
+      const expire = async (ms: number) => {
+        if (settled) return;
+        const at = await this.store
+          .getCheckpoint(runId, seq)
+          .then((cp) => cp?.lastHeartbeatAt?.getTime())
+          .catch(() => undefined);
+        if (settled) return;
+        const now = this.clock();
+        if (at !== undefined && at >= dispatchedAt - HEARTBEAT_CLOCK_SKEW_MS) {
+          if (!localBeats.has(at)) beatsLandElsewhere = true;
+          const allowance = timeoutMs + (beatsLandElsewhere ? this.heartbeatPersistThrottleMs : 0);
+          if (now - at < allowance) {
+            seenBeat = true;
+            arm(Math.min(Math.max(allowance - (now - at), 1), MAX_BACKOFF_MS));
+            return;
+          }
+        }
+        cleanup();
+        this.pending.delete(id);
+        reject(new RemoteStepTimeout(id, ms));
+      };
+      this.heartbeatResets.set(id, (beatAt) => {
         seenBeat = true;
+        if (beatAt !== undefined) {
+          if (localBeats.size >= 256) localBeats.clear();
+          localBeats.add(beatAt);
+        }
         clearTimeout(timer);
         arm();
       });
@@ -5836,6 +5906,10 @@ export class WorkflowEngine {
     });
   }
 }
+
+/** Tolerance (ms) between the worker's clock, which stamps a persisted heartbeat, and this engine's,
+ *  when deciding whether a beat belongs to the current attempt (see `awaitWithHeartbeat`). */
+const HEARTBEAT_CLOCK_SKEW_MS = 1_000;
 
 /** Raised inside the workflow when a remote worker reports a step failure. */
 export class RemoteStepError extends Error {

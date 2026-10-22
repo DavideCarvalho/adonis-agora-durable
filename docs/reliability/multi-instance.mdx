@@ -1,18 +1,18 @@
 ---
 title: Delivery under multiple instances
-description: "Web and worker instances compete for the SAME result and heartbeat queues — each delivery lands on exactly one of them. What that means for steps with and without timeoutMs, why a persisted heartbeat doesn't re-arm a timer, and when to run a pure producer with consumers: 'never'."
+description: "Web and worker instances compete for the SAME result and heartbeat queues — each delivery lands on exactly one of them. What that means for steps with and without timeoutMs, how a heartbeat that lands on another instance still keeps a timeoutMs step alive, and when to run a pure producer with consumers: 'never'."
 icon: Network
 ---
 
 Web + workers consume the SAME result and heartbeat queues, in competition. Each delivery lands on exactly one instance:
 
 - **It landed on the dispatcher**: the fast in-memory path — the result resolves (or the heartbeat re-arms the liveness timer) directly.
-- **It landed on another instance**: that instance writes the checkpoint (`completeRemoteResult`) and tries to resume the run — which fails while the dispatcher still holds the lease (the lease covers the whole execution). The dispatcher stays deaf until its timer fires.
+- **It landed on another instance**: that instance writes the checkpoint — the result (`completeRemoteResult`), or the heartbeat's `lastHeartbeatAt` (at most one write per step per `heartbeatPersistThrottleMs`, default 10s) — and, for a result, tries to resume the run, which fails while the dispatcher still holds the lease (the lease covers the whole execution). The dispatcher's in-memory timer doesn't hear it; it reads the checkpoint when the timer fires.
 
 Practical rules:
 
 1. **Steps WITHOUT `timeoutMs` suspend durably**: any instance can resume the run from the checkpoint. This is the dead-pod-proof mode (scale-down/crash/deploy). Combine it with `remoteRedispatchMs` + `remoteRedispatchMax` against a lost dispatch, and with `reconcileMs` (default 5 min) against a lost wake.
-2. **Steps WITH `timeoutMs` get fast dead-worker detection**, but depend on the in-memory re-arm: use them for SHORT steps (minutes). When the timeout fires, the engine re-reads the checkpoint — if it completed, it resolves with the recorded output; if still pending, it fails as before.
-3. **Never assume "heartbeat in the database = timer re-armed"**: the pulse persists on whichever instance received it, but it only re-arms the timer on the instance that dispatched the step.
+2. **Steps WITH `timeoutMs` get fast dead-worker detection.** When the window runs out, the dispatcher re-reads the checkpoint before failing: a completed step resolves with the recorded output; a step whose persisted `lastHeartbeatAt` is still within `timeoutMs` (a beat consumed by another instance) re-arms for the rest of the window instead of failing over a live worker; only a step silent everywhere times out.
+3. **A beat consumed elsewhere costs at most one throttle window of extra detection.** Another instance persists a step's beats at most once per `heartbeatPersistThrottleMs` (engine option, default 10s), so the newest beat it heard can be up to that much newer than the one on the checkpoint. Once the dispatcher sees a persisted beat it did not hear itself, it allows that much extra silence before timing out — a live worker is never failed over, and a dead one is detected within `timeoutMs` plus the throttle. A single instance (or a dispatcher that heard the beats itself) gets no allowance and detects a dead worker within `timeoutMs`, as before.
 4. **Due timers come in batches**: each timer pass loads at most `timerBatchSize` (config option, default 500) due runs, most overdue first, and walks them in a shuffled order, so a recovery wave of thousands of due runs drains over a few ticks and the instances don't contend for the same leases row by row.
 5. **Processes that never execute steps should set `consumers: 'never'`** (a pure producer): no point-to-point delivery lands on them, so the race with the worker fleet is over. `durable:work` re-enables consumption for itself via `engine.startConsumers()`. Only the `queue` transport defers its consumers today — on `db` and `bullmq` the setting has no effect, so every booted process consumes.
