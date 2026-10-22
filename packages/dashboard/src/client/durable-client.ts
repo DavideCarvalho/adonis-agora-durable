@@ -368,7 +368,9 @@ export interface RunDisplayState {
   detail?: string;
 }
 
-const SINGLETON_INFLIGHT = new Set<RunStatus>(['running', 'suspended']);
+const SINGLETON_INFLIGHT = new Set<RunStatus>(['running', 'suspended', 'blocked']);
+/** Mirrors `SINGLETON_ADMITTED_TAG` in `@adonis-agora/durable`: the run holds a singleton slot. */
+const SINGLETON_ADMITTED_TAG = 'durable:singleton:admitted';
 
 /** Strip the route-by-handler `@partition` suffix so a run's `workflow` matches its `GroupHealth.group`. */
 export function baseGroup(group: string): string {
@@ -396,10 +398,13 @@ export function singletonLeader(
 ): WorkflowRun | undefined {
   const tag = run.tags?.find((t) => t.startsWith('singleton:'));
   if (!tag) return undefined;
+  // A run holding a durable slot (the engine's reserved admission tag) is never queued, even while
+  // it sleeps; another run's leader is the holder of the slot, not merely the oldest in-flight run.
+  if (run.tags?.includes(SINGLETON_ADMITTED_TAG)) return undefined;
   const inflight = runs
     .filter((r) => SINGLETON_INFLIGHT.has(r.status) && r.tags?.includes(tag))
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
-  return inflight[0];
+  return inflight.find((r) => r.tags?.includes(SINGLETON_ADMITTED_TAG)) ?? inflight[0];
 }
 
 function waitingDetail(waiting: RunWaiting): string {

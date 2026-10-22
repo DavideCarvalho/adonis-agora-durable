@@ -243,6 +243,35 @@ describe('deriveRunState: `blocked` is a first-class display state', () => {
   });
 });
 
+describe('deriveRunState: singleton leader is the slot holder', () => {
+  const at = (ms: number) => new Date(ms).toISOString();
+  const gated = (id: string, ms: number, tags: string[]): WorkflowRun => ({
+    id,
+    workflow: 'sync',
+    workflowVersion: '1',
+    status: 'suspended',
+    tags,
+    createdAt: at(ms),
+    updatedAt: at(ms),
+  });
+  // Same createdAt; the waiter's id sorts first, but the holder carries the admission tag.
+  const holder = gated('z-holder', 1000, ['singleton:k', 'durable:singleton:admitted']);
+  const waiter = gated('a-waiter', 1000, ['singleton:k']);
+
+  it('shows the waiter queued behind the holder, not behind itself', () => {
+    expect(deriveRunState(waiter, { runs: [holder, waiter], health: [] })).toEqual({
+      status: 'queued',
+      detail: 'behind leader z-holder',
+    });
+  });
+
+  it('never shows a sleeping holder as queued', () => {
+    expect(deriveRunState(holder, { runs: [holder, waiter], health: [] }).status).not.toBe(
+      'queued',
+    );
+  });
+});
+
 describe('durableClient: the run-list / bulk query string', () => {
   function captureUrl(): { calls: string[] } {
     const calls: string[] = [];
