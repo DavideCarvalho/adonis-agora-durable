@@ -44,7 +44,7 @@ describe.skipIf(!PG_URL)('DbTransport claims across real worker processes (Postg
     expect([...per.values()]).toEqual([1, 1, 1, 1, 1, 1]);
     expect(results).toHaveLength(6);
     expect(results.every((r) => r.status === 'completed')).toBe(true);
-  }, 40_000);
+  }, 120_000);
 
   it('(b) 300 steps across 2 workers × 8 slots: no duplicates, both fill all 8 slots', async () => {
     const { db, engine, results } = await setup();
@@ -68,7 +68,7 @@ describe.skipIf(!PG_URL)('DbTransport claims across real worker processes (Postg
       expect(peak, `peak in-flight on ${instance}`).toBe(8);
     }
     expect(await db.connection().from(TRANSPORT_TABLES.tasks).select('*')).toEqual([]);
-  }, 60_000);
+  }, 180_000);
 
   it('(e) claims by priority, highest first, then oldest first', async () => {
     const { engine, results } = await setup();
@@ -81,5 +81,5 @@ describe.skipIf(!PG_URL)('DbTransport claims across real worker processes (Postg
     await until(() => results.length === 6, 15_000, '6 results');
     // 10, then the two 5s oldest first, then the absent (= 0) before the explicit 0, then -2.
     expect((await runs()).map((r) => r.step_id)).toEqual([5, 2, 4, 1, 6, 3].map((s) => `r1:${s}`));
-  }, 30_000);
+  }, 90_000);
 });

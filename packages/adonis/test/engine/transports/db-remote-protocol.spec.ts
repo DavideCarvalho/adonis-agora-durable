@@ -32,7 +32,7 @@ import { dbBackends } from '../../support/backends.js';
 const POLL = 5;
 const M = TRANSPORT_TABLES.messages;
 
-async function until(cond: () => boolean | Promise<boolean>, budgetMs = 2000): Promise<void> {
+async function until(cond: () => boolean | Promise<boolean>, budgetMs = 20_000): Promise<void> {
   const start = Date.now();
   while (!(await cond())) {
     if (Date.now() - start > budgetMs) throw new Error('timed out waiting for condition');

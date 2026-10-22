@@ -24,7 +24,7 @@ const task = (seq: number, over: Partial<RemoteTask> = {}): RemoteTask => ({
   ...over,
 });
 
-async function until(cond: () => boolean | Promise<boolean>, budgetMs = 3000): Promise<void> {
+async function until(cond: () => boolean | Promise<boolean>, budgetMs = 20_000): Promise<void> {
   const start = Date.now();
   while (!(await cond())) {
     if (Date.now() - start > budgetMs) throw new Error('timed out waiting for condition');

@@ -18,7 +18,7 @@ const REDIS_URL = backendUrl('REDIS_URL');
 const PREFIX = uniqueRedisPrefix('cp');
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** Poll until `cond()` is true or the budget lapses (events arrive async over pub/sub). */
-async function until(cond: () => boolean, budgetMs = 2000) {
+async function until(cond: () => boolean, budgetMs = 20_000) {
   const deadline = Date.now() + budgetMs;
   while (!cond() && Date.now() < deadline) await delay(20);
 }

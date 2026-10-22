@@ -28,6 +28,15 @@ const TOKEN = sanitizeQueueToken(SCENARIO_STEP);
 
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * How far past its written budget an {@link until} may wait. The budgets are what each wait takes on
+ * an idle machine with room to spare; on a shared CI runner, spawning a TypeScript worker process or a
+ * pool's first connection can take several times that. A budget only bounds how long a FAILING run
+ * hangs, so it stretches; the scenarios' timing assertions (lease lower bounds) are separate and
+ * never scaled.
+ */
+const BUDGET_SLACK = 3;
+
 export async function until(
   cond: () => boolean | Promise<boolean>,
   budgetMs: number,
@@ -35,7 +44,9 @@ export async function until(
 ): Promise<void> {
   const start = Date.now();
   while (!(await cond())) {
-    if (Date.now() - start > budgetMs) throw new Error(`timed out waiting for ${label}`);
+    if (Date.now() - start > budgetMs * BUDGET_SLACK) {
+      throw new Error(`timed out waiting for ${label}`);
+    }
     await sleep(20);
   }
 }

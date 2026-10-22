@@ -24,7 +24,7 @@ class ManualTransport {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function until(cond: () => boolean | Promise<boolean>, budgetMs = 2000): Promise<void> {
+async function until(cond: () => boolean | Promise<boolean>, budgetMs = 20_000): Promise<void> {
   const start = Date.now();
   while (!(await cond())) {
     if (Date.now() - start > budgetMs) throw new Error('timed out waiting for condition');

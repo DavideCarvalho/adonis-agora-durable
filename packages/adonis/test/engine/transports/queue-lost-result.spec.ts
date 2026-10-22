@@ -18,7 +18,7 @@ import { MockAdapter } from '../../../src/transports/queue-mock-adapter.js';
  */
 
 /** Poll the store until `runId` reaches a terminal state (the result travels over a poll loop). */
-async function settle(store: InMemoryStateStore, runId: string, budgetMs = 3000) {
+async function settle(store: InMemoryStateStore, runId: string, budgetMs = 20_000) {
   const start = Date.now();
   while (Date.now() - start < budgetMs) {
     const run = await store.getRun(runId);
@@ -37,7 +37,7 @@ async function settle(store: InMemoryStateStore, runId: string, budgetMs = 3000)
 }
 
 /** Poll the store until `predicate` holds, so a test can wait on an intermediate state. */
-async function waitFor(check: () => Promise<boolean>, what: string, budgetMs = 3000) {
+async function waitFor(check: () => Promise<boolean>, what: string, budgetMs = 20_000) {
   const start = Date.now();
   while (Date.now() - start < budgetMs) {
     if (await check()) return;

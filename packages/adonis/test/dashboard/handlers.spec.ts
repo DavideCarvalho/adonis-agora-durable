@@ -71,7 +71,7 @@ const req = (over: Partial<ApiRequest> = {}): ApiRequest => ({
 /** Wait for `fn` to hold, or throw. A compensating cancel drives the saga in the BACKGROUND (see
  *  `engine.cancel`) so the handler can answer without replaying the workflow inside the HTTP
  *  request — which means the undo lands after the response, not before it. */
-async function poll(fn: () => Promise<boolean>, timeoutMs = 2000): Promise<void> {
+async function poll(fn: () => Promise<boolean>, timeoutMs = 20_000): Promise<void> {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     if (await fn()) return;

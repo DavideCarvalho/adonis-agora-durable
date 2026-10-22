@@ -25,7 +25,7 @@ const task = (over: Partial<RemoteTask> = {}): RemoteTask => {
   };
 };
 
-async function waitFor(fn: () => Promise<boolean>, budgetMs = 2000): Promise<void> {
+async function waitFor(fn: () => Promise<boolean>, budgetMs = 20_000): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < budgetMs) {
     if (await fn()) return;
