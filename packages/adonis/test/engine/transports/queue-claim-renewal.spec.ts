@@ -132,6 +132,30 @@ describe('QueueTransport claim renewal', () => {
     for (const release of releases) release();
   });
 
+  it('a job that completes while a renewal is in flight is not reported as lost', async () => {
+    const adapter = new MockAdapter();
+    const errors: unknown[] = [];
+    const t = make(adapter, { stalledCheckIntervalMs: 0, onError: (err) => errors.push(err) });
+    t.onResult(async () => {});
+
+    let release!: () => void;
+    t.handle('ext.slow', () => new Promise((r) => (release = () => r('ok'))));
+    // The renewal round-trip is slow enough for the step to finish (and be finalized) inside it.
+    const original = adapter.renewJobs.bind(adapter);
+    let completedDuringRenew = false;
+    vi.spyOn(adapter, 'renewJobs').mockImplementation(async (queue, jobs) => {
+      release();
+      await until(() => adapter.active.size === 0);
+      completedDuringRenew = true;
+      return original(queue, jobs);
+    });
+
+    await t.dispatch(task());
+    await until(() => completedDuringRenew);
+    await sleep(THRESHOLD);
+    expect(errors).toEqual([]);
+  });
+
   it('defaults the threshold to 2min when the adapter renews, 30min when it has no renewJobs', async () => {
     const renewing = new MockAdapter();
     const legacy = new NonRenewingAdapter();

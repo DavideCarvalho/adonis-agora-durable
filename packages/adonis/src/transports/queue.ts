@@ -683,13 +683,19 @@ export class QueueTransport implements Transport, ControlPlane {
     for (const [queue, leases] of byQueue) {
       try {
         const renewed = await this.#adapter.renewJobs?.(queue, leases);
-        // Fewer renewed than held: the sweep already re-delivered those claims (this worker went
+        // A job that finished normally during the round-trip was finalized, not lost: count only the
+        // claims still open under the same handle, or a healthy completion would raise a false alarm.
+        const stillHeld = leases.filter(
+          (lease) =>
+            this.#openJobs.get(typeof lease === 'string' ? lease : lease.id)?.handle === lease,
+        ).length;
+        // Fewer renewed than still held: the sweep already re-delivered those claims (this worker went
         // silent past the threshold), so another worker may be running the same step right now. The
         // handler can't be aborted — durable steps are idempotent — but the double run must be loud.
-        if (typeof renewed === 'number' && renewed < leases.length) {
+        if (typeof renewed === 'number' && renewed < stillHeld) {
           this.#onError(
             new Error(
-              `[QueueTransport] lost ${leases.length - renewed} of ${leases.length} claim(s) on "${queue}" before renewing them — the jobs were re-delivered and may run twice; raise stalledThresholdMs if this worker blocks its event loop`,
+              `[QueueTransport] lost ${stillHeld - renewed} of ${stillHeld} claim(s) on "${queue}" before renewing them — the jobs were re-delivered and may run twice; raise stalledThresholdMs if this worker blocks its event loop`,
             ),
           );
         }
