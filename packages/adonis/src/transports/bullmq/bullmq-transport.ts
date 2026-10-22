@@ -529,7 +529,16 @@ export class BullMQTransport implements Transport {
     });
     this.#taskWorkers.set(token, worker);
     controller.start();
-    this.#startWorkerHeartbeat(token);
+    // Liveness says "a worker consumes this token". A deferred process (a `node ace` producer) has
+    // no worker yet, so it must not show up in groupHealth / the dashboard as one: the heartbeat
+    // starts with the parked worker, on startConsumers() (the queue and db transports do the same).
+    if (this.#consumersDeferred) {
+      this.#deferredWorkers.push(() => {
+        if (!this.#closing) this.#startWorkerHeartbeat(token);
+      });
+    } else {
+      this.#startWorkerHeartbeat(token);
+    }
   }
 
   /** Route one task job by SHAPE (spec §6.3): a workflow turn runs the replay → decision path, a step
