@@ -11,6 +11,7 @@ import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
 import { QueueTransport } from '../../src/transports/queue.js';
 import { MockAdapter } from '../../src/transports/queue-mock-adapter.js';
 import { MemoryWorkerKeys } from '../../src/transports/worker-keys.js';
+import { RedisWorkerRegistry } from '../../src/worker-runtime/registry.js';
 import { WorkerRuntime } from '../../src/worker-runtime/worker-runtime.js';
 
 /**
@@ -57,6 +58,7 @@ describe('tenant pod ⇄ control plane over QueueTransport (end to end)', () => 
       ...common,
       instanceId: 'control-plane',
       workerKeys: keys,
+      workerKeysCacheMs: 0,
       tenantSubscribersCacheMs: 0,
     });
     const engine = new WorkflowEngine({ store, transport: cpTransport });
@@ -92,7 +94,16 @@ describe('tenant pod ⇄ control plane over QueueTransport (end to end)', () => 
       token: signTenantToken('acme', SECRET),
       requestTimeoutMs: 2000,
     });
-    const runtime = new WorkerRuntime({ transport: tenantTransport, partition: 'acme' });
+    // What the provider does for a tenant pod: declare the role, then advertise through the transport.
+    tenantTransport.useTenantRole();
+    const runtime = new WorkerRuntime({
+      transport: tenantTransport,
+      partition: 'acme',
+      instanceId: 'acme-pod',
+      registry: new RedisWorkerRegistry(tenantTransport.createDescriptorRedis(), {
+        ownsConnection: true,
+      }),
+    });
     const charged: unknown[] = [];
     runtime.handle('charge', async (input) => {
       charged.push(input);
@@ -103,12 +114,14 @@ describe('tenant pod ⇄ control plane over QueueTransport (end to end)', () => 
       return { remote: true, paid };
     });
 
+    void runtime.start();
     cleanups.push(
       () => cpTransport.close(),
       () => tenantTransport.close(),
+      () => runtime.stop(),
       () => responder.stop(),
     );
-    return { adapter, engine, proxy, charged, store, keys };
+    return { adapter, engine, proxy, charged, store, keys, cpTransport };
   }
 
   it('starts a run from the tenant, runs its remote step on the tenant worker, reads it back', async () => {
@@ -180,5 +193,12 @@ describe('tenant pod ⇄ control plane over QueueTransport (end to end)', () => 
     // Anti-IDOR still holds over this transport.
     await expect(globex.getRun(acmeRun.runId)).rejects.toThrow(/another tenant/);
     expect((await store.getRun(acmeRun.runId))?.namespace).toBe('acme');
+  });
+
+  it('the control plane sees the store-less pod’s workers (advertisement forwarded over the queue)', async () => {
+    const { cpTransport } = cluster();
+    await until(async () => (await cpTransport.listWorkerGroups()).includes('charge@acme'));
+    const [descriptor] = await cpTransport.listWorkerDescriptors('remote-flow@acme');
+    expect(descriptor).toMatchObject({ steps: ['charge'], workflows: ['remote-flow'] });
   });
 });

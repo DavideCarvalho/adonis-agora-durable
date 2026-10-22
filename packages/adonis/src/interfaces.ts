@@ -1295,6 +1295,11 @@ export interface Transport {
   /** Start every consumer subscription parked by {@link Transport.deferConsumers} — the explicit
    *  "this process IS a worker" declaration. Idempotent; a no-op when nothing was deferred. */
   startConsumers?(): void;
+  /** Called by the provider when this transport backs a store-less `tenant` pod, before anything is
+   *  registered on it. Optional — a transport whose behaviour does not depend on the role omits it (the
+   *  queue transport uses it to forward worker advertisement to the control plane when it has no key
+   *  store of its own). */
+  useTenantRole?(): void;
   /** Release the transport's resources (broker workers, queues, connections) for a clean shutdown.
    *  Optional — an in-process transport has nothing to close. Called on `onApplicationShutdown`
    *  after the engine drains, so a deploy hands off instead of leaving the broker to time out. */

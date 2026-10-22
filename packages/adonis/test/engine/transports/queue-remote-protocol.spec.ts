@@ -22,6 +22,8 @@ import {
   tenantSubscriberKey,
 } from '../../../src/transports/queue-remote.js';
 import { MemoryWorkerKeys } from '../../../src/transports/worker-keys.js';
+import { RedisWorkerRegistry } from '../../../src/worker-runtime/registry.js';
+import { WorkerRuntime } from '../../../src/worker-runtime/worker-runtime.js';
 
 /**
  * The parts of the store-less protocol the queue transport now carries, mirroring the BullMQ protocol
@@ -636,6 +638,71 @@ describe('QueueTransport — store-less protocol and remote workflows', () => {
       await until(() => got.length === 1);
       await sleep(30);
       expect(got).toEqual(['r1']);
+    });
+  });
+
+  describe('worker advertisement from a store-less tenant pod', () => {
+    const eventually = async (cond: () => Promise<boolean>, budgetMs = 1500) => {
+      const at = Date.now();
+      while (!(await cond())) {
+        if (Date.now() - at > budgetMs) throw new Error('timed out waiting for condition');
+        await sleep(2);
+      }
+    };
+
+    it('is forwarded to the control plane, which records it and lists the worker', async () => {
+      const adapter = new MockAdapter();
+      const keys = new MemoryWorkerKeys();
+      const cp = make(adapter, { workerKeys: keys, workerKeysCacheMs: 0 });
+      cp.onRunRequest(async () => {});
+      const pod = make(adapter, { instanceId: 'pod', partition: 'acme' });
+      pod.useTenantRole();
+      const runtime = new WorkerRuntime({
+        transport: pod,
+        partition: 'acme',
+        instanceId: 'pod',
+        registry: new RedisWorkerRegistry(pod.createDescriptorRedis(), { ownsConnection: true }),
+      });
+      runtime.handle('charge', async () => 'ok');
+      await runtime.start();
+
+      await eventually(async () => (await cp.listWorkerGroups()).includes('charge@acme'));
+      const [descriptor] = await cp.listWorkerDescriptors('charge@acme');
+      expect(descriptor?.steps).toContain('charge');
+
+      await runtime.stop();
+      await eventually(async () => (await cp.listWorkerGroups()).length === 0);
+    });
+
+    it('only the worker advertisement keyspace is recorded from a forwarded write', async () => {
+      const adapter = new MockAdapter();
+      const keys = new MemoryWorkerKeys();
+      const cp = make(adapter, { workerKeys: keys });
+      cp.onRunRequest(async () => {});
+      const pod = make(adapter);
+      pod.useTenantRole();
+      const writer = pod.createDescriptorRedis();
+      await writer.set(
+        tenantSubscriberKey('durable', 'acme', 'evil'),
+        '{"instanceId":"evil"}',
+        'EX',
+        30,
+      );
+      await writer.set('durable-worker-heartbeat:charge@acme:pod', '{}', 'EX', 30);
+      await eventually(async () => (await keys.live(Date.now())).length > 0);
+      await sleep(20);
+      expect((await keys.live(Date.now())).map((k) => k.key)).toEqual([
+        'durable-worker-heartbeat:charge@acme:pod',
+      ]);
+    });
+
+    it('outside a tenant pod, an instance with no key store advertises nothing (no job)', async () => {
+      const adapter = new MockAdapter();
+      const t = make(adapter);
+      const pushed = vi.spyOn(adapter, 'pushOn');
+      await t.createDescriptorRedis().set('durable-worker-heartbeat:x:y', '{}', 'EX', 30);
+      await sleep(5);
+      expect(pushed).not.toHaveBeenCalled();
     });
   });
 });

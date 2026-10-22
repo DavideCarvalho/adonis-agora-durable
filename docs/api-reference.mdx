@@ -360,7 +360,7 @@ Role-specific fields:
 | Role | Field | Type | Notes |
 | --- | --- | --- | --- |
 | `control-plane` | `store`, `transport` | `string` | Both required. |
-| `control-plane` | `verifyTenant` | `TenantVerifier` | Verifies tenant tokens on incoming requests. See [Layered tenant authentication](/docs/durable/cluster/roles-and-config#layered-tenant-authentication). |
+| `control-plane`, `standalone` | `verifyTenant` | `TenantVerifier` | Verifies tenant tokens on incoming requests (a standalone engine answers tenant pods too when its transport carries the store-less protocol). See [Layered tenant authentication](/docs/durable/cluster/roles-and-config#layered-tenant-authentication). |
 | `tenant` | `store`, `stores` | `never` | A store-less pod may not name a store; any value is a compile error. |
 | `tenant` | `transport`, `partition` | `string` | Both required. `partition` suffixes the pod's `<name>@<tenant>` routing tokens. |
 | `tenant` | `tenant` | `{ token?: string }` | The pod's signed claim. |

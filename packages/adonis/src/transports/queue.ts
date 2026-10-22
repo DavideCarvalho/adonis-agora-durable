@@ -389,6 +389,7 @@ export class QueueTransport implements Transport, ControlPlane {
   #runReplyHandler: ((reply: RunReply) => void) | undefined;
   #tenantEventsLoop = false;
   #registrationsLoop = false;
+  #tenantRole = false;
   /** Control-plane side: correlation id (requestId, or a start-run's runId) → the requester's instance
    *  id, held while the request's handler runs so {@link publishRunReply} knows whose inbox to target. */
   readonly #replyRoutes = new Map<string, string>();
@@ -447,9 +448,22 @@ export class QueueTransport implements Transport, ControlPlane {
     });
   }
 
-  /** The writer a worker runtime's registry advertises its descriptor and heartbeat through. */
+  /** The writer a worker runtime's registry advertises its descriptor and heartbeat through: the key
+   *  store when this instance has one. A store-less tenant pod (see {@link useTenantRole}) with no key
+   *  store forwards it to the control plane instead, which records it in its own — so the control plane
+   *  still sees the pod's workers. Otherwise, with no store, nothing is advertised. */
   createDescriptorRedis(): DescriptorRedis {
+    if (this.#workerKeys === NO_WORKER_KEYS && this.#tenantRole) {
+      return this.#inboxes.remoteKeyWriter();
+    }
     return workerKeyWriter(this.#workerKeys, Date.now);
+  }
+
+  /** Declare that this transport backs a store-less `tenant` pod (the provider calls it): worker
+   *  advertisement is then forwarded to the control plane when this instance has no key store. Only a
+   *  tenant pod is guaranteed a control plane that records the forwarded keys. */
+  useTenantRole(): void {
+    this.#tenantRole = true;
   }
 
   /** The live worker descriptors advertised on `token`. */

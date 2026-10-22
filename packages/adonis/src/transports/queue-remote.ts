@@ -1,3 +1,4 @@
+import type { DescriptorRedis } from '../worker-runtime/registry.js';
 import { cachedLiveKeys, NO_WORKER_KEYS, type WorkerKeyStore } from './worker-keys.js';
 
 /**
@@ -20,6 +21,10 @@ import { cachedLiveKeys, NO_WORKER_KEYS, type WorkerKeyStore } from './worker-ke
  * The same registration keeps a TTL'd `${P}-inbox:<instance>` liveness key for every instance that
  * consumes an inbox, which the publisher-side janitor uses to drain the inbox of an instance that died
  * (see {@link InboxRegistry}).
+ *
+ * A worker with no key store of its own (a store-less tenant pod) advertises its descriptor and
+ * heartbeat keys the same way: as {@link KeyAdvertisement}s the control plane records — restricted to
+ * the `-worker-descriptor:` / `-worker-heartbeat:` keyspace — so the control plane still sees it.
  *
  * Segments taken from the wire or from user config (tenant, instance id) are URI-encoded inside KEYS, so
  * neither can contain the `:` separator and one tenant's key prefix can never match another's.
@@ -83,6 +88,19 @@ export interface InboxRegistration {
   withdraw?: string[] | undefined;
 }
 
+/**
+ * A worker's descriptor / heartbeat key writes, forwarded to the control plane by an instance with no
+ * key store of its own. Only `${P}-worker-descriptor:` and `${P}-worker-heartbeat:` keys are recorded.
+ */
+export interface KeyAdvertisement {
+  kind: 'advertise';
+  put: { key: string; value: string; ttlMs: number }[];
+  remove: string[];
+}
+
+/** Everything sent on `${P}:inbox-registrations`. */
+export type RegistryMessage = InboxRegistration | KeyAdvertisement;
+
 /** The value stored under a subscriber / inbox key: the owner's instance id, read back verbatim. */
 interface InboxKeyValue {
   instanceId: string;
@@ -99,6 +117,30 @@ function ownerOf(value: string): string | undefined {
 
 const isStringArray = (v: unknown): v is string[] =>
   Array.isArray(v) && v.length <= MAX_REGISTRATION_TENANTS && v.every((t) => typeof t === 'string');
+
+/** Narrow a key advertisement read off the wire; anything malformed is `undefined` (ignored). */
+export function parseAdvertisement(raw: unknown): KeyAdvertisement | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const r = raw as Record<string, unknown>;
+  if (r.kind !== 'advertise' || !Array.isArray(r.put) || !isStringArray(r.remove)) return undefined;
+  if (r.put.length > MAX_REGISTRATION_TENANTS) return undefined;
+  const put: KeyAdvertisement['put'] = [];
+  for (const entry of r.put as unknown[]) {
+    const e = entry as Record<string, unknown> | null;
+    if (
+      !e ||
+      typeof e.key !== 'string' ||
+      typeof e.value !== 'string' ||
+      typeof e.ttlMs !== 'number' ||
+      !Number.isFinite(e.ttlMs) ||
+      e.ttlMs <= 0
+    ) {
+      return undefined;
+    }
+    put.push({ key: e.key, value: e.value, ttlMs: Math.min(e.ttlMs, MAX_REGISTRATION_TTL_MS) });
+  }
+  return { kind: 'advertise', put, remove: r.remove };
+}
 
 /** Narrow a registration read off the wire; anything malformed is `undefined` (ignored). */
 export function parseRegistration(raw: unknown): InboxRegistration | undefined {
@@ -125,8 +167,8 @@ export interface InboxRegistryOptions {
   ttlMs: number;
   subscribersCacheMs: number;
   sweepIntervalMs: number;
-  /** Send a registration onto `${P}:inbox-registrations`. */
-  announce: (registration: InboxRegistration) => Promise<void>;
+  /** Send a message onto `${P}:inbox-registrations`. */
+  announce: (message: RegistryMessage) => Promise<void>;
   /** Pop and finalize up to `max` jobs of `queue`; resolves `true` once the queue came back empty. */
   drain: (queue: string, max: number) => Promise<boolean>;
   onError: (err: unknown) => void;
@@ -224,12 +266,41 @@ export class InboxRegistry {
     this.#refreshTimer.unref?.();
   }
 
+  /**
+   * A {@link DescriptorRedis} that forwards a worker's descriptor / heartbeat writes to the control
+   * plane instead of a local store. Writes made in the same tick go out as ONE message (a worker beats
+   * every token at once). A failed send is reported, never thrown into the worker's heartbeat.
+   */
+  remoteKeyWriter(): DescriptorRedis {
+    let batch: KeyAdvertisement | undefined;
+    const enqueue = (mutate: (b: KeyAdvertisement) => void): Promise<void> => {
+      if (!batch) {
+        const pending: KeyAdvertisement = { kind: 'advertise', put: [], remove: [] };
+        batch = pending;
+        mutate(pending);
+        return Promise.resolve().then(() => {
+          batch = undefined;
+          return this.#options.announce(pending).catch((err) => this.#options.onError(err));
+        });
+      }
+      mutate(batch);
+      return Promise.resolve();
+    };
+    return {
+      set: (key, value, _mode, ttlSeconds) =>
+        enqueue((b) => b.put.push({ key, value, ttlMs: ttlSeconds * 1000 })),
+      del: (...keys) => enqueue((b) => b.remove.push(...keys)),
+    };
+  }
+
   // ---------------------------------------------------------------------------
   // recorder (control plane)
   // ---------------------------------------------------------------------------
 
-  /** Record an announcement read off `${P}:inbox-registrations` as TTL'd keys in the store. */
+  /** Record a message read off `${P}:inbox-registrations` as TTL'd keys in the store. */
   async record(raw: unknown): Promise<void> {
+    const advertisement = parseAdvertisement(raw);
+    if (advertisement) return this.#recordAdvertisement(advertisement);
     const registration = parseRegistration(raw);
     if (!registration) return; // malformed: nothing safe to record
     if (!this.#enabled) {
@@ -262,6 +333,21 @@ export class InboxRegistry {
         value,
         expiresAt,
       );
+    }
+  }
+
+  /** Record a forwarded worker advertisement — only keys of the worker advertisement keyspace. */
+  async #recordAdvertisement(ad: KeyAdvertisement): Promise<void> {
+    if (!this.#enabled) return;
+    const prefix = this.#options.prefix();
+    const allowed = (key: string) =>
+      key.startsWith(`${prefix}-worker-descriptor:`) ||
+      key.startsWith(`${prefix}-worker-heartbeat:`);
+    const removed = ad.remove.filter(allowed);
+    if (removed.length > 0) await this.#options.store.remove(removed);
+    const now = this.#now();
+    for (const { key, value, ttlMs } of ad.put) {
+      if (allowed(key)) await this.#options.store.put(key, value, now + ttlMs);
     }
   }
 

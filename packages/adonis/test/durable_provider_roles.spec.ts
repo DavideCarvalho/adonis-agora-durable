@@ -317,6 +317,33 @@ describe('DurableProvider — tenant / control-plane roles over the queue transp
     await provider.shutdown();
   });
 
+  it('a store-less tenant pod (no key store) forwards its worker advertisement to the control plane', async () => {
+    const adapter = new MockAdapter();
+    const { app, container } = makeApp({
+      role: 'tenant',
+      transport: 'queue',
+      transports: {
+        queue: transports.queue({
+          adapter: () => adapter,
+          workerKeys: false,
+          pollIntervalMs: 5,
+          stalledCheckIntervalMs: 0,
+        }),
+      },
+      partition: 'acme',
+    } as DurableConfig);
+    const provider = new DurableProvider(app);
+    provider.register();
+    const runtime = await container.make(DURABLE_WORKER_RUNTIME);
+    runtime.handle('charge', async () => 'ok');
+    await runtime.start();
+    await new Promise((r) => setTimeout(r, 5));
+    const announced = adapter.pending.get('durable:inbox-registrations') ?? [];
+    expect(announced.some((j) => (j.payload as { kind?: string }).kind === 'advertise')).toBe(true);
+    await runtime.stop();
+    await provider.shutdown();
+  });
+
   it('a control plane on transports.queue() binds and starts a RunRequestResponder', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const { app, container } = makeApp({
