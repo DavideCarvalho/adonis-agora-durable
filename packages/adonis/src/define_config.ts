@@ -69,7 +69,7 @@ export interface EmbeddedWorkerConfig {
   embedded?: boolean;
   /** Poll interval in ms between ticks. Default 1000 — the same default as `durable:work`. */
   intervalMs?: number;
-  /** Drain timeout in ms applied on shutdown, passed to `engine.drain`. Default 10_000. */
+  /** Shutdown budget in ms: the wait for the tick in flight plus `engine.drain`. Default 10_000. */
   drainTimeoutMs?: number;
 }
 
@@ -229,6 +229,22 @@ export interface BaseDurableConfig {
    * re-dispatching forever. Default 10. Ignored when `remoteRedispatchMs` is unset.
    */
   remoteRedispatchMax?: number;
+  /**
+   * Fallback re-drive window (ms) for a run suspended on an EVENT (a child, a signal, a
+   * `waitForEvent`, a remote step with no `timeoutMs`) whose wake-up was lost — the delivering pod
+   * crashed or rolled mid-handoff. The timer pass re-drives it after this window: an idempotent
+   * replay that re-suspends a still-pending wait, so it is a self-heal, never a double dispatch. Also
+   * the wake a recovered run with a remote step still in flight is parked on. Default 300 000 (5 min);
+   * `0` disables it (a lost wake-up then strands the run until someone re-drives it). A non-finite or
+   * negative value falls back to the default.
+   */
+  reconcileMs?: number;
+  /**
+   * How long (ms) a run parked `blocked` (no capable, protocol-compatible live worker) waits before
+   * the next re-check of the fleet. Lower values pick the run up sooner once a worker appears, at the
+   * cost of more registry reads. Default 5000. A non-finite or sub-1 value falls back to the default.
+   */
+  blockedPollMs?: number;
   /**
    * The most due timers one timer pass loads and resumes, most overdue first; a larger backlog
    * drains over the next ticks. Every worker runs the pass each tick, and each walks its batch in a

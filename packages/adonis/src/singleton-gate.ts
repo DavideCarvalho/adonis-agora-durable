@@ -1,6 +1,7 @@
 import type { SingletonConfig } from './engine.js';
 import { SingletonQueueFullError } from './errors.js';
 import type { StateStore, WorkflowRun } from './interfaces.js';
+import { SINGLETON_ACTIVE_STATUSES, SINGLETON_ADMITTED_TAG } from './singleton-admission.js';
 
 const SINGLETON_RETRY_MS = 1000;
 /**
@@ -11,7 +12,7 @@ const SINGLETON_RETRY_MS = 1000;
 const SINGLETON_RETRY_JITTER_MS = 250;
 
 export interface SingletonGateDeps {
-  store: Pick<StateStore, 'listRuns' | 'updateRun'>;
+  store: Pick<StateStore, 'listRuns' | 'updateRun' | 'tryAdmitSingleton'>;
   clock: () => number;
   /** Hand a gated run to the run dispatcher (fire-and-forget, like the engine's other dispatches). */
   dispatch: (runId: string) => void;
@@ -20,8 +21,8 @@ export interface SingletonGateDeps {
 }
 
 /**
- * Per-key serialization for singleton workflows — start-time back-pressure, FIFO race-free
- * admission, and notify-on-release wakeups. Extracted from {@link WorkflowEngine} so the whole
+ * Per-key serialization for singleton workflows — start-time back-pressure, durable atomic FIFO
+ * admission (claimed by the store's {@link StateStore.tryAdmitSingleton}), and notify-on-release wakeups. Extracted from {@link WorkflowEngine} so the whole
  * singleton feature lives in one place instead of being smeared across `start`, `execute`, both run
  * loops, and `cancel`.
  */
@@ -30,6 +31,9 @@ export class SingletonGate {
 
   /** The tag a singleton run carries, so the gate can find others sharing its key. */
   tag(cfg: SingletonConfig, input: unknown): string {
+    // Checked here, at start time, so a store that can't admit atomically fails the start BEFORE the
+    // run is created instead of stranding a run no executor could ever admit.
+    this.assertAtomicStore();
     return `singleton:${cfg.key(input)}`;
   }
 
@@ -44,8 +48,8 @@ export class SingletonGate {
 
   /**
    * Reject a start that would grow the same-key backlog past `limit + maxQueueDepth` (counting
-   * `pending`/`running`/`suspended` runs sharing the key in one scan). No-op when no `maxQueueDepth`
-   * is configured.
+   * `pending`/`running`/`suspended`/`blocked` runs sharing the key in one scan). No-op when no
+   * `maxQueueDepth` is configured.
    */
   async assertCapacity(workflow: string, cfg: SingletonConfig, input: unknown): Promise<void> {
     if (cfg.maxQueueDepth == null) return;
@@ -53,7 +57,7 @@ export class SingletonGate {
     const queued = await this.deps.store.listRuns({
       tag: this.tag(cfg, input),
       workflow,
-      statuses: ['pending', 'running', 'suspended'],
+      statuses: SINGLETON_ACTIVE_STATUSES,
     });
     if (queued.length >= cap) {
       throw new SingletonQueueFullError(workflow, cfg.key(input), cfg.maxQueueDepth);
@@ -61,22 +65,36 @@ export class SingletonGate {
   }
 
   /**
-   * Whether `run` may run now under its key: it's among the `limit` oldest in-flight (running or
-   * suspended) runs sharing the key, by `(createdAt, id)` order. A consistent store gives every
-   * instance the same ordering, so admission is race-free + FIFO.
+   * Claim (or confirm) a slot for `run` under its key, atomically in the store: runs already holding
+   * a slot keep it, and free slots go to the oldest waiters by `(createdAt, id)`. A denied run is
+   * parked `suspended` on a jittered retry timer by the store, in the same critical section — never
+   * over a run a concurrent cancel already settled. Holding a slot is durable (a reserved tag), so a
+   * holder that sleeps, waits, is recovered on another instance or loses its lease keeps it until it
+   * settles terminally.
    */
   async admit(run: WorkflowRun, cfg: SingletonConfig): Promise<boolean> {
-    // ONE scan for both in-flight statuses; the total `(createdAt, id)` sort makes admission order
-    // independent of the store's row order, preserving the FIFO + race-free-across-instances contract.
-    const inflight = (
-      await this.deps.store.listRuns({
-        tag: this.tag(cfg, run.input),
-        workflow: run.workflow,
-        statuses: ['running', 'suspended'],
-      })
-    ).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
-    const idx = inflight.findIndex((r) => r.id === run.id);
-    return idx >= 0 && idx < (cfg.limit ?? 1);
+    const tryAdmit = this.assertAtomicStore();
+    const admitted = await tryAdmit(
+      run.id,
+      this.tag(cfg, run.input),
+      run.workflow,
+      cfg.limit ?? 1,
+      this.retryWakeAt(),
+    );
+    if (admitted && !run.tags?.includes(SINGLETON_ADMITTED_TAG)) {
+      run.tags = [...(run.tags ?? []), SINGLETON_ADMITTED_TAG];
+    }
+    return admitted;
+  }
+
+  private assertAtomicStore(): NonNullable<StateStore['tryAdmitSingleton']> {
+    const store = this.deps.store;
+    if (!store.tryAdmitSingleton) {
+      throw new Error(
+        'Singleton workflows require StateStore.tryAdmitSingleton (atomic, durable admission); this store does not implement it',
+      );
+    }
+    return store.tryAdmitSingleton.bind(store);
   }
 
   /**
@@ -92,7 +110,10 @@ export class SingletonGate {
     if (!tag) return;
     const gated = (
       await this.deps.store.listRuns({ tag, workflow: settled.workflow, statuses: ['suspended'] })
-    ).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
+    )
+      // A suspended HOLDER (sleeping, waiting on a signal) is not waiting for a slot — leave it be.
+      .filter((r) => !r.tags?.includes(SINGLETON_ADMITTED_TAG))
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
     for (const next of gated.slice(0, cfg.limit ?? 1)) {
       // Make the run due NOW rather than clearing its retry timer. The dispatch below goes through
       // the configured runDispatcher, which may legitimately be a NO-OP (a poll-only deployment

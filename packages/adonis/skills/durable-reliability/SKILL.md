@@ -90,8 +90,11 @@ envelope (`{ input, output }`). Engine-level `compensationRetries` (default 1)
 bounds transient undo failures; failing compensations are skipped so they can't
 mask the original error. Trigger deliberately with
 `await engine.cancel(runId, { compensate: true })` or
-`engine.cancelWhere(filter, { compensate: true })`. Every undo surfaces as a
-visible `compensate:<step>` event. Source: `docs/reliability/sagas.mdx`.
+`engine.cancelWhere(filter, { compensate: true })`. The cancel is durable (a
+`cancel:<runId>` marker) and honored on every exit of the turn running when it
+lands: return, throw, continue-as-new or suspend all compensate and settle
+`cancelled`. Every undo surfaces as a visible `compensate:<step>` event.
+Source: `docs/reliability/sagas.mdx`.
 
 ### Pattern 2 — flow-control queues + fleet-wide admission
 
@@ -130,7 +133,10 @@ Source: `docs/reliability/flow-control.mdx`.
 
 Crash-recovery reclaims orphaned runs within ~`leaseMs`; a run that crashes the
 process every time would loop forever. Cap it and route the terminal `dead`
-status into a handler workflow (idempotent by the `dlq:<runId>` start id):
+status into a handler workflow (idempotent by the `dlq:<runId>` start id). A run
+whose remote step is still in flight is parked `suspended`, never counted, and a
+retry (`requeue` / `durable:retry`) of a `dead`/`failed` run resets
+`recoveryAttempts` to 0:
 
 ```ts title="config/durable.ts"
 export default defineConfig({

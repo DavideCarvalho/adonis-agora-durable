@@ -84,6 +84,15 @@ export class CodecStateStore implements StateStore {
   /** Encodes like {@link saveCheckpoint}. Bound only when the inner store has it, so the engine's
    *  plain-save fallback still kicks in through the wrapper. */
   readonly saveCheckpointIfPending?: (checkpoint: StepCheckpoint) => Promise<boolean>;
+  /** Forwarded verbatim — an admission claim touches only status/tags, never a payload. Bound only
+   *  when the inner store has it, so singleton workflows keep failing fast on a store without it. */
+  readonly tryAdmitSingleton?: (
+    runId: string,
+    tag: string,
+    workflow: string,
+    limit: number,
+    retryWakeAt?: number,
+  ) => Promise<boolean>;
   /** Forwarded verbatim — a count reads no payload. Bound only when the inner store has it. */
   readonly countCheckpoints?: (
     runId: string,
@@ -101,6 +110,11 @@ export class CodecStateStore implements StateStore {
     const saveIfPending = inner.saveCheckpointIfPending;
     if (saveIfPending) {
       this.saveCheckpointIfPending = (cp) => saveIfPending.call(inner, this.encCp(cp));
+    }
+    const tryAdmitSingleton = inner.tryAdmitSingleton;
+    if (tryAdmitSingleton) {
+      this.tryAdmitSingleton = (runId, tag, workflow, limit, retryWakeAt) =>
+        tryAdmitSingleton.call(inner, runId, tag, workflow, limit, retryWakeAt);
     }
     const countCheckpoints = inner.countCheckpoints;
     if (countCheckpoints) {

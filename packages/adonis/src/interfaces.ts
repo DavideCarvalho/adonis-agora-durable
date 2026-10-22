@@ -330,6 +330,33 @@ export interface StateStore {
     patch: Partial<WorkflowRun>,
   ): Promise<boolean>;
 
+  /**
+   * Atomically claim a singleton slot for `runId` — the store half of the `singleton` gate. Required
+   * to use singleton workflows (a start fails before creating the run without it); optional otherwise.
+   *
+   * Inside ONE critical section that serializes competing claims BEFORE it reads (a transaction with
+   * `SELECT … FOR UPDATE`, or a write lock taken first; a plain list-then-update is unsafe across
+   * engine instances): read the active (`pending`/`running`/`suspended`/`blocked`) runs of `workflow`
+   * carrying `tag`, then decide with {@link singletonAdmissionTags} — runs already carrying the
+   * reserved `durable:singleton:admitted` tag keep their slots, and the free ones go to the oldest
+   * unadmitted waiters by `(createdAt, id)`. On admission persist the returned tags and return `true`
+   * (also `true`, without a write, when the run already holds a slot).
+   *
+   * On denial, when `retryWakeAt` is given, park the candidate `suspended` with that `wakeAt` under the
+   * same locks ({@link singletonAdmissionDenialPatch}), and never write a run that is no longer active
+   * (a concurrent cancel must not be resurrected). Return `false` for a missing or inactive run.
+   *
+   * The slot is released by the terminal settle: `updateRun`/`updateRunIf` writing a terminal status
+   * must drop the reserved tag. An expired execution lease never releases it.
+   */
+  tryAdmitSingleton?(
+    runId: string,
+    tag: string,
+    workflow: string,
+    limit: number,
+    retryWakeAt?: number,
+  ): Promise<boolean>;
+
   getRun(runId: string): Promise<WorkflowRun | null>;
 
   /**

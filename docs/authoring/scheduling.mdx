@@ -152,7 +152,7 @@ That is the whole change — one image, one process, one `CMD`. The loop is the 
 |---|---|---|
 | `embedded` | `false` | Start the loop in this process |
 | `intervalMs` | `1000` | Poll interval between ticks |
-| `drainTimeoutMs` | `10_000` | Drain timeout applied on shutdown |
+| `drainTimeoutMs` | `10_000` | Shutdown budget: the wait for the tick in flight plus the drain |
 
 **The loop starts only in the `web` environment.** Without that gate, `node ace migration:run` would quietly become a worker, and `node ace durable:work` would run *two* loops in one process — the command's and the embedded one — ticking every phase twice. The gate is also what lets you keep `embedded: true` in config while still running dedicated worker pods: the command runs in the `console` environment, so no embedded loop competes with it.
 

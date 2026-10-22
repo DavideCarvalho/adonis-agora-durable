@@ -140,7 +140,10 @@ export interface WorkerLoopOptions {
   /** Resolves/rejects to stop the loop gracefully (wired to SIGINT/SIGTERM by the command). */
   stopSignal: Promise<void>;
   logger: WorkerLogger;
-  /** Drain timeout passed to `engine.drain` on shutdown. Default 10s. */
+  /**
+   * Total shutdown budget in ms, from the stop request: the wait for the tick still in flight plus
+   * `engine.drain`. Time spent waiting for the tick is deducted from the drain. Default 10s.
+   */
   drainTimeoutMs?: number;
   /** Injectable sleep, for tests. Default a real timer that resolves after `ms`. */
   sleep?: (ms: number) => Promise<void>;
@@ -168,15 +171,33 @@ export async function runWorkerLoop(
   // (see Transport.deferConsumers) — without this, a worker booted in a console environment would
   // poll the store but never claim broker jobs.
   engine.startConsumers();
+  const drainTimeoutMs = options.drainTimeoutMs ?? 10_000;
   let stopped = false;
+  let stoppedAt = 0;
+  // Resolves `drainTimeoutMs` after the stop request: the most a tick still in flight is waited for.
+  let budgetSpent!: () => void;
+  const outOfBudget = new Promise<'timeout'>((resolve) => {
+    budgetSpent = () => resolve('timeout');
+  });
   void options.stopSignal.then(() => {
     stopped = true;
+    stoppedAt = Date.now();
     // Stop picking up new runs inside the tick that is still running; drain still waits for it.
     engine.beginDrain();
+    const t = setTimeout(budgetSpent, drainTimeoutMs);
+    (t as { unref?: () => void }).unref?.();
   });
   let ticks = 0;
   while (!stopped) {
-    const result = await runTick(engine, options.schedules ? { schedules: options.schedules } : {});
+    const tick = runTick(engine, options.schedules ? { schedules: options.schedules } : {});
+    const result = await Promise.race([tick, outOfBudget]);
+    if (result === 'timeout') {
+      // The tick outlived the whole shutdown budget: stop waiting for it (drain gets nothing left).
+      options.logger.error(
+        `tick still running ${drainTimeoutMs}ms after the stop request; stopping without waiting for it`,
+      );
+      break;
+    }
     ticks += 1;
     const touched = result.pending + result.recovered + result.timers + result.scheduled;
     if (touched > 0) {
@@ -191,8 +212,11 @@ export async function runWorkerLoop(
     // Race the interval against the stop signal so shutdown is prompt, not interval-latent.
     await Promise.race([sleep(options.intervalMs), options.stopSignal.catch(() => undefined)]);
   }
-  options.logger.info(`draining (timeout ${options.drainTimeoutMs ?? 10_000}ms)…`);
-  await engine.drain(options.drainTimeoutMs);
+  // Charge the drain for the time already spent waiting on the in-flight tick, so the stop request
+  // to the end of the drain stays within ONE `drainTimeoutMs`.
+  if (stoppedAt > 0) engine.beginDrain(Date.now() - stoppedAt);
+  options.logger.info(`draining (timeout ${drainTimeoutMs}ms)…`);
+  await engine.drain(drainTimeoutMs);
   options.logger.info(`worker stopped after ${ticks} ticks`);
   return ticks;
 }

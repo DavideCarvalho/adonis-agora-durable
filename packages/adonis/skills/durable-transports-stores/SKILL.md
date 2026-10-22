@@ -280,7 +280,12 @@ without it the engine loads the run's checkpoints per result), implement
 (without it a blind save can put a settled step back to `pending`), and return
 `listDueTimers` most overdue first, with or without a `limit`. Run
 `runStateStoreContract` from `@adonis-agora/durable/testing/conformance`, which
-covers all three and fails a store missing either method.
+covers all three and fails a store missing either method. To run singleton
+workflows a custom store also needs `tryAdmitSingleton` (one transaction that
+locks before it reads, built on the exported `singletonAdmissionTags` /
+`singletonAdmissionDenialPatch`, and a terminal `updateRun`/`updateRunIf` that
+drops the `durable:singleton:admitted` tag); without it a singleton `start`
+throws before creating the run.
 
 Source: `docs/stores/lucid.mdx`, `docs/stores/index.mdx`.
 
