@@ -808,7 +808,11 @@ export class WorkflowEngine {
     this.maxRecoveryAttempts = deps.maxRecoveryAttempts;
     // Default 5min; an explicit 0 disables the fallback (opt back into wake-forever-on-lost-event).
     this.reconcileMs = deps.reconcileMs === undefined ? 300_000 : deps.reconcileMs || undefined;
-    this.heartbeatPersistThrottleMs = deps.heartbeatPersistThrottleMs ?? 10_000;
+    // Validated like `timerBatchSize`: a NaN/negative throttle would silently disable the
+    // cross-instance liveness salvage (`timeoutMs + NaN` never compares true). `0` stays valid.
+    const throttle = deps.heartbeatPersistThrottleMs;
+    this.heartbeatPersistThrottleMs =
+      throttle !== undefined && Number.isFinite(throttle) && throttle >= 0 ? throttle : 10_000;
     // A non-finite or sub-1 value falls back to the default: a NaN limit would stall timer recovery.
     const batch = deps.timerBatchSize;
     this.timerBatchSize =
