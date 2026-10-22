@@ -168,8 +168,10 @@ The mounted dashboard also serves `GET <path>/api/metrics` (these counters plus
 per-group `durable_group_queue_depth` / `durable_group_live_workers` gauges),
 `GET <path>/api/runs/:id/events/:key` (the latest `ctx.setEvent` value, through
 `redact.checkpoint`) and `POST <path>/api/webhooks/:token` (resumes a run parked
-on a `ctx.webhook()`; `wh:` tokens only, only while a run waits on it, and behind
-the console's guard like every route).
+on a `ctx.webhook()`; `wh:` tokens only, behind the console's guard like every
+route — a callback landing before the run waits is buffered `202 { buffered: true }`
+for a live run that has not consumed it yet, consumed by the later `wait()`;
+unknown, terminal or duplicate tokens answer `404` and buffer nothing).
 
 Inside a step, a helper that was never handed the logger records through
 `currentStep()?.info(...)` (from `@adonis-agora/durable`; `undefined` outside a
