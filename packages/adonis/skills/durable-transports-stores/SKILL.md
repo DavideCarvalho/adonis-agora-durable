@@ -316,9 +316,9 @@ JSON column that does not parse reads back as `undefined` and is reported once
 
 To run singleton workflows a custom store also needs `tryAdmitSingleton` (one transaction that
 locks before it reads, built on the exported `singletonAdmissionTags` /
-`singletonAdmissionDenialPatch`, and a terminal `updateRun`/`updateRunIf` that
-drops the `durable:singleton:admitted` tag); without it singletons fall back
-to the old non-atomic scan and the engine warns once.
+`singletonAdmissionDenialPatch` including the pre-0.51 holder count, and a terminal `updateRun`/`updateRunIf` that
+drops both singleton markers (`durable:singleton:admitted` and `durable:singleton:tracked`, via `withoutSingletonMarkers`)); without it singletons fall back
+to the old non-atomic scan and the engine warns once naming `StateStore.tryAdmitSingleton`.
 
 Source: `docs/stores/lucid.mdx`, `docs/stores/index.mdx`.
 
