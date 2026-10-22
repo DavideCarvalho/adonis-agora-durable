@@ -88,6 +88,17 @@ Upgrading an app from 0.6 to 0.7:
 | `maxStalledCount` | `3` | How many times one job may be reclaimed before it is failed permanently — the bound on a poison job. |
 | `onError` | `console.error` | Where a poll-loop failure is reported. Point it at your app's logger. |
 | `instanceId` | random uuid | Stable process id stamped on heartbeats and control messages. |
+| `workerKeys` | the app database | Where the [worker advertisement](/docs/durable/transports#worker-advertisement) lives. Default: the `durable_transport_worker_keys` table through `@adonisjs/lucid`, when the app has it. Pass any `WorkerKeyStore` to keep the keys elsewhere, or `false` to advertise nothing. |
+| `workerKeysConnection` | default Lucid connection | Lucid connection the default worker-key table lives on. |
+| `workerKeysCacheMs` | `5000` | How long a read of the worker keys is reused. |
+
+### Worker advertisement
+
+A queue hands each job to one consumer, so a worker's descriptor and heartbeat cannot travel over it:
+every engine has to read every worker's. They go to a key store instead — by default the app database's
+`durable_transport_worker_keys` table (created on first use, and by the migration `configure`
+publishes), the same one the [db transport](/docs/durable/transports/db) uses. With no database and no
+`workerKeys`, nothing is advertised and the engine routes without descriptors, as before.
 
 ### Stalled-job reclaim
 

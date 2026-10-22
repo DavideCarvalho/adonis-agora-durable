@@ -17,13 +17,15 @@ import { Pollers, type PollLoop } from '../pollers.js';
 import { runStepHandler, type StepHandler } from '../protocol.js';
 import { sanitizeQueueToken, tenantGroup } from '../tenant-group.js';
 import type { DescriptorRedis } from '../worker-runtime/registry.js';
-import { createDurableTransportTables, TRANSPORT_TABLES, WORKER_KEYS_TABLE } from './db-schema.js';
+import { createDurableTransportTables, TRANSPORT_TABLES } from './db-schema.js';
 import {
+  cachedLiveKeys,
   descriptorsOn,
   liveGroupsOf,
   type WorkerKeyStore,
   workerKeyWriter,
 } from './worker-keys.js';
+import { lucidWorkerKeys } from './worker-keys-db.js';
 
 /**
  * The wire payloads carried in the DB transport's table rows. Everything crossing the DB is plain
@@ -187,7 +189,8 @@ export class DbTransport implements Transport, ControlPlane {
   readonly #autoCreate: boolean;
   readonly #instanceId: string;
   readonly #workerKeysCacheMs: number;
-  #workerKeysRead: { at: number; entries: { key: string; value: string }[] } | undefined;
+  #workerKeyStore: WorkerKeyStore | undefined;
+  #readWorkerKeys: (() => Promise<{ key: string; value: string }[]>) | undefined;
   readonly #handlers = new Map<string, StepHandler>();
   readonly #pollers: Pollers;
   #schemaReady: Promise<void> | undefined;
@@ -553,32 +556,12 @@ export class DbTransport implements Transport, ControlPlane {
   // ───────────────────────────────────────────────────────────────────────────
 
   #workerKeys(): WorkerKeyStore {
-    return {
-      put: async (key, value, expiresAt) => {
-        await this.#ensureSchema();
-        const now = this.#now();
-        await this.#client().from(WORKER_KEYS_TABLE).where('expires_at', '<=', now).delete();
-        await this.#client()
-          .insertQuery()
-          .table(WORKER_KEYS_TABLE)
-          .knexQuery.insert({ key, value, expires_at: expiresAt })
-          .onConflict('key')
-          .merge();
-      },
-      remove: async (keys) => {
-        if (keys.length === 0) return;
-        await this.#ensureSchema();
-        await this.#client().from(WORKER_KEYS_TABLE).whereIn('key', keys).delete();
-      },
-      live: async (now) => {
-        await this.#ensureSchema();
-        const rows = (await this.#client()
-          .from(WORKER_KEYS_TABLE)
-          .where('expires_at', '>', now)
-          .select('key', 'value')) as { key: string; value: string }[];
-        return rows;
-      },
-    };
+    this.#workerKeyStore ??= lucidWorkerKeys(this.#db, {
+      connectionName: this.#connectionName,
+      autoCreate: this.#autoCreate,
+      now: () => this.#now(),
+    });
+    return this.#workerKeyStore;
   }
 
   /** The writer a worker runtime's registry advertises its descriptor and heartbeat through. */
@@ -586,19 +569,12 @@ export class DbTransport implements Transport, ControlPlane {
     return workerKeyWriter(this.#workerKeys(), () => this.#now());
   }
 
-  /** The live advertisement keys, reused for {@link DbTransportOptions.workerKeysCacheMs}. `[]` when
-   *  the table cannot be read, so routing falls back to what it does with no advertisement. */
-  async #liveWorkerKeys(): Promise<{ key: string; value: string }[]> {
-    const now = this.#now();
-    const read = this.#workerKeysRead;
-    if (read && now - read.at < this.#workerKeysCacheMs) return read.entries;
-    try {
-      const entries = await this.#workerKeys().live(now);
-      this.#workerKeysRead = { at: now, entries };
-      return entries;
-    } catch {
-      return [];
-    }
+  /** The live advertisement keys, reused for {@link DbTransportOptions.workerKeysCacheMs}. */
+  #liveWorkerKeys(): Promise<{ key: string; value: string }[]> {
+    this.#readWorkerKeys ??= cachedLiveKeys(this.#workerKeys(), this.#workerKeysCacheMs, () =>
+      this.#now(),
+    );
+    return this.#readWorkerKeys();
   }
 
   /** The live worker descriptors advertised on `token`. */

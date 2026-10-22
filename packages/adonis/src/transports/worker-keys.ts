@@ -84,3 +84,34 @@ export class MemoryWorkerKeys implements WorkerKeyStore {
     return out;
   }
 }
+
+/** A {@link WorkerKeyStore} that holds nothing: what a transport with no place for the keys uses. */
+export const NO_WORKER_KEYS: WorkerKeyStore = {
+  put: async () => {},
+  remove: async () => {},
+  live: async () => [],
+};
+
+/**
+ * The live advertisement keys of `store`, reused for `cacheMs` (the engine asks for a token's
+ * descriptors before every dispatch, and the fleet changes on the advertisement cadence). `[]` when
+ * the store cannot be read, so routing falls back to what it does with no advertisement.
+ */
+export function cachedLiveKeys(
+  store: WorkerKeyStore,
+  cacheMs: number,
+  now: () => number,
+): () => Promise<{ key: string; value: string }[]> {
+  let read: { at: number; entries: { key: string; value: string }[] } | undefined;
+  return async () => {
+    const at = now();
+    if (read && at - read.at < cacheMs) return read.entries;
+    try {
+      const entries = await store.live(at);
+      read = { at, entries };
+      return entries;
+    } catch {
+      return [];
+    }
+  };
+}
