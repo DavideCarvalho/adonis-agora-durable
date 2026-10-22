@@ -41,6 +41,35 @@ jobs:
       matrix:
         node: [24, 26]
     name: test (node ${{ matrix.node }})
+    services:
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    # The real backends. With CI set, a suite gated on one of these FAILS when it is missing instead
+    # of skipping (test/support/backends.ts), so a dropped service cannot silently shrink the run.
+    # Test files share each server: Redis keys carry a per-file prefix, and every Postgres test gets
+    # a schema of its own.
+    env:
+      REDIS_URL: redis://127.0.0.1:6379
+      DURABLE_REDIS_URL: redis://127.0.0.1:6379
+      DURABLE_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -57,7 +86,8 @@ jobs:
 
   # The `@adonisjs/queue` peer range spans 0.6 and 0.7, whose adapter contracts differ (0.7 finalizes
   # claims by lease token). The suite above runs on the pinned dev version (0.7); this reruns the
-  # durable package on 0.6, against a real Redis too, so both ends of the range stay green.
+  # durable package on 0.6 against the same real Redis and Postgres (the queue transport's Knex
+  # adapter included), so both ends of the range stay green.
   test-queue-compat:
     runs-on: ubuntu-latest
     name: test (@adonisjs/queue 0.6)
@@ -66,6 +96,30 @@ jobs:
         image: redis:8-alpine
         ports:
           - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    # The real backends. With CI set, a suite gated on one of these FAILS when it is missing instead
+    # of skipping (test/support/backends.ts), so a dropped service cannot silently shrink the run.
+    # Test files share each server: Redis keys carry a per-file prefix, and every Postgres test gets
+    # a schema of its own.
+    env:
+      REDIS_URL: redis://127.0.0.1:6379
+      DURABLE_REDIS_URL: redis://127.0.0.1:6379
+      DURABLE_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -81,7 +135,3 @@ jobs:
       - run: pnpm build
 
       - run: scripts/test-queue-compat.sh 0.6.2
-
-      - run: scripts/test-queue-compat.sh 0.6.2 test/engine/transports
-        env:
-          REDIS_URL: redis://127.0.0.1:6379
