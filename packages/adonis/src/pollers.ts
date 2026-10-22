@@ -60,8 +60,8 @@ export class Pollers {
   }
 
   /** The next sleep for a loop that has seen `idleRounds` consecutive empty rounds, jittered. */
-  #sleepMs(idleRounds: number): number {
-    const backoff = Math.min(2 ** Math.min(idleRounds, 30), this.#idleBackoffMax);
+  #sleepMs(idleRounds: number, idleBackoffMax = this.#idleBackoffMax): number {
+    const backoff = Math.min(2 ** Math.min(idleRounds, 30), idleBackoffMax);
     const base = this.#intervalMs * backoff;
     if (this.#jitterRatio === 0) return base;
     return Math.round(base * (1 - this.#jitterRatio + 2 * this.#jitterRatio * Math.random()));
@@ -71,8 +71,11 @@ export class Pollers {
    * Start a loop driven by `tick`. `tick` resolves to whether it did any work this round; while it
    * keeps returning `true` the loop drains without sleeping, then sleeps `intervalMs` once a round
    * is empty. Returns a handle that stops just this loop (also stopped by {@link stopAll}).
+   * `options.idleBackoffMax` overrides the instance's idle backoff for this loop only.
    */
-  start(tick: () => Promise<boolean>): PollLoop {
+  start(tick: () => Promise<boolean>, options?: { idleBackoffMax?: number }): PollLoop {
+    const idleBackoffMax =
+      options?.idleBackoffMax === undefined ? undefined : Math.max(1, options.idleBackoffMax);
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let idleRounds = 0;
@@ -90,7 +93,7 @@ export class Pollers {
       }
       idleRounds += 1;
       if (!stopped && !this.#closed) {
-        timer = setTimeout(() => track(), this.#sleepMs(idleRounds - 1));
+        timer = setTimeout(() => track(), this.#sleepMs(idleRounds - 1, idleBackoffMax));
         timer.unref?.();
       }
     };

@@ -129,7 +129,7 @@ By default, flow-control accounting is **per engine instance**. For the common s
 
 ## Worker / transport concurrency
 
-A queue's `concurrency` caps what the engine *admits*. How many already-dispatched tasks a `bullmq` worker *executes* at once is a separate, transport-level knob — [`transports.bullmq({ concurrency })`](/docs/durable/transports/bullmq#concurrency):
+A queue's `concurrency` caps what the engine *admits*. How many already-dispatched tasks a worker *executes* at once is a separate, transport-level knob — [`transports.bullmq({ concurrency })`](/docs/durable/transports/bullmq#concurrency), or a fixed [`transports.queue({ concurrency })`](/docs/durable/transports/queue#concurrency-and-idle-polling):
 
 ```ts title="config/durable.ts"
 bullmq: transports.bullmq({

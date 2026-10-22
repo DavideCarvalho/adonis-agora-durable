@@ -52,6 +52,12 @@ export type ControlPayload = ControlMessage;
 
 /** How often the engine-side / worker-side poll loops ask the adapter for the next job. */
 const DEFAULT_POLL_INTERVAL_MS = 200;
+/** Idle backoff for the task, heartbeat and control loops: after consecutive empty polls the sleep
+ *  doubles up to this many poll intervals (800ms at the default interval), and the first job found
+ *  resets it. Each handler name has its own task loop, so an idle worker serving many step names
+ *  would otherwise hit the backend `names × 5` times a second. The results loop is exempt — see
+ *  {@link QueueTransportOptions.idleBackoffMax}. */
+const DEFAULT_IDLE_BACKOFF_MAX = 4;
 
 /** How often (ms) the stalled-job reclaim sweep runs — a coarse, low-frequency check, NOT per poll
  *  tick. Mirrors `DbTransport`'s crash-recovery cadence (its stale-lease default is also 30s). */
@@ -90,6 +96,12 @@ const MAX_EXCEEDED_PER_SWEEP = 100;
 interface JobLeaseLike {
   id: string;
   leaseToken: string;
+}
+
+/** Per-loop knobs: how many jobs it keeps in flight, and its idle backoff (instance default if unset). */
+interface LoopOptions {
+  concurrency?: number;
+  idleBackoffMax?: number;
 }
 
 /** What we pass an adapter's finalize methods: the lease on the new contract, the job id on the old. */
@@ -192,6 +204,24 @@ export interface QueueTransportOptions {
   /** Poll interval (ms) for the result/task/heartbeat/control loops. Default 200ms. */
   pollIntervalMs?: number;
   /**
+   * How many jobs of ONE step name this worker runs at once. Default 1 (one at a time, the historical
+   * behavior). Each handler name's task loop keeps up to this many jobs in flight from a single poll
+   * loop — more slots do not add polling — and every in-flight claim is renewed and drained on
+   * `close()` like a single one.
+   */
+  concurrency?: number;
+  /** How many step results the engine side settles at once. Default 1. */
+  resultConcurrency?: number;
+  /**
+   * Idle backoff for the task, heartbeat and control loops, as a multiple of {@link pollIntervalMs}:
+   * after consecutive empty polls the sleep doubles up to `idleBackoffMax × pollIntervalMs`, and any
+   * poll that finds a job resets it. Default 4 (an idle loop polls every 800ms instead of 200ms),
+   * which bounds the backend load of an idle worker serving many step names at the cost of up to that
+   * much pickup latency for the first job after a quiet spell. `1` disables it. The results loop never
+   * backs off: a result is on the critical path of every step.
+   */
+  idleBackoffMax?: number;
+  /**
    * How often (ms) the stalled-job reclaim sweep runs. Reclaim is ON by default (default 30s); set to
    * `0` to disable it entirely. This is a coarse background check, NOT run on every poll tick — see
    * the reclaim doc block on {@link QueueTransport} for what it recovers and why default-on is safe.
@@ -265,6 +295,11 @@ export class QueueTransport implements Transport, ControlPlane {
   #namespace: string | undefined;
   readonly #explicitNamespace: boolean;
   readonly #pollIntervalMs: number;
+  readonly #concurrency: number;
+  readonly #resultConcurrency: number;
+  readonly #idleBackoffMax: number;
+  /** Every job handler still running (any queue) — `close()` waits for these, bounded. */
+  readonly #runningJobs = new Set<Promise<void>>();
   readonly #stalledThresholdMs: number;
   readonly #maxStalledCount: number;
   readonly #instanceId: string;
@@ -306,6 +341,9 @@ export class QueueTransport implements Transport, ControlPlane {
     this.#namespace = options.namespace;
     this.#explicitNamespace = options.namespace !== undefined;
     this.#pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    this.#concurrency = Math.max(1, Math.floor(options.concurrency ?? 1));
+    this.#resultConcurrency = Math.max(1, Math.floor(options.resultConcurrency ?? 1));
+    this.#idleBackoffMax = Math.max(1, options.idleBackoffMax ?? DEFAULT_IDLE_BACKOFF_MAX);
     const canRenew = typeof this.#adapter.renewJobs === 'function';
     this.#stalledThresholdMs =
       options.stalledThresholdMs ??
@@ -456,13 +494,17 @@ export class QueueTransport implements Transport, ControlPlane {
     if (this.#taskLoops.has(token)) return;
     this.#taskLoops.set(
       token,
-      this.#startLoop(this.#tasksQueue(token), async (job) => {
-        const task = fromJson<TaskPayload>(job.payload);
-        const result = await runStepHandler(task, this.#handlers.get(task.name), (beat) =>
-          this.heartbeat(beat),
-        );
-        await this.#adapter.pushOn(this.#resultsQueue(), this.#job('result', result));
-      }),
+      this.#startLoop(
+        this.#tasksQueue(token),
+        async (job) => {
+          const task = fromJson<TaskPayload>(job.payload);
+          const result = await runStepHandler(task, this.#handlers.get(task.name), (beat) =>
+            this.heartbeat(beat),
+          );
+          await this.#adapter.pushOn(this.#resultsQueue(), this.#job('result', result));
+        },
+        { concurrency: this.#concurrency, idleBackoffMax: this.#idleBackoffMax },
+      ),
     );
   }
 
@@ -476,15 +518,23 @@ export class QueueTransport implements Transport, ControlPlane {
   // ---------------------------------------------------------------------------
 
   onResult(handler: (result: StepResult) => Promise<void>): void {
-    this.#startLoop(this.#resultsQueue(), async (job) => {
-      await handler(fromJson<ResultPayload>(job.payload));
-    });
+    this.#startLoop(
+      this.#resultsQueue(),
+      async (job) => {
+        await handler(fromJson<ResultPayload>(job.payload));
+      },
+      { concurrency: this.#resultConcurrency, idleBackoffMax: 1 },
+    );
   }
 
   onHeartbeat(handler: (beat: Heartbeat) => Promise<void>): void {
-    this.#startLoop(this.#heartbeatsQueue(), async (job) => {
-      await handler(fromJson<HeartbeatPayload>(job.payload));
-    });
+    this.#startLoop(
+      this.#heartbeatsQueue(),
+      async (job) => {
+        await handler(fromJson<HeartbeatPayload>(job.payload));
+      },
+      { idleBackoffMax: this.#idleBackoffMax },
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -497,9 +547,13 @@ export class QueueTransport implements Transport, ControlPlane {
   }
 
   onControl(handler: (msg: ControlMessage) => void): void {
-    this.#startLoop(this.#controlQueue(), async (job) => {
-      handler(fromJson<ControlPayload>(job.payload));
-    });
+    this.#startLoop(
+      this.#controlQueue(),
+      async (job) => {
+        handler(fromJson<ControlPayload>(job.payload));
+      },
+      { idleBackoffMax: this.#idleBackoffMax },
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -521,14 +575,18 @@ export class QueueTransport implements Transport, ControlPlane {
    * reconcile recovery instead of wedging or losing the result.) A job nobody can settle loops at
    * the poll rate and says so on every attempt, which is the failure we want — loud, not invisible.
    */
-  #startLoop(queue: string, onJob: (job: JobData) => Promise<void>): PollLoop {
+  #startLoop(
+    queue: string,
+    onJob: (job: JobData) => Promise<void>,
+    opts: LoopOptions = {},
+  ): PollLoop {
     // Deferred consumption (see deferConsumers): park the start; startConsumers() flushes it. The
     // handle returned now still stops the loop whether it is flushed later or never.
     if (this.#consumersDeferred) {
       let cancelled = false;
       let live: PollLoop | undefined;
       this.#deferredStarts.push(() => {
-        if (!cancelled) live = this.#reallyStartLoop(queue, onJob);
+        if (!cancelled) live = this.#reallyStartLoop(queue, onJob, opts);
       });
       return {
         stop: () => {
@@ -537,26 +595,60 @@ export class QueueTransport implements Transport, ControlPlane {
         },
       };
     }
-    return this.#reallyStartLoop(queue, onJob);
+    return this.#reallyStartLoop(queue, onJob, opts);
   }
 
-  #reallyStartLoop(queue: string, onJob: (job: JobData) => Promise<void>): PollLoop {
+  #reallyStartLoop(
+    queue: string,
+    onJob: (job: JobData) => Promise<void>,
+    { concurrency = 1, idleBackoffMax }: LoopOptions,
+  ): PollLoop {
     // Record every queue we consume from so the reclaim sweep can walk exactly this set.
     this.#poppedQueues.add(queue);
-    return this.#pollers.start(async () => {
-      let job: AcquiredJob | null;
-      try {
-        job = await this.#adapter.popFrom(queue);
-      } catch {
-        // A transient adapter error: treat as "no work", retry on the next tick.
-        return false;
-      }
-      if (!job) return false;
-      // Track the popped-but-unfinished job so close() can hand it back to the broker instead of
-      // destroying the adapter under it (which stranded it `active` until the stalled sweep —
-      // every deploy of a busy fleet parked its mid-flight jobs for up to the stalled threshold).
-      const handle = jobHandle(job);
-      this.#openJobs.set(job.id, { queue, handle });
+    // This loop's jobs still in a handler. With one slot the tick awaits its job (the historical
+    // shape); with more it hands each job off and keeps popping until every slot is taken, so N
+    // slots cost ONE poll loop, not N.
+    const inFlight = new Set<Promise<void>>();
+    return this.#pollers.start(
+      async () => {
+        if (inFlight.size >= concurrency) {
+          // Every slot busy: wait for one to free, then report work so the loop re-ticks at once.
+          await Promise.race(inFlight);
+          return true;
+        }
+        let job: AcquiredJob | null;
+        try {
+          job = await this.#adapter.popFrom(queue);
+        } catch {
+          // A transient adapter error: treat as "no work", retry on the next tick.
+          return false;
+        }
+        if (!job) return false;
+        const run = this.#runJob(queue, job, onJob);
+        if (concurrency === 1) {
+          await run;
+          return true;
+        }
+        inFlight.add(run);
+        void run.finally(() => inFlight.delete(run));
+        return true;
+      },
+      idleBackoffMax === undefined ? undefined : { idleBackoffMax },
+    );
+  }
+
+  /**
+   * Run one popped job and finalize it: complete on success, hand back for redelivery on a throw.
+   * Tracked in {@link #openJobs} (renewed, and handed back by `close()` if unfinished) and in
+   * {@link #runningJobs} (waited for by `close()`, bounded).
+   */
+  #runJob(queue: string, job: AcquiredJob, onJob: (job: JobData) => Promise<void>): Promise<void> {
+    // Track the popped-but-unfinished job so close() can hand it back to the broker instead of
+    // destroying the adapter under it (which stranded it `active` until the stalled sweep —
+    // every deploy of a busy fleet parked its mid-flight jobs for up to the stalled threshold).
+    const handle = jobHandle(job);
+    this.#openJobs.set(job.id, { queue, handle });
+    const run = (async () => {
       try {
         await onJob(job);
         // A lease-based adapter answers `false` when the lease was lost (the reclaim sweep re-delivered
@@ -572,8 +664,10 @@ export class QueueTransport implements Transport, ControlPlane {
       } finally {
         this.#openJobs.delete(job.id);
       }
-      return true;
-    });
+    })();
+    this.#runningJobs.add(run);
+    void run.finally(() => this.#runningJobs.delete(run));
+    return run;
   }
 
   // ---------------------------------------------------------------------------
@@ -716,7 +810,21 @@ export class QueueTransport implements Transport, ControlPlane {
     this.#pollers.stopAll();
     this.#reclaimPollers?.stopAll();
     this.#taskLoops.clear();
+    const drainDeadline = Date.now() + 5_000;
     await this.#pollers.drain(5_000);
+    // Jobs handed off by a multi-slot loop are not part of a poll tick: wait for them too, within the
+    // same budget.
+    if (this.#runningJobs.size > 0) {
+      const left = Math.max(drainDeadline - Date.now(), 0);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        Promise.allSettled([...this.#runningJobs]),
+        new Promise((r) => {
+          timer = setTimeout(r, left);
+        }),
+      ]);
+      clearTimeout(timer);
+    }
     // Renewal keeps running through the drain (a job finishing inside it must keep its claim), then
     // stops before the leftovers are handed back.
     if (this.#renewTimer) clearInterval(this.#renewTimer);
