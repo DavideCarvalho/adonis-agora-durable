@@ -203,6 +203,19 @@ export class LucidStateStore implements StateStore {
     });
   }
 
+  /** Whether the runs table has `awaiting_decision_task_id`, probed once per store and cached. */
+  private decisionMarkerColumn: Promise<boolean> | undefined;
+  private hasDecisionMarkerColumn(trx: TransactionClientContract): Promise<boolean> {
+    // Probed on the caller's transaction: a single-connection pool (SQLite) has no other to use.
+    this.decisionMarkerColumn ??= trx.schema
+      .hasColumn(DURABLE_TABLES.runs, 'awaiting_decision_task_id')
+      .catch(() => {
+        this.decisionMarkerColumn = undefined; // a failed probe is retried, never cached
+        return true;
+      });
+    return this.decisionMarkerColumn;
+  }
+
   /**
    * The row patch for `patch`, plus — when it settles the run terminally — the run's tags without the
    * singleton admission marker, so a terminal settle releases the slot. The current tags are read
@@ -215,6 +228,16 @@ export class LucidStateStore implements StateStore {
     patch: Partial<WorkflowRun>,
   ): Promise<Record<string, unknown>> {
     const row = runPatchToRow(patch);
+    // A patch CLEARING the remote-workflow decision marker (cancel, requeue, settle) on a schema
+    // that predates the column (`autoSchema: false`, an old migration): leave it out, as `runToRow`
+    // does on insert — there is nothing to clear. Setting it still needs the column.
+    if (
+      'awaiting_decision_task_id' in row &&
+      row.awaiting_decision_task_id == null &&
+      !(await this.hasDecisionMarkerColumn(trx))
+    ) {
+      delete row.awaiting_decision_task_id;
+    }
     if (!settlesTerminally(patch)) return row;
     let tags: string[] | undefined;
     if ('tags' in patch) {
