@@ -255,7 +255,7 @@ A bounded wait takes **two** logical positions (the deadline and the wait), so a
 
 - **Access denied.** The default `authorize` fails closed in every environment: it requires a bearer token equal to `DURABLE_DASHBOARD_TOKEN` and denies everything when that variable is unset.
 - **No runs.** With no `store` configured, the engine uses the in-memory store, so each process only sees its own runs — and loses them on restart. Two pools on different namespaces, or a dashboard pointed at a different Lucid connection, also see different sets.
-- **Empty worker health.** `engine.workerHealth()` and the `/api/health` panel read group health off the transport, and only `bullmq` reports it; on `queue`, `db` or `eventEmitter` it is empty, not "healthy".
+- **Empty worker health.** `engine.workerHealth()` and the `/api/health` panel read group health off the transport, and only `bullmq`, `queue` (with a worker-key store) and `db` report it; on `eventEmitter` it is empty, not "healthy".
 
 **Fix:** set the token or your own `authorize` ([Dashboard → Authorization](/docs/durable/observability/dashboard#authorization)); select the [Lucid store](/docs/durable/stores/lucid); for stranded-run detection off BullMQ, use `durable:runs --stale` or `engine.onStalled`.
 

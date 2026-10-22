@@ -75,10 +75,32 @@ const transport = new DbTransport({ db }) // { partition } isolates this pool
 transport.handle('pipeline:extract', async (input) => extract(input))
 ```
 
+A worker runs ONE task row at a time unless `concurrency` is raised
+(`transports.db({ concurrency: 8, resultConcurrency: 8 })`, or `'adaptive'` with
+the same controller and fields as `queue`/`bullmq`); one poll loop serves every
+handler name and claims only as many rows as it has free slots. Every held
+claim is renewed every `leaseMs / 3`, and a row is recorded (task delete +
+result insert, one transaction) only while `claimed_by` is still the worker's
+token — a worker whose claim was taken over drops its result and reports it to
+`onError`. (Releases before this claimed 20 rows per poll, renewed only the
+running one, and double-ran the rest of the batch when a step outlived
+`leaseMs`.) Idle task/heartbeat/control loops back off up to `idleBackoffMax`
+(default 4) poll intervals; results never back off.
+
+Workers beat `durable[-<ns>]-worker-heartbeat:<token>:<instance>` into
+`durable_transport_worker_keys` with their `WorkerStatus`, and `DbTransport`
+implements `groupHealth`: `depth` = pending + claimed task rows of the group.
+Each takeover of a lapsed claim bumps the row's `reclaims` column; past
+`maxStalledCount` (default 3) the row is deleted and a retryable failed
+`StepResult` (`remote step worker failed: claim lapsed more than N times`) is
+published. `autoCreate` / `createDurableTransportTables` add `reclaims` to an
+existing table; with `autoCreate: false` add it yourself (integer, not null,
+default 0) or the poison bound stays off.
+
 Trade-off: throughput is bounded by polling + row contention — right for
 workflow-scale modest rates, not high-fanout firehoses. Delivery is
-at-least-once (crash between insert-result and delete-task), so handlers should
-be idempotent on `step_id`. Source: `docs/transports/db.mdx`.
+at-least-once (a worker that dies after its handler ran re-runs elsewhere), so
+handlers should be idempotent on `step_id`. Source: `docs/transports/db.mdx`.
 
 ### Pattern 2 — real brokers (`queue`, `bullmq`) and stalled-claim tuning
 
@@ -123,7 +145,7 @@ published, so rely on `timeoutMs` / `remoteRedispatchMs` there. Source:
 `docs/transports/queue.mdx`.
 
 For wide fans (`ctx.all` over thousands of steps), raise how many results an
-instance settles at once on `bullmq` or `queue` (`resultConcurrency`; `db` has no such option),
+instance settles at once on `bullmq`, `queue` or `db` (`resultConcurrency`),
 let its workers size their step concurrency, and size the engine's due-timer
 batch:
 

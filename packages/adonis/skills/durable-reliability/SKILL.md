@@ -308,10 +308,10 @@ const stale = filterStale(
 )
 ```
 
-Mechanism: only `bullmq` and `queue` (with a worker-key store) report group
-health — on `db`, `eventEmitter`, or `queue` with `workerKeys: false`,
+Mechanism: only `bullmq`, `queue` (with a worker-key store) and `db` report group
+health — on `eventEmitter`, or `queue` with `workerKeys: false`,
 `workerHealth()` returns `[]`, not an error, so "no stalled groups reported" says
-nothing. On `queue`, `depth` counts pending jobs only. Use the stranded-signature query instead. Source:
+nothing. On `queue`, `depth` counts pending jobs only; on `db`, pending + claimed rows. Use the stranded-signature query instead. Source:
 `docs/reliability/failure-modes.mdx`.
 
 ### MEDIUM writing non-idempotent saga compensations

@@ -384,7 +384,7 @@ The `waiting` value is one input to a richer **display state** that the runs lis
 | `blocked` | Shown as its own state, with the reason from `run.error.message`. No *compatible* worker exists, which starting another worker of the same build cannot fix. See [Fleet health](#fleet-health). |
 | `running` | Everything else open or in flight, including a settled step waiting to be replayed with nothing currently blocking it. |
 
-`no-worker` is gated on a **real backlog**, not on zero live workers alone. A worker only heartbeats for a group while it serves it, so an idle group (a run parked on its reconcile timer with nothing enqueued, a schedule between fires) legitimately reports no live workers without anything being stuck. Worker health comes from `GET /api/workers`, so on transports without `groupHealth` (anything but BullMQ and queue) nothing ever reads `no-worker`.
+`no-worker` is gated on a **real backlog**, not on zero live workers alone. A worker only heartbeats for a group while it serves it, so an idle group (a run parked on its reconcile timer with nothing enqueued, a schedule between fires) legitimately reports no live workers without anything being stuck. Worker health comes from `GET /api/workers`, so on transports without `groupHealth` (anything but BullMQ, queue and db) nothing ever reads `no-worker`.
 
 ### Filter pickers
 
@@ -464,12 +464,12 @@ interface WorkerHeartbeat {
   /** Stable per-process id (host + pid), so N replicas of a group each show as a distinct worker. */
   instanceId: string
   lastBeatAt: number
-  /** BullMQ and queue workers: concurrency, in-flight, RSS/CPU, throughput, p95, last adjustment. */
+  /** BullMQ, queue and db workers: concurrency, in-flight, RSS/CPU, throughput, p95, last adjustment. */
   status?: WorkerStatus
 }
 ```
 
-`depth > 0 && liveWorkers.length === 0` is the actionable alert: work is queued and nothing is consuming it. Pass `extra` to include groups the engine can't derive from its registrations. Only the BullMQ and queue transports implement `groupHealth` (queue with a worker-key store), so on other transports the list is empty.
+`depth > 0 && liveWorkers.length === 0` is the actionable alert: work is queued and nothing is consuming it. Pass `extra` to include groups the engine can't derive from its registrations. Only the BullMQ, queue and db transports implement `groupHealth` (queue with a worker-key store), so on other transports the list is empty.
 
 **Bulk and tree operations:**
 
