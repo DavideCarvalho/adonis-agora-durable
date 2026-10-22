@@ -41,7 +41,7 @@ import {
   runRepliesQueue,
   tenantEventsQueue,
 } from './queue-remote.js';
-import { failedTaskIdentity, infrastructureFailure } from './task-failure.js';
+import { failedTaskIdentity, fanOutDecision, infrastructureFailure } from './task-failure.js';
 import {
   cachedLiveKeys,
   descriptorsOn,
@@ -918,8 +918,8 @@ export class QueueTransport implements Transport, ControlPlane {
       this.#decisionsQueue(),
       async (job) => {
         const decision = fromJson<WorkflowDecision>(job.payload);
-        // Every handler, concurrently, as on bullmq: one that throws must not starve the rest.
-        await Promise.all([...this.#decisionHandlers].map((h) => h(decision)));
+        // Every handler, concurrently; all settle before a failure redelivers the decision.
+        await fanOutDecision(this.#decisionHandlers, decision, this.#onError);
       },
       { idleBackoffMax: 1 },
     );

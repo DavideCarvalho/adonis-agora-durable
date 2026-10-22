@@ -48,7 +48,7 @@ import {
   type MessageKind,
   TRANSPORT_TABLES,
 } from './db-schema.js';
-import { infrastructureFailure } from './task-failure.js';
+import { fanOutDecision, infrastructureFailure } from './task-failure.js';
 import {
   cachedLiveKeys,
   descriptorsOn,
@@ -1317,8 +1317,8 @@ export class DbTransport implements Transport, ControlPlane {
       recipients: () => (this.#consumersDeferred ? [this.#instanceId] : [this.#instanceId, '']),
       idleBackoffMax: 1,
       each: async (decision) => {
-        // Every handler, concurrently, as on bullmq: one that throws must not starve the rest.
-        await Promise.all([...this.#decisionHandlers].map((h) => h(decision)));
+        // Every handler, concurrently; all settle before a failure redelivers the decision.
+        await fanOutDecision(this.#decisionHandlers, decision, this.#onError);
       },
     });
   }

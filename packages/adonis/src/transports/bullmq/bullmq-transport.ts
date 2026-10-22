@@ -18,7 +18,12 @@ import type {
 import { runStepHandler, type StepHandler, withTurnHeartbeat } from '../../protocol.js';
 import { swallowSubscribe } from '../../safe-subscribe.js';
 import { isWorkflowTask, type WorkflowTurnHandler } from '../../workflow-turn.js';
-import { failedTaskIdentity, infrastructureFailure, type TaskIdentity } from '../task-failure.js';
+import {
+  failedTaskIdentity,
+  fanOutDecision,
+  infrastructureFailure,
+  type TaskIdentity,
+} from '../task-failure.js';
 import { AdaptiveController, type ConcurrencyOption } from './adaptive-concurrency.js';
 import {
   type BullMQDeps,
@@ -749,7 +754,11 @@ export class BullMQTransport implements Transport {
       decisionsName(this.#effectivePrefix()),
       async (job) => {
         const decision = job.data as WorkflowDecision;
-        await Promise.all([...this.#decisionHandlers].map((h) => h(decision)));
+        // Every handler, concurrently; all settle before a failure fails (and retries) the job.
+        await fanOutDecision(this.#decisionHandlers, decision, (err) => {
+          if (this.#hasOnError) this.#onError(err);
+          else console.warn(`[adonis-durable] bullmq decision handler failed: ${String(err)}`);
+        });
       },
     );
   }
