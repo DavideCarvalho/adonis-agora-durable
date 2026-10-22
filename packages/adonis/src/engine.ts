@@ -4632,7 +4632,7 @@ export class WorkflowEngine {
         });
       }
       const awaited = def.timeoutMs
-        ? this.awaitWithHeartbeat(id, resultPromise, def.timeoutMs)
+        ? this.awaitWithHeartbeat(run.id, seq, id, resultPromise, def.timeoutMs)
         : resultPromise;
       await this.awaitCompensationOutcome(
         run.id,
@@ -5700,7 +5700,14 @@ export class WorkflowEngine {
       );
       try {
         const resolution = step.timeoutMs
-          ? await this.awaitWithHeartbeat(id, resultPromise, step.timeoutMs, step.pickupTimeoutMs)
+          ? await this.awaitWithHeartbeat(
+              runId,
+              seq,
+              id,
+              resultPromise,
+              step.timeoutMs,
+              step.pickupTimeoutMs,
+            )
           : await resultPromise;
         return await this.settleRemoteAttempt(
           runId,
@@ -5786,6 +5793,8 @@ export class WorkflowEngine {
    * window, so a worker that keeps beating stays alive past `timeoutMs`.
    */
   private awaitWithHeartbeat(
+    runId: string,
+    seq: number,
     id: string,
     resultPromise: Promise<RemoteResolution>,
     timeoutMs: number,
@@ -5793,6 +5802,8 @@ export class WorkflowEngine {
   ): Promise<RemoteResolution> {
     return new Promise<RemoteResolution>((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout>;
+      let settled = false;
+      const dispatchedAt = this.clock();
       // Two windows, one timer: until the FIRST beat arrives the job may be sitting in the broker
       // queue behind long work — a stretch that produces no heartbeats by definition, so it gets
       // `pickupTimeoutMs` (default: `timeoutMs`, the historical behavior). The worker's automatic
@@ -5805,17 +5816,40 @@ export class WorkflowEngine {
       const window = () =>
         Math.min(seenBeat ? timeoutMs : (pickupTimeoutMs ?? timeoutMs), MAX_BACKOFF_MS);
       const cleanup = () => {
+        settled = true;
         clearTimeout(timer);
         this.heartbeatResets.delete(id);
       };
-      const arm = () => {
-        const ms = window();
-        timer = setTimeout(() => {
-          cleanup();
-          this.pending.delete(id);
-          reject(new RemoteStepTimeout(id, ms));
-        }, ms);
+      const arm = (ms = window()) => {
+        timer = setTimeout(() => void expire(ms), ms);
         (timer as { unref?: () => void }).unref?.();
+      };
+      // The window ran out with no beat seen HERE. With several engine instances consuming the same
+      // heartbeat queue (the `queue` transport: point-to-point), the beats may have landed on another
+      // instance — which persists them on the checkpoint (`persistHeartbeat`) but cannot reach this
+      // timer. Before declaring the worker dead, read the persisted beat: a recent one (from this
+      // attempt) means the step is alive, so re-arm for the rest of the window instead of failing
+      // over a healthy step and re-dispatching it while it still runs.
+      const expire = async (ms: number) => {
+        if (settled) return;
+        const at = await this.store
+          .getCheckpoint(runId, seq)
+          .then((cp) => cp?.lastHeartbeatAt?.getTime())
+          .catch(() => undefined);
+        if (settled) return;
+        const now = this.clock();
+        if (
+          at !== undefined &&
+          at >= dispatchedAt - HEARTBEAT_CLOCK_SKEW_MS &&
+          now - at < timeoutMs
+        ) {
+          seenBeat = true;
+          arm(Math.max(timeoutMs - (now - at), 1));
+          return;
+        }
+        cleanup();
+        this.pending.delete(id);
+        reject(new RemoteStepTimeout(id, ms));
       };
       this.heartbeatResets.set(id, () => {
         seenBeat = true;
@@ -5836,6 +5870,10 @@ export class WorkflowEngine {
     });
   }
 }
+
+/** Tolerance (ms) between the worker's clock, which stamps a persisted heartbeat, and this engine's,
+ *  when deciding whether a beat belongs to the current attempt (see `awaitWithHeartbeat`). */
+const HEARTBEAT_CLOCK_SKEW_MS = 1_000;
 
 /** Raised inside the workflow when a remote worker reports a step failure. */
 export class RemoteStepError extends Error {
