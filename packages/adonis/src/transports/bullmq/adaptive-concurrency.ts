@@ -141,6 +141,12 @@ const WINDOW_SIZE = 100;
 const RTT_LONG_EWMA_ALPHA = 0.2;
 // Consecutive ticks with in-flight work but zero completions before we call the worker stalled.
 const STALL_TICKS = 2;
+// Throughput is a rate over the trailing minute: a window whose newest completion is older than this
+// reports 0, so an idle worker never advertises its last burst as live.
+const THROUGHPUT_WINDOW_MS = 60_000;
+// The shortest span a rate is computed over, so a worker's first completion doesn't extrapolate a
+// sub-millisecond gap into a huge per-minute figure.
+const THROUGHPUT_MIN_SPAN_MS = 1_000;
 
 function percentile(sortedAsc: number[], p: number): number {
   if (sortedAsc.length === 0) return 0;
@@ -164,6 +170,10 @@ export interface AdaptiveControllerOptions {
   readRss?: () => number;
   /** Injectable memory-ceiling reader (tests). Defaults to {@link readMemoryLimitBytes} (read once). */
   readMemoryLimit?: () => number;
+  /** Injectable cumulative CPU-time reader (tests). Defaults to `process.cpuUsage()`. */
+  readCpuUsage?: () => NodeJS.CpuUsage;
+  /** Injectable core-count reader (tests), read once. Defaults to `os.cpus().length`. */
+  readCpuCount?: () => number;
 }
 
 /**
@@ -172,9 +182,10 @@ export interface AdaptiveControllerOptions {
  * completions, and — in `adaptive` mode — re-evaluates the worker's concurrency every `tickMs` from a
  * latency gradient, an error/stall backpressure signal, a hard RAM brake and an optional CPU ceiling.
  *
- * In `fixed` mode it never moves the limit but still tracks `inFlight`/RSS/throughput/p95 so the
- * observability half (the heartbeat status payload) works without adaptive. Either way, {@link snapshot}
- * returns the shared {@link WorkerStatus} contract the heartbeat writer stamps.
+ * In `fixed` mode no control loop runs and the limit never moves, but the controller still tracks
+ * `inFlight`/RSS/throughput/p95 (and samples CPU when a snapshot is taken) so the observability half
+ * (the heartbeat status payload) works without adaptive. Either way, {@link snapshot} returns the
+ * shared {@link WorkerStatus} contract the heartbeat writer stamps.
  */
 export class AdaptiveController {
   private readonly resolved: ResolvedConcurrency;
@@ -183,6 +194,8 @@ export class AdaptiveController {
   private readonly readRss: () => number;
   private readonly memoryLimitBytes: number;
   private readonly tickMs: number;
+  private readonly readCpuUsage: () => NodeJS.CpuUsage;
+  private readonly cpuCores: number;
 
   private currentLimit: number;
   private inFlightCount = 0;
@@ -194,6 +207,7 @@ export class AdaptiveController {
   private completionsThisTick = 0;
   private stallTicks = 0;
   private lastCpuUsage?: NodeJS.CpuUsage;
+  private lastCpuSampleAt = 0;
   private timer: ReturnType<typeof setInterval> | undefined;
 
   constructor(options: AdaptiveControllerOptions = {}) {
@@ -203,6 +217,8 @@ export class AdaptiveController {
     this.readRss = options.readRss ?? (() => process.memoryUsage().rss);
     this.memoryLimitBytes = (options.readMemoryLimit ?? readMemoryLimitBytes)();
     this.tickMs = this.resolved.adaptive?.tickMs ?? DEFAULT_TICK_MS;
+    this.readCpuUsage = options.readCpuUsage ?? (() => process.cpuUsage());
+    this.cpuCores = wholeAtLeastOne((options.readCpuCount ?? (() => cpus().length))(), 1);
     this.currentLimit =
       this.resolved.mode === 'adaptive'
         ? (this.resolved.adaptive?.start ?? DEFAULT_MIN)
@@ -224,10 +240,14 @@ export class AdaptiveController {
     return this.resolved.mode === 'adaptive';
   }
 
-  /** Start the control loop. The timer is `unref`'d so it never keeps the process alive; idempotent. */
+  /**
+   * Start the control loop (adaptive mode only; fixed mode just takes a CPU baseline). The timer is
+   * `unref`'d so it never keeps the process alive; idempotent.
+   */
   start(): void {
     if (this.timer) return;
-    this.lastCpuUsage = process.cpuUsage();
+    if (!this.lastCpuUsage) this.resetCpuBaseline();
+    if (!this.isAdaptive) return;
     this.timer = setInterval(() => this.tick(), this.tickMs);
     this.timer.unref?.();
   }
@@ -266,11 +286,13 @@ export class AdaptiveController {
   }
 
   /**
-   * One control-loop iteration: sample CPU, refresh the latency baseline, then (adaptive only) decide
-   * the next limit and apply it. Exposed (not private) so a test can drive ticks deterministically.
+   * One control-loop iteration: sample CPU, refresh the latency baseline, then decide the next limit
+   * and apply it. A no-op in fixed mode. Exposed (not private) so a test can drive ticks
+   * deterministically.
    */
   tick(): void {
-    this.sampleCpu();
+    if (this.resolved.mode !== 'adaptive' || !this.resolved.adaptive) return;
+    this.sampleCpu(this.tickMs);
     this.refreshRttLong();
 
     // Stall = in-flight work but no completion this tick, sustained over STALL_TICKS.
@@ -279,21 +301,36 @@ export class AdaptiveController {
     const stalled = this.stallTicks >= STALL_TICKS;
     this.completionsThisTick = 0;
 
-    if (this.resolved.mode !== 'adaptive' || !this.resolved.adaptive) return;
     this.decide(this.resolved.adaptive, stalled);
   }
 
-  private sampleCpu(): void {
+  private resetCpuBaseline(): void {
+    this.lastCpuUsage = this.readCpuUsage();
+    this.lastCpuSampleAt = this.now();
+  }
+
+  /** Set `cpuPct` from the CPU time spent since the previous sample, over `elapsedMs` of wall time. */
+  private sampleCpu(elapsedMs: number): void {
+    const previous = this.lastCpuUsage;
+    this.resetCpuBaseline();
+    if (!previous || !this.lastCpuUsage || elapsedMs <= 0) return;
+    // CpuUsage is microseconds of CPU; elapsedMs of wall time is elapsedMs*1000 micros per core.
+    const micros =
+      this.lastCpuUsage.user - previous.user + (this.lastCpuUsage.system - previous.system);
+    const pct = (micros / (elapsedMs * 1000 * this.cpuCores)) * 100;
+    if (Number.isFinite(pct)) this.cpuPct = Math.max(0, pct);
+  }
+
+  /** Fixed mode has no control loop, so a snapshot samples CPU itself, at most once per tick period
+   *  (several heartbeat keys snapshot back to back, and a near-zero span gives a meaningless rate). */
+  private sampleCpuForSnapshot(): void {
+    if (this.isAdaptive) return;
     if (!this.lastCpuUsage) {
-      this.lastCpuUsage = process.cpuUsage();
+      this.resetCpuBaseline();
       return;
     }
-    const delta = process.cpuUsage(this.lastCpuUsage);
-    this.lastCpuUsage = process.cpuUsage();
-    const cores = Math.max(1, cpus().length);
-    // delta is microseconds of CPU; the tick spans tickMs ms = tickMs*1000 micros of wall time.
-    const micros = delta.user + delta.system;
-    this.cpuPct = (micros / (this.tickMs * 1000 * cores)) * 100;
+    const elapsedMs = this.now() - this.lastCpuSampleAt;
+    if (elapsedMs >= this.tickMs) this.sampleCpu(elapsedMs);
   }
 
   private refreshRttLong(): void {
@@ -354,6 +391,7 @@ export class AdaptiveController {
   /** The shared {@link WorkerStatus} the heartbeat writer stamps. Best-effort fields are omitted when
    *  unmeasured (no completions yet → no p95/throughput; no CPU sample yet → no `cpuPct`). */
   snapshot(): WorkerStatus {
+    this.sampleCpuForSnapshot();
     const durations = this.window.map((c) => c.durationMs).sort((a, b) => a - b);
     const rssBytes = this.readRss();
     const rssLimitBytes = this.memoryLimitBytes;
@@ -380,14 +418,18 @@ export class AdaptiveController {
     return status;
   }
 
+  /**
+   * Completions per minute over the trailing minute: the window's completions from the last minute,
+   * over the span from the oldest of them (or a full minute, when the window reaches further back) to
+   * now, floored at a second. The rate decays while the worker is idle and reads 0 once a minute passes with no completion.
+   */
   private throughputPerMin(): number {
-    if (this.window.length === 0) return 0;
     const first = this.window[0];
-    const last = this.window[this.window.length - 1];
-    if (!first || !last) return 0;
-    const spanMs = last.at - first.at;
-    // A single completion (or all in the same ms) has no measurable span — report the raw count/min.
-    if (spanMs <= 0) return this.window.length;
-    return (this.window.length / spanMs) * 60_000;
+    if (!first) return 0;
+    const now = this.now();
+    const recent = this.window.filter((c) => now - c.at <= THROUGHPUT_WINDOW_MS).length;
+    if (recent === 0) return 0;
+    const spanMs = clamp(now - first.at, THROUGHPUT_MIN_SPAN_MS, THROUGHPUT_WINDOW_MS);
+    return (recent / spanMs) * 60_000;
   }
 }
