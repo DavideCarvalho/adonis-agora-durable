@@ -33,7 +33,7 @@ export default defineConfig({
 
 ### Workers: `concurrency`
 
-`transports.bullmq({ concurrency })` sets how many tasks each of a worker's task queues runs at once. A number pins it (default `1`; a non-finite or sub-1 value falls back to `1`) and also applies to the decisions, step-events, start-run and run-request consumers.
+`transports.bullmq({ concurrency })` sets how many tasks each of a worker's task queues runs at once. A number pins it (default `1`; a non-finite or sub-1 value falls back to `1`) and also applies to the decisions, step-events, start-run and run-request consumers. A pinned limit runs no control loop.
 
 `'adaptive'`, or an object with `mode: 'adaptive'`, lets the worker move its task-queue limit at runtime. Every `tickMs` it compares the steps' median latency with their no-queuing baseline and the memory and CPU it is using, then:
 
@@ -63,7 +63,7 @@ bullmq: transports.bullmq({
 | `ramCeilingPct` | `85` |
 | `cpuCeilingPct` | off |
 
-A non-finite or out-of-range value falls back to its default, and a non-finite `cpuCeilingPct` turns the CPU ceiling off. This is the same controller as the NestJS BullMQ transport's `concurrency: 'adaptive'`. In both modes the worker heartbeat carries the live limit, in-flight count, RSS, CPU, throughput, p95 and the last adjustment with its reason, which the [console's worker cards](/docs/durable/observability/dashboard) show.
+A non-finite or out-of-range value falls back to its default, and a non-finite `cpuCeilingPct` turns the CPU ceiling off. This is the same controller as the NestJS BullMQ transport's `concurrency: 'adaptive'`. In both modes the worker heartbeat carries the live limit, in-flight count, RSS, CPU, throughput, p95 and the last adjustment with its reason, which the [console's worker cards](/docs/durable/observability/dashboard) show. Throughput is steps per minute over the trailing minute: it decays while the worker is idle and reads 0 once a minute passes with no completed step. With a pinned limit, CPU is sampled when the heartbeat is built, at most once every 2s.
 
 ### Results: `resultConcurrency`
 

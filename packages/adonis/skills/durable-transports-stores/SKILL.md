@@ -129,7 +129,8 @@ export default defineConfig({
 
 Only step durations feed the adaptive window (workflow turns count as in-flight
 work and progress); a non-finite or out-of-range field falls back to its default, and
-`cpuCeilingPct` is off unless set. In adaptive mode the decisions, step-events, start-run and run-request consumers run
+`cpuCeilingPct` is off unless set. A number runs no control loop. The heartbeat's
+throughput covers the trailing minute, decaying while the worker is idle and reading 0 once a minute passes with no completed step; with a fixed limit the heartbeat still reports `cpuPct`, sampled at most once every 2s. In adaptive mode the decisions, step-events, start-run and run-request consumers run
 at 1 (results run at `resultConcurrency`). Sources: `docs/transports/index.mdx`, `docs/cluster/interop.mdx`.
 
 ### Pattern 3 — multi-replica fan-out: the control plane

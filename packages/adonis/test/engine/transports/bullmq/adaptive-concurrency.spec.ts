@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   AdaptiveController,
   resolveConcurrency,
@@ -9,6 +9,9 @@ function makeController(opts: {
   concurrency?: Parameters<typeof resolveConcurrency>[0];
   rss?: number;
   memLimit?: number;
+  now?: () => number;
+  readCpuUsage?: () => NodeJS.CpuUsage;
+  readCpuCount?: () => number;
 }) {
   const applied: number[] = [];
   const controller = new AdaptiveController({
@@ -16,8 +19,22 @@ function makeController(opts: {
     apply: (limit) => applied.push(limit),
     readRss: () => opts.rss ?? 100_000_000,
     readMemoryLimit: () => opts.memLimit ?? 8_000_000_000,
+    ...(opts.now ? { now: opts.now } : {}),
+    ...(opts.readCpuUsage ? { readCpuUsage: opts.readCpuUsage } : {}),
+    ...(opts.readCpuCount ? { readCpuCount: opts.readCpuCount } : {}),
   });
   return { controller, applied };
+}
+
+/** A fake cumulative CPU clock: `spend(ms)` adds CPU time (microseconds) the next read returns. */
+function fakeCpu() {
+  let user = 0;
+  return {
+    read: (): NodeJS.CpuUsage => ({ user, system: 0 }),
+    spend: (ms: number) => {
+      user += ms * 1000;
+    },
+  };
 }
 
 /** Fill the completion window with `n` settled STEP tasks each `durationMs`, `okRatio` fraction
@@ -246,5 +263,162 @@ describe('AdaptiveController.tick — AIMD decisions', () => {
     expect(controller.limit).toBe(5);
     expect(applied).toEqual([]);
     expect(controller.snapshot().lastAdjust).toBeUndefined();
+  });
+});
+
+describe('AdaptiveController.snapshot — throughput decays when idle', () => {
+  it('reads 0 once a minute passes with no completion, and recovers on new work', () => {
+    let now = 1_000_000;
+    const { controller } = makeController({ concurrency: 4, now: () => now });
+    for (let i = 0; i < 10; i++) {
+      controller.onStart();
+      controller.onSettle(100, true, 'step');
+      now += 1_000;
+    }
+    // 10 completions over the last 10s → 60/min.
+    expect(controller.snapshot().throughputPerMin).toBeCloseTo(60);
+
+    now += 61_000;
+    const idle = controller.snapshot();
+    expect(idle.throughputPerMin).toBe(0);
+    // p95 still describes the last window of work.
+    expect(idle.p95Ms).toBe(100);
+
+    controller.onStart();
+    controller.onSettle(100, true, 'step');
+    expect(controller.snapshot().throughputPerMin).toBeGreaterThan(0);
+  });
+
+  it('decays while idle inside the minute', () => {
+    let now = 1_000_000;
+    const { controller } = makeController({ concurrency: 4, now: () => now });
+    for (let i = 0; i < 10; i++) {
+      controller.onStart();
+      controller.onSettle(100, true, 'step');
+      now += 1_000;
+    }
+    const busy = controller.snapshot().throughputPerMin ?? 0;
+    now += 30_000;
+    const quieter = controller.snapshot().throughputPerMin ?? 0;
+    expect(quieter).toBeLessThan(busy);
+    expect(quieter).toBeCloseTo(15); // 10 completions over the trailing 40s
+  });
+
+  it('counts only the trailing minute when the window reaches further back', () => {
+    let now = 1_000_000;
+    const { controller } = makeController({ concurrency: 4, now: () => now });
+    for (let i = 0; i < 20; i++) {
+      controller.onStart();
+      controller.onSettle(100, true, 'step');
+      now += 10_000; // one every 10s, window spans 200s
+    }
+    // 6 of the 20 completed within the last minute.
+    expect(controller.snapshot().throughputPerMin).toBeCloseTo(6);
+  });
+});
+
+describe('AdaptiveController.start — the control loop runs only in adaptive mode', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('fixed mode schedules no timer and never ticks', () => {
+    vi.useFakeTimers();
+    const { controller } = makeController({ concurrency: 5 });
+    const tick = vi.spyOn(controller, 'tick');
+    controller.start();
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(60_000);
+    expect(tick).not.toHaveBeenCalled();
+    expect(controller.snapshot().concurrency).toEqual({ mode: 'fixed', limit: 5 });
+    controller.stop();
+  });
+
+  it('adaptive mode schedules its loop every tickMs', () => {
+    vi.useFakeTimers();
+    const { controller } = makeController({
+      concurrency: { mode: 'adaptive', min: 1, max: 4, tickMs: 1_000 },
+    });
+    const tick = vi.spyOn(controller, 'tick');
+    controller.start();
+    expect(vi.getTimerCount()).toBe(1);
+    vi.advanceTimersByTime(3_000);
+    expect(tick).toHaveBeenCalledTimes(3);
+    controller.stop();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('fixed mode still reports cpuPct, sampled by the snapshot over its own elapsed time', () => {
+    let now = 1_000_000;
+    const cpu = fakeCpu();
+    const { controller } = makeController({
+      concurrency: 2,
+      now: () => now,
+      readCpuUsage: cpu.read,
+      readCpuCount: () => 2,
+    });
+    controller.start();
+    expect(controller.snapshot().cpuPct).toBeUndefined();
+    now += 4_000;
+    cpu.spend(2_000); // 2s of CPU over 4s on 2 cores → 25%
+    expect(controller.snapshot().cpuPct).toBeCloseTo(25);
+    // A back-to-back snapshot keeps the last reading instead of sampling a near-zero span.
+    now += 10;
+    cpu.spend(10);
+    expect(controller.snapshot().cpuPct).toBeCloseTo(25);
+  });
+});
+
+describe('AdaptiveController.tick — CPU ceiling', () => {
+  function saturatedAtCpu(pct: number) {
+    const cpu = fakeCpu();
+    const { controller, applied } = makeController({
+      concurrency: {
+        mode: 'adaptive',
+        min: 1,
+        max: 10,
+        start: 4,
+        cpuCeilingPct: 80,
+        tickMs: 1_000,
+      },
+      readCpuUsage: cpu.read,
+      readCpuCount: () => 2,
+    });
+    controller.start();
+    fill(controller, 20, 100); // healthy gradient
+    for (let i = 0; i < 4; i++) controller.onStart(); // saturated → would otherwise grow
+    cpu.spend((pct / 100) * 1_000 * 2); // pct of 2 cores over one 1s tick
+    controller.tick();
+    controller.stop();
+    return { controller, applied };
+  }
+
+  it('sheds one with reason cpu_ceiling when CPU is at or over the ceiling', () => {
+    const { controller, applied } = saturatedAtCpu(95);
+    expect(controller.snapshot().cpuPct).toBeCloseTo(95);
+    expect(controller.limit).toBe(3);
+    expect(applied).toEqual([3]);
+    expect(controller.snapshot().lastAdjust?.reason).toBe('cpu_ceiling');
+  });
+
+  it('grows as usual when CPU is under the ceiling', () => {
+    const { controller } = saturatedAtCpu(25);
+    expect(controller.snapshot().cpuPct).toBeCloseTo(25);
+    expect(controller.limit).toBe(5);
+    expect(controller.snapshot().lastAdjust?.reason).toBe('grow');
+  });
+
+  it('a non-finite core count falls back to one core', () => {
+    const cpu = fakeCpu();
+    const { controller } = makeController({
+      concurrency: { mode: 'adaptive', tickMs: 1_000 },
+      readCpuUsage: cpu.read,
+      readCpuCount: () => Number.NaN,
+    });
+    controller.start();
+    cpu.spend(500);
+    controller.tick();
+    controller.stop();
+    expect(controller.snapshot().cpuPct).toBeCloseTo(50);
   });
 });
