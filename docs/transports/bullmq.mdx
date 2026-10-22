@@ -56,9 +56,7 @@ This transport only carries tasks, results and heartbeats. Cross-instance lifecy
 
 The `consumers` setting in `config/durable.ts` works on `bullmq` as on [the queue driver](/docs/durable/transports/queue#consumers--why-a-node-ace-script-does-not-drain-the-queue). A BullMQ `Worker` starts fetching as soon as it is built, so a deferred process builds none: its task, results, decisions, step-events, start-run and run-request workers are created only when `durable:work` calls `engine.startConsumers()`. With the default `'auto'`, a `node ace` console or REPL process is a pure producer — it dispatches and publishes, and never claims a job. `'never'` makes every process a producer (for web fleets); `'always'` opts a process in. Pub/sub subscriptions — heartbeats, run replies, tenant events — are broadcast and start regardless.
 
-<Callout type="warn" title="A deferred process still looks like a worker">
-The transport starts a step name's [liveness key](#worker-liveness) when the handler is registered, before its BullMQ worker exists. A `node ace` process that boots the app registers `app/steps`, so while it runs it beats `<P>-worker-heartbeat:<token>:<instanceId>` for every step name and counts as a live worker in `groupHealth` and the dashboard, though it takes no job. The keys expire 35 s after the process exits. The `queue` and `db` transports start beating only once they really consume.
-</Callout>
+A deferred process also stamps no [liveness key](#worker-liveness): a step name's `<P>-worker-heartbeat:<token>:<instanceId>` starts with its BullMQ worker, so a `node ace` process that registers `app/steps` never shows up as a live worker in `groupHealth` or the dashboard.
 
 ## Connection
 

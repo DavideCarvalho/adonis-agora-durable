@@ -41,8 +41,8 @@ const transport = new BullMQTransport({
 
 const runtime = new WorkerRuntime({
   transport,
-  partition: 'acme-corp', // the routing tokens it advertises — keep it equal to the transport's
-  instanceId: 'billing-1', // must match the transport's, so both liveness keys name one worker
+  partition: 'acme-corp', // the routing tokens it advertises — the same tenant as the transport
+  instanceId: 'billing-1', // the same id as the transport, so both liveness keys name one worker
   // The transport mints a client for its own advertisement keyspace.
   registry: new RedisWorkerRegistry(transport.createDescriptorRedis(), { ownsConnection: true }),
 })
@@ -63,10 +63,10 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
 | Option | Default | Description |
 | --- | --- | --- |
 | `transport` | required | The broker transport. It must be able to serve handlers; `handleWorkflow` and `dispatchStepEvent` are optional capabilities layered on top. |
-| `partition` | required | The tenant this worker serves. Every routing token its descriptor advertises becomes `<name>@<partition>`. The transport's own `partition` decides which queues it consumes, so set both to the same value. |
+| `partition` | required | The tenant this worker serves. Every routing token its descriptor advertises becomes `<name>@<partition>`. The transport's `partition` decides which queues it consumes: a transport you construct yourself (as here) takes the same value; in an AdonisJS app the provider gives the top-level `partition` to both. |
 | `namespace` | — | Worker-pool namespace, folded into the descriptor and key names. |
 | `prefix` | `'durable'` | Key prefix for the descriptor and heartbeat keys. |
-| `instanceId` | `ts-<host>-<pid>` | Stable id for this process, stamped on the descriptor and heartbeat keys. Must match the transport's instance id (the `bullmq` transport defaults to the same `ts-<host>-<pid>`; `queue`, `db` and `eventEmitter` default to a random UUID, so set both). |
+| `instanceId` | `ts-<host>-<pid>` | Stable id for this process, stamped on the descriptor and heartbeat keys. Should equal the transport's instance id, so both liveness keys name one worker. In an AdonisJS app the top-level `instanceId` is the default for both; a transport you construct yourself takes it explicitly (the `bullmq` transport defaults to the same `ts-<host>-<pid>`; `queue`, `db` and `eventEmitter` default to a random UUID). |
 | `sdk` | `{ name: '@adonis-agora/durable', version }` | SDK identity on the descriptor. Observability only; it never gates dispatch. |
 | `capabilities` | `[]` | Extra capabilities to advertise beyond the handler names — what a step's [`requires`](/docs/durable/cluster/handshake#capability-aware-routing) is matched against. |
 | `registry` | no-op | Where the descriptor and heartbeat are published. |

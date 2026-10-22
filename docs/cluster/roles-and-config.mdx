@@ -64,8 +64,7 @@ export default defineConfig({
   role: 'tenant',
   transport: 'bullmq',
   transports: {
-    // The transport's own `partition` decides which `<name>@<partition>` queues this pod consumes.
-    bullmq: transports.bullmq({ connection: process.env.REDIS_URL!, partition: 'acme-corp' }),
+    bullmq: transports.bullmq({ connection: process.env.REDIS_URL! }),
   },
   partition: 'acme-corp',            // which tenant this pod serves (required) — see Tenancy
   tenant: { token: process.env.DURABLE_TENANT_TOKEN }, // its signed claim
@@ -75,9 +74,7 @@ export default defineConfig({
 })
 ```
 
-<Callout type="warn" title="Set the partition on the transport too">
-The provider passes the top-level `partition` to the `ProxyRunGateway` (the tenant it claims on the wire) and to the worker runtime (the routing tokens its descriptor advertises). It does **not** pass it to the transport, and the transport is what subscribes the task queues. Give the transport the same `partition`, or the pod consumes the bare `<name>` queues while the control plane dispatches the tenant's steps to `<name>@acme-corp`. The same applies to `instanceId`: the top-level value reaches the worker runtime only, so when you set one, set it on the transport as well, so the runtime's and the transport's liveness keys carry the same id.
-</Callout>
+The top-level `partition` reaches all three: the `ProxyRunGateway` (the tenant it claims on the wire), the worker runtime (the routing tokens its descriptor advertises) and the transport, which subscribes the `<name>@acme-corp` task queues the control plane dispatches the tenant's steps to. The top-level `instanceId` is the transport's default too, so the runtime's and the transport's liveness keys carry the same id. A `partition` or `instanceId` set on the transport itself wins.
 
 `capabilities` lists what the pod advertises beyond its handler names in its [descriptor](/docs/durable/cluster/handshake#the-worker-descriptor); a step's [`requires`](/docs/durable/cluster/handshake#capability-aware-routing) is matched against it.
 
@@ -87,7 +84,7 @@ On the `queue` transport the pod needs no database either: pass `workerKeys: fal
 export default defineConfig({
   role: 'tenant',
   transport: 'queue',
-  transports: { queue: transports.queue({ connection: 'redis', workerKeys: false, partition: 'acme-corp' }) },
+  transports: { queue: transports.queue({ connection: 'redis', workerKeys: false }) },
   partition: 'acme-corp',
   tenant: { token: process.env.DURABLE_TENANT_TOKEN },
 })
@@ -99,7 +96,7 @@ On the `db` transport the pod reaches the control plane's database for the trans
 export default defineConfig({
   role: 'tenant',
   transport: 'db',
-  transports: { db: transports.db({ partition: 'acme-corp' }) },
+  transports: { db: transports.db() },
   partition: 'acme-corp',
   tenant: { token: process.env.DURABLE_TENANT_TOKEN },
 })
@@ -119,7 +116,7 @@ The checks split into compile-time (the config's type) and boot-time (the provid
 | `control-plane` | `store` **and** `transport` (both typed required) | — | Serves no `app/steps`. Uses `NOOP_RUN_DISPATCHER` unless `runDispatcher` is set. The responder is started only on a transport with the run-request methods (`onRunRequest`, `onStartRun`, `publishRunReply`, `publishTenantEvent`). |
 | `tenant` | `transport` and `partition` (both typed required); optional `tenant.token`, `requestTimeoutMs`, `capabilities` | `store`, `stores` (typed `never`) | Resolving the `RunGateway` throws when the transport lacks the store-less methods (`dispatchStartRun`, `dispatchRunRequest`, `onRunReply`, `onTenantEvent`). Resolving the worker runtime throws when the transport cannot serve handlers (`handle()`). No engine and no store are bound, so resolving either throws. |
 
-`partition` is the axis a `tenant` pod is named by: it suffixes the routing tokens the pod's descriptor advertises and is the tenant the proxy claims on the wire when no token is set (the transport's own `partition` decides the queues it consumes, see above). `namespace` stays a separate, optional field on every role (a run scope; absent, it is `'default'` on `standalone` and every pool on `control-plane`); a tenant pod passes it to its transport and worker runtime. What each axis actually partitions is [Tenancy](/docs/durable/concepts/tenancy).
+`partition` is the axis a `tenant` pod is named by: it suffixes the routing tokens the pod's descriptor advertises and is the tenant the proxy claims on the wire when no token is set (and, unless the transport sets its own, the partition of the queues it consumes). `namespace` stays a separate, optional field on every role (a run scope; absent, it is `'default'` on `standalone` and every pool on `control-plane`); a tenant pod passes it to its transport and worker runtime. What each axis actually partitions is [Tenancy](/docs/durable/concepts/tenancy).
 
 ## Worker vs api — the entrypoint decides
 
