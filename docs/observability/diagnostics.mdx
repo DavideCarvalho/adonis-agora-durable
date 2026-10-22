@@ -1,0 +1,117 @@
+---
+title: Diagnostics bus
+description: Every durable engine lifecycle event is re-published on the @adonis-agora/diagnostics bus as agora:durable:<type>, so onDiagnostic subscribers, Telescope, the relays and the OTel bridge see runs and steps alongside your app's other channels. Auto-wired by the provider; attachDurableDiagnostics for everything else.
+icon: Radio
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+When [`@adonis-agora/diagnostics`](/docs/diagnostics) is installed, the durable engine is on the **diagnostics bus**. Every `EngineEvent` the engine emits (`run.started`, `run.failed`, `step.completed` and the rest) is re-published on an `agora:durable:<type>` channel, so an `onDiagnostic('durable', …)` subscriber observes durable's lifecycle the same way it observes every other Agora library in your app. It's the lowest-friction way to react to durable events in-process: no exporter, no store polling, no OTel or Telescope setup.
+
+There is nothing extra to install on the durable side. The bridge ships in `@adonis-agora/durable` and reads the diagnostics `emit` capability **structurally** from a global slot, so durable never imports or depends on `@adonis-agora/diagnostics`. Without it, the bridge is never attached.
+
+```bash
+npm i @adonis-agora/diagnostics
+node ace configure @adonis-agora/diagnostics
+```
+
+<Callout title="Where this sits">
+This is a **peer** of the [OpenTelemetry](/docs/durable/observability/otel) bridge, the [metrics collectors](/docs/durable/observability/metrics) and [`engine.subscribe`](/docs/durable/observability/events-and-interceptors), not a replacement. All of them listen to the same engine event stream independently. The difference is reach: once events are on the diagnostics bus, everything downstream of the hub lights up at once (`onDiagnostic` handlers, the [Telescope](/docs/durable/observability/telescope) generic watcher, the [cross-process relays](/docs/diagnostics/transports), and the [diagnostics OTel bridge](/docs/diagnostics/opentelemetry)).
+</Callout>
+
+## Auto-wiring
+
+You don't call anything. In its `ready()` hook the `@adonis-agora/durable` provider checks whether the diagnostics `emit` slot is populated (it is as soon as `@adonis-agora/diagnostics` is loaded). If it is, the provider resolves the `WorkflowEngine` and calls `attachDurableDiagnostics(engine)`. On `shutdown()` it detaches the bridge again.
+
+- When diagnostics isn't installed, the provider skips the bridge and doesn't build the engine just to attach it.
+- A `tenant` pod owns no engine, so nothing is bridged there. Its runs are bridged on the control plane that executes them.
+- An app booted in warmup mode (the app is assembled but never started) skips it as well.
+
+## Subscribing to durable events
+
+Use `onDiagnostic` from `@adonis-agora/diagnostics`. The usual place is `start/diagnostics.ts`, the preload file its `configure` step creates, so handlers are subscribed before the app serves traffic:
+
+```ts title="start/diagnostics.ts"
+import { onDiagnostic } from '@adonis-agora/diagnostics'
+import type { EngineEvent } from '@adonis-agora/durable'
+import logger from '@adonisjs/core/services/logger'
+
+// One exact channel: agora:durable:run.failed
+onDiagnostic('durable', 'run.failed', (diag) => {
+  const event = diag.payload as EngineEvent
+  logger.error(
+    { runId: event.runId, workflow: event.workflow, err: event.error, traceId: diag.traceId },
+    'durable run failed',
+  )
+})
+
+// Every agora:durable:* channel, including ones first emitted later
+onDiagnostic('durable', (diag) => {
+  const event = diag.payload as EngineEvent
+  if (event.type === 'step.completed') {
+    histogram.observe({ step: event.name }, event.durationMs ?? 0)
+  }
+})
+```
+
+Each call returns an unsubscribe function, and a handler that throws (or a rejected async handler) never reaches the engine. Pass `{ onError }` as the last argument to log those failures.
+
+The handler receives the diagnostics **envelope** (`DiagnosticEvent`): `lib` (`'durable'`), `event` (the engine event type), `ts`, the `traceId` resolved from the request context when one is available, and `payload`. The `payload` is the full `EngineEvent` (`type`, `runId`, `workflow`, `namespace`, `seq`, `name`, `kind`, `output`, `error`, `durationMs`, `queueMs`, `at`, …), so a subscriber gets the same data the dashboard, OTel and Telescope get, without reading the store. Durable doesn't augment the diagnostics `ChannelRegistry`, so the payload is typed `unknown`. Cast it to `EngineEvent` as above.
+
+<Callout type="info" title="Durations live on the payload">
+The bridge forwards the event as-is and sets no envelope-level `durationMs`. Read step and run timings from `payload.durationMs` (and `payload.queueMs` for a remote step's queue wait).
+</Callout>
+
+### Channels
+
+A channel is named `agora:durable:<type>`, one per `EngineEvent` type:
+
+| Channel event | Emitted when |
+| --- | --- |
+| `run.started` | A run begins executing. |
+| `run.completed` | A run finishes successfully. |
+| `run.failed` | A run reaches a terminal failure, including a dead-letter. |
+| `run.suspended` | A run parks (sleep, signal, child, remote step, singleton back-pressure). |
+| `run.routed` | A failed run handed its failure to an [onError handler](/docs/durable/reliability/on-error). |
+| `run.unrouted` | A failed run had onError routes the engine could not apply (`reason` says why). |
+| `step.started` | A step's body begins (`redispatched: true` on a lost-dispatch re-drive). |
+| `step.completed` | A step settles successfully (`durationMs`, plus `queueMs` for remote). |
+| `step.failed` | A step attempt fails (each retry emits its own). |
+| `capability.unavailable` | A dispatch was refused: no live worker advertises a required capability. |
+| `protocol.incompatible` | A dispatch was refused: no live worker speaks a compatible protocol. |
+
+See [the event types](/docs/durable/observability/events-and-interceptors#the-event-types) for what each payload carries. `step.progress` is declared in the `EngineEvent` union, but no engine path emits it today.
+
+### Child runs carry `parentRunId`
+
+An event of a child run the engine started (`ctx.all`, `ctx.child`, `ctx.startChild` without a caller-chosen id) also carries `parentRunId` in its payload. Each child is its own run, so that field is how a subscriber finds every child of one parent, including a whole `ctx.all` fan. `parentRunIdOf(runId)` is exported from `@adonis-agora/durable` if you need the same mapping yourself.
+
+<Callout title="Filtering is the subscriber's job">
+The bridge forwards **every** engine event, including the high-frequency `step.started` and `step.completed`. That's cheap: diagnostics' `emit` short-circuits when a channel has no subscribers, so a channel nobody listens to costs nothing. A subscriber, though, runs **inline** on the engine's emit, so keep handlers cheap and hand expensive work (network, disk) to a queue. Subscribe only to the events you act on.
+</Callout>
+
+## Attaching manually
+
+If you build a `WorkflowEngine` outside the AdonisJS provider (a standalone script, a custom test harness), attach the bridge yourself. `attachDurableDiagnostics(engine)` takes anything with a `subscribe(listener)` method and returns an **unsubscribe** function:
+
+```ts
+import { attachDurableDiagnostics } from '@adonis-agora/durable'
+
+const detach = attachDurableDiagnostics(engine) // now on the agora:durable:* channels
+
+// ...later
+detach() // stop bridging
+```
+
+This is exactly what the provider does in `ready()` (attach) and `shutdown()` (detach). Don't attach it a second time inside an AdonisJS app that already has diagnostics installed, or every event will be published twice.
+
+## The other direction: starting workflows from the bus
+
+The bridge publishes durable events *onto* the bus. To *consume* the bus and start a workflow when a channel fires (any library's `agora:<lib>:<event>`, durable's own included), use `@OnDiagnostic({ lib, event? })` on a workflow. See [Event triggers](/docs/durable/authoring/event-triggers).
+
+## See also
+
+- **[OpenTelemetry](/docs/durable/observability/otel)**: the same events as traces, with a root span per run.
+- **[Metrics](/docs/durable/observability/metrics)**: counters and percentiles from the same events.
+- **[Telescope](/docs/durable/observability/telescope)**: captures these diagnostics events as **Workflows** entries.
+- **[Events & interceptors](/docs/durable/observability/events-and-interceptors)**: `engine.subscribe`, the stream this bridge is built on.

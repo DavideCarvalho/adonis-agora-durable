@@ -8,6 +8,15 @@ import { Callout } from 'fumadocs-ui/components/callout';
 
 Dispatched steps fan out work to workers, and sometimes you need to *throttle* that fan-out: a third-party API allows only N requests per minute, or a downstream service falls over above some concurrency. Flow-control queues cap how much work `ctx.step` admits at once — a concurrency limit, a rate limit (fixed or sliding window), or both — and, crucially, they do it **durably**: a call that can't be admitted doesn't busy-wait or hold the run in memory, it re-suspends and is retried by the timer poller, so the limit survives a crash.
 
+There are four independent levers:
+
+- **Queues** — a named cap (`concurrency` and/or `rateLimit`) that `ctx.step` calls opt into.
+- **Per-call admission hints** — `priority` and `fairnessKey` on the `ctx.step(..., opts)` call, which decide who gets the next slot when a queue is contended.
+- **Worker/transport concurrency** — how many dispatched tasks *this process* runs at once, fixed or self-tuning (adaptive).
+- **Admission scope** — in-process (per engine instance) by default, or fleet-wide across every replica with [`admissions.redis`](#distributed-admission--redis).
+
+Dots below are runs dispatching steps through a queue into a fixed pool of worker slots — hit **burst** and watch backpressure work:
+
 <QueueSim />
 
 <RateLimitSim />
@@ -23,6 +32,8 @@ Register a queue on the engine with `engine.registerQueue`. A `QueueConfig` has:
 - `fairness` — `'fifo'` (default) or `'key'` (round-robin by the call's `fairnessKey`).
 - `order` — `'fifo'` (default) or `'lifo'` arrival ordering among same-priority waiters.
 
+Registering the same name again replaces the queue's config (on the in-process backend, with a fresh controller). A call naming a queue that was never registered is not gated at all.
+
 ```ts title="start/durable.ts"
 // Rate-limit a third-party API to 100 calls/minute:
 engine.registerQueue({ name: 'shipping-api', rateLimit: { limit: 100, periodMs: 60_000 } })
@@ -36,6 +47,14 @@ engine.registerQueue({ name: 'emails', concurrency: 10, rateLimit: { limit: 1000
 // A third-party cap enforced as a rolling window — never more than 100 in ANY 60s span:
 engine.registerQueue({ name: 'openai', rateLimit: { limit: 100, periodMs: 60_000, algorithm: 'sliding' } })
 ```
+
+### Concurrency caps
+
+`concurrency` bounds how many admitted-but-not-yet-settled steps a queue allows at once, on this engine instance (fleet-wide with the [Redis backend](#distributed-admission--redis)). Accounting tracks real in-flight work, not just dispatch — see [how admission works](#how-admission-works-and-why-its-durable) for when a slot is taken and released.
+
+### Rate limits
+
+`rateLimit` is a hard window: at most `limit` admissions per `periodMs`. It is checked **first**, ahead of concurrency and of any priority/fairness ordering — a rate-limited queue blocks every call equally, whatever its priority, until the window allows another admission.
 
 ### Fixed vs sliding window
 
@@ -63,7 +82,23 @@ const sent = await ctx.step(
 )
 ```
 
-A higher `priority` is admitted first; `fairnessKey` round-robins between keys when the queue's `fairness` is `'key'`, so one noisy tenant can't starve the rest.
+When the queue has a free slot, the call is admitted immediately. When it is contended, the admission controller picks the rightful next waiter in this order: higher `priority` first, then (for a queue registered with `fairness: 'key'`) the least-recently-served `fairnessKey`, then arrival order (`order: 'fifo' | 'lifo'`) as the final tiebreak — the same comparison the in-process controller and the [Redis backend](#distributed-admission--redis) implement.
+
+### Priority
+
+`priority` on the call opts is admission priority *within a queue*: higher is admitted first when a slot is contended (absent = unprioritised). The same value also rides along as **broker** priority: it is carried onto the dispatched `RemoteTask`, and the [`bullmq` transport](/docs/durable/transports/bullmq#priority) translates it into a BullMQ job `priority` (BullMQ runs the lowest number first, so the engine maps "higher wins" onto it), so an urgent task can also jump ahead of already-enqueued lower-priority ones at the worker's own queue. Transports without broker priority ignore it.
+
+### Fairness
+
+`fairnessKey` is the fairness bucket — e.g. a tenant id — used when the queue is registered with `fairness: 'key'`. The queue round-robins across distinct keys (the least-recently-served key wins the next contended slot), so one busy key can't monopolize the budget. It **defaults to the run id** when omitted, so unrelated runs are still fair to each other even if you never set it. Priority always wins over fairness; fairness only breaks ties *within* a priority tier, and arrival order breaks whatever is left.
+
+```ts
+// queue config: opt into fairness
+engine.registerQueue({ name: 'emails', concurrency: 10, fairness: 'key' })
+
+// call site: the fairness bucket
+await ctx.step(sendEmail, job, { queue: 'emails', fairnessKey: job.tenantId })
+```
 
 <CodeFlow scene="flow-control" />
 
@@ -92,7 +127,19 @@ A step fan does not accept a `queue`: `ctx.all(step, inputs, { queue })` throws.
 
 By default, flow-control accounting is **per engine instance**. For the common single-orchestrator deployment this is exactly what you want, and it's correct without any cross-process coordination. If you run several worker replicas, each enforces the limit independently (so a `concurrency: 5` queue admits up to 5 *per replica*). For a truly global cap, use the Redis backend below.
 
-A queue's `concurrency` caps what the engine admits. How many admitted steps a `bullmq` worker runs at once is a separate knob, the transport's [`concurrency`](/docs/durable/cluster/interop#workers-concurrency), which can also adapt to the worker's latency and memory.
+## Worker / transport concurrency
+
+A queue's `concurrency` caps what the engine *admits*. How many already-dispatched tasks a `bullmq` worker *executes* at once is a separate, transport-level knob — [`transports.bullmq({ concurrency })`](/docs/durable/transports/bullmq#concurrency):
+
+```ts title="config/durable.ts"
+bullmq: transports.bullmq({
+  connection: { host: '127.0.0.1', port: 6379 },
+  concurrency: 8, // this pod runs up to 8 tasks per task queue in parallel; defaults to 1
+}),
+```
+
+Total parallelism across a fleet is `concurrency × replicas`. Pass `'adaptive'` (or `{ mode: 'adaptive', min, max, start, tickMs, ramCeilingPct, cpuCeilingPct }`) instead of a number to let a control loop move the limit at runtime: it grows when latency shows headroom, shrinks when latency shows queuing or errors/stalls spike, and hard-brakes on RAM (and on CPU when `cpuCeilingPct` is set). Either way the live limit, in-flight count, RSS, CPU, throughput, p95 and the last adjustment with its reason ride the worker heartbeat, and the [dashboard's worker cards](/docs/durable/observability/dashboard#fleet-and-topology) show them. A Python worker has its own equivalent — see [Python: concurrency and memory](/docs/durable/python#concurrency-and-memory).
+
 
 ## Distributed admission — Redis
 
@@ -139,3 +186,20 @@ Either form works: `admission` accepts a ready backend or a lazy thunk that buil
 </Callout>
 
 A held slot is reclaimed only once its owner's heartbeat lapses: a **live** pod keeps its slot for the full step duration no matter how long it runs, and a **crashed** pod's slots free within `instanceTtlMs`. A waiter re-registers on every retry, so a still-trying call never expires; one that gave up (its run was cancelled) is pruned after `waiterTtlMs` so it can't sit as a phantom best-waiter and deadlock the rest.
+
+## Which knob when
+
+| You need to... | Reach for... | Configured on |
+| --- | --- | --- |
+| Cap in-flight calls to a fragile/expensive downstream | `concurrency` | `engine.registerQueue` |
+| Respect a hard external rate limit (calls per interval) | `rateLimit` (`algorithm: 'sliding'` for a rolling cap) | `engine.registerQueue` |
+| Let an urgent call skip the line when a queue is full | per-call `priority` | `ctx.step(..., opts)` |
+| Also jump the broker's own queue at the worker | same `priority` value | `ctx.step(..., opts)` — mirrored onto the BullMQ job |
+| Stop one tenant/key from starving everyone else | `fairness: 'key'` + per-call `fairnessKey` | `engine.registerQueue` + `ctx.step(..., opts)` |
+| Break remaining ties newest-first instead of oldest-first | `order: 'lifo'` | `engine.registerQueue` |
+| Cap one fan within a single run | `ctx.all(step, inputs, { concurrency })` | the call |
+| Refuse new *runs* once a tenant/key has N in flight | a concurrency quota — see [Concurrency quotas](/docs/durable/reliability/concurrency-quotas) | `static workflow` / `StartOptions` |
+| Raise how much work *this process* runs at once | `concurrency` (number) | `transports.bullmq(...)` |
+| Let the process self-tune under CPU/RAM pressure | `concurrency: 'adaptive'` | `transports.bullmq(...)` |
+| Enforce a cap/rate limit across every replica, not per pod | `admission: admissions.redis(...)` | `config/durable.ts` |
+| Retry a failed step with backoff | `retries` / `backoff` — not flow control | see [Retries & backoff](/docs/durable/reliability/retries) |

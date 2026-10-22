@@ -1,0 +1,10 @@
+---
+title: Overview
+description: The build-time tools. A lint rule set that catches non-determinism inside a workflow body before it ever runs, plus build-time codegen — workflow and step barrels, and a typed client for the dashboard API.
+icon: Wrench
+---
+
+You don't need either of these to run a workflow. Linting catches, at author time, a mistake the engine would only discover once it was too late. Codegen moves work from boot time to build time and gives you typed access to the dashboard API.
+
+- **[Linting for non-determinism](/docs/durable/tooling/linting)**: a workflow body must be deterministic, and the engine only notices it wasn't when a replay diverges, often long after the deploy. `@adonis-agora/durable-eslint-plugin` catches `Date.now()`, `Math.random()`, `process.env`, swallowed control-flow signals and direct I/O inside a workflow body. It understands both the `engine.register()` function form and a `BaseWorkflow` class.
+- **[Codegen](/docs/durable/tooling/codegen)**: Assembler `init` hooks generate barrels of `app/workflows` and `app/steps` at build and dev time, so the provider skips its runtime directory scan. The dashboard API's OpenAPI 3.1 document lets you generate a typed client for it.

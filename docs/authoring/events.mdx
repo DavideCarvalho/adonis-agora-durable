@@ -1,0 +1,193 @@
+---
+title: Events
+description: Name-based pub/sub between your app and its workflows. engine.publishEvent(name, payload) resumes every run parked on a matching ctx.waitForEvent and starts every onEvent subscriber, with idempotent publishing, debounce/batch coalescing for bursty sources, and buffered delivery when nobody is listening yet.
+icon: Zap
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+Not every run starts from an explicit `engine.start`, and not every wait is for a signal sent to one particular run. **Events** are name-based pub/sub built on the same suspend machinery as [signals](/docs/durable/concepts/sleep-and-signals#signals-human-in-the-loop). A single `engine.publishEvent(name, payload)` call can:
+
+- **resume** every in-flight run parked on `ctx.waitForEvent(name)` whose `match` the payload satisfies, and
+- **start** a fresh run of every workflow subscribed to `name` with `onEvent`.
+
+One publish reaches every run that cares about it, including runs that don't exist yet.
+
+## Publishing an event
+
+Call `engine.publishEvent(name, payload, opts?)` from anywhere: a controller, a listener, or another workflow's step.
+
+```ts title="app/controllers/payments_controller.ts"
+import type { HttpContext } from '@adonisjs/core/http'
+import engine from '@adonis-agora/durable/services/main'
+
+export default class PaymentsController {
+  async settled({ request, response }: HttpContext) {
+    const body = request.body() // { orderId, amount }
+    const touched = await engine.publishEvent('payment.settled', body)
+    return response.ok({ touched })
+  }
+}
+```
+
+`publishEvent` does three things, in order, and returns how many runs it reached:
+
+1. **Resumes waiters.** It lists every run parked on `ctx.waitForEvent(name, ...)` and signals each one whose `match` the payload satisfies.
+2. **Starts subscribers.** It starts a run of every workflow registered with `onEvent: [name]`, passing `payload` as the input. A subscriber with [`eventBatch`](#coalescing-bursts--eventbatch) instead routes the event into its accumulator.
+3. **Buffers, if nobody heard it.** If steps 1 and 2 reached nobody, one copy is [buffered](#reliable-buffered-delivery) for a future waiter.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `id` | a fresh uuid per publish | Dedupes the subscriber *start* half across redeliveries. See [Idempotent publishing](#idempotent-publishing--optsid). |
+| `buffer` | `true` | Set `false` to drop a publish that reached nobody instead of buffering it. |
+
+A subscriber whose `validateInput` rejects the payload, or whose start throws for any other reason, is skipped. It does not block the other subscribers, and it is not counted in the returned total.
+
+## Starting a workflow from an event
+
+Subscribe a workflow to one or more event names with `onEvent`. Each publish of any of those names starts a fresh run, with the payload as input.
+
+With the class-based [`app/workflows` convention](/docs/durable/authoring/app-workflows), declare it in the `static workflow` config:
+
+```ts title="app/workflows/send_welcome_workflow.ts"
+import { BaseWorkflow, type WorkflowCtx } from '@adonis-agora/durable'
+
+export default class SendWelcomeWorkflow extends BaseWorkflow {
+  static workflow = { name: 'send-welcome', onEvent: ['user.registered', 'user.invited'] }
+
+  async run(ctx: WorkflowCtx, input: { email: string }) {
+    await ctx.step('mail.send-welcome', input)
+  }
+}
+```
+
+With the function form, pass it to `engine.register`:
+
+```ts
+engine.register('fraud-check', '1', async (ctx, payment) => { /* … */ }, {
+  onEvent: ['payment.settled'], // every publish starts a new fraud-check run
+})
+```
+
+From then on, `publishEvent('user.registered', { email })` starts `send-welcome` with `{ email }`. One publish can resume waiters and start subscribers **in the same call**, and the returned count includes both.
+
+<Callout type="info" title="Events from the app emitter and the diagnostics bus">
+You can also have publishes made for you. `@OnEvent` bridges an **AdonisJS emitter** event, and `@OnDiagnostic` bridges an `@adonis-agora/diagnostics` channel into the engine. An exact trigger is published under its canonical name, so it starts the same `onEvent` subscribers. See [Event-triggered workflows](/docs/durable/authoring/event-triggers).
+</Callout>
+
+### Idempotent publishing — `opts.id`
+
+An upstream that delivers at-least-once will publish the same real-world fact twice, and by default each publish starts its own subscriber run. Pass the upstream's own event id, and the second delivery becomes a no-op:
+
+```ts title="app/controllers/webhooks_controller.ts"
+async paymentSettled({ request, response }: HttpContext) {
+  const event = request.body() as { id: string; data: Payment }
+
+  // The provider's event id: redelivering it starts no second run.
+  await engine.publishEvent('payment.settled', event.data, { id: event.id })
+
+  return response.ok({})
+}
+```
+
+Each subscriber run is started with the run id `evt:<id>:<workflow>`, and starting an existing run id is a no-op. This is the same mechanism that makes [scheduling](/docs/durable/authoring/scheduling) and webhooks idempotent. If you omit `id`, each publish gets a fresh uuid, so each publish starts its subscribers once.
+
+`id` only dedupes the **start** half. It does not dedupe the fan-out to runs already parked on `ctx.waitForEvent`, events routed into an [`eventBatch`](#coalescing-bursts--eventbatch) accumulator, or the [buffered copy](#reliable-buffered-delivery), which is stored under its own id.
+
+## Coalescing bursts — `eventBatch`
+
+A source that fires many events in quick succession, such as a stream of uploads or a noisy webhook, usually shouldn't start one run per event. `eventBatch` coalesces an `onEvent` subscription so the workflow starts once per **burst**:
+
+```ts
+// Debounce: one run with the LAST payload, once the source has been quiet for 5s.
+engine.register('reindex', '1', async (ctx, activity) => { /* … */ }, {
+  onEvent: ['activity'],
+  eventBatch: { mode: 'debounce', windowMs: 5_000 },
+})
+
+// Batch: one run per 50 events, or per minute from the first, whichever comes first.
+engine.register('flush-metrics', '1', async (ctx, input) => {
+  const { events } = input as { events: MetricEvent[] }
+  /* … */
+}, {
+  onEvent: ['metric'],
+  eventBatch: { mode: 'batch', maxSize: 50, windowMs: 60_000 },
+})
+```
+
+| Mode | Fires when | Input to the run |
+| --- | --- | --- |
+| `debounce` | no new event for `windowMs` (each event restarts the window) | the **last** payload. Earlier ones in the burst are discarded. |
+| `batch` | `maxSize` events have arrived, or `windowMs` has passed since the first one | `{ events: [...] }`: every payload, in publish order |
+
+Use `debounce` when only the latest state matters, such as reindexing a document that was edited eleven times. Use `batch` when every event is a fact you must not lose, such as metrics or an audit trail. `windowMs` is in milliseconds.
+
+<Callout type="warn">
+`eventBatch` is an `engine.register` option. A class's `static workflow` config has no `eventBatch` field, so to coalesce a subscription, register that workflow with the function form.
+</Callout>
+
+### How the accumulator works
+
+The engine does not start the target directly. It routes each event into a per-workflow **accumulator**: a long-lived built-in workflow (`__evt_debounce` or `__evt_batch`, registered when the engine is constructed) with the run id `__evtacc__:<workflow>`. Events reach it through `signalWithStart`. The accumulator collects payloads, starts the real target once as a child (`ctx.startChild`), then calls `continueAsNew` to get ready for the next burst. Signal buffering means an event that arrives while it is re-arming is not lost.
+
+Because the accumulator is a durable workflow, a window that is still open survives a restart instead of losing the events buffered in it. It also means:
+
+- The accumulator is per **target workflow**, not per event name. A workflow subscribed to several names collects all of them into one burst.
+- An event routed into an accumulator counts as delivered, so it is never also [buffered](#reliable-buffered-delivery).
+- Accumulator runs appear in the dashboard under their built-in names, next to the target runs they start.
+
+## Waiting for an event mid-run
+
+`onEvent` starts a **new** run. `ctx.waitForEvent<TPayload>(name, opts?)` lets a run that is **already running** suspend, using no compute, until a matching event is published. It then resumes with the payload:
+
+```ts
+async run(ctx: WorkflowCtx, input: { orderId: string }) {
+  await ctx.step('orders.mark-awaiting-payment', input)
+
+  // Suspends until a `payment.settled` publish whose payload carries this orderId.
+  const payment = await ctx.waitForEvent<{ orderId: string; amount: number }>('payment.settled', {
+    match: { orderId: input.orderId },
+    timeoutMs: 24 * 60 * 60 * 1000, // 1 day
+  })
+
+  return { orderId: input.orderId, paid: payment.amount }
+}
+```
+
+`match` is a subset of the payload. Each of its top-level keys must equal the payload's value for that key, compared by JSON serialization, so a nested object must also match in key order. **If you omit `match`, the waiter is a broadcast** and resumes on any payload published under that name. With `match`, a publish reaches only the runs it concerns: two order runs waiting on different `orderId`s each resume only from the publish that carries their own id.
+
+`timeoutMs` bounds the wait the same way it does for `ctx.waitForSignal`. If the deadline passes first, the call throws `SignalTimeoutError`, which you can catch to take a default branch. If you omit it, the run waits indefinitely, using no compute either way. The deadline is recorded once as its own checkpoint, so a bounded wait takes **two** replay positions (deadline + wait) and an unbounded one takes one. Adding or removing `timeoutMs` on a wait that in-flight runs have already reached is therefore a [versioning](/docs/durable/authoring/versioning) change.
+
+Internally, `waitForEvent` is a signal waiter whose token encodes the event name, the `match` criteria (base64, so they never collide with the `:` delimiter) and the run position. `publishEvent` finds candidates by listing every waiter token with that name's prefix, then checks each decoded `match` against the payload.
+
+## Reliable (buffered) delivery
+
+A publish that reaches **nobody** (no waiter matched, and no subscriber started or accumulated it) is **buffered** rather than silently dropped. Exactly **one** copy is kept, and the **first** later `ctx.waitForEvent(name, { match })` whose `match` accepts the payload consumes it. This is the events equivalent of [signal buffering](/docs/durable/concepts/sleep-and-signals#signal-buffering--signal-with-start), and it handles the publish/wait race in both directions. After buffering, `publishEvent` checks for waiters once more, and `waitForEvent` checks the buffer after registering, so a waiter that registers in between is still paired.
+
+Buffering is the default. Opt out per publish with `{ buffer: false }` when a publish nobody is listening for should simply be dropped:
+
+```ts
+// Buffered (default): safe even if the order run hasn't reached waitForEvent yet.
+await engine.publishEvent('payment.settled', { orderId, amount })
+
+// Live-only: fan out to whoever is waiting right now, drop it if nobody is.
+await engine.publishEvent('metrics.tick', { at: Date.now() }, { buffer: false })
+```
+
+Buffered events are keyed by event **name**, since many waiters can share a name with different `match` values. A waiter consumes from the buffer by listing the oldest candidates for its name (up to 50 per scan), checking each against its own `match`, and claiming the first that passes. A buffered event that doesn't match never blocks an earlier one that does. On the [Lucid store](/docs/durable/stores/lucid), the copies live in the `durable_buffered_events` table.
+
+<Callout type="info">
+Redelivery is point-to-point. The single buffered copy goes to one waiter, never to an `onEvent` subscriber registered later. The buffer is not a durable broadcast log. If every future subscriber needs to see a past event, model it as workflow state (for example, a run started with `onEvent`) rather than relying on the buffer.
+</Callout>
+
+## Events vs signals vs updates
+
+All three suspend a run, using no compute, until something external resumes it. They differ in addressing and delivery:
+
+| | Addressing | Delivery | Typical use |
+| --- | --- | --- | --- |
+| **Event** (`ctx.waitForEvent` / `engine.publishEvent`) | name + optional `match` | fan-out: one publish can resume many waiters **and** start many `onEvent` subscribers | something happened that any number of runs (or none yet) might care about |
+| **Signal** (`ctx.waitForSignal` / `engine.signal`) | an exact token you choose | point-to-point: resumes one waiter, buffered if it arrives early | a wake-up for one specific run. See [Sleep & signals](/docs/durable/concepts/sleep-and-signals). |
+| **Update** (`ctx.onUpdate` / `engine.update`) | run id + update name | point-to-point, with a validator that can reject before the run is touched | changing one specific run under a business rule it may reject. See [Queries & updates](/docs/durable/authoring/queries-and-updates). |
+
+An event is a signal with the addressing reversed. A signal's token is chosen by the caller to reach one run. An event's name is a stable, shared channel that any number of runs can wait on (`waitForEvent`) or be started by (`onEvent`), and `match` narrows a broadcast down to the runs a given publish concerns. Use an update instead when the caller needs synchronous, validated rejection of a bad delivery. Events and signals are always delivered.

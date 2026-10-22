@@ -10,6 +10,8 @@ A scheduled workflow is just a normal workflow that you **start on a recurring c
 
 Schedules trigger by **time**. To trigger a workflow when an **event** happens instead — an Adonis emitter event or a `@adonis-agora/diagnostics` channel — see [Event-triggered workflows](./event-triggers).
 
+For schedules created and managed **at runtime** — one per user or tenant, stored in the database — see [Persisted schedules](/docs/durable/authoring/persisted-schedules).
+
 ## Describing a schedule — `ScheduledWorkflow`
 
 ```ts

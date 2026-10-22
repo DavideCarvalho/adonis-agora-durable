@@ -34,6 +34,10 @@ export default defineConfig({
 | `path` | `'/durable'` | Route prefix the console mounts under. `'/'` mounts at the root. |
 | `authorize` | see below | Per-request guard: `(ctx: HttpContext) => boolean \| Promise<boolean>`. |
 | `dashboardAuth` | absent | Opt-in [session layer](/docs/durable/observability/dashboard-auth) on top of `authorize`. |
+| `allowUnauthenticated` | `false` | Local development only: serve the console with no auth at all (warns at boot). See below. |
+| `audit` | app logger | `(entry) => void` sink for every mutating attempt: `{ at, actor, method, path }`. |
+| `redact` | absent | `{ run?, checkpoint? }` hooks applied to every serialized run and checkpoint right before it leaves the API. See [Redacting payloads](#redacting-payloads). |
+| `accessDenied` | built-in page | Tweak or replace the [access-denied page](#the-access-denied-page). |
 
 ### Authorization
 
@@ -123,6 +127,19 @@ export default defineConfig({
 
 An `authorize` hook that already wrote a redirect still wins — the provider never overwrites a `location` header, with or without `accessDenied`.
 
+### Redacting payloads
+
+The store may hold payloads encrypted (a codec-wrapped store), but the console reads through the codec, so operators always see them **decoded**. `redact` keeps a card number or PII out of the operator's browser. Each hook receives the serialized shape and returns what to send. It runs on the runs list, the run detail and fan member pages:
+
+```ts title="config/durable_dashboard.ts"
+export default defineConfig({
+  redact: {
+    run: (run) => ({ ...run, input: undefined }),
+    checkpoint: (cp) => ({ ...cp, output: '[redacted]' }),
+  },
+})
+```
+
 ## Where it mounts
 
 All routes are relative to `path` (default `/durable`), and every one of them runs behind the `authorize` guard.
@@ -210,8 +227,12 @@ source.onmessage = (msg) => {
 ```
 
 <Callout type="info">
-The stream sends no keepalive comments and has no server-side idle timeout — it ends when the client disconnects. Behind a proxy that closes idle connections, reconnect from the client (`EventSource` does this on its own by default). The response carries `x-accel-buffering: no` so nginx does not buffer it.
+The server writes a `: ping` comment every 25 seconds. That keeps intermediaries from reaping an idle stream, and it lets Node notice a dead client and drop the subscription. The stream ends when the client disconnects. `EventSource` reconnects on its own if a proxy cuts it anyway. The response carries `x-accel-buffering: no` so nginx does not buffer it.
 </Callout>
+
+Open streams are capped at **100 per instance and 10 per client address**. Past either cap the route answers `429 { "error": "too many open event streams" }`.
+
+The tail is **cross-pod** when the engine has a [control plane](/docs/durable/transports/control-plane). Every instance broadcasts the lifecycle events it produces over the control plane, and the others deliver them to their local subscribers. A dashboard served from a web process can therefore live-tail a run that is executing on a `durable:work` pod. Without a control plane the stream still works, but only for runs executing in the same process as the dashboard.
 
 ### Acting on runs
 
@@ -350,6 +371,69 @@ A `suspended` run with no waiter gets no `waiting` value, and that absence is it
 
 `waiting` appears on the rows of `GET /api/runs` only, and only when the store exposes `listSignalWaiters` — a store-less `tenant` pod skips it silently.
 
+### Display states
+
+The `waiting` value is one input to a richer **display state** that the runs list and the run detail header both derive the same way, so they always agree. The stored status never changes. The console refines what it shows:
+
+| Display state | Means |
+| --- | --- |
+| `sleeping` | Parked on a durable `ctx.sleep` timer. |
+| `awaiting` | Waiting on a signal, webhook, child run, breakpoint or `onError` failure handler, named e.g. `signal approve`, `webhook wh:…`, `child ord-42.child.0`. |
+| `no-worker` | The run's next work is queued on a worker group that has a real backlog (`depth > 0`) and zero live workers. |
+| `queued` | A [singleton](/docs/durable/reliability/singleton) run gated behind another in-flight run holding its key, shown as `behind leader <id>`. |
+| `blocked` | Shown as its own state, with the reason from `run.error.message`. No *compatible* worker exists, which starting another worker of the same build cannot fix. See [Fleet health](#fleet-health). |
+| `running` | Everything else open or in flight, including a settled step waiting to be replayed with nothing currently blocking it. |
+
+`no-worker` is gated on a **real backlog**, not on zero live workers alone. A worker only heartbeats for a group while it serves it, so an idle group (a run parked on its reconcile timer with nothing enqueued, a schedule between fires) legitimately reports no live workers without anything being stuck. Worker health comes from `GET /api/workers`, so on transports without `groupHealth` (anything but BullMQ) nothing ever reads `no-worker`.
+
+### Filter pickers
+
+The tag, tenant and search-attribute filters list the values the runs actually carry, each with a count, and take **several** values at once. A free-text box is usable only by an operator who already knows the tenant name or tag, and a typo there returns an empty list that reads exactly like "no runs match".
+
+- **Options are counted over the runs the *other* filters already select.** Pick a tenant and the tag picker offers that tenant's tags, so a picker never offers a value whose result set is empty. Status is deliberately left out of that scope, so the options don't collapse to the status being viewed.
+- **Several values on one axis are ORed, and the axes are ANDed.** For example: these two tenants, tagged either of these two ways. On search attributes that needs the `in` operator (shown as *is any of*), because two equality predicates on one key are ANDed like every other pair and no run has two values for one attribute.
+- **Typed text still works.** The offered list is a bounded top-N (tag cardinality grows with the data, since a `singleton:<key>` tag is minted per key), so a rare value can be real and absent from it. Engine-minted tags are listed last.
+
+A tag or tenant chip on a run row **adds** to the selection instead of replacing it, so a "these two kinds of run" view can be built by clicking.
+
+<Callout type="info">
+On the Lucid store, counts on the run-table axes (workflow, status, namespace) are exact `GROUP BY`s over the whole matching set. **Tag and search-attribute counts are taken over a bounded scan** of the newest 5,000 matching runs, because those values live in a JSON column and a side table rather than in the row being counted. Treat them as "how common, roughly", not as totals. A store without a native value enumeration (or a store-less tenant pod) gets the same bounded scan for every axis.
+</Callout>
+
+### Tenant and origin filters
+
+**Tenant** matches the run's `namespace` exactly and is pushed down to the store as the `namespace` param on `GET /api/runs` and `POST /api/bulk/:action`. Its default is **every namespace**. The dashboard's read paths are not namespace-scoped, so this is a filter the operator chooses, not a scope imposed on them, and not an authorization boundary either. Selecting several tenants compares them side by side.
+
+**Origin** (which package declared the run's workflow) is a row of facet chips above the list: `all`, one chip per package, and `unknown` when any loaded run has none, each with a count. Runs created before the field existed, and workflows whose package couldn't be resolved, have no origin. An exact-match store filter can't express "no origin", so the chips are counted over the rows the console has already loaded rather than pushed down. That keeps the `unknown` count on screen while a package is selected, so unattributed runs never look like they don't exist.
+
+### At scale: paging and list rows
+
+A deployment accumulates runs for as long as [retention](/docs/durable/reliability/retention) keeps them, so the console treats the list as **pages**:
+
+- The console asks `GET /api/runs` for **100 rows at a time** and fetches the next page as the last loaded rows scroll into view. The server defaults `size` to 50 and caps it at 200.
+- The list is **virtualized**: only the rows in the viewport are mounted, so a deep page costs the same DOM as a shallow one.
+- `GET /api/runs` returns list **rows**, not whole runs: id, workflow and version, status, namespace, origin, tags, timestamps, `recoveryAttempts` and `waiting`. `input`, `output` and `error` are left out, because no row renders them and on a busy deployment they are most of the bytes. `GET /api/runs/:id` still carries all three.
+
+### Dead-letter runs and their links
+
+A run that crash-recovery gives up on after `maxRecoveryAttempts` moves to the terminal **`dead`** status. The console shows it as a first-class status, with a `dead` filter chip and a distinct badge. A dead run stays inspectable and can still be retried from the UI once you've fixed the cause.
+
+When your [`onDead` handler](/docs/durable/reliability/dead-letter#routing-to-a-dlq-workflow) starts a handler run under the id `dlq:<deadRunId>`, the console links the two **both ways**. A `dlq:` run gets a red `dlq` chip in the list and a banner linking back to the dead run. A `dead` run's detail looks up `dlq:<its id>` and, when that run exists, shows a *Dead-lettered* banner with an **open DLQ handler** link.
+
+### Recovering a lost remote step dispatch
+
+A remote step with no `timeoutMs` dispatches its job, persists a `pending` checkpoint and suspends until the worker's result resumes it. If the worker crashed mid-step or the transport dropped the job, the result never comes. By design the reconcile re-drive re-suspends a still-`pending` step instead of re-dispatching it, so a slow worker is never double-run, and the run waits indefinitely.
+
+The timeline flags this instead of drawing it as a healthy in-flight step. A remote step `pending` for more than **10 minutes** is checked against its group's worker heartbeats:
+
+- If a worker beat for the group in the last 90 seconds, the row reads *being worked by `<instanceId>` — heartbeat Ns ago* (plus the worker's in-flight count when it reports one). The dispatch reached a live worker, so wait.
+- If no worker did, the row reads *awaiting worker result — dispatched Nm ago, no live worker (possibly lost)*.
+
+A live heartbeat proves the worker *process* is alive, not that the step is progressing. From a lost row you have two ways to recover:
+
+- **Re-dispatch** — `POST /api/runs/:id/redispatch` (the console's *Re-dispatch* action) re-enqueues every `pending` remote step on the run, bumping its `attempts`, so the idempotent step re-runs and its result resumes the run. It is the same as `engine.redispatchPending(runId)`.
+- **Self-heal** — set `remoteRedispatchMs` (and optionally `remoteRedispatchMax`, default `10`) in `config/durable.ts`, and a reconcile pass re-dispatches a remote step still `pending` past the window by itself, recording a `warn`-level `step.redispatched` event on the checkpoint. Once the bound is spent, the step fails with `remote_step_lost`. This is off by default. See [Failure modes](/docs/durable/reliability/failure-modes#lost-remote-dispatch-the-run-suspends-and-nothing-auto-redrives-it) for the window-sizing rules.
+
 ## Fleet health
 
 When you run a [split or polyglot cluster](/docs/durable/cluster), the console grows a **health and compatibility panel** fed by the [handshake](/docs/durable/cluster/handshake) descriptors and diagnostics events:
@@ -358,6 +442,55 @@ When you run a [split or polyglot cluster](/docs/durable/cluster), the console g
 - **Blocked runs** — runs parked because no live worker advertises a [required capability](/docs/durable/cluster/handshake#capability-aware-routing), so a stuck fleet is diagnosable at a glance rather than a silent hang.
 
 A store-less `tenant` api/dashboard pod serves this same view — its reads proxy to the control plane over the wire, so the panel looks identical whether or not the pod owns a store. Some verbs have no wire equivalent yet and always answer `404` on such a pod: `retry-with-input`, `continue`, the [human-in-the-loop verbs](#human-in-the-loop-signals-updates-and-tasks) (`signal`, `update`, `tasks/*`), and the [schedule controls](#schedules).
+
+## Engine health and admin surface
+
+The console's worker cards and its actions are a thin layer over methods `WorkflowEngine` exposes directly. Import the engine from `@adonis-agora/durable/services/main` when you're scripting an operational task (an ace command, a REPL session) instead of clicking through the console.
+
+**Worker liveness** — `engine.workerHealth(extra?: string[])` returns one `GroupHealth` per worker group. It is the same call behind `GET /api/workers` and the [Telescope](/docs/durable/observability/telescope) worker panel:
+
+```ts
+interface GroupHealth {
+  group: string
+  /** Outstanding jobs in the group's task queue (waiting + active + delayed + prioritized). */
+  depth: number
+  /** Workers with a non-expired heartbeat for this group. */
+  liveWorkers: WorkerHeartbeat[]
+}
+
+interface WorkerHeartbeat {
+  group: string
+  /** Stable per-process id (host + pid), so N replicas of a group each show as a distinct worker. */
+  instanceId: string
+  lastBeatAt: number
+  /** BullMQ workers: concurrency, in-flight, RSS/CPU, throughput, p95, last adjustment. */
+  status?: WorkerStatus
+}
+```
+
+`depth > 0 && liveWorkers.length === 0` is the actionable alert: work is queued and nothing is consuming it. Pass `extra` to include groups the engine can't derive from its registrations. Only the BullMQ transport implements `groupHealth`, so on other transports the list is empty.
+
+**Bulk and tree operations:**
+
+- `engine.cancelWhere(filter, opts?)` cancels every run matching a run query (workflow, status, tag, namespace, search-attribute predicates), each through the normal `cancel` path: child cascade, optional `{ compensate: true }` saga undo, cancel listeners and the control-plane broadcast. It is the scriptable form of the console's bulk cancel, without the 500-run cap. It returns one `RunResult` per matched run.
+- `engine.deleteRun(runId)` hard-deletes a run and its whole child subtree (checkpoints, signal waiters, search-attribute rows) and returns the number of runs deleted. Unlike `cancel`, the run disappears from the listing. Cancel a live run first, since deleting one mid-flight orphans its worker. For deleting by scope, see [`engine.purgeRuns`](/docs/durable/reliability/retention#purging-on-demand--enginepurgeruns).
+- `engine.getRunChildren(parentRunId)` returns the ids a run spawned via `ctx.child` or `ctx.startChild`. The console's run tree and the `cancel` cascade walk the same parent-to-children edge.
+
+**Graceful shutdown** — `engine.drain(timeoutMs = 10_000)` stops the engine picking up new runs and waits for in-flight executions to settle, up to `timeoutMs`, then releases the recovery leases of anything still in flight so the next pod can take over without waiting for them to expire. `durable:work` already drains on stop, so you only call it yourself when you run the engine some other way.
+
+**Cross-instance hooks** — `onEnqueued` and `onCancel` let an instance react to activity from *other* instances over the control plane, without polling:
+
+```ts title="start/durable.ts"
+import engine from '@adonis-agora/durable/services/main'
+
+// Pick up a run the instant another pod enqueues it.
+const stopEnqueued = engine.onEnqueued((runId) => engine.runOne(runId))
+
+// Cooperative cancellation: abort long in-flight work instead of finishing it just to discard it.
+const stopCancel = engine.onCancel((runId) => myWorkerBridge.abort(runId))
+```
+
+Both return an unsubscribe function. `onEnqueued` is only useful on instances that should execute runs.
 
 ## Calling the API directly
 

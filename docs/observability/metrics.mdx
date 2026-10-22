@@ -1,0 +1,197 @@
+---
+title: Metrics
+description: Dependency-free run/step counters and duration percentiles. collectMetrics serves a Prometheus scrape, attachDurableMetrics a JSON snapshot with p50/p95/max, both built from the engine's own lifecycle events.
+icon: ChartLine
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+`@adonis-agora/durable` ships two metrics collectors. Neither needs an OpenTelemetry SDK or a Prometheus client library. Both subscribe to the same engine lifecycle events the [dashboard](/docs/durable/observability/dashboard), the [OTel bridge](/docs/durable/observability/otel) and the [Telescope view](/docs/durable/observability/telescope) use, and turn them into counters you read on demand:
+
+| Collector | Import from | Shape | Reach for it when |
+| --- | --- | --- | --- |
+| `collectMetrics(engine)` | `@adonis-agora/durable` | Prometheus text exposition + raw snapshot | you already scrape Prometheus |
+| `attachDurableMetrics(engine)` | `@adonis-agora/durable/otel` | JSON snapshot with duration percentiles | you want p50/p95/max out of the box, or JSON for a custom dashboard |
+
+## `collectMetrics`: Prometheus text exposition
+
+`collectMetrics` lives in the main entry point and is shaped for a real Prometheus scrape:
+
+```ts
+import { collectMetrics } from '@adonis-agora/durable'
+
+const metrics = collectMetrics(engine)
+```
+
+Its handle:
+
+```ts
+export interface MetricsCollector {
+  snapshot(): MetricsSnapshot
+  /** Prometheus text exposition of the counters — serve this from a `/metrics` endpoint. */
+  prometheus(): string
+  /** Unsubscribe from the engine. */
+  stop(): void
+}
+```
+
+`snapshot()` returns a deep copy of the counters, including a per-workflow breakdown and a step-started counter:
+
+```ts
+export interface MetricsSnapshot {
+  /** `routed`: failures handed to an onError handler; `unrouted`: routes the engine could not apply. */
+  runs: {
+    started: number
+    completed: number
+    failed: number
+    suspended: number
+    routed: number
+    unrouted: number
+  }
+  /** Routed failures by error code (`*` for a failure without one). */
+  routedByCode: Record<string, number>
+  steps: { started: number; completed: number; failed: number }
+  /** Per-workflow run counters, keyed by workflow name. */
+  byWorkflow: Record<string, { started: number; completed: number; failed: number }>
+  /** Sum + count of recorded step durations (ms), for an average. */
+  stepDuration: { sumMs: number; count: number }
+}
+```
+
+### Serving a scrape endpoint
+
+Create the collector **once**, at module scope, and serve `prometheus()` from a route:
+
+```ts title="start/routes.ts"
+import router from '@adonisjs/core/services/router'
+import engine from '@adonis-agora/durable/services/main'
+import { collectMetrics } from '@adonis-agora/durable'
+
+const durableMetrics = collectMetrics(engine)
+
+router.get('/metrics', ({ response }) => {
+  response.header('content-type', 'text/plain; version=0.0.4')
+  return durableMetrics.prometheus()
+})
+```
+
+<Callout type="warn">
+Don't call `collectMetrics(engine)` inside the handler. Each call adds a new engine subscription that starts counting from zero, so a per-request collector would always report nothing and would keep adding listeners. Put the route behind your own middleware/guard (or on an internal-only port) if the numbers shouldn't be public.
+</Callout>
+
+A scrape returns:
+
+```text
+# TYPE durable_runs_total counter
+durable_runs_total{event="started"} 42
+durable_runs_total{event="completed"} 38
+durable_runs_total{event="failed"} 2
+durable_runs_total{event="suspended"} 6
+durable_runs_total{event="routed"} 1
+durable_runs_total{event="unrouted"} 0
+# TYPE durable_steps_total counter
+durable_steps_total{event="started"} 120
+durable_steps_total{event="completed"} 115
+durable_steps_total{event="failed"} 3
+# TYPE durable_runs_by_workflow_total counter
+durable_runs_by_workflow_total{workflow="charge-order",event="started"} 42
+durable_runs_by_workflow_total{workflow="charge-order",event="completed"} 38
+durable_runs_by_workflow_total{workflow="charge-order",event="failed"} 2
+# TYPE durable_runs_routed_total counter
+durable_runs_routed_total{code="E_CARD_DECLINED"} 1
+# TYPE durable_step_duration_ms_sum counter
+durable_step_duration_ms_sum 184230
+# TYPE durable_step_duration_count counter
+durable_step_duration_count 115
+```
+
+The step-duration pair counts only **completed** steps that reported a `durationMs`. Divide the sum by the count for an average. A run event without a workflow name lands under `workflow="unknown"`. Call `stop()` to detach the collector from the engine.
+
+## `attachDurableMetrics`: JSON snapshot with percentiles
+
+`attachDurableMetrics` lives in the `@adonis-agora/durable/otel` subpath, next to the OTel bridge, but it has **no OpenTelemetry dependency** and works without `@opentelemetry/api`:
+
+```ts
+import { attachDurableMetrics } from '@adonis-agora/durable/otel'
+
+const metrics = attachDurableMetrics(engine)
+```
+
+It returns a handle with three methods:
+
+```ts
+export interface DurableMetrics {
+  /** A point-in-time copy of the counters and duration percentiles. */
+  snapshot(): DurableMetricsSnapshot
+  /** Zero everything (e.g. between scrape windows). */
+  reset(): void
+  /** Stop collecting. */
+  unsubscribe(): void
+}
+```
+
+`snapshot()` returns run/step counts by outcome plus p50/p95/max duration stats for both runs and steps:
+
+```ts
+export interface DurableMetricsSnapshot {
+  runs: {
+    started: number
+    completed: number
+    failed: number
+    suspended: number
+    /** Failures handed to an onError handler instead of failing the run. */
+    routed: number
+    /** Failures that had onError routes the engine could not apply (workers disagree). */
+    unrouted: number
+  }
+  /** Routed failures by error code (`*` for a failure without one). */
+  routedByCode: Record<string, number>
+  steps: { completed: number; failed: number }
+  /** Per-step wall-clock (from the `durationMs` on step events). */
+  stepDurationMs: DurationStats
+  /** Per-run wall-clock, measured `run.started` → terminal. */
+  runDurationMs: DurationStats
+}
+
+export interface DurationStats {
+  count: number
+  /** Median, 95th percentile, and max — in milliseconds. */
+  p50: number
+  p95: number
+  max: number
+}
+```
+
+`stepDurationMs` includes both completed and failed step attempts. `runDurationMs` is measured from `run.started` to `run.completed` / `run.failed` **as seen by this collector**: a run that started before the collector was attached (or in another process) is counted in `runs` but contributes no duration.
+
+### Serving a JSON snapshot
+
+`snapshot()` returns plain JSON, so it drops straight into a route:
+
+```ts title="start/routes.ts"
+import router from '@adonisjs/core/services/router'
+import engine from '@adonis-agora/durable/services/main'
+import { attachDurableMetrics } from '@adonis-agora/durable/otel'
+
+const durableMetrics = attachDurableMetrics(engine)
+
+router.get('/metrics/durable', () => durableMetrics.snapshot())
+```
+
+Call `reset()` after reading if you want each window's counters (and percentiles) independent instead of cumulative since boot. `reset()` also forgets the start time of in-flight runs, so a run spanning the reset doesn't contribute a duration. Call `unsubscribe()` to stop listening.
+
+<Callout type="info" title="Percentiles are computed in memory">
+`attachDurableMetrics` keeps every recorded step and run duration until the next `reset()` and sorts them on each `snapshot()`. In a long-lived, high-throughput process, call `reset()` periodically (for example after each scrape) to keep that buffer bounded.
+</Callout>
+
+## Which one to use
+
+Both subscribe to the same event stream through `engine.subscribe` and are safe to run side by side. Each just adds its own listener. Use `collectMetrics` for Prometheus text and per-workflow counters. Use `attachDurableMetrics` for duration percentiles, a JSON snapshot, or a resettable window.
+
+A failure handed to an [onError handler](/docs/durable/reliability/on-error) is counted as `routed`, not `failed`, and is broken down by error code in `routedByCode` (Prometheus: `durable_runs_routed_total{code}`). An `unrouted` count above zero means a deploy left workers announcing different routes.
+
+<Callout type="warn" title="Counters are per process">
+Both collectors count the events **this process's engine** emits, and both reset when the process restarts. A multi-pod deployment needs one scrape target per instance (or an aggregating layer), the same as any Prometheus client library. In a [split cluster](/docs/durable/cluster) the run lifecycle is emitted where the engine runs (the `standalone` / `control-plane` pods), not on store-less `tenant` pods, which have no engine to subscribe to.
+</Callout>
+
+Need labels these collectors don't have? Subscribe to the stream yourself with [`engine.subscribe`](/docs/durable/observability/events-and-interceptors) and feed your own client, or bridge the events onto the [diagnostics bus](/docs/durable/observability/diagnostics).

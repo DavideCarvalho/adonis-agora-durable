@@ -1,0 +1,29 @@
+---
+title: Observability
+description: How to see what your workflows are doing. The embedded dashboard and its auth layer, the engine's event stream and interceptors, OpenTelemetry spans, dependency-free metrics, the diagnostics bus, and the Telescope integration.
+icon: Telescope
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+A durable run is long-lived and spans processes, retries and deploys, so checking the logs is rarely enough. The engine exposes the same lifecycle events through several surfaces. Pick the ones that match how you already operate.
+
+## Start here
+
+- **[Dashboard](/docs/durable/observability/dashboard)**: the embedded operations console, a React SPA plus a JSON API mounted into your AdonisJS routes. Filter runs, follow a run's timeline live, fix and replay a bad input, deliver signals and updates, and check the worker fleet's health. It is the quickest way to answer "what is this run waiting on?".
+- **[Dashboard auth](/docs/durable/observability/dashboard-auth)**: the console's optional session layer. Sign operators in at a built-in login page, or create a session from your already-authenticated app.
+
+## Wiring into your stack
+
+- **[OpenTelemetry](/docs/durable/observability/otel)**: one trace per run and one span per step, with distributed tracing across worker processes, so workflows show up in Jaeger, Grafana or Datadog next to your HTTP traces.
+- **[Metrics](/docs/durable/observability/metrics)**: dependency-free run and step counters and duration percentiles. `collectMetrics` serves a Prometheus scrape, and `attachDurableMetrics` returns a JSON snapshot with p50/p95/max.
+- **[Telescope](/docs/durable/observability/telescope)**: runs and steps inside Telescope, alongside your app's requests, queries and jobs.
+
+## Underneath
+
+- **[Events & interceptors](/docs/durable/observability/events-and-interceptors)**: the two programmatic hooks into a running engine. `engine.subscribe` gives you the lifecycle event stream, and `engine.use` adds middleware around a local step.
+- **[Diagnostics bus](/docs/durable/observability/diagnostics)**: every engine lifecycle event republished on the `@adonis-agora/diagnostics` bus as `agora:durable:<type>`. Several of the surfaces above are built on this feed. Subscribe to it to route durable events somewhere none of them cover.
+
+<Callout type="info">
+These surfaces add up rather than replace each other. A production deployment typically runs the dashboard for people and OpenTelemetry or metrics for alerting, all from the same event stream.
+</Callout>

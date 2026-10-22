@@ -1,0 +1,389 @@
+---
+title: Patterns
+description: A cookbook of common durable-workflow shapes — human approval, webhook confirmation, batch fan-out, cron digests, booking sagas, rate-limited APIs, and long-lived pollers — each a short, self-contained recipe with a link to the full page.
+icon: Shapes
+---
+
+Seven recipes for shapes that come up constantly once you're writing real workflows. Each one is
+short and self-contained — skim for the shape you need, then follow the link for the full
+treatment.
+
+Every recipe uses the idiomatic authoring form: a [`BaseWorkflow` class under `app/workflows/`](/docs/durable/authoring/app-workflows)
+(auto-registered at boot), with its `@Step` classes from `app/steps/` resolved by the container through
+`@inject()`. The step classes are left out where they're ordinary `@Step` methods.
+
+## 1. Human-in-the-loop approval
+
+**Problem:** a run needs a person to make a call — approve a purchase order, review a flagged
+transaction — before it can continue, but it shouldn't wait forever if nobody responds.
+
+```ts title="app/workflows/po_approval_workflow.ts"
+import { inject } from '@adonisjs/core'
+import { BaseWorkflow, SignalTimeoutError } from '@adonis-agora/durable'
+import type { WorkflowCtx } from '@adonis-agora/durable'
+import PurchasingSteps from '#steps/purchasing_steps'
+
+@inject()
+export default class PoApprovalWorkflow extends BaseWorkflow {
+  static workflow = { name: 'po-approval', version: '1' }
+
+  constructor(private purchasing: PurchasingSteps) {
+    super()
+  }
+
+  async run(ctx: WorkflowCtx, po: PurchaseOrder) {
+    // Publish a queryable snapshot so a UI can poll status without touching the run.
+    await ctx.setEvent('status', { state: 'awaiting-approval', amountCents: po.amountCents })
+
+    let decision: { approved: boolean; approver: string }
+    try {
+      // Suspends here (zero compute) until engine.update(runId, 'decision', arg) delivers one,
+      // or 3 days pass.
+      decision = await ctx.onUpdate('decision', { timeoutMs: 3 * 24 * 60 * 60 * 1000 })
+    } catch (error) {
+      if (error instanceof SignalTimeoutError) {
+        await ctx.setEvent('status', { state: 'expired' })
+        return { approved: false, reason: 'expired' }
+      }
+      throw error
+    }
+
+    if (!decision.approved) {
+      await ctx.setEvent('status', { state: 'rejected', by: decision.approver })
+      return { approved: false, reason: 'rejected' }
+    }
+
+    await ctx.step(this.purchasing.releaseOrder, { poId: po.id, approver: decision.approver })
+    await ctx.setEvent('status', { state: 'approved', by: decision.approver })
+    return { approved: true }
+  }
+}
+```
+
+The approver's UI talks to the run through two routes — one reads the snapshot, one delivers the decision:
+
+```ts title="start/routes.ts"
+import router from '@adonisjs/core/services/router'
+import engine from '@adonis-agora/durable/services/main'
+
+router.get('/approvals/:runId', async ({ params }) => {
+  return (await engine.getEvent(params.runId, 'status')) ?? { state: 'pending' }
+})
+
+router.post('/approvals/:runId/decision', async ({ params, request, response }) => {
+  const result = await engine.update(params.runId, 'decision', request.body())
+  if (!result.accepted) return response.badRequest({ error: result.reason })
+  return response.ok({ status: result.run?.status ?? 'pending' })
+})
+```
+
+`ctx.setEvent` gives a controller a side-effect-free snapshot to poll (`engine.getEvent`); pair
+`ctx.onUpdate` with `engine.registerUpdateValidator('po-approval', 'decision', …)` (in a preload such as
+`start/durable.ts`) if you need to reject a bad decision — wrong approver, missing note — before it ever
+touches the run. The `timeoutMs` on `onUpdate` is what turns "wait forever" into a clean expiry branch:
+catch `SignalTimeoutError` and take the default path instead of leaving the run parked. Full walkthrough,
+including the validator and the `engine.update` return shape: [Queries & updates](/docs/durable/authoring/queries-and-updates).
+
+## 2. Payment + webhook confirmation
+
+**Problem:** a payment provider charges asynchronously and calls back a webhook URL once it
+settles — but you also want to give up cleanly if the callback never arrives.
+
+```ts title="app/workflows/checkout_workflow.ts"
+import { inject } from '@adonisjs/core'
+import { BaseWorkflow, FatalError, SignalTimeoutError } from '@adonis-agora/durable'
+import type { WorkflowCtx } from '@adonis-agora/durable'
+import PaymentSteps from '#steps/payment_steps'
+import OrderSteps from '#steps/order_steps'
+
+@inject()
+export default class CheckoutWorkflow extends BaseWorkflow {
+  static workflow = { name: 'checkout', version: '1' }
+
+  constructor(
+    private psp: PaymentSteps,
+    private orders: OrderSteps,
+  ) {
+    super()
+  }
+
+  async run(ctx: WorkflowCtx, order: Order) {
+    // Mint the webhook first: fixes a deterministic token + public url.
+    const hook = ctx.webhook<{ status: 'paid' | 'failed'; providerRef: string }>()
+
+    // Hand the url to the provider INSIDE a step, so the handoff happens exactly once.
+    await ctx.step(this.psp.startPayment, {
+      orderId: order.id,
+      amountCents: order.total,
+      callbackUrl: hook.url,
+    })
+
+    // Bound how long the run parks for the callback — past the deadline, wait() throws.
+    let result: { status: 'paid' | 'failed'; providerRef: string }
+    try {
+      result = await hook.wait({ timeoutMs: 30 * 60 * 1000 })
+    } catch (error) {
+      if (error instanceof SignalTimeoutError) {
+        throw new FatalError(`payment for ${order.id} never confirmed`, 'payment_timeout')
+      }
+      throw error
+    }
+
+    if (result.status !== 'paid') {
+      throw new FatalError(`payment ${result.providerRef} declined`, 'payment_failed')
+    }
+    await ctx.step(this.orders.fulfil, { order, providerRef: result.providerRef })
+    return { orderId: order.id, providerRef: result.providerRef }
+  }
+}
+```
+
+```ts title="start/routes.ts"
+router.post('/durable/webhooks/:token', async ({ params, request, response }) => {
+  await engine.signal(params.token, request.body())
+  return response.noContent()
+})
+```
+
+`ctx.webhook()` reserves the deterministic token/url up front (rendered by the `webhookUrl` builder in
+`config/durable.ts`); handing the url to the provider happens inside a `ctx.step` so the handoff is itself
+checkpointed and replay-safe. `hook.wait({ timeoutMs })` bounds the wait with a checkpointed deadline, so a
+run resumed after a crash still times out when it originally would have. The callback lands as
+`engine.signal(token, body)` from your own route — front it with signature verification, since the token is
+effectively a secret. Full details on minting, the handle shape, and delivering the callback:
+[Durable webhooks](/docs/durable/authoring/webhooks).
+
+## 3. Fan-out/fan-in over a batch
+
+**Problem:** process every item in a batch as its own tracked workflow, running concurrently, and
+come back with all the results (or bail out on the first failure).
+
+```ts title="app/workflows/batch_import_workflow.ts"
+import { BaseWorkflow, GatherError } from '@adonis-agora/durable'
+import type { WorkflowCtx } from '@adonis-agora/durable'
+import ProcessRecordWorkflow from '#workflows/process_record_workflow'
+
+export default class BatchImportWorkflow extends BaseWorkflow {
+  static workflow = { name: 'batch-import', version: '1' }
+
+  async run(ctx: WorkflowCtx, batch: { records: ImportRecord[] }) {
+    try {
+      // Dispatches one ProcessRecordWorkflow per item, concurrently, and waits for every one to
+      // reach a terminal state — resumes with the outputs in input order.
+      const results = await ctx.all(ProcessRecordWorkflow, batch.records, { mode: 'waitAll' })
+      return { imported: results.length }
+    } catch (error) {
+      if (error instanceof GatherError) {
+        // error.failures: which records failed and why.
+        return { imported: batch.records.length - error.failures.length, failures: error.failures }
+      }
+      throw error
+    }
+  }
+}
+```
+
+`ctx.all(workflow, inputs, opts)` is the built-in wait-all/fan-out primitive: each input starts its
+own child run, the parent suspends with zero compute until every child settles, and a mixed
+outcome throws an aggregate `GatherError` (mode `'waitAll'`, the default) so you can see exactly
+which items failed instead of losing that detail. Pass `{ mode: 'failFast' }` to bail the instant
+one child fails, or use `ctx.allSettled` when a failed item is an expected outcome rather than an error.
+If you need to start the batch, do other work, and join later, fan out with `ctx.startChild` per item and
+join each with `ctx.child` using the same id instead — see [Child workflows](/docs/durable/authoring/child-workflows)
+for every form.
+
+When an item is just one step rather than a workflow of its own, pass the `@Step` reference
+instead of a workflow class. Each input becomes one durable step instead of a child run, which is far
+cheaper for a large batch:
+
+```ts
+// One processRecord step per record, at most 500 in flight. The workflow wakes once per settled
+// wave, not once per record.
+const results = await ctx.all(this.records.processRecord, batch.records, { concurrency: 500 })
+```
+
+The same `mode`, `concurrency` and `GatherError` apply. Every step of the fan uses the `@Step`'s
+retry policy (or the per-call `retries` / `backoff` you pass). A flow-control `queue` and a liveness
+`timeoutMs` are not supported on a step fan. Under `concurrency` the steps go out in strict waves of
+that size. See [Fanning out over a step](/docs/durable/authoring/child-workflows#fanning-out-over-a-step).
+
+## 4. Cron digest
+
+**Problem:** send a weekly summary email on a fixed calendar schedule, with no risk of double-firing
+when several worker instances are racing the same tick.
+
+```ts title="app/workflows/weekly_digest_workflow.ts"
+import { inject } from '@adonisjs/core'
+import { BaseWorkflow } from '@adonis-agora/durable'
+import type { WorkflowCtx } from '@adonis-agora/durable'
+import ReportSteps from '#steps/report_steps'
+
+@inject()
+export default class WeeklyDigestWorkflow extends BaseWorkflow {
+  static workflow = { name: 'weekly-digest', version: '1' }
+  // 08:00 every Monday, DST-aware in the given timezone.
+  static schedule = { cron: '0 8 * * MON', timezone: 'America/Sao_Paulo' }
+
+  constructor(private reports: ReportSteps) {
+    super()
+  }
+
+  async run(ctx: WorkflowCtx) {
+    const activity = await ctx.step(this.reports.gatherLastWeek, undefined)
+    await ctx.step(this.reports.emailDigest, activity)
+    return { recipients: activity.recipients.length }
+  }
+}
+```
+
+The colocated `static schedule` is the workflow's default cadence; a deployment can overrule it from
+`config/durable.ts` by the same `key` (here, the workflow name) — pause it in staging, or run it on a
+different cron — and the workflow itself can still be started ad-hoc. Schedules fire from a worker loop
+(`node ace durable:work`, or `worker: { embedded: true }` in the web process). Each cron fire's time bucket
+becomes part of a deterministic run id, and `engine.start` is idempotent by run id, so **each window starts
+exactly once** even with multiple worker instances ticking at the same moment. Full details on `everyMs`
+vs. `cron` + `timezone`, overlap, backfill, and runtime pause/trigger: [Scheduling](/docs/durable/authoring/scheduling).
+
+## 5. Booking saga
+
+**Problem:** a trip booking reserves a flight and a hotel before charging a deposit — if the charge
+is declined, the reservations must be undone, not left stranded.
+
+```ts title="app/workflows/trip_booking_workflow.ts"
+import { inject } from '@adonisjs/core'
+import { BaseWorkflow } from '@adonis-agora/durable'
+import type { WorkflowCtx } from '@adonis-agora/durable'
+import TripSteps from '#steps/trip_steps'
+
+@inject()
+export default class TripBookingWorkflow extends BaseWorkflow {
+  static workflow = { name: 'trip-booking', version: '1' }
+
+  constructor(private trips: TripSteps) {
+    super()
+  }
+
+  async run(ctx: WorkflowCtx, trip: TripRequest) {
+    const flight = await ctx.step(this.trips.reserveFlight, trip, {
+      compensate: this.trips.releaseFlight,
+    })
+    const hotel = await ctx.step(this.trips.reserveHotel, trip, {
+      compensate: this.trips.releaseHotel,
+    })
+    // If this throws, the engine undoes the hotel then the flight reservation before failing.
+    const deposit = await ctx.step(this.trips.chargeDeposit, {
+      customerId: trip.customerId,
+      amountCents: trip.depositCents,
+    })
+    return { flightRef: flight.ref, hotelRef: hotel.ref, depositId: deposit.id }
+  }
+}
+```
+
+```ts title="app/steps/trip_steps.ts"
+import { Step } from '@adonis-agora/durable'
+import type { UndoOf } from '@adonis-agora/durable'
+
+export default class TripSteps {
+  @Step('trips:reserve-flight')
+  async reserveFlight(trip: TripRequest) {
+    return { ref: await flightsApi.reserve(trip) }
+  }
+
+  // An undo is an ordinary @Step, typed to the call it compensates with UndoOf.
+  @Step('trips:release-flight')
+  async releaseFlight(undo: UndoOf<TripSteps['reserveFlight']>) {
+    await flightsApi.release(undo.output.ref)
+  }
+
+  // … reserveHotel / releaseHotel / chargeDeposit follow the same shape
+}
+```
+
+Each `ctx.step` with a real-world side effect names its own `compensate` undo — an ordinary `@Step`,
+dispatched and typed against the call it undoes via `UndoOf`. If a later step fails (exhausts
+retries, or throws `FatalError`), the engine dispatches every registered undo in reverse order,
+checkpointed for crash-safe resume, before failing the run — here, release the hotel, then the
+flight. For in-process work, `ctx.localStep(name, fn, { compensate: () => … })` takes a closure instead.
+This is the short version — for the `StepUndo` envelope, `compensationRetries` / `compensationTimeoutMs`,
+and compensating cancellation via `engine.cancel(runId, { compensate: true })`, see
+[Sagas & compensation](/docs/durable/reliability/sagas).
+
+## 6. Rate-limited external API
+
+**Problem:** a geocoding API allows only 60 requests/minute across the whole fleet, and a handful of
+tenants shouldn't be able to starve the rest of it.
+
+```ts title="start/durable.ts"
+import engine from '@adonis-agora/durable/services/main'
+
+engine.registerQueue({
+  name: 'geocode-api',
+  concurrency: 10,
+  rateLimit: { limit: 60, periodMs: 60_000, algorithm: 'sliding' },
+  fairness: 'key', // round-robin admission across distinct fairnessKeys
+})
+```
+
+```ts
+// inside the workflow
+const location = await ctx.step(this.geocoder.lookup, address, {
+  queue: 'geocode-api',
+  priority: order.urgent ? 10 : 0,
+  fairnessKey: order.tenantId,
+})
+```
+
+`concurrency` and `rateLimit` on the queue bound how much work is admitted at once and per minute
+(`'sliding'` counts a rolling window, matching how most providers count); `priority` and `fairnessKey` on
+the `ctx.step` call decide who wins a contended slot — higher priority first, then round-robin across
+`fairnessKey`s. A blocked call never busy-waits or holds the run in memory: it re-suspends and the
+durable-timer poller retries admission later, so the limit survives a crash. Accounting is per engine
+instance by default; for a cap that truly holds across the fleet, set
+`admission: admissions.redis({ connection: 'main' })` in `config/durable.ts`. Every knob is covered in
+[Flow control](/docs/durable/reliability/flow-control).
+
+## 7. Long-lived poller
+
+**Problem:** poll an external feed every few minutes, forever — without the run's history growing
+unbounded and slowing down every replay.
+
+```ts title="app/workflows/feed_poller_workflow.ts"
+import { inject } from '@adonisjs/core'
+import { BaseWorkflow } from '@adonis-agora/durable'
+import type { WorkflowCtx } from '@adonis-agora/durable'
+import FeedSteps from '#steps/feed_steps'
+
+@inject()
+export default class FeedPollerWorkflow extends BaseWorkflow {
+  static workflow = { name: 'feed-poller', version: '1' }
+
+  constructor(private feed: FeedSteps) {
+    super()
+  }
+
+  async run(ctx: WorkflowCtx, state: { feedId: string; cursor?: string; iterations: number }) {
+    let cursor = state.cursor
+
+    for (let i = 0; i < 200; i++) {
+      const page = await ctx.step(this.feed.poll, { feedId: state.feedId, cursor })
+      cursor = page.nextCursor
+      await ctx.sleep('2m')
+    }
+
+    // 200 iterations is enough checkpoints to slow down replay — start fresh with a clean
+    // history, carrying the cursor forward. Terminal: nothing after this line runs.
+    return ctx.continueAsNew({ feedId: state.feedId, cursor, iterations: state.iterations + 1 })
+  }
+}
+```
+
+Looping directly would accumulate one `step` + one `sleep` checkpoint per iteration forever, and
+every crash/resume replays all of them. `ctx.continueAsNew(input)` ends this run and starts a fresh
+execution of the same workflow (id `<runId>~N`) with a clean history, carrying forward whatever
+state the next iteration needs — here, the feed's cursor. It always throws, so nothing after the
+call ever runs; cap the loop at a fixed iteration count and call it on the way out, as above. If you
+wrap the loop in your own `try/catch`, rethrow with `isWorkflowControlFlowSignal(error)` so the handoff
+isn't mistaken for a failure. See [Continue-as-new](/docs/durable/authoring/child-workflows#continue-as-new),
+[Workflows & steps](/docs/durable/concepts/workflows-and-steps) for the step/checkpoint model this is
+resetting, and [Sleep & signals](/docs/durable/concepts/sleep-and-signals) for `ctx.sleep`.

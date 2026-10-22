@@ -198,39 +198,11 @@ export default class SyncShopWorkflow extends BaseWorkflow {
 }
 ```
 
-| Field | Default | Meaning |
-| --- | --- | --- |
-| `key` | required | Derives the serialization key from the run's input. Runs sharing a key are serialized against each other; different keys never contend. |
-| `limit` | `1` | How many runs may be in flight per key. `1` is a mutex; a higher number is a per-key concurrency cap. |
-| `maxQueueDepth` | unbounded | How many runs may **queue** behind the in-flight ones before `start` is rejected. |
-
-Start a run whose key is already at its limit and nothing fails — the run is created, parked as `suspended`,
-and admitted the moment a slot frees. Admission is **FIFO by creation time** and race-free across engine
-instances (the ordering comes from the store, not from in-memory state), and a settling run wakes the next
-in line immediately rather than making it wait out a poll tick.
-
-### Back-pressure
-
-Without `maxQueueDepth`, a producer that outruns the workflow simply builds an unbounded queue of suspended
-runs — the failure surfaces late, as a store full of runs that will not finish for hours. Setting
-`maxQueueDepth` turns that into an immediate, visible rejection:
-
-```ts
-import { SingletonQueueFullError } from '@adonis-agora/durable'
-
-try {
-  await SyncShopWorkflow.dispatch({ shopId })
-} catch (error) {
-  if (error instanceof SingletonQueueFullError) {
-    // error.workflow, error.key, error.maxQueueDepth
-    return response.tooManyRequests({ retryAfter: 60 })
-  }
-  throw error
-}
-```
-
-The cap is `limit + maxQueueDepth` — in the example above, one running plus twenty queued. The check happens
-**before the run is created**, so a rejected `start` leaves nothing behind to clean up.
+A run whose key is already at its `limit` (default `1`) is created, parked as `suspended`, and admitted in
+creation order the moment a slot frees. `maxQueueDepth` caps the backlog: a start beyond `limit + maxQueueDepth`
+is rejected with `SingletonQueueFullError` before any run is created. See
+[Singleton workflows](/docs/durable/reliability/singleton) for admission, notify-on-release, back-pressure and
+how it differs from a deterministic `runId`.
 
 ## Fan-out (parallel steps)
 

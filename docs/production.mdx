@@ -1,0 +1,264 @@
+---
+title: Running in production
+description: The operational checklist for taking @adonis-agora/durable from a single dev process to a real deployment — picking a store and a transport, choosing a topology, who drives timers and recovery, leases and the dead-letter cap, draining on deploy, replay-safe releases, schema ownership, retention, consumers, encryption at rest, and observability.
+icon: Factory
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+Everything works out of the box in one dev process with zero infrastructure — that is the point of the [durability model](/docs/durable/concepts/durability). This page is the other half: what to change, and what to double-check, before that process becomes a real deployment with several replicas, real deploys, and someone else's uptime on the line. Each item says *why* it matters, shows the `config/durable.ts` change, and links to the page with the full detail.
+
+## 1. Swap the dev defaults
+
+A `config/durable.ts` that names no `store` and no `transport` boots the engine on two in-memory defaults. Neither survives a restart.
+
+- **Store.** With no `store`, the provider uses `InMemoryStateStore` — a `Map` in this process. A crash or redeploy loses every run, and `durable:runs` / the dashboard only ever see this process's runs. Select the [Lucid store](/docs/durable/stores/lucid) before anything durability-sensitive ships.
+- **Transport.** With no `transport`, the provider uses the test `memory` transport, which runs a handler inline inside the dispatch call. Pick a real driver: `eventEmitter` for in-process steps, or `queue` / `db` / `bullmq` once steps must run in another process. See [Transports](/docs/durable/transports).
+
+```ts title="config/durable.ts"
+import { defineConfig, stores, transports } from '@adonis-agora/durable'
+
+export default defineConfig({
+  store: 'lucid',
+  stores: { lucid: stores.lucid() },
+
+  transport: 'event-emitter',
+  transports: { 'event-emitter': transports.eventEmitter() },
+})
+```
+
+## 2. Pick a topology
+
+Which transport you need depends on **where step bodies run**, not on how many replicas you have. The durable state — runs, checkpoints, leases, signal waiters, timers — always lives in the shared store. What the transport and the [control plane](/docs/durable/transports/control-plane) add is cross-process delivery.
+
+| Topology | Store | Transport | Control plane | Who drives timers, recovery and schedules |
+| --- | --- | --- | --- | --- |
+| (a) One process | `lucid` | `eventEmitter` | none | `worker: { embedded: true }` in that process, or a `durable:work` sidecar |
+| (b) Several web replicas, steps run in the pod that started them | `lucid` | `eventEmitter` | optional (see what you lose without it) | `durable:work` process(es), or `worker.embedded` on the replicas |
+| (c) Steps run in a separate worker fleet | `lucid` | `queue`, `db` or `bullmq` | `controlPlanes.redis` | `durable:work` pods |
+
+### (a) Single process — `eventEmitter` + `lucid`
+
+The simplest real deployment: one Adonis process that serves HTTP, runs workflow bodies, and serves `app/steps` over an in-process `EventEmitter`. Checkpoints are in your database, so a crash mid-run resumes from the last completed step.
+
+The one thing you must not forget: **something has to tick the worker loop**. Durable sleeps, retry backoffs, crash recovery, execution timeouts, schedules and retention are all driven by that loop, and a plain web process does not run it. Either embed it:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  store: 'lucid',
+  stores: { lucid: stores.lucid() },
+  transport: 'event-emitter',
+  transports: { 'event-emitter': transports.eventEmitter() },
+
+  // Tick pending/recovery/timers/timeouts/schedules/retention inside the web process.
+  worker: { embedded: true },
+})
+```
+
+or run `node ace durable:work` next to the web server. The embedded loop only starts in the `web` environment, so it never doubles up with `durable:work` or turns `node ace migration:run` into a worker. See [Running the loop in the web process](/docs/durable/authoring/scheduling#running-the-loop-in-the-web-process).
+
+### (b) Several web replicas, steps stay in-process — `eventEmitter` is still enough
+
+If every replica serves the same `app/steps` and your workflows do their I/O in `ctx.localStep` (or in `ctx.step`, which on `eventEmitter` is handled in the pod that dispatched it), you do **not** need a broker to scale horizontally. Correctness never depended on the transport, because every cross-replica decision goes through the shared store:
+
+- **One executor per run.** Every execution — a fresh start, a poll pickup, a signal, a timer, recovery — first takes an atomic lease on the run row (`tryLockRun`) and renews it every `leaseMs / 2`. A replica that fails to take the lease does not run the body.
+- **Signals.** `engine.signal(token, payload)` looks up the waiter row in the store, writes the signal checkpoint, and resumes the run under a lease on whichever replica received the call. If no run is waiting yet, the signal is buffered in the store and consumed by the next `waitForSignal(token)`. If the run is mid-turn on another replica, the checkpoint is already durable and the owner re-checks it when its turn suspends (with the `reconcileMs` wake as the fallback).
+- **Cancellation.** A plain `cancel(runId)` writes `cancelled` to the run row directly. A turn still executing on another replica cannot overwrite that: every settle is a conditional write that is refused once the run is terminal, and any later resume sees the terminal status and stops. A `cancel(runId, { compensate: true })` also buffers a durable `cancel:<runId>` marker in the store, so whichever replica next resumes the run runs the saga unwind — even after a crash.
+- **Timers, recovery, schedules.** These are store queries (`listDueTimers`, orphaned leases, schedule windows) that any ticking process can answer, with the lease again deciding who executes.
+
+What you give up without a control plane is everything that is **broadcast between processes** rather than written to the store:
+
+| Without `controlPlane` | Effect |
+| --- | --- |
+| Cross-pod lifecycle events | The dashboard's live tail and `engine.subscribe` only see runs executing on the pod that serves them. Anything that waits on events — `engine.waitForRun(runId)` and the blocking `BaseWorkflow.start(...)` built on it — never hears about a run that settles on **another** process (for example a run that suspended on `ctx.sleep` and was resumed by `durable:work`), so it waits until its timeout. Use `dispatch` + polling `getRun`, or add a control plane. |
+| Instant cancellation | The cancel is durable either way, but the replica currently executing the run is not told. Its in-flight turn (including the `ctx.localStep` it is running) keeps going until the turn ends and its settle is refused; `engine.onCancel` listeners there never fire. |
+| Schedule pause fan-out | A runtime pause/resume from the dashboard (`engine.setSchedulePaused`) applies only to the pod that served the request; other ticking pods keep firing. Pin `paused` in config to pause fleet-wide. |
+| `enqueued` nudge | Other pods are not told a run was enqueued. Nothing in the library subscribes to it by default — it only matters if you wired `engine.onEnqueued` yourself. |
+
+And someone must still **drive the loop**: run one or more `durable:work` processes, or set `worker.embedded` on the replicas. Several ticking processes are safe — every phase leases before it executes, and schedule windows are idempotent by run id — but each one polls the store.
+
+<Callout type="warn" title="ctx.step on eventEmitter in a fleet">
+A `ctx.step` dispatched over `eventEmitter` is served by the dispatching pod only. If that pod dies mid-step, nothing else holds the job: the run is recovered elsewhere, but the step's `pending` checkpoint has no worker. That is the [lost-dispatch failure mode](/docs/durable/reliability/failure-modes#lost-remote-dispatch-the-run-suspends-and-nothing-auto-redrives-it) — set `remoteRedispatchMs`, or keep in-process work in `ctx.localStep`, which simply re-runs on replay.
+</Callout>
+
+### (c) Remote steps across processes — a broker + `controlPlanes.redis`
+
+Once step bodies must run somewhere other than the pod that dispatched them — a dedicated worker fleet, a GPU pool, a [Python worker](/docs/durable/python) — pick a cross-process transport and add the Redis control plane so events and cancellation reach every pod:
+
+```ts title="config/durable.ts"
+import { controlPlanes, defineConfig, stores, transports } from '@adonis-agora/durable'
+
+export default defineConfig({
+  store: 'lucid',
+  stores: { lucid: stores.lucid() },
+
+  transport: 'queue',
+  transports: { queue: transports.queue({ connection: 'redis' }) },
+
+  // Live tail, cancellation and schedule pauses fan out across every pod.
+  controlPlane: controlPlanes.redis({ connection: 'main' }),
+})
+```
+
+Run the step handlers on `node ace durable:work` pods, which also tick the loop. The [`queue`](/docs/durable/transports/queue) driver rides `@adonisjs/queue`; [`db`](/docs/durable/transports/db) needs no broker at all; [`bullmq`](/docs/durable/transports/bullmq) is the one to pick for a [cross-ecosystem fleet](/docs/durable/cluster/interop). For a store-less worker fleet, see [roles](/docs/durable/cluster/roles-and-config).
+
+**Keep workflow bodies off the web pods if they are heavy.** The default run dispatcher executes a freshly started run on the pod that called `start`. A web pod that should only enqueue can opt out, leaving the run `pending` for a `durable:work` pod's next poll:
+
+```ts title="config/durable.ts (web pods)"
+export default defineConfig({
+  // …store, transport, controlPlane as above
+  runDispatcher: { dispatch: () => {} }, // start() persists the run; durable:work executes it
+})
+```
+
+This only covers fresh starts: a resume triggered on that pod — an `engine.signal` call handled there, say — still executes the body there under the lease. `role: 'control-plane'` applies the same no-op dispatcher and also stops serving `app/steps` in that process.
+
+## 3. Crash recovery is a lease
+
+Running more than one process is safe by design:
+
+- **A crashed executor's lease expires.** While a run executes, its process renews a recovery lease every `leaseMs / 2`. A crashed process stops renewing, the lease lapses, and the next `recoverIncomplete()` — every worker-loop tick, on any process — reclaims the run and replays it from its last checkpoint. `leaseMs` defaults to 30 000.
+- **Exactly one instance per run.** `tryLockRun` is atomic, so several processes racing to recover the same run produce one owner. A lease renewal that reports a takeover fences the old executor: its eventual settle becomes a no-op instead of clobbering the new owner's writes.
+- **A lost wake still wakes.** A run that suspends with no timer of its own gets a fallback wake `reconcileMs` later (an engine option, default 5 minutes; `config/durable.ts` does not expose it), so a signal or child completion that raced the suspend is picked up on the next pass.
+
+Give each process a stable, unique `instanceId` — leases are held by it, so two processes sharing one id could execute the same run at once. The orchestrator's pod name is a good fit:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  leaseMs: 60_000, // above how long a single resume step runs
+  instanceId: process.env.HOSTNAME, // unique per process
+})
+```
+
+None of this needs a control plane. See [Durability & replay](/docs/durable/concepts/durability#deploys-versioning--multiple-instances) and [Delivery under multiple instances](/docs/durable/reliability/multi-instance).
+
+## 4. Cap poison pills with the dead-letter state
+
+Self-healing recovery loops forever on a run that crashes the process every time it is resumed — a deserialization bug, an infinite loop. Cap it:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  maxRecoveryAttempts: 5, // past 5 crash-recoveries, the run moves to `dead`
+})
+```
+
+`maxRecoveryAttempts` is unlimited by default. Past the cap the run moves to the terminal `dead` status with a `max_recovery_attempts` error: still inspectable and retriable (`node ace durable:retry <runId>`), but no longer crash-looping. Route dead runs to an alert or a DLQ workflow with `engine.onDead`; see [Dead-letter queue](/docs/durable/reliability/dead-letter).
+
+## 5. Drain on deploy
+
+On `SIGTERM` you want a process to stop picking up new runs and let in-flight ones finish, rather than die mid-step and leave the run to a `leaseMs` timeout.
+
+- **`durable:work`** handles `SIGINT`/`SIGTERM` itself: it finishes the current tick, stops leasing new work, and calls `engine.drain(--drainTimeout)` (default 10 000 ms) before exiting.
+- **`worker: { embedded: true }`** drains the same way from the provider's `shutdown()`, bounded by `worker.drainTimeoutMs` (default 10 000). The loop is stopped and awaited **before** the transport and control plane close, so an in-flight run can still dispatch and await a remote step while it drains.
+- **A web process without the embedded worker does not drain on its own.** Its provider `shutdown()` closes the transport and control plane but never calls `engine.drain()`, so runs it was executing (started there by the in-process dispatcher, or resumed there by a signal) are left to lease expiry. Drain it from a terminating hook in a preload file — Adonis runs `terminating` hooks before providers shut down:
+
+```ts title="start/durable.ts (registered under preloads in adonisrc.ts)"
+import app from '@adonisjs/core/services/app'
+import { WorkflowEngine } from '@adonis-agora/durable'
+
+app.terminating(async () => {
+  const engine = await app.container.make(WorkflowEngine)
+  await engine.drain(15_000)
+})
+```
+
+`drain(timeoutMs)` stops recovery, timer and pending pickups, then waits for every in-flight execution — including continue-as-new links and deferred children — to settle. It does not cancel anything: if the timeout wins, it releases the leases this process still holds, so the next process's `recoverIncomplete()` replays those runs from their last checkpoint immediately instead of after `leaseMs`. Size the timeout above your typical in-flight turn. (Skip this hook on a `role: 'tenant'` pod, which binds no engine.)
+
+## 6. Replay-safe deploys
+
+Replay is positional, and a deploy is exactly when in-flight runs meet new code. Three layers catch a breaking change at different points:
+
+- **Lint at author time.** [`@adonis-agora/durable-eslint-plugin`](/docs/durable/tooling/linting) flags `Date.now()`, `Math.random()`, `new Date()`, `crypto.randomUUID()` in a workflow body, a `catch` that swallows control-flow signals, and global `fetch(...)` / raw `engine.*` calls in the body. Wire it into CI.
+- **Regression-test replay.** `node ace durable:export <runId> --out tests/fixtures/x.json` captures a real run's history; `assertReplayable` replays it against your current code in CI and throws `NonDeterminismError` on divergence. See [Replay CI](/docs/durable/testing#replay-ci--assertreplayable).
+- **Version breaking changes.** A run always resumes on the version it started on. When a change inserts, removes or reorders steps, register the new version alongside the old one and keep both deployed until the old runs drain — or guard a surgical change with `ctx.patched(id)`. A run whose version is no longer registered fails with `workflow <name>@<version> is not registered — keep the prior version deployed`. See [Versioning & determinism](/docs/durable/authoring/versioning).
+
+**Roll out workers and web together** when a workflow or its steps changed. On a shared broker, a worker still running an old build can pick up a run whose history no longer matches its code — see the stale-worker pitfall in [Tenancy](/docs/durable/concepts/tenancy#pitfalls).
+
+## 7. Own the schema
+
+By default (`autoSchema: true`) the provider calls the store's `ensureSchema()` at boot — for Lucid, the same idempotent, additive `createDurableTables` the published migration runs. If the database user may not run DDL at boot, or every schema change must be a reviewed migration, turn it off:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  autoSchema: false, // the published migration is now the only thing that creates or repairs tables
+})
+```
+
+With `autoSchema: false`, run `node ace migration:run` after every upgrade. With it on, watch for the one-shot `repaired the durable schema in place` warning — it means the database was behind the library and your migration history does not know. See [Lucid → autoSchema](/docs/durable/stores/lucid#who-provisions-the-schema-autoschema).
+
+## 8. Retention
+
+Without a policy, terminal runs accumulate in `durable_workflow_runs` and its child tables forever, and the worker loop's status scans grow with them. Set an age per terminal status, plus scoped policies where one kind of run deserves its own window:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  retention: {
+    completed: '14d',
+    cancelled: '14d',
+    failed: '90d', // keep failures longer for debugging
+    policies: [{ statuses: ['completed'], maxAge: '1d', scope: { tags: ['chat'] } }],
+  },
+})
+```
+
+The sweep runs in the worker loop (`durable:work` or the embedded loop), throttled to one pass a minute. Pair it with `engine.onEvict` to archive a run before it is deleted. See [Retention](/docs/durable/reliability/retention).
+
+## 9. Stop web pods from racing the worker fleet
+
+Broker queues are point-to-point: every process that consumes competes for each job. On the `queue` transport, a web fleet that never executes steps should say so, so step jobs and results stop landing on pods that only enqueue:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  consumers: 'never', // pure producer: dispatch runs and read the store, never claim broker jobs
+})
+```
+
+`durable:work` re-enables consumption for itself, so you can ship one config to both. The default `'auto'` already keeps `node ace` console/REPL processes from consuming. Today only the `queue` transport honours this gate — `db` and `bullmq` consume in every booted process, and the in-process transports have no broker to compete for. See [Delivery under multiple instances](/docs/durable/reliability/multi-instance) and [`consumers`](/docs/durable/transports/queue#consumers--why-a-node-ace-script-does-not-drain-the-queue).
+
+## 10. Isolate environments and pools
+
+A staging deploy, a second pool, or a developer laptop pointed at the **same** database or broker is not an observer — with the same `namespace` (default `'default'`) it polls the same rows and the same queues, and it will execute other pools' runs. Give each pool its own `namespace` (and a `partition` for workers sharing handler names):
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  namespace: process.env.DURABLE_NAMESPACE ?? 'default',
+})
+```
+
+See [Tenancy](/docs/durable/concepts/tenancy) and the [two-pools mistake](/docs/durable/reliability/failure-modes#namespaces-the-classic-two-pools-mistake).
+
+## 11. Flow control across replicas
+
+Queue caps on `ctx.step(…, { queue })` are counted **per engine instance** by default — `concurrency: 5` admits five per replica. For a fleet-wide cap, back admission with Redis:
+
+```ts title="config/durable.ts"
+import { admissions, defineConfig } from '@adonis-agora/durable'
+
+export default defineConfig({
+  admission: admissions.redis({ connection: 'main' }),
+})
+```
+
+When thousands of runs come due at once (recovery after an outage, a fan's children waking together), each timer pass loads at most `timerBatchSize` of them (default 500), most overdue first, shuffled so instances don't contend row by row. See [Flow control](/docs/durable/reliability/flow-control) and [wide fans](/docs/durable/transports#wide-fans-results-and-timers).
+
+## 12. Encrypt payloads at rest
+
+Run and step inputs and outputs are stored as JSON. To keep them out of the database in the clear, wrap the store in `CodecStateStore` with your own `PayloadCodec` — and know that the default coverage leaves step events, error messages and heartbeat progress unencoded unless you opt into `coverage: 'extended'`. See [Encrypting payloads at rest](/docs/durable/stores#encrypting-payloads-at-rest).
+
+## 13. Guard each run at the boundary
+
+Two registration options catch incidents before they become stuck runs:
+
+- **`executionTimeout`** (`'72h'` or ms, on `engine.register` options or a class's `static workflow`) bounds a run's wall-clock life. The worker loop's `sweepTimeouts` moves an overrunning run to `cancelled` with code `execution_timeout` and cancels its child subtree.
+- **`validateInput`** (on `engine.register` options) rejects a bad payload synchronously at `start`, before a run is created.
+
+Both depend on the worker loop running somewhere, like timers and retention.
+
+## 14. Observe it
+
+- **The [dashboard](/docs/durable/observability/dashboard)** is the operating surface — run list, step graph, retry/cancel/fix-and-replay. It fails closed by default: set `DURABLE_DASHBOARD_TOKEN`, or supply your own `authorize` guard or the [session layer](/docs/durable/observability/dashboard-auth).
+- **Page on stranded runs.** `suspended` is not an error, so a lost dispatch alerts nobody. Register `engine.onStalled` (and tune `stalledAfter`, default `'15m'`) so the worker loop pages you once per stranded episode; `node ace durable:runs --stale` is the same query by hand. See [the stalled-run pager](/docs/durable/reliability/failure-modes#the-stalled-run-pager--onstalled--stalledafter).
+- **Dead runs.** `engine.onDead` fires for every run that crosses `maxRecoveryAttempts`.
+- **Traces and metrics.** [OpenTelemetry](/docs/durable/observability/otel) turns runs into traces and continues them on remote workers; [lifecycle events](/docs/durable/observability/events-and-interceptors) feed counters; with `@adonis-agora/diagnostics` installed the provider bridges engine events onto the diagnostics bus automatically, and [Telescope](/docs/durable/observability/telescope) shows runs next to your requests and jobs.
+
+When something does go wrong, start from the symptom: [Troubleshooting](/docs/durable/troubleshooting) and [Failure modes & recovery](/docs/durable/reliability/failure-modes).

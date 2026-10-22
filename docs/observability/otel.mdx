@@ -29,20 +29,7 @@ It subscribes to the same engine lifecycle events the [dashboard](/docs/durable/
 
 ## Lightweight metrics
 
-If you want dependency-free counters and latency percentiles without a full OTel pipeline, `attachDurableMetrics(engine)` collects them from the same events:
-
-```ts
-import { attachDurableMetrics } from '@adonis-agora/durable/otel'
-
-const metrics = attachDurableMetrics(engine)
-// ...later, expose a snapshot on a /metrics route:
-const snap = metrics.snapshot()
-// { runs: { started, completed, failed, suspended },
-//   steps: { completed, failed },
-//   stepDurationMs: { count, p50, p95, max }, runDurationMs: { … } }
-```
-
-The handle has `snapshot()`, `reset()`, and `unsubscribe()`.
+If you want dependency-free counters and latency percentiles without a full OTel pipeline, this subpath also exports `attachDurableMetrics(engine)`, which collects them from the same events and needs no OTel SDK. See [Metrics](/docs/durable/observability/metrics) for it and the Prometheus-shaped `collectMetrics`.
 
 ## Distributed tracing across workers
 

@@ -81,109 +81,23 @@ Writing a **custom [`StateStore`](/docs/durable/stores)**? Reliable delivery nee
 
 ## Named events
 
-A **signal** is point-to-point: one token, one waiter. A **named event** is name-based pub/sub — one `engine.publishEvent(name, payload)` fans out to every run parked on that name, filtered by an optional `match`. Use it when several runs (or none yet) care about the same real-world fact.
-
-Inside a workflow, `ctx.waitForEvent(name, { match })` suspends the run — no compute — until a matching event is published. `match` is a subset of the payload that must deep-equal, so a publish only wakes the runs it concerns:
+A **signal** is point-to-point: one token, one waiter. A **named event** is name-based pub/sub. A single `engine.publishEvent(name, payload)` resumes every run parked on `ctx.waitForEvent(name, { match })` whose `match` the payload satisfies, and starts a fresh run of every workflow subscribed with `onEvent: [name]`. Use it when several runs, or none yet, care about the same real-world fact.
 
 ```ts
-// Each order-run waits only for ITS payment to settle:
+// Each order run waits only for ITS payment to settle:
 const settled = await ctx.waitForEvent<{ orderId: string; amount: number }>(
   'payment.settled',
-  { match: { orderId: order.id } },
+  { match: { orderId: order.id }, timeoutMs: 24 * 60 * 60 * 1000 },
 )
+
+// Elsewhere, a controller or webhook handler:
+await engine.publishEvent('payment.settled', { orderId, amount })
 ```
 
-Publish from anywhere — a controller, a webhook, another workflow — via the engine. `publishEvent` returns how many live recipients it reached:
-
-```ts title="app/controllers/payments_controller.ts"
-async settled({ request, response }: HttpContext) {
-  const body = request.body() // { orderId, amount }
-  await this.engine.publishEvent('payment.settled', body) // wakes every matching waiter
-  return response.noContent()
-}
-```
-
-A publish can also **start** runs: register a workflow with `onEvent: [name]` and each publish of that name starts a fresh run of it, passing the payload as input.
-
-```ts
-engine.register('fraud-check', '1', async (ctx, payment) => { /* … */ }, {
-  onEvent: ['payment.settled'], // every publish starts a new fraud-check run
-})
-```
-
-`match` also bounds a wait in time — pass `{ timeoutMs }`, and if the deadline passes first the call throws `SignalTimeoutError`, exactly like `waitForSignal`.
-
-### Idempotent publishing — `opts.id`
-
-An upstream that delivers at-least-once will publish the same real-world fact twice, and by default each publish starts its own `onEvent` run. Give the publish the upstream's own event id and the second delivery becomes a no-op:
-
-```ts title="app/controllers/webhooks_controller.ts"
-async paymentSettled({ request, response }: HttpContext) {
-  const event = request.body() as { id: string; data: Payment }
-
-  // The provider's event id — redelivering it starts no second run.
-  await this.engine.publishEvent('payment.settled', event.data, { id: event.id })
-
-  return response.ok({})
-}
-```
-
-The id becomes part of the run id each subscriber is started with, and starting a run id twice is a no-op — so the guarantee is the same one that makes [scheduling](/docs/durable/authoring/scheduling) and webhooks idempotent. Omit it and each publish gets a fresh id, meaning each publish triggers.
-
-Two limits worth knowing: it deduplicates the `onEvent` *start* half only, not the fan-out to runs already parked on `ctx.waitForEvent`; and the buffered copy is stored under its own id, so a publish that reached nobody is still buffered.
-
-### Coalescing bursty triggers — `eventBatch`
-
-`onEvent` starts one run per publish, which is wrong for a chatty source. A hundred `activity` events in a minute should not become a hundred runs.
-
-`eventBatch` coalesces them, in one of two modes:
-
-```ts
-// Debounce: one run with the LAST payload, once the source goes quiet for 5s.
-engine.register('reindex', '1', async (ctx, activity) => { /* … */ }, {
-  onEvent: ['activity'],
-  eventBatch: { mode: 'debounce', windowMs: 5_000 },
-})
-
-// Batch: one run per 50 events, or per minute, whichever comes first.
-engine.register('flush-metrics', '1', async (ctx, input) => {
-  const { events } = input as { events: MetricEvent[] }
-  /* … */
-}, {
-  onEvent: ['metric'],
-  eventBatch: { mode: 'batch', maxSize: 50, windowMs: 60_000 },
-})
-```
-
-The two modes differ in what the run receives, and that is the thing to decide on:
-
-| Mode | Fires when | Input to the run |
-| --- | --- | --- |
-| `debounce` | the source has been quiet for `windowMs` | the **last** payload — earlier ones are discarded |
-| `batch` | `maxSize` events accumulate, or `windowMs` elapses from the first | `{ events: [...] }` — every payload, in order |
-
-Pick `debounce` when only the latest state matters (reindex a document that was edited eleven times). Pick `batch` when every event is a fact you must not lose (flush metrics, write an audit trail).
-
-The accumulation itself runs as a long-lived durable workflow, so the pending window survives a restart rather than losing the events buffered in it. Note that a publish routed into an accumulator counts as delivered, so it is never additionally buffered.
+`waitForEvent` suspends with no compute, exactly like `waitForSignal`, and a `timeoutMs` that passes first throws `SignalTimeoutError`. Idempotent publishing (`opts.id`), `debounce`/`batch` coalescing of bursty subscribers (`eventBatch`), the match semantics, and how events compare with signals and updates are covered in the [Events guide](/docs/durable/authoring/events).
 
 ### Reliable (buffered) events
 
-A publish that reaches **no** live recipient — no `waitForEvent` matched *and* no `onEvent` subscriber exists — is **buffered** rather than silently dropped: exactly **one** copy is kept, and the **first** future `ctx.waitForEvent(name, { match })` whose `match` accepts its payload consumes it. Redelivery is point-to-point — the buffered copy goes to one waiter, never to a later-registered `onEvent` subscriber. This is the events analog of signal buffering, and like signals it survives the register/publish race in both directions.
-
-This is the default. Opt out per-publish with `{ buffer: false }` when a publish that nobody's listening for should just be dropped (a live-only broadcast):
-
-```ts
-// Buffered (default): safe even if the order-run hasn't reached waitForEvent yet.
-await engine.publishEvent('payment.settled', { orderId, amount })
-
-// Live-only: fan out to whoever is waiting right now, drop if nobody is.
-await engine.publishEvent('metrics.tick', { at: Date.now() }, { buffer: false })
-```
-
-Buffered events are keyed by event **name** (many waiters can share a name with different `match`), so consumption is *list → evaluate the waiter's own match → claim*: a non-matching buffered event never blocks an earlier matching one behind it. On the [Lucid store](/docs/durable/stores/lucid) the copies live in the `durable_buffered_events` table.
-
-<Callout type="info">
-Because a buffered event holds only **one** copy per publish and is claimed by the first matching waiter, events are point-to-point on redelivery — not a durable broadcast log. If you need every future subscriber to see a past event, model it as workflow state (a run started with `onEvent`) rather than relying on the buffer.
-</Callout>
+A publish that reaches **no** live recipient (no `waitForEvent` matched *and* no `onEvent` subscriber exists) is **buffered** rather than dropped. One copy is kept, and the first future `ctx.waitForEvent(name, { match })` that accepts its payload consumes it. This is the events equivalent of signal buffering, and it handles the publish/wait race in both directions. Pass `{ buffer: false }` to `publishEvent` for a live-only broadcast. On the [Lucid store](/docs/durable/stores/lucid), the copies live in the `durable_buffered_events` table. See [Reliable (buffered) delivery](/docs/durable/authoring/events#reliable-buffered-delivery) for the claim order and its limits.
 
 For a validated, rejectable steering primitive (Temporal-style updates) and a side-effect-free way to read a live run's state, see [Queries & updates](/docs/durable/authoring/queries-and-updates). For the deterministic callback-URL pattern, see [Durable webhooks](/docs/durable/authoring/webhooks).
