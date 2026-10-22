@@ -52,9 +52,11 @@ export default defineConfig({
 })
 ```
 
-The default `authorize` is open outside production and requires a bearer token
-equal to `DURABLE_DASHBOARD_TOKEN` in production (**fails closed if unset**).
-The console mutates runs — always front it with a real guard in production.
+The default `authorize` fails closed in **every** environment: it requires a
+bearer token equal to `DURABLE_DASHBOARD_TOKEN`, denying everything when that
+env var is unset. Open it up explicitly with `dashboardAuth`, your own
+`authorize`, or (local dev only) `allowUnauthenticated: true`.
+The console mutates runs — always front it with a real guard beyond local dev.
 
 ## Core patterns
 
@@ -204,12 +206,12 @@ Per-run actions stay in the durable dashboard. Source:
 
 ## Common mistakes
 
-### HIGH trusting an "empty" dashboard config in production
+### HIGH trusting an "empty" dashboard config to serve the console
 
 Wrong:
 
 ```ts
-export default defineConfig({}) // prod, DURABLE_DASHBOARD_TOKEN unset
+export default defineConfig({}) // DURABLE_DASHBOARD_TOKEN unset — every route 403s
 ```
 
 Correct:
@@ -223,9 +225,11 @@ export default defineConfig({
 })
 ```
 
-Mechanism: the default authorize fails CLOSED in production when the token env
-var is unset, so every console route 403s and the console looks broken rather
-than leaking — either set the token deliberately or override authorize.
+Mechanism: the default authorize fails CLOSED in every environment when the
+token env var is unset, so every console route 403s and the console looks
+broken rather than leaking — either set the token deliberately, configure
+`dashboardAuth`, or override authorize (`allowUnauthenticated: true` is the
+explicit local-dev-only opt-out).
 Source: `docs/observability/dashboard.mdx` ("Authorization").
 
 ### HIGH making interceptor outputs depend on time, randomness or external state
