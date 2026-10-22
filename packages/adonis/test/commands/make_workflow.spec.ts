@@ -41,4 +41,27 @@ describe('make:workflow', () => {
     expect(contents).toContain('async run(ctx: WorkflowCtx');
     expect(contents).toContain("from '@adonis-agora/durable'");
   });
+
+  it.each([
+    ['OrderWorkflow'],
+    ['order_workflow'],
+    ['Order'],
+  ])('accepts %s with or without the Workflow suffix (no doubled suffix)', async (name) => {
+    const ace = await new AceFactory().make(pathToFileURL(`${appRoot}/`), {
+      importer: (filePath) => import(filePath),
+    });
+    await ace.app.init();
+    await ace.app.boot();
+
+    const { default: MakeWorkflow } = await import('../../commands/make_workflow.js');
+    ace.ui.switchMode('raw');
+    const command = await ace.create(MakeWorkflow, [name]);
+    await command.exec();
+
+    const contents = await readFile(join(appRoot, 'app/workflows/order_workflow.ts'), 'utf8');
+    expect(contents).toContain('export default class OrderWorkflow extends BaseWorkflow');
+    expect(contents).not.toContain('WorkflowWorkflow');
+    expect(contents).toContain('interface OrderInput');
+    expect(contents).toContain("name: 'order'");
+  });
 });

@@ -124,7 +124,7 @@ Scaffolds a `BaseWorkflow` subclass under `app/workflows/`, the parallel to `@ad
 node ace make:workflow order
 ```
 
-The class extends `BaseWorkflow` with a `static workflow = { name, version }` identity and a `run(ctx, input)` method; standard generator flags (such as `--force`) are passed through to the stub.
+The name may carry the `Workflow` suffix or not: `order`, `Order`, `OrderWorkflow` and `order_workflow` all write `app/workflows/order_workflow.ts` with the class `OrderWorkflow` and the registered name `'order'`. The class extends `BaseWorkflow` with a `static workflow = { name, version }` identity and a `run(ctx, input)` method; standard generator flags (such as `--force`) are passed through to the stub.
 
 ## Building your own
 

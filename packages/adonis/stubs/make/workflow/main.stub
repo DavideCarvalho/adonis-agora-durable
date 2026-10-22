@@ -1,4 +1,4 @@
-{{#var workflowName = string(entity.name).pascalCase().toString()}}
+{{#var workflowName = string(entity.name).snakeCase().removeSuffix('workflow').pascalCase().toString()}}
 {{#var workflowFileName = string(entity.name).snakeCase().removeSuffix('workflow').toString() + '_workflow'}}
 {{#var registeredName = string(entity.name).snakeCase().removeSuffix('workflow').toString()}}
 {{{
