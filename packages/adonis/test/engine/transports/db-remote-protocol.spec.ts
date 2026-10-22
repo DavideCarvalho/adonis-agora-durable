@@ -615,23 +615,35 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb, makeTransportDb }) => {
 
       it('the janitor leaves a LIVE subscriber’s rows alone', async () => {
         await freshDb();
-        // TTLs wide enough that a loaded machine refreshes the keys in time on a real database.
-        const cp = make({ inboxTtlMs: 300, inboxSweepIntervalMs: 20 });
-        // Consumes slowly but keeps its keys fresh (every 100ms).
+        // TTLs wide enough that a loaded machine refreshes the keys in time on a real database: the
+        // refresh (every TTL / 3) shares a small pool with a janitor sweeping every 20ms.
+        const cp = make({ inboxTtlMs: 600, inboxSweepIntervalMs: 20 });
+        // Consumes slowly but keeps its keys fresh (every 200ms).
         const sub = make({
           instanceId: 'pod',
-          inboxTtlMs: 300,
-          pollIntervalMs: 2_000,
+          inboxTtlMs: 600,
+          pollIntervalMs: 5_000,
           idleBackoffMax: 1,
         });
+        // The subscriber's message polls, seen as they COMPLETE (not as they are sent).
+        let polled = 0;
+        db.connection()
+          .getWriteClient()
+          .on('query-response', (_res: unknown, q: { sql: string; bindings?: unknown[] }) => {
+            if (q.sql.startsWith('select') && q.sql.includes(M) && q.bindings?.includes('pod')) {
+              polled += 1;
+            }
+          });
         const got: number[] = [];
         sub.onTenantEvent('acme', (e) => got.push((e.event as unknown as { seq: number }).seq));
         await recorded('acme', 'pod');
-        await sleep(20); // the subscriber's first (empty) poll is done
+        // Its inbox key too — the janitor judges a recipient by that one.
+        await until(async () => (await liveKeys()).includes(inboxKey('durable', 'pod')));
+        await until(() => polled > 0); // its first (empty) poll is done; the next is 5s away
         for (let i = 0; i < 3; i += 1) {
           await cp.publishTenantEvent({ tenant: 'acme', event: event('r1', i) });
         }
-        await sleep(800); // several TTLs and sweeps
+        await sleep(1_500); // several TTLs and sweeps
         expect(got).toEqual([]);
         expect(await rows({ recipient: 'pod' })).toHaveLength(3);
         await until(() => got.length === 3);
