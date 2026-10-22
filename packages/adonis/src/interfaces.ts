@@ -85,6 +85,17 @@ export interface WorkflowRun {
    * durable state required for correctness — a transport without priority support ignores it.
    */
   priority?: number | undefined;
+  /**
+   * REMOTE workflow turn awaiting a decision: the globally unique `taskId` of the turn the engine
+   * dispatched to a workflow worker and then SUSPENDED on. Written BEFORE the turn is enqueued (and the
+   * run lease released), matched by the engine's decision handler so ONLY the decision for the
+   * currently-awaited turn is applied (a stale / duplicate / foreign decision is dropped), and cleared
+   * the moment that decision is applied. This is what makes a workflow-turn decision multi-instance
+   * safe: whichever engine replica consumes the decision looks the run up by `decision.runId` and
+   * applies it durably, instead of resolving an in-memory promise only the dispatching replica held.
+   * Absent on non-remote runs and on runs not currently awaiting a turn.
+   */
+  awaitingDecisionTaskId?: string | undefined;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -1137,7 +1148,13 @@ export interface StepResult {
 export interface Heartbeat {
   runId: string;
   seq: number;
-  stepId: string;
+  /**
+   * The in-flight step this beat keeps alive. ABSENT (or `''`) for a RUN-scoped (workflow-turn)
+   * heartbeat: a worker replaying a long workflow turn beats for its `runId` so the engine pushes the
+   * awaited turn's re-drive deadline forward (see `WorkflowEngineDeps.remoteAdvanceSilenceMs`). The
+   * Python `durable-worker` sends `{ runId, seq: 0, group }` with no `stepId` for exactly this.
+   */
+  stepId?: string | undefined;
   group: string;
   /** Worker-side emission time (epoch ms). Optional on the wire for back-compat with 0.17-era workers. */
   at?: number | undefined;
@@ -1290,11 +1307,43 @@ export interface WorkflowStepEvent {
  * concerns, identical for in-process and remote workflows.
  */
 export interface WorkflowExecutor {
-  advance(
+  /**
+   * INLINE replay: advance the turn and RETURN its decision (e.g. `LocalWorkflowTurnExecutor`
+   * runs the turn body in-process). The engine awaits this under the run's lease, so it is
+   * single-instance by nature. Provide this OR {@link dispatch}; when both exist the engine uses
+   * `dispatch`.
+   */
+  advance?(
     run: WorkflowRun,
     history: HistoryEvent[],
     pendingSignals?: WorkflowTask['pendingSignals'],
   ): Promise<WorkflowDecision>;
+  /**
+   * DISPATCH-AND-SUSPEND (broker-backed, multi-instance safe): enqueue the turn to a worker under the
+   * ENGINE-SUPPLIED, globally unique `taskId`, WITHOUT awaiting the decision. Before calling this the
+   * engine has already recorded `taskId` on the run ({@link WorkflowRun.awaitingDecisionTaskId}),
+   * suspended it and released its lease, so the worker's {@link WorkflowDecision} — delivered over
+   * {@link Transport.onDecision} to WHICHEVER engine replica consumes it — always finds its marker and
+   * a free lease. This method only enqueues; a throw fails the run.
+   */
+  dispatch?(
+    run: WorkflowRun,
+    history: HistoryEvent[],
+    taskId: string,
+    pendingSignals?: WorkflowTask['pendingSignals'],
+  ): Promise<void>;
+  /**
+   * Subscribe the engine's decision handler to the transport this executor dispatches over. Called
+   * once per registration with the SAME handler function, so a transport that keeps a handler set
+   * (bullmq, queue, db) dedupes it across executors. Required for {@link dispatch} to make progress.
+   */
+  subscribeDecisions?(handler: (decision: WorkflowDecision) => Promise<void>): void;
+  /**
+   * Optional per-workflow liveness window (ms) for a dispatched turn: with no decision and no
+   * run-scoped heartbeat for this long, the turn is re-driven (re-dispatched under a fresh `taskId`).
+   * Combined with the engine's `remoteAdvanceSilenceMs` (the shorter wins). Heartbeats rearm it.
+   */
+  readonly decisionTimeoutMs?: number | undefined;
 }
 
 /**

@@ -15,7 +15,7 @@ import type {
   WorkflowStepEvent,
   WorkflowTask,
 } from '../../interfaces.js';
-import { runStepHandler, type StepHandler } from '../../protocol.js';
+import { runStepHandler, type StepHandler, withTurnHeartbeat } from '../../protocol.js';
 import { swallowSubscribe } from '../../safe-subscribe.js';
 import { isWorkflowTask, type WorkflowTurnHandler } from '../../workflow-turn.js';
 import { failedTaskIdentity, infrastructureFailure, type TaskIdentity } from '../task-failure.js';
@@ -391,7 +391,7 @@ export class BullMQTransport implements Transport {
     // its `pending` checkpoint forever. Synthesize a RETRYABLE failed StepResult so the engine settles
     // the checkpoint and re-dispatches. A PEER replica's worker fails a crashed worker's stalled job,
     // so this still fires cross-process. (A failed WORKFLOW job carries no step identity, so the bridge
-    // no-ops for it — the engine's RemoteWorkflowExecutor re-drives the turn on recovery instead.)
+    // no-ops for it — the turn's liveness window (`remoteAdvanceSilenceMs`) re-drives it instead.)
     worker.on('failed', (job, error) => {
       const identity = failedTaskIdentity(job?.data);
       if (!identity) return; // payload already GC'd, malformed, or a workflow job — nothing safe to publish
@@ -433,7 +433,11 @@ export class BullMQTransport implements Transport {
     try {
       const turn = this.#workflowTurns.get(task.workflow);
       decision = turn
-        ? await turn(task)
+        ? await withTurnHeartbeat(
+            task,
+            (beat) => this.heartbeat(beat),
+            () => turn(task),
+          )
         : {
             taskId: task.taskId,
             runId: task.runId,
@@ -557,10 +561,10 @@ export class BullMQTransport implements Transport {
   }
 
   onDecision(handler: (decision: WorkflowDecision) => Promise<void>): void {
-    // EVERY handler gets every decision: the engine builds one RemoteWorkflowExecutor per remote
-    // workflow and each subscribes here, ignoring decisions whose taskId it isn't awaiting. Keeping
-    // only the first handler (the old behaviour) silently dropped every decision of the second and
-    // later remote workflows, so their runs never advanced.
+    // EVERY handler gets every decision. An engine subscribes one stable handler (it applies a decision
+    // by run id, dropping any its run no longer awaits); a set keeps a second registration of it, or a
+    // second engine sharing this transport, from being lost — keeping only the first handler (an old
+    // behaviour) silently dropped decisions, so runs never advanced.
     this.#decisionHandlers.add(handler);
     if (this.#decisionsWorker) return;
     this.#decisionsWorker = this.#makeWorker(

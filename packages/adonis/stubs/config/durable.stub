@@ -51,6 +51,12 @@ export default defineConfig({
   // remoteRedispatchMax: 10,
 
   /**
+   * Liveness window of a remote (polyglot) workflow turn: with no decision and no run-scoped
+   * heartbeat for this long, the turn is re-driven instead of waiting forever. Heartbeats rearm it.
+   */
+  // remoteAdvanceSilenceMs: 2 * 60 * 1000,
+
+  /**
    * Recurring workflows fired by the \`durable:work\` worker loop on every tick. Each window starts
    * exactly once even with several worker instances racing (idempotent by the schedule's time-bucket
    * run id). Use \`everyMs\` for a fixed interval, or \`cron\` + \`timezone\` for a calendar schedule (cron

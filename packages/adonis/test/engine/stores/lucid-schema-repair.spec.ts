@@ -151,6 +151,25 @@ describe('createDurableTables warns only when it actually repairs something', ()
     expect(warning).toContain(`${DURABLE_TABLES.checkpoints}.last_heartbeat_at`);
   });
 
+  it('adds the remote-turn decision marker to a runs table created before it existed', async () => {
+    const db = makeMemoryDb();
+    open.push(db);
+    await createDurableTables(db, undefined, { logger: { warn: () => {} } });
+    await db.connection().schema.alterTable(DURABLE_TABLES.runs, (table) => {
+      table.dropColumn('awaiting_decision_task_id');
+    });
+    await forgetSchemaMarker(db);
+    const logger = recordingLogger();
+
+    await createDurableTables(db, undefined, { logger });
+
+    expect(
+      await db.connection().schema.hasColumn(DURABLE_TABLES.runs, 'awaiting_decision_task_id'),
+    ).toBe(true);
+    expect(logger.warnings).toHaveLength(1);
+    expect(logger.warnings[0]).toContain(`${DURABLE_TABLES.runs}.awaiting_decision_task_id`);
+  });
+
   it('defaults to console.warn so the boot path is audible without any plumbing', async () => {
     const db = makeMemoryDb();
     open.push(db);

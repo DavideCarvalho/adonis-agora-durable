@@ -9,7 +9,7 @@ description: >-
   rateLimit, fairnessKey) with Redis-backed global admission (admission-redis),
   the dead-letter queue (maxRecoveryAttempts, onDead, retryWithInput), the
   stuck-run playbook (stranded signature, redispatchPending,
-  remoteRedispatchMs), ace ops commands (durable:work/runs/retry --stale), and
+  remoteRedispatchMs, remoteAdvanceSilenceMs for remote workflow turns), ace ops commands (durable:work/runs/retry --stale), and
   the testing harness (createTestEngine, tick, failOnce, conformance kits).
 license: MIT
 metadata:
@@ -203,6 +203,17 @@ Three nets, in preference order:
    it covers a polyglot `call` fan-out (`ctx.gather_calls`) as well as `ctx.step`.
 3. `engine.redispatchPending(runId)` — the operator escape hatch, safe on a
    healthy run (only touches already-pending checkpoints).
+
+Remote (polyglot) workflow TURNS have their own net: `remoteAdvanceSilenceMs`
+(config; `RemoteWorkflowExecutor`'s `timeoutMs` per workflow, shorter wins). The
+engine records the turn's random `taskId` on the run (`awaitingDecisionTaskId`),
+releases the lease, then enqueues; whichever replica consumes the decision
+applies it by run id (stale/duplicate decisions dropped), so a point-to-point
+`<P>-decisions` queue across replicas is safe. A turn with no decision and no
+run-scoped heartbeat (`{ runId, seq: 0, group }`, sent every 5s by the Python
+and TS workers) for the window is re-dispatched by the timer poller — never
+failed. Unset = wait for the decision forever. Source:
+`docs/reliability/multi-instance.mdx` (remote workflow turns).
 
 Source: `docs/reliability/failure-modes.mdx`, `docs/cli.mdx`.
 

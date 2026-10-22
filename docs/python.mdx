@@ -438,7 +438,16 @@ await engine.start('pipeline', { id: baseId }, `pipeline-${baseId}`)
 
 or, from inside another workflow, `await ctx.child('pipeline', { id: baseId })`. The **queue name is
 the routing**: the worker serving `pipeline` runs it. If none is live, the start fails fast so a
-typo'd name never silently hangs.
+typo'd name never silently hangs. The group is resolved per start for the run's namespace: an
+operator starting a tenant's run (`{ namespace: 'acme' }`) reaches the tenant's `pipeline@acme`
+worker, the same token the tenant's steps route to.
+
+Each turn's decision comes back on `<P>-decisions`, and with several Adonis replicas any of them may
+take it; it is applied by run id either way (see
+[Remote workflow turns](/docs/durable/reliability/multi-instance#remote-workflow-turns)). The Python
+worker beats for the run every 5 s while it replays a turn, so set `remoteAdvanceSilenceMs` in
+`config/durable.ts` (say, two minutes) to have a turn whose worker died re-driven instead of waiting
+forever.
 
 The workflow-task/decision wire is language-neutral, so the same Python workflow runs unchanged
 against an Adonis, a [NestJS](/docs/durable/cluster/interop), or any other conformant control plane.

@@ -256,6 +256,10 @@ export default class DurableProvider {
         ...(config.remoteRedispatchMax !== undefined
           ? { remoteRedispatchMax: config.remoteRedispatchMax }
           : {}),
+        // Liveness window of a remote workflow turn (see BaseDurableConfig.remoteAdvanceSilenceMs).
+        ...(config.remoteAdvanceSilenceMs !== undefined
+          ? { remoteAdvanceSilenceMs: config.remoteAdvanceSilenceMs }
+          : {}),
         ...(config.timerBatchSize !== undefined ? { timerBatchSize: config.timerBatchSize } : {}),
         ...(config.eventBufferTtl !== undefined
           ? { eventBufferTtlMs: parseDuration(config.eventBufferTtl) }

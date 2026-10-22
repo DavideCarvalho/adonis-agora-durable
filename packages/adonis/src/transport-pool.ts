@@ -4,6 +4,7 @@ import type {
   NamedTransport,
   RemoteTask,
   StepResult,
+  Transport,
   WorkflowStepEvent,
 } from './interfaces.js';
 
@@ -79,6 +80,20 @@ export class TransportPool {
       }
     }
     return [...groups];
+  }
+
+  /**
+   * The first transport (in pool order) reporting a LIVE worker for `group` — the one a
+   * convention-routed remote workflow must dispatch on. In a mixed pool each transport scans a
+   * different keyspace, so dispatching on the first transport while the worker heartbeats on another
+   * parks the task on a queue nobody consumes. `undefined` when no transport reports the group.
+   */
+  async transportWithLiveGroup(group: string): Promise<Transport | undefined> {
+    for (const { transport } of this.transports) {
+      if (!transport.listWorkerGroups) continue;
+      if ((await transport.listWorkerGroups()).includes(group)) return transport;
+    }
+    return undefined;
   }
 
   /**

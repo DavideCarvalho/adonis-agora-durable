@@ -126,8 +126,8 @@ describe('createDurableTables fingerprint gate', () => {
     // every existing database runs the full check once) and update both values below. (If only a
     // Knex upgrade changed how SQLite spells the same DDL, update the digest alone.)
     expect({ revision: DURABLE_SCHEMA_REVISION, digest }).toEqual({
-      revision: 2,
-      digest: '841096c2c672c9b232359af7a86cc844156a4d2511c4c630bc695abc0e23347d',
+      revision: 3,
+      digest: '004771001d3413ab12ae14444d47fc020402c902050282b14c0e955726943cd0',
     });
   });
 });

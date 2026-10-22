@@ -96,6 +96,27 @@ export class RemoteStepTimeout extends Error {
 }
 
 /**
+ * Raised when an INLINE remote workflow `advance` (an executor that returns its decision in-process)
+ * neither produced a decision nor received a run-scoped heartbeat within the engine's
+ * `remoteAdvanceSilenceMs` — the worker is presumed gone. NOT a run failure: the work may have
+ * completed and only the decision was lost. The engine releases the run lease and leaves the run
+ * `running`, so crash recovery re-drives it (replaying completed steps from history). An executor may
+ * throw it too, to ask for the same recovery instead of a failed run.
+ */
+export class RemoteWorkflowTimeout extends Error {
+  readonly taskId: string;
+  readonly timeoutMs: number | undefined;
+  constructor(taskId: string, timeoutMs?: number) {
+    super(
+      `remote workflow task ${taskId} produced no decision within ${timeoutMs}ms — presumed lost; re-driving via recovery`,
+    );
+    this.name = 'RemoteWorkflowTimeout';
+    this.taskId = taskId;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+/**
  * Thrown on resume when the workflow code no longer matches the recorded history: the step at a
  * logical position has a different name/kind than the checkpoint saved there. This means the
  * workflow definition changed (a step was added/removed/reordered) under an in-flight run without a
