@@ -18,6 +18,7 @@ import type {
 import { runStepHandler, type StepHandler } from '../../protocol.js';
 import { swallowSubscribe } from '../../safe-subscribe.js';
 import { isWorkflowTask, type WorkflowTurnHandler } from '../../workflow-turn.js';
+import { failedTaskIdentity, infrastructureFailure, type TaskIdentity } from '../task-failure.js';
 import { AdaptiveController, type ConcurrencyOption } from './adaptive-concurrency.js';
 import {
   type BullMQDeps,
@@ -440,17 +441,8 @@ export class BullMQTransport implements Transport {
 
   /** Publish a synthetic FAILED StepResult for a task that failed at the infrastructure level (see the
    *  `handle()` bridge). Correlated purely by runId/seq/stepId (StepResult has no `name`). Best-effort. */
-  async #bridgeTaskFailure(
-    identity: { runId: string; seq: number; stepId: string },
-    reason: string,
-  ): Promise<void> {
-    const result: StepResult = {
-      runId: identity.runId,
-      seq: identity.seq,
-      stepId: identity.stepId,
-      status: 'failed',
-      error: { message: `remote step worker failed: ${reason}`, retryable: true },
-    };
+  async #bridgeTaskFailure(identity: TaskIdentity, reason: string): Promise<void> {
+    const result = infrastructureFailure(identity, reason);
     try {
       await this.#queue(resultsName(this.#effectivePrefix())).add(
         'result',
@@ -849,22 +841,6 @@ export class BullMQTransport implements Transport {
   }
 }
 
-/**
- * Narrow a FAILED task job's `data` to the {@link RemoteTask} fields the terminal-failure bridge needs
- * (runId/seq/stepId), WITHOUT an unsafe cast. Returns `undefined` for a payload BullMQ has already
- * GC'd or a malformed job — so the bridge safely no-ops instead of publishing a bogus result.
- */
-function failedTaskIdentity(
-  data: unknown,
-): { runId: string; seq: number; stepId: string } | undefined {
-  if (typeof data !== 'object' || data === null) return undefined;
-  if (!('runId' in data) || !('seq' in data) || !('stepId' in data)) return undefined;
-  const { runId, seq, stepId } = data as Record<string, unknown>;
-  if (typeof runId !== 'string' || typeof seq !== 'number' || typeof stepId !== 'string') {
-    return undefined;
-  }
-  return { runId, seq, stepId };
-}
 /** Resolve when `work` settles or `ms` elapses (the loser is abandoned). `ms <= 0` skips the wait. */
 async function withTimeout(work: Promise<unknown>, ms: number): Promise<void> {
   if (ms <= 0) return;

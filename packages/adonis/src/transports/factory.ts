@@ -3,7 +3,7 @@ import type { AdapterFactory } from '@adonisjs/queue/types';
 import type { ControlPlane, Transport } from '../interfaces.js';
 import { resolveLucidDatabase } from '../resolve-lucid-db.js';
 import { InMemoryTransport } from '../testing/in-memory-transport.js';
-import type { ConcurrencyOption } from './bullmq/adaptive-concurrency.js';
+import type { ConcurrencyOption } from './adaptive-concurrency.js';
 import type { WorkerKeyStore } from './worker-keys.js';
 
 /**
