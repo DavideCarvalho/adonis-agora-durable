@@ -104,7 +104,8 @@ table; with `autoCreate: false` add them yourself (integer, not null, default
 
 `db` also carries remote workflow turns (task rows of kind `workflow`, claimed
 with the token's steps; each decision is a `durable_transport_messages` row
-addressed to the engine replica that dispatched the turn) and store-less tenant
+addressed to the engine replica that dispatched the turn, though any replica
+could apply it) and store-less tenant
 pods that reach the same database: start-run/run-request/step-event rows go to
 any consumer, a reply is a row addressed to the requester, a tenant event is one
 row per live subscriber (pods write their own `-inbox:` / `-tenant-subscriber:`

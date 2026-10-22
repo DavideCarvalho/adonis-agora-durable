@@ -110,7 +110,8 @@ are rows of `durable_transport_messages`; a reply or event is a row addressed to
 one instance, and the pod writes its own `-inbox:` / `-tenant-subscriber:` keys
 and worker advertisement to `durable_transport_worker_keys`. Remote workflow
 turns are task rows of kind `workflow`, and each decision is addressed to the
-engine replica that dispatched the turn. Needs the
+engine replica that dispatched the turn (any replica could apply it: the engine
+applies a decision by run id). Needs the
 `create_durable_transport_messages` migration (or `autoCreate`). Source:
 `docs/transports/db.mdx` (remote workflows and tenant pods).
 
