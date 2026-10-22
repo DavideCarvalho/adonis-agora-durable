@@ -608,6 +608,8 @@ describe('parentRunIdOf', () => {
     expect(parentRunIdOf('p.all.3.17')).toBe('p');
     expect(parentRunIdOf('p.all.3.w2.17')).toBe('p');
     expect(parentRunIdOf('p.child.4')).toBe('p');
+    expect(parentRunIdOf('p.onError.0')).toBe('p');
+    expect(parentRunIdOf('p.all.0.1.onError.2')).toBe('p.all.0.1');
     expect(parentRunIdOf('p.all.0.1.all.2.3')).toBe('p.all.0.1');
     expect(parentRunIdOf('order-42')).toBeUndefined();
     expect(parentRunIdOf('p.all.x.1')).toBeUndefined();

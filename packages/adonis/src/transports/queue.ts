@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { AcquiredJob, AdapterFactory, JobData } from '@adonisjs/queue/types';
+import type { WorkerDescriptor } from '../handshake/descriptor.js';
 import {
   type ControlMessage,
   type ControlPlane,
@@ -11,6 +12,15 @@ import {
 import { Pollers, type PollLoop } from '../pollers.js';
 import { runStepHandler, type StepHandler } from '../protocol.js';
 import { sanitizeQueueToken, tenantGroup } from '../tenant-group.js';
+import type { DescriptorRedis } from '../worker-runtime/registry.js';
+import {
+  cachedLiveKeys,
+  descriptorsOn,
+  liveGroupsOf,
+  NO_WORKER_KEYS,
+  type WorkerKeyStore,
+  workerKeyWriter,
+} from './worker-keys.js';
 
 /**
  * The wire payloads carried as a queue job's `payload`. Everything that crosses the queue is plain
@@ -194,6 +204,16 @@ export interface QueueTransportOptions {
    * `console.error`. Point it at your app's logger to route transport failures into your logs.
    */
   onError?: (err: unknown) => void;
+  /**
+   * Where the worker advertisement (design §7.2: each worker's descriptor and heartbeat keys) lives.
+   * A queue delivers each job to one consumer, so the keys cannot travel over it: they go to a key
+   * store every engine and worker can read — `transports.queue()` defaults to the app database's
+   * `durable_transport_worker_keys` table, the one the db transport uses. Absent: nothing is
+   * advertised, and the engine routes without descriptors.
+   */
+  workerKeys?: WorkerKeyStore;
+  /** How long a read of {@link workerKeys} is reused (ms). Default 5000; `0` reads every time. */
+  workerKeysCacheMs?: number;
 }
 
 /**
@@ -250,6 +270,8 @@ export class QueueTransport implements Transport, ControlPlane {
    *  is never deferred; only consumption is. */
   #consumersDeferred = false;
   readonly #deferredStarts: Array<() => void> = [];
+  readonly #workerKeys: WorkerKeyStore;
+  readonly #liveWorkerKeys: () => Promise<{ key: string; value: string }[]>;
 
   constructor(options: QueueTransportOptions) {
     // Typed through CompatAdapter so the same code drives the 0.6 (job-id) and 0.7 (lease) contracts.
@@ -269,6 +291,27 @@ export class QueueTransport implements Transport, ControlPlane {
     this.#reclaimPollers = this.#startReclaimSweep(
       options.stalledCheckIntervalMs ?? DEFAULT_STALLED_CHECK_INTERVAL_MS,
     );
+    this.#workerKeys = options.workerKeys ?? NO_WORKER_KEYS;
+    this.#liveWorkerKeys = cachedLiveKeys(
+      this.#workerKeys,
+      options.workerKeysCacheMs ?? 5_000,
+      Date.now,
+    );
+  }
+
+  /** The writer a worker runtime's registry advertises its descriptor and heartbeat through. */
+  createDescriptorRedis(): DescriptorRedis {
+    return workerKeyWriter(this.#workerKeys, Date.now);
+  }
+
+  /** The live worker descriptors advertised on `token`. */
+  async listWorkerDescriptors(token: string): Promise<WorkerDescriptor[]> {
+    return descriptorsOn(await this.#liveWorkerKeys(), token);
+  }
+
+  /** The routing tokens a live worker beats on. */
+  async listWorkerGroups(): Promise<string[]> {
+    return liveGroupsOf(await this.#liveWorkerKeys());
   }
 
   /** Stable id stamped on heartbeats and control `from`. */

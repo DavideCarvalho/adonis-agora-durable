@@ -3,6 +3,7 @@ import type { AdapterFactory } from '@adonisjs/queue/types';
 import type { ControlPlane, Transport } from '../interfaces.js';
 import { resolveLucidDatabase } from '../resolve-lucid-db.js';
 import { InMemoryTransport } from '../testing/in-memory-transport.js';
+import type { WorkerKeyStore } from './worker-keys.js';
 
 /**
  * The minimal application surface a {@link TransportFactory} thunk needs at boot to resolve an
@@ -105,6 +106,37 @@ export interface QueueTransportConfig {
    * `console.error`. Point it at your app's logger to route transport failures into your logs.
    */
   onError?: (err: unknown) => void;
+  /**
+   * Where the worker advertisement (each worker's descriptor and heartbeat keys) lives. Default: the
+   * app database's `durable_transport_worker_keys` table, through `@adonisjs/lucid`, when the app has
+   * it — the table the db transport uses. Pass a {@link WorkerKeyStore} to keep the keys elsewhere,
+   * or `false` to advertise nothing.
+   */
+  workerKeys?: WorkerKeyStore | false;
+  /** Lucid connection the default worker-key table lives on. Defaults to the default connection. */
+  workerKeysConnection?: string;
+  /** How long a read of the worker keys is reused (ms). Default 5000. */
+  workerKeysCacheMs?: number;
+}
+
+/**
+ * The worker-key store a queue transport advertises through: the configured one, else the app
+ * database's table when `@adonisjs/lucid` is bound, else none.
+ */
+async function queueWorkerKeys(
+  ctx: TransportContext,
+  config: QueueTransportConfig,
+): Promise<WorkerKeyStore | undefined> {
+  if (config.workerKeys === false) return undefined;
+  if (config.workerKeys) return config.workerKeys;
+  let db: Database;
+  try {
+    db = (await resolveLucidDatabase(ctx)) as Database;
+  } catch {
+    return undefined;
+  }
+  const { lucidWorkerKeys } = await import('./worker-keys-db.js');
+  return lucidWorkerKeys(db, { connectionName: config.workerKeysConnection });
 }
 
 /** Options for the aviary-compatible BullMQ transport (the cross-ecosystem interop path). */
@@ -260,8 +292,13 @@ export const transports = {
     return async (ctx) => {
       const { QueueTransport } = await import('./queue.js');
       const adapter = config.adapter ?? (await resolveQueueAdapter(ctx, config.connection));
+      const workerKeys = await queueWorkerKeys(ctx, config);
       return new QueueTransport({
         adapter,
+        ...(workerKeys !== undefined ? { workerKeys } : {}),
+        ...(config.workerKeysCacheMs !== undefined
+          ? { workerKeysCacheMs: config.workerKeysCacheMs }
+          : {}),
         ...(config.group !== undefined ? { group: config.group } : {}),
         ...(config.partition !== undefined ? { partition: config.partition } : {}),
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),

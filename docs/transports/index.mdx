@@ -101,6 +101,24 @@ export default defineConfig({
 
 Omit it and the engine is **local-only**: events and cancellation reach subscribers on this instance but don't fan out to other processes (fine for a single-instance app). Supply one and lifecycle events broadcast to every process and a `cancel` reaches the process running the run. See [Control plane](/docs/durable/transports/control-plane) for the `controlPlanes.redis` driver (multi-replica, NestJS-interoperable).
 
+## Worker advertisement
+
+A [thin worker](/docs/durable/cluster/thin-workers) publishes a descriptor (what it serves, including the
+[onError routes](/docs/durable/reliability/on-error#remote-workflows) of its workflows) and a heartbeat,
+each with an expiry, and the control plane reads them back for [capability-aware
+routing](/docs/durable/cluster/handshake#capability-aware-routing) and to serve workflows by convention.
+Where they live depends on the transport:
+
+| Transport | Advertisement |
+| --- | --- |
+| `bullmq` | TTL'd Redis keys, shared with NestJS and Python workers |
+| `db` | the `durable_transport_worker_keys` table |
+| `eventEmitter` | in memory, shared by every transport over the same emitter |
+| `queue` | a key store beside the queues — by default the app database's `durable_transport_worker_keys` table (see [queue](/docs/durable/transports/queue#worker-advertisement)) |
+| `memory` | none |
+
+A worker that stops cleanly removes its keys; one that dies drops out when they expire.
+
 ## Wire protocol
 
 Every transport carries the same JSON `RemoteTask` (dispatch) and `StepResult` (reply). The task also carries an optional `transport` (the pool id it was dispatched on) and an optional `traceparent` (see [distributed tracing](/docs/durable/observability/otel#distributed-tracing-across-workers)).

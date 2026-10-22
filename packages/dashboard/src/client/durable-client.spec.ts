@@ -525,3 +525,31 @@ describe('durableClient: root-mounted base (path: "")', () => {
     expect(win.location.href).toBe('/login?returnTo=%2Fruns%2Fabc');
   });
 });
+
+describe('deriveRunState: a run waiting on its onError handler', () => {
+  it('names the handler workflow from the handoff checkpoint', () => {
+    const run: WorkflowRun = {
+      id: 'r1',
+      workflow: 'line',
+      workflowVersion: '1',
+      status: 'suspended',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const timeline = [
+      { seq: 0, name: 'validate', kind: 'remote' as const, status: 'failed' as const, attempts: 1 },
+      {
+        seq: 1,
+        name: 'signal:child:r1.onError.0',
+        kind: 'signal' as const,
+        status: 'running' as const,
+        attempts: 0,
+        input: { workflow: 'line-dead-letter', input: {} },
+      },
+    ];
+    expect(deriveRunState(run, { runs: [run], health: [], timeline })).toEqual({
+      status: 'awaiting',
+      detail: 'failure handler line-dead-letter',
+    });
+  });
+});

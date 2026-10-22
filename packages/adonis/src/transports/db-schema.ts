@@ -13,6 +13,29 @@ export const TRANSPORT_TABLES = {
 } as const;
 
 /**
+ * The worker advertisement keys (design §7.2) — the descriptor and heartbeat keys a worker runtime
+ * writes, each with an expiry. Kept out of {@link TRANSPORT_TABLES}: it is a key/value board, not a
+ * one-shot message channel, and carries no namespace column (the keys embed the namespace).
+ */
+export const WORKER_KEYS_TABLE = 'durable_transport_worker_keys';
+
+/**
+ * Idempotent DDL for the worker-key table alone (`key` PK, `value`, `expires_at`): the descriptor and
+ * heartbeat keys a worker runtime advertises. The queue transport keeps its advertisement here without
+ * the db transport's other tables.
+ */
+export async function createWorkerKeysTable(db: Database): Promise<void> {
+  const conn = () => db.connection().schema;
+  if (await conn().hasTable(WORKER_KEYS_TABLE)) return;
+  await conn().createTable(WORKER_KEYS_TABLE, (table) => {
+    table.string('key', 512).primary();
+    table.text('value').notNullable();
+    table.bigInteger('expires_at').notNullable();
+    table.index(['expires_at'], 'durable_transport_worker_keys_expires_idx');
+  });
+}
+
+/**
  * Idempotent DDL for the four transport tables, via Lucid's schema builder (Knex). Portable across
  * SQLite / Postgres / MySQL: JSON payloads (`input`/`output`/`error`/`payload`) are stored as TEXT
  * and (de)serialized by the transport, and every timestamp is an epoch-ms `bigInteger`, so there's
@@ -101,6 +124,8 @@ export async function createDurableTransportTables(db: Database): Promise<void> 
     });
   }
 
+  await createWorkerKeysTable(db);
+
   // Upgrade path: a deployment created before namespaces existed already has these tables (so the
   // guards above skipped them) but lacks the `namespace` column. Back-fill it — `notNullable` +
   // `defaultTo('default')` stamps every legacy in-flight row `'default'`, so a default engine's
@@ -123,6 +148,7 @@ async function ensureNamespaceColumn(db: Database): Promise<void> {
 /** Drop every transport table. Used by tests and the migration `down`. */
 export async function dropDurableTransportTables(db: Database): Promise<void> {
   const conn = () => db.connection().schema;
+  await conn().dropTableIfExists(WORKER_KEYS_TABLE);
   await conn().dropTableIfExists(TRANSPORT_TABLES.control);
   await conn().dropTableIfExists(TRANSPORT_TABLES.heartbeats);
   await conn().dropTableIfExists(TRANSPORT_TABLES.results);

@@ -3,7 +3,12 @@ import { extname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { WorkflowEngine } from './engine.js';
 import { eventTriggerCanonicalName, workflowEvents } from './workflow-events.js';
-import { type WorkflowMeta, workflowMeta, workflowSchedules } from './workflow-ref.js';
+import {
+  onErrorRoutesOf,
+  type WorkflowMeta,
+  workflowMeta,
+  workflowSchedules,
+} from './workflow-ref.js';
 
 /**
  * The constructor shape discovery hands back. Deliberately **not** {@link WorkflowClass}: that one
@@ -82,6 +87,7 @@ export async function registerWorkflowClass(
       ...(meta.singleton ? { singleton: meta.singleton } : {}),
       ...(meta.concurrency ? { concurrency: meta.concurrency } : {}),
       ...(meta.origin ? { origin: meta.origin } : {}),
+      ...(meta.onError?.length ? { onError: onErrorRoutesOf(meta) } : {}),
     },
   );
   // Collect any colocated `static schedule` on the class so the worker loop can fire it alongside the

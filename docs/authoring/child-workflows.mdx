@@ -190,6 +190,30 @@ undone, give the child its own [compensations](/docs/durable/reliability/sagas) 
 `{ compensate: true }` yourself instead.
 </Callout>
 
+### When a failed item is an expected outcome — `ctx.allSettled`
+
+When some items failing is normal (a line that fails validation, a record a downstream system rejects),
+throwing for the whole batch is the wrong shape. `ctx.allSettled` is the durable `Promise.allSettled`: the
+same fan as `ctx.all` in `waitAll` mode, but it resolves with one result per input, in input order, and leaves
+the parent to decide what a failure means:
+
+```ts
+const results = await ctx.allSettled(ProcessItemWorkflow, batch.items, { concurrency: 1000 })
+// results[i]: { status: 'fulfilled', value } | { status: 'rejected', id, error, code?, details? }
+
+const rejected = results.flatMap((r, i) =>
+  r.status === 'rejected' ? [{ item: batch.items[i], error: r.error }] : []
+)
+if (rejected.length > 0) await ctx.step(recordDeadLetters, rejected)
+```
+
+It takes the same `concurrency` and lays the fan out exactly as `ctx.all` does (same child ids and
+`parallelGroup`). There is no `mode`: it always waits for every child. Cancelling the parent still cancels
+the run; only the children's failures are collected. For a failure that retrying can't fix, throw
+`FatalError` in the child's step: it skips the retries and the child settles as `rejected` straight away,
+with the error's `code` and `details` on the item. A failed `ctx.child` throws a `FatalError` carrying them
+too.
+
 ### Capping how many children run at once — `concurrency`
 
 By default the whole fan is sent at once. For a wide fan that floods the queue and keeps every child run and
@@ -237,11 +261,11 @@ engine.register('batch', '1', async (ctx, batch: Batch) => {
 
 ## When to use which
 
-| | `ctx.child` | `ctx.startChild` | `ctx.all` |
-| --- | --- | --- | --- |
-| Parent waits for the result | ✅ suspends until the child finishes | ❌ returns the id immediately | ✅ suspends until every child finishes |
-| Child failure affects the parent | ✅ throws in the parent | ❌ independent (inspect/retry the child run) | ✅ throws a `GatherError` |
-| Typical use | one sub-task whose output you need | side work; heterogeneous fan-out | the same workflow over a list of inputs |
+| | `ctx.child` | `ctx.startChild` | `ctx.all` | `ctx.allSettled` |
+| --- | --- | --- | --- | --- |
+| Parent waits for the result | ✅ suspends until the child finishes | ❌ returns the id immediately | ✅ suspends until every child finishes | ✅ suspends until every child finishes |
+| Child failure affects the parent | ✅ throws in the parent | ❌ independent (inspect/retry the child run) | ✅ throws a `GatherError` | ❌ returned as a `rejected` item |
+| Typical use | one sub-task whose output you need | side work; heterogeneous fan-out | the same workflow over a list of inputs | a list where some items failing is expected |
 
 `Inner.start(input)` and `Inner.dispatch(input)` are the ergonomic equivalents of `ctx.child(Inner, input)` and
 `ctx.startChild(Inner, input)` — same behavior, they just resolve the ambient `ctx` for you.

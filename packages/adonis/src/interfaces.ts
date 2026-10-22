@@ -279,6 +279,9 @@ export interface StepError {
   message: string;
   /** Optional machine-readable code, e.g. `declined`, `timeout`. */
   code?: string | undefined;
+  /** Structured, JSON-serializable detail of the failure (e.g. validation issues), from
+   *  `FatalError`'s third argument or a `details` on what a step handler threw. */
+  details?: unknown;
   /** Whether the engine should treat this as retryable. */
   retryable?: boolean | undefined;
   stack?: string | undefined;
@@ -849,6 +852,25 @@ export interface AllOptions {
    */
   concurrency?: number;
 }
+
+/** Options for {@link WorkflowCtx.allSettled}: {@link AllOptions} without `mode`. */
+export type AllSettledOptions = Omit<AllOptions, 'mode'>;
+
+/**
+ * One item of a {@link WorkflowCtx.allSettled} fan, in input order. `id` is the child run id;
+ * `error` is the failure message the child settled with.
+ */
+export type Settled<T> =
+  | { status: 'fulfilled'; value: T }
+  | {
+      status: 'rejected';
+      id: string;
+      error: string;
+      /** The failure's `code` (e.g. a `FatalError`'s), so a parent can tell its kinds apart. */
+      code?: string | undefined;
+      /** The failure's structured `details`, when it carried any. */
+      details?: unknown;
+    };
 
 /** One child of a fan as {@link StateStore.registerChildWaits} writes it. */
 export interface ChildWait {
@@ -1746,6 +1768,24 @@ export interface WorkflowCtx {
     opts?: AllOptions,
   ): Promise<TOutput[]>;
   /**
+   * {@link all} that never throws for a failed child: waits for every child to settle, then resolves
+   * with one {@link Settled} per input, in **input order** — the durable `Promise.allSettled`. Same
+   * fan as `all` in `waitAll` mode (ids, `parallelGroup`, `concurrency` waves, one parent turn per
+   * settled wave); only the ending differs. Use it when one child failing is an expected outcome the
+   * parent handles (record it, dead-letter it) rather than a reason to fail the whole run.
+   * Cancelling the parent still propagates.
+   */
+  allSettled<C extends WorkflowClass>(
+    workflow: C,
+    inputs: WorkflowInputOf<C>[],
+    opts?: AllSettledOptions,
+  ): Promise<Settled<WorkflowOutputOf<C>>[]>;
+  allSettled<TOutput = unknown>(
+    workflow: string,
+    inputs: unknown[],
+    opts?: AllSettledOptions,
+  ): Promise<Settled<TOutput>[]>;
+  /**
    * Pause the run at this point until a human resumes it from the dashboard (or
    * `engine.continue(runId)`). Records a visible `pending` checkpoint so the breakpoint shows up
    * in the timeline, then suspends with zero compute — the durable equivalent of a debugger
@@ -1813,8 +1853,8 @@ export interface WorkflowCtx {
 }
 
 /**
- * {@link WorkflowCtx} with ONE signature per method: the string-addressed forms of the four overloaded
- * methods (`step`, `child`, `startChild`, `all`), everything else unchanged.
+ * {@link WorkflowCtx} with ONE signature per method: the string-addressed forms of the five overloaded
+ * methods (`step`, `child`, `startChild`, `all`, `allSettled`), everything else unchanged.
  *
  * For code that drives the ctx DYNAMICALLY — an interpreter that runs a user-defined graph and only
  * ever knows workflow/step names as strings — and for test fakes. An overloaded method is awkward to
@@ -1829,7 +1869,7 @@ export interface WorkflowCtx {
  * Every `WorkflowCtx` is assignable to it (guarded by `test/types/dynamic-workflow-ctx.ts`).
  */
 export interface DynamicWorkflowCtx
-  extends Omit<WorkflowCtx, 'step' | 'child' | 'startChild' | 'all'> {
+  extends Omit<WorkflowCtx, 'step' | 'child' | 'startChild' | 'all' | 'allSettled'> {
   /** {@link WorkflowCtx.step} by step name. */
   step<TOutput = unknown>(
     name: string,
@@ -1854,6 +1894,12 @@ export interface DynamicWorkflowCtx
     inputs: unknown[],
     opts?: AllOptions,
   ): Promise<TOutput[]>;
+  /** {@link WorkflowCtx.allSettled} by workflow name. */
+  allSettled<TOutput = unknown>(
+    workflow: string,
+    inputs: unknown[],
+    opts?: AllSettledOptions,
+  ): Promise<Settled<TOutput>[]>;
 }
 
 /** Result of executing or resuming a workflow run. */
@@ -1897,7 +1943,13 @@ export type EngineEventType =
   | 'capability.unavailable'
   // The run parked `blocked`: a capable worker existed but every live one is protocol-incompatible
   // (no common major, design §7.4/§7.6). Carries `error` + `diagnostics` (the protocol-range delta).
-  | 'protocol.incompatible';
+  | 'protocol.incompatible'
+  // A failed run handed its failure to an onError handler (`name` is the handler workflow, `error`
+  // the failure). The run now waits on the handler and settles with its outcome.
+  | 'run.routed'
+  // A failed run had onError routes that could not be applied — its live workers announce different
+  // ones (`reason` says so) — so it failed instead of being handed off.
+  | 'run.unrouted';
 
 /**
  * A lifecycle event emitted by the engine. The observability surfaces (dashboard, OTel, the
@@ -1936,6 +1988,8 @@ export interface EngineEvent {
    * (`step.redispatched`).
    */
   redispatched?: boolean | undefined;
+  /** Why a `run.unrouted` run's onError routes were not applied. */
+  reason?: string | undefined;
   at: Date;
 }
 
