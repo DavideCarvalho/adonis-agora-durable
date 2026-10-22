@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RedisAdmissionBackend } from '../src/admission-redis/index.js';
-import type { EngineEvent } from '../src/events.js';
-import type { RunGateway } from '../src/run-gateway/index.js';
+import type { EngineEvent } from '../src/interfaces.js';
+import type { RunGateway } from '../src/run-gateway/interface.js';
 import { RunRequestResponder } from '../src/run-gateway/run-request-responder.js';
 
 /** Background promises the library fires without awaiting must never become unhandled rejections. */
