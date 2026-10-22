@@ -45,6 +45,11 @@ export async function configure(command: Configure) {
     'database/migrations/create_durable_transport_tables.stub',
     {},
   );
+  await codemods.makeUsingStub(
+    stubsRoot,
+    'database/migrations/create_durable_transport_worker_keys.stub',
+    {},
+  );
 }
 
 /**

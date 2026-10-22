@@ -39,8 +39,8 @@ const repoRoot = fileURLToPath(new URL('../../../../../', import.meta.url));
 const stubsRoot = join(pkgRoot, 'stubs');
 
 /**
- * Every stub that generates TYPED TypeScript. The four `configure` publishes, plus the
- * `make:workflow` output — all five import from the package and would break a consumer's build if
+ * Every stub that generates TYPED TypeScript. The five `configure` publishes, plus the
+ * `make:workflow` output — all six import from the package and would break a consumer's build if
  * their signatures drifted. `state` is what the generator passes: only `make:workflow` needs an
  * entity, exactly as its command supplies one.
  */
@@ -49,6 +49,7 @@ const STUBS = [
   { path: 'config/durable_dashboard.stub' },
   { path: 'database/migrations/create_durable_tables.stub' },
   { path: 'database/migrations/create_durable_transport_tables.stub' },
+  { path: 'database/migrations/create_durable_transport_worker_keys.stub' },
   { path: 'make/workflow/main.stub', entity: 'order' },
 ];
 

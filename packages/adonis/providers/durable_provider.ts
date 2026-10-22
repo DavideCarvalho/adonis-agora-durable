@@ -324,15 +324,13 @@ export default class DurableProvider {
 
   /**
    * Build the descriptor/heartbeat registry for a tenant worker: a real {@link RedisWorkerRegistry} when
-   * the transport can mint a descriptor-Redis client (design §7.2), else the {@link NoopWorkerRegistry}
-   * (the descriptor is still built + observable, just not published to the shared Redis).
+   * the transport can mint a writer for its advertisement keys (design §7.2) — BullMQ's Redis, the db
+   * transport's key table, the event-emitter's in-memory board — else the {@link NoopWorkerRegistry}
+   * (the queue transport: point-to-point queues hold no key a control plane could read back).
    */
   #buildWorkerRegistry(transport: Transport): WorkerRegistry {
     const redis = descriptorRedisFrom(transport);
     if (redis) return new RedisWorkerRegistry(redis, { ownsConnection: true });
-    // TODO(integrator): expose `createDescriptorRedis()` on the tenant broker transport
-    // (e.g. BullMQTransport, keyed off the same connection its queues use) so a real pod advertises its
-    // descriptor + heartbeat on the shared Redis instead of falling back to the no-op registry.
     return new NoopWorkerRegistry();
   }
 

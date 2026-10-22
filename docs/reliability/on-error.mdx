@@ -112,6 +112,10 @@ announce different routes for the workflow (a rollout in progress), the failure 
 engine emits `run.unrouted` with the reason. The engine reuses what it read for a few seconds, so a
 burst of failures costs one read.
 
+Routes are read from the [worker advertisement](/docs/durable/transports#worker-advertisement), which
+the `bullmq`, `db` and `eventEmitter` transports carry. On the `queue` transport a convention workflow's
+failures are not routed: declare its routes where it is registered instead.
+
 ## On the engine directly
 
 `engine.register(name, version, fn, { onError: [{ code?, workflow }] })`, and `engine.registerRemote`

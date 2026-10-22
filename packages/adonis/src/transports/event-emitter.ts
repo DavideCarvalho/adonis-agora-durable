@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
+import type { WorkerDescriptor } from '../handshake/descriptor.js';
 import {
   type ControlMessage,
   type ControlPlane,
@@ -9,6 +10,8 @@ import {
   type Transport,
 } from '../interfaces.js';
 import { runStepHandler, type StepHandler } from '../protocol.js';
+import type { DescriptorRedis } from '../worker-runtime/registry.js';
+import { descriptorsOn, liveGroupsOf, MemoryWorkerKeys, workerKeyWriter } from './worker-keys.js';
 
 /** Event names the transport multiplexes over a single in-process emitter. */
 export const TASK_EVENT = 'durable.task';
@@ -42,6 +45,10 @@ export interface EventEmitterTransportOptions {
 /** The minimal `on`/`emit` surface this transport needs — satisfied by Node's `EventEmitter` and
  *  `@adonisjs/core`'s emitter alike, so neither is a hard dependency. */
 type EmitterLike = Pick<EventEmitter, 'on' | 'emit'>;
+
+// The worker advertisement keys, one board per emitter: every transport over the same in-process bus
+// (an engine's and a worker runtime's) reads and writes the same keys.
+const workerKeysByEmitter = new WeakMap<EmitterLike, MemoryWorkerKeys>();
 
 /**
  * A production **in-process** {@link Transport} (and {@link ControlPlane}) backed by a single Node
@@ -178,5 +185,32 @@ export class EventEmitterTransport implements Transport, ControlPlane {
 
   onControl(handler: (msg: ControlMessage) => void): void {
     this.#emitter.on(`${CONTROL_EVENT}${this.#suffix()}`, (msg: ControlMessage) => handler(msg));
+  }
+  // ---------------------------------------------------------------------------
+  // worker advertisement (design §7.2) — kept in memory, shared by the emitter's transports
+  // ---------------------------------------------------------------------------
+
+  #workerKeys(): MemoryWorkerKeys {
+    let keys = workerKeysByEmitter.get(this.#emitter);
+    if (!keys) {
+      keys = new MemoryWorkerKeys();
+      workerKeysByEmitter.set(this.#emitter, keys);
+    }
+    return keys;
+  }
+
+  /** The writer a worker runtime's registry advertises its descriptor and heartbeat through. */
+  createDescriptorRedis(): DescriptorRedis {
+    return workerKeyWriter(this.#workerKeys(), Date.now);
+  }
+
+  /** The live worker descriptors advertised on `token`. */
+  async listWorkerDescriptors(token: string): Promise<WorkerDescriptor[]> {
+    return descriptorsOn(await this.#workerKeys().live(Date.now()), token);
+  }
+
+  /** The routing tokens a live worker beats on. */
+  async listWorkerGroups(): Promise<string[]> {
+    return liveGroupsOf(await this.#workerKeys().live(Date.now()));
   }
 }
