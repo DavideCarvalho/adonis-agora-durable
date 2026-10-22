@@ -85,13 +85,17 @@ The sweep (`engine.sweepRetention()`) is a phase of the [`durable:work`](/docs/d
 Deleting a run takes its **children**, but the sweep does not know about a still-live *parent* awaiting a custom-id child — a completed child evicted out from under a suspended parent strands the join. Size the ages well beyond your longest-running parents.
 </Callout>
 
-Retention only runs inside `durable:work`. A web process, a `node ace` one-off or anything else that boots the engine never prunes, and while the engine is draining for shutdown the sweep is skipped.
+Retention only runs inside the worker loop: `durable:work`, or the embedded loop of `worker: { embedded: true }`. A web process without the embedded loop, a `node ace` one-off or anything else that boots the engine never prunes, and while the engine is draining for shutdown the sweep is skipped.
+
+Every worker instance runs its own sweep (the one-a-minute throttle is per instance), so with several workers two of them can pick the same candidates in the same minute. Deleting an already-deleted run is harmless, but the same run can reach `onEvict` on two instances: make the archive write idempotent (key it by run id, as below).
 
 ## Archiving before deletion — `engine.onEvict`
 
 Retention deletes; `onEvict` is how you keep a copy. Register a hook and it runs **before** each run's deletion, receiving the run and its full checkpoint timeline — write them to S3, a cold table, a file:
 
 ```ts title="start/durable.ts"
+import engine from '@adonis-agora/durable/services/main'
+
 engine.onEvict(async (run, checkpoints) => {
   await s3.putObject({
     Bucket: 'durable-archive',
