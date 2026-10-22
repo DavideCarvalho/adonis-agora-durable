@@ -30,7 +30,7 @@ Every topology runs the **same durable engine over the same wire**. Splitting th
 **Every** role dispatches over the transport — that never changes. What changes is who is *subscribed* to the queue a dispatch lands on. Two routing tokens have to agree:
 
 - **Dispatch side.** A step is routed to `<name>@<tenant>`, where the tenant comes from **the run's namespace** (or the step's own `partition`, which wins). A `default`/unset namespace routes to the bare `<name>`.
-- **Consume side.** A worker subscribes `<name>@<partition>` for every handler it serves, where the suffix is **its own `partition`** (a `tenant` pod's required `partition`, or `transports.bullmq({ partition })`) — bare when unset.
+- **Consume side.** A worker subscribes `<name>@<partition>` for every handler it serves, where the suffix is **its own `partition`** (a `tenant` pod's required `partition`, or `transports.bullmq({ partition })` / `transports.queue({ partition })`) — bare when unset.
 
 A process executes a step body when, and only when, those two tokens match. There is no fallback: nothing "runs it anyway" because no worker showed up — the step stays pending (or the run parks `blocked` when the step [`requires`](/docs/durable/cluster/handshake#capability-aware-routing) capabilities no live worker advertises). See [Tenancy](/docs/durable/concepts/tenancy) for how a run's namespace is chosen.
 
@@ -57,6 +57,8 @@ The seam is the **control plane ↔ worker** boundary on the transport:
 - The **control plane** owns the store and the authoritative run state. It dispatches step/workflow tasks onto per-handler queues and consumes their results.
 - A **worker** pulls a task, runs the body through the shared step handler, and publishes the result. It holds no durable state.
 - A **store-less api/dashboard pod** never executes anything; it turns every read/control/start into a wire request answered by the control plane's `RunRequestResponder`.
+
+Two bundled transports carry that seam for store-less pods: `bullmq` (Redis, and the wire NestJS and Python workers speak) and `queue` (any `@adonisjs/queue` adapter). See [Roles & config](/docs/durable/cluster/roles-and-config#control-plane) for choosing between them.
 
 Your application code — `BaseWorkflow` subclasses in `app/workflows`, `@Step` handlers in `app/steps` — is **identical across every role**. The dashboard, routes, and `services/main` reads all go through one `RunGateway` interface that is either backed directly by the store or proxied over the wire, so nothing above that line can tell whether a store is present.
 

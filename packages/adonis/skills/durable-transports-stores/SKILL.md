@@ -109,6 +109,15 @@ task/heartbeat/control loops back off up to `idleBackoffMax × pollIntervalMs`
 (default 4 × 200ms; `1` disables). Source:
 `docs/transports/queue.mdx`.
 
+`queue` also carries remote workflow turns (`<prefix>:decisions`,
+`<prefix>:step-events`) and store-less tenant pods: start-run/run-request are
+plain jobs to the control plane, replies go to a per-pod
+`<prefix>:run-replies:<instanceId>` queue, and tenant events are pushed to each
+subscribed pod's `<prefix>:tenant-events:<instanceId>` (subscriptions announced
+on `<prefix>:inbox-registrations`, recorded in the control plane's key store;
+tune with `inboxTtlMs`, `tenantSubscribersCacheMs`, `inboxSweepIntervalMs`).
+See `durable-cluster`.
+
 For wide fans (`ctx.all` over thousands of steps), raise how many results an
 instance settles at once on `bullmq` or `queue` (`resultConcurrency`; `db` has no such option),
 let its workers size their step concurrency, and size the engine's due-timer

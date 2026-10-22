@@ -1,6 +1,6 @@
 ---
 title: Queue (@adonisjs/queue)
-description: The queue-backed transport driver for cross-process steps, built on @adonisjs/queue. Steps go to a per-group tasks queue; results return on a shared results queue. Run one instance engine-side, one per worker group.
+description: The queue-backed transport driver for cross-process steps, built on @adonisjs/queue. Steps go to a per-group tasks queue; results return on a shared results queue. Also carries remote workflow turns and store-less tenant pods.
 icon: ListOrdered
 ---
 
@@ -34,6 +34,8 @@ export default defineConfig({
 - A worker that serves that name consumes it, runs the handler, and adds the result to the shared `<prefix>:results` queue.
 - The engine-side instance consumes results and checkpoints them.
 - Liveness flows on `<prefix>:heartbeats`; cross-instance control on `<prefix>:control`.
+- A [remote workflow](/docs/durable/cluster/thin-workers#executing-workflow-turns) turn rides the same per-name task queue (the worker tells a turn from a step by its shape); its decision returns on `<prefix>:decisions`, and the local steps it runs mid-turn on `<prefix>:step-events`.
+- A [store-less `tenant` pod](#tenant-pods-over-the-queue-transport) reaches its control plane over the same backend.
 
 The default `prefix` is `durable` and the default `pollIntervalMs` is `200`.
 
@@ -94,6 +96,9 @@ Upgrading an app from 0.6 to 0.7:
 | `workerKeys` | the app database | Where the [worker advertisement](/docs/durable/transports#worker-advertisement) lives. Default: the `durable_transport_worker_keys` table through `@adonisjs/lucid`, when the app has it. Pass any `WorkerKeyStore` to keep the keys elsewhere, or `false` to advertise nothing. |
 | `workerKeysConnection` | default Lucid connection | Lucid connection the default worker-key table lives on. |
 | `workerKeysCacheMs` | `5000` | How long a read of the worker keys is reused. |
+| `inboxTtlMs` | `30_000` | [Tenant pods](#tenant-pods-over-the-queue-transport): how long an announced inbox or live-tail subscription stays recorded. The pod re-announces every third of it, so a dead pod stops receiving pushes within about this long. |
+| `tenantSubscribersCacheMs` | `1000` | Control plane: how long a read of a tenant's live subscribers is reused when publishing events. `0` reads the store on every event. |
+| `inboxSweepIntervalMs` | `30_000` | Control plane: how often the inboxes of dead pods are drained. `0` disables it. |
 
 ### Concurrency and idle polling
 
@@ -165,14 +170,66 @@ Reach for `'always'` only for a script that genuinely must round-trip a remote s
 
 `transports.queue(config)` returns the lazy driver thunk used in `config/durable.ts`; the underlying class is `QueueTransport`, also exported from `@adonis-agora/durable` for constructing a worker-side instance directly.
 
+## Tenant pods over the queue transport
+
+A [`tenant` pod](/docs/durable/cluster/roles-and-config#tenant-store-less-thin-pod) owns no store: every read, control action and run start goes to the control plane as a request, and the answer comes back. The queue transport carries that protocol, so a `control-plane` and its `tenant` pods can share one `@adonisjs/queue` backend instead of Redis plus `bullmq`. Point both at the same connection and prefix:
+
+```ts title="config/durable.ts (control plane)"
+export default defineConfig({
+  role: 'control-plane',
+  transport: 'queue',
+  transports: { queue: transports.queue({ connection: 'redis' }) },
+  store: 'lucid',
+  stores: { lucid: stores.lucid({ connection: 'pg' }) },
+  verifyTenant: hmacTenantVerifier(process.env.DURABLE_TENANT_SECRET!),
+})
+```
+
+```ts title="config/durable.ts (tenant pod)"
+export default defineConfig({
+  role: 'tenant',
+  transport: 'queue',
+  // No database on the pod: its advertisement and subscriptions go to the control plane.
+  transports: { queue: transports.queue({ connection: 'redis', workerKeys: false }) },
+  partition: 'acme-corp',
+  tenant: { token: process.env.DURABLE_TENANT_TOKEN },
+})
+```
+
+Starting a run and sending a read or control request are plain jobs on `<prefix>:start-run` and `<prefix>:run-request`, which one control-plane instance consumes. The two parts BullMQ broadcasts on Redis pub/sub are different here, because a queue job has exactly one consumer:
+
+- **Replies.** Every instance that sends requests consumes its own `<prefix>:run-replies:<instanceId>` queue, and stamps that instance id on each request. The control-plane instance that handles the request pushes the reply onto that queue only, so two pods never receive or take each other's replies.
+- **Live-tail events.** A pod that subscribes to its tenant's events (`runGateway.subscribe`) announces the subscription on `<prefix>:inbox-registrations`, and again every third of `inboxTtlMs`. The control plane records it as a key in its [worker-key store](#worker-advertisement) — the pod itself needs no store — and pushes one copy of each event of that tenant onto `<prefix>:tenant-events:<instanceId>` of every pod with a live subscription. Pods of other tenants receive nothing.
+
+A pod with no key store of its own forwards its [worker advertisement](#worker-advertisement) the same way, so the control plane still sees its workers for capability routing and convention dispatch.
+
+<Callout type="info" title="What a dead pod leaves behind">
+A pod that dies stops re-announcing itself, so its subscription expires after `inboxTtlMs` and the control plane stops pushing to it. Whatever was pushed before that, and replies to requests still in flight when it died, stay on its queues until the control plane's janitor (every `inboxSweepIntervalMs`) drains them: it drains a queue it pushed to once the pod has stopped announcing itself and nothing was pushed for `inboxTtlMs`. A control plane that restarts forgets which queues it pushed to, so a crash of both the pod and the control plane can leave up to `inboxTtlMs` worth of events behind on the pod's queues. Pods that stop cleanly empty their own queues and withdraw their subscriptions on shutdown.
+</Callout>
+
+How this compares with `bullmq`, which carries the same protocol over Redis pub/sub:
+
+- **Order.** Events from one control-plane instance reach a pod in the order they were published, as on pub/sub. Events from several instances are not ordered against each other on either transport.
+- **Latency.** Replies and events are polled, not pushed. The reply loop never backs off (one `pollIntervalMs`); the event loop backs off like the task loops (up to `idleBackoffMax × pollIntervalMs` when idle).
+- **Subscribing.** A new subscription reaches the control plane after its next registration poll plus `tenantSubscribersCacheMs`, so events published in the first second or so after subscribing can be missed. Pub/sub misses only the events published before the subscription.
+- **Cost.** Each event is one job per subscribed pod of its tenant (pub/sub sends it once). Each pod that sends requests or subscribes sends one small registration job every third of `inboxTtlMs`.
+- **Trust.** As on `bullmq`, anything with access to the broker can subscribe to any tenant's events. Requests are checked against `verifyTenant` on the control plane; subscriptions are not.
+- **Requirements.** Live-tail needs a worker-key store on the control plane (the default database table); without one, tenant events reach no pod and the control plane reports it once through `onError`, and the janitor is off. Replies, starts and reads need no key store.
+
 ## Queue naming
 
 | Queue | Direction | Purpose |
 | --- | --- | --- |
-| `<prefix>:tasks:<token>` | engine → workers | step dispatch, one queue per handler name (`tenantGroup(sanitizeQueueToken(name), partition)`) |
+| `<prefix>:tasks:<token>` | engine → workers | step and workflow-turn dispatch, one queue per handler name (`tenantGroup(sanitizeQueueToken(name), partition)`) |
 | `<prefix>:results` | workers → engine | step results |
+| `<prefix>:decisions` | workers → engine | workflow-turn decisions |
+| `<prefix>:step-events` | workers → engine | local steps of a remote workflow turn, streamed mid-turn |
 | `<prefix>:heartbeats` | workers → engine | liveness for `timeoutMs` steps |
 | `<prefix>:control` | bidirectional | lifecycle events + cancellation (best-effort) |
+| `<prefix>:start-run`, `<prefix>:run-request` | tenant pods → control plane | run starts, reads and control actions |
+| `<prefix>:run-replies:<instanceId>` | control plane → one pod | the replies to that pod's requests |
+| `<prefix>:tenant-events:<instanceId>` | control plane → one pod | live-tail events of the tenants that pod subscribed to |
+| `<prefix>:inbox-registrations` | pods → control plane | subscriptions, inbox liveness, forwarded worker advertisement |
 
 Because the payload is the documented `RemoteTask` / `StepResult` JSON, multiple worker processes can share the same queues — scale out by running more `durable:work` processes that serve the same step names.
 

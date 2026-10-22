@@ -16,7 +16,7 @@ Transports are **config-driven drivers**: list the ones you use under `transport
 | --- | --- | --- | --- |
 | `transports.memory()` | none | No (in-process) | **Tests.** Drives a dispatch straight into the handler, so a test is deterministic with no polling and no timers. |
 | `transports.eventEmitter()` | none | No (in-process) | **Single-process production.** Handlers run in this process over a Node `EventEmitter`, but dispatch → worker → result is decoupled across the event loop, the way a real broker behaves. |
-| [`transports.queue(...)`](/docs/durable/transports/queue) | whatever `config/queue.ts` uses | Yes | True **cross-process** steps over [`@adonisjs/queue`](https://github.com/adonisjs/queue) — a separate worker fleet, on Redis or a database adapter. |
+| [`transports.queue(...)`](/docs/durable/transports/queue) | whatever `config/queue.ts` uses | Yes | True **cross-process** steps over [`@adonisjs/queue`](https://github.com/adonisjs/queue) — a separate worker fleet, on Redis or a database adapter. Also carries remote workflow turns and [store-less tenant pods](/docs/durable/transports/queue#tenant-pods-over-the-queue-transport). |
 | [`transports.db(...)`](/docs/durable/transports/db) | the database you already run | Yes (shared DB) | Broker-less, DBOS-style: steps are **rows** in your own database, via `@adonisjs/lucid`. No new infrastructure at all. |
 | `transports.bullmq(...)` | Redis + the `bullmq` package | Yes | **Cross-ecosystem**: byte-compatible with the NestJS `nestjs-durable` BullMQ transport and its Python worker, so an AdonisJS engine and a Python or NestJS worker interoperate on one Redis. See [Python interop](/docs/durable/python). |
 
@@ -133,7 +133,7 @@ Where they live depends on the transport:
 | `bullmq` | TTL'd Redis keys, shared with NestJS and Python workers |
 | `db` | the `durable_transport_worker_keys` table |
 | `eventEmitter` | in memory, shared by every transport over the same emitter |
-| `queue` | a key store beside the queues — by default the app database's `durable_transport_worker_keys` table (see [queue](/docs/durable/transports/queue#worker-advertisement)) |
+| `queue` | a key store beside the queues — by default the app database's `durable_transport_worker_keys` table (see [queue](/docs/durable/transports/queue#worker-advertisement)); a `tenant` pod with none forwards it to the control plane's |
 | `memory` | none |
 
 A worker that stops cleanly removes its keys; one that dies drops out when they expire.
