@@ -742,6 +742,13 @@ export class WorkflowEngine {
   /** Whether the worker tick fires {@link schedules} (the `persistedSchedules` option). */
   readonly persistedSchedulesEnabled: boolean;
   private readonly leaseMs: number;
+  /**
+   * The engine clock when this instance was constructed. Every lease THIS incarnation writes ends at
+   * or after `bootedAt + leaseMs`; a lease held under {@link instanceId} that ends before that was
+   * written by a previous process that ran under the same id (a pod restarted after a crash) — see
+   * {@link selfReclaimable}.
+   */
+  private readonly bootedAt: number;
   private readonly maxRecoveryAttempts?: number | undefined;
   private readonly reconcileMs: number | undefined;
   private readonly heartbeatPersistThrottleMs: number;
@@ -943,6 +950,7 @@ export class WorkflowEngine {
     // which is what it must stay on to reach every tenant's queues.
     if (this.namespace !== undefined) this.pool.useNamespace(this.namespace);
     this.leaseMs = deps.leaseMs ?? 30_000;
+    this.bootedAt = this.clock();
     this.maxRecoveryAttempts = deps.maxRecoveryAttempts;
     // Default 5min; an explicit 0 disables the fallback (opt back into wake-forever-on-lost-event). A
     // non-finite or negative value falls back to the default rather than silently disabling the net
@@ -2728,17 +2736,39 @@ export class WorkflowEngine {
     // that's ~zero rows per tick, instead of fetching every running run and issuing one doomed
     // lock-probe UPDATE per row per worker per second. Falls back to the old full-list + in-process
     // filter for a custom store without the optimized method.
+    //
+    // Self-reclaim: for one lease window after boot, also ask for the runs still leased to THIS
+    // instance id. Under a stable id (a pod name), a SIGKILLed/OOM-killed predecessor's leases read
+    // as "held by me" and would otherwise sit out their full `leaseMs`. After that window no such
+    // lease can still be live, so the extra predicate is dropped and the query is the orphan-only one.
     const incomplete = await asHeartbeat(async () => {
       const nowMs = this.clock();
+      const owner = nowMs < this.bootedAt + this.leaseMs ? this.instanceId : undefined;
       if (this.store.listOrphanedRuns) {
-        return this.store.listOrphanedRuns(nowMs, 100, this.namespace);
+        return owner === undefined
+          ? this.store.listOrphanedRuns(nowMs, 100, this.namespace)
+          : this.store.listOrphanedRuns(nowMs, 100, this.namespace, owner);
       }
       return (await this.store.listIncompleteRuns(this.namespace)).filter(
-        (r) => r.lockedUntil === undefined || r.lockedUntil <= nowMs,
+        (r) =>
+          r.lockedUntil === undefined ||
+          r.lockedUntil <= nowMs ||
+          (owner !== undefined && r.lockedBy === owner),
       );
     });
     for (const listed of incomplete) {
       if (this.draining) break; // stop requested mid-sweep
+      // A run still leased to this instance id: reclaimable only when a PREVIOUS process under the
+      // same id left that lease behind — never one this process holds (see selfReclaimable). Give the
+      // stale lease up so the normal orphan path below can take it; anything else is skipped.
+      if (
+        listed.lockedBy === this.instanceId &&
+        listed.lockedUntil !== undefined &&
+        listed.lockedUntil > nowMs &&
+        !(await this.releaseStaleSelfLease(listed))
+      ) {
+        continue;
+      }
       // An IN-PROCESS turn renews its lease, so an acquirable lease means no turn is executing this
       // run right now. Skip the ones still owned. That is NOT the same as "its worker crashed" — see
       // the dispatched-step guard below for the case it doesn't cover.
@@ -2821,6 +2851,44 @@ export class WorkflowEngine {
       results.push({ runId: run.id, status: 'pending' });
     }
     return results;
+  }
+
+  /**
+   * Whether a lease held under this engine's own {@link instanceId} was left behind by a previous
+   * process that ran under the same id, rather than held by this one. Both must hold:
+   *  - nothing in this process executes the run: no execution in its run gate and no execution lease
+   *    tracked for it;
+   *  - the lease was written before this engine booted: every lease this process writes (acquire or
+   *    renew) ends at `clock() + leaseMs >= bootedAt + leaseMs`, so an earlier end proves an earlier
+   *    writer. This also covers the brief windows where a path of this process holds the lease
+   *    without having entered the run gate yet (a sweep between `tryLockRun` and the resume).
+   *
+   * Sound only when no two LIVE processes share an instance id — the documented requirement.
+   */
+  private selfReclaimable(run: WorkflowRun, gated = this.runGates.has(run.id)): boolean {
+    if (run.lockedBy !== this.instanceId || run.lockedUntil === undefined) return false;
+    if (gated || this.executionLeases.has(run.id)) return false;
+    return run.lockedUntil - this.leaseMs < this.bootedAt;
+  }
+
+  /**
+   * Release a lease this instance's previous incarnation left on `listed` (see {@link selfReclaimable}),
+   * so the recovery sweep can take the run like any orphan. The release runs inside the run's
+   * in-process gate, so a resume landing meanwhile here queues behind it instead of executing on the
+   * lease being given up; the run is re-read there and only released if it is still a stale `running`
+   * self-lease. Returns whether the lease was released.
+   */
+  private async releaseStaleSelfLease(listed: WorkflowRun): Promise<boolean> {
+    if (!this.selfReclaimable(listed)) return false;
+    let released = false;
+    await this.serializeOnRun(listed.id, async () => {
+      const run = await this.store.getRun(listed.id);
+      // The gate is ours now (serializeOnRun registered it before any other resume could queue).
+      if (run?.status !== 'running' || !this.selfReclaimable(run, false)) return;
+      await this.store.releaseRunLock(run.id, this.instanceId);
+      released = true;
+    });
+    return released;
   }
 
   /**

@@ -339,16 +339,28 @@ export class CodecStateStore implements StateStore {
   async listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]> {
     return (await this.inner.listDueTimers(nowMs, namespace, limit)).map((r) => this.decRun(r));
   }
-  async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
+  async listOrphanedRuns(
+    nowMs: number,
+    limit: number,
+    namespace?: string,
+    owner?: string,
+  ): Promise<WorkflowRun[]> {
     // Forward when the inner store implements it; otherwise mirror the engine's own fallback
     // (filter listIncompleteRuns in-process) so wrapping never REMOVES the optimized path's shape.
     if (this.inner.listOrphanedRuns) {
-      return (await this.inner.listOrphanedRuns(nowMs, limit, namespace)).map((r) =>
-        this.decRun(r),
-      );
+      const orphans =
+        owner === undefined
+          ? await this.inner.listOrphanedRuns(nowMs, limit, namespace)
+          : await this.inner.listOrphanedRuns(nowMs, limit, namespace, owner);
+      return orphans.map((r) => this.decRun(r));
     }
     return (await this.inner.listIncompleteRuns(namespace))
-      .filter((r) => r.lockedUntil === undefined || r.lockedUntil <= nowMs)
+      .filter(
+        (r) =>
+          r.lockedUntil === undefined ||
+          r.lockedUntil <= nowMs ||
+          (owner !== undefined && r.lockedBy === owner),
+      )
       .slice(0, limit)
       .map((r) => this.decRun(r));
   }

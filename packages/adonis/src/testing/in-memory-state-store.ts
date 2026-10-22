@@ -330,12 +330,19 @@ export class InMemoryStateStore implements StateStore {
     return (limit === undefined ? due : due.slice(0, limit)).map(copyRun);
   }
 
-  async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
+  async listOrphanedRuns(
+    nowMs: number,
+    limit: number,
+    namespace?: string,
+    owner?: string,
+  ): Promise<WorkflowRun[]> {
     return this.visibleRuns()
       .filter(
         (r) =>
           r.status === 'running' &&
-          (r.lockedUntil === undefined || r.lockedUntil <= nowMs) &&
+          (r.lockedUntil === undefined ||
+            r.lockedUntil <= nowMs ||
+            (owner !== undefined && r.lockedBy === owner)) &&
           (namespace === undefined || namespaceMatches(r.namespace, namespace)),
       )
       .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())

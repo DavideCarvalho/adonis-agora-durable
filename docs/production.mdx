@@ -133,6 +133,10 @@ export default defineConfig({
 })
 ```
 
+A stable id also shortens crash recovery. A process killed without draining (`SIGKILL`, an OOM kill) leaves its runs `running` with leases that name it. When it comes back under the same id, its first recovery passes also pick up the runs still leased to that id and replay them at once, instead of waiting up to `leaseMs` for those leases to expire. A run this process is executing is never taken this way. The engine only releases a lease under its own id when nothing in the process is executing the run and the lease was written before the engine started. Other instances still wait for the lease to expire, as before. The extra lookup only runs during the first `leaseMs` after boot, because no lease from the previous process can outlive that.
+
+This is why the id must be **unique per live process**, not just stable. If two live processes share an id, each reads the other's leases as its own: the leases no longer keep them apart, and a restart of one can reclaim runs the other is still executing. One id per pod (the pod name) is right. One id for a whole deployment, or a pod running several engines under one id, is not.
+
 None of this needs a control plane. See [Durability & replay](/docs/durable/concepts/durability#deploys-versioning--multiple-instances) and [Delivery under multiple instances](/docs/durable/reliability/multi-instance).
 
 ## 4. Cap poison pills with the dead-letter state

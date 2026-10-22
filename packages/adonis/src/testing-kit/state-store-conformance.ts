@@ -854,6 +854,25 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       },
     );
 
+    t(
+      'listOrphanedRuns with an owner also returns the runs still leased to that owner',
+      async () => {
+        if (!store.listOrphanedRuns) return;
+        await store.createRun(run({ id: 'free', status: 'running' }));
+        await store.createRun(run({ id: 'mine', status: 'running' }));
+        await store.createRun(run({ id: 'theirs', status: 'running' }));
+        await store.createRun(run({ id: 'mine-idle', status: 'suspended' }));
+        await store.tryLockRun('mine', 'A', 9_000, 1_000);
+        await store.tryLockRun('theirs', 'B', 9_000, 1_000);
+        await store.tryLockRun('mine-idle', 'A', 9_000, 1_000);
+        const withOwner = await store.listOrphanedRuns(5_000, 10, undefined, 'A');
+        // A store that predates the `owner` parameter ignores it (expiry-only): still conformant.
+        const ids = withOwner.map((r) => r.id).sort();
+        expect([['free'], ['free', 'mine']]).toContainEqual(ids);
+        expect((await store.listOrphanedRuns(5_000, 10)).map((r) => r.id)).toEqual(['free']);
+      },
+    );
+
     t('listDueTimers returns the most overdue first, capped at limit', async () => {
       for (const [id, wakeAt] of [
         ['late', 3_000],
