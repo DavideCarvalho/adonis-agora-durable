@@ -589,21 +589,26 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb, makeTransportDb }) => {
         await freshDb();
         const cp = make({ inboxTtlMs: 60, inboxSweepIntervalMs: 20 });
         // A pod that subscribed and then crashed: its keys are there, nothing consumes its rows, and it
-        // never refreshes them.
-        // Long-lived enough that a slow database (Postgres on a loaded CI box) still publishes to it
-        // before it expires.
+        // never refreshes them. Its keys stay live until the first publishes are seen addressed to it,
+        // then are rewritten already expired — the state a crashed pod's keys reach on their own.
+        // (A fixed 500ms lifetime raced the publishes on a loaded machine: the third found it gone.)
         const keys = lucidWorkerKeys(db);
         const value = JSON.stringify({ instanceId: 'ghost' });
-        const expiresAt = Date.now() + 500;
-        await keys.put(inboxKey('durable', 'ghost'), value, expiresAt);
-        await keys.put(tenantSubscriberKey('durable', 'acme', 'ghost'), value, expiresAt);
+        const ghostKeys = [
+          inboxKey('durable', 'ghost'),
+          tenantSubscriberKey('durable', 'acme', 'ghost'),
+        ];
+        for (const key of ghostKeys) await keys.put(key, value, Date.now() + 60_000);
 
         for (let i = 0; i < 3; i += 1) {
           await cp.publishTenantEvent({ tenant: 'acme', event: event('r1', i) });
         }
         expect(await rows({ recipient: 'ghost' })).toHaveLength(3);
 
-        await sleep(expiresAt - Date.now() + 20); // the keys expire
+        // The keys expire.
+        const expiresAt = Date.now();
+        for (const key of ghostKeys) await keys.put(key, value, expiresAt);
+        await sleep(20);
         for (let i = 3; i < 6; i += 1) {
           await cp.publishTenantEvent({ tenant: 'acme', event: event('r1', i) });
         }
