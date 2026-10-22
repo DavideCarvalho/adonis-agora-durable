@@ -386,7 +386,8 @@ export interface BaseDurableConfig {
    * (`BaseWorkflow` subclasses) to auto-register on the engine — the
    * `app/workflows` convention, mirroring `@adonisjs/queue`'s
    * `app/jobs`. Default `'app/workflows'`. Set `false` to disable discovery entirely (register by
-   * hand with `engine.register(...)`). A missing directory is fine — nothing to register.
+   * hand with `engine.register(...)`). A missing directory is fine — nothing to register. It governs
+   * workflow discovery only: `app/steps` ({@link stepsPath}) and the run-request responder still boot.
    *
    * A modular app lists several directories (`['app/orders/flows', 'app/billing/flows']`): every
    * root is scanned, and the same workflow name + version defined by two different classes in two

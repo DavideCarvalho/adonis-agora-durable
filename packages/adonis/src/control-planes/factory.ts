@@ -34,6 +34,12 @@ export interface RedisControlPlaneConfig {
    * to the NestJS BullMQ transport so an AdonisJS fleet interoperates with a NestJS fleet on one Redis.
    */
   prefix?: string;
+  /**
+   * How often (ms) to PING the connection's pub/sub subscriber, so one a VPN/NAT/idle timeout dropped
+   * silently is reconnected (and resubscribed) instead of sitting deaf until a restart. `0` or `false`
+   * disables it. Default `30_000`.
+   */
+  pingIntervalMs?: number | false;
 }
 
 /** The read view of `@adonisjs/redis`'s service: `connection(name)` returns a pub/sub-capable client. */
@@ -73,6 +79,7 @@ export const controlPlanes = {
       return new RedisControlPlane({
         connection,
         ...(config.prefix !== undefined ? { prefix: config.prefix } : {}),
+        ...(config.pingIntervalMs !== undefined ? { pingIntervalMs: config.pingIntervalMs } : {}),
       });
     };
   },

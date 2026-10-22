@@ -315,6 +315,8 @@ export interface DbTransportConfig {
   maxStalledCount?: number;
   /** How often (ms) a worker refreshes its liveness key per served step name. Default 10000. */
   workerHeartbeatIntervalMs?: number;
+  /** How long a read of the worker keys (groupHealth, listWorkerGroups) is reused (ms). Default 5000. */
+  workerKeysCacheMs?: number;
   /** Create the transport tables on first use if missing (and add newer columns). Default true. */
   autoCreate?: boolean;
   /** Stable id for this process (stamped on heartbeats / control `from` / `claimed_by`). Default random. */
@@ -525,6 +527,9 @@ export const transports = {
           : {}),
         ...(config.workerHeartbeatIntervalMs !== undefined
           ? { workerHeartbeatIntervalMs: config.workerHeartbeatIntervalMs }
+          : {}),
+        ...(config.workerKeysCacheMs !== undefined
+          ? { workerKeysCacheMs: config.workerKeysCacheMs }
           : {}),
         ...(config.autoCreate !== undefined ? { autoCreate: config.autoCreate } : {}),
         ...inherited('instanceId', config.instanceId, ctx),

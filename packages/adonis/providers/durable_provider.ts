@@ -469,9 +469,28 @@ export default class DurableProvider {
     const role = config.role ?? 'standalone';
     if (role === 'tenant') return;
     const workflowRoots = discoveryRoots(config.workflowsPath, 'app/workflows');
-    if (workflowRoots.length === 0) return;
+    // Each convention is governed by its own option: `workflowsPath: false` skips workflow discovery
+    // only, `stepsPath` alone decides app/steps. A control plane always brings up its responder.
+    // With nothing to do at all, the engine stays unbuilt (lazily resolvable on demand).
+    const servesSteps =
+      role === 'standalone' && discoveryRoots(config.stepsPath, 'app/steps').length > 0;
+    if (workflowRoots.length === 0 && !servesSteps && role !== 'control-plane') return;
     const engine = await this.app.container.make(WorkflowEngine);
+    if (workflowRoots.length > 0) await this.#discoverWorkflows(engine, workflowRoots);
 
+    // Embedded worker: only `standalone` serves step bodies in-process (design §3). A `control-plane` is
+    // a pure coordinator — its step bodies run on separate tenant worker pods — so it does NOT serve
+    // app/steps.
+    if (servesSteps) await this.#registerSteps(config);
+
+    await this.#startResponder();
+  }
+
+  /** Register the `app/workflows` convention (barrel or scan), then bridge its event triggers. */
+  async #discoverWorkflows(
+    engine: WorkflowEngine,
+    workflowRoots: readonly string[],
+  ): Promise<void> {
     // Instantiate workflows through the container, so a workflow class gets constructor dependency
     // injection exactly like an `@adonisjs/queue` job. A class with no dependencies is unaffected —
     // the container simply calls `new Ctor()`.
@@ -498,13 +517,6 @@ export default class DurableProvider {
         ...(emitter !== undefined ? { emitter } : {}),
       });
     }
-
-    // Embedded worker: only `standalone` serves step bodies in-process (design §3). A `control-plane` is
-    // a pure coordinator — its step bodies run on separate tenant worker pods — so it does NOT serve
-    // app/steps.
-    if (role === 'standalone') await this.#registerSteps(config);
-
-    await this.#startResponder();
   }
 
   /**

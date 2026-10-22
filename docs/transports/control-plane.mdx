@@ -70,17 +70,17 @@ const controlPlane = new RedisControlPlane({ connection: new Redis(), prefix: 'd
 export default defineConfig({ controlPlane })
 ```
 
-`RedisControlPlane` accepts **either** a raw `ioredis` instance (it duplicates a dedicated subscriber connection) **or** an `@adonisjs/redis` connection (which manages its own subscriber); it detects which by feature. The two carry the same messages on the same channel and differ only in who owns the subscriber connection, which decides the subscriber health check below.
+`RedisControlPlane` accepts **either** a raw `ioredis` instance (it duplicates a dedicated subscriber connection) **or** an `@adonisjs/redis` connection (which manages its own subscriber); it detects which by feature. The two carry the same messages on the same channel and differ only in who owns the subscriber connection, which only changes which connection the health check below pings.
 
 | Constructor option | Default | Meaning |
 | --- | --- | --- |
 | `connection` | — (required) | A raw `ioredis` client or an `@adonisjs/redis` connection. |
 | `prefix` | `'durable'` | Channel is `` `${prefix}-control` ``. |
-| `pingIntervalMs` | `30_000` | Raw `ioredis` form only: how often the watchdog pings the subscriber connection. `0` or `false` disables it. |
+| `pingIntervalMs` | `30_000` | How often the watchdog pings the subscriber connection (both forms; `controlPlanes.redis({ pingIntervalMs })` too). `0` or `false` disables it. |
 
 ## Subscriber health
 
 A pub/sub subscriber connection never writes on its own, so when a VPN, NAT gateway or idle timeout drops it silently, it stays "subscribed" while Redis has already dropped the subscription, and cancellations and live-tail events stop arriving.
 
 - **Raw `ioredis` form.** The control plane `PING`s its dedicated subscriber every `pingIntervalMs`. A ping that fails, or takes longer than the smaller of 5 s and the interval, disconnects it so ioredis reconnects and resubscribes. The first subscriber error of each reconnect burst is logged with `console.warn`. This is the same watchdog the [`bullmq` transport](/docs/durable/transports/bullmq#subscriber-health-pingintervalms) runs.
-- **`controlPlanes.redis()` (the `@adonisjs/redis` form).** There is no watchdog and no `pingIntervalMs`: `@adonisjs/redis` owns the subscriber connection and its reconnects. If your network drops idle connections silently, build a `RedisControlPlane` on a raw `ioredis` client instead.
+- **`controlPlanes.redis()` (the `@adonisjs/redis` form).** The same watchdog pings the connection's own subscriber (`ioSubscriberConnection`) every `pingIntervalMs` and disconnects it on a failed or slow ping so it reconnects and resubscribes. The app-owned connection itself is never closed by the control plane.

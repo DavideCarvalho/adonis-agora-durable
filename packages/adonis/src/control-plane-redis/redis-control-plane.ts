@@ -196,6 +196,12 @@ export class RedisControlPlane implements ControlPlane {
         () => this.closed,
         'control-plane',
       );
+      // The connection keeps its ioredis subscriber on the public `ioSubscriberConnection` field
+      // (created by the subscribe above, replaced if it ends). Watch THAT one: it has the same
+      // silent-death failure mode as the duplicated subscriber on the ioredis path. Read on every
+      // tick, never held, and never disconnected by close(): the connection belongs to the app.
+      const adonis = this.connection as { ioSubscriberConnection?: IoredisSubscriber };
+      this.startPingWatchdog(() => adonis.ioSubscriberConnection);
     }
   }
 
@@ -215,17 +221,19 @@ export class RedisControlPlane implements ControlPlane {
     sub.on?.('ready', () => {
       loggedSinceReady = false;
     });
-    this.startPingWatchdog(sub);
+    this.startPingWatchdog(() => sub);
   }
 
   /**
    * Start the watchdog interval, unless it's disabled or already running (idempotent). Unref'd so
    * it never keeps the process alive on its own; cleared in {@link close}.
    */
-  private startPingWatchdog(sub: IoredisSubscriber): void {
+  private startPingWatchdog(current: () => IoredisSubscriber | undefined): void {
     if (this.pingWatchdogTimer || this.pingIntervalMs === false) return;
-    if (typeof sub.ping !== 'function') return; // not an ioredis-shaped connection — nothing to probe
     this.pingWatchdogTimer = setInterval(() => {
+      const sub = current();
+      // Not created yet, or not an ioredis-shaped connection: nothing to probe this tick.
+      if (!sub || typeof sub.ping !== 'function') return;
       void this.pingSubscriber(sub);
     }, this.pingIntervalMs);
     this.pingWatchdogTimer.unref?.();

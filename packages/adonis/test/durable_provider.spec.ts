@@ -384,6 +384,46 @@ describe('DurableProvider — app/workflows auto-discovery (boot)', () => {
     await expect(provider.boot()).resolves.toBeUndefined();
   });
 
+  it('workflowsPath: false still serves app/steps (stepsPath governs steps)', async () => {
+    await mkdir(join(dir, 'app/steps'), { recursive: true });
+    await writeFile(
+      join(dir, 'app/steps/charge_step.ts'),
+      `import { defineStep } from '${SRC}/step-ref.js'
+       export const charge = defineStep('charge', async (input) => 'charged:' + input)`,
+    );
+    const { app, resolve } = fakeApp({ workflowsPath: false }, dir);
+    const provider = new DurableProvider(app);
+    provider.register();
+    await provider.boot();
+
+    // Workflows registered by hand (no discovery) still reach the auto-registered step.
+    const engine = await resolve();
+    engine.register('order', '1', async (ctx, input) => ctx.step('charge', input));
+    await engine.start('order', 'x', 'o1');
+    expect((await engine.waitForRun('o1', { terminal: true, timeoutMs: 5000 })).output).toBe(
+      'charged:x',
+    );
+  });
+
+  it('workflowsPath and stepsPath both false leave the engine unbuilt at boot', async () => {
+    const { app } = fakeApp(
+      {
+        workflowsPath: false,
+        stepsPath: false,
+        stores: {
+          s: async () => {
+            throw new Error('the engine must not be built at boot');
+          },
+        },
+        store: 's',
+      },
+      dir,
+    );
+    const provider = new DurableProvider(app);
+    provider.register();
+    await expect(provider.boot()).resolves.toBeUndefined();
+  });
+
   const workflowFile = (cls: string, name: string, body: string) =>
     `import { BaseWorkflow } from '${SRC}/base-workflow.js'
      export default class ${cls} extends BaseWorkflow {
