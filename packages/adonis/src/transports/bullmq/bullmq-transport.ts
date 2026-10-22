@@ -18,6 +18,7 @@ import type {
 import { runStepHandler, type StepHandler } from '../../protocol.js';
 import { swallowSubscribe } from '../../safe-subscribe.js';
 import { isWorkflowTask, type WorkflowTurnHandler } from '../../workflow-turn.js';
+import { AdaptiveController, type ConcurrencyOption } from './adaptive-concurrency.js';
 import {
   type BullMQDeps,
   type QueueLike,
@@ -90,6 +91,15 @@ export interface BullMQTransportOptions {
    * from it. A non-finite or sub-1 value falls back to the default. Default 1.
    */
   resultConcurrency?: number | undefined;
+  /**
+   * How many tasks each per-routing-token task worker runs at once. A number pins it (a non-finite or
+   * sub-1 value falls back to 1). `'adaptive'` or `{ mode: 'adaptive', min, max, start, tickMs,
+   * ramCeilingPct, cpuCeilingPct }` lets an {@link AdaptiveController} move the limit at runtime from
+   * step latency, error rate and stalls, braking on RAM (and CPU, when a ceiling is set). The live
+   * limit, in-flight count and last adjustment ride the worker heartbeat in both modes. Unset leaves
+   * each task worker at the deps' default concurrency.
+   */
+  concurrency?: ConcurrencyOption | undefined;
 }
 
 /**
@@ -120,6 +130,10 @@ export class BullMQTransport implements Transport {
   #closing = false;
   readonly #closeTimeoutMs: number;
   readonly #resultConcurrency: number;
+  readonly #concurrency: ConcurrencyOption | undefined;
+  // Shared by every task worker: tracks in-flight work and the step-completion window, snapshots the
+  // heartbeat status and, in adaptive mode, sets every task worker's `concurrency` on each move.
+  #controller: AdaptiveController | undefined;
 
   readonly #handlers = new Map<string, StepHandler>();
   // Worker-side workflow turn consumers, keyed by workflow name — a `workflow`-shaped job routes here.
@@ -139,11 +153,6 @@ export class BullMQTransport implements Transport {
   #workerRedis: RedisLike | undefined;
   #workerHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
   readonly #heartbeatTokens = new Set<string>();
-  // Live execution telemetry carried on the heartbeat (the console's worker cards): jobs currently
-  // in a handler, and a bounded window of recent completions for throughput / p95.
-  #inFlightJobs = 0;
-  readonly #recentCompletions: Array<{ at: number; ms: number }> = [];
-  #lastCpu: { usage: NodeJS.CpuUsage; at: number } | undefined;
 
   // P4 store-less protocol: start-run / run-request queues + consumers, run-reply / tenant-events pub/sub.
   #startRunWorker: WorkerLike | undefined;
@@ -168,6 +177,20 @@ export class BullMQTransport implements Transport {
     this.#hasOnError = options.onError !== undefined;
     this.#closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
     this.#resultConcurrency = workerConcurrency(options.resultConcurrency);
+    this.#concurrency = options.concurrency;
+  }
+
+  /** The shared concurrency controller, created on first use (a task worker, a job or a heartbeat). */
+  #concurrencyController(): AdaptiveController {
+    if (!this.#controller) {
+      this.#controller = new AdaptiveController({
+        ...(this.#concurrency !== undefined ? { concurrency: this.#concurrency } : {}),
+        apply: (limit) => {
+          for (const worker of this.#taskWorkers.values()) worker.concurrency = limit;
+        },
+      });
+    }
+    return this.#controller;
   }
 
   /** Stable id stamped on this instance's worker-liveness keys. */
@@ -273,8 +296,13 @@ export class BullMQTransport implements Transport {
    *  {@link handle} (steps) and {@link handleWorkflow} (workflow turns) — both ride `${P}-tasks-<token>`. */
   #ensureTaskWorker(token: string): void {
     if (this.#taskWorkers.has(token)) return;
-    const worker = this.#deps.makeWorker(tasksName(this.#effectivePrefix(), token), (job) =>
-      this.#runJob(job.data),
+    const controller = this.#concurrencyController();
+    // A new worker starts at the controller's live limit, so a token registered after an adaptive
+    // move joins at the current limit rather than at `start`.
+    const worker = this.#deps.makeWorker(
+      tasksName(this.#effectivePrefix(), token),
+      (job) => this.#runJob(job.data),
+      this.#concurrency !== undefined ? { concurrency: controller.limit } : undefined,
     );
     // Terminal-failure bridge: a task job reaching a TERMINAL `failed` state is an INFRASTRUCTURE
     // failure (worker crash / stalled-count exhaustion), never a handler business error —
@@ -290,21 +318,30 @@ export class BullMQTransport implements Transport {
       void this.#bridgeTaskFailure(identity, job?.failedReason ?? error?.message ?? 'unknown');
     });
     this.#taskWorkers.set(token, worker);
+    controller.start();
     this.#startWorkerHeartbeat(token);
   }
 
   /** Route one task job by SHAPE (spec §6.3): a workflow turn runs the replay → decision path, a step
    *  runs the `runStepHandler` → result path. Both kinds share a token's queue but never each other's. */
   async #runJob(data: unknown): Promise<void> {
+    const controller = this.#concurrencyController();
     const startedAt = Date.now();
-    this.#inFlightJobs += 1;
+    controller.onStart();
+    // Only step durations feed the latency gradient; a workflow turn still counts as in-flight work
+    // and as forward progress for stall detection.
+    if (isWorkflowTask(data)) {
+      try {
+        return await this.#runWorkflowTask(data);
+      } finally {
+        controller.onSettle(Date.now() - startedAt, true, 'workflow');
+      }
+    }
+    let ok = false;
     try {
-      if (isWorkflowTask(data)) return await this.#runWorkflowTask(data);
-      return await this.#runTask(data as RemoteTask);
+      ok = await this.#runTask(data as RemoteTask);
     } finally {
-      this.#inFlightJobs -= 1;
-      this.#recentCompletions.push({ at: Date.now(), ms: Date.now() - startedAt });
-      if (this.#recentCompletions.length > 200) this.#recentCompletions.shift();
+      controller.onSettle(Date.now() - startedAt, ok, 'step');
     }
   }
 
@@ -353,7 +390,8 @@ export class BullMQTransport implements Transport {
     }
   }
 
-  async #runTask(task: RemoteTask): Promise<void> {
+  /** Run one step and publish its result. Resolves `true` when the step completed. */
+  async #runTask(task: RemoteTask): Promise<boolean> {
     let result: StepResult;
     try {
       result = await runStepHandler(task, this.#handlers.get(task.name), (beat) =>
@@ -380,6 +418,7 @@ export class BullMQTransport implements Transport {
         result,
         resultJobOptions(),
       );
+      return result.status === 'completed';
     } catch (err) {
       // The results-queue publish itself threw (e.g. Redis blipped). We still hold `task`, so
       // rethrow so the BullMQ job is marked `failed` and the terminal-failure bridge + durable retry
@@ -494,42 +533,12 @@ export class BullMQTransport implements Transport {
   // ---------------------------------------------------------------------------
 
   /**
-   * The live execution/resource snapshot each heartbeat carries — what lights up the console's
-   * worker cards (concurrency mode, in-flight, RSS/CPU, throughput, p95). Parity with the NestJS
-   * fleet's heartbeat payload; the AdonisJS heartbeat used to carry only the timestamp, leaving the
-   * cards permanently on "no status". Cheap by construction: process-level reads plus a bounded
-   * completions window.
+   * The live execution/resource snapshot each heartbeat carries, which lights up the console's worker
+   * cards (concurrency mode and live limit, in-flight, RSS/CPU, throughput, p95, last adjustment):
+   * the same {@link WorkerStatus} the NestJS fleet stamps.
    */
   #workerStatus(): WorkerStatus {
-    const now = Date.now();
-    const windowStart = now - 60_000;
-    const recent = this.#recentCompletions.filter((c) => c.at >= windowStart);
-    const durations = [...this.#recentCompletions].map((c) => c.ms).sort((a, b) => a - b);
-    const p95 = durations.length
-      ? durations[Math.min(durations.length - 1, Math.floor(durations.length * 0.95))]
-      : undefined;
-    const mem = process.memoryUsage();
-    // CPU% since the previous beat (user+system µs over wall-clock µs).
-    let cpuPct: number | undefined;
-    const cpuNow = process.cpuUsage();
-    if (this.#lastCpu) {
-      const elapsedUs = (now - this.#lastCpu.at) * 1000;
-      const usedUs =
-        cpuNow.user - this.#lastCpu.usage.user + (cpuNow.system - this.#lastCpu.usage.system);
-      if (elapsedUs > 0) cpuPct = Math.round((usedUs / elapsedUs) * 100);
-    }
-    this.#lastCpu = { usage: cpuNow, at: now };
-    return {
-      runtime: 'node',
-      // One BullMQ Worker per handled routing token, each at the adapter's default concurrency (1)
-      // — so this instance can run up to one job per token simultaneously.
-      concurrency: { mode: 'fixed', limit: Math.max(1, this.#taskWorkers.size) },
-      inFlight: this.#inFlightJobs,
-      rssBytes: mem.rss,
-      ...(cpuPct !== undefined ? { cpuPct } : {}),
-      throughputPerMin: recent.length,
-      ...(p95 !== undefined ? { p95Ms: p95 } : {}),
-    };
+    return this.#concurrencyController().snapshot();
   }
 
   /** Refresh EVERY handled routing token's TTL'd liveness key on ONE shared 10s interval until
@@ -808,6 +817,7 @@ export class BullMQTransport implements Transport {
   /** Close all workers/queues and disconnect pub/sub + heartbeat connections so the process can exit. */
   async close(): Promise<void> {
     this.#closing = true;
+    this.#controller?.stop();
     if (this.#workerHeartbeatTimer) clearInterval(this.#workerHeartbeatTimer);
     this.#workerHeartbeatTimer = undefined;
     // Workers first (concurrently with each other), THEN queues: a worker's close() waits for its

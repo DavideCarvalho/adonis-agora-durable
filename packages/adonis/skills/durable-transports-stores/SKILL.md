@@ -23,6 +23,7 @@ sources:
   - 'DavideCarvalho/adonis-durable:docs/transports/control-plane.mdx'
   - 'DavideCarvalho/adonis-durable:docs/stores/index.mdx'
   - 'DavideCarvalho/adonis-durable:docs/stores/lucid.mdx'
+  - 'DavideCarvalho/adonis-durable:docs/cluster/interop.mdx'
 ---
 
 # Transports & state stores
@@ -106,18 +107,30 @@ durable:work` workers serving the step names. Source:
 
 For wide fans (`ctx.all` over thousands of steps), raise how many results an
 instance settles at once on `bullmq` (`queue` and `db` have no such option),
-and size the engine's due-timer batch:
+let its workers size their step concurrency, and size the engine's due-timer
+batch:
 
 ```ts title="config/durable.ts"
 export default defineConfig({
-  timerBatchSize: 200, // due runs per timer pass, most overdue first (default 200)
+  timerBatchSize: 1000, // due runs per timer pass, most overdue first (default 500)
   transports: {
-    bullmq: transports.bullmq({ connection: { host: '127.0.0.1', port: 6379 }, resultConcurrency: 16 }), // default 1
+    bullmq: transports.bullmq({
+      connection: { host: '127.0.0.1', port: 6379 },
+      resultConcurrency: 16, // default 1
+      // A number pins each task queue's concurrency (default 1). 'adaptive' moves it
+      // every tickMs: +1 while steps saturate the limit at steady latency, down by the
+      // latency gradient when they queue, -1 on >20% errors / a stall / the CPU ceiling,
+      // -20% at ramCeilingPct of the cgroup (else host) memory limit.
+      concurrency: { mode: 'adaptive', min: 1, max: 32, start: 1, tickMs: 2000, ramCeilingPct: 85 },
+    }),
   },
 })
 ```
 
-Source: `docs/transports/index.mdx`.
+Only step durations feed the adaptive window (workflow turns count as in-flight
+work and progress); a non-finite or out-of-range field falls back to its default, and
+`cpuCeilingPct` is off unless set. In adaptive mode the decisions, step-events, start-run and run-request consumers run
+at 1 (results run at `resultConcurrency`). Sources: `docs/transports/index.mdx`, `docs/cluster/interop.mdx`.
 
 ### Pattern 3 — multi-replica fan-out: the control plane
 

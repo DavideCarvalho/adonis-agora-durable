@@ -26,6 +26,8 @@ export interface QueueLike {
 
 /** The subset of a BullMQ `Worker` this transport uses. */
 export interface WorkerLike {
+  /** The live concurrency. BullMQ's `Worker` applies an assignment to the jobs it fetches next. */
+  concurrency?: number | undefined;
   on(event: 'failed', listener: (job: JobLike | undefined, err: Error) => void): unknown;
   close(): Promise<unknown>;
 }

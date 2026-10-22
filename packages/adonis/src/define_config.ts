@@ -232,7 +232,7 @@ export interface BaseDurableConfig {
   /**
    * The most due timers one timer pass loads and resumes, most overdue first; a larger backlog
    * drains over the next ticks. Every worker runs the pass each tick, and each walks its batch in a
-   * shuffled order so instances don't contend for the same leases row by row. Default 200.
+   * shuffled order so instances don't contend for the same leases row by row. Default 500.
    */
   timerBatchSize?: number;
   /**

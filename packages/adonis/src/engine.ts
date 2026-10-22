@@ -324,7 +324,7 @@ const COMPENSATION_SEQ_BASE = -2;
 const STEP_FAN_CHUNK = 200;
 
 /** The default {@link WorkflowEngineDeps.timerBatchSize}. */
-const DEFAULT_TIMER_BATCH = 200;
+const DEFAULT_TIMER_BATCH = 500;
 
 /** Fisher–Yates, in place. */
 function shuffle<T>(items: T[]): T[] {
@@ -453,7 +453,7 @@ export interface WorkflowEngineDeps {
    * overdue first. Every driving instance runs that pass each tick, so a wave of thousands of due
    * runs (a recovery after an outage, a fan's children waking together) is worked through in
    * batches instead of every instance loading and walking all of it. A non-finite or sub-1 value
-   * falls back to the default. Default 200.
+   * falls back to the default. Default 500.
    */
   timerBatchSize?: number | undefined;
   /**
