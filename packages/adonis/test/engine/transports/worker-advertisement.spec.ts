@@ -82,11 +82,15 @@ function advertisementContract(
     it('drops a worker that dies without stopping once its keys expire', async () => {
       const t = await make();
       cleanup = t.cleanup;
-      // Long enough to read the keys back over a real database on a loaded machine.
-      await workerOn(t.worker, { ttlSeconds: 0.4 }).start();
+      // Long enough to read the keys back over a real database on a loaded machine (0.4s was not:
+      // the start's writes plus the read outlasted it). The heartbeat never fires within the test,
+      // so the keys lapse one TTL after the start wrote them.
+      const ttlSeconds = 2;
+      await workerOn(t.worker, { ttlSeconds }).start();
+      const writtenBy = Date.now(); // the keys were written by now, so they lapse by + TTL
       expect(await t.engine.listWorkerDescriptors('line@acme')).toHaveLength(1);
 
-      await sleep(600);
+      await sleep(Math.max(0, writtenBy + ttlSeconds * 1000 + 200 - Date.now()));
 
       // The runtime's advertisement expired. (A transport that beats its own liveness per consumed
       // queue — bullmq, queue, db — still lists the loop it keeps consuming: that process is alive.)

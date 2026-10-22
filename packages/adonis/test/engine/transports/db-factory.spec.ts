@@ -8,7 +8,9 @@ describe.each(dbBackends())('on $name', ({ makeTransportDb }) => {
   describe('transports.db — option passthrough', () => {
     const closers: Array<() => Promise<void>> = [];
     afterEach(async () => {
-      await Promise.all(closers.splice(0).map((c) => c()));
+      // In order — the transport first, then the database: closing both at once dropped the schema
+      // and the pool under a close() still settling its loops, which then hung the hook.
+      for (const close of closers.splice(0)) await close();
     });
 
     it('forwards concurrency and the worker-health options to the DbTransport', async () => {
@@ -27,7 +29,7 @@ describe.each(dbBackends())('on $name', ({ makeTransportDb }) => {
       })(ctx)) as DbTransport;
       closers.unshift(() => transport.close());
       transport.handle('ext.work', async () => 'x');
-      const until = Date.now() + 2_000;
+      const until = Date.now() + 20_000;
       let rows: Array<{ key: string; value: string }> = [];
       while (rows.length === 0 && Date.now() < until) {
         await new Promise((r) => setTimeout(r, 10));

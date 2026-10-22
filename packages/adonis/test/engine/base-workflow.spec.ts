@@ -8,7 +8,7 @@ import { getCurrentWorkflowCtx } from '../../src/workflow-als.js';
 import { registerWorkflowClass } from '../../src/workflow-discovery.js';
 import { workflowMeta, workflowName } from '../../src/workflow-ref.js';
 
-async function poll(fn: () => Promise<boolean>, timeoutMs = 1000): Promise<void> {
+async function poll(fn: () => Promise<boolean>, timeoutMs = 20_000): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     if (await fn()) return;

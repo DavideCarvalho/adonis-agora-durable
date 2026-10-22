@@ -13,6 +13,14 @@ import { dbBackends } from '../../support/backends.js';
 describe.each(dbBackends())('on $name', ({ makeStoreDb }) => {
   let db: Database;
   let store: LucidStateStore;
+  let engines: WorkflowEngine[] = [];
+
+  /** An engine drained before the database closes (see afterEach). */
+  const makeEngine = (deps: ConstructorParameters<typeof WorkflowEngine>[0]): WorkflowEngine => {
+    const engine = new WorkflowEngine(deps);
+    engines.push(engine);
+    return engine;
+  };
 
   beforeEach(async () => {
     db = await makeStoreDb();
@@ -20,12 +28,17 @@ describe.each(dbBackends())('on $name', ({ makeStoreDb }) => {
   });
 
   afterEach(async () => {
+    // Settle every engine's background work (a post-suspend re-check, a parent notify, a pickup)
+    // before the database closes: on Postgres closing drops the schema, and a write landing after it
+    // fails on a missing relation.
+    await Promise.all(engines.map((e) => e.drain()));
+    engines = [];
     await db?.manager.closeAll();
   });
 
   describe('WorkflowEngine over LucidStateStore', () => {
     it('runs a single-step workflow to completion', async () => {
-      const engine = new WorkflowEngine({ store });
+      const engine = makeEngine({ store });
       engine.register('greet', '1', async (ctx) => {
         const a = await ctx.localStep('a', async () => 21);
         return a * 2;
@@ -41,7 +54,7 @@ describe.each(dbBackends())('on $name', ({ makeStoreDb }) => {
     });
 
     it('runs a multi-step workflow, persisting each checkpoint', async () => {
-      const engine = new WorkflowEngine({ store });
+      const engine = makeEngine({ store });
       engine.register('pipe', '1', async (ctx) => {
         const a = await ctx.localStep('a', async () => 10);
         const b = await ctx.localStep('b', async () => a + 5);
@@ -58,7 +71,7 @@ describe.each(dbBackends())('on $name', ({ makeStoreDb }) => {
     });
 
     it('resumes after a failure WITHOUT re-running completed steps (durable replay)', async () => {
-      const engine = new WorkflowEngine({ store });
+      const engine = makeEngine({ store });
       let aRuns = 0;
       let failOnce = true;
       engine.register('wf', '1', async (c) => {
@@ -86,7 +99,7 @@ describe.each(dbBackends())('on $name', ({ makeStoreDb }) => {
 
     it('suspends on a durable sleep and resumes once the timer is due', async () => {
       let now = 1_000;
-      const engine = new WorkflowEngine({ store, clock: () => now });
+      const engine = makeEngine({ store, clock: () => now });
       const order: string[] = [];
       engine.register('wf', '1', async (ctx) => {
         await ctx.localStep('before', async () => {
@@ -125,7 +138,7 @@ describe.each(dbBackends())('on $name', ({ makeStoreDb }) => {
     });
 
     it('suspends on waitForSignal and resumes with the delivered payload', async () => {
-      const engine = new WorkflowEngine({ store });
+      const engine = makeEngine({ store });
       engine.register('approval', '1', async (ctx) => {
         const decision = await ctx.waitForSignal<{ approved: boolean }>('approve:run-5');
         return decision.approved ? 'shipped' : 'held';
@@ -147,7 +160,7 @@ describe.each(dbBackends())('on $name', ({ makeStoreDb }) => {
     });
 
     it('survives a fresh engine instance reading the same store (cross-process restart)', async () => {
-      const engineA = new WorkflowEngine({ store });
+      const engineA = makeEngine({ store });
       engineA.register('wf', '1', async (ctx) => {
         await ctx.waitForSignal('go:run-6');
         return 'finished';
@@ -163,7 +176,7 @@ describe.each(dbBackends())('on $name', ({ makeStoreDb }) => {
 
       // A brand-new engine (simulating a process restart) sees the suspended run in the store and
       // resumes it on signal — durability across instances.
-      const engineB = new WorkflowEngine({ store });
+      const engineB = makeEngine({ store });
       engineB.register('wf', '1', async (ctx) => {
         await ctx.waitForSignal('go:run-6');
         return 'finished';

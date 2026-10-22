@@ -44,6 +44,17 @@ export async function makeTransportDb(): Promise<Database> {
 export const POSTGRES_TEST_SCHEMA_PREFIX = 'durable_t_';
 
 /**
+ * The prefix of THIS test run's throwaway schemas: {@link POSTGRES_TEST_SCHEMA_PREFIX} plus the run id
+ * the suite's global setup puts in `DURABLE_PG_TEST_RUN` (inherited by every test worker). The global
+ * teardown drops only this run's schemas, so two runs sharing one server (a developer's parallel runs,
+ * two packages, a retried job on a shared runner) never drop each other's tables mid-test.
+ */
+export function postgresTestSchemaPrefix(): string {
+  const run = process.env.DURABLE_PG_TEST_RUN;
+  return run ? `${POSTGRES_TEST_SCHEMA_PREFIX}${run}_` : POSTGRES_TEST_SCHEMA_PREFIX;
+}
+
+/**
  * Connections per Postgres test pool. Small on purpose: test files run in parallel (and the
  * multi-process scenarios fork workers, each with its own pool), and a slow machine makes every pool
  * grow to its max, so a pool of 10 per database exhausted the server's `max_connections` in CI.
@@ -91,7 +102,7 @@ export async function makeIsolatedPostgresDb(
   url: string,
   opts: { keepSchema?: boolean } = {},
 ): Promise<Database & { schemaName: string }> {
-  const schema = `${POSTGRES_TEST_SCHEMA_PREFIX}${process.pid}_${Math.random().toString(36).slice(2, 10)}`;
+  const schema = `${postgresTestSchemaPrefix()}${process.pid}_${Math.random().toString(36).slice(2, 10)}`;
   const db = makePostgresDb(url, schema) as Database & { schemaName: string };
   db.schemaName = schema;
   await db.rawQuery(`create schema "${schema}"`);

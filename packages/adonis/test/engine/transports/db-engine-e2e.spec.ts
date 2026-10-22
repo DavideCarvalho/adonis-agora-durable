@@ -13,7 +13,7 @@ import { dbBackends } from '../../support/backends.js';
  * A durable dispatched `ctx.step` SUSPENDS the run; the worker result resumes it asynchronously over a polling
  * loop. So we poll the store until the run reaches a terminal state.
  */
-async function settle(store: InMemoryStateStore, runId: string, budgetMs = 4000) {
+async function settle(store: InMemoryStateStore, runId: string, budgetMs = 20_000) {
   const start = Date.now();
   while (Date.now() - start < budgetMs) {
     const run = await store.getRun(runId);
@@ -29,7 +29,8 @@ describe.each(dbBackends())('on $name', ({ makeTransportDb }) => {
   describe('DbTransport + WorkflowEngine (end to end)', () => {
     const cleanups: Array<() => Promise<void>> = [];
     afterEach(async () => {
-      await Promise.all(cleanups.splice(0).map((c) => c()));
+      // In order: the transports close before their database does (closing it drops the schema).
+      for (const cleanup of cleanups.splice(0)) await cleanup();
     });
 
     it('runs a workflow whose remote step executes on a DB worker', async () => {

@@ -1342,6 +1342,8 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         expect(resumed.output).toBe(15);
         // Step `a` checkpointed `completed` the first turn, so replay returns it instead of re-running.
         expect(aRuns).toBe(1);
+        // Settle the engine's background work before the store is cleaned up (closed or dropped).
+        await engine.drain();
       },
     );
   });

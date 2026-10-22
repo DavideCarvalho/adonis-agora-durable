@@ -3,6 +3,15 @@ import { Pollers } from '../../src/pollers.js';
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Wait for `cond` (counted, not timed: a loaded machine stretches every interval). */
+async function until(cond: () => boolean, budgetMs = 20_000): Promise<void> {
+  const start = Date.now();
+  while (!cond()) {
+    if (Date.now() - start > budgetMs) throw new Error('timed out waiting for condition');
+    await delay(1);
+  }
+}
+
 describe('Pollers', () => {
   it('drains greedily while a tick reports work, then sleeps', async () => {
     let calls = 0;
@@ -13,6 +22,7 @@ describe('Pollers', () => {
       calls += 1;
       return calls < 3; // true, true, false → 3 ticks total
     });
+    await until(() => calls >= 3);
     await delay(20);
     expect(calls).toBe(3);
     pollers.stopAll();
@@ -25,7 +35,8 @@ describe('Pollers', () => {
       calls += 1;
       return false;
     });
-    await delay(40);
+    // A loop that stopped after an empty round would never get here.
+    await until(() => calls > 2);
     pollers.stopAll();
     expect(calls).toBeGreaterThan(2);
   });
@@ -37,7 +48,7 @@ describe('Pollers', () => {
       calls += 1;
       return false;
     });
-    await delay(20);
+    await until(() => calls > 1);
     pollers.stopAll();
     const snapshot = calls;
     await delay(30);
@@ -53,7 +64,7 @@ describe('Pollers', () => {
       if (calls === 1) throw new Error('boom');
       return false;
     });
-    await delay(30);
+    await until(() => calls > 1);
     pollers.stopAll();
     expect(errors).toHaveLength(1);
     expect((errors[0] as Error).message).toBe('boom');
@@ -71,7 +82,7 @@ describe('Pollers', () => {
       calls += 1;
       return false;
     });
-    await delay(20);
+    await until(() => calls > 0);
     pollers.stopAll();
     expect(calls).toBeGreaterThan(0);
   });

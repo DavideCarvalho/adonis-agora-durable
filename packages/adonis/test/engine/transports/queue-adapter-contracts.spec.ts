@@ -72,7 +72,7 @@ const POLL = 5;
 const TASKS_QUEUE = `durable:tasks:${sanitizeQueueToken('ext.echo')}`;
 const RESULTS_QUEUE = 'durable:results';
 
-async function until(cond: () => boolean, budgetMs = 2000): Promise<void> {
+async function until(cond: () => boolean, budgetMs = 20_000): Promise<void> {
   const start = Date.now();
   while (!cond()) {
     if (Date.now() - start > budgetMs) throw new Error('timed out waiting for condition');
