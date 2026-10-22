@@ -189,6 +189,21 @@ export interface CtxHost {
   upsertSearchAttributes(runId: string, attrs: SearchAttributes): Promise<void>;
   /** Deliver an op to a durable entity (deferred), optionally with a `reply` token for the result. */
   signalEntity?(name: string, key: string, op: string, arg: unknown, reply?: string): void;
+  /**
+   * Durably buffer an entity op sent from a workflow, tagged with the caller's stable `id` so the
+   * entity skips a re-sent copy. Resolves once stored (the caller checkpoints after it); `false` when
+   * the host can't (the ctx then falls back to {@link signalEntity}).
+   */
+  enqueueEntityOp?(
+    name: string,
+    key: string,
+    op: string,
+    arg: unknown,
+    id: string,
+    reply?: string,
+  ): Promise<boolean>;
+  /** Start / wake the entity so it reads what {@link enqueueEntityOp} buffered (deferred, tracked). */
+  kickEntity?(name: string, key: string): void;
   /** Run a local step body through the registered step interceptors (identity if none). */
   interceptStep?<T>(invocation: StepInvocation, body: () => Promise<T>): Promise<T>;
 }
@@ -1051,9 +1066,27 @@ export function createWorkflowCtx(
     return id;
   };
 
-  // Call a durable entity op and await its result: register a reply waiter at this position, dispatch
-  // the op with the reply token, and suspend until the entity signals the result back (checkpointed,
-  // so replay returns it without re-dispatching).
+  // Durably send an entity op from this run: buffer it (awaited, tagged with this call's stable
+  // `<runId>:<seq>` so the entity skips a copy re-sent by a replay), and only then let the caller
+  // checkpoint. Returns false on a host without the durable path (legacy deferred dispatch).
+  const sendEntityOp = async (
+    name: string,
+    key: string,
+    op: string,
+    arg: unknown,
+    seq: number,
+    reply?: string,
+  ): Promise<boolean> =>
+    (await host.enqueueEntityOp?.(name, key, op, arg, `${runId}:${seq}`, reply)) ?? false;
+
+  // Call a durable entity op and await its result. Exactly once across replay, in three writes:
+  //   1. a `pending` intent checkpoint at this position (`sent: false`) — nothing can reply yet;
+  //   2. the op, durably buffered on the entity's token, tagged with this call's `<runId>:<seq>`;
+  //   3. the intent flipped to `sent: true` — conditionally (`saveCheckpointIfPending`), so a reply
+  //      that already resolved this position is never overwritten.
+  // A replay that finds `sent: true` never re-sends (it only re-wakes the entity, a no-op when it is
+  // busy). One that finds `sent: false` (the turn died between 1 and 3, or the store can't do the
+  // conditional write) re-sends the same id, which the entity skips if the first copy got through.
   const callEntity = async <R>(
     name: string,
     key: string,
@@ -1061,15 +1094,66 @@ export function createWorkflowCtx(
     arg?: unknown,
   ): Promise<R> => {
     const current = pos.next();
-    const existing = await readCheckpoint(current);
+    let existing = await readCheckpoint(current);
     if (existing && existing.status === 'completed') return existing.output as R;
     const reply = `entityreply:${runId}:${current}`;
+    const intentName = `signal:${reply}`;
+    if (existing && existing.name !== intentName) {
+      throw new NonDeterminismError(runId, current, intentName, existing.name);
+    }
+    // The snapshot predates anything that landed during this execution: re-read a pending intent so
+    // a reply that already resolved it is returned, not waited for.
+    if (existing && replay?.has(current)) {
+      existing = (await store.getCheckpoint(runId, current)) ?? existing;
+      if (existing.status === 'completed') return existing.output as R;
+    }
+    const markSent = (): Promise<boolean> =>
+      store.saveCheckpointIfPending?.(
+        instantCheckpoint({
+          runId,
+          seq: current,
+          name: intentName,
+          kind: 'signal',
+          status: 'pending',
+          output: { sent: true },
+        }),
+      ) ?? Promise.resolve(false);
+    if (existing) {
+      const buffered = await consumeBuffered<R>(reply, current);
+      if (buffered) {
+        await store.removeSignalWaiter({ token: reply, runId, seq: current });
+        return buffered.value;
+      }
+      if ((existing.output as { sent?: boolean } | undefined)?.sent !== true) {
+        if (await sendEntityOp(name, key, op, arg, current, reply)) await markSent();
+      }
+      host.kickEntity?.(name, key);
+      throw new WorkflowSuspended(undefined, [current]);
+    }
     await store.putSignalWaiter({ token: reply, runId, seq: current });
-    host.signalEntity?.(name, key, op, arg, reply);
+    if (!host.enqueueEntityOp) {
+      // A host without the durable path: the legacy deferred dispatch (at-least-once on replay).
+      host.signalEntity?.(name, key, op, arg, reply);
+      throw new WorkflowSuspended(undefined, [current]);
+    }
+    await writeCheckpoint(
+      instantCheckpoint({
+        runId,
+        seq: current,
+        name: intentName,
+        kind: 'signal',
+        status: 'pending',
+        output: { sent: false },
+      }),
+    );
+    if (await sendEntityOp(name, key, op, arg, current, reply)) await markSent();
+    host.kickEntity?.(name, key);
     throw new WorkflowSuspended(undefined, [current]);
   };
 
-  // Send a durable entity op without awaiting a result — dispatched once (checkpointed, replay-safe).
+  // Send a durable entity op without awaiting a result. Exactly once across replay: buffered durably
+  // first, then checkpointed; a replay before the checkpoint re-sends the same id, which the entity
+  // skips.
   const signalEntity = async (
     name: string,
     key: string,
@@ -1079,10 +1163,12 @@ export function createWorkflowCtx(
     const current = pos.next();
     const existing = await readCheckpoint(current);
     if (existing && existing.status === 'completed') return;
-    host.signalEntity?.(name, key, op, arg);
+    const durable = await sendEntityOp(name, key, op, arg, current);
+    if (!durable) host.signalEntity?.(name, key, op, arg);
     await writeCheckpoint(
       instantCheckpoint({ runId, seq: current, name: `entitysig:${name}:${key}`, kind: 'local' }),
     );
+    if (durable) host.kickEntity?.(name, key);
   };
 
   // A breakpoint = a visible `pending` checkpoint + a signal waiter the dashboard resumes via
@@ -1169,16 +1255,26 @@ export function createWorkflowCtx(
       const deadlineSeq = timeoutMs == null ? -1 : pos.next();
       const existing = await readCheckpoint(current);
       if (existing && existing.status === 'completed') return existing.output as T;
-      if (timeoutMs == null) {
-        await store.putSignalWaiter({ token, runId, seq: current });
-        throw new WorkflowSuspended(undefined, [current]);
-      }
-      const deadline = await stampDeadline(deadlineSeq, token, timeoutMs);
-      if (host.clock() >= deadline) {
-        await store.takeSignalWaiter(token).catch(() => undefined);
-        throw new SignalTimeoutError(token, timeoutMs);
+      // A callback can land BEFORE this wait: the url was handed out, then the run kept going (a
+      // step, a sleep) and the provider called back while nothing was waiting yet, so engine.signal
+      // buffered it. Consume that buffer first, then register and re-check — the same
+      // check → register → re-check sandwich as waitForSignal, pairing with engine.signal's
+      // take → buffer → re-take so a delivery in either window is never lost.
+      const buffered = await consumeBuffered<T>(token, current);
+      if (buffered) return buffered.value;
+      const deadline =
+        timeoutMs == null ? undefined : await stampDeadline(deadlineSeq, token, timeoutMs);
+      if (deadline !== undefined && host.clock() >= deadline) {
+        // Exact removal of our own row (if a prior replay registered it), never another run's.
+        await store.removeSignalWaiter({ token, runId, seq: current }).catch(() => undefined);
+        throw new SignalTimeoutError(token, timeoutMs as number);
       }
       await store.putSignalWaiter({ token, runId, seq: current });
+      const lateBuffered = await consumeBuffered<T>(token, current);
+      if (lateBuffered) {
+        await store.removeSignalWaiter({ token, runId, seq: current });
+        return lateBuffered.value;
+      }
       throw new WorkflowSuspended(deadline, [current]);
     };
     return { token, url: host.webhookUrl?.(token), wait };

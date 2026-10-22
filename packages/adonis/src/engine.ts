@@ -1086,7 +1086,11 @@ export class WorkflowEngine {
       }
     });
     this.accumulators = new EventAccumulators(this);
-    this.entities = new Entities(this);
+    this.entities = new Entities(this, {
+      bufferSignal: (token, payload) => this.store.bufferSignal(token, payload),
+      wakeWaiter: (token, payload) => this.wakeSignalWaiter(token, payload),
+      ensureStarted: (workflow, input, runId) => this.start(workflow, input, runId),
+    });
   }
 
   /**
@@ -3416,6 +3420,17 @@ export class WorkflowEngine {
       return null;
     }
     return this.deliverSignal(lateWaiter, reclaimed.payload);
+  }
+
+  /**
+   * Wake the run parked on `token` with `payload`, if there is one; otherwise do nothing — unlike
+   * {@link signal}, it never buffers. For a wake-up whose real payload is ALREADY buffered on the
+   * token (an entity op, see `Entities.kick`): a run that isn't parked reads that buffer at its next
+   * wait, so there is nothing to keep.
+   */
+  private async wakeSignalWaiter(token: string, payload: unknown): Promise<RunResult | null> {
+    const waiter = await this.store.takeSignalWaiter(token);
+    return waiter ? this.deliverSignal(waiter, payload) : null;
   }
 
   /**
@@ -5884,6 +5899,24 @@ export class WorkflowEngine {
       signalEntity: (name, key, op, arg, reply) => {
         this.trackEffect(
           Promise.resolve().then(() => this.entities.dispatch(name, key, op, arg, reply)),
+        );
+      },
+      // The durable half of a workflow-side entity send: awaited inside the turn (a store write
+      // only, never an inline entity turn), so the ctx can checkpoint after it. See Entities.enqueue.
+      enqueueEntityOp: (name, key, op, arg, id, reply) =>
+        this.entities.enqueue(name, key, op, arg, id, reply),
+      // Start/wake the entity for what enqueueEntityOp buffered — deferred and tracked like
+      // signalEntity above, so it never re-enters a still-executing turn and drain() waits for it.
+      kickEntity: (name, key) => {
+        this.trackEffect(
+          Promise.resolve().then(() =>
+            this.entities.kick(name, key).catch((err) => {
+              console.warn(
+                `[durable] waking entity "${name}" key "${key}" failed (its op stays buffered for the next wake):`,
+                err,
+              );
+            }),
+          ),
         );
       },
       interceptStep: (invocation, body) => this.interceptStep(invocation, body),
