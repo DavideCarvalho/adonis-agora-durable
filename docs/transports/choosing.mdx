@@ -1,0 +1,123 @@
+---
+title: Choosing a transport
+description: A capability matrix of every transport driver (bullmq, queue, db, eventEmitter, memory) checked against the source, the known limitations of each, and which one to pick.
+icon: Scale
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+Every transport carries the same `RemoteTask` / `StepResult` JSON, and the engine's durable machinery (checkpoints, replay, retry backoff, timers, flow-control admission, dead-lettering) runs on top of any of them. The transports differ in everything **around** that contract: how fast a task is picked up, how many run at once, how a crashed worker is detected, and which optional `Transport` capabilities they implement. The engine turns some cluster features on only when the transport implements them.
+
+This page compares the five drivers side by side. Every cell reflects what the transport's source does today.
+
+## Capability matrix
+
+✅ supported · ⚠️ partial or conditional (see the numbered note) · ❌ not supported · n/a does not apply
+
+`queue` is [`transports.queue()`](/docs/durable/transports/queue) over `@adonisjs/queue`, on its Redis adapter or a database (Knex) adapter. The two adapters implement the same contract the transport uses, so a cell differs between them only where it says so. `memory` is the in-process test driver (see [Testing](/docs/durable/testing)); it's listed for completeness, not for production.
+
+### Delivery
+
+| | `bullmq` | `queue` | `db` (Lucid) | `eventEmitter` | `memory` (tests) |
+| --- | --- | --- | --- | --- | --- |
+| How a task reaches the worker | Push: a BullMQ `Worker` per step name, blocking on Redis | Polling: one `popFrom` loop per step name, every `pollIntervalMs` (default 200 ms) | Polling: one claim query for every served step name, every `pollIntervalMs` (default 200 ms) | In-process `emit` | Handler runs inside `dispatch` |
+| Idle backoff | n/a, the worker blocks instead of polling | ✅ task, heartbeat, control and step-event loops double their sleep up to `idleBackoffMax × pollIntervalMs` (800 ms); results and decisions loops never back off | ✅ same rule and defaults as `queue` | n/a | n/a |
+| Pickup latency on an idle system | Milliseconds | Up to 800 ms for the task after a quiet spell, then up to 200 ms for the result | Up to 800 ms for the task after a quiet spell, then up to 200 ms for the result | Same tick | Inline |
+| Cost while idle | Held Redis connections (a blocking one per BullMQ worker), a liveness key write per served step name every 10 s | One adapter read per loop per backed-off interval, plus the 200 ms results loop and a reclaim sweep every 30 s. On the Knex adapter all of it is a query against your database¹ | One claim query per loop per backed-off interval against your database, plus the 200 ms results loop and a liveness upsert per served step name every 10 s¹ | None | None |
+
+### Throughput
+
+| | `bullmq` | `queue` | `db` (Lucid) | `eventEmitter` | `memory` (tests) |
+| --- | --- | --- | --- | --- | --- |
+| Steps run concurrently per process | ✅ `concurrency` per step-name queue (default 1) | ✅ `concurrency` per step-name loop (default 1) | ✅ `concurrency` across every served step name (default 1) | ⚠️ unbounded² | ⚠️ inline in `dispatch` |
+| Adaptive concurrency (`concurrency: 'adaptive'`) | ✅ | ✅ | ✅ | ❌ | ❌ |
+| Results settled concurrently (engine side) | ✅ `resultConcurrency` (default 1) | ✅ `resultConcurrency` (default 1) | ✅ `resultConcurrency` (default 1), claimed `batchSize` (20) at a time | ⚠️ unbounded² | ⚠️ unbounded |
+| Broker-level step priority | ✅ mapped onto BullMQ job priority, full range | ⚠️ mapped onto the adapter's 1–10 scale³ | ✅ `priority` column, 32-bit range, claimed highest first | ❌ | ❌ |
+
+### Reliability
+
+| | `bullmq` | `queue` | `db` (Lucid) | `eventEmitter` | `memory` (tests) |
+| --- | --- | --- | --- | --- | --- |
+| Delivery guarantee | At-least-once | At-least-once | At-least-once | At-most-once (lost with the process) | At-most-once |
+| Detects a crashed worker via | BullMQ job lock + a peer worker's stalled check⁴ | Claim renewal + the reclaim sweep⁴ | Lease expiry on the next claim poll⁴ | ❌ | ❌ |
+| Default time to re-deliver a crashed worker's step | About 30–60 s (30 s lock, stalled check every 30 s) | About 2–2.5 min (`stalledThresholdMs` 120 s, plus up to one 30 s sweep) | About 30 s (`leaseMs`), plus one poll | ❌ | ❌ |
+| Claim or lock renewed while a long step runs | ✅ BullMQ extends the job lock | ✅ `renewJobs` every half `stalledThresholdMs`, on 0.6 and 0.7⁵ | ✅ every held claim, every `leaseMs / 3`⁵ | n/a | n/a |
+| Poison bound (worker keeps dying ➜ failed `StepResult` ➜ durable retry) | ✅ the `failed` bridge, once a job stalls past BullMQ's `maxStalledCount` (default 1, so on the second stall) | ⚠️ `maxStalledCount` (3), `@adonisjs/queue` 0.7 only⁶ | ✅ `maxStalledCount` (3) | ❌ | ❌ |
+| Result redelivered when the engine's handler throws | ✅ 5 attempts, exponential backoff from 500 ms, then kept 24 h and reported | ✅ redelivered one poll interval later, with no cap | ⚠️ redelivered after `leaseMs`, with no cap | ❌⁷ | ❌ |
+| Step heartbeats (`timeoutMs` liveness) across engine instances | ✅ `<P>-heartbeat` pub/sub reaches every instance | ⚠️ one instance takes each beat; the others read the persisted beat⁸ | ⚠️ one instance takes each beat; the others read the persisted beat⁸ | ✅ in-process | ❌ no beats |
+| Clean shutdown hands unfinished work back | ❌ left to BullMQ's stalled check after `closeTimeoutMs` | ✅ unfinished jobs re-queued at once after the 5 s drain | ✅ claims cleared at once after `closeTimeoutMs`, uncounted | n/a | n/a |
+
+### Cluster features
+
+| | `bullmq` | `queue` | `db` (Lucid) | `eventEmitter` | `memory` (tests) |
+| --- | --- | --- | --- | --- | --- |
+| Steps in another process | ✅ | ✅ | ✅ | ❌ | ❌ |
+| Python and NestJS workers on the same wire | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Remote workflows (`dispatchWorkflowTask` / `onDecision` / `onStepEvent`) | ✅ including Python `@workflow` | ✅ TypeScript worker runtime | ✅ TypeScript worker runtime | ❌ | ❌ |
+| A turn's decision returns to the engine that dispatched it | ❌ any engine may take it⁹ | ❌ any engine may take it⁹ | ✅ addressed to the dispatching instance | n/a | n/a |
+| Store-less tenant pods (`dispatchStartRun`, `RunRequest` / `RunReply`, `TenantEvent`) | ✅ over Redis pub/sub | ✅ per-instance inbox queues¹⁰ | ✅ rows addressed per instance; the pod needs the database | ❌ | ❌ |
+| Worker health in the dashboard (`groupHealth`) | ✅ depth = waiting + active + delayed + prioritized | ⚠️ depth = pending only; needs a worker-key store¹¹ | ✅ depth = pending + claimed rows | ❌ | ❌ |
+| Worker descriptors (handshake routing guard, workflow directory) | ✅ TTL'd Redis keys | ⚠️ needs a worker-key store¹¹ | ✅ `durable_transport_worker_keys` | ⚠️ in-process only | ❌ |
+| `consumers` deferral (`'auto'` console/REPL, `'never'`) | ✅ no BullMQ worker is built; pub/sub still subscribes | ✅ loops parked; its own reply and event inboxes still run | ✅ loops parked; rows addressed to this instance still consumed | n/a | n/a |
+
+### Operations
+
+| | `bullmq` | `queue` | `db` (Lucid) | `eventEmitter` | `memory` (tests) |
+| --- | --- | --- | --- | --- | --- |
+| Infrastructure to run | Redis, plus the `bullmq` and `ioredis` packages | `@adonisjs/queue` and its backend (Redis, or a database through Knex), plus the app database's worker-key table for health and advertisement | The database you already run, through `@adonisjs/lucid` (transport tables auto-created or migrated) | None | None |
+| Several engine instances | ✅ | ✅ | ✅ | ⚠️ only when every step is `ctx.localStep`¹² | ❌ |
+| Built-in control plane (cross-pod live-tail and `cancel` fan-out) | ❌ pair with `controlPlanes.redis`¹³ | ❌ pair with `controlPlanes.redis`¹³ | ❌ pair with `controlPlanes.redis`¹³ | ⚠️ local to the process | ⚠️ local to the process |
+| Bounded shutdown | ✅ `closeTimeoutMs` (default 5 s) | ✅ fixed 5 s drain | ✅ `closeTimeoutMs` (default 5 s) | Nothing to close | Nothing to close |
+
+**Notes**
+
+1. Polling is the cost of a backend-agnostic transport. A `queue` worker runs one task loop per step name it serves, so a worker serving 30 names runs 30 loops; `db` runs one task loop for all of them. Every engine also polls the results table or queue every 200 ms, and the step-event and protocol loops it starts. On the Knex adapter, or on `db`, that load lands on your database.
+2. Every `emit` starts its handler at once, so there is no limit. A burst of steps runs all at once in the same process.
+3. `@adonisjs/queue` runs the lowest number first on a 1–10 scale (default 5). The transport sends `5 − priority`, clamped, so an unprioritised step sits at 5, but every priority of 4 or more lands on 1 and every priority of −5 or less lands on 10. Only priorities from −4 to 4 stay distinct.
+4. Recovery needs a **live consumer of that step name**. BullMQ's stalled check runs on a worker of the same queue, the `queue` reclaim sweep walks only the queues its instance pops from, and a `db` worker claims only rows for the step names it serves. A restarted worker counts. If the only worker for a step dies and never comes back, nothing settles the step; the engine's opt-in `remoteRedispatchMs` covers that case on every transport (see [Lost remote dispatch](/docs/durable/reliability/failure-modes#lost-remote-dispatch-the-run-suspends-and-nothing-auto-redrives-it)).
+5. Renewal runs on a timer, so a step that blocks the event loop longer than the threshold (`stalledThresholdMs` on `queue`, `leaseMs` on `db`) looks dead and is re-delivered while it still runs. Both transports report the lost claim to `onError`. Keep heavy work async, or raise the threshold. An adapter without `renewJobs` (only a custom one) gets no renewal on `queue`, and the threshold defaults to 30 minutes there.
+6. On `@adonisjs/queue` 0.7 the adapter hands a job that stalled too often back to the transport, which fails it and publishes a retryable failed result. On 0.6 the adapter deletes such a job inside its own sweep and returns only a count, so no result is published and the step waits. Set the step's `timeoutMs` or the engine's `remoteRedispatchMs` there. See [Poison jobs](/docs/durable/transports/queue#poison-jobs).
+7. The emitter calls the engine's result handler without awaiting or catching it, so a throw there (a store timeout, say) is not retried.
+8. On `bullmq` every engine instance hears every beat. On `queue` and `db` a beat is a job or a row that one instance takes. Before a `timeoutMs` step's window expires, the dispatching instance reads the last beat persisted on the checkpoint, and keeps waiting if another instance recorded a recent one. That needs a store that persists beats (`recordStepHeartbeat`, which the Lucid store implements) and allows up to `heartbeatPersistThrottleMs` (10 s) of extra silence once beats land elsewhere.
+9. `<P>-decisions` (`bullmq`) and `<prefix>:decisions` (`queue`) are point-to-point queues that every engine consumes. With several engine replicas, a decision taken by a replica that didn't dispatch the turn finds no waiter and is dropped, and the turn waits for the executor's `timeoutMs` or for run recovery to re-drive it. With one engine-side instance this never happens.
+10. Live-tail events need a worker-key store on the control plane. Replies and events are polled, and a new subscription can miss the first second or so of events. See [Tenant pods over the queue transport](/docs/durable/transports/queue#tenant-pods-over-the-queue-transport).
+11. The worker advertisement and liveness keys live in a key store beside the queues, by default the app database's `durable_transport_worker_keys` table. With `workerKeys: false`, or no database, the transport doesn't implement `groupHealth` and the panels stay empty; a `tenant` pod without one forwards its advertisement to the control plane. `depth` counts only pending jobs because the `@adonisjs/queue` adapter contract has no count for jobs in flight or delayed retries. See [Worker health](/docs/durable/transports/queue#worker-health).
+12. Replicas sharing `eventEmitter` and one Lucid store never run the same run, because leases, checkpoints, signals and cancellation all go through the store. A `ctx.step` is still handled only by the process that dispatched it. See [Pick a topology](/docs/durable/production#2-pick-a-topology).
+13. `bullmq` doesn't implement `ControlPlane` at all. `queue` and `db` implement `publishControl` / `onControl`, but over a single-consumer queue (`<prefix>:control`) or table (`durable_transport_control`), so each message reaches one instance, not every one. Use [`controlPlanes.redis`](/docs/durable/transports/control-plane) for cross-pod fan-out with any of them.
+
+**The same on every transport, because the engine owns it:** checkpoints and replay, retry backoff (a durable `wakeAt` on the failed checkpoint), run leases and run recovery, timers, flow-control admission priority and fairness, dead-lettering, `remoteRedispatchMs`, namespaces, and failover across a [transport pool](/docs/durable/transports#pinning-a-transport-per-step-failover-pools). They behave the same whichever transport carries the step.
+
+## Limitations per transport
+
+**`bullmq`.** It needs Redis and two extra packages. Crash recovery depends on a live worker of the same queue, and a clean shutdown doesn't hand unfinished jobs back: after `closeTimeoutMs` they wait for BullMQ's stalled check. The failure bridge exists only in consumers that implement it (this transport, the NestJS one and the Python `durable-worker`). With several engine replicas, a remote workflow's decision can land on the wrong replica (note 9). There is no control plane in the transport, so add `controlPlanes.redis`.
+
+**`queue`.** It's polling-based, so a first task after a quiet spell can wait up to `idleBackoffMax × pollIntervalMs`, and every served step name costs one poll loop. Crash detection is the slowest of the three (about 2 minutes by default). The poison bound needs `@adonisjs/queue` 0.7. Priority is squeezed onto a 1–10 scale. Health depth counts pending jobs only, and health and descriptors need a worker-key store. Heartbeats and decisions are single-consumer (notes 8 and 9), there's no control plane, and there's no cross-language wire.
+
+**`db` (Lucid).** It's polling-based, and every loop, renewal and liveness write is a query against the database your store also uses, so throughput is bounded by polling and row contention. A result whose engine-side handling throws waits out `leaseMs` before it's redelivered. Heartbeats are single-consumer (note 8). There's no control plane, and no cross-language wire: Python and NestJS workers speak `bullmq` only.
+
+**`eventEmitter`.** Single process for steps. There's no persistence of in-flight steps (a crash loses them; the run itself resumes from its checkpoints), no concurrency limit and no worker health. A dispatched step with no registered handler is ignored silently, because another subscriber might own it, so the run waits on it.
+
+**`memory`.** For tests. It runs the handler inside `dispatch`, needs `onResult` registered first, and carries no heartbeats.
+
+## Which one to pick
+
+<Callout type="info" title="Recommended for production: bullmq">
+`transports.bullmq()` is the most complete transport:
+
+- **Push delivery.** A BullMQ worker blocks on Redis instead of polling, so pickup is milliseconds and an idle fleet costs a few held connections, not a stream of queries.
+- **The only cross-language wire.** It is byte-compatible with the NestJS BullMQ transport and the Python `durable-worker`, so Python steps, Python `@workflow` bodies and NestJS workers share one Redis with your Adonis engine. See [Python interop](/docs/durable/python) and [interop](/docs/durable/cluster/interop).
+- **Native lock renewal and stall handling.** BullMQ extends the job lock while a step runs, and a peer's stalled check re-queues a crashed worker's job. A job that keeps stalling past BullMQ's limit is failed, and the transport bridges that into a retryable `StepResult`. A result whose engine-side handling throws is retried 5 times with backoff. Recovery takes about 30–60 seconds.
+- **The broadest dashboard depth.** Worker health counts waiting, active, delayed and prioritized jobs, and step heartbeats reach every engine instance over pub/sub.
+
+Pair it with `controlPlanes.redis` for cross-pod live-tail and cancellation. If you can run Redis, use `bullmq`.
+</Callout>
+
+**`queue`** makes sense when the app already runs `@adonisjs/queue` and you want durable steps on the same backend and the same `config/queue.ts`, or when you want a database-backed queue through its Knex adapter with Adonis-style configuration. Run `@adonisjs/queue` 0.7 for the poison bound, keep the default worker-key table for health and descriptors, and add `controlPlanes.redis` when you run more than one engine instance.
+
+**`db`** makes sense when you have no Redis at all and want the database you already run to be the queue. It fits a modest dispatch rate (workflow and pipeline scale rather than a high-fanout firehose) and idempotent steps. It is also the only transport that addresses a remote workflow's decision to the engine that dispatched it.
+
+**`eventEmitter`** is for a single process: a monolith, local development or a first deploy. It needs no infrastructure. Several replicas can share it with a Lucid store when every step is a `ctx.localStep` (see [Pick a topology](/docs/durable/production#2-pick-a-topology)). Moving to a broker later is a config change, not a workflow-code change.
+
+**`memory`** is for tests only.
+
+You don't have to pick only one. The engine accepts an ordered [pool of transports](/docs/durable/transports#pinning-a-transport-per-step-failover-pools) with failover and per-step pinning.

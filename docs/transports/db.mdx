@@ -6,7 +6,7 @@ icon: Database
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
-The `db` driver needs **no broker**. A dispatched step is a **row** in the same database your durable store already uses: `ctx.step` inserts a task row, a worker claims it with an atomic lease, runs the handler, writes a result row, and the engine polls that row to resume the run. The database you already operate *is* the queue.
+The `db` driver needs **no broker**. A dispatched step is a **row** in the same database your durable store already uses: `ctx.step` inserts a task row, a worker claims it with an atomic lease, runs the handler, writes a result row, and the engine polls that row to resume the run. The database you already operate *is* the queue. To weigh it against the other drivers, see [the comparison](/docs/durable/transports/choosing).
 
 It ships **inside `@adonis-agora/durable`** — `@adonisjs/lucid` is an optional peer, imported lazily only when you select the `db` transport. The transport tables come from a migration published when you configure the package:
 

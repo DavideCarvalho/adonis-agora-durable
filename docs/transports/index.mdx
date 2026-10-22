@@ -6,6 +6,10 @@ icon: Truck
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
+<Callout type="info" title="Comparing the drivers">
+For a capability-by-capability matrix of every driver, its limitations and which one to pick, see [Choosing a transport](/docs/durable/transports/choosing).
+</Callout>
+
 A **transport** is how a dispatched `ctx.step` reaches a step handler and how the result comes back. It's a pluggable driver (`dispatch`, `onResult`, `onHeartbeat`), independent of the [state store](/docs/durable/stores) — mix any transport with any store.
 
 Transports are **config-driven drivers**: list the ones you use under `transports` in `config/durable.ts`, built with the `transports` factory, and pick the active one by name with `transport`. Each driver lazily imports its optional peer (`@adonisjs/queue`, `@adonisjs/lucid`) **only when selected**, so nothing extra is loaded for the drivers you don't use.

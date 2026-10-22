@@ -6,7 +6,7 @@ icon: Server
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
-The `bullmq` driver sends steps over [BullMQ](https://docs.bullmq.io) on Redis. Its wire format matches the NestJS `nestjs-durable` BullMQ transport and the Python `durable-worker` byte for byte, so it is the driver to pick when an Adonis engine and a NestJS or [Python worker](/docs/durable/python) share one Redis. [Cross-ecosystem interop](/docs/durable/cluster/interop) covers the polyglot side. This page covers the transport itself.
+The `bullmq` driver sends steps over [BullMQ](https://docs.bullmq.io) on Redis. Its wire format matches the NestJS `nestjs-durable` BullMQ transport and the Python `durable-worker` byte for byte, so it is the driver to pick when an Adonis engine and a NestJS or [Python worker](/docs/durable/python) share one Redis. [Cross-ecosystem interop](/docs/durable/cluster/interop) covers the polyglot side. This page covers the transport itself. To weigh it against the other drivers, see [the comparison](/docs/durable/transports/choosing).
 
 The driver ships **inside `@adonis-agora/durable`**. `bullmq` and `ioredis` are optional peers, loaded only when `bullmq` is the selected transport, so install them in the app that uses it:
 

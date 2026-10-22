@@ -6,7 +6,7 @@ icon: ListOrdered
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
-The `queue` driver carries steps over [`@adonisjs/queue`](https://github.com/adonisjs/queue) — the path for steps that run in another process. It rides any `@adonisjs/queue` adapter (Redis, a database adapter, or the fake adapter in tests), so it reuses the queue infrastructure you already run.
+The `queue` driver carries steps over [`@adonisjs/queue`](https://github.com/adonisjs/queue) — the path for steps that run in another process. It rides any `@adonisjs/queue` adapter (Redis, a database adapter, or the fake adapter in tests), so it reuses the queue infrastructure you already run. To weigh it against the other drivers, see [the comparison](/docs/durable/transports/choosing).
 
 It ships **inside `@adonis-agora/durable`** — there's nothing extra to install. `@adonisjs/queue` is an optional peer, imported lazily only when you select the `queue` transport, so install and configure it where you use the driver:
 
