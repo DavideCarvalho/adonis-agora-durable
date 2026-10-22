@@ -4,16 +4,18 @@ import { RedisControlPlane } from '../../src/control-plane-redis/index.js';
 import { WorkflowEngine } from '../../src/engine.js';
 import { startRun } from '../../src/test-helpers.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
+import { backendUrl, uniqueRedisPrefix } from '../support/backends.js';
 
 /**
  * Cross-pod fan-out of the {@link RedisControlPlane}, run against a REAL Redis (set REDIS_URL, e.g.
- * `redis://127.0.0.1:6399`). Self-skips when REDIS_URL is unset so the default suite stays green
+ * `redis://127.0.0.1:6399`). Self-skips when REDIS_URL is unset (locally; CI requires it) so the default suite stays green
  * without a server — same gating as the Redis admission specs. Two engines share one Redis (distinct
  * instanceIds) standing in for two pods: a worker that runs the workflow and an API/dashboard that
  * only observes. Covers cross-pod cancel, lifecycle-event fan-out (with `from` dedupe), and that a
  * malformed payload on the channel is ignored.
  */
-const REDIS_URL = process.env.REDIS_URL;
+const REDIS_URL = backendUrl('REDIS_URL');
+const PREFIX = uniqueRedisPrefix('cp');
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** Poll until `cond()` is true or the budget lapses (events arrive async over pub/sub). */
 async function until(cond: () => boolean, budgetMs = 2000) {
@@ -73,7 +75,7 @@ describe.skipIf(!REDIS_URL)('RedisControlPlane (real Redis)', () => {
   }
 
   it('delivers a cancel from one pod to the pod running the work', async () => {
-    const { worker, dashboard } = twoPods(`cp${++ns}`);
+    const { worker, dashboard } = twoPods(`${PREFIX}-${++ns}`);
     const aborted: string[] = [];
     worker.onCancel((runId) => aborted.push(runId));
     await delay(100); // let both subscribers connect
@@ -87,7 +89,7 @@ describe.skipIf(!REDIS_URL)('RedisControlPlane (real Redis)', () => {
   });
 
   it('fans out lifecycle events to another pod, each exactly once (from dedupe)', async () => {
-    const { worker, dashboard } = twoPods(`cp${++ns}`);
+    const { worker, dashboard } = twoPods(`${PREFIX}-${++ns}`);
     const onWorker: string[] = [];
     const onDashboard: string[] = [];
     worker.subscribe((e) => onWorker.push(e.type));
@@ -109,7 +111,7 @@ describe.skipIf(!REDIS_URL)('RedisControlPlane (real Redis)', () => {
   });
 
   it('ignores a malformed payload published on the control channel', async () => {
-    const prefix = `cp${++ns}`;
+    const prefix = `${PREFIX}-${++ns}`;
     const received: string[] = [];
     const sub = plane(prefix);
     sub.onControl((m) => received.push(m.kind));

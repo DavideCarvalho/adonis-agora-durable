@@ -2,10 +2,11 @@ import { afterAll, describe, expect, it } from 'vitest';
 import type { StepResult } from '../../../../src/interfaces.js';
 import { BullMQTransport } from '../../../../src/transports/bullmq/bullmq-transport.js';
 import { createBullMQDeps } from '../../../../src/transports/bullmq/deps.js';
+import { backendUrl, uniqueRedisPrefix } from '../../../support/backends.js';
 
 /**
- * Real-backend interop smoke test (spec §11.2). Gated on `DURABLE_REDIS_URL` — SKIPPED by default (no
- * Redis in unit CI, and it exercises the real `bullmq`/`ioredis` deps). Run it against a live Redis:
+ * Real-backend interop smoke test (spec §11.2). Gated on `DURABLE_REDIS_URL` — skipped locally without it, REQUIRED in
+ * CI (the workflow provides a Redis service); it exercises the real `bullmq`/`ioredis` deps. Run it against a live Redis:
  *
  *   DURABLE_REDIS_URL=redis://localhost:6379 node_modules/.bin/vitest run bullmq-redis
  *
@@ -13,7 +14,7 @@ import { createBullMQDeps } from '../../../../src/transports/bullmq/deps.js';
  * dispatches a step, a worker-side transport (same prefix) runs the handler, and the result flows back
  * on `${P}-results`. A Python worker on the same prefix would be a drop-in substitute for the worker side.
  */
-const REDIS_URL = process.env.DURABLE_REDIS_URL;
+const REDIS_URL = backendUrl('DURABLE_REDIS_URL');
 
 const closers: Array<() => Promise<void>> = [];
 afterAll(async () => {
@@ -22,7 +23,7 @@ afterAll(async () => {
 
 describe.skipIf(!REDIS_URL)('BullMQTransport over real Redis', () => {
   it('round-trips a dispatched step through a worker back to onResult', async () => {
-    const prefix = `durable-it-${Date.now()}`;
+    const prefix = uniqueRedisPrefix('durable-it');
     const connection = { url: REDIS_URL } as unknown;
 
     const engine = new BullMQTransport({
