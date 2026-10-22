@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import type { ApplicationService, ContainerBindings } from '@adonisjs/core/types';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import DurableProvider from '../providers/durable_provider.js';
 import type { DurableConfig } from '../src/define_config.js';
 import {
@@ -17,6 +17,9 @@ import {
   DURABLE_RUN_REQUEST_RESPONDER,
   DURABLE_WORKER_RUNTIME,
 } from '../src/role_bindings.js';
+import { transports } from '../src/transports/factory.js';
+import { MockAdapter } from '../src/transports/queue-mock-adapter.js';
+import { MemoryWorkerKeys } from '../src/transports/worker-keys.js';
 import type { DescriptorRedis } from '../src/worker-runtime/index.js';
 import { WorkerRuntime } from '../src/worker-runtime/index.js';
 
@@ -283,5 +286,52 @@ describe('DurableProvider — role branching (tenant, store-less)', () => {
     await runtime.start();
     expect(runtime.descriptor().steps).toContain('charge');
     await runtime.stop();
+  });
+});
+
+describe('DurableProvider — tenant / control-plane roles over the queue transport', () => {
+  // The provider feature-detects the store-less protocol methods instead of naming a transport, so the
+  // `@adonisjs/queue` transport now qualifies for both roles.
+  const queueTransport = (adapter: MockAdapter, keys: MemoryWorkerKeys) =>
+    transports.queue({
+      adapter: () => adapter,
+      workerKeys: keys,
+      pollIntervalMs: 5,
+      stalledCheckIntervalMs: 0,
+    });
+
+  it('a tenant pod gets a ProxyRunGateway and a WorkerRuntime over transports.queue()', async () => {
+    const { app, container } = makeApp({
+      role: 'tenant',
+      transport: 'queue',
+      transports: { queue: queueTransport(new MockAdapter(), new MemoryWorkerKeys()) },
+      partition: 'acme',
+    } as DurableConfig);
+    const provider = new DurableProvider(app);
+    provider.register();
+
+    const gateway = await container.make(DURABLE_RUN_GATEWAY);
+    expect(gateway).toBeInstanceOf(ProxyRunGateway);
+    const runtime = await container.make(DURABLE_WORKER_RUNTIME);
+    expect(runtime).toBeInstanceOf(WorkerRuntime);
+    await provider.shutdown();
+  });
+
+  it('a control plane on transports.queue() binds and starts a RunRequestResponder', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { app, container } = makeApp({
+      role: 'control-plane',
+      store: 'mem',
+      stores: { mem: async () => new InMemoryStateStore() },
+      transport: 'queue',
+      transports: { queue: queueTransport(new MockAdapter(), new MemoryWorkerKeys()) },
+    } as DurableConfig);
+    const provider = new DurableProvider(app);
+    provider.register();
+    await provider.boot();
+
+    expect(await container.make(DURABLE_RUN_REQUEST_RESPONDER)).toBeInstanceOf(RunRequestResponder);
+    await provider.shutdown();
+    vi.restoreAllMocks();
   });
 });
