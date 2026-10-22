@@ -29,12 +29,20 @@ class ControlTransport implements Transport {
   }
 }
 
-function twoInstances() {
+function twoInstances(heartbeatPersistThrottleMs = 10_000) {
   const store = new InMemoryStateStore();
   const dispatcherTransport = new ControlTransport();
   const otherTransport = new ControlTransport();
-  const dispatcher = new WorkflowEngine({ store, transport: dispatcherTransport });
-  const other = new WorkflowEngine({ store, transport: otherTransport });
+  const dispatcher = new WorkflowEngine({
+    store,
+    transport: dispatcherTransport,
+    heartbeatPersistThrottleMs,
+  });
+  const other = new WorkflowEngine({
+    store,
+    transport: otherTransport,
+    heartbeatPersistThrottleMs,
+  });
   for (const engine of [dispatcher, other]) {
     engine.register('wf', '1', async (ctx) => ctx.step('job', {}, { timeoutMs: 60 }));
   }
@@ -73,8 +81,66 @@ describe('remote-step liveness across engine instances', () => {
     expect(dispatcherTransport.dispatched).toHaveLength(1); // never re-dispatched while alive
   });
 
+  it('beats the other instance heard but throttled away still count — up to the persist throttle', async () => {
+    const { dispatcher, dispatcherTransport, otherTransport } = twoInstances(200);
+    await dispatcher.start('wf', {}, 'r3');
+    const done = dispatcher.waitForRun('r3');
+    await sleep(0);
+    const task = dispatcherTransport.dispatched[0] as RemoteTask;
+    const beat = () =>
+      otherTransport.heartbeatHandler?.({
+        runId: 'r3',
+        seq: task.seq,
+        stepId: task.stepId,
+        group: task.group,
+        at: Date.now(),
+      });
+    // The worker beats every 30ms, all on the other instance; only the first beat gets persisted
+    // (throttle 200ms), so the checkpoint's beat is soon older than the 60ms window.
+    await beat();
+    for (let i = 0; i < 5; i += 1) {
+      await sleep(30);
+      await beat();
+    }
+    await dispatcherTransport.resultHandler?.({
+      runId: 'r3',
+      seq: task.seq,
+      stepId: task.stepId,
+      status: 'completed',
+      output: 'ok',
+    });
+
+    const res = await done;
+    expect(res.status).toBe('completed');
+    expect(dispatcherTransport.dispatched).toHaveLength(1);
+  });
+
+  it('a lone instance gets no allowance: its own persisted beat times out on the plain window', async () => {
+    const store = new InMemoryStateStore();
+    const transport = new ControlTransport();
+    const engine = new WorkflowEngine({ store, transport, heartbeatPersistThrottleMs: 5_000 });
+    engine.register('wf', '1', async (ctx) => ctx.step('job', {}, { timeoutMs: 60 }));
+    await engine.start('wf', {}, 'r4');
+    const done = engine.waitForRun('r4');
+    await sleep(0);
+    const task = transport.dispatched[0] as RemoteTask;
+    const startedAt = Date.now();
+    await transport.heartbeatHandler?.({
+      runId: 'r4',
+      seq: task.seq,
+      stepId: task.stepId,
+      group: task.group,
+      at: Date.now(),
+    });
+
+    const res = await done;
+    expect(res.status).toBe('failed');
+    // Well under the 5s throttle: the beat was this instance's own, so no extra silence was allowed.
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
   it('a step whose worker went silent everywhere still times out', async () => {
-    const { dispatcher, dispatcherTransport, otherTransport } = twoInstances();
+    const { dispatcher, dispatcherTransport, otherTransport } = twoInstances(100);
     await dispatcher.start('wf', {}, 'r2');
     const done = dispatcher.waitForRun('r2');
     await sleep(0);
