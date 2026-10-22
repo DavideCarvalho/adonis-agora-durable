@@ -183,7 +183,9 @@ export class RunRequestResponder {
     });
     if (this.#subscribeEngineEvents) {
       this.#unsubscribeEvents = this.#subscribeEngineEvents((event) => {
-        void this.#republish(event);
+        // Best-effort, like the publish itself: a failing run lookup (the store briefly down) must
+        // not surface as an unhandled rejection from an event listener.
+        void this.#republish(event).catch(() => undefined);
       });
     }
   }

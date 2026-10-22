@@ -150,7 +150,7 @@ export class EventEmitterTransport implements Transport, ControlPlane {
     if (!this.#subscribed) {
       this.#subscribed = true;
       this.#emitter.on(`${TASK_EVENT}${this.#suffix()}`, (task: RemoteTask) => {
-        void this.#process(task);
+        void this.#process(task).catch(() => undefined); // runStepHandler already turns throws into results
       });
     }
   }

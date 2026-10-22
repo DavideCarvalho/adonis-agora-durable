@@ -504,7 +504,7 @@ export default class DurableProvider {
       const dirs = workflowRoots.map((root) => this.app.makePath(root));
       await registerWorkflowsFromDir(engine, dirs, workflowFactory);
     }
-    void this.#reportUnservedOnErrorRoutes(engine);
+    void this.#reportUnservedOnErrorRoutes(engine).catch(() => undefined);
 
     // Event-triggered workflows (`static on` / `@OnEvent` / `@OnDiagnostic`): bridge the
     // Adonis emitter + the diagnostics bus into the engine. Registered AFTER discovery so

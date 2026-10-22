@@ -551,7 +551,7 @@ export default class DashboardProvider {
             return ctx.response.status(400).json({ error: outcome.message });
           }
           if (outcome.kind === 'unauthorized') {
-            this.warnHookThrow(outcome.hookError);
+            void this.warnHookThrow(outcome.hookError).catch(() => undefined);
             if (form) return backToLogin();
             return ctx.response.status(401).json({ error: outcome.message });
           }
@@ -568,7 +568,7 @@ export default class DashboardProvider {
           if (this.loginRateLimited(ctx)) return;
           const outcome = await performSession(auth, ctx.request.request);
           if (outcome.kind === 'unauthorized') {
-            this.warnHookThrow(outcome.hookError);
+            void this.warnHookThrow(outcome.hookError).catch(() => undefined);
             return ctx.response.status(401).json({ error: 'unauthorized' });
           }
           this.writeSessionCookie(ctx, auth, outcome.cookieValue);
@@ -604,12 +604,19 @@ export default class DashboardProvider {
         path: ctx.request.url(false),
       };
       if (config.audit) {
-        config.audit(entry);
+        // Typed `void`, but an async hook is assignable to it: catch its rejection too.
+        const pending = config.audit(entry) as unknown;
+        if (pending instanceof Promise) pending.catch(() => undefined);
         return;
       }
-      void this.app.container.make('logger').then((logger) => {
-        logger.info(`[durable_dashboard] audit actor=${entry.actor} ${entry.method} ${entry.path}`);
-      });
+      void this.app.container
+        .make('logger')
+        .then((logger) => {
+          logger.info(
+            `[durable_dashboard] audit actor=${entry.actor} ${entry.method} ${entry.path}`,
+          );
+        })
+        .catch(() => undefined);
     } catch {
       /* auditing must never break the action */
     }

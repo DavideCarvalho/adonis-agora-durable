@@ -225,7 +225,9 @@ export class RedisAdmissionBackend implements AdmissionBackend {
     this.clock = options.clock ?? Date.now;
     this.redis.defineCommand('admissionAcquire', { numberOfKeys: 8, lua: ACQUIRE_LUA });
     // Keep this instance's liveness fresh even while idle, so slots it holds aren't reclaimed.
-    void this.refreshLiveness();
+    // Best-effort, like the interval below: a Redis that is down at construction must not surface
+    // as an unhandled rejection (the next heartbeat retries).
+    void this.refreshLiveness().catch(() => undefined);
     this.heartbeat = setInterval(
       () => void this.refreshLiveness().catch(() => undefined),
       Math.max(1000, Math.floor(this.instanceTtlMs / 3)),

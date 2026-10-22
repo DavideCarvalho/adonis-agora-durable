@@ -775,7 +775,8 @@ export class BullMQTransport implements Transport {
     );
     sub.on('message', ((_channel: string, payload: string) => {
       try {
-        void handler(JSON.parse(payload) as Heartbeat);
+        // The engine's handler writes to the store: report a rejection, never leave it unhandled.
+        void handler(JSON.parse(payload) as Heartbeat).catch((err) => this.#onError(err));
       } catch {
         /* ignore malformed heartbeats */
       }
