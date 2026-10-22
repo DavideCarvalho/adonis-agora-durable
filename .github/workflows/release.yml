@@ -26,6 +26,30 @@ jobs:
   release:
     if: github.event_name == 'workflow_dispatch' || github.actor == 'renovate[bot]'
     runs-on: ubuntu-latest
+    # The same real backends as ci.yml: the pre-publish `pnpm test` runs with CI set, so a suite gated
+    # on one of them fails when it is missing (test/support/backends.ts) — a release must be tested
+    # against the real infrastructure, not skip it.
+    services:
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -56,6 +80,10 @@ jobs:
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+          DURABLE_REDIS_URL: redis://127.0.0.1:6379
+          DURABLE_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
 
       # A Renovate patch/minor bump automerges on its own and brings no changeset with it, so
       # the step below would find nothing to publish and the new dependency would reach npm
