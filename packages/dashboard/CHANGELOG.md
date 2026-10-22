@@ -1,5 +1,15 @@
 # @adonis-agora/durable-dashboard
 
+## 0.7.1
+
+### Patch Changes
+
+- [#333](https://github.com/DavideCarvalho/adonis-agora-durable/pull/333) [`0559885`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/055988599820c651e9e7b4329ee9e15525a67c0f) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The console links an onError handler run (`<runId>.onError`) to the run it handles, and a run waiting on its handler reads "awaiting · failure handler <workflow>". `parentRunIdOf` reads `<parent>.onError` too, so the diagnostics bridge stamps the handler's `parentRunId`.
+
+- [#334](https://github.com/DavideCarvalho/adonis-agora-durable/pull/334) [`3e68dbd`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/3e68dbd3014a061cb6b0282c5c76a3fba5a40e11) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - onError and allSettled follow-ups: retrying a run whose failure was handed off runs its body again (the previous handoff is retired as `onError:retried:<id>`; handler runs are `<runId>.onError.<attempt>`, handoff checkpoints sit at seq 1,000,000,000 and up). `FatalError(message, code?, details?)`: `code`/`details` reach the run's error, an onError handler, `allSettled` rejected items and a failed `ctx.child`'s `FatalError`. A handed-off run is tagged `onError:<code>` and emits `run.routed`. `engine.unservedOnErrorRoutes()`, and a boot warning from the provider.
+
+- [#338](https://github.com/DavideCarvalho/adonis-agora-durable/pull/338) [`b57b8ac`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/b57b8ac458023e0da6fcdbd78ea23934af06f4f9) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - onError polish: `collectMetrics` and `attachDurableMetrics` count `run.routed` / `run.unrouted` (`runs.routed`, `runs.unrouted`, `routedByCode`, Prometheus `durable_runs_routed_total{code}`), and the OTel bridge records them as span events. The dashboard shows a failure's `code` and `details`. The boot warning for an unserved onError route rechecks after 30s. A retry drops the run's `onError:<code>` tag. The Lucid store's `listCheckpointsByNamePrefix` escapes `_` / `%`, like its `listSignalWaiters` already did.
+
 ## 0.7.0
 
 ### Minor Changes
