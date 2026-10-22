@@ -72,6 +72,8 @@ export async function createDurableTransportTables(db: Database): Promise<void> 
       table.integer('attempt').notNullable();
       // How many times a lapsed claim on this row was taken over — the poison-task bound.
       table.integer('reclaims').notNullable().defaultTo(0);
+      // Dispatch priority, higher first (the engine's convention); absent = 0, "normal".
+      table.integer('priority').notNullable().defaultTo(0);
       table.string('claimed_by');
       table.bigInteger('claimed_at');
       table.bigInteger('created_at').notNullable();
@@ -147,6 +149,8 @@ export async function createDurableTransportTables(db: Database): Promise<void> 
  *   claims exactly the rows it did before namespaces existed.
  * - `reclaims` on the tasks table, `0` — the count of lapsed claims taken over (the poison-task
  *   bound, see `DbTransportOptions.maxStalledCount`); a legacy row starts uncounted.
+ * - `priority` on the tasks table, `0` — the dispatch priority rows are claimed by (higher first);
+ *   a legacy row is "normal", like a dispatch without a priority.
  */
 async function ensureAddedColumns(db: Database): Promise<void> {
   const added: Array<{ table: string; column: string; add: (t: AlterTableBuilder) => void }> = [
@@ -162,6 +166,13 @@ async function ensureAddedColumns(db: Database): Promise<void> {
       column: 'reclaims',
       add: (t: AlterTableBuilder) => {
         t.integer('reclaims').notNullable().defaultTo(0);
+      },
+    },
+    {
+      table: TRANSPORT_TABLES.tasks,
+      column: 'priority',
+      add: (t: AlterTableBuilder) => {
+        t.integer('priority').notNullable().defaultTo(0);
       },
     },
   ];

@@ -76,6 +76,28 @@ const DEFAULT_MAX_STALLED_COUNT = 3;
 /** Key prefix of the worker liveness keys — the one a `WorkerRuntime` uses by default, so both kinds of
  *  beat land in the same keyspace and `groupHealth` reads them alike. */
 const WORKER_KEY_PREFIX = 'durable';
+/** Default budget (ms) `close()` waits for in-flight work before handing the rest back. */
+const DEFAULT_CLOSE_TIMEOUT_MS = 5_000;
+/** The `priority` column is a 32-bit integer on every dialect. */
+const PRIORITY_MIN = -2_147_483_648;
+const PRIORITY_MAX = 2_147_483_647;
+
+/**
+ * The `priority` column value for the engine's dispatch `priority` (higher = more urgent): rounded and
+ * clamped to the column's range, and `0` — "normal" — when absent, which is where the queue
+ * transport's broker mapping puts an unprioritised job too.
+ */
+export function toDbPriority(priority?: number): number {
+  if (priority == null || Number.isNaN(priority)) return 0;
+  return Math.min(PRIORITY_MAX, Math.max(PRIORITY_MIN, Math.round(priority)));
+}
+
+/** The task-table columns added after the first release that the transport adapts to. */
+type TaskColumn = 'reclaims' | 'priority';
+const MISSING_COLUMN_EFFECT: Record<TaskColumn, string> = {
+  reclaims: 'poison tasks are not bounded (maxStalledCount is off)',
+  priority: 'dispatch priority is ignored and tasks are claimed oldest first',
+};
 
 type Client = QueryClientContract | TransactionClientContract;
 
@@ -197,6 +219,12 @@ export interface DbTransportOptions {
    * Default `console.error`.
    */
   onError?: (err: unknown) => void;
+  /**
+   * How long (ms) `close()`/`stop()` waits for in-flight work — running tasks, a result batch being
+   * settled — before handing every claim still held back to the table, uncounted, so another worker
+   * picks it up at once. Default 5000.
+   */
+  closeTimeoutMs?: number;
   /** Create the transport tables on first use if missing. Default true. */
   autoCreate?: boolean;
   /**
@@ -284,8 +312,11 @@ export class DbTransport implements Transport, ControlPlane {
   #renewTimer: ReturnType<typeof setInterval> | undefined;
   /** The renewal round in flight, so a slow database never stacks rounds. */
   #renewal: Promise<void> | undefined;
-  /** Whether the tasks table has the `reclaims` column (resolved once). */
-  #reclaimsColumn: Promise<boolean> | undefined;
+  /** Whether the tasks table has each adaptive column (resolved once per column). */
+  readonly #taskColumns = new Map<TaskColumn, Promise<boolean>>();
+  /** Claim tokens `close()` handed back — a handler still running under one learns why it lost it. */
+  readonly #handedBack = new Set<string>();
+  readonly #closeTimeoutMs: number;
   /** Routing tokens this instance beats a liveness key for (one per handled step name). */
   readonly #heartbeatTokens = new Set<string>();
   readonly #workerHeartbeatIntervalMs: number;
@@ -304,6 +335,10 @@ export class DbTransport implements Transport, ControlPlane {
     this.#instanceId = options.instanceId ?? randomUUID();
     this.#workerKeysCacheMs = options.workerKeysCacheMs ?? 5_000;
     this.#onError = options.onError ?? DEFAULT_LOG;
+    this.#closeTimeoutMs =
+      options.closeTimeoutMs !== undefined && options.closeTimeoutMs >= 0
+        ? options.closeTimeoutMs
+        : DEFAULT_CLOSE_TIMEOUT_MS;
     this.#pollers = new Pollers(this.#pollIntervalMs, this.#onError);
     this.#controller = new AdaptiveController({
       ...(options.concurrency !== undefined ? { concurrency: options.concurrency } : {}),
@@ -365,6 +400,7 @@ export class DbTransport implements Transport, ControlPlane {
 
   async dispatch(task: RemoteTask): Promise<void> {
     await this.#ensureSchema();
+    const withPriority = await this.#hasTaskColumn('priority');
     // Idempotent: a redelivered dispatch for the same step_id is ignored (the PK already exists).
     // `onConflict().ignore()` is a Knex feature not surfaced on Lucid's insert contract, so we use
     // the underlying Knex builder (`.knexQuery`).
@@ -383,6 +419,7 @@ export class DbTransport implements Transport, ControlPlane {
         context: toJson(task.context),
         transport: task.transport ?? null,
         attempt: task.attempt,
+        ...(withPriority ? { priority: toDbPriority(task.priority) } : {}),
         claimed_by: null,
         claimed_at: null,
         created_at: this.#now(),
@@ -489,14 +526,23 @@ export class DbTransport implements Transport, ControlPlane {
       await this.#slotFreed();
       return true;
     }
+    const [countReclaims, byPriority] = await Promise.all([
+      this.#hasTaskColumn('reclaims'),
+      this.#hasTaskColumn('priority'),
+    ]);
     const { rows, token } = await this.#claim<TaskRow>(
       TRANSPORT_TABLES.tasks,
       Math.min(free, this.#batchSize),
       [...this.#servedTokens],
       'step_id',
-      await this.#countsReclaims(),
+      { countReclaims, byPriority },
     );
     if (rows.length === 0) return false;
+    if (this.#pollers.closed) {
+      // close() began while this round was claiming: don't start work it would only abandon.
+      await this.#handBack(TRANSPORT_TABLES.tasks, [token]);
+      return false;
+    }
     this.#hold(
       TRANSPORT_TABLES.tasks,
       token,
@@ -577,6 +623,14 @@ export class DbTransport implements Transport, ControlPlane {
         // count the row as lost.
         this.#release(TRANSPORT_TABLES.tasks, token, task.stepId);
         if (!(await this.#settleTask(task.stepId, token, result))) {
+          if (this.#handedBack.has(token)) {
+            this.#onError(
+              new Error(
+                `[DbTransport] task ${task.stepId} outlived close()'s ${this.#closeTimeoutMs}ms drain and was handed back, so another worker may have run it too; this run's result was dropped`,
+              ),
+            );
+            return;
+          }
           this.#onError(
             new Error(
               `[DbTransport] lost the claim on task ${task.stepId} while running it (this worker went silent past leaseMs) — another worker took it over and may run it too; this run's result was dropped. Raise leaseMs if steps block the event loop`,
@@ -780,7 +834,10 @@ export class DbTransport implements Transport, ControlPlane {
     limit: number,
     groups?: string[],
     idCol: 'id' | 'step_id' = 'step_id',
-    countReclaims = false,
+    {
+      countReclaims = false,
+      byPriority = false,
+    }: { countReclaims?: boolean; byPriority?: boolean } = {},
   ): Promise<{ rows: T[]; token: string }> {
     await this.#ensureSchema();
     // The raw Knex builder — `onConflict`, the `where(cb)` grouping and `whereIn` are cleaner there
@@ -797,7 +854,8 @@ export class DbTransport implements Transport, ControlPlane {
     const token = `${this.#instanceId}:${process.hrtime.bigint().toString(36)}`;
     const at = this.#now();
 
-    // 1) Pick candidate ids (unclaimed or stale-lease), oldest first, bounded by `limit`.
+    // 1) Pick candidate ids (unclaimed or stale-lease) — highest priority first when the table has
+    //    one, then oldest — bounded by `limit`.
     const candidates = (await client
       .knexQuery()
       .from(table)
@@ -807,6 +865,9 @@ export class DbTransport implements Transport, ControlPlane {
         if (groups !== undefined) q.whereIn('grp', groups);
       })
       .where((q) => q.whereNull('claimed_at').orWhere('claimed_at', '<', stale))
+      .modify((q) => {
+        if (byPriority) q.orderBy('priority', 'desc');
+      })
       .orderBy(idCol === 'id' ? 'id' : 'created_at', 'asc')
       .limit(limit)) as Array<Record<string, unknown>>;
     if (candidates.length === 0) return { rows: [], token };
@@ -854,30 +915,35 @@ export class DbTransport implements Transport, ControlPlane {
   }
 
   /**
-   * Whether task reclaims are counted: the tasks table has the `reclaims` column (`autoCreate` adds
-   * it; a table from an older migration with `autoCreate: false` may not). Without it the poison
-   * bound is off — said once through `onError` — and claims behave as before.
+   * Whether the tasks table has `column` — `autoCreate` adds both, but a table from an older migration
+   * run with `autoCreate: false` may lack them. Without `reclaims` the poison bound is off; without
+   * `priority` dispatch priority is ignored and rows are claimed oldest first. Either is said once
+   * through `onError`, and everything else behaves as before.
    */
-  #countsReclaims(): Promise<boolean> {
-    this.#reclaimsColumn ??= this.#ensureSchema()
-      .then(() => this.#client().schema.hasColumn(TRANSPORT_TABLES.tasks, 'reclaims'))
-      .then((has) => {
-        if (!has) {
-          this.#onError(
-            new Error(
-              `[DbTransport] ${TRANSPORT_TABLES.tasks} has no "reclaims" column, so poison tasks are not bounded (maxStalledCount is off). Add it — integer, not null, default 0 — or enable autoCreate`,
-            ),
-          );
-        }
-        return has;
-      })
-      .catch((err) => {
-        // Unknown yet (a transient error): don't count this round, ask again next round.
-        this.#reclaimsColumn = undefined;
-        this.#onError(err);
-        return false;
-      });
-    return this.#reclaimsColumn;
+  #hasTaskColumn(column: TaskColumn): Promise<boolean> {
+    let known = this.#taskColumns.get(column);
+    if (!known) {
+      known = this.#ensureSchema()
+        .then(() => this.#client().schema.hasColumn(TRANSPORT_TABLES.tasks, column))
+        .then((has) => {
+          if (!has) {
+            this.#onError(
+              new Error(
+                `[DbTransport] ${TRANSPORT_TABLES.tasks} has no "${column}" column, so ${MISSING_COLUMN_EFFECT[column]}. Add it — integer, not null, default 0 — or enable autoCreate`,
+              ),
+            );
+          }
+          return has;
+        })
+        .catch((err) => {
+          // Unknown yet (a transient error): go without it this time, ask again next time.
+          this.#taskColumns.delete(column);
+          this.#onError(err);
+          return false;
+        });
+      this.#taskColumns.set(column, known);
+    }
+    return known;
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -923,6 +989,23 @@ export class DbTransport implements Transport, ControlPlane {
       clearInterval(this.#renewTimer);
       this.#renewTimer = undefined;
     }
+  }
+
+  /**
+   * Hand `tokens`' rows of `table` back: clear `claimed_by`/`claimed_at` where the claim is still ours,
+   * so the next poll anywhere claims them as fresh rows — NOT as lapsed claims, so a hand-back never
+   * counts toward the poison bound — and stop renewing them.
+   */
+  async #handBack(table: string, tokens: string[]): Promise<void> {
+    for (const token of tokens) {
+      this.#handedBack.add(token);
+      this.#releaseToken(table, token);
+    }
+    await this.#client()
+      .knexQuery()
+      .from(table)
+      .whereIn('claimed_by', tokens)
+      .update({ claimed_by: null, claimed_at: null });
   }
 
   /**
@@ -1089,9 +1172,15 @@ export class DbTransport implements Transport, ControlPlane {
     await this.#ensureSchema();
   }
 
-  /** Stop every poll loop and wait (bounded, 5s in all) for in-flight work — the tasks in a handler
-   *  get to finish + write their result instead of being abandoned to the lease expiry; their claims
-   *  keep being renewed until they settle. Does not close the shared `Database`. */
+  /**
+   * Stop every poll loop and wait — bounded by {@link DbTransportOptions.closeTimeoutMs}, 5s by
+   * default — for in-flight work: the tasks in a handler get to finish and write their result, and a
+   * result batch being settled gets to finish. Whatever is still unfinished then is HANDED BACK: its
+   * claims are cleared (only where still ours) so another worker picks the rows up at once, instead of
+   * after the lease — and uncounted, so a deploy never pushes a long step toward the poison bound. A
+   * handler still running here may finish after another worker re-ran its step; its result is
+   * dropped. Does not close the shared `Database`.
+   */
   async stop(): Promise<void> {
     this.#pollers.stopAll();
     this.#taskLoop = undefined;
@@ -1099,8 +1188,8 @@ export class DbTransport implements Transport, ControlPlane {
     if (this.#workerHeartbeatTimer) clearInterval(this.#workerHeartbeatTimer);
     this.#workerHeartbeatTimer = undefined;
     this.#heartbeatTokens.clear();
-    const deadline = Date.now() + 5_000;
-    await this.#pollers.drain(5_000);
+    const deadline = Date.now() + this.#closeTimeoutMs;
+    await this.#pollers.drain(this.#closeTimeoutMs);
     if (this.#runningTasks.size > 0) {
       let timer: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([
@@ -1110,6 +1199,13 @@ export class DbTransport implements Transport, ControlPlane {
         }),
       ]);
       clearTimeout(timer);
+    }
+    // A renewal round in flight would re-stamp what we are about to hand back.
+    await this.#renewal;
+    for (const [table, byToken] of [...this.#held]) {
+      const tokens = [...byToken.keys()];
+      if (tokens.length === 0) continue;
+      await this.#handBack(table, tokens).catch((err) => this.#onError(err));
     }
   }
 

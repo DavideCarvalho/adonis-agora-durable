@@ -25,6 +25,7 @@ export default class extends BaseSchema {
       table.string('transport')
       table.integer('attempt').notNullable()
       table.integer('reclaims').notNullable().defaultTo(0)
+      table.integer('priority').notNullable().defaultTo(0)
       table.string('claimed_by')
       table.bigInteger('claimed_at')
       table.bigInteger('created_at').notNullable()

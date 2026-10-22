@@ -275,6 +275,11 @@ export interface DbTransportConfig {
   instanceId?: string;
   /** Where transport failures (a throwing poll, a lost claim) are reported. Default `console.error`. */
   onError?: (err: unknown) => void;
+  /**
+   * How long (ms) `close()` waits for in-flight work before handing every claim it still holds back
+   * to the table, uncounted, for another worker to pick up at once. Default 5000.
+   */
+  closeTimeoutMs?: number;
 }
 
 /**
@@ -454,6 +459,7 @@ export const transports = {
         ...(config.autoCreate !== undefined ? { autoCreate: config.autoCreate } : {}),
         ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
         ...(config.onError !== undefined ? { onError: config.onError } : {}),
+        ...(config.closeTimeoutMs !== undefined ? { closeTimeoutMs: config.closeTimeoutMs } : {}),
       });
     };
   },
