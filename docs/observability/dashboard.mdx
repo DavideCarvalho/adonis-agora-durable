@@ -211,6 +211,12 @@ There is no separate checkpoints route: a run's step timeline comes back as the 
 
 A fan with more than 50 members (a `ctx.all` over children or over a step, a polyglot gather) is summarized: its members leave `timeline`, and the fan comes back as one entry of `fans` with its `group`, `label`, seq range, `size` (members started so far), `total` (its declared size: a `ctx.all` group carries it as `all:<seq>:n<size>`, a step fan as `steps:<seq>:<size>`), `notStarted`, `failFast`, `counts` by status (a failed child counts as `failed`), start and finish, and its first 20 failed members. A fan declared wider than 50 is summarized even while only a few of its waves have been sent. `children` then lists the first 200 child run ids and `childCount` carries the total. `GET /api/runs/:id/fans/:group` pages the members on demand. `?full=true` returns the detail unsummarized. On a store-less tenant pod the control plane summarizes before the detail crosses the wire.
 
+#### Polling the run detail: ETag and 304
+
+On a store with the checkpoint aggregates (`checkpointStats` + `queryCheckpoints`, which the Lucid and in-memory stores have), the summarized detail is built from one `GROUP BY` over the run's checkpoints plus a few targeted reads — the rows outside wide fans, each fan's first 20 failures, the folded checkpoints and the first child edges — instead of every checkpoint. A 40,000-member fan is drawn from a handful of rows.
+
+Those responses carry an `ETag` (derived from the run row and the checkpoint buckets) and `Cache-Control: private, no-cache`. A request whose `If-None-Match` still names the ETag gets a bare `304`, answered after reading the run and the buckets only. The browser adds `If-None-Match` to the console's polls by itself, so an unchanged run costs a 304 instead of a body. `GET /api/runs/:id/fans/:group` is versioned the same way, per page. `?full=true`, and a store without the aggregates, answer in full without an ETag, as before. The options cross the tenant proxy unchanged.
+
 #### Live-tailing one run
 
 `GET /api/runs/:id/stream` is an SSE endpoint. Each frame is a default `message` event whose `data` is one serialized engine lifecycle event for that run:

@@ -58,7 +58,7 @@ A worker whose config sets `namespace` only ever prunes that namespace. The per-
 
 ## How the sweep runs
 
-The sweep (`engine.sweepRetention()`) is a phase of the [`durable:work`](/docs/durable/cli) tick — the same loop that drives recovery, timers and schedules — self-throttled to **one pass per minute per instance**, so calling it every tick is a no-op most of the time. Each pass is bounded (100 candidates per status), so a large backlog drains across passes rather than stalling a tick. Deletion is a *hard* delete: the run, its checkpoints, its signal waiters and search-attribute rows, and — cascading down — its entire child subtree go with it. A deleted run's count includes that subtree.
+The sweep (`engine.sweepRetention()`) is a phase of the [`durable:work`](/docs/durable/cli) tick — the same loop that drives recovery, timers and schedules — self-throttled to **one pass per minute per instance**, so calling it every tick is a no-op most of the time. Each pass is bounded (100 candidates per status), so a large backlog drains across passes rather than stalling a tick. Deletion is a *hard* delete: the run, its checkpoints, its signal waiters and search-attribute rows, and — cascading down — its entire child subtree go with it. A deleted run's count includes that subtree. Each pass collects its runs and their subtrees (children first) and deletes them in one call to the store's optional `deleteRuns`, a few `IN (...)` statements in one transaction, instead of four statements per run; a store without `deleteRuns` gets one `deleteRun` per run. If the batch delete fails, the whole pass is kept and the next pass retries it. With [`eventBufferTtl`](/docs/durable/api-reference#durableconfig) set, the same pass also deletes buffered events older than the TTL, in batches of 500.
 
 <Callout type="warn" title="Eviction cascades down, not up">
 Deleting a run takes its **children**, but the sweep does not know about a still-live *parent* awaiting a custom-id child — a completed child evicted out from under a suspended parent strands the join. Size the ages well beyond your longest-running parents.
@@ -99,7 +99,7 @@ await engine.purgeRuns({ tag: `tenant:${tenantId}` }) // or any other scope
 
 - **Live runs** in the scope are cancelled first (a plain cancel with no saga undo), then deleted. Pass `cancelLive: false` to leave live runs, and live descendants of finished ones, alone and delete terminal history only.
 - **Child runs** are deleted with their root even when they don't match the scope themselves. Pass `children: false` to delete exactly the matching runs.
-- `batchSize` (default `500`) bounds each round, and rounds repeat until the scope is empty.
+- `batchSize` (default `500`) bounds each round, and rounds repeat until the scope is empty. Each round's runs are deleted with one `deleteRuns` call when the store has it.
 - An **empty scope is rejected**, because it would delete every run in the store.
 - `onEvict` hooks are **not** called. A purge is an explicit delete, not retention, so archive first if you need a copy.
 
