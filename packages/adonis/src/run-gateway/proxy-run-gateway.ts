@@ -3,6 +3,7 @@ import type {
   EngineEvent,
   GroupHealth,
   RunFacetQuery,
+  RunFacetRow,
   RunQuery,
   RunReply,
   RunRequest,
@@ -27,7 +28,6 @@ import {
   type RunDetailOptions,
   type RunDetailSource,
 } from '../run-detail-summary.js';
-import type { RunFacetRow } from '../interfaces.js';
 import type { WorkflowRef } from '../workflow-ref.js';
 import type { DurableTopology, RunGateway, StartRunOptions } from './interface.js';
 import { UNSUPPORTED_RUN_REQUEST } from './run-request-responder.js';

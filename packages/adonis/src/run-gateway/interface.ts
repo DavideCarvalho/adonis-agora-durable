@@ -3,6 +3,7 @@ import type {
   EngineEvent,
   GroupHealth,
   RunFacetQuery,
+  RunFacetRow,
   RunQuery,
   RunResult,
   RunValueAxis,
@@ -14,7 +15,6 @@ import type {
   WorkflowRun,
 } from '../interfaces.js';
 import type { FanPage, FanPageQuery, RunDetail, RunDetailOptions } from '../run-detail-summary.js';
-import type { RunFacetRow } from '../interfaces.js';
 import type { WorkflowRef } from '../workflow-ref.js';
 
 /**

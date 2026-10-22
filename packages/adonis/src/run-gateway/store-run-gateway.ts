@@ -2,6 +2,7 @@ import type {
   EngineEvent,
   GroupHealth,
   RunFacetQuery,
+  RunFacetRow,
   RunQuery,
   RunResult,
   RunValueAxis,
@@ -21,7 +22,6 @@ import {
   type RunDetail,
   type RunDetailOptions,
 } from '../run-detail-summary.js';
-import type { RunFacetRow } from '../interfaces.js';
 import { runFacetsOf, waitingForRuns } from '../run-facets.js';
 import type { WorkflowRef } from '../workflow-ref.js';
 import type { DurableTopology, RunGateway, StartRunOptions } from './interface.js';
