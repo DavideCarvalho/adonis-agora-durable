@@ -240,12 +240,41 @@ export interface DbTransportConfig {
   pollIntervalMs?: number;
   /** How long a claimed-but-unfinished row is owned before it's reclaimable (crash recovery). Default 30s. */
   leaseMs?: number;
-  /** Max rows claimed per poll. Default 20. */
+  /**
+   * Max rows claimed per poll by the results, heartbeat and control loops. Default 20. The task loop
+   * claims only as many rows as it has free `concurrency` slots (capped by this).
+   */
   batchSize?: number;
-  /** Create the transport tables on first use if missing. Default true. */
+  /**
+   * How many task rows a worker runs at once. Default 1. One poll loop serves every handler name and
+   * keeps up to this many rows in flight, claiming only as many per poll as it has free slots.
+   *
+   * `'adaptive'`, or `{ mode: 'adaptive', min, max, start, tickMs, ramCeilingPct, cpuCeilingPct }`,
+   * moves the limit at runtime with the controller the BullMQ and queue transports use. Either way
+   * the limit, in-flight count, RSS, CPU, throughput and p95 ride the worker's liveness key.
+   */
+  concurrency?: ConcurrencyOption;
+  /** How many step results the engine side settles at once. Default 1. */
+  resultConcurrency?: number;
+  /**
+   * Idle backoff for the task, heartbeat and control loops, as a multiple of `pollIntervalMs`: after
+   * consecutive empty polls the sleep doubles up to this many intervals. Default 4; `1` disables it.
+   * The results loop never backs off.
+   */
+  idleBackoffMax?: number;
+  /**
+   * How many times a task row's lapsed claim may be taken over before the row is treated as poison:
+   * deleted, with a retryable failed result published for its step. Default 3.
+   */
+  maxStalledCount?: number;
+  /** How often (ms) a worker refreshes its liveness key per served step name. Default 10000. */
+  workerHeartbeatIntervalMs?: number;
+  /** Create the transport tables on first use if missing (and add newer columns). Default true. */
   autoCreate?: boolean;
   /** Stable id for this process (stamped on heartbeats / control `from` / `claimed_by`). Default random. */
   instanceId?: string;
+  /** Where transport failures (a throwing poll, a lost claim) are reported. Default `console.error`. */
+  onError?: (err: unknown) => void;
 }
 
 /**
@@ -411,8 +440,20 @@ export const transports = {
         ...(config.pollIntervalMs !== undefined ? { pollIntervalMs: config.pollIntervalMs } : {}),
         ...(config.leaseMs !== undefined ? { leaseMs: config.leaseMs } : {}),
         ...(config.batchSize !== undefined ? { batchSize: config.batchSize } : {}),
+        ...(config.concurrency !== undefined ? { concurrency: config.concurrency } : {}),
+        ...(config.resultConcurrency !== undefined
+          ? { resultConcurrency: config.resultConcurrency }
+          : {}),
+        ...(config.idleBackoffMax !== undefined ? { idleBackoffMax: config.idleBackoffMax } : {}),
+        ...(config.maxStalledCount !== undefined
+          ? { maxStalledCount: config.maxStalledCount }
+          : {}),
+        ...(config.workerHeartbeatIntervalMs !== undefined
+          ? { workerHeartbeatIntervalMs: config.workerHeartbeatIntervalMs }
+          : {}),
         ...(config.autoCreate !== undefined ? { autoCreate: config.autoCreate } : {}),
         ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+        ...(config.onError !== undefined ? { onError: config.onError } : {}),
       });
     };
   },
