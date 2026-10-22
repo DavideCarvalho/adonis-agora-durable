@@ -75,6 +75,19 @@ Because the retry time is persisted on the run and the poller drives it, the lim
 
 A slot is held from the moment a call is admitted until the step's **result lands** (or the run is cancelled), at which point the slot is released and the next blocked run can be admitted.
 
+## Capping one fan: `ctx.all` concurrency
+
+A queue caps a step across every run that names it. To cap a single fan instead, pass `concurrency` to `ctx.all`:
+
+```ts
+// At most 500 processLine steps in flight for this run; the rest wait their wave.
+const results = await ctx.all(processLine, lines, { concurrency: 500 })
+```
+
+The fan goes out in waves. Over a step, a wave is `concurrency` steps and the next is sent once every step of the previous one has settled. Over a [child workflow](/docs/durable/authoring/child-workflows#capping-how-many-children-run-at-once--concurrency), two waves of `floor(concurrency / 2)` children are in flight and the next goes out as soon as one settles. Either way each settled wave costs the parent one turn, not one turn per result, and the cap holds across instances because the waves come from the parent's checkpoints, not from in-memory slots.
+
+A step fan does not accept a `queue`: `ctx.all(step, inputs, { queue })` throws. When a step must also respect a fleet-wide rate limit, enforce it in the handler, or fan out over a child workflow whose `ctx.step` names the queue.
+
 ## Scope: per engine instance
 
 By default, flow-control accounting is **per engine instance**. For the common single-orchestrator deployment this is exactly what you want, and it's correct without any cross-process coordination. If you run several worker replicas, each enforces the limit independently (so a `concurrency: 5` queue admits up to 5 *per replica*). For a truly global cap, use the Redis backend below.

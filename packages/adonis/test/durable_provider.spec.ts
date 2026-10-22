@@ -153,6 +153,13 @@ describe('DurableProvider', () => {
     expect(deps.remoteRedispatchMax).toBe(3);
   });
 
+  it('forwards timerBatchSize to the engine', async () => {
+    const { app, resolve } = fakeApp({ timerBatchSize: 50 });
+    new DurableProvider(app).register();
+    const engine = await resolve();
+    expect((engine as unknown as { timerBatchSize: number }).timerBatchSize).toBe(50);
+  });
+
   it('forwards config.webhookUrl so ctx.webhook() gets a public url', async () => {
     const { app, resolve } = fakeApp({
       webhookUrl: (token) => `https://api.example.com/durable/webhooks/${token}`,

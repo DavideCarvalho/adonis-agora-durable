@@ -104,6 +104,21 @@ One instance consumes engine-side results; run one or more `node ace
 durable:work` workers serving the step names. Source:
 `docs/transports/queue.mdx`.
 
+For wide fans (`ctx.all` over thousands of steps), raise how many results an
+instance settles at once on `bullmq` (`queue` and `db` have no such option),
+and size the engine's due-timer batch:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  timerBatchSize: 200, // due runs per timer pass, most overdue first (default 200)
+  transports: {
+    bullmq: transports.bullmq({ connection: { host: '127.0.0.1', port: 6379 }, resultConcurrency: 16 }), // default 1
+  },
+})
+```
+
+Source: `docs/transports/index.mdx`.
+
 ### Pattern 3 — multi-replica fan-out: the control plane
 
 The task transport is point-to-point; lifecycle events and cancellation need a
@@ -177,6 +192,15 @@ export default defineConfig({
   stores: { encrypted: async () => new CodecStateStore(new LucidStateStore(db), aesCodec) },
 })
 ```
+
+A custom store should implement `countCheckpoints(runId, fromSeq, toSeq,
+statuses)` as a `COUNT` (the step-fan join barrier calls it on every result;
+without it the engine loads the run's checkpoints per result), implement
+`saveCheckpointIfPending` as one conditional `UPDATE ... WHERE status = 'pending'`
+(without it a blind save can put a settled step back to `pending`), and return
+`listDueTimers` most overdue first, with or without a `limit`. Run
+`runStateStoreContract` from `@adonis-agora/durable/testing/conformance`, which
+covers all three and fails a store missing either method.
 
 Source: `docs/stores/lucid.mdx`, `docs/stores/index.mdx`.
 

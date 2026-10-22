@@ -13,6 +13,7 @@ import {
 import { useCallback, useMemo } from 'react';
 import {
   durableClient,
+  type FanSummary,
   type RunDetail,
   type RunDisplayStatus,
   runDisplayStatus,
@@ -20,12 +21,27 @@ import {
   type WorkflowRun,
 } from '../client/durable-client';
 import { stepDisplayName } from '../client/folded-children';
-import { groupParallelSpans } from '../client/group-parallel-spans';
-import { childRunIdOf } from './child-link';
+import {
+  fanProgress,
+  fanSizeLabel,
+  fanStatus,
+  groupParallelSpans,
+  runFinished,
+} from '../client/group-parallel-spans';
+import {
+  CHILD_DETAIL_LIMIT,
+  childDetailIds,
+  childFallbackLabel,
+  childRunIdOf,
+  detailsById,
+} from './child-link';
+import { FAN_PROGRESS_SEGMENTS } from './fan-progress-style';
 import { BoltIcon, CheckIcon, ChildIcon, iconFor, KIND_LABEL, XIcon } from './icons';
 
 /** Stable empty set so a graph with no `expanded` prop doesn't re-run the layout memo each render. */
 const EMPTY_EXPANDED: Set<string> = new Set();
+/** Stable empty list, for a run whose detail summarized no fans. */
+const NO_FANS: FanSummary[] = [];
 
 /** Awaited child (`ctx.child`, `signal:child:<id>`) returns to the parent; fire-and-forget
  *  (`ctx.startChild`, `spawn:<id>`) does not. Drives whether an expanded child rejoins the flow. */
@@ -37,31 +53,32 @@ function isAwaitedChild(name: string): boolean {
  * Fetch the RunDetail of every VISIBLE child, keyed by run id, so the layout can weave each expanded
  * child's flow in as a lane AND read a collapsed child's lone inner step.
  *
- * Starting from `seed` (the expanded children + the root-level children), we transitively pull in one
- * level under every child whose detail is already cached — i.e. the children of every visible child —
- * because a child node may itself be a single-step wrapper (a `ctx.gather_children` handler) that we
- * want to render AS its lone step, which needs the child's own detail loaded. The reachable set is
- * recomputed each render off the live react-query cache (`getQueryData`), so it grows by one level
- * each time a detail settles and then stabilises once the bounded reachable tree is fully loaded
- * (same `['run', id]` keys → react-query dedupes → no new fetch → no further re-render). The returned
- * map is a plain projection of the settled queries.
+ * Starting from `seed` (the expanded children + the first root-level children), we transitively pull
+ * in one level under every child whose detail is already cached — i.e. the children of every visible
+ * child — because a child node may itself be a single-step wrapper (a `ctx.gather_children` handler)
+ * that we want to render AS its lone step, which needs the child's own detail loaded. The reachable
+ * set is recomputed each render off the live react-query cache (`getQueryData`), so it grows by one
+ * level each time a detail settles and then stabilises once the bounded reachable tree is fully
+ * loaded (same `['run', id]` keys → react-query dedupes → no new fetch → no further re-render).
+ *
+ * Bounded: each lane contributes its first {@link CHILD_DETAIL_LIMIT} children, and the walk stops
+ * {@link CHILD_DETAIL_LIMIT} ids past the seed. A child shown past the bound reads by id. Children
+ * of a summarized fan are not in any timeline, so they are never fetched.
  */
 function useReachableChildDetails(seed: Set<string>): Record<string, RunDetail> {
   const queryClient = useQueryClient();
-  // BFS over the already-cached details to expand `seed` by the children one level under every loaded
-  // child. Recomputed each render (cheap; the tree is small): when a parent's detail lands, the next
-  // render discovers its children and adds them to the fetch list.
   const ids: string[] = (() => {
     const all = new Set(seed);
+    const cap = seed.size + CHILD_DETAIL_LIMIT;
     const queue = [...seed];
-    while (queue.length > 0) {
+    while (queue.length > 0 && all.size < cap) {
       const id = queue.shift();
       if (id === undefined) continue;
       const cached = queryClient.getQueryData<RunDetail>(['run', id]);
       if (cached === undefined) continue;
-      for (const step of cached.timeline) {
-        const childId = childRunIdOf(step);
-        if (childId !== undefined && !all.has(childId)) {
+      for (const childId of childDetailIds(cached.timeline)) {
+        if (all.size >= cap) break;
+        if (!all.has(childId)) {
           all.add(childId);
           queue.push(childId);
         }
@@ -69,18 +86,10 @@ function useReachableChildDetails(seed: Set<string>): Record<string, RunDetail> 
     }
     return [...all].sort();
   })();
-  const results = useQueries({
+  return useQueries({
     queries: ids.map((id) => ({ queryKey: ['run', id], queryFn: () => durableClient.run(id) })),
+    combine: detailsById,
   });
-  // Plain (non-memoized) projection of the settled queries — cheap, and avoids depending on the
-  // useQueries result array (new identity each render) inside a memo. The layout below is likewise
-  // recomputed each render (graph is small; ReactFlow diffs nodes/edges by id).
-  const map: Record<string, RunDetail> = {};
-  ids.forEach((id, i) => {
-    const detail = results[i]?.data;
-    if (detail) map[id] = detail;
-  });
-  return map;
 }
 
 type SubCounts = { ok: number; failed: number; skipped: number };
@@ -115,6 +124,7 @@ type StepData = {
   laneRun?: WorkflowRun;
 };
 type EndData = { status: RunDisplayStatus; label: string };
+type FanData = { fan: FanSummary; runFinished: boolean; depth?: number | undefined };
 
 function StepCardNode({ data }: NodeProps<Node<StepData>>) {
   const failed = data.status === 'failed';
@@ -251,6 +261,64 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
   );
 }
 
+/** A summarized fan as one node: its label and size, a progress bar, and its members by status. */
+function FanCardNode({ data }: NodeProps<Node<FanData>>) {
+  const { fan } = data;
+  const progress = fanProgress(fan, data.runFinished);
+  const status = fanStatus(fan, data.runFinished);
+  const failed = status === 'failed';
+  const pending = status === 'pending' || status === 'running';
+  const rail = failed ? 'bg-red-400' : pending ? 'bg-live' : 'bg-emerald-400';
+  const pct = (n: number) => `${(n / Math.max(progress.total, 1)) * 100}%`;
+  return (
+    <div
+      title={`parallel fan ${fan.group}`}
+      className={`relative w-[208px] overflow-hidden rounded-xl border bg-panel/95 shadow-lg backdrop-blur ${
+        failed ? 'border-red-500/40' : 'border-indigo-500/40'
+      }`}
+    >
+      <span
+        className={`absolute inset-y-0 left-0 w-[3px] ${rail} ${pending ? 'animate-pulse' : ''}`}
+      />
+      <Handle type="target" position={Position.Left} className="!border-0 !bg-zinc-600" />
+      <div className="py-2.5 pl-3.5 pr-3">
+        <div className="flex items-center gap-2">
+          <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-indigo-500/15 text-[11px] text-indigo-300">
+            ⑃
+          </span>
+          <span className="truncate text-[13px] font-medium text-zinc-100">{fan.label}</span>
+          <span className="mono tnum ml-auto shrink-0 text-[11px] text-zinc-400">
+            {fanSizeLabel(progress)}
+          </span>
+        </div>
+        <div className="mt-2 flex h-1.5 overflow-hidden rounded-full bg-zinc-800">
+          {FAN_PROGRESS_SEGMENTS.map((seg) => (
+            <span
+              key={seg.key}
+              className={seg.className}
+              style={{ width: pct(progress[seg.key]) }}
+            />
+          ))}
+        </div>
+        <div className="mono tnum mt-1.5 flex flex-wrap items-center gap-2 text-[10px]">
+          {FAN_PROGRESS_SEGMENTS.map((seg) =>
+            progress[seg.key] > 0 ? (
+              <span key={seg.key} className={seg.text}>
+                {progress[seg.key]} {seg.label}
+                {seg.key === 'skipped' && fan.failFast ? ' (failFast)' : ''}
+              </span>
+            ) : null,
+          )}
+          <span className="ml-auto text-zinc-500">
+            #{fan.firstSeq}–{fan.lastSeq}
+          </span>
+        </div>
+      </div>
+      <Handle type="source" position={Position.Right} className="!border-0 !bg-zinc-600" />
+    </div>
+  );
+}
+
 function TerminalNode({ data }: NodeProps<Node<EndData>>) {
   // Open (non-terminal) states pulse. `suspended` no longer reaches here — runDisplayStatus refines
   // it to running / awaiting (both open → pulse) or sleeping (parked on a timer → static).
@@ -267,7 +335,7 @@ function TerminalNode({ data }: NodeProps<Node<EndData>>) {
   );
 }
 
-const nodeTypes = { step: StepCardNode, terminal: TerminalNode };
+const nodeTypes = { step: StepCardNode, fan: FanCardNode, terminal: TerminalNode };
 
 /** Tally a step's sub-process outcomes (e.g. parallel p-processes) for the at-a-glance node badge.
  *  Returns undefined when the step emitted no sub-process events. */
@@ -284,6 +352,7 @@ function subCounts(s: StepCheckpoint): SubCounts | undefined {
 export function WorkflowGraph({
   run,
   timeline,
+  fans = NO_FANS,
   endStatus,
   selectedKey,
   onSelect,
@@ -294,6 +363,8 @@ export function WorkflowGraph({
 }: {
   run: WorkflowRun;
   timeline: StepCheckpoint[];
+  /** Fans the detail summarized: each is one node, standing for members absent from `timeline`. */
+  fans?: FanSummary[] | undefined;
   /** The run's resolved display status for the end node — passed in so the graph agrees with the
    *  health-aware detail header (no-worker / queued / awaiting). Falls back to the timeline-only
    *  `runDisplayStatus` when omitted. */
@@ -311,23 +382,20 @@ export function WorkflowGraph({
   onToggleChild?: ((id: string) => void) | undefined;
 }) {
   const resolvedExpanded = expanded ?? EMPTY_EXPANDED;
-  // Seed: every expanded child (to lay out its sub-flow) plus every root-level child (so even a
-  // collapsed child node reads the child's real workflow name / lone inner step). The hook below
+  // Seed: every expanded child (to lay out its sub-flow) plus the first root-level children (so even
+  // a collapsed child node reads the child's real workflow name / lone inner step). The hook below
   // transitively pulls in one level under each of these too, so a child nested inside an expanded
   // lane also gets its own detail (and thus single-step collapse) without the user expanding it.
   const seedChildIds = useMemo(() => {
     const ids = new Set(resolvedExpanded);
-    for (const step of timeline) {
-      const childId = childRunIdOf(step);
-      if (childId !== undefined) ids.add(childId);
-    }
+    for (const childId of childDetailIds(timeline)) ids.add(childId);
     return ids;
   }, [resolvedExpanded, timeline]);
   const childData = useReachableChildDetails(seedChildIds);
 
-  // Built inline (not memoized): it reads `childData`, a fresh object each render, and the graph is
-  // small enough that recomputing is cheap; ReactFlow reconciles nodes/edges by id.
-  const { nodes, edges } = (() => {
+  // Memoised on its inputs: `childData` keeps its identity until a child's detail changes (see
+  // `detailsById`), so a render that moved nothing here reuses the last layout.
+  const { nodes, edges } = useMemo(() => {
     const gapX = 248;
     const laneY = 150;
     // Vertical pitch between members of a parallel fan stacked in one column (card height + breathing
@@ -389,7 +457,7 @@ export function WorkflowGraph({
       const displayName = loneChild
         ? loneChild.step.name
         : childId !== undefined
-          ? (childDetail?.run.workflow ?? 'child workflow')
+          ? (childDetail?.run.workflow ?? childFallbackLabel(childId, laneRun.id))
           : stepDisplayName(s);
       const failed = bodyStep.status === 'failed';
       nodes.push({
@@ -422,6 +490,7 @@ export function WorkflowGraph({
       if (detail) {
         const sub = layout(
           detail.timeline,
+          detail.fans ?? NO_FANS,
           depth + 1,
           x + gapX,
           y + laneY,
@@ -451,6 +520,7 @@ export function WorkflowGraph({
     // connectors (so the next step / `end` can link from), and the x/y extents consumed.
     function layout(
       tl: StepCheckpoint[],
+      laneFans: readonly FanSummary[],
       depth: number,
       startX: number,
       baseY: number,
@@ -461,7 +531,29 @@ export function WorkflowGraph({
       const firstIds: string[] = [];
       let connectors: FlowConnector[] = [];
       let bottomY = baseY;
-      for (const node of groupParallelSpans(tl)) {
+      for (const node of groupParallelSpans(tl, laneFans)) {
+        if (node.kind === 'summary') {
+          // A summarized fan is one node standing for all its members, linked like a single step.
+          const id = `${prefix}fan:${node.fan.group}`;
+          nodes.push({
+            id,
+            type: 'fan',
+            draggable: false,
+            position: { x: cursorX, y: baseY },
+            data: {
+              fan: node.fan,
+              runFinished: runFinished(laneRun.status),
+              depth,
+            } satisfies FanData,
+          });
+          if (firstIds.length === 0) firstIds.push(id);
+          for (const from of connectors) edges.push(mainEdge(from.id, id, from.failed));
+          connectors = [
+            { id, failed: fanStatus(node.fan, runFinished(laneRun.status)) === 'failed' },
+          ];
+          cursorX += gapX;
+          continue;
+        }
         const members = node.kind === 'single' ? [node.step] : node.steps;
         const isFirstGroup = firstIds.length === 0;
         const exits: FlowConnector[] = [];
@@ -492,7 +584,7 @@ export function WorkflowGraph({
       draggable: false,
       data: { status: 'running', label: run.workflow } satisfies EndData,
     });
-    const root = layout(timeline, 0, gap0, 0, '', run);
+    const root = layout(timeline, fans, 0, gap0, 0, '', run);
     // `start` fans out to every first node (a run that opens with a parallel fan has several).
     for (const firstId of root.firstIds) {
       edges.push({ id: `start->${firstId}`, source: 'start', target: firstId });
@@ -521,7 +613,18 @@ export function WorkflowGraph({
     }
 
     return { nodes, edges };
-  })();
+  }, [
+    run,
+    timeline,
+    fans,
+    endStatus,
+    selectedKey,
+    onOpenRun,
+    fmtDuration,
+    resolvedExpanded,
+    onToggleChild,
+    childData,
+  ]);
 
   const onNodeClick = useCallback(
     (_: unknown, node: Node) => {

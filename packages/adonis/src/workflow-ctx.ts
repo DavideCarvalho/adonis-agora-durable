@@ -26,6 +26,8 @@ import {
 import type {
   AllOptions,
   AllSettledOptions,
+  AllStepsOptions,
+  AllStepsSettledOptions,
   ChildCallOptions,
   ChildWait,
   DurableWebhook,
@@ -154,6 +156,21 @@ export interface CtxHost {
     transport?: string,
     admission?: { priority?: number | undefined; fairnessKey?: string | undefined },
   ): Promise<TOutput>;
+  /** One durable step per input at the reserved `positions`, joined once (`ctx.all` over a step). */
+  callRemoteAll<TInput, TOutput>(
+    runId: string,
+    positions: number[],
+    step: StepDef<TInput, TOutput>,
+    inputs: TInput[],
+    opts: {
+      mode: 'waitAll' | 'failFast';
+      concurrency?: number | undefined;
+      transport?: string | undefined;
+      admission?: { priority?: number | undefined; fairnessKey?: string | undefined };
+      /** `ctx.allSettled`: resolve with a `Settled` per step instead of throwing a `GatherError`. */
+      settle?: boolean | undefined;
+    },
+  ): Promise<TOutput[] | Settled<TOutput>[]>;
   /** Start a child run once, deferred so it can't reentrantly resume a still-running parent. */
   startChild(workflow: string, input: unknown, id: string, priority?: number): void;
   /**
@@ -679,20 +696,23 @@ export function createWorkflowCtx(
   // is thrown carrying the per-item failures. Parity with the Python SDK's `gather_children`.
   // `settle` is `ctx.allSettled`: the same waitAll fan, resolving with a `Settled` per item instead.
   const fan = async (
-    workflow: WorkflowRef,
+    workflow: WorkflowRef | StepRef,
     inputs: unknown[],
-    opts: AllOptions | undefined,
+    opts: AllOptions | AllStepsOptions | undefined,
     settle: boolean,
   ): Promise<unknown[]> => {
     // Empty: reserve no positions and produce no side effects (degenerate identity).
     if (inputs.length === 0) return [];
+    if (stepNameOf(workflow) !== undefined) {
+      return allSteps(workflow as StepRef, inputs, opts as AllStepsOptions | undefined, settle);
+    }
     const mode = settle ? 'waitAll' : (opts?.mode ?? 'waitAll');
-    const name = workflowName(workflow);
+    const name = workflowName(workflow as WorkflowRef);
     const waves = allWaves(inputs.length, opts?.concurrency);
     // Reserve the whole block in list order BEFORE any dispatch — replay re-derives identical seqs.
     const positions = inputs.map(() => pos.next());
     const firstSeq = positions[0] as number;
-    const group = allGroup(firstSeq, mode);
+    const group = allGroup(firstSeq, inputs.length, mode);
     const waveOf = (i: number) => (waves ? Math.floor(i / waves.waveSize) : undefined);
     const id = (i: number) => allChildId(runId, firstSeq, i, waveOf(i));
     const { checkpoints: existing, folded } = await readFan(positions, [
@@ -895,15 +915,42 @@ export function createWorkflowCtx(
     return outputs;
   };
   const all = <T = unknown>(
-    workflow: WorkflowRef,
+    workflow: WorkflowRef | StepRef,
     inputs: unknown[],
-    opts?: AllOptions,
+    opts?: AllOptions | AllStepsOptions,
   ): Promise<T[]> => fan(workflow, inputs, opts, false) as Promise<T[]>;
   const allSettled = <T = unknown>(
-    workflow: WorkflowRef,
+    workflow: WorkflowRef | StepRef,
     inputs: unknown[],
-    opts?: AllSettledOptions,
+    opts?: AllSettledOptions | AllStepsSettledOptions,
   ): Promise<Settled<T>[]> => fan(workflow, inputs, opts, true) as Promise<Settled<T>[]>;
+
+  // `ctx.all` over a `@Step`: one durable step per input. Reserves the whole position block in list
+  // order first, like the child fan, then hands the fan to the engine, which sends it and joins it.
+  const allSteps = async (
+    ref: StepRef,
+    inputs: unknown[],
+    opts: AllStepsOptions | undefined,
+    settle: boolean,
+  ) => {
+    const unsupported = opts as StepDispatchOpts | undefined;
+    if (unsupported?.queue !== undefined) {
+      throw new Error('ctx.all: a flow-control queue is not supported on a step fan');
+    }
+    const name = stepNameOf(ref) as string;
+    const def: StepDef<unknown, unknown> = {
+      name,
+      ...resolveStepPolicy(stepConfigOf(ref), opts),
+    };
+    const positions = inputs.map(() => pos.next());
+    return host.callRemoteAll(runId, positions, def, inputs, {
+      mode: settle ? 'waitAll' : (opts?.mode ?? 'waitAll'),
+      settle,
+      concurrency: opts?.concurrency,
+      transport: opts?.transport,
+      admission: { priority: opts?.priority, fairnessKey: opts?.fairnessKey },
+    });
+  };
 
   // A fan's checkpoints: from the replay snapshot, plus ONE prefix query for any the snapshot does
   // not hold (on the first dispatch, all of them) instead of a lookup per child. A folded checkpoint

@@ -297,7 +297,42 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
 
     // ---- checkpoints ------------------------------------------------------------------------
 
+    t('countCheckpoints counts a seq range by status', async () => {
+      // Optional on the interface (the engine has a fallback), but a conformant store MUST provide
+      // it — assert presence, then exercise the fast path.
+      expect(store.countCheckpoints).toBeDefined();
+      if (!store.countCheckpoints) return;
+      await store.createRun(run());
+      for (const [seq, status] of [
+        [0, 'completed'],
+        [1, 'pending'],
+        [2, 'pending'],
+        [3, 'failed'],
+        [4, 'pending'],
+      ] as const) {
+        await store.saveCheckpoint(checkpoint({ seq, status, stepId: `r1:${seq}` }));
+      }
+      await store.createRun(run({ id: 'other' }));
+      await store.saveCheckpoint(
+        checkpoint({ runId: 'other', seq: 2, status: 'pending', stepId: 'other:2' }),
+      );
+
+      expect(await store.countCheckpoints('r1', 1, 3, ['pending'])).toBe(2);
+      expect(await store.countCheckpoints('r1', 0, 4, ['pending', 'failed'])).toBe(4);
+      // Both bounds are inclusive.
+      expect(await store.countCheckpoints('r1', 2, 2, ['pending'])).toBe(1);
+      expect(await store.countCheckpoints('r1', 1, 4, ['pending'])).toBe(3);
+      expect(await store.countCheckpoints('r1', 0, 0, ['completed'])).toBe(1);
+      // `other` has a pending row at seq 2: a count is scoped to its run.
+      expect(await store.countCheckpoints('other', 0, 4, ['pending'])).toBe(1);
+      expect(await store.countCheckpoints('r1', 5, 9, ['pending'])).toBe(0);
+      expect(await store.countCheckpoints('r1', 0, 4, [])).toBe(0);
+    });
+
     t('saveCheckpointIfPending writes over a pending row only', async () => {
+      // Optional on the interface (the engine falls back to a blind save, which can clobber a settled
+      // row), but a conformant store MUST provide it — assert presence, then exercise it.
+      expect(store.saveCheckpointIfPending).toBeDefined();
       if (!store.saveCheckpointIfPending) return;
       await store.createRun(run());
       const pending = checkpoint({ status: 'pending', output: undefined });
@@ -313,6 +348,18 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       const after = await store.getCheckpoint('r1', 0);
       expect(after?.status).toBe('completed');
       expect(after?.output).toEqual({ ok: true });
+      // The settling write carried no deadline, so the one the pending row held is cleared.
+      expect(after?.wakeAt).toBeUndefined();
+      // A refused write is refused for every status that is not `pending`, and leaves the row as is.
+      await store.saveCheckpoint(
+        checkpoint({ seq: 1, status: 'failed', stepId: 'r1:1', error: { message: 'boom' } }),
+      );
+      expect(await store.saveCheckpointIfPending({ ...pending, seq: 1, stepId: 'r1:1' })).toBe(
+        false,
+      );
+      const failed = await store.getCheckpoint('r1', 1);
+      expect(failed?.status).toBe('failed');
+      expect(failed?.error?.message).toBe('boom');
       // No row to compare against: nothing is written.
       expect(await store.saveCheckpointIfPending({ ...pending, seq: 9 })).toBe(false);
       expect(await store.getCheckpoint('r1', 9)).toBeNull();
@@ -490,6 +537,27 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         expect((await store.listOrphanedRuns(5_000, 1)).length).toBe(1);
       },
     );
+
+    t('listDueTimers returns the most overdue first, capped at limit', async () => {
+      for (const [id, wakeAt] of [
+        ['late', 3_000],
+        ['earliest', 1_000],
+        ['middle', 2_000],
+        ['future', 9_000],
+      ] as const) {
+        await store.createRun(run({ id, status: 'suspended', wakeAt }));
+      }
+
+      expect((await store.listDueTimers(5_000)).map((r) => r.id)).toEqual([
+        'earliest',
+        'middle',
+        'late',
+      ]);
+      expect((await store.listDueTimers(5_000, undefined, 2)).map((r) => r.id)).toEqual([
+        'earliest',
+        'middle',
+      ]);
+    });
 
     t('listDueTimers honors the optional limit, oldest deadline first (when applied)', async () => {
       await store.createRun(run({ id: 'later', status: 'suspended', wakeAt: 4_000 }));

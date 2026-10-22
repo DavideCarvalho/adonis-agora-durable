@@ -5,7 +5,7 @@ import {
   type StepEvent,
   type WorkflowRun,
 } from './durable-client.js';
-import { mergeLiveEvents } from './merge-live-events.js';
+import { appendLiveEvent, mergeLiveEvents } from './merge-live-events.js';
 
 const RUN: WorkflowRun = {
   id: 'r1',
@@ -75,5 +75,63 @@ describe('mergeLiveEvents', () => {
     ]);
     const bySeq = new Map(mergeLiveEvents(prev, fresh).timeline.map((s) => [s.seq, s.events]));
     expect(bySeq.get(1)).toEqual([ev(7), ev(8)]); // preserved despite reordering
+  });
+});
+
+describe('appendLiveEvent', () => {
+  const event: StepEvent = { at: 1, level: 'info', message: 'tick' };
+
+  it('appends the event to the step with that seq', () => {
+    const prev: RunDetail = { run: RUN, timeline: [step({ seq: 0 }), step({ seq: 1 })] };
+    const next = appendLiveEvent(prev, 1, event);
+    expect(next?.timeline[1]?.events).toEqual([event]);
+    expect(next?.timeline[0]).toBe(prev.timeline[0]);
+  });
+
+  it('leaves the detail untouched for a step it does not list (a summarized fan member)', () => {
+    const prev: RunDetail = {
+      run: RUN,
+      timeline: [step({ seq: 0 })],
+      fans: [
+        {
+          group: 'steps:1:40000',
+          label: 'work',
+          firstSeq: 1,
+          lastSeq: 40000,
+          size: 40000,
+          failFast: false,
+          counts: { running: 40000 },
+          failures: [],
+        },
+      ],
+    };
+    expect(appendLiveEvent(prev, 20000, event)).toBe(prev);
+  });
+
+  it('is a no-op before the detail has loaded', () => {
+    expect(appendLiveEvent(undefined, 0, event)).toBeUndefined();
+  });
+});
+
+describe('mergeLiveEvents with a summarized detail', () => {
+  it('carries the fresh fans and childCount through', () => {
+    const fans: RunDetail['fans'] = [
+      {
+        group: 'all:3',
+        label: 'child runs',
+        firstSeq: 1,
+        lastSeq: 900,
+        size: 900,
+        failFast: false,
+        counts: { completed: 900 },
+        failures: [],
+      },
+    ];
+    const merged = mergeLiveEvents(
+      { run: RUN, timeline: [step()] },
+      { run: RUN, timeline: [step()], fans, childCount: 900 },
+    );
+    expect(merged.fans).toBe(fans);
+    expect(merged.childCount).toBe(900);
   });
 });

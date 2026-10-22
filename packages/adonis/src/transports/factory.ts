@@ -157,8 +157,17 @@ export interface BullMQTransportConfig {
   prefix?: string;
   /** Logical deployment namespace, segmenting every queue/channel/key. `"default"`/absent = unchanged. */
   namespace?: string;
-  /** How many tasks a worker runs concurrently from each of its queues (BullMQ `Worker` concurrency). Default 1. */
+  /**
+   * How many tasks a worker runs concurrently from each of its queues (BullMQ `Worker` concurrency).
+   * Default 1. A non-finite or sub-1 value falls back to 1.
+   */
   concurrency?: number;
+  /**
+   * How many step results this instance settles at once from the results queue. Raise it for wide
+   * fans; one run's turns still go in order on an instance. Default 1. A non-finite or sub-1 value
+   * falls back to 1.
+   */
+  resultConcurrency?: number;
   /** Stable id for this process (stamped on the worker-liveness keys). Default `ts-<host>-<pid>`. */
   instanceId?: string;
   /**
@@ -338,6 +347,9 @@ export const transports = {
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
         ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
         ...(config.closeTimeoutMs !== undefined ? { closeTimeoutMs: config.closeTimeoutMs } : {}),
+        ...(config.resultConcurrency !== undefined
+          ? { resultConcurrency: config.resultConcurrency }
+          : {}),
         ...(config.onError !== undefined ? { onError: config.onError } : {}),
       });
     };

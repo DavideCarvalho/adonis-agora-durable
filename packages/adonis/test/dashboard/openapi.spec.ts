@@ -21,6 +21,7 @@ describe('the dashboard OpenAPI document', () => {
       '/runs',
       '/runs/values',
       '/runs/{id}',
+      '/runs/{id}/fans/{group}',
       '/runs/{id}/stream',
       '/runs/{id}/retry',
       '/runs/{id}/retry-with-input',

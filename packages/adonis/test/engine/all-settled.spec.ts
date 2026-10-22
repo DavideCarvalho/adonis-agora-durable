@@ -2,9 +2,17 @@ import { describe, expect, it } from 'vitest';
 import { isWorkflowControlFlowSignal } from '../../src/control-flow-signal.js';
 import { WorkflowEngine } from '../../src/engine.js';
 import { FatalError } from '../../src/errors.js';
+import { allGroup, stepFanGroup } from '../../src/fan-join.js';
 import type { Settled } from '../../src/interfaces.js';
+import {
+  DURABLE_STEP_CONFIG,
+  DURABLE_STEP_NAME,
+  type StepConfig,
+  type StepRef,
+} from '../../src/step-name-symbol.js';
 import { startRun } from '../../src/test-helpers.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
+import { InMemoryTransport } from '../../src/testing/in-memory-transport.js';
 
 async function until(check: () => boolean | Promise<boolean>, max = 2000): Promise<void> {
   for (let i = 0; i < max; i += 1) {
@@ -12,6 +20,14 @@ async function until(check: () => boolean | Promise<boolean>, max = 2000): Promi
     await new Promise((resolve) => setTimeout(resolve, 2));
   }
   throw new Error('condition not met');
+}
+
+/** Stamp a plain function as a `@Step` reference, as the `@Step` decorator does. */
+function stepRef<TInput, TOutput>(name: string, config?: StepConfig): StepRef<TInput, TOutput> {
+  const ref = (() => {}) as unknown as StepRef<TInput, TOutput>;
+  (ref as { [DURABLE_STEP_NAME]?: string })[DURABLE_STEP_NAME] = name;
+  if (config) (ref as { [DURABLE_STEP_CONFIG]?: StepConfig })[DURABLE_STEP_CONFIG] = config;
+  return ref;
 }
 
 const lines = (n: number) => Array.from({ length: n }, (_, i) => ({ i }));
@@ -167,6 +183,118 @@ describe('ctx.allSettled', () => {
         .filter((c) => c.name.startsWith('signal:child:'))
         .map((c) => c.parallelGroup),
     );
-    expect(groups).toEqual(new Set(['all:0']));
+    // A settled fan waits for every child, so it is a waitAll group: no `:failFast` suffix.
+    expect(groups).toEqual(new Set([allGroup(0, 3, 'waitAll')]));
+  });
+});
+
+describe('ctx.allSettled over a @Step', () => {
+  const LINE = 'Lines.validate';
+
+  function stepFan(handler: (input: { i: number }) => Promise<number>) {
+    const store = new InMemoryStateStore();
+    const transport = new InMemoryTransport();
+    const calls: number[] = [];
+    transport.handle(LINE, async (input) => {
+      const line = input as { i: number };
+      calls.push(line.i);
+      return handler(line);
+    });
+    const engine = new WorkflowEngine({ store, transport, reconcileMs: 0 });
+    return { store, engine, calls };
+  }
+
+  it('resolves with every outcome in input order', async () => {
+    const { store, engine } = stepFan(async ({ i }) => {
+      if (i === 2) throw new Error('bad line 2');
+      return i;
+    });
+    const validate = stepRef<{ i: number }, number>(LINE);
+    engine.register('file', '1', async (ctx) => ctx.allSettled(validate, lines(4)));
+
+    await startRun(engine, 'file', {}, 'p');
+    await until(async () => (await store.getRun('p'))?.status === 'completed');
+
+    expect((await store.getRun('p'))?.output).toEqual([
+      { status: 'fulfilled', value: 0 },
+      { status: 'fulfilled', value: 1 },
+      { status: 'rejected', id: expect.any(String), error: expect.stringContaining('bad line 2') },
+      { status: 'fulfilled', value: 3 },
+    ]);
+  });
+
+  it('rejects a FatalError item without spending its retries', async () => {
+    const { store, engine, calls } = stepFan(async ({ i }) => {
+      if (i === 1) throw new FatalError('schema mismatch', 'invalid');
+      return i;
+    });
+    const validate = stepRef<{ i: number }, number>(LINE, { retries: 3 });
+    engine.register('file', '1', async (ctx) => ctx.allSettled(validate, lines(3)));
+
+    await startRun(engine, 'file', {}, 'p');
+    await until(async () => (await store.getRun('p'))?.status === 'completed');
+
+    const out = (await store.getRun('p'))?.output as Settled<number>[];
+    expect(out[1]).toMatchObject({ status: 'rejected', error: 'schema mismatch' });
+    expect(calls.filter((i) => i === 1)).toHaveLength(1);
+  });
+
+  it("carries a failed step's code and details", async () => {
+    const { store, engine } = stepFan(async ({ i }) => {
+      if (i === 1) throw new FatalError('schema mismatch', 'invalid', { path: ['amount'] });
+      return i;
+    });
+    const validate = stepRef<{ i: number }, number>(LINE);
+    engine.register('file', '1', async (ctx) => ctx.allSettled(validate, lines(2)));
+
+    await startRun(engine, 'file', {}, 'p');
+    await until(async () => (await store.getRun('p'))?.status === 'completed');
+
+    const [, invalid] = ((await store.getRun('p'))?.output ?? []) as Settled<number>[];
+    expect(invalid).toMatchObject({
+      status: 'rejected',
+      code: 'invalid',
+      details: { path: ['amount'] },
+    });
+  });
+
+  it('settles a concurrency-limited step fan and continues past it', async () => {
+    const { store, engine } = stepFan(async ({ i }) => {
+      if (i % 5 === 0) throw new Error(`bad line ${i}`);
+      return i;
+    });
+    const validate = stepRef<{ i: number }, number>(LINE);
+    engine.register('file', '1', async (ctx) => {
+      const results = await ctx.allSettled(validate, lines(12), { concurrency: 3 });
+      const after = await ctx.step<number>(LINE, { i: 7 });
+      return { rejected: results.filter((r) => r.status === 'rejected').length, after };
+    });
+
+    await startRun(engine, 'file', {}, 'p');
+    await until(async () => (await store.getRun('p'))?.status === 'completed');
+
+    expect((await store.getRun('p'))?.output).toEqual({ rejected: 3, after: 7 });
+  });
+
+  it('settles even though a mode would ask to fail fast', async () => {
+    const { store, engine } = stepFan(async ({ i }) => {
+      if (i === 0) throw new FatalError('bad line 0');
+      return i;
+    });
+    const validate = stepRef<{ i: number }, number>(LINE);
+    engine.register('file', '1', async (ctx) =>
+      // `mode` is not part of the settled options; a caller bypassing the type still gets waitAll.
+      ctx.allSettled(validate, lines(3), { mode: 'failFast' } as never),
+    );
+
+    await startRun(engine, 'file', {}, 'p');
+    await until(async () => (await store.getRun('p'))?.status === 'completed');
+
+    const out = (await store.getRun('p'))?.output as Settled<number>[];
+    expect(out.map((r) => r.status)).toEqual(['rejected', 'fulfilled', 'fulfilled']);
+    const groups = new Set(
+      (await store.listCheckpoints('p')).filter((c) => c.name === LINE).map((c) => c.parallelGroup),
+    );
+    expect(groups).toEqual(new Set([stepFanGroup(0, 3, 'waitAll')]));
   });
 });

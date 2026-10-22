@@ -8,6 +8,7 @@ import type {
   StepCheckpoint,
   WorkflowRun,
 } from '../interfaces.js';
+import type { FanPage, FanPageQuery, RunDetail, RunDetailOptions } from '../run-detail-summary.js';
 import type { WorkflowRef } from '../workflow-ref.js';
 
 /**
@@ -66,6 +67,18 @@ export interface RunGateway {
   /** The ids of the runs this run spawned (parent→child tree) — the detail view's children list. Empty
    *  for a leaf run (or an unknown one). A `ProxyRunGateway` round-trips this over the P4 wire. */
   getRunChildren(runId: string): Promise<string[]>;
+
+  /**
+   * The run, its timeline and its children in one read — with `summarizeFansOver`, a wide fan comes
+   * back as one {@link import('../run-detail-summary.js').FanSummary} instead of a row per member.
+   * Optional: a caller without it composes the detail from {@link getRun}, {@link getCheckpoints}
+   * and {@link getRunChildren}.
+   */
+  getRunDetail?(runId: string, options?: RunDetailOptions): Promise<RunDetail | null>;
+
+  /** One page of a summarized fan's members, or null for an unknown run. Optional, like
+   *  {@link getRunDetail}. */
+  getFanMembers?(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null>;
 
   /** Typed, queryable run data (`searchAttributes`) stamped on the run, or undefined if it has none. */
   getSearchAttributes(runId: string): Promise<SearchAttributes | undefined>;

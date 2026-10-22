@@ -188,15 +188,28 @@ export class WorkflowSuspended extends Error {
   readonly waitSeqs?: number[] | undefined;
   /** Set when awaited children are what the run is waiting on — see {@link FanJoin}. */
   readonly fan?: FanJoin | undefined;
+  /**
+   * The position blocks of the step fans (`ctx.all` over a `@Step`) this suspension waits on. Their
+   * steps are deliberately NOT in {@link waitSeqs}: one settled step must not re-drive the run, only
+   * a fan with no step left `pending` does.
+   */
+  readonly stepFans?: StepFanRange[] | undefined;
   /** Marks this as a control-flow signal — see {@link isWorkflowControlFlowSignal}. */
   readonly [CONTROL_FLOW_SIGNAL] = true;
-  constructor(wakeAt?: number, waitSeqs?: number[], fan?: FanJoin) {
+  constructor(wakeAt?: number, waitSeqs?: number[], fan?: FanJoin, stepFans?: StepFanRange[]) {
     super('workflow suspended');
     this.name = 'WorkflowSuspended';
     this.wakeAt = wakeAt;
     this.waitSeqs = waitSeqs;
     this.fan = fan;
+    this.stepFans = stepFans;
   }
+}
+
+/** The seqs `from..to` (inclusive) of one step fan's position block. */
+export interface StepFanRange {
+  from: number;
+  to: number;
 }
 
 /**

@@ -179,8 +179,9 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
       },
       '/runs/{id}': {
         get: {
-          summary: "A run's detail: the run, its step timeline, its children",
-          parameters: [idParam],
+          summary:
+            "A run's detail: the run, its step timeline, its children. A fan with more than 50 members is summarized into `fans` unless `full=true`",
+          parameters: [idParam, { name: 'full', in: 'query', schema: { type: 'boolean' } }],
           responses: {
             '200': jsonResponse('Run detail.', {
               type: 'object',
@@ -188,6 +189,30 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
                 run: { $ref: '#/components/schemas/RunSummary' },
                 timeline: { type: 'array', items: { $ref: '#/components/schemas/Checkpoint' } },
                 children: { type: 'array', items: { type: 'string' } },
+                fans: { type: 'array', items: { type: 'object' } },
+                childCount: { type: 'integer' },
+              },
+            }),
+            '404': err('Unknown run.'),
+          },
+        },
+      },
+      '/runs/{id}/fans/{group}': {
+        get: {
+          summary: "One page of a summarized fan's members, in seq order",
+          parameters: [
+            idParam,
+            { name: 'group', in: 'path', required: true, schema: { type: 'string' } },
+            { name: 'offset', in: 'query', schema: { type: 'integer' } },
+            { name: 'limit', in: 'query', schema: { type: 'integer' } },
+            { name: 'failed', in: 'query', schema: { type: 'boolean' } },
+          ],
+          responses: {
+            '200': jsonResponse('A page of members.', {
+              type: 'object',
+              properties: {
+                items: { type: 'array', items: { $ref: '#/components/schemas/Checkpoint' } },
+                total: { type: 'integer' },
               },
             }),
             '404': err('Unknown run.'),

@@ -139,6 +139,8 @@ The full surface:
 | `listRuns(query)` | a filtered listing (status, workflow, tag, namespace, search attributes) |
 | `getCheckpoints(runId)` | the run's step timeline |
 | `getRunChildren(runId)` | the ids of the run's child workflows |
+| `getRunDetail?(runId, { summarizeFansOver? })` | the run, its timeline and its children in one read, or `null`. With `summarizeFansOver: n`, each fan of more than `n` members comes back as one `FanSummary` in `fans` instead of a row per member, `children` lists the first 200 ids and `childCount` the total |
+| `getFanMembers?(runId, group, { offset?, limit?, failedOnly? })` | one page of a fan's members in seq order (`limit` defaults to 100, at most 500), with the matching `total`, or `null` for an unknown run |
 | `getSearchAttributes(runId)` | the run's [search attributes](/docs/durable/authoring/queries-and-updates) |
 | `start(workflow, input, opts?)` | start a run; `opts.runId` is the idempotency key, and omitting it mints one |
 | `signal(runId, signal, payload?)` | deliver a [signal](/docs/durable/concepts/sleep-and-signals) |
@@ -146,6 +148,17 @@ The full surface:
 | `redispatchPending(runId)` | re-enqueue every remote step still `pending` — [the operator escape hatch](/docs/durable/reliability/failure-modes) |
 | `workerHealth()` | queue depth and live workers per group |
 | `subscribe(runId, onEvent)` | live-tail one run's lifecycle events; returns the unsubscribe |
+
+`getRunDetail` and `getFanMembers` are optional on the interface, and every built-in gateway implements them. A custom gateway without them still works: the dashboard and the responder build the same detail from `getRun`, `getCheckpoints` and `getRunChildren`, and the exported `loadRunDetail` / `loadFanMembers` helpers do it for your own code.
+
+```ts
+const detail = await runGateway.getRunDetail?.(params.id, { summarizeFansOver: 50 })
+// detail.fans: [{ group: 'steps:3:40000', label: 'processLine', size: 600, total: 40000, counts: { completed: 580, pending: 20 }, … }]
+```
+
+<Callout type="warn" title="Upgrade the control plane before its tenants">
+On a store-less `tenant` pod the [dashboard](/docs/durable/observability/dashboard) reads run detail through the `getRunDetail` run-request verb, and pages a fan through `getFanMembers`, so the control plane summarizes a wide fan before it crosses the wire. A control plane on an older version rejects verbs it does not know, so run detail fails on an upgraded tenant until its control plane is upgraded too. Upgrade the control plane first, or with its tenants. Before answering either verb, the responder checks tenant ownership on the run alone, without loading its timeline.
+</Callout>
 
 On a store role, `engine` (the default export of `services/main`) is still there for everything the gateway does not cover — registering workflows, driving poll loops, `continue`, `retryWithInput`. On a `tenant` pod there is no engine to resolve, which is exactly the point: reach for `runGateway` in anything that must run on more than one role.
 

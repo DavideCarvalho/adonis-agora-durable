@@ -214,7 +214,7 @@ describe('ctx.all scaling', () => {
     await startRun(engine, 'parent', {}, 'p');
     await poll(async () => (await store.getRun('p'))?.status === 'completed');
     expect((await store.getRun('p'))?.output).toBe('failed-fast');
-    expect((await store.getCheckpoint('p', 0))?.parallelGroup).toBe('all:0:failFast');
+    expect((await store.getCheckpoint('p', 0))?.parallelGroup).toMatch(/^all:0:n\d+:failFast$/);
   });
 });
 

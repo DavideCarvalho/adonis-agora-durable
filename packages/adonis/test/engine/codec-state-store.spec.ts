@@ -42,6 +42,29 @@ describe('CodecStateStore', () => {
     expect(new CodecStateStore(inner, wrapCodec).saveCheckpointIfPending).toBeUndefined();
   });
 
+  it('forwards countCheckpoints only when the inner store has it', async () => {
+    const inner = new InMemoryStateStore();
+    const at = new Date();
+    await inner.saveCheckpoint({
+      runId: 'r1',
+      seq: 3,
+      name: 'charge',
+      kind: 'remote',
+      stepId: 'r1:3',
+      status: 'pending',
+      attempts: 1,
+      enqueuedAt: at,
+      startedAt: at,
+      finishedAt: at,
+    });
+    expect(
+      await new CodecStateStore(inner, wrapCodec).countCheckpoints?.('r1', 0, 9, ['pending']),
+    ).toBe(1);
+
+    Object.defineProperty(inner, 'countCheckpoints', { value: undefined });
+    expect(new CodecStateStore(inner, wrapCodec).countCheckpoints).toBeUndefined();
+  });
+
   it('encodes payloads at rest and decodes them on read', async () => {
     const inner = new InMemoryStateStore();
     const store = new CodecStateStore(inner, wrapCodec);

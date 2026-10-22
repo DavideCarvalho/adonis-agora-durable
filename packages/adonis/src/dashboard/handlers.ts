@@ -18,6 +18,15 @@ import type {
   UpdateResult,
   WorkflowRun,
 } from '../index.js';
+import {
+  type FanPage,
+  type FanPageQuery,
+  type FanSummary,
+  loadFanMembers,
+  loadRunDetail,
+  type RunDetail,
+  type RunDetailOptions,
+} from '../run-detail-summary.js';
 import { RUN_VALUE_FACET_LIMIT } from '../run-value-facets.js';
 import { indexWaitersByRun, resolveRunWaiting } from '../run-waiting.js';
 import { RUN_STATUSES, RunFilter } from './run-filter.js';
@@ -61,6 +70,15 @@ export interface DashboardEngine {
   listRuns(query: RunQuery): Promise<WorkflowRun[]>;
   listCheckpoints(runId: string): Promise<StepCheckpoint[]>;
   getRunChildren(runId: string): Promise<string[]>;
+  /**
+   * The run detail in one read, wide fans summarized per `options`. Optional: without it the
+   * handlers build it from {@link getRun} / {@link listCheckpoints} / {@link getRunChildren}. A
+   * tenant pod's adapter forwards it, so the control plane summarizes before the detail crosses the
+   * wire.
+   */
+  getRunDetail?(runId: string, options?: RunDetailOptions): Promise<RunDetail | null>;
+  /** One page of a summarized fan's members. Optional, like {@link getRunDetail}. */
+  getFanMembers?(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null>;
   requeue(runId: string): Promise<RunResult | null>;
   redispatchPending(runId: string): Promise<RunResult | null>;
   cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null>;
@@ -356,22 +374,77 @@ export async function listRuns(deps: Deps, req: ApiRequest): Promise<ApiResponse
   });
 }
 
-/** `GET /runs/:id` — a run's detail: the run, its step timeline, and child run ids. */
+/** A fan wider than this comes back from `GET /runs/:id` as one summary, unless `?full=true`. */
+export const SUMMARIZE_FANS_OVER = 50;
+
+/**
+ * `GET /runs/:id` — a run's detail: the run, its step timeline, and child run ids. A fan with more
+ * than {@link SUMMARIZE_FANS_OVER} members is summarized into `fans` (its members leave `timeline`,
+ * `children` is capped and `childCount` carries the total); `?full=true` returns every member.
+ */
 export async function getRun(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
   const { engine } = deps;
   const id = req.params.id;
   if (!id) return notFound('run id is required');
-  const run = await engine.getRun(id);
-  if (!run) return notFound(`run ${id} not found`);
-  const [timeline, children] = await Promise.all([
-    engine.listCheckpoints(id),
-    engine.getRunChildren(id),
-  ]);
+  const full = readFlag(req, 'full');
+  if (full === INVALID_FLAG) return badRequest('full must be a boolean');
+  const options = full ? undefined : { summarizeFansOver: SUMMARIZE_FANS_OVER };
+  const detail = engine.getRunDetail
+    ? await engine.getRunDetail(id, options)
+    : await loadRunDetail(engine, id, options);
+  if (!detail) return notFound(`run ${id} not found`);
+  const checkpoint = (cp: StepCheckpoint) =>
+    redacted(deps.redact?.checkpoint, summarizeCheckpoint(cp));
   return ok({
-    run: redacted(deps.redact?.run, detailRun(run)),
-    timeline: timeline.map((cp) => redacted(deps.redact?.checkpoint, summarizeCheckpoint(cp))),
-    children,
+    run: redacted(deps.redact?.run, detailRun(detail.run)),
+    timeline: detail.timeline.map(checkpoint),
+    children: detail.children,
+    ...(detail.fans ? { fans: detail.fans.map((fan) => serializeFan(fan, checkpoint)) } : {}),
+    ...(detail.childCount !== undefined ? { childCount: detail.childCount } : {}),
   });
+}
+
+/**
+ * `GET /runs/:id/fans/:group` — one page of a summarized fan's members, in seq order, with the
+ * total. Query: `offset`, `limit` (at most 500, default 100), `failed=true` for failed members only.
+ */
+export async function getFanMembers(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
+  const { engine } = deps;
+  const id = req.params.id;
+  const group = req.params.group;
+  if (!id || !group) return notFound('run id and fan group are required');
+  const failed = readFlag(req, 'failed');
+  if (failed === INVALID_FLAG) return badRequest('failed must be a boolean');
+  const number = (key: string): number | undefined => {
+    const raw = firstQuery(req.query[key]);
+    return raw === undefined ? undefined : Number(raw);
+  };
+  const query: FanPageQuery = {
+    offset: number('offset'),
+    limit: number('limit'),
+    failedOnly: failed,
+  };
+  const page = engine.getFanMembers
+    ? await engine.getFanMembers(id, group, query)
+    : await loadFanMembers(engine, id, group, query);
+  if (!page) return notFound(`run ${id} not found`);
+  return ok({
+    items: page.items.map((cp) => redacted(deps.redact?.checkpoint, summarizeCheckpoint(cp))),
+    total: page.total,
+  });
+}
+
+/** A {@link FanSummary} on the wire: ISO dates, and its failure sample shaped like timeline steps. */
+function serializeFan(
+  fan: FanSummary,
+  checkpoint: (cp: StepCheckpoint) => Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    ...fan,
+    startedAt: fan.startedAt ? new Date(fan.startedAt).toISOString() : undefined,
+    finishedAt: fan.finishedAt ? new Date(fan.finishedAt).toISOString() : undefined,
+    failures: fan.failures.map(checkpoint),
+  };
 }
 
 /**

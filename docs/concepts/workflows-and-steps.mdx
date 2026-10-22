@@ -243,6 +243,14 @@ const [a, b] = await Promise.all([
 ])
 ```
 
+For the same dispatched step over many inputs, pass the step reference to `ctx.all` instead. It runs one durable step per input and returns the outputs in input order:
+
+```ts
+const results = await ctx.all(processLine, lines, { concurrency: 500, mode: 'failFast' })
+```
+
+Every result of a `Promise.all` replays the workflow, so a fan of N steps costs O(N²) checkpoint reads. `ctx.all` puts a join barrier in front of the workflow instead: a result resumes it only once no step of the fan is still `pending`, or when one fails, so the workflow replays once per settled wave. `concurrency` sends the steps in waves of that size, and `mode` is `waitAll` (the default: every step settles, then a `GatherError` lists the failed indexes) or `failFast` (throws on the first failed step). See [fanning out over a step](/docs/durable/authoring/child-workflows#fanning-out-over-a-step) for the full rules.
+
 ## Fatal errors
 
 Any thrown error is retried up to the step's limit. To stop retrying a business failure that a retry can't fix, throw `FatalError` — it fails the run immediately:

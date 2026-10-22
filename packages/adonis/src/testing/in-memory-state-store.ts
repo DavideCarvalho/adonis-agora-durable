@@ -169,12 +169,9 @@ export class InMemoryStateStore implements StateStore {
         r.wakeAt <= nowMs &&
         (namespace === undefined || r.namespace === namespace),
     );
-    // Oldest deadline first when capped (mirrors the SQL stores' ORDER BY wake_at LIMIT).
-    if (limit !== undefined) {
-      due.sort((a, b) => (a.wakeAt ?? 0) - (b.wakeAt ?? 0));
-      return due.slice(0, limit).map((r) => ({ ...r }));
-    }
-    return due.map((r) => ({ ...r }));
+    // Most overdue first (mirrors the SQL stores' ORDER BY wake_at).
+    due.sort((a, b) => (a.wakeAt ?? 0) - (b.wakeAt ?? 0));
+    return (limit === undefined ? due : due.slice(0, limit)).map((r) => ({ ...r }));
   }
 
   async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
@@ -545,6 +542,25 @@ export class InMemoryStateStore implements StateStore {
     }
     this.lastCheckpointRowsRead = latest ? 1 : 0;
     return latest ? { ...latest } : undefined;
+  }
+
+  async countCheckpoints(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    statuses: StepCheckpoint['status'][],
+  ): Promise<number> {
+    let n = 0;
+    for (const cp of this.checkpoints.values()) {
+      if (
+        cp.runId === runId &&
+        cp.seq >= fromSeq &&
+        cp.seq <= toSeq &&
+        statuses.includes(cp.status)
+      )
+        n += 1;
+    }
+    return n;
   }
 
   async listCheckpointsByNamePrefix(runId: string, prefixes: string[]): Promise<StepCheckpoint[]> {

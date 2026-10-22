@@ -10,6 +10,7 @@ import type {
   UpdateResult,
 } from '../interfaces.js';
 import { DURABLE_RUN_GATEWAY } from '../role_bindings.js';
+import type { FanPageQuery, RunDetailOptions } from '../run-detail-summary.js';
 import type { RunGateway } from '../run-gateway/interface.js';
 import type { DashboardEngine } from './handlers.js';
 
@@ -153,6 +154,22 @@ export function gatewayDashboardEngine(gateway: RunGateway): DashboardEngine {
     listRuns: (query) => gateway.listRuns(query),
     listCheckpoints: (runId) => gateway.getCheckpoints(runId),
     getRunChildren: (runId) => gateway.getRunChildren(runId),
+    ...(gateway.getRunDetail
+      ? {
+          getRunDetail: (runId: string, options?: RunDetailOptions) =>
+            (gateway.getRunDetail as NonNullable<RunGateway['getRunDetail']>)(runId, options),
+        }
+      : {}),
+    ...(gateway.getFanMembers
+      ? {
+          getFanMembers: (runId: string, group: string, query: FanPageQuery) =>
+            (gateway.getFanMembers as NonNullable<RunGateway['getFanMembers']>)(
+              runId,
+              group,
+              query,
+            ),
+        }
+      : {}),
     requeue: (runId): Promise<RunResult | null> => gateway.redispatchPending(runId),
     redispatchPending: (runId): Promise<RunResult | null> => gateway.redispatchPending(runId),
     cancel: (runId, opts) => gateway.cancel(runId, opts),

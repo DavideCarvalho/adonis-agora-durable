@@ -233,6 +233,54 @@ changes nothing.
 (`<parentRunId>.all.<seq>.w<k>.<i>`). Changing it while a run is in flight is a non-deterministic change, the
 same as changing `inputs`.
 
+### Fanning out over a step
+
+When each item is just one step rather than a workflow of its own, pass the step's reference (a
+`defineStep` ref or a `@Step` method) instead of a workflow. Each input becomes one durable step instead of a child run, which is far cheaper for a
+large batch: a child costs a whole run (its row, a turn, a lease, a completion signal), a step costs a
+checkpoint and a dispatch.
+
+```ts
+// One processRecord step per record, at most 500 in flight. The workflow wakes once per settled
+// wave, not once per record, and the dashboard shows the steps as one fan.
+const results = await ctx.all(processRecord, batch.records, { concurrency: 500 })
+```
+
+Outputs come back in input order. The same `mode` and `GatherError` apply: `waitAll` throws once every
+step has settled, with the failed indexes in `.failures`; `failFast` throws on the first failed step.
+`concurrency` sends the steps in waves of that size, the next once the previous has settled (unlike a child
+fan, which keeps two half-size waves in flight). It must be a positive integer, and unset sends every step at
+once. Every step of the fan uses the `@Step`'s retry policy, or the per-call `retries` / `backoff` you pass,
+and a failed step with attempts left is retried inside the fan rather than failing it. `transport`,
+`priority` and `fairnessKey` apply to every step too. A flow-control `queue` and a liveness `timeoutMs` (on
+the call or on the step) are rejected: a step fan needs durable steps.
+
+`failFast` cancels nothing. A step already dispatched still runs to the end on its worker; the steps of
+waves not yet sent are never sent.
+
+`ctx.allSettled` takes a step reference too, with the same options minus `mode`. It waits for every step
+and resolves with one `{ status: 'fulfilled', value } | { status: 'rejected', id, error, code?, details? }`
+per input, where `id` is the step id. A step that throws `FatalError` settles as `rejected` without spending
+its retries.
+
+```ts
+const results = await ctx.allSettled(validateLine, lines, { concurrency: 500 })
+```
+
+Prefer it to `Promise.all` over `ctx.step` past a handful of steps: every result of a `Promise.all`
+replays the workflow, which makes a fan of N steps cost O(N²) checkpoint reads. A step fan replays
+once per settled wave, because a result resumes the workflow only when no step of the fan is still
+`pending` (or when one fails). The steps share a `parallelGroup` of `steps:<firstSeq>:<size>`, with a
+`:failFast` suffix in that mode (an `allSettled` fan is a `waitAll` one, so it never has the suffix), so any one step's checkpoint names the whole block the barrier waits on. The
+barrier counts the fan's pending steps through the optional `StateStore.countCheckpoints`, which the
+Lucid and in-memory stores implement; a store without it falls back to loading the run's checkpoints
+on every result.
+
+A child fan's `parallelGroup` is `all:<firstSeq>:n<size>`, with the same `:failFast` suffix. The size is
+there so the [dashboard](/docs/durable/observability/dashboard#what-it-shows) can show how many
+children are still to be started. A run that began before the size was part of the group still has
+`all:<firstSeq>`, and the barrier reads both forms.
+
 ### Fanning out by hand
 
 `ctx.all` covers one workflow over N inputs. When the fan-out is heterogeneous — different workflows, or work
