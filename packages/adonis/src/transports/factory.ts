@@ -18,6 +18,24 @@ export interface TransportContext {
     container: { make(service: unknown): Promise<unknown> };
     config: { get<T>(key: string, defaultValue?: T): T };
   };
+  /**
+   * The process's top-level `partition` (a `tenant` pod's tenant), forwarded by the provider so a
+   * transport configured without its own `partition` consumes the `<name>@<partition>` queues the
+   * control plane dispatches that tenant's work to. A transport-level `partition` wins.
+   */
+  partition?: string | undefined;
+  /** The process's top-level `instanceId`, the default for a transport without its own. */
+  instanceId?: string | undefined;
+}
+
+/** A transport option that falls back to the provider-forwarded top-level value. */
+function inherited(
+  key: 'partition' | 'instanceId',
+  own: string | undefined,
+  ctx: TransportContext,
+): Record<string, string> {
+  const value = own ?? ctx[key];
+  return value !== undefined ? { [key]: value } : {};
 }
 
 /**
@@ -392,11 +410,11 @@ export const transports = {
    * (mirroring a real broker), unlike the test-only {@link transports.memory}.
    */
   eventEmitter(config: EventEmitterTransportConfig = {}): TransportFactory {
-    return async () => {
+    return async (ctx) => {
       const { EventEmitterTransport } = await import('./event-emitter.js');
       return new EventEmitterTransport({
         ...(config.group !== undefined ? { group: config.group } : {}),
-        ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+        ...inherited('instanceId', config.instanceId, ctx),
         ...(config.onError !== undefined ? { onError: config.onError } : {}),
       });
     };
@@ -415,7 +433,7 @@ export const transports = {
           ? { workerKeysCacheMs: config.workerKeysCacheMs }
           : {}),
         ...(config.group !== undefined ? { group: config.group } : {}),
-        ...(config.partition !== undefined ? { partition: config.partition } : {}),
+        ...inherited('partition', config.partition, ctx),
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
         ...(config.prefix !== undefined ? { prefix: config.prefix } : {}),
         ...(config.pollIntervalMs !== undefined ? { pollIntervalMs: config.pollIntervalMs } : {}),
@@ -437,7 +455,7 @@ export const transports = {
         ...(config.maxStalledCount !== undefined
           ? { maxStalledCount: config.maxStalledCount }
           : {}),
-        ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+        ...inherited('instanceId', config.instanceId, ctx),
         ...(config.onError !== undefined ? { onError: config.onError } : {}),
         ...(config.inboxTtlMs !== undefined ? { inboxTtlMs: config.inboxTtlMs } : {}),
         ...(config.tenantSubscribersCacheMs !== undefined
@@ -458,7 +476,7 @@ export const transports = {
    * reimplement the control plane). `bullmq`/`ioredis` are imported lazily, only when selected.
    */
   bullmq(config: BullMQTransportConfig): TransportFactory {
-    return async () => {
+    return async (ctx) => {
       const { BullMQTransport } = await import('./bullmq/bullmq-transport.js');
       const { createBullMQDeps } = await import('./bullmq/deps.js');
       const deps = await createBullMQDeps(
@@ -468,10 +486,10 @@ export const transports = {
       return new BullMQTransport({
         deps,
         ...(config.concurrency !== undefined ? { concurrency: config.concurrency } : {}),
-        ...(config.partition !== undefined ? { partition: config.partition } : {}),
+        ...inherited('partition', config.partition, ctx),
         ...(config.prefix !== undefined ? { prefix: config.prefix } : {}),
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
-        ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+        ...inherited('instanceId', config.instanceId, ctx),
         ...(config.closeTimeoutMs !== undefined ? { closeTimeoutMs: config.closeTimeoutMs } : {}),
         ...(config.resultConcurrency !== undefined
           ? { resultConcurrency: config.resultConcurrency }
@@ -491,7 +509,7 @@ export const transports = {
       return new DbTransport({
         db,
         ...(config.group !== undefined ? { group: config.group } : {}),
-        ...(config.partition !== undefined ? { partition: config.partition } : {}),
+        ...inherited('partition', config.partition, ctx),
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
         ...(config.connection !== undefined ? { connectionName: config.connection } : {}),
         ...(config.pollIntervalMs !== undefined ? { pollIntervalMs: config.pollIntervalMs } : {}),
@@ -509,7 +527,7 @@ export const transports = {
           ? { workerHeartbeatIntervalMs: config.workerHeartbeatIntervalMs }
           : {}),
         ...(config.autoCreate !== undefined ? { autoCreate: config.autoCreate } : {}),
-        ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+        ...inherited('instanceId', config.instanceId, ctx),
         ...(config.onError !== undefined ? { onError: config.onError } : {}),
         ...(config.closeTimeoutMs !== undefined ? { closeTimeoutMs: config.closeTimeoutMs } : {}),
         ...(config.inboxTtlMs !== undefined ? { inboxTtlMs: config.inboxTtlMs } : {}),

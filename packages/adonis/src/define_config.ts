@@ -92,6 +92,15 @@ export interface BaseDurableConfig {
   /** Named transports, built with the {@link transports} factory. */
   transports?: Record<string, TransportFactory>;
   /**
+   * More transports (keys of {@link transports}) to build ALONGSIDE {@link transport}, in failover
+   * order: the engine dispatches on `transport` first and falls over to these on a dispatch error,
+   * and a step can pin any of them by name with `ctx.step(step, input, { transport: 'db' })`. Each
+   * one gets the same consumer deferral, namespace and shutdown as `transport`. Only the transports
+   * named here (and `transport`) are built: the rest of `transports` stays a menu. Store-backed
+   * roles only; a `tenant` pod uses its one `transport`.
+   */
+  transportPool?: string[];
+  /**
    * Name of the state store (a key of {@link stores}) for runs/checkpoints/timers. Omit for the
    * in-memory store (single-process).
    */

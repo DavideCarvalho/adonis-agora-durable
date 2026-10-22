@@ -148,8 +148,20 @@ export class TransportPool {
   /** Pinned `preferId` first, then the rest (failover order). */
   private ordered(preferId?: string): NamedTransport[] {
     if (!preferId) return this.transports;
-    const pref = this.transports.filter((t) => t.id === preferId);
-    if (pref.length === 0) throw new Error(`transport "${preferId}" is not registered`);
-    return [...pref, ...this.transports.filter((t) => t.id !== preferId)];
+    let pref = this.transports.filter((t) => t.id === preferId);
+    // `default` is the id a single-transport engine stamped on its tasks: a task persisted under it
+    // (re-dispatched after an upgrade that named the pool) still means the primary transport.
+    if (pref.length === 0 && preferId === 'default' && this.transports[0]) {
+      pref = [this.transports[0]];
+    }
+    if (pref.length === 0) {
+      const ids = this.transports.map((t) => `"${t.id}"`).join(', ') || 'none';
+      throw new Error(
+        `transport "${preferId}" is not registered on this engine (registered: ${ids}). ` +
+          `To pin steps to it, build it into the pool: list it in \`transportPool\` in ` +
+          `config/durable.ts (or pass it in the WorkflowEngine \`transports\` option).`,
+      );
+    }
+    return [...pref, ...this.transports.filter((t) => !pref.includes(t))];
   }
 }

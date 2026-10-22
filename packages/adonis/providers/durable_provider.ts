@@ -99,6 +99,8 @@ const UNSERVED_ROUTES_RECHECK_MS = 30_000;
 export default class DurableProvider {
   #detachDiagnostics: (() => void) | null = null;
   #transport: (Transport & { close?: () => Promise<void> }) | null = null;
+  /** The `transportPool` transports built alongside {@link #transport}, closed with it on shutdown. */
+  #pooledTransports: Array<Transport & { close?: () => Promise<void> }> = [];
   #controlPlane: (ControlPlane & { close?: () => Promise<void> }) | null = null;
   #responder: RunRequestResponder | null = null;
   /** Memoized tenant transport so the ProxyRunGateway + WorkerRuntime share ONE broker connection. */
@@ -205,6 +207,19 @@ export default class DurableProvider {
       const namespace = config.namespace ?? (role === 'standalone' ? 'default' : undefined);
       const store = await this.#resolveStore(config, ctx, namespace);
       const transport = await this.#resolveTransport(config, ctx);
+      // `transportPool`: extra transports built alongside the selected one, in failover order, so a
+      // step can pin them by name. Each gets the same consumer deferral below and is closed on shutdown.
+      const pooled: Array<{ id: string; transport: Transport }> = [];
+      for (const name of config.transportPool ?? []) {
+        if (name === config.transport || pooled.some((p) => p.id === name)) continue;
+        if (!config.transports?.[name]) {
+          throw new Error(
+            `@agora/durable: config.transportPool lists "${name}", but config.transports.${name} is not defined`,
+          );
+        }
+        pooled.push({ id: name, transport: await this.#resolveTransport(config, ctx, name) });
+      }
+      this.#pooledTransports = pooled.map((p) => p.transport);
       // Console/REPL processes must not become broker consumers (`consumers: 'auto'`, the default):
       // a one-off `node ace` process that subscribes competes with the worker fleet for point-to-point
       // jobs — it claims steps it dies with, steals results addressed to the real engine, and a boot
@@ -213,12 +228,16 @@ export default class DurableProvider {
       // `engine.startConsumers()`. Web/test processes keep today's eager behavior, as does
       // `consumers: 'always'`, while `consumers: 'never'` defers unconditionally — a pure producer
       // in every environment. Transports without `deferConsumers` (in-process) are unaffected.
-      if (config.consumers === 'never') {
+      const deferAll = (): void => {
         transport.deferConsumers?.();
+        for (const p of pooled) p.transport.deferConsumers?.();
+      };
+      if (config.consumers === 'never') {
+        deferAll();
       } else if ((config.consumers ?? 'auto') === 'auto') {
         // Optional call: naive test doubles of ApplicationService may not carry getEnvironment.
         const environment = this.app.getEnvironment?.();
-        if (environment === 'console' || environment === 'repl') transport.deferConsumers?.();
+        if (environment === 'console' || environment === 'repl') deferAll();
       }
       // Hold the transport so `shutdown()` can release broker workers/connections cleanly.
       this.#transport = transport;
@@ -229,7 +248,11 @@ export default class DurableProvider {
 
       const deps: WorkflowEngineDeps = {
         store,
-        transport,
+        // A named pool when the config names a transport, so `ctx.step(..., { transport: name })`
+        // resolves the selected one (and `transportPool`'s) by its config key.
+        ...(config.transport
+          ? { transports: [{ id: config.transport, transport }, ...pooled] }
+          : { transport }),
         ...(controlPlane ? { controlPlane } : {}),
         ...(config.leaseMs !== undefined ? { leaseMs: config.leaseMs } : {}),
         ...(config.instanceId ? { instanceId: config.instanceId } : {}),
@@ -401,7 +424,14 @@ export default class DurableProvider {
   #tenantTransport(config: TenantConfig): Promise<Transport & { close?: () => Promise<void> }> {
     if (!this.#tenantTransportPromise) {
       this.#tenantTransportPromise = (async () => {
-        const transport = await this.#resolveTransport(config, { app: this.app });
+        // The pod's top-level `partition` / `instanceId` are the transport's defaults: a tenant pod
+        // must consume the `<name>@<tenant>` queues the control plane dispatches its work to, even
+        // when the transport entry doesn't repeat the partition (an explicit one there wins).
+        const transport = await this.#resolveTransport(config, {
+          app: this.app,
+          partition: config.partition,
+          ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+        });
         transport.useNamespace?.(config.namespace ?? 'default');
         // A transport whose behaviour depends on serving a store-less pod adapts to it here.
         transport.useTenantRole?.();
@@ -697,8 +727,11 @@ export default class DurableProvider {
   }
 
   /** Resolve the configured transport (a key of `config.transports`), or the in-memory default. */
-  async #resolveTransport(config: DurableConfig, ctx: TransportContext): Promise<Transport> {
-    const name = config.transport;
+  async #resolveTransport(
+    config: DurableConfig,
+    ctx: TransportContext,
+    name: string | undefined = config.transport,
+  ): Promise<Transport> {
     if (!name) return new InMemoryTransport();
     const factory = config.transports?.[name];
     if (!factory) {
@@ -784,6 +817,7 @@ export default class DurableProvider {
     // Release the transport's broker workers / queues / connections so a deploy hands off cleanly.
     await this.#transport?.close?.();
     this.#transport = null;
+    for (const pooled of this.#pooledTransports.splice(0)) await pooled.close?.();
     this.#tenantTransportPromise = null;
     // Tear down the control plane's subscriber connection (Redis pub/sub) on the way out.
     await this.#controlPlane?.close?.();
