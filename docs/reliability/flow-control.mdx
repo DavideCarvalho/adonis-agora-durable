@@ -28,7 +28,7 @@ Register a queue on the engine with `engine.registerQueue`. A `QueueConfig` has:
 - `name` — the queue's name, referenced from `ctx.step(step, input, { queue: name })`.
 - `concurrency` — the maximum number of steps in flight at once for this queue. Omit for unlimited.
 - `rateLimit` — `{ limit, periodMs, algorithm? }`: at most `limit` admissions per `periodMs`. `algorithm` is `'fixed'` (default) or `'sliding'` — see below. Omit for unlimited.
-- `retryMs` — how long (ms) a concurrency-blocked call waits before re-checking for a free slot. Defaults to 1000.
+- `retryMs` — how long (ms) a concurrency-blocked call waits before re-checking for a free slot. Defaults to 1000. (A rate-limited call is told to come back when the window allows, not after `retryMs`.)
 - `fairness` — `'fifo'` (default) or `'key'` (round-robin by the call's `fairnessKey`).
 - `order` — `'fifo'` (default) or `'lifo'` arrival ordering among same-priority waiters.
 
@@ -108,7 +108,12 @@ When a queued call is reached, the engine asks the queue's controller to admit o
 
 Because the retry time is persisted on the run and the poller drives it, the limit is durable: a process that crashes while runs are parked waiting for a slot loses nothing — the parked runs come back when their timers are due. No run is ever held in memory waiting for a slot.
 
-A slot is held from the moment a call is admitted until the step's **result lands** (or the run is cancelled), at which point the slot is released and the next blocked run can be admitted.
+A slot is held from the moment a call is admitted until the step's **result lands**, at which point the slot is released and the next blocked run can be admitted. The queue name is stored on the step's checkpoint, so whichever instance consumes the result releases the slot — the dispatching pod does not have to be alive. A late result for a run that was cancelled (or has already failed) still releases its slot. Two consequences:
+
+- **A durable retry re-admits.** A step whose attempt failed gives its slot back when that failed result lands, and goes through admission again when its backoff is up, so a step waiting out its backoff holds nothing. A [`timeoutMs`](/docs/durable/reliability/retries#the-in-memory-liveness-path-timeoutms) step is the exception: it is admitted once and keeps its slot across its timeout re-dispatches, until the await on the dispatching instance ends.
+- **A lost job keeps its slot.** A step whose result never arrives holds its slot until the step is re-driven and settles (`remoteRedispatchMs`, or `engine.redispatchPending(runId)` — see [Lost remote dispatch](/docs/durable/reliability/failure-modes#lost-remote-dispatch-the-run-suspends-and-nothing-auto-redrives-it)), or until the holder goes away: a restart of the process, for the in-process backend, or a lapsed instance heartbeat, for Redis.
+
+A blocked run normally retries at its `retryAt`. With the [Redis backend](#distributed-admission--redis), a released slot is also announced over Redis pub/sub, so each instance re-tries its blocked runs on that queue right away instead of waiting for the tick.
 
 ## Capping one fan: `ctx.all` concurrency
 
@@ -125,7 +130,7 @@ A step fan does not accept a `queue`: `ctx.all(step, inputs, { queue })` throws.
 
 ## Scope: per engine instance
 
-By default, flow-control accounting is **per engine instance**. For the common single-orchestrator deployment this is exactly what you want, and it's correct without any cross-process coordination. If you run several worker replicas, each enforces the limit independently (so a `concurrency: 5` queue admits up to 5 *per replica*). For a truly global cap, use the Redis backend below.
+By default, flow-control accounting is **per engine instance**. For the common single-orchestrator deployment this is exactly what you want, and it's correct without any cross-process coordination. If you run several worker replicas, each enforces the limit independently (so a `concurrency: 5` queue admits up to 5 *per replica*). The per-replica count is also approximate: a result consumed by another replica releases the slot on *that* replica's counter, not on the one that admitted it. For a truly global (and exact) cap, use the Redis backend below.
 
 ## Worker / transport concurrency
 
@@ -138,7 +143,7 @@ bullmq: transports.bullmq({
 }),
 ```
 
-Total parallelism across a fleet is `concurrency × replicas`. Pass `'adaptive'` (or `{ mode: 'adaptive', min, max, start, tickMs, ramCeilingPct, cpuCeilingPct }`) instead of a number to let a control loop move the limit at runtime: it grows when latency shows headroom, shrinks when latency shows queuing or errors/stalls spike, and hard-brakes on RAM (and on CPU when `cpuCeilingPct` is set). Either way the live limit, in-flight count, RSS, CPU, throughput, p95 and the last adjustment with its reason ride the worker heartbeat, and the [dashboard's worker cards](/docs/durable/observability/dashboard#fleet-and-topology) show them. A Python worker has its own equivalent — see [Python: concurrency and memory](/docs/durable/python#concurrency-and-memory).
+Total parallelism across a fleet is `concurrency × replicas`. Pass `'adaptive'` (or `{ mode: 'adaptive', min, max, start, tickMs, ramCeilingPct, cpuCeilingPct }`) instead of a number to let a control loop move the limit at runtime (defaults: `min` 1, `max` 32, `start` = `min`, `tickMs` 2000, `ramCeilingPct` 85, `cpuCeilingPct` off): it grows when latency shows headroom, shrinks when latency shows queuing or errors/stalls spike, and hard-brakes on RAM (and on CPU when `cpuCeilingPct` is set). Either way the live limit, in-flight count, RSS, CPU, throughput, p95 and the last adjustment with its reason ride the worker heartbeat, and the [dashboard's worker cards](/docs/durable/observability/dashboard#fleet-and-topology) show them. A Python worker has its own equivalent — see [Python: concurrency and memory](/docs/durable/python#concurrency-and-memory).
 
 
 ## Distributed admission — Redis
@@ -186,6 +191,8 @@ Either form works: `admission` accepts a ready backend or a lazy thunk that buil
 </Callout>
 
 A held slot is reclaimed only once its owner's heartbeat lapses: a **live** pod keeps its slot for the full step duration no matter how long it runs, and a **crashed** pod's slots free within `instanceTtlMs`. A waiter re-registers on every retry, so a still-trying call never expires; one that gave up (its run was cancelled) is pruned after `waiterTtlMs` so it can't sit as a phantom best-waiter and deadlock the rest.
+
+The Lua script touches several keys in one call, so the backend targets a single (non-cluster) Redis.
 
 ## Which knob when
 

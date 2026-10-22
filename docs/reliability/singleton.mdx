@@ -43,7 +43,7 @@ With the key derived from `storeId`, two `sync-inventory` runs for `storeId: 'A'
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `key` | required | `(input) => string` — derives the serialization key from the run's input. Runs whose `key(input)` returns the same string compete for the same slot(s); everything else is unaffected. |
-| `limit` | `1` | Max concurrent runs sharing the key. `1` is a true mutex; a higher number is a per-key concurrency cap. |
+| `limit` | `1` | Max concurrent runs sharing the key. `1` is a true mutex; a higher number is a per-key concurrency cap. Must be a positive integer: a `0`, negative or fractional limit makes the admission check throw. |
 | `maxQueueDepth` | unbounded | Caps the same-key *backlog* (see [below](#bounding-the-queue-maxqueuedepth-and-singletonqueuefullerror)). |
 
 The key is scoped to the workflow: admission only looks at runs of the **same workflow** sharing the key. (A [concurrency quota](/docs/durable/reliability/concurrency-quotas) key, by contrast, is shared across workflows.)
@@ -59,7 +59,7 @@ A singleton run is tagged `singleton:<key>` at start time. Start never blocks an
 
 A slot is held from admission until the run reaches a terminal status (`completed`, `failed`, `cancelled`, `dead`), and nothing else releases it. A holder that sleeps, waits on a signal, is parked `blocked`, is recovered by another instance, or whose execution lease expires keeps its slot. A later start can't take a slot away from a holder, including a start in the same millisecond whose id happens to sort first. Each admission check after the first is a cheap confirmation.
 
-Completion is push, not just poll: when a singleton run reaches a terminal state — including a cancel or an execution-timeout sweep — the engine immediately makes the oldest `limit` gated waiters sharing its key due and dispatches them, instead of making them wait out their retry timer. Sleeping holders are left alone. Each woken waiter claims through the store, so only as many as there are free slots actually run. The durable retry timer still exists as the crash/cross-instance fallback — if the notify is missed (e.g. the notifying instance dies first), the next timer tick catches up.
+Completion is push, not just poll: when a singleton run reaches a terminal state — including a cancel or an execution-timeout sweep — the engine immediately makes the oldest `limit` gated waiters sharing its key due and dispatches them, instead of making them wait out their retry timer. Sleeping holders are left alone. Each woken waiter claims through the store, so only as many as there are free slots actually run. The durable retry timer still exists as the crash/cross-instance fallback — if the notify is missed (e.g. the notifying instance dies first), the next timer tick catches up. It is also how waiters learn about a holder that was dead-lettered: the `dead` write drops the holder's admission tag, and the waiters claim the slot on their next retry.
 
 ```ts
 // A: holds the slot for store A
@@ -87,6 +87,7 @@ Admission needs `StateStore.tryAdmitSingleton`. The bundled stores implement it:
 
 - **[Lucid store](/docs/durable/stores/lucid):** a transaction that locks the key's active rows with `SELECT … FOR UPDATE` (ordered by id) on Postgres and MySQL. On SQLite, which has no row locks, the transaction takes the database write lock first with a no-op `UPDATE`, then reads. No migration is needed: the slot is a tag on the existing `tags` column.
 - **In-memory store:** the claim runs in one synchronous turn.
+- **`CodecStateStore`** (a payload codec — encryption, compression — around another store) forwards the call to the store it wraps (when that store implements it), so wrapping a store keeps admission atomic.
 
 A custom `StateStore` without `tryAdmitSingleton` keeps working after an upgrade, singleton workflows included. On such a store the engine falls back to the previous admission: a scan of the key's `running`/`suspended` runs, admitting the run if it is among the `limit` oldest by `(createdAt, id)`. That fallback is a read followed by a decision, not a claim. Replicas can briefly admit more than `limit` runs, an older run picked up after a younger one is admitted alongside it, and a same-millisecond start can displace a holder. The engine prints one warning per engine (`console.warn`, naming `StateStore.tryAdmitSingleton`) the first time it admits this way. To get atomic admission, implement `tryAdmitSingleton`. The helpers `singletonAdmissionTags` and `singletonAdmissionDenialPatch` (exported from `@adonis-agora/durable`) implement the decision. A store wraps them in its own transaction and must drop the `durable:singleton:admitted` tag when `updateRun`/`updateRunIf` writes a terminal status. The [state-store conformance suite](/docs/durable/testing) covers the claim.
 
@@ -124,7 +125,7 @@ try {
 }
 ```
 
-The capacity check counts the `pending`/`running`/`suspended`/`blocked` runs of the workflow sharing the key in one scan and compares against `(limit ?? 1) + maxQueueDepth`. It runs *before* the run row is written, so a rejected start leaves no trace in the store. Once a slot frees (notify-on-release promotes the oldest waiter, which later settles), the backlog count drops below the cap and the next `start` is accepted again.
+The capacity check counts the `pending`/`running`/`suspended`/`blocked` runs of the workflow sharing the key in one scan and compares against `(limit ?? 1) + maxQueueDepth`. Unlike the slot claim, that scan is an ordinary run read, so with `scopeReads` on it only counts the engine's own namespace. It runs *before* the run row is written, so a rejected start leaves no trace in the store. Once a slot frees (notify-on-release promotes the oldest waiter, which later settles), the backlog count drops below the cap and the next `start` is accepted again.
 
 The check applies wherever the workflow is started — `engine.start`, `Wf.dispatch` / `Wf.start`, child workflows (a rejected child start is delivered to the parent as a failed child), event triggers and schedules. An idempotent re-`start` of an existing `runId` returns that run before the check and is never rejected.
 

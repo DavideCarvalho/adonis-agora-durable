@@ -10,7 +10,9 @@ A durable run often performs several irreversible side effects in sequence — r
 
 Attach a `compensate` callback to an in-process [`ctx.localStep`](/docs/durable/concepts/workflows-and-steps#local-in-process-steps). The callback is registered when the step completes; if the run later fails, the engine runs every registered compensation in **reverse order** (last completed step undone first), restoring the world before failing the run.
 
-```ts
+```ts title="start/durable.ts"
+import engine from '@adonis-agora/durable/services/main'
+
 engine.register('checkout', '1', async (ctx, order: Order) => {
   const reservation = await ctx.localStep(
     'reserve-inventory',
@@ -116,9 +118,9 @@ export default defineConfig({
 })
 ```
 
-Because a compensation may run more than once, **compensations should be idempotent** — releasing an already-released reservation or refunding an already-refunded charge must be a no-op. A compensation that keeps failing past `compensationRetries` is *skipped* rather than allowed to throw: a permanently-failing undo must not mask the original failure or strand the remaining compensations.
+Attempts run back to back: there is no backoff between them, for a local closure or a dispatched undo. Because a compensation may run more than once, **compensations should be idempotent** — releasing an already-released reservation or refunding an already-refunded charge must be a no-op. A compensation that keeps failing past `compensationRetries` is *skipped* rather than allowed to throw: a permanently-failing undo must not mask the original failure or strand the remaining compensations. The run still settles `failed` with the error that triggered the saga, not the compensation's.
 
-A **dispatched** undo whose step definition carries no liveness `timeoutMs` is additionally bounded by `compensationTimeoutMs` (engine config, default 300 000 — 5 minutes): if the worker produces no result within the window, that attempt fails like any other undo failure — retried up to `compensationRetries`, then skipped loudly — instead of the unwind awaiting a lost job forever.
+A **dispatched** undo whose step definition carries no liveness `timeoutMs` is additionally bounded by `compensationTimeoutMs` (engine config, default 300 000 — 5 minutes; values under 1 000 are raised to 1 000): if the worker produces no result within the window, that attempt fails like any other undo failure — retried up to `compensationRetries`, then skipped loudly — instead of the unwind awaiting a lost job forever.
 
 ```ts title="config/durable.ts"
 export default defineConfig({
@@ -161,11 +163,15 @@ Terminal runs are immutable: `cancel` on a run that is already `completed`, `fai
 
 Likewise, a `failed` run is only re-driven by an explicit retry (`engine.requeue(runId)` / the dashboard retry, or a direct `engine.resume(runId)`). The engine's implicit wake-ups (a late signal or step result, a wait recheck, a due timer, a redelivered dispatch) leave it failed.
 
-A compensating cancel returns immediately (non-blocking) and runs the undo in the background: the run is resumed so the replay re-registers the saga from history, the engine runs the compensations in reverse, and marks the run `cancelled`. For the checkout example, cancelling a run that had already charged the card and reserved inventory with `{ compensate: true }` issues the refund and releases the reservation before the run becomes `cancelled` — leaving the world clean, exactly as a failure would.
+`{ compensate: true }` applies to a run that is `running` or `suspended`. A run that is still `pending` (or parked `blocked`) is cancelled immediately, without the unwind, even with the option set.
+
+A compensating cancel returns immediately (non-blocking), reporting the run's current status rather than `cancelled`, and runs the undo in the background: the run is resumed so the replay re-registers the saga from history, the engine runs the compensations in reverse, and marks the run `cancelled`. For the checkout example, cancelling a run that had already charged the card and reserved inventory with `{ compensate: true }` issues the refund and releases the reservation before the run becomes `cancelled` — leaving the world clean, exactly as a failure would.
 
 The request itself is durable: `cancel({ compensate: true })` persists a cancel marker alongside broadcasting the cancellation, so the undo survives a crash or a pod handoff — whichever pod next drives the run honors the marker and runs the saga, even if the pod that took the cancel request couldn't run the workflow (or died before it did).
 
 The cancel is honored however the turn ends. If the run is mid-turn when you cancel it, that turn (or the resume queued behind it) checks for the cancel when it returns, throws, continues-as-new or suspends. In each case it runs the compensations and settles `cancelled`, instead of completing, failing or forking a continuation. A body with no suspension point left can't slip past a compensating cancel this way.
+
+Cancelling a live run also cancels its children — awaited (`ctx.child`) and fire-and-forget (`ctx.startChild`) alike, recursively — with the same `{ compensate }` option, so each child runs its own saga when asked to. Children that already finished are left alone.
 
 To cancel many runs at once, `engine.cancelWhere(filter, opts?)` cancels every run matching a [run query](/docs/durable/concepts/workflows-and-steps#tags) (with the same `{ compensate }` option).
 
