@@ -306,7 +306,9 @@ function describeBackend(backend: Backend): void {
             prefix,
             pollIntervalMs: 10,
             stalledCheckIntervalMs: 50,
-            stalledThresholdMs: 300,
+            // Renewal runs every half threshold; 1.5s tolerates the event-loop stalls of a shared CI
+            // runner, while the 5s step still outlives the threshold 3× — without renewal it is re-run.
+            stalledThresholdMs: 1_500,
           });
           transports.push(t);
           return t;
@@ -318,7 +320,7 @@ function describeBackend(backend: Backend): void {
         let runs = 0;
         worker.handle(name, async () => {
           runs += 1;
-          await new Promise((r) => setTimeout(r, 1_200));
+          await new Promise((r) => setTimeout(r, 5_000));
           return 'done';
         });
 
@@ -329,6 +331,7 @@ function describeBackend(backend: Backend): void {
         await new Promise((r) => setTimeout(r, 50));
         expect(await activeJobs(probe, `${prefix}:tasks:${sanitizeQueueToken(name)}`)).toBe(0);
       },
+      20_000,
     );
 
     it.skipIf(!backend.enabled)(
