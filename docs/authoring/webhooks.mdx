@@ -147,16 +147,11 @@ That signal wakes the exact run suspended on that token, and `hook.wait()` resum
 The token is `wh:<runId>:<seq>`, derived from the run id, which a caller may know or guess. Don't rely on it for authentication: this endpoint is reachable by external systems, so verify the provider's signature (or a shared secret) before calling `engine.signal`.
 </Callout>
 
-<Callout type="warn" title="A callback that beats the wait is not delivered">
-`hook.wait()` resumes only on a signal that arrives **after** it registered its waiter; unlike `ctx.waitForSignal`, it does not consume a [buffered signal](/docs/durable/concepts/sleep-and-signals#signal-buffering--signal-with-start). If the provider calls back while the run is still before `wait()` (for example while a dispatched `ctx.step` that handed out the URL is waiting for its result), the dashboard route answers `404`, and `engine.signal` returns `null` after buffering a copy the webhook never reads. Reply with a non-2xx in that case so the provider retries:
+### A callback that beats the wait
 
-```ts
-const result = await engine.signal(params.token, request.body())
-return result ? response.noContent() : response.serviceUnavailable() // provider retries later
-```
+The provider may call back before the run reaches `hook.wait()`, for example while the step that handed out the URL is still waiting for its result. `engine.signal` then finds no waiter and buffers the body, the same [signal buffering](/docs/durable/concepts/sleep-and-signals#signal-buffering--signal-with-start) `ctx.waitForSignal` uses, and returns `null`. When the run gets to `hook.wait()`, the wait consumes the buffered body and resumes at once instead of suspending. The wait also re-checks the buffer after it registers, so a callback that lands in between is not lost either. With your own route, answer `2xx` whether or not `engine.signal` returned a result.
 
-If the provider does not retry, hand the URL out from a `ctx.localStep` right before `wait()` (as in the full example) to keep the window short, or use `ctx.waitForSignal` with a token you mint yourself, which does consume an early, buffered delivery.
-</Callout>
+The dashboard route is stricter: it delivers only to a run that is already waiting, and answers `404` to an early callback without buffering it, so a provider that retries on a non-2xx delivers it again once the run waits. If your provider doesn't retry, receive the callback on your own route.
 
 ## External tasks — `ctx.task`
 

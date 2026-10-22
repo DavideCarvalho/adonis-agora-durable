@@ -223,9 +223,12 @@ Under the hood an entity is an ordinary durable run like any other, so everythin
   operations in the same relative order.
 - **Durable across restarts and replay.** The handler's result and the resulting state are captured in one
   checkpoint per operation, so replay restores the state rather than re-running the handler.
-- **Exactly once from a workflow.** `ctx.callEntity` and `ctx.signalEntity` are checkpointed where they are
-  called: once the call has completed, a replay returns the recorded result instead of sending the
-  operation again.
+- **Exactly once from a workflow, across replay.** `ctx.callEntity` and `ctx.signalEntity` store the
+  operation durably, tagged with the caller's stable `<runId>:<seq>`, before they checkpoint. A replay
+  that finds the checkpoint never sends the operation again, including a replay of a `callEntity` that
+  is still waiting for its reply. If the caller dies between storing the operation and checkpointing it,
+  the replay sends the same id again and the entity skips the copy. From outside a workflow,
+  `engine.signalEntity` has no such id: retrying a failed call can apply the operation twice.
 
 ## Pitfalls
 
