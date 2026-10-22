@@ -19,13 +19,29 @@ engine.register('checkout', '1', async (ctx: WorkflowCtx, order: Order) => {
 })
 ```
 
-`register(name, version, fn, opts?)` takes an options object for `tags`, an `executionTimeout` (`'30s'` or ms), a [`singleton`](#singleton-workflows-one-run-per-key) config, input validation, and event triggers. Start runs with `engine.start('checkout', input, runId)` — pass the registered **name** and a stable `runId`. (Starting the same `runId` twice is a no-op, which is what makes [scheduling](/docs/durable/authoring/scheduling) and webhooks idempotent.)
+`register(name, version, fn, opts?)` takes an options object:
+
+| Option | What it does |
+| --- | --- |
+| `tags` | Static [tags](#tags) stamped on every run. |
+| `executionTimeout` | `'30s'` or ms. A run still in flight past it is cancelled with an `execution_timeout` error by the worker's timeout sweep. |
+| `singleton` | [One run per key](#singleton-workflows-one-run-per-key). |
+| `concurrency` | A start-time [concurrency quota](/docs/durable/reliability/concurrency-quotas). |
+| `inputSchema` | A [Standard Schema](#validation-with-any-standard-schema-library) the input is validated against at `start`, before any run exists. Its output is what the run stores. |
+| `validateInput` | `(input) => void \| Promise<void>`, run after `inputSchema`. Throw to reject the start. |
+| `searchAttributesSchema` | The [typed search attributes](#typed-search-attributes) shape. |
+| `onEvent`, `eventBatch` | Start a run per [published event](/docs/durable/authoring/events), optionally debounced or batched. |
+| `requires` | Capabilities a live worker must advertise to run this workflow's turns. It is checked only for a workflow whose body runs remotely (`registerRemote`); a local body ignores it. For steps, see [`requires`](#requires--refuse-to-dispatch-into-a-queue-nobody-serves). |
+| `origin` | [Package attribution](#run-origin--package-attribution) on every run. |
+| `onError` | Route a matching failure to a handler workflow (see [onError routing](/docs/durable/reliability/on-error)). |
+
+Start runs with `engine.start('checkout', input, runId)` — pass the registered **name** and a stable `runId`. (Starting the same `runId` twice is a no-op, which is what makes [scheduling](/docs/durable/authoring/scheduling) and webhooks idempotent.)
 
 <Callout type="info" title="The idiomatic form">
 `engine.register` is the low-level primitive. The recommended way to author is a `BaseWorkflow` class under
 `app/workflows/` with a `static workflow = { name, version }` (auto-registered at boot), run with the
 context-aware statics `Wf.dispatch(input)` (fire-and-forget → `{ runId }`) and `Wf.start(input)` (blocks until
-the run settles → result). See [app/workflows](/docs/durable/authoring/app-workflows).
+the run reaches a terminal state → its output). See [app/workflows](/docs/durable/authoring/app-workflows).
 </Callout>
 
 <Callout type="info">
@@ -169,7 +185,7 @@ transport.handle('payments:charge-card', async (input: { orderId: number; amount
 })
 ```
 
-Routing is by name: a step's queue/wire token is derived from its (sanitized) name, optionally isolated onto its own worker pool with a `partition`. (The old per-step `group` option is **deprecated** — accepted but ignored.)
+Routing is by name: a step's queue/wire token is derived from its (sanitized) name, suffixed `<name>@<partition>` when the run belongs to a non-default namespace or the transport sets a `partition` (see [Tenancy](/docs/durable/concepts/tenancy#partition--the-queue-suffix)). The transports' old `group` option is **deprecated**: it is accepted and ignored, so use `partition` for isolation.
 
 ## Local (in-process) steps
 
@@ -248,13 +264,13 @@ const [a, b] = await Promise.all([
 ])
 ```
 
-For the same dispatched step over many inputs, pass the step reference to `ctx.all` instead. It runs one durable step per input and returns the outputs in input order:
+`Promise.all` is right for a handful of different steps. For the same dispatched step over many inputs, pass the step reference to `ctx.all` instead. It runs one durable step per input and returns the outputs in input order:
 
 ```ts
 const results = await ctx.all(processLine, lines, { concurrency: 500, mode: 'failFast' })
 ```
 
-Every result of a `Promise.all` replays the workflow, so a fan of N steps costs O(N²) checkpoint reads. `ctx.all` puts a join barrier in front of the workflow instead: a result resumes it only once no step of the fan is still `pending`, or when one fails, so the workflow replays once per settled wave. `concurrency` sends the steps in waves of that size, and `mode` is `waitAll` (the default: every step settles, then a `GatherError` lists the failed indexes) or `failFast` (throws on the first failed step). See [fanning out over a step](/docs/durable/authoring/child-workflows#fanning-out-over-a-step) for the full rules.
+Every result of a `Promise.all` replays the workflow, so a fan of N steps costs O(N²) checkpoint reads. `ctx.all` puts a join barrier in front of the workflow instead: a result resumes it only once no step of the fan is still `pending`, or when one fails, so the workflow replays once per settled wave. `concurrency` sends the steps in waves of that size, and `mode` is `waitAll` (the default: every step settles, then a `GatherError` lists the failed indexes) or `failFast` (throws on the first failed step). `ctx.allSettled(step, inputs, opts?)` is the same fan but never throws for a failed item: it resolves one `Settled` per input. A step is much cheaper than a child workflow per item: a checkpoint and a dispatch instead of a run row, a turn, a lease and a parent signal. See [fanning out over a step](/docs/durable/authoring/child-workflows#fanning-out-over-a-step) for the full rules.
 
 ## Long-running loops — `ctx.continueAsNew`
 
@@ -341,6 +357,24 @@ await ctx.localStep('process-batch', async (log) => {
 ```
 
 The step logger also offers `log.debug/info/warn/error(message, data?)` for leveled logs, `log.subProcess(name, body)` for nested, phased sub-work, and `log.subEvent({ ... })` for a fully-specified sub-process entry (its own `id`, `group`, `phase`, `status`, `message` and `data`) when `log.sub`'s three arguments are not enough. Rule of thumb: if you want each unit to **retry or replay independently**, make it a **step** (or a [child workflow](/docs/durable/authoring/child-workflows)). If you only want to **see** what happened inside one durable unit, emit **sub-process events**.
+
+### Emitting from deep inside a step
+
+The logger argument only reaches the step body itself. When the code that knows the progress lives a few calls down (a shared batch inserter, an HTTP client, a parser), `currentStep()` returns the logger of the step running on the current async path, so you don't have to thread it through every signature:
+
+```ts title="app/services/bulk_insert.ts"
+import { currentStep } from '@adonis-agora/durable'
+
+// A generic utility: it takes no logger, and its callers were not edited.
+export async function insertRows(rows: Row[]) {
+  for (const chunk of chunks(rows, 100)) {
+    await db.table('rows').multiInsert(chunk)
+    currentStep()?.info('inserted batch', { rows: chunk.length })
+  }
+}
+```
+
+It is an `AsyncLocalStorage`, installed around every step body, local and dispatched alike, with the same logger instance the body receives, so ambient and explicit events land in the same list. Concurrent steps each see their own. Outside a step it returns `undefined`, so the optional chain keeps the helper usable on a non-durable path and in unit tests.
 
 ### Reporting liveness from inside a long step
 

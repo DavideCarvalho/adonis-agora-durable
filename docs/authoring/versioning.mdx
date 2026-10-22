@@ -1,6 +1,6 @@
 ---
 title: Versioning & determinism
-description: Keeping in-flight runs replay-safe across code changes — workflow versions for breaking changes, the NonDeterminismError guard, the deterministic ctx.now and ctx.sideEffect capture sources, and ctx.patched for guarding an in-place change without a new version.
+description: Keeping in-flight runs replay-safe across code changes — workflow versions for breaking changes (and pinning a start to one), the NonDeterminismError guard, the deterministic ctx.now and ctx.sideEffect capture sources, and ctx.patched for guarding an in-place change without a new version.
 icon: History
 ---
 
@@ -23,7 +23,7 @@ This is a guard, not a fix. It tells you a code change is incompatible with runs
 
 ### Workflow primitives inside a step body
 
-A step body runs once and is then replayed from its checkpoint *without* re-running. A ctx primitive called from inside one (`ctx.startChild`, `ctx.child`, `ctx.step`, `ctx.sleep`, `ctx.sideEffect`, …, or `BaseWorkflow.start()`/`.dispatch()` resolving the ambient ctx) would claim a journal position that replay never claims again. The engine refuses it at the call site with a `NestedWorkflowCallError` (a `FatalError`, code `nested_workflow_call`):
+A step body (`ctx.localStep`, `ctx.transaction`, `ctx.sideEffect`, `ctx.now`) runs once and is then replayed from its checkpoint *without* re-running. A ctx primitive called from inside one (`ctx.startChild`, `ctx.child`, `ctx.step`, `ctx.sleep`, `ctx.sideEffect`, …, or `BaseWorkflow.start()`/`.dispatch()` resolving the ambient ctx) would claim a journal position that replay never claims again. The engine refuses it at the call site with a `NestedWorkflowCallError` (a `FatalError`, code `nested_workflow_call`, carrying `runId`, `primitive` and `step`):
 
 ```ts
 // ✗ throws NestedWorkflowCallError: the step starts a child
@@ -100,6 +100,22 @@ A run records the **code version it started on** (`workflowVersion` on the run).
 
 If a run's starting version is no longer registered when it resumes, the engine refuses to replay it on a different body and throws `workflow checkout@1 is not registered — keep the prior version deployed so in-flight runs can drain (skew protection)`. Execution timeouts (`executionTimeout`) follow the same rule: a run is timed out against the version it started on when that registration is known.
 
+### Starting a specific version
+
+"Latest" is the default, not the only option. Pass `version` in the start options to run the exact version you mean — on `engine.start` or on a class's `dispatch` / `start` (whose options are `StartOptions` plus `runId`):
+
+```ts
+import engine from '@adonis-agora/durable/services/main'
+import CheckoutWorkflowV2 from '#workflows/checkout_workflow_v2'
+
+await engine.start('checkout', order, runId, { version: '1' }) // runs the v1 body, not v2
+await CheckoutWorkflowV2.dispatch(order, { runId, version: '1' }) // same name, pinned to '1'
+```
+
+Reach for it when the caller *records* which version it ran — a pinned pipeline definition, a reproducible re-run of an old job. A version that is **not registered** throws `workflow checkout@1 is not registered` at start, before any run row is created; it never quietly falls back to the latest, because a caller that asked for `checkout@1` and silently got `checkout@2` has no way to notice. Pass a **constant** from inside a workflow body: computing the version at call time makes the body non-deterministic, exactly like reading the clock.
+
+Pinning resolves against real registrations — a class's `static workflow = { version }`, `engine.register`, `engine.registerRemote`, `engine.remote`. It is deliberately not honoured by convention routing (an unregistered name routed to a live worker group of the same name), which invents its version: a pinned start there throws instead. To pin a cross-SDK workflow, register it for real with `engine.remote(name, { group, version })` (see [What can I call?](/docs/durable/cluster/handshake#what-can-i-call)).
+
 Versioning is the right tool when the change is structural and you're prepared to keep both bodies around. For a small, surgical change, the version split is heavyweight — that's where `ctx.patched` comes in.
 
 ## Patching in place — `ctx.patched(id)`
@@ -107,6 +123,8 @@ Versioning is the right tool when the change is structural and you're prepared t
 `ctx.patched(id)` guards an in-place change **without** a new version. Wrap the changed code in a branch on it:
 
 ```ts
+import { FatalError } from '@adonis-agora/durable'
+
 engine.register('checkout', '1', async (ctx, order: Order) => {
   const quote = await ctx.localStep('quote', () => price(order))
 
@@ -124,6 +142,7 @@ How it stays replay-safe:
 
 - A **fresh run** (started after the patch shipped) hits `ctx.patched('add-fraud-check')`, records a `patch:add-fraud-check` marker at that position, and returns `true` — it takes the **new** branch.
 - A run **already recorded under the old code** replays into this position and finds a *real step* there (the step that, in the old code, came next) — not a marker. So `patched` rewinds the logical position, gives it back to that old step, and returns `false` — the run keeps the **old** branch.
+- If the position holds a *different* patch marker (two `ctx.patched` calls with different ids swapped places), the engine throws `NonDeterminismError` instead of guessing.
 
 The marker is **position-transparent** for old runs: because it rewinds rather than consuming a position, it never shifts an in-flight run's recorded checkpoints. New runs get the new path; old runs finish on the old path; neither is corrupted. Once every run that started under the old code has drained, remove the guard and keep just the new branch.
 

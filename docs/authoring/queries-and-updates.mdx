@@ -11,6 +11,8 @@ A run is durable but it is not opaque. While it is in flight — suspended on a 
 - **Queries** publish a named value from inside the run (`ctx.setEvent`) and read the latest one from outside (`engine.getEvent`) with no side effect on the run.
 - **Updates** expose a named update point inside the run (`ctx.onUpdate`) that suspends until an external `engine.update` delivers an argument — gated by an optional validator that can reject the update *before* it touches the run.
 
+The examples import the engine singleton with `import engine from '@adonis-agora/durable/services/main'`. It is bound on the `standalone` and `control-plane` roles; a store-less `tenant` pod has no engine, so `getEvent` / `update` are not available there (the dashboard's routes for them answer 404 on that topology). See [Roles & config](/docs/durable/cluster/roles-and-config#reading-and-steering-runs-rungateway).
+
 ## Queries
 
 A query is a side-effect-free read of a run's state. The run publishes values; readers observe them. Neither side resumes, suspends, or otherwise perturbs the run.
@@ -47,22 +49,21 @@ Use `setEvent` for anything an outside observer might want before the run comple
 
 From outside the run — a controller, a polling endpoint, another service — read the latest published value with `engine.getEvent(runId, key)`. It returns the most recent value for that key, or `undefined` if the run never published it. Crucially, **the read has no effect on the run**: it does not resume a suspended run, does not consume a logical position, and does not appear in the run's history.
 
-```ts
-import { WorkflowEngine } from '@adonis-agora/durable'
-import { inject } from '@adonisjs/core'
+```ts title="app/controllers/jobs_controller.ts"
+import type { HttpContext } from '@adonisjs/core/http'
+import engine from '@adonis-agora/durable/services/main'
 
-@inject()
 export default class JobsController {
-  constructor(private engine: WorkflowEngine) {}
-
   async progress({ params, response }: HttpContext) {
-    const progress = await this.engine.getEvent<{ phase: string; pct: number }>(params.runId, 'progress')
+    const progress = await engine.getEvent<{ phase: string; pct: number }>(params.runId, 'progress')
     return response.ok(progress ?? { phase: 'pending', pct: 0 })
   }
 }
 ```
 
-`getEvent` works against a live run *and* a finished one — the published values live in the run's checkpoints, so they remain queryable after the run completes. The read is typed: pass the value type as the generic (`getEvent<TValue>`), and the engine returns `TValue | undefined`.
+`getEvent` works against a live run *and* a finished one — the published values live in the run's checkpoints, so they remain queryable after the run completes (useful for surfacing a final summary without unpacking the full output). The read is typed: pass the value type as the generic (`getEvent<TValue>`), and the engine returns `TValue | undefined`.
+
+The [dashboard](/docs/durable/observability/dashboard) exposes the same read over HTTP as `GET <path>/api/runs/:id/events/:key` (`path` defaults to `/durable`). It answers `{ value }` — `{}` when the run never published that key, 404 for an unknown run — and passes the value through the `checkpoint` redaction hook, so any HTTP client can poll a run's progress without holding the engine.
 
 <CodeFlow scene="queries" />
 
@@ -75,6 +76,8 @@ A query reads; an **update** steers. An update point inside the run suspends unt
 Inside the workflow, `await ctx.onUpdate(name)` suspends the run with zero compute until an `engine.update(runId, name, arg)` delivers `arg`, then resumes with it. The `name` is **run-scoped** — unique within this run, not globally. Pass `{ timeoutMs }` to bound the wait; if the deadline passes, the call throws `SignalTimeoutError`.
 
 ```ts
+import { FatalError, SignalTimeoutError } from '@adonis-agora/durable'
+
 engine.register('expense-approval', '1', async (ctx, expense: Expense) => {
   await ctx.setEvent('status', { state: 'awaiting-approval', amountCents: expense.amountCents })
 
@@ -105,13 +108,21 @@ engine.register('expense-approval', '1', async (ctx, expense: Expense) => {
 
 ### The validator — `engine.registerUpdateValidator(workflow, name, validate)`
 
-Register a validator for a `(workflow, update name)` pair. It runs **before** the update is delivered, in the calling request — so it can enforce a business rule and **reject** the update without ever disturbing the run. To reject, throw an error whose message is the reason; to accept, return nothing. The validator may be async.
+Register a validator for a `(workflow, update name)` pair. It runs **before** the update is delivered, in the calling request — so it can enforce a business rule and **reject** the update without ever disturbing the run. To reject, either return a non-empty reason string or throw (the error's message becomes the reason); to accept, return nothing. The validator may be async, so it can check a database or an authorization service. Its type is `UpdateValidator<TArg> = (arg: TArg) => void | string | Promise<void | string>`.
 
-```ts
-engine.registerUpdateValidator('expense-approval', 'decision', async (arg: { by?: string }) => {
-  if (!arg?.by) throw new Error('approver is required')
-  const approver = await people.find(arg.by)
-  if (!approver?.canApproveExpenses) throw new Error(`${arg.by} is not allowed to approve expenses`)
+Register validators once at boot, next to your workflow registrations — for example in a preloaded `start/durable.ts`:
+
+```ts title="start/durable.ts"
+import engine from '@adonis-agora/durable/services/main'
+import Person from '#models/person'
+
+type Decision = { approved: boolean; approver: string; note?: string }
+
+engine.registerUpdateValidator<Decision>('expense-approval', 'decision', async (arg) => {
+  if (!arg?.approver) return 'approver is required'
+  const approver = await Person.findBy('handle', arg.approver)
+  if (!approver?.canApproveExpenses) return `${arg.approver} is not allowed to approve expenses`
+  if (!arg.approved && !arg.note) throw new Error('a rejection must include a note')
   // returning nothing accepts the update
 })
 ```
@@ -128,27 +139,29 @@ type UpdateResult =
   | { accepted: true; run: RunResult | null }
 ```
 
-- `{ accepted: false, reason }` — the validator rejected it. The run is untouched; `reason` is the validator's thrown message.
-- `{ accepted: true, run }` — accepted and delivered. `run` is the resumed run's result, or `null` when nothing was waiting at that update point yet.
+- `{ accepted: false, reason }` — the validator rejected it, or the run does not exist (`reason` is `run <id> not found`). The run is untouched; `reason` is the validator's returned string or thrown message.
+- `{ accepted: true, run }` — accepted and delivered. `run` is the resumed run's result, or `null` when nothing was waiting at that update point yet (a too-early or duplicate update).
 
-```ts
-@inject()
+```ts title="app/controllers/expenses_controller.ts"
+import type { HttpContext } from '@adonisjs/core/http'
+import engine from '@adonis-agora/durable/services/main'
+
 export default class ExpensesController {
-  constructor(private engine: WorkflowEngine) {}
-
   async decide({ params, request, response }: HttpContext) {
-    const result = await this.engine.update(params.runId, 'decision', request.body())
+    const result = await engine.update(params.runId, 'decision', request.body())
     if (!result.accepted) return response.badRequest({ error: result.reason })
     return response.ok({ status: result.run?.status ?? 'pending' })
   }
 }
 ```
 
+The dashboard exposes the same validated path as `POST <path>/api/runs/:id/update/:name` with a `{ arg }` body: a rejection answers 422 with the reason, and nothing is delivered.
+
 <CodeFlow scene="update-happy" />
 
 ### Why a validator beats a raw signal
 
-You can already steer a run with `ctx.waitForSignal` + `engine.signal`. The difference is *where the rejection happens*. A signal always lands; if the argument is bad, the workflow body has to detect it after resuming. An update with a validator rejects in the caller's request, synchronously, with a reason — the run never wakes for a bad update, and the caller gets immediate, actionable feedback.
+You can already steer a run with `ctx.waitForSignal` + `engine.signal`. The difference is *where the rejection happens*. A signal always lands; if the argument is bad, the workflow body has to detect it after resuming and somehow get the run back to a waiting state. An update with a validator rejects in the caller's request, synchronously, with a reason — the run never wakes for a bad update, and the caller gets immediate, actionable feedback.
 
 ## Search attributes
 
@@ -160,7 +173,7 @@ An attribute set is a flat map of primitives:
 type SearchAttributes = Record<string, string | number | boolean>
 ```
 
-Unlike a free-form `setEvent` value, attributes are **typed and queryable**: SQL stores explode them into an indexed side-table so `amount >= 200` is a real range scan, not an in-memory filter over every row.
+Unlike a free-form `setEvent` value, attributes are **typed and queryable**: the [Lucid store](/docs/durable/stores/lucid) explodes them into an indexed side-table so `amount >= 200` is a real indexed predicate, not an in-memory filter over every row.
 
 ### Stamping attributes on a run
 
@@ -198,37 +211,76 @@ engine.register('checkout', '1', async (ctx, order: Order) => {
 Use `ctx.upsertSearchAttributes` instead of injecting the `StateStore` to mutate the run you're executing — it's the replay-safe path. It also means you never reach for `store.updateRun(ctx.runId, …)` from inside a workflow, which would double-write on every replay turn.
 </Callout>
 
+### Typed attributes — a search-attributes schema
+
+By default any flat `string | number | boolean` map is accepted. To pin the shape, declare a [Standard Schema](https://standardschema.dev) (zod, valibot, arktype, …) whose output is search-attribute-shaped — on a class workflow as `static workflow = { searchAttributes }`, or on a string-named one as `engine.register(name, version, fn, { searchAttributesSchema })`. Then:
+
+- every `ctx.upsertSearchAttributes` validates the **merged** attributes (the schema describes the whole run's bag, so make keys that arrive later optional) and a non-conforming write throws a `SchemaValidationError` (a non-retryable `FatalError`, code `schema_validation`) in the body — nothing is written or recorded;
+- typing `run`'s ctx as `WorkflowCtx<InferSearchAttributes<typeof schema>>` narrows `upsertSearchAttributes` to `Partial<A>` at compile time;
+- a schema whose output has a nested object or array value is a compile-time error, and its `validate` must be synchronous (an async refinement could make replay nondeterministic).
+
+```ts title="app/workflows/checkout_workflow.ts"
+import { BaseWorkflow, type InferSearchAttributes, type WorkflowCtx } from '@adonis-agora/durable'
+import { z } from 'zod'
+
+const checkoutAttrs = z.object({
+  tier: z.enum(['free', 'pro']),
+  amount: z.number(),
+  stage: z.enum(['charging', 'shipped']).optional(),
+})
+
+export default class CheckoutWorkflow extends BaseWorkflow {
+  static workflow = { name: 'checkout', searchAttributes: checkoutAttrs }
+
+  async run(ctx: WorkflowCtx<InferSearchAttributes<typeof checkoutAttrs>>, order: Order) {
+    await ctx.upsertSearchAttributes({ tier: order.tier, amount: order.totalCents, stage: 'charging' })
+    // ...
+  }
+}
+```
+
+Read them back typed with `attributesOf(CheckoutWorkflow, run)` (the schema is resolved from the class) or `readSearchAttributes(schema, run)`. Both are deliberately lenient: an older run whose attributes predate the schema yields `{}` instead of throwing, so a read path never crashes on old history.
+
+```ts
+import { attributesOf } from '@adonis-agora/durable'
+import engine from '@adonis-agora/durable/services/main'
+import CheckoutWorkflow from '#workflows/checkout_workflow'
+
+const run = await engine.getRun(runId)
+const { tier, amount } = attributesOf(CheckoutWorkflow, run ?? {})
+```
+
 ### Querying by attribute — `engine.listRuns`
 
 Filter runs with an `attributes` array on a `RunQuery`. Each entry is an `AttributeFilter`, and the query **ANDs** them all together:
 
 ```ts
-type AttributeOp = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte'
+type AttributeOp = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' | 'in'
+type AttributeValue = string | number | boolean
 
-interface AttributeFilter {
-  key: string
-  op: AttributeOp
-  value: string | number | boolean
-}
+type AttributeFilter =
+  | { key: string; op: Exclude<AttributeOp, 'in'>; value: AttributeValue }
+  | { key: string; op: 'in'; values: AttributeValue[] } // OR inside one predicate
 ```
 
 Pair the attribute predicates with the coarse `workflow` / `status` / `tag` filters so the store can bound the scan before applying them:
 
-```ts
-@inject()
-export default class RunsController {
-  constructor(private engine: WorkflowEngine) {}
+```ts title="app/controllers/runs_controller.ts"
+import type { HttpContext } from '@adonisjs/core/http'
+import engine from '@adonis-agora/durable/services/main'
 
-  // GET /admin/big-pro-checkouts
-  async bigProCheckouts({ response }: HttpContext) {
-    const runs = await this.engine.listRuns({
-      workflow: 'checkout',        // coarse filter — bounds the scan
+export default class RunsController {
+  // GET /admin/big-paid-checkouts
+  async bigPaidCheckouts({ response }: HttpContext) {
+    const runs = await engine.listRuns({
+      workflow: 'checkout', // coarse filter — bounds the scan
       status: 'suspended',
       attributes: [
         { key: 'amount', op: 'gte', value: 20000 }, // amount >= 20000 cents
-        { key: 'tier', op: 'eq', value: 'pro' },    // AND tier === 'pro'
+        { key: 'tier', op: 'in', values: ['pro', 'enterprise'] }, // AND tier is pro OR enterprise
       ],
-      limit: 50,
+      page: 1,
+      size: 50,
     })
     return response.ok(runs)
   }
@@ -238,6 +290,8 @@ export default class RunsController {
 A few semantics worth knowing:
 
 - **A missing key never matches.** If a run never set `tier`, it fails *any* filter on `tier` — including `ne` (there is simply no value to compare). Filter on keys you know you stamp.
-- **Booleans** are compared by `eq`/`ne` only (stored as `"true"`/`"false"` under the hood); numeric range ops (`gt`/`gte`/`lt`/`lte`) apply to numbers.
+- **Booleans** are compared by `eq`/`ne` only (stored as `"true"`/`"false"` under the hood); range ops (`gt`/`gte`/`lt`/`lte`) are meant for numbers (a string operand compares lexicographically).
+- **`in`** matches when the value equals any member of `values` — the only way to OR on one key, since two `eq` predicates on the same key are ANDed. An empty `values` matches nothing.
 - **Empty / absent `attributes`** matches everything — the query degrades to a plain `listRuns`.
-- On SQL stores the predicates push **down** into the indexed side-table; the in-memory test store applies the identical logic in-process, so a query behaves the same across adapters.
+- **Paging** is `page` (1-based) + `size`; omit `size` for every matching run.
+- On the Lucid store the predicates push **down** into the indexed side-table (`EXISTS` subqueries); the in-memory test store applies the identical logic in-process, so a query behaves the same across adapters.

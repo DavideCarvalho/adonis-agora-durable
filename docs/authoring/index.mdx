@@ -8,11 +8,11 @@ icon: PenLine
 
 ## Writing workflows
 
-- **[app/workflows & make:workflow](/docs/durable/authoring/app-workflows)**: the class-based convention. One `BaseWorkflow` subclass per file under `app/workflows`, with a `static workflow` config, registered automatically at boot and scaffolded by `make:workflow`.
+- **[app/workflows & make:workflow](/docs/durable/authoring/app-workflows)**: the class-based convention. One `BaseWorkflow` subclass per file under `app/workflows`, with a `static workflow` config (name, version, input schema, singleton, onError routes, …), registered automatically at boot, constructor-injected through the container, and scaffolded by `make:workflow`.
 
 ## Composition
 
-- **[Child workflows](/docs/durable/authoring/child-workflows)**: call a workflow from a workflow. `Inner.start` / `ctx.child` waits for a result, `Inner.dispatch` / `ctx.startChild` starts one without waiting, and `ctx.all` fans out over a list. Pass a class for typed input and output, or a name string for a child in another runtime.
+- **[Child workflows](/docs/durable/authoring/child-workflows)**: call a workflow from a workflow. `Inner.start` / `ctx.child` waits for a result, `Inner.dispatch` / `ctx.startChild` starts one without waiting, `ctx.all` fans out over a list (of child workflows or of steps), and `ctx.allSettled` does the same without failing on a failed item. `ctx.continueAsNew` restarts a long loop with a clean history. Pass a class for typed input and output, or a name string for a child in another runtime.
 - **[Durable entities](/docs/durable/authoring/entities)**: keyed virtual actors. `engine.registerEntity` defines handlers that run one at a time per key over durable state, exactly once. Drive them with `engine.signalEntity` / `ctx.callEntity`.
 
 ## Talking to a running run
@@ -27,4 +27,4 @@ icon: PenLine
 
 - **[Versioning & determinism](/docs/durable/authoring/versioning)**: how in-flight runs stay replay-safe across a deploy. Covers workflow versions for breaking changes, the `NonDeterminismError` guard, deterministic `ctx.now` / `ctx.sideEffect`, and `ctx.patched` for an in-place change.
 - **[Scheduling](/docs/durable/authoring/scheduling)**: recurring workflows declared in `config/durable.ts` (or colocated as `static schedule`), on a fixed interval or a DST-aware cron, started exactly once per window.
-- **[Persisted schedules](/docs/durable/authoring/persisted-schedules)**: `engine.schedules`, for schedules you create, update, pause, trigger and delete at runtime, stored in the state store (`durable_schedules`), and fired by the `durable:work` tick when `persistedSchedules` is on. Safe with any number of workers.
+- **[Persisted schedules](/docs/durable/authoring/persisted-schedules)**: `engine.schedules`, for schedules you create, update, pause, trigger and delete at runtime, stored in the state store (`durable_schedules`), and fired by the worker tick (`node ace durable:work` or the embedded worker) when `persistedSchedules` is on. Safe with any number of workers.

@@ -20,15 +20,18 @@ A [durable webhook](/docs/durable/authoring/webhooks) waits for an *inbound HTTP
 ctx.task<TResult>(
   name: string,               // unique per run — the correlation id the far side reports back on
   dispatch: () => Promise<void>, // fire the request (runs once, checkpointed)
-  options?: StepOptions,      // same retry/timeout options as a step
+  options?: StepOptions,      // retries/backoff for the dispatch call, not for the wait
 ): Promise<TResult>
 ```
 
-Under the hood `ctx.task` runs `dispatch` exactly once (as a checkpointed step, so it never re-fires on replay/recovery), then suspends the run on an internal token derived from the run id and `name`. Nothing runs, nothing polls, no thread is held. When the far side is done, **your** code calls `engine.completeTask(runId, name, result)` (or `engine.failTask`) and the run resumes with the result.
+Under the hood `ctx.task` runs `dispatch` exactly once (as a checkpointed local step named `task:dispatch:<name>`, so it never re-fires on replay/recovery), then suspends the run on the signal token `task:<runId>:<name>`. Nothing runs, nothing polls, no thread is held. When the far side is done, **your** code calls `engine.completeTask(runId, name, result)` (or `engine.failTask`) and the run resumes with the result.
+
+`name` must be unique per run: it is the id both the dispatch checkpoint and the completion key on. The far side therefore needs two things to report back, the run id (`ctx.runId`) and the task name, so put both in the message you dispatch. `options` is a [`StepOptions`](/docs/durable/reliability/retries) (`retries`, `backoff`, `backoffMs`, …) and governs the `dispatch` call only; the wait itself has no timeout.
 
 ```ts title="app/workflows/transcode_workflow.ts"
 import { BaseWorkflow } from '@adonis-agora/durable'
 import type { WorkflowCtx } from '@adonis-agora/durable'
+import transcodeQueue from '#services/transcode_queue' // your SQS / broker client
 
 interface TranscodeResult {
   outputUrl: string
@@ -40,12 +43,9 @@ export default class TranscodeWorkflow extends BaseWorkflow {
 
   async run(ctx: WorkflowCtx, job: { id: string; src: string }) {
     // Dispatch to a foreign, NON-durable worker (an SQS queue, a Python service, a GPU box),
-    // then suspend with zero compute until it reports back. `job.id` is the correlation id.
-    const result = await ctx.task<TranscodeResult>(job.id, async () => {
-      await sqs.send({
-        queueUrl: env.get('TRANSCODE_QUEUE_URL'),
-        body: JSON.stringify({ jobId: job.id, src: job.src }),
-      })
+    // then suspend with zero compute until it reports back with this run id + task name.
+    const result = await ctx.task<TranscodeResult>('transcode', async () => {
+      await transcodeQueue.send({ runId: ctx.runId, task: 'transcode', src: job.src })
     })
 
     await ctx.step('publish-asset', { jobId: job.id, url: result.outputUrl })
@@ -66,26 +66,29 @@ engine.completeTask(runId: string, name: string, result: unknown): Promise<RunRe
 engine.failTask(runId: string, name: string, error: string): Promise<RunResult | null>
 ```
 
-Both return the resumed run's result, or `null` when **no run is waiting** on that task — a duplicate or late delivery is a safe no-op, so an at-least-once callback source can't corrupt the run.
+Both deliver a signal on `task:<runId>:<name>`, so they inherit [signal buffering](/docs/durable/concepts/sleep-and-signals#signal-buffering--signal-with-start):
+
+- When the run is waiting, they resume it and return its `RunResult`.
+- When no run is waiting **yet** (the far side answered before the run reached the wait), the completion is buffered and they return `null`. The run consumes it when it reaches `ctx.task`, so a fast worker never loses its result.
+- A duplicate or late delivery, after the run has moved past the task, also returns `null`. It can't corrupt the run: nothing waits on that token again.
+
+`failTask` makes `ctx.task` throw a `FatalError` with the message `task "<name>" failed: <error>`. A fatal error is not retried, so catch it in the workflow if you want a fallback branch.
+
+The [dashboard](/docs/durable/observability/dashboard#human-in-the-loop-signals-updates-and-tasks) exposes the same two calls as `POST /api/runs/:id/tasks/:name/complete` and `.../fail`, so an operator can settle a stuck task by hand.
 
 ```ts title="app/controllers/transcode_callbacks_controller.ts"
-import { WorkflowEngine } from '@adonis-agora/durable'
-import { inject } from '@adonisjs/core'
 import type { HttpContext } from '@adonisjs/core/http'
+import engine from '@adonis-agora/durable/services/main'
 
-@inject()
 export default class TranscodeCallbacksController {
-  constructor(private engine: WorkflowEngine) {}
-
-  // The transcode worker POSTs here when a job finishes.
+  // The transcode worker POSTs here when a job finishes, echoing the runId + task it was sent.
   async handle({ request, response }: HttpContext) {
-    const { jobId, status, outputUrl, durationMs, error } = request.body()
+    const { runId, task, status, outputUrl, durationMs, error } = request.body()
 
     if (status === 'ok') {
-      // `jobId` is the same `name` the workflow passed to ctx.task.
-      await this.engine.completeTask(`transcode:${jobId}`, jobId, { outputUrl, durationMs })
+      await engine.completeTask(runId, task, { outputUrl, durationMs })
     } else {
-      await this.engine.failTask(`transcode:${jobId}`, jobId, error ?? 'transcode failed')
+      await engine.failTask(runId, task, error ?? 'transcode failed')
     }
 
     return response.noContent()
@@ -110,7 +113,9 @@ ctx.transaction<TOutput>(
 ): Promise<TOutput>
 ```
 
-`fn` receives the **store-native** transaction handle — with the [Lucid store](/docs/durable/stores/lucid), a Lucid `TransactionClientContract`; a custom store hands over whatever its own transaction object is. Do your writes on that handle so they land in the same transaction as the checkpoint.
+`fn` receives the **store-native** transaction handle — with the [Lucid store](/docs/durable/stores/lucid), a Lucid `TransactionClientContract` opened on the store's own connection; a custom store hands over whatever its own transaction object is. Do your writes on that handle (not on the app's `db` service) so they land in the same transaction as the checkpoint. That also means the tables you write must live in the same database as the durable tables.
+
+Like any step, the call is position-checked on replay: renaming `name` on a workflow with runs in flight throws a `NonDeterminismError`, so treat it as a [versioned change](/docs/durable/authoring/versioning).
 
 ```ts title="app/workflows/payout_workflow.ts"
 import { BaseWorkflow } from '@adonis-agora/durable'
@@ -125,10 +130,10 @@ export default class PayoutWorkflow extends BaseWorkflow {
     // either commits both or neither — the payout is never double-recorded on recovery.
     const ledgerId = await ctx.transaction('record-payout', async (raw) => {
       const trx = raw as TransactionClientContract
-      await trx.insertQuery().table('accounts')
+      await trx.from('accounts')
         .where('id', payout.accountId)
         .decrement('balance_cents', payout.cents)
-      const [row] = await trx.insertQuery().table('ledger_entries')
+      const [row] = await trx.table('ledger_entries')
         .insert({ payout_id: payout.id, cents: payout.cents })
         .returning('id')
       return row.id as number
@@ -140,12 +145,12 @@ export default class PayoutWorkflow extends BaseWorkflow {
 ```
 
 <Callout type="warn">
-**`ctx.transaction` needs a transactional store.** It requires a store that supports transactions — the bundled SQL adapters (Lucid) do; the in-memory test store does not, and the call throws with a clear message. For non-transactional or idempotent work, a plain `ctx.step`/`ctx.localStep` is the right tool. Use `ctx.transaction` specifically when a single non-idempotent DB write must be exactly-once.
+**`ctx.transaction` needs a store with `transaction()`.** The [Lucid store](/docs/durable/stores/lucid) has it. The in-memory test store accepts the call too, so workflows using it stay testable, but it has no real transaction: it runs `fn` (handing it the store itself as `tx`) and then saves the checkpoint, with no atomicity across a crash. A custom store without `transaction()` makes the call throw `ctx.transaction needs a store that supports transactions`. For non-transactional or idempotent work, a plain `ctx.step`/`ctx.localStep` is the right tool. Use `ctx.transaction` specifically when a single non-idempotent DB write must be exactly-once.
 </Callout>
 
 ## Human-in-the-loop pauses — `ctx.breakpoint`
 
-`ctx.breakpoint(label?)` pauses a run at a point and waits for a human to resume it — the durable equivalent of a debugger breakpoint. It records a **visible `pending` checkpoint** (so the pause shows up in the run's timeline in the [dashboard](/docs/durable/observability/dashboard)), then suspends with zero compute. An operator resumes it from the [dashboard](/docs/durable/observability/dashboard#continuing-a-breakpoint) (or that page's `POST <path>/api/runs/:id/continue`), or you call `engine.continue(runId)` yourself — the run replays past the breakpoint and carries on.
+`ctx.breakpoint(label?)` pauses a run at a point and waits for a human to resume it — the durable equivalent of a debugger breakpoint. It records a **visible `pending` checkpoint** (so the pause shows up in the run's timeline in the [dashboard](/docs/durable/observability/dashboard)), then suspends with zero compute. An operator resumes it from the [dashboard](/docs/durable/observability/dashboard#continuing-a-breakpoint) (or that page's `POST <path>/api/runs/:id/continue`), or you call `engine.continue(runId)` yourself — the run replays past the breakpoint and carries on. `engine.continue` returns the resumed `RunResult`, or `null` when the run is not paused at a breakpoint, so calling it blindly is safe.
 
 ```ts
 ctx.breakpoint(label?: string): Promise<void>
@@ -163,7 +168,7 @@ export default class ImportWorkflow extends BaseWorkflow {
   async run(ctx: WorkflowCtx, job: { id: string; dryRun: boolean }) {
     // The string form returns `unknown`, so name the payload with a generic (or pass a
     // @Step reference, which infers it).
-    const extracted = await ctx.step<{ rows: Row[] }>('extract', { jobId: job.id })
+    const extracted = await ctx.step<{ rows: Record<string, unknown>[] }>('extract', { jobId: job.id })
     await ctx.setEvent('preview', extracted) // publish so a reviewer can inspect it
 
     // On a supervised import, park here until a human approves from the dashboard.
@@ -179,11 +184,16 @@ export default class ImportWorkflow extends BaseWorkflow {
 
 Resuming from a controller is a one-liner:
 
-```ts
-// POST /runs/:runId/continue
-async continue({ params, response }: HttpContext) {
-  await this.engine.continue(params.runId)
-  return response.ok({ resumed: true })
+```ts title="app/controllers/imports_controller.ts"
+import type { HttpContext } from '@adonisjs/core/http'
+import engine from '@adonis-agora/durable/services/main'
+
+export default class ImportsController {
+  // POST /imports/:runId/continue
+  async continue({ params, response }: HttpContext) {
+    const result = await engine.continue(params.runId)
+    return result ? response.ok({ resumed: true }) : response.notFound({ resumed: false })
+  }
 }
 ```
 

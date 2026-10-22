@@ -4,6 +4,8 @@ description: ctx.webhook() mints a durable callback handle with a deterministic 
 icon: Webhook
 ---
 
+import { Callout } from 'fumadocs-ui/components/callout';
+
 Plenty of third-party APIs are asynchronous: you ask them to do something, they hand you back a reference, and *later* they call **you** back at a URL you gave them. Done by hand, that means standing up a callback endpoint, persisting "which run is waiting for which callback", parking the run, and matching the inbound POST back to it. `ctx.webhook()` is the durable, replay-safe, first-class version of exactly that pattern — "expose a callback URL and wait for it" collapsed into two calls.
 
 ## Minting a webhook — `ctx.webhook()`
@@ -81,7 +83,9 @@ interface PaymentResult {
   providerRef: string
 }
 
-engine.register('checkout', '1', async (ctx, order: Order) => {
+engine.register('checkout', '1', async (ctx, input) => {
+  const order = input as Order
+
   // 1. Mint the webhook: fixes a deterministic token and (with a builder) a public url.
   const hook = ctx.webhook<PaymentResult>()
 
@@ -111,7 +115,21 @@ engine.register('checkout', '1', async (ctx, order: Order) => {
 
 ## Delivering the callback
 
-When the payment provider POSTs to the callback URL, deliver the body as `engine.signal(token, body)` from your own controller — the token is in the URL, and it already encodes the run and position, so there's nothing else to look up:
+The callback has to become `engine.signal(token, body)` on the waiting run. You have two ways to receive it.
+
+### Through the dashboard route
+
+If you mount the [dashboard](/docs/durable/observability/dashboard#live-queries-webhooks-and-metrics), it already serves `POST /durable/api/webhooks/:token`. Point `webhookUrl` at it:
+
+```ts title="config/durable.ts"
+webhookUrl: (token) => `https://api.example.com/durable/api/webhooks/${token}`,
+```
+
+The route accepts only webhook tokens (`wh:<runId>:<seq>`), and only while a run is actually waiting on that token: a duplicate, stale or guessed callback answers `404` and buffers nothing. It answers `{ result }` on delivery and `413` past the 1 MiB payload limit. It sits behind the console's `authorize` guard like every dashboard route, so let the provider through there (a shared header or a signature check on that path).
+
+### From your own route
+
+Without the dashboard, or to verify the provider's signature in your own middleware, deliver the body yourself. The token is in the URL and already encodes the run and position, so there's nothing else to look up:
 
 ```ts title="start/routes.ts"
 import router from '@adonisjs/core/services/router'
@@ -125,7 +143,20 @@ router.post('/durable/webhooks/:token', async ({ params, request, response }) =>
 
 That signal wakes the exact run suspended on that token, and `hook.wait()` resumes with `body` as its typed payload.
 
-> The token embeds `runId:seq`, so treat it as a secret — this endpoint is reachable by external systems. Front it with signature verification in your own middleware.
+<Callout type="warn" title="The token is not a secret">
+The token is `wh:<runId>:<seq>`, derived from the run id, which a caller may know or guess. Don't rely on it for authentication: this endpoint is reachable by external systems, so verify the provider's signature (or a shared secret) before calling `engine.signal`.
+</Callout>
+
+<Callout type="warn" title="A callback that beats the wait is not delivered">
+`hook.wait()` resumes only on a signal that arrives **after** it registered its waiter; unlike `ctx.waitForSignal`, it does not consume a [buffered signal](/docs/durable/concepts/sleep-and-signals#signal-buffering--signal-with-start). If the provider calls back while the run is still before `wait()` (for example while a dispatched `ctx.step` that handed out the URL is waiting for its result), the dashboard route answers `404`, and `engine.signal` returns `null` after buffering a copy the webhook never reads. Reply with a non-2xx in that case so the provider retries:
+
+```ts
+const result = await engine.signal(params.token, request.body())
+return result ? response.noContent() : response.serviceUnavailable() // provider retries later
+```
+
+If the provider does not retry, hand the URL out from a `ctx.localStep` right before `wait()` (as in the full example) to keep the window short, or use `ctx.waitForSignal` with a token you mint yourself, which does consume an early, buffered delivery.
+</Callout>
 
 ## External tasks — `ctx.task`
 
@@ -161,7 +192,7 @@ router.post('/transcode-callbacks', async ({ request, response }) => {
 })
 ```
 
-`completeTask` resumes the run with the result as `ctx.task`'s return value; `failTask` makes `ctx.task` throw a `FatalError`. Both return `null` when no run is waiting on that task (a duplicate or late delivery), so a retried callback cannot corrupt an already-resumed run. `ctx.webhook` is the special case where the "external system" is an HTTP client and the engine builds the URL for you. See [External tasks](/docs/durable/authoring/external-tasks) for the full reference.
+`completeTask` resumes the run with the result as `ctx.task`'s return value; `failTask` makes `ctx.task` throw a `FatalError`. Both return `null` when no run is waiting on that task. A completion that arrives *before* the run reaches the wait is buffered and consumed when it gets there, and a duplicate or late delivery cannot corrupt an already-resumed run. `ctx.webhook` is the special case where the "external system" is an HTTP client and the engine builds the URL for you. See [External tasks](/docs/durable/authoring/external-tasks) for the full reference.
 
 ## Why this is better than rolling it yourself
 

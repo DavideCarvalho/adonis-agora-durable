@@ -16,7 +16,7 @@ This page is about the **sources**. The engine side (`publishEvent`, `onEvent`, 
 ## Authoring — decorators and `static on`
 
 ```ts
-import { BaseWorkflow, OnEvent, OnDiagnostic } from '@adonis-agora/durable'
+import { BaseWorkflow, OnEvent, OnDiagnostic, type WorkflowCtx } from '@adonis-agora/durable'
 
 @OnDiagnostic({ lib: 'payments', event: 'payment.succeeded' })
 @OnEvent({ event: 'agora:payments:payment.succeeded' })
@@ -31,7 +31,7 @@ export class ProcessPaymentWorkflow extends BaseWorkflow {
 Both forms are supported, exactly like schedules:
 
 - `@OnEvent({ event })` / `@OnDiagnostic({ lib, event? })` — named-parameter decorators, and
-- a colocated `static on = [...]` literal (the decorators only stamp `static on`):
+- a colocated `static on` literal, one trigger or an array (the decorators only stamp `static on`):
 
 ```ts
 static on = [
@@ -44,6 +44,8 @@ static on = [
 
 Repeated decorators and an existing `static on` accumulate (decorators prepend, top-first).
 
+The first example declares **both** sources for the same fact. Each exact trigger maps to a canonical engine event name: the literal event name for `@OnEvent`, and `agora:<lib>:<event>` for `@OnDiagnostic`. Here both resolve to `agora:payments:payment.succeeded`, so the workflow is subscribed once, but **each source that fires publishes separately**. If the library emits the fact on the emitter *and* on the diagnostics bus, you get two runs. Declare the one source you actually consume.
+
 <Callout type="info" title="Source capabilities">
 The Adonis emitter has no wildcard, so `@OnEvent` matches **exact names only**. Regex / "every event" is available on the diagnostics bus, whose channel registry the bridge subscribes to (current and future channels).
 </Callout>
@@ -51,13 +53,50 @@ The Adonis emitter has no wildcard, so `@OnEvent` matches **exact names only**. 
 ## How it fires
 
 - **Exact triggers** route through [`engine.publishEvent(canonical, payload)`](/docs/durable/authoring/events#publishing-an-event), which starts a fresh run of every workflow registered with that canonical `onEvent` name, with the payload as input. The same publish also resumes any run parked on `ctx.waitForEvent(canonical)`. The bridge passes no `opts.id`, so every emitted event starts its subscribers once. To dedupe an upstream's redeliveries, call `publishEvent` yourself with the upstream's id (see [Idempotent publishing](/docs/durable/authoring/events#idempotent-publishing--optsid)).
-- **Regex / any triggers** start the workflow directly with the event payload (the concrete channel name isn't known at registration time).
+- **Regex / any triggers** start the workflow directly with `engine.start(workflow, payload, <fresh uuid>)`, because the concrete channel name isn't known at registration time. They bypass `publishEvent`: each message starts exactly one run with a new id (no dedupe), and they never resume a `ctx.waitForEvent` nor buffer a copy.
 
-The diagnostics channel envelope's `payload` becomes the run input. The payload type is whatever the emitting library published (e.g. `@adonis-agora/payments`' `payment.succeeded` payload with `externalReference`).
+For both kinds, the run input still goes through the workflow's [`inputSchema`](/docs/durable/authoring/app-workflows#validating-the-input), so a payload it rejects starts nothing.
+
+For an emitter trigger, the emitted data is the run input. For a diagnostics trigger, the channel envelope's `payload` becomes the run input. The payload type is whatever the emitting library published (e.g. `@adonis-agora/payments`' `payment.succeeded` payload with `externalReference`).
 
 ## Wiring
 
 No config needed. The provider reads the triggers from discovered workflow classes (`static on`) and bridges the app's emitter (when resolvable) + the diagnostics channels at boot. If the emitter is unavailable, emitter triggers are inert; diagnostics triggers work regardless (they use `node:diagnostics_channel` directly).
+
+A few consequences of how the bridge is wired:
+
+- **It is in-process.** Both the emitter and `node:diagnostics_channel` are local to one Node process, so an event starts runs only in the process that emitted it. A fact emitted on a web replica is published by that replica; workers don't see it. To fan a fact out across processes, call [`engine.publishEvent`](/docs/durable/authoring/events#publishing-an-event) from a shared transport consumer instead.
+- **It needs an engine.** The bridge is attached by the provider's `boot` on the roles that own one (`standalone` and `control-plane`). A store-less `tenant` pod attaches no bridge, and neither does a warmed-up command (`node ace codegen` and similar) that never starts the app.
+- **Regex / "every event" needs the diagnostics registry.** Exact diagnostics triggers subscribe to their channel directly. Regex and any-event triggers discover the current and future `agora:<lib>:*` channels through the `@adonis-agora/diagnostics` registry, so they stay inert until that package is loaded.
+
+### Triggering from your own app events
+
+`@OnEvent` works with any event on the app emitter, not only library events. Declare the event in `EventsList` so `emitter.emit` type-checks:
+
+```ts title="app/workflows/send_welcome_workflow.ts"
+import { BaseWorkflow, OnEvent, type WorkflowCtx } from '@adonis-agora/durable'
+
+declare module '@adonisjs/core/types' {
+  interface EventsList {
+    'user:registered': { email: string }
+  }
+}
+
+@OnEvent({ event: 'user:registered' })
+export default class SendWelcomeWorkflow extends BaseWorkflow {
+  static workflow = { name: 'send-welcome' }
+
+  async run(ctx: WorkflowCtx, input: { email: string }) {
+    await ctx.step('mail.send-welcome', input)
+  }
+}
+```
+
+```ts
+import emitter from '@adonisjs/core/services/emitter'
+
+await emitter.emit('user:registered', { email: user.email }) // starts one send-welcome run
+```
 
 ## Event payloads → workflow input
 
