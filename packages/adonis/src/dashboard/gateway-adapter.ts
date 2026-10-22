@@ -27,6 +27,10 @@ export interface StoreEngineLike {
   listRuns: DashboardEngine['listRuns'];
   listCheckpoints: DashboardEngine['listCheckpoints'];
   getRunChildren: DashboardEngine['getRunChildren'];
+  /** The run detail from the store's checkpoint aggregates (with an `etag`) — forwarded when the
+   *  engine has it; without it the handlers build the detail from the full checkpoint list. */
+  getRunDetail?: DashboardEngine['getRunDetail'];
+  getFanMembers?: DashboardEngine['getFanMembers'];
   requeue: DashboardEngine['requeue'];
   redispatchPending?: DashboardEngine['redispatchPending'];
   cancel: DashboardEngine['cancel'];
@@ -80,6 +84,22 @@ export function storeDashboardEngine(engine: StoreEngineLike): DashboardEngine {
     listRuns: (query) => engine.listRuns(query),
     listCheckpoints: (runId) => engine.listCheckpoints(runId),
     getRunChildren: (runId) => engine.getRunChildren(runId),
+    ...(engine.getRunDetail
+      ? {
+          getRunDetail: (runId: string, options?: RunDetailOptions) =>
+            (engine.getRunDetail as NonNullable<StoreEngineLike['getRunDetail']>)(runId, options),
+        }
+      : {}),
+    ...(engine.getFanMembers
+      ? {
+          getFanMembers: (runId: string, group: string, query: FanPageQuery) =>
+            (engine.getFanMembers as NonNullable<StoreEngineLike['getFanMembers']>)(
+              runId,
+              group,
+              query,
+            ),
+        }
+      : {}),
     requeue: (runId) => engine.requeue(runId),
     redispatchPending: (runId) => engine.redispatchPending?.(runId) ?? Promise.resolve(null),
     cancel: (runId, opts) => engine.cancel(runId, opts),

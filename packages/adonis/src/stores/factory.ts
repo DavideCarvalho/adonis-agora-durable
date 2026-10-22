@@ -21,6 +21,12 @@ export type StoreFactory = (ctx: StoreContext) => Promise<StateStore>;
 export interface LucidStoreConfig {
   /** Lucid connection name to use. Defaults to the `Database` default connection. */
   connection?: string;
+  /**
+   * MySQL/MariaDB only: the collation the durable tables use — new tables are created with it and
+   * existing ones are converted to it at boot. Set it to your own tables' collation (e.g.
+   * `'utf8mb4_unicode_ci'`) so a JOIN against them doesn't fail with `Illegal mix of collations`.
+   */
+  collation?: string;
 }
 
 /**
@@ -47,10 +53,10 @@ export const stores = {
     return async (ctx) => {
       const db = (await resolveLucidDatabase(ctx)) as Database;
       const { LucidStateStore } = await import('./lucid.js');
-      return new LucidStateStore(
-        db,
-        config.connection !== undefined ? { connectionName: config.connection } : {},
-      );
+      return new LucidStateStore(db, {
+        ...(config.connection !== undefined ? { connectionName: config.connection } : {}),
+        ...(config.collation !== undefined ? { collation: config.collation } : {}),
+      });
     };
   },
 };

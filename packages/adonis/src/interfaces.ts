@@ -339,6 +339,16 @@ export interface StateStore {
    */
   deleteRun(runId: string): Promise<void>;
 
+  /**
+   * {@link deleteRun} for a batch of runs: every id's checkpoints, signal waiters, attribute rows and
+   * run row, as a few `IN (...)` statements in one transaction instead of four statements per run.
+   * Unknown ids are ignored. Like {@link deleteRun} it removes exactly the listed runs; the engine's
+   * `purgeRuns` and retention sweep walk the child edges first.
+   *
+   * Optional: a store that omits it gets one {@link deleteRun} per id.
+   */
+  deleteRuns?(runIds: string[]): Promise<void>;
+
   getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null>;
   /**
    * Persist a checkpoint and advance the run atomically. Durable semantics depend on this
@@ -355,6 +365,16 @@ export interface StateStore {
    * Optional: a store that omits it falls back to {@link saveCheckpoint}, which keeps that race.
    */
   saveCheckpointIfPending?(checkpoint: StepCheckpoint): Promise<boolean>;
+  /**
+   * {@link saveCheckpointIfPending} for many checkpoints in one call: resolves, per entry and in
+   * input order, whether it wrote. Same result as calling it on each entry in turn (a later entry for
+   * the same `(runId, seq)` is compared against the earlier one's write), with each row's
+   * compare-and-set still atomic. The call as a whole is atomic too: if it rejects, nothing was
+   * written. The engine settles a batch of one run's step results through it, one call per batch.
+   *
+   * Optional: a store that omits it gets one {@link saveCheckpointIfPending} per entry.
+   */
+  saveCheckpointsIfPending?(checkpoints: StepCheckpoint[]): Promise<boolean[]>;
 
   /**
    * Used by recovery on boot to find runs to resume (crashed, left `running`). When `namespace` is
@@ -519,6 +539,15 @@ export interface StateStore {
    * returns `true` is the one that gets to deliver the payload; every other caller backs off.
    */
   removeBufferedEvent(id: string): Promise<boolean>;
+  /**
+   * Delete up to `limit` buffered events published before `publishedBefore` (epoch ms), oldest
+   * first, across every name; resolves how many it deleted. What the engine's `eventBufferTtlMs`
+   * prune calls, so an event nobody ever waits for does not stay in the table forever.
+   *
+   * Optional: without it the prune has no way to enumerate names, and expired events are only skipped
+   * (and removed) when a `waitForEvent` for their name scans them.
+   */
+  pruneBufferedEvents?(publishedBefore: number, limit: number): Promise<number>;
 
   /**
    * Run `work` in a SINGLE store transaction — giving it the store-native transaction handle (`raw`)
@@ -537,6 +566,16 @@ export interface StateStore {
    * Optional: without it the engine counts a {@link listRuns} result.
    */
   countRuns?(query: Omit<RunQuery, 'page' | 'size'>): Promise<number>;
+
+  /**
+   * Count the runs matching `query`, grouped by `(status, origin)`: the totals behind a console's
+   * status and origin chips in ONE aggregate, instead of a listing counted in memory. Cells with a
+   * zero count are absent; a run with no (or a blank) origin counts under `origin: null`.
+   *
+   * Optional: without it `runFacetsOf` counts a {@link listRuns} result, which is correct but
+   * unbounded.
+   */
+  runFacets?(query: RunFacetQuery): Promise<RunFacetRow[]>;
 
   // Persisted schedules (optional) — see {@link ScheduleRecord}. A store implements all five or none;
   // `engine.schedules` refuses to run on a store without them.
@@ -630,6 +669,91 @@ export interface StateStore {
     toSeq: number,
     statuses: StepCheckpoint['status'][],
   ): Promise<number>;
+
+  /**
+   * The run's checkpoints aggregated into {@link CheckpointStat} buckets — one per
+   * `(parallelGroup, status, nameKind)` present — with `opts.group` narrowing it to one group. A
+   * `GROUP BY`, not a load: it is what lets a run detail draw a 40,000-member fan from a few rows.
+   * Ungrouped checkpoints come back under `group: null`. Bucket order is unspecified.
+   *
+   * Optional: a store that omits it still works — the run detail then loads every checkpoint and
+   * summarizes it in JS (`summarizeTimeline`), which is the same answer read the expensive way. A
+   * store that implements it must implement {@link queryCheckpoints} too.
+   */
+  checkpointStats?(runId: string, opts?: { group?: string | undefined }): Promise<CheckpointStat[]>;
+
+  /**
+   * The run's checkpoints that match `query`, in `seq` order (the order of {@link listCheckpoints}),
+   * paged by `offset`/`limit`. Every filter is optional; an absent one does not narrow. An EMPTY
+   * `statuses` or `namePrefixes` matches nothing; an empty `excludeGroups` excludes nothing.
+   *
+   * Optional, paired with {@link checkpointStats}: the run detail reads a fan's failures, its folded
+   * checkpoints and one page of its members through it, instead of the run's whole history.
+   */
+  queryCheckpoints?(runId: string, query: CheckpointQuery): Promise<StepCheckpoint[]>;
+}
+
+/**
+ * How a checkpoint's name classifies it, for {@link CheckpointStat}: an awaited child's
+ * `signal:child:` checkpoint, a folded `fan:` checkpoint standing for many children, a `spawn:`
+ * edge to a fire-and-forget child, or any other step.
+ */
+export type CheckpointNameKind = 'child' | 'folded' | 'spawn' | 'step';
+
+/** The {@link CheckpointNameKind} of a checkpoint name — what a store's SQL `CASE` must agree with. */
+export function checkpointNameKind(name: string): CheckpointNameKind {
+  if (name.startsWith('signal:child:')) return 'child';
+  if (name.startsWith('fan:')) return 'folded';
+  if (name.startsWith('spawn:')) return 'spawn';
+  return 'step';
+}
+
+/**
+ * One bucket of {@link StateStore.checkpointStats}: the checkpoints of one run sharing a
+ * `parallelGroup`, a `status` and a {@link CheckpointNameKind}, reduced to aggregates.
+ */
+export interface CheckpointStat {
+  /** The bucket's `parallelGroup`, or `null` for ungrouped checkpoints. */
+  group: string | null;
+  status: StepCheckpoint['status'];
+  nameKind: CheckpointNameKind;
+  /** Rows in the bucket (at least 1). */
+  count: number;
+  minSeq: number;
+  maxSeq: number;
+  /** Smallest and largest `name`, by the database's string order. Equal when every row shares one. */
+  minName: string;
+  maxName: string;
+  /** Earliest `enqueuedAt`, read as {@link StateStore.listCheckpoints} reads it (falling back to `startedAt`). */
+  minEnqueuedAt: Date;
+  minStartedAt: Date;
+  maxStartedAt: Date;
+  maxFinishedAt: Date;
+  /** Sum of `attempts` — moves when a step is retried in place, so a change marker sees it. */
+  sumAttempts: number;
+}
+
+/** What {@link StateStore.queryCheckpoints} selects. */
+export interface CheckpointQuery {
+  /** Only this `parallelGroup`'s checkpoints. */
+  group?: string | undefined;
+  /** Leave out these groups' checkpoints (ungrouped checkpoints are kept). */
+  excludeGroups?: string[] | undefined;
+  statuses?: StepCheckpoint['status'][] | undefined;
+  /** Only names starting with one of these. */
+  namePrefixes?: string[] | undefined;
+  offset?: number | undefined;
+  limit?: number | undefined;
+}
+
+/**
+ * One `(status, origin)` cell of {@link StateStore.runFacets} — a `GROUP BY` row, not a page of runs.
+ * `origin` is `null` for runs carrying none (absent or blank).
+ */
+export interface RunFacetRow {
+  status: RunStatus;
+  origin: string | null;
+  count: number;
 }
 
 /** Typed, queryable per-run data — exact values for `eq`/`ne`, numbers/strings for range ops. */

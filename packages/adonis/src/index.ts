@@ -101,6 +101,7 @@ export * from './protocol.js';
 export * from './queue.js';
 export * from './remote-workflow-executor.js';
 export * from './run-detail-summary.js';
+export * from './run-facets.js';
 // --- store-less cluster: RunGateway (read/control surface) ------------------
 export type { DurableTopology, RunGateway, StartRunOptions } from './run-gateway/interface.js';
 export {
@@ -140,8 +141,15 @@ export type { LucidStoreConfig, StoreContext, StoreFactory } from './stores/fact
 export { stores } from './stores/factory.js';
 export { LucidStateStore, type LucidStateStoreOptions } from './stores/lucid.js';
 export {
+  type CorruptJsonColumn,
+  onCorruptJsonColumn,
+} from './stores/lucid-mappers.js';
+export {
   type CreateDurableTablesOptions,
   createDurableTables,
+  DURABLE_JSON_COLUMNS,
+  DURABLE_SCHEMA_META_TABLE,
+  DURABLE_SCHEMA_REVISION,
   DURABLE_TABLES,
   type DurableSchemaLogger,
   dropDurableTables,

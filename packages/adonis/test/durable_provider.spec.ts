@@ -153,6 +153,37 @@ describe('DurableProvider', () => {
     expect(deps.remoteRedispatchMax).toBe(3);
   });
 
+  it('forwards eventBufferTtl (a duration) to the engine as eventBufferTtlMs', async () => {
+    const { app, resolve } = fakeApp({ eventBufferTtl: '2h' });
+    new DurableProvider(app).register();
+    const engine = await resolve();
+    expect((engine as unknown as { eventBufferTtlMs: number }).eventBufferTtlMs).toBe(7_200_000);
+  });
+
+  it('scopeReads hands the engine the store fenced to its namespace', async () => {
+    const inner = new InMemoryStateStore();
+    await inner.createRun({
+      id: 'theirs',
+      workflow: 'wf',
+      workflowVersion: '1',
+      status: 'completed',
+      input: {},
+      namespace: 'globex',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const { app, resolve } = fakeApp({
+      namespace: 'acme',
+      scopeReads: true,
+      store: 'mem',
+      stores: { mem: async () => inner },
+    } as DurableConfig);
+    new DurableProvider(app).register();
+    const engine = await resolve();
+    expect(await engine.getRun('theirs')).toBeNull();
+    expect(await inner.getRun('theirs')).not.toBeNull();
+  });
+
   it('forwards timerBatchSize to the engine', async () => {
     const { app, resolve } = fakeApp({ timerBatchSize: 50 });
     new DurableProvider(app).register();

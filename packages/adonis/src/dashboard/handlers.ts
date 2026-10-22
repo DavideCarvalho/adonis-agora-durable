@@ -165,13 +165,32 @@ export interface ApiRequest {
   query: Record<string, unknown>;
   /** Parsed JSON body (for POST actions). */
   body?: unknown;
+  /** Request headers, lower-cased names. Read by the run-detail routes for `If-None-Match`. */
+  headers?: Record<string, string | undefined>;
 }
 
 /** A plain JSON response: an HTTP status and a serializable body. */
 export interface ApiResponse {
   status: number;
   body: unknown;
+  /** Extra response headers (the run-detail routes' `ETag` / `Cache-Control`). */
+  headers?: Record<string, string>;
 }
+
+/**
+ * Revalidation headers for a versioned run detail or fan page: `no-cache` makes the browser ask on
+ * every poll and send the `ETag` back as `If-None-Match`, so an unchanged run costs a 304.
+ */
+function etagHeaders(etag: string): Record<string, string> {
+  return { etag, 'cache-control': 'private, no-cache' };
+}
+
+/** A bare `304 Not Modified` carrying its validator. */
+const notModified = (etag: string): ApiResponse => ({
+  status: 304,
+  body: null,
+  headers: etagHeaders(etag),
+});
 
 /** A `200 OK` JSON response. Exported so sibling handlers (e.g. `compat`) share one convention. */
 export const ok = (body: unknown): ApiResponse => ({ status: 200, body });
@@ -388,20 +407,27 @@ export async function getRun(deps: Deps, req: ApiRequest): Promise<ApiResponse> 
   if (!id) return notFound('run id is required');
   const full = readFlag(req, 'full');
   if (full === INVALID_FLAG) return badRequest('full must be a boolean');
-  const options = full ? undefined : { summarizeFansOver: SUMMARIZE_FANS_OVER };
+  const ifNoneMatch = req.headers?.['if-none-match'];
+  const options = full
+    ? undefined
+    : { summarizeFansOver: SUMMARIZE_FANS_OVER, ...(ifNoneMatch ? { ifNoneMatch } : {}) };
   const detail = engine.getRunDetail
     ? await engine.getRunDetail(id, options)
     : await loadRunDetail(engine, id, options);
   if (!detail) return notFound(`run ${id} not found`);
+  if (detail.etag && detail.notModified) return notModified(detail.etag);
   const checkpoint = (cp: StepCheckpoint) =>
     redacted(deps.redact?.checkpoint, summarizeCheckpoint(cp));
-  return ok({
-    run: redacted(deps.redact?.run, detailRun(detail.run)),
-    timeline: detail.timeline.map(checkpoint),
-    children: detail.children,
-    ...(detail.fans ? { fans: detail.fans.map((fan) => serializeFan(fan, checkpoint)) } : {}),
-    ...(detail.childCount !== undefined ? { childCount: detail.childCount } : {}),
-  });
+  return {
+    ...ok({
+      run: redacted(deps.redact?.run, detailRun(detail.run)),
+      timeline: detail.timeline.map(checkpoint),
+      children: detail.children,
+      ...(detail.fans ? { fans: detail.fans.map((fan) => serializeFan(fan, checkpoint)) } : {}),
+      ...(detail.childCount !== undefined ? { childCount: detail.childCount } : {}),
+    }),
+    ...(detail.etag ? { headers: etagHeaders(detail.etag) } : {}),
+  };
 }
 
 /**
@@ -419,19 +445,25 @@ export async function getFanMembers(deps: Deps, req: ApiRequest): Promise<ApiRes
     const raw = firstQuery(req.query[key]);
     return raw === undefined ? undefined : Number(raw);
   };
+  const ifNoneMatch = req.headers?.['if-none-match'];
   const query: FanPageQuery = {
     offset: number('offset'),
     limit: number('limit'),
     failedOnly: failed,
+    ...(ifNoneMatch ? { ifNoneMatch } : {}),
   };
   const page = engine.getFanMembers
     ? await engine.getFanMembers(id, group, query)
     : await loadFanMembers(engine, id, group, query);
   if (!page) return notFound(`run ${id} not found`);
-  return ok({
-    items: page.items.map((cp) => redacted(deps.redact?.checkpoint, summarizeCheckpoint(cp))),
-    total: page.total,
-  });
+  if (page.etag && page.notModified) return notModified(page.etag);
+  return {
+    ...ok({
+      items: page.items.map((cp) => redacted(deps.redact?.checkpoint, summarizeCheckpoint(cp))),
+      total: page.total,
+    }),
+    ...(page.etag ? { headers: etagHeaders(page.etag) } : {}),
+  };
 }
 
 /** A {@link FanSummary} on the wire: ISO dates, and its failure sample shaped like timeline steps. */

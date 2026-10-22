@@ -36,6 +36,9 @@ export interface RunGatewayEngine {
   listRuns(query: RunQuery): Promise<WorkflowRun[]>;
   listCheckpoints(runId: string): Promise<StepCheckpoint[]>;
   getRunChildren(parentRunId: string): Promise<string[]>;
+  /** Present on the real engine: the detail from the store's checkpoint aggregates, with an `etag`. */
+  getRunDetail?(runId: string, options?: RunDetailOptions): Promise<RunDetail | null>;
+  getFanMembers?(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null>;
   workerHealth(extra?: string[]): Promise<GroupHealth[]>;
   start(
     workflow: string,
@@ -102,10 +105,12 @@ export class StoreRunGateway implements RunGateway {
   }
 
   getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail | null> {
+    if (this.#engine.getRunDetail) return this.#engine.getRunDetail(runId, options);
     return loadRunDetail(this.#engine, runId, options);
   }
 
   getFanMembers(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null> {
+    if (this.#engine.getFanMembers) return this.#engine.getFanMembers(runId, group, query);
     return loadFanMembers(this.#engine, runId, group, query);
   }
 

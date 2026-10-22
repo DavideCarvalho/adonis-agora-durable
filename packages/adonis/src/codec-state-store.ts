@@ -1,6 +1,9 @@
 import type {
+  CheckpointQuery,
+  CheckpointStat,
   ChildWait,
   RunFacetQuery,
+  RunFacetRow,
   RunQuery,
   RunStatus,
   RunValueAxis,
@@ -84,6 +87,26 @@ export class CodecStateStore implements StateStore {
   /** Encodes like {@link saveCheckpoint}. Bound only when the inner store has it, so the engine's
    *  plain-save fallback still kicks in through the wrapper. */
   readonly saveCheckpointIfPending?: (checkpoint: StepCheckpoint) => Promise<boolean>;
+  /** Encodes each checkpoint like {@link saveCheckpoint}. Bound only when the inner store has it. */
+  readonly saveCheckpointsIfPending?: (checkpoints: StepCheckpoint[]) => Promise<boolean[]>;
+  /** Forwarded verbatim — deletes read no payload. Bound only when the inner store has it, so the
+   *  engine's one-`deleteRun`-per-id fallback still applies through the wrapper. */
+  readonly deleteRuns?: (runIds: string[]) => Promise<void>;
+  /** Forwarded verbatim — a `GROUP BY` reads no payload. Bound only when the inner store has it. */
+  readonly runFacets?: (query: RunFacetQuery) => Promise<RunFacetRow[]>;
+  /** Forwarded verbatim — the buckets aggregate names, statuses and timestamps, never a payload.
+   *  Bound only when the inner store aggregates, so the run detail's fallback still applies. */
+  readonly checkpointStats?: (
+    runId: string,
+    opts?: { group?: string | undefined },
+  ) => Promise<CheckpointStat[]>;
+  /** Filters on unencoded columns, then decodes the rows like {@link listCheckpoints}. Bound only
+   *  when the inner store has it. */
+  readonly queryCheckpoints?: (runId: string, query: CheckpointQuery) => Promise<StepCheckpoint[]>;
+  /** Forwarded verbatim. Bound only when the inner store has it. */
+  readonly pruneBufferedEvents?: (publishedBefore: number, limit: number) => Promise<number>;
+  /** The same codec over the inner store's scoped view. Bound only when the inner store scopes. */
+  readonly withScope?: (scope: { namespace?: string | undefined }) => CodecStateStore;
   /** Forwarded verbatim — a count reads no payload. Bound only when the inner store has it. */
   readonly countCheckpoints?: (
     runId: string,
@@ -101,6 +124,36 @@ export class CodecStateStore implements StateStore {
     const saveIfPending = inner.saveCheckpointIfPending;
     if (saveIfPending) {
       this.saveCheckpointIfPending = (cp) => saveIfPending.call(inner, this.encCp(cp));
+    }
+    const saveManyIfPending = inner.saveCheckpointsIfPending;
+    if (saveManyIfPending) {
+      this.saveCheckpointsIfPending = (cps) =>
+        saveManyIfPending.call(
+          inner,
+          cps.map((cp) => this.encCp(cp)),
+        );
+    }
+    const deleteRuns = inner.deleteRuns;
+    if (deleteRuns) this.deleteRuns = (ids) => deleteRuns.call(inner, ids);
+    const runFacets = inner.runFacets;
+    if (runFacets) this.runFacets = (query) => runFacets.call(inner, query);
+    const stats = inner.checkpointStats;
+    const queryCps = inner.queryCheckpoints;
+    if (stats && queryCps) {
+      this.checkpointStats = (runId, opts) => stats.call(inner, runId, opts);
+      this.queryCheckpoints = async (runId, query) =>
+        (await queryCps.call(inner, runId, query)).map((c) => this.decCp(c));
+    }
+    const prune = inner.pruneBufferedEvents;
+    if (prune) this.pruneBufferedEvents = (before, limit) => prune.call(inner, before, limit);
+    const scoped = (inner as StateStore & { withScope?: unknown }).withScope;
+    if (typeof scoped === 'function') {
+      this.withScope = (scope) =>
+        new CodecStateStore(
+          (scoped as (s: { namespace?: string | undefined }) => StateStore).call(inner, scope),
+          codec,
+          options,
+        );
     }
     const countCheckpoints = inner.countCheckpoints;
     if (countCheckpoints) {

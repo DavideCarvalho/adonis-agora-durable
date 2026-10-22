@@ -280,7 +280,22 @@ without it the engine loads the run's checkpoints per result), implement
 (without it a blind save can put a settled step back to `pending`), and return
 `listDueTimers` most overdue first, with or without a `limit`. Run
 `runStateStoreContract` from `@adonis-agora/durable/testing/conformance`, which
-covers all three and fails a store missing either method.
+covers all three and fails a store missing either method. The contract also
+requires `saveCheckpointsIfPending` (batched result settling), `deleteRuns`
+(batched retention/purge deletes), `runFacets`, `pruneBufferedEvents`
+(`eventBufferTtl`) and the `checkpointStats` + `queryCheckpoints` pair (the run
+detail from aggregates, with an ETag the console polls with `If-None-Match`).
+
+The Lucid schema check runs at every boot but is gated by a fingerprint row in
+`durable_schema_meta`: a current schema costs two statements. A stale or missing
+marker runs the full check under `pg_advisory_xact_lock` / MySQL `GET_LOCK`, so
+pods booting together don't race `CREATE TABLE`. Bump `DURABLE_SCHEMA_REVISION`
+with any DDL change; a hand change behind the marker needs `{ force: true }`. On
+MySQL the JSON columns are `longtext` (an old `text` column is widened in place;
+a table rebuild, so run the migration in a maintenance window for big tables),
+and `stores.lucid({ collation })` aligns the tables to the app's collation. A
+JSON column that does not parse reads back as `undefined` and is reported once
+(`onCorruptJsonColumn`) instead of failing every read that touches the row.
 
 Source: `docs/stores/lucid.mdx`, `docs/stores/index.mdx`.
 

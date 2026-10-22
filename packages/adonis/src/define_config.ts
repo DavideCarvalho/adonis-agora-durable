@@ -236,6 +236,21 @@ export interface BaseDurableConfig {
    */
   timerBatchSize?: number;
   /**
+   * How long a buffered event (a `publishEvent` that matched no waiter) is kept for a later
+   * `waitForEvent` — a duration string (`'7d'`) or ms. Omit to keep it until consumed. When set, an
+   * expired event is never delivered, and the worker tick's retention phase deletes expired rows
+   * across every name (through the store's `pruneBufferedEvents`).
+   */
+  eventBufferTtl?: string | number;
+  /**
+   * Confine the store's run reads to {@link BaseDurableConfig.namespace} — a tenant-boundary view in
+   * which `getRun`, `listRuns`, the counts and the recovery/timer scans only see this namespace's
+   * runs (writes are unaffected). Default `false`: the operator view that sees every namespace. Needs
+   * `namespace` set and a store with `withScope` (the Lucid and in-memory stores have it); otherwise
+   * it has no effect.
+   */
+  scopeReads?: boolean;
+  /**
    * Recurring workflows to start on a schedule (fixed interval via `everyMs`, or cron via `cron` +
    * `timezone`). The `durable:work` worker loop fires any due windows on every tick (the 5th phase,
    * after timeouts are swept). `engine.start` is idempotent by each schedule's time-bucket run id, so
