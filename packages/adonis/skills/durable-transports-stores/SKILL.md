@@ -91,9 +91,9 @@ export default defineConfig({
   transports: {
     queue: transports.queue({
       connection: 'redis',
-      // A claim is NEVER renewed while a worker processes it — its age is the
-      // step's elapsed time. Raise the threshold above your longest step:
-      stalledThresholdMs: 2 * 60 * 60 * 1000, // default 30min
+      // Claims are renewed while a step runs, so this bounds worker SILENCE
+      // (crash, or a blocked event loop), not step length. Default 2min:
+      stalledThresholdMs: 5 * 60 * 1000,
       maxStalledCount: 3, // bounds a poison job
       onError: (err) => logger.error({ err }, 'durable queue transport'),
     }),
@@ -220,24 +220,28 @@ Source: `docs/stores/lucid.mdx`, `docs/stores/index.mdx`.
 
 ## Common mistakes
 
-### HIGH setting `stalledThresholdMs` below the longest legitimate step
+### HIGH blocking the event loop longer than `stalledThresholdMs`
 
 Wrong:
 
 ```ts
-transports.queue({ connection: 'redis', stalledThresholdMs: 60_000 }) // imports take ~90min
+// a step body that renders a report synchronously for ~3 minutes, default 2min threshold
+transports.queue({ connection: 'redis' })
 ```
 
 Correct:
 
 ```ts
-transports.queue({ connection: 'redis', stalledThresholdMs: 2 * 60 * 60 * 1000 })
+transports.queue({ connection: 'redis', stalledThresholdMs: 5 * 60 * 1000 })
+// or keep the heavy work async / off the main thread
 ```
 
-Mechanism: a claim's age equals the step's elapsed runtime because nothing
-renews it mid-processing; a threshold below the longest step redelivers jobs
-from merely-slow workers and double-runs the step. For tighter detection use
-per-step `timeoutMs`, which IS heartbeat-aware.
+Mechanism: the transport renews every in-flight claim each half threshold
+(`adapter.renewJobs`), so a long but async step keeps its claim forever. A
+synchronous body starves the renewal timer; once the claim goes unrenewed past
+the threshold the sweep re-delivers it and the step runs twice — reported to
+`onError` as `lost N of M claim(s)`. Raising the threshold to cover step LENGTH
+is no longer needed (that was the pre-renewal rule).
 Source: `docs/transports/queue.mdx` ("Stalled-job reclaim").
 
 ### HIGH hand-copying the DDL into the migration

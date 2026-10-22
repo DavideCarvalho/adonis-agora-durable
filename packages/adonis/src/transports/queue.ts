@@ -56,13 +56,22 @@ const DEFAULT_POLL_INTERVAL_MS = 200;
 /** How often (ms) the stalled-job reclaim sweep runs — a coarse, low-frequency check, NOT per poll
  *  tick. Mirrors `DbTransport`'s crash-recovery cadence (its stale-lease default is also 30s). */
 const DEFAULT_STALLED_CHECK_INTERVAL_MS = 30_000;
-/** How old (ms) a claim must be before the sweep presumes its worker dead and re-delivers the job.
- *  Deliberately generous: re-delivery double-runs a step whose worker is merely slow, so this must
- *  comfortably exceed the longest legitimate step execution (see the reclaim doc block for why this
- *  is safe under the durable idempotency contract). The claim's `acquiredAt` is never renewed while
- *  the worker processes — long-running steps hold one claim for their whole duration — so this
- *  default clears real steps in the tens of minutes; a step routinely longer should raise it. */
+/** How old (ms) a claim must be before the sweep presumes its worker dead and re-delivers the job, on
+ *  an adapter that CANNOT renew claims (one without `renewJobs` — every `@adonisjs/queue` driver has it,
+ *  so in practice a custom adapter). There the claim's `acquiredAt` is never
+ *  refreshed while the worker processes — a long step holds one claim for its whole duration — so the
+ *  threshold must comfortably exceed the longest legitimate step: re-delivery double-runs a step whose
+ *  worker is merely slow (safe under the durable idempotency contract, see the reclaim doc block, but
+ *  not free). A step routinely longer than this should raise it. */
 const DEFAULT_STALLED_THRESHOLD_MS = 1_800_000;
+/** The threshold on an adapter that renews claims (`adapter.renewJobs`, on both `@adonisjs/queue` 0.6
+ *  and 0.7). Every
+ *  in-flight claim is renewed every half threshold (see {@link QueueTransport.#renewOpenClaims}), so a
+ *  claim's age measures how long its worker has been SILENT, not how long the step has run: a dead
+ *  worker's job is re-delivered within about this long, and a healthy long step never is. Larger than
+ *  `@boringnode/queue`'s own 30s worker default so a step that blocks the event loop for a while (a
+ *  CPU-heavy body starves the renewal timer) is not mistaken for a dead worker. */
+const DEFAULT_RENEWING_STALLED_THRESHOLD_MS = 120_000;
 /** How many times a single job may be reclaimed before the adapter fails it permanently instead of
  *  re-delivering — bounds a poison job that stalls every worker it touches. */
 const DEFAULT_MAX_STALLED_COUNT = 3;
@@ -100,6 +109,11 @@ interface CompatAdapter {
   completeJob(job: JobHandle, queue: string): Promise<unknown>;
   failJob(job: JobHandle, queue: string, error?: Error): Promise<unknown>;
   retryJob(job: JobHandle, queue: string, retryAt?: Date): Promise<unknown>;
+  /** Refresh the `acquiredAt` of in-flight claims — the heartbeat `@boringnode/queue`'s own `Worker`
+   *  runs so long-running jobs are not mistaken for stalled ones. Takes the same handles as the finalize
+   *  methods: leases on 0.9 (`@adonisjs/queue` 0.7), job ids on 0.6 (ownership checked against the
+   *  adapter's worker id). Resolves to how many were renewed; a claim lost meanwhile is skipped. */
+  renewJobs?(queue: string, jobs: JobHandle[]): Promise<number>;
   recoverStalledJobs?(
     queue: string,
     stalledThreshold: number,
@@ -185,10 +199,16 @@ export interface QueueTransportOptions {
   stalledCheckIntervalMs?: number;
   /**
    * How old (ms) a claim must be before the reclaim sweep presumes its worker dead and re-delivers the
-   * job. Default 30min — intentionally generous, because the claim's `acquiredAt` is never renewed
-   * while the worker processes: a legitimately long step holds one claim for its entire duration, and
-   * re-delivery double-runs a step whose worker is merely slow. Raise it above your longest step. Only used when the adapter implements
-   * `recoverStalledJobs` and the sweep is enabled.
+   * job. Only used when the adapter implements `recoverStalledJobs` and the sweep is enabled.
+   *
+   * - On an adapter that renews claims (`adapter.renewJobs` — every `@adonisjs/queue` 0.6/0.7 driver):
+   *   default 2min. This transport renews every in-flight claim each half threshold, so the threshold
+   *   bounds how long a worker may go SILENT (crashed, or its event loop blocked), not how long a step
+   *   may run.
+   * - On an adapter that cannot (a custom one without `renewJobs`): default 30min — intentionally
+   *   generous, because the claim is never renewed and a legitimately long step holds it for its entire
+   *   duration; re-delivery double-runs a step whose worker is merely slow. Raise it above your longest
+   *   step.
    */
   stalledThresholdMs?: number;
   /**
@@ -265,6 +285,11 @@ export class QueueTransport implements Transport, ControlPlane {
    *  (`stalledCheckIntervalMs <= 0`) or the adapter can't `recoverStalledJobs`. Separate from
    *  {@link #pollers} because the sweep cadence is unrelated to the fast job-poll cadence. */
   readonly #reclaimPollers: Pollers | undefined;
+  /** Renews the claims in {@link #openJobs} every half threshold. Absent when the adapter can't
+   *  `renewJobs`. */
+  #renewTimer: ReturnType<typeof setInterval> | undefined;
+  /** The renewal round in flight, so a slow adapter never stacks rounds and close() can await it. */
+  #renewal: Promise<void> | undefined;
   /** When set (see {@link deferConsumers}), {@link QueueTransport.#startLoop} parks its loop here
    *  instead of polling — {@link startConsumers} flushes the parked starts. Dispatching (`pushOn`)
    *  is never deferred; only consumption is. */
@@ -281,7 +306,10 @@ export class QueueTransport implements Transport, ControlPlane {
     this.#namespace = options.namespace;
     this.#explicitNamespace = options.namespace !== undefined;
     this.#pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-    this.#stalledThresholdMs = options.stalledThresholdMs ?? DEFAULT_STALLED_THRESHOLD_MS;
+    const canRenew = typeof this.#adapter.renewJobs === 'function';
+    this.#stalledThresholdMs =
+      options.stalledThresholdMs ??
+      (canRenew ? DEFAULT_RENEWING_STALLED_THRESHOLD_MS : DEFAULT_STALLED_THRESHOLD_MS);
     this.#maxStalledCount = options.maxStalledCount ?? DEFAULT_MAX_STALLED_COUNT;
     this.#instanceId = options.instanceId ?? randomUUID();
     this.#onError = options.onError ?? DEFAULT_LOG;
@@ -291,6 +319,7 @@ export class QueueTransport implements Transport, ControlPlane {
     this.#reclaimPollers = this.#startReclaimSweep(
       options.stalledCheckIntervalMs ?? DEFAULT_STALLED_CHECK_INTERVAL_MS,
     );
+    if (canRenew) this.#startClaimRenewal();
     this.#workerKeys = options.workerKeys ?? NO_WORKER_KEYS;
     this.#liveWorkerKeys = cachedLiveKeys(
       this.#workerKeys,
@@ -568,8 +597,9 @@ export class QueueTransport implements Transport, ControlPlane {
    * engine ignores results for a checkpoint that already completed — so re-running a reclaimed step, or
    * re-delivering the two production shapes (result published but `completeJob` never reached; or claimed
    * and died before any result), cannot corrupt a run. The only cost is wasted work when a merely-slow
-   * worker's job is re-delivered, which is why {@link DEFAULT_STALLED_THRESHOLD_MS} is deliberately
-   * generous. A permanently lost job is a worse failure than a rare double-run of an idempotent step, so
+   * worker's job is re-delivered — which claim renewal ({@link #startClaimRenewal}) rules out on an
+   * adapter that supports it, and which is why {@link DEFAULT_STALLED_THRESHOLD_MS} is deliberately
+   * generous on one that doesn't. A permanently lost job is a worse failure than a rare double-run of an idempotent step, so
    * this defaults ON; set `stalledCheckIntervalMs: 0` to opt out.
    *
    * Feature-detected: an adapter that doesn't implement `recoverStalledJobs` (not every driver does)
@@ -613,6 +643,62 @@ export class QueueTransport implements Transport, ControlPlane {
     return pollers;
   }
 
+  // ---------------------------------------------------------------------------
+  // claim renewal
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Renew every claim this instance is still working on, each half {@link #stalledThresholdMs} —
+   * the heartbeat `@boringnode/queue`'s own `Worker` runs, which this transport bypasses (see the
+   * class header) exactly as it bypasses that class's stalled recovery.
+   *
+   * WHY: without it, a claim's age is the step's elapsed runtime, so the threshold had to exceed the
+   * longest step — a 30min default that also left a dead worker's job unrecovered for 30min, while a
+   * step that legitimately ran longer was re-delivered and ran twice. Renewing makes the age measure
+   * the worker's silence instead, so a short threshold recovers crashes fast without ever re-running a
+   * healthy long step.
+   *
+   * Each claim is renewed with the handle it is finalized with (lease on 0.9, job id on 0.6). The timer is `unref`'d, and a round still in flight skips the next tick instead of stacking.
+   */
+  #startClaimRenewal(): void {
+    const intervalMs = Math.max(Math.floor(this.#stalledThresholdMs / 2), 1);
+    this.#renewTimer = setInterval(() => {
+      if (this.#renewal) return;
+      const round = this.#renewOpenClaims().finally(() => {
+        if (this.#renewal === round) this.#renewal = undefined;
+      });
+      this.#renewal = round;
+    }, intervalMs);
+    this.#renewTimer.unref?.();
+  }
+
+  async #renewOpenClaims(): Promise<void> {
+    if (this.#openJobs.size === 0) return;
+    const byQueue = new Map<string, JobHandle[]>();
+    for (const { queue, handle } of this.#openJobs.values()) {
+      const leases = byQueue.get(queue) ?? [];
+      leases.push(handle);
+      byQueue.set(queue, leases);
+    }
+    for (const [queue, leases] of byQueue) {
+      try {
+        const renewed = await this.#adapter.renewJobs?.(queue, leases);
+        // Fewer renewed than held: the sweep already re-delivered those claims (this worker went
+        // silent past the threshold), so another worker may be running the same step right now. The
+        // handler can't be aborted — durable steps are idempotent — but the double run must be loud.
+        if (typeof renewed === 'number' && renewed < leases.length) {
+          this.#onError(
+            new Error(
+              `[QueueTransport] lost ${leases.length - renewed} of ${leases.length} claim(s) on "${queue}" before renewing them — the jobs were re-delivered and may run twice; raise stalledThresholdMs if this worker blocks its event loop`,
+            ),
+          );
+        }
+      } catch (err) {
+        this.#onError(err);
+      }
+    }
+  }
+
   /**
    * Stop every poll loop, WAIT (bounded) for the job already in a handler's hands, and hand any
    * still-unfinished job back to the broker before destroying the adapter. Without the wait, a
@@ -625,6 +711,11 @@ export class QueueTransport implements Transport, ControlPlane {
     this.#reclaimPollers?.stopAll();
     this.#taskLoops.clear();
     await this.#pollers.drain(5_000);
+    // Renewal keeps running through the drain (a job finishing inside it must keep its claim), then
+    // stops before the leftovers are handed back.
+    if (this.#renewTimer) clearInterval(this.#renewTimer);
+    this.#renewTimer = undefined;
+    await this.#renewal;
     // Anything still open after the bounded drain (a long step): re-deliver it now so another
     // worker picks it up immediately instead of waiting out the stalled threshold.
     for (const [jobId, { queue, handle }] of [...this.#openJobs]) {

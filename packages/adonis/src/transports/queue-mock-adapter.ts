@@ -12,7 +12,7 @@ interface StalledJobsRecovery {
 
 /**
  * A tiny in-memory `@adonisjs/queue` adapter for tests — implements just the surface the
- * `QueueTransport` touches (push/pop/complete/fail/retry/recoverStalledJobs/destroy) as plain FIFO
+ * `QueueTransport` touches (push/pop/complete/fail/retry/renewJobs/recoverStalledJobs/destroy) as plain FIFO
  * queues, plus throwing stubs for the rest of the contract. No Redis, no Knex. `popFrom` mimics the
  * real adapters' atomic move (pending → active) so two transports sharing one instance never
  * double-consume, and the delayed → pending promotion a `retryJob(…, retryAt)` relies on.
@@ -163,6 +163,23 @@ export class MockAdapter implements Adapter {
     return { recovered, exceeded };
   }
 
+  /**
+   * Refresh `acquiredAt` of the active jobs of `queue` still held under these leases, as the real
+   * adapters' heartbeat does. A lease that is stale (the job was reclaimed, re-leased, or finalized)
+   * renews nothing; the count says how many were.
+   */
+  async renewJobs(queue: string, jobs: JobLease[]): Promise<number> {
+    const now = Date.now();
+    let renewed = 0;
+    for (const lease of jobs) {
+      if (this.activeQueue.get(lease.id) !== queue || !this.#holds(lease)) continue;
+      const job = this.active.get(lease.id) as AcquiredJob;
+      this.active.set(lease.id, { ...job, acquiredAt: now });
+      renewed += 1;
+    }
+    return renewed;
+  }
+
   /** Promote every delayed job of `queue` whose `readyAt` has passed into `pending` (see popFrom). */
   #promoteDelayed(queue: string): void {
     const waiting = this.delayed.get(queue);
@@ -201,7 +218,6 @@ export class MockAdapter implements Adapter {
   pushManyOn = this.#unsupported('pushManyOn');
   getJob = this.#unsupported('getJob');
   migrate = async (): Promise<void> => {};
-  renewJobs = this.#unsupported('renewJobs');
   upsertSchedule = this.#unsupported('upsertSchedule');
   createSchedule = this.#unsupported('createSchedule');
   getSchedule = this.#unsupported('getSchedule');
