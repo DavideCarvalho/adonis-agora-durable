@@ -20,6 +20,10 @@ import {
  */
 const PG_URL = backendUrl('DURABLE_PG_URL');
 
+/** The least lease a SIGKILLed worker can leave behind: it renews every leaseMs / 3, so ~2/3 remain,
+ *  minus scheduling slack on a loaded runner. */
+const LEASE_LEFT_AT_KILL = (leaseMs: number): number => Math.floor((leaseMs * 2) / 3) - 250;
+
 describe.skipIf(!PG_URL)(
   'DbTransport crash, deploy and boot across real worker processes (Postgres)',
   () => {
@@ -33,8 +37,8 @@ describe.skipIf(!PG_URL)(
       }
       const a = await spawnReady({ role: 'worker', instanceId: 'A', concurrency: 3, leaseMs });
       await until(async () => (await runs()).length === 3, 10_000, 'A to start 3 steps');
-      const startedOnA = Math.max(...(await runs()).map((r) => Number(r.at)));
       a.proc.kill('SIGKILL');
+      const killedA = Date.now();
       expect((await a.exited).signal).toBe('SIGKILL');
       await spawnReady({ role: 'worker', instanceId: 'B', concurrency: 3, leaseMs });
 
@@ -43,8 +47,10 @@ describe.skipIf(!PG_URL)(
       expect(onB.map((r) => r.step_id).sort()).toEqual(['r1:1', 'r1:2', 'r1:3']);
       // A takeover of a lapsed claim, counted toward the poison bound.
       expect(onB.map((r) => r.reclaims)).toEqual([1, 1, 1]);
-      // Not before A's lease ran out: the row stayed A's while its claim could still be renewed.
-      for (const r of onB) expect(Number(r.at) - startedOnA).toBeGreaterThanOrEqual(leaseMs - 100);
+      // Not before A's lease ran out. The lease runs from A's last renewal (every leaseMs / 3), not
+      // from when the step body started, so at the kill at least ~2/3 of it was left.
+      for (const r of onB)
+        expect(Number(r.at) - killedA).toBeGreaterThanOrEqual(LEASE_LEFT_AT_KILL(leaseMs));
       expect(results.map((r) => r.status)).toEqual(['completed', 'completed', 'completed']);
     }, 30_000);
 
@@ -101,8 +107,8 @@ describe.skipIf(!PG_URL)(
       await engine.dispatch(task(2, long));
       const c = await spawnReady({ role: 'worker', instanceId: 'C', leaseMs });
       await until(async () => (await runs()).some((r) => r.instance === 'C'), 10_000, 'C to start');
-      const startedOnC = Number((await runs()).find((r) => r.instance === 'C')?.at);
       c.proc.kill('SIGKILL');
+      const killedC = Date.now();
       await c.exited;
       await spawnReady({ role: 'worker', instanceId: 'D', leaseMs });
       await until(
@@ -112,7 +118,7 @@ describe.skipIf(!PG_URL)(
       );
       const takeover = (await runs()).find((r) => r.instance === 'D');
       expect(takeover).toMatchObject({ step_id: 'r1:2', reclaims: 1 });
-      expect(Number(takeover?.at) - startedOnC).toBeGreaterThanOrEqual(leaseMs - 100);
+      expect(Number(takeover?.at) - killedC).toBeGreaterThanOrEqual(LEASE_LEFT_AT_KILL(leaseMs));
     }, 45_000);
 
     it('(g) four processes creating the tables at once on an empty schema all succeed', async () => {
