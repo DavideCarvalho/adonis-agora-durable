@@ -369,6 +369,14 @@ const DEFAULT_TIMER_BATCH = 500;
 /** The most results of one run settled by one batched write (see `completeRemoteResult`). */
 const RESULT_BATCH_MAX = 256;
 
+/**
+ * How soon (ms) orphan recovery re-drives a REMOTE workflow run found `running` with a call in flight:
+ * its turn was lost (an inline advance timed out, or the replica applying a decision died), so it is
+ * parked on this short wake rather than the whole `reconcileMs` window. Re-driving dispatches a fresh
+ * turn; the calls already in flight are not re-dispatched (their pending checkpoints dedupe them).
+ */
+const REMOTE_TURN_REDRIVE_MS = 1_000;
+
 /** A step result waiting for its run's next batched settle. */
 interface QueuedResult {
   result: StepResult;
@@ -2640,10 +2648,21 @@ export class WorkflowEngine {
       // of `remoteRedispatchMs` / `redispatchPending`.
       const dispatched = await this.inFlightRemoteStep(run.id);
       if (dispatched) {
+        // A REMOTE workflow reads `running` only while a turn is being computed or applied, so a free
+        // lease here means that turn was lost — the call in flight is not what the run waits on next.
+        // Park it on a near wake so the timer pass re-drives the turn promptly (never later than the
+        // call's own deadline) instead of after the whole reconcile window.
+        const registered =
+          this.workflows.get(versionKey(run.workflow, run.workflowVersion)) ??
+          this.latest.get(run.workflow);
+        const stepWake = this.reconcileWakeAt(dispatched.wakeAt);
+        const wakeAt = registered?.remote
+          ? Math.min(stepWake ?? Number.POSITIVE_INFINITY, this.clock() + REMOTE_TURN_REDRIVE_MS)
+          : stepWake;
         // Conditional on still-`running`: a lease-free `cancel()` may have settled it meanwhile.
         const parked = await this.store.updateRunIf(run.id, ['running'], {
           status: 'suspended',
-          wakeAt: this.reconcileWakeAt(dispatched.wakeAt),
+          wakeAt,
           updatedAt: new Date(),
         });
         await this.store.releaseRunLock(run.id, this.instanceId);

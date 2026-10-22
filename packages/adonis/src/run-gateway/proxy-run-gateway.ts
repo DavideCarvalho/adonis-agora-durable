@@ -28,6 +28,7 @@ import {
   type RunDetailOptions,
   type RunDetailSource,
 } from '../run-detail-summary.js';
+import { runFacetsOf } from '../run-facets.js';
 import type { WorkflowRef } from '../workflow-ref.js';
 import type { DurableTopology, RunGateway, StartRunOptions } from './interface.js';
 import { UNSUPPORTED_RUN_REQUEST } from './run-request-responder.js';
@@ -346,9 +347,27 @@ export class ProxyRunGateway implements RunGateway {
     return this.#request<{ runId: string } | null>({ kind: 'retryWithInput', runId, input });
   }
 
-  /** Scoped by the control plane to this tenant's own runs (the query's namespace is replaced). */
+  /**
+   * Scoped by the control plane to this tenant's own runs (the query's namespace is replaced). A
+   * control plane older than the verb rejects it as unknown; the proxy then counts the same cells
+   * from `runValueFacets` (the status axis per origin), or — on one older still — from a `listRuns`
+   * of the tenant's matching runs. Each answer is scoped by the control plane like the verb itself.
+   */
   runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
-    return this.#request<RunFacetRow[]>({ kind: 'runFacets', query });
+    return this.#withFallback(
+      'runFacets',
+      () => this.#request<RunFacetRow[]>({ kind: 'runFacets', query }),
+      () =>
+        this.#withFallback(
+          'runValueFacets',
+          () =>
+            runFacetsOf(
+              { runValueFacets: (axis, q, opts) => this.runValueFacets(axis, q, opts) },
+              query,
+            ),
+          () => runFacetsOf({ listRuns: (q) => this.listRuns(q) }, query),
+        ),
+    );
   }
 
   /** Scoped by the control plane to this tenant's own runs (the query's namespace is replaced). */

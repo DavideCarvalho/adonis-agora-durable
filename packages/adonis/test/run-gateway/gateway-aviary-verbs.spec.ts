@@ -184,7 +184,8 @@ describe('aviary RunGateway verbs over the wire', () => {
         }) as unknown as RunGateway,
     );
     await expect(acme.retry('x')).rejects.toMatchObject({ code: 'unsupported-request' });
-    await expect(acme.runFacets({})).rejects.toMatchObject({ code: 'unsupported-request' });
+    // runFacets degrades instead: the proxy counts the cells from the tenant's `listRuns`.
+    await expect(acme.runFacets({})).resolves.toBeInstanceOf(Array);
     await expect(acme.waitingFor(['x'])).rejects.toMatchObject({ code: 'unsupported-request' });
   });
 });

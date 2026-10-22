@@ -189,6 +189,9 @@ describe.each(stores)('%s', (_label, makeStore) => {
       const parked = (await store.getRun('run1')) as WorkflowRun;
       expect(parked.status).toBe('suspended');
       expect(parked.recoveryAttempts ?? 0).toBe(0);
+      // Its turn was lost, so it is re-driven soon, not after the whole reconcile window.
+      expect(parked.wakeAt).toBeDefined();
+      expect((parked.wakeAt as number) - Date.now()).toBeLessThanOrEqual(1_000);
       expect(t.turns).toHaveLength(1);
 
       // The call's result resumes it into a fresh turn, which completes it.
@@ -196,6 +199,70 @@ describe.each(stores)('%s', (_label, makeStore) => {
       await until(() => t.turns.length === 2);
       await t.decide(completed(t.turns[1] as WorkflowTask));
       expect((await settled(store, 'run1')).status).toBe('completed');
+    });
+  });
+
+  describe('remote decisions x inline advance timeout', () => {
+    it('a turn that timed out with a call in flight is re-driven promptly, without re-dispatching the call', async () => {
+      const store = await makeStore();
+      const t = manualTransport();
+      const engine = new WorkflowEngine({
+        store,
+        transport: t.transport,
+        instanceId: 'A',
+        remoteAdvanceSilenceMs: 40,
+        reconcileMs: 3_600_000,
+        maxRecoveryAttempts: 1,
+      });
+      let advances = 0;
+      engine.registerRemote('proc', '1', {
+        group: GROUP,
+        executor: {
+          // Turn 1 dispatches a call; turn 2's worker goes silent (the advance never answers); turn 3
+          // completes. A replay must not re-dispatch the call turn 1 already sent.
+          advance: async (run, history): Promise<WorkflowDecision> => {
+            advances += 1;
+            const taskId = `${run.id}:inline:${advances}`;
+            if (advances === 1) {
+              return {
+                taskId,
+                runId: run.id,
+                status: 'continue',
+                commands: [{ kind: 'call', seq: 0, name: 'leaf', group: 'steps', input: {} }],
+              };
+            }
+            if (advances === 2) return new Promise<WorkflowDecision>(() => {});
+            return {
+              taskId,
+              runId: run.id,
+              status: 'completed',
+              commands: [],
+              output: { seen: history.map((e) => e.seq) },
+            };
+          },
+        },
+      });
+
+      await engine.start('proc', {}, 'run1');
+      await until(() => t.steps.length === 1);
+      // A wake (a signal, a recheck) drives turn 2, which times out: left `running`, lease released.
+      await engine.resume('run1');
+      expect(advances).toBe(2);
+      expect((await store.getRun('run1'))?.status).toBe('running');
+
+      // Orphan recovery parks it on a near wake, counting no recovery attempt.
+      await engine.recoverIncomplete(Date.now() + 3_600_000);
+      const parked = (await store.getRun('run1')) as WorkflowRun;
+      expect(parked.status).toBe('suspended');
+      expect(parked.recoveryAttempts ?? 0).toBe(0);
+      expect((parked.wakeAt as number) - Date.now()).toBeLessThanOrEqual(1_000);
+
+      // The timer pass re-drives the turn as soon as that wake is due — not after reconcileMs.
+      await engine.resumeDueTimers(Date.now() + 1_100);
+      const done = await settled(store, 'run1');
+      expect(done.status).toBe('completed');
+      expect(advances).toBe(3);
+      expect(t.steps).toHaveLength(1);
     });
   });
 

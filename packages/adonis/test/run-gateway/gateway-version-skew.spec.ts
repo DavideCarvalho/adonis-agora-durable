@@ -242,6 +242,40 @@ describe('ProxyRunGateway against an older control plane', () => {
     expect(wire.requests).toContain('getCheckpoints');
   });
 
+  it('counts runFacets from runValueFacets, then from listRuns, as the control plane gets older', async () => {
+    const sort = (cells: { status: string; origin: string | null; count: number }[]) =>
+      [...cells].sort((a, b) => a.status.localeCompare(b.status));
+    const wire = new Wire();
+    await controlPlane(wire);
+    const proxy = new ProxyRunGateway(wire, { partition: 'acme', requestTimeoutMs: 2_000 });
+    const current = sort(await proxy.runFacets({}));
+    expect(current).toEqual([{ status: 'completed', origin: null, count: 81 }]);
+
+    // Before 0.51: no runFacets verb, but runValueFacets exists.
+    const older = new Wire();
+    await controlPlane(older);
+    older.legacy = new Set(['runFacets']);
+    const viaValues = new ProxyRunGateway(older, { partition: 'acme', requestTimeoutMs: 2_000 });
+    expect(sort(await viaValues.runFacets({}))).toEqual(current);
+    expect(older.requests).toContain('runValueFacets');
+    expect(older.requests).not.toContain('listRuns');
+    // The missing verb is remembered: the next call goes straight to the fallback.
+    await viaValues.runFacets({});
+    expect(older.requests.filter((k) => k === 'runFacets')).toHaveLength(1);
+
+    // Older still: neither verb, so the proxy counts the tenant's matching runs.
+    const oldest = new Wire();
+    await controlPlane(oldest);
+    oldest.legacy = new Set(['runFacets', 'runValueFacets']);
+    oldest.legacyStyle = 'code';
+    const viaList = new ProxyRunGateway(oldest, { partition: 'acme', requestTimeoutMs: 2_000 });
+    expect(sort(await viaList.runFacets({}))).toEqual(current);
+    expect(sort(await viaList.runFacets({ workflow: 'parent' }))).toEqual([
+      { status: 'completed', origin: null, count: 1 },
+    ]);
+    expect(oldest.requests).toContain('listRuns');
+  });
+
   it('a real failure of getRunDetail surfaces instead of falling back', async () => {
     const wire = new Wire();
     await controlPlane(wire, (g) => throwing(g, 'getRunDetail'));

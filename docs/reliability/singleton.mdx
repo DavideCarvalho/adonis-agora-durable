@@ -79,6 +79,8 @@ The claim is atomic, so several instances sharing one store can never admit more
 
 A holder whose process crashes keeps its slot while it is `running` with an expired lease, until recovery re-drives it (or a cancel, timeout or dead-letter settles it). That is deliberate: the run's earlier steps already ran under the slot.
 
+Admission is global, whatever the engine's [`scopeReads`](/docs/durable/api-reference#durableconfig) setting. `scopeReads` fences an engine's run *reads* to its `namespace`, but the slot claim (`tryAdmitSingleton`) always counts every active run of the workflow that shares the key, in every namespace. That is the point of a singleton key: an engine scoped to `acme` and another scoped to `globex` starting `sync-inventory` with the same key still get one run at a time. To get one slot per tenant, put the tenant in the key the `key` function returns, e.g. `` `${tenant}:store:${storeId}` ``.
+
 ## Store support
 
 Admission needs `StateStore.tryAdmitSingleton`. The bundled stores implement it:

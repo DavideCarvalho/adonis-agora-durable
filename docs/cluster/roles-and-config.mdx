@@ -213,6 +213,8 @@ Tenant pods and the control plane can be upgraded in either order.
 | Tenant | Control plane | What happens |
 | --- | --- | --- |
 | 0.50+ | 0.49.x | The old responder knows `getRunDetail` and `getFanMembers` but not the six newer verbs. It rejects those with an `unknown run-request verb` error, which `ProxyRunGateway` reads as `unsupported-request`; the tenant console degrades as described in [the dashboard docs](/docs/durable/observability/dashboard#fleet-health). |
+| 0.51+ | 0.50.x | The old responder does not know `runFacets`. `ProxyRunGateway` counts the same `(status, origin)` cells from `runValueFacets` (the status axis once overall and once per origin), so the console's chips and backlog gauges keep working. |
+| 0.51+ | 0.49.x | No `runFacets` and no `runValueFacets`: the proxy counts the cells from a `listRuns` of the tenant's matching runs, which reads every one of them, so finish upgrading the control plane soon. |
 | 0.50+ | before 0.49 | Also no `getRunDetail` / `getFanMembers`. `ProxyRunGateway` builds the run detail itself from `getRun`, `getCheckpoints` and `getRunChildren` (each still ownership-checked by the responder), summarizes wide fans on the tenant, and pages fans out of the full timeline. |
 | 0.49.x | 0.50+ | An older proxy never sends the newer verbs; the new responder answers everything it sends exactly as before. |
 
