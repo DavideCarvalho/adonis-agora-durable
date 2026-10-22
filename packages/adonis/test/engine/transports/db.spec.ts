@@ -92,6 +92,31 @@ describe('DbTransport (unit)', () => {
     expect(Number(tasksLeft[0].c)).toBe(0);
   });
 
+  it('deferConsumers() keeps a process from claiming task rows until startConsumers()', async () => {
+    db = await makeTransportDb();
+    const engine = transport();
+    const results: StepResult[] = [];
+    engine.onResult(async (r) => void results.push(r));
+    let ran = 0;
+    const producer = transport();
+    producer.deferConsumers();
+    producer.handle('math.double', (input) => {
+      ran += 1;
+      return { result: (input as { n: number }).n * 2 };
+    });
+
+    await engine.dispatch(task());
+    await new Promise((r) => setTimeout(r, 60));
+    // A pure producer (a `node ace` command): the row stays unclaimed for a real worker.
+    expect(ran).toBe(0);
+    const claimed = await db.connection().from(TRANSPORT_TABLES.tasks).whereNotNull('claimed_by');
+    expect(claimed).toHaveLength(0);
+
+    producer.startConsumers();
+    await waitFor(async () => results.length === 1);
+    expect(ran).toBe(1);
+  });
+
   it('delivers a worker result row to the engine onResult handler', async () => {
     db = await makeTransportDb();
     const engine = transport();

@@ -75,10 +75,50 @@ const transport = new DbTransport({ db }) // { partition } isolates this pool
 transport.handle('pipeline:extract', async (input) => extract(input))
 ```
 
+A worker runs ONE task row at a time unless `concurrency` is raised
+(`transports.db({ concurrency: 8, resultConcurrency: 8 })`, or `'adaptive'` with
+the same controller and fields as `queue`/`bullmq`); one poll loop serves every
+handler name and claims only as many rows as it has free slots. Every held
+claim is renewed every `leaseMs / 3`, and a row is recorded (task delete +
+result insert, one transaction) only while `claimed_by` is still the worker's
+token — a worker whose claim was taken over drops its result and reports it to
+`onError`. (Releases before this claimed 20 rows per poll, renewed only the
+running one, and double-ran the rest of the batch when a step outlived
+`leaseMs`.) Idle task/heartbeat/control loops back off up to `idleBackoffMax`
+(default 4) poll intervals; results never back off.
+
+Workers beat `durable[-<ns>]-worker-heartbeat:<token>:<instance>` into
+`durable_transport_worker_keys` with their `WorkerStatus`, and `DbTransport`
+implements `groupHealth`: `depth` = pending + claimed task rows of the group.
+Each takeover of a lapsed claim bumps the row's `reclaims` column; past
+`maxStalledCount` (default 3) the row is deleted and a retryable failed
+`StepResult` (`remote step worker failed: claim lapsed more than N times`) is
+published. `close()` (after `closeTimeoutMs`, default 5s) clears every claim it
+still holds, uncounted, so another worker takes the rows at once and a deploy
+never pushes a step toward the poison bound; only a crash (no close) counts.
+Dispatch `priority` is stored on the row (`0` when absent = normal) and rows
+are claimed highest priority first, then oldest. `autoCreate` /
+`createDurableTransportTables` add `reclaims` and `priority` to an existing
+table; with `autoCreate: false` add them yourself (integer, not null, default
+0), or the poison bound / priority ordering stay off.
+
+`db` also carries remote workflow turns (task rows of kind `workflow`, claimed
+with the token's steps; each decision is a `durable_transport_messages` row
+addressed to the engine replica that dispatched the turn) and store-less tenant
+pods that reach the same database: start-run/run-request/step-event rows go to
+any consumer, a reply is a row addressed to the requester, a tenant event is one
+row per live subscriber (pods write their own `-inbox:` / `-tenant-subscriber:`
+keys to `durable_transport_worker_keys`). A janitor on every instance that
+addresses rows deletes those older than `inboxTtlMs` whose recipient's inbox key
+is gone. Ships as the `create_durable_transport_messages` migration (also adds
+the tasks `kind` column) or via `autoCreate`; without it the protocol is off and
+said once through `onError`. Tune with `inboxTtlMs`, `tenantSubscribersCacheMs`,
+`inboxSweepIntervalMs`. See `durable-cluster`.
+
 Trade-off: throughput is bounded by polling + row contention — right for
 workflow-scale modest rates, not high-fanout firehoses. Delivery is
-at-least-once (crash between insert-result and delete-task), so handlers should
-be idempotent on `step_id`. Source: `docs/transports/db.mdx`.
+at-least-once (a worker that dies after its handler ran re-runs elsewhere), so
+handlers should be idempotent on `step_id`. Source: `docs/transports/db.mdx`.
 
 ### Pattern 2 — real brokers (`queue`, `bullmq`) and stalled-claim tuning
 
@@ -104,13 +144,35 @@ export default defineConfig({
 One instance consumes engine-side results; run one or more `node ace
 durable:work` workers serving the step names. A worker runs ONE job of a step
 name at a time unless `concurrency` is raised (`transports.queue({ connection,
-concurrency: 8, resultConcurrency: 8 })`); the slots share one poll loop. Idle
+concurrency: 8, resultConcurrency: 8 })`); the slots share one poll loop.
+`concurrency: 'adaptive'` (or `{ mode: 'adaptive', min, max, start, tickMs,
+ramCeilingPct, cpuCeilingPct }`) runs the same controller as `bullmq` (below);
+each step name's loop reads the live limit every poll. Idle
 task/heartbeat/control loops back off up to `idleBackoffMax × pollIntervalMs`
-(default 4 × 200ms; `1` disables). Source:
+(default 4 × 200ms; `1` disables).
+
+A `queue` worker beats `<prefix>-worker-heartbeat:<token>:<instance>` into the
+worker-key store (10s, live 35s) with its `WorkerStatus`, and the transport
+implements `groupHealth` when a store is configured (the default with a database;
+absent with `workerKeys: false`). Its `depth` is the PENDING count (`sizeOf`) only —
+the adapter contract can't count jobs in flight or delayed retries. A task that
+stalls past `maxStalledCount` is failed AND bridged into a retryable failed
+`StepResult` (`remote step worker failed: stalled more than N times`) on
+`@adonisjs/queue` 0.7; on 0.6 the adapter deletes it internally and nothing is
+published, so rely on `timeoutMs` / `remoteRedispatchMs` there. Source:
 `docs/transports/queue.mdx`.
 
+`queue` also carries remote workflow turns (`<prefix>:decisions`,
+`<prefix>:step-events`) and store-less tenant pods: start-run/run-request are
+plain jobs to the control plane, replies go to a per-pod
+`<prefix>:run-replies:<instanceId>` queue, and tenant events are pushed to each
+subscribed pod's `<prefix>:tenant-events:<instanceId>` (subscriptions announced
+on `<prefix>:inbox-registrations`, recorded in the control plane's key store;
+tune with `inboxTtlMs`, `tenantSubscribersCacheMs`, `inboxSweepIntervalMs`).
+See `durable-cluster`.
+
 For wide fans (`ctx.all` over thousands of steps), raise how many results an
-instance settles at once on `bullmq` or `queue` (`resultConcurrency`; `db` has no such option),
+instance settles at once on `bullmq`, `queue` or `db` (`resultConcurrency`),
 let its workers size their step concurrency, and size the engine's due-timer
 batch:
 

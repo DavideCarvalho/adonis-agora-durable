@@ -46,6 +46,12 @@ export type TenantVerifier = (input: {
 export interface StandaloneConfig extends BaseDurableConfig {
   /** Optional here so a config with no `role` still type-checks and defaults to `'standalone'`. */
   role?: 'standalone';
+  /**
+   * Verifier for tenant tokens on incoming `RunRequest`/`StartRunMessage`s, as on a `control-plane`. A
+   * standalone engine on a transport that carries the store-less protocol (`bullmq`, `queue`, `db`) also
+   * answers tenant pods; without a verifier the wire `tenant` claim is trusted verbatim.
+   */
+  verifyTenant?: TenantVerifier;
 }
 
 /**

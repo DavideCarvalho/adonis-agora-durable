@@ -87,8 +87,10 @@ function advertisementContract(
 
       await sleep(120);
 
+      // The runtime's advertisement expired. (A transport that beats its own liveness per consumed
+      // queue — bullmq, queue, db — still lists the loop it keeps consuming: that process is alive.)
       expect(await t.engine.listWorkerDescriptors('line@acme')).toEqual([]);
-      expect(await t.engine.listWorkerGroups()).toEqual([]);
+      expect(await t.engine.listWorkerGroups()).not.toContain('line@acme');
     });
   });
 }

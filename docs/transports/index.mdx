@@ -6,6 +6,10 @@ icon: Truck
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
+<Callout type="info" title="Comparing the drivers">
+For a capability-by-capability matrix of every driver, its limitations and which one to pick, see [Choosing a transport](/docs/durable/transports/choosing).
+</Callout>
+
 A **transport** is how a dispatched `ctx.step` reaches a step handler and how the result comes back. It's a pluggable driver (`dispatch`, `onResult`, `onHeartbeat`), independent of the [state store](/docs/durable/stores) — mix any transport with any store.
 
 Transports are **config-driven drivers**: list the ones you use under `transports` in `config/durable.ts`, built with the `transports` factory, and pick the active one by name with `transport`. Each driver lazily imports its optional peer (`@adonisjs/queue`, `@adonisjs/lucid`) **only when selected**, so nothing extra is loaded for the drivers you don't use.
@@ -16,8 +20,8 @@ Transports are **config-driven drivers**: list the ones you use under `transport
 | --- | --- | --- | --- |
 | `transports.memory()` | none | No (in-process) | **Tests.** Drives a dispatch straight into the handler, so a test is deterministic with no polling and no timers. |
 | `transports.eventEmitter()` | none | No (in-process) | **Single-process production.** Handlers run in this process over a Node `EventEmitter`, but dispatch → worker → result is decoupled across the event loop, the way a real broker behaves. |
-| [`transports.queue(...)`](/docs/durable/transports/queue) | whatever `config/queue.ts` uses | Yes | True **cross-process** steps over [`@adonisjs/queue`](https://github.com/adonisjs/queue) — a separate worker fleet, on Redis or a database adapter. |
-| [`transports.db(...)`](/docs/durable/transports/db) | the database you already run | Yes (shared DB) | Broker-less, DBOS-style: steps are **rows** in your own database, via `@adonisjs/lucid`. No new infrastructure at all. |
+| [`transports.queue(...)`](/docs/durable/transports/queue) | whatever `config/queue.ts` uses | Yes | True **cross-process** steps over [`@adonisjs/queue`](https://github.com/adonisjs/queue) — a separate worker fleet, on Redis or a database adapter. Also carries remote workflow turns and [store-less tenant pods](/docs/durable/transports/queue#tenant-pods-over-the-queue-transport). |
+| [`transports.db(...)`](/docs/durable/transports/db) | the database you already run | Yes (shared DB) | Broker-less, DBOS-style: steps are **rows** in your own database, via `@adonisjs/lucid`. No new infrastructure at all. Also carries remote workflow turns and [tenant pods](/docs/durable/transports/db#remote-workflows-and-tenant-pods) that share the database. |
 | `transports.bullmq(...)` | Redis + the `bullmq` package | Yes | **Cross-ecosystem**: byte-compatible with the NestJS `nestjs-durable` BullMQ transport and its Python worker, so an AdonisJS engine and a Python or NestJS worker interoperate on one Redis. See [Python interop](/docs/durable/python). |
 
 <Callout type="warn" title="memory is for tests; eventEmitter is the single-process production driver">
@@ -63,6 +67,7 @@ export default defineConfig({
 | --- | --- | --- |
 | `group` | — | Accepted for parity with the broker drivers. Handlers match by step name in-process, so it does not affect routing. |
 | `instanceId` | random | Stable id for this process, stamped on control messages. |
+| `onError` | `console.error` | Where a failing result or heartbeat handler is reported. A failed result is redelivered from memory with backoff (100ms doubling to 5s) until `close()`; a failed heartbeat is dropped. |
 
 Pair it with the [Lucid store](/docs/durable/stores/lucid) and the durability guarantees are the real ones: a crash mid-run resumes from the last checkpoint, because the checkpoints are in Postgres even though the steps never left the process.
 
@@ -107,8 +112,8 @@ Omit it and the engine is **local-only**: events and cancellation reach subscrib
 
 A [`ctx.all`](/docs/durable/authoring/child-workflows#fanning-out-over-a-step) fan of thousands of steps sends thousands of results back at once, and two knobs decide how fast an engine-side instance works through them:
 
-- **Steps.** On `bullmq`, `transports.bullmq({ concurrency })` sets how many steps each worker task queue runs at once: a number (fixed, with no control loop), or `'adaptive'` to let the worker raise and lower it from step latency, errors, memory and CPU; see [the BullMQ options](/docs/durable/transports/bullmq#concurrency).
-- **Results.** `transports.bullmq({ resultConcurrency })` settles that many results at once per instance (default `1`); see [the BullMQ options](/docs/durable/transports/bullmq#result-concurrency). On `queue`, `transports.queue({ resultConcurrency })` does the same (default `1`), and `transports.queue({ concurrency })` sets how many jobs of one step a worker runs at once; see [the queue options](/docs/durable/transports/queue#concurrency-and-idle-polling). The `db` transport has no such option: each instance settles results one at a time from its result loop, and `db` claims up to `batchSize` result rows (default 20) per poll. The fan's join barrier adds one count to each result's settle and resumes the workflow once per settled wave, whichever transport carries it.
+- **Steps.** On `bullmq`, `queue` and `db`, `concurrency` sets how many steps a worker runs at once (per task queue on `bullmq` and `queue`, across the one task loop on `db`): a number (fixed, with no control loop), or `'adaptive'` to let the worker raise and lower it from step latency, errors, memory and CPU; see the [BullMQ](/docs/durable/transports/bullmq#concurrency), [queue](/docs/durable/transports/queue#adaptive-concurrency) and [db](/docs/durable/transports/db#concurrency-and-idle-polling) options.
+- **Results.** `transports.bullmq({ resultConcurrency })` settles that many results at once per instance (default `1`); see [the BullMQ options](/docs/durable/transports/bullmq#result-concurrency). On `queue` and `db`, `transports.queue({ resultConcurrency })` and `transports.db({ resultConcurrency })` do the same (default `1`); see [the queue options](/docs/durable/transports/queue#concurrency-and-idle-polling). `db` claims up to `batchSize` result rows (default 20) per poll and settles them `resultConcurrency` at a time. The fan's join barrier adds one count to each result's settle and resumes the workflow once per settled wave, whichever transport carries it.
 - **Timers.** Each timer pass loads at most `timerBatchSize` due runs, most overdue first, and walks them in a shuffled order. It is an engine option in `config/durable.ts` (default `500`), not a transport one; a non-finite or sub-1 value falls back to `500`:
 
 ```ts title="config/durable.ts"
@@ -133,7 +138,7 @@ Where they live depends on the transport:
 | `bullmq` | TTL'd Redis keys, shared with NestJS and Python workers |
 | `db` | the `durable_transport_worker_keys` table |
 | `eventEmitter` | in memory, shared by every transport over the same emitter |
-| `queue` | a key store beside the queues — by default the app database's `durable_transport_worker_keys` table (see [queue](/docs/durable/transports/queue#worker-advertisement)) |
+| `queue` | a key store beside the queues — by default the app database's `durable_transport_worker_keys` table (see [queue](/docs/durable/transports/queue#worker-advertisement)); a `tenant` pod with none forwards it to the control plane's |
 | `memory` | none |
 
 A worker that stops cleanly removes its keys; one that dies drops out when they expire.

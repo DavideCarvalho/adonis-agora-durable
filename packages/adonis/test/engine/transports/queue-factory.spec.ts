@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { transports } from '../../../src/transports/factory.js';
 import { MockAdapter } from '../../../src/transports/queue-mock-adapter.js';
+import { MemoryWorkerKeys } from '../../../src/transports/worker-keys.js';
 
 /** A fake booted app exposing only `config.get('queue', …)` — what the factory reads. */
 function fakeCtx(queueConfig: unknown) {
@@ -124,6 +125,63 @@ describe('transports.queue — options reaching the transport', () => {
     });
     await vi.waitFor(() => expect(errors.length).toBeGreaterThan(0));
     expect((errors[0] as Error).message).toBe('boom');
+    await transport.close?.();
+  });
+
+  it('passes an adaptive `concurrency` through; the worker beats it into groupHealth', async () => {
+    const ctx = fakeCtx({ adapters: {} });
+    const transport = await transports.queue({
+      adapter: () => new MockAdapter(),
+      concurrency: { mode: 'adaptive', min: 2, max: 6 },
+      workerKeys: new MemoryWorkerKeys(),
+      workerKeysCacheMs: 0,
+    })(ctx);
+    (transport as unknown as { handle(name: string, fn: unknown): void }).handle(
+      'ship',
+      async () => 'ok',
+    );
+    await vi.waitFor(async () => {
+      const health = await transport.groupHealth?.('ship');
+      expect(health?.liveWorkers[0]?.status?.concurrency).toEqual({
+        mode: 'adaptive',
+        limit: 2,
+        min: 2,
+        max: 6,
+      });
+    });
+    await transport.close?.();
+  });
+
+  it('passes `workerHeartbeatIntervalMs` through to the liveness beat', async () => {
+    const keys = new MemoryWorkerKeys();
+    const puts: number[] = [];
+    const put = keys.put.bind(keys);
+    keys.put = async (key, value, expiresAt) => {
+      puts.push(Date.now());
+      return put(key, value, expiresAt);
+    };
+    const ctx = fakeCtx({ adapters: {} });
+    const transport = await transports.queue({
+      adapter: () => new MockAdapter(),
+      workerKeys: keys,
+      workerHeartbeatIntervalMs: 20,
+    })(ctx);
+    (transport as unknown as { handle(name: string, fn: unknown): void }).handle(
+      'ship',
+      async () => 'ok',
+    );
+    // At the 10s default only the first beat would land within this window.
+    await vi.waitFor(() => expect(puts.length).toBeGreaterThanOrEqual(3), { timeout: 1_000 });
+    await transport.close?.();
+  });
+
+  it('offers no groupHealth with `workerKeys: false` (nothing could report liveness)', async () => {
+    const ctx = fakeCtx({ adapters: {} });
+    const transport = await transports.queue({
+      adapter: () => new MockAdapter(),
+      workerKeys: false,
+    })(ctx);
+    expect(transport.groupHealth).toBeUndefined();
     await transport.close?.();
   });
 

@@ -1295,12 +1295,17 @@ export interface Transport {
   /** Start every consumer subscription parked by {@link Transport.deferConsumers} — the explicit
    *  "this process IS a worker" declaration. Idempotent; a no-op when nothing was deferred. */
   startConsumers?(): void;
+  /** Called by the provider when this transport backs a store-less `tenant` pod, before anything is
+   *  registered on it. Optional — a transport whose behaviour does not depend on the role omits it (the
+   *  queue transport uses it to forward worker advertisement to the control plane when it has no key
+   *  store of its own). */
+  useTenantRole?(): void;
   /** Release the transport's resources (broker workers, queues, connections) for a clean shutdown.
    *  Optional — an in-process transport has nothing to close. Called on `onApplicationShutdown`
    *  after the engine drains, so a deploy hands off instead of leaving the broker to time out. */
   close?(): Promise<void>;
   /** engine → workflow worker: dispatch a {@link WorkflowTask} (the polyglot-workflow path). Optional
-   *  — only transports that carry workflow tasks (BullMQ) implement it; the {@link RemoteWorkflowExecutor}
+   *  — only transports that carry workflow tasks (BullMQ, queue, db) implement it; the {@link RemoteWorkflowExecutor}
    *  uses it + {@link onDecision} to advance a remote workflow over the broker. */
   dispatchWorkflowTask?(task: WorkflowTask): Promise<void>;
   /** workflow worker → engine: a replayed turn's {@link WorkflowDecision}. Pair with dispatchWorkflowTask. */
@@ -1312,8 +1317,8 @@ export interface Transport {
   /** engine ← workflow worker: consume streamed {@link WorkflowStepEvent}s. Pair with dispatchStepEvent. */
   onStepEvent?(handler: (event: WorkflowStepEvent) => Promise<void>): void;
   /** Worker-health for a group: queue backlog + live worker heartbeats. Optional — only broker
-   *  transports (BullMQ) that can introspect the task queue and the worker-heartbeat keys implement
-   *  it. The engine aggregates this across its groups in {@link WorkflowEngine.workerHealth}. */
+   *  transports (BullMQ, queue, db) that can introspect the task queue and the worker-heartbeat keys
+   *  implement it. The engine aggregates this across its groups in {@link WorkflowEngine.workerHealth}. */
   groupHealth?(group: string): Promise<GroupHealth>;
   /** Distinct groups that currently have a live worker heartbeat — discovered from the heartbeat
    *  keyspace, so a group with workers but no engine-side registration (e.g. a local-step group)
@@ -1333,10 +1338,12 @@ export interface Transport {
 
   // -------------------------------------------------------------------------
   // P4 — store-less read/control/start protocol (spec §6.2, §8). All OPTIONAL:
-  // only broker transports that carry the hosted-control-plane protocol (BullMQ) implement them, so a
-  // caller capability-checks (`transport.dispatchRunRequest?.(…)`) before wiring the proxy/responder.
-  // start-run & run-request ride BullMQ QUEUES (durable, one consumer); run-reply & tenant-events ride
-  // Redis PUB/SUB (fan-out) — the same substrate `RedisControlPlane` uses (spec §6 note).
+  // only broker transports that carry the hosted-control-plane protocol (BullMQ, queue, db) implement them,
+  // so a caller capability-checks (`transport.dispatchRunRequest?.(…)`) before wiring the proxy/responder.
+  // start-run & run-request ride QUEUES (durable, one consumer); on BullMQ run-reply & tenant-events
+  // ride Redis PUB/SUB (fan-out) — the same substrate `RedisControlPlane` uses (spec §6 note) — and on
+  // the `@adonisjs/queue` transport they ride per-instance inbox queues (`transports/queue-remote.ts`);
+  // on the db transport they are rows addressed to one instance (`transports/db-remote.ts`).
   // -------------------------------------------------------------------------
 
   /** tenant → control plane: publish a {@link StartRunMessage} on `${P}-start-run` (queue, job
@@ -1417,7 +1424,9 @@ export interface WorkerHeartbeat {
  *  consumer (exactly the failure where a worker is "alive but not consuming"). */
 export interface GroupHealth {
   group: string;
-  /** Outstanding jobs in the group's task queue (waiting + active + delayed + prioritized). */
+  /** Outstanding jobs in the group's task queue (waiting + active + delayed + prioritized on BullMQ;
+   *  pending only on the queue transport, whose adapter contract counts nothing else; pending +
+   *  claimed task rows on the db transport). */
   depth: number;
   /** Workers with a non-expired heartbeat for this group. */
   liveWorkers: WorkerHeartbeat[];

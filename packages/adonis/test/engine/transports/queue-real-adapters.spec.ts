@@ -6,9 +6,23 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { Adapter } from '@adonisjs/queue/types';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import type { RemoteTask, StepResult } from '../../../src/interfaces.js';
+import type {
+  EngineEvent,
+  RemoteTask,
+  RunReply,
+  StepResult,
+  TenantEvent,
+  WorkflowDecision,
+} from '../../../src/interfaces.js';
 import { sanitizeQueueToken } from '../../../src/tenant-group.js';
-import { QueueTransport } from '../../../src/transports/queue.js';
+import { QueueTransport, type QueueTransportOptions } from '../../../src/transports/queue.js';
+import {
+  inboxKey,
+  runRepliesQueue,
+  tenantEventsQueue,
+  tenantSubscriberKey,
+} from '../../../src/transports/queue-remote.js';
+import { MemoryWorkerKeys } from '../../../src/transports/worker-keys.js';
 
 /**
  * The QueueTransport against the REAL adapters of whichever `@adonisjs/queue` is installed (0.6 or
@@ -33,6 +47,10 @@ const boringnodeVersion = (
     readFileSync(join(knexDriverPath.split('/build/')[0] as string, 'package.json'), 'utf8'),
   ) as { version: string }
 ).version;
+
+// `@boringnode/queue` >= 0.8 hands a job that stalled too often back to the caller to fail; 0.6 deletes
+// it inside `recoverStalledJobs`, so there is nothing to bridge there.
+const handsBackExceeded = Number(boringnodeVersion.split('.')[1]) >= 8;
 
 type AnyAdapterFactory = () => Adapter;
 interface KnexLike {
@@ -171,12 +189,13 @@ describe.each(backends)(
       await backend.teardown();
     });
 
-    const make = (): QueueTransport => {
+    const make = (opts: Partial<QueueTransportOptions> = {}): QueueTransport => {
       const t = new QueueTransport({
         adapter: factory,
         prefix,
         pollIntervalMs: 10,
         stalledCheckIntervalMs: 0,
+        ...opts,
       });
       transports.push(t);
       return t;
@@ -294,6 +313,265 @@ describe.each(backends)(
         expect(peak).toBe(3);
         await new Promise((r) => setTimeout(r, 50));
         expect(await activeJobs(probe, `${prefix}:tasks:${sanitizeQueueToken(name)}`)).toBe(0);
+      },
+    );
+
+    it.skipIf(!backend.enabled)(
+      'groupHealth reports the pending backlog and the live worker with its status',
+      async () => {
+        const name = `health-${randomUUID().slice(0, 6)}`;
+        const token = sanitizeQueueToken(name);
+        const keys = new MemoryWorkerKeys();
+        const withKeys = (extra: Partial<ConstructorParameters<typeof QueueTransport>[0]> = {}) => {
+          const t = new QueueTransport({
+            adapter: factory,
+            prefix,
+            pollIntervalMs: 10,
+            stalledCheckIntervalMs: 0,
+            workerKeys: keys,
+            workerKeysCacheMs: 0,
+            ...extra,
+          });
+          transports.push(t);
+          return t;
+        };
+        const engine = withKeys();
+        const results: StepResult[] = [];
+        engine.onResult(async (r) => void results.push(r));
+        for (let seq = 1; seq <= 3; seq += 1) {
+          await engine.dispatch({ ...task(name), seq, stepId: `r1:${seq}` });
+        }
+        expect(await engine.groupHealth?.(token)).toEqual({
+          group: token,
+          depth: 3,
+          liveWorkers: [],
+        });
+
+        let release: () => void = () => {};
+        const gate = new Promise<void>((r) => {
+          release = r;
+        });
+        const worker = withKeys({ instanceId: 'w1', workerHeartbeatIntervalMs: 20 });
+        worker.handle(name, async () => {
+          await gate;
+          return 'ok';
+        });
+        await until(async () => {
+          const h = await engine.groupHealth?.(token);
+          return h?.depth === 2 && h.liveWorkers[0]?.status?.inFlight === 1;
+        });
+        expect((await engine.groupHealth?.(token))?.liveWorkers[0]).toMatchObject({
+          instanceId: 'w1',
+          status: { concurrency: { mode: 'fixed', limit: 1 } },
+        });
+        release();
+        await until(() => results.length === 3, 10_000);
+        expect((await engine.groupHealth?.(token))?.depth).toBe(0);
+      },
+    );
+
+    it.skipIf(!backend.enabled)(
+      'adaptive concurrency raises the slot count on a saturated backlog',
+      async () => {
+        const name = `adapt-${randomUUID().slice(0, 6)}`;
+        const engine = make();
+        const worker = new QueueTransport({
+          adapter: factory,
+          prefix,
+          pollIntervalMs: 5,
+          stalledCheckIntervalMs: 0,
+          concurrency: { mode: 'adaptive', min: 1, max: 4, start: 1, tickMs: 20 },
+        });
+        transports.push(worker);
+        const results: StepResult[] = [];
+        engine.onResult(async (r) => void results.push(r));
+        let running = 0;
+        let peak = 0;
+        worker.handle(name, async () => {
+          running += 1;
+          peak = Math.max(peak, running);
+          await new Promise((r) => setTimeout(r, 40));
+          running -= 1;
+          return 'ok';
+        });
+        for (let seq = 1; seq <= 30; seq += 1) {
+          await engine.dispatch({ ...task(name), seq, stepId: `r1:${seq}` });
+        }
+        await until(() => results.length === 30, 15_000);
+        expect(peak).toBeGreaterThan(1);
+        expect(peak).toBeLessThanOrEqual(4);
+        await new Promise((r) => setTimeout(r, 50));
+        expect(await activeJobs(probe, `${prefix}:tasks:${sanitizeQueueToken(name)}`)).toBe(0);
+      },
+    );
+
+    it.skipIf(!backend.enabled || !handsBackExceeded)(
+      'a task that stalled past maxStalledCount is failed and bridged into a failed StepResult',
+      async () => {
+        const name = `poison-${randomUUID().slice(0, 6)}`;
+        const tasksQueue = `${prefix}:tasks:${sanitizeQueueToken(name)}`;
+        const engine = make();
+        const results: StepResult[] = [];
+        engine.onResult(async (r) => void results.push(r));
+        await engine.dispatch(task(name));
+        // A worker claims the task and dies on it (never finalizes, never renews).
+        expect(await probe.popFrom(tasksQueue)).not.toBeNull();
+
+        const worker = new QueueTransport({
+          adapter: factory,
+          prefix,
+          pollIntervalMs: 10,
+          stalledCheckIntervalMs: 50,
+          stalledThresholdMs: 50,
+          maxStalledCount: 0,
+        });
+        transports.push(worker);
+        let runs = 0;
+        worker.handle(name, async () => {
+          runs += 1;
+          return 'ok';
+        });
+
+        await until(() => results.length === 1, 10_000);
+        expect(results[0]).toEqual({
+          runId: 'r1',
+          seq: 1,
+          stepId: 'r1:1',
+          status: 'failed',
+          error: {
+            message: 'remote step worker failed: stalled more than 0 times',
+            retryable: true,
+          },
+        });
+        expect(runs).toBe(0);
+        expect(await activeJobs(probe, tasksQueue)).toBe(0);
+      },
+    );
+    it.skipIf(!backend.enabled)(
+      'routes run replies to each requester only, and finalizes every claim',
+      async () => {
+        const tag = randomUUID().slice(0, 6);
+        const cp = make({ instanceId: `cp-${tag}` });
+        const a = make({ instanceId: `a-${tag}` });
+        const b = make({ instanceId: `b-${tag}` });
+        cp.onRunRequest(async (msg) => {
+          await cp.publishRunReply({
+            requestId: msg.requestId,
+            result: { ok: true, data: msg.requestId },
+          });
+        });
+        const gotA: RunReply[] = [];
+        const gotB: RunReply[] = [];
+        a.onRunReply((r) => gotA.push(r));
+        b.onRunReply((r) => gotB.push(r));
+        for (let i = 0; i < 3; i += 1) {
+          await a.dispatchRunRequest({
+            requestId: `a${i}-${tag}`,
+            tenant: 'acme',
+            body: { kind: 'workerHealth' },
+          });
+          await b.dispatchRunRequest({
+            requestId: `b${i}-${tag}`,
+            tenant: 'acme',
+            body: { kind: 'workerHealth' },
+          });
+        }
+        await until(() => gotA.length === 3 && gotB.length === 3);
+        expect(gotA.map((r) => r.requestId).sort()).toEqual([0, 1, 2].map((i) => `a${i}-${tag}`));
+        expect(gotB.map((r) => r.requestId).sort()).toEqual([0, 1, 2].map((i) => `b${i}-${tag}`));
+        await new Promise((r) => setTimeout(r, 50));
+        expect(await activeJobs(probe, `${prefix}:run-request`)).toBe(0);
+        expect(await activeJobs(probe, runRepliesQueue(prefix, `a-${tag}`))).toBe(0);
+        expect(await activeJobs(probe, runRepliesQueue(prefix, `b-${tag}`))).toBe(0);
+      },
+    );
+
+    it.skipIf(!backend.enabled)(
+      'fans a tenant event out to every subscriber of that tenant; a dead one is drained',
+      async () => {
+        const tag = randomUUID().slice(0, 6);
+        const keys = new MemoryWorkerKeys();
+        // Only the control plane has a key store; the subscribers are store-less.
+        const cp = make({
+          workerKeys: keys,
+          tenantSubscribersCacheMs: 0,
+          inboxTtlMs: 200,
+          inboxSweepIntervalMs: 50,
+        });
+        cp.onRunRequest(async () => {}); // the responder's consumers start the subscription recorder
+        const s1 = make({ instanceId: `s1-${tag}` });
+        const s2 = make({ instanceId: `s2-${tag}` });
+        const other = make({ instanceId: `o-${tag}` });
+        const got1: TenantEvent[] = [];
+        const got2: TenantEvent[] = [];
+        const gotOther: TenantEvent[] = [];
+        s1.onTenantEvent(`acme-${tag}`, (e) => got1.push(e));
+        s2.onTenantEvent(`acme-${tag}`, (e) => got2.push(e));
+        other.onTenantEvent(`globex-${tag}`, (e) => gotOther.push(e));
+        const recorded = async (tenant: string, instanceId: string) =>
+          (await keys.live(Date.now())).some(
+            (k) => k.key === tenantSubscriberKey(prefix, tenant, instanceId),
+          );
+        await until(
+          async () =>
+            (await recorded(`acme-${tag}`, `s1-${tag}`)) &&
+            (await recorded(`acme-${tag}`, `s2-${tag}`)) &&
+            (await recorded(`globex-${tag}`, `o-${tag}`)),
+        );
+
+        // A subscriber that crashed: advertised, never consuming, never refreshing. Written right before
+        // the publish (not before the wait above) so a slow CI can't expire it before it is pushed to,
+        // and short-lived (under inboxTtlMs) so the janitor sees it dead and drains its inbox.
+        const ghost = `ghost-${tag}`;
+        const value = JSON.stringify({ instanceId: ghost });
+        await keys.put(tenantSubscriberKey(prefix, `acme-${tag}`, ghost), value, Date.now() + 150);
+        await keys.put(inboxKey(prefix, ghost), value, Date.now() + 150);
+        const evt = {
+          type: 'run.completed',
+          runId: 'r1',
+          at: new Date(0),
+        } as unknown as EngineEvent;
+        await cp.publishTenantEvent({ tenant: `acme-${tag}`, event: evt });
+        await until(() => got1.length === 1 && got2.length === 1);
+        expect(gotOther).toEqual([]);
+        expect(got1[0]?.event.runId).toBe('r1');
+        expect(await probe.sizeOf(tenantEventsQueue(prefix, ghost))).toBe(1);
+        // The ghost's keys expire; the janitor drains what it was sent.
+        await until(async () => (await probe.sizeOf(tenantEventsQueue(prefix, ghost))) === 0, 5000);
+        expect(await activeJobs(probe, tenantEventsQueue(prefix, ghost))).toBe(0);
+      },
+    );
+
+    it.skipIf(!backend.enabled)(
+      'round-trips a workflow turn (task → decision) and finalizes every claim',
+      async () => {
+        const name = `wf-${randomUUID().slice(0, 6)}`;
+        const engine = make();
+        const worker = make();
+        const decisions: WorkflowDecision[] = [];
+        engine.onDecision(async (d) => void decisions.push(d));
+        worker.handleWorkflow(name, async (t) => ({
+          taskId: t.taskId,
+          runId: t.runId,
+          status: 'completed',
+          commands: [],
+          output: t.input,
+        }));
+        await engine.dispatchWorkflowTask({
+          taskId: 't1',
+          runId: 'r1',
+          workflow: name,
+          workflowVersion: '1',
+          input: { n: 1 },
+          history: [],
+          group: sanitizeQueueToken(name),
+          attempt: 1,
+        });
+        await until(() => decisions.length === 1);
+        expect(decisions[0]).toMatchObject({ taskId: 't1', status: 'completed', output: { n: 1 } });
+        await new Promise((r) => setTimeout(r, 50));
+        expect(await activeJobs(probe, `${prefix}:tasks:${sanitizeQueueToken(name)}`)).toBe(0);
+        expect(await activeJobs(probe, `${prefix}:decisions`)).toBe(0);
       },
     );
   },

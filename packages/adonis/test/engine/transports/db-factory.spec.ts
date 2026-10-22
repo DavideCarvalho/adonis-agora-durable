@@ -1,0 +1,40 @@
+import { afterEach, describe, expect, it } from 'vitest';
+import type { DbTransport } from '../../../src/transports/db.js';
+import { makeTransportDb } from '../../../src/transports/db-helpers.js';
+import { WORKER_KEYS_TABLE } from '../../../src/transports/db-schema.js';
+import { transports } from '../../../src/transports/factory.js';
+
+describe('transports.db — option passthrough', () => {
+  const closers: Array<() => Promise<void>> = [];
+  afterEach(async () => {
+    await Promise.all(closers.splice(0).map((c) => c()));
+  });
+
+  it('forwards concurrency and the worker-health options to the DbTransport', async () => {
+    const db = await makeTransportDb();
+    closers.push(() => db.manager.closeAll());
+    // structural test double for TransportContext: only `lucid.db` is resolved
+    const ctx = { app: { container: { make: async () => db } } } as any;
+    const transport = (await transports.db({
+      concurrency: 4,
+      resultConcurrency: 2,
+      idleBackoffMax: 2,
+      maxStalledCount: 5,
+      workerHeartbeatIntervalMs: 10,
+      instanceId: 'w-factory',
+      pollIntervalMs: 5,
+    })(ctx)) as DbTransport;
+    closers.unshift(() => transport.close());
+    transport.handle('ext.work', async () => 'x');
+    const until = Date.now() + 2_000;
+    let rows: Array<{ key: string; value: string }> = [];
+    while (rows.length === 0 && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 10));
+      rows = await db.connection().from(WORKER_KEYS_TABLE).select('key', 'value');
+    }
+    expect(rows.map((r) => r.key)).toEqual(['durable-worker-heartbeat:ext.work:w-factory']);
+    expect(JSON.parse(rows[0]?.value ?? '{}').status).toMatchObject({
+      concurrency: { mode: 'fixed', limit: 4 },
+    });
+  });
+});

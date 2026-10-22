@@ -3168,7 +3168,7 @@ export class WorkflowEngine {
    *  (so a registered group with backlog and ZERO workers still reports — the alert case) UNION the
    *  groups discovered from live heartbeats (so a local-step group like `pipeline`, not derivable
    *  from registrations, shows once its workers beat). Empty when no transport can introspect health
-   *  (only the BullMQ transport implements `groupHealth`). */
+   *  (only the BullMQ, queue and db transports implement `groupHealth`). */
   async workerHealth(extra: string[] = []): Promise<GroupHealth[]> {
     const groups = new Set([...this.knownGroups(extra), ...(await this.pool.listWorkerGroups())]);
     // One round per group, in parallel — the dashboard polls this, and each group's health is an

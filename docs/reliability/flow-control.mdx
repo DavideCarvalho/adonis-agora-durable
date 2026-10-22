@@ -86,7 +86,7 @@ When the queue has a free slot, the call is admitted immediately. When it is con
 
 ### Priority
 
-`priority` on the call opts is admission priority *within a queue*: higher is admitted first when a slot is contended (absent = unprioritised). The same value also rides along as **broker** priority: it is carried onto the dispatched `RemoteTask`, and the [`bullmq` transport](/docs/durable/transports/bullmq#priority) translates it into a BullMQ job `priority` (BullMQ runs the lowest number first, so the engine maps "higher wins" onto it), so an urgent task can also jump ahead of already-enqueued lower-priority ones at the worker's own queue. Transports without broker priority ignore it.
+`priority` on the call opts is admission priority *within a queue*: higher is admitted first when a slot is contended (absent = unprioritised). The same value also rides along as **broker** priority: it is carried onto the dispatched `RemoteTask`, and the [`bullmq` transport](/docs/durable/transports/bullmq#priority) translates it into a BullMQ job `priority` (BullMQ runs the lowest number first, so the engine maps "higher wins" onto it), so an urgent task can also jump ahead of already-enqueued lower-priority ones at the worker's own queue. The `queue` transport maps it onto its adapter's job priority, and the [`db` transport](/docs/durable/transports/db#priority) stores it on the task row and claims higher priority first. Transports without broker priority ignore it.
 
 ### Fairness
 
@@ -129,7 +129,7 @@ By default, flow-control accounting is **per engine instance**. For the common s
 
 ## Worker / transport concurrency
 
-A queue's `concurrency` caps what the engine *admits*. How many already-dispatched tasks a worker *executes* at once is a separate, transport-level knob — [`transports.bullmq({ concurrency })`](/docs/durable/transports/bullmq#concurrency), or a fixed [`transports.queue({ concurrency })`](/docs/durable/transports/queue#concurrency-and-idle-polling):
+A queue's `concurrency` caps what the engine *admits*. How many already-dispatched tasks a worker *executes* at once is a separate, transport-level knob — [`transports.bullmq({ concurrency })`](/docs/durable/transports/bullmq#concurrency), [`transports.queue({ concurrency })`](/docs/durable/transports/queue#concurrency-and-idle-polling) or [`transports.db({ concurrency })`](/docs/durable/transports/db#concurrency-and-idle-polling):
 
 ```ts title="config/durable.ts"
 bullmq: transports.bullmq({
@@ -199,7 +199,7 @@ A held slot is reclaimed only once its owner's heartbeat lapses: a **live** pod 
 | Break remaining ties newest-first instead of oldest-first | `order: 'lifo'` | `engine.registerQueue` |
 | Cap one fan within a single run | `ctx.all(step, inputs, { concurrency })` | the call |
 | Refuse new *runs* once a tenant/key has N in flight | a concurrency quota — see [Concurrency quotas](/docs/durable/reliability/concurrency-quotas) | `static workflow` / `StartOptions` |
-| Raise how much work *this process* runs at once | `concurrency` (number) | `transports.bullmq(...)` |
-| Let the process self-tune under CPU/RAM pressure | `concurrency: 'adaptive'` | `transports.bullmq(...)` |
+| Raise how much work *this process* runs at once | `concurrency` (number) | `transports.bullmq(...)` / `transports.queue(...)` / `transports.db(...)` |
+| Let the process self-tune under CPU/RAM pressure | `concurrency: 'adaptive'` | `transports.bullmq(...)` / `transports.queue(...)` / `transports.db(...)` |
 | Enforce a cap/rate limit across every replica, not per pod | `admission: admissions.redis(...)` | `config/durable.ts` |
 | Retry a failed step with backoff | `retries` / `backoff` — not flow control | see [Retries & backoff](/docs/durable/reliability/retries) |

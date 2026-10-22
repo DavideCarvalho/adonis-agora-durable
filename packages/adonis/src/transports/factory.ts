@@ -3,7 +3,7 @@ import type { AdapterFactory } from '@adonisjs/queue/types';
 import type { ControlPlane, Transport } from '../interfaces.js';
 import { resolveLucidDatabase } from '../resolve-lucid-db.js';
 import { InMemoryTransport } from '../testing/in-memory-transport.js';
-import type { ConcurrencyOption } from './bullmq/adaptive-concurrency.js';
+import type { ConcurrencyOption } from './adaptive-concurrency.js';
 import type { WorkerKeyStore } from './worker-keys.js';
 
 /**
@@ -44,6 +44,8 @@ export interface EventEmitterTransportConfig {
   group?: string;
   /** Stable id for this process (stamped on control `from` when a publisher leaves it unset). Default random. */
   instanceId?: string;
+  /** Where a failing result/heartbeat handler is reported (a failed result is redelivered). Default `console.error`. */
+  onError?: (err: unknown) => void;
 }
 
 /** Options for the `@adonisjs/queue` transport. */
@@ -84,11 +86,23 @@ export interface QueueTransportConfig {
   prefix?: string;
   /** Poll interval (ms) for the result/task/heartbeat/control loops. Default 200ms. */
   pollIntervalMs?: number;
+  /** How long `close()` waits for in-flight jobs before handing them back (ms). Default 5000. */
+  closeTimeoutMs?: number;
+  /** How often (ms) a worker refreshes the liveness key of each step name it serves. Default 10000. */
+  workerHeartbeatIntervalMs?: number;
   /**
    * How many jobs of one step name a worker runs at once. Default 1. More slots share one poll loop,
    * so raising it adds no polling.
+   *
+   * `'adaptive'`, or `{ mode: 'adaptive', min, max, start, tickMs, ramCeilingPct, cpuCeilingPct }`,
+   * moves the limit at runtime with the same controller as `transports.bullmq({ concurrency })`: up by
+   * one while steps saturate it at a steady latency, down by the latency gradient when they queue, down
+   * by one on a >20% error rate, a stall or the CPU ceiling, and down by 20% when RSS reaches
+   * `ramCeilingPct` of the memory limit. Defaults: `min` 1, `max` 32, `start` `min`, `tickMs` 2000,
+   * `ramCeilingPct` 85, `cpuCeilingPct` off. The limit applies to each step name's task loop; the
+   * results, heartbeat and control loops are unaffected.
    */
-  concurrency?: number;
+  concurrency?: ConcurrencyOption;
   /** How many step results the engine side settles at once. Default 1. */
   resultConcurrency?: number;
   /**
@@ -133,6 +147,16 @@ export interface QueueTransportConfig {
   workerKeysConnection?: string;
   /** How long a read of the worker keys is reused (ms). Default 5000. */
   workerKeysCacheMs?: number;
+  /**
+   * Store-less protocol: TTL (ms) of the event subscriptions and inbox liveness an instance announces
+   * to the control plane (recorded in the control plane's worker-key store), re-announced every third
+   * of it. Default 30000.
+   */
+  inboxTtlMs?: number;
+  /** How long a control plane reuses its read of a tenant's live event subscribers (ms). Default 1000. */
+  tenantSubscribersCacheMs?: number;
+  /** How often (ms) a control plane drains the inboxes of tenant pods that died. Default 30000; `0` off. */
+  inboxSweepIntervalMs?: number;
 }
 
 /**
@@ -232,12 +256,56 @@ export interface DbTransportConfig {
   pollIntervalMs?: number;
   /** How long a claimed-but-unfinished row is owned before it's reclaimable (crash recovery). Default 30s. */
   leaseMs?: number;
-  /** Max rows claimed per poll. Default 20. */
+  /**
+   * Max rows claimed per poll by the results, heartbeat and control loops. Default 20. The task loop
+   * claims only as many rows as it has free `concurrency` slots (capped by this).
+   */
   batchSize?: number;
-  /** Create the transport tables on first use if missing. Default true. */
+  /**
+   * How many task rows a worker runs at once. Default 1. One poll loop serves every handler name and
+   * keeps up to this many rows in flight, claiming only as many per poll as it has free slots.
+   *
+   * `'adaptive'`, or `{ mode: 'adaptive', min, max, start, tickMs, ramCeilingPct, cpuCeilingPct }`,
+   * moves the limit at runtime with the controller the BullMQ and queue transports use. Either way
+   * the limit, in-flight count, RSS, CPU, throughput and p95 ride the worker's liveness key.
+   */
+  concurrency?: ConcurrencyOption;
+  /** How many step results the engine side settles at once. Default 1. */
+  resultConcurrency?: number;
+  /**
+   * Idle backoff for the task, heartbeat and control loops, as a multiple of `pollIntervalMs`: after
+   * consecutive empty polls the sleep doubles up to this many intervals. Default 4; `1` disables it.
+   * The results loop never backs off.
+   */
+  idleBackoffMax?: number;
+  /**
+   * How many times a task row's lapsed claim may be taken over before the row is treated as poison:
+   * deleted, with a retryable failed result published for its step. Default 3.
+   */
+  maxStalledCount?: number;
+  /** How often (ms) a worker refreshes its liveness key per served step name. Default 10000. */
+  workerHeartbeatIntervalMs?: number;
+  /** Create the transport tables on first use if missing (and add newer columns). Default true. */
   autoCreate?: boolean;
   /** Stable id for this process (stamped on heartbeats / control `from` / `claimed_by`). Default random. */
   instanceId?: string;
+  /** Where transport failures (a throwing poll, a lost claim) are reported. Default `console.error`. */
+  onError?: (err: unknown) => void;
+  /**
+   * How long (ms) `close()` waits for in-flight work before handing every claim it still holds back
+   * to the table, uncounted, for another worker to pick up at once. Default 5000.
+   */
+  closeTimeoutMs?: number /**
+   * Remote workflows and store-less tenant pods: TTL (ms) of the keys an instance writes to say it
+   * consumes the rows addressed to it (replies, tenant events, decisions) and which tenants' events it
+   * wants, re-written every third of it. Default 30000.
+   */;
+  inboxTtlMs?: number;
+  /** How long a publisher reuses its read of a tenant's live event subscribers (ms). Default 1000. */
+  tenantSubscribersCacheMs?: number;
+  /** How often (ms) an instance deletes the rows it addressed to instances that are gone. Default
+   *  30000; `0` off. */
+  inboxSweepIntervalMs?: number;
 }
 
 /**
@@ -317,6 +385,7 @@ export const transports = {
       return new EventEmitterTransport({
         ...(config.group !== undefined ? { group: config.group } : {}),
         ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+        ...(config.onError !== undefined ? { onError: config.onError } : {}),
       });
     };
   },
@@ -338,6 +407,10 @@ export const transports = {
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
         ...(config.prefix !== undefined ? { prefix: config.prefix } : {}),
         ...(config.pollIntervalMs !== undefined ? { pollIntervalMs: config.pollIntervalMs } : {}),
+        ...(config.closeTimeoutMs !== undefined ? { closeTimeoutMs: config.closeTimeoutMs } : {}),
+        ...(config.workerHeartbeatIntervalMs !== undefined
+          ? { workerHeartbeatIntervalMs: config.workerHeartbeatIntervalMs }
+          : {}),
         ...(config.concurrency !== undefined ? { concurrency: config.concurrency } : {}),
         ...(config.resultConcurrency !== undefined
           ? { resultConcurrency: config.resultConcurrency }
@@ -354,6 +427,13 @@ export const transports = {
           : {}),
         ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
         ...(config.onError !== undefined ? { onError: config.onError } : {}),
+        ...(config.inboxTtlMs !== undefined ? { inboxTtlMs: config.inboxTtlMs } : {}),
+        ...(config.tenantSubscribersCacheMs !== undefined
+          ? { tenantSubscribersCacheMs: config.tenantSubscribersCacheMs }
+          : {}),
+        ...(config.inboxSweepIntervalMs !== undefined
+          ? { inboxSweepIntervalMs: config.inboxSweepIntervalMs }
+          : {}),
       });
     };
   },
@@ -403,8 +483,28 @@ export const transports = {
         ...(config.pollIntervalMs !== undefined ? { pollIntervalMs: config.pollIntervalMs } : {}),
         ...(config.leaseMs !== undefined ? { leaseMs: config.leaseMs } : {}),
         ...(config.batchSize !== undefined ? { batchSize: config.batchSize } : {}),
+        ...(config.concurrency !== undefined ? { concurrency: config.concurrency } : {}),
+        ...(config.resultConcurrency !== undefined
+          ? { resultConcurrency: config.resultConcurrency }
+          : {}),
+        ...(config.idleBackoffMax !== undefined ? { idleBackoffMax: config.idleBackoffMax } : {}),
+        ...(config.maxStalledCount !== undefined
+          ? { maxStalledCount: config.maxStalledCount }
+          : {}),
+        ...(config.workerHeartbeatIntervalMs !== undefined
+          ? { workerHeartbeatIntervalMs: config.workerHeartbeatIntervalMs }
+          : {}),
         ...(config.autoCreate !== undefined ? { autoCreate: config.autoCreate } : {}),
         ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+        ...(config.onError !== undefined ? { onError: config.onError } : {}),
+        ...(config.closeTimeoutMs !== undefined ? { closeTimeoutMs: config.closeTimeoutMs } : {}),
+        ...(config.inboxTtlMs !== undefined ? { inboxTtlMs: config.inboxTtlMs } : {}),
+        ...(config.tenantSubscribersCacheMs !== undefined
+          ? { tenantSubscribersCacheMs: config.tenantSubscribersCacheMs }
+          : {}),
+        ...(config.inboxSweepIntervalMs !== undefined
+          ? { inboxSweepIntervalMs: config.inboxSweepIntervalMs }
+          : {}),
       });
     };
   },

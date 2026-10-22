@@ -336,7 +336,7 @@ These are the console's Schedules tab, riding [`engine.listSchedules` / `setSche
 
 `GET /api/workers` returns the raw `GroupHealth[]` — for each routing token, its queue `depth` and the **individual live workers** with their `instanceId` and `lastBeatAt`. That is what tells "one worker is wedged" apart from "the whole group is down".
 
-On the [BullMQ transport](/docs/durable/cluster/interop), each worker's heartbeat also carries a live `status` telemetry snapshot (`WorkerStatus`) that the console renders on its worker cards: the concurrency mode and limit (`fixed` or `adaptive`, with `min`/`max`), `inFlight`, RSS (`rssBytes`, plus `rssLimitBytes`/`rssPct` when a ceiling is known), `cpuPct`, `throughputPerMin`, `p95Ms`, and the last adaptive concurrency adjustment with its reason. Workers on other transports simply omit `status` — the cards degrade to liveness only.
+On the [BullMQ](/docs/durable/cluster/interop) and [queue](/docs/durable/transports/queue#worker-health) transports, each worker's heartbeat also carries a live `status` telemetry snapshot (`WorkerStatus`) that the console renders on its worker cards: the concurrency mode and limit (`fixed` or `adaptive`, with `min`/`max`), `inFlight`, RSS (`rssBytes`, plus `rssLimitBytes`/`rssPct` when a ceiling is known), `cpuPct`, `throughputPerMin`, `p95Ms`, and the last adaptive concurrency adjustment with its reason. Workers that beat without one (a thin worker runtime's compact beat) omit `status` — the cards degrade to liveness only.
 
 `GET /api/health` is the older, compact view of the same data: it collapses `liveWorkers` to a count and adds `stalled: depth > 0 && liveWorkers === 0`. It stays for hand-written clients and probes; prefer `/api/workers` for anything new.
 
@@ -384,7 +384,7 @@ The `waiting` value is one input to a richer **display state** that the runs lis
 | `blocked` | Shown as its own state, with the reason from `run.error.message`. No *compatible* worker exists, which starting another worker of the same build cannot fix. See [Fleet health](#fleet-health). |
 | `running` | Everything else open or in flight, including a settled step waiting to be replayed with nothing currently blocking it. |
 
-`no-worker` is gated on a **real backlog**, not on zero live workers alone. A worker only heartbeats for a group while it serves it, so an idle group (a run parked on its reconcile timer with nothing enqueued, a schedule between fires) legitimately reports no live workers without anything being stuck. Worker health comes from `GET /api/workers`, so on transports without `groupHealth` (anything but BullMQ) nothing ever reads `no-worker`.
+`no-worker` is gated on a **real backlog**, not on zero live workers alone. A worker only heartbeats for a group while it serves it, so an idle group (a run parked on its reconcile timer with nothing enqueued, a schedule between fires) legitimately reports no live workers without anything being stuck. Worker health comes from `GET /api/workers`, so on transports without `groupHealth` (anything but BullMQ, queue and db) nothing ever reads `no-worker`.
 
 ### Filter pickers
 
@@ -452,7 +452,8 @@ The console's worker cards and its actions are a thin layer over methods `Workfl
 ```ts
 interface GroupHealth {
   group: string
-  /** Outstanding jobs in the group's task queue (waiting + active + delayed + prioritized). */
+  /** Outstanding jobs in the group's task queue: waiting + active + delayed + prioritized on BullMQ,
+   *  pending only on the queue transport. */
   depth: number
   /** Workers with a non-expired heartbeat for this group. */
   liveWorkers: WorkerHeartbeat[]
@@ -463,12 +464,12 @@ interface WorkerHeartbeat {
   /** Stable per-process id (host + pid), so N replicas of a group each show as a distinct worker. */
   instanceId: string
   lastBeatAt: number
-  /** BullMQ workers: concurrency, in-flight, RSS/CPU, throughput, p95, last adjustment. */
+  /** BullMQ, queue and db workers: concurrency, in-flight, RSS/CPU, throughput, p95, last adjustment. */
   status?: WorkerStatus
 }
 ```
 
-`depth > 0 && liveWorkers.length === 0` is the actionable alert: work is queued and nothing is consuming it. Pass `extra` to include groups the engine can't derive from its registrations. Only the BullMQ transport implements `groupHealth`, so on other transports the list is empty.
+`depth > 0 && liveWorkers.length === 0` is the actionable alert: work is queued and nothing is consuming it. Pass `extra` to include groups the engine can't derive from its registrations. Only the BullMQ, queue and db transports implement `groupHealth` (queue with a worker-key store), so on other transports the list is empty.
 
 **Bulk and tree operations:**
 

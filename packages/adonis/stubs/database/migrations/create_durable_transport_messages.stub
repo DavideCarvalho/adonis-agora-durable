@@ -1,0 +1,43 @@
+{{{
+  exports({ to: app.migrationsPath(`${new Date().getTime()}_create_durable_transport_messages.ts`) })
+}}}
+import { BaseSchema } from '@adonisjs/lucid/schema'
+
+/**
+ * The message channel of the @adonis-agora/durable \`db\` transport: remote-workflow decisions and step
+ * events, and the store-less (tenant pod) protocol's start-run, run-request, run-reply and tenant-event
+ * rows. Also adds the \`kind\` column (\`step\` / \`workflow\`) to \`durable_transport_tasks\` when an
+ * older migration created that table without it. Only needed when you select the \`db\` transport in
+ * config/durable.ts.
+ */
+export default class extends BaseSchema {
+  async up() {
+    this.schema.createTable('durable_transport_messages', (table) => {
+      table.increments('id').primary()
+      table.string('kind', 32).notNullable()
+      table.string('namespace').notNullable().defaultTo('default')
+      table.string('recipient').notNullable().defaultTo('')
+      table.string('reply_to')
+      table.text('payload').notNullable()
+      table.string('claimed_by')
+      table.bigInteger('claimed_at')
+      table.bigInteger('created_at').notNullable()
+      table.index(['namespace', 'kind', 'recipient', 'claimed_at', 'id'], 'durable_transport_messages_idx')
+    })
+
+    // Upgrading: a tasks table from an earlier release has no kind column. (A fresh install creates
+    // it with one, whichever of the two migrations runs first.)
+    // Each check takes a fresh schema builder: a Knex schema builder is stateful.
+    this.defer(async (db) => {
+      if (!(await db.schema.hasTable('durable_transport_tasks'))) return
+      if (await db.schema.hasColumn('durable_transport_tasks', 'kind')) return
+      await db.schema.alterTable('durable_transport_tasks', (table) => {
+        table.string('kind', 16).notNullable().defaultTo('step')
+      })
+    })
+  }
+
+  async down() {
+    this.schema.dropTableIfExists('durable_transport_messages')
+  }
+}

@@ -8,7 +8,8 @@ description: >-
   (compatible/degraded/incompatible) and capability routing (requires → blocked
   runs), layered tenant auth (signTenantToken/hmacTenantVerifier/verifyTenant),
   runGateway as the role-portable read/control surface, namespace vs partition,
-  and Python (durable-worker) / NestJS interop over the bullmq wire. Use when
+  tenant pods over bullmq, the @adonisjs/queue transport or the db transport, and Python
+  (durable-worker) / NestJS interop over the bullmq wire. Use when
   splitting web from workers, isolating tenants, or adding polyglot workers.
 license: MIT
 metadata:
@@ -48,7 +49,7 @@ import { defineConfig, stores, transports } from '@adonis-agora/durable'
 
 export default defineConfig({
   role: 'control-plane',
-  transport: 'bullmq', // cross-ecosystem wire; queue/db work for Adonis-only splits
+  transport: 'bullmq', // or 'queue' / 'db' for Adonis-only fleets
   transports: { bullmq: transports.bullmq({ connection: { host: '127.0.0.1', port: 6379 } }) },
   store: 'lucid',
   stores: { lucid: stores.lucid({ connection: 'pg' }) },
@@ -78,6 +79,40 @@ node ace durable:worker  # store-less tenant loop: serves app/steps, heartbeats,
 Isolation is three-layered: type (`store` is `never` on tenant), container (no
 store binding registered), object (`WorkerRuntime`/`ProxyRunGateway` have no
 store field).
+
+Tenant pods need a transport carrying the run-request protocol: `bullmq`,
+`queue` or `db` (the provider feature-detects the methods). Both sides use the
+same transport and backend. On `queue`, replies go to a per-pod
+`<prefix>:run-replies:<instanceId>` queue and live-tail events are pushed to
+each subscribed pod's `<prefix>:tenant-events:<instanceId>`; the pod announces
+its subscriptions and (with `workerKeys: false`) its worker advertisement to the
+control plane, which records them in its own key store — so the pod needs no
+database:
+
+```ts title="config/durable.ts (tenant pod, queue transport)"
+export default defineConfig({
+  role: 'tenant',
+  transport: 'queue',
+  transports: { queue: transports.queue({ connection: 'redis', workerKeys: false }) },
+  partition: 'acme-corp',
+  tenant: { token: process.env.DURABLE_TENANT_TOKEN },
+})
+```
+
+Queue-transport limits vs bullmq: replies/events are polled (not pushed), a new
+subscription can miss events for about a second, each event costs one job per
+subscribed pod, and live-tail needs a worker-key store on the control plane.
+Source: `docs/transports/queue.mdx` (tenant pods over the queue transport).
+
+On `db`, the pod points `transports.db()` at the control plane's database (it
+still owns no durable store). Requests, starts, replies, decisions and events
+are rows of `durable_transport_messages`; a reply or event is a row addressed to
+one instance, and the pod writes its own `-inbox:` / `-tenant-subscriber:` keys
+and worker advertisement to `durable_transport_worker_keys`. Remote workflow
+turns are task rows of kind `workflow`, and each decision is addressed to the
+engine replica that dispatched the turn. Needs the
+`create_durable_transport_messages` migration (or `autoCreate`). Source:
+`docs/transports/db.mdx` (remote workflows and tenant pods).
 
 ## Core patterns
 
@@ -293,6 +328,28 @@ Mechanism: a worker on no partition serves the bare `<name>` tokens — exactly
 the queues the deployed fleet consumes — so the local process steals production
 tasks; docs call this out under Tenancy pitfalls ("competes for, and steals, the
 deployed fleet's tasks"). Source: `docs/concepts/tenancy.mdx`.
+
+### HIGH a db-transport tenant pod on a database of its own
+
+Wrong:
+
+```ts
+// the pod's default Lucid connection is its own app database
+defineConfig({ role: 'tenant', transport: 'db', transports: { db: transports.db() }, partition: 'acme' })
+```
+
+Correct:
+
+```ts
+// a connection to the CONTROL PLANE's database (config/database.ts), used only for the transport tables
+defineConfig({ role: 'tenant', transport: 'db', transports: { db: transports.db({ connection: 'durable' }) }, partition: 'acme' })
+```
+
+Mechanism: on `db` the wire IS the transport tables, so a pod writing its
+requests to another database is never answered — every `runGateway` call times
+out after `requestTimeoutMs` and no step reaches it. Pods that cannot reach the
+control plane's database need `queue` or `bullmq`. Source:
+`docs/transports/db.mdx` (remote workflows and tenant pods).
 
 ### MEDIUM stamping runs into a namespace nothing polls
 

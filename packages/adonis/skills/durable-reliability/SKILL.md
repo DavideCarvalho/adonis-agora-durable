@@ -296,7 +296,7 @@ Source: `docs/observability/events-and-interceptors.mdx`.
 Wrong:
 
 ```ts
-const stalled = (await engine.workerHealth()).some((g) => g.stalled) // always false on queue/db
+const stalled = (await engine.workerHealth()).some((g) => g.stalled) // always false where no group health is reported (eventEmitter, queue with workerKeys: false)
 ```
 
 Correct:
@@ -308,9 +308,10 @@ const stale = filterStale(
 )
 ```
 
-Mechanism: group health is BullMQ-only — on `queue`, `db` or `eventEmitter`,
+Mechanism: only `bullmq`, `queue` (with a worker-key store) and `db` report group
+health — on `eventEmitter`, or `queue` with `workerKeys: false`,
 `workerHealth()` returns `[]`, not an error, so "no stalled groups reported" says
-nothing. Use the stranded-signature query instead. Source:
+nothing. On `queue`, `depth` counts pending jobs only; on `db`, pending + claimed rows. Use the stranded-signature query instead. Source:
 `docs/reliability/failure-modes.mdx`.
 
 ### MEDIUM writing non-idempotent saga compensations
