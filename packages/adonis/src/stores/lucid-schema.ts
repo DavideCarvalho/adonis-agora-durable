@@ -181,6 +181,7 @@ export async function createDurableTables(
       table.text('tags');
       table.text('search_attributes');
       table.integer('priority');
+      table.text('awaiting_decision_task_id');
       table.bigInteger('created_at').notNullable();
       table.bigInteger('updated_at').notNullable();
       table.index(['status'], 'durable_runs_status_idx');
@@ -217,6 +218,14 @@ export async function createDurableTables(
         table.string('origin');
       });
       repairs.push(`${DURABLE_TABLES.runs}.origin`);
+    }
+    if (!(await conn().hasColumn(DURABLE_TABLES.runs, 'awaiting_decision_task_id'))) {
+      // Remote-turn decision marker (multi-instance decisions): nullable, so an existing run reads back
+      // as "not awaiting a dispatched turn". TEXT: it embeds the run id plus a UUID.
+      await conn().alterTable(DURABLE_TABLES.runs, (table) => {
+        table.text('awaiting_decision_task_id');
+      });
+      repairs.push(`${DURABLE_TABLES.runs}.awaiting_decision_task_id`);
     }
     // Index-only repair: the dashboard's default (unfiltered) listing orders by created_at DESC —
     // without this a page load over a large table is a full sort.

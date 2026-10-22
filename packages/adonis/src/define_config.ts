@@ -230,6 +230,17 @@ export interface BaseDurableConfig {
    */
   remoteRedispatchMax?: number;
   /**
+   * Opt-in liveness window (ms) for a remote (polyglot) workflow TURN. A dispatched turn with no
+   * decision and no run-scoped heartbeat for this long is presumed lost and re-driven: a fresh turn
+   * is dispatched with the same history (the worker's replay is deterministic), and a late decision
+   * of the old one is dropped. Each heartbeat pushes the deadline forward (one write per half
+   * window), so a worker still replaying a long turn is never re-driven — the Python `durable-worker`
+   * and the bundled TS transports beat every 5s while a turn runs. A `RemoteWorkflowExecutor`'s own
+   * `timeoutMs` is the per-workflow version; when both are set the shorter wins. Unset (the default)
+   * waits for the decision with no deadline.
+   */
+  remoteAdvanceSilenceMs?: number;
+  /**
    * The most due timers one timer pass loads and resumes, most overdue first; a larger backlog
    * drains over the next ticks. Every worker runs the pass each tick, and each walks its batch in a
    * shuffled order so instances don't contend for the same leases row by row. Default 500.

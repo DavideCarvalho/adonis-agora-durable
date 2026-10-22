@@ -231,6 +231,17 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         expect(r?.lockedBy).toBe('owner-2');
         expect(r?.wakeAt).toBe(123_456);
         expect(r?.lockedUntil).toBe(222_222);
+
+        // The remote-turn decision marker must round-trip AND clear: the engine sets it when it
+        // suspends on a dispatched turn and clears it (`undefined`) when the decision is applied. A
+        // store that drops it on read, or ignores `undefined` instead of writing NULL, makes every
+        // replica discard the decision (it reads back a stale or absent marker).
+        await store.updateRun('r1', { awaitingDecisionTaskId: 'r1:wf:turn-7' });
+        expect((await store.getRun('r1'))?.awaitingDecisionTaskId).toBe('r1:wf:turn-7');
+        expect(
+          await store.updateRunIf('r1', ['completed'], { awaitingDecisionTaskId: undefined }),
+        ).toBe(true);
+        expect((await store.getRun('r1'))?.awaitingDecisionTaskId).toBeUndefined();
       },
     );
 

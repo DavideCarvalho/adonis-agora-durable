@@ -24,7 +24,7 @@ import {
   type WorkflowTask,
 } from '../interfaces.js';
 import { atLeastOne, Pollers, type PollLoop } from '../pollers.js';
-import { runStepHandler, type StepHandler } from '../protocol.js';
+import { runStepHandler, type StepHandler, withTurnHeartbeat } from '../protocol.js';
 import { sanitizeQueueToken, tenantGroup } from '../tenant-group.js';
 import type { DescriptorRedis } from '../worker-runtime/registry.js';
 import type { WorkflowTurnHandler } from '../workflow-turn.js';
@@ -391,7 +391,7 @@ export class DbTransport implements Transport, ControlPlane {
   readonly #livenessWrites = new Set<Promise<void>>();
   /** Workflow turn consumers by workflow name — a `workflow` task row routes here. */
   readonly #workflowTurns = new Map<string, WorkflowTurnHandler>();
-  /** Every `onDecision` handler: each `RemoteWorkflowExecutor` resolves only its own task ids. */
+  /** Every `onDecision` handler (an engine subscribes one; it applies a decision by run id). */
   readonly #decisionHandlers = new Set<(decision: WorkflowDecision) => Promise<void>>();
   /** Which message loops run (each starts once). */
   readonly #messageLoops = new Set<MessageKind>();
@@ -622,16 +622,19 @@ export class DbTransport implements Transport, ControlPlane {
   /** Worker side: publish a liveness heartbeat for an in-flight long step. */
   async heartbeat(beat: Heartbeat): Promise<void> {
     await this.#ensureSchema();
-    await this.#client().table(TRANSPORT_TABLES.heartbeats).insert({
-      run_id: beat.runId,
-      seq: beat.seq,
-      step_id: beat.stepId,
-      grp: beat.group,
-      namespace: this.#namespaceValue(),
-      claimed_by: null,
-      claimed_at: null,
-      created_at: this.#now(),
-    });
+    await this.#client()
+      .table(TRANSPORT_TABLES.heartbeats)
+      .insert({
+        run_id: beat.runId,
+        seq: beat.seq,
+        // '' for a run-scoped (workflow-turn) beat: the column is NOT NULL.
+        step_id: beat.stepId ?? '',
+        grp: beat.group,
+        namespace: this.#namespaceValue(),
+        claimed_by: null,
+        claimed_at: null,
+        created_at: this.#now(),
+      });
   }
 
   /**
@@ -776,8 +779,8 @@ export class DbTransport implements Transport, ControlPlane {
    * {@link WorkflowDecision}, addressed to the engine that dispatched it, in ONE transaction and only
    * while this round still holds the claim (as a step's result). An unknown workflow or a throwing turn
    * still yields a `failed` decision so the run settles. A row past the poison bound is deleted without
-   * a decision, as on the other transports: a turn carries no step to fail, and the run waits for the
-   * executor's `timeoutMs` or recovery to re-drive it.
+   * a decision, as on the other transports: a turn carries no step to fail, and the turn's liveness
+   * window (`remoteAdvanceSilenceMs` / the executor's `timeoutMs`) re-drives it.
    */
   async #runWorkflowRow(row: TaskRow, token: string): Promise<void> {
     const id = row.step_id;
@@ -855,7 +858,11 @@ export class DbTransport implements Transport, ControlPlane {
       };
     }
     try {
-      return await turn(task);
+      return await withTurnHeartbeat(
+        task,
+        (beat) => this.heartbeat(beat),
+        () => turn(task),
+      );
     } catch (err) {
       this.#onError(err);
       return {
@@ -998,7 +1005,7 @@ export class DbTransport implements Transport, ControlPlane {
           await handler({
             runId: row.run_id,
             seq: Number(row.seq),
-            stepId: row.step_id,
+            ...(row.step_id ? { stepId: row.step_id } : {}),
             group: row.grp,
           });
         })) > 0,
@@ -1248,7 +1255,8 @@ export class DbTransport implements Transport, ControlPlane {
    * engine → workflow worker: a {@link WorkflowTask} as a task row of kind `workflow` on the workflow's
    * routing token, where a {@link handleWorkflow} consumer claims it (with the token's steps, by
    * priority). Stamped with this instance as the decision's recipient when it consumes decisions, so
-   * the decision comes back to the engine awaiting it — never to a sibling replica that would drop it.
+   * the decision comes back to the engine that dispatched the turn (any replica could apply it — the
+   * engine applies decisions durably by run id — but the dispatcher is the one known to be live).
    * Idempotent per `taskId`. Throws when the schema lacks the tasks `kind` column or the messages table.
    */
   async dispatchWorkflowTask(task: WorkflowTask): Promise<void> {
@@ -1295,7 +1303,7 @@ export class DbTransport implements Transport, ControlPlane {
 
   /**
    * engine ← workflow worker: consume {@link WorkflowDecision}s. ONE loop per transport; every handler
-   * sees every decision (each `RemoteWorkflowExecutor` resolves only its own task ids). It claims the
+   * sees every decision (the engine applies one by run id, dropping any its run no longer awaits). It claims the
    * decisions addressed to this instance — consumed even while consumers are deferred, as nobody else
    * may take them — and, once consuming, the unaddressed ones (a worker that did not know whom to
    * reply to). Never backs off: a decision is on the critical path of every remote workflow turn.

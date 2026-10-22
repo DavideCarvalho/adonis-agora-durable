@@ -256,6 +256,10 @@ export default class DurableProvider {
         ...(config.remoteRedispatchMax !== undefined
           ? { remoteRedispatchMax: config.remoteRedispatchMax }
           : {}),
+        // Liveness window of a remote workflow turn (see BaseDurableConfig.remoteAdvanceSilenceMs).
+        ...(config.remoteAdvanceSilenceMs !== undefined
+          ? { remoteAdvanceSilenceMs: config.remoteAdvanceSilenceMs }
+          : {}),
         ...(config.timerBatchSize !== undefined ? { timerBatchSize: config.timerBatchSize } : {}),
         // Where a freshly-started run executes: explicit config wins; else `control-plane` leaves it
         // pending for the poll loop (no inline execution), and `standalone` uses the engine's in-process

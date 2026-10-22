@@ -153,6 +153,21 @@ describe('DurableProvider', () => {
     expect(deps.remoteRedispatchMax).toBe(3);
   });
 
+  it('forwards remoteAdvanceSilenceMs to the engine (unset by default)', async () => {
+    const configured = fakeApp({ remoteAdvanceSilenceMs: 120_000 });
+    new DurableProvider(configured.app).register();
+    const engine = await configured.resolve();
+    expect((engine as unknown as { remoteAdvanceSilenceMs?: number }).remoteAdvanceSilenceMs).toBe(
+      120_000,
+    );
+    const plain = fakeApp();
+    new DurableProvider(plain.app).register();
+    const defaults = await plain.resolve();
+    expect(
+      (defaults as unknown as { remoteAdvanceSilenceMs?: number }).remoteAdvanceSilenceMs,
+    ).toBeUndefined();
+  });
+
   it('forwards timerBatchSize to the engine', async () => {
     const { app, resolve } = fakeApp({ timerBatchSize: 50 });
     new DurableProvider(app).register();
