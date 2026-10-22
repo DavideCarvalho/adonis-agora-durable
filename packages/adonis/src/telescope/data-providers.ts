@@ -1,4 +1,4 @@
-import { type RunStatus, WorkflowEngine } from '../index.js';
+import { type RunStatus, type WorkerStatus, WorkflowEngine } from '../index.js';
 import type { DataProvider, ExtensionContext, TelescopeEntryLike } from './telescope-sdk.js';
 
 /**
@@ -29,7 +29,7 @@ function countByStatus(engine: WorkflowEngine, status: RunStatus): Promise<numbe
 /** The Telescope diagnostic-entry content the durable bridge produces (`payload` is the EngineEvent). */
 interface DurableEntryContent {
   event?: string;
-  payload?: { workflow?: string; runId?: string; durationMs?: number };
+  payload?: { workflow?: string; runId?: string; durationMs?: number; at?: string | number };
 }
 
 /** Resolve the live durable engine from the host container. */
@@ -37,9 +37,43 @@ function engineOf(ctx: ExtensionContext): Promise<WorkflowEngine> {
   return ctx.container.make<WorkflowEngine>(WorkflowEngine);
 }
 
-/** Fetch captured `agora:durable:*` lifecycle entries from Telescope storage (newest-first). */
+/** Run lifecycle events that happen at most once per run between two retries. */
+const ONCE_PER_ATTEMPT = new Set(['run.started', 'run.completed', 'run.failed']);
+
+/**
+ * Collapse copies of ONE lifecycle event recorded by several pods, keeping the first. Before the
+ * bridge forwarded only local events, every pod of a fleet with a control plane recorded every
+ * other pod's events too, so Telescope stores that were shared across pods (or that still hold that
+ * history) count each run N times. The copies share the event's emission instant (`payload.at`, set
+ * once where the event was produced and carried over the control plane), so `event + runId + at` is
+ * an exact identity: a retried run's second `run.failed` or a run's tenth `run.suspended` has its own
+ * instant and is kept. Entries recorded without `at` fall back to `event + runId` for the events that
+ * happen once per attempt; step events and anything without a run id pass through untouched.
+ */
+export function dedupeRunEvents<E extends TelescopeEntryLike>(entries: readonly E[]): E[] {
+  const seen = new Set<string>();
+  const out: E[] = [];
+  for (const e of entries) {
+    const c = contentOf(e);
+    const runId = c.payload?.runId;
+    let key: string | undefined;
+    if (c.event?.startsWith('run.') && runId) {
+      if (c.payload?.at !== undefined) key = `${c.event}:${runId}:${String(c.payload.at)}`;
+      else if (ONCE_PER_ATTEMPT.has(c.event)) key = `${c.event}:${runId}`;
+    }
+    if (key !== undefined) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+    }
+    out.push(e);
+  }
+  return out;
+}
+
+/** Fetch captured `agora:durable:*` lifecycle entries from Telescope storage (newest-first), with
+ *  cross-pod copies of one event collapsed (see {@link dedupeRunEvents}). */
 async function fetchEntries(ctx: ExtensionContext, limit = 5_000): Promise<TelescopeEntryLike[]> {
-  return ctx.store.list({ type: 'diagnostic', tag: 'lib:durable', limit });
+  return dedupeRunEvents(await ctx.store.list({ type: 'diagnostic', tag: 'lib:durable', limit }));
 }
 
 const contentOf = (e: TelescopeEntryLike): DurableEntryContent =>
@@ -148,8 +182,93 @@ export function durableWorkerHealthProvider(): DataProvider {
   };
 }
 
-const STATE_BREAKDOWN_PALETTE = ['#34d399', '#fbbf24', '#f87171', '#38bdf8', '#a78bfa'];
+/** Compact "Nm ago" stamp for an epoch-ms instant. */
+function relAgo(atMs: number): string {
+  const sec = Math.max(0, Math.round((Date.now() - atMs) / 1000));
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.round(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const h = Math.round(min / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+
+/**
+ * The two blanks a worker cell can show, kept apart: `n/a` is a heartbeat that carries no
+ * {@link WorkerStatus} at all (an older SDK), `—` is a status with nothing measured yet for that
+ * field (an idle worker whose rolling window is empty). Reading one as the other sends someone
+ * hunting for a broken worker that is merely idle.
+ */
+const NOT_REPORTED = 'n/a';
+const NOT_YET_MEASURED = '—';
+
+function measured(n: number | undefined, status: WorkerStatus | undefined): number | string {
+  if (typeof n === 'number') return Math.round(n);
+  return status ? NOT_YET_MEASURED : NOT_REPORTED;
+}
+
+/**
+ * One row per LIVE worker instance (not per group), flattening `engine.workerHealth()` with the
+ * {@link WorkerStatus} each heartbeat carries: concurrency mode, limit and range, in-flight
+ * saturation, RSS/CPU, throughput, p95 and the last adaptive adjustment. Groups with a backlog sort
+ * first, then by group and instance id. Empty when the transport cannot report worker health.
+ */
+export function durableWorkerStatusProvider(): DataProvider {
+  return {
+    name: 'durable.workerStatus',
+    async resolve(_query, ctx) {
+      const engine = await engineOf(ctx);
+      const health = await engine.workerHealth();
+      const rows = health
+        .slice()
+        .sort((a, b) => Number(b.depth > 0) - Number(a.depth > 0) || a.group.localeCompare(b.group))
+        .flatMap((group) =>
+          group.liveWorkers
+            .slice()
+            .sort((a, b) => a.instanceId.localeCompare(b.instanceId))
+            .map((worker) => {
+              const status = worker.status;
+              const concurrency = status?.concurrency;
+              const adjust = status?.lastAdjust;
+              return {
+                group: group.group,
+                instanceId: worker.instanceId,
+                mode: concurrency?.mode ?? NOT_REPORTED,
+                limit: concurrency?.limit ?? NOT_REPORTED,
+                minMax:
+                  concurrency?.mode === 'adaptive'
+                    ? `${concurrency.min ?? 1}–${concurrency.max ?? 32}`
+                    : NOT_REPORTED,
+                saturation:
+                  concurrency && status ? `${status.inFlight}/${concurrency.limit}` : NOT_REPORTED,
+                queued: group.depth,
+                rssPct: measured(status?.rssPct, status),
+                cpuPct: measured(status?.cpuPct, status),
+                throughputPerMin: measured(status?.throughputPerMin, status),
+                p95Ms: measured(status?.p95Ms, status),
+                lastAdjust: !status
+                  ? NOT_REPORTED
+                  : adjust
+                    ? `${adjust.reason} ${adjust.from}→${adjust.to} ${relAgo(adjust.at)}`
+                    : NOT_YET_MEASURED,
+                lastBeat: relAgo(worker.lastBeatAt),
+              };
+            }),
+        );
+      return { rows };
+    },
+  };
+}
+
 const STATE_BREAKDOWN_STATUSES: RunStatus[] = ['running', 'pending', 'completed', 'failed', 'dead'];
+/** Segment colors, index-aligned with {@link STATE_BREAKDOWN_STATUSES}. */
+const STATE_BREAKDOWN_PALETTE = [
+  '#38bdf8', // running   → blue
+  '#fbbf24', // pending   → amber
+  '#34d399', // completed → green
+  '#f87171', // failed    → red
+  '#a78bfa', // dead      → purple
+];
 
 /** Pie/donut segments: a count per status from the engine. */
 export function durableStateBreakdownProvider(): DataProvider {

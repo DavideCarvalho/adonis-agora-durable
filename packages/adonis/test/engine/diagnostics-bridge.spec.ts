@@ -1,7 +1,21 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { attachDurableDiagnostics } from '../../src/diagnostics-bridge.js';
 import { WorkflowEngine } from '../../src/engine.js';
+import type { ControlMessage, ControlPlane } from '../../src/interfaces.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
+
+/** A broadcast bus shared by several engines, like a Redis control plane (echoes to the sender). */
+function sharedControlPlane(): ControlPlane {
+  const handlers: Array<(msg: ControlMessage) => void> = [];
+  return {
+    async publishControl(msg) {
+      for (const h of handlers) h(JSON.parse(JSON.stringify(msg)) as ControlMessage);
+    },
+    onControl(handler) {
+      handlers.push(handler);
+    },
+  };
+}
 
 const EMIT_SLOT = Symbol.for('@agora/diagnostics:emit');
 const slot = globalThis as Record<symbol, unknown>;
@@ -72,5 +86,56 @@ describe('attachDurableDiagnostics', () => {
     expect(seen.filter((e) => e.runId === 'p').every((e) => e.parentRunId === undefined)).toBe(
       true,
     );
+  });
+
+  it('forwards only the events this instance produced, so a fleet records each event once', async () => {
+    const seen: Array<{ pod: string; event: string; runId: string }> = [];
+    const store = new InMemoryStateStore();
+    const controlPlane = sharedControlPlane();
+    const worker = new WorkflowEngine({ store, controlPlane, instanceId: 'worker' });
+    const api = new WorkflowEngine({ store, controlPlane, instanceId: 'api' });
+    worker.register('w', '1', async () => 'ok');
+    // Each pod's bridge emits into its own process's diagnostics hub; tag by pod to tell them apart.
+    let pod = '';
+    slot[EMIT_SLOT] = (_lib: string, event: string, payload: unknown) =>
+      seen.push({ pod, event, runId: (payload as { runId: string }).runId });
+    const offWorker = worker.subscribe(() => {
+      pod = 'worker';
+    });
+    const offApi = api.subscribe(() => {
+      pod = 'api';
+    });
+    const detachWorker = attachDurableDiagnostics(worker);
+    const detachApi = attachDurableDiagnostics(api);
+
+    await worker.start('w', {}, 'fleet-1');
+    await worker.waitForRun('fleet-1');
+    await new Promise((r) => setTimeout(r, 10));
+    detachWorker();
+    detachApi();
+    offWorker();
+    offApi();
+
+    const completed = seen.filter((e) => e.event === 'run.completed' && e.runId === 'fleet-1');
+    expect(completed).toHaveLength(1);
+    expect(seen.every((e) => e.pod === 'worker')).toBe(true);
+  });
+
+  it('includeRemote: true also forwards the events heard from other instances', async () => {
+    const events: string[] = [];
+    const store = new InMemoryStateStore();
+    const controlPlane = sharedControlPlane();
+    const worker = new WorkflowEngine({ store, controlPlane, instanceId: 'worker' });
+    const api = new WorkflowEngine({ store, controlPlane, instanceId: 'api' });
+    worker.register('w', '1', async () => 'ok');
+    slot[EMIT_SLOT] = (_lib: string, event: string) => events.push(event);
+    const detach = attachDurableDiagnostics(api, { includeRemote: true });
+
+    await worker.start('w', {}, 'fleet-2');
+    await worker.waitForRun('fleet-2');
+    await new Promise((r) => setTimeout(r, 10));
+    detach();
+
+    expect(events).toContain('run.completed');
   });
 });

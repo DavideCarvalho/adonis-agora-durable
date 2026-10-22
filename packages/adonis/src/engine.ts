@@ -103,6 +103,7 @@ import {
 } from './on-error.js';
 import { breakpointToken, type StepHandler, stepId } from './protocol.js';
 import type { QueueConfig } from './queue.js';
+import { markRemoteEvent } from './remote-event.js';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor.js';
 import { scanRunValueFacets } from './run-value-facets.js';
 import { listSignalWaitersOfRuns } from './run-waiting.js';
@@ -909,7 +910,7 @@ export class WorkflowEngine {
       if (msg.from === this.instanceId) return;
       if (msg.kind === 'event') {
         // `at` may be a string after JSON transit (Redis) — normalize back to a Date.
-        this.deliver({ ...msg.event, at: new Date(msg.event.at) });
+        this.deliver(markRemoteEvent({ ...msg.event, at: new Date(msg.event.at) }));
       } else if (msg.kind === 'cancel') {
         this.notifyCancelled(msg.runId);
       } else if (msg.kind === 'schedulePause') {

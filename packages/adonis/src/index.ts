@@ -99,6 +99,7 @@ export * from './on-error.js';
 export * from './pollers.js';
 export * from './protocol.js';
 export * from './queue.js';
+export { isRemoteEvent } from './remote-event.js';
 export * from './remote-workflow-executor.js';
 export * from './run-detail-summary.js';
 // --- store-less cluster: RunGateway (read/control surface) ------------------
