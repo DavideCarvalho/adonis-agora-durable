@@ -114,6 +114,16 @@ export interface BullMQTransportOptions {
    * Default `30_000`.
    */
   pingIntervalMs?: number | false | undefined;
+  /**
+   * Wall-clock ceiling (ms) for one step handler on THIS worker. A wedged handler (an await that will
+   * never settle: a dead connection swallowed by a wrapper stream, an external call with no timeout)
+   * otherwise holds its BullMQ job forever, because the job lock renews on a timer whether or not the
+   * handler makes progress, so the job is never reclaimed as stalled. When set, a step still running
+   * after `stepTimeoutMs` publishes a RETRYABLE failed StepResult (the engine's durable retry
+   * re-dispatches it) and the orphaned handler promise is abandoned. Opt-in: pick a value well above
+   * your slowest legitimate step. Unset (the default) = no ceiling.
+   */
+  stepTimeoutMs?: number | undefined;
 }
 
 /** Default {@link BullMQTransportOptions.pingIntervalMs}. */
@@ -200,6 +210,7 @@ export class BullMQTransport implements Transport {
   // connections are not tracked: they write, so a dead one fails its next publish instead of silently.
   readonly #subscribers = new Set<RedisLike>();
   readonly #pingIntervalMs: number | false;
+  readonly #stepTimeoutMs: number | undefined;
   #pingWatchdogTimer: ReturnType<typeof setInterval> | undefined;
 
   constructor(options: BullMQTransportOptions) {
@@ -215,6 +226,12 @@ export class BullMQTransport implements Transport {
     this.#resultConcurrency = workerConcurrency(options.resultConcurrency);
     this.#concurrency = options.concurrency;
     this.#pingIntervalMs = normalizePingInterval(options.pingIntervalMs);
+    this.#stepTimeoutMs =
+      options.stepTimeoutMs !== undefined &&
+      Number.isFinite(options.stepTimeoutMs) &&
+      options.stepTimeoutMs > 0
+        ? options.stepTimeoutMs
+        : undefined;
   }
 
   /**
@@ -587,8 +604,9 @@ export class BullMQTransport implements Transport {
   async #runTask(task: RemoteTask): Promise<boolean> {
     let result: StepResult;
     try {
-      result = await runStepHandler(task, this.#handlers.get(task.name), (beat) =>
-        this.heartbeat(beat),
+      result = await this.#withStepTimeout(
+        task,
+        runStepHandler(task, this.#handlers.get(task.name), (beat) => this.heartbeat(beat)),
       );
     } catch (err) {
       // runStepHandler is pure (a handler throw becomes a failed StepResult), so reaching here is a
@@ -619,6 +637,36 @@ export class BullMQTransport implements Transport {
       this.#onError(err);
       throw err;
     }
+  }
+
+  /**
+   * Race a step handler against {@link BullMQTransportOptions.stepTimeoutMs}. At the ceiling, resolve
+   * with a RETRYABLE failed StepResult and abandon the still-pending handler (a wedged await cannot be
+   * cancelled from outside; what matters is that the run stops waiting on it). A rejection settles
+   * through the caller's catch, as before. No ceiling configured: pass-through.
+   */
+  #withStepTimeout(task: RemoteTask, run: Promise<StepResult>): Promise<StepResult> {
+    const ms = this.#stepTimeoutMs;
+    if (ms === undefined) return run;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const ceiling = new Promise<StepResult>((resolve) => {
+      timer = setTimeout(
+        () =>
+          resolve({
+            runId: task.runId,
+            seq: task.seq,
+            stepId: task.stepId,
+            status: 'failed',
+            error: {
+              message: `remote step worker failed: step exceeded stepTimeoutMs (${ms}ms), presumed wedged`,
+              retryable: true,
+            },
+          }),
+        ms,
+      );
+      timer.unref?.();
+    });
+    return Promise.race([run, ceiling]).finally(() => clearTimeout(timer));
   }
 
   /** Worker side: publish a liveness heartbeat for an in-flight long step on the `${P}-heartbeat`

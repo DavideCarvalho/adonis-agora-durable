@@ -234,6 +234,12 @@ export interface BullMQTransportConfig {
    * instead of sitting deaf until a restart. `0` or `false` disables it. Default `30_000`.
    */
   pingIntervalMs?: number | false;
+  /**
+   * Wall-clock ceiling (ms) for one step handler on this worker. A handler still running at the
+   * ceiling is failed RETRYABLE so durable retry re-dispatches the step, instead of a wedged await
+   * holding its job (whose lock keeps renewing) forever. Unset = no ceiling.
+   */
+  stepTimeoutMs?: number;
 }
 
 /** Options for the DB-table-backed (`@adonisjs/lucid`) transport. */
@@ -472,6 +478,7 @@ export const transports = {
           : {}),
         ...(config.onError !== undefined ? { onError: config.onError } : {}),
         ...(config.pingIntervalMs !== undefined ? { pingIntervalMs: config.pingIntervalMs } : {}),
+        ...(config.stepTimeoutMs !== undefined ? { stepTimeoutMs: config.stepTimeoutMs } : {}),
       });
     };
   },
