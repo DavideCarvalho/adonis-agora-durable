@@ -210,6 +210,7 @@ export class InboxRegistry {
   #sweepTimer: ReturnType<typeof setInterval> | undefined;
   #sweeping: Promise<void> | undefined;
   #warned = false;
+  #warnedAdvertisement = false;
 
   constructor(options: InboxRegistryOptions) {
     this.#options = options;
@@ -338,7 +339,19 @@ export class InboxRegistry {
 
   /** Record a forwarded worker advertisement — only keys of the worker advertisement keyspace. */
   async #recordAdvertisement(ad: KeyAdvertisement): Promise<void> {
-    if (!this.#enabled) return;
+    if (!this.#enabled) {
+      if (!this.#warnedAdvertisement) {
+        this.#warnedAdvertisement = true;
+        this.#options.onError(
+          new Error(
+            '[QueueTransport] received a forwarded worker advertisement but has no worker-key store ' +
+              'to record it in (transports.queue() defaults to the app database); the store-less ' +
+              "pod's workers will not appear in groupHealth, the dashboard or handshake negotiation.",
+          ),
+        );
+      }
+      return;
+    }
     const prefix = this.#options.prefix();
     const allowed = (key: string) =>
       key.startsWith(`${prefix}-worker-descriptor:`) ||

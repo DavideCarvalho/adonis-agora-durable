@@ -12,7 +12,7 @@ Real workflows wait — for a delay, or for the outside world. Both kinds of pau
 
 ## Durable sleep
 
-`ctx.sleep(duration: string | number): Promise<void>` suspends the run until the timer is due. Accepts milliseconds as a number, or a duration string such as `'500ms'`, `'30s'`, `'15m'`, `'2h'`, `'7d'`, `'7 days'`, `'1w'` or `'2 weeks'` (units `ms`, `s`/`sec`/`second(s)`, `m`/`min`/`minute(s)`, `h`/`hr`/`hour(s)`, `d`/`day(s)`, `w`/`week(s)`):
+`ctx.sleep(duration: string | number): Promise<void>` suspends the run until the timer is due. Accepts milliseconds as a number, or a duration string such as `'500ms'`, `'30s'`, `'15m'`, `'2h'`, `'7d'`, `'7 days'`, `'1w'` or `'2 weeks'` (units `ms`, `s`/`sec`/`second(s)`, `m`/`min`/`minute(s)`, `h`/`hr`/`hour(s)`, `d`/`day(s)`, `w`/`week(s)`, case-insensitive; a decimal value such as `'1.5h'` works too). An unparseable string throws `invalid duration: …` or `unknown duration unit: …` in the body. `parseDuration` is exported from `@adonis-agora/durable` if you need the same parsing elsewhere:
 
 ```ts
 await ctx.localStep('draft', () => generate(topic))
@@ -32,6 +32,10 @@ To wait until a specific moment instead of for a duration, use `ctx.sleepUntil(w
 await ctx.sleepUntil(new Date('2026-12-31T00:00:00Z'))
 ```
 
+`sleepUntil` records the same `sleep` checkpoint as `sleep`, so it replays the same way. A target already in the past still records the checkpoint and suspends once; the next timer pass (`resumeDueTimers`) resumes it straight away.
+
+To delay a run's **first** step rather than pause in the middle, don't open the body with a sleep: pass `startAt` to `engine.start` and the run is created parked until then, with no sleep in its history. See [Delayed starts](/docs/durable/concepts/workflows-and-steps#delayed-starts--startat).
+
 <Callout type="info">
 Capture the target time deterministically — derive it from a checkpointed value (a step result, `ctx.now()`), never from a raw `Date.now()` in the body. See [Versioning & determinism](/docs/durable/authoring/versioning).
 </Callout>
@@ -48,9 +52,14 @@ if (!decision.approved) return { status: 'rejected' }
 Deliver the signal from anywhere — typically a controller — via `engine.signal`:
 
 ```ts title="app/controllers/approvals_controller.ts"
-async approve({ params, request, response }: HttpContext) {
-  await this.engine.signal(`approve:${params.id}`, request.body()) // resumes the run with the payload
-  return response.noContent()
+import type { HttpContext } from '@adonisjs/core/http'
+import engine from '@adonis-agora/durable/services/main'
+
+export default class ApprovalsController {
+  async approve({ params, request, response }: HttpContext) {
+    await engine.signal(`approve:${params.id}`, request.body()) // resumes the run with the payload
+    return response.noContent()
+  }
 }
 ```
 
@@ -130,7 +139,7 @@ await engine.publishEvent('payment.settled', { orderId, amount })
 
 ### Reliable (buffered) events
 
-A publish that reaches **no** live recipient (no `waitForEvent` matched *and* no `onEvent` subscriber exists) is **buffered** rather than dropped. One copy is kept, and the first future `ctx.waitForEvent(name, { match })` that accepts its payload consumes it. This is the events equivalent of signal buffering, and it handles the publish/wait race in both directions. Pass `{ buffer: false }` to `publishEvent` for a live-only broadcast. On the [Lucid store](/docs/durable/stores/lucid), the copies live in the `durable_buffered_events` table. See [Reliable (buffered) delivery](/docs/durable/authoring/events#reliable-buffered-delivery) for the claim order and its limits.
+A publish that reaches **no** live recipient (no `waitForEvent` matched *and* no `onEvent` subscriber exists) is **buffered** rather than dropped. One copy is kept, and the first future `ctx.waitForEvent(name, { match })` that accepts its payload consumes it. Unlike a buffered signal, a buffered event can be given an expiry with `eventBufferTtl` in `config/durable.ts`. This is the events equivalent of signal buffering, and it handles the publish/wait race in both directions. Pass `{ buffer: false }` to `publishEvent` for a live-only broadcast. On the [Lucid store](/docs/durable/stores/lucid), the copies live in the `durable_buffered_events` table. See [Reliable (buffered) delivery](/docs/durable/authoring/events#reliable-buffered-delivery) for the claim order and its limits.
 
 ## Signals vs updates vs webhooks
 
@@ -142,6 +151,29 @@ All three suspend a run with zero compute until an external call resumes it, but
 | **Update** (`ctx.onUpdate` / `engine.update`) | Run-scoped name | Yes — an optional validator can reject before touching the run | Steering a run from outside with a rejectable business rule |
 | **Webhook** (`ctx.webhook()` / `hook.wait()`) | Deterministic per-call token (`wh:<runId>:<seq>`), with a public URL | No — a raw signal under the hood | Third-party async callbacks |
 
-An update is a signal with a validator in front (rejection happens in the caller's request, before the run ever wakes) and a run-scoped name instead of a global token. A webhook is a signal with the token and callback URL minted for you — your route in `start/routes.ts` turns the third party's POST into `engine.signal(token, body)`.
+An update is a signal with a validator in front (rejection happens in the caller's request, before the run ever wakes) and a run-scoped name instead of a global token. A webhook is a signal with the token and callback URL minted for you. The dashboard's `POST <path>/api/webhooks/:token` route, or a route of your own in `start/routes.ts`, turns the third party's POST into `engine.signal(token, body)`; see [Delivering the callback](/docs/durable/authoring/webhooks#delivering-the-callback).
 
 For a validated, rejectable steering primitive (Temporal-style updates) and a side-effect-free way to read a live run's state, see [Queries & updates](/docs/durable/authoring/queries-and-updates). For the deterministic callback-URL pattern, see [Durable webhooks](/docs/durable/authoring/webhooks).
+
+## Patterns
+
+**Human approval with a visible status.** Publish a queryable status with [`ctx.setEvent`](/docs/durable/authoring/queries-and-updates#publishing-a-value--ctxseteventkey-value) before parking, so a controller can show "awaiting approval" through `engine.getEvent(runId, 'status')`, and let the timeout fall through to an expiry branch:
+
+```ts
+await ctx.setEvent('status', 'awaiting-approval')
+try {
+  const decision = await ctx.waitForSignal<{ approved: boolean }>(`approve:${order.id}`, {
+    timeoutMs: 3 * 24 * 60 * 60 * 1000, // 3 days
+  })
+  await ctx.setEvent('status', decision.approved ? 'approved' : 'rejected')
+  return decision
+} catch (err) {
+  if (!(err instanceof SignalTimeoutError)) throw err
+  await ctx.setEvent('status', 'expired')
+  return { approved: false }
+}
+```
+
+If the caller must get a synchronous rejection for a bad decision, not just a run that ignores it, use `ctx.onUpdate` with a validator instead (see [Updates](/docs/durable/authoring/queries-and-updates#updates)).
+
+**One long-lived run per key.** `engine.signalWithStart` feeding a run that loops on `waitForSignal` is the accumulator shown above. For the packaged version, with per-key state and request/reply operations, see [Entities](/docs/durable/authoring/entities). Bound its history with [`ctx.continueAsNew`](/docs/durable/authoring/child-workflows#continue-as-new).

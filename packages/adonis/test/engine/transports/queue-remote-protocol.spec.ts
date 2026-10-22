@@ -624,6 +624,22 @@ describe('QueueTransport — store-less protocol and remote workflows', () => {
       expect(String(errors[0])).toContain('no worker-key store');
     });
 
+    it('a control plane without a worker-key store reports, once, that forwarded worker advertisements are dropped', async () => {
+      const adapter = new MockAdapter();
+      const errors: unknown[] = [];
+      controlPlane(adapter, undefined, { onError: (e) => errors.push(e) });
+      const pod = make(adapter, { instanceId: 'pod' });
+      pod.useTenantRole();
+      const writer = pod.createDescriptorRedis();
+      await writer.set('durable-worker-heartbeat:charge:pod', '{}', 'EX', 30);
+      await until(() => errors.length > 0);
+      await writer.set('durable-worker-heartbeat:charge:pod', '{}', 'EX', 30);
+      await new Promise((r) => setTimeout(r, POLL * 5));
+      expect(errors).toHaveLength(1);
+      expect(String(errors[0])).toContain('no worker-key store');
+      expect(String(errors[0])).toContain('worker advertisement');
+    });
+
     it('namespace folding applies to the inbox queues, registrations and keys', async () => {
       const adapter = new MockAdapter();
       const keys = new MemoryWorkerKeys();

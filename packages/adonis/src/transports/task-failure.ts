@@ -38,3 +38,23 @@ export function infrastructureFailure(identity: TaskIdentity, reason: string): S
     error: { message: `remote step worker failed: ${reason}`, retryable: true },
   };
 }
+
+/**
+ * Hand `decision` to every `onDecision` handler and wait for ALL of them to settle before reporting.
+ * With `Promise.all` the carrier failed (and redelivered) the job the moment the first handler
+ * rejected, while the others were still running, so the redelivery ran them again concurrently with
+ * themselves, and only that first failure was ever reported. Each failure but the first goes to
+ * `onError`; the first is rethrown so the carrier reports it and redelivers the decision, which is
+ * safe: the engine applies a decision at most once, fenced by its task id.
+ */
+export async function fanOutDecision<D>(
+  handlers: Iterable<(decision: D) => Promise<void>>,
+  decision: D,
+  onError: (err: unknown) => void,
+): Promise<void> {
+  const settled = await Promise.allSettled([...handlers].map((h) => h(decision)));
+  const failures = settled.flatMap((s) => (s.status === 'rejected' ? [s.reason] : []));
+  if (failures.length === 0) return;
+  for (const err of failures.slice(1)) onError(err);
+  throw failures[0];
+}

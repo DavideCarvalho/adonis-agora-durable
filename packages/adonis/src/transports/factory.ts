@@ -18,6 +18,24 @@ export interface TransportContext {
     container: { make(service: unknown): Promise<unknown> };
     config: { get<T>(key: string, defaultValue?: T): T };
   };
+  /**
+   * The process's top-level `partition` (a `tenant` pod's tenant), forwarded by the provider so a
+   * transport configured without its own `partition` consumes the `<name>@<partition>` queues the
+   * control plane dispatches that tenant's work to. A transport-level `partition` wins.
+   */
+  partition?: string | undefined;
+  /** The process's top-level `instanceId`, the default for a transport without its own. */
+  instanceId?: string | undefined;
+}
+
+/** A transport option that falls back to the provider-forwarded top-level value. */
+function inherited(
+  key: 'partition' | 'instanceId',
+  own: string | undefined,
+  ctx: TransportContext,
+): Record<string, string> {
+  const value = own ?? ctx[key];
+  return value !== undefined ? { [key]: value } : {};
 }
 
 /**
@@ -228,6 +246,18 @@ export interface BullMQTransportConfig {
   closeTimeoutMs?: number;
   /** Receives transport failures (including pub/sub subscribe failures). Default: swallowed or `console.warn`. */
   onError?: (err: unknown) => void;
+  /**
+   * How often (ms) to PING each pub/sub subscriber connection (heartbeats, run replies, tenant
+   * events) so a connection a VPN/NAT/idle timeout dropped silently is reconnected and resubscribed
+   * instead of sitting deaf until a restart. `0` or `false` disables it. Default `30_000`.
+   */
+  pingIntervalMs?: number | false;
+  /**
+   * Wall-clock ceiling (ms) for one step handler on this worker. A handler still running at the
+   * ceiling is failed RETRYABLE so durable retry re-dispatches the step, instead of a wedged await
+   * holding its job (whose lock keeps renewing) forever. Unset = no ceiling.
+   */
+  stepTimeoutMs?: number;
 }
 
 /** Options for the DB-table-backed (`@adonisjs/lucid`) transport. */
@@ -285,6 +315,8 @@ export interface DbTransportConfig {
   maxStalledCount?: number;
   /** How often (ms) a worker refreshes its liveness key per served step name. Default 10000. */
   workerHeartbeatIntervalMs?: number;
+  /** How long a read of the worker keys (groupHealth, listWorkerGroups) is reused (ms). Default 5000. */
+  workerKeysCacheMs?: number;
   /** Create the transport tables on first use if missing (and add newer columns). Default true. */
   autoCreate?: boolean;
   /** Stable id for this process (stamped on heartbeats / control `from` / `claimed_by`). Default random. */
@@ -380,11 +412,11 @@ export const transports = {
    * (mirroring a real broker), unlike the test-only {@link transports.memory}.
    */
   eventEmitter(config: EventEmitterTransportConfig = {}): TransportFactory {
-    return async () => {
+    return async (ctx) => {
       const { EventEmitterTransport } = await import('./event-emitter.js');
       return new EventEmitterTransport({
         ...(config.group !== undefined ? { group: config.group } : {}),
-        ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+        ...inherited('instanceId', config.instanceId, ctx),
         ...(config.onError !== undefined ? { onError: config.onError } : {}),
       });
     };
@@ -403,7 +435,7 @@ export const transports = {
           ? { workerKeysCacheMs: config.workerKeysCacheMs }
           : {}),
         ...(config.group !== undefined ? { group: config.group } : {}),
-        ...(config.partition !== undefined ? { partition: config.partition } : {}),
+        ...inherited('partition', config.partition, ctx),
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
         ...(config.prefix !== undefined ? { prefix: config.prefix } : {}),
         ...(config.pollIntervalMs !== undefined ? { pollIntervalMs: config.pollIntervalMs } : {}),
@@ -425,7 +457,7 @@ export const transports = {
         ...(config.maxStalledCount !== undefined
           ? { maxStalledCount: config.maxStalledCount }
           : {}),
-        ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+        ...inherited('instanceId', config.instanceId, ctx),
         ...(config.onError !== undefined ? { onError: config.onError } : {}),
         ...(config.inboxTtlMs !== undefined ? { inboxTtlMs: config.inboxTtlMs } : {}),
         ...(config.tenantSubscribersCacheMs !== undefined
@@ -446,7 +478,7 @@ export const transports = {
    * reimplement the control plane). `bullmq`/`ioredis` are imported lazily, only when selected.
    */
   bullmq(config: BullMQTransportConfig): TransportFactory {
-    return async () => {
+    return async (ctx) => {
       const { BullMQTransport } = await import('./bullmq/bullmq-transport.js');
       const { createBullMQDeps } = await import('./bullmq/deps.js');
       const deps = await createBullMQDeps(
@@ -456,15 +488,17 @@ export const transports = {
       return new BullMQTransport({
         deps,
         ...(config.concurrency !== undefined ? { concurrency: config.concurrency } : {}),
-        ...(config.partition !== undefined ? { partition: config.partition } : {}),
+        ...inherited('partition', config.partition, ctx),
         ...(config.prefix !== undefined ? { prefix: config.prefix } : {}),
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
-        ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+        ...inherited('instanceId', config.instanceId, ctx),
         ...(config.closeTimeoutMs !== undefined ? { closeTimeoutMs: config.closeTimeoutMs } : {}),
         ...(config.resultConcurrency !== undefined
           ? { resultConcurrency: config.resultConcurrency }
           : {}),
         ...(config.onError !== undefined ? { onError: config.onError } : {}),
+        ...(config.pingIntervalMs !== undefined ? { pingIntervalMs: config.pingIntervalMs } : {}),
+        ...(config.stepTimeoutMs !== undefined ? { stepTimeoutMs: config.stepTimeoutMs } : {}),
       });
     };
   },
@@ -477,7 +511,7 @@ export const transports = {
       return new DbTransport({
         db,
         ...(config.group !== undefined ? { group: config.group } : {}),
-        ...(config.partition !== undefined ? { partition: config.partition } : {}),
+        ...inherited('partition', config.partition, ctx),
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
         ...(config.connection !== undefined ? { connectionName: config.connection } : {}),
         ...(config.pollIntervalMs !== undefined ? { pollIntervalMs: config.pollIntervalMs } : {}),
@@ -494,8 +528,11 @@ export const transports = {
         ...(config.workerHeartbeatIntervalMs !== undefined
           ? { workerHeartbeatIntervalMs: config.workerHeartbeatIntervalMs }
           : {}),
+        ...(config.workerKeysCacheMs !== undefined
+          ? { workerKeysCacheMs: config.workerKeysCacheMs }
+          : {}),
         ...(config.autoCreate !== undefined ? { autoCreate: config.autoCreate } : {}),
-        ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+        ...inherited('instanceId', config.instanceId, ctx),
         ...(config.onError !== undefined ? { onError: config.onError } : {}),
         ...(config.closeTimeoutMs !== undefined ? { closeTimeoutMs: config.closeTimeoutMs } : {}),
         ...(config.inboxTtlMs !== undefined ? { inboxTtlMs: config.inboxTtlMs } : {}),

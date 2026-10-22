@@ -14,6 +14,7 @@ export type {
 } from './admissions/factory.js';
 // --- config-driven admission drivers ----------------------------------------
 export { admissions } from './admissions/factory.js';
+export { currentStep } from './ambient-step.js';
 export {
   BaseWorkflow,
   setWorkflowEngineResolver,
@@ -90,6 +91,7 @@ export { childIdsOf, parentRunIdOf } from './fan-join.js';
 // --- store-less cluster: handshake & capability negotiation -----------------
 export * from './handshake/announced.js';
 export * from './handshake/descriptor.js';
+export * from './handshake/directory.js';
 export * from './handshake/negotiate.js';
 export * from './handshake/routing.js';
 export * from './interfaces.js';
@@ -99,8 +101,10 @@ export * from './on-error.js';
 export * from './pollers.js';
 export * from './protocol.js';
 export * from './queue.js';
+export { isRemoteEvent } from './remote-event.js';
 export * from './remote-workflow-executor.js';
 export * from './run-detail-summary.js';
+export * from './run-facets.js';
 // --- store-less cluster: RunGateway (read/control surface) ------------------
 export type { DurableTopology, RunGateway, StartRunOptions } from './run-gateway/interface.js';
 export {
@@ -112,6 +116,7 @@ export {
   type ResponderTransport,
   RunRequestResponder,
   type RunRequestResponderOptions,
+  UNSUPPORTED_RUN_REQUEST,
 } from './run-gateway/run-request-responder.js';
 export {
   type RunGatewayEngine,
@@ -125,6 +130,9 @@ export * from './run-waiting.js';
 export * from './scheduler.js';
 export * from './schedules.js';
 export * from './search-attributes.js';
+export * from './search-attributes-schema.js';
+export * from './singleton-admission.js';
+export * from './standard-schema.js';
 export * from './step-discovery.js';
 export {
   DURABLE_STEP_CONFIG,
@@ -140,8 +148,15 @@ export type { LucidStoreConfig, StoreContext, StoreFactory } from './stores/fact
 export { stores } from './stores/factory.js';
 export { LucidStateStore, type LucidStateStoreOptions } from './stores/lucid.js';
 export {
+  type CorruptJsonColumn,
+  onCorruptJsonColumn,
+} from './stores/lucid-mappers.js';
+export {
   type CreateDurableTablesOptions,
   createDurableTables,
+  DURABLE_JSON_COLUMNS,
+  DURABLE_SCHEMA_META_TABLE,
+  DURABLE_SCHEMA_REVISION,
   DURABLE_TABLES,
   type DurableSchemaLogger,
   dropDurableTables,

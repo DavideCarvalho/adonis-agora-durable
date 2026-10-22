@@ -84,6 +84,19 @@ const idParam = {
   description: 'The run id.',
 } as const;
 
+/** The run-detail routes are versioned: a 200 carries an `ETag` when the store aggregates. */
+const ifNoneMatchParam = {
+  name: 'If-None-Match',
+  in: 'header',
+  schema: { type: 'string' },
+  description:
+    'The `ETag` of the response the client holds. Still current: a bodiless 304. Sent by the browser on its own, as the 200 is `Cache-Control: private, no-cache`.',
+} as const;
+
+const notModifiedResponse = {
+  description: 'Unchanged since the `ETag` in `If-None-Match`. No body.',
+} as const;
+
 const nameParam = (what: string) =>
   ({
     name: 'name',
@@ -181,7 +194,11 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
         get: {
           summary:
             "A run's detail: the run, its step timeline, its children. A fan with more than 50 members is summarized into `fans` unless `full=true`",
-          parameters: [idParam, { name: 'full', in: 'query', schema: { type: 'boolean' } }],
+          parameters: [
+            idParam,
+            { name: 'full', in: 'query', schema: { type: 'boolean' } },
+            ifNoneMatchParam,
+          ],
           responses: {
             '200': jsonResponse('Run detail.', {
               type: 'object',
@@ -193,6 +210,7 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
                 childCount: { type: 'integer' },
               },
             }),
+            '304': notModifiedResponse,
             '404': err('Unknown run.'),
           },
         },
@@ -206,8 +224,10 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
             { name: 'offset', in: 'query', schema: { type: 'integer' } },
             { name: 'limit', in: 'query', schema: { type: 'integer' } },
             { name: 'failed', in: 'query', schema: { type: 'boolean' } },
+            ifNoneMatchParam,
           ],
           responses: {
+            '304': notModifiedResponse,
             '200': jsonResponse('A page of members.', {
               type: 'object',
               properties: {
@@ -408,6 +428,62 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
         get: {
           summary: 'Worker-group health (compact)',
           responses: { '200': jsonResponse('Groups.', { type: 'object' }) },
+        },
+      },
+      '/runs/{id}/events/{key}': {
+        get: {
+          summary: 'The latest value the run published for `key` via ctx.setEvent',
+          parameters: [
+            idParam,
+            {
+              name: 'key',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'The event key.',
+            },
+          ],
+          responses: {
+            '200': jsonResponse('`{ value }`; `value` absent when never published.', {
+              type: 'object',
+            }),
+            '404': err('Unknown run, or unavailable on this topology.'),
+          },
+        },
+      },
+      '/webhooks/{token}': {
+        post: {
+          summary: 'Deliver a ctx.webhook() callback; the body resumes the waiting run',
+          parameters: [
+            {
+              name: 'token',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'The webhook token (`wh:<runId>:<seq>`).',
+            },
+          ],
+          requestBody: { required: false, content: { 'application/json': { schema: {} } } },
+          responses: {
+            '200': jsonResponse('`{ result }` — the waiting run was resumed.', { type: 'object' }),
+            '202': jsonResponse(
+              '`{ buffered: true }` — the run is live but not waiting yet; its `wait()` consumes it.',
+              { type: 'object' },
+            ),
+            '404': err('Not a webhook token, an unknown or terminal run, or already delivered.'),
+            '413': err('Payload too large.'),
+          },
+        },
+      },
+      '/metrics': {
+        get: {
+          summary: 'Prometheus text exposition: event counters plus backlog and worker gauges',
+          responses: {
+            '200': {
+              description: 'Prometheus text format 0.0.4.',
+              content: { 'text/plain': { schema: { type: 'string' } } },
+            },
+          },
         },
       },
       '/workers': {

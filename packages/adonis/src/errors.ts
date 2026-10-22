@@ -96,6 +96,27 @@ export class RemoteStepTimeout extends Error {
 }
 
 /**
+ * Raised when an INLINE remote workflow `advance` (an executor that returns its decision in-process)
+ * neither produced a decision nor received a run-scoped heartbeat within the engine's
+ * `remoteAdvanceSilenceMs` — the worker is presumed gone. NOT a run failure: the work may have
+ * completed and only the decision was lost. The engine releases the run lease and leaves the run
+ * `running`, so crash recovery re-drives it (replaying completed steps from history). An executor may
+ * throw it too, to ask for the same recovery instead of a failed run.
+ */
+export class RemoteWorkflowTimeout extends Error {
+  readonly taskId: string;
+  readonly timeoutMs: number | undefined;
+  constructor(taskId: string, timeoutMs?: number) {
+    super(
+      `remote workflow task ${taskId} produced no decision within ${timeoutMs}ms — presumed lost; re-driving via recovery`,
+    );
+    this.name = 'RemoteWorkflowTimeout';
+    this.taskId = taskId;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+/**
  * Thrown on resume when the workflow code no longer matches the recorded history: the step at a
  * logical position has a different name/kind than the checkpoint saved there. This means the
  * workflow definition changed (a step was added/removed/reordered) under an in-flight run without a
@@ -146,6 +167,49 @@ export class NestedWorkflowCallError extends FatalError {
     this.runId = runId;
     this.primitive = primitive;
     this.step = step;
+  }
+}
+
+/** One Standard Schema issue in JSON-safe form: its message and the dotted-path segments. */
+export interface SchemaIssue {
+  message: string;
+  path: string[];
+}
+
+/**
+ * Thrown when a value fails a Standard Schema (zod / valibot / arktype / …) the app declared: a
+ * `@Step({ input, output })` schema, a workflow's `inputSchema`, or its typed `searchAttributes`.
+ * A `FatalError` (code `schema_validation`), so it is NOT retried — retrying cannot fix a payload
+ * that doesn't match its schema. `issues` (also in `details.issues`, so it survives the transport
+ * to the run's error / an `onError` handler) lists every issue with a JSON-safe `path`. Route it
+ * with `onError: [{ code: SchemaValidationError, workflow: … }]`.
+ */
+export class SchemaValidationError extends FatalError {
+  static readonly code = 'schema_validation';
+  readonly issues: SchemaIssue[];
+  constructor(
+    label: string,
+    issues: ReadonlyArray<{
+      readonly message: string;
+      readonly path?: ReadonlyArray<PropertyKey | { readonly key: PropertyKey }> | undefined;
+    }>,
+  ) {
+    const normalized = issues.map((issue) => ({
+      message: issue.message,
+      path: (issue.path ?? []).map((segment) =>
+        String(typeof segment === 'object' && segment !== null ? segment.key : segment),
+      ),
+    }));
+    const summary = normalized
+      .map(
+        (issue) => `${issue.path.length > 0 ? issue.path.join('.') : '(root)'}: ${issue.message}`,
+      )
+      .join('; ');
+    super(`${label} failed schema validation — ${summary}`, SchemaValidationError.code, {
+      issues: normalized,
+    });
+    this.name = 'SchemaValidationError';
+    this.issues = normalized;
   }
 }
 

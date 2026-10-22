@@ -78,7 +78,7 @@ Non-determinism isn't the only way a workflow body silently breaks — the plugi
 
 Every rule in the plugin is **AST-scoped** — it only fires *inside a workflow body*, recognizing both forms Agora supports:
 
-- **The function form** — the function passed to `engine.register(name, version, fn)` (and `registerRemote` / `registerEntity`), where the receiver reads as a workflow engine (`engine`, `workflowEngine`, `this.engine`, …). An unrelated `someRegistry.register(...)` is left alone.
+- **The function form** — the function passed to `engine.register(name, version, fn)` (and `registerRemote` / `registerEntity`), where the receiver reads as a workflow engine: any identifier or member whose name contains `engine`, case-insensitively (`engine`, `workflowEngine`, `this.engine`, …). An unrelated `someRegistry.register(...)` is left alone.
 - **The class form** — the `run` method of a workflow class: a `BaseWorkflow` subclass, or any class carrying a `static workflow = { name, … }` config.
 
 Crucially, the rules **stop at a `ctx.localStep(...)`, `ctx.task(...)`, or `ctx.sideEffect(...)` callback boundary**: those are the checkpoint-callback primitives whose body runs once and whose whole result is recorded, so a `Date.now()`, a `try/catch`, or a `fetch()` inside one is fine. (`ctx.step` is **not** a boundary — it is the always-dispatched step whose second argument is data, not a callback.) Only the deterministic orchestration prefix is checked, so you can enable the rules across your whole `**/*.ts` glob without false positives. Code outside a workflow body — a controller, a service, a step handler under `app/steps` that runs once and checkpoints its result — is never touched, because it isn't replayed.
@@ -112,6 +112,14 @@ export default [
   durable.configs.recommended,
 ]
 ```
+
+The preset registers the plugin and sets the three rules; it carries no `files` glob, so it applies to whatever your other config objects match. To scope it, spread it into your own object: `{ files: ['app/**/*.ts'], ...durable.configs.recommended }`. None of the rules take options. Besides the default export, the package also exports `rules`, `configs`, and the individual rule objects (`noNondeterminism`, `rethrowControlFlowSignals`, `noIoInWorkflowBody`) for custom setups.
+
+| Rule | Type | Fixable |
+| --- | --- | --- |
+| `@adonis-agora/durable/no-nondeterminism` | problem | no |
+| `@adonis-agora/durable/rethrow-control-flow-signals` | problem | editor suggestion (inserts the guard) |
+| `@adonis-agora/durable/no-io-in-workflow-body` | problem | no |
 
 Each report points at the exact call and names its deterministic replacement, e.g. *"Non-deterministic `Date.now()` inside a durable workflow body — use `ctx.now()` (recorded once, then replayed)."*
 

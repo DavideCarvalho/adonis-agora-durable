@@ -23,6 +23,8 @@ A useful shorthand: `namespace` is what a control plane **polls**; `partition` i
 ## `namespace` — the store poll scope
 
 ```ts title="config/durable.ts"
+import { defineConfig, stores, transports } from '@adonis-agora/durable'
+
 export default defineConfig({
   namespace: 'blue',      // this engine's pool
   transport: 'bullmq',
@@ -44,16 +46,30 @@ It isolates two things at once:
 Both follow one **default-is-bare** rule: `'default'` (the default value) leaves every name
 byte-identical to a single-pool deployment. Only a real, non-default namespace prefixes anything.
 
-**Leaving `namespace` unset makes the engine an operator.** It then scopes nothing: the store's poll
-filters no-op, so it drives, recovers and resumes runs of *every* namespace, and its transports stay on
-the bare prefix. "Seeing everyone" is the absence of a namespace, not a wildcard value — `'default'` is
-an ordinary namespace like any other, and an engine set to it sees only its own runs.
+**What an unset `namespace` means depends on the role.** On a `standalone` engine (the default role)
+it means `'default'`: the provider gives the engine `namespace: 'default'`, so it drives, recovers and
+resumes only the default pool's runs. That includes legacy rows written before runs carried a
+namespace: the Lucid schema heal adds the column as `NOT NULL DEFAULT 'default'`, and every shipped store
+reads a missing (`NULL`) value back as `'default'`. An empty string is the default pool too, as it is
+for the transports: an engine configured with `namespace: ''` stamps and polls `'default'`, the stores
+write `''` as `'default'`, and a legacy row stored with `''` reads back as `'default'` and matches every
+`'default'` filter. On a
+`control-plane` it makes the engine the **operator**: it scopes nothing, so the store's poll filters
+no-op, it drives runs of *every* namespace, and its transports stay on the bare prefix. "Seeing
+everyone" is the absence of a namespace on a control plane, not a wildcard value. There is no standalone
+operator: a process that must drive every pool is a `control-plane`.
+
+<Callout type="warn">
+Behaviour change. A standalone engine without a `namespace` used to be the operator, driving every
+pool's runs on a shared store. It now stays in `'default'`. If you relied on that, move the process to
+`role: 'control-plane'`.
+</Callout>
 
 <Callout type="info">
-The engine's namespace and a run's namespace are not the same kind of value. The engine's may be
+The engine's namespace and a run's namespace are not the same kind of value. A control plane's may be
 `undefined` (the operator). A **stored run's** never is: every store normalizes it to `'default'` on
-write, matching the SQL column default. So "an engine with no namespace" and "a run with no namespace"
-mean different things, and only the first one means *all*.
+write, matching the SQL column default. So "a control plane with no namespace" and "a run with no
+namespace" mean different things, and only the first one means *all*.
 </Callout>
 
 ## `partition` — the queue suffix
@@ -88,17 +104,35 @@ one step; omitted, it inherits the worker's partition, so a workflow and the ste
 in the same pool by default. The same suffix is what a
 [Python worker](/docs/durable/python) matches with `run_redis_worker(worker, partition=...)`.
 
+## The wire between control plane and tenant
+
+A store-less pod holds no database credentials. Everything it would otherwise read from or write to
+the store crosses the transport as plain JSON, in the same shapes the NestJS and Python SDKs use:
+
+- **`StartRunMessage`** on `<prefix>-start-run`: `{ tenant, workflow, input, runId?, tags?,
+  searchAttributes? }`. The control plane turns it into a durable run.
+- **`RunRequest` / `RunReply`** on `<prefix>-run-request` and `<prefix>-run-reply`, correlated by
+  `requestId`: every read and control verb (`getRunDetail`, `listRuns`, `cancel`, `retry`,
+  `continue`, `retryWithInput`, …) proxied to the control plane and answered on the reply.
+- **`TenantEvent`**: lifecycle events re-published per tenant, so a tenant's dashboard can tail its
+  own runs live.
+
+Which verbs each role exposes is covered in
+[Reading and steering runs](/docs/durable/cluster/roles-and-config#reading-and-steering-runs-rungateway).
+
 ## The isolation boundary
 
-A store-less pod holds no database credentials, so every read, control action and run-start it
-performs is a wire request answered by the control plane's `RunRequestResponder`. That responder — not
-the client — is the boundary, and it enforces:
+Every read, control action and run-start a store-less pod performs is a wire request answered by the
+control plane's `RunRequestResponder`. That responder — not the client — is the boundary, and it
+enforces:
 
-- **`listRuns` is namespace-forced** to the tenant it derived. The client's `namespace` is
-  *discarded*, never merely validated, so a tenant cannot widen its query into another's.
-- **Every runId-bearing verb** (`getRun`, `getCheckpoints`, `getSearchAttributes`, `signal`, `cancel`,
-  `redispatch`) loads the run **first** and rejects with `cross-tenant` when `run.namespace` isn't the
-  derived tenant — anti-IDOR, before anything mutates.
+- **`listRuns`, `runFacets` and `runValueFacets` are namespace-forced** to the tenant it derived. The
+  client's `namespace` is *discarded*, never merely validated, so a tenant cannot list, count or read
+  the tag vocabulary of another's runs. **`waitingFor`** answers only for the run ids the tenant owns.
+- **Every runId-bearing verb** (`getRun`, `getCheckpoints`, `getRunChildren`, `getRunDetail`,
+  `getFanMembers`, `getSearchAttributes`, `signal`, `cancel`, `redispatch`, `retry`, `continue`,
+  `retryWithInput`) loads the run **first** and rejects with `cross-tenant` when `run.namespace` isn't
+  the derived tenant — anti-IDOR, before anything is read or mutated.
 - **`workerHealth` is group-scoped** to the tenant's own `@<tenant>` queues; the operator's bare groups
   and every other tenant's are dropped.
 - **`start` forces the run's namespace** to the derived tenant, so a run a tenant starts is owned by,
@@ -114,6 +148,17 @@ Pair this with
 network/prefix segmentation, plus a signed token the control plane derives the tenant *from* instead of
 trusting the body.
 </Callout>
+
+## Read scoping: `scopeReads`
+
+The responder fences what a store-less pod can reach. A process that **does** hold the store can be
+fenced too: with `scopeReads: true` and a namespace in effect (an explicit `namespace`, or the implicit
+`'default'` of a standalone engine), the provider hands
+the engine a view of the store whose run reads (`getRun`, `listRuns`, the counts and facets, and the
+recovery, dispatch and timer scans) only see that namespace's runs. Writes are not fenced. It is off by
+default, because a control plane's own operator screens should see everything, and it has no effect on
+a store without scoping support (the Lucid and in-memory stores have it). See
+[Scoped reads](/docs/durable/stores/lucid#scoped-reads-scopereads).
 
 ## Which namespace a new run gets
 
@@ -139,8 +184,9 @@ pools:
   [cluster docs](/docs/durable/cluster) describe.
 - **Fully separate pools.** Give each pool its own `namespace`. Runs, queues and keys are all prefixed,
   so a dev cluster and a developer's laptop can share infrastructure without either driving the other's
-  runs. Each namespaced engine drives only its own; an operator alongside them drives all of them, which
-  is what lets one deployed control plane orchestrate work that executes on many pools.
+  runs. Each namespaced engine drives only its own; an operator (a `control-plane` with no `namespace`)
+  alongside them drives all of them, which is what lets one deployed control plane orchestrate work
+  that executes on many pools.
 
 <Callout type="info">
 The two combine, and they answer different questions. Reach for `partition` when the runs are the same
@@ -156,7 +202,7 @@ to different deployments.
   the deployed fleet's tasks. Give it a real partition.
 - **A run stamped into a namespace nothing polls sits pending forever.** Passing `opts.namespace` (or
   starting from a tenant pod) routes the run to a pool that must actually have someone polling it —
-  either an engine on that namespace, or an operator. Between namespaced engines there is no fallback
+  either an engine on that namespace, or an operator control plane. Between namespaced engines there is no fallback
   owner, so a namespace with no operator above it and no engine of its own is a dead end.
 - **A stale local worker with an old build can misroute a run even when partitioned.** A process left
   running after a step or workflow rename can pick up a run with code that no longer matches its

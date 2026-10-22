@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { type AdmissionBackend, InMemoryAdmissionBackend } from './admission.js';
 import { backoffDelay, MAX_BACKOFF_MS } from './backoff.js';
 import { instantCheckpoint, lostStepEvent, stepCheckpoint } from './checkpoints.js';
@@ -31,6 +32,7 @@ import {
   type GatherItemFailure,
   NonDeterminismError,
   RemoteStepTimeout,
+  RemoteWorkflowTimeout,
   type StepFanRange,
   WorkflowSuspended,
 } from './errors.js';
@@ -43,10 +45,12 @@ import {
   parseStepFanGroup,
   stepFanGroup,
 } from './fan-join.js';
-import { aggregateAnnouncements } from './handshake/announced.js';
+import { type AnnouncedWorkflow, aggregateAnnouncements } from './handshake/announced.js';
 import type { WorkerDescriptor } from './handshake/descriptor.js';
+import { buildWorkflowDirectory, type WorkflowDirectory } from './handshake/directory.js';
 import type {
   ControlPlane,
+  DeadLetter,
   EngineEvent,
   EngineListener,
   GroupHealth,
@@ -56,6 +60,7 @@ import type {
   RemoteTask,
   RunDispatcher,
   RunFacetQuery,
+  RunFacetRow,
   RunQuery,
   RunResult,
   RunScope,
@@ -65,6 +70,7 @@ import type {
   RunValueFacetRow,
   ScopedRetentionPolicy,
   SearchAttributes,
+  SearchAttributesSchema,
   Settled,
   SignalWaiter,
   StateStore,
@@ -88,6 +94,7 @@ import type {
   WorkflowStepEvent,
 } from './interfaces.js';
 import { isNonEmptyRunScope, TERMINAL_RUN_STATUSES } from './interfaces.js';
+import { DEFAULT_NAMESPACE } from './namespaces.js';
 import { asHeartbeat } from './observability-scope.js';
 import {
   assertRoutes,
@@ -103,12 +110,34 @@ import {
 } from './on-error.js';
 import { breakpointToken, type StepHandler, stepId } from './protocol.js';
 import type { QueueConfig } from './queue.js';
+import { markRemoteEvent } from './remote-event.js';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor.js';
+import {
+  type FanPage,
+  type FanPageQuery,
+  loadFanMembers,
+  loadRunDetail,
+  type RunDetail,
+  type RunDetailOptions,
+  type RunDetailSource,
+} from './run-detail-summary.js';
+import { runFacetsOf } from './run-facets.js';
 import { scanRunValueFacets } from './run-value-facets.js';
 import { listSignalWaitersOfRuns } from './run-waiting.js';
 import { type ScheduledWorkflow, scheduleWindow } from './scheduler.js';
 import { ScheduleClient } from './schedules.js';
+import {
+  SINGLETON_RESERVED_TAGS,
+  SINGLETON_TRACKED_TAG,
+  withoutAdmission,
+  withSingletonTracked,
+} from './singleton-admission.js';
 import { SingletonGate } from './singleton-gate.js';
+import {
+  type StandardSchemaV1,
+  validateStandard,
+  validateStandardSync,
+} from './standard-schema.js';
 import { sanitizeQueueToken, tenantGroup } from './tenant-group.js';
 import { TransportPool } from './transport-pool.js';
 import { workflowAls } from './workflow-als.js';
@@ -130,6 +159,16 @@ type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
 
 /** Options for {@link WorkflowEngine.start}. */
 export interface StartOptions {
+  /**
+   * Pin the run to this registered version of the workflow instead of the newest one. Resolved
+   * against the name@version registry ({@link WorkflowEngine.register}, `registerRemote`,
+   * {@link WorkflowEngine.remote}); a version that is not registered throws before any run row is
+   * created and never falls back to the newest (a caller that asked for `name@3` and silently got
+   * `name@4` could not tell). Not honoured by convention routing (an unregistered name routed to a
+   * live worker group), which invents its version: a pinned start there throws instead. Absent →
+   * the newest registered version, as before.
+   */
+  version?: string | undefined;
   /** Run-scoped tags, merged with the workflow's static `workflow` config `tags` onto the run. */
   tags?: string[] | undefined;
   /** Typed, queryable run data stamped on the run (e.g. `{ amount: 200, tier: 'pro' }`). */
@@ -211,8 +250,9 @@ export interface StalledRunInfo {
 /**
  * Serialize runs of a workflow that share a key — a durable, FIFO mutex (e.g. one pipeline per base).
  * Excess runs are admitted in creation order, `limit` at a time; the rest wait (suspended) and retry
- * admission on a timer until a slot frees. Race-free on a consistent store (admission order is the
- * same `(createdAt, id)` view for every instance).
+ * admission on a timer until a slot frees. The store claims slots atomically
+ * ({@link StateStore.tryAdmitSingleton}) and records them durably on the run, so concurrent
+ * replicas can't over-admit and a later (or same-millisecond) start can't displace a holder.
  */
 export interface SingletonConfig {
   /** Derive the serialization key from the workflow input. */
@@ -223,7 +263,7 @@ export interface SingletonConfig {
    * Max GATED (waiting-for-admission) runs allowed to queue behind the `limit` in-flight ones. When
    * set, `start` rejects with {@link SingletonQueueFullError} once in-flight + gated reaches
    * `limit + maxQueueDepth` — back-pressure against an unbounded same-key backlog. Omit for the
-   * default unbounded queue. Counts `pending`/`running`/`suspended` runs sharing the key.
+   * default unbounded queue. Counts `pending`/`running`/`suspended`/`blocked` runs sharing the key.
    */
   maxQueueDepth?: number;
 }
@@ -282,6 +322,8 @@ interface RegisteredWorkflow {
   fn: WorkflowFn;
   /** Where a failed run of this workflow is routed instead of failing. See {@link OnErrorRoute}. */
   onError?: OnErrorRoute[] | undefined;
+  /** The workflow a `dead` run of this one is handed to (name). Overrides the engine's default. */
+  deadLetterWorkflow?: string | undefined;
   /** Made by {@link WorkflowEngine.ensureConventionWorkflow}: its onError routes are the ones its live
    *  workers announce, read when a run fails. */
   convention?: true | undefined;
@@ -297,6 +339,13 @@ interface RegisteredWorkflow {
   executionTimeoutMs?: number | undefined;
   /** Validate the input at start; throw to reject before a run is created. Validator-agnostic. */
   validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
+  /** Standard Schema (zod / valibot / arktype / …) the input is validated against at start, BEFORE
+   *  `validateInput`; its OUTPUT value becomes the run's input. A failure throws a
+   *  `SchemaValidationError` and no run is created. */
+  inputSchema?: StandardSchemaV1 | undefined;
+  /** Typed search-attributes shape: `ctx.upsertSearchAttributes` validates the MERGED attributes
+   *  against it and rejects a non-conforming write. See {@link SearchAttributesSchema}. */
+  searchAttributesSchema?: SearchAttributesSchema | undefined;
   /** Event names that start a fresh run of this workflow when published. See `publishEvent`. */
   onEvent?: string[] | undefined;
   /** Coalesce `onEvent` triggers: debounce (fire once it's quiet) or batch (fire on size/window). */
@@ -325,6 +374,24 @@ const STEP_FAN_CHUNK = 200;
 
 /** The default {@link WorkflowEngineDeps.timerBatchSize}. */
 const DEFAULT_TIMER_BATCH = 500;
+
+/** The most results of one run settled by one batched write (see `completeRemoteResult`). */
+const RESULT_BATCH_MAX = 256;
+
+/**
+ * How soon (ms) orphan recovery re-drives a REMOTE workflow run found `running` with a call in flight:
+ * its turn was lost (an inline advance timed out, or the replica applying a decision died), so it is
+ * parked on this short wake rather than the whole `reconcileMs` window. Re-driving dispatches a fresh
+ * turn; the calls already in flight are not re-dispatched (their pending checkpoints dedupe them).
+ */
+const REMOTE_TURN_REDRIVE_MS = 1_000;
+
+/** A step result waiting for its run's next batched settle. */
+interface QueuedResult {
+  result: StepResult;
+  resolve: () => void;
+  reject: (err: unknown) => void;
+}
 
 /** Fisher–Yates, in place. */
 function shuffle<T>(items: T[]): T[] {
@@ -413,12 +480,17 @@ export interface WorkflowEngineDeps {
    * (`runPending` / `recoverIncomplete` / `resumeDueTimers` / `sweepTimeouts`) only act on runs in
    * this namespace, and `resume` of a foreign run throws {@link NamespaceMismatch}.
    *
-   * **Leaving it UNSET makes this engine an operator**: it drives, recovers and resumes runs of EVERY
+   * **`undefined` here makes this engine an operator**: it drives, recovers and resumes runs of EVERY
    * namespace (the store's poll filters no-op on `undefined`) and leaves its transports on their bare
    * prefix. That is what lets one control plane serve many tenant pools — the queue a step lands on
    * is derived from the RUN's namespace, not this engine's. Set a value to scope the instance to one
    * pool instead, so ONE state store can be shared across non-interchangeable pools (e.g. local dev
    * vs a cluster). `'default'` and `''` are the bare pool, byte-identical to a single-pool deployment.
+   *
+   * The AdonisJS provider maps `config/durable.ts` onto this: an absent `namespace` is `'default'` on
+   * a `standalone` engine (it drives only the default pool, legacy rows included), and stays
+   * `undefined` — the operator — only on a `role: 'control-plane'` engine. Constructing the engine by
+   * hand keeps the raw meaning above.
    */
   namespace?: string | undefined;
   /** Recovery lease duration in ms — how long this instance owns a run it picked up. Default 30s. */
@@ -446,6 +518,7 @@ export interface WorkflowEngineDeps {
    * advances), so it's a safe self-heal, not a retry that can double-dispatch. The primary event path
    * still wins first for a healthy run (it re-drives long before this fires), so this only ever fires
    * for a genuinely-orphaned run. Default 5min; set `0` to disable (the prior wake-forever behavior).
+   * A non-finite or negative value falls back to the default.
    */
   reconcileMs?: number | undefined;
   /**
@@ -456,6 +529,14 @@ export interface WorkflowEngineDeps {
    * falls back to the default. Default 500.
    */
   timerBatchSize?: number | undefined;
+  /**
+   * How long (ms) a BUFFERED event that no `waitForEvent` claimed is kept (see
+   * {@link WorkflowEngine.publishEvent}'s buffering). Default `undefined`: kept until consumed, like a
+   * buffered signal. When set, a `waitForEvent` skips (and removes) a candidate older than this, and
+   * the worker tick's retention phase deletes expired rows across every name in bounded batches
+   * (through {@link StateStore.pruneBufferedEvents}, when the store has it).
+   */
+  eventBufferTtlMs?: number | undefined;
   /**
    * Opt-in self-heal window (ms) for a remote step with NO `timeoutMs` whose dispatched job was LOST —
    * the worker crashed mid-step leaving no result, or the transport dropped the job (a Redis
@@ -485,6 +566,19 @@ export interface WorkflowEngineDeps {
    * instead of re-dispatching forever. Default 10. Ignored when `remoteRedispatchMs` is unset.
    */
   remoteRedispatchMax?: number | undefined;
+  /**
+   * Opt-in liveness window (ms) for a remote workflow TURN. A dispatched turn whose decision has not
+   * landed, and whose worker has sent no run-scoped {@link Heartbeat}, within this window is presumed
+   * lost: the timer poller re-drives the run by dispatching a fresh turn (new `taskId`, same history —
+   * the worker's replay is deterministic), and a late decision for the old turn is dropped. Each
+   * run-scoped beat pushes the deadline forward (throttled to one write per half window), so a worker
+   * still replaying a long turn is never re-driven. For an INLINE executor (one that returns its
+   * decision in-process) a lapsed window releases the run lease and leaves the run to crash recovery
+   * instead of failing it. A `RemoteWorkflowExecutor`'s own `timeoutMs` is the per-workflow version of
+   * this window; when both are set the shorter wins. Unset (the default) waits for the decision with
+   * no deadline.
+   */
+  remoteAdvanceSilenceMs?: number | undefined;
   /**
    * Build the public callback URL for a `ctx.webhook()` token (e.g.
    * ``(t) => `https://api.example.com/durable/webhooks/${t}` ``). Populates
@@ -551,6 +645,14 @@ export interface WorkflowEngineDeps {
    */
   retentionPolicies?: ScopedRetentionPolicy[] | undefined;
   /**
+   * The fleet-default dead-letter workflow: a run that goes `dead` (past `maxRecoveryAttempts`) is
+   * handed to it — started with a {@link DeadLetter} input under the run id `dlq:<deadRunId>`, in the
+   * dead run's namespace. A workflow's own `deadLetterWorkflow` (register option / static config)
+   * wins. Idempotent by that run id, so a run dead-lettered twice is handled once. A handler run
+   * (`dlq:…`) that itself goes dead is not routed again.
+   */
+  deadLetterWorkflow?: WorkflowRef | undefined;
+  /**
    * How long an in-flight run must sit untouched — with the stranded signature (a wake-forever
    * suspension, or an old pending remote step whose worker heartbeat is silent) — before the
    * {@link WorkflowEngine.onStalled} listeners are notified. Default 900 000 (15 min, matching the
@@ -590,7 +692,7 @@ export interface WorkflowEngineDeps {
    * How long (ms) a run parked `blocked` (no capable/compatible worker, design §7.5) waits before the
    * blocked-recovery poll re-drives it to re-check the live fleet. Default 5000. The run proceeds the
    * moment a capable+compatible worker appears on the next poll; a lower value trades broker SCANs for
-   * faster pickup.
+   * faster pickup. A non-finite or sub-1 value falls back to the default.
    */
   blockedPollMs?: number | undefined;
   /**
@@ -645,12 +747,21 @@ export class WorkflowEngine {
   /** Whether the worker tick fires {@link schedules} (the `persistedSchedules` option). */
   readonly persistedSchedulesEnabled: boolean;
   private readonly leaseMs: number;
+  /**
+   * The engine clock when this instance was constructed. Every lease THIS incarnation writes ends at
+   * or after `bootedAt + leaseMs`; a lease held under {@link instanceId} that ends before that was
+   * written by a previous process that ran under the same id (a pod restarted after a crash) — see
+   * {@link selfReclaimable}.
+   */
+  private readonly bootedAt: number;
   private readonly maxRecoveryAttempts?: number | undefined;
   private readonly reconcileMs: number | undefined;
   private readonly heartbeatPersistThrottleMs: number;
   private readonly timerBatchSize: number;
+  private readonly eventBufferTtlMs: number | undefined;
   private readonly remoteRedispatchMs: number | undefined;
   private readonly remoteRedispatchMax: number;
+  private readonly remoteAdvanceSilenceMs: number | undefined;
   private readonly webhookUrl?: ((token: string) => string) | undefined;
   private readonly traceparent?: (() => string | undefined) | undefined;
   private readonly context?: (() => Record<string, unknown> | undefined) | undefined;
@@ -708,6 +819,8 @@ export class WorkflowEngine {
   private readonly accumulators: EventAccumulators;
   /** In-flight remote steps awaiting a worker result, keyed by stepId. */
   private readonly pending = new Map<string, PendingRemote>();
+  /** Each run's step results waiting to be settled on this instance — see {@link completeRemoteResult}. */
+  private readonly resultQueues = new Map<string, QueuedResult[]>();
   /** Per-step "reset the liveness timer" callbacks, called with the beat's worker timestamp when a
    *  heartbeat arrives. */
   private readonly heartbeatResets = new Map<string, (at: number | undefined) => void>();
@@ -720,6 +833,8 @@ export class WorkflowEngine {
   private readonly enqueuedListeners = new Set<(runId: string) => void>();
   /** Notified when a run is dead-lettered (moved to `dead`) — a hook for a DLQ handler. */
   private readonly deadListeners = new Set<(run: WorkflowRun) => void>();
+  /** The fleet-default dead-letter workflow's name — see {@link WorkflowEngineDeps.deadLetterWorkflow}. */
+  private readonly deadLetterWorkflow: string | undefined;
   /** Validators gating `engine.update`, keyed by `<workflow>:<updateName>`. */
   private readonly updateValidators = new Map<string, UpdateValidator>();
   /** Runs being cancelled WITH saga compensation — see `cancel({ compensate: true })`. */
@@ -747,6 +862,29 @@ export class WorkflowEngine {
    */
   private readonly leaseLostRuns = new Set<string>();
   /**
+   * The lease handle of each execution in flight in this process, by run id. A path that gives the run
+   * lease away mid-execution on purpose (a remote turn suspending on its dispatched decision, see
+   * {@link releaseTurnLease}) flags it, so the execution's renew loop stops renewing and never reads its
+   * own release as a takeover: a late `false` renew would otherwise fence whoever applies the decision.
+   */
+  private readonly executionLeases = new Map<string, { handedOff: boolean }>();
+  /** Stable decision handler subscribed on every remote executor's transport (see registerRemote). */
+  private readonly decisionHandler = (decision: WorkflowDecision): Promise<void> => {
+    // A transport that delivers the decision from INSIDE its own `dispatchWorkflowTask` (an in-process
+    // broker) would otherwise wait on the run gate the dispatching execution still holds. Apply it once
+    // that execution has returned instead; it is tracked, so drain still waits for it.
+    if (turnDispatchAls.getStore() === decision?.runId) {
+      this.trackEffect(this.completeRemoteDecision(decision));
+      return Promise.resolve();
+    }
+    return this.completeRemoteDecision(decision);
+  };
+  /** Earliest clock time an awaited turn's deadline is worth reading again (`runId` → clock ms), the
+   *  read throttle for {@link rearmDecisionDeadline}. */
+  private readonly decisionDeadlineRearms = new Map<string, number>();
+  /** Whether any registered remote executor carries its own turn window (`decisionTimeoutMs`). */
+  private anyDecisionTimeout = false;
+  /**
    * The in-process execution gate, by run id: the execution of the run currently in flight in THIS
    * process (`tail`), and at most one resume queued behind it (`queued`). See {@link resumeRun}.
    *
@@ -769,6 +907,10 @@ export class WorkflowEngine {
    */
   private readonly postSettle = new Set<Promise<unknown>>();
   private draining = false;
+  /** Shutdown wait already spent before/alongside {@link drain} (see {@link beginDrain}). */
+  private drainSpentMs = 0;
+  /** Re-arms the deadline of every {@link drain} currently waiting, when more wait is reported. */
+  private readonly drainRearms = new Set<() => void>();
 
   constructor(deps: WorkflowEngineDeps) {
     this.store = deps.store;
@@ -783,7 +925,9 @@ export class WorkflowEngine {
     // instead of waiting for their retry tick. Best-effort (the retry tick remains the guarantee).
     this.admission.onFreed?.((queue) => this.wakeQueueWaiters(queue));
     this.instanceId = deps.instanceId ?? globalThis.crypto.randomUUID();
-    this.namespace = deps.namespace;
+    // `''` is the default pool (the transports already treat it as bare): normalize it here so the
+    // runs this engine stamps, and the pool it polls, are the default pool's.
+    this.namespace = deps.namespace === '' ? DEFAULT_NAMESPACE : deps.namespace;
     // The control-plane's own handshake descriptor — the side negotiated AGAINST each worker so a
     // protocol-incompatible fleet is detected before dispatch (design §7.3). Scoped to this engine's
     // namespace/partition; capabilities/protocol are config-driven (default: current single major).
@@ -797,7 +941,13 @@ export class WorkflowEngine {
         ? { namespace: this.namespace }
         : {}),
     });
-    this.blockedPollMs = deps.blockedPollMs ?? 5000;
+    // A non-finite or sub-1 poll falls back to the default: NaN would park a blocked run on an
+    // unreachable wake, and 0 would re-drive it in a hot loop.
+    const blockedPoll = deps.blockedPollMs;
+    this.blockedPollMs =
+      blockedPoll !== undefined && Number.isFinite(blockedPoll) && blockedPoll >= 1
+        ? blockedPoll
+        : 5000;
     // Propagate the engine's namespace to its transport(s) so the SAME namespace that partitions the
     // store also partitions the transport's queues/keys — set once on the engine, applied everywhere.
     // The transport makes "default" a no-op (byte-identical names); an empty pool is a no-op too.
@@ -805,9 +955,16 @@ export class WorkflowEngine {
     // which is what it must stay on to reach every tenant's queues.
     if (this.namespace !== undefined) this.pool.useNamespace(this.namespace);
     this.leaseMs = deps.leaseMs ?? 30_000;
+    this.bootedAt = this.clock();
     this.maxRecoveryAttempts = deps.maxRecoveryAttempts;
-    // Default 5min; an explicit 0 disables the fallback (opt back into wake-forever-on-lost-event).
-    this.reconcileMs = deps.reconcileMs === undefined ? 300_000 : deps.reconcileMs || undefined;
+    // Default 5min; an explicit 0 disables the fallback (opt back into wake-forever-on-lost-event). A
+    // non-finite or negative value falls back to the default rather than silently disabling the net
+    // (NaN) or stamping a wake in the past that re-drives the run every tick (negative).
+    const reconcile = deps.reconcileMs;
+    this.reconcileMs =
+      reconcile === undefined || !Number.isFinite(reconcile) || reconcile < 0
+        ? 300_000
+        : reconcile || undefined;
     // Validated like `timerBatchSize`: a NaN/negative throttle would silently disable the
     // cross-instance liveness salvage (`timeoutMs + NaN` never compares true). `0` stays valid.
     const throttle = deps.heartbeatPersistThrottleMs;
@@ -819,9 +976,13 @@ export class WorkflowEngine {
       batch !== undefined && Number.isFinite(batch) && batch >= 1
         ? Math.floor(batch)
         : DEFAULT_TIMER_BATCH;
+    const ttl = deps.eventBufferTtlMs;
+    this.eventBufferTtlMs = ttl !== undefined && Number.isFinite(ttl) && ttl > 0 ? ttl : undefined;
     // Opt-in: unset (or 0) leaves the by-design "re-suspend a lost dispatch, never re-dispatch" behavior.
     this.remoteRedispatchMs = deps.remoteRedispatchMs || undefined;
     this.remoteRedispatchMax = Math.max(1, deps.remoteRedispatchMax ?? 10);
+    // Opt-in: unset (or 0) keeps the unbounded wait for a remote workflow turn's decision.
+    this.remoteAdvanceSilenceMs = deps.remoteAdvanceSilenceMs || undefined;
     this.webhookUrl = deps.webhookUrl;
     this.traceparent = deps.traceparent;
     this.context = deps.context;
@@ -831,6 +992,8 @@ export class WorkflowEngine {
     this.compensationTimeoutMs = Math.max(1_000, deps.compensationTimeoutMs ?? 300_000);
     this.retention = deps.retention;
     this.retentionPolicies = deps.retentionPolicies ?? [];
+    this.deadLetterWorkflow =
+      deps.deadLetterWorkflow !== undefined ? workflowName(deps.deadLetterWorkflow) : undefined;
     this.persistedSchedulesEnabled = deps.persistedSchedules ?? false;
     this.schedules = new ScheduleClient(
       this.store,
@@ -908,7 +1071,17 @@ export class WorkflowEngine {
       // in-memory waiter (the step suspended DURABLY, possibly on another instance) the beat rearms
       // the step's durable LEASE instead, so a worker still holding a long step is never presumed
       // lost and double-dispatched (see rearmStepLease).
+      //
+      // A RUN-scoped beat (no `stepId`: a worker replaying a long workflow TURN) keeps that turn alive
+      // instead: an inline advance awaiting on THIS instance rearms its in-memory deadline, otherwise
+      // the awaited turn's durable re-drive deadline moves forward (see rearmDecisionDeadline).
       async (beat) => {
+        if (!beat.stepId) {
+          const resetTurn = this.heartbeatResets.get(turnBeatKey(beat.runId));
+          if (resetTurn) resetTurn(beat.at);
+          else await this.rearmDecisionDeadline(beat.runId);
+          return;
+        }
         const reset = this.heartbeatResets.get(beat.stepId);
         if (reset) reset(beat.at);
         else await this.rearmStepLease(beat.runId, beat.seq);
@@ -927,7 +1100,7 @@ export class WorkflowEngine {
       if (msg.from === this.instanceId) return;
       if (msg.kind === 'event') {
         // `at` may be a string after JSON transit (Redis) — normalize back to a Date.
-        this.deliver({ ...msg.event, at: new Date(msg.event.at) });
+        this.deliver(markRemoteEvent({ ...msg.event, at: new Date(msg.event.at) }));
       } else if (msg.kind === 'cancel') {
         this.notifyCancelled(msg.runId);
       } else if (msg.kind === 'schedulePause') {
@@ -947,7 +1120,11 @@ export class WorkflowEngine {
       }
     });
     this.accumulators = new EventAccumulators(this);
-    this.entities = new Entities(this);
+    this.entities = new Entities(this, {
+      bufferSignal: (token, payload) => this.store.bufferSignal(token, payload),
+      wakeWaiter: (token, payload) => this.wakeSignalWaiter(token, payload),
+      ensureStarted: (workflow, input, runId) => this.start(workflow, input, runId),
+    });
   }
 
   /**
@@ -1085,6 +1262,44 @@ export class WorkflowEngine {
   }
 
   /** Read an entity's current durable state (published after each op), or undefined if it has none yet. */
+  /**
+   * The entity lost-wake reconcile: wake (start, if need be) every entity that has ops sitting in its
+   * buffer, up to `limit` of them. A workflow-side send stores the op and THEN wakes the entity, so a
+   * process that dies in between leaves the op buffered while the entity sleeps; this pass is what
+   * applies it. Idempotent — a wake carries a no-op nudge, and the entity reads its buffer in arrival
+   * order, consuming each op once (an op with a stable id is skipped if already applied). The worker
+   * tick runs it, throttled to one pass a minute. Returns how many entities were woken. A no-op on a
+   * store without `listBufferedSignalTokens`.
+   */
+  async reconcileEntityWakes(limit = 100): Promise<number> {
+    if (this.draining || !this.store.listBufferedSignalTokens) return 0;
+    const tokens = await this.store.listBufferedSignalTokens('entity:', limit);
+    let woken = 0;
+    for (const token of tokens) {
+      if (this.draining) break;
+      try {
+        if (await this.entities.kickRunId(token)) woken += 1;
+      } catch (err) {
+        console.warn(
+          `[adonis-durable] entity reconcile of ${token} skipped: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+    return woken;
+  }
+
+  /** Throttle stamp for the tick's {@link reconcileEntityWakes} pass. */
+  #lastEntityReconcileAt = Number.NEGATIVE_INFINITY;
+
+  /** {@link reconcileEntityWakes}, at most once a minute — the worker tick's entry point. */
+  async sweepEntityWakes(now: number = this.clock()): Promise<number> {
+    if (now - this.#lastEntityReconcileAt < 60_000) return 0;
+    this.#lastEntityReconcileAt = now;
+    return this.reconcileEntityWakes();
+  }
+
   getEntityState<S = unknown>(name: string, key: string): Promise<S | undefined> {
     return this.entities.getState<S>(name, key);
   }
@@ -1126,6 +1341,10 @@ export class WorkflowEngine {
       concurrency?: ConcurrencyConfig | undefined;
       executionTimeout?: string | number | undefined;
       validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
+      /** Standard Schema validated at start, before `validateInput` — see `RegisteredWorkflow.inputSchema`. */
+      inputSchema?: StandardSchemaV1 | undefined;
+      /** Typed/validated `searchAttributes` shape — see `RegisteredWorkflow.searchAttributesSchema`. */
+      searchAttributesSchema?: SearchAttributesSchema | undefined;
       onEvent?: string[] | undefined;
       eventBatch?: EventBatchConfig | undefined;
       requires?: string[] | undefined;
@@ -1133,6 +1352,8 @@ export class WorkflowEngine {
       origin?: string | undefined;
       /** Handler workflows a matching failure is routed to — see {@link OnErrorRoute}. */
       onError?: OnErrorRoute[] | undefined;
+      /** Where a `dead` run of this workflow is handed (overrides the engine's default). */
+      deadLetterWorkflow?: WorkflowRef | undefined;
     },
   ): void {
     const registered: RegisteredWorkflow = {
@@ -1140,6 +1361,8 @@ export class WorkflowEngine {
       version,
       fn,
       onError: this.checkedRoutes(name, opts?.onError),
+      deadLetterWorkflow:
+        opts?.deadLetterWorkflow !== undefined ? workflowName(opts.deadLetterWorkflow) : undefined,
       tags: opts?.tags,
       origin: opts?.origin,
       singleton: opts?.singleton,
@@ -1147,6 +1370,8 @@ export class WorkflowEngine {
       executionTimeoutMs:
         opts?.executionTimeout != null ? parseDuration(opts.executionTimeout) : undefined,
       validateInput: opts?.validateInput,
+      inputSchema: opts?.inputSchema,
+      searchAttributesSchema: opts?.searchAttributesSchema,
       onEvent: opts?.onEvent,
       eventBatch: opts?.eventBatch,
       requires: opts?.requires,
@@ -1178,15 +1403,21 @@ export class WorkflowEngine {
       concurrency?: ConcurrencyConfig;
       executionTimeout?: string | number;
       validateInput?: (input: unknown) => void | Promise<void>;
+      /** Standard Schema validated at start, before `validateInput` — see `RegisteredWorkflow.inputSchema`. */
+      inputSchema?: StandardSchemaV1;
       requires?: string[];
       /** Handler workflows a matching failure is routed to — see {@link OnErrorRoute}. */
       onError?: OnErrorRoute[];
+      /** Where a `dead` run of this workflow is handed (overrides the engine's default). */
+      deadLetterWorkflow?: WorkflowRef;
     },
   ): void {
     const registered: RegisteredWorkflow = {
       name,
       version,
       onError: this.checkedRoutes(name, opts.onError),
+      deadLetterWorkflow:
+        opts.deadLetterWorkflow !== undefined ? workflowName(opts.deadLetterWorkflow) : undefined,
       // A remote workflow has no in-process body; execute() branches on `remote` before this is read.
       fn: () => {
         throw new Error(`workflow ${name} is remote — it has no in-process body`);
@@ -1197,31 +1428,76 @@ export class WorkflowEngine {
       executionTimeoutMs:
         opts.executionTimeout != null ? parseDuration(opts.executionTimeout) : undefined,
       validateInput: opts.validateInput,
+      inputSchema: opts.inputSchema,
       remote: { group: opts.group, executor: opts.executor },
       requires: opts.requires,
     };
+    // A dispatched turn's decision is applied by whichever replica consumes it, so every engine that
+    // can dispatch a turn also consumes decisions. The handler is one stable function: a transport that
+    // keeps a handler set registers it once however many remote workflows share the transport.
+    opts.executor.subscribeDecisions?.(this.decisionHandler);
+    if (opts.executor.decisionTimeoutMs) this.anyDecisionTimeout = true;
     this.workflows.set(versionKey(name, version), registered);
     const current = this.latest.get(name);
     if (!current || isNewerVersion(version, current.version)) this.latest.set(name, registered);
   }
 
   /**
-   * Convention-dispatch resolution: when `name` isn't locally registered but a LIVE worker group of
-   * the same name exists, auto-register a remote workflow routed to that group (bare group, no
-   * partition) so its runs advance over the broker like any `registerRemote`'d one. Always on — the
-   * queue name IS the routing, exactly as the aviary engine does — so a Python/NestJS/thin-worker
-   * workflow is reached by NAME with no `registerRemote` boilerplate. Returns whether `name` is
-   * registered afterwards. A no-op (returns `false`) when no transport is wired (nothing to route
-   * over) or no matching worker group is live (then `start`/`resume` throws `is not registered`).
+   * Register a workflow whose body runs in another SDK, routed to worker `group` — {@link
+   * registerRemote} with the executor built for you over this engine's primary transport. `version`
+   * defaults to `'1'`; register `name` at a version explicitly to pin starts to it
+   * ({@link StartOptions.version}).
    */
-  private async ensureConventionWorkflow(name: string): Promise<boolean> {
+  remote(
+    name: string,
+    opts: Omit<Parameters<WorkflowEngine['registerRemote']>[2], 'executor'> & {
+      version?: string | undefined;
+    },
+  ): void {
+    if (!this.primaryTransport) {
+      throw new Error(
+        `@agora/durable: engine.remote('${name}') needs a transport that carries workflow tasks.`,
+      );
+    }
+    const { version, ...rest } = opts;
+    this.registerRemote(name, version ?? '1', {
+      ...rest,
+      executor: new RemoteWorkflowExecutor(this.primaryTransport, opts.group),
+    });
+  }
+
+  /**
+   * Convention-dispatch resolution: when `name` isn't locally registered but a LIVE worker group for
+   * it exists, auto-register a remote workflow routed to that group so its runs advance over the
+   * broker like any `registerRemote`'d one. Always on — the queue name IS the routing, exactly as the
+   * aviary engine does — so a Python/NestJS/thin-worker workflow is reached by NAME with no
+   * `registerRemote` boilerplate. Returns whether `name` is registered (and routable for `namespace`)
+   * afterwards. A no-op (returns `false`) when no transport is wired (nothing to route over) or no
+   * matching worker group is live (then `start`/`resume` throws `is not registered`).
+   *
+   * TENANT-AWARE, per run: the group is the one the RUN's namespace routes to,
+   * `<name>@<namespace>` (bare for an absent/`default` namespace) — the token a tenant worker
+   * (`partition: <tenant>`) serves, and the same rule steps follow ({@link stepGroup}). So an operator
+   * starting a tenant's run reaches the tenant's live `<name>@<tenant>` group, not the bare one, and a
+   * convention workflow is re-checked for the namespace of every start.
+   */
+  private async ensureConventionWorkflow(name: string, namespace?: string): Promise<boolean> {
     if (!this.primaryTransport) return false;
-    if (this.latest.get(name)) return true;
-    const groups = await this.pool.listWorkerGroups();
-    if (!groups.includes(name)) return false;
+    const current = this.latest.get(name);
+    if (current && !current.convention) return true;
+    const group = conventionGroup(name, namespace);
+    // The transport whose keyspace reports the live group: in a mixed pool each transport scans a
+    // different keyspace, and dispatching on the primary while the worker beats on another one parks
+    // the turn on a queue nobody consumes.
+    const transport = await this.pool.transportWithLiveGroup(group);
+    if (!transport) return false;
+    if (current) return true;
     this.registerRemote(name, '1', {
       group: name,
-      executor: new RemoteWorkflowExecutor(this.primaryTransport, name),
+      // Per run: each run dispatches to the group of its own namespace.
+      executor: new RemoteWorkflowExecutor(transport, (run) =>
+        conventionGroup(run.workflow, run.namespace),
+      ),
     });
     const registered = this.workflows.get(versionKey(name, '1'));
     if (registered) registered.convention = true;
@@ -1252,9 +1528,10 @@ export class WorkflowEngine {
    * wholesale past 1024 entries — a rare extra write, never a leak.
    */
   private persistHeartbeat(beat: Heartbeat): void {
-    if (!this.store.recordStepHeartbeat) return;
+    const id = beat.stepId;
+    if (!this.store.recordStepHeartbeat || !id) return;
     const now = this.clock();
-    const last = this.heartbeatPersists.get(beat.stepId);
+    const last = this.heartbeatPersists.get(id);
     const upgradesToProgress =
       beat.progress !== undefined && last !== undefined && !last.hadProgress;
     if (
@@ -1264,7 +1541,7 @@ export class WorkflowEngine {
     )
       return;
     if (this.heartbeatPersists.size > 1024) this.heartbeatPersists.clear();
-    this.heartbeatPersists.set(beat.stepId, { at: now, hadProgress: beat.progress !== undefined });
+    this.heartbeatPersists.set(id, { at: now, hadProgress: beat.progress !== undefined });
     void this.store
       .recordStepHeartbeat(beat.runId, beat.seq, new Date(beat.at ?? now), beat.progress)
       .catch(() => undefined);
@@ -1376,6 +1653,41 @@ export class WorkflowEngine {
         /* a dead-letter handler must not break recovery */
       }
     }
+    this.routeDeadLetter(run);
+  }
+
+  /**
+   * Hand a `dead` run to its dead-letter workflow, when one is configured: the workflow's own
+   * `deadLetterWorkflow`, else the engine's default. Started as `dlq:<runId>` (idempotent: a run
+   * dead-lettered twice is handled once; the dashboard links the pair by that id) in the dead run's
+   * namespace, with a {@link DeadLetter} input. Tracked, so a drain waits for the start; a failure
+   * (e.g. the handler is not registered here) is warned, never thrown into recovery. A handler run
+   * that itself goes dead is not routed again — no `dlq:dlq:…` chain.
+   */
+  private routeDeadLetter(run: WorkflowRun): void {
+    if (run.id.startsWith('dlq:')) return;
+    const registered =
+      this.workflows.get(versionKey(run.workflow, run.workflowVersion)) ??
+      this.latest.get(run.workflow);
+    const target = registered?.deadLetterWorkflow ?? this.deadLetterWorkflow;
+    if (!target) return;
+    const input: DeadLetter = {
+      deadRunId: run.id,
+      workflow: run.workflow,
+      input: run.input,
+      ...(run.error ? { error: run.error } : {}),
+    };
+    this.trackEffect(
+      this.start(target, input, `dlq:${run.id}`, {
+        ...(run.namespace !== undefined ? { namespace: run.namespace } : {}),
+      }).catch((err: unknown) => {
+        console.warn(
+          `[adonis-durable] could not start dead-letter workflow ${target} for run ${run.id}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }),
+    );
   }
 
   /** Emit a locally-produced lifecycle event: deliver to subscribers AND broadcast it on the
@@ -1443,15 +1755,34 @@ export class WorkflowEngine {
     dispatch: boolean,
   ): Promise<RunResult> {
     const name = workflowName(workflow);
-    let registered = this.latest.get(name);
+    // A pinned start (`opts.version`) resolves name@version and stops there: no newest, no
+    // convention fallback, since neither can prove that version exists.
+    const pinned = opts?.version;
+    let registered =
+      pinned === undefined ? this.latest.get(name) : this.workflows.get(versionKey(name, pinned));
     // Convention dispatch: an unregistered workflow whose name matches a LIVE worker group is routed
-    // to it as a remote workflow (bare group). No registration needed — the queue name is the routing;
-    // when no matching group is live this is a no-op and the "not registered" throw below fires.
-    if (!registered && (await this.ensureConventionWorkflow(name))) {
-      registered = this.latest.get(name);
+    // to it as a remote workflow — the group of the namespace this run will carry (see
+    // ensureConventionWorkflow). No registration needed — the queue name is the routing; when no
+    // matching group is live this is a no-op and the "not registered" throw below fires. Re-checked
+    // per start for a convention registration, since the tenant can differ from one start to the next.
+    // A pinned start never falls back to convention: it cannot prove the pinned version exists.
+    if (pinned === undefined && (!registered || registered.convention)) {
+      registered = (await this.ensureConventionWorkflow(name, opts?.namespace ?? this.namespace))
+        ? this.latest.get(name)
+        : undefined;
     }
-    if (!registered) throw new Error(`workflow ${name} is not registered`);
-    // Validate the input up front — a bad payload is rejected before any run is created.
+    if (!registered) {
+      throw new Error(
+        pinned === undefined
+          ? `workflow ${name} is not registered`
+          : `workflow ${name}@${pinned} is not registered`,
+      );
+    }
+    // Validate the input up front — a bad payload is rejected before any run is created. The schema
+    // runs first and its OUTPUT (parsed/coerced) is what the run stores; `validateInput` then sees it.
+    if (registered.inputSchema) {
+      input = await validateStandard(registered.inputSchema, input, `workflow "${name}" input`);
+    }
     await registered.validateInput?.(input);
     // Idempotent by run id: a redelivered trigger (at-least-once queues) or a scheduler re-tick for
     // the same id is a no-op, returning the existing run's state instead of starting a duplicate.
@@ -1478,10 +1809,12 @@ export class WorkflowEngine {
       ...(registered.singleton ? [this.singletons.tag(registered.singleton, input)] : []),
       ...(quota ? [concurrencyTag(quota.key)] : []),
     ];
+    // The admission marker is owned by the store's atomic claim: a fresh run can neither supply it nor
+    // inherit it (`retryWithInput` copies the original run's tags).
     const tags = mergeTags(
       registered.tags,
       minted.length ? [...(opts?.tags ?? []), ...minted] : opts?.tags,
-    );
+    )?.filter((t) => !SINGLETON_RESERVED_TAGS.includes(t));
     // Singleton back-pressure: reject a start that would grow the same-key backlog past
     // `limit + maxQueueDepth` (no-op when no maxQueueDepth is configured).
     if (registered.singleton) {
@@ -1642,6 +1975,43 @@ export class WorkflowEngine {
   }
 
   /**
+   * How the runs matching `query` split across `(status, origin)`, in one aggregate when the store
+   * has {@link StateStore.runFacets} (else counted over a listing). Part of the engine's read API.
+   */
+  runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
+    return runFacetsOf(this.store, query);
+  }
+
+  /**
+   * A run's detail (see `loadRunDetail`), built from the store's checkpoint aggregates when it has
+   * `checkpointStats` + `queryCheckpoints` — a summarized detail then reads a few rows per wide fan
+   * instead of the whole history, and carries an `etag` that `options.ifNoneMatch` can match.
+   */
+  getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail | null> {
+    return loadRunDetail(this.detailSource(), runId, options);
+  }
+
+  /** One page of a summarized fan's members (see `loadFanMembers`), versioned like {@link getRunDetail}. */
+  getFanMembers(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null> {
+    return loadFanMembers(this.detailSource(), runId, group, query);
+  }
+
+  private detailSource(): RunDetailSource {
+    const store = this.store;
+    return {
+      getRun: (id) => this.getRun(id),
+      listCheckpoints: (id) => store.listCheckpoints(id),
+      getRunChildren: (id) => this.getRunChildren(id),
+      ...(store.checkpointStats && store.queryCheckpoints
+        ? {
+            checkpointStats: store.checkpointStats.bind(store),
+            queryCheckpoints: store.queryCheckpoints.bind(store),
+          }
+        : {}),
+    };
+  }
+
+  /**
    * Hard-delete a run and its whole child subtree from the store, returning the number of runs
    * removed (0 if `runId` is unknown). Children are collected BEFORE this run's checkpoints are
    * deleted (the parent→children edge is read from them). Use for retention/cleanup; this is a
@@ -1746,9 +2116,17 @@ export class WorkflowEngine {
    * parents.
    */
   async sweepRetention(now: number = this.clock()): Promise<number> {
-    if ((!this.retention && this.retentionPolicies.length === 0) || this.draining) return 0;
+    if (
+      (!this.retention &&
+        this.retentionPolicies.length === 0 &&
+        this.eventBufferTtlMs === undefined) ||
+      this.draining
+    ) {
+      return 0;
+    }
     if (now - this.#lastRetentionSweepAt < 60_000) return 0;
     this.#lastRetentionSweepAt = now;
+    await this.pruneExpiredBufferedEvents(now);
     let evicted = 0;
     const passes: RunQuery[] = [];
     for (const status of TERMINAL_RUN_STATUSES) {
@@ -1758,7 +2136,9 @@ export class WorkflowEngine {
     }
     for (const policy of this.retentionPolicies) {
       const statuses = policy.statuses.filter((s) => TERMINAL_RUN_STATUSES.includes(s));
-      if (statuses.length === 0 || !(policy.maxAgeMs > 0)) continue;
+      const byAge = policy.maxAgeMs !== undefined && policy.maxAgeMs > 0;
+      const byCount = policy.maxCount !== undefined && policy.maxCount >= 0;
+      if (statuses.length === 0 || (!byAge && !byCount)) continue;
       // A namespaced worker only ever prunes its own partition: a scope naming another one is not its
       // to sweep (the operator, `namespace: undefined`, sweeps every partition).
       if (
@@ -1768,24 +2148,39 @@ export class WorkflowEngine {
       ) {
         continue;
       }
-      passes.push({
+      const scoped: RunQuery = {
         ...policy.scope,
         namespace: policy.scope.namespace ?? this.namespace,
         statuses,
-        updatedBefore: now - policy.maxAgeMs,
-      });
+      };
+      if (byAge) passes.push({ ...scoped, updatedBefore: now - (policy.maxAgeMs as number) });
+      if (byCount) {
+        // Keep the `maxCount` newest (listRuns is newest-first by createdAt): the last one kept marks
+        // the cutoff, and every run created strictly before it goes. A run sharing that start
+        // millisecond is kept too, so a tie never deletes one of the newest `maxCount`.
+        const maxCount = policy.maxCount as number;
+        if (maxCount === 0) {
+          passes.push(scoped);
+        } else {
+          const [lastKept] = await this.store.listRuns({ ...scoped, page: maxCount, size: 1 });
+          if (lastKept) {
+            passes.push({ ...scoped, createdBefore: lastKept.createdAt.getTime() - 1 });
+          }
+        }
+      }
     }
     for (const pass of passes) {
       const candidates = await this.store.listRuns({ ...pass, size: 100 });
+      const archived: string[] = [];
       for (const run of candidates) {
         try {
           if (this.evictListeners.size > 0) {
             const checkpoints = await this.store.listCheckpoints(run.id);
             for (const listener of this.evictListeners) await listener(run, checkpoints);
           }
-          evicted += await this.deleteRun(run.id);
+          archived.push(run.id);
         } catch (err) {
-          // An archival hook (or the delete itself) failed — keep the run; the next sweep retries.
+          // An archival hook failed — keep the run; the next sweep retries.
           console.warn(
             `[adonis-durable] retention eviction of run ${run.id} skipped: ${
               err instanceof Error ? err.message : String(err)
@@ -1793,8 +2188,73 @@ export class WorkflowEngine {
           );
         }
       }
+      try {
+        // One batched delete per pass (the store's `deleteRuns`), subtrees included.
+        evicted += await this.deleteRunTrees(archived);
+      } catch (err) {
+        // The delete failed — keep the runs; the next sweep retries.
+        console.warn(
+          `[adonis-durable] retention eviction of ${archived.length} run(s) skipped: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
     }
     return evicted;
+  }
+
+  /**
+   * The {@link eventBufferTtlMs} prune: delete buffered events older than the TTL, a bounded batch
+   * at a time, through the store's `pruneBufferedEvents`. Runs in {@link sweepRetention}'s pass.
+   * Best-effort — a failure is warned and retried on the next pass.
+   */
+  private async pruneExpiredBufferedEvents(now: number): Promise<void> {
+    const ttl = this.eventBufferTtlMs;
+    if (ttl === undefined || !this.store.pruneBufferedEvents) return;
+    try {
+      for (let pass = 0; pass < 10; pass += 1) {
+        const deleted = await this.store.pruneBufferedEvents(now - ttl, 500);
+        if (deleted < 500) break;
+      }
+    } catch (err) {
+      console.warn(
+        `[adonis-durable] buffered-event prune skipped: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Delete the runs `rootIds` and their child subtrees: the ids are collected children-first (the
+   * edge is read from the parent's checkpoints, so before anything is deleted), deleted in one
+   * {@link deleteRunIds} batch, then each one's token-keyed buffered signals are swept like
+   * {@link deleteRun} does. Returns how many runs were deleted.
+   */
+  private async deleteRunTrees(rootIds: string[]): Promise<number> {
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    const visit = async (id: string): Promise<void> => {
+      if (seen.has(id)) return;
+      seen.add(id);
+      if (!(await this.store.getRun(id))) return;
+      for (const child of await this.getRunChildren(id)) await visit(child);
+      ids.push(id);
+    };
+    for (const id of rootIds) await visit(id);
+    await this.deleteRunIds(ids);
+    for (const id of ids) await this.sweepRunBufferedSignals(id);
+    return ids.length;
+  }
+
+  /** Bulk-delete through the store's `deleteRuns`, or one `deleteRun` per id when it has none. */
+  private async deleteRunIds(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    if (this.store.deleteRuns) {
+      await this.store.deleteRuns(ids);
+      return;
+    }
+    for (const id of ids) await this.store.deleteRun(id);
   }
 
   async deleteRun(runId: string): Promise<number> {
@@ -1877,6 +2337,7 @@ export class WorkflowEngine {
         ids.push(id); // post-order: children before their parent
       };
       for (const run of batch) await visit(run.id);
+      const doomed: string[] = [];
       for (const id of ids) {
         const status = known.has(id) ? known.get(id) : (await this.store.getRun(id))?.status;
         if (status === undefined) continue; // already gone
@@ -1884,10 +2345,12 @@ export class WorkflowEngine {
           if (!cancelLive) continue;
           await this.cancel(id).catch(() => undefined);
         }
-        await this.store.deleteRun(id);
-        await this.sweepRunBufferedSignals(id);
-        deleted += 1;
+        doomed.push(id);
       }
+      // One batched delete per page (the store's `deleteRuns`), children before their parent.
+      await this.deleteRunIds(doomed);
+      for (const id of doomed) await this.sweepRunBufferedSignals(id);
+      deleted += doomed.length;
       if (batch.length < size) break;
     }
     return deleted;
@@ -2019,7 +2482,7 @@ export class WorkflowEngine {
     let registered = this.workflows.get(versionKey(run.workflow, run.workflowVersion));
     // Convention dispatch: a run recovered on an instance that never registered this workflow (e.g. a
     // crash-recovery pickup) is re-routed to a live worker group of the same name, if one exists.
-    if (!registered && (await this.ensureConventionWorkflow(run.workflow))) {
+    if (!registered && (await this.ensureConventionWorkflow(run.workflow, run.namespace))) {
       registered =
         this.workflows.get(versionKey(run.workflow, run.workflowVersion)) ??
         this.latest.get(run.workflow);
@@ -2120,9 +2583,19 @@ export class WorkflowEngine {
    * (and their per-run lock loops) start nothing once this is called, and {@link runOne} refuses
    * broker-delivered runs. Runs already started finish. {@link drain} calls it first; the worker loop
    * calls it the moment a stop is requested, so a tick still in flight stops leasing a backlog.
+   *
+   * `spentMs` is wait time ALREADY spent on this shutdown (the worker loop waiting for its in-flight
+   * tick). It is deducted from the budget of a later {@link drain}, so that wait plus the drain stay
+   * within one `drainTimeoutMs`; a drain already waiting is shortened. Only time actually spent
+   * waiting is charged, and reports add up. Non-finite or negative values are ignored, so one bad
+   * report can't turn every later drain into a 0 ms wait.
    */
-  beginDrain(): void {
+  beginDrain(spentMs = 0): void {
     this.draining = true;
+    if (Number.isFinite(spentMs) && spentMs > 0) {
+      this.drainSpentMs += spentMs;
+      for (const rearm of this.drainRearms) rearm();
+    }
   }
 
   /** True once {@link beginDrain} (or {@link drain}) has been called. */
@@ -2148,14 +2621,39 @@ export class WorkflowEngine {
    * process is going away, so a held lease would only delay the next pod's `recoverIncomplete` until
    * expiry; after release the next pod replays deterministically (a pending step re-dispatches the same
    * `stepId`, idempotent by the durable contract; a completed step short-circuits).
+   *
+   * `timeoutMs` is the TOTAL shutdown budget: wait already reported through {@link beginDrain}
+   * (`spentMs`) is deducted, so a worker that first waited for its in-flight tick drains only for
+   * what is left. With nothing reported, the full `timeoutMs` applies.
    */
   async drain(timeoutMs = 10_000): Promise<void> {
     this.beginDrain();
     if (this.inflight.size === 0 && this.postSettle.size === 0) return;
+    // The deadline is `start + timeoutMs - spent`, re-read whenever `beginDrain(spentMs)` reports more
+    // wait — so a shutdown that already waited for an in-flight tick only drains for the remainder.
+    const start = Date.now();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let rearm = (): void => {};
     const timer = new Promise<'timeout'>((resolve) => {
-      const t = setTimeout(() => resolve('timeout'), timeoutMs);
-      (t as { unref?: () => void }).unref?.();
+      rearm = () => {
+        clearTimeout(timeout);
+        const remaining = Math.max(0, start + timeoutMs - this.drainSpentMs - Date.now());
+        timeout = setTimeout(() => resolve('timeout'), remaining);
+        (timeout as { unref?: () => void }).unref?.();
+      };
+      rearm();
     });
+    this.drainRearms.add(rearm);
+    try {
+      await this.drainUntil(timer);
+    } finally {
+      this.drainRearms.delete(rearm);
+      clearTimeout(timeout);
+    }
+  }
+
+  /** The {@link drain} wait loop, bounded by `timer`. */
+  private async drainUntil(timer: Promise<'timeout'>): Promise<void> {
     // Loop, don't snapshot-once: settling an in-flight run fires post-settle effects (parent notify,
     // singleton wake) that can resume — and thus re-inflight — another run, which settles and fires
     // more effects. Wait until BOTH sets reach steady-state empty, or the shared timer wins. The
@@ -2266,19 +2764,42 @@ export class WorkflowEngine {
     // that's ~zero rows per tick, instead of fetching every running run and issuing one doomed
     // lock-probe UPDATE per row per worker per second. Falls back to the old full-list + in-process
     // filter for a custom store without the optimized method.
+    //
+    // Self-reclaim: for one lease window after boot, also ask for the runs still leased to THIS
+    // instance id. Under a stable id (a pod name), a SIGKILLed/OOM-killed predecessor's leases read
+    // as "held by me" and would otherwise sit out their full `leaseMs`. After that window no such
+    // lease can still be live, so the extra predicate is dropped and the query is the orphan-only one.
     const incomplete = await asHeartbeat(async () => {
       const nowMs = this.clock();
+      const owner = nowMs < this.bootedAt + this.leaseMs ? this.instanceId : undefined;
       if (this.store.listOrphanedRuns) {
-        return this.store.listOrphanedRuns(nowMs, 100, this.namespace);
+        return owner === undefined
+          ? this.store.listOrphanedRuns(nowMs, 100, this.namespace)
+          : this.store.listOrphanedRuns(nowMs, 100, this.namespace, owner);
       }
       return (await this.store.listIncompleteRuns(this.namespace)).filter(
-        (r) => r.lockedUntil === undefined || r.lockedUntil <= nowMs,
+        (r) =>
+          r.lockedUntil === undefined ||
+          r.lockedUntil <= nowMs ||
+          (owner !== undefined && r.lockedBy === owner),
       );
     });
     for (const listed of incomplete) {
       if (this.draining) break; // stop requested mid-sweep
-      // A live worker renews its lease, so an acquirable lease means the run is genuinely orphaned
-      // (its worker crashed). Skip the ones still owned.
+      // A run still leased to this instance id: reclaimable only when a PREVIOUS process under the
+      // same id left that lease behind — never one this process holds (see selfReclaimable). Give the
+      // stale lease up so the normal orphan path below can take it; anything else is skipped.
+      if (
+        listed.lockedBy === this.instanceId &&
+        listed.lockedUntil !== undefined &&
+        listed.lockedUntil > nowMs &&
+        !(await this.releaseStaleSelfLease(listed))
+      ) {
+        continue;
+      }
+      // An IN-PROCESS turn renews its lease, so an acquirable lease means no turn is executing this
+      // run right now. Skip the ones still owned. That is NOT the same as "its worker crashed" — see
+      // the dispatched-step guard below for the case it doesn't cover.
       const acquired = await this.store.tryLockRun(
         listed.id,
         this.instanceId,
@@ -2296,6 +2817,38 @@ export class WorkflowEngine {
       const run = await this.store.getRun(listed.id);
       if (run?.status !== 'running') {
         await this.store.releaseRunLock(listed.id, this.instanceId);
+        continue;
+      }
+      // NOT AN ORPHAN: a run with an in-flight (`pending`) remote step is not executed in process at
+      // all — its work sits on the transport, run by a worker that holds NO run lease, so the free
+      // lease proves nothing about it. By contract such a run is durably SUSPENDED (see
+      // `StepCheckpoint.status`); reading `running` means a turn ended without restoring that. Counting
+      // it as a crash would burn the poison-pill budget on a healthy run and, past
+      // `maxRecoveryAttempts`, dead-letter it while its worker is still executing the step. Re-assert
+      // the contract instead: park it `suspended` on the step's deadline or the reconcile timer. The
+      // worker's result resumes it; `resumeDueTimers` is the safety net. A LOST dispatch stays the job
+      // of `remoteRedispatchMs` / `redispatchPending`.
+      const dispatched = await this.inFlightRemoteStep(run.id);
+      if (dispatched) {
+        // A REMOTE workflow reads `running` only while a turn is being computed or applied, so a free
+        // lease here means that turn was lost — the call in flight is not what the run waits on next.
+        // Park it on a near wake so the timer pass re-drives the turn promptly (never later than the
+        // call's own deadline) instead of after the whole reconcile window.
+        const registered =
+          this.workflows.get(versionKey(run.workflow, run.workflowVersion)) ??
+          this.latest.get(run.workflow);
+        const stepWake = this.reconcileWakeAt(dispatched.wakeAt);
+        const wakeAt = registered?.remote
+          ? Math.min(stepWake ?? Number.POSITIVE_INFINITY, this.clock() + REMOTE_TURN_REDRIVE_MS)
+          : stepWake;
+        // Conditional on still-`running`: a lease-free `cancel()` may have settled it meanwhile.
+        const parked = await this.store.updateRunIf(run.id, ['running'], {
+          status: 'suspended',
+          wakeAt,
+          updatedAt: new Date(),
+        });
+        await this.store.releaseRunLock(run.id, this.instanceId);
+        if (parked) results.push({ runId: run.id, status: 'suspended' });
         continue;
       }
       // Count the attempt / dead-letter a poison pill past maxRecoveryAttempts.
@@ -2329,6 +2882,54 @@ export class WorkflowEngine {
   }
 
   /**
+   * Whether a lease held under this engine's own {@link instanceId} was left behind by a previous
+   * process that ran under the same id, rather than held by this one. Both must hold:
+   *  - nothing in this process executes the run: no execution in its run gate and no execution lease
+   *    tracked for it;
+   *  - the lease was written before this engine booted: every lease this process writes (acquire or
+   *    renew) ends at `clock() + leaseMs >= bootedAt + leaseMs`, so an earlier end proves an earlier
+   *    writer. This also covers the brief windows where a path of this process holds the lease
+   *    without having entered the run gate yet (a sweep between `tryLockRun` and the resume).
+   *
+   * Sound only when no two LIVE processes share an instance id — the documented requirement.
+   */
+  private selfReclaimable(run: WorkflowRun, gated = this.runGates.has(run.id)): boolean {
+    if (run.lockedBy !== this.instanceId || run.lockedUntil === undefined) return false;
+    if (gated || this.executionLeases.has(run.id)) return false;
+    return run.lockedUntil - this.leaseMs < this.bootedAt;
+  }
+
+  /**
+   * Release a lease this instance's previous incarnation left on `listed` (see {@link selfReclaimable}),
+   * so the recovery sweep can take the run like any orphan. The release runs inside the run's
+   * in-process gate, so a resume landing meanwhile here queues behind it instead of executing on the
+   * lease being given up; the run is re-read there and only released if it is still a stale `running`
+   * self-lease. Returns whether the lease was released.
+   */
+  private async releaseStaleSelfLease(listed: WorkflowRun): Promise<boolean> {
+    if (!this.selfReclaimable(listed)) return false;
+    let released = false;
+    await this.serializeOnRun(listed.id, async () => {
+      const run = await this.store.getRun(listed.id);
+      // The gate is ours now (serializeOnRun registered it before any other resume could queue).
+      if (run?.status !== 'running' || !this.selfReclaimable(run, false)) return;
+      await this.store.releaseRunLock(run.id, this.instanceId);
+      released = true;
+    });
+    return released;
+  }
+
+  /**
+   * The remote step this run dispatched and still awaits a result for, if any — the durable marker
+   * that tells {@link recoverIncomplete} "this run's work is on the transport, not in a crashed
+   * process". A `pending` remote checkpoint is written before the dispatch and settled by the result.
+   */
+  private async inFlightRemoteStep(runId: string): Promise<StepCheckpoint | undefined> {
+    const checkpoints = await this.store.listCheckpoints(runId);
+    return checkpoints.find((cp) => cp.kind === 'remote' && cp.status === 'pending');
+  }
+
+  /**
    * Per-recovery bookkeeping (called once the lease is held): count the attempt, or — past
    * `maxRecoveryAttempts` — move a poison pill to the `dead` dead-letter state. Returns a terminal
    * result to skip the resume, `null` to skip it silently (the run is no longer `running`), or
@@ -2359,6 +2960,9 @@ export class WorkflowEngine {
         error,
       });
       this.notifyDead({ ...run, status: 'dead', error, recoveryAttempts: attempts });
+      // `dead` is terminal like `failed`: a parent awaiting this run as a child (ctx.child, a ctx.all /
+      // allSettled fan) must learn it now, as a failed child, not on its next reconcile wake.
+      this.notifyParent(run.id, failedCompletion(error));
       return { runId: run.id, status: 'dead', error };
     }
     // Count BEFORE resuming, so a crash mid-resume still advances the counter.
@@ -2442,7 +3046,9 @@ export class WorkflowEngine {
     //   live `running` placeholder with its `child:<id>` waiter put back — a separately retried
     //   child's completion (already buffered, or still to come) then resumes this run.
     //   Retry child and parent in either order; signal buffering makes it converge.
-    if (run.status === 'failed' || run.status === 'dead') {
+    // - the run-level `recoveryAttempts` budget goes back to zero (see the final `updateRun`).
+    const resurrecting = run.status === 'failed' || run.status === 'dead';
+    if (resurrecting) {
       const isFailureCompletion = (v: unknown): boolean =>
         typeof v === 'object' && v !== null && (v as { ok?: unknown }).ok === false;
       for (const cp of await this.store.listCheckpoints(runId)) {
@@ -2528,9 +3134,27 @@ export class WorkflowEngine {
     await this.store.releaseRunLock(runId);
     // Explicit `error: undefined` CLEARS the stale failure (the store spreads the patch over the
     // run) — otherwise the dashboard keeps showing the old error while the run is re-executing.
+    //
+    // RESURRECTING a `failed`/`dead` run also resets `recoveryAttempts`, or the retry is a lie: a run
+    // dead-lettered AT `maxRecoveryAttempts` comes back `pending`, and the next `recoverIncomplete`
+    // pass that finds it orphaned computes `cap + 1` and kills it again with the same
+    // `max_recovery_attempts` error. The budget bounds ONE crash-loop episode; resurrecting a run that
+    // came to rest starts a new one. `0`, not `undefined`, so every store writes a real value.
+    // Gated on `resurrecting`: requeueing a still-live run is not a resurrection, and zeroing there
+    // would let a retry loop keep a crash-looping run alive forever.
+    //
+    // It also drops a stale singleton admission marker (a terminal settle clears it; this covers a
+    // row written before that), so the resurrected run competes for a slot like any waiter.
+    //
+    // And it clears a remote workflow turn's decision marker (`awaitingDecisionTaskId`): the requeued
+    // run dispatches a FRESH turn, so a late decision of the old one must find no marker to match.
+    const staleAdmission = resurrecting ? withoutAdmission(run.tags) : undefined;
     await this.store.updateRun(runId, {
       status: 'pending',
       error: undefined,
+      awaitingDecisionTaskId: undefined,
+      ...(resurrecting ? { recoveryAttempts: 0 } : {}),
+      ...(staleAdmission ? { tags: staleAdmission } : {}),
       updatedAt: new Date(),
     });
     await this.runDispatcher.dispatch(runId);
@@ -2541,8 +3165,9 @@ export class WorkflowEngine {
    * Explicitly re-dispatch every remote step of `runId` stuck `pending` — the OPERATOR escape hatch for
    * a run whose dispatched step job was LOST (worker crashed with no result, or a transport that dropped
    * the job). No automatic recovery re-drives these: a reconcile re-drive re-suspends a still-pending
-   * step by design (unless `remoteRedispatchMs` is set), `recoverIncomplete` only reclaims LEASED runs,
-   * and `requeue` just replays back to the pending guard. This re-enqueues the same `stepId` so the
+   * step by design (unless `remoteRedispatchMs` is set), `recoverIncomplete` parks a run with an
+   * in-flight `pending` remote step back to `suspended` instead of re-driving it, and `requeue` just
+   * replays back to the pending guard. This re-enqueues the same `stepId` so the
    * (idempotent) step re-runs and its result resumes the run. Safe to call on a healthy run — it re-runs
    * only in-flight `pending` remote steps, which are idempotent by the durable contract. Returns the
    * run's current status (with the count re-dispatched), or null if the run is unknown.
@@ -2625,8 +3250,15 @@ export class WorkflowEngine {
   waitForRun(runId: string, opts?: { timeoutMs?: number; terminal?: boolean }): Promise<RunResult> {
     const isTerminal = (s: RunStatus): boolean =>
       s === 'completed' || s === 'failed' || s === 'cancelled' || s === 'dead';
-    const isSettled = (s: RunStatus): boolean => s !== 'pending' && s !== 'running';
-    const shouldResolve = opts?.terminal ? isTerminal : isSettled;
+    // A run `suspended` while it awaits a dispatched remote workflow turn's decision
+    // (`awaitingDecisionTaskId` set) is mid-turn, not settled: that suspend is the engine's re-drive
+    // marker, not a sleep/signal the body asked for. Keep waiting until the decision lands.
+    const isSettled = (run: WorkflowRun): boolean =>
+      run.status !== 'pending' &&
+      run.status !== 'running' &&
+      !(run.status === 'suspended' && run.awaitingDecisionTaskId !== undefined);
+    const shouldResolve = (run: WorkflowRun): boolean =>
+      opts?.terminal ? isTerminal(run.status) : isSettled(run);
     const toResult = (run: WorkflowRun): RunResult => ({
       runId,
       status: run.status,
@@ -2658,7 +3290,7 @@ export class WorkflowEngine {
         void this.store
           .getRun(runId)
           .then((run) => {
-            if (run && shouldResolve(run.status)) finish(run);
+            if (run && shouldResolve(run)) finish(run);
           })
           .catch(() => undefined);
       };
@@ -2679,6 +3311,12 @@ export class WorkflowEngine {
   /**
    * Resume each run only if this instance can acquire its recovery lease — so when several
    * replicas recover or poll at once, each run is picked up by exactly one of them.
+   *
+   * A run this instance cannot resume is SKIPPED (and logged), never allowed to abort the batch: a
+   * leased batch is a mixed bag during a rolling deploy (a pod without a run's workflow throws for
+   * it by design) and a store hiccup can fail one row, but the rest of the batch is runs it can drive
+   * — and every caller is a recovery/poll sweep. The skipped run stays locked only until its lease
+   * expires, then another instance (or a later tick) picks it up.
    */
   private async resumeLeased(
     runs: WorkflowRun[],
@@ -2706,9 +3344,27 @@ export class WorkflowEngine {
           nowMs,
         );
         if (!acquired) continue;
-        // A per-run hook (recovery counting / dead-lettering) may settle the run terminally instead.
-        const settled = onLocked ? await onLocked(run) : undefined;
-        results.push(settled ?? (await this.resumeImplicit(run.id)));
+        if (this.draining) {
+          // Drain began while the lock was being taken. Starting the run now would hand `drain()` work
+          // it may already have stopped waiting for, and an exit would strand the lease until expiry.
+          // Give the lease back; the run stays for the next instance.
+          await this.store.releaseRunLock(run.id, this.instanceId).catch(() => undefined);
+          return;
+        }
+        try {
+          // A per-run hook (recovery counting / dead-lettering) may settle the run terminally instead.
+          const settled = onLocked ? await onLocked(run) : undefined;
+          results.push(settled ?? (await this.resumeImplicit(run.id)));
+        } catch (error) {
+          // A foreign-namespace run is simply not ours (resume released its lease) — skip quietly.
+          if (error instanceof NamespaceMismatch) continue;
+          // Loud: a skip is not nothing — the run is still there and not progressing, and the reason
+          // (a version skew, a store outage) is what tells an operator which.
+          console.error(
+            `[adonis-durable] could not resume run ${run.id} (${run.workflow}@${run.workflowVersion}); leaving it for another instance or a later tick:`,
+            error,
+          );
+        }
       }
     };
     await Promise.all(Array.from({ length: Math.min(CONCURRENCY, runs.length) }, () => worker()));
@@ -2907,6 +3563,17 @@ export class WorkflowEngine {
   }
 
   /**
+   * Wake the run parked on `token` with `payload`, if there is one; otherwise do nothing — unlike
+   * {@link signal}, it never buffers. For a wake-up whose real payload is ALREADY buffered on the
+   * token (an entity op, see `Entities.kick`): a run that isn't parked reads that buffer at its next
+   * wait, so there is nothing to keep.
+   */
+  private async wakeSignalWaiter(token: string, payload: unknown): Promise<RunResult | null> {
+    const waiter = await this.store.takeSignalWaiter(token);
+    return waiter ? this.deliverSignal(waiter, payload) : null;
+  }
+
+  /**
    * Ensure a run exists for `runId`, then deliver a signal to it — atomically race-free thanks to
    * signal buffering: if the run is new (or busy / not yet waiting), the signal is buffered and
    * consumed when it reaches `waitForSignal(token)`. The canonical **durable-entity / accumulator**
@@ -3087,7 +3754,13 @@ export class WorkflowEngine {
       return { runId, status: run.status };
     }
     const error = { message: 'cancelled' };
-    await this.store.updateRun(runId, { status: 'cancelled', error, updatedAt: new Date() });
+    // Clears a remote turn's decision marker too: a cancelled run awaits no decision.
+    await this.store.updateRun(runId, {
+      status: 'cancelled',
+      error,
+      awaitingDecisionTaskId: undefined,
+      updatedAt: new Date(),
+    });
     this.emit({
       type: 'run.failed',
       runId,
@@ -3204,6 +3877,40 @@ export class WorkflowEngine {
    */
   countRuns(query: Omit<RunQuery, 'page' | 'size'>): Promise<number> {
     return countRuns(this.store, query);
+  }
+
+  /**
+   * Every workflow the live fleet can execute in this engine's partition: what workers DECLARE in
+   * their descriptors, plus the live routing tokens no descriptor explains (a worker too old to
+   * describe itself). Each entry says which kind of evidence it rests on. See
+   * {@link workflowDirectory} for why the list is the length it is.
+   */
+  async announcedWorkflows(): Promise<AnnouncedWorkflow[]> {
+    return (await this.workflowDirectory()).workflows;
+  }
+
+  /**
+   * {@link announcedWorkflows}, plus why it is empty when it is: no transport here can read the fleet
+   * (`supported: false`), nothing is live, or workers are live only on OTHER partitions
+   * (`otherPartitions`), which otherwise reads exactly like an empty fleet. Two live reads, neither
+   * retained: the descriptor advertisement and the heartbeat keyspace. Only the BullMQ transport reads
+   * them today.
+   */
+  async workflowDirectory(): Promise<WorkflowDirectory> {
+    const supported = this.pool.introspectsFleet;
+    const [descriptors, heartbeats] = supported
+      ? await Promise.all([
+          this.pool.readAllWorkerDescriptors(),
+          this.pool.readAllWorkerHeartbeats(),
+        ])
+      : [[], []];
+    return buildWorkflowDirectory({
+      descriptors,
+      heartbeats,
+      namespace: this.namespace,
+      supported,
+      sanitize: sanitizeQueueToken,
+    });
   }
 
   /** The worker groups this engine dispatches to: every registered remote workflow's group, plus any
@@ -3406,8 +4113,13 @@ export class WorkflowEngine {
         return { runId: run.id, status: run.status };
       }
     }
+    const lease = { handedOff: false };
+    this.executionLeases.set(run.id, lease);
     const renew = setInterval(
       () => {
+        // A lease this execution gave away on purpose (see releaseTurnLease) is not renewed, and its
+        // `false` renew is not a takeover.
+        if (lease.handedOff) return;
         // A renew that returns FALSE means the lease was taken over (this turn stalled past expiry
         // and another instance reclaimed the run) — this executor is now a zombie. Fence it: mark
         // the run so its eventual settle degrades to a no-op echo instead of clobbering the new
@@ -3416,7 +4128,7 @@ export class WorkflowEngine {
         void this.store
           .renewRunLock(run.id, this.instanceId, this.clock() + this.leaseMs)
           .then((renewed) => {
-            if (!renewed) this.leaseLostRuns.add(run.id);
+            if (!renewed && !lease.handedOff) this.leaseLostRuns.add(run.id);
           })
           .catch(() => undefined);
       },
@@ -3446,6 +4158,7 @@ export class WorkflowEngine {
     } finally {
       clearInterval(renew);
       this.leaseLostRuns.delete(run.id);
+      if (this.executionLeases.get(run.id) === lease) this.executionLeases.delete(run.id);
     }
   }
 
@@ -3540,7 +4253,7 @@ export class WorkflowEngine {
   ): Promise<HandoffOutcome | undefined> {
     const registered = this.workflows.get(versionKey(run.workflow, run.workflowVersion));
     const routes = registered?.convention
-      ? await this.announcedRoutes(run, registered.remote?.group ?? run.workflow, error)
+      ? await this.announcedRoutes(run, conventionGroup(run.workflow, run.namespace), error)
       : registered?.onError;
     const route = routeFor(routes, error);
     if (!route) return undefined;
@@ -3752,14 +4465,76 @@ export class WorkflowEngine {
     return this.reconcileMs != null ? this.clock() + this.reconcileMs : undefined;
   }
 
+  /**
+   * The result of a turn the singleton gate denied. The store already parked the run `suspended` on
+   * its retry timer INSIDE the admission claim (or left it alone, when a concurrent cancel had
+   * settled it), so report what is persisted rather than writing over it.
+   */
+  /**
+   * A run's first execution: `pending` -> `running`. A singleton run not yet admitted is stamped
+   * {@link SINGLETON_TRACKED_TAG} in the same write, BEFORE it competes for a slot, so a run this
+   * replica is about to admit or deny is never mistaken for a holder admitted by a replica older than
+   * 0.51 (see `legacySingletonHolders`).
+   */
+  private async markStarted(run: WorkflowRun, singleton: boolean): Promise<void> {
+    const tags = singleton ? withSingletonTracked(run.tags) : run.tags;
+    const retag = tags !== run.tags;
+    await this.store.updateRun(run.id, {
+      status: 'running',
+      ...(retag ? { tags } : {}),
+      updatedAt: new Date(),
+    });
+    run.status = 'running';
+    if (retag) run.tags = tags;
+  }
+
+  private async singletonWaitResult(run: WorkflowRun): Promise<RunResult> {
+    const current = await this.store.getRun(run.id);
+    await this.store.releaseRunLock(run.id, this.instanceId);
+    if (!current) throw new Error(`run ${run.id} was deleted during singleton admission`);
+    if (current.status === 'suspended') {
+      this.emit({
+        type: 'run.suspended',
+        runId: current.id,
+        workflow: current.workflow,
+        namespace: current.namespace,
+      });
+    }
+    return {
+      runId: current.id,
+      status: current.status,
+      output: current.output,
+      error: current.error,
+    };
+  }
+
   private async runRemoteExecution(
     run: WorkflowRun,
     registered: RegisteredWorkflow,
   ): Promise<RunResult> {
     const remote = registered.remote as NonNullable<RegisteredWorkflow['remote']>;
+    // A compensating cancel (`cancel(id, { compensate: true })`) resumes the run to unwind it. A remote
+    // workflow registers no engine-side saga compensations, so the unwind is just the `cancelled`
+    // settle — and it must happen even while a dispatched turn is still out (the hold below would
+    // otherwise swallow the cancel's resume, and the in-flight turn's decision would carry the run on
+    // as if it was never cancelled). The late decision then finds the run cancelled and is dropped.
+    if (await this.takeCancelIntent(run.id)) return this.compensateAndCancel(run, []);
+    // A dispatched turn is still out and within its liveness window: whatever woke the run (a step
+    // result, a signal, a wait recheck) must not dispatch a second turn over it — that would supersede
+    // the first and drop its decision, re-running whatever local steps that turn ran. Everything such a
+    // wake wrote is durable already; the in-flight turn's decision is applied as usual and its suspend
+    // rechecks what it waits on (the `reconcileMs` wake is the fallback). Only a LAPSED window (the
+    // timer poller, `wakeAt` due) re-drives the turn below.
+    if (
+      run.status === 'suspended' &&
+      run.awaitingDecisionTaskId !== undefined &&
+      (run.wakeAt == null || run.wakeAt > this.clock())
+    ) {
+      await this.releaseTurnLease(run.id);
+      return { runId: run.id, status: 'suspended' };
+    }
     if (run.status === 'pending') {
-      await this.store.updateRun(run.id, { status: 'running', updatedAt: new Date() });
-      run.status = 'running';
+      await this.markStarted(run, registered?.singleton !== undefined);
       this.emit({
         type: 'run.started',
         runId: run.id,
@@ -3768,22 +4543,16 @@ export class WorkflowEngine {
       });
     }
     if (registered.singleton && !(await this.singletons.admit(run, registered.singleton))) {
-      const wakeAt = this.singletons.retryWakeAt();
-      await this.store.updateRun(run.id, { status: 'suspended', wakeAt, updatedAt: new Date() });
-      this.emit({
-        type: 'run.suspended',
-        runId: run.id,
-        workflow: run.workflow,
-        namespace: run.namespace,
-      });
-      await this.store.releaseRunLock(run.id);
-      return { runId: run.id, status: 'suspended' };
+      return this.singletonWaitResult(run);
     }
 
     // Capability/protocol guard (design §7.5): a remote workflow's turn dispatches a WorkflowTask to
     // its group — if no live worker on that group can run it, park `blocked` before advancing rather
     // than handing the task to the executor to enqueue into a void. Re-checked each turn (recovery).
-    const routePlan = await this.planRoute(remote.group, registered.requires);
+    const routePlan = await this.planRoute(
+      registered.convention ? conventionGroup(run.workflow, run.namespace) : remote.group,
+      registered.requires,
+    );
     if (routePlan?.status === 'blocked') return this.parkBlocked(run, routePlan);
 
     const checkpoints = await this.store.listCheckpoints(run.id);
@@ -3793,10 +4562,40 @@ export class WorkflowEngine {
       return this.settleRun(run, await this.followHandoff(run, handoff));
     }
     const history = await this.remoteHistory(run.id, checkpoints);
+    // Broker-backed executors: dispatch the turn and suspend on it. The decision is applied by
+    // whichever replica consumes it (completeRemoteDecision), never awaited here.
+    if (remote.executor.dispatch) return this.dispatchRemoteTurn(run, registered, history);
+
+    // INLINE advance (an executor that produces the decision in-process): await it under the lease.
+    const advance = remote.executor.advance;
+    if (!advance) {
+      throw new Error(
+        `workflow ${run.workflow}@${run.workflowVersion}: its executor implements neither advance nor dispatch`,
+      );
+    }
     let decision: WorkflowDecision;
     try {
-      decision = await remote.executor.advance(run, history);
+      const silenceMs = this.remoteAdvanceSilenceMs;
+      const pending = advance.call(remote.executor, run, history);
+      decision =
+        silenceMs != null
+          ? await this.awaitTurnWithSilence(run.id, pending, silenceMs)
+          : await pending;
     } catch (err) {
+      // A timed-out advance is not a failure: the decision may have been lost while the work completed.
+      // Failing the run would notify its parent of a failure that never happened. Leave it `running`
+      // with its lease released, so crash recovery re-drives it (replaying completed steps; bounded by
+      // `maxRecoveryAttempts`).
+      if (err instanceof RemoteWorkflowTimeout) {
+        await this.store
+          .updateRunIf(run.id, ['running', 'suspended'], {
+            status: 'running',
+            updatedAt: new Date(),
+          })
+          .catch(() => false);
+        await this.releaseTurnLease(run.id);
+        return { runId: run.id, status: 'running' };
+      }
       const error = {
         message: err instanceof Error ? err.message : String(err),
         stack: err instanceof Error ? err.stack : undefined,
@@ -3812,6 +4611,17 @@ export class WorkflowEngine {
       return { runId: run.id, status: 'failed', error };
     }
 
+    return this.applyDecision(run, decision);
+  }
+
+  /**
+   * Apply a remote workflow turn's {@link WorkflowDecision}: persist the local steps it ran, then settle
+   * (completed/failed/cancelled) or dispatch its blocking ops and suspend (continue). Shared by the
+   * INLINE advance path ({@link runRemoteExecution}, under the execution's lease) and the dispatched
+   * path ({@link completeRemoteDecision}, which holds the lease itself and has already checked that
+   * this is the decision of the turn the run awaits).
+   */
+  private async applyDecision(run: WorkflowRun, decision: WorkflowDecision): Promise<RunResult> {
     if (decision.status === 'completed') {
       // Persist the local steps THIS turn ran before marking the run done. A workflow that runs
       // straight to completion in a single turn (every step inline, never suspending — e.g. a Python
@@ -3858,6 +4668,346 @@ export class WorkflowEngine {
     }
 
     return suspended;
+  }
+
+  /**
+   * The dispatched-turn path of {@link runRemoteExecution}: SUSPEND, then ENQUEUE. The engine mints a
+   * globally unique turn `taskId`, records it on the run as the awaited marker, and releases the lease,
+   * all BEFORE the turn is enqueued, so a worker's decision, however fast and on whichever replica it
+   * lands, always finds both its marker and a free lease (see {@link completeRemoteDecision}). The
+   * deadline is the turn's liveness window ({@link decisionWindowMs}); when it lapses with no decision
+   * and no run-scoped heartbeat, the timer poller re-drives the run, which dispatches a fresh turn.
+   */
+  private async dispatchRemoteTurn(
+    run: WorkflowRun,
+    registered: RegisteredWorkflow,
+    history: HistoryEvent[],
+  ): Promise<RunResult> {
+    const executor = (registered.remote as NonNullable<RegisteredWorkflow['remote']>).executor;
+    const dispatch = executor.dispatch as NonNullable<WorkflowExecutor['dispatch']>;
+    // Zombie fence, as settleRun's: a lost lease means another instance owns the run now.
+    if (this.leaseLostRuns.has(run.id)) return this.echoCurrentStatus(run.id);
+    // Random, not a per-process counter: two replicas re-driving the same run must never mint the same
+    // id (the `db` transport dedupes a turn by it, and the marker gates the decision on it).
+    const taskId = `${run.id}:wf:${globalThis.crypto.randomUUID()}`;
+    const windowMs = this.decisionWindowMs(registered);
+    const marked = await this.store.updateRunIf(run.id, SETTLE_ELIGIBLE_STATUSES, {
+      status: 'suspended',
+      awaitingDecisionTaskId: taskId,
+      wakeAt: windowMs != null ? this.clock() + Math.min(windowMs, MAX_BACKOFF_MS) : undefined,
+      updatedAt: new Date(),
+    });
+    if (!marked) {
+      // Cancelled / completed / dead while this turn was being prepared: nothing to dispatch.
+      await this.releaseTurnLease(run.id);
+      return this.echoCurrentStatus(run.id);
+    }
+    this.emit({
+      type: 'run.suspended',
+      runId: run.id,
+      workflow: run.workflow,
+      namespace: run.namespace,
+    });
+    await this.releaseTurnLease(run.id);
+    try {
+      await turnDispatchAls.run(run.id, () => dispatch.call(executor, run, history, taskId));
+    } catch (err) {
+      return this.failUndispatchedTurn(run, taskId, err);
+    }
+    return { runId: run.id, status: 'suspended' };
+  }
+
+  /**
+   * The turn could not be enqueued (the transport cannot carry workflow turns, or the broker refused the
+   * write): fail the run, as an advance that throws does — but only while it still awaits THIS turn, so
+   * a cancel or a re-drive that landed meanwhile wins.
+   */
+  private async failUndispatchedTurn(
+    run: WorkflowRun,
+    taskId: string,
+    err: unknown,
+  ): Promise<RunResult> {
+    const error = {
+      message: err instanceof Error ? err.message : String(err),
+      stack: err instanceof Error ? err.stack : undefined,
+    };
+    const current = await this.store.getRun(run.id);
+    if (current?.awaitingDecisionTaskId !== taskId) return this.echoCurrentStatus(run.id);
+    const failed = await this.store.updateRunIf(run.id, ['suspended'], {
+      status: 'failed',
+      error,
+      awaitingDecisionTaskId: undefined,
+      wakeAt: undefined,
+      updatedAt: new Date(),
+    });
+    if (!failed) return this.echoCurrentStatus(run.id);
+    this.emit({
+      type: 'run.failed',
+      runId: run.id,
+      workflow: run.workflow,
+      namespace: run.namespace,
+      error,
+    });
+    return { runId: run.id, status: 'failed', error };
+  }
+
+  /**
+   * Give the run lease away mid-execution on purpose: stop the execution's renew loop from renewing it
+   * (or reading the release as a takeover), then release it. Owner-scoped, so a lease another instance
+   * already holds is left alone.
+   */
+  private async releaseTurnLease(runId: string): Promise<void> {
+    const lease = this.executionLeases.get(runId);
+    if (lease) lease.handedOff = true;
+    await this.store.releaseRunLock(runId, this.instanceId);
+  }
+
+  /**
+   * The liveness window of a dispatched turn: the engine's `remoteAdvanceSilenceMs` and the executor's
+   * own `decisionTimeoutMs` (a `RemoteWorkflowExecutor`'s `timeoutMs`), the shorter of the two when both
+   * are set. `undefined` = no deadline: the run waits for its decision.
+   */
+  private decisionWindowMs(registered: RegisteredWorkflow | undefined): number | undefined {
+    const own = registered?.remote?.executor.decisionTimeoutMs || undefined;
+    const silence = this.remoteAdvanceSilenceMs;
+    if (own != null && silence != null) return Math.min(own, silence);
+    return own ?? silence;
+  }
+
+  /**
+   * Await an INLINE advance, rejecting with {@link RemoteWorkflowTimeout} once `silenceMs` passes with
+   * neither a decision nor a run-scoped heartbeat for `runId`. Each beat rearms the window. The beat
+   * hook is registered before this returns, so a beat can't slip in unseen.
+   */
+  private awaitTurnWithSilence(
+    runId: string,
+    advance: Promise<WorkflowDecision>,
+    silenceMs: number,
+  ): Promise<WorkflowDecision> {
+    const key = turnBeatKey(runId);
+    const windowMs = Math.min(silenceMs, MAX_BACKOFF_MS);
+    return new Promise<WorkflowDecision>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout>;
+      const cleanup = () => {
+        clearTimeout(timer);
+        if (this.heartbeatResets.get(key) === reset) this.heartbeatResets.delete(key);
+      };
+      const arm = () => {
+        timer = setTimeout(() => {
+          cleanup();
+          reject(new RemoteWorkflowTimeout(runId, silenceMs));
+        }, windowMs);
+        (timer as { unref?: () => void }).unref?.();
+      };
+      const reset = () => {
+        clearTimeout(timer);
+        arm();
+      };
+      this.heartbeatResets.set(key, reset);
+      arm();
+      advance.then(
+        (decision) => {
+          cleanup();
+          resolve(decision);
+        },
+        (err) => {
+          cleanup();
+          reject(err);
+        },
+      );
+    });
+  }
+
+  /** Whether `run` is awaiting exactly `decision`'s turn (and so may still apply it). */
+  private awaitsDecision(run: WorkflowRun | null, decision: WorkflowDecision): run is WorkflowRun {
+    return (
+      run !== null &&
+      run.status === 'suspended' &&
+      run.awaitingDecisionTaskId !== undefined &&
+      run.awaitingDecisionTaskId === decision.taskId
+    );
+  }
+
+  /**
+   * Apply a remote workflow-turn {@link WorkflowDecision} durably, on WHICHEVER replica consumes it: the
+   * dispatching replica may be gone, or a point-to-point decisions queue handed the decision to a
+   * sibling. The durable twin of {@link completeRemoteResult} for a workflow TURN: look the run up by
+   * `decision.runId`, check that it still awaits this `taskId` (a stale, duplicate, foreign or
+   * superseded decision is dropped, so a decision applies at most once), lease it, and apply it.
+   * Serialized with this replica's own executions of the run through the run gate.
+   */
+  private async completeRemoteDecision(decision: WorkflowDecision): Promise<void> {
+    if (!decision?.runId || !decision.taskId) return;
+    const run = await this.store.getRun(decision.runId);
+    if (!this.awaitsDecision(run, decision)) return;
+    // A scoped engine leaves another pool's runs to that pool (an operator applies everyone's).
+    if (
+      this.namespace !== undefined &&
+      run.namespace !== undefined &&
+      run.namespace !== this.namespace
+    ) {
+      return;
+    }
+    await this.serializeOnRun(decision.runId, () => this.applyRemoteDecision(decision));
+  }
+
+  /**
+   * Run `fn` in the run's in-process execution gate (see {@link resumeRun}): after the execution in
+   * flight here, before any resume that lands later. A resume already queued (not started) runs first.
+   */
+  private serializeOnRun(runId: string, fn: () => Promise<void>): Promise<void> {
+    let gate = this.runGates.get(runId);
+    const prior: Promise<unknown> = gate ? gate.tail.catch(() => undefined) : Promise.resolve();
+    const done = prior.then(fn);
+    const tail: Promise<RunResult> = done.then(
+      () => ({ runId, status: 'suspended' }),
+      () => ({ runId, status: 'suspended' }),
+    );
+    if (!gate) {
+      gate = { tail };
+      this.runGates.set(runId, gate);
+    } else {
+      gate.tail = tail;
+    }
+    this.closeGateAfter(runId, gate, tail);
+    this.trackEffect(done);
+    return done;
+  }
+
+  /** {@link completeRemoteDecision} inside the run gate: lease, re-check, claim the turn, apply. */
+  private async applyRemoteDecision(decision: WorkflowDecision): Promise<void> {
+    const runId = decision.runId;
+    if (!(await this.leaseForDecision(decision))) return;
+    const renew = setInterval(
+      () => {
+        void this.store
+          .renewRunLock(runId, this.instanceId, this.clock() + this.leaseMs)
+          .then((renewed) => {
+            if (!renewed) this.leaseLostRuns.add(runId);
+          })
+          .catch(() => undefined);
+      },
+      Math.max(50, Math.floor(this.leaseMs / 2)),
+    );
+    renew.unref?.();
+    try {
+      const fresh = await this.store.getRun(runId);
+      if (!this.awaitsDecision(fresh, decision)) return;
+      // Claim the turn: clear the marker and its deadline, and flip to `running` while the decision is
+      // applied. Under the lease the marker cannot move (only a leased dispatch or re-drive rewrites
+      // it); the status predicate loses to a lease-free cancel/requeue. If this instance dies
+      // mid-apply, the run is a plain `running` orphan that crash recovery re-drives.
+      const claimed = await this.store.updateRunIf(runId, ['suspended'], {
+        status: 'running',
+        awaitingDecisionTaskId: undefined,
+        wakeAt: undefined,
+        updatedAt: new Date(),
+      });
+      if (!claimed) return;
+      this.decisionDeadlineRearms.delete(runId);
+      const run: WorkflowRun = {
+        ...fresh,
+        status: 'running',
+        awaitingDecisionTaskId: undefined,
+        wakeAt: undefined,
+      };
+      const registered =
+        this.workflows.get(versionKey(run.workflow, run.workflowVersion)) ??
+        this.latest.get(run.workflow);
+      const result = await this.applyDecision(run, decision);
+      // Notify-on-release, as execute does for a turn it settles.
+      if (
+        registered?.singleton &&
+        (result.status === 'completed' ||
+          result.status === 'failed' ||
+          result.status === 'cancelled' ||
+          result.status === 'dead')
+      ) {
+        this.trackEffect(this.singletons.wakeNext(run));
+      }
+    } finally {
+      clearInterval(renew);
+      this.leaseLostRuns.delete(runId);
+      await this.store.releaseRunLock(runId, this.instanceId).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Acquire the run lease to apply `decision`. The dispatcher released it before enqueueing, so this
+   * normally succeeds at once; another replica may still hold it briefly (its wake found the turn in
+   * flight and is releasing), so retry until the lease frees, the run stops awaiting this turn, or one
+   * lease window passes (a crashed holder's lease expires within it). A lease THIS instance holds is
+   * reused: we are inside the run gate, so no execution of it is running here.
+   */
+  private async leaseForDecision(decision: WorkflowDecision): Promise<boolean> {
+    const runId = decision.runId;
+    // Real time, not `this.clock`: a test clock may stand still.
+    const giveUpAt = Date.now() + this.leaseMs + 1_000;
+    let delayMs = 10;
+    for (;;) {
+      const run = await this.store.getRun(runId);
+      if (!this.awaitsDecision(run, decision)) return false;
+      const now = this.clock();
+      if (run.lockedBy === this.instanceId && (run.lockedUntil ?? 0) > now) return true;
+      if (await this.store.tryLockRun(runId, this.instanceId, now + this.leaseMs, now)) return true;
+      if (Date.now() >= giveUpAt) {
+        console.warn(
+          `[adonis-durable] could not lease run ${runId} to apply the decision of turn ${decision.taskId}; the turn's liveness window re-drives it`,
+        );
+        return false;
+      }
+      await new Promise((r) => setTimeout(r, delayMs));
+      delayMs = Math.min(delayMs * 2, 250);
+    }
+  }
+
+  /**
+   * A run-scoped heartbeat for a run awaiting a dispatched turn's decision: push its re-drive deadline
+   * (`wakeAt`) forward so a worker still replaying the turn is not re-driven. The durable counterpart
+   * of an inline advance's in-memory rearm, and the run-scoped sibling of {@link rearmStepLease}.
+   *
+   * Throttled the same way: a renewal buys at most one window, so it is only worth a write once the
+   * window is half spent. A beat that finds more than half of it left writes nothing and records the
+   * half-spent mark, so later beats skip even the read until then. That bounds the cost at one read and
+   * one write per half window per awaited turn, whatever the beat cadence. The mark is in memory only
+   * (cold on another replica, which re-derives the same answer from the run's `wakeAt`). Best-effort:
+   * it runs inside the transport's serial beat handler, so a store error is swallowed, and the mark only
+   * moves after a write commits, so the next beat retries.
+   */
+  private async rearmDecisionDeadline(runId: string): Promise<void> {
+    // No window anywhere: nothing ever re-drives a turn, so there is no deadline to defend.
+    if (!runId || (this.remoteAdvanceSilenceMs == null && !this.anyDecisionTimeout)) return;
+    const now = this.clock();
+    const lookAgainAt = this.decisionDeadlineRearms.get(runId);
+    if (lookAgainAt !== undefined && now < lookAgainAt) return;
+    try {
+      const run = await this.store.getRun(runId);
+      if (run?.status !== 'suspended' || run.awaitingDecisionTaskId === undefined) {
+        this.decisionDeadlineRearms.delete(runId);
+        return;
+      }
+      const windowMs = this.decisionWindowMs(
+        this.workflows.get(versionKey(run.workflow, run.workflowVersion)) ??
+          this.latest.get(run.workflow),
+      );
+      if (windowMs == null) return;
+      const halfWindow = Math.ceil(windowMs / 2);
+      if (run.wakeAt != null && run.wakeAt > now + halfWindow) {
+        this.decisionDeadlineRearms.set(runId, run.wakeAt - halfWindow);
+        return;
+      }
+      const renewed = now + Math.min(windowMs, MAX_BACKOFF_MS);
+      // Only while the same turn is still awaited: a decision applied (or a re-drive) meanwhile wins.
+      const applied = await this.store.updateRunIf(runId, ['suspended'], {
+        wakeAt: renewed,
+        updatedAt: new Date(),
+      });
+      if (!applied) return;
+      if (this.decisionDeadlineRearms.size > 1024) this.decisionDeadlineRearms.clear();
+      this.decisionDeadlineRearms.set(runId, renewed - halfWindow);
+    } catch {
+      // Best-effort liveness: a store blip costs one skipped renewal, never the beat loop.
+    }
   }
 
   /**
@@ -4344,6 +5494,63 @@ export class WorkflowEngine {
     return wakeAt;
   }
 
+  /**
+   * Whether a compensating cancel is pending for this run, consuming the in-memory flag. The intent
+   * lives in TWO places: the in-memory `cancelRequested` fast path (same pod, same boot), and the
+   * DURABLE buffered `cancel:<id>` marker `cancel()` persisted — so a crash or a cross-pod handoff
+   * mid-cancellation can't silently forget the cancel. The marker is peeked (take + re-buffer), not
+   * consumed: it must survive a crash mid-unwind; {@link compensateAndCancel} drains it once
+   * `cancelled` is durably recorded.
+   */
+  private async takeCancelIntent(runId: string): Promise<boolean> {
+    if (this.cancelRequested.delete(runId)) return true;
+    const marker = await this.store.takeBufferedSignal(`cancel:${runId}`);
+    if (!marker) return false;
+    await this.store.bufferSignal(`cancel:${runId}`, marker.payload).catch(() => undefined);
+    return true;
+  }
+
+  /**
+   * Undo the registered saga compensations in reverse and settle the run `cancelled`. Shared by EVERY
+   * exit of a turn with a compensating cancel pending — the body returned, suspended, hit
+   * continue-as-new or threw — so the cancel is never lost because the body didn't stop at a
+   * suspension point.
+   */
+  private async compensateAndCancel(
+    run: WorkflowRun,
+    compensations: Compensation[],
+  ): Promise<RunResult> {
+    this.cancelRequested.delete(run.id);
+    // Zombie fence (as in settleRun): another instance owns the run now; the durable marker is still
+    // there for it, so this stale turn must neither undo nor write.
+    if (this.leaseLostRuns.has(run.id)) return this.echoCurrentStatus(run.id);
+    for (let i = compensations.length - 1; i >= 0; i -= 1) {
+      const comp = compensations[i];
+      if (comp) await this.runCompensation(run, comp, i);
+    }
+    const error = { message: 'cancelled' };
+    await this.store.updateRun(run.id, {
+      status: 'cancelled',
+      error,
+      awaitingDecisionTaskId: undefined,
+      updatedAt: new Date(),
+    });
+    // The cancellation is durably recorded — consume the marker(s) so a later retry of this run id
+    // doesn't get spuriously re-cancelled.
+    for (;;) {
+      const m = await this.store.takeBufferedSignal(`cancel:${run.id}`).catch(() => null);
+      if (!m) break;
+    }
+    this.emit({
+      type: 'run.failed',
+      runId: run.id,
+      workflow: run.workflow,
+      namespace: run.namespace,
+      error,
+    });
+    return { runId: run.id, status: 'cancelled', error };
+  }
+
   /** The run body, lease held + renewed by {@link execute}. */
   private async runExecution(
     run: WorkflowRun,
@@ -4351,11 +5558,10 @@ export class WorkflowEngine {
     registered: RegisteredWorkflow | undefined,
   ): Promise<RunResult> {
     // First execution of an enqueued run: mark it running and announce the start, BEFORE the singleton
-    // gate — `singletons.admit` only counts `running`/`suspended` runs, so a still-`pending` run could
-    // never be admitted. A resumed run is already past `pending`, so this fires exactly once.
+    // gate, so an admitted run's body never starts while it still reads `pending`. A resumed run is
+    // already past `pending`, so this fires exactly once.
     if (run.status === 'pending') {
-      await this.store.updateRun(run.id, { status: 'running', updatedAt: new Date() });
-      run.status = 'running';
+      await this.markStarted(run, registered?.singleton !== undefined);
       this.emit({
         type: 'run.started',
         runId: run.id,
@@ -4366,16 +5572,7 @@ export class WorkflowEngine {
     // Singleton admission gate: if this run shares its key with `limit` older in-flight runs, wait
     // (suspend on a short timer) until a slot frees instead of running now. Re-checked on each resume.
     if (registered?.singleton && !(await this.singletons.admit(run, registered.singleton))) {
-      const wakeAt = this.singletons.retryWakeAt();
-      await this.store.updateRun(run.id, { status: 'suspended', wakeAt, updatedAt: new Date() });
-      this.emit({
-        type: 'run.suspended',
-        runId: run.id,
-        workflow: run.workflow,
-        namespace: run.namespace,
-      });
-      await this.store.releaseRunLock(run.id, this.instanceId);
-      return { runId: run.id, status: 'suspended' };
+      return this.singletonWaitResult(run);
     }
     // Saga compensations registered by completed steps; run in reverse if the run later fails.
     const compensations: Compensation[] = [];
@@ -4411,12 +5608,21 @@ export class WorkflowEngine {
       // (`BaseWorkflow.start`/`dispatch`) reachable from `fn` route through this run's `ctx.child`/
       // `ctx.startChild`. Re-set on every replay turn (each is its own async scope) — correct.
       const output = await workflowAls.run(ctx, () => fn(ctx, run.input));
+      // A compensating cancel requested while this turn ran (or one whose resume replays straight to
+      // `return`, with no suspension point left) still wins: undo + settle cancelled, never completed.
+      if (await this.takeCancelIntent(run.id)) {
+        return await this.compensateAndCancel(run, compensations);
+      }
       return await this.settleRun(run, { kind: 'completed', output });
     } catch (err) {
       if (err instanceof ContinueAsNew) {
         // Hand off to a fresh execution with a clean history: persist the next run (`<id>~N`), then
         // complete this one. Zombie fence first — a fenced turn must not fork a continuation either.
         if (this.leaseLostRuns.has(run.id)) return await this.echoCurrentStatus(run.id);
+        // A cancel in flight wins over continue-as-new: undo + cancel instead of forking the next run.
+        if (await this.takeCancelIntent(run.id)) {
+          return await this.compensateAndCancel(run, compensations);
+        }
         const nextId = nextContinuationId(run.id);
         // Persist the continuation BEFORE the parent's terminal write — the durable ordering that
         // makes the chain crash-safe. The old order (complete parent, then create the continuation
@@ -4458,43 +5664,8 @@ export class WorkflowEngine {
       if (err instanceof WorkflowSuspended) {
         // A compensating cancel resumed this run to reach here: the replay re-registered the saga,
         // so undo the completed steps in reverse and mark it cancelled instead of re-suspending.
-        // The intent lives in TWO places: the in-memory `cancelRequested` fast path (same pod, same
-        // boot), and the DURABLE buffered `cancel:<id>` marker `cancel()` persisted — so a crash or
-        // a cross-pod handoff mid-cancellation can't silently forget the cancel and settle the run
-        // back to `suspended` as if nothing happened. Peek the marker (take + re-buffer) rather than
-        // consume it: it must survive a crash mid-unwind; it's drained below once `cancelled` is
-        // durably recorded.
-        let cancelling = this.cancelRequested.delete(run.id);
-        if (!cancelling) {
-          const marker = await this.store.takeBufferedSignal(`cancel:${run.id}`);
-          if (marker) {
-            cancelling = true;
-            await this.store
-              .bufferSignal(`cancel:${run.id}`, marker.payload)
-              .catch(() => undefined);
-          }
-        }
-        if (cancelling) {
-          for (let i = compensations.length - 1; i >= 0; i -= 1) {
-            const comp = compensations[i];
-            if (comp) await this.runCompensation(run, comp, i);
-          }
-          const error = { message: 'cancelled' };
-          await this.store.updateRun(run.id, { status: 'cancelled', error, updatedAt: new Date() });
-          // The cancellation is durably recorded — consume the marker(s) so a later retry of this
-          // run id doesn't get spuriously re-cancelled.
-          for (;;) {
-            const m = await this.store.takeBufferedSignal(`cancel:${run.id}`).catch(() => null);
-            if (!m) break;
-          }
-          this.emit({
-            type: 'run.failed',
-            runId: run.id,
-            workflow: run.workflow,
-            namespace: run.namespace,
-            error,
-          });
-          return { runId: run.id, status: 'cancelled', error };
+        if (await this.takeCancelIntent(run.id)) {
+          return await this.compensateAndCancel(run, compensations);
         }
         const settled = await this.settleRun(run, { kind: 'suspended', wakeAt: err.wakeAt });
         // Close the settle-vs-delivery race: a signal/result that landed WHILE this turn was still
@@ -4510,6 +5681,11 @@ export class WorkflowEngine {
         }
         if (settled.status === 'suspended') suspendedOnFan = err.fan;
         return settled;
+      }
+      // A cancel in flight that surfaced as a thrown error settles `cancelled`, not `failed`: the saga
+      // undo runs either way; this keeps the terminal status faithful to the cancel request.
+      if (await this.takeCancelIntent(run.id)) {
+        return await this.compensateAndCancel(run, compensations);
       }
       const error = {
         message: err instanceof Error ? err.message : String(err),
@@ -4663,7 +5839,9 @@ export class WorkflowEngine {
   ): Promise<void> {
     if (this.pool.size === 0) throw new Error('dispatched compensation requires a Transport');
     const token = stepGroup(def, run.namespace);
-    const validInput = def.input ? def.input.parse(args) : args;
+    const validInput = def.input
+      ? await validateStandard(def.input, args, `step "${def.name}" input`)
+      : args;
     const id = `${run.id}:compensate:${def.name}:${attempt}`;
     const name = `compensate:${def.name}`;
     const existing = await this.store.getCheckpoint(run.id, seq);
@@ -4820,6 +5998,7 @@ export class WorkflowEngine {
       store: this.store,
       replay,
       clock: this.clock,
+      eventBufferTtlMs: this.eventBufferTtlMs,
       webhookUrl: this.webhookUrl,
       startStep: (s) => this.startStep(s),
       completeStep: (s) => this.completeStep(s),
@@ -4848,8 +6027,23 @@ export class WorkflowEngine {
       // Shallow-merge into the run's searchAttributes (the ctx primitive makes this exactly-once).
       upsertSearchAttributes: async (runId, attrs) => {
         const run = await this.store.getRun(runId);
+        const merged = { ...(run?.searchAttributes ?? {}), ...attrs };
+        // A declared `searchAttributesSchema` validates the MERGED bag (the schema describes the whole
+        // run's shape, optional keys included) — before the write, so the ctx primitive records no
+        // checkpoint and a rejected write throws in the body (non-retryable SchemaValidationError).
+        const schema = run
+          ? this.workflows.get(versionKey(run.workflow, run.workflowVersion))
+              ?.searchAttributesSchema
+          : undefined;
+        if (schema) {
+          validateStandardSync(
+            schema,
+            merged,
+            `workflow "${run?.workflow}": ctx.upsertSearchAttributes`,
+          );
+        }
         await this.store.updateRun(runId, {
-          searchAttributes: { ...(run?.searchAttributes ?? {}), ...attrs },
+          searchAttributes: merged,
           updatedAt: new Date(),
         });
       },
@@ -4861,6 +6055,24 @@ export class WorkflowEngine {
       signalEntity: (name, key, op, arg, reply) => {
         this.trackEffect(
           Promise.resolve().then(() => this.entities.dispatch(name, key, op, arg, reply)),
+        );
+      },
+      // The durable half of a workflow-side entity send: awaited inside the turn (a store write
+      // only, never an inline entity turn), so the ctx can checkpoint after it. See Entities.enqueue.
+      enqueueEntityOp: (name, key, op, arg, id, reply) =>
+        this.entities.enqueue(name, key, op, arg, id, reply),
+      // Start/wake the entity for what enqueueEntityOp buffered — deferred and tracked like
+      // signalEntity above, so it never re-enters a still-executing turn and drain() waits for it.
+      kickEntity: (name, key) => {
+        this.trackEffect(
+          Promise.resolve().then(() =>
+            this.entities.kick(name, key).catch((err) => {
+              console.warn(
+                `[durable] waking entity "${name}" key "${key}" failed (its op stays buffered for the next wake):`,
+                err,
+              );
+            }),
+          ),
         );
       },
       interceptStep: (invocation, body) => this.interceptStep(invocation, body),
@@ -5218,7 +6430,9 @@ export class WorkflowEngine {
 
     // Optional runtime schema: validate only when the def carries one (a bare `@Step()` / string-name
     // call carries none — the engine passes the input through untouched then).
-    const validInput = step.input ? step.input.parse(input) : input;
+    const validInput = step.input
+      ? await validateStandard(step.input, input, `step "${step.name}" input`)
+      : input;
     // Routing token: BY NAME (sanitized for brokers), optionally partition-suffixed. Computed once and
     // used at BOTH the checkpoint's workerGroup and the dispatched task's routing `group`, so the same
     // token the worker subscribes to per handler name serves this step.
@@ -5402,9 +6616,10 @@ export class WorkflowEngine {
   ): Promise<void> {
     const token = stepGroup(step, runNamespace);
     await this.ensureRoutable(token, step.requires);
-    const input = (i: number): unknown =>
-      step.input ? step.input.parse(inputs[i] as TInput) : inputs[i];
-    const validInputs = new Map(batch.map((i) => [i, input(i)]));
+    const input = (i: number): unknown | Promise<unknown> =>
+      step.input ? validateStandard(step.input, inputs[i], `step "${step.name}" input`) : inputs[i];
+    const validInputs = new Map<number, unknown>();
+    for (const i of batch) validInputs.set(i, await input(i));
     const enqueuedAt = new Date();
     for (let at = 0; at < batch.length; at += STEP_FAN_CHUNK) {
       await Promise.all(
@@ -5510,11 +6725,64 @@ export class WorkflowEngine {
     return true;
   }
 
-  private async completeRemoteResult(result: StepResult): Promise<void> {
+  /**
+   * Settle a durable step result and (barrier permitting) resume its run in the background.
+   *
+   * One run's results are settled in batches: the first starts a batch, and the ones that arrive
+   * while it is being written (with `resultConcurrency > 1`) form the next, up to
+   * {@link RESULT_BATCH_MAX}. A batch of several claims its checkpoints with one
+   * {@link StateStore.saveCheckpointsIfPending} call, asks each step fan's barrier once, and resumes
+   * the run at most once; a batch of one takes the single-result path unchanged. A result resolves
+   * only once its own write committed, so the transport acknowledges nothing that is not durable.
+   */
+  private completeRemoteResult(result: StepResult): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const entry: QueuedResult = { result, resolve, reject };
+      const queued = this.resultQueues.get(result.runId);
+      if (queued) {
+        queued.push(entry);
+        return;
+      }
+      const queue = [entry];
+      this.resultQueues.set(result.runId, queue);
+      void this.drainResultQueue(result.runId, queue);
+    });
+  }
+
+  /** Settle `queue` (one run's queued results) batch by batch until it is empty, then retire it. */
+  private async drainResultQueue(runId: string, queue: QueuedResult[]): Promise<void> {
+    // Results delivered in the same tick as the first join its batch.
+    await Promise.resolve();
+    while (queue.length > 0) {
+      const batch = queue.splice(0, RESULT_BATCH_MAX);
+      let outcomes: Array<true | { error: unknown }>;
+      try {
+        outcomes = await this.completeRemoteResults(
+          runId,
+          batch.map((q) => q.result),
+        );
+      } catch (error) {
+        outcomes = batch.map(() => ({ error }));
+      }
+      batch.forEach((q, i) => {
+        const outcome = outcomes[i] ?? true;
+        if (outcome === true) q.resolve();
+        else q.reject(outcome.error);
+      });
+    }
+    // Same tick as the empty check: a result arriving later starts a new queue.
+    this.resultQueues.delete(runId);
+  }
+
+  /** The single-result path: settle `result`, then resume its run unless its fan is still running. */
+  private async completeOneRemoteResult(result: StepResult): Promise<void> {
     const cp = await this.settleRemoteCheckpoint(result);
     if (cp === undefined) return;
     if (await this.stepFanStillRunning(cp, result)) return;
-    const runId = result.runId;
+    this.resumeInBackground(result.runId);
+  }
+
+  private resumeInBackground(runId: string): void {
     this.trackEffect(
       this.resumeImplicit(runId).catch((err) => {
         console.warn(
@@ -5524,6 +6792,158 @@ export class WorkflowEngine {
         );
       }),
     );
+  }
+
+  /**
+   * Settle a batch of one run's step results; per result, `true` (settled or dropped) or the error
+   * that kept it from settling, which the transport then redelivers. Same outcome per result as
+   * {@link completeOneRemoteResult} on each in turn, with one resume for the batch: that resume
+   * replays every write of the batch, so a second would only replay it again.
+   */
+  private async completeRemoteResults(
+    runId: string,
+    results: StepResult[],
+  ): Promise<Array<true | { error: unknown }>> {
+    const outcomes: Array<true | { error: unknown }> = results.map(() => true);
+    const settleOneByOne = async (indexes: number[]) => {
+      for (const i of indexes) {
+        try {
+          await this.completeOneRemoteResult(results[i] as StepResult);
+        } catch (error) {
+          outcomes[i] = { error };
+        }
+      }
+      return outcomes;
+    };
+    if (results.length === 1) return settleOneByOne([0]);
+    // A second copy of a result in the same batch is a duplicate delivery: the first copy settles
+    // the step (or re-drives the resume), so the copy is dropped like a late one.
+    const seen = new Set<number>();
+    const live = results.flatMap((r, i) => {
+      if (seen.has(r.seq)) return [];
+      seen.add(r.seq);
+      return [i];
+    });
+    const run = await this.store.getRun(runId);
+    // A finished or unknown run takes the single-result path, which salvages a late success onto a
+    // failed run and frees the slots of a cancelled one. Rare, so it is not batched.
+    if (
+      run === null ||
+      run.status === 'completed' ||
+      run.status === 'failed' ||
+      run.status === 'cancelled' ||
+      run.status === 'dead'
+    ) {
+      return settleOneByOne(live);
+    }
+    const reads = await Promise.allSettled(
+      live.map((i) => this.store.getCheckpoint(runId, (results[i] as StepResult).seq)),
+    );
+    // Checkpoints whose result should resume the run (barrier permitting): the ones this batch
+    // settled, and redeliveries of ones settled before — whose resume may never have happened.
+    const resumable: Array<{ cp: StepCheckpoint; result: StepResult }> = [];
+    const pending: Array<{ index: number; cp: StepCheckpoint }> = [];
+    reads.forEach((read, k) => {
+      const index = live[k] as number;
+      const result = results[index] as StepResult;
+      if (read.status === 'rejected') outcomes[index] = { error: read.reason };
+      else if (!read.value) return;
+      else if (read.value.status === 'pending') pending.push({ index, cp: read.value });
+      else resumable.push({ cp: read.value, result });
+    });
+    const finishedAt = new Date();
+    const writes = pending.map(({ index, cp }) => {
+      const result = results[index] as StepResult;
+      return {
+        ...cp,
+        status: result.status,
+        output: result.status === 'completed' ? result.output : cp.output,
+        error: result.error,
+        events: result.events ?? cp.events,
+        startedAt: result.startedAt ? new Date(result.startedAt) : cp.startedAt,
+        finishedAt,
+      };
+    });
+    // Claimed, not blindly written: a duplicate delivery may have settled a step first.
+    const claims = await this.savePendingCheckpoints(writes);
+    for (const [k, claim] of claims.entries()) {
+      const { index, cp } = pending[k] as { index: number; cp: StepCheckpoint };
+      const result = results[index] as StepResult;
+      if (claim === false) {
+        resumable.push({ cp, result });
+        continue;
+      }
+      if (claim !== true) {
+        outcomes[index] = claim;
+        continue;
+      }
+      try {
+        await this.releaseQueueSlot(cp);
+      } catch (error) {
+        // Written but not acknowledged: the redelivery finds the step settled and re-drives.
+        outcomes[index] = { error };
+      }
+      const startedAt = result.startedAt ? new Date(result.startedAt) : cp.startedAt;
+      this.emit({
+        type: result.status === 'completed' ? 'step.completed' : 'step.failed',
+        runId,
+        seq: result.seq,
+        name: cp.name,
+        kind: cp.kind,
+        output: result.output,
+        error: result.error,
+        queueMs: startedAt.getTime() - cp.enqueuedAt.getTime(),
+        durationMs: finishedAt.getTime() - startedAt.getTime(),
+      });
+      resumable.push({ cp, result });
+    }
+    // Asked after every write of the batch committed, so the batch holding a fan's last step sees
+    // its barrier open; once per fan. A barrier that cannot be read counts as open: a spare resume
+    // replays and re-suspends, a lost one strands the run.
+    const barriers = new Map<number, Promise<boolean>>();
+    for (const { cp, result } of resumable) {
+      const fan = parseStepFanGroup(cp.parallelGroup);
+      if (!fan || result.status === 'failed') {
+        this.resumeInBackground(runId);
+        return outcomes;
+      }
+      let closed = barriers.get(fan.firstSeq);
+      if (!closed) {
+        closed = this.countPendingSteps(runId, fan.firstSeq, fan.firstSeq + fan.size - 1).then(
+          (n) => n > 0,
+          () => false,
+        );
+        barriers.set(fan.firstSeq, closed);
+      }
+      if (!(await closed)) {
+        this.resumeInBackground(runId);
+        return outcomes;
+      }
+    }
+    return outcomes;
+  }
+
+  /**
+   * {@link savePendingCheckpoint} for checkpoints at distinct seqs: one
+   * {@link StateStore.saveCheckpointsIfPending} call when the store has it, else one write each.
+   * Never rejects as a whole: a failed write is reported as that entry's error, and the batch call
+   * rejecting means it wrote nothing, so the entries are then written one by one.
+   */
+  private async savePendingCheckpoints(
+    checkpoints: StepCheckpoint[],
+  ): Promise<Array<boolean | { error: unknown }>> {
+    if (checkpoints.length > 1 && this.store.saveCheckpointsIfPending) {
+      try {
+        const wrote = await this.store.saveCheckpointsIfPending(checkpoints);
+        return checkpoints.map((_, i) => wrote[i] === true);
+      } catch {
+        // Fall through: one bad row must not fail the whole batch.
+      }
+    }
+    const settled = await Promise.allSettled(
+      checkpoints.map((cp) => this.savePendingCheckpoint(cp)),
+    );
+    return settled.map((r) => (r.status === 'fulfilled' ? r.value : { error: r.reason }));
   }
 
   /**
@@ -5669,7 +7089,9 @@ export class WorkflowEngine {
     admission?: { priority?: number | undefined; fairnessKey?: string | undefined },
   ): Promise<TOutput> {
     if (this.pool.size === 0) throw new Error('remote steps require a Transport');
-    const validInput = step.input ? step.input.parse(input) : input;
+    const validInput = step.input
+      ? await validateStandard(step.input, input, `step "${step.name}" input`)
+      : input;
     const token = stepGroup(step, runNamespace);
     // Capability/protocol guard (design §7.5) — same as the durable path, before the `step.started`
     // emit + dispatch, so a step nobody can run parks `blocked` instead of awaiting a phantom worker.
@@ -5840,7 +7262,9 @@ export class WorkflowEngine {
     enqueuedAt: Date,
   ): Promise<TOutput> {
     const output = (
-      step.output ? step.output.parse(resolution.output) : resolution.output
+      step.output
+        ? await validateStandard(step.output, resolution.output, `step "${step.name}" output`)
+        : resolution.output
     ) as TOutput;
     // The worker reports when it actually picked the task up; fall back to dispatch time if a
     // transport doesn't carry it (queue-wait then reads as zero rather than going negative).
@@ -5960,6 +7384,21 @@ export class WorkflowEngine {
     });
   }
 }
+
+/** The worker group a convention-routed workflow's run dispatches to: its sanitized name, suffixed by
+ *  the run's namespace (bare for absent/`''`/`default`) — the token a tenant worker serves. */
+function conventionGroup(name: string, namespace: string | undefined): string {
+  return tenantGroup(sanitizeQueueToken(name), namespace);
+}
+
+/** Key of an inline remote turn's liveness reset in `heartbeatResets` (step keys are `runId:seq`). */
+function turnBeatKey(runId: string): string {
+  return `turn:${runId}`;
+}
+
+/** The run whose remote turn is being enqueued in the current async context — lets the decision
+ *  handler spot a transport delivering the decision from inside its own `dispatchWorkflowTask`. */
+const turnDispatchAls = new AsyncLocalStorage<string>();
 
 /** Tolerance (ms) between the worker's clock, which stamps a persisted heartbeat, and this engine's,
  *  when deciding whether a beat belongs to the current attempt (see `awaitWithHeartbeat`). */

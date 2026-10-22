@@ -1,6 +1,6 @@
 ---
 title: Dead-letter queue
-description: Cap crash-recovery with maxRecoveryAttempts so a poison-pill run moves to the terminal dead status instead of crash-looping forever, then route dead runs with engine.onDead to alert, compensate, or start a durable handler workflow.
+description: Cap crash-recovery with maxRecoveryAttempts so a poison-pill run moves to the terminal dead status instead of crash-looping forever, then hand dead runs to a dead-letter workflow (an inline deadLetter() method, a per-workflow or fleet-default deadLetterWorkflow) or route them yourself with engine.onDead.
 icon: Skull
 ---
 
@@ -10,9 +10,11 @@ Most failures are transient and recover cleanly. But occasionally a run is a **p
 
 ## Capping recovery: `maxRecoveryAttempts`
 
-Crash-recovery is **self-healing and periodic**: while a run executes its worker renews a recovery lease, so a crashed worker's lease expires and recovery (`engine.recoverIncomplete()`, called every tick by the [`durable:work`](/docs/durable/cli) loop) reclaims the orphaned run within ~`leaseMs` — on any instance, not just on the next boot. That's what makes a genuine poison pill visible: it gets picked up again and again. Every time crash-recovery picks up a run that still reads `running` once it holds the lease (it re-reads the run under the lease, so a run that settled after the orphan listing is left alone and never counted), the engine increments that run's `recoveryAttempts` *before* resuming it (so a crash mid-resume still advances the counter).
+Crash-recovery is **self-healing and periodic**: while a run executes its worker renews a recovery lease, so a crashed worker's lease expires and recovery (`engine.recoverIncomplete()`, called every tick by the [`durable:work`](/docs/durable/cli) loop, or by the embedded loop of `worker: { embedded: true }`) reclaims the orphaned run within ~`leaseMs` — on any instance, not just on the next boot. That's what makes a genuine poison pill visible: it gets picked up again and again. Every time crash-recovery picks up a run that still reads `running` once it holds the lease (it re-reads the run under the lease, so a run that settled after the orphan listing is left alone and never counted), the engine increments that run's `recoveryAttempts` *before* resuming it (so a crash mid-resume still advances the counter).
 
-Set `maxRecoveryAttempts` in `config/durable.ts`, and once a run exceeds it, instead of resuming yet again the engine moves the run to the terminal **`dead`** status with a `max_recovery_attempts` error, releases its lease, and stops touching it:
+A run whose remote step is still in flight is not counted. A free run lease doesn't mean anything crashed in that case: the step is on the transport with a worker that holds no run lease. Recovery parks such a run `suspended` on the step's deadline or the `reconcileMs` wake, and the worker's result resumes it. A slow remote step therefore can't burn the budget and be dead-lettered while its worker is still busy.
+
+Set `maxRecoveryAttempts` in `config/durable.ts`, and once a run exceeds it (the pickup that would be attempt `maxRecoveryAttempts + 1`), instead of resuming yet again the engine moves the run to the terminal **`dead`** status with a `max_recovery_attempts` error, releases its lease, and stops touching it:
 
 ```ts title="config/durable.ts"
 export default defineConfig({
@@ -21,81 +23,26 @@ export default defineConfig({
 })
 ```
 
-Omit `maxRecoveryAttempts` for unlimited recovery (the default). A `dead` run is terminal but **not lost**: it stays fully inspectable in the [dashboard](/docs/durable/observability/dashboard) — its history, its checkpoints, its error — and it can be retried from there (or via [`durable:retry`](/docs/durable/cli)) once you've shipped a fix. The point is that one poison pill no longer keeps the process crashing for every other run.
-
-## Handling dead runs: `engine.onDead`
-
-Parking a dead run is the floor, not the ceiling. Subscribe with `engine.onDead` to be notified the moment a run is dead-lettered — the listener receives the dead `WorkflowRun` (status `dead`, with its error) — so you can do something active: page an on-call engineer, push to a real message queue, or kick off a workflow that handles it.
-
-```ts title="start/durable.ts"
-engine.onDead((run) => {
-  logger.error(`run ${run.id} (${run.workflow}) dead-lettered: ${run.error?.message}`)
-  void pager.alert('durable-poison-pill', { runId: run.id, workflow: run.workflow })
-})
-```
-
-`onDead` returns an unsubscribe function. It fires on the instance that dead-letters the run.
-
-Dead-lettering also goes through the engine's event stream: the transition emits a `run.failed` event whose `error.code` is `max_recovery_attempts`, so [events and interceptors](/docs/durable/observability/events-and-interceptors), OpenTelemetry and Telescope see a dead-lettered run as a failure without any extra wiring. The `dead` status and that error code are what tell it apart from an ordinary step failure.
+Omit `maxRecoveryAttempts` for unlimited recovery (the default). A `dead` run is terminal but **not lost**: it stays fully inspectable in the [dashboard](/docs/durable/observability/dashboard) — its history, its checkpoints, its error — and it can be retried from there (or via [`durable:retry`](/docs/durable/cli)) once you've shipped a fix. A retry (`engine.requeue`) of a `dead` or `failed` run resets its `recoveryAttempts` to 0, so the retried run gets the full budget again. Requeueing a run that is still live keeps its count. The point is that one poison pill no longer keeps the process crashing for every other run.
 
 ## Routing to a DLQ workflow
 
-The most powerful option is to route dead runs into a *workflow of their own* — a durable handler that gets all the reliability machinery (retries, steps, its own observability) to triage the failure. Start it from your `onDead` listener with a deterministic `dlq:<runId>` id so a run is never double-handled (`start` is idempotent by run id):
+The most useful thing to do with a dead run is hand it to a *workflow of its own*: a durable handler that gets all the reliability machinery (retries, steps, its own observability) to triage the failure. Declare it and the engine starts it for you.
 
-```ts title="start/durable.ts"
-// The handler workflow — typed to the original run's input + error.
-interface DeadLetter {
-  deadRunId: string
-  workflow: string
-  input: unknown
-  error?: { message: string; code?: string }
-}
+### An inline `deadLetter()` method
 
-engine.register('dlq', '1', async (ctx, dl: DeadLetter) => {
-  await ctx.localStep('alert', () =>
-    alerts.page('durable-dead-letter', { runId: dl.deadRunId, workflow: dl.workflow, error: dl.error?.message }),
-  )
-  const ticket = await ctx.localStep('open-ticket', () =>
-    tickets.create({
-      title: `Dead-lettered run ${dl.deadRunId} (${dl.workflow})`,
-      body: dl.error?.message ?? 'unknown error',
-      payload: dl.input, // the original input, ready to replay after a fix
-    }),
-  )
-  return { ticketId: ticket.id }
-})
+The shortest form lives on the workflow class itself. Define a `deadLetter(ctx, dead)` method on a [`BaseWorkflow`](/docs/durable/authoring/app-workflows):
 
-// Route every dead run into it — idempotent by `dlq:<runId>`.
-engine.onDead((run) => {
-  void engine.start(
-    'dlq',
-    { deadRunId: run.id, workflow: run.workflow, input: run.input, error: run.error },
-    `dlq:${run.id}`,
-  )
-})
-```
-
-### A class-based handler under `app/workflows`
-
-When the handler deserves its own file, write it as an ordinary [`BaseWorkflow`](/docs/durable/authoring/app-workflows) class. It is auto-registered like any other workflow and gets its services through the constructor. Then start it from `onDead` with the `dlq:<runId>` id:
-
-```ts title="app/workflows/pipeline_dlq_workflow.ts"
+```ts title="app/workflows/pipeline_workflow.ts"
 import { inject } from '@adonisjs/core'
 import { BaseWorkflow } from '@adonis-agora/durable'
-import type { WorkflowCtx } from '@adonis-agora/durable'
+import type { DeadLetter, WorkflowCtx } from '@adonis-agora/durable'
 import AlertService from '#services/alert_service'
 import TicketService from '#services/ticket_service'
 
-interface DeadLetter {
-  deadRunId: string
-  workflow: string
-  input: unknown
-  error?: { message: string; code?: string }
-}
-
 @inject()
-export default class PipelineDlqWorkflow extends BaseWorkflow {
-  static workflow = { name: 'pipeline-dlq', version: '1' }
+export default class PipelineWorkflow extends BaseWorkflow {
+  static workflow = { name: 'pipeline', version: '1' }
 
   constructor(
     private alerts: AlertService,
@@ -104,52 +51,91 @@ export default class PipelineDlqWorkflow extends BaseWorkflow {
     super()
   }
 
-  async run(ctx: WorkflowCtx, dl: DeadLetter) {
+  async run(ctx: WorkflowCtx, input: PipelineInput) {
+    // …
+  }
+
+  async deadLetter(ctx: WorkflowCtx, dl: DeadLetter<PipelineInput>) {
     await ctx.step(this.alerts.page, { runId: dl.deadRunId, workflow: dl.workflow })
     const ticket = await ctx.step(this.tickets.create, {
       title: `Dead-lettered run ${dl.deadRunId} (${dl.workflow})`,
-      payload: dl.input,
+      payload: dl.input, // the original input, ready to replay after a fix
     })
     return { ticketId: ticket.id }
   }
 }
 ```
 
-```ts title="start/durable.ts"
-import engine from '@adonis-agora/durable/services/main'
-import PipelineDlqWorkflow from '#workflows/pipeline_dlq_workflow'
+Discovery registers the method as a separate workflow named `<name>.dlq` (here `pipeline.dlq`), with the same version and origin, and routes this workflow's dead runs to it. It runs as a durable workflow of its own (`ctx` is the handler run's context), and it shares the instance's constructor-injected services.
 
-engine.onDead((run) => {
-  void PipelineDlqWorkflow.dispatch(
-    { deadRunId: run.id, workflow: run.workflow, input: run.input, error: run.error },
-    { runId: `dlq:${run.id}` },
-  )
+### A `deadLetterWorkflow` reference
+
+To point at a handler that lives elsewhere, or to share one across workflows, name it. `deadLetterWorkflow` takes a workflow name, a workflow class, or a ref, and is accepted in three places:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  maxRecoveryAttempts: 5,
+  deadLetterWorkflow: 'global-dlq', // fleet default for every workflow
 })
 ```
 
-### Per-workflow routing
-
-Dead-lettering is usually **per-workflow**: a dead `checkout` run wants a different handler than a dead `pipeline` run. There is one `onDead` hook per engine, so route on `run.workflow` inside it, and send everything you didn't name to a catch-all handler:
-
-```ts title="start/durable.ts"
-const handlers: Record<string, string> = {
-  pipeline: 'pipeline-dlq',
-  checkout: 'checkout-dlq',
+```ts title="app/workflows/checkout_workflow.ts"
+export default class CheckoutWorkflow extends BaseWorkflow {
+  static workflow = { name: 'checkout', version: '1', deadLetterWorkflow: CheckoutDlqWorkflow }
+  // …
 }
+```
+
+```ts title="start/durable.ts"
+engine.register('import', '1', importFn, { deadLetterWorkflow: 'import-dlq' })
+// remote workflows take it too: engine.registerRemote(name, version, { …, deadLetterWorkflow })
+```
+
+The handler is an ordinary workflow, so write it like any other (`run(ctx, dl: DeadLetter)`). The first match wins: the inline `deadLetter()` method, then the workflow's own `deadLetterWorkflow`, then the config default. A class that declares both a `deadLetter()` method and a `deadLetterWorkflow` option throws at registration ("declares both a deadLetter() method and a deadLetterWorkflow option").
+
+### What the handler run gets
+
+- **Run id `dlq:<deadRunId>`.** `start` is idempotent by run id, so a run that is dead-lettered (and re-detected) more than once still triggers exactly one handler run. The dashboard links the pair by that id (see below).
+- **Input `DeadLetter`**, exported from `@adonis-agora/durable`: `{ deadRunId, workflow, input, error? }` — which run died, of which workflow, with what input, and why (`max_recovery_attempts`). `DeadLetter<TInput>` types `input`.
+- **The dead run's namespace.** Tags are not copied.
+- **Only `dead` runs are routed** — runs past `maxRecoveryAttempts`, so it must be set. An ordinary `failed` run is [`onError`](/docs/durable/reliability/on-error)'s job.
+- **No chains.** A handler run (a `dlq:` id) that itself goes dead is not routed again.
+- **A failed start is warned, not thrown.** If the handler is not registered on the instance that dead-letters the run, the engine logs a `console.warn` and recovery carries on.
+
+## Handling dead runs manually: `engine.onDead`
+
+Subscribe with `engine.onDead` to be notified the moment a run is dead-lettered. The listener receives the dead `WorkflowRun` (status `dead`, with its error), so you can page an on-call engineer or push to a real message queue:
+
+```ts title="start/durable.ts"
+import logger from '@adonisjs/core/services/logger'
+import engine from '@adonis-agora/durable/services/main'
 
 engine.onDead((run) => {
-  const handler = handlers[run.workflow] ?? 'global-dlq' // backstop for everything else
-  void engine.start(
-    handler,
-    { deadRunId: run.id, workflow: run.workflow, input: run.input, error: run.error },
-    `dlq:${run.id}`,
-  )
+  logger.error(`run ${run.id} (${run.workflow}) dead-lettered: ${run.error?.message}`)
+  void pager.alert('durable-poison-pill', { runId: run.id, workflow: run.workflow })
 })
 ```
 
-Keep the `dlq:<runId>` id whichever handler you pick. The dashboard relies on that id convention (see below).
+`onDead` returns an unsubscribe function. It fires on the instance that dead-letters the run, which is whichever worker's recovery pass picked the run up — so register the listener in a preload that every worker process loads (`start/durable.ts`), not only in the web process. It fires **before** the declared dead-letter workflow is started.
 
-Because every start is idempotent by `dlq:<runId>`, a run that gets dead-lettered (and re-detected) more than once still triggers exactly one DLQ run. The DLQ run is a normal durable run — it shows up in the dashboard with its own history, so you can confirm it did its job (alerted, opened a ticket, compensated), then retry the original once it's fixed.
+The listener is called synchronously and its return value is not awaited. A throw is swallowed so that a broken handler can't break recovery, and a rejected promise goes unobserved, so catch inside it (`void pager.alert(...).catch(...)`). The hook is in-memory, and so is the declarative routing above: if the process dies between the `dead` write and the call, nothing replays it. For a handler that must not be missed, alert on the `run.failed` event or on `dead` runs in the dashboard as well.
+
+`onDead` stays the escape hatch for routing the declarative form can't express. To start a handler from it yourself, keep the `dlq:<runId>` id (and don't also declare a `deadLetterWorkflow`, since both would claim the same id):
+
+```ts title="start/durable.ts"
+import type { DeadLetter } from '@adonis-agora/durable'
+
+const handlers: Record<string, string> = { pipeline: 'pipeline-dlq', checkout: 'checkout-dlq' }
+
+engine.onDead((run) => {
+  const input: DeadLetter = { deadRunId: run.id, workflow: run.workflow, input: run.input, error: run.error }
+  void engine.start(handlers[run.workflow] ?? 'global-dlq', input, `dlq:${run.id}`)
+})
+```
+
+Dead-lettering also goes through the engine's event stream: the transition emits a `run.failed` event whose `error.code` is `max_recovery_attempts`, so [events and interceptors](/docs/durable/observability/events-and-interceptors), OpenTelemetry and Telescope see a dead-lettered run as a failure without any extra wiring. The `dead` status and that error code are what tell it apart from an ordinary step failure.
+
+The handler run is a normal durable run. It shows up in the dashboard with its own history, so you can confirm it did its job (alerted, opened a ticket, compensated), then retry the original once it's fixed.
 
 <CodeFlow scene="dead-letter" />
 
@@ -167,5 +153,7 @@ From either end you can walk from a poison pill to its handler and back, check t
 When the cause was bad input, `engine.retryWithInput(runId, input, newRunId?)` starts a fresh run with the same workflow but corrected input — useful for replaying a dead run once you've fixed the data that poisoned it:
 
 ```ts
-await engine.retryWithInput(deadRunId, { ...originalInput, fixed: true })
+const { runId } = (await engine.retryWithInput(deadRunId, { ...originalInput, fixed: true }))!
 ```
+
+It is a **new** run with a clean history (`newRunId` defaults to `<runId>~retry~<8 hex chars>`), started with the original run's tags and namespace; the dead run stays as it is, inspectable. It resolves to `{ runId }`, or `null` when `deadRunId` is unknown. When the input was fine and the fix was a deploy, retry the run itself instead (`engine.requeue(runId)` / `durable:retry`), which replays its completed steps and resets `recoveryAttempts`.

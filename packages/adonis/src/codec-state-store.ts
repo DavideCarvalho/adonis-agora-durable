@@ -1,6 +1,9 @@
 import type {
+  CheckpointQuery,
+  CheckpointStat,
   ChildWait,
   RunFacetQuery,
+  RunFacetRow,
   RunQuery,
   RunStatus,
   RunValueAxis,
@@ -84,6 +87,37 @@ export class CodecStateStore implements StateStore {
   /** Encodes like {@link saveCheckpoint}. Bound only when the inner store has it, so the engine's
    *  plain-save fallback still kicks in through the wrapper. */
   readonly saveCheckpointIfPending?: (checkpoint: StepCheckpoint) => Promise<boolean>;
+  /** Encodes each checkpoint like {@link saveCheckpoint}. Bound only when the inner store has it. */
+  readonly saveCheckpointsIfPending?: (checkpoints: StepCheckpoint[]) => Promise<boolean[]>;
+  /** Forwarded verbatim — deletes read no payload. Bound only when the inner store has it, so the
+   *  engine's one-`deleteRun`-per-id fallback still applies through the wrapper. */
+  readonly deleteRuns?: (runIds: string[]) => Promise<void>;
+  /** Forwarded verbatim — a `GROUP BY` reads no payload. Bound only when the inner store has it. */
+  readonly runFacets?: (query: RunFacetQuery) => Promise<RunFacetRow[]>;
+  /** Forwarded verbatim — the buckets aggregate names, statuses and timestamps, never a payload.
+   *  Bound only when the inner store aggregates, so the run detail's fallback still applies. */
+  readonly checkpointStats?: (
+    runId: string,
+    opts?: { group?: string | undefined },
+  ) => Promise<CheckpointStat[]>;
+  /** Filters on unencoded columns, then decodes the rows like {@link listCheckpoints}. Bound only
+   *  when the inner store has it. */
+  readonly queryCheckpoints?: (runId: string, query: CheckpointQuery) => Promise<StepCheckpoint[]>;
+  /** Forwarded verbatim. Bound only when the inner store has it. */
+  readonly pruneBufferedEvents?: (publishedBefore: number, limit: number) => Promise<number>;
+  /** The same codec over the inner store's scoped view. Bound only when the inner store scopes. */
+  readonly withScope?: (scope: { namespace?: string | undefined }) => CodecStateStore;
+  /** Forwarded verbatim — an admission claim touches only status/tags, never a payload. Bound only
+   *  when the inner store has it, so singleton workflows keep failing fast on a store without it. */
+  readonly tryAdmitSingleton?: (
+    runId: string,
+    tag: string,
+    workflow: string,
+    limit: number,
+    retryWakeAt?: number,
+  ) => Promise<boolean>;
+  /** Forwarded verbatim — reads tokens, never a payload. Bound only when the inner store has it. */
+  readonly listBufferedSignalTokens?: (prefix: string, limit: number) => Promise<string[]>;
   /** Forwarded verbatim — a count reads no payload. Bound only when the inner store has it. */
   readonly countCheckpoints?: (
     runId: string,
@@ -101,6 +135,45 @@ export class CodecStateStore implements StateStore {
     const saveIfPending = inner.saveCheckpointIfPending;
     if (saveIfPending) {
       this.saveCheckpointIfPending = (cp) => saveIfPending.call(inner, this.encCp(cp));
+    }
+    const saveManyIfPending = inner.saveCheckpointsIfPending;
+    if (saveManyIfPending) {
+      this.saveCheckpointsIfPending = (cps) =>
+        saveManyIfPending.call(
+          inner,
+          cps.map((cp) => this.encCp(cp)),
+        );
+    }
+    const deleteRuns = inner.deleteRuns;
+    if (deleteRuns) this.deleteRuns = (ids) => deleteRuns.call(inner, ids);
+    const runFacets = inner.runFacets;
+    if (runFacets) this.runFacets = (query) => runFacets.call(inner, query);
+    const stats = inner.checkpointStats;
+    const queryCps = inner.queryCheckpoints;
+    if (stats && queryCps) {
+      this.checkpointStats = (runId, opts) => stats.call(inner, runId, opts);
+      this.queryCheckpoints = async (runId, query) =>
+        (await queryCps.call(inner, runId, query)).map((c) => this.decCp(c));
+    }
+    const prune = inner.pruneBufferedEvents;
+    if (prune) this.pruneBufferedEvents = (before, limit) => prune.call(inner, before, limit);
+    const scoped = (inner as StateStore & { withScope?: unknown }).withScope;
+    if (typeof scoped === 'function') {
+      this.withScope = (scope) =>
+        new CodecStateStore(
+          (scoped as (s: { namespace?: string | undefined }) => StateStore).call(inner, scope),
+          codec,
+          options,
+        );
+    }
+    const tryAdmitSingleton = inner.tryAdmitSingleton;
+    if (tryAdmitSingleton) {
+      this.tryAdmitSingleton = (runId, tag, workflow, limit, retryWakeAt) =>
+        tryAdmitSingleton.call(inner, runId, tag, workflow, limit, retryWakeAt);
+    }
+    const listTokens = inner.listBufferedSignalTokens;
+    if (listTokens) {
+      this.listBufferedSignalTokens = (prefix, limit) => listTokens.call(inner, prefix, limit);
     }
     const countCheckpoints = inner.countCheckpoints;
     if (countCheckpoints) {
@@ -266,16 +339,28 @@ export class CodecStateStore implements StateStore {
   async listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]> {
     return (await this.inner.listDueTimers(nowMs, namespace, limit)).map((r) => this.decRun(r));
   }
-  async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
+  async listOrphanedRuns(
+    nowMs: number,
+    limit: number,
+    namespace?: string,
+    owner?: string,
+  ): Promise<WorkflowRun[]> {
     // Forward when the inner store implements it; otherwise mirror the engine's own fallback
     // (filter listIncompleteRuns in-process) so wrapping never REMOVES the optimized path's shape.
     if (this.inner.listOrphanedRuns) {
-      return (await this.inner.listOrphanedRuns(nowMs, limit, namespace)).map((r) =>
-        this.decRun(r),
-      );
+      const orphans =
+        owner === undefined
+          ? await this.inner.listOrphanedRuns(nowMs, limit, namespace)
+          : await this.inner.listOrphanedRuns(nowMs, limit, namespace, owner);
+      return orphans.map((r) => this.decRun(r));
     }
     return (await this.inner.listIncompleteRuns(namespace))
-      .filter((r) => r.lockedUntil === undefined || r.lockedUntil <= nowMs)
+      .filter(
+        (r) =>
+          r.lockedUntil === undefined ||
+          r.lockedUntil <= nowMs ||
+          (owner !== undefined && r.lockedBy === owner),
+      )
       .slice(0, limit)
       .map((r) => this.decRun(r));
   }

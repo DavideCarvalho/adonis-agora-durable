@@ -57,7 +57,7 @@ same **name**. Two things have to line up:
 
 | Must match | Engine side (`transports.bullmq`) | Worker side (`run_redis_worker`) | Why |
 | --- | --- | --- | --- |
-| **connection** | `connection: { host, port, … }` | `connection="redis://host:port"` | Same Redis instance — the meeting point. |
+| **connection** | `connection`: ioredis options, an ioredis instance, or a `redis://` / `rediss://` URL | `connection="redis://host:port"` | Same Redis instance — the meeting point. |
 | **prefix** | `prefix` (default `durable`) | `prefix` (default `durable`) | Namespaces the queue keys: `<prefix>-tasks-<name>`, `<prefix>-results`. |
 
 ```ts title="config/durable.ts (Adonis engine side)"
@@ -73,9 +73,19 @@ export default defineConfig({
 ```
 
 Each registered step **name** gets its own queue — no separate group to declare. Sharing one broker
-across isolated deployments? Set the same `partition` on both sides (`transports.bullmq({ partition })`
-engine-side, `run_redis_worker(worker, partition=...)` worker-side) and every queue is suffixed
-`<name>@<partition>`.
+across tenants? The engine routes a step to `<name>@<tenant>`, where the tenant is the **run's
+namespace** (or the step's own `partition`, which wins); a `default` or unset namespace routes to the
+bare `<name>`. Start the Python worker with `run_redis_worker(worker, partition="acme")` to consume
+the `acme` tenant's queues. `transports.bullmq({ partition })` on the Adonis side only decides which
+queues that Adonis process itself consumes; it does not change where the engine dispatches. See
+[Tenancy](/docs/durable/concepts/tenancy).
+
+<Callout type="warn">
+An engine with a `namespace` in `config/durable.ts` also segments the queue prefix: its queues become
+`durable-<namespace>-tasks-…` and `durable-<namespace>-results`. Give the Python worker
+`prefix="durable-<namespace>"` (and `partition="<namespace>"`), or run the engine without a
+namespace and start runs with `{ namespace }` per tenant, which keeps the bare `durable` prefix.
+</Callout>
 
 The engine and the workers are decoupled producers and consumers on per-name queues:
 
@@ -124,16 +134,18 @@ await run_redis_worker(
 ```
 
 Use `redis://` for plaintext and `rediss://` for TLS. This is the same Redis the engine's
-`transports.bullmq({ connection })` points at — the worker uses the same credentials.
+`transports.bullmq({ connection })` points at — the worker uses the same credentials. The engine
+side accepts the same URL form: `transports.bullmq({ connection: process.env.REDIS_URL! })` parses it
+into ioredis options (`rediss:` turns on TLS, the path's first segment selects the database).
 
 ### `run_redis_worker` options
 
 | Option | Default | Description |
 | --- | --- | --- |
 | `worker` | — | The `Worker` whose handlers run. |
-| `partition` | `None` | Optional isolation suffix — appends `@<partition>` to every one of this worker's per-name queues. Must match the engine's `transports.bullmq({ partition })`. |
+| `partition` | `None` | Optional isolation suffix — appends `@<partition>` to every one of this worker's per-name queues. Must match the tenant the engine routes the step to: the run's namespace, or the step's own `partition`. |
 | `connection` | `redis://localhost:6379` | Redis URL (the broker the engine also uses). |
-| `prefix` | `durable` | Queue-key namespace; must match the engine's `transports.bullmq({ prefix })`. |
+| `prefix` | `durable` | Queue-key namespace; must match the engine's effective prefix: `transports.bullmq({ prefix })`, plus `-<namespace>` when the engine sets one. |
 | `concurrency` | `1` | Tasks at a time: an `int` (fixed), `"adaptive"`, or a config dict — see [Concurrency and memory](#concurrency-and-memory). |
 | `cancellation` | created for you | A `CancellationRegistry` fed by the control channel — see [Cooperative cancellation](#cooperative-cancellation). |
 
@@ -220,6 +232,16 @@ like a Node one. The SDK stamps it for you.
 for unit tests). Because the contract is language-neutral, a Go or Rust worker can implement the same
 thing.
 
+### Replying on the right broker
+
+`task["transport"]` is the id of the transport the engine dispatched on, and a result must go back on
+that same broker. A `run_redis_worker` per broker already replies on the broker it consumes, so
+there is nothing to route. A single Python loop that multiplexes several brokers picks the reply
+target with `durable_worker.routing.reply_target(task, targets)`, which looks the id up in a dict and
+falls back to the lone entry when there is one. An Adonis engine built from `config/durable.ts` uses
+one transport, so its tasks carry a single id; this matters only for an engine you construct yourself
+with a `transports` pool.
+
 ## Cooperative cancellation
 
 When a run is cancelled — `engine.cancel(runId)` on the Adonis side — a step already running in a
@@ -230,8 +252,9 @@ control message and the handler bails out on its own at a safe point.
   [`controlPlanes.redis`](/docs/durable/transports/control-plane#multi-replica-controlplanesredis)
   that is the Redis channel `<prefix>-control` — the same channel and payload the NestJS transport
   uses, which is the one `durable-worker` subscribes to. The `bullmq` transport does not publish this
-  channel itself, so **configure `controlPlanes.redis` on the same Redis, with the same `prefix`**, or
-  Python handlers never see the cancel.
+  channel itself, so **configure `controlPlanes.redis` on the same Redis, with the `prefix` the Python
+  worker uses** (`durable-<namespace>` when the engine sets a namespace), or Python handlers never see
+  the cancel.
 - `run_redis_worker` **subscribes** to that channel and feeds a `CancellationRegistry` — a thread-safe
   set of cancelled run ids. One is created for you if you don't pass your own.
 - The registry is surfaced to your handler through the step context as **`ctx.cancelled`** (a bool) and
@@ -437,8 +460,19 @@ await engine.start('pipeline', { id: baseId }, `pipeline-${baseId}`)
 ```
 
 or, from inside another workflow, `await ctx.child('pipeline', { id: baseId })`. The **queue name is
-the routing**: the worker serving `pipeline` runs it. If none is live, the start fails fast so a
-typo'd name never silently hangs.
+the routing**: the worker serving `pipeline` runs it. If none is live, the start throws
+`workflow pipeline is not registered`, so a typo'd name never silently hangs. The live-queue check
+reads worker heartbeats, so it works on any transport that lists live worker groups, but only
+`bullmq` carries Python workers. The group is resolved per start for the run's namespace: an
+operator starting a tenant's run (`{ namespace: 'acme' }`) reaches the tenant's `pipeline@acme`
+worker, the same token the tenant's steps route to.
+
+Each turn's decision comes back on `<P>-decisions`, and with several Adonis replicas any of them may
+take it; it is applied by run id either way (see
+[Remote workflow turns](/docs/durable/reliability/multi-instance#remote-workflow-turns)). The Python
+worker beats for the run every 5 s while it replays a turn, so set `remoteAdvanceSilenceMs` in
+`config/durable.ts` (say, two minutes) to have a turn whose worker died re-driven instead of waiting
+forever.
 
 The workflow-task/decision wire is language-neutral, so the same Python workflow runs unchanged
 against an Adonis, a [NestJS](/docs/durable/cluster/interop), or any other conformant control plane.

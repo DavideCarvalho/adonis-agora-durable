@@ -41,12 +41,15 @@ import {
   continueRun,
   type DashboardEngine,
   type Deps,
+  deliverWebhook,
   failTaskRun,
   getFanMembers,
   getRun,
+  getRunEvent,
   health,
   listRuns,
   listSchedules,
+  metricsText,
   redispatchPendingRun,
   retryRun,
   retryWithInputRun,
@@ -62,6 +65,7 @@ import { openApiDocument } from '../src/dashboard/openapi.js';
 import { contentTypeFor, renderIndexHtml } from '../src/dashboard/spa.js';
 import type { DurableConfig } from '../src/define_config.js';
 import { WorkflowEngine } from '../src/index.js';
+import { collectMetrics, type MetricsCollector } from '../src/metrics.js';
 import { DURABLE_TRANSPORT } from '../src/role_bindings.js';
 
 /**
@@ -151,6 +155,8 @@ export default class DashboardProvider {
   private readonly diagnostics = new BlockedDiagnosticsRecorder();
   /** Detach handle for the diagnostics subscription, released on {@link shutdown}. */
   private detachDiagnostics: (() => void) | null = null;
+  /** This process's event counters for `GET /metrics` (store roles; a tenant pod has no engine). */
+  private metricsCollector: MetricsCollector | null = null;
 
   /** The active durable role (`standalone` when no `durable` config is present — today's default). */
   private durableRole(): 'standalone' | 'control-plane' | 'tenant' {
@@ -184,6 +190,7 @@ export default class DashboardProvider {
     try {
       const engine = await this.app.container.make(WorkflowEngine);
       this.detachDiagnostics = this.diagnostics.attach(engine);
+      this.metricsCollector = collectMetrics(engine);
     } catch {
       // No store-backed engine available — the compat panel degrades to reason-only blocked runs.
     }
@@ -204,6 +211,7 @@ export default class DashboardProvider {
     const deps = async (): Promise<Deps> => ({
       engine: await resolveEngine(),
       ...(config.redact ? { redact: config.redact } : {}),
+      ...(this.metricsCollector ? { metrics: this.metricsCollector } : {}),
     });
 
     // Built-in `dashboardAuth` (Mode A `session` and/or Mode B `login`, opt-in). Registered ONLY when
@@ -224,6 +232,11 @@ export default class DashboardProvider {
         if (isMutatingMethod(ctx)) this.audit(config, ctx);
         try {
           const result = await handler(await deps(), toApiRequest(ctx));
+          for (const [name, value] of Object.entries(result.headers ?? {})) {
+            ctx.response.header(name, value);
+          }
+          // A 304 carries no body (its validator rides in the headers).
+          if (result.status === 304) return ctx.response.status(304).send('');
           return ctx.response.status(result.status).json(result.body);
         } catch (error) {
           // Generic body on a 500: raw driver/store messages (connection strings, SQL fragments)
@@ -265,6 +278,28 @@ export default class DashboardProvider {
     router
       .post(`${apiBase}/runs/:id/tasks/:name/fail`, json(failTaskRun))
       .as('durable_dashboard.runs.task_fail');
+    // Live query of a value the run published with `ctx.setEvent` (no side effect).
+    router
+      .get(`${apiBase}/runs/:id/events/:key`, json(getRunEvent))
+      .as('durable_dashboard.runs.event');
+    // `ctx.webhook()` callbacks. Behind the same guard as every route here: see `deliverWebhook`.
+    router
+      .post(`${apiBase}/webhooks/:token`, json(deliverWebhook))
+      .as('durable_dashboard.webhooks.deliver');
+    // Prometheus scrape: this process's counters plus backlog and worker gauges.
+    router
+      .get(`${apiBase}/metrics`, async (ctx: HttpContext) => {
+        if (!(await this.enforce(config, ctx, 'api'))) return;
+        try {
+          const text = await metricsText(await deps());
+          ctx.response.header('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+          return ctx.response.status(200).send(text);
+        } catch (error) {
+          void this.logServerError(error);
+          return ctx.response.status(500).json({ error: 'internal error' });
+        }
+      })
+      .as('durable_dashboard.metrics');
     // Runtime schedule control: list the ticked schedules, pause/resume one fleet-wide (runtime
     // override; a deploy resets to the config), or fire its current window now (idempotent).
     router.get(`${apiBase}/schedules`, json(listSchedules)).as('durable_dashboard.schedules.index');
@@ -516,7 +551,7 @@ export default class DashboardProvider {
             return ctx.response.status(400).json({ error: outcome.message });
           }
           if (outcome.kind === 'unauthorized') {
-            this.warnHookThrow(outcome.hookError);
+            void this.warnHookThrow(outcome.hookError).catch(() => undefined);
             if (form) return backToLogin();
             return ctx.response.status(401).json({ error: outcome.message });
           }
@@ -533,7 +568,7 @@ export default class DashboardProvider {
           if (this.loginRateLimited(ctx)) return;
           const outcome = await performSession(auth, ctx.request.request);
           if (outcome.kind === 'unauthorized') {
-            this.warnHookThrow(outcome.hookError);
+            void this.warnHookThrow(outcome.hookError).catch(() => undefined);
             return ctx.response.status(401).json({ error: 'unauthorized' });
           }
           this.writeSessionCookie(ctx, auth, outcome.cookieValue);
@@ -569,12 +604,19 @@ export default class DashboardProvider {
         path: ctx.request.url(false),
       };
       if (config.audit) {
-        config.audit(entry);
+        // Typed `void`, but an async hook is assignable to it: catch its rejection too.
+        const pending = config.audit(entry) as unknown;
+        if (pending instanceof Promise) pending.catch(() => undefined);
         return;
       }
-      void this.app.container.make('logger').then((logger) => {
-        logger.info(`[durable_dashboard] audit actor=${entry.actor} ${entry.method} ${entry.path}`);
-      });
+      void this.app.container
+        .make('logger')
+        .then((logger) => {
+          logger.info(
+            `[durable_dashboard] audit actor=${entry.actor} ${entry.method} ${entry.path}`,
+          );
+        })
+        .catch(() => undefined);
     } catch {
       /* auditing must never break the action */
     }
@@ -722,6 +764,8 @@ export default class DashboardProvider {
   async shutdown(): Promise<void> {
     this.detachDiagnostics?.();
     this.detachDiagnostics = null;
+    this.metricsCollector?.stop();
+    this.metricsCollector = null;
   }
 }
 
@@ -797,5 +841,6 @@ function toApiRequest(ctx: HttpContext): ApiRequest {
     params: ctx.params as Record<string, string | undefined>,
     query: ctx.request.qs() as Record<string, string | string[] | undefined>,
     body: ctx.request.body(),
+    headers: { 'if-none-match': ctx.request.header('if-none-match') },
   };
 }

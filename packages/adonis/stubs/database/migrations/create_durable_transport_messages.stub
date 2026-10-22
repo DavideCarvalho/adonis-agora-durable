@@ -18,7 +18,7 @@ export default class extends BaseSchema {
       table.string('namespace').notNullable().defaultTo('default')
       table.string('recipient').notNullable().defaultTo('')
       table.string('reply_to')
-      table.text('payload').notNullable()
+      table.text('payload', 'longtext').notNullable()
       table.string('claimed_by')
       table.bigInteger('claimed_at')
       table.bigInteger('created_at').notNullable()

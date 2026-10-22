@@ -1,20 +1,45 @@
+import { childIdsOf } from '../fan-join.js';
 import type {
   EngineEvent,
   GroupHealth,
+  RunFacetQuery,
+  RunFacetRow,
   RunQuery,
   RunReply,
   RunRequest,
   RunRequestKind,
   RunResult,
+  RunValueAxis,
+  RunValueFacetOptions,
+  RunValueFacetRow,
+  RunWaiting,
   SearchAttributes,
   StartRunMessage,
   StepCheckpoint,
   TenantEvent,
   WorkflowRun,
 } from '../interfaces.js';
-import type { FanPage, FanPageQuery, RunDetail, RunDetailOptions } from '../run-detail-summary.js';
+import {
+  type FanPage,
+  type FanPageQuery,
+  loadFanMembers,
+  loadRunDetail,
+  type RunDetail,
+  type RunDetailOptions,
+  type RunDetailSource,
+} from '../run-detail-summary.js';
+import { runFacetsOf } from '../run-facets.js';
 import type { WorkflowRef } from '../workflow-ref.js';
 import type { DurableTopology, RunGateway, StartRunOptions } from './interface.js';
+import { UNSUPPORTED_RUN_REQUEST } from './run-request-responder.js';
+
+/** The control plane answered a verb it does not know: it runs an older release than this tenant. */
+class UnsupportedRunRequestError extends Error {
+  readonly code = UNSUPPORTED_RUN_REQUEST;
+}
+
+/** The message a responder before 0.50 rejected an unknown verb with (it sent no `code`). */
+const LEGACY_UNKNOWN_VERB = /^unknown run-request verb: /;
 
 /**
  * The narrow slice of {@link import('../interfaces.js').Transport} the {@link ProxyRunGateway} needs —
@@ -49,6 +74,11 @@ export interface ProxyRunGatewayOptions {
   /** Round-trip timeout (ms) for a proxied read/control/start. Default 10_000. Spec §8: on timeout the
    *  proxy fails fast with a clear error rather than hanging a request forever. */
   requestTimeoutMs?: number | undefined;
+  /**
+   * How long (ms) the proxy remembers that the control plane does not know a verb (an older release,
+   * mid rolling upgrade) and serves it from older verbs instead of asking again. Default 60_000.
+   */
+  capabilityTtlMs?: number | undefined;
 }
 
 /**
@@ -69,8 +99,9 @@ interface PendingReply {
  * over the wire. It owns NO store (structural isolation, spec §5): every verb round-trips to the
  * control plane's `RunRequestResponder` and back.
  *
- * - read/control (`getRun`/`listRuns`/`getCheckpoints`/`getSearchAttributes`/`workerHealth`/`signal`/
- *   `cancel`/`redispatchPending`) → publish a {@link RunRequest} correlated by a minted `requestId`,
+ * - read/control (`getRun`/`listRuns`/`getCheckpoints`/`getRunChildren`/`getRunDetail`/
+ *   `getFanMembers`/`getSearchAttributes`/`runFacets`/`runValueFacets`/`waitingFor`/`workerHealth`/
+ *   `signal`/`cancel`/`retry`/`continue`/`retryWithInput`/`redispatchPending`) → publish a {@link RunRequest} correlated by a minted `requestId`,
  *   await the {@link RunReply} within `requestTimeoutMs`;
  * - `start` → publish a {@link StartRunMessage} (its own channel, byte-compatible with aviary), then
  *   await the reply the responder correlates by the minted `runId`;
@@ -89,6 +120,13 @@ export class ProxyRunGateway implements RunGateway {
   readonly #wireTenant: string;
   readonly #timeoutMs: number;
   readonly #pending = new Map<string, PendingReply>();
+  readonly #capabilityTtlMs: number;
+  /**
+   * Verb → when to ask the control plane for it again, after it answered that it does not know it.
+   * During a rolling upgrade the control plane is several pods of mixed versions behind one queue and
+   * a reply does not say which pod sent it, so the whole control plane counts as old until then.
+   */
+  readonly #unsupportedUntil = new Map<RunRequestKind['kind'], number>();
 
   constructor(transport: ProxyTransport, options: ProxyRunGatewayOptions) {
     this.#transport = transport;
@@ -97,6 +135,7 @@ export class ProxyRunGateway implements RunGateway {
     // no token, the raw partition does (prefix-isolation-only, aviary-compatible).
     this.#wireTenant = options.token ?? options.partition;
     this.#timeoutMs = options.requestTimeoutMs ?? 10_000;
+    this.#capabilityTtlMs = options.capabilityTtlMs ?? 60_000;
     // One reply subscription for the whole gateway; every RunReply is matched to its pending call by id.
     this.#transport.onRunReply((reply) => this.#handleReply(reply));
   }
@@ -108,6 +147,12 @@ export class ProxyRunGateway implements RunGateway {
     this.#pending.delete(reply.requestId);
     if (reply.result.ok) {
       pending.resolve(reply.result.data);
+    } else if (
+      reply.result.error.code === UNSUPPORTED_RUN_REQUEST ||
+      (reply.result.error.code === undefined &&
+        LEGACY_UNKNOWN_VERB.test(reply.result.error.message))
+    ) {
+      pending.reject(new UnsupportedRunRequestError(reply.result.error.message));
     } else {
       const err = new Error(reply.result.error.message) as Error & { code?: string };
       if (reply.result.error.code !== undefined) err.code = reply.result.error.code;
@@ -168,16 +213,75 @@ export class ProxyRunGateway implements RunGateway {
     return this.#request<string[]>({ kind: 'getRunChildren', runId });
   }
 
+  /**
+   * The detail in one round-trip. A control plane older than the verb (before 0.49) rejects it as
+   * unknown; the proxy then builds the same detail here from `getRun` + `getCheckpoints` (+
+   * `getRunChildren`), each still ownership-checked by the responder, and summarizes it locally.
+   */
   getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail | null> {
-    return this.#request<RunDetail | null>(
-      options === undefined
-        ? { kind: 'getRunDetail', runId }
-        : { kind: 'getRunDetail', runId, options },
+    return this.#withFallback(
+      'getRunDetail',
+      () =>
+        this.#request<RunDetail | null>(
+          options === undefined
+            ? { kind: 'getRunDetail', runId }
+            : { kind: 'getRunDetail', runId, options },
+        ),
+      () => loadRunDetail(this.#legacyDetailSource(), runId, options),
     );
   }
 
+  /** One page of a fan, paged here from the full timeline when the control plane predates the verb. */
   getFanMembers(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null> {
-    return this.#request<FanPage | null>({ kind: 'getFanMembers', runId, group, query });
+    return this.#withFallback(
+      'getFanMembers',
+      () => this.#request<FanPage | null>({ kind: 'getFanMembers', runId, group, query }),
+      () => loadFanMembers(this.#legacyDetailSource(), runId, group, query),
+    );
+  }
+
+  /**
+   * Ask the control plane for `kind`, or serve `fallback` when it answers that it does not know the
+   * verb (remembered for `capabilityTtlMs`, so a fleet mid-upgrade costs one extra round-trip a
+   * minute rather than one per call). Any other failure propagates.
+   */
+  async #withFallback<T>(
+    kind: RunRequestKind['kind'],
+    ask: () => Promise<T>,
+    fallback: () => Promise<T>,
+  ): Promise<T> {
+    if (!this.#knownUnsupported(kind)) {
+      try {
+        return await ask();
+      } catch (err) {
+        if (!(err instanceof UnsupportedRunRequestError)) throw err;
+        this.#unsupportedUntil.set(kind, Date.now() + this.#capabilityTtlMs);
+      }
+    }
+    return fallback();
+  }
+
+  #knownUnsupported(kind: RunRequestKind['kind']): boolean {
+    const until = this.#unsupportedUntil.get(kind);
+    if (until === undefined) return false;
+    if (Date.now() < until) return true;
+    this.#unsupportedUntil.delete(kind);
+    return false;
+  }
+
+  /** The verbs every control plane answers, as a {@link RunDetailSource}. Children fall back to the
+   *  timeline's child edges if even `getRunChildren` is unknown. */
+  #legacyDetailSource(): RunDetailSource {
+    return {
+      getRun: (runId) => this.getRun(runId),
+      listCheckpoints: (runId) => this.getCheckpoints(runId),
+      getRunChildren: (runId) =>
+        this.#withFallback(
+          'getRunChildren',
+          () => this.getRunChildren(runId),
+          async () => [...new Set(childIdsOf(await this.getCheckpoints(runId)))],
+        ),
+    };
   }
 
   getSearchAttributes(runId: string): Promise<SearchAttributes | undefined> {
@@ -229,6 +333,60 @@ export class ProxyRunGateway implements RunGateway {
       kind: 'redispatch',
       runId,
     });
+  }
+
+  retry(runId: string): Promise<RunResult | null> {
+    return this.#request<RunResult | null>({ kind: 'retry', runId });
+  }
+
+  continue(runId: string): Promise<RunResult | null> {
+    return this.#request<RunResult | null>({ kind: 'continue', runId });
+  }
+
+  retryWithInput(runId: string, input: unknown): Promise<{ runId: string } | null> {
+    return this.#request<{ runId: string } | null>({ kind: 'retryWithInput', runId, input });
+  }
+
+  /**
+   * Scoped by the control plane to this tenant's own runs (the query's namespace is replaced). A
+   * control plane older than the verb rejects it as unknown; the proxy then counts the same cells
+   * from `runValueFacets` (the status axis per origin), or — on one older still — from a `listRuns`
+   * of the tenant's matching runs. Each answer is scoped by the control plane like the verb itself.
+   */
+  runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
+    return this.#withFallback(
+      'runFacets',
+      () => this.#request<RunFacetRow[]>({ kind: 'runFacets', query }),
+      () =>
+        this.#withFallback(
+          'runValueFacets',
+          () =>
+            runFacetsOf(
+              { runValueFacets: (axis, q, opts) => this.runValueFacets(axis, q, opts) },
+              query,
+            ),
+          () => runFacetsOf({ listRuns: (q) => this.listRuns(q) }, query),
+        ),
+    );
+  }
+
+  /** Scoped by the control plane to this tenant's own runs (the query's namespace is replaced). */
+  runValueFacets(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]> {
+    return this.#request<RunValueFacetRow[]>(
+      opts === undefined
+        ? { kind: 'runValueFacets', axis, query }
+        : { kind: 'runValueFacets', axis, query, opts },
+    );
+  }
+
+  /** Only this tenant's own runs come back; another tenant's ids are silently absent. */
+  waitingFor(runIds: string[]): Promise<Record<string, RunWaiting>> {
+    if (runIds.length === 0) return Promise.resolve({});
+    return this.#request<Record<string, RunWaiting>>({ kind: 'waitingFor', runIds });
   }
 
   /** Live-tail ONE run by bridging onto this tenant's event channel and filtering by `runId`. */

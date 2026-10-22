@@ -41,7 +41,7 @@ export default class PaymentsController {
 | `id` | a fresh uuid per publish | Dedupes the subscriber *start* half across redeliveries. See [Idempotent publishing](#idempotent-publishing--optsid). |
 | `buffer` | `true` | Set `false` to drop a publish that reached nobody instead of buffering it. |
 
-A subscriber whose `validateInput` rejects the payload, or whose start throws for any other reason, is skipped. It does not block the other subscribers, and it is not counted in the returned total.
+A subscriber whose `inputSchema` or `validateInput` rejects the payload, or whose start throws for any other reason (a [`concurrency`](/docs/durable/reliability/concurrency-quotas) quota, for example), is skipped. It does not block the other subscribers, and it is not counted in the returned total.
 
 ## Starting a workflow from an event
 
@@ -175,6 +175,15 @@ await engine.publishEvent('metrics.tick', { at: Date.now() }, { buffer: false })
 ```
 
 Buffered events are keyed by event **name**, since many waiters can share a name with different `match` values. A waiter consumes from the buffer by listing the oldest candidates for its name (up to 50 per scan), checking each against its own `match`, and claiming the first that passes. A buffered event that doesn't match never blocks an earlier one that does. On the [Lucid store](/docs/durable/stores/lucid), the copies live in the `durable_buffered_events` table.
+
+By default a buffered copy is kept until a waiter consumes it. Set `eventBufferTtl` in `config/durable.ts` (a duration string like `'7d'`, or ms) to expire unclaimed copies: a waiter skips (and removes) a candidate older than the TTL, and the [retention sweep](/docs/durable/reliability/retention) of the `durable:work` tick deletes expired rows across every event name. See [`DurableConfig`](/docs/durable/api-reference#durableconfig).
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  // …
+  eventBufferTtl: '7d', // drop events nobody waited for within a week
+})
+```
 
 <Callout type="info">
 Redelivery is point-to-point. The single buffered copy goes to one waiter, never to an `onEvent` subscriber registered later. The buffer is not a durable broadcast log. If every future subscriber needs to see a past event, model it as workflow state (for example, a run started with `onEvent`) rather than relying on the buffer.

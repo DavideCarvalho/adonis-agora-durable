@@ -1,4 +1,5 @@
 import type { EngineEvent } from './interfaces.js';
+import { isRemoteEvent } from './remote-event.js';
 
 export interface MetricsSnapshot {
   /** `routed`: failures handed to an onError handler; `unrouted`: routes the engine could not apply. */
@@ -54,6 +55,9 @@ export function collectMetrics(engine: Subscribable): MetricsCollector {
   };
 
   const stop = engine.subscribe((e) => {
+    // Counters are per process and each instance is scraped: an event another instance produced
+    // (re-delivered over the control plane) is that instance's to count.
+    if (isRemoteEvent(e)) return;
     switch (e.type) {
       case 'run.started':
         m.runs.started += 1;

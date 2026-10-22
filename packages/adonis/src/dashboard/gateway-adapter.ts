@@ -2,6 +2,7 @@ import type { ScheduleInfo } from '../engine.js';
 import type {
   EngineEvent,
   RunFacetQuery,
+  RunQuery,
   RunResult,
   RunValueAxis,
   RunValueFacetOptions,
@@ -12,6 +13,8 @@ import type {
 import { DURABLE_RUN_GATEWAY } from '../role_bindings.js';
 import type { FanPageQuery, RunDetailOptions } from '../run-detail-summary.js';
 import type { RunGateway } from '../run-gateway/interface.js';
+import { UNSUPPORTED_RUN_REQUEST } from '../run-gateway/run-request-responder.js';
+import { scanRunValueFacets } from '../run-value-facets.js';
 import type { DashboardEngine } from './handlers.js';
 
 /**
@@ -27,6 +30,10 @@ export interface StoreEngineLike {
   listRuns: DashboardEngine['listRuns'];
   listCheckpoints: DashboardEngine['listCheckpoints'];
   getRunChildren: DashboardEngine['getRunChildren'];
+  /** The run detail from the store's checkpoint aggregates (with an `etag`) — forwarded when the
+   *  engine has it; without it the handlers build the detail from the full checkpoint list. */
+  getRunDetail?: DashboardEngine['getRunDetail'];
+  getFanMembers?: DashboardEngine['getFanMembers'];
   requeue: DashboardEngine['requeue'];
   redispatchPending?: DashboardEngine['redispatchPending'];
   cancel: DashboardEngine['cancel'];
@@ -54,6 +61,9 @@ export interface StoreEngineLike {
   listSignalWaiters?(prefix: string): Promise<SignalWaiter[]>;
   /** Targeted per-page variant (`run_id IN (...)`, indexed) — forwarded when the engine has it. */
   listSignalWaitersByRunIds?(runIds: string[]): Promise<SignalWaiter[]>;
+  /** Backlog gauges for `GET /metrics` and the `ctx.setEvent` live query — forwarded 1:1. */
+  countRuns?(query: Omit<RunQuery, 'page' | 'size'>): Promise<number>;
+  getEvent?(runId: string, key: string): Promise<unknown>;
   /** Value enumeration for the console's pickers — forwarded 1:1 when the engine has it. */
   runValueFacets?(
     axis: RunValueAxis,
@@ -80,6 +90,22 @@ export function storeDashboardEngine(engine: StoreEngineLike): DashboardEngine {
     listRuns: (query) => engine.listRuns(query),
     listCheckpoints: (runId) => engine.listCheckpoints(runId),
     getRunChildren: (runId) => engine.getRunChildren(runId),
+    ...(engine.getRunDetail
+      ? {
+          getRunDetail: (runId: string, options?: RunDetailOptions) =>
+            (engine.getRunDetail as NonNullable<StoreEngineLike['getRunDetail']>)(runId, options),
+        }
+      : {}),
+    ...(engine.getFanMembers
+      ? {
+          getFanMembers: (runId: string, group: string, query: FanPageQuery) =>
+            (engine.getFanMembers as NonNullable<StoreEngineLike['getFanMembers']>)(
+              runId,
+              group,
+              query,
+            ),
+        }
+      : {}),
     requeue: (runId) => engine.requeue(runId),
     redispatchPending: (runId) => engine.redispatchPending?.(runId) ?? Promise.resolve(null),
     cancel: (runId, opts) => engine.cancel(runId, opts),
@@ -97,6 +123,18 @@ export function storeDashboardEngine(engine: StoreEngineLike): DashboardEngine {
       engine.subscribe((event) => {
         if (event.runId === runId) onEvent(event);
       }),
+    ...(engine.countRuns
+      ? {
+          countRuns: (query: Omit<RunQuery, 'page' | 'size'>) =>
+            (engine.countRuns as NonNullable<StoreEngineLike['countRuns']>)(query),
+        }
+      : {}),
+    ...(engine.getEvent
+      ? {
+          getEvent: (runId: string, key: string) =>
+            (engine.getEvent as NonNullable<StoreEngineLike['getEvent']>)(runId, key),
+        }
+      : {}),
     ...(engine.listSignalWaiters
       ? {
           listSignalWaiters: (prefix: string) =>
@@ -143,10 +181,13 @@ export function storeDashboardEngine(engine: StoreEngineLike): DashboardEngine {
  * `RunRequestKind` verb), so a store-less tenant pod's run detail view lists children round-tripped over
  * the wire — the responder enforces the tenant-ownership check before answering (anti-IDOR).
  *
- * `retryWithInput`/`continue` have NO gateway verb yet (design §8 didn't need fix-and-replay or
- * breakpoint-continue over the wire) — they degrade to `null`, same convention as
- * `RunGatewayEngine.redispatchPending`'s optional degrade. A tenant pod's dashboard therefore shows
- * these actions as unavailable (the handlers 404) until the wire protocol grows the verbs.
+ * `retry`, `continue`, `retryWithInput`, `runValueFacets` and `waitingFor` ride the wire too (aviary's
+ * verbs), so a tenant pod's console retries in place, continues a breakpoint, fixes and replays,
+ * fills its value pickers and names what a suspended run waits on. Against a control plane that
+ * predates them (it answers `unsupported-request` or an unknown-verb error) each degrades the way it
+ * did before those verbs existed: `requeue` re-dispatches the run's pending steps, `continue` and
+ * `retryWithInput` answer `null` (the handlers 404), the pickers count a bounded `listRuns` scan,
+ * and the list rows carry no `waiting` stamp.
  */
 export function gatewayDashboardEngine(gateway: RunGateway): DashboardEngine {
   return {
@@ -170,14 +211,74 @@ export function gatewayDashboardEngine(gateway: RunGateway): DashboardEngine {
             ),
         }
       : {}),
-    requeue: (runId): Promise<RunResult | null> => gateway.redispatchPending(runId),
+    requeue: (runId): Promise<RunResult | null> =>
+      gateway.retry
+        ? orOlder(gateway.retry(runId), () => gateway.redispatchPending(runId))
+        : gateway.redispatchPending(runId),
     redispatchPending: (runId): Promise<RunResult | null> => gateway.redispatchPending(runId),
     cancel: (runId, opts) => gateway.cancel(runId, opts),
     workerHealth: () => gateway.workerHealth(),
-    retryWithInput: () => Promise.resolve(null),
-    continue: () => Promise.resolve(null),
+    retryWithInput: (runId, input) =>
+      gateway.retryWithInput
+        ? orOlder(gateway.retryWithInput(runId, input), () => Promise.resolve(null))
+        : Promise.resolve(null),
+    continue: (runId) =>
+      gateway.continue
+        ? orOlder(gateway.continue(runId), () => Promise.resolve(null))
+        : Promise.resolve(null),
+    ...(gateway.runValueFacets
+      ? {
+          runValueFacets: (
+            axis: RunValueAxis,
+            query: RunFacetQuery,
+            opts?: RunValueFacetOptions,
+          ): Promise<RunValueFacetRow[]> =>
+            orOlder(
+              (gateway.runValueFacets as NonNullable<RunGateway['runValueFacets']>)(
+                axis,
+                query,
+                opts,
+              ),
+              () => scanRunValueFacets({ listRuns: (q) => gateway.listRuns(q) }, axis, query, opts),
+            ),
+        }
+      : {}),
+    ...(gateway.runFacets
+      ? {
+          // The metrics backlog gauges, scoped to the tenant by the control plane.
+          countRuns: async ({
+            status,
+            statuses,
+            ...rest
+          }: Omit<RunQuery, 'page' | 'size'>): Promise<number> => {
+            const wanted = new Set(statuses ?? (status ? [status] : []));
+            const cells = await (gateway.runFacets as NonNullable<RunGateway['runFacets']>)(rest);
+            return cells
+              .filter((c) => wanted.size === 0 || wanted.has(c.status))
+              .reduce((n, c) => n + c.count, 0);
+          },
+        }
+      : {}),
+    ...(gateway.waitingFor
+      ? {
+          waitingFor: (runIds: string[]) =>
+            orOlder((gateway.waitingFor as NonNullable<RunGateway['waitingFor']>)(runIds), () =>
+              Promise.resolve({}),
+            ),
+        }
+      : {}),
     subscribe: (runId, onEvent) => gateway.subscribe(runId, onEvent),
   };
+}
+
+/** `work`, or `older()` when the control plane answered that it does not know the verb. */
+async function orOlder<T>(work: Promise<T>, older: () => Promise<T>): Promise<T> {
+  try {
+    return await work;
+  } catch (err) {
+    if ((err as { code?: unknown } | null)?.code === UNSUPPORTED_RUN_REQUEST) return older();
+    throw err;
+  }
 }
 
 /** The minimal container surface {@link dashboardEngineForRole} resolves bindings through. */

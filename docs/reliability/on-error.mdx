@@ -56,8 +56,8 @@ body, so the same thing happens whether the body ran in-process or on a remote w
 1. The run's body fails with an error carrying `code: 'invalid_line'`. Saga compensations of the body
    run, as for any failure.
 2. Instead of marking the run `failed`, the engine starts the handler as its own run, with the id
-   `<runId>.onError.<attempt>` and an `OnErrorInput` (`{ runId, workflow, input, error }`), tags the run
-   `onError:<code>`, emits `run.routed`, and suspends the failed run on the handler the way a parent
+   `<runId>.onError.<attempt>` (`.0` for the first handoff) and an `OnErrorInput` (`{ runId, workflow, input, error }`)
+   in the failed run's namespace, tags the run `onError:<code>` (`onError:*` for the catch-all route), emits `run.routed`, and suspends the failed run on the handler the way a parent
    waits for a `ctx.child`.
 3. From then on the run only follows its handler: the body is never run again, not by a recovery wake
    nor by a manual resume. When the handler finishes, the run settles with its outcome: `completed`
@@ -124,7 +124,9 @@ several codes to one handler, list one route per code with the same `workflow`.
 
 The code comes from `FatalError`'s second argument, from a `code` on whatever a step handler threw, or
 from the code a remote worker reported for the failed step. A failure from a step reaches the route once
-the step's retries are spent; a `FatalError` skips them.
+the step's retries are spent; a `FatalError` skips them (in a dispatched handler too, because it carries
+`retryable: false`). A `SchemaValidationError` thrown in the body (a step's input or output schema rejected a value) is a
+`FatalError` with the code `schema_validation`, so it can be routed like any other code.
 
 Never routed: cancellation (a run past its `executionTimeout` is cancelled too), dead-lettering, and the
 failures that mean the deployment is broken (non-determinism, a ctx call nested in a step). Those keep

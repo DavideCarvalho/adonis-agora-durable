@@ -81,11 +81,30 @@ export async function registerWorkflowClass(
   const exactNames = events
     .map(eventTriggerCanonicalName)
     .filter((name): name is string => name !== null);
+  // Inline dead-letter handler: a `deadLetter(ctx, dead)` method becomes the workflow `<name>.dlq`.
+  const inlineDeadLetter = (instance as { deadLetter?: unknown }).deadLetter;
+  let deadLetterWorkflow = meta.deadLetterWorkflow;
+  if (typeof inlineDeadLetter === 'function') {
+    if (meta.deadLetterWorkflow !== undefined) {
+      throw new Error(
+        `workflow ${meta.name} declares both a deadLetter() method and a deadLetterWorkflow option. Use one: the inline handler, or the reference.`,
+      );
+    }
+    const dlqName = `${meta.name}.dlq`;
+    engine.register(
+      dlqName,
+      meta.version,
+      (ctx, input) => Promise.resolve(inlineDeadLetter.call(instance, ctx, input)),
+      meta.origin ? { origin: meta.origin } : undefined,
+    );
+    deadLetterWorkflow = dlqName;
+  }
   engine.register(
     meta.name,
     meta.version,
     (ctx, input) => Promise.resolve(instance.run(ctx, input)),
     {
+      ...(deadLetterWorkflow !== undefined ? { deadLetterWorkflow } : {}),
       ...(meta.tags ? { tags: meta.tags } : {}),
       ...(meta.executionTimeout !== undefined ? { executionTimeout: meta.executionTimeout } : {}),
       ...(meta.onEvent || exactNames.length > 0
@@ -95,6 +114,8 @@ export async function registerWorkflowClass(
       ...(meta.concurrency ? { concurrency: meta.concurrency } : {}),
       ...(meta.origin ? { origin: meta.origin } : {}),
       ...(meta.onError?.length ? { onError: onErrorRoutesOf(meta) } : {}),
+      ...(meta.inputSchema ? { inputSchema: meta.inputSchema } : {}),
+      ...(meta.searchAttributes ? { searchAttributesSchema: meta.searchAttributes } : {}),
     },
   );
   // Collect any colocated `static schedule` on the class so the worker loop can fire it alongside the

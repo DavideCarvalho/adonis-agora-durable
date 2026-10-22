@@ -6,7 +6,7 @@ description: >-
   (memory, event-emitter, queue, db, bullmq; lucid store), the WorkflowEngine
   container singleton from @adonis-agora/durable/services/main,
   Workflow.dispatch vs .start, where runs execute (in-process dispatcher,
-  NOOP_RUN_DISPATCHER, durable:work), consumers, leaseMs. Use when setting up
+  drive: false, durable:work), consumers, leaseMs, shutdown drain. Use when setting up
   durable workflows for the first time, moving from dev defaults to production
   infrastructure, or diagnosing "runs vanish on restart" / "workflows compete
   with HTTP traffic".
@@ -14,7 +14,7 @@ license: MIT
 metadata:
   type: core
   library: "@adonis-agora/durable"
-  library_version: "0.25.0"
+  library_version: "0.51.0"
   framework: adonisjs
 sources:
   - 'DavideCarvalho/adonis-durable:docs/getting-started.mdx'
@@ -34,15 +34,20 @@ default is for development only.
 
 ## Setup
 
-Install via ace (registers `@adonis-agora/durable/durable_provider` in
-`adonisrc.ts` and publishes `config/durable.ts`):
+Install via ace. The `configure` hook registers the durable and dashboard
+providers, the Ace commands and the `app/workflows` / `app/steps` codegen hooks
+in `adonisrc.ts`, adds the `#workflows/*` / `#steps/*` subpath imports to
+`package.json`, and publishes `config/durable.ts`, `config/durable_dashboard.ts`
+and the Lucid migrations:
 
 ```bash
 node ace add @adonis-agora/durable
 ```
 
 The provider binds a singleton `WorkflowEngine` built from the config. Import it
-anywhere with `import engine from '@adonis-agora/durable/services/main'`.
+anywhere with `import engine from '@adonis-agora/durable/services/main'` — never
+`app.container.make(WorkflowEngine)` in app code. On a store-less `tenant` pod
+the engine is `undefined`; use the same module's `runGateway` export instead.
 
 ```ts title="config/durable.ts"
 import { defineConfig, stores, transports } from '@adonis-agora/durable'
@@ -120,28 +125,41 @@ export default defineConfig({
 })
 ```
 
-Run `node ace durable:work` alongside (or rely on the embedded worker) so
-recovery, timers and schedules are driven even if you later split processes.
+Run `node ace durable:work` alongside (or set `worker: { embedded: true }` to
+run the same loop inside the web process) so recovery, timers and schedules are
+driven even if you later split processes.
 Source: `docs/transports/index.mdx`.
 
 ### Pattern 2 — split web from workers
 
 `engine.start()` never blocks the caller, but by default the body executes on a
 microtask **on the calling instance**. On an API/dashboard pod that means heavy
-runs compete with HTTP traffic and the DB pool. Pass `NOOP_RUN_DISPATCHER` so
-the API pod only creates runs, and let `durable:work` execute them:
+runs compete with HTTP traffic and the DB pool. Set `drive: false` (with
+`consumers: 'never'`) so the API pod only creates runs, and let `durable:work`
+execute them:
 
 ```ts title="config/durable.ts (API/dashboard pod)"
-import { NOOP_RUN_DISPATCHER, defineConfig, stores, transports } from '@adonis-agora/durable'
+import { defineConfig, stores, transports } from '@adonis-agora/durable'
 
 export default defineConfig({
   transport: 'queue',
   transports: { queue: transports.queue({ connection: 'redis' }) },
   store: 'lucid',
   stores: { lucid: stores.lucid() },
-  runDispatcher: NOOP_RUN_DISPATCHER, // create runs; never execute bodies here
+  drive: false, // create runs; never execute bodies here
+  consumers: 'never', // claim no broker jobs either
 })
 ```
+
+`durable:work` drives through its poll whatever `drive` says, so one config file
+can serve both pods (runs a worker pod starts itself, e.g. children, are picked
+up on its next tick rather than inline). A resume handled on the API pod (an
+`engine.signal` or webhook) still executes there under the run's lease. An
+explicit `runDispatcher` wins over `drive`; `drive: false` plus
+`worker: { embedded: true }` throws at boot. Every store-backed process drains
+in-flight runs on shutdown (`worker.drainTimeoutMs`, else `drainTimeoutMs`,
+default 10s) before the transport closes; no `app.terminating` hook
+needed.
 
 ```bash title="a separate worker process"
 node ace durable:work --interval=500 --drain-timeout=15000
@@ -149,20 +167,27 @@ node ace durable:work --interval=500 --drain-timeout=15000
 
 Each `durable:work` tick runs `engine.runPending()` → `recoverIncomplete()` →
 `resumeDueTimers()` → `sweepTimeouts()` → fires due schedules, then drains on
-`SIGINT`/`SIGTERM`. Source: `docs/concepts/durability.mdx`,
+`SIGINT`/`SIGTERM`. `--drain-timeout` bounds the whole shutdown: the wait for
+the tick in flight is deducted from the drain. The recovery fallbacks are
+`config/durable.ts` fields: `reconcileMs` (lost-wake re-drive, default 300000,
+`0` off) and `blockedPollMs` (blocked-run re-check, default 5000). Source: `docs/concepts/durability.mdx`,
 `docs/reliability/failure-modes.mdx`, `docs/cli.mdx`.
 
 ### Pattern 3 — dispatch vs start vs waitForRun
 
 One rule: `.dispatch(input)` = fire-and-forget (`{ runId }`); `.start(input)` =
-block until the run settles (terminal state or suspended) and get the result;
-`engine.waitForRun(runId)` resolves a previously started run.
+block until the run is **terminal** (it waits through sleeps/signals) and get its
+output; `engine.waitForRun(runId)` resolves a previously started run once it
+**settles** (terminal or suspended — except a `suspended` run still awaiting a
+remote workflow turn's decision, which keeps waiting until the decision lands) —
+pass `{ terminal: true }` to wait for the end.
 
 ```ts
 const { runId } = await OrderWorkflow.dispatch(order) // hot path — respond now
-const result = await OrderWorkflow.start(order) // scripts / short runs only
+const output = await OrderWorkflow.start(order) // scripts / short runs only
 await engine.start('order', order, runId)
-const settled = await engine.waitForRun(runId) // resolves on settle
+const settled = await engine.waitForRun(runId) // RunResult, resolves on settle
+const done = await engine.waitForRun(runId, { terminal: true, timeoutMs: 60_000 })
 ```
 
 `.start` blocks the calling context — avoid it on a hot HTTP path for
@@ -249,12 +274,13 @@ export default defineConfig({ transport: 'queue', transports: { /* … */ } })
 Correct:
 
 ```ts
-import { NOOP_RUN_DISPATCHER, defineConfig } from '@adonis-agora/durable'
+import { defineConfig } from '@adonis-agora/durable'
 
 export default defineConfig({
   transport: 'queue',
   transports: { /* … */ },
-  runDispatcher: NOOP_RUN_DISPATCHER,
+  drive: false,
+  consumers: 'never',
 })
 ```
 
@@ -284,9 +310,12 @@ export default defineConfig({
 ```
 
 —or don't round-trip inline: start the run, exit, let the worker fleet finish
-it. Mechanism: console/repl processes deliberately do not start broker consumer
-loops (they would claim jobs and die holding them), so nothing receives results
-in that process unless `consumers: 'always'`.
+it. Mechanism: with `consumers: 'auto'` (the default) console/repl processes
+deliberately do not start broker consumer loops (they would claim jobs and die
+holding them), so nothing receives results in that process unless
+`consumers: 'always'`. Before 0.50 the bullmq and db transports ignored this and
+a one-off `node ace` command consumed jobs; upgrade if you see that.
+`consumers: 'never'` makes a web fleet a pure producer.
 Source: `docs/transports/queue.mdx` ("consumers").
 
 See also: `durable-transports-stores` — picking drivers, namespaces, migrations.

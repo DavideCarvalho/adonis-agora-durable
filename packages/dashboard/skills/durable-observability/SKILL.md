@@ -52,9 +52,11 @@ export default defineConfig({
 })
 ```
 
-The default `authorize` is open outside production and requires a bearer token
-equal to `DURABLE_DASHBOARD_TOKEN` in production (**fails closed if unset**).
-The console mutates runs — always front it with a real guard in production.
+The default `authorize` fails closed in **every** environment: it requires a
+bearer token equal to `DURABLE_DASHBOARD_TOKEN`, denying everything when that
+env var is unset. Open it up explicitly with `dashboardAuth`, your own
+`authorize`, or (local dev only) `allowUnauthenticated: true`.
+The console mutates runs — always front it with a real guard beyond local dev.
 
 ## Core patterns
 
@@ -156,6 +158,25 @@ export default defineConfig({
 })
 ```
 
+Every bridge (`collectMetrics`, `attachDurableMetrics`, `attachDurableOtel`, the
+diagnostics bridge Telescope reads) handles only the events its own instance
+produced; another pod's events, re-delivered over the control plane, are skipped
+(`isRemoteEvent(event)`), so a fleet counts and traces each event once.
+
+The mounted dashboard also serves `GET <path>/api/metrics` (these counters plus
+`durable_pending_runs` / `durable_running_runs` / `durable_dead_runs` and
+per-group `durable_group_queue_depth` / `durable_group_live_workers` gauges),
+`GET <path>/api/runs/:id/events/:key` (the latest `ctx.setEvent` value, through
+`redact.checkpoint`) and `POST <path>/api/webhooks/:token` (resumes a run parked
+on a `ctx.webhook()`; `wh:` tokens only, behind the console's guard like every
+route — a callback landing before the run waits is buffered `202 { buffered: true }`
+for a live run that has not consumed it yet, consumed by the later `wait()`;
+unknown, terminal or duplicate tokens answer `404` and buffer nothing).
+
+Inside a step, a helper that was never handed the logger records through
+`currentStep()?.info(...)` (from `@adonis-agora/durable`; `undefined` outside a
+step).
+
 Live-tail one run over SSE:
 `new EventSource('/durable/api/runs/${runId}/stream')`.
 Source: `docs/observability/events-and-interceptors.mdx`,
@@ -169,7 +190,7 @@ Register the extension once and workflows appear next to requests/queries/jobs:
 import { durableTelescopeExtension } from '@adonis-agora/durable/telescope'
 
 export default defineConfig({
-  extensions: [durableTelescopeExtension({ runHref: '/durable/runs/{runId}' })],
+  extensions: [durableTelescopeExtension({ runHref: '/durable#/run/{runId}' })],
 })
 ```
 
@@ -177,18 +198,22 @@ Rollups (success rate, throughput, duration percentiles, top failures) come from
 captured entries bounded by Telescope's prune window; current-state gauges
 (dead/suspended/running/pending NOW) read live from the store via
 `engine.countRuns` (an exact `COUNT`, falling back to a capped `listRuns`
-listing on stores without it).
+listing on stores without it). The **Worker health** table lists every group
+(STARVED first); the **Workers** table has one row per live instance (mode,
+limit, saturation, RAM/CPU, steps/min, p95, last adjustment; `n/a` = no status
+reported, `—` = nothing measured yet). Copies of one event recorded by several
+pods are collapsed by event + runId + emission instant (`dedupeRunEvents`).
 Per-run actions stay in the durable dashboard. Source:
 `docs/observability/telescope.mdx`.
 
 ## Common mistakes
 
-### HIGH trusting an "empty" dashboard config in production
+### HIGH trusting an "empty" dashboard config to serve the console
 
 Wrong:
 
 ```ts
-export default defineConfig({}) // prod, DURABLE_DASHBOARD_TOKEN unset
+export default defineConfig({}) // DURABLE_DASHBOARD_TOKEN unset — every route 403s
 ```
 
 Correct:
@@ -202,9 +227,11 @@ export default defineConfig({
 })
 ```
 
-Mechanism: the default authorize fails CLOSED in production when the token env
-var is unset, so every console route 403s and the console looks broken rather
-than leaking — either set the token deliberately or override authorize.
+Mechanism: the default authorize fails CLOSED in every environment when the
+token env var is unset, so every console route 403s and the console looks
+broken rather than leaking — either set the token deliberately, configure
+`dashboardAuth`, or override authorize (`allowUnauthenticated: true` is the
+explicit local-dev-only opt-out).
 Source: `docs/observability/dashboard.mdx` ("Authorization").
 
 ### HIGH making interceptor outputs depend on time, randomness or external state
@@ -288,4 +315,5 @@ undercounts the fleet and zeroes on every deploy of that pod. Source:
 See also: `durable-reliability` — what the events mean operationally; bulk
 cancel + compensate semantics.
 See also: `durable-cluster` — which verbs proxy over the wire on store-less pods
-(`retry-with-input` / `continue` answer 404 there).
+(`retry`, `retry-with-input`, `continue` and the value pickers do; signal /
+update / tasks / events / webhooks / schedules answer 404 there).

@@ -1,6 +1,6 @@
 ---
 title: Retries & backoff
-description: In-process localStep retries with fixed/exponential backoff and jitter, FatalError to opt out, the durable dispatched-step retry path (re-dispatch on a persisted wakeAt), retryable:false worker verdicts, and the in-memory timeoutMs + heartbeat liveness path.
+description: In-process localStep retries with fixed/exponential backoff and jitter, FatalError to opt out, the durable dispatched-step retry path (re-dispatch on a persisted wakeAt), retryable:false worker verdicts, retrying a run after its budget is spent, the in-memory timeoutMs + heartbeat liveness path, and the lost-dispatch nets.
 icon: RefreshCw
 ---
 
@@ -27,9 +27,14 @@ The `StepOptions` retry fields are:
 - `backoffMs` — the base delay in ms. Omit (or set to 0) to retry with no delay.
 - `backoffMaxMs` — an upper bound, so an exponential backoff doesn't grow without limit.
 - `jitter` — adds random jitter (the delay becomes 50–100% of the computed value) so a fleet of runs retrying the same downstream don't synchronize into a thundering herd.
-- `timeoutMs` — bound a single attempt; on a local step it caps how long `fn` may run.
+
+`timeoutMs` and `pickupTimeoutMs` are accepted by the same `StepOptions` type but are **ignored on a local step**: they are liveness windows for a dispatched step (see [below](#the-in-memory-liveness-path-timeoutms)). A local step that can hang needs its own timeout inside `fn` (an `AbortSignal.timeout(...)` on the call it makes, for example).
 
 With `backoff: 'exp'`, `backoffMs: 200` the delays before attempts 2, 3, 4… are 200ms, 400ms, 800ms… until they hit `backoffMaxMs`. With `jitter: true` each of those is scaled to a random point in its top half, so two runs that failed at the same instant don't retry in lockstep. Every computed delay is also clamped to Node's `setTimeout` ceiling (2³¹−1 ms, about 24.8 days), so a very large exponential never overflows into an immediate retry.
+
+A local step's retries are **in memory**: the backoff is a timer inside the turn that is executing the run, which keeps holding (and renewing) the run's lease while it waits. Only the outcome is checkpointed — the step's output once an attempt succeeds, or its error once the last attempt fails — so if the process dies between attempts, recovery replays the step from attempt 1. Keep local-step backoffs short; a long wait between attempts belongs on a dispatched step, whose retries [suspend durably](#the-durable-path-no-timeoutms).
+
+Every error a local step throws is retried except a `FatalError` (below). A `retryable: false` property on a thrown error is a worker-side verdict for dispatched steps and has no effect here.
 
 ### FatalError — never retried
 
@@ -83,7 +88,13 @@ Every retry field is also a per-call override on `ctx.step(handler, input, opts)
 await ctx.step(chargeCard, input, { retries: 8, backoffMaxMs: 120_000 })
 ```
 
-When a worker reports a **failed** result for a durable step, the engine consults `retries`. If the budget remains, it re-dispatches — but durably, not in a loop. It computes the next retry deadline as `now + backoffDelay(attempt)` and stamps it on the failed checkpoint's `wakeAt`, then suspends. Because that deadline is **persisted on the checkpoint** rather than living in a timer in memory, it is replay-stable and crash-safe (a process that dies before the retry fires picks it back up when the timer poller sees the `wakeAt` come due). Once the deadline passes, the poller resumes the run, the call re-dispatches with an incremented `attempt`, and the cycle continues until the result lands or `retries` is exhausted.
+When a worker reports a **failed** result for a durable step, the engine consults `retries`. If the budget remains, it re-dispatches — but durably, not in a loop. The first time it sees the failed checkpoint it computes the next retry deadline as `now + backoffDelay(attempt)` and stamps it on the checkpoint's `wakeAt`, then suspends. Because that deadline is **persisted on the checkpoint** rather than living in a timer in memory, it is replay-stable and crash-safe (a process that dies before the retry fires picks it back up when the timer poller sees the `wakeAt` come due). Once the deadline passes, the poller resumes the run, the call re-dispatches with an incremented `attempt` (and the same `stepId`), and the cycle continues until the result lands or `retries` is exhausted. Then the step's error is thrown into the workflow as a `RemoteStepError` (exported from `@adonis-agora/durable`), whose `stepError` holds the worker's `message`, `code` and `details`.
+
+A step that names a flow-control [`queue`](/docs/durable/reliability/flow-control) goes back through admission on every retry: the slot an attempt held is released when its result lands, so a step waiting out its backoff doesn't keep a slot.
+
+### Retrying after the budget is spent
+
+Exhausting `retries` fails the run (unless a [saga](/docs/durable/reliability/sagas), an [`onError`](/docs/durable/reliability/on-error) route or the workflow's own `catch` handles it). A retry of the run — the dashboard's retry, `node ace durable:retry <runId>`, or `engine.requeue(runId)` — resets every failed checkpoint to a fresh first attempt (`attempts` back to 0, `retryable` forced back on, due immediately), so the replay re-dispatches the failed step with its full budget instead of re-throwing the recorded failure. Completed steps are not re-run.
 
 <CodeFlow scene="retries" />
 
@@ -91,9 +102,11 @@ When a worker reports a **failed** result for a durable step, the engine consult
 
 A durable remote step retries on a failed worker result **unless the worker marks the error as non-retryable**. A worker that reports an error has returned a deterministic verdict — a declined card, a validation failure — so re-dispatching it just hammers the worker for the same answer. Throw an error with `retryable: false` and the engine surfaces it to the workflow immediately instead of retrying:
 
-```ts
-// inside the worker handler:
-transport.handle('payments:charge-card', async (input) => {
+```ts title="start/durable.ts"
+import engine from '@adonis-agora/durable/services/main'
+
+// A handler served by name on the engine's transport (an `app/steps` handler works the same way):
+engine.handle('payments:charge-card', async (input) => {
   const res = await stripe.charge(input)
   if (res.declined) {
     // a deterministic verdict — don't make the engine retry it
@@ -103,11 +116,13 @@ transport.handle('payments:charge-card', async (input) => {
 })
 ```
 
-The default is `retryable !== false`, i.e. an ordinary error is retried; only an explicit `retryable: false` opts out. This is the worker-side counterpart of throwing `FatalError` in a local step.
+The default is `retryable !== false`, i.e. an ordinary error is retried; only an explicit `retryable: false` opts out. This is the worker-side counterpart of throwing `FatalError` in a local step — and `FatalError` itself carries `retryable: false`, so throwing one from a TypeScript step handler (`throw new FatalError('card declined', 'declined')`) has the same effect without the `Object.assign`. A worker with no handler for the step's name reports a non-retryable `no handler for <name>` failure.
 
 ### The in-memory liveness path (`timeoutMs`)
 
-Setting `timeoutMs` on a dispatched step opts it into a different path. `timeoutMs` is a **liveness window**: if the worker produces neither a result nor a heartbeat within that many ms, the engine presumes it dead, fails the dispatch with a `RemoteStepTimeout`, and — because that timeout is retryable — re-dispatches it up to `retries`. Each heartbeat the worker emits (via `transport.onHeartbeat`) rearms the window, so a long but healthy step that keeps beating stays alive well past `timeoutMs`.
+Setting `timeoutMs` on a dispatched step opts it into a different path. `timeoutMs` is a **liveness window**: if the worker produces neither a result nor a heartbeat within that many ms, the engine presumes it dead, fails the dispatch with a `RemoteStepTimeout`, and — because that timeout is retryable — re-dispatches it up to `retries`. Each heartbeat the worker emits (the automatic pickup beat, and every `log.heartbeat()` the handler calls) rearms the window, so a long but healthy step that keeps beating stays alive well past `timeoutMs`. Before it times a step out, the engine re-reads the checkpoint: a result another instance already recorded is used instead of failing the step, and a heartbeat another instance persisted keeps the window open (see [Delivery under multiple instances](/docs/durable/reliability/multi-instance)).
+
+The re-dispatches on this path happen back to back, inside the turn that awaits the step: `backoff`/`backoffMs` are not applied between timeout retries. When the last attempt times out, the `RemoteStepTimeout` is thrown into the workflow. A step fan (`ctx.all(step, inputs)`) does not accept a step with `timeoutMs`; fans need durable steps.
 
 ```ts
 export const renderVideo = defineStep(
@@ -123,6 +138,8 @@ export const renderVideo = defineStep(
 ```
 
 The crucial difference between the two paths: the durable path retries on a worker **reporting a failure** and suspends between attempts (crash-safe, not in memory); the liveness path retries on a worker **going silent** and awaits the result in memory between attempts. They also disagree on what a *reported* error means: the durable path retries it (subject to `retryable`), while a `timeoutMs` step only re-dispatches on a timeout and surfaces any reported error to the workflow on the first attempt. Reach for `timeoutMs` only when you genuinely need to detect and replace a stuck worker; otherwise leave it off and get the durable, crash-safe path.
+
+The liveness timer lives in the process that dispatched the step. If that process dies, the step's `pending` checkpoint stays behind: once the run's lease expires, recovery parks the run `suspended` on the `reconcileMs` wake (default 5 minutes) without counting a recovery attempt, and the replay then dispatches the step again from its first attempt. A result the worker publishes in the meantime still completes the checkpoint and resumes the run. See [Failure modes](/docs/durable/reliability/failure-modes#a-timeoutms-step-whose-coordinator-crashed).
 
 ### Queue wait vs. silence while running — `pickupTimeoutMs`
 
@@ -145,7 +162,7 @@ A worker emits an automatic beat the moment it claims the task, and **that first
 
 It defaults to `timeoutMs`, so leaving it off preserves the single-window behaviour. It is only consulted when `timeoutMs` is set — on a step with no `timeoutMs` there is no in-memory window at all, and `pickupTimeoutMs` does nothing.
 
-An expiry of either window raises the same retryable `RemoteStepTimeout`, so `retries` and `backoff` apply identically. To make either window meaningful, have the handler call [`log.heartbeat(progress?)`](/docs/durable/concepts/workflows-and-steps#reporting-liveness-from-inside-a-long-step) as it works.
+An expiry of either window raises the same retryable `RemoteStepTimeout`, so `retries` applies identically to both. To make either window meaningful, have the handler call [`log.heartbeat(progress?)`](/docs/durable/concepts/workflows-and-steps#reporting-liveness-from-inside-a-long-step) as it works.
 
 ### A third case: the dispatch itself gets lost
 
@@ -153,7 +170,7 @@ Neither path above covers a step whose job **never produces a result at all**: n
 
 - The [BullMQ transport](/docs/durable/transports/bullmq#crash-recovery) closes this gap for its own consumers: when a crashed or stalled task job ends `failed`, the worker publishes a synthetic, retryable failed result for it, so the checkpoint fails and the durable retry path above takes over. A worker on another SDK only gets this if that SDK implements the same bridge.
 - For any transport, `engine.redispatchPending(runId)` (or the dashboard's redispatch action) re-enqueues a run's stuck `pending` remote steps by hand.
-- `remoteRedispatchMs`, an **opt-in** setting in `config/durable.ts`, makes this self-healing. A dispatched remote step carries a **lease** on its `pending` checkpoint (`wakeAt`), and the run suspends on it. A result, or a step-scoped heartbeat, must land before the lease lapses; a heartbeat **renews** it, throttled to one write per half-window, so a worker beating every few seconds does not cause a write storm. A lapsed lease re-dispatches the same `stepId`, bounded by `remoteRedispatchMax` (default 10), after which the step fails with `remote_step_lost` and reaches the workflow's own error path. It is off by default because a re-dispatch can double-run a step that is merely slow **and does not beat**: the window must exceed the longest legitimate duration of a non-heartbeating step, and the step must be idempotent.
+- `remoteRedispatchMs`, an **opt-in** setting in `config/durable.ts`, makes this self-healing. A dispatched remote step carries a **lease** on its `pending` checkpoint (`wakeAt`), and the run suspends on it (never later than the `reconcileMs` wake would have woken it anyway; an early wake just re-parks on the unexpired lease). A result, or a step-scoped heartbeat, must land before the lease lapses; a heartbeat **renews** it, throttled to one write per half-window, so a worker beating every few seconds does not cause a write storm. A lapsed lease re-dispatches the same `stepId`, bounded by `remoteRedispatchMax` (default 10), after which the step fails with a `RemoteStepError` (`stepError.code: 'remote_step_lost'`) and reaches the workflow's own error path. It is off by default because a re-dispatch can double-run a step that is merely slow **and does not beat**: the window must exceed the longest legitimate duration of a non-heartbeating step, and the step must be idempotent.
 
   The same policy covers a polyglot workflow's `call` fan-out, not just `ctx.step`.
 

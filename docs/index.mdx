@@ -24,7 +24,7 @@ Multi-step processes are usually scattered: a queued job here, a cron there, a m
 
 ## Quickstart
 
-The minimal loop — install, configure, define a workflow, start a run — with zero infrastructure: the in-memory store and an in-process transport. Swap those for a [Lucid store](/docs/durable/stores/lucid) and a [queue transport](/docs/durable/transports/queue) when you go to production. For the full walkthrough, see [Getting Started](/docs/durable/getting-started).
+The minimal loop — install, configure, define a workflow, start a run — with zero infrastructure: the in-memory store and an in-process transport. Swap those for a [Lucid store](/docs/durable/stores/lucid) and a cross-process transport ([queue](/docs/durable/transports/queue), [db](/docs/durable/transports/db) or [BullMQ](/docs/durable/transports/bullmq)) when you go to production. For the full walkthrough, see [Getting Started](/docs/durable/getting-started).
 
 <Steps>
 <Step>
@@ -35,7 +35,7 @@ Install and configure the umbrella package:
 node ace add @adonis-agora/durable
 ```
 
-This registers the provider in `adonisrc.ts` and publishes `config/durable.ts`.
+This registers the durable and dashboard providers, the Ace commands and the codegen hooks in `adonisrc.ts`, adds the `#workflows/*` / `#steps/*` subpath imports, and publishes `config/durable.ts`, `config/durable_dashboard.ts` and the Lucid migrations.
 
 </Step>
 <Step>
@@ -102,15 +102,15 @@ Need the outcome inline instead? `await engine.waitForRun(runId)` resolves once 
 
 ## Steps across processes
 
-A step does not have to run in the same process. `ctx.step(refOrName, input)` is **always dispatched**, routed to a handler by **name** over a pluggable [transport](/docs/durable/transports) to wherever it lives. Author the handler as a `@Step` class under `app/steps`, or with `defineStep` for a typed ref:
+A step does not have to run in the same process. `ctx.step(refOrName, input)` is **always dispatched**, routed to a handler by **name** over a pluggable [transport](/docs/durable/transports) to wherever it lives. Author the handler as a `@Step` class under `app/steps`, or with `defineStep` for a typed ref. The optional `input`/`output` schemas are [Standard Schema](https://standardschema.dev), validated at the serve boundary:
 
 ```ts title="app/steps/charge.ts"
 import { defineStep } from '@adonis-agora/durable'
-import { z } from 'zod'
+import { z } from 'zod' // any Standard Schema library works: zod, valibot, arktype, …
 
 export const chargeCard = defineStep(
   'payments:charge-card',
-  async (input: { orderId: number; amountCents: number }) => ({ chargeId: await charge(input) }),
+  async (input) => ({ chargeId: await charge(input) }), // input typed from the schema
   {
     input: z.object({ orderId: z.number().int(), amountCents: z.number().int() }),
     output: z.object({ chargeId: z.string() }),
@@ -130,8 +130,9 @@ The split goes both ways: a separate worker can implement a step the AdonisJS wo
 
 - **Crash-proof by replay.** Each step is checkpointed and runs exactly once, logically; only unfinished work executes after a restart.
 - **Durable sleep and signals.** Pause for minutes or months with `ctx.sleep` (no compute while waiting), or wait on a human approval or webhook with `ctx.waitForSignal`. Both survive restarts.
-- **Bring Lucid, any SQL database.** State lives in Postgres, MySQL, or SQLite through a `StateStore` interface, with a [Lucid adapter](/docs/durable/stores/lucid) and a published migration.
-- **See the whole flow.** A built-in [control plane](/docs/durable/observability/dashboard) renders each run; [OpenTelemetry](/docs/durable/observability/otel) and a [Telescope](/docs/durable/observability/telescope) view give you two more views of the same event log.
+- **Bring Lucid, any SQL database.** State lives in Postgres, MySQL, or SQLite through a `StateStore` interface, with a [Lucid adapter](/docs/durable/stores/lucid) that provisions its own tables at boot (`autoSchema`, on by default) — or manage them yourself from a migration with `createDurableTables`.
+- **See the whole flow.** A built-in [dashboard](/docs/durable/observability/dashboard) renders each run; [OpenTelemetry](/docs/durable/observability/otel), [metrics](/docs/durable/observability/metrics), [diagnostics](/docs/durable/observability/diagnostics) and a [Telescope](/docs/durable/observability/telescope) view read the same event log.
+- **Cross-language cluster.** Run a store-less [tenant/control-plane topology](/docs/durable/cluster), and interoperate with NestJS ([nestjs-durable](https://github.com/DavideCarvalho/nestjs-durable)) and [Python](/docs/durable/python) workers on one Redis wire.
 
 ## Where to go next
 
@@ -140,11 +141,12 @@ The split goes both ways: a separate worker can implement a step the AdonisJS wo
   <Card title="Patterns" href="/docs/durable/patterns" description="A cookbook: human approval, webhook confirmation, batch fan-out, cron digests, booking sagas, rate-limited APIs, long-lived pollers." />
   <Card title="Comparison" href="/docs/durable/comparison" description="How this library compares to plain @adonisjs/queue jobs, Temporal, Inngest, and BullMQ — honestly." />
   <Card title="Concepts" href="/docs/durable/concepts/durability" description="Durability, deterministic replay, and the mental model behind the engine." />
-  <Card title="Authoring" href="/docs/durable/authoring/child-workflows" description="Child workflows, queries and updates, webhooks, versioning, scheduling, and event-triggered workflows." />
-  <Card title="Reliability" href="/docs/durable/reliability" description="Retries, sagas, dead-letter, and flow control." />
-  <Card title="Transports" href="/docs/durable/transports" description="The in-process default, the @adonisjs/queue transport, and the broker-less DB transport." />
+  <Card title="Authoring" href="/docs/durable/authoring/child-workflows" description="Child workflows, queries and updates, webhooks, entities, versioning, scheduling, and event-triggered workflows." />
+  <Card title="Reliability" href="/docs/durable/reliability" description="Retries, sagas, dead-letter, onError routing, singleton, concurrency quotas, retention, and flow control." />
+  <Card title="Transports" href="/docs/durable/transports" description="The in-process transports, @adonisjs/queue, the broker-less DB transport, BullMQ, and the Redis control plane." />
   <Card title="State stores" href="/docs/durable/stores" description="Persist runs to Postgres, MySQL, or SQLite with Lucid." />
-  <Card title="Observability" href="/docs/durable/observability/dashboard" description="The control-plane dashboard, OpenTelemetry traces, and the Telescope view." />
+  <Card title="Observability" href="/docs/durable/observability" description="The dashboard, events and interceptors, OpenTelemetry traces, metrics, diagnostics, and the Telescope view." />
+  <Card title="Cluster" href="/docs/durable/cluster" description="Store-less tenant pods, a control plane, the handshake, and cross-runtime interop." />
   <Card title="Python" href="/docs/durable/python" description="Implement steps and author whole workflows from a Python worker, over the same Redis wire." />
   <Card title="Tooling" href="/docs/durable/tooling" description="The determinism linter and build-time codegen (workflow/step barrels, a typed dashboard client)." />
   <Card title="Testing" href="/docs/durable/testing" description="createTestEngine, a controllable clock, failure injection, assertions, and replay CI." />

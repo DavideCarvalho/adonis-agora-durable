@@ -16,13 +16,17 @@ A durable run is long-lived and spans processes, retries and deploys, so checkin
 ## Wiring into your stack
 
 - **[OpenTelemetry](/docs/durable/observability/otel)**: one trace per run and one span per step, with distributed tracing across worker processes, so workflows show up in Jaeger, Grafana or Datadog next to your HTTP traces.
-- **[Metrics](/docs/durable/observability/metrics)**: dependency-free run and step counters and duration percentiles. `collectMetrics` serves a Prometheus scrape, and `attachDurableMetrics` returns a JSON snapshot with p50/p95/max.
-- **[Telescope](/docs/durable/observability/telescope)**: runs and steps inside Telescope, alongside your app's requests, queries and jobs.
+- **[Metrics](/docs/durable/observability/metrics)**: dependency-free run and step counters and duration percentiles. `collectMetrics` serves a Prometheus scrape, and `attachDurableMetrics` returns a JSON snapshot with p50/p95/max. The dashboard also serves both counters and backlog/worker gauges at `GET <path>/api/metrics`.
+- **[Telescope](/docs/durable/observability/telescope)**: runs and steps inside Telescope, alongside your app's requests, queries and jobs, plus a Workflows health dashboard with a per-worker table.
 
 ## Underneath
 
-- **[Events & interceptors](/docs/durable/observability/events-and-interceptors)**: the two programmatic hooks into a running engine. `engine.subscribe` gives you the lifecycle event stream, and `engine.use` adds middleware around a local step.
+- **[Events & interceptors](/docs/durable/observability/events-and-interceptors)**: the two programmatic hooks into a running engine. `engine.subscribe` gives you the lifecycle event stream, and `engine.use` adds middleware around a local step. `currentStep()` reaches the step logger from code a step calls.
 - **[Diagnostics bus](/docs/durable/observability/diagnostics)**: every engine lifecycle event republished on the `@adonis-agora/diagnostics` bus as `agora:durable:<type>`. Several of the surfaces above are built on this feed. Subscribe to it to route durable events somewhere none of them cover.
+
+<Callout type="info" title="Each event is counted once per fleet">
+With a [control plane](/docs/durable/transports/control-plane), every instance also hears the other instances' events, so live views work from any pod. Since 0.51 the recording surfaces (metrics, OpenTelemetry, the diagnostics bridge and therefore Telescope) handle only the events their own instance produced. Scrape or record every pod and sum: each event is counted once. See [events from other instances](/docs/durable/observability/events-and-interceptors#events-from-other-instances).
+</Callout>
 
 <Callout type="info">
 These surfaces add up rather than replace each other. A production deployment typically runs the dashboard for people and OpenTelemetry or metrics for alerting, all from the same event stream.

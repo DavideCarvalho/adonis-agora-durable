@@ -19,6 +19,7 @@ import type {
 } from './control-planes/factory.js';
 import { controlPlanes } from './control-planes/factory.js';
 import type { ControlPlane, RunDispatcher, RunScope, TerminalRunStatus } from './interfaces.js';
+import type { QueueConfig } from './queue.js';
 import type { ScheduledWorkflow } from './scheduler.js';
 import type { LucidStoreConfig, StoreContext, StoreFactory } from './stores/factory.js';
 import { stores } from './stores/factory.js';
@@ -31,6 +32,7 @@ import type {
   TransportFactory,
 } from './transports/factory.js';
 import { transports } from './transports/factory.js';
+import type { WorkflowRef } from './workflow-ref.js';
 
 /**
  * The **shared** fields of `config/durable.ts`, common to every {@link DurableConfig} role. Everything
@@ -69,7 +71,7 @@ export interface EmbeddedWorkerConfig {
   embedded?: boolean;
   /** Poll interval in ms between ticks. Default 1000 — the same default as `durable:work`. */
   intervalMs?: number;
-  /** Drain timeout in ms applied on shutdown, passed to `engine.drain`. Default 10_000. */
+  /** Shutdown budget in ms: the wait for the tick in flight plus `engine.drain`. Default 10_000. */
   drainTimeoutMs?: number;
 }
 
@@ -89,6 +91,15 @@ export interface BaseDurableConfig {
   transport?: string;
   /** Named transports, built with the {@link transports} factory. */
   transports?: Record<string, TransportFactory>;
+  /**
+   * More transports (keys of {@link transports}) to build ALONGSIDE {@link transport}, in failover
+   * order: the engine dispatches on `transport` first and falls over to these on a dispatch error,
+   * and a step can pin any of them by name with `ctx.step(step, input, { transport: 'db' })`. Each
+   * one gets the same consumer deferral, namespace and shutdown as `transport`. Only the transports
+   * named here (and `transport`) are built: the rest of `transports` stays a menu. Store-backed
+   * roles only; a `tenant` pod uses its one `transport`.
+   */
+  transportPool?: string[];
   /**
    * Name of the state store (a key of {@link stores}) for runs/checkpoints/timers. Omit for the
    * in-memory store (single-process).
@@ -121,6 +132,21 @@ export interface BaseDurableConfig {
    */
   admission?: AdmissionBackend | AdmissionFactory;
   /**
+   * Flow-control queues, registered on the engine at boot — the declarative form of
+   * `engine.registerQueue(...)`, same {@link QueueConfig} shape (`{ name, concurrency?, rateLimit?,
+   * retryMs?, fairness?, order? }`). Reference one from a step with `ctx.step(step, input, { queue:
+   * name })`. Caps count per engine instance unless {@link admission} is a shared backend. Two entries
+   * with the same `name` throw at boot; a later `engine.registerQueue` of the same name replaces it.
+   */
+  queues?: QueueConfig[];
+  /**
+   * The fleet-default dead-letter workflow (a name, or a workflow class / ref): a run that goes `dead`
+   * (past `maxRecoveryAttempts`) is handed to it — started with a `DeadLetter` input
+   * (`{ deadRunId, workflow, input, error }`) under the run id `dlq:<deadRunId>`, in the dead run's
+   * namespace. A workflow's own `deadLetter()` method or `static workflow.deadLetterWorkflow` wins.
+   */
+  deadLetterWorkflow?: WorkflowRef;
+  /**
    * Build the public callback URL for a `ctx.webhook()` token, e.g.
    * ``(token) => `https://api.example.com/durable/webhooks/${token}` ``. It populates the `url` field
    * of the object `ctx.webhook()` returns, so a step can hand a third party a ready callback address.
@@ -152,8 +178,16 @@ export interface BaseDurableConfig {
   /**
    * Worker-pool partition for this engine. Stamped on every run it creates; the poll/recovery paths
    * only act on runs in this namespace, and a non-`'default'` namespace also segments the transport's
-   * queue names. Default `'default'` — byte-identical to a single-pool deployment. Set distinct values
-   * to safely share ONE state store + broker across non-interchangeable pools (e.g. local dev vs a cluster).
+   * queue names. Set distinct values to safely share ONE state store + broker across
+   * non-interchangeable pools (e.g. local dev vs a cluster).
+   *
+   * Absent, it depends on the role. A `standalone` engine (the default role) is in `'default'`: it
+   * drives only the default pool (runs stamped `'default'`, and legacy rows stored without a
+   * namespace, which every shipped store reads back as `'default'`) — byte-identical to a
+   * single-pool deployment. A `control-plane` engine with no namespace is the OPERATOR: it drives,
+   * recovers and resumes the runs of every pool, which is what lets one control plane serve many
+   * tenant pools. There is no standalone operator: a process that must drive every pool is a
+   * `control-plane`.
    */
   namespace?: string;
   /** Cap crash-recovery pickups before dead-lettering a poison run. Omit for unlimited. */
@@ -174,14 +208,22 @@ export interface BaseDurableConfig {
    *
    * `policies` adds SCOPED rules next to the per-status ages — each deletes terminal runs in its
    * `statuses` that match its `scope` (namespace / tags / workflows / search attributes) once older
-   * than `maxAge`: `{ statuses: ['completed'], maxAge: '1d', scope: { tags: ['chat'] } }`.
+   * than `maxAge`: `{ statuses: ['completed'], maxAge: '1d', scope: { tags: ['chat'] } }`. A
+   * policy can bound by count instead (or as well): `maxCount: 200` keeps the 200 newest runs (by
+   * start time) of its status set within its scope and deletes the rest; with both bounds a run goes
+   * once it is past either. A policy with neither throws at boot.
    */
   retention?: {
     completed?: string | number;
     failed?: string | number;
     cancelled?: string | number;
     dead?: string | number;
-    policies?: Array<{ statuses: TerminalRunStatus[]; maxAge: string | number; scope: RunScope }>;
+    policies?: Array<{
+      statuses: TerminalRunStatus[];
+      maxAge?: string | number;
+      maxCount?: number;
+      scope: RunScope;
+    }>;
   };
   /**
    * How long an in-flight run must sit untouched, with the stranded signature, before
@@ -191,6 +233,31 @@ export interface BaseDurableConfig {
   stalledAfter?: string | number;
   /** Where a freshly-started run executes. Defaults to in-process (microtask). */
   runDispatcher?: RunDispatcher;
+  /**
+   * Whether THIS process executes the runs it starts. `true` (the default): a started (or requeued,
+   * or recovered) run executes in-process right away. `false`: those runs stay `pending` until a
+   * driving instance's poll (`node ace durable:work`, or a `control-plane`) picks them up. For web
+   * pods whose workflow bodies are heavy: pair it with `consumers: 'never'` so the pod also claims no
+   * broker jobs (and so settles no step results). What still executes on such a pod is a resume it
+   * is asked for directly — an `engine.signal` / webhook it handles, a compensating cancel — under the
+   * run's lease, like on any instance.
+   *
+   * An explicit {@link runDispatcher} wins over `drive: false` (it already decides where a run goes,
+   * and an enqueueing dispatcher drives nothing in-process either). `drive: false` together with
+   * `worker.embedded: true` is a contradiction and throws at boot. `node ace durable:work` drives
+   * through its poll whatever the value, so the same config file serves web and worker pods. A
+   * `control-plane` already never drives in-process; a `tenant` pod has no engine, so it ignores this.
+   */
+  drive?: boolean;
+  /**
+   * Shutdown budget (ms) for the engine's in-flight executions: on app shutdown the provider stops
+   * picking up work and waits up to this long for the runs executing in this process before it
+   * closes the transport and control plane. A run that does not finish in time is left to crash
+   * recovery on another instance. Default `10_000`. A `worker.drainTimeoutMs`, when set, takes
+   * precedence (it is the same budget); with the embedded worker on, that loop's drain is the one
+   * shutdown drain, never repeated.
+   */
+  drainTimeoutMs?: number;
   /**
    * When this process's transport starts its broker **consumer** loops. `'auto'` (default): a
    * `console`/`repl` process defers consumption — it can dispatch runs and read the store, but never
@@ -230,11 +297,53 @@ export interface BaseDurableConfig {
    */
   remoteRedispatchMax?: number;
   /**
+   * Fallback re-drive window (ms) for a run suspended on an EVENT (a child, a signal, a
+   * `waitForEvent`, a remote step with no `timeoutMs`) whose wake-up was lost — the delivering pod
+   * crashed or rolled mid-handoff. The timer pass re-drives it after this window: an idempotent
+   * replay that re-suspends a still-pending wait, so it is a self-heal, never a double dispatch. Also
+   * the wake a recovered run with a remote step still in flight is parked on. Default 300 000 (5 min);
+   * `0` disables it (a lost wake-up then strands the run until someone re-drives it). A non-finite or
+   * negative value falls back to the default.
+   */
+  reconcileMs?: number;
+  /**
+   * How long (ms) a run parked `blocked` (no capable, protocol-compatible live worker) waits before
+   * the next re-check of the fleet. Lower values pick the run up sooner once a worker appears, at the
+   * cost of more registry reads. Default 5000. A non-finite or sub-1 value falls back to the default.
+   */
+  blockedPollMs?: number;
+  /**
+   * Opt-in liveness window (ms) for a remote (polyglot) workflow TURN. A dispatched turn with no
+   * decision and no run-scoped heartbeat for this long is presumed lost and re-driven: a fresh turn
+   * is dispatched with the same history (the worker's replay is deterministic), and a late decision
+   * of the old one is dropped. Each heartbeat pushes the deadline forward (one write per half
+   * window), so a worker still replaying a long turn is never re-driven — the Python `durable-worker`
+   * and the bundled TS transports beat every 5s while a turn runs. A `RemoteWorkflowExecutor`'s own
+   * `timeoutMs` is the per-workflow version; when both are set the shorter wins. Unset (the default)
+   * waits for the decision with no deadline.
+   */
+  remoteAdvanceSilenceMs?: number;
+  /**
    * The most due timers one timer pass loads and resumes, most overdue first; a larger backlog
    * drains over the next ticks. Every worker runs the pass each tick, and each walks its batch in a
    * shuffled order so instances don't contend for the same leases row by row. Default 500.
    */
   timerBatchSize?: number;
+  /**
+   * How long a buffered event (a `publishEvent` that matched no waiter) is kept for a later
+   * `waitForEvent` — a duration string (`'7d'`) or ms. Omit to keep it until consumed. When set, an
+   * expired event is never delivered, and the worker tick's retention phase deletes expired rows
+   * across every name (through the store's `pruneBufferedEvents`).
+   */
+  eventBufferTtl?: string | number;
+  /**
+   * Confine the store's run reads to {@link BaseDurableConfig.namespace} — a tenant-boundary view in
+   * which `getRun`, `listRuns`, the counts and the recovery/timer scans only see this namespace's
+   * runs (writes are unaffected). Default `false`: the operator view that sees every namespace. Needs
+   * `namespace` set and a store with `withScope` (the Lucid and in-memory stores have it); otherwise
+   * it has no effect.
+   */
+  scopeReads?: boolean;
   /**
    * Recurring workflows to start on a schedule (fixed interval via `everyMs`, or cron via `cron` +
    * `timezone`). The `durable:work` worker loop fires any due windows on every tick (the 5th phase,
@@ -277,7 +386,8 @@ export interface BaseDurableConfig {
    * (`BaseWorkflow` subclasses) to auto-register on the engine — the
    * `app/workflows` convention, mirroring `@adonisjs/queue`'s
    * `app/jobs`. Default `'app/workflows'`. Set `false` to disable discovery entirely (register by
-   * hand with `engine.register(...)`). A missing directory is fine — nothing to register.
+   * hand with `engine.register(...)`). A missing directory is fine — nothing to register. It governs
+   * workflow discovery only: `app/steps` ({@link stepsPath}) and the run-request responder still boot.
    *
    * A modular app lists several directories (`['app/orders/flows', 'app/billing/flows']`): every
    * root is scanned, and the same workflow name + version defined by two different classes in two

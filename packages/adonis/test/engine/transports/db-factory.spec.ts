@@ -40,5 +40,26 @@ describe.each(dbBackends())('on $name', ({ makeTransportDb }) => {
         concurrency: { mode: 'fixed', limit: 4 },
       });
     });
+
+    it('forwards workerKeysCacheMs (0 = every read sees the live keys)', async () => {
+      const db = await makeTransportDb();
+      closers.push(() => db.manager.closeAll());
+      const ctx = { app: { container: { make: async () => db } } } as any;
+      const transport = (await transports.db({ workerKeysCacheMs: 0, pollIntervalMs: 5 })(
+        ctx,
+      )) as DbTransport;
+      closers.unshift(() => transport.close());
+      expect(await transport.listWorkerGroups()).toEqual([]);
+      // A worker elsewhere advertises; with the default 5s cache the read above would be reused.
+      await db
+        .connection()
+        .table(WORKER_KEYS_TABLE)
+        .insert({
+          key: 'durable-worker-heartbeat:ext.late:w2',
+          value: JSON.stringify({ at: Date.now() }),
+          expires_at: Date.now() + 60_000,
+        });
+      expect(await transport.listWorkerGroups()).toEqual(['ext.late']);
+    });
   });
 });

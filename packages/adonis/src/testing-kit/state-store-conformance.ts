@@ -8,6 +8,7 @@ import {
   WorkflowEngine,
   type WorkflowRun,
 } from '../index.js';
+import { registerCheckpointAggregationCases } from './checkpoint-aggregation-contract.js';
 
 /**
  * A freshly provisioned, empty {@link StateStore} plus a `cleanup` to release its resources (close
@@ -129,12 +130,17 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       };
     });
 
-    /** Register a contract case that no-ops (passes) when the backend was reported unavailable. */
-    const t = (label: string, fn: () => Promise<void>): void => {
-      it(label, async () => {
-        if (skipReason) return;
-        await fn();
-      });
+    /** Register a contract case that no-ops (passes) when the backend was reported unavailable.
+     *  `timeoutMs` widens the runner's per-test timeout for a case that does many round-trips. */
+    const t = (label: string, fn: () => Promise<void>, timeoutMs?: number): void => {
+      it(
+        label,
+        async () => {
+          if (skipReason) return;
+          await fn();
+        },
+        timeoutMs,
+      );
     };
 
     // ---- create / get / update --------------------------------------------------------------
@@ -231,6 +237,17 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         expect(r?.lockedBy).toBe('owner-2');
         expect(r?.wakeAt).toBe(123_456);
         expect(r?.lockedUntil).toBe(222_222);
+
+        // The remote-turn decision marker must round-trip AND clear: the engine sets it when it
+        // suspends on a dispatched turn and clears it (`undefined`) when the decision is applied. A
+        // store that drops it on read, or ignores `undefined` instead of writing NULL, makes every
+        // replica discard the decision (it reads back a stale or absent marker).
+        await store.updateRun('r1', { awaitingDecisionTaskId: 'r1:wf:turn-7' });
+        expect((await store.getRun('r1'))?.awaitingDecisionTaskId).toBe('r1:wf:turn-7');
+        expect(
+          await store.updateRunIf('r1', ['completed'], { awaitingDecisionTaskId: undefined }),
+        ).toBe(true);
+        expect((await store.getRun('r1'))?.awaitingDecisionTaskId).toBeUndefined();
       },
     );
 
@@ -294,6 +311,163 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         expect(after?.output).toBeUndefined();
       },
     );
+
+    // ---- tryAdmitSingleton (atomic singleton slots) -----------------------------------------
+    // Optional SPI: a store without it can't run singleton workflows, so these cases pass vacuously.
+
+    const ADMITTED = 'durable:singleton:admitted';
+    const TRACKED = 'durable:singleton:tracked';
+    const gated = (id: string, createdMs: number, over: Partial<WorkflowRun> = {}): WorkflowRun =>
+      run({
+        id,
+        workflow: 'job',
+        status: 'running',
+        // `running` and tracked: the engine stamps the tracked marker on a singleton run's first
+        // execution, before it claims (an untracked, untagged running run reads as a pre-0.51 holder).
+        tags: ['singleton:k', TRACKED],
+        createdAt: new Date(createdMs),
+        updatedAt: new Date(createdMs),
+        ...over,
+      });
+
+    t('tryAdmitSingleton admits the oldest waiter and persists the slot in its tags', async () => {
+      if (!store.tryAdmitSingleton) return;
+      await store.createRun(gated('a', 1000));
+      await store.createRun(gated('b', 2000));
+      expect(await store.tryAdmitSingleton('b', 'singleton:k', 'job', 1, 5000)).toBe(false);
+      expect(await store.tryAdmitSingleton('a', 'singleton:k', 'job', 1, 5000)).toBe(true);
+      expect((await store.getRun('a'))?.tags).toEqual(['singleton:k', ADMITTED]);
+      // The denied waiter was parked on its retry timer, in the same claim.
+      const parked = await store.getRun('b');
+      expect(parked?.status).toBe('suspended');
+      expect(parked?.wakeAt).toBe(5000);
+      // A holder re-checking (a resumed turn) keeps its slot.
+      expect(await store.tryAdmitSingleton('a', 'singleton:k', 'job', 1, 5000)).toBe(true);
+    });
+
+    t('tryAdmitSingleton never lets a later or same-instant run displace a holder', async () => {
+      if (!store.tryAdmitSingleton) return;
+      await store.createRun(gated('z-holder', 1000, { tags: ['singleton:k', ADMITTED] }));
+      // Same createdAt, smaller id: it would sort first in a positional scan.
+      await store.createRun(gated('a-waiter', 1000));
+      expect(await store.tryAdmitSingleton('a-waiter', 'singleton:k', 'job', 1)).toBe(false);
+      expect((await store.getRun('a-waiter'))?.tags).toEqual(['singleton:k', TRACKED]);
+      // A second slot goes to the waiter.
+      expect(await store.tryAdmitSingleton('a-waiter', 'singleton:k', 'job', 2)).toBe(true);
+    });
+
+    t('tryAdmitSingleton scopes slots to the workflow and the key', async () => {
+      if (!store.tryAdmitSingleton) return;
+      await store.createRun(gated('other-key', 1000, { tags: ['singleton:x', ADMITTED] }));
+      await store.createRun(
+        gated('other-wf', 1000, { workflow: 'job2', tags: ['singleton:k', ADMITTED] }),
+      );
+      await store.createRun(gated('mine', 2000));
+      expect(await store.tryAdmitSingleton('mine', 'singleton:k', 'job', 1)).toBe(true);
+    });
+
+    t('tryAdmitSingleton never parks a run a concurrent cancel already settled', async () => {
+      if (!store.tryAdmitSingleton) return;
+      await store.createRun(
+        gated('holder', 1000, { status: 'suspended', tags: ['singleton:k', ADMITTED] }),
+      );
+      await store.createRun(gated('cancelled', 2000, { status: 'cancelled' }));
+      expect(await store.tryAdmitSingleton('cancelled', 'singleton:k', 'job', 1, 5000)).toBe(false);
+      const after = await store.getRun('cancelled');
+      expect(after?.status).toBe('cancelled');
+      expect(after?.wakeAt).toBeUndefined();
+      expect(await store.tryAdmitSingleton('missing', 'singleton:k', 'job', 1, 5000)).toBe(false);
+    });
+
+    t('a terminal settle releases the slot; non-terminal writes keep it', async () => {
+      if (!store.tryAdmitSingleton) return;
+      await store.createRun(gated('a', 1000));
+      expect(await store.tryAdmitSingleton('a', 'singleton:k', 'job', 1)).toBe(true);
+      await store.updateRun('a', { status: 'suspended', wakeAt: 9000 });
+      expect((await store.getRun('a'))?.tags).toContain(ADMITTED);
+      await store.updateRun('a', { status: 'failed', error: { message: 'x' } });
+      expect((await store.getRun('a'))?.tags).toEqual(['singleton:k']);
+      await store.createRun(gated('b', 2000));
+      expect(await store.tryAdmitSingleton('b', 'singleton:k', 'job', 1)).toBe(true);
+      expect(await store.updateRunIf('b', ['running'], { status: 'completed' })).toBe(true);
+      expect((await store.getRun('b'))?.tags).toEqual(['singleton:k']);
+    });
+
+    // A replica older than 0.51 admits by a scan (the `limit` oldest running/suspended runs of the
+    // key) and writes no admission tag. During a rolling upgrade such a holder still occupies its
+    // slot for the new replicas.
+    t('tryAdmitSingleton counts an untagged pre-0.51 holder (rolling upgrade)', async () => {
+      if (!store.tryAdmitSingleton) return;
+      const claim = (id: string, wakeAt?: number) =>
+        store.tryAdmitSingleton?.(id, 'singleton:k', 'job', 1, wakeAt);
+      // Written by an old replica: admitted by its scan, running, no tag at all. It is NEWER than the
+      // run below, which was still `pending` (invisible to the old scan) back then.
+      await store.createRun(gated('legacy', 2000, { tags: ['singleton:k'] }));
+      // The older run, now picked up by a new replica: tracked from its first execution.
+      await store.createRun(gated('new', 1000));
+      expect(await claim('new', 12_000)).toBe(false);
+      expect(await store.getRun('new')).toMatchObject({ status: 'suspended', wakeAt: 12_000 });
+      expect((await store.getRun('new'))?.tags).toContain(TRACKED);
+      // A legacy holder parked on its own sleep still holds the slot.
+      await store.updateRun('legacy', { status: 'suspended', wakeAt: 20_000 });
+      expect(await claim('new')).toBe(false);
+      // Once it settles, the new admission takes over, swapping the marker for the admitted tag.
+      await store.updateRun('legacy', { status: 'completed' });
+      expect(await claim('new')).toBe(true);
+      expect((await store.getRun('new'))?.tags).toEqual(['singleton:k', ADMITTED]);
+      await store.updateRun('new', { status: 'completed' });
+      expect((await store.getRun('new'))?.tags).toEqual(['singleton:k']);
+    });
+
+    t('legacy singleton waiters keep their FIFO place across the upgrade', async () => {
+      if (!store.tryAdmitSingleton) return;
+      const claim = (id: string, wakeAt?: number) =>
+        store.tryAdmitSingleton?.(id, 'singleton:k', 'job', 1, wakeAt);
+      await store.createRun(gated('holder', 1000, { tags: ['singleton:k'] }));
+      // Denied by an old replica: suspended on its retry timer, no tag.
+      await store.createRun(
+        gated('old-waiter', 2000, { status: 'suspended', wakeAt: 5_000, tags: ['singleton:k'] }),
+      );
+      await store.createRun(gated('new-run', 3000));
+      expect(await claim('new-run')).toBe(false);
+      expect(await claim('old-waiter')).toBe(false);
+      // A legacy waiter re-checked by a new replica is tracked from then on; it keeps its place.
+      expect(await claim('old-waiter', 6_000)).toBe(false);
+      expect((await store.getRun('old-waiter'))?.tags).toContain(TRACKED);
+      await store.updateRun('holder', { status: 'completed' });
+      expect(await claim('new-run')).toBe(false);
+      expect(await claim('old-waiter')).toBe(true);
+      expect(await claim('new-run')).toBe(false);
+      await store.updateRun('old-waiter', { status: 'completed' });
+      expect(await claim('new-run')).toBe(true);
+    });
+
+    t('concurrent claims never over-admit beside an untagged legacy holder', async () => {
+      if (!store.tryAdmitSingleton) return;
+      await store.createRun(gated('legacy', 1000, { tags: ['singleton:k'] }));
+      const ids = ['c1', 'c2', 'c3', 'c4'];
+      for (const [i, id] of ids.entries()) await store.createRun(gated(id, 2000 + i * 1000));
+      const results = await Promise.all(
+        [...ids].reverse().map((id) => store.tryAdmitSingleton?.(id, 'singleton:k', 'job', 2)),
+      );
+      // One slot is the legacy holder's; only the oldest new run takes the other.
+      expect(results).toEqual([false, false, false, true]);
+      const rows = await Promise.all(ids.map((id) => store.getRun(id)));
+      expect(rows.filter((r) => r?.tags?.includes(ADMITTED)).map((r) => r?.id)).toEqual(['c1']);
+    });
+
+    t('concurrent claims for one slot admit exactly one run', async () => {
+      if (!store.tryAdmitSingleton) return;
+      const ids = Array.from({ length: 6 }, (_, i) => `c${i}`);
+      // Same createdAt for all, so the claim order is decided only by the store's serialization.
+      for (const id of ids) await store.createRun(gated(id, 1000));
+      const verdicts = await Promise.all(
+        ids.map((id) => store.tryAdmitSingleton?.(id, 'singleton:k', 'job', 1, 5000)),
+      );
+      expect(verdicts.filter(Boolean)).toHaveLength(1);
+      const rows = await Promise.all(ids.map((id) => store.getRun(id)));
+      expect(rows.filter((r) => r?.tags?.includes(ADMITTED))).toHaveLength(1);
+    });
 
     // ---- checkpoints ------------------------------------------------------------------------
 
@@ -364,6 +538,214 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.saveCheckpointIfPending({ ...pending, seq: 9 })).toBe(false);
       expect(await store.getCheckpoint('r1', 9)).toBeNull();
     });
+
+    t('saveCheckpointsIfPending settles a batch row by row, in order', async () => {
+      // Optional on the interface (the engine falls back to one saveCheckpointIfPending per entry),
+      // but a conformant store MUST provide it — assert presence, then exercise it.
+      expect(store.saveCheckpointsIfPending).toBeDefined();
+      if (!store.saveCheckpointsIfPending) return;
+      expect(await store.saveCheckpointsIfPending([])).toEqual([]);
+      await store.createRun(run());
+      await store.createRun(run({ id: 'r2' }));
+      const pending = (runId: string, seq: number) =>
+        checkpoint({
+          runId,
+          seq,
+          stepId: `${runId}:${seq}`,
+          status: 'pending',
+          output: undefined,
+          wakeAt: 5_000,
+        });
+      for (const seq of [0, 1, 2, 3]) await store.saveCheckpoint(pending('r1', seq));
+      await store.saveCheckpoint(pending('r2', 0));
+      // seq 1 already settled: a stale write must not land on it.
+      await store.saveCheckpoint({
+        ...pending('r1', 1),
+        status: 'completed',
+        output: { first: 1 },
+      });
+      const done = (runId: string, seq: number, output: unknown): StepCheckpoint => ({
+        ...pending(runId, seq),
+        status: 'completed',
+        output,
+        wakeAt: undefined,
+      });
+
+      const wrote = await store.saveCheckpointsIfPending([
+        done('r1', 0, { n: 0 }),
+        done('r1', 1, { n: 1 }),
+        // A second copy of the same row: compared against the first copy's write, so refused.
+        done('r1', 0, { n: 'dup' }),
+        { ...pending('r1', 2), status: 'failed', error: { message: 'boom' }, wakeAt: undefined },
+        // No such row: nothing is written.
+        done('r1', 9, { n: 9 }),
+        // Another run's row, same seq as one above.
+        done('r2', 0, { n: 'r2' }),
+      ]);
+      expect(wrote).toEqual([true, false, false, true, false, true]);
+
+      const r1 = await store.listCheckpoints('r1');
+      expect(r1.map((c) => [c.seq, c.status, c.output])).toEqual([
+        [0, 'completed', { n: 0 }],
+        [1, 'completed', { first: 1 }],
+        [2, 'failed', undefined],
+        [3, 'pending', undefined],
+      ]);
+      expect(r1[2]?.error).toEqual({ message: 'boom' });
+      // The settling write carried no deadline, so the one the pending row held is cleared.
+      expect(r1[0]?.wakeAt).toBeUndefined();
+      expect(r1[3]?.wakeAt).toBe(5_000);
+      expect(await store.getCheckpoint('r1', 9)).toBeNull();
+      expect((await store.getCheckpoint('r2', 0))?.output).toEqual({ n: 'r2' });
+
+      // A pending-to-pending write keeps the row pending, so a later entry still lands on it.
+      expect(
+        await store.saveCheckpointsIfPending([
+          { ...pending('r1', 3), wakeAt: 9_000 },
+          done('r1', 3, { n: 3 }),
+        ]),
+      ).toEqual([true, true]);
+      expect((await store.getCheckpoint('r1', 3))?.output).toEqual({ n: 3 });
+    });
+
+    t(
+      'listBufferedSignalTokens lists distinct prefixed tokens with a buffered signal (when implemented)',
+      async () => {
+        if (!store.listBufferedSignalTokens) return;
+        await store.bufferSignal('entity:a:1', { op: 'x' });
+        await store.bufferSignal('entity:a:1', { op: 'y' });
+        await store.bufferSignal('entity:b:2', { op: 'z' });
+        await store.bufferSignal('other', 1);
+        expect([...(await store.listBufferedSignalTokens('entity:', 10))].sort()).toEqual([
+          'entity:a:1',
+          'entity:b:2',
+        ]);
+        expect(await store.listBufferedSignalTokens('entity:', 1)).toHaveLength(1);
+        // Listing consumes nothing; a drained token drops out.
+        await store.takeBufferedSignal('entity:b:2');
+        expect(await store.listBufferedSignalTokens('entity:', 10)).toEqual(['entity:a:1']);
+        // `%` / `_` in the prefix are literal.
+        expect(await store.listBufferedSignalTokens('entity_', 10)).toEqual([]);
+      },
+    );
+
+    t(
+      'saveCheckpointsIfPending writes a wide batch',
+      async () => {
+        if (!store.saveCheckpointsIfPending) return;
+        await store.createRun(run());
+        const n = 600;
+        const rows = Array.from({ length: n }, (_, seq) =>
+          checkpoint({ seq, stepId: `r1:${seq}`, status: 'pending', output: undefined }),
+        );
+        for (const row of rows) await store.saveCheckpoint(row);
+        const wrote = await store.saveCheckpointsIfPending(
+          rows.map((row) => ({ ...row, status: 'completed' as const, output: { seq: row.seq } })),
+        );
+        expect(wrote).toHaveLength(n);
+        expect(wrote.every((w) => w === true)).toBe(true);
+        expect(await store.countCheckpoints?.('r1', 0, n - 1, ['completed'])).toBe(n);
+        expect((await store.getCheckpoint('r1', n - 1))?.output).toEqual({ seq: n - 1 });
+        // ~1,200 sequential round-trips: a networked store on a loaded runner needs more than 5s.
+      },
+      30_000,
+    );
+
+    t('deleteRuns removes every listed run and its rows, and nothing else', async () => {
+      expect(store.deleteRuns).toBeDefined();
+      if (!store.deleteRuns) return;
+      await store.deleteRuns([]);
+      for (const id of ['a', 'b', 'keep']) {
+        await store.createRun(run({ id, searchAttributes: { tier: 'pro' } }));
+        await store.saveCheckpoint(checkpoint({ runId: id, stepId: `${id}:0` }));
+        await store.putSignalWaiter({ token: `tok-${id}`, runId: id, seq: 1 });
+      }
+      await store.deleteRuns(['a', 'b', 'missing', 'a']);
+      expect(await store.getRun('a')).toBeNull();
+      expect(await store.getRun('b')).toBeNull();
+      expect(await store.listCheckpoints('a')).toEqual([]);
+      expect(await store.listSignalWaiters('tok-a')).toEqual([]);
+      expect(
+        (await store.listRuns({ attributes: [{ key: 'tier', op: 'eq', value: 'pro' }] })).map(
+          (r) => r.id,
+        ),
+      ).toEqual(['keep']);
+      expect((await store.getRun('keep'))?.id).toBe('keep');
+      expect(await store.listCheckpoints('keep')).toHaveLength(1);
+      expect(await store.listSignalWaiters('tok-keep')).toHaveLength(1);
+    });
+
+    t('runFacets counts the matching runs by (status, origin)', async () => {
+      expect(store.runFacets).toBeDefined();
+      if (!store.runFacets) return;
+      const seedRun = (id: string, status: RunStatus, origin?: string, workflow = 'checkout') =>
+        store.createRun(run({ id, status, workflow, ...(origin !== undefined ? { origin } : {}) }));
+      await seedRun('f1', 'completed', 'api');
+      await seedRun('f2', 'completed', 'api');
+      await seedRun('f3', 'failed', 'api');
+      await seedRun('f4', 'completed');
+      await seedRun('f5', 'completed', '  ');
+      await seedRun('f6', 'running', 'cron', 'other');
+      const sort = (rows: { status: string; origin: string | null; count: number }[]) =>
+        [...rows].sort((a, b) =>
+          `${a.status}|${a.origin}`.localeCompare(`${b.status}|${b.origin}`),
+        );
+      expect(sort(await store.runFacets({}))).toEqual(
+        sort([
+          { status: 'completed', origin: 'api', count: 2 },
+          { status: 'failed', origin: 'api', count: 1 },
+          // An absent and a blank origin are the same unattributed bucket.
+          { status: 'completed', origin: null, count: 2 },
+          { status: 'running', origin: 'cron', count: 1 },
+        ]),
+      );
+      expect(sort(await store.runFacets({ workflow: 'other' }))).toEqual([
+        { status: 'running', origin: 'cron', count: 1 },
+      ]);
+      expect(await store.runFacets({ workflow: 'none' })).toEqual([]);
+    });
+
+    t('pruneBufferedEvents deletes the oldest expired events, capped at limit', async () => {
+      expect(store.pruneBufferedEvents).toBeDefined();
+      if (!store.pruneBufferedEvents) return;
+      for (const [id, name, publishedAt] of [
+        ['e1', 'a', 100],
+        ['e2', 'b', 200],
+        ['e3', 'a', 300],
+        ['e4', 'b', 1_000],
+      ] as const) {
+        await store.bufferEvent({ id, name, payload: { id }, publishedAt });
+      }
+      expect(await store.pruneBufferedEvents(500, 2)).toBe(2);
+      expect((await store.listBufferedEvents('a', 10)).map((e) => e.id)).toEqual(['e3']);
+      expect((await store.listBufferedEvents('b', 10)).map((e) => e.id)).toEqual(['e4']);
+      expect(await store.pruneBufferedEvents(500, 10)).toBe(1);
+      expect(await store.pruneBufferedEvents(500, 10)).toBe(0);
+      expect((await store.listBufferedEvents('b', 10)).map((e) => e.id)).toEqual(['e4']);
+    });
+
+    t('withScope fences run reads to one namespace (when the store scopes)', async () => {
+      const scopeable = store as StateStore & {
+        withScope?: (scope: { namespace?: string | undefined }) => StateStore;
+      };
+      if (typeof scopeable.withScope !== 'function') return;
+      await store.createRun(run({ id: 'mine', namespace: 'acme', status: 'pending' }));
+      await store.createRun(run({ id: 'theirs', namespace: 'globex', status: 'pending' }));
+      const acme = scopeable.withScope({ namespace: 'acme' });
+      expect((await acme.getRun('mine'))?.id).toBe('mine');
+      expect(await acme.getRun('theirs')).toBeNull();
+      expect((await acme.listRuns({})).map((r) => r.id)).toEqual(['mine']);
+      expect((await acme.listPendingRuns(10)).map((r) => r.id)).toEqual(['mine']);
+      expect(await acme.countRuns?.({})).toBe(1);
+      // Writes are not fenced, and the operator view still sees both.
+      await acme.updateRun('theirs', { status: 'running' });
+      expect((await store.getRun('theirs'))?.status).toBe('running');
+      expect((await store.listRuns({})).map((r) => r.id).sort()).toEqual(['mine', 'theirs']);
+      const operator = scopeable.withScope({ namespace: undefined });
+      expect(await operator.listRuns({})).toHaveLength(2);
+    });
+
+    registerCheckpointAggregationCases(t, () => store, run);
 
     t(
       'upserts checkpoints, reads them by (runId, seq), and lists them ordered by seq',
@@ -535,6 +917,25 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         expect(orphans.map((r) => r.id).sort()).toEqual(['expired', 'free']);
         // The limit caps the batch.
         expect((await store.listOrphanedRuns(5_000, 1)).length).toBe(1);
+      },
+    );
+
+    t(
+      'listOrphanedRuns with an owner also returns the runs still leased to that owner',
+      async () => {
+        if (!store.listOrphanedRuns) return;
+        await store.createRun(run({ id: 'free', status: 'running' }));
+        await store.createRun(run({ id: 'mine', status: 'running' }));
+        await store.createRun(run({ id: 'theirs', status: 'running' }));
+        await store.createRun(run({ id: 'mine-idle', status: 'suspended' }));
+        await store.tryLockRun('mine', 'A', 9_000, 1_000);
+        await store.tryLockRun('theirs', 'B', 9_000, 1_000);
+        await store.tryLockRun('mine-idle', 'A', 9_000, 1_000);
+        const withOwner = await store.listOrphanedRuns(5_000, 10, undefined, 'A');
+        // A store that predates the `owner` parameter ignores it (expiry-only): still conformant.
+        const ids = withOwner.map((r) => r.id).sort();
+        expect([['free'], ['free', 'mine']]).toContainEqual(ids);
+        expect((await store.listOrphanedRuns(5_000, 10)).map((r) => r.id)).toEqual(['free']);
       },
     );
 

@@ -31,6 +31,39 @@ export interface EventTriggerBridgeOptions {
   engine: WorkflowEngine;
   /** The AdonisJS app emitter, when resolvable (missing = emitter triggers are inert). */
   emitter?: EmitterLike;
+  /**
+   * Called when a triggered start or publish fails (an unregistered workflow, a rejected input, a
+   * concurrency quota, a store error). Default: a `console.warn`. The bridge always catches, so a
+   * failing trigger never becomes an unhandled rejection that could take the process down.
+   */
+  onError?: (error: unknown, info: { trigger: NormalizedEventTrigger }) => void;
+}
+
+/** Run a trigger's start/publish, routing a rejection to `onError` (or a warning). */
+function fire(
+  trigger: NormalizedEventTrigger,
+  options: EventTriggerBridgeOptions,
+  run: () => Promise<unknown>,
+): void {
+  const report = (error: unknown): void => {
+    try {
+      if (options.onError) {
+        options.onError(error, { trigger });
+        return;
+      }
+    } catch {
+      /* a throwing reporter must not escape either; fall through to the warning */
+    }
+    console.warn(
+      `[durable] event trigger for workflow "${trigger.workflow}" (${String(trigger.event)}) failed:`,
+      error,
+    );
+  };
+  try {
+    run().catch(report);
+  } catch (error) {
+    report(error);
+  }
 }
 
 /** One subscription installed by the bridge (for exact teardown). */
@@ -75,7 +108,7 @@ function wireEmitter(
 ): Wire {
   if (!options.emitter) return { disposer: () => {} };
   const handler = (payload: unknown) => {
-    void options.engine.publishEvent(trigger.event, payload);
+    fire(trigger, options, () => options.engine.publishEvent(trigger.event, payload));
   };
   options.emitter.on(trigger.event, handler);
   return { disposer: () => options.emitter?.off(trigger.event, handler) };
@@ -96,10 +129,12 @@ function wireDiagnostics(
     const payload = envelope.payload;
     if (exact) {
       const name = eventTriggerCanonicalName(trigger);
-      if (name !== null) void options.engine.publishEvent(name, payload);
+      if (name !== null) fire(trigger, options, () => options.engine.publishEvent(name, payload));
     } else {
       // Regex/any: the concrete name is unknown upfront — start the workflow directly.
-      void options.engine.start(trigger.workflow, payload, crypto.randomUUID());
+      fire(trigger, options, () =>
+        options.engine.start(trigger.workflow, payload, crypto.randomUUID()),
+      );
     }
   };
 

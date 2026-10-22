@@ -30,16 +30,21 @@ Reach for the subpath directly when you are building the worker **outside** an A
 
 ```ts title="worker.ts"
 import { RedisWorkerRegistry, WorkerRuntime } from '@adonis-agora/durable/worker'
-import { transports } from '@adonis-agora/durable'
-import { Redis } from 'ioredis'
+import { BullMQTransport, createBullMQDeps } from '@adonis-agora/durable'
 
-const transport = await transports.bullmq({ connection: process.env.REDIS_URL })({ app })
-const redis = new Redis(process.env.REDIS_URL!)
+// No AdonisJS app here, so build the transport directly instead of through `transports.bullmq()`.
+const transport = new BullMQTransport({
+  deps: await createBullMQDeps(process.env.REDIS_URL!),
+  partition: 'acme-corp', // the queues it consumes: `<name>@acme-corp`
+  instanceId: 'billing-1',
+})
 
 const runtime = new WorkerRuntime({
   transport,
-  partition: 'acme-corp',
-  registry: new RedisWorkerRegistry(redis, { ownsConnection: true }),
+  partition: 'acme-corp', // the routing tokens it advertises — the same tenant as the transport
+  instanceId: 'billing-1', // the same id as the transport, so both liveness keys name one worker
+  // The transport mints a client for its own advertisement keyspace.
+  registry: new RedisWorkerRegistry(transport.createDescriptorRedis(), { ownsConnection: true }),
 })
 
 runtime.registerStep('billing.charge', async (input, log) => {
@@ -58,10 +63,11 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
 | Option | Default | Description |
 | --- | --- | --- |
 | `transport` | required | The broker transport. It must be able to serve handlers; `handleWorkflow` and `dispatchStepEvent` are optional capabilities layered on top. |
-| `partition` | required | The tenant this worker serves. Every routing token becomes `<name>@<partition>`, so two pools serving the same step name never cross. |
+| `partition` | required | The tenant this worker serves. Every routing token its descriptor advertises becomes `<name>@<partition>`. The transport's `partition` decides which queues it consumes: a transport you construct yourself (as here) takes the same value; in an AdonisJS app the provider gives the top-level `partition` to both. |
 | `namespace` | — | Worker-pool namespace, folded into the descriptor and key names. |
 | `prefix` | `'durable'` | Key prefix for the descriptor and heartbeat keys. |
-| `instanceId` | `ts-<host>-<pid>` | Stable id for this process. |
+| `instanceId` | `ts-<host>-<pid>` | Stable id for this process, stamped on the descriptor and heartbeat keys. Should equal the transport's instance id, so both liveness keys name one worker. In an AdonisJS app the top-level `instanceId` is the default for both; a transport you construct yourself takes it explicitly (the `bullmq` transport defaults to the same `ts-<host>-<pid>`; `queue`, `db` and `eventEmitter` default to a random UUID). |
+| `sdk` | `{ name: '@adonis-agora/durable', version }` | SDK identity on the descriptor. Observability only; it never gates dispatch. |
 | `capabilities` | `[]` | Extra capabilities to advertise beyond the handler names — what a step's [`requires`](/docs/durable/cluster/handshake#capability-aware-routing) is matched against. |
 | `registry` | no-op | Where the descriptor and heartbeat are published. |
 | `heartbeatIntervalMs` | `10_000` | How often it re-advertises and beats. |
@@ -70,7 +76,7 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
 
 `start()` and `stop()` are both idempotent. `stop()` removes the descriptor and heartbeat keys before closing, so a graceful shutdown disappears from the fleet view immediately instead of waiting out the TTL — which is the difference between a rolling deploy looking clean and looking like a partial outage.
 
-Registering a handler after `start()` re-advertises automatically, so late registration is safe.
+Registering a handler after `start()` re-advertises automatically, so late registration is safe. `registerSteps`, `registerStepsFromDir` and `registerStepsFromBarrel` (also exported from the subpath) accept the runtime directly, so you can serve an `app/steps`-style directory without the ace command.
 
 ## Publishing the descriptor: the registry
 
@@ -94,6 +100,8 @@ runtime.registerWorkflow('checkout', (ctx, input) => {
   return { paid, shipped }
 })
 ```
+
+To announce what the worker runs beyond the name (a version, the declaring package, the `onError` routes the engine applies to it), pass a third `meta` argument: `runtime.registerWorkflow('checkout', body, { version: '2', origin: 'billing' })`, or `workflowAnnouncement(CheckoutWorkflow)` (from `@adonis-agora/durable`) to build it from a class's `static workflow`. See [announced registrations](/docs/durable/cluster/handshake#announced-registrations). `registerWorkflowName(name)` / `registerWorkflowNames(names)` advertise a name without a body: it appears in the descriptor's `workflows` list, but this worker executes no turns for it and announces no registration.
 
 The body is synchronous, and that is deliberate rather than a limitation. `ctx.step` either returns the value already recorded in the history or ends the turn by throwing — so a turn is a pure replay that produces a decision, never a long-lived process holding state in memory. `WorkflowTurnCtx` offers `step`, `sleep`, `waitSignal`, `startChild`, `gatherCalls`, `gatherChildren`, `now` and `sideEffect`.
 

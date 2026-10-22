@@ -14,7 +14,7 @@ license: MIT
 metadata:
   type: core
   library: "@adonis-agora/durable"
-  library_version: "0.25.0"
+  library_version: "0.51.0"
   framework: adonisjs
 sources:
   - 'DavideCarvalho/adonis-durable:docs/transports/index.mdx'
@@ -59,6 +59,11 @@ export default defineConfig({
 
 Switching transports is a one-line change; workflow code never changes.
 
+`transports.eventEmitter({ onError })` reports a failing result/heartbeat
+handler (default `console.error`) and redelivers a failed result from memory
+with backoff until `close()`. Before 0.50 such a failure was an unhandled
+rejection — fatal under Node's default — and the result was lost.
+
 ## Core patterns
 
 ### Pattern 1 — cross-process steps without new infrastructure (`db`)
@@ -82,9 +87,9 @@ handler name and claims only as many rows as it has free slots. Every held
 claim is renewed every `leaseMs / 3`, and a row is recorded (task delete +
 result insert, one transaction) only while `claimed_by` is still the worker's
 token — a worker whose claim was taken over drops its result and reports it to
-`onError`. (Releases before this claimed 20 rows per poll, renewed only the
+`onError`. (Before 0.50 the loop claimed 20 rows per poll, renewed only the
 running one, and double-ran the rest of the batch when a step outlived
-`leaseMs`.) Idle task/heartbeat/control loops back off up to `idleBackoffMax`
+`leaseMs` — upgrade if `db` steps run twice.) Idle task/heartbeat/control loops back off up to `idleBackoffMax`
 (default 4) poll intervals; results never back off.
 
 Workers beat `durable[-<ns>]-worker-heartbeat:<token>:<instance>` into
@@ -104,7 +109,8 @@ table; with `autoCreate: false` add them yourself (integer, not null, default
 
 `db` also carries remote workflow turns (task rows of kind `workflow`, claimed
 with the token's steps; each decision is a `durable_transport_messages` row
-addressed to the engine replica that dispatched the turn) and store-less tenant
+addressed to the engine replica that dispatched the turn, though any replica
+could apply it) and store-less tenant
 pods that reach the same database: start-run/run-request/step-event rows go to
 any consumer, a reply is a row addressed to the requester, a tenant event is one
 row per live subscriber (pods write their own `-inbox:` / `-tenant-subscriber:`
@@ -181,7 +187,7 @@ export default defineConfig({
   timerBatchSize: 1000, // due runs per timer pass, most overdue first (default 500)
   transports: {
     bullmq: transports.bullmq({
-      connection: { host: '127.0.0.1', port: 6379 },
+      connection: { host: '127.0.0.1', port: 6379 }, // or 'redis://…' / 'rediss://…' (0.50+)
       resultConcurrency: 16, // default 1
       // A number pins each task queue's concurrency (default 1). 'adaptive' moves it
       // every tickMs: +1 while steps saturate the limit at steady latency, down by the
@@ -198,6 +204,17 @@ work and progress); a non-finite or out-of-range field falls back to its default
 `cpuCeilingPct` is off unless set. A number runs no control loop. The heartbeat's
 throughput covers the trailing minute, decaying while the worker is idle and reading 0 once a minute passes with no completed step; with a fixed limit the heartbeat still reports `cpuPct`, sampled at most once every 2s. In adaptive mode the decisions, step-events, start-run and run-request consumers run
 at 1 (results run at `resultConcurrency`). Sources: `docs/transports/index.mdx`, `docs/cluster/interop.mdx`.
+
+Two `bullmq` safety nets: `pingIntervalMs` (default 30s; `0`/`false` off) PINGs
+every pub/sub subscriber (heartbeats, run replies, tenant events) and reconnects
+one a VPN/NAT/idle timeout dropped silently, so autoResubscribe restores it; each
+subscriber also gets an `error` listener (reported once per burst to `onError`).
+`stepTimeoutMs` (off by default) fails a step handler still running at the
+ceiling as RETRYABLE, so a wedged `await` cannot hold its job forever (BullMQ
+renews the lock on a timer, so the job never stalls). A `redis://` /
+`rediss://` connection string is parsed into ioredis options since 0.50; before
+0.50 it was silently ignored and every client connected to `127.0.0.1:6379`.
+Source: `docs/transports/bullmq.mdx`.
 
 ### Pattern 3 — multi-replica fan-out: the control plane
 
@@ -280,7 +297,28 @@ without it the engine loads the run's checkpoints per result), implement
 (without it a blind save can put a settled step back to `pending`), and return
 `listDueTimers` most overdue first, with or without a `limit`. Run
 `runStateStoreContract` from `@adonis-agora/durable/testing/conformance`, which
-covers all three and fails a store missing either method.
+covers all three and fails a store missing either method. The contract also
+requires `saveCheckpointsIfPending` (batched result settling), `deleteRuns`
+(batched retention/purge deletes), `runFacets`, `pruneBufferedEvents`
+(`eventBufferTtl`) and the `checkpointStats` + `queryCheckpoints` pair (the run
+detail from aggregates, with an ETag the console polls with `If-None-Match`).
+
+The Lucid schema check runs at every boot but is gated by a fingerprint row in
+`durable_schema_meta`: a current schema costs two statements. A stale or missing
+marker runs the full check under `pg_advisory_xact_lock` / MySQL `GET_LOCK`, so
+pods booting together don't race `CREATE TABLE`. Bump `DURABLE_SCHEMA_REVISION`
+with any DDL change; a hand change behind the marker needs `{ force: true }`. On
+MySQL the JSON columns are `longtext` (an old `text` column is widened in place;
+a table rebuild, so run the migration in a maintenance window for big tables),
+and `stores.lucid({ collation })` aligns the tables to the app's collation. A
+JSON column that does not parse reads back as `undefined` and is reported once
+(`onCorruptJsonColumn`) instead of failing every read that touches the row.
+
+To run singleton workflows a custom store also needs `tryAdmitSingleton` (one transaction that
+locks before it reads, built on the exported `singletonAdmissionTags` /
+`singletonAdmissionDenialPatch` including the pre-0.51 holder count, and a terminal `updateRun`/`updateRunIf` that
+drops both singleton markers (`durable:singleton:admitted` and `durable:singleton:tracked`, via `withoutSingletonMarkers`)); without it singletons fall back
+to the old non-atomic scan and the engine warns once naming `StateStore.tryAdmitSingleton`.
 
 Source: `docs/stores/lucid.mdx`, `docs/stores/index.mdx`.
 
@@ -307,7 +345,8 @@ Mechanism: the transport renews every in-flight claim each half threshold
 synchronous body starves the renewal timer; once the claim goes unrenewed past
 the threshold the sweep re-delivers it and the step runs twice — reported to
 `onError` as `lost N of M claim(s)`. Raising the threshold to cover step LENGTH
-is no longer needed (that was the pre-renewal rule).
+is no longer needed: before 0.50 the `queue` transport never renewed claims
+(30min default threshold, long steps re-delivered); upgrade instead.
 Source: `docs/transports/queue.mdx` ("Stalled-job reclaim").
 
 ### HIGH hand-copying the DDL into the migration
@@ -379,7 +418,8 @@ transports.db({ partition: 'tenant-a' })
 Mechanism: routing is by handler name — an instance serves whatever names it
 registers, so there is no group to declare. Isolation comes from `partition`
 (suffixes routing tokens `<name>@<partition>`) plus `namespace` (scopes which
-runs this engine polls). Source: `docs/transports/db.mdx` options table,
+runs this engine polls; absent = `'default'` on standalone, every pool on a
+control plane). Source: `docs/transports/db.mdx` options table,
 `docs/concepts/tenancy.mdx`.
 
 ### MEDIUM wrapping a store in CodecStateStore and expecting heartbeats

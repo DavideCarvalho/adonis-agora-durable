@@ -7,7 +7,8 @@ import { createDurableTables, dropDurableTables } from '@adonis-agora/durable'
 
 /**
  * Durable workflow tables for the @adonis-agora/durable \`lucid\` state store: runs, step checkpoints,
- * the search-attribute side-table, signal waiters, buffered signals and buffered events.
+ * the search-attribute side-table, signal waiters, buffered signals, buffered events and persisted
+ * schedules (seven tables, plus the one-row \`durable_schema_meta\` marker).
  *
  * This migration DELEGATES to the library instead of reproducing its DDL. The schema belongs to the
  * library — \`LucidStateStore\` decides what columns it reads and writes — so a hand-copied snapshot

@@ -43,22 +43,23 @@ With the key derived from `storeId`, two `sync-inventory` runs for `storeId: 'A'
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `key` | required | `(input) => string` — derives the serialization key from the run's input. Runs whose `key(input)` returns the same string compete for the same slot(s); everything else is unaffected. |
-| `limit` | `1` | Max concurrent runs sharing the key. `1` is a true mutex; a higher number is a per-key concurrency cap. |
+| `limit` | `1` | Max concurrent runs sharing the key. `1` is a true mutex; a higher number is a per-key concurrency cap. Must be a positive integer: a `0`, negative or fractional limit makes the admission check throw. |
 | `maxQueueDepth` | unbounded | Caps the same-key *backlog* (see [below](#bounding-the-queue-maxqueuedepth-and-singletonqueuefullerror)). |
 
 The key is scoped to the workflow: admission only looks at runs of the **same workflow** sharing the key. (A [concurrency quota](/docs/durable/reliability/concurrency-quotas) key, by contrast, is shared across workflows.)
 
 ## What happens when a second start arrives
 
-A singleton run is tagged `singleton:<key>` at start time. Start never blocks and, without `maxQueueDepth`, never fails: the run is created as usual. The gate runs when the run is executed — first marked `running`, then checked **before its body executes**:
+A singleton run is tagged `singleton:<key>` at start time. Start never blocks and, without `maxQueueDepth`, never fails: the run is created as usual. The gate runs when the run is executed — first marked `running`, then checked **before its body executes**. The check is one atomic call to the store, `tryAdmitSingleton`:
 
-1. The engine lists this workflow's runs carrying the same `singleton:<key>` tag in `running` or `suspended`, and sorts them by `(createdAt, id)`.
-2. If this run is among the first `limit`, it is admitted and its body runs.
-3. Otherwise it suspends with a retry `wakeAt` (~1s, jittered ±250ms so a queue of waiters doesn't wake in lockstep) and releases its lease. The timer poller wakes it and the check runs again.
+1. Inside a single transaction that serializes competing claims, the store reads this workflow's runs carrying the same `singleton:<key>` tag in `pending`, `running`, `suspended` or `blocked`.
+2. Runs that already **hold a slot** keep it. A holder is marked durably on the run itself, with the reserved tag `durable:singleton:admitted`.
+3. The free slots (`limit` minus the holders) go to the oldest waiters by `(createdAt, id)`. If this run is one of them, the store adds the admission tag in the same transaction and the body runs.
+4. Otherwise the store parks the run `suspended` with a retry `wakeAt` (~1s, jittered ±250ms so a queue of waiters doesn't wake in lockstep), still inside that transaction, and the engine releases the lease. The timer poller wakes it and the claim runs again.
 
-The ordering comes from the store, not from in-memory state, so every instance reading a consistent store sees the same order — admission is FIFO by creation time. A holder keeps counting while it is `running` or `suspended`, so a singleton run sleeping or waiting on a signal still occupies its slot. Admission is re-checked every time the run resumes.
+A slot is held from admission until the run reaches a terminal status (`completed`, `failed`, `cancelled`, `dead`), and nothing else releases it. A holder that sleeps, waits on a signal, is parked `blocked`, is recovered by another instance, or whose execution lease expires keeps its slot. A later start can't take a slot away from a holder, including a start in the same millisecond whose id happens to sort first. Each admission check after the first is a cheap confirmation.
 
-Completion is push, not just poll: when a singleton run reaches a terminal state (`completed`, `failed`, `cancelled`, `dead`) — including a cancel or an execution-timeout sweep — the engine immediately makes the oldest `limit` gated waiters sharing its key due and dispatches them, instead of making them wait out their retry timer. Each one re-checks admission, so only the winner of a free slot actually runs. The durable retry timer still exists as the crash/cross-instance fallback — if the notify is missed (e.g. the notifying instance dies first), the next timer tick catches up.
+Completion is push, not just poll: when a singleton run reaches a terminal state — including a cancel or an execution-timeout sweep — the engine immediately makes the oldest `limit` gated waiters sharing its key due and dispatches them, instead of making them wait out their retry timer. Sleeping holders are left alone. Each woken waiter claims through the store, so only as many as there are free slots actually run. The durable retry timer still exists as the crash/cross-instance fallback — if the notify is missed (e.g. the notifying instance dies first), the next timer tick catches up. It is also how waiters learn about a holder that was dead-lettered: the `dead` write drops the holder's admission tag, and the waiters claim the slot on their next retry.
 
 ```ts
 // A: holds the slot for store A
@@ -69,12 +70,43 @@ await engine.start('sync-inventory', { storeId: 'A' }, 'run-2')
 await engine.start('sync-inventory', { storeId: 'B' }, 'run-3')
 ```
 
+## Guarantees across instances
+
+The claim is atomic, so several instances sharing one store can never admit more than `limit` runs for a key. Two consequences of the store doing the claim:
+
+- **No over-admission.** Two replicas claiming at the same moment are serialized by the store: the second sees the first's holder and waits. An older run that a worker picks up *after* a younger one is never admitted alongside it. Both are in the FIFO queue from the moment they are created (`pending` counts), so whichever is picked up first, only the oldest waiter takes a free slot.
+- **A cancel is never undone by the gate.** A run cancelled while its admission check is in flight stays `cancelled`: the store only parks a run that is still active, under the same lock as the read.
+
+A holder whose process crashes keeps its slot while it is `running` with an expired lease, until recovery re-drives it (or a cancel, timeout or dead-letter settles it). That is deliberate: the run's earlier steps already ran under the slot.
+
+Admission is global, whatever the engine's [`scopeReads`](/docs/durable/api-reference#durableconfig) setting. `scopeReads` fences an engine's run *reads* to its `namespace`, but the slot claim (`tryAdmitSingleton`) always counts every active run of the workflow that shares the key, in every namespace. That is the point of a singleton key: an engine scoped to `acme` and another scoped to `globex` starting `sync-inventory` with the same key still get one run at a time. To get one slot per tenant, put the tenant in the key the `key` function returns, e.g. `` `${tenant}:store:${storeId}` ``.
+
 ## Store support
 
-Admission is built on the store's ordinary `listRuns` (tag + workflow + status filters) and `updateRun`. There is no dedicated store method and no extra table or column — the key rides the run's existing tags — so the [Lucid store](/docs/durable/stores/lucid), the in-memory store and any custom `StateStore` all support singleton workflows without a migration.
+Admission needs `StateStore.tryAdmitSingleton`. The bundled stores implement it:
 
-<Callout type="warn" title="A scan, not an atomic claim">
-Admission is a read of the store followed by a decision, not a locked claim, and it is re-derived from the `(createdAt, id)` order on every check. Two consequences follow. A run is only ordered once it has left `pending`, so an older run that a worker picks up *after* a younger one was admitted sorts ahead of it and is admitted too, so the key briefly has more than `limit` runs executing. The younger holder keeps running its current turn, then finds itself past `limit` on its next resume and gates until a slot frees again. And a holder that crashes stays `running` (so it keeps its slot) until recovery reclaims it. If two overlapping turns would be harmful, keep each step idempotent rather than relying on the gate alone.
+- **[Lucid store](/docs/durable/stores/lucid):** a transaction that locks the key's active rows with `SELECT … FOR UPDATE` (ordered by id) on Postgres and MySQL. On SQLite, which has no row locks, the transaction takes the database write lock first with a no-op `UPDATE`, then reads. No migration is needed: the slot is a tag on the existing `tags` column.
+- **In-memory store:** the claim runs in one synchronous turn.
+- **`CodecStateStore`** (a payload codec — encryption, compression — around another store) forwards the call to the store it wraps (when that store implements it), so wrapping a store keeps admission atomic.
+
+A custom `StateStore` without `tryAdmitSingleton` keeps working after an upgrade, singleton workflows included. On such a store the engine falls back to the previous admission: a scan of the key's `running`/`suspended` runs, admitting the run if it is among the `limit` oldest by `(createdAt, id)`. That fallback is a read followed by a decision, not a claim. Replicas can briefly admit more than `limit` runs, an older run picked up after a younger one is admitted alongside it, and a same-millisecond start can displace a holder. The engine prints one warning per engine (`console.warn`, naming `StateStore.tryAdmitSingleton`) the first time it admits this way. To get atomic admission, implement `tryAdmitSingleton`. The helpers `singletonAdmissionTags` and `singletonAdmissionDenialPatch` (exported from `@adonis-agora/durable`) implement the decision, including the count of holders admitted by pre-0.51 replicas (see the upgrade note below). A store wraps them in its own transaction and must drop the `durable:singleton:admitted` and `durable:singleton:tracked` tags when `updateRun`/`updateRunIf` writes a terminal status (`withoutSingletonMarkers` does it). The [state-store conformance suite](/docs/durable/testing) covers the claim.
+
+<Callout type="info" title="Rolling upgrade from 0.50 or older">
+Mixing 0.50 (or older) and 0.51 replicas over one store during a rolling upgrade never over-admits: a 0.51 replica doesn't admit a run beside a holder an old replica is running, including one the old replica admitted out of order.
+
+Old replicas admit by a scan and write no admission tag. A run may run there while it is among the `limit` oldest `running`/`suspended` runs of its key by `(createdAt, id)`. A 0.51 replica marks the runs it decides on: it stamps the reserved `durable:singleton:tracked` tag on a singleton run's first execution (in the same write that sets it `running`, before it competes) and on every denial, and swaps it for `durable:singleton:admitted` on admission. Both tags are dropped when the run settles or is requeued, and stripped from the tags a caller passes to `start`. A claim then counts as holders, beside the tagged ones, the untagged `running`/`suspended` runs of the key that either:
+
+- **lack the tracked marker** — a 0.51 replica would have stamped it, so an old replica executed (admitted) that run, wherever it ranks. That covers a younger run an old replica admitted while an older one was still `pending` (the old scan ignored `pending`);
+- or **sit inside the old scan's window** (the `limit` oldest of those runs, every tagged holder keeping its seat in it) — an old replica can admit a run a 0.51 replica had marked without clearing the marker, and the window is what it admitted it on.
+
+The candidate never counts itself.
+
+- **FIFO is kept across versions.** An old replica's denied waiter queued before a new start is still admitted first.
+- **Handover is automatic.** When the old holder settles, the next waiter claims the slot on its retry.
+- **No over-admission under concurrent claims.** The count is read inside the same locked transaction as the claim.
+- **Waiters an old replica parked may wait about one retry longer.** Until a 0.51 replica re-checks such a waiter (and marks it), it is untagged and untracked, so it counts as a holder. That only delays, never over-admits.
+
+In a fleet with no old replica left, every run carries one of the two tags, and decisions are the same as before for `limit: 1` (a tracked run inside the window is the head of the FIFO, admitted next anyway). With a larger `limit`, a tracked waiter inside the window can delay another one until a holder settles.
 </Callout>
 
 ## Bounding the queue: `maxQueueDepth` and `SingletonQueueFullError`
@@ -107,7 +139,7 @@ try {
 }
 ```
 
-The capacity check counts the `pending`/`running`/`suspended` runs of the workflow sharing the key in one scan and compares against `(limit ?? 1) + maxQueueDepth`. It runs *before* the run row is written, so a rejected start leaves no trace in the store. Once a slot frees (notify-on-release promotes the oldest waiter, which later settles), the backlog count drops below the cap and the next `start` is accepted again.
+The capacity check counts the `pending`/`running`/`suspended`/`blocked` runs of the workflow sharing the key in one scan and compares against `(limit ?? 1) + maxQueueDepth`. Unlike the slot claim, that scan is an ordinary run read, so with `scopeReads` on it only counts the engine's own namespace. It runs *before* the run row is written, so a rejected start leaves no trace in the store. Once a slot frees (notify-on-release promotes the oldest waiter, which later settles), the backlog count drops below the cap and the next `start` is accepted again.
 
 The check applies wherever the workflow is started — `engine.start`, `Wf.dispatch` / `Wf.start`, child workflows (a rejected child start is delivered to the parent as a failed child), event triggers and schedules. An idempotent re-`start` of an existing `runId` returns that run before the check and is never rejected.
 

@@ -33,6 +33,8 @@ You write ordinary linear code; the engine guarantees each step runs **exactly o
 
 `start` does **not** run the workflow inline. `engine.start(workflow, input, runId, opts?)` **creates the run as `'pending'` and returns immediately** with `{ runId, status: 'pending' }` (a delayed `startAt` run returns `suspended`). Starting is idempotent by `runId`: a second `start` with the same id returns the existing run's state instead of creating a duplicate. The caller — an HTTP handler, say — never blocks on workflow logic; the body is dispatched to a worker.
 
+`start` throws, before any run is created, when the workflow isn't registered (`workflow checkout is not registered`, or `workflow checkout@2 is not registered` for a start pinned with `opts.version`) or when the input fails the workflow's [`inputSchema`](/docs/durable/authoring/app-workflows#validating-the-input) (a `SchemaValidationError`). A bad payload never becomes a run.
+
 ```text
 start('checkout', order, runId)  → run created, status: 'pending', returns now
   (a worker picks the run up)    → status: 'running', body executes
@@ -41,13 +43,18 @@ start('checkout', order, runId)  → run created, status: 'pending', returns now
 ```
 
 - **`'pending'`** is a run status: created and enqueued, not yet picked up by a worker.
-- **Where a run executes is a `runDispatcher`.** The default is **in-process** — the run executes on the same instance, asynchronously on a microtask — so a single-process app still runs workflows with zero setup; it just doesn't block the caller. `runDispatcher` in `config/durable.ts` accepts any `{ dispatch(runId) }` object, so a broker-backed dispatcher can enqueue run ids for a worker pool that calls `engine.runOne(runId)` per consumed id (lease + resume one run; returns `null` if another instance holds the lease or the engine is draining).
-- **Await the outcome with `waitForRun`** when you need it inline: `engine.waitForRun(runId)` resolves once the run **settles** — a terminal state (completed/failed/cancelled/dead) **or** `suspended`.
+- **Where a run executes is a `runDispatcher`.** The default is **in-process** — the run executes on the same instance, asynchronously on a microtask — so a single-process app still runs workflows with zero setup; it just doesn't block the caller. `runDispatcher` in `config/durable.ts` accepts any `{ dispatch(runId) }` object, so a broker-backed dispatcher can enqueue run ids for a worker pool that calls `engine.runOne(runId)` per consumed id (lease + resume one run; returns `null` if another instance holds the lease or the engine is draining). `drive: false` swaps in a no-op dispatcher: the process creates runs but leaves them `pending` for a `durable:work` poll.
+- **Await the outcome with `waitForRun`** when you need it inline: `engine.waitForRun(runId, opts?)` resolves once the run **settles** — a terminal state (completed/failed/cancelled/dead) **or** `suspended`. Pass `{ terminal: true }` to keep waiting through suspensions until the run actually ends, and `{ timeoutMs }` to bound the wait (it rejects with a `waitForRun(<id>) timed out` error; the run itself is untouched). It resolves with the `RunResult` (`{ runId, status, output?, error? }`) and does not throw for a failed run, so check `status`.
 
   ```ts
+  import engine from '@adonis-agora/durable/services/main'
+
   await engine.start('checkout', order, runId)
-  const result = await engine.waitForRun(runId) // resolves when the run settles
+  const settled = await engine.waitForRun(runId) // completed, failed, … or suspended
+  const done = await engine.waitForRun(runId, { terminal: true, timeoutMs: 60_000 }) // ignores suspensions
   ```
+
+  `BaseWorkflow`'s `Wf.start(input)` is this pair with `{ terminal: true }` built in; see [Running a workflow](/docs/durable/authoring/app-workflows#running-a-workflow).
 
 <CodeFlow scene="execution-model" />
 
@@ -59,7 +66,9 @@ For scale you can split an app into **web** processes (handle HTTP, the dashboar
 - `engine.recoverIncomplete()` — reclaim runs a crashed worker left `running`.
 - `engine.resumeDueTimers()` — wake runs whose [sleep](/docs/durable/concepts/sleep-and-signals) or retry timer has come due.
 - `engine.sweepTimeouts()` — fail runs that blew their execution timeout.
-- Fire any due recurring [schedules](/docs/durable/authoring/scheduling) (from `config/durable.ts` and colocated `static schedule`).
+- Fire any due recurring [schedules](/docs/durable/authoring/scheduling) (from `config/durable.ts` and colocated `static schedule`), then any due [persisted schedules](/docs/durable/authoring/persisted-schedules) when `persistedSchedules: true`.
+- `engine.sweepRetention()` — delete terminal runs past their [retention](/docs/durable/reliability/retention) age (a no-op without a `retention` config; at most one pass a minute).
+- `engine.sweepStalled()` — notify `engine.onStalled(listener)` subscribers about stranded runs (a no-op without listeners; at most one pass a minute).
 
 Each phase is isolated: one failing phase is logged and the tick continues with the next. `--interval` sets the poll interval (default 1000 ms) and `--drain-timeout` the shutdown drain bound (default 10000 ms):
 
@@ -109,4 +118,5 @@ Because the engine is embedded in your app, deploys and replicas need a word.
 - **The state survives the deploy.** Checkpoints live in the database, so killing the old instance loses nothing. The new instance recovers `running` runs — and any other instance reclaims orphaned runs within ~`leaseMs` via periodic recovery — while the timer poller resumes due sleeps. Suspended and `pending` runs don't even notice a deploy; a worker picks them up afterward.
 - **Version-pinned replay (skew protection).** Replay is *positional* — changing a workflow's body (reordering/inserting steps) while runs are in flight would corrupt them. So a workflow is registered with a `version`, and a run **resumes on the version it started on** (`workflowVersion` on the run). Register the old and new versions side by side during a breaking change: in-flight runs drain on the old version, new runs start on the newest. A run whose version is no longer registered fails loudly rather than corrupting. See [Versioning & determinism](/docs/durable/authoring/versioning).
 - **One instance per run (recovery lease).** With several replicas, each would try to recover the same `running` runs. The engine takes an atomic, self-expiring **lease** on a run before resuming it (`StateStore.tryLockRun`), so a run is picked up by exactly one instance, and **renews** the lease while it runs (`StateStore.renewRunLock`) so a long-running run isn't reclaimed out from under a live worker. A crashed worker stops renewing, so its lease expires and another instance recovers the run. A turn releases its lease only **after** the state it settled on (completed, failed, suspended, blocked) is written, so a run never sits unleased while it still reads `running`; and recovery re-reads a run once it holds the lease, leaving alone anything that is no longer `running` (a turn that settled, or a run a fast step result already resumed, between the orphan listing and the lease). Set `leaseMs` (config `leaseMs`, default 30s) above how long a single resume step runs.
-- **Graceful shutdown.** On `SIGINT`/`SIGTERM` the `durable:work` loop **drains**: it stops picking up new runs and waits for in-flight ones to settle (bounded by `--drain-timeout`, default 10s), then **releases the leases** of any run still in flight so the next instance recovers it immediately instead of waiting for lease expiry. The embedded worker drains the same way on `app.terminate()`.
+- **Remote workflow turns.** A workflow whose body runs on another worker (a [thin worker](/docs/durable/cluster/thin-workers) or the [Python SDK](/docs/durable/python)) advances one turn at a time, and any replica may apply the turn's decision: it is applied by run id, durably, only while the run still awaits that turn. A lost turn is re-driven after `remoteAdvanceSilenceMs`. See [Remote workflow turns](/docs/durable/reliability/multi-instance#remote-workflow-turns).
+- **Graceful shutdown.** On `SIGINT`/`SIGTERM` the `durable:work` loop **drains**: it stops picking up new runs and waits for in-flight ones to settle (bounded by `--drain-timeout`, default 10s), then **releases the leases** of any run still in flight so the next instance recovers it immediately instead of waiting for lease expiry. The embedded worker drains the same way on `app.terminate()`, and so does every other store-backed process (a web pod without the embedded worker, a control plane): the provider calls `engine.drain(drainTimeoutMs)` (default 10s, falling back to `worker.drainTimeoutMs`) before closing the transport and control plane.

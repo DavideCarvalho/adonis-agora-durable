@@ -127,14 +127,23 @@ const DEFAULT_PING_INTERVAL_MS = 30_000;
 const SUBSCRIBER_PING_TIMEOUT_MS = 5_000;
 
 /**
- * Normalise `pingIntervalMs`: `undefined` → the default, `0`/`false` → disabled, any other number
- * → itself verbatim (including a caller's smaller interval for short-lived tests).
+ * Normalise `pingIntervalMs`: `undefined` → the default, `0`/`false` → disabled, a positive finite
+ * number → itself verbatim (including a caller's smaller interval for short-lived tests), anything
+ * else (negative, NaN, Infinity, past the timer range) → the default.
  */
 function normalizePingInterval(value: number | false | undefined): number | false {
   if (value === undefined) return DEFAULT_PING_INTERVAL_MS;
   if (value === false || value === 0) return false;
+  // setInterval turns a negative, NaN or > 2^31-1 delay into ~1ms: a PING hot loop. Treat those as
+  // unset (the default), like a non-positive stepTimeoutMs.
+  if (!Number.isFinite(value) || value < 0 || value > MAX_TIMER_DELAY_MS) {
+    return DEFAULT_PING_INTERVAL_MS;
+  }
   return value;
 }
+
+/** The largest delay `setInterval` honours (a signed 32-bit int); anything above fires at ~1ms. */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
 /**
  * A {@link ControlPlane} backed by Redis pub/sub: the cross-pod broadcast channel for workflow
@@ -196,6 +205,12 @@ export class RedisControlPlane implements ControlPlane {
         () => this.closed,
         'control-plane',
       );
+      // The connection keeps its ioredis subscriber on the public `ioSubscriberConnection` field
+      // (created by the subscribe above, replaced if it ends). Watch THAT one: it has the same
+      // silent-death failure mode as the duplicated subscriber on the ioredis path. Read on every
+      // tick, never held, and never disconnected by close(): the connection belongs to the app.
+      const adonis = this.connection as { ioSubscriberConnection?: IoredisSubscriber };
+      this.startPingWatchdog(() => adonis.ioSubscriberConnection);
     }
   }
 
@@ -215,17 +230,19 @@ export class RedisControlPlane implements ControlPlane {
     sub.on?.('ready', () => {
       loggedSinceReady = false;
     });
-    this.startPingWatchdog(sub);
+    this.startPingWatchdog(() => sub);
   }
 
   /**
    * Start the watchdog interval, unless it's disabled or already running (idempotent). Unref'd so
    * it never keeps the process alive on its own; cleared in {@link close}.
    */
-  private startPingWatchdog(sub: IoredisSubscriber): void {
+  private startPingWatchdog(current: () => IoredisSubscriber | undefined): void {
     if (this.pingWatchdogTimer || this.pingIntervalMs === false) return;
-    if (typeof sub.ping !== 'function') return; // not an ioredis-shaped connection — nothing to probe
     this.pingWatchdogTimer = setInterval(() => {
+      const sub = current();
+      // Not created yet, or not an ioredis-shaped connection: nothing to probe this tick.
+      if (!sub || typeof sub.ping !== 'function') return;
       void this.pingSubscriber(sub);
     }, this.pingIntervalMs);
     this.pingWatchdogTimer.unref?.();

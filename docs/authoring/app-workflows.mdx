@@ -18,7 +18,9 @@ the engine automatically — you never call `engine.register(...)` by hand.
 node ace make:workflow order
 ```
 
-This emits `app/workflows/order_workflow.ts`:
+This emits `app/workflows/order_workflow.ts`. The registered name is the snake-cased argument with any
+`workflow` suffix removed (`order`), and a path argument nests the file (`node ace make:workflow billing/refund`
+writes `app/workflows/billing/refund_workflow.ts`):
 
 ```ts
 import { BaseWorkflow } from '@adonis-agora/durable'
@@ -31,8 +33,12 @@ interface OrderInput {
 export default class OrderWorkflow extends BaseWorkflow {
   static workflow = { name: 'order', version: '1' }
 
+  // Optional: run this workflow on a recurring schedule (colocated with the class), fired by the
+  // durable:work worker. Cron needs the optional cron-parser peer dependency.
+  // static schedule = { cron: '0 4 * * *', timezone: 'America/Sao_Paulo' }
+
   async run(ctx: WorkflowCtx, input: OrderInput) {
-    // Compose ctx.step / ctx.localStep / ctx.child / ctx.sleep …
+    // Your workflow logic here — compose ctx.step / ctx.localStep / ctx.child / ctx.sleep …
     return input
   }
 }
@@ -40,16 +46,71 @@ export default class OrderWorkflow extends BaseWorkflow {
 
 The class's `run(ctx, input)` **is** the workflow body — the same deterministic `(ctx, input) => …` that
 [`engine.register`](/docs/durable/concepts/workflows-and-steps) takes, just attached to a class so a class
-ref (`OrderWorkflow.dispatch(input)`, `ctx.child(OrderWorkflow)`) carries its input/output types. The
-`static workflow` object accepts the same options as `engine.register` — `name`, `version`, and
-optional `tags` / `onEvent` / `executionTimeout`.
+ref (`OrderWorkflow.dispatch(input)`, `ctx.child(OrderWorkflow)`) carries its input/output types.
+
+## The `static workflow` options
+
+`static workflow` is a `WorkflowOptions` object. Only `name` is required:
+
+| Option | What it does |
+| --- | --- |
+| `name` | The registered workflow name, the identity other runtimes and `engine.start('order', …)` use. |
+| `version` | Defaults to `'1'`. Register a new version for a breaking change. See [Versioning](/docs/durable/authoring/versioning). |
+| `tags` | Labels merged onto every run of this workflow. |
+| `executionTimeout` | Wall-clock budget for the whole run (`'5m'`, or ms). |
+| `onEvent` | Event names that start a run when published. See [Events](/docs/durable/authoring/events). |
+| `singleton` | Per-key serialization: excess runs sharing a key wait (suspended) for a slot. See [Singleton](/docs/durable/reliability/singleton). |
+| `concurrency` | A start-time quota: a start over `limit` runs sharing a key throws `ConcurrencyLimitError` and creates nothing. See [Concurrency quotas](/docs/durable/reliability/concurrency-quotas). |
+| `onError` | Route a failed run to a handler workflow by error `code`. See [onError routing](/docs/durable/reliability/on-error). |
+| `inputSchema` | A Standard Schema validated at start. See [below](#validating-the-input). |
+| `searchAttributes` | A typed search-attributes schema. See [Typed search attributes](/docs/durable/concepts/workflows-and-steps#typed-search-attributes). |
+| `origin` | Package attribution stamped on every run (the console's origin facet). Omit it for an app-local workflow. |
+
+Discovery forwards each of these to `engine.register`. Two names differ between the two forms:
+`searchAttributes` here is `searchAttributesSchema` on `engine.register`. And three `engine.register`
+options have no `static workflow` equivalent: `validateInput` (a function-form validator), `eventBatch`
+(debounce/batch coalescing for `onEvent`) and `requires` (worker capabilities). A workflow that needs one of
+those is registered by hand with `engine.register`.
+
+## Validating the input
+
+Declare an `inputSchema` — any [Standard Schema](/docs/durable/concepts/workflows-and-steps#validation-with-any-standard-schema-library)
+(zod, valibot, arktype, …) — and every start is validated **before a run is created**:
+
+```ts title="app/workflows/order_workflow.ts"
+import { BaseWorkflow } from '@adonis-agora/durable'
+import type { WorkflowCtx } from '@adonis-agora/durable'
+import { type } from 'arktype'
+
+const OrderInput = type({ orderId: 'string', amount: 'number > 0' })
+
+export default class OrderWorkflow extends BaseWorkflow {
+  static workflow = { name: 'order', version: '1', inputSchema: OrderInput }
+
+  async run(ctx: WorkflowCtx, input: typeof OrderInput.infer) {
+    // …
+  }
+}
+```
+
+A bad payload makes `start` / `dispatch` throw a `SchemaValidationError` (code `schema_validation`,
+issues in `details.issues`) and nothing is persisted; an [`onEvent`](/docs/durable/authoring/events)
+subscriber whose schema rejects the payload simply doesn't start. The schema's **output** value
+(parsed / coerced / defaulted) is what the run stores and `run` receives. The same option exists on
+`engine.register(name, version, fn, { inputSchema })` and `engine.registerRemote(...)`, next to the
+function-form `validateInput` — when both are set the schema runs first and `validateInput` sees the
+parsed value.
 
 ## Auto-registration
 
 At boot the provider scans the configured directory (default `app/workflows`), imports each module, and
-registers every exported workflow class from its `static workflow` config — including the version,
-`tags`, `executionTimeout`, `onEvent` and `singleton` from its options, plus any
-[colocated schedule](/docs/durable/authoring/scheduling#colocate-the-schedule-with-the-workflow).
+registers every exported workflow class (default and named exports) from its `static workflow` config, with
+every option in the table above, plus any
+[colocated schedule](/docs/durable/authoring/scheduling#colocate-the-schedule-with-the-workflow) and any
+[colocated event trigger](/docs/durable/authoring/event-triggers). The scan is recursive, so sub-directories
+of `app/workflows` are picked up too. A class without a `static workflow` (or whose `name` is not a string)
+is skipped. When the [codegen barrel](/docs/durable/tooling/codegen) exists, the provider imports it instead of
+scanning the directory at runtime.
 
 ## Dependency injection in the constructor
 
@@ -61,8 +122,8 @@ container resolves them:
 import { inject } from '@adonisjs/core'
 import { BaseWorkflow } from '@adonis-agora/durable'
 import type { WorkflowCtx } from '@adonis-agora/durable'
-import BillingService from '#services/billing_service'
-import NotificationService from '#services/notification_service'
+import BillingSteps from '#steps/billing_steps'
+import NotificationSteps from '#steps/notification_steps'
 
 interface OrderInput {
   orderId: string
@@ -74,8 +135,8 @@ export default class OrderWorkflow extends BaseWorkflow {
   static workflow = { name: 'order', version: '1' }
 
   constructor(
-    private billing: BillingService,
-    private notifications: NotificationService,
+    private billing: BillingSteps,
+    private notifications: NotificationSteps,
   ) {
     super()
   }
@@ -110,8 +171,12 @@ wiring and keep per-run state in the workflow's input and step outputs, never on
 
 A class with no constructor dependencies is unaffected: the container simply builds it with no arguments.
 
+Injecting a step class only gives the workflow a typed reference to its methods. The step bodies are
+served by whatever registers them, which is [`stepsPath`](/docs/durable/concepts/workflows-and-steps#serving-a-step-handler) discovery
+(default `app/steps`) on the process running the worker, so a `@Step` class has to live there to run.
+
 <Callout type="warn">
-Injected services are for **composing** the workflow, not for doing its work. Calling `this.billing.charge(...)`
+Injected dependencies are for **composing** the workflow, not for doing its work. Calling `this.billing.charge(...)`
 directly from `run` performs I/O outside a step, so it re-executes on every replay and is never checkpointed.
 Always reach a service through `ctx.step` / `ctx.localStep`.
 </Callout>
@@ -132,10 +197,38 @@ const result = await OrderWorkflow.start(input)
 Both are **context-aware**: called inside a running workflow body they route to a child instead of the engine.
 See [Child workflows](/docs/durable/authoring/child-workflows) for the full semantics table.
 
+The second argument (`WorkflowDispatchOptions`) is an optional `runId` plus the engine's `StartOptions`:
+
+```ts
+await OrderWorkflow.dispatch(input, {
+  runId: `order:${input.orderId}`, // idempotency key; omitted → a random UUID
+  version: '2',                    // pin a registered version; omitted → the newest
+  startAt: tomorrow,               // create the run now, start it later (epoch ms or Date)
+  tags: ['vip'],                   // merged with static workflow.tags
+  searchAttributes: { amount: input.amount },
+  priority: 10,                    // dispatch priority for a remote run; higher wins
+  namespace: 'tenant-a',           // worker-pool partition for this run
+})
+```
+
+`origin` and a per-start `concurrency` quota are accepted too. A `version` that is not registered throws
+before any run is created; it never falls back to the newest.
+
+<Callout type="warn" title="Wf.start outside a workflow does not throw on failure">
+Outside a workflow, `Wf.start` waits for a **terminal** status (`completed`, `failed`, `cancelled` or
+`dead`), blocking through any sleep or signal wait with no timeout, and returns the run's `output`. A run
+that failed or was cancelled has no output, so the call resolves with `undefined` rather than throwing. When
+the outcome matters, use `Wf.dispatch` and then `engine.waitForRun(runId, { terminal: true })`, which
+returns `{ status, output, error }`. Inside a workflow, `Wf.start` is `ctx.child`, which does throw.
+</Callout>
+
 <Callout type="info">
-`engine.start(OrderWorkflow, input, runId)` remains the lower-level equivalent — resolve the engine from the
-container and start by class (typed) or by registered **name** (`engine.start('order', input, runId)`).
-`Wf.dispatch` / `Wf.start` resolve the engine for you.
+`engine.start(OrderWorkflow, input, runId, opts?)` remains the lower-level equivalent. Import the engine from
+`@adonis-agora/durable/services/main` and start by class (typed) or by registered **name**
+(`engine.start('order', input, runId)`). It returns a `RunResult` and needs an explicit `runId`.
+`Wf.dispatch` / `Wf.start` resolve the engine for you. To point them at a different engine (an in-memory
+one in a test), call `setWorkflowEngineResolver(() => engine)`, and `setWorkflowEngineResolver(undefined)`
+to restore the container lookup. See [Testing](/docs/durable/testing).
 </Callout>
 
 Configure or disable discovery in `config/durable.ts`:
@@ -181,11 +274,18 @@ import app from '@adonisjs/core/services/app'
 import engine from '@adonis-agora/durable/services/main'
 import { registerStepsFromDir, registerWorkflowsFromDir } from '@adonis-agora/durable'
 
-await registerWorkflowsFromDir(engine, app.makePath('app/engine/flows'))
+await registerWorkflowsFromDir(engine, app.makePath('app/engine/flows'), (Ctor) =>
+  app.container.make(Ctor),
+)
 await registerStepsFromDir(engine, app.makePath('app/engine/steps'))
 ```
 
 Both accept one directory or an array, and apply the same cross-directory duplicate check.
+`registerWorkflowsFromDir` takes an optional third argument, the factory that builds each class. Without it
+the class is built with `new Ctor()`, so pass `(Ctor) => app.container.make(Ctor)` as above when the
+workflows use [constructor injection](#dependency-injection-in-the-constructor). It returns the metadata of
+every workflow it registered. For a single class, `registerWorkflowClass(engine, Cls, factory?)` does the same
+for one class.
 `engine.handle` throws if the engine's transport can't serve handlers. A `tenant` pod has no engine:
 `node ace durable:worker` serves `stepsPath` there.
 

@@ -17,7 +17,7 @@ license: MIT
 metadata:
   type: core
   library: "@adonis-agora/durable"
-  library_version: "0.25.0"
+  library_version: "0.51.0"
   framework: adonisjs
 sources:
   - 'DavideCarvalho/adonis-durable:docs/authoring/app-workflows.mdx'
@@ -48,7 +48,6 @@ transport (`engine.handle`).
 ## Setup
 
 ```ts title="app/workflows/checkout_workflow.ts"
-import { inject } from '@adonisjs/core'
 import { BaseWorkflow } from '@adonis-agora/durable'
 import type { WorkflowCtx } from '@adonis-agora/durable'
 
@@ -70,7 +69,8 @@ export default class CheckoutWorkflow extends BaseWorkflow {
 ```
 
 Run it from anywhere: `CheckoutWorkflow.dispatch(input, { runId })` enqueues;
-`CheckoutWorkflow.start(input)` awaits the settled result. Both statics are
+`CheckoutWorkflow.start(input)` blocks until the run is terminal and returns its
+output. Both statics are
 context-aware — inside a running body they become a linked child /
 fire-and-forget child instead of a top-level run.
 
@@ -83,7 +83,7 @@ Steps are discovered from `app/steps` and served by name automatically. A
 
 ```ts title="app/steps/payment_steps.ts"
 import { Step } from '@adonis-agora/durable'
-import { z } from 'zod'
+import { z } from 'zod' // any Standard Schema library: zod, valibot, arktype, …
 
 export default class PaymentSteps {
   @Step({
@@ -128,6 +128,26 @@ constructor as wiring; keep per-run state in input and step outputs, never on
 `this`. Injected services are for **composing**, not doing work: reach them
 through step refs so the work is checkpointed.
 
+Schemas are **any Standard Schema** (zod 3.24+/4, valibot, arktype, effect
+schema, …) — the package depends on none of them. They fit every schema slot:
+`@Step({ input, output })` / `defineStep` (with an unannotated handler the types
+are inferred from the schema), `static workflow = { inputSchema }` (validated at
+`start`, nothing created on failure; the schema's output value is the run's
+input), and `static workflow = { searchAttributes }` (every
+`ctx.upsertSearchAttributes` is validated against the merged attributes; type
+the ctx as `WorkflowCtx<InferSearchAttributes<typeof schema>>` and read back with
+`attributesOf(WorkflowClass, run)`). A failure is a `SchemaValidationError`
+(`FatalError`, code `schema_validation`, issues in `details.issues`) — never
+retried.
+
+```ts
+import * as v from 'valibot'
+
+export const charge = defineStep('billing:charge', async (input) => input.amount * 100, {
+  input: v.object({ amount: v.number() }), // input: { amount: number }, inferred
+})
+```
+
 ### Pattern 2 — pausing durably: sleeps, signals, events
 
 All three suspend the run with zero compute and survive restarts.
@@ -159,15 +179,12 @@ events with `{ onEvent: ['payment.settled'] }`; coalesce chatty sources with
 `{ mode: 'batch', maxSize: 50, windowMs: 60_000 }` (receives `{ events: [...] }`).
 
 ```ts title="app/controllers/approvals_controller.ts"
-import { inject } from '@adonisjs/core'
-import { WorkflowEngine } from '@adonis-agora/durable'
+import type { HttpContext } from '@adonisjs/core/http'
+import engine from '@adonis-agora/durable/services/main'
 
-@inject()
 export default class ApprovalsController {
-  constructor(private engine: WorkflowEngine) {}
-
   async approve({ params, request, response }: HttpContext) {
-    await this.engine.signal(`approve:${params.id}`, request.body())
+    await engine.signal(`approve:${params.id}`, request.body())
     return response.noContent()
   }
 }
@@ -189,9 +206,9 @@ use `ctx.allSettled(Workflow, inputs, { concurrency })` instead: the same fan,
 resolving with `{ status: 'fulfilled', value } | { status: 'rejected', id, error, code?, details? }`
 per input and never throwing for a child. Child ids derive from the call position and
 are replay-stable; never pass a random one. `{ concurrency: n }` caps how many
-children run at once (waves of `floor(n / 2)`, two at a time), and the wave goes into each child
-id), so changing it for an in-flight run is non-deterministic, like changing
-`inputs`.
+children run at once (waves of `floor(n / 2)`, two at a time). The wave is part of
+each child id (`<runId>.all.<firstSeq>.w<k>.<i>`), so changing it for an in-flight
+run is non-deterministic, like changing `inputs`.
 
 For the same step over many inputs, pass the step reference (`defineStep` ref
 or `@Step` method) to `ctx.all`. It
@@ -211,8 +228,10 @@ Prefer it to `Promise.all` past a handful of steps (every result of a
 child-workflow `ctx.all` when each item is just a step. A `queue` or a
 `timeoutMs` is rejected on a step fan.
 
-Serialize runs per subject with a singleton — runs sharing a key queue FIFO and
-are race-free across instances:
+Serialize runs per subject with a singleton — runs sharing a key queue FIFO.
+Admission is an atomic store claim (`StateStore.tryAdmitSingleton`, built into the
+Lucid and in-memory stores), and a holder keeps its slot until it settles
+terminally, so replicas never over-admit and a later start never displaces it:
 
 ```ts
 export default class SyncShopWorkflow extends BaseWorkflow {
@@ -362,7 +381,7 @@ each replay breaks that dedup and re-fires the child. Source:
 Wrong:
 
 ```ts
-const result = await CheckoutWorkflow.start(order) // request held open until settle
+const result = await CheckoutWorkflow.start(order) // request held open until the run is terminal
 ```
 
 Correct:
@@ -372,8 +391,9 @@ const { runId } = await CheckoutWorkflow.dispatch(order, { runId: `checkout:${or
 return response.accepted({ runId })
 ```
 
-Mechanism: `.start` resolves only when the run reaches a terminal state or
-`suspends` — hours later for a long workflow. Source: `docs/getting-started.mdx`
+Mechanism: `.start` resolves only when the run reaches a terminal state — it
+keeps waiting through every sleep/signal suspension, hours later for a long
+workflow. Source: `docs/getting-started.mdx`
 (warning callout).
 
 ### MEDIUM awaiting a webhook with no timeout

@@ -1,7 +1,10 @@
 import type {
   AttributeFilter,
+  CheckpointQuery,
+  CheckpointStat,
   ChildWait,
   RunFacetQuery,
+  RunFacetRow,
   RunQuery,
   RunStatus,
   RunValueAxis,
@@ -14,18 +17,76 @@ import type {
   StepCheckpoint,
   WorkflowRun,
 } from '../interfaces.js';
+import { namespaceMatches, normalizeNamespace } from '../namespaces.js';
+import { checkpointStatsOf, queryCheckpointsOf } from '../run-detail-summary.js';
+import { mergeRunFacetRows } from '../run-facets.js';
 import { runPageWindow } from '../run-pagination.js';
 import { scanRunValueFacets } from '../run-value-facets.js';
 import { normalizeAttributeRows, type RunAttributeRow } from '../search-attributes.js';
+import {
+  settlesTerminally,
+  singletonAdmissionDenialPatch,
+  singletonAdmissionTags,
+  withoutAdmission,
+} from '../singleton-admission.js';
 
 /**
  * A non-durable, in-process `StateStore` for tests and local development.
  * The shipped `@dudousxd/nestjs-durable-store` package re-exports an equivalent.
  */
+/**
+ * Everything an {@link InMemoryStateStore} holds, in ONE object, so a {@link InMemoryStateStore.withScope}
+ * view can share it by reference: a write through either is visible through both, and the read
+ * counters are one set. Only the scope is per view.
+ */
+interface InMemoryState {
+  readonly runs: Map<string, WorkflowRun>;
+  readonly checkpoints: Map<string, StepCheckpoint>;
+  readonly signalWaiters: Map<string, SignalWaiter>;
+  readonly attributeIndex: Map<string, Map<string, RunAttributeRow>>;
+  readonly bufferedSignals: Map<string, unknown[]>;
+  readonly bufferedEvents: Map<string, { name: string; payload: unknown; publishedAt: number }>;
+  readonly schedules: Map<string, ScheduleRecord>;
+  readonly stats: {
+    lastAttributeCandidates: number;
+    lastCheckpointRowsRead: number;
+    checkpointRowsRead: number;
+  };
+}
+
+/** A caller's copy of a stored run, with a legacy `''`/absent namespace read as `'default'`. */
+const copyRun = (run: WorkflowRun): WorkflowRun => ({
+  ...run,
+  namespace: normalizeNamespace(run.namespace),
+});
+
+/** A run about to be stored, its namespace normalized (`''` is the default pool). */
+const withNormalizedNamespace = (run: WorkflowRun): WorkflowRun =>
+  run.namespace === undefined || run.namespace === '' ? copyRun(run) : run;
+
+const freshState = (): InMemoryState => ({
+  runs: new Map(),
+  checkpoints: new Map(),
+  signalWaiters: new Map(),
+  attributeIndex: new Map(),
+  bufferedSignals: new Map(),
+  bufferedEvents: new Map(),
+  schedules: new Map(),
+  stats: { lastAttributeCandidates: 0, lastCheckpointRowsRead: 0, checkpointRowsRead: 0 },
+});
+
 export class InMemoryStateStore implements StateStore {
-  private readonly runs = new Map<string, WorkflowRun>();
-  private readonly checkpoints = new Map<string, StepCheckpoint>();
-  private readonly signalWaiters = new Map<string, SignalWaiter>();
+  /** All of this store's data; shared by reference with every {@link withScope} view. */
+  private state: InMemoryState = freshState();
+  private get runs(): Map<string, WorkflowRun> {
+    return this.state.runs;
+  }
+  private get checkpoints(): Map<string, StepCheckpoint> {
+    return this.state.checkpoints;
+  }
+  private get signalWaiters(): Map<string, SignalWaiter> {
+    return this.state.signalWaiters;
+  }
 
   /**
    * Normalized search-attribute side-table, the in-memory analog of the SQL stores'
@@ -33,16 +94,66 @@ export class InMemoryStateStore implements StateStore {
    * attribute query can be pushed DOWN to a key-indexed candidate set instead of scanning every run
    * and comparing in-process. Mirrors {@link normalizeAttributeRows} so behavior matches the SQL path.
    */
-  private readonly attributeIndex = new Map<string, Map<string, RunAttributeRow>>();
+  private get attributeIndex(): Map<string, Map<string, RunAttributeRow>> {
+    return this.state.attributeIndex;
+  }
   /** Test/observability hook: how many candidate runs the last attribute query's index produced. */
-  lastAttributeCandidates = 0;
+  get lastAttributeCandidates(): number {
+    return this.state.stats.lastAttributeCandidates;
+  }
+  set lastAttributeCandidates(value: number) {
+    this.state.stats.lastAttributeCandidates = value;
+  }
   /**
    * Test/observability hook: how many checkpoint rows the LAST checkpoint read materialized (the rows
    * actually returned to the caller). `listCheckpoints` returns all rows for the run; the targeted
    * {@link getLatestCheckpointByName} / {@link listCheckpointsByNamePrefix} return only the matches —
    * so this lets the benchmark contrast "fetch N, scan in JS" against "fetch the k that match".
    */
-  lastCheckpointRowsRead = 0;
+  get lastCheckpointRowsRead(): number {
+    return this.state.stats.lastCheckpointRowsRead;
+  }
+  set lastCheckpointRowsRead(value: number) {
+    this.state.stats.lastCheckpointRowsRead = value;
+  }
+  /**
+   * Test/observability hook: checkpoint rows materialized since construction, across every
+   * checkpoint read that returns rows — what a run-detail test compares between paths.
+   */
+  get checkpointRowsRead(): number {
+    return this.state.stats.checkpointRowsRead;
+  }
+  set checkpointRowsRead(value: number) {
+    this.state.stats.checkpointRowsRead = value;
+  }
+  /** The namespace run reads are fenced to (see {@link withScope}); undefined sees every run. */
+  private scopeNamespace: string | undefined;
+
+  /**
+   * A view of THIS store (same data) whose run reads — `getRun`, `listRuns`, the counts and the
+   * recovery/dispatch/timer scans — only see `scope.namespace`. Writes stay unscoped. Mirrors
+   * `LucidStateStore.withScope`; `{ namespace: undefined }` is the operator view.
+   */
+  withScope(scope: { namespace?: string | undefined }): InMemoryStateStore {
+    // A plain store holding the SAME state object by reference (not an `Object.create(this)` child,
+    // whose own-property writes — a counter bump — would shadow the base's, and which would break on
+    // any `#private` field). Overrides of a subclass are not carried over to the view.
+    const view = new InMemoryStateStore();
+    view.state = this.state;
+    view.scopeNamespace = scope.namespace;
+    return view;
+  }
+
+  private inScope(run: WorkflowRun): boolean {
+    return (
+      this.scopeNamespace === undefined || namespaceMatches(run.namespace, this.scopeNamespace)
+    );
+  }
+
+  private visibleRuns(): WorkflowRun[] {
+    const runs = [...this.runs.values()];
+    return this.scopeNamespace === undefined ? runs : runs.filter((r) => this.inScope(r));
+  }
 
   private key(runId: string, seq: number): string {
     return `${runId}:${seq}`;
@@ -70,14 +181,18 @@ export class InMemoryStateStore implements StateStore {
     // Normalize an undefined namespace to 'default', matching the SQL stores' column DEFAULT 'default'
     // — so a run created directly against this store (bypassing the engine, e.g. in tests) is still
     // reachable via a namespace='default' filter and partitions consistently.
-    this.runs.set(run.id, { ...run, namespace: run.namespace ?? 'default' });
+    this.runs.set(run.id, { ...run, namespace: normalizeNamespace(run.namespace) });
     this.reindexAttributes(run.id, run.searchAttributes);
   }
 
   async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
     const existing = this.runs.get(runId);
     if (!existing) throw new Error(`run ${runId} not found`);
-    const next = { ...existing, ...patch };
+    const next = withNormalizedNamespace({
+      ...existing,
+      ...patch,
+      ...releasedSlot(existing, patch),
+    });
     this.runs.set(runId, next);
     if ('searchAttributes' in patch) this.reindexAttributes(runId, next.searchAttributes);
   }
@@ -91,15 +206,39 @@ export class InMemoryStateStore implements StateStore {
     // same reasoning tryLockRun/renewRunLock already rely on for their compare-and-set.
     const existing = this.runs.get(runId);
     if (!existing || !expectedStatuses.includes(existing.status)) return false;
-    const next = { ...existing, ...patch };
+    const next = withNormalizedNamespace({
+      ...existing,
+      ...patch,
+      ...releasedSlot(existing, patch),
+    });
     this.runs.set(runId, next);
     if ('searchAttributes' in patch) this.reindexAttributes(runId, next.searchAttributes);
     return true;
   }
 
+  async tryAdmitSingleton(
+    runId: string,
+    tag: string,
+    workflow: string,
+    limit: number,
+    retryWakeAt?: number,
+  ): Promise<boolean> {
+    // No `await` between the snapshot and the claim: this synchronous turn is the critical section.
+    const runs = [...this.runs.values()];
+    const tags = singletonAdmissionTags(runs, runId, tag, workflow, limit);
+    const run = this.runs.get(runId);
+    if (!tags || !run) {
+      const parked = singletonAdmissionDenialPatch(runs, runId, tag, workflow, retryWakeAt);
+      if (parked && run) this.runs.set(runId, { ...run, ...parked });
+      return false;
+    }
+    this.runs.set(runId, { ...run, tags });
+    return true;
+  }
+
   async getRun(runId: string): Promise<WorkflowRun | null> {
     const run = this.runs.get(runId);
-    return run ? { ...run } : null;
+    return run && this.inScope(run) ? copyRun(run) : null;
   }
 
   async deleteRun(runId: string): Promise<void> {
@@ -112,6 +251,10 @@ export class InMemoryStateStore implements StateStore {
     }
     // Drop the run's normalized attribute rows (reindex with no attributes clears them).
     this.reindexAttributes(runId, undefined);
+  }
+
+  async deleteRuns(runIds: string[]): Promise<void> {
+    for (const runId of runIds) await this.deleteRun(runId);
   }
 
   async getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null> {
@@ -130,6 +273,15 @@ export class InMemoryStateStore implements StateStore {
     return true;
   }
 
+  async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
+    return checkpoints.map((checkpoint) => {
+      const key = this.key(checkpoint.runId, checkpoint.seq);
+      if (this.checkpoints.get(key)?.status !== 'pending') return false;
+      this.checkpoints.set(key, { ...checkpoint });
+      return true;
+    });
+  }
+
   /** Mirror of `LucidStateStore.recordStepHeartbeat`: mutate in place, no-op when absent. */
   async recordStepHeartbeat(
     runId: string,
@@ -144,47 +296,58 @@ export class InMemoryStateStore implements StateStore {
   }
 
   async listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]> {
-    return [...this.runs.values()]
+    return this.visibleRuns()
       .filter(
-        (r) => r.status === 'running' && (namespace === undefined || r.namespace === namespace),
+        (r) =>
+          r.status === 'running' &&
+          (namespace === undefined || namespaceMatches(r.namespace, namespace)),
       )
-      .map((r) => ({ ...r }));
+      .map(copyRun);
   }
 
   async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
-    return [...this.runs.values()]
+    return this.visibleRuns()
       .filter(
-        (r) => r.status === 'pending' && (namespace === undefined || r.namespace === namespace),
+        (r) =>
+          r.status === 'pending' &&
+          (namespace === undefined || namespaceMatches(r.namespace, namespace)),
       )
       .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id))
       .slice(0, limit)
-      .map((r) => ({ ...r }));
+      .map(copyRun);
   }
 
   async listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]> {
-    const due = [...this.runs.values()].filter(
+    const due = this.visibleRuns().filter(
       (r) =>
         r.status === 'suspended' &&
         r.wakeAt !== undefined &&
         r.wakeAt <= nowMs &&
-        (namespace === undefined || r.namespace === namespace),
+        (namespace === undefined || namespaceMatches(r.namespace, namespace)),
     );
     // Most overdue first (mirrors the SQL stores' ORDER BY wake_at).
     due.sort((a, b) => (a.wakeAt ?? 0) - (b.wakeAt ?? 0));
-    return (limit === undefined ? due : due.slice(0, limit)).map((r) => ({ ...r }));
+    return (limit === undefined ? due : due.slice(0, limit)).map(copyRun);
   }
 
-  async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
-    return [...this.runs.values()]
+  async listOrphanedRuns(
+    nowMs: number,
+    limit: number,
+    namespace?: string,
+    owner?: string,
+  ): Promise<WorkflowRun[]> {
+    return this.visibleRuns()
       .filter(
         (r) =>
           r.status === 'running' &&
-          (r.lockedUntil === undefined || r.lockedUntil <= nowMs) &&
-          (namespace === undefined || r.namespace === namespace),
+          (r.lockedUntil === undefined ||
+            r.lockedUntil <= nowMs ||
+            (owner !== undefined && r.lockedBy === owner)) &&
+          (namespace === undefined || namespaceMatches(r.namespace, namespace)),
       )
       .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
       .slice(0, limit)
-      .map((r) => ({ ...r }));
+      .map(copyRun);
   }
 
   async tryLockRun(
@@ -284,11 +447,21 @@ export class InMemoryStateStore implements StateStore {
     return work({ raw: this, saveCheckpoint: (cp) => this.saveCheckpoint(cp) });
   }
 
-  private readonly bufferedSignals = new Map<string, unknown[]>();
+  private get bufferedSignals(): Map<string, unknown[]> {
+    return this.state.bufferedSignals;
+  }
   async bufferSignal(token: string, payload: unknown): Promise<void> {
     const queue = this.bufferedSignals.get(token) ?? [];
     queue.push(payload);
     this.bufferedSignals.set(token, queue);
+  }
+  async listBufferedSignalTokens(prefix: string, limit: number): Promise<string[]> {
+    const out: string[] = [];
+    for (const [token, queue] of this.bufferedSignals) {
+      if (out.length >= limit) break;
+      if (token.startsWith(prefix) && queue.length > 0) out.push(token);
+    }
+    return out;
   }
   async takeBufferedSignal(token: string): Promise<{ payload: unknown } | null> {
     const queue = this.bufferedSignals.get(token);
@@ -300,10 +473,9 @@ export class InMemoryStateStore implements StateStore {
 
   /** `id -> row`, so {@link removeBufferedEvent} can delete an exact row regardless of iteration
    *  order — mirrors the SQL store's PK-by-id delete. */
-  private readonly bufferedEvents = new Map<
-    string,
-    { name: string; payload: unknown; publishedAt: number }
-  >();
+  private get bufferedEvents(): InMemoryState['bufferedEvents'] {
+    return this.state.bufferedEvents;
+  }
   async bufferEvent(input: {
     name: string;
     payload: unknown;
@@ -328,6 +500,14 @@ export class InMemoryStateStore implements StateStore {
   }
   async removeBufferedEvent(id: string): Promise<boolean> {
     return this.bufferedEvents.delete(id);
+  }
+  async pruneBufferedEvents(publishedBefore: number, limit: number): Promise<number> {
+    const expired = [...this.bufferedEvents.entries()]
+      .filter(([, e]) => e.publishedAt < publishedBefore)
+      .sort((a, b) => a[1].publishedAt - b[1].publishedAt)
+      .slice(0, Math.max(0, limit));
+    for (const [id] of expired) this.bufferedEvents.delete(id);
+    return expired.length;
   }
 
   /**
@@ -388,10 +568,20 @@ export class InMemoryStateStore implements StateStore {
     return (await this.listRuns(query)).length;
   }
 
-  private readonly schedules = new Map<string, ScheduleRecord>();
+  async runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
+    const runs = await this.listRuns(query);
+    return mergeRunFacetRows(runs.map((r) => ({ status: r.status, origin: r.origin, count: 1 })));
+  }
+
+  private get schedules(): Map<string, ScheduleRecord> {
+    return this.state.schedules;
+  }
 
   async saveSchedule(record: ScheduleRecord): Promise<void> {
-    this.schedules.set(record.id, structuredClone(record));
+    this.schedules.set(record.id, {
+      ...structuredClone(record),
+      namespace: normalizeNamespace(record.namespace),
+    });
   }
 
   async getSchedule(id: string): Promise<ScheduleRecord | null> {
@@ -407,7 +597,8 @@ export class InMemoryStateStore implements StateStore {
     const record = this.schedules.get(id);
     if (!record) return false;
     if (expectedNextFireAt !== undefined && record.nextFireAt !== expectedNextFireAt) return false;
-    this.schedules.set(id, { ...record, ...structuredClone(patch) });
+    const next = { ...record, ...structuredClone(patch) };
+    this.schedules.set(id, { ...next, namespace: normalizeNamespace(next.namespace) });
     return true;
   }
 
@@ -417,7 +608,9 @@ export class InMemoryStateStore implements StateStore {
 
   async listSchedules(query: ScheduleQuery): Promise<ScheduleRecord[]> {
     const rows = [...this.schedules.values()]
-      .filter((s) => query.namespace === undefined || s.namespace === query.namespace)
+      .filter(
+        (s) => query.namespace === undefined || namespaceMatches(s.namespace, query.namespace),
+      )
       .filter((s) => query.workflow === undefined || s.workflow === query.workflow)
       .filter((s) => query.tag === undefined || (s.tags ?? []).includes(query.tag))
       .filter((s) => query.paused === undefined || s.paused === query.paused)
@@ -438,7 +631,7 @@ export class InMemoryStateStore implements StateStore {
   }
 
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
-    let runs = [...this.runs.values()];
+    let runs = this.visibleRuns();
     if (query.workflow) runs = runs.filter((r) => r.workflow === query.workflow);
     if (query.workflows) {
       runs =
@@ -446,13 +639,16 @@ export class InMemoryStateStore implements StateStore {
           ? []
           : runs.filter((r) => query.workflows?.includes(r.workflow));
     }
-    if (query.namespace !== undefined) runs = runs.filter((r) => r.namespace === query.namespace);
+    if (query.namespace !== undefined) {
+      const namespace = query.namespace;
+      runs = runs.filter((r) => namespaceMatches(r.namespace, namespace));
+    }
     if (query.namespaces) {
       runs =
         query.namespaces.length === 0
           ? []
           : runs.filter(
-              (r) => r.namespace !== undefined && query.namespaces?.includes(r.namespace),
+              (r) => query.namespaces?.some((ns) => namespaceMatches(r.namespace, ns)) ?? false,
             );
     }
     if (query.origin) runs = runs.filter((r) => r.origin === query.origin);
@@ -503,9 +699,7 @@ export class InMemoryStateStore implements StateStore {
     runs.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
     // 1-based `page`/`size` in, 0-based slice out — same resolution the SQL adapters apply.
     const { limit, offset } = runPageWindow(query);
-    return runs
-      .slice(offset, limit === undefined ? undefined : offset + limit)
-      .map((r) => ({ ...r }));
+    return runs.slice(offset, limit === undefined ? undefined : offset + limit).map(copyRun);
   }
 
   /**
@@ -528,7 +722,26 @@ export class InMemoryStateStore implements StateStore {
       .sort((a, b) => a.seq - b.seq)
       .map((cp) => ({ ...cp }));
     this.lastCheckpointRowsRead = rows.length;
+    this.checkpointRowsRead += rows.length;
     return rows;
+  }
+
+  async checkpointStats(
+    runId: string,
+    opts?: { group?: string | undefined },
+  ): Promise<CheckpointStat[]> {
+    return checkpointStatsOf(this.runCheckpoints(runId), opts);
+  }
+
+  async queryCheckpoints(runId: string, query: CheckpointQuery): Promise<StepCheckpoint[]> {
+    const rows = queryCheckpointsOf(this.runCheckpoints(runId), query).map((cp) => ({ ...cp }));
+    this.lastCheckpointRowsRead = rows.length;
+    this.checkpointRowsRead += rows.length;
+    return rows;
+  }
+
+  private runCheckpoints(runId: string): StepCheckpoint[] {
+    return [...this.checkpoints.values()].filter((cp) => cp.runId === runId);
   }
 
   async getLatestCheckpointByName(
@@ -569,6 +782,17 @@ export class InMemoryStateStore implements StateStore {
       .sort((a, b) => a.seq - b.seq)
       .map((cp) => ({ ...cp }));
     this.lastCheckpointRowsRead = rows.length;
+    this.checkpointRowsRead += rows.length;
     return rows;
   }
+}
+
+/** A terminal settle releases the run's singleton slot: drop the admission marker from its tags. */
+function releasedSlot(
+  existing: WorkflowRun,
+  patch: Partial<WorkflowRun>,
+): Pick<WorkflowRun, 'tags'> | undefined {
+  if (!settlesTerminally(patch)) return undefined;
+  const tags = withoutAdmission('tags' in patch ? patch.tags : existing.tags);
+  return tags ? { tags } : undefined;
 }

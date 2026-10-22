@@ -1,3 +1,4 @@
+import { runInStepLogger } from './ambient-step.js';
 import type { Heartbeat, RemoteTask, StepEvent, StepLogger, StepResult } from './interfaces.js';
 import { createStepLogger } from './step-logger.js';
 import { runOutsideWorkflowCtx } from './workflow-als.js';
@@ -29,6 +30,36 @@ function withRestoredContext<T>(snapshot: Record<string, unknown> | undefined, f
   const scope = (globalThis as Record<symbol, unknown>)[CONTEXT_SCOPE];
   if (typeof scope !== 'function') return fn();
   return (scope as ContextScope)(snapshot, fn);
+}
+
+/** How often a workflow worker beats for a turn it is replaying (the Python `durable-worker` uses 5s). */
+export const TURN_HEARTBEAT_INTERVAL_MS = 5_000;
+
+/**
+ * Run a workflow turn while emitting RUN-scoped heartbeats (`{ runId, seq: 0, group }`, no `stepId`):
+ * one right away, then every `intervalMs` until the turn settles. They keep an engine that set
+ * `remoteAdvanceSilenceMs` from re-driving a turn that is still being replayed. Best-effort: a failed
+ * publish never breaks the turn.
+ */
+export async function withTurnHeartbeat<T>(
+  task: { runId: string; group: string },
+  publish: (beat: Heartbeat) => Promise<void>,
+  turn: () => Promise<T>,
+  intervalMs: number = TURN_HEARTBEAT_INTERVAL_MS,
+): Promise<T> {
+  const beat = (): void => {
+    void Promise.resolve()
+      .then(() => publish({ runId: task.runId, seq: 0, group: task.group, at: Date.now() }))
+      .catch(() => undefined);
+  };
+  beat();
+  const timer = setInterval(beat, intervalMs);
+  (timer as { unref?: () => void }).unref?.();
+  try {
+    return await turn();
+  } finally {
+    clearInterval(timer);
+  }
 }
 
 /** Canonical step id — the stable identity of a step within a run, used for dedupe and
@@ -98,8 +129,9 @@ export async function runStepHandler(
     try {
       // Outside any ambient workflow ctx: an in-process transport runs the handler on the parent
       // body's async path, but a handler is not the body (see `runOutsideWorkflowCtx`).
+      const logger = createStepLogger(events, Date.now, beat);
       const output = await runOutsideWorkflowCtx(() =>
-        handler(task.input, createStepLogger(events, Date.now, beat)),
+        runInStepLogger(logger, () => handler(task.input, logger)),
       );
       return withEvents({ ...base, status: 'completed', output });
     } catch (err) {

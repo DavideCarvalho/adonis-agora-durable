@@ -15,7 +15,7 @@ license: MIT
 metadata:
   type: core
   library: "@adonis-agora/durable"
-  library_version: "0.25.0"
+  library_version: "0.51.0"
   framework: adonisjs
 sources:
   - 'DavideCarvalho/adonis-durable:docs/cluster/index.mdx'
@@ -45,7 +45,7 @@ execute changes.
 Split fleet: a pure coordinator plus store-less tenant workers.
 
 ```ts title="config/durable.ts (control plane)"
-import { defineConfig, stores, transports } from '@adonis-agora/durable'
+import { defineConfig, hmacTenantVerifier, stores, transports } from '@adonis-agora/durable'
 
 export default defineConfig({
   role: 'control-plane',
@@ -110,7 +110,8 @@ are rows of `durable_transport_messages`; a reply or event is a row addressed to
 one instance, and the pod writes its own `-inbox:` / `-tenant-subscriber:` keys
 and worker advertisement to `durable_transport_worker_keys`. Remote workflow
 turns are task rows of kind `workflow`, and each decision is addressed to the
-engine replica that dispatched the turn. Needs the
+engine replica that dispatched the turn (any replica could apply it: the engine
+applies a decision by run id). Needs the
 `create_durable_transport_messages` migration (or `autoCreate`). Source:
 `docs/transports/db.mdx` (remote workflows and tenant pods).
 
@@ -142,16 +143,22 @@ export default class RunsController {
 Verbs: `getRun`, `listRuns`, `getCheckpoints`, `getRunChildren`,
 `getRunDetail` / `getFanMembers` (optional; summarize and page wide fans),
 `getSearchAttributes`, `start`, `signal`, `cancel`, `redispatchPending`,
-`workerHealth`, `subscribe`, `topology()`. Never branch on `role`.
+`workerHealth`, `subscribe`, `topology()`, and the NestJS gateway's `retry`
+(in-place requeue), `continue` (breakpoint), `retryWithInput`, `runFacets`,
+`runValueFacets`, `waitingFor` (optional on the interface; both built-in
+gateways implement them, tenant-scoped by the responder). Never branch on `role`.
 
 ```ts
 // Each fan of more than 50 members — or declared wider than 50 — comes back as one FanSummary in `fans`.
 const detail = await runGateway.getRunDetail?.(params.id, { summarizeFansOver: 50 })
 ```
 
-A tenant pod's dashboard reads run detail through the `getRunDetail` verb, and
-an older control plane rejects unknown verbs: upgrade the control plane first,
-or with its tenants.
+Tenants and the control plane upgrade in either order. A verb the control plane
+does not know comes back as `unsupported-request` (or, before 0.50, an
+`unknown run-request verb` error) and the proxy falls back at once: run detail
+is built from `getRun` + `getCheckpoints` and summarized on the tenant, and the
+tenant console degrades `retry` to a re-dispatch; it remembers the old control
+plane for a minute. Every request gets a reply, even when the gateway throws.
 Source: `docs/cluster/roles-and-config.mdx`.
 
 ### Pattern 2 — capability-aware routing and blocked runs
@@ -182,10 +189,11 @@ imports zero store code:
 
 ```ts title="worker.ts"
 import { RedisWorkerRegistry, WorkerRuntime } from '@adonis-agora/durable/worker'
-import { transports } from '@adonis-agora/durable'
+import { BullMQTransport, createBullMQDeps } from '@adonis-agora/durable'
 import { Redis } from 'ioredis'
 
-const transport = await transports.bullmq({ connection: process.env.REDIS_URL })({ app })
+// No Adonis app here, so build the transport directly instead of through `transports.bullmq()`.
+const transport = new BullMQTransport({ deps: await createBullMQDeps(process.env.REDIS_URL) })
 const runtime = new WorkerRuntime({
   transport,
   partition: 'acme-corp',
@@ -368,7 +376,11 @@ await engine.start('checkout', order, id, { namespace: 'eu-west' })
 
 Mechanism: between namespaced engines there is no fallback owner; a namespace
 with neither an engine of its own nor an operator above it is a dead end where
-runs sit `pending` forever. Source: `docs/concepts/tenancy.mdx` (pitfalls).
+runs sit `pending` forever. Since 0.51 only a `control-plane` with no
+`namespace` is the operator; a `standalone` engine with no `namespace` is the
+`'default'` pool. Before 0.51 an unset namespace made ANY engine an operator,
+so a standalone app sharing a store drove every pool's runs. Source:
+`docs/concepts/tenancy.mdx` (pitfalls).
 
 See also: `durable-setup` — the standalone execution model this scales out of.
 See also: `durable-transports-stores` — bullmq/queue/db driver details,

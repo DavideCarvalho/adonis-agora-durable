@@ -1,6 +1,6 @@
 ---
 title: Troubleshooting
-description: Symptom-first answers to the errors and stuck states you will actually hit — NonDeterminismError, NestedWorkflowCallError, a caught suspend that corrupts a run, runs wedged in pending, running or suspended, timers and schedules that never fire, waitForRun hanging across pods, jobs stuck in active on the queue transport, steps that run twice, node ace processes that hang or steal work, schema and dashboard surprises.
+description: Symptom-first answers to the errors and stuck states you will actually hit — NonDeterminismError, NestedWorkflowCallError, a caught suspend that corrupts a run, runs wedged in pending, running or suspended, timers and schedules that never fire, waitForRun hanging across pods, jobs stuck in active on the queue transport, steps that run twice, node ace processes that hang or steal work, schema and dashboard surprises, and the failures fixed by upgrading to 0.50 or 0.51.
 icon: Stethoscope
 ---
 
@@ -96,7 +96,7 @@ Better still, use the built-in `compensate` option ([Sagas](/docs/durable/reliab
 
 **Cause:** the process that held the run's lease died. A live executor renews its lease every `leaseMs / 2`; a dead one stops, and `recoverIncomplete()` reclaims the run once the lease lapses — but only a ticking worker loop calls `recoverIncomplete()`. If the run's `recoveryAttempts` keeps climbing, it is being reclaimed and crashing the process every time: a poison pill.
 
-**Fix:** run a worker loop and wait about `leaseMs` (default 30 s). For a poison pill, set `maxRecoveryAttempts` so it moves to `dead` instead of crash-looping, then fix and `node ace durable:retry <runId>`. A run that is genuinely busy in a long `ctx.localStep` also reads `running` — its lease keeps renewing, so recovery leaves it alone.
+**Fix:** run a worker loop and wait about `leaseMs` (default 30 s). For a poison pill, set `maxRecoveryAttempts` so it moves to `dead` instead of crash-looping, then fix and `node ace durable:retry <runId>`. A run that is genuinely busy in a long `ctx.localStep` also reads `running` — its lease keeps renewing, so recovery leaves it alone. A run found `running` with a remote step still in flight is parked back to `suspended` instead of counted, so it never climbs toward `dead` while its worker is busy.
 
 ## A run is stuck in `suspended`
 
@@ -181,7 +181,7 @@ Better still, use the built-in `compensate` option ([Sagas](/docs/durable/reliab
 
 **Cause:** web processes consume eagerly, and the queues are point-to-point, so each delivery lands on whichever process polls first. See [Delivery under multiple instances](/docs/durable/reliability/multi-instance).
 
-**Fix:** set `consumers: 'never'` on the web fleet — `durable:work` re-enables consumption for itself. Every broker transport honours this gate — `queue`, `db` and `bullmq` (on `db` and `bullmq` since this release; before it they consumed in every process that booted them).
+**Fix:** set `consumers: 'never'` on the web fleet — `durable:work` re-enables consumption for itself. Every broker transport honours this gate: `queue` since 0.17, `db` and `bullmq` since 0.50 (before 0.50 they consumed in every process that booted them — see [the upgrade note](#upgrade-node-ace-commands-claim-jobs-on-bullmq-or-db-fixed-in-050)).
 
 ## Durable jobs fail under `queue:work`
 
@@ -197,7 +197,7 @@ Better still, use the built-in `compensate` option ([Sagas](/docs/durable/reliab
 
 **Cause:** `maxRecoveryAttempts` is set and the run exceeded it: crash recovery kept resuming it, and it kept taking the process down — a deserialization bug, an unguarded non-deterministic change, an infinite loop. The engine stopped touching it, with a `max_recovery_attempts` error.
 
-**Fix:** `dead` is terminal but not lost. Diagnose from its history, ship the fix, then `node ace durable:retry <runId>` (or the dashboard's Retry). Use `engine.onDead` or a DLQ workflow for alerting. See [Dead-letter queue](/docs/durable/reliability/dead-letter).
+**Fix:** `dead` is terminal but not lost. Diagnose from its history, ship the fix, then `node ace durable:retry <runId>` (or the dashboard's Retry). The retry resets `recoveryAttempts` to 0, so the run is not dead-lettered again by the next recovery pass. Use `engine.onDead` or a DLQ workflow for alerting. See [Dead-letter queue](/docs/durable/reliability/dead-letter).
 
 ## A step fails on its first attempt, or after exhausting retries
 
@@ -254,10 +254,10 @@ A bounded wait takes **two** logical positions (the deadline and the wait), so a
 **Cause:**
 
 - **Access denied.** The default `authorize` fails closed in every environment: it requires a bearer token equal to `DURABLE_DASHBOARD_TOKEN` and denies everything when that variable is unset.
-- **No runs.** With no `store` configured, the engine uses the in-memory store, so each process only sees its own runs — and loses them on restart. Two pools on different namespaces, or a dashboard pointed at a different Lucid connection, also see different sets.
+- **No runs.** With `scopeReads: true` (and a `namespace`), the engine reads through a store view that only sees its own namespace, so runs stamped with another namespace are invisible to this dashboard by design. With no `store` configured, the engine uses the in-memory store, so each process only sees its own runs — and loses them on restart. Two pools on different namespaces, or a dashboard pointed at a different Lucid connection, also see different sets.
 - **Empty worker health.** `engine.workerHealth()` and the `/api/health` panel read group health off the transport, and only `bullmq`, `queue` (with a worker-key store) and `db` report it; on `eventEmitter` it is empty, not "healthy".
 
-**Fix:** set the token or your own `authorize` ([Dashboard → Authorization](/docs/durable/observability/dashboard#authorization)); select the [Lucid store](/docs/durable/stores/lucid); for stranded-run detection off BullMQ, use `durable:runs --stale` or `engine.onStalled`.
+**Fix:** set the token or your own `authorize` ([Dashboard → Authorization](/docs/durable/observability/dashboard#authorization)); select the [Lucid store](/docs/durable/stores/lucid) and check `namespace` / `scopeReads` on the process serving the dashboard; for stranded-run detection off BullMQ, use `durable:runs --stale` or `engine.onStalled`.
 
 ## Two pools execute each other's runs
 
@@ -266,3 +266,71 @@ A bounded wait takes **two** logical positions (the deadline and the wait), so a
 **Cause:** both engines left `namespace` unset, so both are `'default'` — by construction the same pool.
 
 **Fix:** set a distinct `namespace` per pool. See [the two-pools mistake](/docs/durable/reliability/failure-modes#namespaces-the-classic-two-pools-mistake).
+
+## Upgrade notes: failures fixed in 0.50 and 0.51
+
+Each entry below is a bug in an older release, not a configuration mistake. If the symptom matches and you are on an affected version, upgrading is the fix; the workaround is for when you cannot upgrade yet.
+
+### Upgrade: `node ace` commands claim jobs on `bullmq` or `db` (fixed in 0.50)
+
+**Symptom:** on `transports.bullmq(...)` or `transports.db(...)`, steps are claimed by short-lived `node ace` commands or a REPL that then exit holding them; results meant for the long-lived engine disappear; a boot or migration command with queued jobs never exits. On `bullmq` a claimed job stays held until BullMQ's stall check, on `db` until the row lease expires.
+
+**Cause:** before 0.50 only the `queue` transport honoured `consumers`. `bullmq` and `db` started consuming in every process that booted them.
+
+**Fix:** upgrade to 0.50. With the default `consumers: 'auto'`, `console` and `repl` processes are pure producers on every broker transport, and `durable:work` re-enables consumption for itself ([CLI → `durable:work`](/docs/durable/cli#durablework--the-worker-loop)). Before upgrading, avoid running `node ace` commands against a production broker while jobs are queued.
+
+### Upgrade: a `redis://` connection string is ignored on `bullmq` (fixed in 0.50)
+
+**Symptom:** `transports.bullmq({ connection: 'redis://host:port/db' })` boots fine, but every client connects to `127.0.0.1:6379` — jobs pile up in a local Redis (or the connection fails) while the real one stays empty.
+
+**Cause:** before 0.50 the string passed validation and was then spread into the ioredis options character by character, so the URL was lost and ioredis used its defaults.
+
+**Fix:** upgrade to 0.50: a `redis://` / `rediss://` URL is parsed into host, port, credentials, db and TLS, and a malformed URL throws at boot. Until then, pass an options object (`{ host, port, password, db }`) or an ioredis instance. See [BullMQ → Connection](/docs/durable/transports/bullmq#connection).
+
+### Upgrade: the `eventEmitter` transport crashes the process with an unhandled rejection (fixed in 0.50)
+
+**Symptom:** on `transports.eventEmitter(...)`, the process dies with an unhandled promise rejection when the store hiccups while a step result settles, and the result is lost.
+
+**Cause:** before 0.50 the engine's result and heartbeat handlers were called as `void handler(...)`, so a rejection had no handler — fatal under Node's default `--unhandled-rejections=throw`.
+
+**Fix:** upgrade to 0.50: failures go to the transport's new `onError` option (default `console.error`), a failed result is redelivered from memory with backoff until `close()`, and a failed heartbeat is dropped.
+
+### Upgrade: a step runs twice on the `db` transport (fixed in 0.50)
+
+**Symptom:** on `transports.db(...)`, a step that outlives `leaseMs` is followed by other steps running twice and writing a second result; one worker holds many task rows while others sit idle.
+
+**Cause:** before 0.50 the task loop claimed up to `batchSize` (20) rows per poll, ran them one at a time, and renewed only the row it was running. When an earlier step outlived `leaseMs`, an idle worker reclaimed the rest of the batch and ran it, and the first worker then ran those rows again.
+
+**Fix:** upgrade to 0.50: the loop claims only as many rows as it has free `concurrency` slots, renews every held claim every `leaseMs / 3`, re-checks a claim before running a row, and writes the result only while it still owns the claim. Note the behaviour change: an unconfigured worker now runs one row at a time, so raise `concurrency` to run steps in parallel. See [DB transport → The claim protocol](/docs/durable/transports/db#the-claim-protocol).
+
+### Upgrade: the `queue` transport never renews claims (fixed in 0.50)
+
+**Symptom:** on `transports.queue(...)`, a step that runs longer than `stalledThresholdMs` is re-delivered and runs twice, while a crashed worker's job is not recovered for half an hour.
+
+**Cause:** before 0.50 the transport drove the `@adonisjs/queue` adapter directly, bypassing the `Worker` heartbeat, so a claim's age was the step's runtime. The 30-minute `stalledThresholdMs` default had to exceed the longest step.
+
+**Fix:** upgrade to 0.50: the transport calls `adapter.renewJobs` every half `stalledThresholdMs` for its in-flight claims, and the default drops to 2 minutes on adapters that can renew. During a rolling upgrade an old worker that does not renew can have a long step reclaimed by a new instance's 2-minute sweep; pin `stalledThresholdMs` to the old value until every worker is upgraded if a double run is expensive. See [Queue → Stalled-job reclaim](/docs/durable/transports/queue#stalled-job-reclaim).
+
+### Upgrade: remote workflow turns hang with several engine replicas (fixed in 0.51)
+
+**Symptom:** a remote workflow (`engine.registerRemote(...)`, a [thin worker](/docs/durable/cluster/thin-workers), a Python or NestJS worker) works with one engine replica but stalls with two or more: the run stays leased with a turn out, the worker logged the decision, and nothing advances. On `db`, a second turn can be silently ignored.
+
+**Cause:** before 0.51 the executor waited for each turn's decision in an in-memory map. On `bullmq` and `queue` the decisions queue is point-to-point, so a replica that had not dispatched the turn often consumed the decision, found no waiter and dropped it. Turns were also numbered with a per-process counter, so two replicas could send the same `taskId`.
+
+**Fix:** upgrade to 0.51: the engine records a random `taskId` on the run (`awaitingDecisionTaskId`) before dispatching, and any replica that takes the decision applies it durably; stale or duplicate decisions are dropped. Set `remoteAdvanceSilenceMs` so a turn whose worker died is re-dispatched instead of waiting forever. The schema gains a nullable `awaiting_decision_task_id` column, added by `autoSchema` or the migration. Before upgrading, run a single engine replica for remote workflows.
+
+### Upgrade: a by-name start for a tenant routes to the operator's worker (fixed in 0.51)
+
+**Symptom:** a workflow started by name with no local registration (convention routing to a live worker group) runs on the bare `<name>` group — the operator's own worker — even though the run carries a tenant `namespace`, or fails with `workflow <name> is not registered` when only the tenant's `<name>@<tenant>` worker is live.
+
+**Cause:** before 0.51 convention routing ignored the run's namespace and treated every start as if `namespace` were absent: it looked for and dispatched to the bare group, the operator's.
+
+**Fix:** upgrade to 0.51: convention routing is per run, `<name>@<namespace>` (bare only for an absent or `'default'` namespace) — the same rule steps follow — and is re-checked on every start, so an operator starting a tenant's run reaches the tenant's worker. See [Tenancy](/docs/durable/concepts/tenancy).
+
+### Upgrade: a standalone app with no `namespace` drives every pool's runs (fixed in 0.51)
+
+**Symptom:** several apps share one database through the Lucid store, and only some of them set `namespace`. The app that leaves `namespace` unset recovers, resumes and sweeps runs belonging to the other apps' pools, then fails them with `workflow <name> is not registered` or runs their code against the wrong app.
+
+**Cause:** before 0.51 an engine without `namespace` was the operator on every role. The operator scopes nothing: its poll, recovery and timer sweeps cover every namespace in the store, so a plain `standalone` app on a shared store acted as the fleet's operator without meaning to.
+
+**Fix:** upgrade to 0.51. On `role: 'standalone'` an absent `namespace` now means the `'default'` pool, so the engine drives only `'default'` runs (rows written before the upgrade read back as `'default'`). Only a `control-plane` with no `namespace` is still the operator. If you relied on a standalone app driving every pool, give that duty to a control plane. Before upgrading, set an explicit `namespace` on every app that shares the store. See [Tenancy](/docs/durable/concepts/tenancy).

@@ -74,6 +74,8 @@ try {
 The run carries the tag `concurrency:<key>`, and `start` counts the runs with that tag in `countStatuses` before creating the new one. The count goes through the store's `countRuns` — one `COUNT(*)` on the [Lucid store](/docs/durable/stores/lucid), also implemented by the in-memory store; a custom store without `countRuns` falls back to the length of a `listRuns` listing. The store is the only source of truth, so there is nothing to leak or reconcile when a process crashes: a slot frees the moment its run leaves the counted statuses.
 
 - An idempotent re-`start` of an existing `runId` returns that run and is never rejected — the existing-run check happens before the quota check.
+- The count spans every namespace that shares the store, like the key itself. With [`scopeReads`](/docs/durable/api-reference#durableconfig) on, the store's reads are fenced to the engine's `namespace`, so the quota only counts that namespace's runs. Put the tenant in the key when the limit is per tenant.
+- A per-start `concurrency` replaces the workflow's quota for that start entirely (key, limit and `countStatuses`); it is not merged with it.
 - The quota applies wherever the workflow is started: `engine.start` / `Wf.dispatch` / `Wf.start`, child workflows (`ctx.child` / `ctx.startChild` — a rejected child start is delivered to the parent as a failed child), [event triggers](/docs/durable/authoring/event-triggers) (a rejected subscriber is skipped) and [schedules](/docs/durable/authoring/scheduling).
 - [Persisted schedules](/docs/durable/authoring/persisted-schedules) take a `concurrency` quota of their own; an over-limit window is skipped and recorded as the schedule's `lastError`.
 

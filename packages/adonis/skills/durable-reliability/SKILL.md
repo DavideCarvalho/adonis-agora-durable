@@ -5,23 +5,25 @@ description: >-
   backoff and jitter, FatalError and worker retryable:false, timeoutMs liveness
   vs the durable suspend path, pickupTimeoutMs, log.heartbeat, saga
   compensation (compensate callbacks/refs, UndoOf, compensationRetries,
-  cancel({compensate:true})), flow-control queues (registerQueue, concurrency,
+  cancel({compensate:true})), flow-control queues (config queues / registerQueue, concurrency,
   rateLimit, fairnessKey) with Redis-backed global admission (admission-redis),
-  the dead-letter queue (maxRecoveryAttempts, onDead, retryWithInput), the
+  the dead-letter queue (maxRecoveryAttempts, deadLetterWorkflow, deadLetter()
+  method, onDead, retryWithInput), retention (maxAge/maxCount policies), the
   stuck-run playbook (stranded signature, redispatchPending,
-  remoteRedispatchMs), ace ops commands (durable:work/runs/retry --stale), and
+  remoteRedispatchMs, remoteAdvanceSilenceMs for remote workflow turns), ace ops commands (durable:work/runs/retry --stale), and
   the testing harness (createTestEngine, tick, failOnce, conformance kits).
 license: MIT
 metadata:
   type: core
   library: "@adonis-agora/durable"
-  library_version: "0.25.0"
+  library_version: "0.51.0"
   framework: adonisjs
 sources:
   - 'DavideCarvalho/adonis-durable:docs/reliability/retries.mdx'
   - 'DavideCarvalho/adonis-durable:docs/reliability/sagas.mdx'
   - 'DavideCarvalho/adonis-durable:docs/reliability/dead-letter.mdx'
   - 'DavideCarvalho/adonis-durable:docs/reliability/flow-control.mdx'
+  - 'DavideCarvalho/adonis-durable:docs/reliability/retention.mdx'
   - 'DavideCarvalho/adonis-durable:docs/reliability/failure-modes.mdx'
   - 'DavideCarvalho/adonis-durable:docs/cli.mdx'
   - 'DavideCarvalho/adonis-durable:docs/testing.mdx'
@@ -40,7 +42,7 @@ Retries are declared per step; `FatalError` opts a deterministic business
 failure out of the retry path:
 
 ```ts title="app/steps/charge.ts"
-import { defineStep } from '@adonis-agora/durable'
+import { FatalError, defineStep } from '@adonis-agora/durable'
 
 export const chargeCard = defineStep(
   'payments:charge-card',
@@ -48,7 +50,7 @@ export const chargeCard = defineStep(
     const res = await stripe.charge(input)
     if (res.declined) {
       // deterministic verdict — don't make the engine retry it
-      throw Object.assign(new Error('card declined'), { code: 'declined', retryable: false })
+      throw new FatalError('card declined', 'declined')
     }
     return { chargeId: res.id }
   },
@@ -56,7 +58,9 @@ export const chargeCard = defineStep(
 )
 ```
 
-A dispatched step WITHOUT `timeoutMs` takes the durable path: failure → persist
+`FatalError` carries `retryable: false`, which the step result builders read; a
+worker in another runtime gets the same effect by throwing any error with
+`retryable: false` (and an optional `code`). A dispatched step WITHOUT `timeoutMs` takes the durable path: failure → persist
 `wakeAt = now + backoff(attempt)` on the checkpoint → suspend → the timer poller
 re-dispatches. Crash-safe, never held in memory.
 
@@ -90,16 +94,20 @@ envelope (`{ input, output }`). Engine-level `compensationRetries` (default 1)
 bounds transient undo failures; failing compensations are skipped so they can't
 mask the original error. Trigger deliberately with
 `await engine.cancel(runId, { compensate: true })` or
-`engine.cancelWhere(filter, { compensate: true })`. Every undo surfaces as a
-visible `compensate:<step>` event. Source: `docs/reliability/sagas.mdx`.
+`engine.cancelWhere(filter, { compensate: true })`. The cancel is durable (a
+`cancel:<runId>` marker) and honored on every exit of the turn running when it
+lands: return, throw, continue-as-new or suspend all compensate and settle
+`cancelled`. Every undo surfaces as a visible `compensate:<step>` event.
+Source: `docs/reliability/sagas.mdx`.
 
 ### Pattern 2 — flow-control queues + fleet-wide admission
 
 Cap concurrency/rate durably — a blocked call re-suspends with a persisted
 `retryAt`, driven by the timer poller (nothing waits in memory):
 
-```ts title="start/durable.ts"
-engine.registerQueue({ name: 'emails', concurrency: 10, rateLimit: { limit: 1000, periodMs: 3_600_000 } })
+```ts title="config/durable.ts"
+queues: [{ name: 'emails', concurrency: 10, rateLimit: { limit: 1000, periodMs: 3_600_000 } }],
+// or at runtime: engine.registerQueue({ name: 'emails', … }) — same shape, replaces a same-named one
 ```
 
 ```ts
@@ -130,7 +138,12 @@ Source: `docs/reliability/flow-control.mdx`.
 
 Crash-recovery reclaims orphaned runs within ~`leaseMs`; a run that crashes the
 process every time would loop forever. Cap it and route the terminal `dead`
-status into a handler workflow (idempotent by the `dlq:<runId>` start id):
+status into a handler workflow — the engine starts it as `dlq:<runId>`
+(idempotent) with a `DeadLetter` input `{ deadRunId, workflow, input, error }`
+in the dead run's namespace. A run
+whose remote step is still in flight is parked `suspended`, never counted, and a
+retry (`requeue` / `durable:retry`) of a `dead`/`failed` run resets
+`recoveryAttempts` to 0:
 
 ```ts title="config/durable.ts"
 export default defineConfig({
@@ -139,19 +152,39 @@ export default defineConfig({
 })
 ```
 
-```ts title="start/durable.ts"
-engine.onDead((run) => {
-  void engine.start(
-    'dlq',
-    { deadRunId: run.id, workflow: run.workflow, input: run.input, error: run.error },
-    `dlq:${run.id}`,
-  )
-})
+```ts title="app/workflows/pipeline_workflow.ts"
+export default class PipelineWorkflow extends BaseWorkflow {
+  static workflow = { name: 'pipeline', version: '1' }
+  async run(ctx: WorkflowCtx, input: PipelineInput) { /* … */ }
+  // registered as `pipeline.dlq`; shares this instance's injected services
+  async deadLetter(ctx: WorkflowCtx, dl: DeadLetter<PipelineInput>) { /* alert, ticket */ }
+}
 ```
+
+Precedence: inline `deadLetter()` > per-workflow `deadLetterWorkflow`
+(`static workflow` / `register` / `registerRemote` option) > config
+`deadLetterWorkflow` (fleet default). Declaring both a method and the option
+throws. A `dlq:` handler run that dies is not routed again; a failed start
+(handler not registered) is `console.warn`-ed. `engine.onDead(run => …)` still
+fires first and is the manual escape hatch (keep the `dlq:<runId>` id).
 
 A dead run stays inspectable and retriable (`durable:retry <runId>`, dashboard
 retry, or `engine.retryWithInput(runId, fixedInput)` for bad data).
 Source: `docs/reliability/dead-letter.mdx`.
+
+Retention bounds terminal history (swept by `durable:work`, once a minute,
+`onEvict` archives first). Scoped policies take `maxAge`, `maxCount` (keep the N
+newest by start time within the scope; `0` deletes all matching), or both (most
+restrictive wins); a policy with neither fails boot:
+
+```ts title="config/durable.ts"
+retention: {
+  completed: '30d',
+  policies: [{ statuses: ['completed', 'failed'], maxCount: 200, scope: { namespace: 'acme' } }],
+},
+```
+
+Source: `docs/reliability/retention.mdx`.
 
 ### Pattern 4 — the stuck-run playbook
 
@@ -166,22 +199,14 @@ node ace durable:retry checkout:1234
 ```
 
 ```ts title="app/controllers/ops_controller.ts"
-import { inject } from '@adonisjs/core'
-import {
-  DEFAULT_STALE_MS,
-  WorkflowEngine,
-  attachLiveness,
-  filterStale,
-  listRuns,
-} from '@adonis-agora/durable'
+import type { HttpContext } from '@adonisjs/core/http'
+import { DEFAULT_STALE_MS, attachLiveness, filterStale, listRuns } from '@adonis-agora/durable'
+import engine from '@adonis-agora/durable/services/main'
 
-@inject()
 export default class OpsController {
-  constructor(private engine: WorkflowEngine) {}
-
   async strandedRuns({ response }: HttpContext) {
-    const runs = await listRuns(this.engine, { statuses: ['running', 'suspended'], limit: 200 })
-    const stale = filterStale(await attachLiveness(this.engine, runs), DEFAULT_STALE_MS)
+    const runs = await listRuns(engine, { statuses: ['running', 'suspended'], limit: 200 })
+    const stale = filterStale(await attachLiveness(engine, runs), DEFAULT_STALE_MS)
     return response.ok({ stranded: stale.map(({ run }) => run.id) })
   }
 }
@@ -197,6 +222,20 @@ Three nets, in preference order:
    it covers a polyglot `call` fan-out (`ctx.gather_calls`) as well as `ctx.step`.
 3. `engine.redispatchPending(runId)` — the operator escape hatch, safe on a
    healthy run (only touches already-pending checkpoints).
+
+Remote (polyglot) workflow TURNS have their own net: `remoteAdvanceSilenceMs`
+(config; `RemoteWorkflowExecutor`'s `timeoutMs` per workflow, shorter wins). The
+engine records the turn's random `taskId` on the run (`awaitingDecisionTaskId`),
+releases the lease, then enqueues; whichever replica consumes the decision
+applies it by run id (stale/duplicate decisions dropped), so a point-to-point
+`<P>-decisions` queue across replicas is safe. That is 0.51+: before 0.51 a
+replica that had not dispatched the turn consumed the decision, found no waiter
+and dropped it, leaving the run leased forever — upgrade any multi-replica fleet
+running remote (Python/NestJS) workflows. A turn with no decision and no
+run-scoped heartbeat (`{ runId, seq: 0, group }`, sent every 5s by the Python
+and TS workers) for the window is re-dispatched by the timer poller — never
+failed. Unset = wait for the decision forever. Source:
+`docs/reliability/multi-instance.mdx` (remote workflow turns).
 
 Source: `docs/reliability/failure-modes.mdx`, `docs/cli.mdx`.
 
@@ -282,7 +321,7 @@ Correct:
 
 ```ts
 const inFlight = counts['run.started'] - (counts['run.completed'] + counts['run.failed'])
-// or read the store: listRuns({ status: ['running', 'suspended'] })
+// or read the store: listRuns(engine, { statuses: ['running', 'suspended'] })
 ```
 
 Mechanism: `run.suspended` fires on EVERY park — each sleep, signal wait, child

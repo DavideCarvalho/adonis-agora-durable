@@ -153,11 +153,86 @@ describe('DurableProvider', () => {
     expect(deps.remoteRedispatchMax).toBe(3);
   });
 
+  it('forwards eventBufferTtl (a duration) to the engine as eventBufferTtlMs', async () => {
+    const { app, resolve } = fakeApp({ eventBufferTtl: '2h' });
+    new DurableProvider(app).register();
+    const engine = await resolve();
+    expect((engine as unknown as { eventBufferTtlMs: number }).eventBufferTtlMs).toBe(7_200_000);
+  });
+
+  it('scopeReads hands the engine the store fenced to its namespace', async () => {
+    const inner = new InMemoryStateStore();
+    await inner.createRun({
+      id: 'theirs',
+      workflow: 'wf',
+      workflowVersion: '1',
+      status: 'completed',
+      input: {},
+      namespace: 'globex',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const { app, resolve } = fakeApp({
+      namespace: 'acme',
+      scopeReads: true,
+      store: 'mem',
+      stores: { mem: async () => inner },
+    } as DurableConfig);
+    new DurableProvider(app).register();
+    const engine = await resolve();
+    expect(await engine.getRun('theirs')).toBeNull();
+    expect(await inner.getRun('theirs')).not.toBeNull();
+  });
+
+  it('forwards remoteAdvanceSilenceMs to the engine (unset by default)', async () => {
+    const configured = fakeApp({ remoteAdvanceSilenceMs: 120_000 });
+    new DurableProvider(configured.app).register();
+    const engine = await configured.resolve();
+    expect((engine as unknown as { remoteAdvanceSilenceMs?: number }).remoteAdvanceSilenceMs).toBe(
+      120_000,
+    );
+    const plain = fakeApp();
+    new DurableProvider(plain.app).register();
+    const defaults = await plain.resolve();
+    expect(
+      (defaults as unknown as { remoteAdvanceSilenceMs?: number }).remoteAdvanceSilenceMs,
+    ).toBeUndefined();
+  });
+
   it('forwards timerBatchSize to the engine', async () => {
     const { app, resolve } = fakeApp({ timerBatchSize: 50 });
     new DurableProvider(app).register();
     const engine = await resolve();
     expect((engine as unknown as { timerBatchSize: number }).timerBatchSize).toBe(50);
+  });
+
+  it('forwards reconcileMs and blockedPollMs to the engine', async () => {
+    const { app, resolve } = fakeApp({ reconcileMs: 60_000, blockedPollMs: 250 });
+    new DurableProvider(app).register();
+    const engine = await resolve();
+    const deps = engine as unknown as { reconcileMs?: number; blockedPollMs: number };
+    expect(deps.reconcileMs).toBe(60_000);
+    expect(deps.blockedPollMs).toBe(250);
+  });
+
+  it('reconcileMs: 0 disables the fallback; non-finite tuning values fall back to the defaults', async () => {
+    const off = fakeApp({ reconcileMs: 0, blockedPollMs: 0 });
+    new DurableProvider(off.app).register();
+    const disabled = (await off.resolve()) as unknown as {
+      reconcileMs?: number;
+      blockedPollMs: number;
+    };
+    expect(disabled.reconcileMs).toBeUndefined();
+    expect(disabled.blockedPollMs).toBe(5000);
+
+    const bad = fakeApp({ reconcileMs: Number.NaN, blockedPollMs: Number.POSITIVE_INFINITY });
+    new DurableProvider(bad.app).register();
+    const guarded = (await bad.resolve()) as unknown as {
+      reconcileMs?: number;
+      blockedPollMs: number;
+    };
+    expect(guarded.reconcileMs).toBe(300_000);
+    expect(guarded.blockedPollMs).toBe(5000);
   });
 
   it('forwards config.webhookUrl so ctx.webhook() gets a public url', async () => {
@@ -304,6 +379,46 @@ describe('DurableProvider — app/workflows auto-discovery (boot)', () => {
 
   it('skips discovery when workflowsPath is false', async () => {
     const { app } = fakeApp({ workflowsPath: false }, dir);
+    const provider = new DurableProvider(app);
+    provider.register();
+    await expect(provider.boot()).resolves.toBeUndefined();
+  });
+
+  it('workflowsPath: false still serves app/steps (stepsPath governs steps)', async () => {
+    await mkdir(join(dir, 'app/steps'), { recursive: true });
+    await writeFile(
+      join(dir, 'app/steps/charge_step.ts'),
+      `import { defineStep } from '${SRC}/step-ref.js'
+       export const charge = defineStep('charge', async (input) => 'charged:' + input)`,
+    );
+    const { app, resolve } = fakeApp({ workflowsPath: false }, dir);
+    const provider = new DurableProvider(app);
+    provider.register();
+    await provider.boot();
+
+    // Workflows registered by hand (no discovery) still reach the auto-registered step.
+    const engine = await resolve();
+    engine.register('order', '1', async (ctx, input) => ctx.step('charge', input));
+    await engine.start('order', 'x', 'o1');
+    expect((await engine.waitForRun('o1', { terminal: true, timeoutMs: 5000 })).output).toBe(
+      'charged:x',
+    );
+  });
+
+  it('workflowsPath and stepsPath both false leave the engine unbuilt at boot', async () => {
+    const { app } = fakeApp(
+      {
+        workflowsPath: false,
+        stepsPath: false,
+        stores: {
+          s: async () => {
+            throw new Error('the engine must not be built at boot');
+          },
+        },
+        store: 's',
+      },
+      dir,
+    );
     const provider = new DurableProvider(app);
     provider.register();
     await expect(provider.boot()).resolves.toBeUndefined();

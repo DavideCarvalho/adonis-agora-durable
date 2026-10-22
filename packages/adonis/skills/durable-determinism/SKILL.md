@@ -6,14 +6,15 @@ description: >-
   checkpointed ctx.now() and ctx.sideEffect() capture sources,
   NonDeterminismError at replay time, workflow versions for breaking shape
   changes (skew protection), ctx.patched for surgical in-place guards, and the
-  @adonis-agora/durable-eslint-plugin no-nondeterminism rule with its
-  recommended preset. Use when authoring or changing workflow code that has
+  @adonis-agora/durable-eslint-plugin rules (no-nondeterminism,
+  rethrow-control-flow-signals, no-io-in-workflow-body) and its recommended
+  preset. Use when authoring or changing workflow code that has
   runs in flight, fixing NonDeterminismError, or wiring determinism linting.
 license: MIT
 metadata:
   type: core
   library: "@adonis-agora/durable"
-  library_version: "0.25.0"
+  library_version: "0.51.0"
   framework: adonisjs
 sources:
   - 'DavideCarvalho/adonis-durable:docs/concepts/durability.mdx'
@@ -75,15 +76,20 @@ export default [
     plugins: { '@adonis-agora/durable': durable },
     rules: {
       '@adonis-agora/durable/no-nondeterminism': 'error',
+      '@adonis-agora/durable/rethrow-control-flow-signals': 'error',
+      '@adonis-agora/durable/no-io-in-workflow-body': 'error',
     },
   },
 ]
 
-// or simply:
+// or simply (enables all three):
 // export default [durable.configs.recommended]
 ```
 
-Each report names its replacement ("use `ctx.now()`"). The plugin is the cheap
+`rethrow-control-flow-signals` flags a `catch` around an awaited ctx op that
+does not rethrow `isWorkflowControlFlowSignal(error)`; `no-io-in-workflow-body`
+flags a global `fetch()` and raw `engine.*` calls in the body. Each report names
+its replacement ("use `ctx.now()`"). The plugin is the cheap
 early layer; `NonDeterminismError` is the replay-time backstop for calls it
 cannot see (transitive helpers). Source: `docs/tooling/linting.mdx`.
 

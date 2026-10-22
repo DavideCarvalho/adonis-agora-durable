@@ -126,3 +126,49 @@ describe('BullMQTransport deferred consumers', () => {
     expect(broker.workers).toHaveLength(0);
   });
 });
+
+describe('BullMQTransport deferred consumers — worker liveness', () => {
+  /** A broker whose Redis records every `SET` (the liveness keys a worker stamps). */
+  class RecordingBroker extends FakeBroker {
+    readonly setKeys: string[] = [];
+    override makeRedis(): RedisLike {
+      return {
+        ...noopRedis(),
+        set: async (key: string) => {
+          this.setKeys.push(key);
+          return 'OK';
+        },
+      };
+    }
+  }
+  const beats = (broker: RecordingBroker) =>
+    broker.setKeys.filter((k) => k.includes('worker-heartbeat'));
+
+  it('a deferred (producer) process advertises no live worker until it starts consuming', async () => {
+    const broker = new RecordingBroker();
+    const t = new BullMQTransport({ deps: broker, instanceId: 'w1' });
+    t.deferConsumers();
+    t.handle('charge', async () => 'ok');
+    t.handleWorkflow('order-flow', async () => ({ commands: [] }) as never);
+    await new Promise((r) => setTimeout(r, 5));
+    // No worker exists, so nothing may claim to be one (groupHealth / the dashboard read these keys).
+    expect(beats(broker)).toEqual([]);
+
+    t.startConsumers();
+    await new Promise((r) => setTimeout(r, 5));
+    expect(beats(broker).some((k) => k.includes('charge'))).toBe(true);
+    expect(beats(broker).some((k) => k.includes('order-flow'))).toBe(true);
+    await t.close();
+  });
+
+  it('a producer closed before it ever consumed never advertises', async () => {
+    const broker = new RecordingBroker();
+    const t = new BullMQTransport({ deps: broker, instanceId: 'w1' });
+    t.deferConsumers();
+    t.handle('charge', async () => 'ok');
+    await t.close();
+    t.startConsumers();
+    await new Promise((r) => setTimeout(r, 5));
+    expect(beats(broker)).toEqual([]);
+  });
+});

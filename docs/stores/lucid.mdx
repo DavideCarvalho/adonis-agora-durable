@@ -18,7 +18,7 @@ The `lucid` driver persists runs and step checkpoints through [`@adonisjs/lucid`
 node ace configure @adonis-agora/durable
 ```
 
-`configure` registers the provider, publishes `config/durable.ts`, and publishes the migration that creates the six durable tables (alongside the optional `db`-transport migration — delete that one if you don't use the `db` transport).
+`configure` registers the provider, publishes `config/durable.ts` and `config/durable_dashboard.ts`, and publishes the migration that creates the durable tables. It also publishes three migrations for the [`db` transport](/docs/durable/transports/db) (`…_create_durable_transport_tables`, `…_create_durable_transport_worker_keys` and `…_create_durable_transport_messages`). Delete them if you don't use the `db` transport, but keep the worker-keys one if you use the [`queue` transport](/docs/durable/transports/queue#worker-advertisement): by default it stores its worker advertisement in that table.
 
 </Step>
 <Step>
@@ -80,27 +80,38 @@ Pass `{ connection }` to target a non-default Lucid connection:
 stores.lucid({ connection: 'durable' })
 ```
 
+On MySQL/MariaDB, pass `{ collation }` to create the durable tables with your own tables' collation (see [MySQL: longtext and collation](#mysql-longtext-and-collation)):
+
+```ts
+stores.lucid({ collation: 'utf8mb4_unicode_ci' })
+```
+
 </Step>
 </Steps>
 
 ## What the migration creates
 
-The migration creates six tables (default names, from the `DURABLE_TABLES` constant):
+The migration creates seven tables (default names, from the `DURABLE_TABLES` constant), plus the one-row `durable_schema_meta` marker described [below](#who-provisions-the-schema-autoschema):
 
 | Table | Purpose |
 | --- | --- |
-| `durable_workflow_runs` | one row per run: status, input/output/error, `wake_at`, lock columns, `recovery_attempts`, tags, search attributes |
-| `durable_step_checkpoints` | one row per step `(run_id, seq)`: name, kind, status, input/output/error, attempts, events, timing |
+| `durable_workflow_runs` | one row per run: workflow and version, status, `namespace`, `origin`, `priority`, input/output/error, `wake_at`, lock columns (`locked_by`, `locked_until`), `recovery_attempts`, tags, search attributes, and `awaiting_decision_task_id` (the remote workflow turn the run waits on, see [Remote workflow turns](/docs/durable/reliability/multi-instance#remote-workflow-turns)) |
+| `durable_step_checkpoints` | one row per step `(run_id, seq)`: name, kind, `step_id`, status, input/output/error, attempts, events, `worker_group`, the admitted flow-control `queue`, `parallel_group`, `wake_at`, timing (`enqueued_at`, `started_at`, `finished_at`) and the last heartbeat (`last_heartbeat_at`, `heartbeat_progress`) |
 | `durable_run_attributes` | normalized side-table of searchable attributes (`key` + `str_value`/`num_value`) for fast filtering |
 | `durable_signal_waiters` | runs parked on a [signal](/docs/durable/concepts/sleep-and-signals) token |
 | `durable_buffered_signals` | signals delivered before the run waited (FIFO per token) |
 | `durable_buffered_events` | [named events](/docs/durable/concepts/sleep-and-signals#reliable-buffered-events) published before any run was waiting, keyed by `name` and indexed `(name, published_at)` for the oldest-first redelivery scan |
+| `durable_schedules` | persisted [schedules](/docs/durable/authoring/persisted-schedules) (`engine.schedules`): `workflow`, `namespace`, `paused`, `next_fire_at`, tags, and the engine-owned `spec` / `state` documents |
 
-The runs table is indexed on `status` and on `(status, wake_at)` so the worker's `listPendingRuns` and `listDueTimers` scans stay fast; checkpoints are keyed `(run_id, seq)` with a `(run_id, name)` index for targeted reads; signal waiters are indexed on `run_id` (`durable_signal_waiters_run_idx`), which the [`ctx.all`](/docs/durable/authoring/child-workflows) join barrier's per-child lookup and the run-scoped waiter reads use; and the attributes table is indexed per `(key, value)` so [search-attribute](/docs/durable/concepts/workflows-and-steps#tags) filters push down to SQL.
+The runs table is indexed on `status` and on `(status, wake_at)` so the worker's `listPendingRuns` and `listDueTimers` scans stay fast, on `(namespace, status, created_at)` for the namespaced poll and recovery queries, and on `created_at` for the dashboard's default newest-first listing; checkpoints are keyed `(run_id, seq)` with a `(run_id, name)` index for targeted reads and a `(run_id, parallel_group, seq)` index (`durable_step_checkpoints_group_idx`) for the run detail's per-fan reads; signal waiters are indexed on `run_id` (`durable_signal_waiters_run_idx`), which the [`ctx.all`](/docs/durable/authoring/child-workflows) join barrier's per-child lookup and the run-scoped waiter reads use; buffered signals are indexed on `token`; schedules on `(paused, next_fire_at)` for the tick's due scan; and the attributes table is indexed per `(key, value)` so [search-attribute](/docs/durable/concepts/workflows-and-steps#tags) filters push down to SQL.
 
 ## Who provisions the schema: `autoSchema`
 
 By default the provider provisions the store's schema at boot by calling `ensureSchema()`, which for the Lucid driver is exactly the `createDurableTables(db, connection)` the migration runs. It is idempotent — every table is `hasTable`-guarded and every column `hasColumn`-guarded — so it is safe on a database that already has some or all of the tables. The library managing its own tables is the ecosystem convention, shared with `@adonis-agora/agent`, `@adonis-agora/authz` and `@adonis-agora/telescope`.
+
+Every boot of every pod runs it, so it is gated by a fingerprint. The `durable_schema_meta` table holds one row: a hash of `DURABLE_SCHEMA_REVISION` (bumped with every DDL change in the library) and the configured collation. When the row matches, the call reads it and returns — two statements, no table, column or index probes. When it is missing (a fresh database, or one provisioned by an older release) or different (an upgrade that changed the DDL), the full check runs under a cross-process lock — `pg_advisory_xact_lock` on Postgres, `GET_LOCK` on MySQL (a pod waits up to 60 seconds for a sibling, then warns and checks without the lock), none on SQLite — and re-reads the row after taking the lock, so pods booting together against a fresh database don't race the same `CREATE TABLE`, and only one of them does the work. Then it writes the row. `DURABLE_SCHEMA_REVISION`, `DURABLE_SCHEMA_META_TABLE`, `DURABLE_TABLES` and `DURABLE_JSON_COLUMNS` are exported from `@adonis-agora/durable` if your tooling needs them.
+
+The marker trusts that nobody changes the durable tables by hand. After you do, run the check explicitly with `createDurableTables(db, connectionName, { force: true })`.
 
 Turn it off to own the schema entirely through migrations:
 
@@ -118,7 +129,7 @@ export default defineConfig({
 Reach for `autoSchema: false` when the app's database user may not run DDL at boot, or when every schema change must be an explicit, reviewed migration. The in-memory store has no schema, so the flag is a no-op for it.
 
 <Callout type="warn" title="autoSchema: false means nothing repairs the schema for you">
-With the boot-time provisioning off, a database that is behind the installed library version stays behind. Run `node ace migration:run` after every upgrade — the migration calls the same `createDurableTables`, so it brings the schema forward.
+With the boot-time provisioning off, a database that is behind the installed library version stays behind. The published migration has already run, so `node ace migration:run` alone does not re-run it. After an upgrade that changes the schema (the changelog says so, and `DURABLE_SCHEMA_REVISION` changes), add a new migration whose `up()` calls `createDurableTables(db, this.db.connectionName)`, the same body as the published one, and run `node ace migration:run`.
 </Callout>
 
 ## The repair warning
@@ -126,13 +137,13 @@ With the boot-time provisioning off, a database that is behind the installed lib
 `createDurableTables` is additive-only. When it finds a table that exists but is missing a column the current library writes, it adds the column with an `ALTER TABLE` — every added column is nullable or defaulted, so existing rows read back unchanged. When at least one such repair is actually applied, it logs a single warning:
 
 ```
-@adonis-agora/durable: repaired the durable schema in place — added
+@adonis-agora/durable: repaired the durable schema in place — added or changed
 durable_step_checkpoints.last_heartbeat_at, durable_step_checkpoints.heartbeat_progress.
-The database was behind the installed library version, so these columns were added at
-runtime and nothing recorded it in your migration history. …
+The database was behind the installed library version, so these were added at runtime
+and nothing recorded it in your migration history. …
 ```
 
-Read it as: **the database was behind, the library caught up silently, and your migration history does not know.** Fix it by running `node ace migration:run` so the change is recorded the same way every other schema change is.
+Read it as: **the database was behind, the library caught up silently, and your migration history does not know.** Record it the way every other schema change is recorded: add a new migration whose `up()` calls `createDurableTables(db, this.db.connectionName)` (the published migration has already run, so it won't run again) and run `node ace migration:run`. It is idempotent, so it is a no-op on a database the boot already repaired, and does the repair on one the boot never touched (another environment, or one with `autoSchema: false`).
 
 The warning only fires when a repair was genuinely applied. A fresh create says nothing, and so does a boot against an already-current schema — which is the point: a warning on every boot would be filtered as noise, and that noise is exactly what let a wrong migration-managed schema go undetected before.
 
@@ -148,13 +159,43 @@ async up() {
 
 The logger only needs a `warn(message: string)` method, which both `console` (the default) and AdonisJS's `Logger` satisfy.
 
+## MySQL: longtext and collation
+
+MySQL's `text` holds 64KB. A larger step output, input or event log — a fan step's `events`, a big report — is rejected in strict mode and cut off in non-strict mode, where the row then fails to parse on read. So the JSON columns (`DURABLE_JSON_COLUMNS`: run and checkpoint `input`/`output`/`error`, `events`, `tags`, `search_attributes`, `heartbeat_progress`, the buffered payloads and the schedule documents) are `longtext` on MySQL. Postgres and SQLite `text` has no limit, and their DDL is unchanged.
+
+A table created by an older release still has `text` columns. The schema check widens them with one `ALTER TABLE … MODIFY` per table, only for the columns that are not `longtext` yet, and reports it in the [repair warning](#the-repair-warning). MySQL rebuilds the table for that `ALTER`, which on a large `durable_step_checkpoints` takes a while and locks writes; on a big production table, run it in a maintenance window (a new migration that calls `createDurableTables`, or a one-off script calling it, with `autoSchema: false` on the pods) rather than letting the first booting pod do it. A value that was cut off before the widening is not recovered: it [reads back as `undefined`](#a-json-column-that-does-not-parse).
+
+Knex creates MySQL tables with the server's default collation (`utf8mb4_0900_ai_ci` on MySQL 8) unless told otherwise. If your own tables use another one, a JOIN between them and a durable table fails with `Illegal mix of collations`. Set `collation` (`stores.lucid({ collation })`, or `createDurableTables(db, name, { collation })` in a migration): new durable tables are created with it, and an existing one with a different collation is converted (`ALTER TABLE … CONVERT TO CHARACTER SET … COLLATE …`). Without the option, the Knex connection's `collate` setting is used when it has one. Changing the collation changes the fingerprint, so the next boot converts once.
+
+## A JSON column that does not parse
+
+A JSON column whose text is not valid JSON — a value cut off at 64KB before the column was widened, or a row edited by hand — reads back as `undefined` for that field only. The rest of the row, and every other row, reads normally: `listRuns`, the run detail and other runs' replays keep working where one bad row used to make every read that touched it throw. Each damaged row and column is reported once, by default with a `console.warn` naming the column and the row (`run id`, or `runId#seq` for a checkpoint). Route it elsewhere with `onCorruptJsonColumn`, exported from `@adonis-agora/durable`. It installs a process-wide reporter and returns the previous one; installing a reporter resets the once-per-row memory, so the new one hears about every damaged row. Install it once, from a preload file:
+
+```ts title="start/durable.ts"
+import logger from '@adonisjs/core/services/logger'
+import { onCorruptJsonColumn } from '@adonis-agora/durable'
+
+onCorruptJsonColumn(({ column, row, message }) => {
+  logger.error({ column, row }, `durable: corrupt JSON column (${message})`)
+})
+```
+
+The damaged run itself sees the field as missing: a completed step whose `output` was lost replays as if it returned `undefined`. Treat the warning as a data-loss report for that run.
+
+## Scoped reads: `scopeReads`
+
+With `scopeReads: true` and a namespace in effect (the configured `namespace`, or `'default'` on a standalone engine that sets none), the provider hands the engine `store.withScope({ namespace })`: a view of the same store whose run reads — `getRun`, `listRuns`, `countRuns`, the facet queries and the recovery, dispatch and timer scans — only see that namespace's runs. Writes are not fenced. Use it for a tenant-facing process that must never read another tenant's runs; without `scopeReads` (the default) the store reads every namespace. On a `control-plane` with no `namespace` (the operator), or on a store without `withScope`, `scopeReads` has no effect. A [`CodecStateStore`](/docs/durable/stores#encrypting-payloads-at-rest) around the Lucid store keeps the capability. You can also build the view yourself, with `store.withScope({ namespace: 'acme' })` or `new LucidStateStore(db, { scope: { namespace: 'acme' } })`.
+
 ## Read API for dashboards & tooling
 
-Beyond the durability primitives, the Lucid store implements the read side the [dashboard](/docs/durable/observability/dashboard) and [CLI](/docs/durable/cli) lean on — `listRuns(query)` with workflow/status/tag/attribute filters, ordering, and pagination; `listCheckpoints(runId)` for a run's timeline; and the targeted-read fast paths `getLatestCheckpointByName` / `listCheckpointsByNamePrefix` used by [queries](/docs/durable/authoring/queries-and-updates) and child-run lookups.
+Beyond the durability primitives, the Lucid store implements the read side the [dashboard](/docs/durable/observability/dashboard) and [CLI](/docs/durable/cli) lean on — `listRuns(query)` with workflow/status/tag/attribute filters, ordering, and pagination; `runFacets(query)`, one `GROUP BY status, origin` over the same predicates; `listCheckpoints(runId)` for a run's timeline; and the targeted-read fast paths `getLatestCheckpointByName` / `listCheckpointsByNamePrefix` used by [queries](/docs/durable/authoring/queries-and-updates) and child-run lookups. Bulk deletes (`deleteRuns`, used by retention and `purgeRuns`) run the per-run cascade (checkpoints, signal waiters, attribute rows, then the run) as `IN (…)` statements over chunks of 500 ids, in one transaction. The buffered-event prune (`pruneBufferedEvents`) behind [`eventBufferTtl`](/docs/durable/api-reference#durableconfig) is a bounded batched delete, run by the worker tick's retention phase.
 
 ## Wide fans
 
-The store implements the two reads a wide fan leans on, with no schema change:
+The store implements the reads and writes a wide fan leans on:
 
 - **`countCheckpoints(runId, fromSeq, toSeq, statuses)`** is one `COUNT(*)` over the `(run_id, seq)` primary key, filtered by `status`. A [step fan](/docs/durable/authoring/child-workflows#fanning-out-over-a-step)'s join barrier calls it on every result to ask whether any step of the fan is still `pending`, so a 10,000-step fan never loads its 10,000 rows per result.
+- **`saveCheckpointsIfPending(checkpoints)`** settles a batch of step results: the conditional `UPDATE … WHERE status = 'pending'` of `saveCheckpointIfPending`, once per entry and in order, in one transaction. The engine calls it when several results of one run land together (`resultConcurrency > 1`).
+- **`registerChildWaits(entries)`** writes a child fan's waiters, then its `running` placeholders, as multi-row upserts of 100 rows, in one transaction. **`hasSignalWaiter`** answers the child join barrier with an escaped `LIKE` on the `run_id` index, confirmed case-sensitively in JavaScript.
+- **`checkpointStats(runId, { group? })`** is one `GROUP BY parallel_group, status, <name kind>` returning counts, seq and timestamp bounds and an attempt sum per bucket, and **`queryCheckpoints(runId, query)`** pages checkpoints in seq order by group, status and case-sensitive name prefix. The [run detail](/docs/durable/observability/dashboard#polling-the-run-detail-etag-and-304) is built from them, with an ETag. The name kind and the prefix match compare `substr(name, …)`, as `binary` on MySQL, so both stay case-sensitive even on MySQL's case-insensitive default collation.
 - **`listDueTimers(nowMs, namespace?, limit?)`** orders by `wake_at` ascending, most overdue first, whether or not a `limit` is passed, and the `(status, wake_at)` index serves it. The engine's timer pass passes `timerBatchSize` (default 500) as the `limit`.

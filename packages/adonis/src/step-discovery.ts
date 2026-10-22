@@ -8,6 +8,7 @@ import {
 } from './discovery-roots.js';
 import type { StepLogger } from './interfaces.js';
 import type { StepHandler } from './protocol.js';
+import { validateStandard } from './standard-schema.js';
 import { DURABLE_STEP_NAME } from './step-name-symbol.js';
 import { type DurableStepMeta, stepMetaOf } from './step-ref.js';
 
@@ -23,22 +24,27 @@ export interface DiscoveredStep {
   handler: (input: unknown, log: StepLogger) => unknown | Promise<unknown>;
 }
 
-/** Wrap a handler with the opt-in zod validation its `@Step`/`defineStep` metadata declared: `input`
- *  is parsed before the body runs, `output` before the result is handed back. A handler with neither
- *  schema is served as-is (compile-time types only). */
+/** Wrap a handler with the opt-in Standard Schema validation its `@Step`/`defineStep` metadata
+ *  declared: `input` is validated before the body runs (the body receives the schema's OUTPUT value),
+ *  `output` before the result is handed back. A failure throws a non-retryable
+ *  `SchemaValidationError`. A handler with neither schema is served as-is (compile-time types only). */
 function validating(step: DiscoveredStep): StepHandler {
   const { meta, handler } = step;
   if (!meta.input && !meta.output) return handler;
   return async (input: unknown, log: StepLogger) => {
-    const parsed = meta.input ? meta.input.parse(input) : input;
+    const parsed = meta.input
+      ? await validateStandard(meta.input, input, `step "${meta.name}" input`)
+      : input;
     const output = await handler(parsed, log);
-    return meta.output ? meta.output.parse(output) : output;
+    return meta.output
+      ? validateStandard(meta.output, output, `step "${meta.name}" output`)
+      : output;
   };
 }
 
 /**
  * Register a single discovered step on `server` under its stamped name, wrapping it with any
- * declared zod validation. The low-level `transport.handle(name, fn)` stays the escape hatch — this
+ * declared schema validation. The low-level `transport.handle(name, fn)` stays the escape hatch — this
  * is the convention the `app/steps` discovery builds on.
  */
 export function registerStep(server: StepServer, step: DiscoveredStep): void {

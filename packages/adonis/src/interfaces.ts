@@ -1,7 +1,7 @@
-import type { z } from 'zod';
 import type { DispatchDiagnostics } from './dispatch-routing.js';
 import type { WorkerDescriptor } from './handshake/descriptor.js';
 import type { FanPageQuery, RunDetailOptions } from './run-detail-summary.js';
+import type { StandardSchemaV1 } from './standard-schema.js';
 import type { StepRef } from './step-name-symbol.js';
 import type { WorkflowClass, WorkflowInputOf, WorkflowOutputOf } from './workflow-ref.js';
 
@@ -85,6 +85,17 @@ export interface WorkflowRun {
    * durable state required for correctness — a transport without priority support ignores it.
    */
   priority?: number | undefined;
+  /**
+   * REMOTE workflow turn awaiting a decision: the globally unique `taskId` of the turn the engine
+   * dispatched to a workflow worker and then SUSPENDED on. Written BEFORE the turn is enqueued (and the
+   * run lease released), matched by the engine's decision handler so ONLY the decision for the
+   * currently-awaited turn is applied (a stale / duplicate / foreign decision is dropped), and cleared
+   * the moment that decision is applied. This is what makes a workflow-turn decision multi-instance
+   * safe: whichever engine replica consumes the decision looks the run up by `decision.runId` and
+   * applies it durably, instead of resolving an in-memory promise only the dispatching replica held.
+   * Absent on non-remote runs and on runs not currently awaiting a turn.
+   */
+  awaitingDecisionTaskId?: string | undefined;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -330,6 +341,33 @@ export interface StateStore {
     patch: Partial<WorkflowRun>,
   ): Promise<boolean>;
 
+  /**
+   * Atomically claim a singleton slot for `runId` — the store half of the `singleton` gate. Required
+   * for ATOMIC singleton admission; without it the engine falls back to a non-atomic scan and warns once.
+   *
+   * Inside ONE critical section that serializes competing claims BEFORE it reads (a transaction with
+   * `SELECT … FOR UPDATE`, or a write lock taken first; a plain list-then-update is unsafe across
+   * engine instances): read the active (`pending`/`running`/`suspended`/`blocked`) runs of `workflow`
+   * carrying `tag`, then decide with {@link singletonAdmissionTags} — runs already carrying the
+   * reserved `durable:singleton:admitted` tag keep their slots, and the free ones go to the oldest
+   * unadmitted waiters by `(createdAt, id)`. On admission persist the returned tags and return `true`
+   * (also `true`, without a write, when the run already holds a slot).
+   *
+   * On denial, when `retryWakeAt` is given, park the candidate `suspended` with that `wakeAt` under the
+   * same locks ({@link singletonAdmissionDenialPatch}), and never write a run that is no longer active
+   * (a concurrent cancel must not be resurrected). Return `false` for a missing or inactive run.
+   *
+   * The slot is released by the terminal settle: `updateRun`/`updateRunIf` writing a terminal status
+   * must drop the reserved tag. An expired execution lease never releases it.
+   */
+  tryAdmitSingleton?(
+    runId: string,
+    tag: string,
+    workflow: string,
+    limit: number,
+    retryWakeAt?: number,
+  ): Promise<boolean>;
+
   getRun(runId: string): Promise<WorkflowRun | null>;
 
   /**
@@ -338,6 +376,16 @@ export interface StateStore {
    * engine's {@link WorkflowEngine.deleteRun} handles the child-subtree cascade.
    */
   deleteRun(runId: string): Promise<void>;
+
+  /**
+   * {@link deleteRun} for a batch of runs: every id's checkpoints, signal waiters, attribute rows and
+   * run row, as a few `IN (...)` statements in one transaction instead of four statements per run.
+   * Unknown ids are ignored. Like {@link deleteRun} it removes exactly the listed runs; the engine's
+   * `purgeRuns` and retention sweep walk the child edges first.
+   *
+   * Optional: a store that omits it gets one {@link deleteRun} per id.
+   */
+  deleteRuns?(runIds: string[]): Promise<void>;
 
   getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null>;
   /**
@@ -355,6 +403,16 @@ export interface StateStore {
    * Optional: a store that omits it falls back to {@link saveCheckpoint}, which keeps that race.
    */
   saveCheckpointIfPending?(checkpoint: StepCheckpoint): Promise<boolean>;
+  /**
+   * {@link saveCheckpointIfPending} for many checkpoints in one call: resolves, per entry and in
+   * input order, whether it wrote. Same result as calling it on each entry in turn (a later entry for
+   * the same `(runId, seq)` is compared against the earlier one's write), with each row's
+   * compare-and-set still atomic. The call as a whole is atomic too: if it rejects, nothing was
+   * written. The engine settles a batch of one run's step results through it, one call per batch.
+   *
+   * Optional: a store that omits it gets one {@link saveCheckpointIfPending} per entry.
+   */
+  saveCheckpointsIfPending?(checkpoints: StepCheckpoint[]): Promise<boolean[]>;
 
   /**
    * Used by recovery on boot to find runs to resume (crashed, left `running`). When `namespace` is
@@ -368,8 +426,20 @@ export interface StateStore {
    * without it the engine falls back to {@link listIncompleteRuns} and filters in process, which on
    * a busy fleet fetches (and lock-probes) every healthy running run once per tick per worker. When
    * `namespace` is given, restrict to that worker-pool partition (ANDed).
+   *
+   * When `owner` is given, ALSO return `running` runs whose lease is still live but held by `owner`
+   * (`locked_by = owner`, ORed with the free/expired predicate). The engine passes its own
+   * `instanceId` for one lease window after boot, so an instance that restarts under a stable id
+   * (a pod name) after a crash reclaims the leases its previous incarnation left behind at once,
+   * instead of waiting up to `leaseMs` for them to expire; the engine itself filters out the runs
+   * the live process is executing. A store that ignores `owner` keeps the expiry-only behaviour.
    */
-  listOrphanedRuns?(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]>;
+  listOrphanedRuns?(
+    nowMs: number,
+    limit: number,
+    namespace?: string,
+    owner?: string,
+  ): Promise<WorkflowRun[]>;
 
   /**
    * The oldest `pending` runs awaiting dispatch (FIFO, by `createdAt`), capped at `limit`. When
@@ -486,6 +556,13 @@ export interface StateStore {
   bufferSignal(token: string, payload: unknown): Promise<void>;
   /** Take the oldest buffered signal for `token` (FIFO), or null if none is buffered. */
   takeBufferedSignal(token: string): Promise<{ payload: unknown } | null>;
+  /**
+   * Up to `limit` distinct tokens starting with `prefix` that have at least one buffered signal.
+   * Reads no payload and consumes nothing. Optional: the entity lost-wake reconcile
+   * (`engine.reconcileEntityWakes`) uses it to find entity ops buffered while no wake reached their
+   * entity; without it that reconcile is a no-op.
+   */
+  listBufferedSignalTokens?(prefix: string, limit: number): Promise<string[]>;
 
   /**
    * Buffer a published event that matched NO live waiter, so a LATER `ctx.waitForEvent(name, { match })`
@@ -519,6 +596,15 @@ export interface StateStore {
    * returns `true` is the one that gets to deliver the payload; every other caller backs off.
    */
   removeBufferedEvent(id: string): Promise<boolean>;
+  /**
+   * Delete up to `limit` buffered events published before `publishedBefore` (epoch ms), oldest
+   * first, across every name; resolves how many it deleted. What the engine's `eventBufferTtlMs`
+   * prune calls, so an event nobody ever waits for does not stay in the table forever.
+   *
+   * Optional: without it the prune has no way to enumerate names, and expired events are only skipped
+   * (and removed) when a `waitForEvent` for their name scans them.
+   */
+  pruneBufferedEvents?(publishedBefore: number, limit: number): Promise<number>;
 
   /**
    * Run `work` in a SINGLE store transaction — giving it the store-native transaction handle (`raw`)
@@ -537,6 +623,16 @@ export interface StateStore {
    * Optional: without it the engine counts a {@link listRuns} result.
    */
   countRuns?(query: Omit<RunQuery, 'page' | 'size'>): Promise<number>;
+
+  /**
+   * Count the runs matching `query`, grouped by `(status, origin)`: the totals behind a console's
+   * status and origin chips in ONE aggregate, instead of a listing counted in memory. Cells with a
+   * zero count are absent; a run with no (or a blank) origin counts under `origin: null`.
+   *
+   * Optional: without it `runFacetsOf` counts a {@link listRuns} result, which is correct but
+   * unbounded.
+   */
+  runFacets?(query: RunFacetQuery): Promise<RunFacetRow[]>;
 
   // Persisted schedules (optional) — see {@link ScheduleRecord}. A store implements all five or none;
   // `engine.schedules` refuses to run on a store without them.
@@ -630,10 +726,131 @@ export interface StateStore {
     toSeq: number,
     statuses: StepCheckpoint['status'][],
   ): Promise<number>;
+
+  /**
+   * The run's checkpoints aggregated into {@link CheckpointStat} buckets — one per
+   * `(parallelGroup, status, nameKind)` present — with `opts.group` narrowing it to one group. A
+   * `GROUP BY`, not a load: it is what lets a run detail draw a 40,000-member fan from a few rows.
+   * Ungrouped checkpoints come back under `group: null`. Bucket order is unspecified.
+   *
+   * Optional: a store that omits it still works — the run detail then loads every checkpoint and
+   * summarizes it in JS (`summarizeTimeline`), which is the same answer read the expensive way. A
+   * store that implements it must implement {@link queryCheckpoints} too.
+   */
+  checkpointStats?(runId: string, opts?: { group?: string | undefined }): Promise<CheckpointStat[]>;
+
+  /**
+   * The run's checkpoints that match `query`, in `seq` order (the order of {@link listCheckpoints}),
+   * paged by `offset`/`limit`. Every filter is optional; an absent one does not narrow. An EMPTY
+   * `statuses` or `namePrefixes` matches nothing; an empty `excludeGroups` excludes nothing.
+   *
+   * Optional, paired with {@link checkpointStats}: the run detail reads a fan's failures, its folded
+   * checkpoints and one page of its members through it, instead of the run's whole history.
+   */
+  queryCheckpoints?(runId: string, query: CheckpointQuery): Promise<StepCheckpoint[]>;
+}
+
+/**
+ * How a checkpoint's name classifies it, for {@link CheckpointStat}: an awaited child's
+ * `signal:child:` checkpoint, a folded `fan:` checkpoint standing for many children, a `spawn:`
+ * edge to a fire-and-forget child, or any other step.
+ */
+export type CheckpointNameKind = 'child' | 'folded' | 'spawn' | 'step';
+
+/** The {@link CheckpointNameKind} of a checkpoint name — what a store's SQL `CASE` must agree with. */
+export function checkpointNameKind(name: string): CheckpointNameKind {
+  if (name.startsWith('signal:child:')) return 'child';
+  if (name.startsWith('fan:')) return 'folded';
+  if (name.startsWith('spawn:')) return 'spawn';
+  return 'step';
+}
+
+/**
+ * One bucket of {@link StateStore.checkpointStats}: the checkpoints of one run sharing a
+ * `parallelGroup`, a `status` and a {@link CheckpointNameKind}, reduced to aggregates.
+ */
+export interface CheckpointStat {
+  /** The bucket's `parallelGroup`, or `null` for ungrouped checkpoints. */
+  group: string | null;
+  status: StepCheckpoint['status'];
+  nameKind: CheckpointNameKind;
+  /** Rows in the bucket (at least 1). */
+  count: number;
+  minSeq: number;
+  maxSeq: number;
+  /** Smallest and largest `name`, by the database's string order. Equal when every row shares one. */
+  minName: string;
+  maxName: string;
+  /** Earliest `enqueuedAt`, read as {@link StateStore.listCheckpoints} reads it (falling back to `startedAt`). */
+  minEnqueuedAt: Date;
+  minStartedAt: Date;
+  maxStartedAt: Date;
+  maxFinishedAt: Date;
+  /** Sum of `attempts` — moves when a step is retried in place, so a change marker sees it. */
+  sumAttempts: number;
+}
+
+/** What {@link StateStore.queryCheckpoints} selects. */
+export interface CheckpointQuery {
+  /** Only this `parallelGroup`'s checkpoints. */
+  group?: string | undefined;
+  /** Leave out these groups' checkpoints (ungrouped checkpoints are kept). */
+  excludeGroups?: string[] | undefined;
+  statuses?: StepCheckpoint['status'][] | undefined;
+  /** Only names starting with one of these. */
+  namePrefixes?: string[] | undefined;
+  offset?: number | undefined;
+  limit?: number | undefined;
+}
+
+/**
+ * One `(status, origin)` cell of {@link StateStore.runFacets} — a `GROUP BY` row, not a page of runs.
+ * `origin` is `null` for runs carrying none (absent or blank).
+ */
+export interface RunFacetRow {
+  status: RunStatus;
+  origin: string | null;
+  count: number;
 }
 
 /** Typed, queryable per-run data — exact values for `eq`/`ne`, numbers/strings for range ops. */
 export type SearchAttributes = Record<string, string | number | boolean>;
+
+/**
+ * A Standard Schema (https://standardschema.dev — zod, valibot, arktype, …) whose validated OUTPUT is
+ * search-attribute-shaped: flat `string`/`number`/`boolean` values only. Declared via
+ * `static workflow = { searchAttributes }` (or `register(..., { searchAttributesSchema })`), it makes
+ * `ctx.upsertSearchAttributes` validate the MERGED attributes and reject a non-conforming write with a
+ * `SchemaValidationError`. The `Output extends SearchAttributes` bound is enforced at the declaration
+ * site — a schema whose output has a nested object/array value is a compile-time error. Its
+ * `validate` must be synchronous (an async refinement could make replay nondeterministic).
+ *
+ * @example
+ * ```ts
+ * const orderAttrs = z.object({ tier: z.enum(['free', 'pro']), amount: z.number() })
+ *
+ * export default class CheckoutWorkflow extends BaseWorkflow {
+ *   static workflow = { name: 'checkout', searchAttributes: orderAttrs }
+ *   async run(ctx: WorkflowCtx<InferSearchAttributes<typeof orderAttrs>>, input: Order) {
+ *     await ctx.upsertSearchAttributes({ tier: input.tier, amount: input.total })
+ *   }
+ * }
+ * ```
+ */
+export type SearchAttributesSchema<A extends SearchAttributesShape = SearchAttributesShape> =
+  StandardSchemaV1<unknown, A>;
+
+/**
+ * The bound a TYPED search-attributes shape must satisfy: {@link SearchAttributes} whose values may
+ * also be `undefined` — so an optional key (`v.optional(v.number())`, `z.number().optional()`), which
+ * infers as `key?: number | undefined`, still type-checks under `exactOptionalPropertyTypes`.
+ */
+export type SearchAttributesShape = Record<string, string | number | boolean | undefined>;
+
+/** Infer the validated OUTPUT shape of a {@link SearchAttributesSchema} — feed it to
+ *  `WorkflowCtx<A>`: `WorkflowCtx<InferSearchAttributes<typeof mySchema>>`. */
+export type InferSearchAttributes<S extends StandardSchemaV1<unknown, SearchAttributesShape>> =
+  StandardSchemaV1.InferOutput<S>;
 
 export type AttributeOp = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' | 'in';
 
@@ -774,6 +991,19 @@ export function isNonEmptyRunScope(scope: RunScope | undefined): boolean {
   );
 }
 
+/**
+ * The input a dead-letter workflow is started with when a run goes `dead` (see the engine's
+ * `deadLetterWorkflow` and a workflow's own `deadLetterWorkflow` / `deadLetter()` method): which run
+ * died, of which workflow, with what input, and why (`max_recovery_attempts`). The handler run's id is
+ * `dlq:<deadRunId>`.
+ */
+export interface DeadLetter<TInput = unknown> {
+  deadRunId: string;
+  workflow: string;
+  input: TInput;
+  error?: StepError | undefined;
+}
+
 /** The terminal run statuses — the only ones retention may delete. */
 export type TerminalRunStatus = 'completed' | 'failed' | 'cancelled' | 'dead';
 export const TERMINAL_RUN_STATUSES: readonly TerminalRunStatus[] = [
@@ -785,12 +1015,19 @@ export const TERMINAL_RUN_STATUSES: readonly TerminalRunStatus[] = [
 
 /**
  * A retention rule confined to a {@link RunScope}: terminal runs in `statuses` matching `scope` are
- * hard-deleted once their last activity is older than `maxAgeMs`. Sits next to the per-status
- * `retention` ages, so e.g. chat turns can age out after a day while everything else keeps 30.
+ * hard-deleted once their last activity is older than `maxAgeMs`, and/or once more than `maxCount`
+ * newer ones exist. Sits next to the per-status `retention` ages, so e.g. chat turns can age out
+ * after a day while everything else keeps 30.
+ *
+ * `maxCount` keeps the `maxCount` newest runs (by start time, `createdAt`) of the whole status set
+ * WITHIN the scope — "keep acme's newest 100" counts acme's runs only — and deletes the older ones.
+ * With both bounds the most restrictive wins: a run goes once it is past either. At least one of the
+ * two must be set.
  */
 export interface ScopedRetentionPolicy {
   statuses: TerminalRunStatus[];
-  maxAgeMs: number;
+  maxAgeMs?: number | undefined;
+  maxCount?: number | undefined;
   scope: RunScope;
 }
 
@@ -986,7 +1223,13 @@ export interface StepResult {
 export interface Heartbeat {
   runId: string;
   seq: number;
-  stepId: string;
+  /**
+   * The in-flight step this beat keeps alive. ABSENT (or `''`) for a RUN-scoped (workflow-turn)
+   * heartbeat: a worker replaying a long workflow turn beats for its `runId` so the engine pushes the
+   * awaited turn's re-drive deadline forward (see `WorkflowEngineDeps.remoteAdvanceSilenceMs`). The
+   * Python `durable-worker` sends `{ runId, seq: 0, group }` with no `stepId` for exactly this.
+   */
+  stepId?: string | undefined;
   group: string;
   /** Worker-side emission time (epoch ms). Optional on the wire for back-compat with 0.17-era workers. */
   at?: number | undefined;
@@ -1139,11 +1382,43 @@ export interface WorkflowStepEvent {
  * concerns, identical for in-process and remote workflows.
  */
 export interface WorkflowExecutor {
-  advance(
+  /**
+   * INLINE replay: advance the turn and RETURN its decision (e.g. `LocalWorkflowTurnExecutor`
+   * runs the turn body in-process). The engine awaits this under the run's lease, so it is
+   * single-instance by nature. Provide this OR {@link dispatch}; when both exist the engine uses
+   * `dispatch`.
+   */
+  advance?(
     run: WorkflowRun,
     history: HistoryEvent[],
     pendingSignals?: WorkflowTask['pendingSignals'],
   ): Promise<WorkflowDecision>;
+  /**
+   * DISPATCH-AND-SUSPEND (broker-backed, multi-instance safe): enqueue the turn to a worker under the
+   * ENGINE-SUPPLIED, globally unique `taskId`, WITHOUT awaiting the decision. Before calling this the
+   * engine has already recorded `taskId` on the run ({@link WorkflowRun.awaitingDecisionTaskId}),
+   * suspended it and released its lease, so the worker's {@link WorkflowDecision} — delivered over
+   * {@link Transport.onDecision} to WHICHEVER engine replica consumes it — always finds its marker and
+   * a free lease. This method only enqueues; a throw fails the run.
+   */
+  dispatch?(
+    run: WorkflowRun,
+    history: HistoryEvent[],
+    taskId: string,
+    pendingSignals?: WorkflowTask['pendingSignals'],
+  ): Promise<void>;
+  /**
+   * Subscribe the engine's decision handler to the transport this executor dispatches over. Called
+   * once per registration with the SAME handler function, so a transport that keeps a handler set
+   * (bullmq, queue, db) dedupes it across executors. Required for {@link dispatch} to make progress.
+   */
+  subscribeDecisions?(handler: (decision: WorkflowDecision) => Promise<void>): void;
+  /**
+   * Optional per-workflow liveness window (ms) for a dispatched turn: with no decision and no
+   * run-scoped heartbeat for this long, the turn is re-driven (re-dispatched under a fresh `taskId`).
+   * Combined with the engine's `remoteAdvanceSilenceMs` (the shorter wins). Heartbeats rearm it.
+   */
+  readonly decisionTimeoutMs?: number | undefined;
 }
 
 /**
@@ -1216,10 +1491,11 @@ export interface RunRequest {
 
 /**
  * The discriminated verb + args of a {@link RunRequest}. Mirrors THIS package's tenant-facing
- * {@link RunGateway} — so it diverges from aviary's verb set (aviary has `getRunDetail`/`retry`/
- * `continue`/`retryWithInput`/`waitingFor`; this package has `getRun`/`getCheckpoints`/
- * `getSearchAttributes`/`signal`) while the shared verbs (`listRuns`/`cancel`/`redispatch`/
- * `workerHealth`) keep aviary's EXACT shape, and the request/reply ENVELOPE stays byte-compatible.
+ * {@link RunGateway}: aviary's whole verb set in aviary's EXACT shapes (`getRunDetail`,
+ * `getFanMembers`, `listRuns`, `runFacets`, `runValueFacets`, `workerHealth`, `cancel`, `retry`,
+ * `continue`, `retryWithInput`, `redispatch`, `waitingFor`), plus this package's own
+ * `getRun`/`getCheckpoints`/`getRunChildren`/`getSearchAttributes`/`signal`. The request/reply
+ * ENVELOPE stays byte-compatible.
  * `start` and `subscribe` are NOT here — they ride `${P}-start-run` and `${P}-tenant-events-<tenant>`
  * respectively.
  */
@@ -1242,7 +1518,22 @@ export type RunRequestKind =
   | { kind: 'workerHealth' }
   | { kind: 'signal'; runId: string; signal: string; payload?: unknown }
   | { kind: 'cancel'; runId: string; opts?: { compensate?: boolean } }
-  | { kind: 'redispatch'; runId: string };
+  | { kind: 'redispatch'; runId: string }
+  // Aviary's verbs, in aviary's shapes. `runFacets`/`runValueFacets` are namespace-forced like
+  // `listRuns`; `waitingFor` is bulk and filtered to the requester's own runs; the rest are
+  // runId-bearing and ownership-checked first. Additive: an older control plane answers them with an
+  // unknown-verb error, which `ProxyRunGateway` reports as such.
+  | { kind: 'runFacets'; query: RunFacetQuery }
+  | {
+      kind: 'runValueFacets';
+      axis: RunValueAxis;
+      query: RunFacetQuery;
+      opts?: RunValueFacetOptions | undefined;
+    }
+  | { kind: 'retry'; runId: string }
+  | { kind: 'continue'; runId: string }
+  | { kind: 'retryWithInput'; runId: string; input: unknown }
+  | { kind: 'waitingFor'; runIds: string[] };
 
 /** The control plane's answer to a {@link RunRequest} (or to a start-run, correlated by the minted
  *  runId), keyed by `requestId`. Byte-compatible with aviary's `RunReply`. */
@@ -1335,6 +1626,17 @@ export interface Transport {
    * `[]` (never throw) when the keyspace is empty or unreadable. Pairs with {@link listWorkerGroups}.
    */
   listWorkerDescriptors?(token: string): Promise<WorkerDescriptor[]>;
+  /**
+   * EVERY live worker descriptor, across all routing tokens — the fleet-wide read behind
+   * {@link WorkflowEngine.workflowDirectory}. Optional, and MUST degrade to `[]` when unreadable.
+   */
+  readAllWorkerDescriptors?(): Promise<WorkerDescriptor[]>;
+  /**
+   * EVERY live worker heartbeat, across all routing tokens — the liveness floor of
+   * {@link WorkflowEngine.workflowDirectory}, which is how a worker too old to publish a descriptor
+   * still shows up. Optional, same as {@link readAllWorkerDescriptors}.
+   */
+  readAllWorkerHeartbeats?(): Promise<WorkerHeartbeat[]>;
 
   // -------------------------------------------------------------------------
   // P4 — store-less read/control/start protocol (spec §6.2, §8). All OPTIONAL:
@@ -1534,7 +1836,8 @@ export interface StepOptions {
  * name (a worker subscribes per registered handler name, not a hand-declared group). There is no
  * public factory for this anymore — `ctx.step(ref, input)` builds one internally from the
  * `@Step`-stamped name (see {@link StepRef}/`stepNameOf`) and a `ctx.step(name, input)` from the
- * literal string. `input`/`output` are OPTIONAL runtime zod schemas an authoring layer MAY attach
+ * literal string. `input`/`output` are OPTIONAL runtime Standard Schemas (zod, valibot, arktype, …)
+ * an authoring layer MAY attach
  * (e.g. `@Step({ input, output })`) for validation at the dispatch boundary — a bare `@Step()`
  * carries neither, and the engine skips validation when they're absent. The `StepOptions` fields
  * (retries/backoff/timeoutMs …) carry the merged per-call/def dispatch policy.
@@ -1544,8 +1847,8 @@ export interface StepDef<TInput = unknown, TOutput = unknown> extends StepOption
   /** Optional isolation partition; routing is by `name`. Suffixes the routing token as
    *  `<name>@<partition>` (via `tenantGroup`) — omit to route by the bare (sanitized) `name`. */
   partition?: string | undefined;
-  input?: z.ZodType<TInput> | undefined;
-  output?: z.ZodType<TOutput> | undefined;
+  input?: StandardSchemaV1<unknown, TInput> | undefined;
+  output?: StandardSchemaV1<unknown, TOutput> | undefined;
 }
 
 /**
@@ -1637,8 +1940,13 @@ export interface DurableWebhook<TPayload = unknown> {
 /**
  * The context handed to a workflow function. Every interaction with the outside world goes
  * through it so the engine can checkpoint — the workflow body itself stays deterministic.
+ *
+ * Generic over `A`, the run's {@link SearchAttributes} shape — narrows {@link upsertSearchAttributes}
+ * to a `Partial<A>` (pair it with a {@link SearchAttributesSchema}: annotate `run`'s ctx as
+ * `WorkflowCtx<InferSearchAttributes<typeof mySchema>>`). Defaults to the untyped bag, so a bare
+ * `WorkflowCtx` behaves exactly as before.
  */
-export interface WorkflowCtx {
+export interface WorkflowCtx<A extends SearchAttributesShape = SearchAttributes> {
   readonly runId: string;
   /**
    * Run a durable step — always dispatched, always engine-scheduled: the ONE step primitive (no
@@ -1916,8 +2224,10 @@ export interface WorkflowCtx {
    * exactly-once — recorded at this position on the first run and SKIPPED on replay, so it does one
    * write, not one per turn. Use this instead of injecting the {@link StateStore} to mutate the run
    * you're executing (`store.updateRun(ctx.runId, …)` becomes `ctx.upsertSearchAttributes(…)`).
+   * With a declared {@link SearchAttributesSchema}, the merged result is validated first and a
+   * non-conforming write throws a `SchemaValidationError` (nothing is written or recorded).
    */
-  upsertSearchAttributes(attrs: SearchAttributes): Promise<void>;
+  upsertSearchAttributes(attrs: Partial<A>): Promise<void>;
 }
 
 /**
@@ -1936,8 +2246,8 @@ export interface WorkflowCtx {
  *
  * Every `WorkflowCtx` is assignable to it (guarded by `test/types/dynamic-workflow-ctx.ts`).
  */
-export interface DynamicWorkflowCtx
-  extends Omit<WorkflowCtx, 'step' | 'child' | 'startChild' | 'all' | 'allSettled'> {
+export interface DynamicWorkflowCtx<A extends SearchAttributesShape = SearchAttributes>
+  extends Omit<WorkflowCtx<A>, 'step' | 'child' | 'startChild' | 'all' | 'allSettled'> {
   /** {@link WorkflowCtx.step} by step name. */
   step<TOutput = unknown>(
     name: string,

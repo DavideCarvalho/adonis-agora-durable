@@ -20,7 +20,13 @@ This guide gets a workflow running in an AdonisJS app in a few minutes — no br
 node ace add @adonis-agora/durable
 ```
 
-`add` installs the package, registers `@adonis-agora/durable/durable_provider` in `adonisrc.ts`, and publishes `config/durable.ts`.
+`add` installs the package and runs its `configure` hook, which:
+
+- registers `@adonis-agora/durable/durable_provider` and `@adonis-agora/durable/dashboard_provider` in `adonisrc.ts`;
+- registers the Ace commands (`@adonis-agora/durable/commands`) — see [the CLI](/docs/durable/cli);
+- registers the Assembler `init` hooks that generate the typed `app/workflows` / `app/steps` barrels — see [codegen](/docs/durable/tooling/codegen);
+- adds the `#workflows/*` and `#steps/*` subpath imports to your `package.json`;
+- publishes `config/durable.ts`, `config/durable_dashboard.ts` and the Lucid migrations for the optional `lucid` store and `db` transport.
 
 </Tab>
 
@@ -31,13 +37,13 @@ npm i @adonis-agora/durable
 node ace configure @adonis-agora/durable
 ```
 
-`configure` runs the same codemods as `add` (register the provider, publish the config).
+`configure` runs the same codemods as `add` (providers, commands, codegen hooks, subpath imports, config files and migrations).
 
 </Tab>
 
 </Tabs>
 
-The published `config/durable.ts` defaults to the in-process `memory` transport + the in-memory store, so the engine works with zero extra infrastructure. Drivers are selected by **name** from the `transports` / `stores` maps — each lazily imports its optional peer (`@adonisjs/queue`, `@adonisjs/lucid`) only when chosen:
+The published `config/durable.ts` defaults to the in-process `memory` transport + the in-memory store, so the engine works with zero extra infrastructure. Drivers are selected by **name** from the `transports` / `stores` maps — each lazily imports its optional peer (`@adonisjs/queue`, `@adonisjs/lucid`, `bullmq`) only when chosen:
 
 ```ts title="config/durable.ts"
 import { defineConfig, transports } from '@adonis-agora/durable'
@@ -46,8 +52,10 @@ export default defineConfig({
   transport: 'memory',
   transports: {
     memory: transports.memory(),
+    // 'event-emitter': transports.eventEmitter(), // single-process production, no infra
     // queue: transports.queue({ connection: 'redis' }), // names a config/queue.ts adapter
     // db: transports.db(),
+    // bullmq: transports.bullmq({ connection: { host: '127.0.0.1', port: 6379 } }),
   },
   // store: 'lucid',
   // stores: { lucid: stores.lucid() },
@@ -55,21 +63,25 @@ export default defineConfig({
 })
 ```
 
+<Callout type="warn" title="memory is test-only">
+The `memory` transport drives a dispatch straight into its handler and exists for tests and this tutorial. For a **single-process production** app with no external infrastructure, select `transports.eventEmitter()`; for several processes, pick a [cross-process transport](/docs/durable/transports/choosing) and the [Lucid store](/docs/durable/stores/lucid).
+</Callout>
+
 <Callout type="info">
-The provider binds a singleton [`WorkflowEngine`](/docs/durable/concepts/workflows-and-steps) built from this config. Import it anywhere — a controller, a service, a start file — with `import engine from '@adonis-agora/durable/services/main'`. (The container binding, `app.container.make(WorkflowEngine)`, is the lower-level path.)
+The provider binds a singleton [`WorkflowEngine`](/docs/durable/concepts/workflows-and-steps) built from this config. Import it anywhere — a controller, a service, a start file — with `import engine from '@adonis-agora/durable/services/main'`. On a store-less [`tenant`](/docs/durable/cluster/roles-and-config) pod there is no engine; the same module exports `runGateway`, the role-agnostic read/control/start surface.
 </Callout>
 
 ## 2. Define a step (optional)
 
-`ctx.step(refOrName, input)` is the durable step primitive — always dispatched, routed to a handler by **name**. Author the handler as a `@Step` class under `app/steps`, or with `defineStep` for a typed ref. Schemas are optional — add [zod](https://zod.dev) `input`/`output` to validate at the serve boundary:
+`ctx.step(refOrName, input)` is the durable step primitive — always dispatched, routed to a handler by **name**. Author the handler as a `@Step` class under `app/steps`, or with `defineStep` for a typed ref. Schemas are optional — add `input`/`output` from any [Standard Schema](https://standardschema.dev) library (zod, valibot, arktype, …) to validate at the serve boundary; the handler's `input` type is then inferred from the schema:
 
 ```ts title="app/steps/charge.ts"
 import { defineStep } from '@adonis-agora/durable'
-import { z } from 'zod'
+import { z } from 'zod' // or valibot, arktype, … — any Standard Schema
 
 export const chargeCard = defineStep(
   'payments:charge-card',
-  async (input: { orderId: number; amountCents: number }) => ({ chargeId: `ch_${input.orderId}` }),
+  async (input) => ({ chargeId: `ch_${input.orderId}` }),
   {
     input: z.object({ orderId: z.number().int(), amountCents: z.number().int() }),
     output: z.object({ chargeId: z.string() }),
@@ -134,18 +146,14 @@ export const createCheckoutValidator = vine.compile(
 ```
 
 ```ts title="app/controllers/checkout_controller.ts"
-import { inject } from '@adonisjs/core'
 import type { HttpContext } from '@adonisjs/core/http'
-import { WorkflowEngine } from '@adonis-agora/durable'
+import engine from '@adonis-agora/durable/services/main'
 import CheckoutWorkflow from '#workflows/checkout_workflow'
 import Order from '#models/order'
 import { createCheckoutValidator } from '#validators/checkout'
 
-@inject()
 export default class CheckoutController {
   // the engine is only needed to signal the run; dispatch resolves it for you
-  constructor(private engine: WorkflowEngine) {}
-
   async store({ request, response }: HttpContext) {
     const { total } = await request.validateUsing(createCheckoutValidator)
     const order = await Order.create({ total, status: 'pending' })
@@ -161,7 +169,7 @@ export default class CheckoutController {
 
   // Later, from your approval webhook — this completes & ships the run.
   async approve({ params, response }: HttpContext) {
-    await this.engine.signal(`approve:${params.id}`, { approved: true })
+    await engine.signal(`approve:${params.id}`, { approved: true })
     return response.noContent()
   }
 }
@@ -179,17 +187,21 @@ router.post('checkout/:id/approve', [CheckoutController, 'approve'])
 ```
 
 <Callout type="info">
-`CheckoutWorkflow.dispatch(input, { runId })` is the ergonomic equivalent of resolving the engine and calling
-`engine.start('checkout', input, runId)`, and `.start(input)` equals that followed by
-`await engine.waitForRun(runId)`. The `runId` acts as the idempotency key, so dispatching the same one twice is a
-no-op. Prefer injecting the engine directly? `engine.start(CheckoutWorkflow, input, runId)` is the lower-level form.
+`CheckoutWorkflow.dispatch(input, { runId })` is the ergonomic equivalent of
+`engine.start(CheckoutWorkflow, input, runId)` (a random UUID when you omit `runId`), and `.start(input)` equals that
+followed by `await engine.waitForRun(runId, { terminal: true })`, returning the run's `output`. The `runId` acts as the
+idempotency key, so dispatching the same one twice is a no-op. Called **inside** a running workflow, the same statics
+start a child instead (`.start` → `ctx.child`, `.dispatch` → `ctx.startChild`) — see
+[child workflows](/docs/durable/authoring/child-workflows).
 </Callout>
 
-Need the outcome inline? `CheckoutWorkflow.start(input)` **blocks the caller** until the run **settles** — a terminal state (completed/failed/cancelled/dead) or `suspended` — and returns the run's result:
+Need the outcome inline? `CheckoutWorkflow.start(input)` **blocks the caller** until the run reaches a **terminal** state (completed/failed/cancelled/dead) — it keeps waiting through `sleep`/`waitForSignal` suspensions — and returns the workflow's output:
 
 ```ts
-const result = await CheckoutWorkflow.start({ id: order.id, total: order.total }) // resolves when the run settles
+const output = await CheckoutWorkflow.start({ id: order.id, total: order.total }) // resolves when the run is terminal
 ```
+
+`engine.waitForRun(runId)` without `{ terminal: true }` resolves earlier, once the run **settles** — a terminal state or `suspended` — and returns the full `RunResult` (`status`, `output`, `error`). Pass `{ timeoutMs }` to bound the wait.
 
 <Callout type="warn">
 `.start` blocks the calling context until the run settles — great for scripts and short runs, but avoid it on a
@@ -203,4 +215,5 @@ That's it — a durable workflow whose dispatched step runs in-process, that pau
 - [Transports](/docs/durable/transports) — move steps to another process.
 - [State stores](/docs/durable/stores) — persist to Postgres with Lucid.
 - [The CLI](/docs/durable/cli) — run a worker, list runs, retry from the terminal.
-- [Observability](/docs/durable/observability/dashboard) — the control plane, OTel, and Telescope.
+- [Testing](/docs/durable/testing) — drive workflows deterministically in Japa/Vitest.
+- [Observability](/docs/durable/observability) — the dashboard, OTel, metrics, and Telescope.

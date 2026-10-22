@@ -1,6 +1,10 @@
 import type { Database } from '@adonisjs/lucid/database';
 import { afterEach, describe, expect, it } from 'vitest';
-import { createDurableTables, DURABLE_TABLES } from '../../../src/stores/lucid-schema.js';
+import {
+  createDurableTables,
+  DURABLE_SCHEMA_META_TABLE,
+  DURABLE_TABLES,
+} from '../../../src/stores/lucid-schema.js';
 import { dbBackends } from '../../support/backends.js';
 
 /**
@@ -31,6 +35,15 @@ function recordingLogger() {
  * its database right now. Built by creating the current schema and dropping the two columns, so it
  * tracks the real table rather than a hand-written replica that could itself drift.
  */
+/**
+ * Drop the schema marker, as on a database provisioned by a release before the fingerprint gate. The
+ * tests below change the tables by hand to imitate an older schema; with the marker left in place the
+ * gate would (correctly) trust it and skip the check.
+ */
+async function forgetSchemaMarker(db: Database): Promise<void> {
+  await db.connection().schema.dropTableIfExists(DURABLE_SCHEMA_META_TABLE);
+}
+
 async function withPreHeartbeatCheckpoints(db: Database): Promise<void> {
   await createDurableTables(db, undefined, { logger: { warn: () => {} } });
   await db.connection().schema.alterTable(DURABLE_TABLES.checkpoints, (table) => {
@@ -39,6 +52,7 @@ async function withPreHeartbeatCheckpoints(db: Database): Promise<void> {
   await db.connection().schema.alterTable(DURABLE_TABLES.checkpoints, (table) => {
     table.dropColumn('heartbeat_progress');
   });
+  await forgetSchemaMarker(db);
 }
 
 describe.each(dbBackends())('on $name', ({ makeMemoryDb }) => {
@@ -126,6 +140,7 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb }) => {
       await db.connection().schema.alterTable(DURABLE_TABLES.runs, (table) => {
         table.dropColumn('priority');
       });
+      await forgetSchemaMarker(db);
       const logger = recordingLogger();
 
       await createDurableTables(db, undefined, { logger });
@@ -135,6 +150,25 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb }) => {
       expect(warning).toContain(`${DURABLE_TABLES.runs}.priority`);
       expect(warning).toContain(`${DURABLE_TABLES.checkpoints}.parallel_group`);
       expect(warning).toContain(`${DURABLE_TABLES.checkpoints}.last_heartbeat_at`);
+    });
+
+    it('adds the remote-turn decision marker to a runs table created before it existed', async () => {
+      const db = await makeMemoryDb();
+      open.push(db);
+      await createDurableTables(db, undefined, { logger: { warn: () => {} } });
+      await db.connection().schema.alterTable(DURABLE_TABLES.runs, (table) => {
+        table.dropColumn('awaiting_decision_task_id');
+      });
+      await forgetSchemaMarker(db);
+      const logger = recordingLogger();
+
+      await createDurableTables(db, undefined, { logger });
+
+      expect(
+        await db.connection().schema.hasColumn(DURABLE_TABLES.runs, 'awaiting_decision_task_id'),
+      ).toBe(true);
+      expect(logger.warnings).toHaveLength(1);
+      expect(logger.warnings[0]).toContain(`${DURABLE_TABLES.runs}.awaiting_decision_task_id`);
     });
 
     it('defaults to console.warn so the boot path is audible without any plumbing', async () => {
@@ -199,6 +233,7 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb }) => {
       await createDurableTables(db, undefined, { logger: { warn: () => {} } });
       await db.rawQuery('drop index "durable_runs_created_idx"');
       await db.rawQuery('drop index "durable_signal_waiters_run_idx"');
+      await forgetSchemaMarker(db);
       const logger = recordingLogger();
 
       await createDurableTables(db, undefined, { logger });

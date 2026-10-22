@@ -58,9 +58,27 @@ export interface MetricsSnapshot {
 }
 ```
 
-### Serving a scrape endpoint
+### Counting across a fleet
 
-Create the collector **once**, at module scope, and serve `prometheus()` from a route:
+Both collectors count only the events their own instance produced. With a [control plane](/docs/durable/transports/control-plane), every instance also hears every other instance's events (that is how a dashboard pod live-tails a run on a worker), but those are counted where they happened. Scrape every pod and sum the series: each run and each step is counted once. (Before 0.51, every pod counted what it heard as well, so a sum over N pods read N times too high.) If you write your own collector on [`engine.subscribe`](/docs/durable/observability/events-and-interceptors#events-from-other-instances), skip `isRemoteEvent(event)` the same way.
+
+### The dashboard's scrape endpoint
+
+With the [dashboard](/docs/durable/observability/dashboard#live-queries-webhooks-and-metrics) mounted, `GET <path>/api/metrics` (new in 0.51) already serves a Prometheus exposition (`text/plain; version=0.0.4`), behind the console's guard. It is the `collectMetrics` counters of the process that answers, followed by gauges read at scrape time:
+
+| Gauge | Labels | Value |
+| --- | --- | --- |
+| `durable_pending_runs` | | runs waiting to be picked up (the dispatch backlog) |
+| `durable_running_runs` | | runs currently `running` |
+| `durable_dead_runs` | | runs in the [dead-letter queue](/docs/durable/reliability/dead-letter) |
+| `durable_group_queue_depth` | `group` | queued remote work per worker group |
+| `durable_group_live_workers` | `group` | live workers heartbeating for the group |
+
+`durable_group_queue_depth > 0` with `durable_group_live_workers == 0` is the alert: work is queued for a group nobody serves. The run-count gauges are store reads that every pod answers with the same number, so take them from **one** target (or use `max`), not a sum across pods. They are left out when the count fails (a control plane too old to answer it, read from a tenant pod) rather than reported as 0. The group gauges appear only when the transport reports worker health (BullMQ, queue and db today).
+
+### Serving a scrape endpoint yourself
+
+To serve the counters from your own route instead, create the collector **once**, at module scope, and serve `prometheus()` from a route:
 
 ```ts title="start/routes.ts"
 import router from '@adonisjs/core/services/router'

@@ -64,6 +64,111 @@ describe.each(dbBackends())('on $name', ({ makeStoreDb }) => {
     });
   });
 
+  for (const [label, makeStore] of [
+    [
+      'in-memory',
+      async () => ({ store: new InMemoryStateStore() as StateStore, close: async () => {} }),
+    ],
+    [
+      'Lucid',
+      async () => {
+        const db = await makeStoreDb();
+        return { store: new LucidStateStore(db) as StateStore, close: () => db.manager.closeAll() };
+      },
+    ],
+  ] as const) {
+    describe(`retention by count — maxCount (${label})`, () => {
+      it('keeps the newest maxCount runs of the status set within the scope', async () => {
+        const { store, close } = await makeStore();
+        try {
+          const engine = new WorkflowEngine({
+            store,
+            clock: () => 1_000_000,
+            retentionPolicies: [
+              { statuses: ['completed', 'failed'], maxCount: 2, scope: { namespace: 'acme' } },
+            ],
+          });
+          for (let i = 1; i <= 5; i += 1) {
+            await store.createRun(
+              run({
+                id: `acme-${i}`,
+                namespace: 'acme',
+                status: i % 2 ? 'completed' : 'failed',
+                createdAt: new Date(i * 1_000),
+              }),
+            );
+          }
+          // Outside the scope / not terminal: never counted, never deleted.
+          await store.createRun(run({ id: 'globex-1', namespace: 'globex' }));
+          await store.createRun(
+            run({ id: 'acme-live', namespace: 'acme', status: 'running', createdAt: new Date(1) }),
+          );
+
+          expect(await engine.sweepRetention()).toBe(3);
+          expect(await ids(store)).toEqual(['acme-4', 'acme-5', 'acme-live', 'globex-1']);
+        } finally {
+          await close();
+        }
+      });
+
+      it('composes with maxAge — a run goes once it is past either bound', async () => {
+        const { store, close } = await makeStore();
+        try {
+          const engine = new WorkflowEngine({
+            store,
+            clock: () => 100_000,
+            retentionPolicies: [
+              { statuses: ['completed'], maxAgeMs: 10_000, maxCount: 3, scope: {} },
+            ],
+          });
+          // Newest four: r4 is past the count; r3 is within it but too old.
+          await store.createRun(
+            run({ id: 'r1', createdAt: new Date(4_000), updatedAt: new Date(99_000) }),
+          );
+          await store.createRun(
+            run({ id: 'r2', createdAt: new Date(3_000), updatedAt: new Date(99_000) }),
+          );
+          await store.createRun(
+            run({ id: 'r3', createdAt: new Date(2_000), updatedAt: new Date(1_000) }),
+          );
+          await store.createRun(
+            run({ id: 'r4', createdAt: new Date(1_000), updatedAt: new Date(99_000) }),
+          );
+
+          expect(await engine.sweepRetention()).toBe(2);
+          expect(await ids(store)).toEqual(['r1', 'r2']);
+        } finally {
+          await close();
+        }
+      });
+
+      it('keeps a run that shares the last kept start millisecond; maxCount 0 keeps none', async () => {
+        const { store, close } = await makeStore();
+        try {
+          await store.createRun(run({ id: 'a', createdAt: new Date(5_000) }));
+          await store.createRun(run({ id: 'b', createdAt: new Date(5_000) }));
+          await store.createRun(run({ id: 'c', createdAt: new Date(1_000) }));
+          const keepOne = new WorkflowEngine({
+            store,
+            clock: () => 100_000,
+            retentionPolicies: [{ statuses: ['completed'], maxCount: 1, scope: {} }],
+          });
+          expect(await keepOne.sweepRetention()).toBe(1);
+          expect(await ids(store)).toEqual(['a', 'b']);
+          const keepNone = new WorkflowEngine({
+            store,
+            clock: () => 100_000,
+            retentionPolicies: [{ statuses: ['completed'], maxCount: 0, scope: {} }],
+          });
+          expect(await keepNone.sweepRetention()).toBe(2);
+          expect(await ids(store)).toEqual([]);
+        } finally {
+          await close();
+        }
+      });
+    });
+  }
+
   for (const [label, make] of [
     [
       'InMemoryStateStore',

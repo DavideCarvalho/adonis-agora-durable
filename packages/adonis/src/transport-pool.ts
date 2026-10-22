@@ -1,9 +1,12 @@
+import type { WorkerDescriptor } from './handshake/descriptor.js';
 import type {
   GroupHealth,
   Heartbeat,
   NamedTransport,
   RemoteTask,
   StepResult,
+  Transport,
+  WorkerHeartbeat,
   WorkflowStepEvent,
 } from './interfaces.js';
 
@@ -81,6 +84,47 @@ export class TransportPool {
     return [...groups];
   }
 
+  /** Whether any transport here can read the fleet's descriptor and heartbeat keyspaces. */
+  get introspectsFleet(): boolean {
+    return this.transports.some(
+      ({ transport }) => transport.readAllWorkerDescriptors || transport.readAllWorkerHeartbeats,
+    );
+  }
+
+  /** Every live worker descriptor, across every transport that can read them. */
+  async readAllWorkerDescriptors(): Promise<WorkerDescriptor[]> {
+    const out: WorkerDescriptor[] = [];
+    for (const { transport } of this.transports) {
+      if (transport.readAllWorkerDescriptors)
+        out.push(...(await transport.readAllWorkerDescriptors()));
+    }
+    return out;
+  }
+
+  /** Every live worker heartbeat, across every transport that can read them. */
+  async readAllWorkerHeartbeats(): Promise<WorkerHeartbeat[]> {
+    const out: WorkerHeartbeat[] = [];
+    for (const { transport } of this.transports) {
+      if (transport.readAllWorkerHeartbeats)
+        out.push(...(await transport.readAllWorkerHeartbeats()));
+    }
+    return out;
+  }
+
+  /**
+   * The first transport (in pool order) reporting a LIVE worker for `group` — the one a
+   * convention-routed remote workflow must dispatch on. In a mixed pool each transport scans a
+   * different keyspace, so dispatching on the first transport while the worker heartbeats on another
+   * parks the task on a queue nobody consumes. `undefined` when no transport reports the group.
+   */
+  async transportWithLiveGroup(group: string): Promise<Transport | undefined> {
+    for (const { transport } of this.transports) {
+      if (!transport.listWorkerGroups) continue;
+      if ((await transport.listWorkerGroups()).includes(group)) return transport;
+    }
+    return undefined;
+  }
+
   /**
    * Propagate the engine's `namespace` to every transport that partitions by it — so the same
    * namespace that scopes the store also scopes each transport's queues/keys. A transport that
@@ -104,8 +148,20 @@ export class TransportPool {
   /** Pinned `preferId` first, then the rest (failover order). */
   private ordered(preferId?: string): NamedTransport[] {
     if (!preferId) return this.transports;
-    const pref = this.transports.filter((t) => t.id === preferId);
-    if (pref.length === 0) throw new Error(`transport "${preferId}" is not registered`);
-    return [...pref, ...this.transports.filter((t) => t.id !== preferId)];
+    let pref = this.transports.filter((t) => t.id === preferId);
+    // `default` is the id a single-transport engine stamped on its tasks: a task persisted under it
+    // (re-dispatched after an upgrade that named the pool) still means the primary transport.
+    if (pref.length === 0 && preferId === 'default' && this.transports[0]) {
+      pref = [this.transports[0]];
+    }
+    if (pref.length === 0) {
+      const ids = this.transports.map((t) => `"${t.id}"`).join(', ') || 'none';
+      throw new Error(
+        `transport "${preferId}" is not registered on this engine (registered: ${ids}). ` +
+          `To pin steps to it, build it into the pool: list it in \`transportPool\` in ` +
+          `config/durable.ts (or pass it in the WorkflowEngine \`transports\` option).`,
+      );
+    }
+    return [...pref, ...this.transports.filter((t) => !pref.includes(t))];
   }
 }

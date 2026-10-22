@@ -8,7 +8,9 @@
 
 import type { ConcurrencyConfig } from './concurrency.js';
 import type { SingletonConfig } from './engine.js';
+import type { SearchAttributesSchema } from './interfaces.js';
 import type { ScheduledWorkflow, WorkflowScheduleConfig } from './scheduler.js';
+import type { StandardSchemaV1 } from './standard-schema.js';
 
 /** Options for a workflow's `static workflow = { name, version, … }` config (see {@link BaseWorkflow}). */
 export interface WorkflowOptions {
@@ -54,6 +56,28 @@ export interface WorkflowOptions {
    * `onError: [{ code: InvalidLine, workflow: LineDeadLetterWorkflow }]`.
    */
   onError?: { code?: string | { readonly code: string }; workflow: WorkflowRef }[];
+  /**
+   * Where a run of this workflow that goes `dead` (past `maxRecoveryAttempts`) is handed: the engine
+   * starts this workflow with a `DeadLetter` input (`{ deadRunId, workflow, input, error }`) under
+   * the run id `dlq:<deadRunId>`, in the dead run's namespace. Overrides the config-level
+   * `deadLetterWorkflow`. A class can instead define a `deadLetter(ctx, dead)` method (registered as
+   * `<name>.dlq`); declaring both is an error at boot.
+   */
+  deadLetterWorkflow?: WorkflowRef;
+  /**
+   * Validate the run input at start against any Standard Schema (zod, valibot, arktype, …). A bad
+   * payload throws a `SchemaValidationError` from `start` and no run is created (an `onEvent`
+   * trigger with a rejected payload simply doesn't start this workflow). The schema's OUTPUT value
+   * (parsed / coerced / defaulted) is what the run stores and `run(ctx, input)` receives.
+   */
+  inputSchema?: StandardSchemaV1;
+  /**
+   * The run's typed search-attributes shape (a {@link SearchAttributesSchema}): every
+   * `ctx.upsertSearchAttributes` validates the merged attributes against it and rejects a
+   * non-conforming write. Pair with `run(ctx: WorkflowCtx<InferSearchAttributes<typeof schema>>)`
+   * for compile-time typing, and read them back typed with `attributesOf(WorkflowClass, run)`.
+   */
+  searchAttributes?: SearchAttributesSchema;
 }
 
 /** The metadata read off a workflow class's `static workflow` config for discovery + registration. */

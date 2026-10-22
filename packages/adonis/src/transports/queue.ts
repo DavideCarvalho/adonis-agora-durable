@@ -20,7 +20,7 @@ import {
   type WorkflowTask,
 } from '../interfaces.js';
 import { atLeastOne, Pollers, type PollLoop } from '../pollers.js';
-import { runStepHandler, type StepHandler } from '../protocol.js';
+import { runStepHandler, type StepHandler, withTurnHeartbeat } from '../protocol.js';
 import { sanitizeQueueToken, tenantGroup } from '../tenant-group.js';
 import type { DescriptorRedis } from '../worker-runtime/registry.js';
 import { isWorkflowTask, type WorkflowTurnHandler } from '../workflow-turn.js';
@@ -41,7 +41,7 @@ import {
   runRepliesQueue,
   tenantEventsQueue,
 } from './queue-remote.js';
-import { failedTaskIdentity, infrastructureFailure } from './task-failure.js';
+import { failedTaskIdentity, fanOutDecision, infrastructureFailure } from './task-failure.js';
 import {
   cachedLiveKeys,
   descriptorsOn,
@@ -429,7 +429,7 @@ export class QueueTransport implements Transport, ControlPlane {
   readonly #liveWorkerKeys: () => Promise<{ key: string; value: string }[]>;
   /** Workflow turn consumers by workflow name — a `workflow`-shaped task job routes here. */
   readonly #workflowTurns = new Map<string, WorkflowTurnHandler>();
-  /** Every `onDecision` handler: each `RemoteWorkflowExecutor` resolves only its own task ids. */
+  /** Every `onDecision` handler (an engine subscribes one; it applies a decision by run id). */
   readonly #decisionHandlers = new Set<(decision: WorkflowDecision) => Promise<void>>();
   #decisionsLoop = false;
   #stepEventsLoop = false;
@@ -825,7 +825,11 @@ export class QueueTransport implements Transport, ControlPlane {
     const turn = this.#workflowTurns.get(task.workflow);
     try {
       decision = turn
-        ? await turn(task)
+        ? await withTurnHeartbeat(
+            task,
+            (beat) => this.heartbeat(beat),
+            () => turn(task),
+          )
         : {
             taskId: task.taskId,
             runId: task.runId,
@@ -912,8 +916,8 @@ export class QueueTransport implements Transport, ControlPlane {
 
   /**
    * engine ← workflow worker: consume {@link WorkflowDecision}s from `${P}:decisions`. ONE loop per
-   * transport; every registered handler sees every decision (each `RemoteWorkflowExecutor` keeps its own
-   * pending task ids and ignores the rest), so several remote workflows can share the transport.
+   * transport; every registered handler sees every decision (the engine applies one by run id and drops
+   * any its run no longer awaits), so several remote workflows can share the transport.
    */
   onDecision(handler: (decision: WorkflowDecision) => Promise<void>): void {
     this.#decisionHandlers.add(handler);
@@ -923,8 +927,8 @@ export class QueueTransport implements Transport, ControlPlane {
       this.#decisionsQueue(),
       async (job) => {
         const decision = fromJson<WorkflowDecision>(job.payload);
-        // Every handler, concurrently, as on bullmq: one that throws must not starve the rest.
-        await Promise.all([...this.#decisionHandlers].map((h) => h(decision)));
+        // Every handler, concurrently; all settle before a failure redelivers the decision.
+        await fanOutDecision(this.#decisionHandlers, decision, this.#onError);
       },
       { idleBackoffMax: 1 },
     );

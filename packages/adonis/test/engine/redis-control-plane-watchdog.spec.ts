@@ -152,6 +152,17 @@ describe('RedisControlPlane subscriber watchdog', () => {
     expect(sub.disconnects).toEqual([false]); // close()'s teardown only — no reconnect
   });
 
+  it('a negative, non-finite or overflowing pingIntervalMs falls back to the default (no hot loop)', async () => {
+    for (const bad of [-5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31]) {
+      const sub = new FakeSub();
+      const plane = new RedisControlPlane({ connection: connFor(sub), pingIntervalMs: bad });
+      plane.onControl(() => {});
+      await delay(40);
+      expect(sub.pings, String(bad)).toBe(0);
+      await plane.close();
+    }
+  });
+
   it('close() stops the watchdog', async () => {
     const sub = new FakeSub();
     const plane = new RedisControlPlane({ connection: connFor(sub), pingIntervalMs: 10 });
@@ -162,5 +173,49 @@ describe('RedisControlPlane subscriber watchdog', () => {
     const after = sub.pings;
     await delay(50);
     expect(sub.pings).toBe(after);
+  });
+});
+
+describe('RedisControlPlane subscriber watchdog — @adonisjs/redis connection', () => {
+  /**
+   * An `@adonisjs/redis` `RedisConnection` stand-in: no `duplicate()`, `subscribe(channel, handler)`,
+   * and the ioredis subscriber it creates on the first subscribe exposed as `ioSubscriberConnection`
+   * (a public field of the package's AbstractConnection).
+   */
+  function adonisConn(sub: FakeSub) {
+    const conn: {
+      publish: () => undefined;
+      subscribe: (channel: string, handler: (m: string) => void) => undefined;
+      ioSubscriberConnection?: FakeSub;
+    } = {
+      publish: () => undefined,
+      subscribe: () => {
+        conn.ioSubscriberConnection = sub;
+        return undefined;
+      },
+    };
+    return conn;
+  }
+
+  it("reconnects the connection's subscriber when its PING rejects", async () => {
+    const sub = new FakeSub();
+    sub.pingImpl = () => Promise.reject(new Error('connection is closed'));
+    const plane = new RedisControlPlane({ connection: adonisConn(sub), pingIntervalMs: 10 });
+    plane.onControl(() => {});
+    await until(() => sub.disconnects.length > 0);
+    expect(sub.disconnects[0]).toBe(true);
+    await plane.close();
+  });
+
+  it('close() stops the watchdog without disconnecting the app-owned connection', async () => {
+    const sub = new FakeSub();
+    const plane = new RedisControlPlane({ connection: adonisConn(sub), pingIntervalMs: 10 });
+    plane.onControl(() => {});
+    await until(() => sub.pings > 0);
+    await plane.close();
+    const after = sub.pings;
+    await delay(50);
+    expect(sub.pings).toBe(after);
+    expect(sub.disconnects).toEqual([]); // the connection belongs to @adonisjs/redis
   });
 });

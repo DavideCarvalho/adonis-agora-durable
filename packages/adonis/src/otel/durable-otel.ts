@@ -7,6 +7,7 @@ import {
   trace,
 } from '@opentelemetry/api';
 import type { EngineEvent, WorkflowEngine } from '../index.js';
+import { isRemoteEvent } from '../remote-event.js';
 
 export interface DurableOtelOptions {
   /** Tracer to use. Defaults to one from the global provider (or `provider` if given). */
@@ -51,6 +52,9 @@ export function attachDurableOtel(
   };
 
   return engine.subscribe((event) => {
+    // Spans come from the instance that ran the work; another instance's events, re-delivered here
+    // over the control plane, would open a duplicate trace of the same run on every pod.
+    if (isRemoteEvent(event)) return;
     switch (event.type) {
       case 'run.started': {
         const span = tracer.startSpan(`workflow ${event.workflow ?? '?'}`, {

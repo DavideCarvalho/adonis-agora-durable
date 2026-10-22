@@ -5,6 +5,7 @@ import type {
   StepEvent,
   WorkflowRun,
 } from '../interfaces.js';
+import { normalizeNamespace } from '../namespaces.js';
 
 /**
  * Row shapes as they live in the durable tables: snake_case columns, JSON payloads stored as TEXT
@@ -33,6 +34,8 @@ export interface RunRow {
   tags: string | null;
   search_attributes: string | null;
   priority: number | string | null;
+  /** Nullable + optional: the column arrived in a later schema wave (multi-instance remote decisions). */
+  awaiting_decision_task_id?: string | null;
   created_at: number | string;
   updated_at: number | string;
 }
@@ -70,11 +73,79 @@ function toJson(value: unknown): string | null {
   return JSON.stringify(value);
 }
 
-/** Parse a TEXT JSON column back to its value, treating NULL/empty as "absent". */
-function fromJson<T>(value: string | null): T | undefined {
-  if (value == null) return undefined;
-  return JSON.parse(value) as T;
+/** Where a column held text that is not JSON — see {@link parseJsonColumn}. */
+export interface CorruptJsonColumn {
+  /** `<table>.<column>`, e.g. `durable_step_checkpoints.events`. */
+  column: string;
+  /** The row's key: a run id, `runId#seq`, a schedule id, a buffered row id. */
+  row: string;
+  /** The parse error's message. */
+  message: string;
 }
+
+/** Rows already reported, so a dashboard polling a broken run logs it once, not every 2 seconds. */
+const reportedCorruptRows = new Set<string>();
+const REPORTED_CORRUPT_ROWS_MAX = 1_000;
+
+let corruptJsonReporter: (info: CorruptJsonColumn) => void = (info) => {
+  console.warn(
+    `@adonis-agora/durable: ${info.column} of row ${info.row} is not valid JSON (${info.message}); it reads back as undefined. A MySQL \`text\` column cut off at 64KB does this: the schema check widens the column to longtext, but a value cut off before that is lost.`,
+  );
+};
+
+/**
+ * Route the corrupt-column report of the Lucid store (default: one `console.warn` per row and
+ * column) — to a logger or an error tracker; the store keeps reading either way. Returns the
+ * previous reporter. Installing one resets the once-per-row memory.
+ */
+export function onCorruptJsonColumn(
+  reporter: (info: CorruptJsonColumn) => void,
+): (info: CorruptJsonColumn) => void {
+  const previous = corruptJsonReporter;
+  corruptJsonReporter = reporter;
+  // A new sink hears about every damaged row, including ones the previous sink was told about.
+  reportedCorruptRows.clear();
+  return previous;
+}
+
+/**
+ * Parse a TEXT JSON column back to its value, treating NULL as "absent". A value that is not JSON — a
+ * MySQL `text` column cut off at 64KB before the schema used `longtext`, or a row edited by hand —
+ * reads back as `undefined` and is reported once (see {@link onCorruptJsonColumn}) instead of
+ * throwing: a throw here fails every read that touches the row, so one broken checkpoint used to take
+ * down `listRuns`, the dashboard and the run detail, not just its own field.
+ */
+export function parseJsonColumn<T>(
+  value: string | null | undefined,
+  column: string,
+  row: string,
+): T | undefined {
+  if (value == null) return undefined;
+  // A driver may already hand back a parsed value (a native JSON column).
+  if (typeof value !== 'string') return value as T;
+  try {
+    return JSON.parse(value) as T;
+  } catch (err) {
+    const key = `${column}\u0000${row}`;
+    if (!reportedCorruptRows.has(key)) {
+      if (reportedCorruptRows.size >= REPORTED_CORRUPT_ROWS_MAX) reportedCorruptRows.clear();
+      reportedCorruptRows.add(key);
+      try {
+        corruptJsonReporter({
+          column,
+          row,
+          message: err instanceof Error ? err.message : String(err),
+        });
+      } catch {
+        /* a reporter must not break the read it reports on */
+      }
+    }
+    return undefined;
+  }
+}
+
+const RUNS = 'durable_workflow_runs';
+const CHECKPOINTS = 'durable_step_checkpoints';
 
 /** Coerce a possibly-stringified numeric column (some drivers return bigints as strings) to a number. */
 function toNum(value: number | string | null | undefined): number | undefined {
@@ -96,9 +167,9 @@ export function runToRow(run: WorkflowRun): RunRow {
     workflow: run.workflow,
     workflow_version: run.workflowVersion,
     status: run.status,
-    // Persist the partition, defaulting an absent one to 'default' (matches the column DEFAULT) so
-    // every row is reachable by a namespace='default' filter.
-    namespace: run.namespace ?? 'default',
+    // Persist the partition, defaulting an absent (or '') one to 'default' (matches the column
+    // DEFAULT) so every default-pool row is reachable by a namespace='default' filter.
+    namespace: normalizeNamespace(run.namespace),
     origin: run.origin ?? null,
     input: toJson(run.input),
     output: toJson(run.output),
@@ -110,6 +181,11 @@ export function runToRow(run: WorkflowRun): RunRow {
     tags: toJson(run.tags),
     search_attributes: toJson(run.searchAttributes),
     priority: run.priority ?? null,
+    // Only when set: a fresh run never awaits a turn, and leaving the column out of the INSERT keeps
+    // run creation working on a schema that predates it (`autoSchema: false`, migrations not re-run).
+    ...(run.awaitingDecisionTaskId !== undefined
+      ? { awaiting_decision_task_id: run.awaitingDecisionTaskId }
+      : {}),
     created_at: run.createdAt.getTime(),
     updated_at: run.updatedAt.getTime(),
   };
@@ -126,7 +202,7 @@ export function runPatchToRow(patch: Partial<WorkflowRun>): Partial<RunRow> {
   if ('workflow' in patch) row.workflow = patch.workflow;
   if ('workflowVersion' in patch) row.workflow_version = patch.workflowVersion;
   if ('status' in patch) row.status = patch.status;
-  if ('namespace' in patch) row.namespace = patch.namespace ?? 'default';
+  if ('namespace' in patch) row.namespace = normalizeNamespace(patch.namespace);
   if ('origin' in patch) row.origin = patch.origin ?? null;
   if ('input' in patch) row.input = toJson(patch.input);
   if ('output' in patch) row.output = toJson(patch.output);
@@ -138,6 +214,9 @@ export function runPatchToRow(patch: Partial<WorkflowRun>): Partial<RunRow> {
   if ('tags' in patch) row.tags = toJson(patch.tags);
   if ('searchAttributes' in patch) row.search_attributes = toJson(patch.searchAttributes);
   if ('priority' in patch) row.priority = patch.priority ?? null;
+  if ('awaitingDecisionTaskId' in patch) {
+    row.awaiting_decision_task_id = patch.awaitingDecisionTaskId ?? null;
+  }
   if (patch.createdAt != null) row.created_at = patch.createdAt.getTime();
   if (patch.updatedAt != null) row.updated_at = patch.updatedAt.getTime();
   return row;
@@ -149,14 +228,14 @@ export function rowToRun(row: RunRow): WorkflowRun {
     workflow: row.workflow,
     workflowVersion: row.workflow_version,
     status: row.status as WorkflowRun['status'],
-    input: fromJson(row.input),
-    namespace: row.namespace ?? 'default',
+    input: parseJsonColumn(row.input, `${RUNS}.input`, row.id),
+    namespace: normalizeNamespace(row.namespace),
     createdAt: new Date(toNumOr0(row.created_at)),
     updatedAt: new Date(toNumOr0(row.updated_at)),
   };
-  const output = fromJson(row.output);
+  const output = parseJsonColumn(row.output, `${RUNS}.output`, row.id);
   if (output !== undefined) run.output = output;
-  const error = fromJson<StepError>(row.error);
+  const error = parseJsonColumn<StepError>(row.error, `${RUNS}.error`, row.id);
   if (error !== undefined) run.error = error;
   const wakeAt = toNum(row.wake_at);
   if (wakeAt !== undefined) run.wakeAt = wakeAt;
@@ -166,12 +245,19 @@ export function rowToRun(row: RunRow): WorkflowRun {
   if (lockedUntil !== undefined) run.lockedUntil = lockedUntil;
   const recoveryAttempts = toNum(row.recovery_attempts);
   if (recoveryAttempts !== undefined) run.recoveryAttempts = recoveryAttempts;
-  const tags = fromJson<string[]>(row.tags);
+  const tags = parseJsonColumn<string[]>(row.tags, `${RUNS}.tags`, row.id);
   if (tags !== undefined) run.tags = tags;
-  const searchAttributes = fromJson<WorkflowRun['searchAttributes']>(row.search_attributes);
+  const searchAttributes = parseJsonColumn<WorkflowRun['searchAttributes']>(
+    row.search_attributes,
+    `${RUNS}.search_attributes`,
+    row.id,
+  );
   if (searchAttributes !== undefined) run.searchAttributes = searchAttributes;
   const priority = toNum(row.priority);
   if (priority !== undefined) run.priority = priority;
+  if (row.awaiting_decision_task_id != null) {
+    run.awaitingDecisionTaskId = row.awaiting_decision_task_id;
+  }
   return run;
 }
 
@@ -201,6 +287,7 @@ export function checkpointToRow(cp: StepCheckpoint): CheckpointRow {
 }
 
 export function rowToCheckpoint(row: CheckpointRow): StepCheckpoint {
+  const key = `${row.run_id}#${row.seq}`;
   const cp: StepCheckpoint = {
     runId: row.run_id,
     seq: toNumOr0(row.seq),
@@ -208,17 +295,17 @@ export function rowToCheckpoint(row: CheckpointRow): StepCheckpoint {
     kind: row.kind as StepCheckpoint['kind'],
     stepId: row.step_id,
     status: row.status as StepCheckpoint['status'],
-    input: fromJson(row.input),
+    input: parseJsonColumn(row.input, `${CHECKPOINTS}.input`, key),
     attempts: toNumOr0(row.attempts),
     enqueuedAt: new Date(toNum(row.enqueued_at) ?? toNumOr0(row.started_at)),
     startedAt: new Date(toNumOr0(row.started_at)),
     finishedAt: new Date(toNumOr0(row.finished_at)),
   };
-  const output = fromJson(row.output);
+  const output = parseJsonColumn(row.output, `${CHECKPOINTS}.output`, key);
   if (output !== undefined) cp.output = output;
-  const error = fromJson<StepError>(row.error);
+  const error = parseJsonColumn<StepError>(row.error, `${CHECKPOINTS}.error`, key);
   if (error !== undefined) cp.error = error;
-  const events = fromJson<StepEvent[]>(row.events);
+  const events = parseJsonColumn<StepEvent[]>(row.events, `${CHECKPOINTS}.events`, key);
   if (events !== undefined) cp.events = events;
   if (row.worker_group != null) cp.workerGroup = row.worker_group;
   if (row.queue != null) cp.queue = row.queue;
@@ -227,7 +314,11 @@ export function rowToCheckpoint(row: CheckpointRow): StepCheckpoint {
   if (row.parallel_group != null) cp.parallelGroup = row.parallel_group;
   const lastHeartbeatAt = toNum(row.last_heartbeat_at);
   if (lastHeartbeatAt !== undefined) cp.lastHeartbeatAt = new Date(lastHeartbeatAt);
-  const heartbeatProgress = fromJson(row.heartbeat_progress ?? null);
+  const heartbeatProgress = parseJsonColumn(
+    row.heartbeat_progress,
+    `${CHECKPOINTS}.heartbeat_progress`,
+    key,
+  );
   if (heartbeatProgress !== undefined) cp.heartbeatProgress = heartbeatProgress;
   return cp;
 }
