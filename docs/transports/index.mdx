@@ -84,18 +84,27 @@ Several replicas can still share `eventEmitter` + a shared Lucid store **when ev
 
 ## Transport pools and failover
 
-`config/durable.ts` builds **one** transport per process: the `transport` you select. The provider hands it to the engine as a one-entry pool with the id `default`, and the other entries of `transports` are never built.
+A single instance can dispatch over an ordered pool of named transports and fail over between them; a step pins one with `ctx.step(step, input, { transport: id })`. In `config/durable.ts`, only `transport` is built by default (the rest of `transports` is a menu); list the others to build into the pool in `transportPool`, in failover order. Each one gets the same consumer deferral, namespace and shutdown as `transport`:
 
-The engine itself can dispatch over an ordered **pool** of named transports, but only when you construct a `WorkflowEngine` yourself and pass `transports: [{ id, transport }, …]` instead of `transport`. It dispatches each step on the first transport and fails over to the next on a dispatch error, throwing only when every one fails. A step pins one by id, tried first with the rest as failover:
+```ts title="config/durable.ts"
+export default defineConfig({
+  transport: 'queue',
+  transportPool: ['db'], // built alongside 'queue'; the engine falls over to it on a dispatch error
+  transports: {
+    queue: transports.queue({ connection: 'redis' }),
+    db: transports.db(),
+  },
+})
+```
+
+When you construct a `WorkflowEngine` yourself, pass `transports: [{ id, transport }, …]` instead of `transport`. Either way the engine dispatches each step on the first transport and fails over to the next on a dispatch error, throwing only when every one fails. A step pins one by id, tried first with the rest as failover:
 
 ```ts
-// only with an engine built with transports: [{ id: 'redis', … }, { id: 'db', … }]
+// 'db' must be in the pool (transportPool, or transports: [...] on a hand-built engine)
 const result = await ctx.step(heavyStep, input, { transport: 'db' })
 ```
 
-<Callout type="warn" title="Don't pin a transport in a config-driven app">
-With the provider's engine the only id is `default`. A `{ transport: 'db' }` pin there fails the dispatch with `transport "db" is not registered`, even when `config.transports` has a `db` entry.
-</Callout>
+A pin names a transport by its key in `transports` (`default` still means the primary `transport`). Pinning one the engine didn't build fails the step with an error that lists the transports it has and points at `transportPool`.
 
 The id of the transport that accepted the dispatch is stamped on the task as `task.transport`, so a worker consuming several transports replies on the **matching** one, and the engine registers its result and heartbeat handlers on every transport of the pool. Failover is symmetric. Worker health (`groupHealth`) and the worker directory are merged across every transport of the pool.
 

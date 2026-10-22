@@ -201,7 +201,7 @@ The transport runs one shared watchdog that `PING`s every subscriber connection 
 
 Each subscriber connection also gets an `error` listener. The first error of each reconnect burst goes to `onError`, or to `console.warn` without one, instead of surfacing as an unhandled `error` event.
 
-A real close (a Redis restart, `CLIENT KILL`) needs no watchdog: ioredis reconnects and resubscribes by itself. The watchdog is for the silent drop. A `RedisControlPlane` built on a raw ioredis instance runs the same watchdog on its control channel; the `controlPlanes.redis()` factory form, which rides an `@adonisjs/redis` connection, does not (see [Control plane](/docs/durable/transports/control-plane#subscriber-health)).
+A real close (a Redis restart, `CLIENT KILL`) needs no watchdog: ioredis reconnects and resubscribes by itself. The watchdog is for the silent drop. A `RedisControlPlane` runs the same watchdog on its control channel, in both its raw-ioredis and `controlPlanes.redis()` forms (see [Control plane](/docs/durable/transports/control-plane#subscriber-health)).
 
 ## Beyond steps
 
