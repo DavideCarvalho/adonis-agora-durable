@@ -1305,7 +1305,7 @@ export interface Transport {
    *  after the engine drains, so a deploy hands off instead of leaving the broker to time out. */
   close?(): Promise<void>;
   /** engine → workflow worker: dispatch a {@link WorkflowTask} (the polyglot-workflow path). Optional
-   *  — only transports that carry workflow tasks (BullMQ, queue) implement it; the {@link RemoteWorkflowExecutor}
+   *  — only transports that carry workflow tasks (BullMQ, queue, db) implement it; the {@link RemoteWorkflowExecutor}
    *  uses it + {@link onDecision} to advance a remote workflow over the broker. */
   dispatchWorkflowTask?(task: WorkflowTask): Promise<void>;
   /** workflow worker → engine: a replayed turn's {@link WorkflowDecision}. Pair with dispatchWorkflowTask. */
@@ -1338,11 +1338,12 @@ export interface Transport {
 
   // -------------------------------------------------------------------------
   // P4 — store-less read/control/start protocol (spec §6.2, §8). All OPTIONAL:
-  // only broker transports that carry the hosted-control-plane protocol (BullMQ, queue) implement them,
+  // only broker transports that carry the hosted-control-plane protocol (BullMQ, queue, db) implement them,
   // so a caller capability-checks (`transport.dispatchRunRequest?.(…)`) before wiring the proxy/responder.
   // start-run & run-request ride QUEUES (durable, one consumer); on BullMQ run-reply & tenant-events
   // ride Redis PUB/SUB (fan-out) — the same substrate `RedisControlPlane` uses (spec §6 note) — and on
-  // the `@adonisjs/queue` transport they ride per-instance inbox queues (`transports/queue-remote.ts`).
+  // the `@adonisjs/queue` transport they ride per-instance inbox queues (`transports/queue-remote.ts`);
+  // on the db transport they are rows addressed to one instance (`transports/db-remote.ts`).
   // -------------------------------------------------------------------------
 
   /** tenant → control plane: publish a {@link StartRunMessage} on `${P}-start-run` (queue, job

@@ -289,7 +289,17 @@ export interface DbTransportConfig {
    * How long (ms) `close()` waits for in-flight work before handing every claim it still holds back
    * to the table, uncounted, for another worker to pick up at once. Default 5000.
    */
-  closeTimeoutMs?: number;
+  closeTimeoutMs?: number /**
+   * Remote workflows and store-less tenant pods: TTL (ms) of the keys an instance writes to say it
+   * consumes the rows addressed to it (replies, tenant events, decisions) and which tenants' events it
+   * wants, re-written every third of it. Default 30000.
+   */;
+  inboxTtlMs?: number;
+  /** How long a publisher reuses its read of a tenant's live event subscribers (ms). Default 1000. */
+  tenantSubscribersCacheMs?: number;
+  /** How often (ms) an instance deletes the rows it addressed to instances that are gone. Default
+   *  30000; `0` off. */
+  inboxSweepIntervalMs?: number;
 }
 
 /**
@@ -477,6 +487,13 @@ export const transports = {
         ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
         ...(config.onError !== undefined ? { onError: config.onError } : {}),
         ...(config.closeTimeoutMs !== undefined ? { closeTimeoutMs: config.closeTimeoutMs } : {}),
+        ...(config.inboxTtlMs !== undefined ? { inboxTtlMs: config.inboxTtlMs } : {}),
+        ...(config.tenantSubscribersCacheMs !== undefined
+          ? { tenantSubscribersCacheMs: config.tenantSubscribersCacheMs }
+          : {}),
+        ...(config.inboxSweepIntervalMs !== undefined
+          ? { inboxSweepIntervalMs: config.inboxSweepIntervalMs }
+          : {}),
       });
     };
   },

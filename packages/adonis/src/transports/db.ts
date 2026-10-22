@@ -11,15 +11,23 @@ import {
   type GroupHealth,
   type Heartbeat,
   type RemoteTask,
+  type RunReply,
+  type RunRequest,
+  type StartRunMessage,
   type StepResult,
+  type TenantEvent,
   type Transport,
   type WorkerHeartbeat,
   type WorkerStatus,
+  type WorkflowDecision,
+  type WorkflowStepEvent,
+  type WorkflowTask,
 } from '../interfaces.js';
 import { atLeastOne, Pollers, type PollLoop } from '../pollers.js';
 import { runStepHandler, type StepHandler } from '../protocol.js';
 import { sanitizeQueueToken, tenantGroup } from '../tenant-group.js';
 import type { DescriptorRedis } from '../worker-runtime/registry.js';
+import type { WorkflowTurnHandler } from '../workflow-turn.js';
 import { AdaptiveController, type ConcurrencyOption } from './adaptive-concurrency.js';
 import { effectivePrefix, workerHeartbeatKey } from './bullmq/naming.js';
 import {
@@ -28,7 +36,18 @@ import {
   WORKER_HEARTBEAT_INTERVAL_MS,
   WORKER_HEARTBEAT_TTL_SECONDS,
 } from './bullmq/serialization.js';
-import { createDurableTransportTables, TRANSPORT_TABLES } from './db-schema.js';
+import {
+  DbInboxRegistry,
+  DEFAULT_DB_INBOX_SWEEP_INTERVAL_MS,
+  DEFAULT_DB_INBOX_TTL_MS,
+  DEFAULT_DB_TENANT_SUBSCRIBERS_CACHE_MS,
+} from './db-remote.js';
+import {
+  createDurableTransportTables,
+  MESSAGE_KINDS,
+  type MessageKind,
+  TRANSPORT_TABLES,
+} from './db-schema.js';
 import { infrastructureFailure } from './task-failure.js';
 import {
   cachedLiveKeys,
@@ -93,11 +112,25 @@ export function toDbPriority(priority?: number): number {
 }
 
 /** The task-table columns added after the first release that the transport adapts to. */
-type TaskColumn = 'reclaims' | 'priority';
-const MISSING_COLUMN_EFFECT: Record<TaskColumn, string> = {
-  reclaims: 'poison tasks are not bounded (maxStalledCount is off)',
-  priority: 'dispatch priority is ignored and tasks are claimed oldest first',
+type TaskColumn = 'reclaims' | 'priority' | 'kind';
+const MISSING_COLUMN: Record<TaskColumn, { effect: string; ddl: string }> = {
+  reclaims: {
+    effect: 'poison tasks are not bounded (maxStalledCount is off)',
+    ddl: 'integer, not null, default 0',
+  },
+  priority: {
+    effect: 'dispatch priority is ignored and tasks are claimed oldest first',
+    ddl: 'integer, not null, default 0',
+  },
+  kind: {
+    effect: 'remote workflow turns cannot be dispatched on it',
+    ddl: "string, not null, default 'step'",
+  },
 };
+
+/** A workflow turn as stored in a task row's `input`: the {@link WorkflowTask} plus the instance its
+ *  decision is addressed to (stripped before the turn runs). */
+type WorkflowTaskPayload = WorkflowTask & { replyTo?: string };
 
 type Client = QueryClientContract | TransactionClientContract;
 
@@ -115,6 +148,8 @@ interface TaskRow {
   attempt: number;
   /** Absent on a legacy table without the column (and `autoCreate: false`). */
   reclaims?: number | string | null;
+  /** `step` or `workflow`; absent on a legacy table (every row is a step there). */
+  kind?: string | null;
 }
 interface ResultRow {
   step_id: string;
@@ -136,6 +171,18 @@ interface HeartbeatRow {
 interface ControlRow {
   id: number;
   payload: string;
+}
+interface MessageRow {
+  id: number;
+  kind: string;
+  recipient: string;
+  reply_to: string | null;
+  payload: string;
+}
+/** Narrows a messages-table claim to one `kind`, addressed to any of `recipients` (`''` = anyone). */
+interface MessageScope {
+  kind: MessageKind;
+  recipients: string[];
 }
 
 const DEFAULT_LOG = (err: unknown): void => console.error('[DbTransport] poll failed', err);
@@ -235,6 +282,19 @@ export interface DbTransportOptions {
   workerKeysCacheMs?: number;
   /** Stable id for this process (stamped on heartbeats / control `from` / `claimed_by`). Default random. */
   instanceId?: string;
+  /**
+   * Store-less protocol and remote workflows: TTL (ms) of the keys an instance writes to say it is
+   * consuming its addressed rows (run replies, tenant events, decisions) and which tenants' events it
+   * wants, re-written every third of it. A publisher addresses rows only to live subscribers, and the
+   * janitor deletes rows addressed to an instance whose key expired. Default 30000.
+   */
+  inboxTtlMs?: number;
+  /** How long a publisher reuses its read of a tenant's live event subscribers (ms). A subscription
+   *  made within this window of an event may miss it. Default 1000; `0` reads on every event. */
+  tenantSubscribersCacheMs?: number;
+  /** How often (ms) an instance that addressed rows deletes those whose recipient is gone (a dead pod,
+   *  an engine that crashed awaiting a decision). Default 30000; `0` disables the janitor. */
+  inboxSweepIntervalMs?: number;
 }
 
 /**
@@ -253,6 +313,12 @@ export interface DbTransportOptions {
  * workflow/pipeline scale (modest rate, long steps), not for high-fanout firehoses. The
  * {@link ControlPlane} here is single-consumer (one row → one poller), correct for a single engine
  * instance but NOT a true broadcast.
+ *
+ * It also carries remote workflow turns (`dispatchWorkflowTask` / `handleWorkflow` / `onDecision`,
+ * streamed step events) and the store-less tenant-pod protocol (start-run, run-request, run replies,
+ * tenant events), so a `tenant` pod can reach a `control-plane` over the database alone. Those ride the
+ * `durable_transport_messages` table: run replies go to the requester only, tenant events to every
+ * live subscriber of the tenant, decisions to the engine that dispatched the turn — see `db-remote.ts`.
  *
  * Run one instance engine-side (`onResult` + `dispatch`) and one per worker process (`handle()` for
  * its group). Call {@link start} to begin the engine-side pollers; `handle()` auto-starts the task
@@ -323,6 +389,27 @@ export class DbTransport implements Transport, ControlPlane {
   #workerHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
   /** Liveness-key writes still in flight — `close()` lets them land before withdrawing the keys. */
   readonly #livenessWrites = new Set<Promise<void>>();
+  /** Workflow turn consumers by workflow name — a `workflow` task row routes here. */
+  readonly #workflowTurns = new Map<string, WorkflowTurnHandler>();
+  /** Every `onDecision` handler: each `RemoteWorkflowExecutor` resolves only its own task ids. */
+  readonly #decisionHandlers = new Set<(decision: WorkflowDecision) => Promise<void>>();
+  /** Which message loops run (each starts once). */
+  readonly #messageLoops = new Set<MessageKind>();
+  #runReplyHandler: ((reply: RunReply) => void) | undefined;
+  /** Control-plane side: correlation id (requestId, or a start-run's runId) → the requester's instance
+   *  id, held while the request's handler runs so {@link publishRunReply} knows whom to address. */
+  readonly #replyRoutes = new Map<string, string>();
+  readonly #tenantEventHandlers = new Map<string, Set<(evt: TenantEvent) => void>>();
+  /** Serializes {@link publishTenantEvent} so each subscriber gets one publisher's events in order. */
+  #tenantPublishChain: Promise<void> = Promise.resolve();
+  readonly #inboxes: DbInboxRegistry;
+  readonly #inboxTtlMs: number;
+  readonly #inboxSweepIntervalMs: number;
+  #sweepTimer: ReturnType<typeof setInterval> | undefined;
+  #sweeping: Promise<void> | undefined;
+  /** Whether the messages table exists (resolved once), and whether its absence was reported. */
+  #messagesTable: Promise<boolean> | undefined;
+  #messagesTableReported = false;
 
   constructor(options: DbTransportOptions) {
     this.#db = options.db;
@@ -359,6 +446,21 @@ export class DbTransport implements Transport, ControlPlane {
       options.workerHeartbeatIntervalMs,
       WORKER_HEARTBEAT_INTERVAL_MS,
     );
+    this.#inboxTtlMs = atLeastOne(options.inboxTtlMs, DEFAULT_DB_INBOX_TTL_MS);
+    this.#inboxSweepIntervalMs =
+      options.inboxSweepIntervalMs !== undefined && Number.isFinite(options.inboxSweepIntervalMs)
+        ? Math.max(0, options.inboxSweepIntervalMs)
+        : DEFAULT_DB_INBOX_SWEEP_INTERVAL_MS;
+    this.#inboxes = new DbInboxRegistry({
+      store: () => this.#workerKeys(),
+      prefix: () => this.#keyPrefix(),
+      instanceId: this.#instanceId,
+      ttlMs: this.#inboxTtlMs,
+      subscribersCacheMs:
+        options.tenantSubscribersCacheMs ?? DEFAULT_DB_TENANT_SUBSCRIBERS_CACHE_MS,
+      onError: this.#onError,
+      now: () => this.#now(),
+    });
   }
 
   /** Stable id stamped on heartbeats, control `from`, and `claimed_by`. */
@@ -487,6 +589,23 @@ export class DbTransport implements Transport, ControlPlane {
    */
   handle(name: string, fn: StepHandler): void {
     this.#handlers.set(name, fn);
+    this.#serve(name);
+  }
+
+  /**
+   * Register a WORKFLOW turn consumer (worker side). Shares the task loop — and the routing token —
+   * of a step of the same name: {@link dispatchWorkflowTask} writes a task row of kind `workflow`, which
+   * runs `turn(task)` in a slot like any step, and its {@link WorkflowDecision} is written to the
+   * messages table, addressed to the engine instance that dispatched the turn. Re-registering swaps
+   * the turn fn.
+   */
+  handleWorkflow(name: string, turn: WorkflowTurnHandler): void {
+    this.#workflowTurns.set(name, turn);
+    this.#serve(name);
+  }
+
+  /** Serve `name`'s routing token on the shared task loop (started on the first call). */
+  #serve(name: string): void {
     const token = tenantGroup(sanitizeQueueToken(name), this.#partition);
     const isNew = !this.#servedTokens.has(token);
     this.#servedTokens.add(token);
@@ -580,6 +699,7 @@ export class DbTransport implements Transport, ControlPlane {
    * The claim is renewed for the whole run with every other held claim (see {@link #renewHeld}).
    */
   async #runTask(row: TaskRow, token: string): Promise<void> {
+    if (row.kind === 'workflow') return this.#runWorkflowRow(row, token);
     const task: RemoteTask = {
       runId: row.run_id,
       seq: Number(row.seq),
@@ -649,6 +769,144 @@ export class DbTransport implements Transport, ControlPlane {
     } finally {
       this.#release(TRANSPORT_TABLES.tasks, token, task.stepId);
     }
+  }
+
+  /**
+   * Run one claimed `workflow` task row: replay the turn and settle it — delete the row and write its
+   * {@link WorkflowDecision}, addressed to the engine that dispatched it, in ONE transaction and only
+   * while this round still holds the claim (as a step's result). An unknown workflow or a throwing turn
+   * still yields a `failed` decision so the run settles. A row past the poison bound is deleted without
+   * a decision, as on the other transports: a turn carries no step to fail, and the run waits for the
+   * executor's `timeoutMs` or recovery to re-drive it.
+   */
+  async #runWorkflowRow(row: TaskRow, token: string): Promise<void> {
+    const id = row.step_id;
+    try {
+      let task: WorkflowTask;
+      let replyTo: string | undefined;
+      try {
+        const payload = fromJson<WorkflowTaskPayload>(row.input);
+        if (!payload) throw new Error('empty payload');
+        ({ replyTo, ...task } = payload);
+      } catch (err) {
+        this.#release(TRANSPORT_TABLES.tasks, token, id);
+        await this.#deleteClaimed(TRANSPORT_TABLES.tasks, 'step_id', id, token);
+        this.#onError(
+          new Error(
+            `[DbTransport] dropped workflow task ${id}: unreadable payload (${String(err)})`,
+          ),
+        );
+        return;
+      }
+      if (row.reclaims != null && Number(row.reclaims) > this.#maxStalledCount) {
+        this.#release(TRANSPORT_TABLES.tasks, token, id);
+        await this.#deleteClaimed(TRANSPORT_TABLES.tasks, 'step_id', id, token);
+        this.#onError(
+          new Error(
+            `[DbTransport] dropped workflow task ${id} (run ${task.runId}): its claim lapsed more than ${this.#maxStalledCount} times. No decision is written: as on bullmq and queue, the turn is re-driven by the executor's timeoutMs or by recovery`,
+          ),
+        );
+        return;
+      }
+      if (!(await this.#stillHolds(id, token))) {
+        this.#release(TRANSPORT_TABLES.tasks, token, id);
+        this.#onError(
+          new Error(
+            `[DbTransport] lost the claim on workflow task ${id} before running it — another worker took it over; not running it here`,
+          ),
+        );
+        return;
+      }
+      const startedAt = Date.now();
+      this.#controller.onStart();
+      try {
+        const decision = await this.#replayTurn(task);
+        this.#release(TRANSPORT_TABLES.tasks, token, id);
+        if (!(await this.#settleWorkflow(id, token, decision, replyTo))) {
+          this.#onError(
+            new Error(
+              this.#handedBack.has(token)
+                ? `[DbTransport] workflow task ${id} outlived close()'s ${this.#closeTimeoutMs}ms drain and was handed back; this turn's decision was dropped`
+                : `[DbTransport] lost the claim on workflow task ${id} while running it — another worker took it over; this turn's decision was dropped`,
+            ),
+          );
+        }
+      } finally {
+        // Only step durations feed the latency gradient; a turn still counts as in-flight work.
+        this.#controller.onSettle(Date.now() - startedAt, true, 'workflow');
+      }
+    } catch (err) {
+      this.#onError(err);
+    } finally {
+      this.#release(TRANSPORT_TABLES.tasks, token, id);
+    }
+  }
+
+  /** Replay one turn. Never throws: an unknown workflow or a throwing turn is a `failed` decision. */
+  async #replayTurn(task: WorkflowTask): Promise<WorkflowDecision> {
+    const turn = this.#workflowTurns.get(task.workflow);
+    if (!turn) {
+      return {
+        taskId: task.taskId,
+        runId: task.runId,
+        status: 'failed',
+        commands: [],
+        error: { message: `no workflow registered for '${task.workflow}'`, code: 'no_workflow' },
+      };
+    }
+    try {
+      return await turn(task);
+    } catch (err) {
+      this.#onError(err);
+      return {
+        taskId: task.taskId,
+        runId: task.runId,
+        status: 'failed',
+        commands: [],
+        error: { message: err instanceof Error ? err.message : String(err) },
+      };
+    }
+  }
+
+  /** Delete the workflow row and write its decision in ONE transaction, only while `token` holds it. */
+  async #settleWorkflow(
+    id: string,
+    token: string,
+    decision: WorkflowDecision,
+    replyTo: string | undefined,
+  ): Promise<boolean> {
+    const settled = await this.#client().transaction(async (trx) => {
+      const deleted = await trx
+        .knexQuery()
+        .from(TRANSPORT_TABLES.tasks)
+        .where('step_id', id)
+        .where('claimed_by', token)
+        .delete();
+      if (Number(deleted) === 0) return false;
+      await this.#insertMessages(
+        MESSAGE_KINDS.decision,
+        [{ recipient: replyTo ?? '', payload: decision }],
+        trx,
+      );
+      return true;
+    });
+    if (settled && replyTo) this.#noteAddressed();
+    return settled;
+  }
+
+  /** Delete one row of `table` while `token` still holds its claim. */
+  async #deleteClaimed(
+    table: string,
+    idCol: 'id' | 'step_id',
+    id: string | number,
+    token: string,
+  ): Promise<void> {
+    await this.#client()
+      .knexQuery()
+      .from(table)
+      .where(idCol, id)
+      .where('claimed_by', token)
+      .delete();
   }
 
   /** Re-stamp the row's claim if this round still holds it; `false` once another instance took it. */
@@ -760,8 +1018,11 @@ export class DbTransport implements Transport, ControlPlane {
     idCol: 'id' | 'step_id',
     concurrency: number,
     each: (row: T) => Promise<void>,
+    scope?: MessageScope,
   ): Promise<number> {
-    const { rows, token } = await this.#claim<T>(table, this.#batchSize, undefined, idCol);
+    const { rows, token } = await this.#claim<T>(table, this.#batchSize, undefined, idCol, {
+      scope,
+    });
     if (rows.length === 0) return 0;
     const idOf = (row: T): string | number =>
       (row as Record<string, string | number>)[idCol] as string | number;
@@ -816,6 +1077,444 @@ export class DbTransport implements Transport, ControlPlane {
   }
 
   // ───────────────────────────────────────────────────────────────────────────
+  // remote workflows + the store-less (tenant pod) protocol — the messages table
+  //
+  // Workflow turns ride the task table (kind `workflow`, next to the steps of the same token). Every
+  // other message is a row of `durable_transport_messages`, claimed and deleted like the other
+  // channels and told apart by `kind`. A row is either for ANY consumer of its kind (`recipient = ''`:
+  // step events, start-run, run-request) or addressed to ONE instance (`recipient = <instanceId>`: the
+  // reply to the requester, a tenant event to each live subscriber, a decision to the engine that
+  // dispatched the turn). See `db-remote.ts` for the subscriber registry and the janitor.
+  // ───────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Whether the messages table exists — `autoCreate` creates it; a deployment that runs its own
+   * migrations needs `create_durable_transport_messages`. Resolved once. With `report`, its absence is
+   * said ONCE through `onError` (the consumer loops ask silently, so a deployment that never uses the
+   * protocol hears nothing).
+   */
+  async #messagesReady(report: boolean): Promise<boolean> {
+    let known = this.#messagesTable;
+    if (!known) {
+      known = this.#ensureSchema()
+        .then(() => this.#client().schema.hasTable(TRANSPORT_TABLES.messages))
+        .catch((err) => {
+          this.#messagesTable = undefined; // unknown yet (a transient error): ask again next time
+          this.#onError(err);
+          return false;
+        });
+      this.#messagesTable = known;
+    }
+    const has = await known;
+    if (!has && report && !this.#messagesTableReported) {
+      this.#messagesTableReported = true;
+      this.#onError(new Error(this.#messagesMissing()));
+    }
+    return has;
+  }
+
+  #messagesMissing(): string {
+    return `[DbTransport] the ${TRANSPORT_TABLES.messages} table does not exist, so remote workflows and store-less tenant pods do not work on this transport. Run the create_durable_transport_messages migration (node ace configure @adonis-agora/durable publishes it), or enable autoCreate`;
+  }
+
+  /** Insert `rows` of `kind` in one statement. */
+  async #insertMessages(
+    kind: MessageKind,
+    rows: Array<{ recipient?: string; replyTo?: string; payload: unknown }>,
+    client: Client = this.#client(),
+  ): Promise<void> {
+    if (rows.length === 0) return;
+    const at = this.#now();
+    await client
+      .insertQuery()
+      .table(TRANSPORT_TABLES.messages)
+      .knexQuery.insert(
+        rows.map((row) => ({
+          kind,
+          namespace: this.#namespaceValue(),
+          recipient: row.recipient ?? '',
+          reply_to: row.replyTo ?? null,
+          payload: JSON.stringify(row.payload),
+          claimed_by: null,
+          claimed_at: null,
+          created_at: at,
+        })),
+      );
+  }
+
+  /**
+   * Start the consumer loop of `kind` (once). `recipients` is re-read every poll. A loop over rows
+   * anyone may take is `shared`: parked while consumers are deferred, like every other consumer. One
+   * over rows addressed to this instance is not — nobody else could take them. A payload that does not
+   * parse is reported and dropped (never re-delivered forever).
+   */
+  #startMessageLoop<T>(
+    kind: MessageKind,
+    {
+      shared,
+      recipients,
+      idleBackoffMax,
+      each,
+    }: {
+      shared: boolean;
+      recipients: () => string[];
+      idleBackoffMax: number;
+      each: (payload: T, row: MessageRow) => Promise<void>;
+    },
+  ): void {
+    if (this.#messageLoops.has(kind)) return;
+    this.#messageLoops.add(kind);
+    const tick = async (): Promise<boolean> => {
+      if (!(await this.#messagesReady(false))) return false;
+      const handled = await this.#drain<MessageRow>(
+        TRANSPORT_TABLES.messages,
+        'id',
+        1,
+        async (row) => {
+          let payload: T;
+          try {
+            payload = JSON.parse(row.payload) as T;
+          } catch (err) {
+            this.#onError(
+              new Error(`[DbTransport] dropped ${kind} message ${row.id}: ${String(err)}`),
+            );
+            return;
+          }
+          await each(payload, row);
+        },
+        { kind, recipients: recipients() },
+      );
+      return handled > 0;
+    };
+    if (shared) this.#startLoop(tick, idleBackoffMax);
+    else this.#pollers.start(tick, { idleBackoffMax });
+  }
+
+  /** This instance consumes rows addressed to it: keep its inbox key live (and delete what is left
+   *  addressed to it on close). */
+  #consumeInbox(): void {
+    void this.#inboxes.activateInbox();
+  }
+
+  /** This instance addressed a row to another one: run the janitor (once). */
+  #noteAddressed(): void {
+    if (this.#inboxSweepIntervalMs <= 0 || this.#sweepTimer) return;
+    this.#sweepTimer = setInterval(() => {
+      if (this.#sweeping) return;
+      const round = this.sweepInboxes()
+        .catch((err) => this.#onError(err))
+        .finally(() => {
+          if (this.#sweeping === round) this.#sweeping = undefined;
+        });
+      this.#sweeping = round;
+    }, this.#inboxSweepIntervalMs);
+    this.#sweepTimer.unref?.();
+  }
+
+  /**
+   * One janitor round: delete the addressed rows older than the inbox TTL whose recipient has no live
+   * inbox key — a requester or subscriber that died, an engine that crashed awaiting a decision. Rows
+   * younger than the TTL are never touched, so an instance that is just starting (or whose key write is
+   * a refresh late) keeps its rows. Reads everything from the database, so it needs no memory of what
+   * was addressed — any instance that addressed a row runs it, and a restart forgets nothing.
+   */
+  async sweepInboxes(): Promise<void> {
+    if (!(await this.#messagesReady(false))) return;
+    const cutoff = this.#now() - this.#inboxTtlMs;
+    const namespace = this.#namespaceValue();
+    const recipients = (
+      (await this.#client()
+        .knexQuery()
+        .from(TRANSPORT_TABLES.messages)
+        .distinct('recipient')
+        .where('namespace', namespace)
+        .whereNot('recipient', '')
+        .where('created_at', '<', cutoff)) as Array<{ recipient: string }>
+    ).map((r) => r.recipient);
+    if (recipients.length === 0) return;
+    const alive = await this.#inboxes.liveInboxOwners();
+    const dead = recipients.filter((r) => !alive.has(r));
+    if (dead.length === 0) return;
+    await this.#client()
+      .knexQuery()
+      .from(TRANSPORT_TABLES.messages)
+      .where('namespace', namespace)
+      .whereIn('recipient', dead)
+      .where('created_at', '<', cutoff)
+      .delete();
+  }
+
+  /**
+   * engine → workflow worker: a {@link WorkflowTask} as a task row of kind `workflow` on the workflow's
+   * routing token, where a {@link handleWorkflow} consumer claims it (with the token's steps, by
+   * priority). Stamped with this instance as the decision's recipient when it consumes decisions, so
+   * the decision comes back to the engine awaiting it — never to a sibling replica that would drop it.
+   * Idempotent per `taskId`. Throws when the schema lacks the tasks `kind` column or the messages table.
+   */
+  async dispatchWorkflowTask(task: WorkflowTask): Promise<void> {
+    await this.#ensureSchema();
+    const [hasKind, hasMessages, withPriority] = await Promise.all([
+      this.#hasTaskColumn('kind'),
+      this.#messagesReady(true),
+      this.#hasTaskColumn('priority'),
+    ]);
+    if (!hasMessages) throw new Error(this.#messagesMissing());
+    if (!hasKind) {
+      throw new Error(
+        `[DbTransport] ${TRANSPORT_TABLES.tasks} has no "kind" column, so remote workflow turns cannot be dispatched on it. Run the create_durable_transport_messages migration, or enable autoCreate`,
+      );
+    }
+    const payload: WorkflowTaskPayload = {
+      ...task,
+      ...(this.#decisionHandlers.size > 0 ? { replyTo: this.#instanceId } : {}),
+    };
+    await this.#client()
+      .insertQuery()
+      .table(TRANSPORT_TABLES.tasks)
+      .knexQuery.insert({
+        step_id: task.taskId,
+        run_id: task.runId,
+        seq: 0,
+        name: task.workflow,
+        grp: task.group,
+        namespace: this.#namespaceValue(),
+        input: toJson(payload),
+        traceparent: task.traceparent ?? null,
+        context: null,
+        transport: task.transport ?? null,
+        attempt: task.attempt,
+        kind: 'workflow',
+        ...(withPriority ? { priority: toDbPriority(task.priority) } : {}),
+        claimed_by: null,
+        claimed_at: null,
+        created_at: this.#now(),
+      })
+      .onConflict('step_id')
+      .ignore();
+  }
+
+  /**
+   * engine ← workflow worker: consume {@link WorkflowDecision}s. ONE loop per transport; every handler
+   * sees every decision (each `RemoteWorkflowExecutor` resolves only its own task ids). It claims the
+   * decisions addressed to this instance — consumed even while consumers are deferred, as nobody else
+   * may take them — and, once consuming, the unaddressed ones (a worker that did not know whom to
+   * reply to). Never backs off: a decision is on the critical path of every remote workflow turn.
+   */
+  onDecision(handler: (decision: WorkflowDecision) => Promise<void>): void {
+    this.#decisionHandlers.add(handler);
+    if (this.#messageLoops.has(MESSAGE_KINDS.decision)) return;
+    this.#consumeInbox();
+    this.#startMessageLoop<WorkflowDecision>(MESSAGE_KINDS.decision, {
+      shared: false,
+      recipients: () => (this.#consumersDeferred ? [this.#instanceId] : [this.#instanceId, '']),
+      idleBackoffMax: 1,
+      each: async (decision) => {
+        for (const h of this.#decisionHandlers) await h(decision);
+      },
+    });
+  }
+
+  /** workflow worker → engine: a local step's lifecycle, for ONE engine instance to checkpoint. A
+   *  deployment without the messages table drops it (reported once): it is observability only. */
+  async dispatchStepEvent(event: WorkflowStepEvent): Promise<void> {
+    if (!(await this.#messagesReady(true))) return;
+    await this.#insertMessages(MESSAGE_KINDS.stepEvent, [{ payload: event }]);
+  }
+
+  /** engine ← workflow worker: consume streamed step events. Idempotent — a second call is a no-op. */
+  onStepEvent(handler: (event: WorkflowStepEvent) => Promise<void>): void {
+    this.#startMessageLoop<WorkflowStepEvent>(MESSAGE_KINDS.stepEvent, {
+      shared: true,
+      recipients: () => [''],
+      idleBackoffMax: this.#idleBackoffMax,
+      each: (event) => handler(event),
+    });
+  }
+
+  /** tenant → control plane: a {@link StartRunMessage} for any control plane, with this instance as
+   *  the reply's recipient. Throws when the messages table is missing. */
+  async dispatchStartRun(msg: StartRunMessage): Promise<void> {
+    this.#ensureRunRepliesLoop();
+    if (!(await this.#messagesReady(true))) throw new Error(this.#messagesMissing());
+    await this.#insertMessages(MESSAGE_KINDS.startRun, [
+      { replyTo: this.#instanceId, payload: msg },
+    ]);
+  }
+
+  /** control plane ← tenant: consume {@link StartRunMessage}s. Idempotent — a second call is a no-op. */
+  onStartRun(handler: (msg: StartRunMessage) => Promise<void>): void {
+    this.#startMessageLoop<StartRunMessage>(MESSAGE_KINDS.startRun, {
+      shared: true,
+      recipients: () => [''],
+      idleBackoffMax: this.#idleBackoffMax,
+      each: (msg, row) => this.#withReplyRoute(msg.runId, row.reply_to, () => handler(msg)),
+    });
+  }
+
+  /** tenant → control plane: a {@link RunRequest} for any control plane, with this instance as the
+   *  reply's recipient. Throws when the messages table is missing. */
+  async dispatchRunRequest(msg: RunRequest): Promise<void> {
+    this.#ensureRunRepliesLoop();
+    if (!(await this.#messagesReady(true))) throw new Error(this.#messagesMissing());
+    await this.#insertMessages(MESSAGE_KINDS.runRequest, [
+      { replyTo: this.#instanceId, payload: msg },
+    ]);
+  }
+
+  /** control plane ← tenant: consume {@link RunRequest}s. Idempotent — a second call is a no-op. */
+  onRunRequest(handler: (msg: RunRequest) => Promise<void>): void {
+    this.#startMessageLoop<RunRequest>(MESSAGE_KINDS.runRequest, {
+      shared: true,
+      recipients: () => [''],
+      idleBackoffMax: this.#idleBackoffMax,
+      each: (msg, row) => this.#withReplyRoute(msg.requestId, row.reply_to, () => handler(msg)),
+    });
+  }
+
+  /** Remember who asked for `correlationId` while `work` (the responder, which replies inside it) runs. */
+  async #withReplyRoute(
+    correlationId: string | undefined,
+    replyTo: string | null,
+    work: () => Promise<void>,
+  ): Promise<void> {
+    if (correlationId === undefined || !replyTo) return work();
+    this.#replyRoutes.set(correlationId, replyTo);
+    try {
+      await work();
+    } finally {
+      if (this.#replyRoutes.get(correlationId) === replyTo) this.#replyRoutes.delete(correlationId);
+    }
+  }
+
+  /**
+   * control plane → tenant: a correlated {@link RunReply}, addressed to the instance that sent the
+   * request. Only the instance handling that request knows the requester, so this must run while it
+   * is handled — which is what the responder does. A reply with no known requester is dropped and
+   * reported, never broadcast.
+   */
+  async publishRunReply(reply: RunReply): Promise<void> {
+    const owner = this.#replyRoutes.get(reply.requestId);
+    if (owner === undefined) {
+      this.#onError(
+        new Error(
+          `[DbTransport] dropped the run reply for "${reply.requestId}": no requester is known for it on this instance`,
+        ),
+      );
+      return;
+    }
+    if (!(await this.#messagesReady(true))) return;
+    await this.#insertMessages(MESSAGE_KINDS.runReply, [{ recipient: owner, payload: reply }]);
+    this.#noteAddressed();
+  }
+
+  /**
+   * tenant ← control plane: consume the replies addressed to this instance. Idempotent — a second call
+   * is a no-op (one gateway per transport matches every reply by id). Consumed even while consumers are
+   * deferred: nobody else may take them.
+   */
+  onRunReply(handler: (reply: RunReply) => void): void {
+    if (this.#runReplyHandler) return;
+    this.#runReplyHandler = handler;
+    this.#ensureRunRepliesLoop();
+  }
+
+  /** Start consuming this instance's replies (once) — also on the first request, so a reply is never
+   *  left behind because the gateway subscribed late. Never backs off: a reply is on the critical path
+   *  of every proxied call. */
+  #ensureRunRepliesLoop(): void {
+    if (this.#messageLoops.has(MESSAGE_KINDS.runReply)) return;
+    this.#consumeInbox();
+    this.#startMessageLoop<RunReply>(MESSAGE_KINDS.runReply, {
+      shared: false,
+      recipients: () => [this.#instanceId],
+      idleBackoffMax: 1,
+      each: async (reply) => {
+        try {
+          this.#runReplyHandler?.(reply);
+        } catch (err) {
+          this.#onError(err); // a throwing listener must not re-deliver the reply
+        }
+      },
+    });
+  }
+
+  /**
+   * control plane → tenant: one row of the {@link TenantEvent} per instance with a live subscription to
+   * `evt.tenant` (none: nothing is written), in one INSERT. Publishes are serialized, so each subscriber
+   * receives one publisher's events in publish order.
+   */
+  publishTenantEvent(evt: TenantEvent): Promise<void> {
+    const run = this.#tenantPublishChain.then(async () => {
+      const owners = await this.#inboxes.subscribersOf(evt.tenant);
+      if (owners.length === 0) return;
+      if (!(await this.#messagesReady(true))) return;
+      await this.#insertMessages(
+        MESSAGE_KINDS.tenantEvent,
+        owners.map((recipient) => ({ recipient, payload: evt })),
+      );
+      this.#noteAddressed();
+    });
+    this.#tenantPublishChain = run.catch(() => undefined);
+    return run;
+  }
+
+  /**
+   * tenant ← control plane: subscribe to `tenant`'s events. Writes this instance's subscriber key
+   * (kept live every third of {@link DbTransportOptions.inboxTtlMs}) and consumes the events addressed
+   * to it — never deferred, nobody else may take them. Returns an unsubscribe fn that detaches only
+   * this handler; the last one removes the subscription.
+   */
+  onTenantEvent(tenant: string, handler: (evt: TenantEvent) => void): () => void {
+    let handlers = this.#tenantEventHandlers.get(tenant);
+    if (!handlers) {
+      handlers = new Set();
+      this.#tenantEventHandlers.set(tenant, handlers);
+    }
+    handlers.add(handler);
+    void this.#inboxes.subscribe(tenant);
+    // Keeps running after the last unsubscribe, so events written before the key went away are
+    // consumed rather than left behind.
+    this.#startMessageLoop<TenantEvent>(MESSAGE_KINDS.tenantEvent, {
+      shared: false,
+      recipients: () => [this.#instanceId],
+      idleBackoffMax: this.#idleBackoffMax,
+      each: async (evt) => {
+        for (const h of this.#tenantEventHandlers.get(evt.tenant) ?? []) {
+          try {
+            h(evt);
+          } catch (err) {
+            this.#onError(err); // a throwing listener must not re-deliver (and reorder) the event
+          }
+        }
+      },
+    });
+    return () => {
+      const set = this.#tenantEventHandlers.get(tenant);
+      if (!set?.delete(handler) || set.size > 0) return;
+      this.#tenantEventHandlers.delete(tenant);
+      this.#inboxes.unsubscribe(tenant);
+    };
+  }
+
+  /** On close: remove this instance's inbox and subscriber keys, then delete what is still addressed
+   *  to it — replies, events and decisions for a process going away have no one else to go to. */
+  async #closeInboxes(): Promise<void> {
+    await this.#inboxes.close();
+    const own = [MESSAGE_KINDS.decision, MESSAGE_KINDS.runReply, MESSAGE_KINDS.tenantEvent].filter(
+      (kind) => this.#messageLoops.has(kind),
+    );
+    if (own.length === 0) return;
+    await this.#client()
+      .knexQuery()
+      .from(TRANSPORT_TABLES.messages)
+      .where('namespace', this.#namespaceValue())
+      .where('recipient', this.#instanceId)
+      .whereIn('kind', own)
+      .delete()
+      .catch((err) => this.#onError(err));
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
   // atomic claim — portable compare-and-set (no FOR UPDATE SKIP LOCKED)
   // ───────────────────────────────────────────────────────────────────────────
 
@@ -839,7 +1538,8 @@ export class DbTransport implements Transport, ControlPlane {
     {
       countReclaims = false,
       byPriority = false,
-    }: { countReclaims?: boolean; byPriority?: boolean } = {},
+      scope,
+    }: { countReclaims?: boolean; byPriority?: boolean; scope?: MessageScope | undefined } = {},
   ): Promise<{ rows: T[]; token: string }> {
     await this.#ensureSchema();
     // The raw Knex builder — `onConflict`, the `where(cb)` grouping and `whereIn` are cleaner there
@@ -865,6 +1565,7 @@ export class DbTransport implements Transport, ControlPlane {
       .where('namespace', namespace)
       .modify((q) => {
         if (groups !== undefined) q.whereIn('grp', groups);
+        if (scope !== undefined) q.where('kind', scope.kind).whereIn('recipient', scope.recipients);
       })
       .where((q) => q.whereNull('claimed_at').orWhere('claimed_at', '<', stale))
       .modify((q) => {
@@ -931,7 +1632,7 @@ export class DbTransport implements Transport, ControlPlane {
           if (!has) {
             this.#onError(
               new Error(
-                `[DbTransport] ${TRANSPORT_TABLES.tasks} has no "${column}" column, so ${MISSING_COLUMN_EFFECT[column]}. Add it — integer, not null, default 0 — or enable autoCreate`,
+                `[DbTransport] ${TRANSPORT_TABLES.tasks} has no "${column}" column, so ${MISSING_COLUMN[column].effect}. Add it — ${MISSING_COLUMN[column].ddl} — or enable autoCreate`,
               ),
             );
           }
@@ -1130,11 +1831,29 @@ export class DbTransport implements Transport, ControlPlane {
   // ───────────────────────────────────────────────────────────────────────────
 
   #workerKeys(): WorkerKeyStore {
-    this.#workerKeyStore ??= lucidWorkerKeys(this.#db, {
-      connectionName: this.#connectionName,
-      autoCreate: this.#autoCreate,
-      now: () => this.#now(),
-    });
+    if (!this.#workerKeyStore) {
+      // The table is created with the others by #ensureSchema — waited for first, so a key written
+      // while the schema is still being created never races its CREATE.
+      const keys = lucidWorkerKeys(this.#db, {
+        connectionName: this.#connectionName,
+        autoCreate: false,
+        now: () => this.#now(),
+      });
+      this.#workerKeyStore = {
+        put: async (key, value, expiresAt) => {
+          await this.#ensureSchema();
+          await keys.put(key, value, expiresAt);
+        },
+        remove: async (removed) => {
+          await this.#ensureSchema();
+          await keys.remove(removed);
+        },
+        live: async (at) => {
+          await this.#ensureSchema();
+          return keys.live(at);
+        },
+      };
+    }
     return this.#workerKeyStore;
   }
 
@@ -1189,6 +1908,8 @@ export class DbTransport implements Transport, ControlPlane {
     this.#pollers.stopAll();
     this.#taskLoop = undefined;
     this.#controller.stop();
+    if (this.#sweepTimer) clearInterval(this.#sweepTimer);
+    this.#sweepTimer = undefined;
     if (this.#workerHeartbeatTimer) clearInterval(this.#workerHeartbeatTimer);
     // A clean stop withdraws this instance's liveness keys at once, so the dashboard and
     // `listWorkerGroups` drop it now instead of after the 35s TTL. In-flight beats land first, or one
@@ -1224,6 +1945,8 @@ export class DbTransport implements Transport, ControlPlane {
       if (tokens.length === 0) continue;
       await this.#handBack(table, tokens).catch((err) => this.#onError(err));
     }
+    await this.#sweeping;
+    await this.#closeInboxes();
   }
 
   /** Stop the pollers (alias of {@link stop} for the `Transport.close` contract). */

@@ -102,6 +102,19 @@ are claimed highest priority first, then oldest. `autoCreate` /
 table; with `autoCreate: false` add them yourself (integer, not null, default
 0), or the poison bound / priority ordering stay off.
 
+`db` also carries remote workflow turns (task rows of kind `workflow`, claimed
+with the token's steps; each decision is a `durable_transport_messages` row
+addressed to the engine replica that dispatched the turn) and store-less tenant
+pods that reach the same database: start-run/run-request/step-event rows go to
+any consumer, a reply is a row addressed to the requester, a tenant event is one
+row per live subscriber (pods write their own `-inbox:` / `-tenant-subscriber:`
+keys to `durable_transport_worker_keys`). A janitor on every instance that
+addresses rows deletes those older than `inboxTtlMs` whose recipient's inbox key
+is gone. Ships as the `create_durable_transport_messages` migration (also adds
+the tasks `kind` column) or via `autoCreate`; without it the protocol is off and
+said once through `onError`. Tune with `inboxTtlMs`, `tenantSubscribersCacheMs`,
+`inboxSweepIntervalMs`. See `durable-cluster`.
+
 Trade-off: throughput is bounded by polling + row contention — right for
 workflow-scale modest rates, not high-fanout firehoses. Delivery is
 at-least-once (a worker that dies after its handler ran re-runs elsewhere), so

@@ -1,0 +1,13 @@
+---
+'@adonis-agora/durable': minor
+---
+
+The `db` transport now carries remote workflow turns and store-less `tenant` pods, which used to need `bullmq` or `queue`.
+
+- Remote workflows: `dispatchWorkflowTask` / `handleWorkflow` / `onDecision` and streamed step events. A turn is a task row of kind `workflow` on the workflow's routing token, next to the steps of the same name. It is claimed by priority, runs in a `concurrency` slot, and is renewed, handed back on close and bounded by `maxStalledCount` like a step. Its decision is a row addressed to the engine instance that dispatched the turn, so with several engine replicas a decision never lands on one that is not waiting for it. Every `onDecision` handler on that instance sees it.
+- Tenant pods: run starts and read/control requests are rows any control-plane instance may take. A reply is a row addressed to the requester only. A live-tail event is one row per pod subscribed to its tenant. A pod on `db` reaches the control plane's database by definition, so it writes its own subscription and inbox keys to `durable_transport_worker_keys` and nothing is relayed through the control plane. A janitor on every instance that addresses rows deletes rows older than `inboxTtlMs` whose recipient is gone. New options: `inboxTtlMs`, `tenantSubscribersCacheMs`, `inboxSweepIntervalMs`.
+- Schema: a new `durable_transport_messages` table and a `kind` column on `durable_transport_tasks` (default `'step'`). `autoCreate` adds both. `node ace configure` publishes a new `create_durable_transport_messages` migration, which creates the table and adds `kind` to an existing tasks table. Without them, steps run as before; the transport says once through `onError` that the protocol is off the first time something uses it, and run starts, requests and remote turns fail at once instead of timing out.
+- `autoCreate` no longer fails when several processes create the transport tables at the same moment: a `CREATE` or `ALTER` that loses the race to another process now counts as success. With four processes booting at once on an empty Postgres schema, all but one used to fail.
+- A `standalone` or `control-plane` engine on `db` now starts the run-request responder, as it already did on `bullmq` and `queue`: it polls the start-run and run-request rows (with idle backoff), and logs a warning at boot unless `verifyTenant` is set.
+
+Compared with `bullmq`, replies and events are polled rather than pushed, a new subscription can miss events published in its first second or so, and each event costs one row per subscribed pod. The rows are this package's own wire: Python and NestJS workers speak `bullmq` only.
