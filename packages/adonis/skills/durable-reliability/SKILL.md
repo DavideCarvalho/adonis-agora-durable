@@ -296,7 +296,7 @@ Source: `docs/observability/events-and-interceptors.mdx`.
 Wrong:
 
 ```ts
-const stalled = (await engine.workerHealth()).some((g) => g.stalled) // always false on queue/db
+const stalled = (await engine.workerHealth()).some((g) => g.stalled) // always false on db
 ```
 
 Correct:
