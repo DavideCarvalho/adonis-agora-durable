@@ -664,6 +664,25 @@ export class DbTransport implements Transport, ControlPlane {
       await this.#handBack(TRANSPORT_TABLES.tasks, [token]);
       return false;
     }
+    // `free` was read before the claim's round trips. The adaptive limit may have dropped meanwhile
+    // (the RAM brake fires on its own timer), and a round sized for the old limit would run past the
+    // new one. Un-claim what no longer fits, so the slot loop never runs more than the LIVE limit.
+    // (A lapsed row handed back this way keeps the reclaim its takeover counted: rare — a limit drop
+    // inside one claim round — and only ever early toward the poison bound, never past it unnoticed.)
+    const fits = Math.max(0, this.#controller.limit - this.#runningTasks.size);
+    if (rows.length > fits) {
+      const excess = rows.splice(fits);
+      await this.#client()
+        .knexQuery()
+        .from(TRANSPORT_TABLES.tasks)
+        .where('claimed_by', token)
+        .whereIn(
+          'step_id',
+          excess.map((row) => row.step_id),
+        )
+        .update({ claimed_by: null, claimed_at: null });
+      if (rows.length === 0) return true;
+    }
     this.#hold(
       TRANSPORT_TABLES.tasks,
       token,
