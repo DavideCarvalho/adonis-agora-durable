@@ -1,6 +1,6 @@
 ---
 title: Events & interceptors
-description: The two programmatic hooks into a running engine — engine.subscribe for the lifecycle event stream (every EngineEvent type and its payload), and engine.use for onion middleware around a local step. Plus collectMetrics for a Prometheus endpoint and attachDurableDiagnostics for the diagnostics bus.
+description: The two programmatic hooks into a running engine — engine.subscribe for the lifecycle event stream (every EngineEvent type and its payload, and how events from other instances arrive), and engine.use for onion middleware around a local step. Plus currentStep() for step logs, collectMetrics for a Prometheus endpoint and attachDurableDiagnostics for the diagnostics bus.
 icon: Radio
 ---
 
@@ -26,11 +26,27 @@ const unsubscribe = engine.subscribe((event) => {
 })
 ```
 
-A listener that throws cannot break workflow execution — the engine isolates each delivery — but it can still slow the run down, so keep the body cheap and hand anything expensive to a queue.
+A listener that throws cannot break workflow execution — the engine isolates each delivery — but it runs synchronously on the engine's emit, so it can still slow the run down. Keep the body cheap and hand anything expensive to a queue. The engine does not await a listener: if you pass an `async` function, catch its errors yourself, or a rejection surfaces as an `unhandledRejection`.
+
+### Events from other instances
+
+With a [control plane](/docs/durable/transports/control-plane) configured, every instance also receives the lifecycle events every **other** instance produced. That is what lets a dashboard pod live-tail a run executing on a worker pod. A listener therefore sees two kinds of event: the ones its own engine emitted, and copies re-delivered from the fleet. Anything that **records or counts** events (a metric, an audit row, a trace) should keep only the local ones, or a three-pod fleet records every event three times:
+
+```ts title="start/durable.ts"
+import engine from '@adonis-agora/durable/services/main'
+import { isRemoteEvent } from '@adonis-agora/durable'
+
+engine.subscribe((event) => {
+  if (isRemoteEvent(event)) return // counted on the instance that produced it
+  if (event.type === 'run.completed') runsCompleted.inc({ workflow: event.workflow })
+})
+```
+
+`isRemoteEvent(event)` remembers re-delivered events by identity (a `WeakSet`), so it adds no field to the event and nothing to the wire. Since 0.51 the built-in consumers ([`collectMetrics`, `attachDurableMetrics`](/docs/durable/observability/metrics), [`attachDurableOtel`](/docs/durable/observability/otel) and the [diagnostics bridge](/docs/durable/observability/diagnostics#local-events-only)) all skip remote events. A listener that only **reacts** to a run (an in-memory UI push, a cache invalidation on every pod) can keep both kinds.
 
 ### The event types
 
-`EngineEvent.type` is one of nine values. Every event carries `runId` and `at`; the rest of the payload depends on the type:
+`EngineEvent.type` is one of twelve values (eleven are emitted today). Every event carries `runId` and `at`; the rest of the payload depends on the type:
 
 | Type | Also carries | Emitted when |
 | --- | --- | --- |
@@ -38,13 +54,15 @@ A listener that throws cannot break workflow execution — the engine isolates e
 | `run.completed` | `workflow`, `namespace`, `output` | a run finishes successfully |
 | `run.failed` | `workflow`, `namespace`, `error` | a run reaches a terminal failure, including a dead-letter |
 | `run.suspended` | `workflow`, `namespace` | a run parks — on a sleep, a signal, a child, a remote step, or singleton back-pressure |
-| `step.started` | `seq`, `name`, `kind` | a step's body begins |
-| `step.completed` | `seq`, `name`, `kind`, `output`, `durationMs`, `queueMs` | a step settles successfully |
-| `step.failed` | `seq`, `name`, `kind`, `error`, `durationMs`, `queueMs` | a step attempt fails (each retry emits its own) |
+| `run.routed` | `workflow`, `namespace`, `name`, `error` | a failed run handed its failure to an [onError handler](/docs/durable/reliability/on-error) (`name` is the handler workflow); the run now waits on the handler |
+| `run.unrouted` | `workflow`, `namespace`, `error`, `reason` | a failed run had onError routes the engine could not apply (its live workers announce different route sets), so it failed instead |
+| `step.started` | `seq`, `name`, `kind`, `redispatched?` | a step's body begins; `redispatched: true` marks a lost-dispatch re-drive of a remote step, not a first attempt or a failure retry |
+| `step.completed` | `seq`, `name`, `kind`, `output`, `durationMs`, `queueMs` (remote) | a step settles successfully |
+| `step.failed` | `seq`, `name`, `kind`, `error`, `durationMs`, `queueMs` (remote) | a step attempt fails (each retry emits its own) |
 | `capability.unavailable` | `workflow`, `namespace`, `error`, `diagnostics` | a dispatch is refused because no live worker advertises a [required capability](/docs/durable/cluster/handshake#capability-aware-routing) |
 | `protocol.incompatible` | `workflow`, `namespace`, `error`, `diagnostics` | a dispatch is refused because no live worker speaks a compatible protocol |
 
-`kind` is `local`, `remote`, `sleep` or `signal`. `queueMs` is how long a remote step waited before a worker picked it up, and `durationMs` how long it then ran — the pair that separates "the step is slow" from "the fleet is saturated".
+`namespace` is stamped on the `run.*` events only, never on step events. `kind` is `local`, `remote`, `sleep` or `signal`. `queueMs` is how long a remote step waited before a worker picked it up, and `durationMs` how long it then ran — the pair that separates "the step is slow" from "the fleet is saturated".
 
 The two block events carry a `diagnostics` payload with everything needed to explain the block without guessing: the routing `token`, what the step `requires`, which capabilities were `missing`, how many live workers were considered, and the descriptors of both the control plane and the workers.
 
@@ -53,7 +71,7 @@ The two block events carry a `diagnostics` payload with everything needed to exp
 </Callout>
 
 <Callout type="info">
-A `step.progress` type is declared in the union but no engine path emits it today. Treat it as reserved: handle it defensively if you switch exhaustively, but do not build on it.
+A `step.progress` type (carrying `event`, one live step log line) is declared in the union but no engine path emits it today: step events reach observers with the step's `step.completed` / `step.failed` checkpoint. Treat it as reserved: handle it defensively if you switch exhaustively, but do not build on it.
 </Callout>
 
 ### Prometheus counters, for free
@@ -73,9 +91,9 @@ router.get('/metrics/durable', ({ response }) => {
 })
 ```
 
-The exposition carries `durable_runs_total{event}`, `durable_steps_total{event}`, `durable_runs_by_workflow_total{workflow,event}`, and `durable_step_duration_ms_sum` / `durable_step_duration_count` for an average step duration. `metrics.snapshot()` returns the same numbers as a plain object, and `metrics.stop()` detaches.
+The exposition carries `durable_runs_total{event}` (`started`, `completed`, `failed`, `suspended`, `routed`, `unrouted`), `durable_steps_total{event}`, `durable_runs_by_workflow_total{workflow,event}`, `durable_runs_routed_total{code}`, and `durable_step_duration_ms_sum` / `durable_step_duration_count` for an average step duration. `metrics.snapshot()` returns the same numbers as a plain object, and `metrics.stop()` detaches. With the [dashboard](/docs/durable/observability/dashboard) mounted you may not need this route at all: `GET <path>/api/metrics` already serves these counters plus backlog and worker gauges. See [Metrics](/docs/durable/observability/metrics).
 
-Counters are **per process** and reset when it restarts, so scrape every instance and aggregate in Prometheus rather than expecting one pod to know the fleet's totals.
+Counters are **per process**, count only the events this process produced, and reset when it restarts, so scrape every instance and sum in Prometheus rather than expecting one pod to know the fleet's totals.
 
 ### Bridging to the diagnostics bus
 
@@ -121,8 +139,23 @@ Three properties matter more than the signature:
 
 - **First registered is outermost.** Interceptors compose as an onion in registration order, so a logging interceptor registered first wraps a caching one registered second.
 - **They never fire on replay.** A replayed step returns its recorded output without executing, so the interceptor is not called. That is what makes timings measured here *real* execution timings rather than replay artefacts — and it is also why an interceptor is the wrong place to enforce an invariant that must hold on every turn.
-- **They wrap local steps only.** A dispatched `ctx.step` executes on a worker, in a different process, so there is no local body to wrap. To wrap those, register an interceptor on the worker's engine.
+- **They wrap local steps only.** A dispatched `ctx.step` executes on a worker, in a different process, so there is no local body to wrap. The worker side does not run engine interceptors either: a transport runs a step handler directly. To time or log a remote step, wrap the handler body itself, or read `durationMs` / `queueMs` off its `step.completed` event.
 
 <Callout type="warn">
 An interceptor runs **inside** the deterministic execution of a step, so it must not do anything that changes the checkpointed result between runs. Read the invocation, time it, log it, retry-classify its error — but do not make the returned value depend on wall-clock time, randomness or external state, or a replay will disagree with the recorded checkpoint.
 </Callout>
+
+## `currentStep()` — step logs from deep inside a step
+
+A step body receives a step logger, and the lines it records are checkpointed with the step and shown on the step in the [dashboard](/docs/durable/observability/dashboard). Code a few calls below the step (a batch inserter, an HTTP client) usually cannot take that logger as a parameter. `currentStep()` returns the logger of the step executing on the current async path, or `undefined` outside one:
+
+```ts title="app/services/order_importer.ts"
+import { currentStep } from '@adonis-agora/durable'
+
+export async function insertBatch(rows: Row[]) {
+  await db.table('orders').multiInsert(rows)
+  currentStep()?.info('inserted batch', { rows: rows.length })
+}
+```
+
+It works on local steps and on remote step handlers running on a worker, and concurrent steps each see their own logger. A line recorded through `currentStep()` lands in the same list as one recorded through the argument. Keep the optional chain: outside a step there is nothing to record to, and the same helper keeps working in a unit test with no run around it. `currentStep()` is new in 0.51 and is the TypeScript twin of the Python SDK's `current_step()`.

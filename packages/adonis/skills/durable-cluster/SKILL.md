@@ -15,7 +15,7 @@ license: MIT
 metadata:
   type: core
   library: "@adonis-agora/durable"
-  library_version: "0.25.0"
+  library_version: "0.51.0"
   framework: adonisjs
 sources:
   - 'DavideCarvalho/adonis-durable:docs/cluster/index.mdx'
@@ -40,18 +40,12 @@ execute changes.
 | `control-plane` | ✅ required | ❌ | optional |
 | `tenant` | ❌ typed `never` | worker pods ✅ | api/dashboard pod |
 
-Namespace: an absent `namespace` is `'default'` on `standalone` (it drives only
-the default pool) and the **operator** (every pool) on `control-plane`. There is
-no standalone operator — a process that must drive every pool is a
-`control-plane`. A standalone web pod that should only start runs sets
-`drive: false` (plus `consumers: 'never'`) and leaves execution to `durable:work`.
-
 ## Setup
 
 Split fleet: a pure coordinator plus store-less tenant workers.
 
 ```ts title="config/durable.ts (control plane)"
-import { defineConfig, stores, transports } from '@adonis-agora/durable'
+import { defineConfig, hmacTenantVerifier, stores, transports } from '@adonis-agora/durable'
 
 export default defineConfig({
   role: 'control-plane',
@@ -195,10 +189,11 @@ imports zero store code:
 
 ```ts title="worker.ts"
 import { RedisWorkerRegistry, WorkerRuntime } from '@adonis-agora/durable/worker'
-import { transports } from '@adonis-agora/durable'
+import { BullMQTransport, createBullMQDeps } from '@adonis-agora/durable'
 import { Redis } from 'ioredis'
 
-const transport = await transports.bullmq({ connection: process.env.REDIS_URL })({ app })
+// No Adonis app here, so build the transport directly instead of through `transports.bullmq()`.
+const transport = new BullMQTransport({ deps: await createBullMQDeps(process.env.REDIS_URL) })
 const runtime = new WorkerRuntime({
   transport,
   partition: 'acme-corp',
@@ -369,20 +364,23 @@ control plane's database need `queue` or `bullmq`. Source:
 Wrong:
 
 ```ts
-await engine.start('checkout', order, id, { namespace: 'eu-west' }) // no engine on eu-west, no operator control plane
+await engine.start('checkout', order, id, { namespace: 'eu-west' }) // no engine/operator polls eu-west
 ```
 
 Correct:
 
 ```ts
-// Run at least one engine on 'eu-west' (or a control-plane with no namespace) first:
+// Run at least one engine on 'eu-west' (or an operator above it) first:
 await engine.start('checkout', order, id, { namespace: 'eu-west' })
 ```
 
 Mechanism: between namespaced engines there is no fallback owner; a namespace
-with neither an engine of its own nor an operator (a `control-plane` with no
-`namespace`) above it is a dead end where
-runs sit `pending` forever. Source: `docs/concepts/tenancy.mdx` (pitfalls).
+with neither an engine of its own nor an operator above it is a dead end where
+runs sit `pending` forever. Since 0.51 only a `control-plane` with no
+`namespace` is the operator; a `standalone` engine with no `namespace` is the
+`'default'` pool. Before 0.51 an unset namespace made ANY engine an operator,
+so a standalone app sharing a store drove every pool's runs. Source:
+`docs/concepts/tenancy.mdx` (pitfalls).
 
 See also: `durable-setup` — the standalone execution model this scales out of.
 See also: `durable-transports-stores` — bullmq/queue/db driver details,

@@ -90,9 +90,23 @@ An event of a child run the engine started (`ctx.all`, `ctx.child`, `ctx.startCh
 The bridge forwards **every** engine event, including the high-frequency `step.started` and `step.completed`. That's cheap: diagnostics' `emit` short-circuits when a channel has no subscribers, so a channel nobody listens to costs nothing. A subscriber, though, runs **inline** on the engine's emit, so keep handlers cheap and hand expensive work (network, disk) to a queue. Subscribe only to the events you act on.
 </Callout>
 
+## Local events only
+
+With a [control plane](/docs/durable/transports/control-plane) configured, every pod hears every other pod's lifecycle events (that is how a dashboard pod live-tails a run on a worker). Since 0.51 the bridge forwards only the events **its own** instance produced (`isRemoteEvent(event)` is false), so a fleet puts each event on the bus once, on the pod that ran the work, and Telescope or a relay downstream records it once. Before 0.51 every pod forwarded what it heard as well: a three-pod fleet published, and Telescope counted, every `run.completed` three times.
+
+To make one process mirror the whole fleet onto its own bus, attach the bridge with `includeRemote: true`:
+
+```ts
+import { attachDurableDiagnostics } from '@adonis-agora/durable'
+
+const detach = attachDurableDiagnostics(engine, { includeRemote: true })
+```
+
+The provider always attaches with the default (`includeRemote: false`) and has no config switch for it, so use the option where you attach the bridge yourself (below). Attaching an `includeRemote` bridge **next to** the provider's would publish this pod's own events twice.
+
 ## Attaching manually
 
-If you build a `WorkflowEngine` outside the AdonisJS provider (a standalone script, a custom test harness), attach the bridge yourself. `attachDurableDiagnostics(engine)` takes anything with a `subscribe(listener)` method and returns an **unsubscribe** function:
+If you build a `WorkflowEngine` outside the AdonisJS provider (a standalone script, a custom test harness), attach the bridge yourself. `attachDurableDiagnostics(engine, options?)` takes anything with a `subscribe(listener)` method (`DurableEventSource`), an optional `DurableDiagnosticsOptions` (`{ includeRemote?: boolean }`, default `false`), and returns an **unsubscribe** function:
 
 ```ts
 import { attachDurableDiagnostics } from '@adonis-agora/durable'

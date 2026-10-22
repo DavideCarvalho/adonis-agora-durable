@@ -1,12 +1,12 @@
 ---
 title: API reference
-description: Every public member of WorkflowCtx, BaseWorkflow and the authoring decorators, the WorkflowEngine's selected surface, the DurableConfig options of config/durable.ts, the driver factories, the thrown error classes, the run/checkpoint status enums and the package's subpath exports — one line each, distilled from source.
+description: Every public member of WorkflowCtx, BaseWorkflow and the authoring decorators, the WorkflowEngine's selected surface, the RunGateway, the run-detail and fan types, the DurableConfig options of config/durable.ts, the driver factories, the observability and command building blocks, the thrown error classes, the run/checkpoint status enums and the package's subpath exports — one line each, distilled from source.
 icon: BookMarked
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
-This page is a flat lookup table of the public API of `@adonis-agora/durable`: the `WorkflowCtx`, `BaseWorkflow` and the decorators, the engine, `defineConfig`, the driver factories, the errors and the statuses. It is deliberately terse. For the reasoning behind an entry, follow its link to the concept, authoring or reliability page.
+This page is a flat lookup table of the public API of `@adonis-agora/durable`: the `WorkflowCtx`, `BaseWorkflow` and the decorators, the engine, the `RunGateway`, `defineConfig`, the driver factories, the observability and command building blocks, the errors and the statuses. It is deliberately terse. For the reasoning behind an entry, follow its link to the concept, authoring or reliability page.
 
 Everything below is exported from the package root (`@adonis-agora/durable`) unless a row names a [subpath](#subpath-exports).
 
@@ -273,11 +273,13 @@ import engine from '@adonis-agora/durable/services/main'
 | `listRuns` | `listRuns(query: RunQuery): Promise<WorkflowRun[]>` | Filter by workflow, status, tags, namespace and search attributes. See [Querying by attribute](/docs/durable/authoring/queries-and-updates#querying-by-attribute--enginelistruns). |
 | `countRuns` | `countRuns(query: Omit<RunQuery, 'page' \| 'size'>): Promise<number>` | Exact count through the store when it supports one. |
 | `listCheckpoints` | `listCheckpoints(runId: string): Promise<StepCheckpoint[]>` | A run's checkpoint timeline. |
-| `getRunDetail` | `getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail \| null>` | The run, its timeline and children, wide fans summarized with `summarizeFansOver`. On a store with `checkpointStats` + `queryCheckpoints` it is built from the aggregates and carries an `etag`; `options.ifNoneMatch` naming it returns `notModified` without reading the timeline. |
+| `getRunDetail` | `getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail \| null>` | The run, its timeline and children; with `summarizeFansOver` every wider fan is summarized into `fans`. When `summarizeFansOver` is set **and** the store has `checkpointStats` + `queryCheckpoints` (the Lucid store does), the detail is built from those aggregates and carries an `etag`; `options.ifNoneMatch` naming it returns `{ notModified: true }` without reading the timeline (the dashboard's `304`). See [Run detail and fan types](#run-detail-and-fan-types). |
 | `getFanMembers` | `getFanMembers(runId: string, group: string, query: FanPageQuery): Promise<FanPage \| null>` | One page of a summarized fan, versioned like `getRunDetail` (`query.ifNoneMatch`). |
 | `runFacets` | `runFacets(query: RunFacetQuery): Promise<RunFacetRow[]>` | How the matching runs split across `(status, origin)`: one `GROUP BY` through the store's `runFacets`, else counted over `listRuns`. |
+| `runValueFacets` | `runValueFacets(axis: RunValueAxis, query: RunFacetQuery, opts?: RunValueFacetOptions): Promise<RunValueFacetRow[]>` | The distinct values of one filter axis (workflow, tag, …) over the matching runs, with counts: what a console's pickers list. Delegates to the store's `runValueFacets`, else counts a bounded scan (`RUN_VALUE_FACET_SCAN`, 5000 runs). |
 | `getRunChildren` | `getRunChildren(parentRunId: string): Promise<string[]>` | Ids of the runs this run spawned, stable after they finish. |
-| `workerHealth` | `workerHealth(extra?: string[]): Promise<GroupHealth[]>` | Per-group queue backlog and live worker heartbeats, for transports that support introspection. |
+| `workerHealth` | `workerHealth(extra?: string[]): Promise<GroupHealth[]>` | Per-group queue backlog and live worker heartbeats, over `knownGroups(extra)` plus every group seen in a heartbeat. Empty unless the transport can introspect health (the `bullmq`, `queue` and `db` transports). |
+| `knownGroups` | `knownGroups(extra?: string[]): string[]` | The worker groups this engine dispatches to: every registered remote workflow's group plus `extra`. Pass local-step groups in `extra` so a group with backlog and no workers still reports. |
 | `workflowDirectory` | `workflowDirectory(): Promise<WorkflowDirectory>` | Every workflow the live fleet can run in this engine's partition (`workflows`, each `declared` or `observed`), whether the fleet could be asked at all (`supported`), workers live on other partitions (`otherPartitions`) and a one-line `detail`. See [What can I call?](/docs/durable/cluster/handshake#what-can-i-call). |
 | `announcedWorkflows` | `announcedWorkflows(): Promise<AnnouncedWorkflow[]>` | `workflowDirectory()`'s `workflows`. |
 | `unservedOnErrorRoutes` | `unservedOnErrorRoutes(): Promise<{ workflow: string; route: OnErrorRoute }[]>` | onError routes whose handler nothing can run. See [Catching a misnamed handler](/docs/durable/reliability/on-error#catching-a-misnamed-handler). |
@@ -335,6 +337,57 @@ These are the phases `node ace durable:work` (or the [embedded worker](#durablec
 | `origin` | `string` | Override the registration's package attribution for this run. |
 | `concurrency` | `ConcurrencyQuota` (`{ key: string; limit: number; countStatuses?: RunStatus[] }`) | A per-start quota that overrides the registered one. See [Concurrency quotas](/docs/durable/reliability/concurrency-quotas). |
 
+## RunGateway
+
+The read, control and start surface every role exposes, as `runGateway` from `@adonis-agora/durable/services/main`. On `standalone` and `control-plane` it is a `StoreRunGateway` over the engine; on a `tenant` pod it is a `ProxyRunGateway` that round-trips each call over the transport to the control plane's `RunRequestResponder`. The dashboard and the CLI read through it, so code written against it runs unchanged on every role. See [Reading and steering runs](/docs/durable/cluster/roles-and-config#reading-and-steering-runs-rungateway).
+
+```ts
+import { runGateway } from '@adonis-agora/durable/services/main'
+
+const detail = await runGateway.getRunDetail?.(runId, { summarizeFansOver: 50 })
+```
+
+| Member | Signature | Notes |
+| --- | --- | --- |
+| `topology` | `topology(): DurableTopology` | `{ role: 'control-plane' \| 'standalone' \| 'tenant'; tenant? }`. |
+| `getRun` / `listRuns` | `getRun(runId): Promise<WorkflowRun \| null>` / `listRuns(query: RunQuery): Promise<WorkflowRun[]>` | As on the engine. |
+| `getCheckpoints` / `getRunChildren` | `(runId: string) => Promise<StepCheckpoint[]>` / `Promise<string[]>` | A run's timeline (the engine's `listCheckpoints`) and its child ids. |
+| `getRunDetail?` / `getFanMembers?` | as on the engine | Summarized detail and fan pages, ETag-versioned (`ifNoneMatch` → `notModified`). Optional: absent on a gateway that predates them. |
+| `getSearchAttributes` | `getSearchAttributes(runId: string): Promise<SearchAttributes \| undefined>` | A run's search attributes. |
+| `workerHealth` | `workerHealth(): Promise<GroupHealth[]>` | Per-group backlog and live workers. |
+| `start` | `start(workflow: WorkflowRef, input: unknown, opts?: StartRunOptions): Promise<RunResult>` | `StartRunOptions` is `StartOptions & { runId? }`; a missing `runId` is minted. Idempotent by run id. |
+| `signal` | `signal(runId: string, signal: string, payload?: unknown): Promise<RunResult \| null>` | Deliver a signal by token. `runId` lets a proxy route to the owning control plane; an unclaimed payload is buffered. |
+| `cancel` | `cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult \| null>` | As on the engine. |
+| `redispatchPending` | `redispatchPending(runId: string): Promise<(RunResult & { redispatched: number }) \| null>` | As on the engine. |
+| `retry?` / `continue?` / `retryWithInput?` | `retry(runId)` (the engine's `requeue`), `continue(runId)`, `retryWithInput(runId, input)` | Optional control verbs. Against a control plane that predates them (it answers `unsupported-request`), the dashboard degrades: `retry` falls back to `redispatchPending`, `continue` and `retryWithInput` answer `null` (the handlers 404). |
+| `runFacets?` / `runValueFacets?` | as on the engine | Status/origin split and per-axis value counts for the runs list. Optional; against an older control plane the dashboard counts a bounded `listRuns` scan instead. |
+| `waitingFor?` | `waitingFor(runIds: string[]): Promise<Record<string, RunWaiting>>` | What each suspended run is parked on (signal, webhook, child, breakpoint), for the ones parked on something. Against an older control plane the list rows carry no `waiting` stamp. |
+| `subscribe` | `subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void` | Live lifecycle events of one run (the dashboard's live tail). |
+
+| Export | Signature | Notes |
+| --- | --- | --- |
+| `StoreRunGateway` | `new StoreRunGateway(engine: RunGatewayEngine, options?: { role?: 'standalone' \| 'control-plane' })` | The store-backed gateway the provider binds on the store roles. |
+| `ProxyRunGateway` | `new ProxyRunGateway(transport: ProxyTransport, options: { partition: string; token?: string; requestTimeoutMs?: number })` | The tenant pod's gateway. `requestTimeoutMs` is the config's `requestTimeoutMs`. |
+| `RunRequestResponder` | `new RunRequestResponder(transport: ResponderTransport, gateway: RunGateway, options?: { verifyTenant?; subscribeEngineEvents? })` | Answers proxied run requests on the control plane; a request it cannot serve is answered `UNSUPPORTED_RUN_REQUEST`. |
+| `signTenantToken` | `signTenantToken(tenant: string, secret: string, opts?: { ttlMs?: number; now?: number }): string` | Mint a pod's HMAC tenant claim (`config.tenant.token`); `ttlMs` makes it expire. |
+| `hmacTenantVerifier` | `hmacTenantVerifier(secret: string \| string[], capabilities?: string[]): TenantVerifier` | The matching `verifyTenant`. A list of secrets allows rotation. See [Layered tenant authentication](/docs/durable/cluster/roles-and-config#layered-tenant-authentication). |
+
+## Run detail and fan types
+
+What `getRunDetail` and `getFanMembers` return, on the engine and the `RunGateway`, and the helpers they are built from.
+
+| Type / export | Shape | Notes |
+| --- | --- | --- |
+| `RunDetail` | `{ run, timeline, children, fans?, childCount?, etag?, notModified? }` | When summarized, the members of a wide fan are left out of `timeline` and described in `fans`, and `children` lists at most `SUMMARY_CHILD_LIMIT` (200) ids, `childCount` the total. `notModified: true` comes back with an empty body when `ifNoneMatch` matched. |
+| `RunDetailOptions` | `{ summarizeFansOver?: number; ifNoneMatch?: string }` | Summarize every fan with more members than `summarizeFansOver`. `ifNoneMatch` is ignored when no etag can be computed (no `summarizeFansOver`, or a store without checkpoint aggregates). |
+| `FanSummary` | `{ group, label, firstSeq, lastSeq, size, total?, notStarted?, failFast, counts, startedAt?, finishedAt?, failures }` | One summarized fan; `failures` holds at most `FAN_SUMMARY_FAILURES` (20) failed members. |
+| `FanPageQuery` | `{ offset?, limit?, failedOnly?, ifNoneMatch? }` | `offset` defaults to 0, `limit` to 100, clamped to 1–500. |
+| `FanPage` | `{ items: StepCheckpoint[]; total: number; etag?; notModified? }` | One page of a fan's members in seq order. |
+| `summarizeTimeline` / `summarizeFan` / `pageFan` | `summarizeTimeline(timeline, over)` → `{ timeline, fans }`; `summarizeFan(group, members)` → `FanSummary`; `pageFan(timeline, group, query)` → `FanPage` | The in-memory versions, over a loaded checkpoint list. |
+| `summarizeRunFromStore` / `pageFanFromStore` | `(store, runId, over \| group, …)` | The same, read from a store's `checkpointStats` / `queryCheckpoints` aggregates. |
+| `runDetailEtag` / `fanPageEtag` / `etagMatches` | `→ string` / `→ string` / `(ifNoneMatch, etag) → boolean` | The ETags the detail and fan reads carry, and the weak `If-None-Match` comparison (`*` included). |
+| `childIdsOf` / `parentRunIdOf` | `childIdsOf(checkpoints): string[]` / `parentRunIdOf(runId): string \| undefined` | The child ids a timeline references; the parent of an engine-minted child id (also stamped as `parentRunId` on [diagnostics events](/docs/durable/observability/diagnostics#child-runs-carry-parentrunid)). |
+
 ## DurableConfig
 
 `defineConfig(config)` in `config/durable.ts` returns a `DurableConfig`, a union discriminated on `role`: `StandaloneConfig` (the default when `role` is omitted), `ControlPlaneConfig` or `TenantConfig`. All roles share the fields below. See [Roles & config](/docs/durable/cluster/roles-and-config).
@@ -367,7 +420,7 @@ export default defineConfig({
 | `trackStepStart` | `boolean` | `true` | Persist a `running` checkpoint when a local step starts; `false` halves checkpoint writes on hot paths. |
 | `leaseMs` | `number` | `30000` | Recovery lease duration. See [Delivery under multiple instances](/docs/durable/reliability/multi-instance). |
 | `instanceId` | `string` | random | Unique per process; run leases are held by it. |
-| `namespace` | `string` | `'default'` on `standalone`; every pool on `control-plane` | Worker-pool partition; poll and recovery paths act only on this namespace. Absent on a `control-plane`, the engine is the operator and drives every pool. See [Tenancy](/docs/durable/concepts/tenancy). |
+| `namespace` | `string` | `'default'` on `standalone`; unset (operator) on `control-plane` | Worker-pool partition; poll and recovery paths act only on this namespace. A `control-plane` with no `namespace` is the operator and drives every pool (before 0.51 an unset namespace meant operator on every role). See [Tenancy](/docs/durable/concepts/tenancy). |
 | `maxRecoveryAttempts` | `number` | unlimited | Crash-recovery pickups before a run moves to `dead`. See [Dead-letter queue](/docs/durable/reliability/dead-letter). |
 | `compensationRetries` | `number` | `1` | Attempts per saga compensation on run failure. See [Retrying a transient undo](/docs/durable/reliability/sagas#retrying-a-transient-undo). |
 | `compensationTimeoutMs` | `number` | `300000` | Upper bound on awaiting one dispatched compensation without its own `timeoutMs`. |
@@ -413,13 +466,50 @@ Each factory returns a lazy thunk, so a driver's peer dependency is imported onl
 | `transports.memory` | `memory(_config?: MemoryTransportConfig): TransportFactory` | Test-only in-process transport (the default when no `transport` is named). See [In-process for tests](/docs/durable/transports#in-process-for-tests--memory). |
 | `transports.eventEmitter` | `eventEmitter(config?: EventEmitterTransportConfig): TransportFactory` | Production in-process transport and control plane over a Node `EventEmitter`. See [Single-process production](/docs/durable/transports#single-process-production--eventemitter). |
 | `transports.queue` | `queue(config?: QueueTransportConfig): TransportFactory` | Cross-process over `@adonisjs/queue`. See [Queue transport](/docs/durable/transports/queue). |
-| `transports.bullmq` | `bullmq(config: BullMQTransportConfig): TransportFactory` | Cross-process over BullMQ (`bullmq` / `ioredis` imported lazily). See [Transports](/docs/durable/transports). |
+| `transports.bullmq` | `bullmq(config: BullMQTransportConfig): TransportFactory` | Cross-process over BullMQ (`bullmq` / `ioredis` imported lazily). Its options include `pingIntervalMs` (default `30000`) and the opt-in `stepTimeoutMs`, a wall-clock ceiling per step handler past which the step fails retryable ([wedged steps](/docs/durable/transports/bullmq#wedged-steps-steptimeoutms)). See [BullMQ transport](/docs/durable/transports/bullmq). |
 | `transports.db` | `db(config?: DbTransportConfig): TransportFactory` | Cross-process over the app's database through `@adonisjs/lucid`, no broker. See [DB transport](/docs/durable/transports/db). |
 | `stores.lucid` | `lucid(config?: LucidStoreConfig): StoreFactory` | Persist in SQL through `@adonisjs/lucid` (`{ connection?: string; collation?: string }`). See [Lucid store](/docs/durable/stores/lucid). |
 | `controlPlanes.redis` | `redis(config?: RedisControlPlaneConfig): ControlPlaneFactory` | Lifecycle and cancellation broadcast over `@adonisjs/redis` pub/sub. See [Multi-replica: `controlPlanes.redis`](/docs/durable/transports/control-plane#multi-replica-controlplanesredis). |
 | `admissions.redis` | `redis(config?: RedisAdmissionConfig): AdmissionFactory` | Fleet-wide flow-control caps in one atomic Lua script on Redis. See [Distributed admission](/docs/durable/reliability/flow-control#distributed-admission--redis). |
 
 The concrete classes (`InMemoryTransport`, `EventEmitterTransport`, `QueueTransport`, `BullMQTransport`, `DbTransport`, `InMemoryStateStore`, `LucidStateStore`, `RedisControlPlane`) are exported too, for passing an instance directly or writing tests. Schema helpers for a hand-written migration: `createDurableTables(db: Database, connectionName?: string, options?: CreateDurableTablesOptions): Promise<void>`, `dropDurableTables(db: Database, connectionName?: string): Promise<void>` (`CreateDurableTablesOptions` is `{ logger?, collation?, force? }`; `DURABLE_SCHEMA_REVISION`, `DURABLE_SCHEMA_META_TABLE` and `DURABLE_JSON_COLUMNS` describe what it manages), `onCorruptJsonColumn(reporter)` to route the Lucid store's report of a JSON column that does not parse, `createDurableTransportTables(db: Database): Promise<void>` and `dropDurableTransportTables(db: Database): Promise<void>`. See [Lucid store](/docs/durable/stores/lucid) and [DB transport](/docs/durable/transports/db#the-tables).
+
+## Observability building blocks
+
+Root exports for wiring the engine's lifecycle events into your own tooling. The [`/otel`](#subpath-exports) and [`/telescope`](#subpath-exports) subpaths hold the heavier integrations.
+
+| Export | Signature | Notes |
+| --- | --- | --- |
+| `collectMetrics` | `collectMetrics(engine: { subscribe }): MetricsCollector` | Dependency-free counters; `.prometheus()` returns the text exposition, `.snapshot()` the raw `MetricsSnapshot`, `.stop()` unsubscribes. Counts only this instance's events. See [Metrics](/docs/durable/observability/metrics). |
+| `attachDurableDiagnostics` | `attachDurableDiagnostics(engine: DurableEventSource, options?: { includeRemote?: boolean }): () => void` | Bridge every `EngineEvent` onto the `@adonis-agora/diagnostics` bus as `durable` / `<event type>`. The provider attaches it for you. `includeRemote` (default `false`) also forwards events heard from other instances over the control plane. See [Diagnostics](/docs/durable/observability/diagnostics). |
+| `isRemoteEvent` | `isRemoteEvent(event: EngineEvent): boolean` | `true` for an event another instance produced and the control plane re-delivered here. Filter on it in a listener that records or counts, so a fleet counts each event once. |
+| `withScheduleOrigin` / `asHeartbeat` | `<T>(fn: () => T) => T` | Label `fn` as scheduler-driven work, or as a liveness probe an observability tool may drop. A no-op unless a driver (Telescope's) is installed. |
+| `currentStep` | `currentStep(): StepLogger \| undefined` | The running step's logger. See [`currentStep()`](#currentstep). |
+
+## Command building blocks
+
+The pieces `durable:work`, `durable:runs` and `durable:retry` are built from, exported so an app can compose its own command or scheduler without re-implementing the loop. See [Building your own](/docs/durable/cli#building-your-own).
+
+| Export | Signature | Notes |
+| --- | --- | --- |
+| `runTick` | `runTick(engine: WorkflowEngine, options?: { now?: number; schedules?: ScheduledWorkflow[] }): Promise<TickResult>` | One worker tick, in phases: `runPending`, `recoverIncomplete`, `resumeDueTimers`, `sweepTimeouts`, schedules (config and, with `persistedSchedules`, persisted), `sweepRetention`, `sweepStalled`. `TickResult` is `{ pending, recovered, timers, scheduled, evicted, errors: { phase, error }[] }`; a failing phase does not stop the others. |
+| `runWorkerLoop` | `runWorkerLoop(engine: WorkflowEngine, options: WorkerLoopOptions): Promise<number>` | `runTick` every `intervalMs` until `stopSignal` resolves, then drains. Starts deferred consumers first. `WorkerLoopOptions` is `{ intervalMs, stopSignal, logger: WorkerLogger, sleep?, schedules?, … }`. |
+| `listRuns` | `listRuns(source: RunLister, opts: { status?, statuses?, workflow?, limit? }): Promise<WorkflowRun[]>` | The `durable:runs` query. |
+| `attachLiveness` / `filterStale` | `attachLiveness(source, runs, now?): Promise<RunLiveness[]>` / `filterStale(liveRuns, thresholdMs = DEFAULT_STALE_MS)` | Add each run's age and oldest pending remote step; keep the ones idle past the threshold (`DEFAULT_STALE_MS` is 15 minutes). |
+| `renderRunsTable` / `staleHint` / `parseDurationMs` | `renderRunsTable(liveRuns): string`, `staleHint(runId): string`, `parseDurationMs(input): number \| undefined` | The `durable:runs` table, its remediation hint, and its `--stale` parser. |
+| `retryRun` | `retryRun(engine, runId): Promise<RunResult \| null>` | `engine.requeue(runId)`, what `durable:retry` calls. |
+
+## Discovery helpers
+
+What the provider runs over `workflowsPath` / `stepsPath`, for a directory it does not scan (a preload, a package). See [Registering an extra directory by hand](/docs/durable/authoring/app-workflows#registering-an-extra-directory-by-hand).
+
+| Export | Signature | Notes |
+| --- | --- | --- |
+| `registerWorkflowsFromDir` | `registerWorkflowsFromDir(engine, dir: string \| string[], factory?): Promise<WorkflowMeta[]>` | Import every module under `dir` and register its `BaseWorkflow` classes. |
+| `registerWorkflowsFromBarrel` | `registerWorkflowsFromBarrel(engine, barrel, factory?): Promise<WorkflowMeta[]>` | The same over a generated barrel (`hooks/workflows`). |
+| `registerStepsFromDir` / `registerStepsFromBarrel` | `(server: StepServer, dir \| barrel) => Promise<DurableStepMeta[]>` | Serve every `@Step` class and `defineStep` handler found. The engine is a `StepServer`. |
+| `registerWorkflowClass` / `registerSteps` | `registerWorkflowClass(engine, cls, factory?)` / `registerSteps(server, exports)` | Register one class, or the steps in a list of module exports. |
+| `parseDuration` | `parseDuration(duration: string \| number): number` | The duration parser every `'30s'` / `'7 days'` option goes through. |
 
 ## Errors
 
@@ -494,17 +584,17 @@ Only `completed`, `failed`, `cancelled` and `dead` are terminal (`TerminalRunSta
 | Import path | What it provides |
 | --- | --- |
 | `@adonis-agora/durable` | Everything on this page: ctx types, `BaseWorkflow`, decorators, `WorkflowEngine`, `defineConfig`, factories, errors, statuses. |
-| `@adonis-agora/durable/services/main` | The `WorkflowEngine` singleton (default export) and `runGateway`. See [Roles & config](/docs/durable/cluster/roles-and-config#reading-and-steering-runs-rungateway). |
+| `@adonis-agora/durable/services/main` | The `WorkflowEngine` singleton (default export, `undefined` on a `tenant` pod) and [`runGateway`](#rungateway). See [Roles & config](/docs/durable/cluster/roles-and-config#reading-and-steering-runs-rungateway). |
 | `@adonis-agora/durable/durable_provider` | The AdonisJS provider registered by `node ace configure`. See [Getting started](/docs/durable/getting-started). |
 | `@adonis-agora/durable/dashboard_provider` | The dashboard provider. See [Dashboard](/docs/durable/observability/dashboard). |
-| `@adonis-agora/durable/dashboard` | Dashboard building blocks (its own `defineConfig`, handlers, auth). See [Dashboard auth](/docs/durable/observability/dashboard-auth). |
-| `@adonis-agora/durable/worker` | The store-less worker entry: `WorkerRuntime`, step registration helpers, `runWorkflowTurn`. See [Thin workers](/docs/durable/cluster/thin-workers). |
+| `@adonis-agora/durable/dashboard` | Dashboard building blocks: its own `defineConfig` / `resolveConfig` / `defaultAuthorize`, the framework-agnostic handlers (`listRuns`, `getRun`, `getRunEvent`, `cancelRun`, `retryRun`, `retryWithInputRun`, `continueRun`, `redispatchPendingRun`, `bulkAction`, `runValues`, `workers`, `topology`, `health`, `metricsText`, `deliverWebhook`), `dashboardEngineForRole` / `gatewayDashboardEngine`, the auth helpers (`resolveDashboardAuth`, `performLogin`, `performSession`, `readSession`, `SESSION_COOKIE_NAME`) and the access-denied / login page renderers. See [Dashboard](/docs/durable/observability/dashboard) and [Dashboard auth](/docs/durable/observability/dashboard-auth). |
+| `@adonis-agora/durable/worker` | The store-less worker entry: `WorkerRuntime`, step registration helpers (`registerSteps`, `registerStepsFromDir`, `registerStepsFromBarrel`), `runWorkflowTurn` and its errors, the worker registries (`RedisWorkerRegistry`, `NoopWorkerRegistry`) and the descriptor / routing-token helpers. See [Thin workers](/docs/durable/cluster/thin-workers). |
 | `@adonis-agora/durable/otel` | `attachDurableOtel`, `attachDurableMetrics`, `otelTraceparent`. See [OpenTelemetry](/docs/durable/observability/otel). |
-| `@adonis-agora/durable/telescope` | `durableTelescopeExtension`, `durableDashboard`, `durableSchedules`. See [Telescope](/docs/durable/observability/telescope). |
-| `@adonis-agora/durable/testing` | `createTestEngine`, `MutableClock`, `assertRunStatus`, `assertOutput`, `assertStepsRan`, `assertStepAttempts`, `failOnce`, `failTimes`, `assertReplayable`, transport conformance. See [Testing](/docs/durable/testing). |
-| `@adonis-agora/durable/testing/conformance` | State-store and admission-backend conformance kits. See [Conformance kits](/docs/durable/testing#conformance-kits). |
-| `@adonis-agora/durable/hooks/workflows` / `@adonis-agora/durable/hooks/steps` | Assembler hooks that generate the `app/workflows` and `app/steps` barrels. See [app/workflows](/docs/durable/authoring/app-workflows). |
+| `@adonis-agora/durable/telescope` | `durableTelescopeExtension`, `durableDashboard`, `durableSchedules`, the data providers behind its widgets (`durableStateProvider`, `durableWorkerHealthProvider`, `durableWorkerStatusProvider`, `durableTimeseriesProvider`, …) and `dedupeRunEvents`. See [Telescope](/docs/durable/observability/telescope). |
+| `@adonis-agora/durable/testing` | `createTestEngine`, `MutableClock`, `assertRunStatus`, `assertOutput`, `assertStepsRan`, `assertStepAttempts`, `recordedSteps`, `failOnce`, `failTimes`, `captureHistory`, `parseRunHistory`, `assertReplayable`, and the transport conformance kit `assertTransportConformance`. See [Testing](/docs/durable/testing). |
+| `@adonis-agora/durable/testing/conformance` | State-store and admission-backend conformance kits: `runStateStoreContract`, `runAdmissionBackendContract`, and `StateStoreUnavailableError` (throw it from a store factory to skip the contract when the backend is down). See [Conformance kits](/docs/durable/testing#conformance-kits). |
+| `@adonis-agora/durable/hooks/workflows` / `@adonis-agora/durable/hooks/steps` | Assembler hooks that generate the `app/workflows` and `app/steps` barrels (default exports; `workflowsHook(options)` / `stepsHook(options)` take `{ source?, importAlias?, output? }`, output `.adonisjs/durable/workflows.ts` / `steps.ts`). See [app/workflows](/docs/durable/authoring/app-workflows). |
 | `@adonis-agora/durable/admission-redis` | `RedisAdmissionBackend`, for passing an instance directly. See [Flow control](/docs/durable/reliability/flow-control). |
 | `@adonis-agora/durable/control-plane-redis` | `RedisControlPlane`, for passing an instance directly. See [Control plane](/docs/durable/transports/control-plane). |
-| `@adonis-agora/durable/commands` | The ace commands (`durable:work`, `durable:runs`, …). See [CLI](/docs/durable/cli). |
+| `@adonis-agora/durable/commands` | The ace commands: `durable:work`, `durable:worker`, `durable:runs`, `durable:retry`, `durable:export` and `make:workflow`. See [CLI](/docs/durable/cli). |
 | `@adonis-agora/durable/configure` | The `node ace configure` hook (also re-exported from the root). |
