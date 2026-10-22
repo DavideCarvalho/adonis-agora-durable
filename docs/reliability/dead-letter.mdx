@@ -12,6 +12,8 @@ Most failures are transient and recover cleanly. But occasionally a run is a **p
 
 Crash-recovery is **self-healing and periodic**: while a run executes its worker renews a recovery lease, so a crashed worker's lease expires and recovery (`engine.recoverIncomplete()`, called every tick by the [`durable:work`](/docs/durable/cli) loop) reclaims the orphaned run within ~`leaseMs` — on any instance, not just on the next boot. That's what makes a genuine poison pill visible: it gets picked up again and again. Every time crash-recovery picks up a run that still reads `running` once it holds the lease (it re-reads the run under the lease, so a run that settled after the orphan listing is left alone and never counted), the engine increments that run's `recoveryAttempts` *before* resuming it (so a crash mid-resume still advances the counter).
 
+A run whose remote step is still in flight is not counted. A free run lease doesn't mean anything crashed in that case: the step is on the transport with a worker that holds no run lease. Recovery parks such a run `suspended` on the step's deadline or the `reconcileMs` wake, and the worker's result resumes it. A slow remote step therefore can't burn the budget and be dead-lettered while its worker is still busy.
+
 Set `maxRecoveryAttempts` in `config/durable.ts`, and once a run exceeds it, instead of resuming yet again the engine moves the run to the terminal **`dead`** status with a `max_recovery_attempts` error, releases its lease, and stops touching it:
 
 ```ts title="config/durable.ts"
@@ -21,7 +23,7 @@ export default defineConfig({
 })
 ```
 
-Omit `maxRecoveryAttempts` for unlimited recovery (the default). A `dead` run is terminal but **not lost**: it stays fully inspectable in the [dashboard](/docs/durable/observability/dashboard) — its history, its checkpoints, its error — and it can be retried from there (or via [`durable:retry`](/docs/durable/cli)) once you've shipped a fix. The point is that one poison pill no longer keeps the process crashing for every other run.
+Omit `maxRecoveryAttempts` for unlimited recovery (the default). A `dead` run is terminal but **not lost**: it stays fully inspectable in the [dashboard](/docs/durable/observability/dashboard) — its history, its checkpoints, its error — and it can be retried from there (or via [`durable:retry`](/docs/durable/cli)) once you've shipped a fix. A retry (`engine.requeue`) of a `dead` or `failed` run resets its `recoveryAttempts` to 0, so the retried run gets the full budget again. Requeueing a run that is still live keeps its count. The point is that one poison pill no longer keeps the process crashing for every other run.
 
 ## Handling dead runs: `engine.onDead`
 

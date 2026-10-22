@@ -165,6 +165,8 @@ A compensating cancel returns immediately (non-blocking) and runs the undo in th
 
 The request itself is durable: `cancel({ compensate: true })` persists a cancel marker alongside broadcasting the cancellation, so the undo survives a crash or a pod handoff — whichever pod next drives the run honors the marker and runs the saga, even if the pod that took the cancel request couldn't run the workflow (or died before it did).
 
+The cancel is honored however the turn ends. If the run is mid-turn when you cancel it, that turn (or the resume queued behind it) checks for the cancel when it returns, throws, continues-as-new or suspends. In each case it runs the compensations and settles `cancelled`, instead of completing, failing or forking a continuation. A body with no suspension point left can't slip past a compensating cancel this way.
+
 To cancel many runs at once, `engine.cancelWhere(filter, opts?)` cancels every run matching a [run query](/docs/durable/concepts/workflows-and-steps#tags) (with the same `{ compensate }` option).
 
 ## Saga vs. retries vs. dead-letter

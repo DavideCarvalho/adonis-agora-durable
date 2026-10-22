@@ -22,6 +22,12 @@ import { mergeRunFacetRows } from '../run-facets.js';
 import { runPageWindow } from '../run-pagination.js';
 import { scanRunValueFacets } from '../run-value-facets.js';
 import { normalizeAttributeRows, type RunAttributeRow } from '../search-attributes.js';
+import {
+  settlesTerminally,
+  singletonAdmissionDenialPatch,
+  singletonAdmissionTags,
+  withoutAdmission,
+} from '../singleton-admission.js';
 
 /**
  * A non-durable, in-process `StateStore` for tests and local development.
@@ -109,7 +115,7 @@ export class InMemoryStateStore implements StateStore {
   async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
     const existing = this.runs.get(runId);
     if (!existing) throw new Error(`run ${runId} not found`);
-    const next = { ...existing, ...patch };
+    const next = { ...existing, ...patch, ...releasedSlot(existing, patch) };
     this.runs.set(runId, next);
     if ('searchAttributes' in patch) this.reindexAttributes(runId, next.searchAttributes);
   }
@@ -123,9 +129,29 @@ export class InMemoryStateStore implements StateStore {
     // same reasoning tryLockRun/renewRunLock already rely on for their compare-and-set.
     const existing = this.runs.get(runId);
     if (!existing || !expectedStatuses.includes(existing.status)) return false;
-    const next = { ...existing, ...patch };
+    const next = { ...existing, ...patch, ...releasedSlot(existing, patch) };
     this.runs.set(runId, next);
     if ('searchAttributes' in patch) this.reindexAttributes(runId, next.searchAttributes);
+    return true;
+  }
+
+  async tryAdmitSingleton(
+    runId: string,
+    tag: string,
+    workflow: string,
+    limit: number,
+    retryWakeAt?: number,
+  ): Promise<boolean> {
+    // No `await` between the snapshot and the claim: this synchronous turn is the critical section.
+    const runs = [...this.runs.values()];
+    const tags = singletonAdmissionTags(runs, runId, tag, workflow, limit);
+    const run = this.runs.get(runId);
+    if (!tags || !run) {
+      const parked = singletonAdmissionDenialPatch(runs, runId, tag, workflow, retryWakeAt);
+      if (parked && run) this.runs.set(runId, { ...run, ...parked });
+      return false;
+    }
+    this.runs.set(runId, { ...run, tags });
     return true;
   }
 
@@ -649,4 +675,14 @@ export class InMemoryStateStore implements StateStore {
     this.checkpointRowsRead += rows.length;
     return rows;
   }
+}
+
+/** A terminal settle releases the run's singleton slot: drop the admission marker from its tags. */
+function releasedSlot(
+  existing: WorkflowRun,
+  patch: Partial<WorkflowRun>,
+): Pick<WorkflowRun, 'tags'> | undefined {
+  if (!settlesTerminally(patch)) return undefined;
+  const tags = withoutAdmission('tags' in patch ? patch.tags : existing.tags);
+  return tags ? { tags } : undefined;
 }

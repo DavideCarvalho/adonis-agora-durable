@@ -191,6 +191,35 @@ describe('DurableProvider', () => {
     expect((engine as unknown as { timerBatchSize: number }).timerBatchSize).toBe(50);
   });
 
+  it('forwards reconcileMs and blockedPollMs to the engine', async () => {
+    const { app, resolve } = fakeApp({ reconcileMs: 60_000, blockedPollMs: 250 });
+    new DurableProvider(app).register();
+    const engine = await resolve();
+    const deps = engine as unknown as { reconcileMs?: number; blockedPollMs: number };
+    expect(deps.reconcileMs).toBe(60_000);
+    expect(deps.blockedPollMs).toBe(250);
+  });
+
+  it('reconcileMs: 0 disables the fallback; non-finite tuning values fall back to the defaults', async () => {
+    const off = fakeApp({ reconcileMs: 0, blockedPollMs: 0 });
+    new DurableProvider(off.app).register();
+    const disabled = (await off.resolve()) as unknown as {
+      reconcileMs?: number;
+      blockedPollMs: number;
+    };
+    expect(disabled.reconcileMs).toBeUndefined();
+    expect(disabled.blockedPollMs).toBe(5000);
+
+    const bad = fakeApp({ reconcileMs: Number.NaN, blockedPollMs: Number.POSITIVE_INFINITY });
+    new DurableProvider(bad.app).register();
+    const guarded = (await bad.resolve()) as unknown as {
+      reconcileMs?: number;
+      blockedPollMs: number;
+    };
+    expect(guarded.reconcileMs).toBe(300_000);
+    expect(guarded.blockedPollMs).toBe(5000);
+  });
+
   it('forwards config.webhookUrl so ctx.webhook() gets a public url', async () => {
     const { app, resolve } = fakeApp({
       webhookUrl: (token) => `https://api.example.com/durable/webhooks/${token}`,

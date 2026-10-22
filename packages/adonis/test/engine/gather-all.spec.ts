@@ -103,9 +103,9 @@ describe('ctx.all (parallel child workflows, wait-all)', () => {
   it('empty inputs returns [] immediately, with no side effects', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });
-    let childDispatched = false;
+    let childRuns = 0;
     engine.register('handle', '1', async () => {
-      childDispatched = true;
+      childRuns += 1;
       return 'x';
     });
     engine.register('parent', '1', async (ctx) => {
@@ -119,7 +119,9 @@ describe('ctx.all (parallel child workflows, wait-all)', () => {
     expect((res.output as { before: string[] }).before).toEqual([]);
     // The empty all reserved no positions: the later startChild gets position 0.
     expect((res.output as { id: string }).id).toBe('p1.child.0');
-    expect(childDispatched).toBe(false); // empty all dispatched nothing
+    // The empty all dispatched nothing: the only `handle` run is the explicit startChild one.
+    expect(childRuns).toBeLessThanOrEqual(1);
+    expect((await store.listRuns({ workflow: 'handle' })).map((r) => r.id)).toEqual(['p1.child.0']);
   });
 
   it('waitAll aggregates child failures into a GatherError', async () => {

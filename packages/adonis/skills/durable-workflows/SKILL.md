@@ -211,8 +211,10 @@ Prefer it to `Promise.all` past a handful of steps (every result of a
 child-workflow `ctx.all` when each item is just a step. A `queue` or a
 `timeoutMs` is rejected on a step fan.
 
-Serialize runs per subject with a singleton — runs sharing a key queue FIFO and
-are race-free across instances:
+Serialize runs per subject with a singleton — runs sharing a key queue FIFO.
+Admission is an atomic store claim (`StateStore.tryAdmitSingleton`, built into the
+Lucid and in-memory stores), and a holder keeps its slot until it settles
+terminally, so replicas never over-admit and a later start never displaces it:
 
 ```ts
 export default class SyncShopWorkflow extends BaseWorkflow {

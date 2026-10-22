@@ -149,7 +149,10 @@ node ace durable:work --interval=500 --drain-timeout=15000
 
 Each `durable:work` tick runs `engine.runPending()` → `recoverIncomplete()` →
 `resumeDueTimers()` → `sweepTimeouts()` → fires due schedules, then drains on
-`SIGINT`/`SIGTERM`. Source: `docs/concepts/durability.mdx`,
+`SIGINT`/`SIGTERM`. `--drain-timeout` bounds the whole shutdown: the wait for
+the tick in flight is deducted from the drain. The recovery fallbacks are
+`config/durable.ts` fields: `reconcileMs` (lost-wake re-drive, default 300000,
+`0` off) and `blockedPollMs` (blocked-run re-check, default 5000). Source: `docs/concepts/durability.mdx`,
 `docs/reliability/failure-modes.mdx`, `docs/cli.mdx`.
 
 ### Pattern 3 — dispatch vs start vs waitForRun

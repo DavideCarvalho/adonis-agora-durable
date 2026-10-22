@@ -39,6 +39,14 @@ import {
   sqlComparator,
 } from '../search-attributes.js';
 import {
+  SINGLETON_ACTIVE_STATUSES,
+  SINGLETON_ADMITTED_TAG,
+  settlesTerminally,
+  singletonAdmissionDenialPatch,
+  singletonAdmissionTags,
+  withoutAdmission,
+} from '../singleton-admission.js';
+import {
   type CheckpointRow,
   checkpointToRow,
   parseJsonColumn,
@@ -145,8 +153,8 @@ export class LucidStateStore implements StateStore {
   }
 
   async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
-    const row = runPatchToRow(patch);
     await this.client().transaction(async (trx) => {
+      const row = await this.releaseSlot(trx, runId, patch);
       // Knex throws on an empty `.update({})`; skip the UPDATE when no mapped column changed.
       if (Object.keys(row).length) {
         await trx.from(DURABLE_TABLES.runs).where('id', runId).update(row);
@@ -162,8 +170,8 @@ export class LucidStateStore implements StateStore {
     expectedStatuses: RunStatus[],
     patch: Partial<WorkflowRun>,
   ): Promise<boolean> {
-    const row = runPatchToRow(patch);
     return this.client().transaction(async (trx) => {
+      const row = await this.releaseSlot(trx, runId, patch);
       let applied: boolean;
       if (Object.keys(row).length) {
         // The status predicate lives IN the UPDATE's WHERE clause, alongside `updateRun`'s existing
@@ -189,6 +197,76 @@ export class LucidStateStore implements StateStore {
         await this.reindexAttributes(trx, runId, patch.searchAttributes);
       }
       return applied;
+    });
+  }
+
+  /**
+   * The row patch for `patch`, plus — when it settles the run terminally — the run's tags without the
+   * singleton admission marker, so a terminal settle releases the slot. The current tags are read
+   * under a row lock (Postgres/MySQL) so an admission committing concurrently can't be overwritten
+   * with a stale tag list.
+   */
+  private async releaseSlot(
+    trx: TransactionClientContract,
+    runId: string,
+    patch: Partial<WorkflowRun>,
+  ): Promise<Record<string, unknown>> {
+    const row = runPatchToRow(patch);
+    if (!settlesTerminally(patch)) return row;
+    let tags: string[] | undefined;
+    if ('tags' in patch) {
+      tags = patch.tags;
+    } else {
+      const q = trx.from(DURABLE_TABLES.runs).where('id', runId).select('tags');
+      if (locksRows(trx)) q.forUpdate();
+      const current = (await q.first()) as Pick<RunRow, 'tags'> | null;
+      tags = parseJsonColumn<string[]>(current?.tags, `${DURABLE_TABLES.runs}.tags`, runId);
+    }
+    const released = withoutAdmission(tags);
+    return released ? { ...row, ...runPatchToRow({ tags: released }) } : row;
+  }
+
+  async tryAdmitSingleton(
+    runId: string,
+    tag: string,
+    workflow: string,
+    limit: number,
+    retryWakeAt?: number,
+  ): Promise<boolean> {
+    return this.client().transaction(async (trx) => {
+      // Every active run sharing the key. The tag LIKE may over-match (it is only a lock-scope
+      // narrowing); the decision re-filters exactly.
+      const sharing = () =>
+        trx
+          .from(DURABLE_TABLES.runs)
+          .where('workflow', workflow)
+          .whereIn('status', SINGLETON_ACTIVE_STATUSES)
+          .whereRaw(`tags like ? escape '!'`, [`%"${escapeLike(tag)}"%`]);
+      let rows: RunRow[];
+      if (locksRows(trx)) {
+        // Lock the key's active rows in a stable order (no lock-order deadlock between two claims).
+        // A competing claim blocks here until this one commits, then reads the committed holder.
+        rows = (await sharing().orderBy('id', 'asc').forUpdate()) as RunRow[];
+      } else {
+        // SQLite has no row locks: take the database write lock FIRST with a no-op write, then read,
+        // so no other connection or process can claim between this read and the write below.
+        await sharing().update({ workflow });
+        rows = (await sharing()) as RunRow[];
+      }
+      const runs = rows.map(rowToRun);
+      const tags = singletonAdmissionTags(runs, runId, tag, workflow, limit);
+      if (!tags) {
+        const parked = singletonAdmissionDenialPatch(runs, runId, tag, workflow, retryWakeAt);
+        if (parked) {
+          await trx.from(DURABLE_TABLES.runs).where('id', runId).update(runPatchToRow(parked));
+        }
+        return false;
+      }
+      // Already a holder (a resumed turn): nothing to write.
+      if (!runs.find((r) => r.id === runId)?.tags?.includes(SINGLETON_ADMITTED_TAG)) {
+        await trx.from(DURABLE_TABLES.runs).where('id', runId).update(runPatchToRow({ tags }));
+      }
+      return true;
     });
   }
 
@@ -1092,6 +1170,12 @@ function nameKindSql(dialect: string): string {
 
 function escapeLike(value: string): string {
   return value.replace(/[!%_]/g, (c) => `!${c}`);
+}
+
+/** Whether this connection's dialect supports `SELECT … FOR UPDATE` row locks. */
+function locksRows(client: Client): boolean {
+  const name = client.dialect.name;
+  return name === 'postgres' || name === 'mysql';
 }
 
 /** Knex `.update()` / `.delete()` return the affected row count as a number across dialects. */

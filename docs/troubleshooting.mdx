@@ -96,7 +96,7 @@ Better still, use the built-in `compensate` option ([Sagas](/docs/durable/reliab
 
 **Cause:** the process that held the run's lease died. A live executor renews its lease every `leaseMs / 2`; a dead one stops, and `recoverIncomplete()` reclaims the run once the lease lapses — but only a ticking worker loop calls `recoverIncomplete()`. If the run's `recoveryAttempts` keeps climbing, it is being reclaimed and crashing the process every time: a poison pill.
 
-**Fix:** run a worker loop and wait about `leaseMs` (default 30 s). For a poison pill, set `maxRecoveryAttempts` so it moves to `dead` instead of crash-looping, then fix and `node ace durable:retry <runId>`. A run that is genuinely busy in a long `ctx.localStep` also reads `running` — its lease keeps renewing, so recovery leaves it alone.
+**Fix:** run a worker loop and wait about `leaseMs` (default 30 s). For a poison pill, set `maxRecoveryAttempts` so it moves to `dead` instead of crash-looping, then fix and `node ace durable:retry <runId>`. A run that is genuinely busy in a long `ctx.localStep` also reads `running` — its lease keeps renewing, so recovery leaves it alone. A run found `running` with a remote step still in flight is parked back to `suspended` instead of counted, so it never climbs toward `dead` while its worker is busy.
 
 ## A run is stuck in `suspended`
 
@@ -197,7 +197,7 @@ Better still, use the built-in `compensate` option ([Sagas](/docs/durable/reliab
 
 **Cause:** `maxRecoveryAttempts` is set and the run exceeded it: crash recovery kept resuming it, and it kept taking the process down — a deserialization bug, an unguarded non-deterministic change, an infinite loop. The engine stopped touching it, with a `max_recovery_attempts` error.
 
-**Fix:** `dead` is terminal but not lost. Diagnose from its history, ship the fix, then `node ace durable:retry <runId>` (or the dashboard's Retry). Use `engine.onDead` or a DLQ workflow for alerting. See [Dead-letter queue](/docs/durable/reliability/dead-letter).
+**Fix:** `dead` is terminal but not lost. Diagnose from its history, ship the fix, then `node ace durable:retry <runId>` (or the dashboard's Retry). The retry resets `recoveryAttempts` to 0, so the run is not dead-lettered again by the next recovery pass. Use `engine.onDead` or a DLQ workflow for alerting. See [Dead-letter queue](/docs/durable/reliability/dead-letter).
 
 ## A step fails on its first attempt, or after exhausting retries
 

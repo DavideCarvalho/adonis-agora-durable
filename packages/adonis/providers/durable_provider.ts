@@ -260,6 +260,9 @@ export default class DurableProvider {
         ...(config.eventBufferTtl !== undefined
           ? { eventBufferTtlMs: parseDuration(config.eventBufferTtl) }
           : {}),
+        // Engine tuning; the engine guards the values (non-finite/out-of-range → its default).
+        ...(config.reconcileMs !== undefined ? { reconcileMs: config.reconcileMs } : {}),
+        ...(config.blockedPollMs !== undefined ? { blockedPollMs: config.blockedPollMs } : {}),
         // Where a freshly-started run executes: explicit config wins; else `control-plane` leaves it
         // pending for the poll loop (no inline execution), and `standalone` uses the engine's in-process
         // default (embedded worker).

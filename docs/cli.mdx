@@ -26,7 +26,7 @@ node ace durable:work --interval=500 --drain-timeout=15000
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--interval` | `1000` | poll interval in ms between ticks |
-| `--drain-timeout` | `10000` | drain timeout in ms on shutdown |
+| `--drain-timeout` | `10000` | shutdown budget in ms, from the stop signal: the wait for the tick in flight plus the drain |
 
 Each tick runs `engine.runPending()` → `engine.recoverIncomplete()` → `engine.resumeDueTimers()` → `engine.sweepTimeouts()` → fire due [schedules](/docs/durable/authoring/scheduling) → `engine.sweepRetention()` ([retention eviction](/docs/durable/reliability/retention), self-throttled to once a minute) → `engine.sweepStalled()` (the [stalled-run pager](/docs/durable/reliability/failure-modes#the-stalled-run-pager--onstalled--stalledafter), same throttle, a no-op without listeners). Run this as a dedicated process (or several) when you split web from worker; in a single-process app the in-process dispatcher already runs workflows, so this is optional but recommended for [recovery and timers](/docs/durable/concepts/durability#consequences).
 

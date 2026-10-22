@@ -296,6 +296,97 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       },
     );
 
+    // ---- tryAdmitSingleton (atomic singleton slots) -----------------------------------------
+    // Optional SPI: a store without it can't run singleton workflows, so these cases pass vacuously.
+
+    const ADMITTED = 'durable:singleton:admitted';
+    const gated = (id: string, createdMs: number, over: Partial<WorkflowRun> = {}): WorkflowRun =>
+      run({
+        id,
+        workflow: 'job',
+        status: 'running',
+        tags: ['singleton:k'],
+        createdAt: new Date(createdMs),
+        updatedAt: new Date(createdMs),
+        ...over,
+      });
+
+    t('tryAdmitSingleton admits the oldest waiter and persists the slot in its tags', async () => {
+      if (!store.tryAdmitSingleton) return;
+      await store.createRun(gated('a', 1000));
+      await store.createRun(gated('b', 2000));
+      expect(await store.tryAdmitSingleton('b', 'singleton:k', 'job', 1, 5000)).toBe(false);
+      expect(await store.tryAdmitSingleton('a', 'singleton:k', 'job', 1, 5000)).toBe(true);
+      expect((await store.getRun('a'))?.tags).toEqual(['singleton:k', ADMITTED]);
+      // The denied waiter was parked on its retry timer, in the same claim.
+      const parked = await store.getRun('b');
+      expect(parked?.status).toBe('suspended');
+      expect(parked?.wakeAt).toBe(5000);
+      // A holder re-checking (a resumed turn) keeps its slot.
+      expect(await store.tryAdmitSingleton('a', 'singleton:k', 'job', 1, 5000)).toBe(true);
+    });
+
+    t('tryAdmitSingleton never lets a later or same-instant run displace a holder', async () => {
+      if (!store.tryAdmitSingleton) return;
+      await store.createRun(gated('z-holder', 1000, { tags: ['singleton:k', ADMITTED] }));
+      // Same createdAt, smaller id: it would sort first in a positional scan.
+      await store.createRun(gated('a-waiter', 1000));
+      expect(await store.tryAdmitSingleton('a-waiter', 'singleton:k', 'job', 1)).toBe(false);
+      expect((await store.getRun('a-waiter'))?.tags).toEqual(['singleton:k']);
+      // A second slot goes to the waiter.
+      expect(await store.tryAdmitSingleton('a-waiter', 'singleton:k', 'job', 2)).toBe(true);
+    });
+
+    t('tryAdmitSingleton scopes slots to the workflow and the key', async () => {
+      if (!store.tryAdmitSingleton) return;
+      await store.createRun(gated('other-key', 1000, { tags: ['singleton:x', ADMITTED] }));
+      await store.createRun(
+        gated('other-wf', 1000, { workflow: 'job2', tags: ['singleton:k', ADMITTED] }),
+      );
+      await store.createRun(gated('mine', 2000));
+      expect(await store.tryAdmitSingleton('mine', 'singleton:k', 'job', 1)).toBe(true);
+    });
+
+    t('tryAdmitSingleton never parks a run a concurrent cancel already settled', async () => {
+      if (!store.tryAdmitSingleton) return;
+      await store.createRun(
+        gated('holder', 1000, { status: 'suspended', tags: ['singleton:k', ADMITTED] }),
+      );
+      await store.createRun(gated('cancelled', 2000, { status: 'cancelled' }));
+      expect(await store.tryAdmitSingleton('cancelled', 'singleton:k', 'job', 1, 5000)).toBe(false);
+      const after = await store.getRun('cancelled');
+      expect(after?.status).toBe('cancelled');
+      expect(after?.wakeAt).toBeUndefined();
+      expect(await store.tryAdmitSingleton('missing', 'singleton:k', 'job', 1, 5000)).toBe(false);
+    });
+
+    t('a terminal settle releases the slot; non-terminal writes keep it', async () => {
+      if (!store.tryAdmitSingleton) return;
+      await store.createRun(gated('a', 1000));
+      expect(await store.tryAdmitSingleton('a', 'singleton:k', 'job', 1)).toBe(true);
+      await store.updateRun('a', { status: 'suspended', wakeAt: 9000 });
+      expect((await store.getRun('a'))?.tags).toContain(ADMITTED);
+      await store.updateRun('a', { status: 'failed', error: { message: 'x' } });
+      expect((await store.getRun('a'))?.tags).toEqual(['singleton:k']);
+      await store.createRun(gated('b', 2000));
+      expect(await store.tryAdmitSingleton('b', 'singleton:k', 'job', 1)).toBe(true);
+      expect(await store.updateRunIf('b', ['running'], { status: 'completed' })).toBe(true);
+      expect((await store.getRun('b'))?.tags).toEqual(['singleton:k']);
+    });
+
+    t('concurrent claims for one slot admit exactly one run', async () => {
+      if (!store.tryAdmitSingleton) return;
+      const ids = Array.from({ length: 6 }, (_, i) => `c${i}`);
+      // Same createdAt for all, so the claim order is decided only by the store's serialization.
+      for (const id of ids) await store.createRun(gated(id, 1000));
+      const verdicts = await Promise.all(
+        ids.map((id) => store.tryAdmitSingleton?.(id, 'singleton:k', 'job', 1, 5000)),
+      );
+      expect(verdicts.filter(Boolean)).toHaveLength(1);
+      const rows = await Promise.all(ids.map((id) => store.getRun(id)));
+      expect(rows.filter((r) => r?.tags?.includes(ADMITTED))).toHaveLength(1);
+    });
+
     // ---- checkpoints ------------------------------------------------------------------------
 
     t('countCheckpoints counts a seq range by status', async () => {

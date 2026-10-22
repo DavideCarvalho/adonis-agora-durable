@@ -107,6 +107,15 @@ export class CodecStateStore implements StateStore {
   readonly pruneBufferedEvents?: (publishedBefore: number, limit: number) => Promise<number>;
   /** The same codec over the inner store's scoped view. Bound only when the inner store scopes. */
   readonly withScope?: (scope: { namespace?: string | undefined }) => CodecStateStore;
+  /** Forwarded verbatim — an admission claim touches only status/tags, never a payload. Bound only
+   *  when the inner store has it, so singleton workflows keep failing fast on a store without it. */
+  readonly tryAdmitSingleton?: (
+    runId: string,
+    tag: string,
+    workflow: string,
+    limit: number,
+    retryWakeAt?: number,
+  ) => Promise<boolean>;
   /** Forwarded verbatim — a count reads no payload. Bound only when the inner store has it. */
   readonly countCheckpoints?: (
     runId: string,
@@ -154,6 +163,11 @@ export class CodecStateStore implements StateStore {
           codec,
           options,
         );
+    }
+    const tryAdmitSingleton = inner.tryAdmitSingleton;
+    if (tryAdmitSingleton) {
+      this.tryAdmitSingleton = (runId, tag, workflow, limit, retryWakeAt) =>
+        tryAdmitSingleton.call(inner, runId, tag, workflow, limit, retryWakeAt);
     }
     const countCheckpoints = inner.countCheckpoints;
     if (countCheckpoints) {
