@@ -47,8 +47,12 @@ Both follow one **default-is-bare** rule: `'default'` (the default value) leaves
 byte-identical to a single-pool deployment. Only a real, non-default namespace prefixes anything.
 
 **What an unset `namespace` means depends on the role.** On a `standalone` engine (the default role)
-it means `'default'`: the engine drives, recovers and resumes only the default pool's runs, including
-legacy rows stored without a namespace, which every shipped store reads back as `'default'`. On a
+it means `'default'`: the provider gives the engine `namespace: 'default'`, so it drives, recovers and
+resumes only the default pool's runs. That includes legacy rows written before runs carried a
+namespace: the Lucid schema heal adds the column as `NOT NULL DEFAULT 'default'`, and every shipped store
+reads a missing (`NULL`) value back as `'default'`. An empty string is **not** normalized in the store:
+a run stamped `''` (an engine configured with `namespace: ''`) is not `'default'` to the poll, even
+though the transport treats `''` as bare. Leave `namespace` unset instead of setting it to `''`. On a
 `control-plane` it makes the engine the **operator**: it scopes nothing, so the store's poll filters
 no-op, it drives runs of *every* namespace, and its transports stay on the bare prefix. "Seeing
 everyone" is the absence of a namespace on a control plane, not a wildcard value. There is no standalone
@@ -147,7 +151,8 @@ trusting the body.
 ## Read scoping: `scopeReads`
 
 The responder fences what a store-less pod can reach. A process that **does** hold the store can be
-fenced too: with `scopeReads: true` and a `namespace` set in `config/durable.ts`, the provider hands
+fenced too: with `scopeReads: true` and a namespace in effect (an explicit `namespace`, or the implicit
+`'default'` of a standalone engine), the provider hands
 the engine a view of the store whose run reads (`getRun`, `listRuns`, the counts and facets, and the
 recovery, dispatch and timer scans) only see that namespace's runs. Writes are not fenced. It is off by
 default, because a control plane's own operator screens should see everything, and it has no effect on
