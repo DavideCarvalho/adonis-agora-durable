@@ -207,15 +207,44 @@ describe('singleton admission is an atomic, durable store claim', () => {
     await engine.drain();
   });
 
-  it('a start fails before creating a run when the store cannot admit atomically', async () => {
-    const store = new InMemoryStateStore();
-    Object.defineProperty(store, 'tryAdmitSingleton', { value: undefined });
-    const engine = new WorkflowEngine({ store });
-    engine.register('job', '1', async () => 'done', { singleton: { key: () => 'k' } });
-    await expect(engine.start('job', {}, 'unsupported')).rejects.toThrow(
-      'StateStore.tryAdmitSingleton',
-    );
-    expect(await store.getRun('unsupported')).toBeNull();
+  it('a store without tryAdmitSingleton still admits by scan and warns exactly once per engine', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const store = new InMemoryStateStore();
+      Object.defineProperty(store, 'tryAdmitSingleton', { value: undefined });
+      let now = 1000;
+      const engine = new WorkflowEngine({ store, clock: () => now });
+      const entered: string[] = [];
+      engine.register(
+        'job',
+        '1',
+        async (ctx) => {
+          await ctx.localStep('enter', async () => void entered.push(ctx.runId));
+          await ctx.waitForSignal(`release:${ctx.runId}`);
+        },
+        { singleton: { key: () => 'k' } },
+      );
+      // No throw: the start creates the run, and scan admission serializes the key as before.
+      expect((await startRun(engine, 'job', {}, 'first')).status).toBe('suspended');
+      await settle(5);
+      expect((await startRun(engine, 'job', {}, 'second')).status).toBe('suspended');
+      expect(entered).toEqual(['first']);
+      // Scan semantics: no durable slot is recorded.
+      expect((await store.getRun('first'))?.tags).not.toContain(SINGLETON_ADMITTED_TAG);
+      // The denied run was parked on its retry timer and re-checks there.
+      expect((await store.getRun('second'))?.wakeAt).toBeGreaterThan(now);
+      await engine.signal('release:first', null);
+      await until(() => entered.length === 2);
+      expect(entered).toEqual(['first', 'second']);
+
+      const notAtomic = warn.mock.calls.filter((c) => String(c[0]).includes('tryAdmitSingleton'));
+      expect(notAtomic).toHaveLength(1);
+      expect(String(notAtomic[0]?.[0])).toContain('NOT atomic');
+      now += 1;
+      await engine.drain();
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('maxQueueDepth counts a blocked holder', async () => {

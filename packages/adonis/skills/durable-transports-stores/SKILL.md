@@ -284,8 +284,8 @@ covers all three and fails a store missing either method. To run singleton
 workflows a custom store also needs `tryAdmitSingleton` (one transaction that
 locks before it reads, built on the exported `singletonAdmissionTags` /
 `singletonAdmissionDenialPatch`, and a terminal `updateRun`/`updateRunIf` that
-drops the `durable:singleton:admitted` tag); without it a singleton `start`
-throws before creating the run.
+drops the `durable:singleton:admitted` tag); without it singletons fall back
+to the old non-atomic scan and the engine warns once.
 
 Source: `docs/stores/lucid.mdx`, `docs/stores/index.mdx`.
 

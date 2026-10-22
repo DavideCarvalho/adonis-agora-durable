@@ -9,4 +9,4 @@ Singleton admission is now an atomic, durable store claim. The gate used to re-s
 - Notify-on-release no longer wakes a sleeping holder. `maxQueueDepth` also counts `blocked` runs.
 - The decision helpers `singletonAdmissionTags`, `singletonAdmissionDenialPatch`, `SINGLETON_ADMITTED_TAG` and `SINGLETON_ACTIVE_STATUSES` are exported for custom stores, and the state-store conformance suite covers the claim.
 
-No schema migration. **Breaking for custom stores:** a store without `tryAdmitSingleton` can't run singleton workflows, and their `start` throws before creating the run. Upgrade every worker together, because runs already in flight carry no admission tag (they compete as ordinary FIFO waiters on their next check).
+No schema migration, and not breaking: a custom store without `tryAdmitSingleton` keeps the previous scan-based admission (not atomic) and the engine prints a one-time warning naming `StateStore.tryAdmitSingleton`. Implement it to get atomic admission. Upgrade every worker together, because runs already in flight carry no admission tag (they compete as ordinary FIFO waiters on their next check).

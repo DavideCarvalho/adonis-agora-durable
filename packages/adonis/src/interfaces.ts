@@ -332,7 +332,7 @@ export interface StateStore {
 
   /**
    * Atomically claim a singleton slot for `runId` — the store half of the `singleton` gate. Required
-   * to use singleton workflows (a start fails before creating the run without it); optional otherwise.
+   * for ATOMIC singleton admission; without it the engine falls back to a non-atomic scan and warns once.
    *
    * Inside ONE critical section that serializes competing claims BEFORE it reads (a transaction with
    * `SELECT … FOR UPDATE`, or a write lock taken first; a plain list-then-update is unsafe across
