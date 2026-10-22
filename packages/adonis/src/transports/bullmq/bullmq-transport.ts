@@ -135,8 +135,16 @@ const SUBSCRIBER_PING_TIMEOUT_MS = 5_000;
 function normalizePingInterval(value: number | false | undefined): number | false {
   if (value === undefined) return DEFAULT_PING_INTERVAL_MS;
   if (value === false || value === 0) return false;
+  // setInterval turns a negative, NaN or > 2^31-1 delay into ~1ms: a PING hot loop. Treat those as
+  // unset (the default), like a non-positive stepTimeoutMs.
+  if (!Number.isFinite(value) || value < 0 || value > MAX_TIMER_DELAY_MS) {
+    return DEFAULT_PING_INTERVAL_MS;
+  }
   return value;
 }
+
+/** The largest delay `setInterval` honours (a signed 32-bit int); anything above fires at ~1ms. */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
 /**
  * A queue-backed {@link Transport} over BullMQ/Redis, BYTE-COMPATIBLE with the aviary

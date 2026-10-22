@@ -147,6 +147,17 @@ describe('BullMQTransport subscriber watchdog', () => {
     }
   });
 
+  it('a negative, non-finite or overflowing pingIntervalMs falls back to the default (no hot loop)', async () => {
+    for (const bad of [-5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31]) {
+      const { t, clients } = transport(bad);
+      t.onRunReply(() => {});
+      await delay(40);
+      // setInterval clamps these to ~1ms: a watchdog would PING dozens of times here.
+      expect(clients[0]?.pings, String(bad)).toBe(0);
+      await t.close();
+    }
+  });
+
   it('attaches an error listener so a subscriber error never goes unhandled', async () => {
     const { t, clients } = transport(false);
     t.onHeartbeat(async () => {});
