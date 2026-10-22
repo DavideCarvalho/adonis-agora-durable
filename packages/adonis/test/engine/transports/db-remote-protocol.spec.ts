@@ -512,7 +512,9 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb, makeTransportDb }) => {
         expect(got1.map((e) => e.event.runId)).toEqual(['r1']);
         expect(got2.map((e) => e.event.runId)).toEqual(['r1']);
         expect(got3.map((e) => e.event.runId)).toEqual(['r2']);
-        expect(await rows()).toEqual([]);
+        // A delivered row is deleted after its handler ran — wait for that rather than assume 30ms
+        // covers it (a loaded CI runner on Postgres did not).
+        await until(async () => (await rows()).length === 0);
       });
 
       it('a subscriber receives one publisher’s events in publish order', async () => {
