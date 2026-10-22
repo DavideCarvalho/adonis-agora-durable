@@ -287,7 +287,10 @@ describe.each(dbBackends())('on $name', ({ name: backendName, makeTransportDb })
         );
         let last: WorkerStatus | undefined;
         await until(
-          async () => (last = await statusOf(engine))?.concurrency.limit === 1,
+          async () => {
+            last = await statusOf(engine);
+            return last?.concurrency.limit === 1;
+          },
           20_000,
           'the braked limit',
         ).catch((err) => {
