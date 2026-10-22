@@ -426,8 +426,20 @@ export interface StateStore {
    * without it the engine falls back to {@link listIncompleteRuns} and filters in process, which on
    * a busy fleet fetches (and lock-probes) every healthy running run once per tick per worker. When
    * `namespace` is given, restrict to that worker-pool partition (ANDed).
+   *
+   * When `owner` is given, ALSO return `running` runs whose lease is still live but held by `owner`
+   * (`locked_by = owner`, ORed with the free/expired predicate). The engine passes its own
+   * `instanceId` for one lease window after boot, so an instance that restarts under a stable id
+   * (a pod name) after a crash reclaims the leases its previous incarnation left behind at once,
+   * instead of waiting up to `leaseMs` for them to expire; the engine itself filters out the runs
+   * the live process is executing. A store that ignores `owner` keeps the expiry-only behaviour.
    */
-  listOrphanedRuns?(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]>;
+  listOrphanedRuns?(
+    nowMs: number,
+    limit: number,
+    namespace?: string,
+    owner?: string,
+  ): Promise<WorkflowRun[]>;
 
   /**
    * The oldest `pending` runs awaiting dispatch (FIFO, by `createdAt`), capped at `limit`. When

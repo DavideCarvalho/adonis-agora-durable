@@ -382,16 +382,23 @@ export class LucidStateStore implements StateStore {
     return (rows as RunRow[]).map(rowToRun);
   }
 
-  async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
+  async listOrphanedRuns(
+    nowMs: number,
+    limit: number,
+    namespace?: string,
+    owner?: string,
+  ): Promise<WorkflowRun[]> {
     // The lease predicate lives IN the query: only genuinely orphaned runs (no lease, or an expired
     // one) come back, so a healthy fleet's recovery tick fetches ~zero rows instead of every
-    // running run — and issues ~zero lock-probe UPDATEs.
+    // running run — and issues ~zero lock-probe UPDATEs. `owner` adds the runs still leased to that
+    // instance id (a rebooted instance's own leftovers; the engine filters what it is executing).
     const q = this.fenced(
       this.client()
         .from(DURABLE_TABLES.runs)
         .where('status', 'running')
         .andWhere((sub) => {
           sub.whereNull('locked_until').orWhere('locked_until', '<=', nowMs);
+          if (owner !== undefined) sub.orWhere('locked_by', owner);
         }),
     );
     if (namespace !== undefined) q.andWhere('namespace', namespace);

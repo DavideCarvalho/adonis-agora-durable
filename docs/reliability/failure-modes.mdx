@@ -31,7 +31,7 @@ Before diagnosing anything, know which of the three `runDispatcher` modes your a
 | A `timeoutMs` step never times out, run `running` with a stale lease, then `suspended` | `timeoutMs` step whose coordinating process crashed (the liveness timer died with it) | Run's lease is stale (`lockedUntil` passed) and its step is `pending` | Nothing to do — recovery parks the run `suspended` and the `reconcileMs` wake re-dispatches the step. See [below](#a-timeoutms-step-whose-coordinator-crashed) |
 | `/durable/api/health` shows nothing for a pool you know is stalled | You're on `eventEmitter`, or on `queue` with no worker-key store (`workerKeys: false`, or no database) — only `bullmq`, `queue` and `db` implement `groupHealth` | `engine.workerHealth()` returns `[]` | Use the stranded-signature query instead of the health panel |
 | You learned about a stuck run from a customer, not an alert | Nothing pages on the stranded signature — `suspended` is not an error | Nothing, until you query for it | Wire [`engine.onStalled`](#the-stalled-run-pager--onstalled--stalledafter) to your pager |
-| A deploy leaves runs `running` for ~`leaseMs` before another pod picks them up | The process was killed without draining (a `SIGKILL`, or a drain cut short by the orchestrator's grace period) | Runs reclaimed by `recoverIncomplete()` right after a rollout | Let the drain finish (see [Deploys](#deploys-drain-before-you-exit)) |
+| A deploy leaves runs `running` for ~`leaseMs` before another pod picks them up | The process was killed without draining (a `SIGKILL`, or a drain cut short by the orchestrator's grace period) | Runs reclaimed by `recoverIncomplete()` right after a rollout | Let the drain finish (see [Deploys](#deploys-drain-before-you-exit)). With a stable, unique-per-process `instanceId`, the restarted process reclaims its own leftovers at once (see below) |
 | Two pools sharing one Redis/DB seem to steal each other's runs | No `namespace` set — both standalone engines default to `'default'` | A run started by pool A gets executed by a worker in pool B | Set a distinct `namespace` per pool (see below) |
 
 ## Worker crashes mid-run (leased run)
@@ -124,7 +124,7 @@ For contrast, the [`db` transport](/docs/durable/transports/db) claims rows with
 
 ## Deploys: drain before you exit
 
-A process killed mid-run leaves its runs to lease expiry: nothing is lost, but each one waits ~`leaseMs` (default 30s) before another instance's recovery picks it up. Draining avoids that wait:
+A process killed mid-run leaves its runs to lease expiry: nothing is lost, but each one waits ~`leaseMs` (default 30s) before another instance's recovery picks it up. There is one exception. A process that restarts under the same [stable `instanceId`](/docs/durable/production#3-crash-recovery-is-a-lease) (the pod name) reclaims the runs still leased to its id on its first recovery passes after boot. It never takes a run it is executing itself, and other instances still wait for expiry. That only holds if no two live processes share an id. Draining avoids the wait altogether:
 
 - **`durable:work`** traps `SIGINT`/`SIGTERM`, stops leasing new work, waits for the tick in flight, then calls `engine.drain()`. `--drain-timeout` (default 10 000 ms) is the budget for that whole sequence, the tick wait included.
 - **The embedded loop** (`worker: { embedded: true }`) drains the same way on app shutdown, bounded by `worker.drainTimeoutMs` (default 10 000).
