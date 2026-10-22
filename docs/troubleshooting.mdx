@@ -146,7 +146,7 @@ Better still, use the built-in `compensate` option ([Sagas](/docs/durable/reliab
 **Cause:** in rough order of likelihood:
 
 - **`@adonisjs/queue` 0.7 on a durable release older than 0.45.** The 0.7 adapter contract finishes a claim by its lease token; older durable releases passed the job id, which on Redis finished nothing and left every job `active` (and the stalled sweep then delivered it again, running each step twice).
-- **A worker vanished mid-step.** A claim is never renewed while a worker processes it, so the stalled-claim sweep only re-delivers it once it is older than `stalledThresholdMs` — **30 minutes** by default — and fails a job permanently after `maxStalledCount` (default 3) reclaims. Adapters without `recoverStalledJobs` are skipped, so their jobs are never re-delivered.
+- **A worker vanished mid-step.** The stalled-claim sweep re-delivers a claim once it has gone unrenewed for `stalledThresholdMs` — **2 minutes** by default (30 minutes on releases before claim renewal, or on an adapter without `renewJobs`) — and fails a job permanently after `maxStalledCount` (default 3) reclaims. Adapters without `recoverStalledJobs` are skipped, so their jobs are never re-delivered.
 - **A short-lived process claimed it and died.** Before `consumers` existed, any `node ace` command consumed broker jobs; the symptom was `active` jobs stamped with the ids of long-gone commands. `consumers: 'always'` brings that behaviour back.
 - **Older releases' results loop.** A result whose resumed turn awaited the next `timeoutMs` step on the same serial loop could deadlock until a liveness timer fired; fixed in 0.38.2.
 
@@ -159,10 +159,10 @@ Better still, use the built-in `compensate` option ([Sagas](/docs/durable/reliab
 **Cause:** rarely a completed step re-running on replay — a `completed` checkpoint short-circuits replay. The usual suspects:
 
 - **The side effect lives in the workflow body**, not in a step. The body re-runs from the top on every replay; only step results are checkpointed.
-- **A redelivery window shorter than the step.** On the queue transport, `stalledThresholdMs` below your longest step re-delivers a job whose worker is merely slow. Likewise `remoteRedispatchMs` below a step's real duration re-dispatches a live, non-heartbeating step.
+- **A redelivery window shorter than a silence.** On the queue transport, claims are renewed while a step runs, so only a worker that stops renewing — crashed, or its event loop blocked longer than `stalledThresholdMs` — gets its job re-delivered; the transport reports that to `onError` as `lost N of M claim(s)`. Likewise `remoteRedispatchMs` below a step's real duration re-dispatches a live, non-heartbeating step.
 - **A crash between the work and its checkpoint.** If a process dies after a worker ran a step but before its result was recorded, the step runs again on recovery. That is inherent to at-least-once execution.
 
-**Fix:** move side effects into `ctx.localStep` / `ctx.step` (or `ctx.sideEffect` for a value); raise `stalledThresholdMs` / `remoteRedispatchMs` above the longest legitimate step; make handlers idempotent on the stable `stepId` (`runId:seq`) they receive.
+**Fix:** move side effects into `ctx.localStep` / `ctx.step` (or `ctx.sideEffect` for a value); raise `stalledThresholdMs` above the longest event-loop block and `remoteRedispatchMs` above the longest legitimate step; make handlers idempotent on the stable `stepId` (`runId:seq`) they receive.
 
 ## A `node ace` command hangs, or waits forever for a step
 

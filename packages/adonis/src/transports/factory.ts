@@ -91,8 +91,10 @@ export interface QueueTransportConfig {
   stalledCheckIntervalMs?: number;
   /**
    * How old (ms) a claim must be before the reclaim sweep presumes its worker dead and re-delivers the
-   * job. Default 30min — deliberately generous, because the claim is never renewed while the worker
-   * processes: raise it above your longest step, or a slow step gets double-run.
+   * job. The transport renews every in-flight claim each half threshold, so this bounds how long a
+   * worker may go silent (default 2min) — a long step is never re-delivered. An adapter without
+   * `renewJobs` (only a custom one) keeps the old 30min default: raise it above your longest step, or a
+   * slow step gets double-run.
    */
   stalledThresholdMs?: number;
   /**

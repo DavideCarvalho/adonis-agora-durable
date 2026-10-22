@@ -226,5 +226,40 @@ describe.each(backends)(
         expect(await activeJobs(probe, `${prefix}:results`)).toBe(0);
       },
     );
+
+    it.skipIf(!backend.enabled)(
+      'renews the claim of a step longer than the stalled threshold, so it runs exactly once',
+      async () => {
+        const name = `slow-${randomUUID().slice(0, 6)}`;
+        const reclaiming = (): QueueTransport => {
+          const t = new QueueTransport({
+            adapter: factory,
+            prefix,
+            pollIntervalMs: 10,
+            stalledCheckIntervalMs: 50,
+            stalledThresholdMs: 300,
+          });
+          transports.push(t);
+          return t;
+        };
+        const engine = reclaiming();
+        const worker = reclaiming();
+        const results: StepResult[] = [];
+        engine.onResult(async (r) => void results.push(r));
+        let runs = 0;
+        worker.handle(name, async () => {
+          runs += 1;
+          await new Promise((r) => setTimeout(r, 1_200));
+          return 'done';
+        });
+
+        await engine.dispatch(task(name));
+        await until(() => results.length === 1, 10_000);
+        expect(runs).toBe(1);
+        expect(results[0]).toMatchObject({ status: 'completed', output: 'done' });
+        await new Promise((r) => setTimeout(r, 50));
+        expect(await activeJobs(probe, `${prefix}:tasks:${sanitizeQueueToken(name)}`)).toBe(0);
+      },
+    );
   },
 );
