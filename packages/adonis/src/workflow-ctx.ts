@@ -142,6 +142,8 @@ export interface CtxHost {
    */
   readonly replay?: Map<number, StepCheckpoint> | undefined;
   clock(): number;
+  /** A buffered event older than this (ms) is expired: skipped and removed instead of consumed. */
+  eventBufferTtlMs?: number | undefined;
   webhookUrl?: ((token: string) => string) | undefined;
   /** Mark a local step's body as started — emits `step.started` and (optionally) a `running` checkpoint. */
   startStep(step: StepRecord): Promise<void>;
@@ -432,7 +434,13 @@ export function createWorkflowCtx(
     seq: number,
   ): Promise<{ value: T } | null> => {
     const candidates = await store.listBufferedEvents(name, EVENT_BUFFER_SCAN_LIMIT);
+    const ttl = host.eventBufferTtlMs;
+    const nowMs = ttl === undefined ? 0 : host.clock();
     for (const candidate of candidates) {
+      if (ttl !== undefined && nowMs - candidate.publishedAt > ttl) {
+        await store.removeBufferedEvent(candidate.id); // expired: prune it, whatever its match
+        continue;
+      }
       if (!eventMatches(candidate.payload, match ?? {})) continue;
       if (!(await store.removeBufferedEvent(candidate.id))) continue; // raced away — try the next
       // Resolved it ourselves — remove OUR OWN waiter row via the exact match (harmless here since an

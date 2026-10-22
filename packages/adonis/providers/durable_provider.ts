@@ -257,6 +257,9 @@ export default class DurableProvider {
           ? { remoteRedispatchMax: config.remoteRedispatchMax }
           : {}),
         ...(config.timerBatchSize !== undefined ? { timerBatchSize: config.timerBatchSize } : {}),
+        ...(config.eventBufferTtl !== undefined
+          ? { eventBufferTtlMs: parseDuration(config.eventBufferTtl) }
+          : {}),
         // Where a freshly-started run executes: explicit config wins; else `control-plane` leaves it
         // pending for the poll loop (no inline execution), and `standalone` uses the engine's in-process
         // default (embedded worker).
@@ -622,6 +625,15 @@ export default class DurableProvider {
     // call is then a no-op.
     if (config.autoSchema !== false) {
       await store.ensureSchema?.();
+    }
+    // `scopeReads`: a tenant-boundary view of the store, fenced to this engine's namespace.
+    if (config.scopeReads === true && config.namespace !== undefined) {
+      const scopeable = store as StateStore & {
+        withScope?: (scope: { namespace?: string | undefined }) => StateStore;
+      };
+      if (typeof scopeable.withScope === 'function') {
+        return scopeable.withScope({ namespace: config.namespace });
+      }
     }
     return store;
   }

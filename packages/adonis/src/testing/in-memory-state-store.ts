@@ -1,7 +1,10 @@
 import type {
   AttributeFilter,
+  CheckpointQuery,
+  CheckpointStat,
   ChildWait,
   RunFacetQuery,
+  RunFacetRow,
   RunQuery,
   RunStatus,
   RunValueAxis,
@@ -14,6 +17,8 @@ import type {
   StepCheckpoint,
   WorkflowRun,
 } from '../interfaces.js';
+import { checkpointStatsOf, queryCheckpointsOf } from '../run-detail-summary.js';
+import { mergeRunFacetRows } from '../run-facets.js';
 import { runPageWindow } from '../run-pagination.js';
 import { scanRunValueFacets } from '../run-value-facets.js';
 import { normalizeAttributeRows, type RunAttributeRow } from '../search-attributes.js';
@@ -43,6 +48,33 @@ export class InMemoryStateStore implements StateStore {
    * so this lets the benchmark contrast "fetch N, scan in JS" against "fetch the k that match".
    */
   lastCheckpointRowsRead = 0;
+  /**
+   * Test/observability hook: checkpoint rows materialized since construction, across every
+   * checkpoint read that returns rows — what a run-detail test compares between paths.
+   */
+  checkpointRowsRead = 0;
+  /** The namespace run reads are fenced to (see {@link withScope}); undefined sees every run. */
+  private scopeNamespace: string | undefined;
+
+  /**
+   * A view of THIS store (same data) whose run reads — `getRun`, `listRuns`, the counts and the
+   * recovery/dispatch/timer scans — only see `scope.namespace`. Writes stay unscoped. Mirrors
+   * `LucidStateStore.withScope`; `{ namespace: undefined }` is the operator view.
+   */
+  withScope(scope: { namespace?: string | undefined }): InMemoryStateStore {
+    const view = Object.create(this) as InMemoryStateStore;
+    view.scopeNamespace = scope.namespace;
+    return view;
+  }
+
+  private inScope(run: WorkflowRun): boolean {
+    return this.scopeNamespace === undefined || run.namespace === this.scopeNamespace;
+  }
+
+  private visibleRuns(): WorkflowRun[] {
+    const runs = [...this.runs.values()];
+    return this.scopeNamespace === undefined ? runs : runs.filter((r) => this.inScope(r));
+  }
 
   private key(runId: string, seq: number): string {
     return `${runId}:${seq}`;
@@ -99,7 +131,7 @@ export class InMemoryStateStore implements StateStore {
 
   async getRun(runId: string): Promise<WorkflowRun | null> {
     const run = this.runs.get(runId);
-    return run ? { ...run } : null;
+    return run && this.inScope(run) ? { ...run } : null;
   }
 
   async deleteRun(runId: string): Promise<void> {
@@ -112,6 +144,10 @@ export class InMemoryStateStore implements StateStore {
     }
     // Drop the run's normalized attribute rows (reindex with no attributes clears them).
     this.reindexAttributes(runId, undefined);
+  }
+
+  async deleteRuns(runIds: string[]): Promise<void> {
+    for (const runId of runIds) await this.deleteRun(runId);
   }
 
   async getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null> {
@@ -130,6 +166,15 @@ export class InMemoryStateStore implements StateStore {
     return true;
   }
 
+  async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
+    return checkpoints.map((checkpoint) => {
+      const key = this.key(checkpoint.runId, checkpoint.seq);
+      if (this.checkpoints.get(key)?.status !== 'pending') return false;
+      this.checkpoints.set(key, { ...checkpoint });
+      return true;
+    });
+  }
+
   /** Mirror of `LucidStateStore.recordStepHeartbeat`: mutate in place, no-op when absent. */
   async recordStepHeartbeat(
     runId: string,
@@ -144,7 +189,7 @@ export class InMemoryStateStore implements StateStore {
   }
 
   async listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]> {
-    return [...this.runs.values()]
+    return this.visibleRuns()
       .filter(
         (r) => r.status === 'running' && (namespace === undefined || r.namespace === namespace),
       )
@@ -152,7 +197,7 @@ export class InMemoryStateStore implements StateStore {
   }
 
   async listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]> {
-    return [...this.runs.values()]
+    return this.visibleRuns()
       .filter(
         (r) => r.status === 'pending' && (namespace === undefined || r.namespace === namespace),
       )
@@ -162,7 +207,7 @@ export class InMemoryStateStore implements StateStore {
   }
 
   async listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]> {
-    const due = [...this.runs.values()].filter(
+    const due = this.visibleRuns().filter(
       (r) =>
         r.status === 'suspended' &&
         r.wakeAt !== undefined &&
@@ -175,7 +220,7 @@ export class InMemoryStateStore implements StateStore {
   }
 
   async listOrphanedRuns(nowMs: number, limit: number, namespace?: string): Promise<WorkflowRun[]> {
-    return [...this.runs.values()]
+    return this.visibleRuns()
       .filter(
         (r) =>
           r.status === 'running' &&
@@ -329,6 +374,14 @@ export class InMemoryStateStore implements StateStore {
   async removeBufferedEvent(id: string): Promise<boolean> {
     return this.bufferedEvents.delete(id);
   }
+  async pruneBufferedEvents(publishedBefore: number, limit: number): Promise<number> {
+    const expired = [...this.bufferedEvents.entries()]
+      .filter(([, e]) => e.publishedAt < publishedBefore)
+      .sort((a, b) => a[1].publishedAt - b[1].publishedAt)
+      .slice(0, Math.max(0, limit));
+    for (const [id] of expired) this.bufferedEvents.delete(id);
+    return expired.length;
+  }
 
   /**
    * Candidate run ids satisfying ONE attribute predicate, served from {@link attributeIndex} — the
@@ -388,6 +441,11 @@ export class InMemoryStateStore implements StateStore {
     return (await this.listRuns(query)).length;
   }
 
+  async runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
+    const runs = await this.listRuns(query);
+    return mergeRunFacetRows(runs.map((r) => ({ status: r.status, origin: r.origin, count: 1 })));
+  }
+
   private readonly schedules = new Map<string, ScheduleRecord>();
 
   async saveSchedule(record: ScheduleRecord): Promise<void> {
@@ -438,7 +496,7 @@ export class InMemoryStateStore implements StateStore {
   }
 
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
-    let runs = [...this.runs.values()];
+    let runs = this.visibleRuns();
     if (query.workflow) runs = runs.filter((r) => r.workflow === query.workflow);
     if (query.workflows) {
       runs =
@@ -528,7 +586,26 @@ export class InMemoryStateStore implements StateStore {
       .sort((a, b) => a.seq - b.seq)
       .map((cp) => ({ ...cp }));
     this.lastCheckpointRowsRead = rows.length;
+    this.checkpointRowsRead += rows.length;
     return rows;
+  }
+
+  async checkpointStats(
+    runId: string,
+    opts?: { group?: string | undefined },
+  ): Promise<CheckpointStat[]> {
+    return checkpointStatsOf(this.runCheckpoints(runId), opts);
+  }
+
+  async queryCheckpoints(runId: string, query: CheckpointQuery): Promise<StepCheckpoint[]> {
+    const rows = queryCheckpointsOf(this.runCheckpoints(runId), query).map((cp) => ({ ...cp }));
+    this.lastCheckpointRowsRead = rows.length;
+    this.checkpointRowsRead += rows.length;
+    return rows;
+  }
+
+  private runCheckpoints(runId: string): StepCheckpoint[] {
+    return [...this.checkpoints.values()].filter((cp) => cp.runId === runId);
   }
 
   async getLatestCheckpointByName(
@@ -569,6 +646,7 @@ export class InMemoryStateStore implements StateStore {
       .sort((a, b) => a.seq - b.seq)
       .map((cp) => ({ ...cp }));
     this.lastCheckpointRowsRead = rows.length;
+    this.checkpointRowsRead += rows.length;
     return rows;
   }
 }

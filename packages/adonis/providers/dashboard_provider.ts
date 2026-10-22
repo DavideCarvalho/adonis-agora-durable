@@ -224,6 +224,11 @@ export default class DashboardProvider {
         if (isMutatingMethod(ctx)) this.audit(config, ctx);
         try {
           const result = await handler(await deps(), toApiRequest(ctx));
+          for (const [name, value] of Object.entries(result.headers ?? {})) {
+            ctx.response.header(name, value);
+          }
+          // A 304 carries no body (its validator rides in the headers).
+          if (result.status === 304) return ctx.response.status(304).send('');
           return ctx.response.status(result.status).json(result.body);
         } catch (error) {
           // Generic body on a 500: raw driver/store messages (connection strings, SQL fragments)
@@ -797,5 +802,6 @@ function toApiRequest(ctx: HttpContext): ApiRequest {
     params: ctx.params as Record<string, string | undefined>,
     query: ctx.request.qs() as Record<string, string | string[] | undefined>,
     body: ctx.request.body(),
+    headers: { 'if-none-match': ctx.request.header('if-none-match') },
   };
 }

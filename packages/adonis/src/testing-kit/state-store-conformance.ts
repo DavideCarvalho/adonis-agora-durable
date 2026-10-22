@@ -8,6 +8,7 @@ import {
   WorkflowEngine,
   type WorkflowRun,
 } from '../index.js';
+import { registerCheckpointAggregationCases } from './checkpoint-aggregation-contract.js';
 
 /**
  * A freshly provisioned, empty {@link StateStore} plus a `cleanup` to release its resources (close
@@ -364,6 +365,188 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.saveCheckpointIfPending({ ...pending, seq: 9 })).toBe(false);
       expect(await store.getCheckpoint('r1', 9)).toBeNull();
     });
+
+    t('saveCheckpointsIfPending settles a batch row by row, in order', async () => {
+      // Optional on the interface (the engine falls back to one saveCheckpointIfPending per entry),
+      // but a conformant store MUST provide it — assert presence, then exercise it.
+      expect(store.saveCheckpointsIfPending).toBeDefined();
+      if (!store.saveCheckpointsIfPending) return;
+      expect(await store.saveCheckpointsIfPending([])).toEqual([]);
+      await store.createRun(run());
+      await store.createRun(run({ id: 'r2' }));
+      const pending = (runId: string, seq: number) =>
+        checkpoint({
+          runId,
+          seq,
+          stepId: `${runId}:${seq}`,
+          status: 'pending',
+          output: undefined,
+          wakeAt: 5_000,
+        });
+      for (const seq of [0, 1, 2, 3]) await store.saveCheckpoint(pending('r1', seq));
+      await store.saveCheckpoint(pending('r2', 0));
+      // seq 1 already settled: a stale write must not land on it.
+      await store.saveCheckpoint({
+        ...pending('r1', 1),
+        status: 'completed',
+        output: { first: 1 },
+      });
+      const done = (runId: string, seq: number, output: unknown): StepCheckpoint => ({
+        ...pending(runId, seq),
+        status: 'completed',
+        output,
+        wakeAt: undefined,
+      });
+
+      const wrote = await store.saveCheckpointsIfPending([
+        done('r1', 0, { n: 0 }),
+        done('r1', 1, { n: 1 }),
+        // A second copy of the same row: compared against the first copy's write, so refused.
+        done('r1', 0, { n: 'dup' }),
+        { ...pending('r1', 2), status: 'failed', error: { message: 'boom' }, wakeAt: undefined },
+        // No such row: nothing is written.
+        done('r1', 9, { n: 9 }),
+        // Another run's row, same seq as one above.
+        done('r2', 0, { n: 'r2' }),
+      ]);
+      expect(wrote).toEqual([true, false, false, true, false, true]);
+
+      const r1 = await store.listCheckpoints('r1');
+      expect(r1.map((c) => [c.seq, c.status, c.output])).toEqual([
+        [0, 'completed', { n: 0 }],
+        [1, 'completed', { first: 1 }],
+        [2, 'failed', undefined],
+        [3, 'pending', undefined],
+      ]);
+      expect(r1[2]?.error).toEqual({ message: 'boom' });
+      // The settling write carried no deadline, so the one the pending row held is cleared.
+      expect(r1[0]?.wakeAt).toBeUndefined();
+      expect(r1[3]?.wakeAt).toBe(5_000);
+      expect(await store.getCheckpoint('r1', 9)).toBeNull();
+      expect((await store.getCheckpoint('r2', 0))?.output).toEqual({ n: 'r2' });
+
+      // A pending-to-pending write keeps the row pending, so a later entry still lands on it.
+      expect(
+        await store.saveCheckpointsIfPending([
+          { ...pending('r1', 3), wakeAt: 9_000 },
+          done('r1', 3, { n: 3 }),
+        ]),
+      ).toEqual([true, true]);
+      expect((await store.getCheckpoint('r1', 3))?.output).toEqual({ n: 3 });
+    });
+
+    t('saveCheckpointsIfPending writes a wide batch', async () => {
+      if (!store.saveCheckpointsIfPending) return;
+      await store.createRun(run());
+      const n = 600;
+      const rows = Array.from({ length: n }, (_, seq) =>
+        checkpoint({ seq, stepId: `r1:${seq}`, status: 'pending', output: undefined }),
+      );
+      for (const row of rows) await store.saveCheckpoint(row);
+      const wrote = await store.saveCheckpointsIfPending(
+        rows.map((row) => ({ ...row, status: 'completed' as const, output: { seq: row.seq } })),
+      );
+      expect(wrote).toHaveLength(n);
+      expect(wrote.every((w) => w === true)).toBe(true);
+      expect(await store.countCheckpoints?.('r1', 0, n - 1, ['completed'])).toBe(n);
+      expect((await store.getCheckpoint('r1', n - 1))?.output).toEqual({ seq: n - 1 });
+    });
+
+    t('deleteRuns removes every listed run and its rows, and nothing else', async () => {
+      expect(store.deleteRuns).toBeDefined();
+      if (!store.deleteRuns) return;
+      await store.deleteRuns([]);
+      for (const id of ['a', 'b', 'keep']) {
+        await store.createRun(run({ id, searchAttributes: { tier: 'pro' } }));
+        await store.saveCheckpoint(checkpoint({ runId: id, stepId: `${id}:0` }));
+        await store.putSignalWaiter({ token: `tok-${id}`, runId: id, seq: 1 });
+      }
+      await store.deleteRuns(['a', 'b', 'missing', 'a']);
+      expect(await store.getRun('a')).toBeNull();
+      expect(await store.getRun('b')).toBeNull();
+      expect(await store.listCheckpoints('a')).toEqual([]);
+      expect(await store.listSignalWaiters('tok-a')).toEqual([]);
+      expect(
+        (await store.listRuns({ attributes: [{ key: 'tier', op: 'eq', value: 'pro' }] })).map(
+          (r) => r.id,
+        ),
+      ).toEqual(['keep']);
+      expect((await store.getRun('keep'))?.id).toBe('keep');
+      expect(await store.listCheckpoints('keep')).toHaveLength(1);
+      expect(await store.listSignalWaiters('tok-keep')).toHaveLength(1);
+    });
+
+    t('runFacets counts the matching runs by (status, origin)', async () => {
+      expect(store.runFacets).toBeDefined();
+      if (!store.runFacets) return;
+      const seedRun = (id: string, status: RunStatus, origin?: string, workflow = 'checkout') =>
+        store.createRun(run({ id, status, workflow, ...(origin !== undefined ? { origin } : {}) }));
+      await seedRun('f1', 'completed', 'api');
+      await seedRun('f2', 'completed', 'api');
+      await seedRun('f3', 'failed', 'api');
+      await seedRun('f4', 'completed');
+      await seedRun('f5', 'completed', '  ');
+      await seedRun('f6', 'running', 'cron', 'other');
+      const sort = (rows: { status: string; origin: string | null; count: number }[]) =>
+        [...rows].sort((a, b) =>
+          `${a.status}|${a.origin}`.localeCompare(`${b.status}|${b.origin}`),
+        );
+      expect(sort(await store.runFacets({}))).toEqual(
+        sort([
+          { status: 'completed', origin: 'api', count: 2 },
+          { status: 'failed', origin: 'api', count: 1 },
+          // An absent and a blank origin are the same unattributed bucket.
+          { status: 'completed', origin: null, count: 2 },
+          { status: 'running', origin: 'cron', count: 1 },
+        ]),
+      );
+      expect(sort(await store.runFacets({ workflow: 'other' }))).toEqual([
+        { status: 'running', origin: 'cron', count: 1 },
+      ]);
+      expect(await store.runFacets({ workflow: 'none' })).toEqual([]);
+    });
+
+    t('pruneBufferedEvents deletes the oldest expired events, capped at limit', async () => {
+      expect(store.pruneBufferedEvents).toBeDefined();
+      if (!store.pruneBufferedEvents) return;
+      for (const [id, name, publishedAt] of [
+        ['e1', 'a', 100],
+        ['e2', 'b', 200],
+        ['e3', 'a', 300],
+        ['e4', 'b', 1_000],
+      ] as const) {
+        await store.bufferEvent({ id, name, payload: { id }, publishedAt });
+      }
+      expect(await store.pruneBufferedEvents(500, 2)).toBe(2);
+      expect((await store.listBufferedEvents('a', 10)).map((e) => e.id)).toEqual(['e3']);
+      expect((await store.listBufferedEvents('b', 10)).map((e) => e.id)).toEqual(['e4']);
+      expect(await store.pruneBufferedEvents(500, 10)).toBe(1);
+      expect(await store.pruneBufferedEvents(500, 10)).toBe(0);
+      expect((await store.listBufferedEvents('b', 10)).map((e) => e.id)).toEqual(['e4']);
+    });
+
+    t('withScope fences run reads to one namespace (when the store scopes)', async () => {
+      const scopeable = store as StateStore & {
+        withScope?: (scope: { namespace?: string | undefined }) => StateStore;
+      };
+      if (typeof scopeable.withScope !== 'function') return;
+      await store.createRun(run({ id: 'mine', namespace: 'acme', status: 'pending' }));
+      await store.createRun(run({ id: 'theirs', namespace: 'globex', status: 'pending' }));
+      const acme = scopeable.withScope({ namespace: 'acme' });
+      expect((await acme.getRun('mine'))?.id).toBe('mine');
+      expect(await acme.getRun('theirs')).toBeNull();
+      expect((await acme.listRuns({})).map((r) => r.id)).toEqual(['mine']);
+      expect((await acme.listPendingRuns(10)).map((r) => r.id)).toEqual(['mine']);
+      expect(await acme.countRuns?.({})).toBe(1);
+      // Writes are not fenced, and the operator view still sees both.
+      await acme.updateRun('theirs', { status: 'running' });
+      expect((await store.getRun('theirs'))?.status).toBe('running');
+      expect((await store.listRuns({})).map((r) => r.id).sort()).toEqual(['mine', 'theirs']);
+      const operator = scopeable.withScope({ namespace: undefined });
+      expect(await operator.listRuns({})).toHaveLength(2);
+    });
+
+    registerCheckpointAggregationCases(t, () => store, run);
 
     t(
       'upserts checkpoints, reads them by (runId, seq), and lists them ordered by seq',

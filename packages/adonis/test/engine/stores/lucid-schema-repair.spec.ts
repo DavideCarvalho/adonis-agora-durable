@@ -1,7 +1,11 @@
 import type { Database } from '@adonisjs/lucid/database';
 import { afterEach, describe, expect, it } from 'vitest';
 import { makeMemoryDb } from '../../../src/stores/lucid-helpers.js';
-import { createDurableTables, DURABLE_TABLES } from '../../../src/stores/lucid-schema.js';
+import {
+  createDurableTables,
+  DURABLE_SCHEMA_META_TABLE,
+  DURABLE_TABLES,
+} from '../../../src/stores/lucid-schema.js';
 
 /**
  * `createDurableTables` self-heals: on an existing table missing a column a newer library writes, it
@@ -31,6 +35,15 @@ function recordingLogger() {
  * its database right now. Built by creating the current schema and dropping the two columns, so it
  * tracks the real table rather than a hand-written replica that could itself drift.
  */
+/**
+ * Drop the schema marker, as on a database provisioned by a release before the fingerprint gate. The
+ * tests below change the tables by hand to imitate an older schema; with the marker left in place the
+ * gate would (correctly) trust it and skip the check.
+ */
+async function forgetSchemaMarker(db: Database): Promise<void> {
+  await db.connection().schema.dropTableIfExists(DURABLE_SCHEMA_META_TABLE);
+}
+
 async function withPreHeartbeatCheckpoints(db: Database): Promise<void> {
   await createDurableTables(db, undefined, { logger: { warn: () => {} } });
   await db.connection().schema.alterTable(DURABLE_TABLES.checkpoints, (table) => {
@@ -39,6 +52,7 @@ async function withPreHeartbeatCheckpoints(db: Database): Promise<void> {
   await db.connection().schema.alterTable(DURABLE_TABLES.checkpoints, (table) => {
     table.dropColumn('heartbeat_progress');
   });
+  await forgetSchemaMarker(db);
 }
 
 describe('createDurableTables warns only when it actually repairs something', () => {
@@ -125,6 +139,7 @@ describe('createDurableTables warns only when it actually repairs something', ()
     await db.connection().schema.alterTable(DURABLE_TABLES.runs, (table) => {
       table.dropColumn('priority');
     });
+    await forgetSchemaMarker(db);
     const logger = recordingLogger();
 
     await createDurableTables(db, undefined, { logger });
@@ -191,6 +206,7 @@ describe('createDurableTables repairs indexes by probe, not by create-and-swallo
     await createDurableTables(db, undefined, { logger: { warn: () => {} } });
     await db.rawQuery('drop index "durable_runs_created_idx"');
     await db.rawQuery('drop index "durable_signal_waiters_run_idx"');
+    await forgetSchemaMarker(db);
     const logger = recordingLogger();
 
     await createDurableTables(db, undefined, { logger });

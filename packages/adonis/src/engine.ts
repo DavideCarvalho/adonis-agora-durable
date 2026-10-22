@@ -56,6 +56,7 @@ import type {
   RemoteTask,
   RunDispatcher,
   RunFacetQuery,
+  RunFacetRow,
   RunQuery,
   RunResult,
   RunScope,
@@ -104,6 +105,16 @@ import {
 import { breakpointToken, type StepHandler, stepId } from './protocol.js';
 import type { QueueConfig } from './queue.js';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor.js';
+import {
+  type FanPage,
+  type FanPageQuery,
+  loadFanMembers,
+  loadRunDetail,
+  type RunDetail,
+  type RunDetailOptions,
+  type RunDetailSource,
+} from './run-detail-summary.js';
+import { runFacetsOf } from './run-facets.js';
 import { scanRunValueFacets } from './run-value-facets.js';
 import { listSignalWaitersOfRuns } from './run-waiting.js';
 import { type ScheduledWorkflow, scheduleWindow } from './scheduler.js';
@@ -326,6 +337,16 @@ const STEP_FAN_CHUNK = 200;
 /** The default {@link WorkflowEngineDeps.timerBatchSize}. */
 const DEFAULT_TIMER_BATCH = 500;
 
+/** The most results of one run settled by one batched write (see `completeRemoteResult`). */
+const RESULT_BATCH_MAX = 256;
+
+/** A step result waiting for its run's next batched settle. */
+interface QueuedResult {
+  result: StepResult;
+  resolve: () => void;
+  reject: (err: unknown) => void;
+}
+
 /** Fisher–Yates, in place. */
 function shuffle<T>(items: T[]): T[] {
   for (let i = items.length - 1; i > 0; i -= 1) {
@@ -456,6 +477,14 @@ export interface WorkflowEngineDeps {
    * falls back to the default. Default 500.
    */
   timerBatchSize?: number | undefined;
+  /**
+   * How long (ms) a BUFFERED event that no `waitForEvent` claimed is kept (see
+   * {@link WorkflowEngine.publishEvent}'s buffering). Default `undefined`: kept until consumed, like a
+   * buffered signal. When set, a `waitForEvent` skips (and removes) a candidate older than this, and
+   * the worker tick's retention phase deletes expired rows across every name in bounded batches
+   * (through {@link StateStore.pruneBufferedEvents}, when the store has it).
+   */
+  eventBufferTtlMs?: number | undefined;
   /**
    * Opt-in self-heal window (ms) for a remote step with NO `timeoutMs` whose dispatched job was LOST —
    * the worker crashed mid-step leaving no result, or the transport dropped the job (a Redis
@@ -649,6 +678,7 @@ export class WorkflowEngine {
   private readonly reconcileMs: number | undefined;
   private readonly heartbeatPersistThrottleMs: number;
   private readonly timerBatchSize: number;
+  private readonly eventBufferTtlMs: number | undefined;
   private readonly remoteRedispatchMs: number | undefined;
   private readonly remoteRedispatchMax: number;
   private readonly webhookUrl?: ((token: string) => string) | undefined;
@@ -708,6 +738,8 @@ export class WorkflowEngine {
   private readonly accumulators: EventAccumulators;
   /** In-flight remote steps awaiting a worker result, keyed by stepId. */
   private readonly pending = new Map<string, PendingRemote>();
+  /** Each run's step results waiting to be settled on this instance — see {@link completeRemoteResult}. */
+  private readonly resultQueues = new Map<string, QueuedResult[]>();
   /** Per-step "reset the liveness timer" callbacks, called with the beat's worker timestamp when a
    *  heartbeat arrives. */
   private readonly heartbeatResets = new Map<string, (at: number | undefined) => void>();
@@ -819,6 +851,8 @@ export class WorkflowEngine {
       batch !== undefined && Number.isFinite(batch) && batch >= 1
         ? Math.floor(batch)
         : DEFAULT_TIMER_BATCH;
+    const ttl = deps.eventBufferTtlMs;
+    this.eventBufferTtlMs = ttl !== undefined && Number.isFinite(ttl) && ttl > 0 ? ttl : undefined;
     // Opt-in: unset (or 0) leaves the by-design "re-suspend a lost dispatch, never re-dispatch" behavior.
     this.remoteRedispatchMs = deps.remoteRedispatchMs || undefined;
     this.remoteRedispatchMax = Math.max(1, deps.remoteRedispatchMax ?? 10);
@@ -1624,6 +1658,43 @@ export class WorkflowEngine {
   }
 
   /**
+   * How the runs matching `query` split across `(status, origin)`, in one aggregate when the store
+   * has {@link StateStore.runFacets} (else counted over a listing). Part of the engine's read API.
+   */
+  runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
+    return runFacetsOf(this.store, query);
+  }
+
+  /**
+   * A run's detail (see `loadRunDetail`), built from the store's checkpoint aggregates when it has
+   * `checkpointStats` + `queryCheckpoints` — a summarized detail then reads a few rows per wide fan
+   * instead of the whole history, and carries an `etag` that `options.ifNoneMatch` can match.
+   */
+  getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail | null> {
+    return loadRunDetail(this.detailSource(), runId, options);
+  }
+
+  /** One page of a summarized fan's members (see `loadFanMembers`), versioned like {@link getRunDetail}. */
+  getFanMembers(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null> {
+    return loadFanMembers(this.detailSource(), runId, group, query);
+  }
+
+  private detailSource(): RunDetailSource {
+    const store = this.store;
+    return {
+      getRun: (id) => this.getRun(id),
+      listCheckpoints: (id) => store.listCheckpoints(id),
+      getRunChildren: (id) => this.getRunChildren(id),
+      ...(store.checkpointStats && store.queryCheckpoints
+        ? {
+            checkpointStats: store.checkpointStats.bind(store),
+            queryCheckpoints: store.queryCheckpoints.bind(store),
+          }
+        : {}),
+    };
+  }
+
+  /**
    * Hard-delete a run and its whole child subtree from the store, returning the number of runs
    * removed (0 if `runId` is unknown). Children are collected BEFORE this run's checkpoints are
    * deleted (the parent→children edge is read from them). Use for retention/cleanup; this is a
@@ -1728,9 +1799,17 @@ export class WorkflowEngine {
    * parents.
    */
   async sweepRetention(now: number = this.clock()): Promise<number> {
-    if ((!this.retention && this.retentionPolicies.length === 0) || this.draining) return 0;
+    if (
+      (!this.retention &&
+        this.retentionPolicies.length === 0 &&
+        this.eventBufferTtlMs === undefined) ||
+      this.draining
+    ) {
+      return 0;
+    }
     if (now - this.#lastRetentionSweepAt < 60_000) return 0;
     this.#lastRetentionSweepAt = now;
+    await this.pruneExpiredBufferedEvents(now);
     let evicted = 0;
     const passes: RunQuery[] = [];
     for (const status of TERMINAL_RUN_STATUSES) {
@@ -1759,15 +1838,16 @@ export class WorkflowEngine {
     }
     for (const pass of passes) {
       const candidates = await this.store.listRuns({ ...pass, size: 100 });
+      const archived: string[] = [];
       for (const run of candidates) {
         try {
           if (this.evictListeners.size > 0) {
             const checkpoints = await this.store.listCheckpoints(run.id);
             for (const listener of this.evictListeners) await listener(run, checkpoints);
           }
-          evicted += await this.deleteRun(run.id);
+          archived.push(run.id);
         } catch (err) {
-          // An archival hook (or the delete itself) failed — keep the run; the next sweep retries.
+          // An archival hook failed — keep the run; the next sweep retries.
           console.warn(
             `[adonis-durable] retention eviction of run ${run.id} skipped: ${
               err instanceof Error ? err.message : String(err)
@@ -1775,8 +1855,73 @@ export class WorkflowEngine {
           );
         }
       }
+      try {
+        // One batched delete per pass (the store's `deleteRuns`), subtrees included.
+        evicted += await this.deleteRunTrees(archived);
+      } catch (err) {
+        // The delete failed — keep the runs; the next sweep retries.
+        console.warn(
+          `[adonis-durable] retention eviction of ${archived.length} run(s) skipped: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
     }
     return evicted;
+  }
+
+  /**
+   * The {@link eventBufferTtlMs} prune: delete buffered events older than the TTL, a bounded batch
+   * at a time, through the store's `pruneBufferedEvents`. Runs in {@link sweepRetention}'s pass.
+   * Best-effort — a failure is warned and retried on the next pass.
+   */
+  private async pruneExpiredBufferedEvents(now: number): Promise<void> {
+    const ttl = this.eventBufferTtlMs;
+    if (ttl === undefined || !this.store.pruneBufferedEvents) return;
+    try {
+      for (let pass = 0; pass < 10; pass += 1) {
+        const deleted = await this.store.pruneBufferedEvents(now - ttl, 500);
+        if (deleted < 500) break;
+      }
+    } catch (err) {
+      console.warn(
+        `[adonis-durable] buffered-event prune skipped: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Delete the runs `rootIds` and their child subtrees: the ids are collected children-first (the
+   * edge is read from the parent's checkpoints, so before anything is deleted), deleted in one
+   * {@link deleteRunIds} batch, then each one's token-keyed buffered signals are swept like
+   * {@link deleteRun} does. Returns how many runs were deleted.
+   */
+  private async deleteRunTrees(rootIds: string[]): Promise<number> {
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    const visit = async (id: string): Promise<void> => {
+      if (seen.has(id)) return;
+      seen.add(id);
+      if (!(await this.store.getRun(id))) return;
+      for (const child of await this.getRunChildren(id)) await visit(child);
+      ids.push(id);
+    };
+    for (const id of rootIds) await visit(id);
+    await this.deleteRunIds(ids);
+    for (const id of ids) await this.sweepRunBufferedSignals(id);
+    return ids.length;
+  }
+
+  /** Bulk-delete through the store's `deleteRuns`, or one `deleteRun` per id when it has none. */
+  private async deleteRunIds(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    if (this.store.deleteRuns) {
+      await this.store.deleteRuns(ids);
+      return;
+    }
+    for (const id of ids) await this.store.deleteRun(id);
   }
 
   async deleteRun(runId: string): Promise<number> {
@@ -1859,6 +2004,7 @@ export class WorkflowEngine {
         ids.push(id); // post-order: children before their parent
       };
       for (const run of batch) await visit(run.id);
+      const doomed: string[] = [];
       for (const id of ids) {
         const status = known.has(id) ? known.get(id) : (await this.store.getRun(id))?.status;
         if (status === undefined) continue; // already gone
@@ -1866,10 +2012,12 @@ export class WorkflowEngine {
           if (!cancelLive) continue;
           await this.cancel(id).catch(() => undefined);
         }
-        await this.store.deleteRun(id);
-        await this.sweepRunBufferedSignals(id);
-        deleted += 1;
+        doomed.push(id);
       }
+      // One batched delete per page (the store's `deleteRuns`), children before their parent.
+      await this.deleteRunIds(doomed);
+      for (const id of doomed) await this.sweepRunBufferedSignals(id);
+      deleted += doomed.length;
       if (batch.length < size) break;
     }
     return deleted;
@@ -4791,6 +4939,7 @@ export class WorkflowEngine {
       store: this.store,
       replay,
       clock: this.clock,
+      eventBufferTtlMs: this.eventBufferTtlMs,
       webhookUrl: this.webhookUrl,
       startStep: (s) => this.startStep(s),
       completeStep: (s) => this.completeStep(s),
@@ -5481,11 +5630,64 @@ export class WorkflowEngine {
     return true;
   }
 
-  private async completeRemoteResult(result: StepResult): Promise<void> {
+  /**
+   * Settle a durable step result and (barrier permitting) resume its run in the background.
+   *
+   * One run's results are settled in batches: the first starts a batch, and the ones that arrive
+   * while it is being written (with `resultConcurrency > 1`) form the next, up to
+   * {@link RESULT_BATCH_MAX}. A batch of several claims its checkpoints with one
+   * {@link StateStore.saveCheckpointsIfPending} call, asks each step fan's barrier once, and resumes
+   * the run at most once; a batch of one takes the single-result path unchanged. A result resolves
+   * only once its own write committed, so the transport acknowledges nothing that is not durable.
+   */
+  private completeRemoteResult(result: StepResult): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const entry: QueuedResult = { result, resolve, reject };
+      const queued = this.resultQueues.get(result.runId);
+      if (queued) {
+        queued.push(entry);
+        return;
+      }
+      const queue = [entry];
+      this.resultQueues.set(result.runId, queue);
+      void this.drainResultQueue(result.runId, queue);
+    });
+  }
+
+  /** Settle `queue` (one run's queued results) batch by batch until it is empty, then retire it. */
+  private async drainResultQueue(runId: string, queue: QueuedResult[]): Promise<void> {
+    // Results delivered in the same tick as the first join its batch.
+    await Promise.resolve();
+    while (queue.length > 0) {
+      const batch = queue.splice(0, RESULT_BATCH_MAX);
+      let outcomes: Array<true | { error: unknown }>;
+      try {
+        outcomes = await this.completeRemoteResults(
+          runId,
+          batch.map((q) => q.result),
+        );
+      } catch (error) {
+        outcomes = batch.map(() => ({ error }));
+      }
+      batch.forEach((q, i) => {
+        const outcome = outcomes[i] ?? true;
+        if (outcome === true) q.resolve();
+        else q.reject(outcome.error);
+      });
+    }
+    // Same tick as the empty check: a result arriving later starts a new queue.
+    this.resultQueues.delete(runId);
+  }
+
+  /** The single-result path: settle `result`, then resume its run unless its fan is still running. */
+  private async completeOneRemoteResult(result: StepResult): Promise<void> {
     const cp = await this.settleRemoteCheckpoint(result);
     if (cp === undefined) return;
     if (await this.stepFanStillRunning(cp, result)) return;
-    const runId = result.runId;
+    this.resumeInBackground(result.runId);
+  }
+
+  private resumeInBackground(runId: string): void {
     this.trackEffect(
       this.resumeImplicit(runId).catch((err) => {
         console.warn(
@@ -5495,6 +5697,158 @@ export class WorkflowEngine {
         );
       }),
     );
+  }
+
+  /**
+   * Settle a batch of one run's step results; per result, `true` (settled or dropped) or the error
+   * that kept it from settling, which the transport then redelivers. Same outcome per result as
+   * {@link completeOneRemoteResult} on each in turn, with one resume for the batch: that resume
+   * replays every write of the batch, so a second would only replay it again.
+   */
+  private async completeRemoteResults(
+    runId: string,
+    results: StepResult[],
+  ): Promise<Array<true | { error: unknown }>> {
+    const outcomes: Array<true | { error: unknown }> = results.map(() => true);
+    const settleOneByOne = async (indexes: number[]) => {
+      for (const i of indexes) {
+        try {
+          await this.completeOneRemoteResult(results[i] as StepResult);
+        } catch (error) {
+          outcomes[i] = { error };
+        }
+      }
+      return outcomes;
+    };
+    if (results.length === 1) return settleOneByOne([0]);
+    // A second copy of a result in the same batch is a duplicate delivery: the first copy settles
+    // the step (or re-drives the resume), so the copy is dropped like a late one.
+    const seen = new Set<number>();
+    const live = results.flatMap((r, i) => {
+      if (seen.has(r.seq)) return [];
+      seen.add(r.seq);
+      return [i];
+    });
+    const run = await this.store.getRun(runId);
+    // A finished or unknown run takes the single-result path, which salvages a late success onto a
+    // failed run and frees the slots of a cancelled one. Rare, so it is not batched.
+    if (
+      run === null ||
+      run.status === 'completed' ||
+      run.status === 'failed' ||
+      run.status === 'cancelled' ||
+      run.status === 'dead'
+    ) {
+      return settleOneByOne(live);
+    }
+    const reads = await Promise.allSettled(
+      live.map((i) => this.store.getCheckpoint(runId, (results[i] as StepResult).seq)),
+    );
+    // Checkpoints whose result should resume the run (barrier permitting): the ones this batch
+    // settled, and redeliveries of ones settled before — whose resume may never have happened.
+    const resumable: Array<{ cp: StepCheckpoint; result: StepResult }> = [];
+    const pending: Array<{ index: number; cp: StepCheckpoint }> = [];
+    reads.forEach((read, k) => {
+      const index = live[k] as number;
+      const result = results[index] as StepResult;
+      if (read.status === 'rejected') outcomes[index] = { error: read.reason };
+      else if (!read.value) return;
+      else if (read.value.status === 'pending') pending.push({ index, cp: read.value });
+      else resumable.push({ cp: read.value, result });
+    });
+    const finishedAt = new Date();
+    const writes = pending.map(({ index, cp }) => {
+      const result = results[index] as StepResult;
+      return {
+        ...cp,
+        status: result.status,
+        output: result.status === 'completed' ? result.output : cp.output,
+        error: result.error,
+        events: result.events ?? cp.events,
+        startedAt: result.startedAt ? new Date(result.startedAt) : cp.startedAt,
+        finishedAt,
+      };
+    });
+    // Claimed, not blindly written: a duplicate delivery may have settled a step first.
+    const claims = await this.savePendingCheckpoints(writes);
+    for (const [k, claim] of claims.entries()) {
+      const { index, cp } = pending[k] as { index: number; cp: StepCheckpoint };
+      const result = results[index] as StepResult;
+      if (claim === false) {
+        resumable.push({ cp, result });
+        continue;
+      }
+      if (claim !== true) {
+        outcomes[index] = claim;
+        continue;
+      }
+      try {
+        await this.releaseQueueSlot(cp);
+      } catch (error) {
+        // Written but not acknowledged: the redelivery finds the step settled and re-drives.
+        outcomes[index] = { error };
+      }
+      const startedAt = result.startedAt ? new Date(result.startedAt) : cp.startedAt;
+      this.emit({
+        type: result.status === 'completed' ? 'step.completed' : 'step.failed',
+        runId,
+        seq: result.seq,
+        name: cp.name,
+        kind: cp.kind,
+        output: result.output,
+        error: result.error,
+        queueMs: startedAt.getTime() - cp.enqueuedAt.getTime(),
+        durationMs: finishedAt.getTime() - startedAt.getTime(),
+      });
+      resumable.push({ cp, result });
+    }
+    // Asked after every write of the batch committed, so the batch holding a fan's last step sees
+    // its barrier open; once per fan. A barrier that cannot be read counts as open: a spare resume
+    // replays and re-suspends, a lost one strands the run.
+    const barriers = new Map<number, Promise<boolean>>();
+    for (const { cp, result } of resumable) {
+      const fan = parseStepFanGroup(cp.parallelGroup);
+      if (!fan || result.status === 'failed') {
+        this.resumeInBackground(runId);
+        return outcomes;
+      }
+      let closed = barriers.get(fan.firstSeq);
+      if (!closed) {
+        closed = this.countPendingSteps(runId, fan.firstSeq, fan.firstSeq + fan.size - 1).then(
+          (n) => n > 0,
+          () => false,
+        );
+        barriers.set(fan.firstSeq, closed);
+      }
+      if (!(await closed)) {
+        this.resumeInBackground(runId);
+        return outcomes;
+      }
+    }
+    return outcomes;
+  }
+
+  /**
+   * {@link savePendingCheckpoint} for checkpoints at distinct seqs: one
+   * {@link StateStore.saveCheckpointsIfPending} call when the store has it, else one write each.
+   * Never rejects as a whole: a failed write is reported as that entry's error, and the batch call
+   * rejecting means it wrote nothing, so the entries are then written one by one.
+   */
+  private async savePendingCheckpoints(
+    checkpoints: StepCheckpoint[],
+  ): Promise<Array<boolean | { error: unknown }>> {
+    if (checkpoints.length > 1 && this.store.saveCheckpointsIfPending) {
+      try {
+        const wrote = await this.store.saveCheckpointsIfPending(checkpoints);
+        return checkpoints.map((_, i) => wrote[i] === true);
+      } catch {
+        // Fall through: one bad row must not fail the whole batch.
+      }
+    }
+    const settled = await Promise.allSettled(
+      checkpoints.map((cp) => this.savePendingCheckpoint(cp)),
+    );
+    return settled.map((r) => (r.status === 'fulfilled' ? r.value : { error: r.reason }));
   }
 
   /**
