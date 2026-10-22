@@ -4,6 +4,8 @@ description: Surface workflow runs and steps inside Telescope with durableTelesc
 icon: Telescope
 ---
 
+import { Callout } from 'fumadocs-ui/components/callout';
+
 Already running [Telescope](/docs/telescope)? The `@adonis-agora/durable/telescope` subpath adds a dedicated **Workflows** view so durable flows appear next to your requests, queries, and jobs — with a health dashboard built from the engine's lifecycle events and live store reads. It ships in the main `@adonis-agora/durable` package — no extra install.
 
 ## Registering the extension
@@ -11,39 +13,64 @@ Already running [Telescope](/docs/telescope)? The `@adonis-agora/durable/telesco
 Register `durableTelescopeExtension()` under Telescope's `extensions`:
 
 ```ts title="config/telescope.ts"
+import { defineConfig } from '@adonis-agora/telescope'
 import { durableTelescopeExtension } from '@adonis-agora/durable/telescope'
 
 export default defineConfig({
   extensions: [
-    durableTelescopeExtension({ runHref: '/durable/runs/{runId}' }),
+    durableTelescopeExtension({
+      runHref: '/durable#/run/{runId}',
+      recentFailuresWindowMs: 24 * 60 * 60 * 1000, // default: only show failures from the last 24h
+    }),
   ],
 })
 ```
 
-The extension contributes a `durable` entry type (labeled **Workflows** in the nav), a `durable.workflows` dashboard, and a set of data providers. `runHref` is an optional URL template (default `'/durable/runs/{runId}'`) used to deep-link a run row out to the [durable dashboard](/docs/durable/observability/dashboard); `{runId}` is substituted per row.
+The extension contributes a `durable` entry type (labeled **Workflows** in the nav), a `durable.workflows` dashboard, nine data providers, and your workflows' schedules on Telescope's Live Schedules screen. Both options are optional:
 
-The durable runs become Telescope entries automatically — the `@adonis-agora/durable` provider bridges engine lifecycle events onto the [`@adonis-agora/diagnostics`](/docs/diagnostics) bus when diagnostics is installed, and Telescope captures from that bus. So you get one entry per lifecycle event (`run.started`, `step.completed`, `run.failed`, …) with zero extra wiring.
+- `runHref` is a URL template used to deep-link a run row out to the [durable dashboard](/docs/durable/observability/dashboard). `{runId}` is substituted per row. The default is `'/durable#/run/{runId}'`. Pass your own when the console is mounted somewhere other than `/durable` (the `path` in `config/durable_dashboard.ts`), because the extension can't know the mount path. Keep the `#/run/` shape: the console is a hash-routed SPA, so a plain path such as `/durable/runs/<id>` is answered by your app's router and 404s.
+- `recentFailuresWindowMs` sets how far back the **Stuck runs** table looks. The default is 24 hours, so a healthy system shows an **empty** table instead of surfacing days-old failures as a live incident. Pass `0` to disable the window and show every failed and dead run.
+
+## How runs become entries
+
+There is no durable-specific watcher to register. The `@adonis-agora/durable` provider bridges every engine lifecycle event onto the [`@adonis-agora/diagnostics`](/docs/diagnostics) bus as `agora:durable:<type>` (e.g. `agora:durable:run.failed`) when diagnostics is installed. Telescope's generic diagnostics watcher captures that bus. You get one entry per lifecycle event (`run.started`, `step.completed`, `run.completed`, `run.failed`, …), recorded as a `diagnostic` entry tagged `lib:durable`, with the whole engine event as its payload. When diagnostics isn't installed, the bridge is an inert subscription and costs nothing.
 
 An event of a child run started by `ctx.all`, `ctx.child` or `ctx.startChild` (without a caller-chosen id) also carries `parentRunId` in its payload. Each child is its own run, so that field is how you find every child of one parent, a whole `ctx.all` fan included. `parentRunIdOf(runId)` is exported from `@adonis-agora/durable` if you need the same mapping yourself.
 
+A dead-lettered run shows up as a `run.failed` entry with `error.code: 'max_recovery_attempts'` (see [Dead-letter queue](/docs/durable/reliability/dead-letter)), so it counts toward the failure rollups.
+
 ## The Workflows dashboard
 
-The `durable.workflows` dashboard is assembled from these data providers:
+The `durable.workflows` dashboard is laid out in three sections:
 
-- **Golden signals** — success rate, throughput (completed runs/hour), duration percentiles (p50/p95/p99), and failure count over a window.
-- **Current-state gauges** — **dead** / **suspended** / **running** / **pending** *now*.
-- **Needs attention** — top failing workflows, recent failed runs (deep-linked via `runHref`), and starved worker groups.
-- **Trends** — runs over time, duration distribution, and a state breakdown.
+- **Health** has **Success rate** (a gauge that warns below 98% and turns bad below 95%), **Duration p95**, **Backlog** (the count of `pending` runs) and **Throughput** (completed runs per hour, with a trend spark).
+- **Needs attention** has **Top failing workflows** (the eight workflows producing the most failures), **Stuck runs** (recent failed and dead runs as a table, deep-linked via `runHref` and bounded by `recentFailuresWindowMs`), and **Starved worker groups** (every worker group with its queue depth and live-worker count; `STARVED` groups, which have a backlog and zero live workers, are sorted first).
+- **Trends** has **Runs over time** (stacked done/failed), **Duration distribution** (a histogram with p50/p95/p99 markers) and **Runs by state** (a donut of running/pending/completed/failed/dead counts).
 
-### Two data sources
+### Data providers
 
-The panels read from two different places, by design:
+Nine providers back the panels, reading from three different places by design:
 
-- **Rollups** (success rate, throughput, duration, top failures) are computed from the `durable` entries Telescope already captured — the **recent-history** view, bounded by Telescope's prune window.
-- **Current-state gauges** (dead / suspended / running / pending *now*) and the state breakdown are read **live** from the durable store, so they're exact and **not** limited by the prune window. They count through `engine.countRuns`, a `COUNT` on a store that has one (the Lucid store does), which stays exact and cheap when a wide fan puts tens of thousands of runs in one status.
+- **Telescope's own captured entries.** `durable.timeseries` (success rate, failed count, top failures), `durable.duration` (p50/p95/p99 and the histogram), `durable.runsOverTime`, `durable.successRate` and `durable.throughput` aggregate the `lib:durable` entries Telescope already captured. This is the **recent-history** view, bounded by Telescope's prune window. Success rate and throughput compare a 24-hour window against the previous one to show a delta.
+- **The live durable store.** `durable.state` (one status count, e.g. Backlog; defaults to `dead`), `durable.recentFailures` (the Stuck runs table) and `durable.stateBreakdown` (the Runs-by-state donut) are read **live**, so they're exact and **not** limited by the prune window. The counts go through `engine.countRuns`, a `COUNT` on a store that has one (the Lucid store does), which stays exact and cheap when a wide fan puts tens of thousands of runs in one status. An engine without `countRuns` falls back to a listing capped at 10,000 runs.
+- **The live worker layer.** `durable.workerHealth` reads `engine.workerHealth()` and returns per-group backlog and live-worker rows. Query it with `{ metric: 'starvedCount' }` for a single stat: the number of groups with a backlog and zero live workers. The list is empty when the transport can't introspect its groups, and only the BullMQ transport implements `groupHealth` today.
 
 Telescope is the health and visibility view, and deep-links out: **per-run actions** (retry, cancel) and the **step timeline** stay in the [durable dashboard](/docs/durable/observability/dashboard).
 
+## Schedules on the Live Schedules screen
+
+The extension also contributes your workflows' schedules to Telescope's **Live Schedules** screen, so nobody keeps a second, hand-typed list. It reports every schedule the engine discovered from a workflow class, either a [colocated `static schedule` or `@Scheduled`](/docs/durable/authoring/scheduling#colocate-the-schedule-with-the-workflow), read from the container once Telescope is ready:
+
+- A `cron` schedule is listed as `cron` with its expression and timezone. An `every` schedule is listed as `interval`, rendered like `every 2m`.
+- The schedule's pinned `namespace` is shown as the **pool** that services its runs. An unpinned schedule shows no pool, meaning whichever worker's tick wins fires it.
+- A **paused** schedule is still listed. The screen shows what exists, and a cron that silently disappears is harder to debug than one marked paused.
+
+Only schedules declared on workflow classes are contributed. Schedules listed under `schedules` in `config/durable.ts` don't appear on the screen.
+
 ## Mounting just the dashboard spec
 
-If you want the durable health dashboard's spec to compose into your own Telescope layout, the package also exports `durableDashboard(opts?)` (returning the dashboard spec) and the individual data providers (`durableStateProvider`, `durableSuccessRateProvider`, `durableThroughputProvider`, `durableDurationProvider`, `durableRecentFailuresProvider`, `durableWorkerHealthProvider`, and more) so you can pick and place panels yourself.
+If you want the durable health dashboard's spec to compose into your own Telescope layout, the package also exports `durableDashboard(opts?)` (returning the dashboard spec, with the same `runHref` / `recentFailuresWindowMs` options), `durableSchedules(ctx)`, and the individual data providers (`durableStateProvider`, `durableTimeseriesProvider`, `durableRecentFailuresProvider`, `durableWorkerHealthProvider`, `durableDurationProvider`, `durableRunsOverTimeProvider`, `durableSuccessRateProvider`, `durableThroughputProvider`, `durableStateBreakdownProvider`) so you can pick and place panels yourself.
+
+<Callout type="info">
+The extension object structurally satisfies `@adonis-agora/telescope`'s `TelescopeExtension` type without importing it, so `@adonis-agora/durable` takes no dependency on Telescope. The engine-backed providers resolve `WorkflowEngine` from the AdonisJS container at query time.
+</Callout>

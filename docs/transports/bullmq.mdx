@@ -1,0 +1,217 @@
+---
+title: BullMQ / Redis
+description: The BullMQ transport for cross-process and cross-language steps. Each step name gets its own tasks queue, and results come back on one shared results queue. Covers connection, fixed and adaptive concurrency, result concurrency, priority, namespaces, crash recovery and shutdown.
+icon: Server
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+The `bullmq` driver sends steps over [BullMQ](https://docs.bullmq.io) on Redis. Its wire format matches the NestJS `nestjs-durable` BullMQ transport and the Python `durable-worker` byte for byte, so it is the driver to pick when an Adonis engine and a NestJS or [Python worker](/docs/durable/python) share one Redis. [Cross-ecosystem interop](/docs/durable/cluster/interop) covers the polyglot side. This page covers the transport itself.
+
+The driver ships **inside `@adonis-agora/durable`**. `bullmq` and `ioredis` are optional peers, loaded only when `bullmq` is the selected transport, so install them in the app that uses it:
+
+```bash
+npm i bullmq ioredis
+```
+
+<Callout type="info">
+For an **Adonis-only** fleet, the [`queue`](/docs/durable/transports/queue) and [`db`](/docs/durable/transports/db) drivers are usually a better fit, because they reuse infrastructure you already configured. Choose `bullmq` when you need the wire it shares with NestJS and Python, or when you want BullMQ's own tooling on the queues.
+</Callout>
+
+## How it works
+
+- `ctx.step` dispatches a task to a **per-name** queue, `<P>-tasks-<token>`. The routing token is the step name with `:` replaced by `-` (BullMQ does not allow `:` in a queue name), plus `@<partition>` when a partition is set.
+- A worker that registered that step name consumes the queue, runs the handler, and adds the result to the shared `<P>-results` queue.
+- The engine-side instance consumes `<P>-results` and checkpoints each result.
+- Heartbeats from long steps (`timeoutMs`) travel on the `<P>-heartbeat` pub/sub channel. Workers advertise themselves with TTL'd Redis keys.
+
+`P` is the effective prefix: `prefix` (default `durable`), with `-<namespace>` appended for a non-default [namespace](#namespace-partition-and-prefix).
+
+Run one **engine-side** process, which consumes results, and one or more **worker** processes. Each worker starts a dedicated BullMQ `Worker` for every step name it serves:
+
+```ts title="config/durable.ts"
+import { defineConfig, transports, controlPlanes, stores } from '@adonis-agora/durable'
+
+export default defineConfig({
+  transport: 'bullmq',
+  transports: {
+    bullmq: transports.bullmq({ connection: { host: '127.0.0.1', port: 6379 } }),
+  },
+  // The BullMQ transport does not include a control plane: add one for multi-replica cancel + live-tail.
+  controlPlane: controlPlanes.redis({ connection: 'main' }),
+  store: 'lucid',
+  stores: { lucid: stores.lucid() },
+})
+```
+
+```bash title="a separate worker process"
+node ace durable:work
+```
+
+`durable:work` boots the app from the same `config/durable.ts` and serves the step handlers the app registers. Handlers under `app/steps` are discovered automatically.
+
+<Callout type="warn" title="Pair it with a control plane">
+This transport only carries tasks, results and heartbeats. Cross-instance lifecycle events and cancellation go through the [control plane](/docs/durable/transports/control-plane). Use `controlPlanes.redis(...)`, which owns the byte-compatible `<prefix>-control` channel. If you omit it, the engine stays local-only.
+</Callout>
+
+The `consumers` setting in `config/durable.ts` (see [the queue driver](/docs/durable/transports/queue#consumers--why-a-node-ace-script-does-not-drain-the-queue)) has **no effect** on `bullmq`. This transport has no deferred-consumer mode, so any process that boots it starts its result consumer and the task workers for the handlers it registers. That includes a `node ace` console process.
+
+## Connection
+
+`connection` is required. It is passed directly to BullMQ and ioredis, and accepts:
+
+- ioredis `ConnectionOptions` (`host`, `port`, `password`, `db`, `sentinels`, ...),
+- a connection string, or
+- an existing ioredis `Redis` instance.
+
+BullMQ workers need `maxRetriesPerRequest: null`. When you pass an options object, the transport sets that for its worker connections. A `Redis` instance you pass in is used as-is, so configure it yourself. Pub/sub, heartbeat and liveness clients are `duplicate()`s of a passed instance, or fresh clients with a 10s keep-alive.
+
+A missing or empty `connection` throws at boot. Without that check, ioredis would silently connect to its own default, `127.0.0.1:6379`, instead of your Redis.
+
+<Callout type="info">
+Unlike `stores.lucid({ connection })` or `controlPlanes.redis({ connection })`, this `connection` is **not** the name of a `config/redis.ts` connection. It is the raw ioredis connection itself. To reuse your app's Redis settings, read them from `env` in `config/durable.ts`.
+</Callout>
+
+## Concurrency
+
+`concurrency` sets how many tasks each of this instance's per-name task queues runs at once (the BullMQ `Worker` concurrency). It accepts three forms:
+
+- **A number** fixes the limit. The default is `1`. A non-finite or sub-1 value falls back to `1`, and a fractional value is rounded down. A fixed limit runs no control loop. The number also applies to the decisions, step-events, start-run and run-request consumers.
+- **`'adaptive'`** lets an `AdaptiveController` move the limit at runtime, using the defaults below.
+- **`{ mode: 'adaptive', ... }`** is adaptive mode with overrides.
+
+Every `tickMs`, an adaptive worker compares the steps' median latency with their no-queuing baseline, and checks the memory and CPU it is using. Then it moves the limit:
+
+| Signal | Move |
+| --- | --- |
+| RSS at or above `ramCeilingPct` of the memory limit (cgroup v2, then cgroup v1, then host total) | down 20% |
+| CPU at or above `cpuCeilingPct` | down 1 |
+| more than 20% of recent steps failed, or work in flight with no completion for two ticks | down 1 |
+| median latency above 1/0.7 of the baseline (steps are queuing) | down by that ratio |
+| median latency within 1/0.9 of the baseline while in-flight work fills at least 80% of the limit | up 1 |
+
+```ts title="config/durable.ts"
+bullmq: transports.bullmq({
+  connection: { host: '127.0.0.1', port: 6379 },
+  concurrency: { mode: 'adaptive', min: 2, max: 64, start: 8, ramCeilingPct: 80, cpuCeilingPct: 90 },
+}),
+```
+
+| Option | Default |
+| --- | --- |
+| `min` | `1` |
+| `max` | `32` (raised to `min` when lower) |
+| `start` | `min`, clamped into `[min, max]` |
+| `tickMs` | `2000` |
+| `ramCeilingPct` | `85` |
+| `cpuCeilingPct` | off |
+
+A non-finite or out-of-range value falls back to its default. A non-finite or non-positive `cpuCeilingPct` turns the CPU ceiling off.
+
+The limit stays within `[min, max]`. It applies to every task queue of the instance at once, and a task queue registered later starts at the current limit. Only step durations are measured. A workflow turn on the same queue counts as in-flight work and as progress, but its duration is not added to the latency window. In adaptive mode, the decisions, step-events, start-run and run-request consumers run at `1`.
+
+Total parallelism across a fleet is `concurrency × replicas`. In both modes, the worker heartbeat carries the live limit, in-flight count, RSS, CPU, throughput, p95 and (in adaptive mode) the last adjustment with its reason. The [dashboard's worker cards](/docs/durable/observability/dashboard#fleet-and-topology) display these. Throughput is steps per minute over the trailing minute, so it decays while the worker is idle and drops to 0 after a minute with no completed step. This is the same controller as the NestJS BullMQ transport's `concurrency: 'adaptive'`.
+
+The transport's `concurrency` is separate from a [flow-control queue](/docs/durable/reliability/flow-control)'s `concurrency`. That one limits what the engine *admits*. This one limits how many admitted steps a worker *runs* at once.
+
+## Result concurrency
+
+`concurrency` applies to the **task** queues a worker consumes. The engine side consumes the shared `<P>-results` queue, and `resultConcurrency` sets how many results this instance settles at once. The default is `1`. A non-finite or sub-1 value falls back to `1`, and a fractional value is rounded down.
+
+With one result at a time, the results of a wide fan wait in line for one checkpoint write at a time on each pod. Raise it on the instances that consume results:
+
+```ts title="config/durable.ts"
+bullmq: transports.bullmq({
+  connection: { host: '127.0.0.1', port: 6379 },
+  resultConcurrency: 16, // results of different runs settle in parallel
+}),
+```
+
+Raising it never gives a run two concurrent turns: the run lease admits one executor, and replay is positional. The fan's join barrier resumes the parent once per settled wave rather than once per result. For the engine-side timer batch (`timerBatchSize`) that goes with wide fans, see [Wide fans: results and timers](/docs/durable/transports#wide-fans-results-and-timers).
+
+### Result delivery
+
+If the engine's result handler throws on a result job (for example, a store timeout at peak load), the job is retried up to **5 times** with exponential backoff starting at **500 ms**. Retrying is safe because the engine settles a step only while its checkpoint is still `pending`. A result that still fails is kept in the results queue for **24 hours**, and the transport reports that it gave up on it (with the step and run ids) to `onError`, or to `console.error` when no `onError` is set.
+
+## Priority
+
+A per-call `priority` on `ctx.step` follows the engine's convention: **higher wins**. BullMQ's job priority works the other way, with lower numbers running first. The transport converts between them (`clamp(round(1_048_576 - priority), 1, 2_097_151)`), so "higher means more urgent" holds end to end. The NestJS and Python sides use the same mapping. Leave `priority` unset to keep the default FIFO ordering.
+
+## Namespace, partition and prefix
+
+- **`prefix`** (default `durable`) is the root of every queue, channel and key name.
+- **`namespace`** separates every name this instance touches, so one Redis can host several isolated deployments. Unset or `'default'` keeps the names identical to the un-namespaced scheme. Any other value inserts `-<namespace>` after the prefix. If you don't set it here, the transport takes the engine's `namespace` from `config/durable.ts`. A value set explicitly on the transport takes precedence.
+- **`partition`** adds `@<partition>` to every per-name task queue this instance subscribes to. Several worker pools can then serve the same step name on one Redis without their tasks mixing.
+
+An engine and its workers must agree on all three, or they end up on different queues. See [Tenancy](/docs/durable/concepts/tenancy) for what each axis actually partitions.
+
+## Crash recovery
+
+If a worker crashes or stalls mid-step, it never produces a `StepResult`, and the step's checkpoint would stay `pending`. The transport handles this case **automatically**:
+
+- BullMQ's own stalled-job check, run by a **peer** worker on the same queue, marks the crashed worker's job `failed` once its stall limit is reached.
+- Every task worker listens for `failed`. When a task job ends `failed`, the listener publishes a synthetic, **retryable** failed `StepResult` for it on `<P>-results`. The engine then settles the checkpoint as failed, and its normal durable retry re-dispatches the step.
+- Task jobs are enqueued with `removeOnFail: { age: 86400 }`, so a failed job's payload stays in Redis for 24 hours. That gives the bridge time to read the `runId` / `seq` / `stepId` it needs before BullMQ removes the job.
+
+A handler's own error does not go through this path. The worker catches every handler throw and publishes a failed `StepResult` itself, so the BullMQ job *succeeds* and nothing is published twice. A `failed` workflow-turn job carries no step identity, so the bridge skips it. The engine re-drives that turn on recovery instead.
+
+**The bridge lives in the consumer, not in the queue.** A worker written in another SDK consumes the same queues, and only gets this behaviour if that SDK implements its own `failed` listener.
+
+Two gaps remain. The engine's opt-in `remoteRedispatchMs` self-heal covers both (see [Lost remote dispatch](/docs/durable/reliability/failure-modes#lost-remote-dispatch-the-run-suspends-and-nothing-auto-redrives-it)):
+
+- If the **only** worker for a queue crashes and never restarts, no peer's stalled check runs, so nothing settles the checkpoint.
+- If the consuming SDK has no failure bridge, the job's final failure is never turned into a result.
+
+`engine.redispatchPending(runId)` is the manual fix for a run that is already stuck.
+
+## Worker liveness
+
+Each served routing token gets a liveness key, `<P>-worker-heartbeat:<token>:<instanceId>`. Its value is `{ ts, status }`, where `status` is the live concurrency snapshot. Every token is refreshed on one shared **10s** interval, and the key has a **35s** TTL. A worker that stops refreshing disappears from the registry when its key expires.
+
+Workers that run the store-less [worker runtime](/docs/durable/cluster/thin-workers) also publish a [handshake](/docs/durable/cluster/handshake) descriptor under `<P>-worker-descriptor:<token>:<instanceId>`. The engine reads these keys with `SCAN` (never `KEYS`) and caches descriptor reads for 5s per token, so routing does not scan Redis on every dispatch. Per-group health, meaning queue depth (waiting + active + delayed + prioritized) plus live workers, comes from the same keys.
+
+`instanceId` defaults to `ts-<hostname>-<pid>`. The Python SDK uses `py-<hostname>-<pid>`, so the fleet view shows which runtime each worker runs.
+
+## Beyond steps
+
+The same transport also carries:
+
+- **Workflow turns** for workflows whose body runs in another SDK. A `workflow` job goes on the workflow's own `<P>-tasks-<token>` queue (workers tell step jobs and workflow jobs apart by shape), and the worker's decision returns on `<P>-decisions`. Local-step lifecycle events from those workers come back on `<P>-step-events`. See [Python workers & workflows](/docs/durable/python).
+- **The store-less tenant protocol**. A [tenant pod](/docs/durable/cluster/roles-and-config#tenant-store-less-thin-pod) enqueues start requests on `<P>-start-run` and read/control requests on `<P>-run-request`. The control plane replies on the `<P>-run-reply` pub/sub channel and re-publishes each tenant's lifecycle events on `<P>-tenant-events-<tenant>`.
+
+[How the wire lines up](/docs/durable/cluster/interop#how-the-wire-lines-up) lists every channel next to its NestJS and Python counterpart.
+
+## Shutdown
+
+`closeTimeoutMs` (default `5000` ms) limits how long `close()` waits for a graceful shutdown. `0` skips the wait. Workers close first, concurrently, so a step that is still running can publish its result. The queues close after that. Both phases share one deadline. When the deadline passes, the transport disconnects its pub/sub, heartbeat and liveness connections anyway. Abandoned BullMQ workers may keep running their jobs on their own connections until the process exits. A job that did not finish is recovered through BullMQ's stalled-job handling and the [crash-recovery bridge](#crash-recovery). The provider calls `close()` on app shutdown.
+
+## Options — `transports.bullmq(config)`
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `connection` | — (required) | ioredis `ConnectionOptions`, a connection string, or a `Redis` instance. See [Connection](#connection). |
+| `concurrency` | `1` | Task-queue concurrency: a number, `'adaptive'`, or `{ mode: 'adaptive', ... }`. See [Concurrency](#concurrency). |
+| `resultConcurrency` | `1` | How many step results this instance settles at once. See [Result concurrency](#result-concurrency). |
+| `prefix` | `'durable'` | Root of every queue, channel and key name. |
+| `namespace` | the engine's | Deployment namespace folded into every name. An explicit value wins over the engine's. |
+| `partition` | — | Isolation suffix (`@<partition>`) on every per-name task queue this instance subscribes to. |
+| `instanceId` | `ts-<hostname>-<pid>` | Stable id for this process, stamped on its liveness keys. |
+| `closeTimeoutMs` | `5000` | Graceful-shutdown deadline for `close()`. `0` skips the wait. |
+| `onError` | swallowed / `console.warn` | Receives background failures: heartbeat refresh errors, result-publish errors, pub/sub subscribe failures, and a result the transport gave up on. |
+
+`transports.bullmq(config)` returns the lazy driver thunk used in `config/durable.ts`. The underlying `BullMQTransport` class (with `createBullMQDeps`) is also exported from `@adonis-agora/durable` if you want to build one by hand.
+
+## Queue naming
+
+| Name | Kind | Direction | Purpose |
+| --- | --- | --- | --- |
+| `<P>-tasks-<token>` | queue | engine → workers | step dispatch (job `task`) and remote workflow turns (job `workflow`), one queue per routing token |
+| `<P>-results` | queue | workers → engine | step results (job `result`) |
+| `<P>-decisions` | queue | workers → engine | remote workflow decisions |
+| `<P>-step-events` | queue | workers → engine | streamed local-step lifecycle from remote workflows |
+| `<P>-heartbeat` | pub/sub | workers → engine | liveness for `timeoutMs` steps |
+| `<P>-worker-heartbeat:<token>:<instance>` | key, `EX 35` | workers → engine | worker liveness + live status |
+| `<P>-start-run`, `<P>-run-request` | queue | tenant → control plane | store-less start / read / control requests |
+| `<P>-run-reply`, `<P>-tenant-events-<tenant>` | pub/sub | control plane → tenant | correlated replies, per-tenant lifecycle events |
+
+The payloads are the documented `RemoteTask` / `StepResult` JSON, with the DTO itself as the job data and no envelope. This is why a non-Node worker on the same queues works with this transport.

@@ -1,0 +1,30 @@
+---
+title: Authoring
+description: Everything you build a real workflow from. The app/workflows convention, child workflows, durable entities, queries and updates, events, webhooks and external tasks, versioning, and both config-driven and runtime-persisted scheduling.
+icon: PenLine
+---
+
+[Workflows & steps](/docs/durable/concepts/workflows-and-steps) covers the primitive every workflow is built from. This section covers what you need once a single workflow is no longer enough.
+
+## Writing workflows
+
+- **[app/workflows & make:workflow](/docs/durable/authoring/app-workflows)**: the class-based convention. One `BaseWorkflow` subclass per file under `app/workflows`, with a `static workflow` config, registered automatically at boot and scaffolded by `make:workflow`.
+
+## Composition
+
+- **[Child workflows](/docs/durable/authoring/child-workflows)**: call a workflow from a workflow. `Inner.start` / `ctx.child` waits for a result, `Inner.dispatch` / `ctx.startChild` starts one without waiting, and `ctx.all` fans out over a list. Pass a class for typed input and output, or a name string for a child in another runtime.
+- **[Durable entities](/docs/durable/authoring/entities)**: keyed virtual actors. `engine.registerEntity` defines handlers that run one at a time per key over durable state, exactly once. Drive them with `engine.signalEntity` / `ctx.callEntity`.
+
+## Talking to a running run
+
+- **[Queries & updates](/docs/durable/authoring/queries-and-updates)**: read a live run's state without affecting it (`ctx.setEvent` + `engine.getEvent`), steer it with validated updates that can be rejected before they reach the run, and index runs with search attributes.
+- **[Events](/docs/durable/authoring/events)**: `engine.publishEvent` resumes every run parked on a matching `ctx.waitForEvent` and starts every `onEvent` subscriber, with idempotent publishing, debounce/batch coalescing and buffered delivery.
+- **[Event-triggered workflows](/docs/durable/authoring/event-triggers)**: start a workflow from an AdonisJS emitter event (`@OnEvent`) or an `@adonis-agora/diagnostics` channel (`@OnDiagnostic`), with the payload as input.
+- **[Durable webhooks](/docs/durable/authoring/webhooks)**: `ctx.webhook()` creates a callback URL to hand to a third party inside a step. The run then suspends, using no compute, until the callback arrives.
+- **[External tasks & control primitives](/docs/durable/authoring/external-tasks)**: `ctx.task` with `engine.completeTask` / `failTask` for work a foreign system completes, `ctx.transaction` for a step that checkpoints in the same transaction as its write, and `ctx.breakpoint` to pause a run for a human.
+
+## Keeping it running
+
+- **[Versioning & determinism](/docs/durable/authoring/versioning)**: how in-flight runs stay replay-safe across a deploy. Covers workflow versions for breaking changes, the `NonDeterminismError` guard, deterministic `ctx.now` / `ctx.sideEffect`, and `ctx.patched` for an in-place change.
+- **[Scheduling](/docs/durable/authoring/scheduling)**: recurring workflows declared in `config/durable.ts` (or colocated as `static schedule`), on a fixed interval or a DST-aware cron, started exactly once per window.
+- **[Persisted schedules](/docs/durable/authoring/persisted-schedules)**: `engine.schedules`, for schedules you create, update, pause, trigger and delete at runtime, stored in the state store (`durable_schedules`), and fired by the `durable:work` tick when `persistedSchedules` is on. Safe with any number of workers.

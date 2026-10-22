@@ -1,5 +1,5 @@
 {
   "title": "Tooling",
   "icon": "Wrench",
-  "pages": ["linting"]
+  "pages": ["index", "linting", "codegen"]
 }

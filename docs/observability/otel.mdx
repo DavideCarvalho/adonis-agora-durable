@@ -4,6 +4,8 @@ description: One trace per run, one span per step. Bridge the engine's lifecycle
 icon: Waypoints
 ---
 
+import { Callout } from 'fumadocs-ui/components/callout';
+
 The `@adonis-agora/durable/otel` subpath turns workflow runs into OpenTelemetry traces — a root span per run, a child span per step — so they show up in the tracing stack you already run. It ships in the main `@adonis-agora/durable` package; install `@opentelemetry/api` as the only extra peer.
 
 ```bash
@@ -21,28 +23,42 @@ import { attachDurableOtel } from '@adonis-agora/durable/otel'
 const detach = attachDurableOtel(engine) // uses the global tracer provider
 ```
 
-It creates one root span per run and one child span per step (local / remote / sleep / signal). Each step span carries `durable.run_id`, `durable.workflow`, `durable.step.seq`, and `durable.step.kind`; a failed run marks its span with an error status. Pass `{ tracer }` or `{ provider }` in the options to use a specific tracer instead of the global one. With no OTel SDK registered, it falls back to no-op spans — zero overhead.
+It creates one root span per run and one child span per step (local / remote / sleep / signal). The root span is named `workflow <name>` and carries `durable.run_id` and `durable.workflow`; each step span is named `step <name>` and carries `durable.run_id`, `durable.step.seq`, and `durable.step.kind`. A failed step or run marks its span with an error status (and the error message, when there is one). Step spans are emitted when the step settles (`step.completed` / `step.failed`) and their start is reconstructed from the event's `durationMs`, so the span covers the step's real window and latencies are accurate. With no OTel SDK registered, it falls back to no-op spans — zero overhead.
+
+`attachDurableOtel` takes an options object if you don't want the global tracer provider:
+
+```ts
+export interface DurableOtelOptions {
+  /** Tracer to use. Defaults to one from the global provider (or `provider` if given). */
+  tracer?: Tracer
+  /** Tracer provider to take the tracer from. Defaults to the global OTel provider. */
+  provider?: TracerProvider
+}
+```
+
+Pass `tracer` to supply an already-created `Tracer`, or `provider` to take one (named `@adonis-agora/durable`) from a specific `TracerProvider` — both types come from `@opentelemetry/api` — instead of the process-wide global:
+
+```ts
+const detach = attachDurableOtel(engine, { provider: myTracerProvider })
+```
 
 It subscribes to the same engine lifecycle events the [dashboard](/docs/durable/observability/dashboard) and the [Telescope](/docs/durable/observability/telescope) view use — three views of one event log. OTel is for **debugging in production** (latency, correlation, alerts); the dashboard is for **operating** the workflow.
 
 > **Already running Telescope?** If your app has [`@adonis-agora/telescope`](/docs/telescope) installed *and* configured with [`otel.enabled: true`](/docs/telescope/packages/otel), you likely don't need to wire `attachDurableOtel` at all. Telescope's generic OTel bridge already turns durable's own `agora:durable:*` diagnostics events (emitted via `diagnostics-bridge.ts` — the same events the [Telescope view](/docs/durable/observability/telescope) uses) into OTLP spans and logs, alongside every other Agora library's events, in one place — zero durable-specific code required. Prefer that route when both libs are present. Reach for durable's own bridge on this page only when Telescope isn't part of the stack, or when you specifically want durable's root-span-per-run / child-span-per-step shape (Telescope's generic bridge parents spans under the resolved trace id only, not under a sibling run span).
 
+<Callout type="warn" title="A suspended-then-resumed run is NOT one continuous root span">
+The root span opens on `run.started` (the run's first `pending` → `running` transition) and is **ended and forgotten** on `run.suspended` — it does not reopen when the run resumes. `run.started` fires exactly once per run, so a workflow that suspends (a sleep, a signal wait, a remote dispatch awaiting a result) and later resumes does **not** get a fresh root span either: there is no root to attach the resumed steps to. Steps that settle *after* a resume show up as spans with no parent — detached from the run's original trace — rather than nested under one long-lived root.
+
+A run that parks `blocked` (`capability.unavailable` / `protocol.incompatible`) ends its root span the same way, with an error status, since the resume from `blocked` emits no new `run.started` either. The [dashboard](/docs/durable/observability/dashboard)'s run timeline is unaffected: it is built from the state store's checkpoints, not from spans.
+</Callout>
+
+## onError handoffs
+
+A failure handed to an [onError handler](/docs/durable/reliability/on-error) adds a `durable.run.routed` event to the run's root span, with the attributes `durable.on_error.handler`, `durable.error.code`, and `durable.error.message`. A failure that could not be routed adds `durable.run.unrouted` with `durable.on_error.reason` and `durable.error.code`. Both are emitted while the root span is still open — the handoff before the run suspends on its handler, the unrouted failure before the run fails — so they land on the run's trace, subject to the suspend boundary above.
+
 ## Lightweight metrics
 
-If you want dependency-free counters and latency percentiles without a full OTel pipeline, `attachDurableMetrics(engine)` collects them from the same events:
-
-```ts
-import { attachDurableMetrics } from '@adonis-agora/durable/otel'
-
-const metrics = attachDurableMetrics(engine)
-// ...later, expose a snapshot on a /metrics route:
-const snap = metrics.snapshot()
-// { runs: { started, completed, failed, suspended },
-//   steps: { completed, failed },
-//   stepDurationMs: { count, p50, p95, max }, runDurationMs: { … } }
-```
-
-The handle has `snapshot()`, `reset()`, and `unsubscribe()`.
+If you want dependency-free counters and latency percentiles without a full OTel pipeline, this subpath also exports `attachDurableMetrics(engine)`, which collects them from the same events and needs no OTel SDK. See [Metrics](/docs/durable/observability/metrics) for it and the Prometheus-shaped `collectMetrics`.
 
 ## Distributed tracing across workers
 

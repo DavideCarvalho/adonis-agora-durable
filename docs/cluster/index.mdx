@@ -25,6 +25,20 @@ Every topology runs the **same durable engine over the same wire**. Splitting th
 - **`control-plane`** — a pure coordinator. It owns the store and does everything *except* run your bodies: dispatch, crash recovery, timers, retention, and answering read/control requests from thin pods. Bodies execute on separate `tenant` worker pods.
 - **`tenant`** — a **store-less thin pod**. It never owns a store; every read, control action, and run-start round-trips over the wire to the control plane. Whether a tenant pod is a *worker* or an *api/dashboard* pod is decided by the **entrypoint you launch**, not extra config (see [Roles & config](/docs/durable/cluster/roles-and-config)).
 
+### Dispatch and execution are separate
+
+**Every** role dispatches over the transport — that never changes. What changes is who is *subscribed* to the queue a dispatch lands on. Two routing tokens have to agree:
+
+- **Dispatch side.** A step is routed to `<name>@<tenant>`, where the tenant comes from **the run's namespace** (or the step's own `partition`, which wins). A `default`/unset namespace routes to the bare `<name>`.
+- **Consume side.** A worker subscribes `<name>@<partition>` for every handler it serves, where the suffix is **its own `partition`** (a `tenant` pod's required `partition`, or `transports.bullmq({ partition })`) — bare when unset.
+
+A process executes a step body when, and only when, those two tokens match. There is no fallback: nothing "runs it anyway" because no worker showed up — the step stays pending (or the run parks `blocked` when the step [`requires`](/docs/durable/cluster/handshake#capability-aware-routing) capabilities no live worker advertises). See [Tenancy](/docs/durable/concepts/tenancy) for how a run's namespace is chosen.
+
+Two consequences of the roles above:
+
+- **`standalone` serves `app/steps` itself** (the embedded worker); **`control-plane` does not** — the provider skips step registration for it, so its steps only run where a worker consumes the matching token.
+- **A `control-plane` still runs the workflow bodies** — the deterministic coordinator code in `app/workflows` that decides which step to dispatch next. Unless you set `runDispatcher`, the role uses `NOOP_RUN_DISPATCHER`, so `engine.start()` never runs a body inline on the calling (e.g. HTTP) process; the run is left `pending` for the [`durable:work`](/docs/durable/cli) poll loop, which replays the body and dispatches each `ctx.step` to the workers. See [where a run actually executes](/docs/durable/reliability/failure-modes#where-a-run-actually-executes).
+
 ## When to reach for each
 
 <Callout type="warn">

@@ -1,0 +1,133 @@
+---
+title: Singleton workflows
+description: "`singleton` serializes runs of a workflow that share a key — a durable, FIFO mutex: at most `limit` run concurrently per key, the rest wait (suspended) and are admitted in creation order as slots free, with an optional maxQueueDepth back-pressure cap that rejects a start with SingletonQueueFullError instead of letting the same-key backlog grow forever."
+icon: Diamond
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+Some work must never overlap for a given key, even though many *different* keys should run freely in parallel — one inventory sync per store, one statement generation per account, one deploy per environment. `singleton` is a durable, FIFO mutex over a workflow's runs: declare a key function once, and the engine admits at most `limit` runs sharing that key at a time, across every instance that shares the store.
+
+As a live system: three keys, one mutex slot each. Burst `store:A` and only its lane backs up, while the waiters sit suspended with zero compute:
+
+<SingletonSim />
+
+## Declaring a singleton
+
+Put `singleton` in the class's `static workflow` config:
+
+```ts title="app/workflows/sync_inventory_workflow.ts"
+import { BaseWorkflow } from '@adonis-agora/durable'
+import type { WorkflowCtx } from '@adonis-agora/durable'
+
+export default class SyncInventoryWorkflow extends BaseWorkflow {
+  static workflow = {
+    name: 'sync-inventory',
+    version: '1',
+    singleton: {
+      key: (input: unknown) => `store:${(input as { storeId: string }).storeId}`,
+    },
+  }
+
+  async run(ctx: WorkflowCtx, input: { storeId: string }) {
+    const items = await ctx.step('inventory:fetch', input)
+    await ctx.step('inventory:reconcile', items)
+  }
+}
+```
+
+The same `singleton` option is accepted by `engine.register(name, version, fn, { singleton })` and `engine.registerRemote(...)`.
+
+With the key derived from `storeId`, two `sync-inventory` runs for `storeId: 'A'` never overlap, while a run for `storeId: 'B'` proceeds independently — its own key, its own slot. `SingletonConfig` has three fields:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `key` | required | `(input) => string` — derives the serialization key from the run's input. Runs whose `key(input)` returns the same string compete for the same slot(s); everything else is unaffected. |
+| `limit` | `1` | Max concurrent runs sharing the key. `1` is a true mutex; a higher number is a per-key concurrency cap. |
+| `maxQueueDepth` | unbounded | Caps the same-key *backlog* (see [below](#bounding-the-queue-maxqueuedepth-and-singletonqueuefullerror)). |
+
+The key is scoped to the workflow: admission only looks at runs of the **same workflow** sharing the key. (A [concurrency quota](/docs/durable/reliability/concurrency-quotas) key, by contrast, is shared across workflows.)
+
+## What happens when a second start arrives
+
+A singleton run is tagged `singleton:<key>` at start time. Start never blocks and, without `maxQueueDepth`, never fails: the run is created as usual. The gate runs when the run is executed — first marked `running`, then checked **before its body executes**:
+
+1. The engine lists this workflow's runs carrying the same `singleton:<key>` tag in `running` or `suspended`, and sorts them by `(createdAt, id)`.
+2. If this run is among the first `limit`, it is admitted and its body runs.
+3. Otherwise it suspends with a retry `wakeAt` (~1s, jittered ±250ms so a queue of waiters doesn't wake in lockstep) and releases its lease. The timer poller wakes it and the check runs again.
+
+The ordering comes from the store, not from in-memory state, so every instance reading a consistent store sees the same order — admission is FIFO by creation time. A holder keeps counting while it is `running` or `suspended`, so a singleton run sleeping or waiting on a signal still occupies its slot. Admission is re-checked every time the run resumes.
+
+Completion is push, not just poll: when a singleton run reaches a terminal state (`completed`, `failed`, `cancelled`, `dead`) — including a cancel or an execution-timeout sweep — the engine immediately makes the oldest `limit` gated waiters sharing its key due and dispatches them, instead of making them wait out their retry timer. Each one re-checks admission, so only the winner of a free slot actually runs. The durable retry timer still exists as the crash/cross-instance fallback — if the notify is missed (e.g. the notifying instance dies first), the next timer tick catches up.
+
+```ts
+// A: holds the slot for store A
+await engine.start('sync-inventory', { storeId: 'A' }, 'run-1')
+// B: same key, key is taken → suspended, gated behind A
+await engine.start('sync-inventory', { storeId: 'A' }, 'run-2')
+// C: different key → its own slot, runs immediately
+await engine.start('sync-inventory', { storeId: 'B' }, 'run-3')
+```
+
+## Store support
+
+Admission is built on the store's ordinary `listRuns` (tag + workflow + status filters) and `updateRun`. There is no dedicated store method and no extra table or column — the key rides the run's existing tags — so the [Lucid store](/docs/durable/stores/lucid), the in-memory store and any custom `StateStore` all support singleton workflows without a migration.
+
+<Callout type="warn" title="A scan, not an atomic claim">
+Admission is a read of the store followed by a decision, not a locked claim, and it is re-derived from the `(createdAt, id)` order on every check. Two consequences follow. A run is only ordered once it has left `pending`, so an older run that a worker picks up *after* a younger one was admitted sorts ahead of it and is admitted too, so the key briefly has more than `limit` runs executing. The younger holder keeps running its current turn, then finds itself past `limit` on its next resume and gates until a slot frees again. And a holder that crashes stays `running` (so it keeps its slot) until recovery reclaims it. If two overlapping turns would be harmful, keep each step idempotent rather than relying on the gate alone.
+</Callout>
+
+## Bounding the queue: `maxQueueDepth` and `SingletonQueueFullError`
+
+Left unset, the same-key backlog can grow without bound — every `start` for a busy key is accepted and simply queues behind the ones ahead of it, and the failure surfaces late, as a store full of runs that will not finish for hours. Set `maxQueueDepth` to cap it: once the runs sharing the key reach `limit + maxQueueDepth`, a further `start` is rejected outright with `SingletonQueueFullError`, and **no run is created** for it:
+
+```ts title="app/workflows/sync_inventory_workflow.ts"
+static workflow = {
+  name: 'sync-inventory',
+  version: '1',
+  singleton: {
+    key: (input: unknown) => `store:${(input as { storeId: string }).storeId}`,
+    limit: 1,
+    maxQueueDepth: 2, // at most 1 running + 2 waiting per store; a 4th start is rejected
+  },
+}
+```
+
+```ts
+import { SingletonQueueFullError } from '@adonis-agora/durable'
+
+try {
+  await SyncInventoryWorkflow.dispatch({ storeId: 'A' })
+} catch (error) {
+  if (error instanceof SingletonQueueFullError) {
+    // error.workflow, error.key, error.maxQueueDepth — retry later or shed the request
+    return response.tooManyRequests({ retryAfter: 60 })
+  }
+  throw error
+}
+```
+
+The capacity check counts the `pending`/`running`/`suspended` runs of the workflow sharing the key in one scan and compares against `(limit ?? 1) + maxQueueDepth`. It runs *before* the run row is written, so a rejected start leaves no trace in the store. Once a slot frees (notify-on-release promotes the oldest waiter, which later settles), the backlog count drops below the cap and the next `start` is accepted again.
+
+The check applies wherever the workflow is started — `engine.start`, `Wf.dispatch` / `Wf.start`, child workflows (a rejected child start is delivered to the parent as a failed child), event triggers and schedules. An idempotent re-`start` of an existing `runId` returns that run before the check and is never rejected.
+
+## Singleton schedules
+
+A [schedule](/docs/durable/authoring/scheduling) fires a **new** run for every window, whether or not the previous one is still going. Making the scheduled workflow a singleton (with a constant key) serializes those runs instead of letting them overlap; the schedule's own `overlap: 'skip'` is the alternative when a late window should be dropped rather than queued.
+
+## Interaction with `signalWithStart`
+
+`signalWithStart` is just `start` (idempotent by `runId`) followed by a signal — it doesn't bypass the singleton gate. If the workflow it starts is a singleton and the derived key is already busy, the new run is created (or, with `maxQueueDepth` set, rejected with `SingletonQueueFullError` exactly as any other start) and gates like any other same-key run. The signal is buffered, but the body that waits for it doesn't execute until the run is admitted. Don't rely on `signalWithStart` to get a gated singleton entity moving immediately; it still queues behind whatever else shares its key.
+
+## Singleton key vs. a deterministic `runId`
+
+Both look like "dedupe", but they solve different problems:
+
+- **Deterministic `runId`** dedupes the *start itself*. `start` is idempotent by `runId`: if a run with that id already exists, the call is a no-op that returns the existing run's state — no new run, nothing queues. Use this when a redelivered trigger (an at-least-once queue, a retried request) must not create a second run of *the same logical job*.
+- **`singleton` key** serializes *distinct* runs. Two different `runId`s that share a singleton key are two real runs — each gets its own history, its own dashboard entry — but the engine admits only `limit` of them at a time and gates the rest. Use this when overlapping runs for the same key are the problem even though each one is a legitimately distinct execution (e.g. two independently-triggered inventory syncs for the same store shouldn't race each other, but both should eventually run and both should be individually inspectable).
+
+In short: a deterministic `runId` says "this is the same job, don't start it twice"; `singleton` says "these may be different jobs, but only `limit` of them may run at a time." They compose — a singleton workflow can still be started with a deterministic `runId` to also dedupe exact-duplicate triggers on top of the per-key serialization.
+
+<Callout type="info" title="Queue or reject?">
+`singleton` **queues** excess runs and admits them in order. If an over-limit start should be **refused** instead (an HTTP 429, nothing created), use a [concurrency quota](/docs/durable/reliability/concurrency-quotas).
+</Callout>

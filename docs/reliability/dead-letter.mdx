@@ -36,6 +36,8 @@ engine.onDead((run) => {
 
 `onDead` returns an unsubscribe function. It fires on the instance that dead-letters the run.
 
+Dead-lettering also goes through the engine's event stream: the transition emits a `run.failed` event whose `error.code` is `max_recovery_attempts`, so [events and interceptors](/docs/durable/observability/events-and-interceptors), OpenTelemetry and Telescope see a dead-lettered run as a failure without any extra wiring. The `dead` status and that error code are what tell it apart from an ordinary step failure.
+
 ## Routing to a DLQ workflow
 
 The most powerful option is to route dead runs into a *workflow of their own* — a durable handler that gets all the reliability machinery (retries, steps, its own observability) to triage the failure. Start it from your `onDead` listener with a deterministic `dlq:<runId>` id so a run is never double-handled (`start` is idempotent by run id):
@@ -73,9 +75,92 @@ engine.onDead((run) => {
 })
 ```
 
+### A class-based handler under `app/workflows`
+
+When the handler deserves its own file, write it as an ordinary [`BaseWorkflow`](/docs/durable/authoring/app-workflows) class. It is auto-registered like any other workflow and gets its services through the constructor. Then start it from `onDead` with the `dlq:<runId>` id:
+
+```ts title="app/workflows/pipeline_dlq_workflow.ts"
+import { inject } from '@adonisjs/core'
+import { BaseWorkflow } from '@adonis-agora/durable'
+import type { WorkflowCtx } from '@adonis-agora/durable'
+import AlertService from '#services/alert_service'
+import TicketService from '#services/ticket_service'
+
+interface DeadLetter {
+  deadRunId: string
+  workflow: string
+  input: unknown
+  error?: { message: string; code?: string }
+}
+
+@inject()
+export default class PipelineDlqWorkflow extends BaseWorkflow {
+  static workflow = { name: 'pipeline-dlq', version: '1' }
+
+  constructor(
+    private alerts: AlertService,
+    private tickets: TicketService,
+  ) {
+    super()
+  }
+
+  async run(ctx: WorkflowCtx, dl: DeadLetter) {
+    await ctx.step(this.alerts.page, { runId: dl.deadRunId, workflow: dl.workflow })
+    const ticket = await ctx.step(this.tickets.create, {
+      title: `Dead-lettered run ${dl.deadRunId} (${dl.workflow})`,
+      payload: dl.input,
+    })
+    return { ticketId: ticket.id }
+  }
+}
+```
+
+```ts title="start/durable.ts"
+import engine from '@adonis-agora/durable/services/main'
+import PipelineDlqWorkflow from '#workflows/pipeline_dlq_workflow'
+
+engine.onDead((run) => {
+  void PipelineDlqWorkflow.dispatch(
+    { deadRunId: run.id, workflow: run.workflow, input: run.input, error: run.error },
+    { runId: `dlq:${run.id}` },
+  )
+})
+```
+
+### Per-workflow routing
+
+Dead-lettering is usually **per-workflow**: a dead `checkout` run wants a different handler than a dead `pipeline` run. There is one `onDead` hook per engine, so route on `run.workflow` inside it, and send everything you didn't name to a catch-all handler:
+
+```ts title="start/durable.ts"
+const handlers: Record<string, string> = {
+  pipeline: 'pipeline-dlq',
+  checkout: 'checkout-dlq',
+}
+
+engine.onDead((run) => {
+  const handler = handlers[run.workflow] ?? 'global-dlq' // backstop for everything else
+  void engine.start(
+    handler,
+    { deadRunId: run.id, workflow: run.workflow, input: run.input, error: run.error },
+    `dlq:${run.id}`,
+  )
+})
+```
+
+Keep the `dlq:<runId>` id whichever handler you pick. The dashboard relies on that id convention (see below).
+
 Because every start is idempotent by `dlq:<runId>`, a run that gets dead-lettered (and re-detected) more than once still triggers exactly one DLQ run. The DLQ run is a normal durable run — it shows up in the dashboard with its own history, so you can confirm it did its job (alerted, opened a ticket, compensated), then retry the original once it's fixed.
 
 <CodeFlow scene="dead-letter" />
+
+## Dead runs in the dashboard
+
+The [dashboard](/docs/durable/observability/dashboard) links the two ends of a dead-letter by the `dlq:<runId>` id:
+
+- A run whose id starts with `dlq:` gets a red **dlq** chip in the runs list. Its detail page shows a *Dead-letter handler* banner that links back to the dead run it is handling.
+- A `dead` run's detail page looks up `dlq:<its id>`. If that handler run exists, the page shows a *Dead-lettered* banner with an **open DLQ handler** link. If it doesn't, no link is shown.
+
+From either end you can walk from a poison pill to its handler and back, check that the handler did its job, and retry the original once it's fixed.
 
 ## Retrying a dead run with corrected input
 

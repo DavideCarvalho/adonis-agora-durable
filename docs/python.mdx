@@ -77,6 +77,219 @@ across isolated deployments? Set the same `partition` on both sides (`transports
 engine-side, `run_redis_worker(worker, partition=...)` worker-side) and every queue is suffixed
 `<name>@<partition>`.
 
+The engine and the workers are decoupled producers and consumers on per-name queues:
+
+```
+  Adonis engine                              Redis (the broker)                    Python worker
+  ─────────────                              ──────────────────                    ─────────────
+  ctx.step(name)   ───dispatch───▶  durable-tasks-<name>[@<partition>]  ───consume──▶  @worker.step(name)
+  resume ctx.step   ◀──consume────  durable-results                     ◀───add──────  return / raise
+```
+
+Match the connection, the prefix and the name, and a `ctx.step('payments.charge-card', …)` is
+delivered to whichever worker registered `payments.charge-card` — the queue name *is* the routing.
+A few properties follow from this being queue-based:
+
+- **At-least-once delivery.** A task can be redelivered (a worker crash, a reconnect), so handlers
+  should be **idempotent** — key external side effects on `stepId` (`<runId>:<seq>`) or your own
+  dedupe key. The engine already dedupes a step that *completed*, but a handler can be re-run before
+  its result is recorded.
+- **Workers are stateless and horizontal.** Run as many copies as you want for a given step; Redis
+  hands each task to one of them. Scale a slow step by adding workers, not by touching the workflow.
+- **The engine owns correlation.** Every result carries the `stepId` it answers; the engine matches
+  it to the suspended `ctx.step` and resumes the run. The worker never needs the run's state.
+- **A killed worker's job is reported.** A process killed mid-step (an OOM kill) produces no result.
+  The `durable-worker` runner, like the Adonis `bullmq` transport, listens for BullMQ's terminal
+  `failed` event on its task workers, so when a peer's stalled-check fails the dead worker's job, a
+  live replica publishes a synthetic **retryable** failed result and the engine's durable retry
+  re-dispatches the step. If the **only** worker for a queue dies and never restarts, no stalled-check
+  runs at all — that case needs the engine's `remoteRedispatchMs` self-heal (see
+  [lost remote dispatch](/docs/durable/reliability/failure-modes#lost-remote-dispatch-the-run-suspends-and-nothing-auto-redrives-it)).
+
+<Callout type="info">
+Python workers reach an Adonis engine over the **`bullmq` transport** — the one that speaks the
+aviary wire byte-for-byte (see [interop](/docs/durable/cluster/interop)). The Python SDK's SQS and SQL
+runners target the NestJS transports' layouts, not the Adonis `queue` or `db` transports.
+</Callout>
+
+### Authentication
+
+The `connection` is a standard Redis URL, so credentials and TLS go in the URL:
+
+```python
+await run_redis_worker(
+    worker,
+    connection="rediss://default:my-password@my-redis.example.com:6379",
+)
+```
+
+Use `redis://` for plaintext and `rediss://` for TLS. This is the same Redis the engine's
+`transports.bullmq({ connection })` points at — the worker uses the same credentials.
+
+### `run_redis_worker` options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `worker` | — | The `Worker` whose handlers run. |
+| `partition` | `None` | Optional isolation suffix — appends `@<partition>` to every one of this worker's per-name queues. Must match the engine's `transports.bullmq({ partition })`. |
+| `connection` | `redis://localhost:6379` | Redis URL (the broker the engine also uses). |
+| `prefix` | `durable` | Queue-key namespace; must match the engine's `transports.bullmq({ prefix })`. |
+| `concurrency` | `1` | Tasks at a time: an `int` (fixed), `"adaptive"`, or a config dict — see [Concurrency and memory](#concurrency-and-memory). |
+| `cancellation` | created for you | A `CancellationRegistry` fed by the control channel — see [Cooperative cancellation](#cooperative-cancellation). |
+
+## Concurrency and memory
+
+`concurrency` takes a fixed `int`, the string `"adaptive"`, or a dict of overrides. An adaptive Python
+worker tunes its own limit from a latency gradient and, since `durable-worker` 0.25, protects itself
+from OOM with a **memory admission gate**: before each step starts, the worker asks whether there is
+room for one more right now and **waits** rather than starting a step it cannot fit. (This is the
+Python worker's own controller; the Adonis-side worker controller is
+[`transports.bullmq({ concurrency })`](/docs/durable/transports/bullmq#concurrency).)
+
+```python
+worker = Worker(concurrency="adaptive")                  # gate on, all defaults
+worker = Worker(concurrency={"min": 1, "max": 16})       # adaptive, with bounds
+worker = Worker(concurrency={"ramAdmission": False})     # gate off (pre-0.25 behaviour)
+```
+
+Memory usage is read as **current** usage: cgroup v2 `memory.current`, then cgroup v1
+`memory.usage_in_bytes`, then `/proc/self/status` `VmRSS`, and only as a last resort `ru_maxrss`.
+Reclaimable page cache (`memory.stat` `inactive_file`) is subtracted, giving the same working set
+kubelet evicts on.
+
+- A deferred step is **not** a failed step — it keeps its job (BullMQ renews the lock) and starts as
+  soon as there is headroom.
+- With **nothing in flight the gate always admits**, so a worker can never deadlock waiting for
+  memory that only it could free.
+- Crossing `ramCeilingPct` drops the limit to `min` **in one move**; growing back requires
+  `growHeadroomTicks` consecutive ticks of real headroom.
+- Per-step-name costs are learned from steps that ran alone and reserved for the next one, because
+  usage at admission time doesn't yet include what an admitted step is about to allocate. The first
+  task of a process runs alone so there is always one real measurement.
+
+| Knob (camelCase or snake_case) | Default | What it does |
+| --- | --- | --- |
+| `min` / `max` / `start` | `1` / `32` / `min` | Bounds and starting limit. |
+| `ramCeilingPct` | `85` | Brake: at/above this the limit collapses to `min`. |
+| `ramAdmitPct` | `75` | Gate: above this, new steps wait. Clamped to `ramCeilingPct`. |
+| `ramResumePct` | `65` | Hysteresis: once deferring, usage must fall under this to admit again. |
+| `ramAdmission` | `true` | Set `false` to turn the gate off entirely. |
+| `admissionPollMs` | `250` | How often a waiting step re-checks for headroom. |
+| `admissionMaxWaitMs` | `0` | `0` = wait as long as it takes. A non-zero budget **runs the step anyway** when it expires, so a tight budget trades the gate away under sustained pressure. |
+| `growHeadroomTicks` | `3` | Consecutive ticks under `ramResumePct` required before growing. |
+| `subtractPageCache` | `true` | Subtract reclaimable `inactive_file` from the cgroup charge. |
+| `stepCostTracking` | `true` | Learn per-step-name costs and reserve them; `false` = usage-only gate. |
+
+A fixed `concurrency=N` worker is never gated — N is your explicit promise — but it still publishes
+the same memory numbers on its heartbeat, which the
+[dashboard's worker cards](/docs/durable/observability/dashboard#fleet-and-topology) show. Adaptive
+protects **that pod**: a shared dependency still needs a global cap (see
+[flow control](/docs/durable/reliability/flow-control)).
+
+## The wire protocol
+
+The contract is plain JSON, identical across languages. The engine dispatches a **task**:
+
+```jsonc
+{
+  "runId": "wrun_8Kb2", "seq": 1, "name": "payments.charge-card",
+  "stepId": "wrun_8Kb2:1", "group": "payments",
+  "input": { "orderId": "o1", "amountCents": 4200 }, "attempt": 1
+}
+```
+
+The worker replies with a **result**:
+
+```jsonc
+{ "runId": "wrun_8Kb2", "seq": 1, "stepId": "wrun_8Kb2:1",
+  "status": "completed", "output": { "chargeId": "ch_1" },
+  "startedAt": 1718900000123 }
+```
+
+A task can also carry `transport` (the id of the transport it was dispatched on), `priority`,
+`traceparent`, and `context` (the originating request's context snapshot). A failed result carries
+`error: { message, code?, details?, retryable? }` instead of `output`; `retryable: false` (what
+`FatalError` sends) skips the engine's retries.
+
+`startedAt` is the epoch-ms moment the worker picked the task up. The engine subtracts the dispatch
+time from it to report **queue-wait** — how long the step sat in the queue before a worker was free —
+so a Python step's queue time shows up in the [dashboard](/docs/durable/observability/dashboard) just
+like a Node one. The SDK stamps it for you.
+
+`Worker.process_task(task) -> result` is the pure, transport-agnostic core (no broker needed — ideal
+for unit tests). Because the contract is language-neutral, a Go or Rust worker can implement the same
+thing.
+
+## Cooperative cancellation
+
+When a run is cancelled — `engine.cancel(runId)` on the Adonis side — a step already running in a
+Python worker can't be force-killed from outside the process. Instead the engine **broadcasts** a
+control message and the handler bails out on its own at a safe point.
+
+- The engine publishes `{"kind": "cancel", "runId": ...}` on its control plane. With
+  [`controlPlanes.redis`](/docs/durable/transports/control-plane#multi-replica-controlplanesredis)
+  that is the Redis channel `<prefix>-control` — the same channel and payload the NestJS transport
+  uses, which is the one `durable-worker` subscribes to. The `bullmq` transport does not publish this
+  channel itself, so **configure `controlPlanes.redis` on the same Redis, with the same `prefix`**, or
+  Python handlers never see the cancel.
+- `run_redis_worker` **subscribes** to that channel and feeds a `CancellationRegistry` — a thread-safe
+  set of cancelled run ids. One is created for you if you don't pass your own.
+- The registry is surfaced to your handler through the step context as **`ctx.cancelled`** (a bool) and
+  **`ctx.raise_if_cancelled()`** (raises `Cancelled`).
+
+```ts title="config/durable.ts"
+import { defineConfig, transports, controlPlanes } from '@adonis-agora/durable'
+
+export default defineConfig({
+  role: 'control-plane',
+  transport: 'bullmq',
+  transports: { bullmq: transports.bullmq({ connection: { host: '127.0.0.1', port: 6379 } }) },
+  controlPlane: controlPlanes.redis({ connection: 'main' }), // channel `durable-control`
+  // ...
+})
+```
+
+Opt in by declaring the second `ctx` parameter on your handler, then poll it inside the loop:
+
+```python
+from durable_worker import Worker, Cancelled
+
+worker = Worker()
+
+@worker.step("pipeline.transcode")
+def transcode(data, ctx):
+    out = []
+    for chunk in data["chunks"]:
+        if ctx.cancelled:                         # the run was cancelled — stop early
+            ctx.warn("cancelled — stopping early", {"done": len(out)})
+            return {"partial": out, "cancelled": True}
+        out.append(encode_chunk(chunk))
+    return {"chunks": out}
+
+@worker.step("pipeline.crawl")
+async def crawl(data, ctx):
+    results = []
+    for url in data["urls"]:
+        ctx.raise_if_cancelled()                  # raises Cancelled the moment the run is cancelled
+        results.append(await fetch(url))
+    return {"results": results}
+```
+
+`Cancelled` is a subclass of `Exception`, so it surfaces as a failed step. To drive a registry
+yourself (e.g. share one across runners), construct it and pass it in:
+
+```python
+from durable_worker.cancellation import CancellationRegistry
+
+cancellation = CancellationRegistry()
+await run_redis_worker(worker, connection="redis://localhost:6379", cancellation=cancellation)
+```
+
+Cancellation is **cooperative**: a handler that never checks `ctx.cancelled` runs to completion and
+the engine discards its result. The control-channel subscription is **best-effort** — it needs the
+`redis` async client for pub/sub; if it isn't available the runner logs and continues, steps still
+run, and cancellation just isn't observed.
+
 ## Authoring workflows in Python
 
 A Python worker can own **the whole workflow function**, not just a step. The Adonis engine stays
@@ -85,8 +298,12 @@ sending the run's history as a workflow task, the Python runtime **replays** the
 locally, and returns the commands the replay produced (a step dispatch, a sleep, a signal wait) for
 the engine to persist and act on — a pure, store-free coordinator.
 
-The simplest deployment registers the workflow **and** its step handlers on **one** `Worker` (each
-registered name gets its own queue — route-by-handler), run with `run_workers`:
+### One unified worker (recommended)
+
+The simplest deployment registers the workflow **and** its step handlers on **one** `Worker`. Each
+registered `@worker.workflow`/`@worker.step` name gets its own queue (route-by-handler), so a single
+process replays the workflow turns and runs the steps it dispatches. `run_workers` connects it and
+drains cleanly on `SIGTERM`/`SIGINT`:
 
 ```python
 from durable_worker import Worker, WorkflowContext, redis_url_from_env, run_workers
@@ -110,23 +327,103 @@ def pipeline(ctx: WorkflowContext, data):
 run_workers([worker], redis=redis_url_from_env())        # one loop, one Redis pool, graceful shutdown
 ```
 
+A failure the workflow should turn into an outcome (a line that fails validation) is routed to a
+handler: `.on_error(code)` on the workflow function registers the handler as its own workflow
+(`pipeline.onError.<function>`) and announces the route in the worker's
+[handshake descriptor](/docs/durable/cluster/handshake); the Adonis engine starts it when a run fails
+with that code. Raise `FatalError(message, code, details=...)` in the step so it skips the retries
+and the handler gets `failure["error"]["details"]`. See
+[Routing a run's failure](/docs/durable/reliability/on-error#remote-workflows).
+
+```python
+@pipeline.on_error("invalid_line")
+def reject_line(ctx: WorkflowContext, failure):  # {"runId", "workflow", "input", "error"}
+    ctx.step("record_rejected_line", failure)
+    return {"rows": 0, "rejected": True}
+```
+
+### Workflows as classes
+
+A workflow can be a class: `run(self, ctx, input)` is the body, and each method marked
+`@on_error(code)` is a handler (`<name>.onError.<method>`). Decorate it with `@worker.workflow(name)`.
+A registered class is a workflow reference: pass it to `ctx.start_child`, `ctx.gather_children` or
+`ctx.all_settled` instead of the name.
+
+```python
+from durable_worker import FatalError, WorkflowContext, on_error
+
+class InvalidLine(FatalError):
+    code = "invalid_line"
+
+@worker.workflow("line")
+class LineWorkflow:
+    def run(self, ctx: WorkflowContext, line):
+        ctx.step("validate_line", line)
+        return {"ok": 1, "failed": 0}
+
+    @on_error(InvalidLine)
+    def reject_line(self, ctx: WorkflowContext, failure):
+        ctx.step("record_rejected_line", failure)  # side effects go in steps
+        return {"ok": 0, "failed": 1}
+
+@worker.workflow("file")
+def file(ctx: WorkflowContext, lines):
+    return ctx.all_settled(LineWorkflow, lines)
+```
+
+The body and the handlers are replayed, so their side effects belong in steps. A class that needs
+something at construction (configuration, a client) is declared with `@workflow(name, ...)` instead
+and handed to the worker built: `worker.register(LineWorkflow(cfg))`. The instance serves every run
+and every replay, so keep only what it was built with on it, never run state.
+
+### The `WorkflowContext` ops
+
 `ctx` mirrors the TypeScript `WorkflowCtx` — each op is keyed by a deterministic seq, so a completed
-op replays its recorded result instead of re-running:
+op replays its recorded result instead of re-running. Every op compiles to one of the commands the
+Adonis engine applies (`call`, `recordStep`, `sleep`, `waitSignal`, `startChild`):
 
 | Op | Meaning |
 | --- | --- |
-| `ctx.step(name, input, group=...)` | Dispatch a step (routed by handler `name`, any language) and await its result. |
-| `ctx.now()` | A replay-stable epoch-ms timestamp — captured once, replayed thereafter. |
-| `ctx.side_effect(fn)` | Run `fn` once, checkpoint its result, replay the same value (ids/random/env). |
-| `ctx.sleep(ms)` | Durable timer — the run suspends and the engine resumes it. |
-| `ctx.wait_signal(name)` | Block until a signal `name` is delivered; returns its payload. |
-| `ctx.start_child(workflow, input)` | Start a child run and await its output. |
-| `ctx.gather_calls([{name, input}, …])` | Dispatch several steps in parallel within one run (flat, no child runs). |
-| `ctx.gather_children([…])` | Start several child runs in parallel. |
+| `ctx.step(name, input, group=...)` | Dispatch a step (routed by handler `name`, any language) and await its result. Always durable, always engine-scheduled. |
+| `ctx.now()` | A replay-stable epoch-ms timestamp (like JS `Date.now()`) — captured once, replayed thereafter. |
+| `ctx.side_effect(fn)` | Run `fn` once, checkpoint its result, replay the same value without re-running. For ids/random/env, e.g. `ctx.side_effect(lambda: str(uuid7()))`. |
+| `ctx.sleep(ms)` | Durable timer — the run suspends and the engine resumes it when it fires. |
+| `ctx.wait_signal(name)` | Block until a signal `name` is delivered (via `engine.signal(name, payload)`); returns its payload. |
+| `ctx.start_child(workflow, input)` | Start a child run and await its output (a failed child raises `StepFailed`). |
+| `ctx.gather_calls([{name, input}, …])` | Dispatch several steps **in parallel within one run** (flat, no child runs) and await all. |
+| `ctx.gather_children([…])` | Start several **child runs** in parallel and await all. |
+| `ctx.gather([…])` | Run several local steps in parallel and await all. |
+| `ctx.all_settled(workflow, inputs)` | `gather_children` that never raises for a failed child: one `{"status": "fulfilled", "value"}` / `{"status": "rejected", "id", "error", "code"?, "details"?}` per input, in order. |
+| `ctx.gather_calls_settled([{name, input}, …])` | The same for a step fan: `gather_calls` that returns every outcome instead of raising. |
+| `ctx.gather_settled([(name, body), …])` | The same for local steps: `gather` that runs and records every body, then returns every outcome instead of raising. |
 
-Changing the op sequence under a run already in flight raises `NondeterminismError`. A failed step
-raises `StepFailed`; the `gather*` fan-outs default to `wait_all` (raising `GatherFailed`), with an
-opt-in `fail_fast`.
+Changing the op sequence under a run already in flight raises `NondeterminismError` rather than
+silently diverging. The three `gather*` fan-outs default to `wait_all` — raising an aggregate
+`GatherFailed` if anything fails — with an opt-in `fail_fast`. A single step that fails raises
+`StepFailed` in the workflow; catch it to compensate, or let it propagate to fail the run.
+
+### Dedicated workflow worker
+
+To keep workflow replay and step execution in **separate** processes, author on a dedicated
+`WorkflowWorker` and run it with `run_redis_workflow_worker` (the workflow-shaped sibling of
+`run_redis_worker`):
+
+```python
+from durable_worker import WorkflowWorker, redis_url_from_env
+from durable_worker.redis_runner import run_redis_workflow_worker
+
+workflows = WorkflowWorker(group="py-workflows")
+
+@workflows.workflow("pipeline")
+def pipeline(ctx, base_id):
+    rows = ctx.step("ingestion", {"key": f"/{base_id}/data.csv"}, group="pipeline")
+    return {"rows": rows}
+
+# await run_redis_workflow_worker(workflows, connection=redis_url_from_env())
+```
+
+You can also mix step and workflow workers in one process with `run_workers([step_worker, workflows],
+redis=...)`.
 
 ## Dispatching a Python workflow from Adonis
 

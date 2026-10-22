@@ -15,7 +15,7 @@ This is proven with **live bidirectional interop tests**, not just a shared spec
 
 ## The BullMQ transport
 
-Interop rides one transport: `transports.bullmq(...)`, built on the real `bullmq` npm package with the identical job structure the Python raw-Redis runner mirrors.
+Interop rides one transport: [`transports.bullmq(...)`](/docs/durable/transports/bullmq), built on the real `bullmq` npm package with the identical job structure the Python raw-Redis runner mirrors.
 
 ```ts title="config/durable.ts"
 import { defineConfig, transports, stores } from '@adonis-agora/durable'
@@ -31,51 +31,19 @@ export default defineConfig({
 })
 ```
 
+The transport's own options (connection, fixed and adaptive `concurrency`, `resultConcurrency`, priority, namespace and partition, crash recovery, shutdown) are covered on the [BullMQ transport page](/docs/durable/transports/bullmq). The parts that matter for a mixed fleet are summarized below.
+
 ### Workers: `concurrency`
 
-`transports.bullmq({ concurrency })` sets how many tasks each of a worker's task queues runs at once. A number pins it (default `1`; a non-finite or sub-1 value falls back to `1`) and also applies to the decisions, step-events, start-run and run-request consumers. A pinned limit runs no control loop.
-
-`'adaptive'`, or an object with `mode: 'adaptive'`, lets the worker move its task-queue limit at runtime. Every `tickMs` it compares the steps' median latency with their no-queuing baseline and the memory and CPU it is using, then:
-
-| Signal | Move |
-|--------|------|
-| RSS at or above `ramCeilingPct` of the memory limit (cgroup v2, then cgroup v1, then host total) | down 20% |
-| CPU at or above `cpuCeilingPct` | down 1 |
-| more than 20% of recent steps failed, or work in flight with no completion for two ticks | down 1 |
-| median latency inflated past 1/0.7 of the baseline (steps are queuing) | down by that ratio |
-| median latency within 1/0.9 of the baseline while in-flight work fills at least 80% of the limit | up 1 |
-
-The limit stays within `[min, max]`. It applies to every task queue of the instance at once, and a task queue registered later starts at the current limit. Only step durations are measured; a workflow turn on the same queue counts as in-flight work and as progress, but its duration never enters the latency window. The decisions, step-events, start-run and run-request consumers run at `1` in adaptive mode.
-
-```ts title="config/durable.ts"
-bullmq: transports.bullmq({
-  connection: { host: '127.0.0.1', port: 6379 },
-  concurrency: { mode: 'adaptive', min: 2, max: 64, start: 8, ramCeilingPct: 80, cpuCeilingPct: 90 },
-}),
-```
-
-| Option | Default |
-|--------|---------|
-| `min` | `1` |
-| `max` | `32` (raised to `min` when lower) |
-| `start` | `min`, clamped into `[min, max]` |
-| `tickMs` | `2000` |
-| `ramCeilingPct` | `85` |
-| `cpuCeilingPct` | off |
-
-A non-finite or out-of-range value falls back to its default, and a non-finite `cpuCeilingPct` turns the CPU ceiling off. This is the same controller as the NestJS BullMQ transport's `concurrency: 'adaptive'`. In both modes the worker heartbeat carries the live limit, in-flight count, RSS, CPU, throughput, p95 and the last adjustment with its reason, which the [console's worker cards](/docs/durable/observability/dashboard) show. Throughput is steps per minute over the trailing minute: it decays while the worker is idle and reads 0 once a minute passes with no completed step. With a pinned limit, CPU is sampled when the heartbeat is built, at most once every 2s.
+`concurrency` (a number, or `'adaptive'`) sets how many tasks each of an Adonis worker's task queues runs at once. The adaptive controller is the same one as the NestJS BullMQ transport's `concurrency: 'adaptive'`, and the live status it stamps on the worker heartbeat uses the same `WorkerStatus` shape as the NestJS fleet, so the dashboard reads both the same way. It passes a worker's status through as-is and renders the fields it recognizes, so a worker that only writes `{ ts }` still appears as live. See [Concurrency](/docs/durable/transports/bullmq#concurrency).
 
 ### Results: `resultConcurrency`
 
-`transports.bullmq({ resultConcurrency })` sets how many step results an instance settles at once from the results queue (default `1`; a non-finite or sub-1 value falls back to `1`). With one at a time, a wide fan's results queue up behind one checkpoint write per pod; the engine still runs one run's turns in order on an instance, so raising it never gives a run two concurrent turns. It is separate from [`concurrency`](#workers-concurrency), which sets how many tasks a worker runs at once from each of its task queues.
-
-```ts title="config/durable.ts"
-bullmq: transports.bullmq({ connection: { host: '127.0.0.1', port: 6379 }, resultConcurrency: 16 }),
-```
+`resultConcurrency` sets how many step results an engine-side instance settles at once from the shared results queue (default `1`). Results from Python or NestJS workers land on the same queue and are settled the same way. See [Result concurrency](/docs/durable/transports/bullmq#result-concurrency).
 
 ### Shutdown: `closeTimeoutMs`
 
-`transports.bullmq({ closeTimeoutMs })` bounds how long `close()` waits for a graceful shutdown (default `5000` ms, `0` skips the wait). Workers close first, concurrently, so a step that is still running can publish its result; the queues close after, and both phases share the one deadline. When it expires the transport disconnects its pub/sub, heartbeat and liveness connections anyway. Abandoned BullMQ workers may keep running their jobs on their own connections until the process exits; a job that did not finish is recovered through BullMQ's stalled-job handling. `onError` receives transport failures, including pub/sub subscribe failures.
+`closeTimeoutMs` (default `5000` ms) limits how long a graceful `close()` waits before the transport disconnects anyway. See [Shutdown](/docs/durable/transports/bullmq#shutdown).
 
 <Callout type="warn">
 The `queue` and `db` transports remain the right choice for **Adonis-only** fleets. `bullmq` is required **only** for cross-ecosystem interop — it is the one wire all three runtimes share.

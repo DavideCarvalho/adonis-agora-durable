@@ -1,6 +1,6 @@
 ---
 title: Reliability
-description: How @adonis-agora/durable keeps long-running work correct in the face of transient failures, crashes and overload — step retries, saga compensation, durable flow-control queues and the dead-letter queue.
+description: How @adonis-agora/durable keeps long-running work correct in the face of transient failures, crashes and overload — step retries, saga compensation, flow control, concurrency quotas, singleton workflows, onError routing, the dead-letter queue, retention and multi-instance delivery.
 icon: ShieldCheck
 ---
 
@@ -10,24 +10,32 @@ A durable workflow's whole reason to exist is that the world it talks to is unre
 
 A worker crashing mid-run is handled automatically by **self-healing recovery**: while a run executes its worker renews a recovery lease, and a crashed worker stops renewing, so its lease expires. Recovery (`engine.recoverIncomplete()`) runs both on boot **and periodically** — the [`durable:work`](/docs/durable/cli) loop calls it every tick — so an orphaned `running` run is reclaimed by another instance within ~`leaseMs`, not only on the next deploy. See [Durability & replay](/docs/durable/concepts/durability#deploys-versioning--multiple-instances).
 
-The building blocks compose: a remote step can retry with backoff, register a compensation to undo itself, be admitted through a rate-limited queue, and — if recovery can never make it past a crash — land in the dead-letter state for a handler to deal with.
+The building blocks compose: a remote step can retry with backoff, register a compensation to undo itself, be admitted through a rate-limited queue, and — if recovery can never make it past a crash — land in the dead-letter state for a human or a handler to deal with.
 
 ## The four primitives
 
 <Cards>
-  <Card title="Retries & backoff" href="/docs/durable/reliability/retries" description="Local-step retries with fixed/exponential backoff and jitter, FatalError to opt out, and the durable remote-step retry path." />
+  <Card title="Retries & backoff" href="/docs/durable/reliability/retries" description="Local-step retries with fixed/exponential backoff and jitter, FatalError and retryable:false to opt out, the durable remote-step retry path, the timeoutMs liveness path, and recovering a lost dispatch." />
   <Card title="Sagas & compensation" href="/docs/durable/reliability/sagas" description="Undo the side effects of a partially-completed run with per-step compensate callbacks that run in reverse." />
   <Card title="Flow control" href="/docs/durable/reliability/flow-control" description="Durable queues that cap concurrency and enforce rate limits — per-instance, or distributed with Redis admission." />
+  <Card title="Concurrency quotas" href="/docs/durable/reliability/concurrency-quotas" description="A start-time quota across workflows that rejects an over-limit start with ConcurrencyLimitError before anything is created." />
+  <Card title="Singleton workflows" href="/docs/durable/reliability/singleton" description="A durable FIFO mutex per key — at most limit runs in flight, the rest wait suspended — with a maxQueueDepth back-pressure cap." />
+  <Card title="Routing a run's failure — onError" href="/docs/durable/reliability/on-error" description="Route a failed run to a handler workflow by error code, and settle the run with the handler's outcome." />
   <Card title="Dead-letter queue" href="/docs/durable/reliability/dead-letter" description="Cap crash-recovery with maxRecoveryAttempts so a poison pill moves to the terminal dead status instead of crash-looping." />
   <Card title="Retention & archival" href="/docs/durable/reliability/retention" description="Hard-delete terminal runs past a per-status age, and archive each one first with engine.onEvict — a throwing hook skips the delete." />
   <Card title="Failure modes & recovery" href="/docs/durable/reliability/failure-modes" description="An operator's symptom → diagnosis → fix map: a stuck suspended run, a lost remote dispatch, the stalled-run pager, queue-transport gaps, and the namespace mistake." />
+  <Card title="Delivery under multiple instances" href="/docs/durable/reliability/multi-instance" description="Web and worker instances compete for the same result and heartbeat queues — what that means for timeoutMs steps, and when to run a producer with consumers set to never." />
 </Cards>
 
 ## At a glance
 
-- **Retries** — both `ctx.step` (dispatched) and `ctx.localStep` (in-process) retry on failure. A local step retries the in-process function; a dispatched step has a **durable** retry path (a failed dispatch re-dispatches by suspending the run on a persisted `wakeAt`, so retries survive a crash) plus a `timeoutMs` heartbeat-liveness path for presumed-dead workers.
-- **Sagas** — attach a `compensate` closure to a `ctx.localStep`, or a `compensate` step ref to a dispatched `ctx.step`; the engine runs registered undos in reverse order when the run fails. `compensationRetries` retries a transient undo, and you can trigger the saga deliberately with `engine.cancel(runId, { compensate: true })`.
-- **Flow control** — register a queue with `engine.registerQueue` and reference it from `ctx.step(step, input, { queue })`. A call that can't be admitted re-suspends with a retry time. For a global cross-process cap, use the [`@adonis-agora/durable/admission-redis`](/docs/durable/reliability/flow-control#distributed-admission--redis) backend.
-- **Dead-lettering** — `maxRecoveryAttempts` caps how many times crash-recovery retries a run before moving it to the terminal `dead` status, where it stays inspectable and retriable. `engine.onDead` routes the dead run to a handler.
+- **Retries** — both `ctx.step` (dispatched) and `ctx.localStep` (in-process) retry on failure. A local step retries the in-process function; a dispatched step has a **durable** retry path (a failed dispatch re-dispatches by suspending the run on a persisted `wakeAt`, so retries survive a crash) plus a `timeoutMs` heartbeat-liveness path for presumed-dead workers. Throw a `FatalError` (or report a `retryable: false` error from the worker) to opt a deterministic business failure out of retrying. A dispatch that is lost outright is re-driven by `engine.redispatchPending(runId)` or the opt-in `remoteRedispatchMs` self-heal.
+- **Sagas** — attach a `compensate` closure to a `ctx.localStep`, or a `compensate` step ref to a dispatched `ctx.step`; the engine runs registered undos in reverse order when the run fails. `compensationRetries` retries a transient undo, every compensation surfaces as a `compensate:<step>` event so a stranded undo is visible, and you can trigger the saga deliberately with `engine.cancel(runId, { compensate: true })`.
+- **Flow control** — register a queue with `engine.registerQueue` and reference it from `ctx.step(step, input, { queue })`. A call that can't be admitted re-suspends with a retry time, and the timer poller retries admission when it comes due, so the limit survives a crash. For a global cross-process cap, use the [`@adonis-agora/durable/admission-redis`](/docs/durable/reliability/flow-control#distributed-admission--redis) backend.
+- **Concurrency quotas** — `concurrency` (on the workflow config, `engine.register`, or per start via `StartOptions.concurrency`) caps how many runs sharing a key are in flight across workflows; an over-limit start is rejected with `ConcurrencyLimitError` before anything is created.
+- **Singleton workflows** — `singleton: { key, limit?, maxQueueDepth? }` serializes runs of one workflow that share a key: excess runs wait suspended and are admitted in creation order, and `maxQueueDepth` rejects a start with `SingletonQueueFullError` once the backlog is full.
+- **onError routing** — `onError: [{ code, workflow }]` hands a run that failed with a matching error `code` to a handler workflow, and the run settles with the handler's outcome, so a fan-out over it keeps going when one item fails.
+- **Dead-lettering** — `maxRecoveryAttempts` caps how many times crash-recovery retries a run before moving it to the terminal `dead` status, where it stays inspectable and retriable from the dashboard. `engine.onDead` routes the dead run to a handler.
 - **Retention** — the `retention` config hard-deletes terminal runs past a per-status age, swept by the worker tick; `engine.onEvict` archives each run (with its checkpoints) before deletion, and a throwing hook skips the delete.
 - **The stalled-run pager** — `engine.onStalled` + `stalledAfter` turn [the stranded signature](/docs/durable/reliability/failure-modes#the-stranded-signature) into a page instead of a query you remember to run: once per stranded episode, a listener receives the run and why it looks stuck.
+- **Multiple instances** — web and worker processes compete for the same result and heartbeat queues, so each delivery lands on exactly one of them. Steps without `timeoutMs` resume on whichever instance gets the result; on the `queue` transport, a pure producer can opt out of the race with `consumers: 'never'`.

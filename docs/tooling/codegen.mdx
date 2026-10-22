@@ -1,0 +1,149 @@
+---
+title: Codegen
+description: The build-time code durable generates and publishes. Assembler init hooks write lazy barrels of app/workflows and app/steps so the provider skips its runtime directory scan, and an OpenAPI 3.1 document of the dashboard API lets you generate a typed client for it.
+icon: Wand2
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+Durable does two kinds of code generation. Neither is required to run a workflow:
+
+- **Discovery barrels.** Two AdonisJS Assembler `init` hooks write typed, lazy barrels of `app/workflows` and `app/steps` into `.adonisjs/durable/`. The provider imports them at boot instead of scanning those directories with `readdir`.
+- **A dashboard API contract.** The [dashboard](/docs/durable/observability/dashboard) serves an OpenAPI 3.1 document of its JSON API, which you can feed to any OpenAPI client generator.
+
+## Workflow and step barrels
+
+`@adonis-agora/durable/hooks/workflows` and `@adonis-agora/durable/hooks/steps` are Assembler `init` hooks. They work the same way `@adonisjs/core` generates its controllers/events/listeners barrels. The dev server, the test runner and `node ace build` run them, and the file watcher re-runs the generator whenever a file in the scanned directory is added or removed, so the barrels always reflect the directories.
+
+### Setup
+
+`node ace configure @adonis-agora/durable` registers both hooks for you:
+
+```ts title="adonisrc.ts"
+export default defineConfig({
+  hooks: {
+    init: [
+      () => import('@adonis-agora/durable/hooks/workflows'),
+      () => import('@adonis-agora/durable/hooks/steps'),
+    ],
+  },
+})
+```
+
+It also adds the subpath imports the generated barrels import through to your `package.json`:
+
+```json title="package.json"
+{
+  "imports": {
+    "#workflows/*": "./app/workflows/*.js",
+    "#steps/*": "./app/steps/*.js"
+  }
+}
+```
+
+`configure` never overwrites an `imports` entry you already define. If you wire the hooks by hand, add these entries too. Without them, the build succeeds but the app fails at boot with `ERR_PACKAGE_IMPORT_NOT_DEFINED`.
+
+### What gets generated
+
+| Hook | Scans | Writes | Export |
+| --- | --- | --- | --- |
+| `@adonis-agora/durable/hooks/workflows` | `app/workflows` | `.adonisjs/durable/workflows.ts` | `workflows` |
+| `@adonis-agora/durable/hooks/steps` | `app/steps` | `.adonisjs/durable/steps.ts` | `steps` |
+
+Each barrel is a map of key to lazy import. Keys drop the `workflow` / `step` file suffix, the way controller barrels drop `controller`:
+
+```ts title=".adonisjs/durable/workflows.ts"
+export const workflows = {
+  Charge: () => import('#workflows/charge_workflow'),
+  // ...
+}
+```
+
+### How the provider uses them
+
+At boot the provider imports `.adonisjs/durable/workflows.js`. It awaits each thunk and registers every `BaseWorkflow` subclass it finds, through the container so constructor injection works. Each class is registered once, even when it's re-exported from several modules. It does the same with `.adonisjs/durable/steps.js`, serving every `@Step` / `defineStep` export by name on the app's transport.
+
+When a barrel file doesn't exist (because the hook isn't registered), the provider **falls back** to scanning the configured directory at runtime (`workflowsPath`, default `app/workflows`; `stepsPath`, default `app/steps`). Registration is identical either way. Only a genuine "module not found" triggers the fallback: a barrel that exists but fails to import throws at boot instead of quietly degrading. Setting `workflowsPath: false` or `stepsPath: false` in `config/durable.ts` turns discovery off entirely, barrel included.
+
+The barrels serve the app process's provider. A dedicated worker process started with `node ace durable:worker` registers its step handlers by scanning `stepsPath` at runtime and doesn't read the steps barrel.
+
+### Options
+
+The default export of each hook module uses the defaults. For a different directory or alias, export the factory (`workflowsHook` / `stepsHook`, exported from the same subpaths) with options from your own hook module and register that module instead:
+
+```ts title="hooks/durable_workflows.ts"
+import { workflowsHook } from '@adonis-agora/durable/hooks/workflows'
+
+export default workflowsHook({ source: 'app/flows', importAlias: '#flows' })
+```
+
+| Option | `workflowsHook` default | `stepsHook` default | Description |
+| --- | --- | --- | --- |
+| `source` | `'app/workflows'` | `'app/steps'` | Directory scanned, relative to the app root. |
+| `importAlias` | `'#workflows'` | `'#steps'` | Import alias each barrel entry uses. Needs a matching `package.json` `imports` entry. |
+| `output` | `'.adonisjs/durable/workflows.ts'` | `'.adonisjs/durable/steps.ts'` | Where the barrel is written. |
+
+<Callout type="warn" title="Keep the default output path">
+The provider always imports the barrel from the fixed `.adonisjs/durable/workflows.js` / `.adonisjs/durable/steps.js` path. If you change `output`, the provider won't find the barrel and silently falls back to the runtime directory scan.
+</Callout>
+
+## A typed client for the dashboard API
+
+Durable doesn't ship a generated or prebuilt client for the dashboard's REST API. What it ships is the contract: the dashboard serves a hand-written **OpenAPI 3.1** document of its JSON API, and you can generate a client from it with any OpenAPI tool. A spec in the durable repo asserts the document matches the registered routes, so a handler change can't silently drift from it.
+
+### Getting the document
+
+The document is served at `GET <path>/api/openapi.json`, which is `/durable/api/openapi.json` with the default `path`:
+
+```bash
+curl -H "Authorization: Bearer $DURABLE_DASHBOARD_TOKEN" \
+  http://localhost:3333/durable/api/openapi.json > durable-openapi.json
+```
+
+The route sits behind the same [`authorize` gate](/docs/durable/observability/dashboard#authorization) as the rest of the API, so send the dashboard token (or a session) like any other API call. Its `servers` entry is the mounted API base (`/durable/api`, or `<path>/api`), so paths in the document are relative to it (`/runs`, `/runs/{id}/retry`, …).
+
+The document isn't exported as a library function. The served route is the way to get it, and committing the downloaded `durable-openapi.json` keeps client generation reproducible offline and in CI. Diffing a freshly fetched copy against the committed one after an upgrade shows exactly what changed in the wire contract.
+
+### Generating types with `openapi-typescript`
+
+```bash
+npm i -D openapi-typescript
+npm i openapi-fetch
+npx openapi-typescript ./durable-openapi.json -o ./types/durable-api.d.ts
+```
+
+The document defines no `operationId`s, so a path-keyed client such as `openapi-fetch` fits better than a generator that names methods after operations:
+
+```ts title="types/durable.ts"
+import createClient from 'openapi-fetch'
+import type { paths } from './durable-api'
+
+export const durable = createClient<paths>({ baseUrl: '/durable/api' })
+```
+
+```ts
+// List failed runs (typed RunSummary[])
+const { data } = await durable.GET('/runs', { params: { query: { page: 1, size: 50 } } })
+
+// Run detail: run + step timeline + children
+const { data: detail } = await durable.GET('/runs/{id}', { params: { path: { id: runId } } })
+
+// Retry it
+if (detail?.run?.status === 'failed') {
+  await durable.POST('/runs/{id}/retry', { params: { path: { id: runId } } })
+}
+```
+
+What the generated types cover:
+
+- **Fully shaped:** the components `RunStatus`, `RunSummary`, `Checkpoint`, `RunResult` and `Error`, the `GET /runs` page (`runs`, `meta`, `statuses`), the `GET /runs/{id}` detail (`run`, `timeline`, `children`, `fans`, `childCount`), path and query parameters, and request bodies.
+- **Loosely typed:** many action and fleet responses (retry, cancel, bulk, schedules, health, workers, topology, compat, …) are declared as a plain `object`, so you get the route and its parameters typed but should narrow the response yourself. The [dashboard page](/docs/durable/observability/dashboard#where-it-mounts) documents what each returns.
+- Filters beyond `page` / `size` on `GET /runs` (the `filter[...]` envelope and flat `status` / `workflow` / `tag` / … params) are described in prose rather than as declared parameters. Pass them as extra query keys.
+
+`GET /runs/{id}/stream` is a Server-Sent Events endpoint, so read it with `EventSource` (see [Live-tailing one run](/docs/durable/observability/dashboard#live-tailing-one-run)) rather than through the generated client.
+
+<Callout type="warn" title="It's still a control surface">
+A generated client talks to the same routes the console does, including retry, cancel, bulk and the human-in-the-loop verbs. A browser client in your own frontend needs the dashboard to accept its requests: configure [`dashboardAuth`](/docs/durable/observability/dashboard-auth) or a custom `authorize` that recognises your app's session rather than shipping the bearer token to the browser. Mutating requests are also subject to the dashboard's cross-site rejection and session-role checks.
+</Callout>
+
+For server-side code in the same app, you don't need HTTP at all. The handlers behind the routes (`listRuns`, `getRun`, `retryRun`, `cancelRun`, …) are exported from `@adonis-agora/durable/dashboard`, and `runGateway` from `@adonis-agora/durable/services/main` is the role-agnostic read/control surface. See [Calling the API directly](/docs/durable/observability/dashboard#calling-the-api-directly).

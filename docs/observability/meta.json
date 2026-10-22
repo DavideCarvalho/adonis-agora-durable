@@ -1,5 +1,14 @@
 {
   "title": "Observability",
   "icon": "Telescope",
-  "pages": ["dashboard", "dashboard-auth", "events-and-interceptors", "otel", "telescope"]
+  "pages": [
+    "index",
+    "dashboard",
+    "dashboard-auth",
+    "events-and-interceptors",
+    "otel",
+    "metrics",
+    "diagnostics",
+    "telescope"
+  ]
 }

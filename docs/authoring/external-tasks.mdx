@@ -110,7 +110,7 @@ ctx.transaction<TOutput>(
 ): Promise<TOutput>
 ```
 
-`fn` receives the **store-native** transaction handle — a Lucid/Knex transaction, a TypeORM/MikroORM `EntityManager`, a Prisma tx client, a Drizzle tx — depending on your [state store](/docs/durable/stores). Do your writes on that handle so they land in the same transaction as the checkpoint.
+`fn` receives the **store-native** transaction handle — with the [Lucid store](/docs/durable/stores/lucid), a Lucid `TransactionClientContract`; a custom store hands over whatever its own transaction object is. Do your writes on that handle so they land in the same transaction as the checkpoint.
 
 ```ts title="app/workflows/payout_workflow.ts"
 import { BaseWorkflow } from '@adonis-agora/durable'

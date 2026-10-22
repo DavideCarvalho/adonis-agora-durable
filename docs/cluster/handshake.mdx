@@ -25,6 +25,7 @@ interface WorkerDescriptor {
   capabilities: string[]   // named features: 'saga', 'signals', 'priority', 'child-workflows', ...
   workflows: string[]      // registered handler names → routing
   steps: string[]
+  registrations?: WorkflowRegistration[]  // what this worker can EXECUTE — see below
   partition?: string
   namespace?: string
   startedAt: number
@@ -61,11 +62,70 @@ export const settlePayment = defineStep(
 )
 ```
 
+A workflow served by another process declares them on its registration — `engine.registerRemote(name, version, { group, executor, requires: ['saga'] })` — and a per-call `ctx.step(step, input, { requires })` overrides/augments the step's own list.
+
 The control plane dispatches such work **only** to workers whose descriptor advertises those capabilities. If **no live capable worker** exists, the run does not hang and does not dead-letter — it **parks as `blocked`**:
 
 <Callout type="warn">
 `blocked: no compatible worker (requires 'saga')` is a first-class run status, visible in the [dashboard](/docs/durable/observability/dashboard). The control plane re-checks blocked runs on a poll, so the moment a capable worker registers, the run resumes automatically. A capability mismatch is **never** a silent hang.
 </Callout>
+
+## Announced registrations
+
+`workflows: string[]` says which names a worker routes; it does not say which version it runs, which queue it consumes, or which package declared it. The descriptor's optional `registrations` carries that — what the worker can **execute**:
+
+```ts
+interface WorkflowRegistration {
+  name: string
+  version?: string   // absent = the announcer did not state one
+  group?: string     // the routing token (queue) this worker consumes for it
+  requires?: string[]
+  origin?: string    // the package that declared the workflow
+  onError?: { code?: string; workflow: string }[]  // failure routes — see below
+}
+```
+
+The rule is **announce only what you can run**. A worker publishes a registration for a body it holds and a queue it consumes; it never publishes one for a workflow it merely knows how to *route to* (an engine's `registerRemote`). So an entry means a live process said "I can run this", not "somebody, somewhere, might". The control plane's own descriptor announces nothing — it is a router, not an executor.
+
+On a store-less Adonis worker, `WorkerRuntime.registerWorkflow(name, body, meta)` announces a registration for every body it holds, with `group` set to the routing token it consumes; `workflowAnnouncement(MyWorkflow)` builds `meta` (`version`, `origin`, `onError`) from a class's `static workflow`. A name advertised with `registerWorkflowName` (routed elsewhere, not run here) gets no registration. A Python worker fills the same axes with `@worker.workflow("pipeline", version="2", origin="…")`.
+
+### Liveness
+
+A registration rides the descriptor key, which is written with the worker-heartbeat TTL (`EX 35`) and refreshed by the same ~10s beat. A worker that dies stops refreshing, the key expires, and its registrations disappear with it — there is no expiry bookkeeping in the engine, and no way for an announcement to outlive its worker beyond one TTL window.
+
+### Folding the fleet's claims
+
+`aggregateAnnouncements(descriptors)` (exported from `@adonis-agora/durable`) folds live descriptors into one `AnnouncedWorkflow` entry per `name@version`: its `groups`, `origins`, `requires`, `onError` route sets, `runtimes` and `instances`. It is pure — it holds and caches nothing — so you feed it what a transport reads back, e.g. the `bullmq` transport's `listWorkerDescriptors(token)`:
+
+```ts
+import { aggregateAnnouncements } from '@adonis-agora/durable'
+
+const entries = aggregateAnnouncements(await transport.listWorkerDescriptors('pipeline'))
+// [{ evidence: 'declared', key: 'pipeline@2', name: 'pipeline', version: '2', groups: ['pipeline'],
+//    origins: ['flip-python-db'], requires: [['saga']], onError: [], runtimes: ['python'],
+//    instances: ['py-1', 'py-2'], disagreements: [] }]
+```
+
+The same instance publishing its descriptor under several tokens folds to one announcer — `instances` counts workers, not keys.
+
+### Disagreement
+
+Two live workers can announce the same `name@version` with different groups, origins, capability demands or `onError` routes. The aggregate **reports every distinct claim and picks none of them**:
+
+```ts
+{ key: 'pipeline@2', groups: ['pipeline', 'pipeline-v2'],
+  disagreements: [{ axis: 'group', values: ['pipeline', 'pipeline-v2'] }] }
+```
+
+Two origins for one `name@version` is a name collision between packages; two `requires` sets is two code versions under one version tag; two groups means a caller cannot know which queue to dispatch to. **Silence is not a claim** — a worker that announced no origin does not disagree with one that did. A capability demand is compared as a set, so `['saga', 'signals']` and `['signals', 'saga']` agree.
+
+### The field the engine acts on
+
+`onError` is the one announced field the engine **uses**: for a workflow it serves by convention (a live queue of that name, no local registration), the failure routes come from what the live workers announce. If they announce different route sets (a rollout in progress), the failure is not routed and the engine emits `run.unrouted`. See [Routing a run's failure — remote workflows](/docs/durable/reliability/on-error#remote-workflows).
+
+### Cross-SDK
+
+Every SDK already publishes `workflows: string[]`, and a bare name not covered by a registration is still announced as an unversioned, group-less claim — so a worker that has not adopted `registrations` is listed rather than invisible, and a worker that describes some workflows richly and others by name alone is reported in full. The aggregate never invents a version, group or origin nobody stated.
 
 ## Loud, structured failures
 

@@ -34,6 +34,8 @@ engine.register('checkout', '1', async (ctx, order: Order) => {
 
 If `allocate-shipment` throws (and exhausts its retries, or throws a `FatalError`), the run fails — but before it does, the engine refunds the card and releases the inventory. The saga is reconstructed from the run's history on replay, so it works correctly even after a crash: the steps that completed are the ones whose compensations get registered.
 
+Concretely: on resume, a completed `localStep` checkpoint returns its saved output *without re-running `fn`* — but its `compensate` closure is still pushed onto the compensation stack, exactly as it was the first time. That is what makes registration crash-safe: after a mid-run crash, the resumed execution rebuilds the full stack of undos for every step that had actually completed, not just the ones this pass happened to run.
+
 ## Dispatched compensation — a step ref on `ctx.step`
 
 A dispatched [`ctx.step`](/docs/durable/concepts/workflows-and-steps#steps) undoes itself with a `compensate` **step ref** — a `@Step`/`defineStep` handler (or its name) that runs as its own dispatched step at unwind time. The undo handler receives a `StepUndo` envelope — `{ input, output }` — of the step it compensates, so it can reverse exactly what ran:
@@ -61,11 +63,47 @@ const booking = await ctx.step(this.booking.book, { flightId, pax }, {
 })
 ```
 
+The undo is dispatched to whatever worker serves its name and called with **one** argument: the `StepUndo<TInput, TOutput>` envelope — `{ input, output }` of the call it is undoing (`book`'s input and its `{ bookingRef }` result here). The original handler is never re-invoked in-process. That is the whole contract, and it is why a worker in another runtime can serve the undo: it just reads `{ input, output }` off the task it received.
+
+`UndoOf<H>` derives that envelope type from the original step method, so the ref form is compile-checked against the call it undoes instead of hand-written and driftable:
+
+```ts
+type UndoOf<H> = H extends (input: infer I, ...rest: never[]) => infer R
+  ? StepUndo<I, Awaited<R>>
+  : StepUndo<unknown, unknown>
+```
+
+The **string form** — `compensate: 'flights:cancel'` — works the same way for a handler with no JS reference to import, e.g. an undo served by a [Python worker](/docs/durable/python)'s `@worker.step("flights:cancel")`. Routing is by name either way. From the undo's own `@Step` config the engine takes its routing (name and partition), its input schema and its liveness `timeoutMs`; its retry budget is the engine-level [`compensationRetries`](#retrying-a-transient-undo), the same for every undo.
+
 Both kinds of compensation live in the same reverse-order stack: whether a step registered a local closure or a dispatched undo ref, the engine unwinds them last-completed-first when the run fails.
 
 > A dispatched step is already deduplicated by its deterministic `stepId` (`runId:seq`), which workers can use as an idempotency key — so there's no separate idempotency-key option.
 
 <CodeFlow scene="saga" />
+
+## What triggers the saga
+
+Any error that escapes the workflow body triggers compensation — not just a business-logic throw. A `ctx.step` or `ctx.localStep` that exhausts its retries, or throws a `FatalError`, propagates out of the body like an ordinary exception, and the engine treats that the same way whatever the reason the step gave up. The saga does **not** run on a suspension: a durable `ctx.sleep`, a pending `ctx.step`, a signal wait or a continue-as-new all leave the compensation stack untouched — it is only consulted when the run's execution ends in an unhandled error (or on a [compensating cancel](#compensating-cancellation)).
+
+The unwind is a strict **LIFO** over the compensations registered so far: the engine walks the stack from the most recently completed step back to the first, undoing exactly the steps that finished before the failure. A step that never completed never registered a compensation, so there is nothing to undo for it. In the checkout above, `charge-card`'s refund runs before `reserve-inventory`'s release.
+
+## Hand-rolled compensation: the control-flow-signal pitfall
+
+The `compensate` option is the engine's own machinery and is already safe — reach for it whenever a step's undo is a static ref or closure. When the undo doesn't fit (it is conditional, or needs values only known deep in a `catch`), you write the catch yourself:
+
+```ts
+import { isWorkflowControlFlowSignal } from '@adonis-agora/durable'
+
+try {
+  await ctx.step('payments:charge-card', input)
+} catch (error) {
+  if (isWorkflowControlFlowSignal(error)) throw error // suspend / continue-as-new: rethrow as-is
+  await ctx.step('payments:refund', input) // a REAL failure — safe to run cleanup here
+  throw error
+}
+```
+
+**The guard and rethrow are not optional.** A suspend (a durable sleep, a step still pending) and a continue-as-new unwind the turn by **throwing** internally — the same JS exception mechanism a real failure uses to reach your `catch`. If the `catch` runs its cleanup step on one of those, that step is recorded as an **extra** command during what a later replay will see as a plain suspend, and the resumed replay dies with a `NonDeterminismError`. The predicate checks a stamped marker (`CONTROL_FLOW_SIGNAL`), not `instanceof`; it is deliberately `false` for a cancelled run and for a real step failure, which you may compensate on directly. See [Catching errors](/docs/durable/concepts/workflows-and-steps#catching-errors--rethrow-control-flow-signals), and the [`rethrow-control-flow-signals`](/docs/durable/tooling/linting) lint rule that flags an unguarded catch.
 
 ## Retrying a transient undo
 
@@ -74,7 +112,7 @@ A compensation can itself fail transiently — the refund API might be momentari
 ```ts title="config/durable.ts"
 export default defineConfig({
   // … plus your transport/store (see Getting Started)
-  compensationRetries: 5, // retry each saga undo up to 5 times before giving up on it
+  compensationRetries: 5, // up to 5 attempts per saga undo before giving up on it
 })
 ```
 
@@ -96,11 +134,16 @@ Compensations are not just dispatched — they are **checkpointed**, at reserved
 - **A crash mid-unwind doesn't restart it from scratch.** A re-driven unwind reads the checkpoints, skips undos already completed (no double refunds), and resumes each remaining undo's attempt count where it left off.
 - **Multi-pod deployments work.** On a shared results queue, a dispatched undo's worker result can land on *another* pod; because the undo is a persisted checkpoint, whichever pod consumes the result completes the unwind instead of dropping it.
 
+Two ways a dispatched undo deliberately differs from an ordinary `ctx.step` dispatch:
+
+- **It never waits behind flow control.** An undo is handed straight to the transport, skipping the [admission/flow-control](/docs/durable/reliability/flow-control) gates an ordinary step goes through: the saga is often unwinding *because* the system is under pressure, and the very limit that throttled the forward work must not starve its own undo. Plan undo-handler capacity accordingly if a saga can fire under load.
+- **It is awaited inside the unwind**, not suspended on: the engine waits for the worker's result (or the settled checkpoint, when another pod consumed it), bounded by the undo's own `timeoutMs` heartbeat window or else by `compensationTimeoutMs`.
+
 You don't configure any of this — it's how the saga executes. It's why the "compensations should be idempotent" rule above is about *your* undo handlers, not about the engine re-running undos it already knows finished.
 
 ## Compensations are visible
 
-Every compensation surfaces as a `compensate:<step>` event, emitted as a `step.completed` (the undo ran) or `step.failed` (it exhausted its retries) lifecycle event. The [dashboard](/docs/durable/observability/dashboard) and the [Telescope](/docs/durable/observability/telescope) view render these, so a stranded undo is *visible* rather than silently swallowed. For the checkout above you'd see `compensate:charge-card` and `compensate:reserve-inventory` appear in the timeline as the saga unwinds.
+Every compensation surfaces as a `compensate:<step>` event, emitted as a `step.completed` (the undo ran) or `step.failed` (it exhausted its retries) lifecycle event. The [dashboard](/docs/durable/observability/dashboard) and the [Telescope](/docs/durable/observability/telescope) view render these, so a stranded undo is *visible* rather than silently swallowed. For the checkout above you'd see `compensate:charge-card` and `compensate:reserve-inventory` appear in the timeline as the saga unwinds. Each undo is also a real checkpoint at its reserved negative seq, and the dashboard's run view splits those out of the body timeline into a separate **compensation** section, listed in unwind order.
 
 ## Compensating cancellation
 
@@ -123,3 +166,7 @@ A compensating cancel returns immediately (non-blocking) and runs the undo in th
 The request itself is durable: `cancel({ compensate: true })` persists a cancel marker alongside broadcasting the cancellation, so the undo survives a crash or a pod handoff — whichever pod next drives the run honors the marker and runs the saga, even if the pod that took the cancel request couldn't run the workflow (or died before it did).
 
 To cancel many runs at once, `engine.cancelWhere(filter, opts?)` cancels every run matching a [run query](/docs/durable/concepts/workflows-and-steps#tags) (with the same `{ compensate }` option).
+
+## Saga vs. retries vs. dead-letter
+
+These three mechanisms answer different questions about a failure, and one run often uses all three. [Retries & backoff](/docs/durable/reliability/retries) answer "can this exact step just be tried again?" — reach for them first, on the step itself, when a failure is transient (a timeout, a 502). Sagas answer "this run is not going to complete — what do I need to undo?" — reach for `compensate` when a step has an irreversible side effect an *earlier* step would otherwise leave stranded. They compose: a step exhausts its own retries (or throws `FatalError`) before its failure ever reaches the saga, so compensation is what happens *after* retrying has given up. The [dead-letter queue](/docs/durable/reliability/dead-letter) answers a third, orthogonal question: "this run keeps crashing the process itself" — a poison pill a saga can't help with, because the body never gets far enough to fail cleanly. Cap it with `maxRecoveryAttempts` and handle it with `engine.onDead`; use sagas for a run that fails cleanly but has already done things in the world.

@@ -1,5 +1,5 @@
 {
   "title": "Transports",
   "icon": "Cable",
-  "pages": ["index", "queue", "db", "control-plane"]
+  "pages": ["index", "queue", "bullmq", "db", "control-plane"]
 }

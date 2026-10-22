@@ -66,7 +66,9 @@ export default defineConfig({
 
 Pair it with the [Lucid store](/docs/durable/stores/lucid) and the durability guarantees are the real ones: a crash mid-run resumes from the last checkpoint, because the checkpoints are in Postgres even though the steps never left the process.
 
-What you do **not** get is a second process. It also doubles as a local control plane, broadcasting to every subscriber in this process — correct for a single instance, but it does not fan out across pods. The moment you run two replicas, move to `queue` or `db` and add a [control plane](/docs/durable/transports/control-plane).
+What you do **not** get is a second process serving your steps: a `ctx.step` dispatched over `eventEmitter` is handled only by the process that dispatched it. It also doubles as a local control plane, broadcasting to every subscriber in this process — it does not fan out across pods.
+
+Several replicas can still share `eventEmitter` + a shared Lucid store **when every step is a `ctx.localStep`**: leases, checkpoints, signals and cancellation all go through the store, so two replicas never execute the same run. What you lose without a [control plane](/docs/durable/transports/control-plane) is cross-pod fan-out — live-tail, `onCancel` listeners, schedule pause and a `waitForRun` (or a blocking `start()`) that waits on a run resumed by another pod. Add `controlPlanes.redis` for those, and move to `queue`, `db` or `bullmq` once steps must run in another process. See [Pick a topology](/docs/durable/production#2-pick-a-topology).
 
 ## In-process for tests — `memory`
 
@@ -105,8 +107,8 @@ Omit it and the engine is **local-only**: events and cancellation reach subscrib
 
 A [`ctx.all`](/docs/durable/authoring/child-workflows#fanning-out-over-a-step) fan of thousands of steps sends thousands of results back at once, and two knobs decide how fast an engine-side instance works through them:
 
-- **Steps.** On `bullmq`, `transports.bullmq({ concurrency })` sets how many steps each worker task queue runs at once: a number (fixed, with no control loop), or `'adaptive'` to let the worker raise and lower it from step latency, errors, memory and CPU; see [the BullMQ options](/docs/durable/cluster/interop#workers-concurrency).
-- **Results.** `transports.bullmq({ resultConcurrency })` settles that many results at once per instance (default `1`); see [the BullMQ options](/docs/durable/cluster/interop#results-resultconcurrency). The `queue` and `db` transports have no such option: each instance settles results one at a time from its result loop, and `db` claims up to `batchSize` result rows (default 20) per poll. The fan's join barrier adds one count to each result's settle and resumes the workflow once per settled wave, whichever transport carries it.
+- **Steps.** On `bullmq`, `transports.bullmq({ concurrency })` sets how many steps each worker task queue runs at once: a number (fixed, with no control loop), or `'adaptive'` to let the worker raise and lower it from step latency, errors, memory and CPU; see [the BullMQ options](/docs/durable/transports/bullmq#concurrency).
+- **Results.** `transports.bullmq({ resultConcurrency })` settles that many results at once per instance (default `1`); see [the BullMQ options](/docs/durable/transports/bullmq#result-concurrency). The `queue` and `db` transports have no such option: each instance settles results one at a time from its result loop, and `db` claims up to `batchSize` result rows (default 20) per poll. The fan's join barrier adds one count to each result's settle and resumes the workflow once per settled wave, whichever transport carries it.
 - **Timers.** Each timer pass loads at most `timerBatchSize` due runs, most overdue first, and walks them in a shuffled order. It is an engine option in `config/durable.ts` (default `500`), not a transport one; a non-finite or sub-1 value falls back to `500`:
 
 ```ts title="config/durable.ts"

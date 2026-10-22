@@ -59,8 +59,12 @@ The members below are **optional**, and the engine works without every one of th
 | `registerChildWaits(entries)` | Batched fan dispatch: put each entry's waiter and upsert its `running` placeholder checkpoint, in one transaction. A waiter must be durable no later than its placeholder, because the engine reads a placeholder as proof its waiter exists. Without it the waiters and placeholders are written one by one. |
 | `compactCheckpoints(runId, fromSeq, toSeq, into)` | Folding a settled `ctx.all` fan: atomically replace the run's checkpoints in a contiguous seq range by one checkpoint. Without it a settled fan keeps one checkpoint per child. |
 | `runValueFacets(axis, query, opts?)` | Native picker enumeration (distinct values + counts per filter axis). Callers fall back to counting a bounded `listRuns` scan in-process — same shape, bounded approximation on the non-column axes. |
+| `countRuns(query)` | A single `COUNT(*)` over the same predicates `listRuns` applies. The start-time [concurrency quota](/docs/durable/reliability/concurrency-quotas) asks it on every start, so it must stay an aggregate. Without it the engine counts a `listRuns` result. |
+| `saveSchedule` / `getSchedule` / `updateSchedule` / `deleteSchedule` / `listSchedules` | Persisted schedules. Implement all five or none: `engine.schedules` refuses to run on a store without them. `updateSchedule(id, patch, expectedNextFireAt?)` is a compare-and-set on `nextFireAt` (`null` matching NULL) — how two schedulers racing on one due schedule agree on who advanced it. |
 
 Everything else is **required**, including `updateRunIf`.
+
+The Lucid driver implements every optional member in the table. `saveCheckpointIfPending` is one conditional `UPDATE … WHERE status = 'pending'`, never a read followed by a write, and `countCheckpoints` and `countRuns` are single `COUNT(*)` queries.
 
 ## `updateRunIf` — the compare-and-set write
 
@@ -127,6 +131,20 @@ The factory runs once per test case, so each case gets a fresh store. Two escape
 The conformance kit lives on the `@adonis-agora/durable/testing/conformance` subpath rather than `@adonis-agora/durable/testing`, because it generates the suite with vitest's `describe`/`it`. See [Testing](/docs/durable/testing#conformance-kits).
 </Callout>
 
+## Auto-schema
+
+By default the provider calls the selected store's `ensureSchema()` at boot — for the Lucid driver, the same idempotent `createDurableTables(db, connection)` the published migration runs. Set `autoSchema: false` in `config/durable.ts` to own the schema through migrations only; the in-memory store has no schema, so the flag is a no-op for it. See [the Lucid page](/docs/durable/stores/lucid#who-provisions-the-schema-autoschema) for the tables it creates and the upgrade caveat. It only ever adds the durable tables — it never touches yours.
+
+## Exactly-once DB writes with `ctx.transaction`
+
+A plain `ctx.step` is at-least-once: if the process dies after the step's business write commits but before its checkpoint does, the step re-runs on replay. `ctx.transaction(name, fn)` closes that gap by running `fn` and saving the step's checkpoint inside **one** store transaction, so they commit or fail together. It relies on the optional `transaction(work)` member: the store hands `work` its native transaction handle (`raw`) plus a `saveCheckpoint` that writes inside that same transaction.
+
+For the Lucid driver, `raw` is the Lucid `TransactionClientContract` opened on the store's connection — run your writes on it, not on the app's regular `db` service, or they land outside the transaction. On a store without `transaction()`, `ctx.transaction` throws. See [Transactional steps](/docs/durable/authoring/external-tasks#transactional-steps--ctxtransaction) for a full example.
+
+## Retention & pruning
+
+Terminal runs (`completed`, `failed`, `cancelled`, `dead`) otherwise accumulate forever. The `retention` config — per-status ages plus scoped `policies` — is swept by the `durable:work` tick, throttled to one pass a minute per instance. The sweep needs nothing beyond the required members: it asks `listRuns` for up to 100 candidates per pass using the `statuses` and `updatedBefore` pushdowns, then deletes each one (and its child subtree) through `deleteRun`. Any store that implements the required interface supports retention. See [Retention & archival](/docs/durable/reliability/retention).
+
 ## Encrypting payloads at rest
 
 `CodecStateStore` decorates any store and runs run/step **payloads** through a `PayloadCodec` — encoded on write, decoded on read — so inputs and outputs are never stored in the clear. Searchable metadata (id, status, workflow, tags, namespace, timestamps) is left untouched, so the dashboard, queries and recovery keep working.
@@ -173,6 +191,4 @@ export default defineConfig({
 
 `encode` and `decode` are synchronous and `decode` must be the exact inverse of `encode` — wrap an async KMS behind a local cache yourself. Beyond run and checkpoint payloads the decorator also encodes buffered signal and event payloads.
 
-<Callout type="warn">
-`CodecStateStore` does not implement the optional `recordStepHeartbeat`, so wrapping a store trades persisted step heartbeats for encryption at rest. The live `step.started` event still fires.
-</Callout>
+`CodecStateStore` never hides a capability of the store it wraps, and never invents one. `saveCheckpointIfPending`, `countCheckpoints`, `registerChildWaits`, `compactCheckpoints`, `hasSignalWaiter` and the five schedule methods are bound only when the inner store has them, so the engine's fallbacks still apply through the wrapper. Payload-carrying writes (`saveCheckpointIfPending`, the placeholder checkpoints of `registerChildWaits`, the folded checkpoint of `compactCheckpoints`, a schedule's `spec`) are encoded; `countCheckpoints` and `hasSignalWaiter` read no payload and are forwarded verbatim. `recordStepHeartbeat` is forwarded too (a no-op when the inner store lacks it), with the progress payload encoded under `extended` coverage, and `transaction()` encodes the checkpoint its `saveCheckpoint` writes.

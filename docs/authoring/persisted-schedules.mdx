@@ -1,0 +1,97 @@
+---
+title: Persisted schedules
+description: "engine.schedules — Temporal-style schedules created, updated, paused, resumed, triggered and deleted at runtime, persisted in the store (durable_schedules), fired by the durable:work worker tick when persistedSchedules is on, with cron + timezone or fixed intervals, jitter, overlap and catch-up policies. Safe with any number of workers."
+icon: CalendarClock
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+The `schedules` config option and colocated `static schedule` ([Scheduling](/docs/durable/authoring/scheduling)) cover cadences you know at deploy time. Many apps need schedules that **users create**: a morning brief per person at *their* 9:00, an automation per tenant on a cron they typed, a weekly digest per team. Those belong in the database, next to the runs they start — that is `engine.schedules`.
+
+## Turning it on
+
+```ts title="config/durable.ts"
+import { defineConfig, stores } from '@adonis-agora/durable'
+
+export default defineConfig({
+  store: 'lucid',
+  stores: { lucid: stores.lucid() },
+  // the worker tick fires due persisted schedules
+  persistedSchedules: true,
+})
+```
+
+With `persistedSchedules` on, every worker tick — `node ace durable:work` or the [embedded worker](/docs/durable/authoring/scheduling#running-the-loop-in-the-web-process) — fires the due persisted schedules, right after the config schedules. It is off by default.
+
+Schedules live in the `durable_schedules` table. The Lucid store creates it with the rest of its tables — at boot via `autoSchema`, or through `createDurableTables` in a migration when `autoSchema` is off (see [Lucid store](/docs/durable/stores/lucid)). The in-memory store keeps them in memory. The table is only read when `persistedSchedules` is on or when you call `engine.schedules` yourself, so a deployment that doesn't use it never touches it. A custom store must implement `saveSchedule` / `getSchedule` / `updateSchedule` / `deleteSchedule` / `listSchedules`; otherwise every `engine.schedules` call throws.
+
+## Managing schedules
+
+Import the engine and use `engine.schedules`:
+
+```ts
+import engine from '@adonis-agora/durable/services/main'
+import MorningBriefWorkflow from '#workflows/morning_brief_workflow'
+
+await engine.schedules.upsert({
+  id: `brief:${user.id}`,              // stable id — also part of every run id it starts
+  workflow: MorningBriefWorkflow,      // class or registered name
+  input: { userId: user.id },
+  cron: '0 9 * * 1-5',                 // or `every: '15m'`
+  timezone: user.timezone,             // IANA zone the cron is evaluated in
+  jitter: '2m',                        // spread thousands of 9:00 briefs over two minutes
+  overlap: 'skip',                     // don't start while yesterday's is still running
+  catchup: 'latest',                   // after an outage, fire the most recent missed window once
+  tags: [`tenant:${user.tenantId}`],   // find schedules by tag; stamped on every run too
+  namespace: user.tenantId,            // optional: partition of the schedule and its runs
+})
+
+await engine.schedules.pause(`brief:${user.id}`, 'user on vacation')
+await engine.schedules.resume(`brief:${user.id}`)    // continues from the next window
+await engine.schedules.trigger(`brief:${user.id}`)   // one run now, outside the cadence
+await engine.schedules.list({ tag: `tenant:${tenantId}` })
+await engine.schedules.get(`brief:${user.id}`)       // next fire, last fire/run, fires, lastError
+await engine.schedules.delete(`brief:${user.id}`)    // its past runs are left alone
+```
+
+- `create` throws `ScheduleAlreadyExistsError` on a taken id; `upsert` creates or replaces the definition while keeping history (last fire, last run, fire count) and — when `paused` is omitted — the current paused state.
+- Changing a definition recomputes the next fire from now, so an upsert never re-fires a window. An invalid cron or timezone is rejected up front, and exactly one of `cron` / `every` is required.
+- `pause`, `resume` and `trigger` throw `ScheduleNotFoundError` on an unknown id; `get` returns `null` and `delete` returns `false`.
+- `resume` continues from the next window after now — windows skipped while paused are **not** caught up.
+- `trigger` starts one run right now, paused or not, with the run id `sched:<id>:manual:<nowMs>`; it doesn't move the schedule's next fire.
+- `list` filters by `namespace`, `workflow`, `tag` and `paused` (with `limit` / `offset`) and returns the soonest-due first.
+- Every run carries the schedule's tags plus `schedule:<id>`, its namespace, and the optional `searchAttributes` / `priority` from the definition. A window's run id is `sched:<id>:<windowMs>`.
+- `get` / `list` describe a schedule with its definition plus `nextFireAt` (jitter included; `null` when paused), `lastFireAt`, `lastRunId`, `fires` (manual triggers excluded), `lastError` and an optional free-form `note` (set on the definition, or by `pause(id, note)`).
+
+## Policies
+
+| Option | Values | Meaning |
+| --- | --- | --- |
+| `cron` / `every` | cron expression / duration (`'15m'` or ms) | Exactly one. Intervals are aligned to the epoch. Cron is 5 fields, or 6 with leading seconds, and needs the `cron-parser` peer. |
+| `timezone` | IANA zone, default `UTC` | Zone the cron is evaluated in (DST-aware). |
+| `jitter` | duration (`'30s'` or ms) | A stable per-(schedule, window) delay in `[0, jitter)` so schedules sharing a cron don't all start in the same second. The run id stays the nominal window. |
+| `overlap` | `'allow'` (default) / `'skip'` | `'skip'` skips a window while the previous run of this schedule is still in flight. |
+| `catchup` | `'latest'` (default) / `'skip'` | Windows missed while nothing polled: fire the most recent one once, or drop them. Never more than one catch-up run. |
+| `paused` | boolean | Create paused. On `upsert`, omit to keep the current state. |
+| `concurrency` | `{ key, limit, countStatuses? }` | A [concurrency quota](/docs/durable/reliability/concurrency-quotas) applied to every run it starts; an over-limit window is skipped and recorded as `lastError`. |
+
+A start that fails (unregistered workflow, input validation, a concurrency limit…) is recorded as the schedule's `lastError` and the schedule moves on to its next window; the next successful start clears it. A definition that stops evaluating (e.g. a timezone removed from the tz database) pauses the schedule with the reason in `lastError`.
+
+## Multi-worker safety
+
+Any number of worker instances can run with `persistedSchedules` at once. Each tick is one indexed "due by now" query per instance (`paused = false AND next_fire_at <= now`, served by the `durable_schedules_due_idx` index), in batches of 100. For each due schedule:
+
+1. the window's run is started with its deterministic id — racing instances collapse into one run, because `start` is idempotent by id;
+2. the schedule is advanced with a **compare-and-set** on its `next_fire_at` — exactly one instance moves it on; the others see the CAS fail and leave it.
+
+A crash between 1 and 2 just re-fires the same (idempotent) start on the next tick. No locks, no leases, no leader election. A draining engine stops firing.
+
+A tick fires the due schedules in the engine's own `namespace`; an engine with no `namespace` (an [operator](/docs/durable/concepts/tenancy)) fires them for every namespace.
+
+## Driving it yourself
+
+Outside the worker loop, call `await engine.schedules.tick()` from any poller; it fires every due schedule in the engine's namespace (all namespaces for an operator engine) and returns the run ids it started. It does not consult `persistedSchedules` — that flag only controls whether the worker tick calls it.
+
+<Callout type="info">
+The dashboard's Schedules tab lists the config and colocated schedules (`engine.listSchedules`). Persisted schedules are managed through `engine.schedules`; their runs show up in the run list with the `schedule:<id>` tag.
+</Callout>

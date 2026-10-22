@@ -71,11 +71,30 @@ steps are checkpointed and retried, and the wait survives a crash like any child
 
 `error` carries the failure's `message`, `code` and `details`. `details` is whatever JSON-serializable
 value the failure was raised with — `new FatalError(message, code, details)` — so a handler can record
-exactly what went wrong (e.g. a schema's validation issues).
+exactly what went wrong (e.g. a schema's validation issues):
+
+```ts
+// FatalError(message, code, details)
+export class InvalidLine extends FatalError {
+  static readonly code = 'invalid_line'
+  constructor(message: string, issues?: unknown) {
+    super(message, InvalidLine.code, issues)
+  }
+}
+
+// in the step
+const parsed = LineSchema.safeParse(line)
+if (!parsed.success) throw new InvalidLine(`line ${line.n} is invalid`, parsed.error.issues)
+
+// in the handler: failure.error.details is the issues array
+```
+
+The same `details` reach a parent's [`ctx.allSettled`](/docs/durable/authoring/child-workflows#when-a-failed-item-is-an-expected-outcome--ctxallsettled)
+item. In Python: `raise FatalError("line 3 is invalid", "invalid_line", details=issues)`.
 
 ## Retrying a run
 
-Retrying a failed run runs its **body** again. A handoff the run made before is retired: it stays in
+Retrying a failed run (from the dashboard, `node ace durable:retry <runId>`, or `engine.requeue(runId)`) runs its **body** again. A handoff the run made before is retired: it stays in
 the timeline, renamed `onError:retried:<handler id>`, and is never followed again, and the run's
 `onError:<code>` tag is removed. If the body fails again, the engine hands the new failure to a new
 handler run (`<runId>.onError.1`, then `.2`, …), tagged again.
@@ -99,7 +118,9 @@ bridge as `agora:durable:run.routed` / `run.unrouted`.
 Routing matches on the error's **`code`**, not its class: a dispatched step's error reaches the engine
 as a plain `{ message, code }`, and a remote body's failure was never a JavaScript error at all. `code` is
 the code string, or an error class with a `static code`; a route without `code` is the catch-all, taking
-any failure no other route matches.
+any failure no other route matches. An exact `code` match always wins over the catch-all. Two routes for
+the same code, or two catch-alls, are ambiguous and rejected when the workflow is registered. To send
+several codes to one handler, list one route per code with the same `workflow`.
 
 The code comes from `FatalError`'s second argument, from a `code` on whatever a step handler threw, or
 from the code a remote worker reported for the failed step. A failure from a step reaches the route once
@@ -116,6 +137,23 @@ queue name), the routes come from what its workers **announce** in their handsha
 worker announces them through `WorkerRuntime.registerWorkflow(name, body, meta)` —
 `workflowAnnouncement(MyWorkflow)` builds that `meta` from a class's `static workflow` — and the Python
 SDK through `@worker.workflow("line", on_error=[{"code": "invalid_line", "workflow": "line-rejected"}])`.
+
+A Python worker can also declare the handler inline: `.on_error(code)` on the workflow function registers
+the handler as its own workflow, `<workflow>.onError.<function>`, and announces the route to it. `code` is
+a code string or an exception class with a `code` attribute:
+
+```python
+@worker.workflow("line")
+def line(ctx, input): ...
+
+@line.on_error(InvalidLine)
+def reject_line(ctx, failure):  # {"runId", "workflow", "input", "error"}
+    ctx.step("record_rejected_line", {"line": failure["input"], "error": failure["error"]})
+    return {"ok": 0, "failed": 1}
+```
+
+A Python workflow class does the same with `@on_error(code)` methods. See
+[Python: workflows as classes](/docs/durable/python#workflows-as-classes).
 
 The handler can be a workflow of any runtime; the engine only starts a run by name. If the live workers
 announce different routes for the workflow (a rollout in progress), the failure is not routed and the
@@ -137,5 +175,8 @@ takes the same option for a remote workflow registered by hand rather than serve
 | | Who decides | Fires on |
 | --- | --- | --- |
 | `onError` | the workflow, for every caller | a run that failed with a routed code |
-| [`ctx.allSettled`](/docs/durable/authoring/child-workflows) | the parent, for one fan | a failed child |
+| [`ctx.allSettled`](/docs/durable/authoring/child-workflows) | the parent, for one fan | a failed child or step |
 | [`engine.onDead`](/docs/durable/reliability/dead-letter) | the app | a run that crash recovery gave up on (`dead`) |
+
+Reach for `onError` when the failure policy belongs to the workflow, and for `ctx.allSettled` when it
+belongs to one caller.

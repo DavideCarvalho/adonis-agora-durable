@@ -8,7 +8,7 @@ import { Callout } from 'fumadocs-ui/components/callout';
 
 A scheduled workflow starts on time; an **event-triggered workflow** starts when something happens — a payment succeeded, a webhook arrived, a document changed. Instead of you wiring "event → `engine.start(...)`" by hand, the workflow class declares its triggers and the durable provider bridges the event source into the engine for you.
 
-Two sources are supported:
+This page is about the **sources**. The engine side (`publishEvent`, `onEvent`, `ctx.waitForEvent`, coalescing and buffering) is covered in the [Events guide](/docs/durable/authoring/events). Two sources are supported:
 
 - the **AdonisJS emitter** (`@OnEvent`) — exact event names,
 - the **`@adonis-agora/diagnostics` bus** (`@OnDiagnostic`) — `agora:<lib>:<event>` channels, exact or regex, plus "every event of a lib".
@@ -50,7 +50,7 @@ The Adonis emitter has no wildcard, so `@OnEvent` matches **exact names only**. 
 
 ## How it fires
 
-- **Exact triggers** route through `engine.publishEvent(canonical, payload)` — a fresh run of every workflow registered with that canonical `onEvent` name, with the payload as input. Idempotent by `evt:<id>:<workflow>` (durable's own dedup for redelivered events).
+- **Exact triggers** route through [`engine.publishEvent(canonical, payload)`](/docs/durable/authoring/events#publishing-an-event), which starts a fresh run of every workflow registered with that canonical `onEvent` name, with the payload as input. The same publish also resumes any run parked on `ctx.waitForEvent(canonical)`. The bridge passes no `opts.id`, so every emitted event starts its subscribers once. To dedupe an upstream's redeliveries, call `publishEvent` yourself with the upstream's id (see [Idempotent publishing](/docs/durable/authoring/events#idempotent-publishing--optsid)).
 - **Regex / any triggers** start the workflow directly with the event payload (the concrete channel name isn't known at registration time).
 
 The diagnostics channel envelope's `payload` becomes the run input. The payload type is whatever the emitting library published (e.g. `@adonis-agora/payments`' `payment.succeeded` payload with `externalReference`).

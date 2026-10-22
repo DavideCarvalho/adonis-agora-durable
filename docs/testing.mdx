@@ -30,7 +30,27 @@ test('checkout completes', async () => {
 })
 ```
 
-`t.run(workflow, input, runId, opts?)` enqueues and waits for the run to settle (terminal or suspended) — use it when a test needs the outcome synchronously, since `engine.start` only enqueues.
+`t.run(workflow, input, runId, opts?)` enqueues and waits for the run to settle (terminal or suspended) — use it when a test needs the outcome synchronously, since `engine.start` only enqueues. It is exactly `await t.engine.start(workflow, input, runId, opts)` followed by `t.engine.waitForRun(runId)`, and resolves to the same `RunResult` (`{ runId, status, output, error }`).
+
+### Dispatched steps — `t.transport.handle`
+
+A `ctx.step(name, input)` is always **dispatched**, so the test has to serve it: register a fake worker for each step name on the in-memory transport with `t.transport.handle(name, fn)` (the handler receives the step input). Because a dispatched step parks the run until its result comes back, `t.run` resolves on that first **`suspended`** state — wait for a terminal state instead:
+
+```ts
+t.engine.register('checkout', '1', async (ctx, order) => {
+  await ctx.step('reserve', order)
+  return ctx.step('ship', order)
+})
+t.transport.handle('reserve', async () => ({ reserved: true })) // stands in for the remote worker
+t.transport.handle('ship', async () => ({ shipped: true }))
+
+await t.engine.start('checkout', order, 'run1')                      // enqueues → pending
+const result = await t.engine.waitForRun('run1', { terminal: true }) // skip the suspended hand-offs
+await assertRunStatus(t.store, 'run1', 'completed')
+await assertOutput(t.store, 'run1', { shipped: true })
+```
+
+`waitForRun(runId, { terminal: true })` only resolves on `completed` / `failed` / `cancelled` / `dead`; add `timeoutMs` to bound it so a wedged run fails the test instead of hanging it.
 
 ## Control time (durable sleep)
 
@@ -48,7 +68,18 @@ await t.tick(7 * 24 * 60 * 60 * 1000) // the sleep is due → completes
 await assertRunStatus(t.store, 'run1', 'completed')
 ```
 
-The clock itself (`t.clock`, a `MutableClock`) has `set(ms)` and `advance(ms)` if you need finer control.
+`t.tick(ms)` is `t.clock.advance(ms)` followed by `engine.resumeDueTimers(clock.now())`, and returns the `RunResult[]` of the runs it resumed. A tick that leaves a sleep short of its deadline resumes nothing — the run stays `suspended`.
+
+The clock itself (`t.clock`, a `MutableClock`) is a standalone export, with `set(ms)` (jump to an absolute instant) alongside `advance(ms)` (move forward by a delta); `now()` reads it. `createTestEngine` starts it at `1_000`. Reach for it directly when you need an absolute time, or when you're driving code that only takes a bare `now: () => number`:
+
+```ts
+import { MutableClock } from '@adonis-agora/durable/testing'
+
+const clock = new MutableClock(1_720_000_000_000) // starts at this instant instead of the default 1_000
+clock.set(1_720_100_000_000)                       // jump to an absolute instant
+clock.advance(60_000)                              // ...then move forward a minute
+clock.now()                                        // 1_720_100_060_000
+```
 
 ## Inject crashes & retries
 
@@ -64,7 +95,22 @@ await t.run('wf', {}, 'run1')
 await assertStepAttempts(t.store, 'run1', 'charge', 2) // failed once, then succeeded
 ```
 
-`failTimes(n, value)` fails the first `n` attempts before returning `value`.
+Each factory returns a fresh step body that counts its own calls: `failOnce(value)` throws once then returns `value`; `failTimes(n, value)` throws the first `n` calls then returns it (`failOnce` is exactly `failTimes(1)`). Both take an optional custom `Error` as the last argument (default `new Error('injected failure')`).
+
+Use `failTimes` to exhaust a retry budget — the classic "does a poison step actually fail the run?" test. On a `ctx.localStep`, `retries` is the **total** number of attempts (`retries: 3` means three tries, not one plus three), so failing all three must fail the run:
+
+```ts
+import { failTimes, assertRunStatus, assertStepAttempts } from '@adonis-agora/durable/testing'
+
+t.engine.register('wf', '1', async (ctx) =>
+  ctx.localStep('flaky', failTimes(3, { ok: true }, new Error('upstream 503')), { retries: 3 }),
+)
+const result = await t.run('wf', {}, 'run1')
+await assertRunStatus(t.store, 'run1', 'failed')       // result.error.message === 'upstream 503'
+await assertStepAttempts(t.store, 'run1', 'flaky', 3)  // all attempts thrown → run failed
+```
+
+Inject failures with `ctx.localStep`, as above: a dispatched `ctx.step` retries on a different policy (a worker that *reported* an error is surfaced to the workflow rather than re-dispatched; re-dispatch is reserved for liveness timeouts), so it is not the path to drive with `failOnce`.
 
 ## Assertions
 
@@ -74,9 +120,11 @@ All assertions read the store, so they work against any run the engine produced:
 | --- | --- |
 | `assertRunStatus(store, runId, status)` | the run reached `status` |
 | `assertOutput(store, runId, expected)` | the run's output equals `expected` |
-| `assertStepsRan(store, runId, names)` | exactly these steps were recorded |
-| `assertStepAttempts(store, runId, name, n)` | the step took `n` attempts |
-| `recordedSteps(store, runId)` | returns the recorded step names |
+| `assertStepsRan(store, runId, names)` | every named step was recorded, in any order (other steps may also have run) |
+| `assertStepAttempts(store, runId, name, n)` | the step's checkpoint records exactly `n` attempts |
+| `recordedSteps(store, runId)` | returns the recorded step names, in order — for an exact-sequence check, `expect(await recordedSteps(...)).toEqual([...])` |
+
+`assertOutput` compares by `JSON.stringify`, so key order matters. Each assertion throws a plain `Error` with the expected and actual values, so it works under Japa, vitest, or any runner that fails a test on a thrown error; an unknown `runId` throws `run <id> not found`.
 
 ## Conformance kits
 
@@ -112,6 +160,8 @@ runStateStoreContract('MyStateStore', async () => {
 })
 ```
 
+The factory runs before **every** case and must return a fresh, empty store plus a `cleanup`. If it can't reach its backend at all (no Docker, no local Postgres), throw `StateStoreUnavailableError` (from `@adonis-agora/durable/testing/conformance`) instead of letting the connection error fail the suite — every case catches it, logs one `SKIPPING` warning, and passes as a no-op rather than reporting a false failure. The returned context can also opt out of two capabilities a driver genuinely lacks: `supportsAsyncTransaction: false` (a synchronous driver whose `transaction()` rejects a promise-returning callback) and `supportsTagFilter: false` (no `listRuns({ tag })` filter); both default to `true`.
+
 ```ts title="tests/my_admission.spec.ts"
 import { runAdmissionBackendContract } from '@adonis-agora/durable/testing/conformance'
 import { MyAdmissionBackend } from '../src/my_admission_backend.js'
@@ -132,7 +182,7 @@ The loop is capture → commit → assert:
 node ace durable:export ord-42 --out tests/fixtures/checkout-run.json
 ```
 
-Or in code, `captureHistory(engine, runId)` returns the same `RunHistory` (`{ run, checkpoints }`) from any live engine — the [`onEvict`](/docs/durable/reliability/retention#archiving-before-deletion--engineonevict) archival hook receives it too, so an archived run is already a fixture.
+Or in code, `captureHistory(engine, runId)` returns the same `RunHistory` (`{ run, checkpoints }`) from any live engine (or `null` for an unknown run) — including a `createTestEngine()` engine, so a test can record its own fixture. The [`onEvict`](/docs/durable/reliability/retention#archiving-before-deletion--engineonevict) archival hook receives the same pair as two arguments, `(run, checkpoints)`, so writing `{ run, checkpoints }` from it makes an archived run a fixture.
 
 **2. Commit the JSON** next to your tests. It is the frozen contract: "code that cannot replay this history cannot be deployed over runs shaped like it."
 
@@ -150,3 +200,5 @@ test('checkout replays its recorded production history', async () => {
 ```
 
 A passing test means the current code replays the recorded history checkpoint-for-checkpoint. A failing one is the exact break that would have corrupted an in-flight run on deploy — fix it with a [version bump or a `ctx.patched` gate](/docs/durable/authoring/versioning) rather than by re-recording the fixture, unless no runs of the old shape can still be in flight.
+
+`assertReplayable` only throws on a **non-determinism** divergence (as an error named `NonDeterminismError`); a replay that fails for another reason does not throw, so it is not a substitute for asserting the run's outcome.

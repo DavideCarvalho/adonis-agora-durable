@@ -1,0 +1,32 @@
+---
+title: Concepts
+description: The mental model behind the engine. Replay is the durability mechanism, workflows orchestrate while steps do the work, a run can wait for months without holding a process, and every run belongs to a namespace that decides who drives it.
+icon: Lightbulb
+---
+
+import { Cards, Card } from 'fumadocs-ui/components/card';
+
+Four ideas carry the whole engine. Everything else in these docs follows from one of them.
+
+<Cards>
+  <Card title="Durability & replay" href="/docs/durable/concepts/durability" description="Checkpoint-and-replay makes a run survive crashes, and imposes one rule: the workflow body must be deterministic." />
+  <Card title="Workflows & steps" href="/docs/durable/concepts/workflows-and-steps" description="engine.register and BaseWorkflow, dispatched ctx.step vs in-process ctx.localStep, retries, fan-out and fatal errors." />
+  <Card title="Sleep & signals" href="/docs/durable/concepts/sleep-and-signals" description="ctx.sleep, ctx.waitForSignal and ctx.waitForEvent: durable waits that use no compute and survive restarts." />
+  <Card title="Tenancy" href="/docs/durable/concepts/tenancy" description="The two isolation axes, namespace on the engine and partition on the transport, and what each one partitions." />
+</Cards>
+
+## Durability is replay
+
+A run survives a crash because the engine **replays the workflow body from the top** and gives steps that already completed their saved results instead of running them again. That one mechanism is what provides crash recovery, and it imposes one rule: the body must be deterministic. No `Date.now()`, `Math.random()`, or direct I/O outside a step. See [Durability & replay](/docs/durable/concepts/durability).
+
+## Workflows orchestrate, steps do
+
+A workflow decides *what happens next*. A step is the only place a side effect may happen. `ctx.step` dispatches a named handler over the configured [transport](/docs/durable/transports), checkpoints it, retries it on its own policy, and returns the recorded result on the next replay. `ctx.localStep` runs a closure in-process when no worker boundary is needed. Fan-out, [child workflows](/docs/durable/authoring/child-workflows) and [entities](/docs/durable/authoring/entities) all build on these. See [Workflows & steps](/docs/durable/concepts/workflows-and-steps).
+
+## Waiting costs nothing
+
+A run parked on `ctx.sleep`, `ctx.waitForSignal` or `ctx.waitForEvent` holds no process, thread or connection. Its state is a row and a wake time, and the engine resumes it when the timer comes due or the signal or event arrives. While parked, a month-long wait costs the same as a one-second wait. See [Sleep & signals](/docs/durable/concepts/sleep-and-signals), and [Events](/docs/durable/authoring/events) for name-based pub/sub.
+
+## Runs belong to someone
+
+Every run is stamped with a namespace, and that stamp decides which pool drives it and which workers execute its steps. This is what lets one store and one broker host several worker pools without any of them taking another's work. See [Tenancy](/docs/durable/concepts/tenancy), and [Cluster](/docs/durable/cluster) for the deployment shapes built on it.

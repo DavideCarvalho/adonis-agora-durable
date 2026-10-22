@@ -3,6 +3,8 @@
   "pages": [
     "index",
     "getting-started",
+    "patterns",
+    "comparison",
     "---Guides---",
     "concepts",
     "authoring",
@@ -18,7 +20,10 @@
     "---Operations---",
     "tooling",
     "testing",
-    "cli"
+    "cli",
+    "production",
+    "troubleshooting",
+    "api-reference"
   ],
   "root": true,
   "description": "Durable, resumable workflows for AdonisJS.",

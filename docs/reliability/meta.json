@@ -6,6 +6,8 @@
     "retries",
     "sagas",
     "flow-control",
+    "concurrency-quotas",
+    "singleton",
     "on-error",
     "dead-letter",
     "retention",

@@ -1,0 +1,268 @@
+---
+title: Troubleshooting
+description: Symptom-first answers to the errors and stuck states you will actually hit — NonDeterminismError, NestedWorkflowCallError, a caught suspend that corrupts a run, runs wedged in pending, running or suspended, timers and schedules that never fire, waitForRun hanging across pods, jobs stuck in active on the queue transport, steps that run twice, node ace processes that hang or steal work, schema and dashboard surprises.
+icon: Stethoscope
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+This page is organized by what you **see** — an error name, a stuck status, a hung command — rather than by subsystem. Each entry names the symptom, why it happens, and the fix. For the operator's map from a stuck run to the knob that heals it, see [Failure modes & recovery](/docs/durable/reliability/failure-modes); for the pre-flight checklist, see [Running in production](/docs/durable/production).
+
+Two commands answer most first questions:
+
+```bash
+node ace durable:runs --status=suspended   # what is parked, how long since it moved, its oldest pending remote step
+node ace durable:runs --stale=1h           # only runs that look stranded, each with a durable:retry hint
+```
+
+## `NonDeterminismError` on resume
+
+**Symptom:** a run that was replaying (resumed after a suspend, or recovered after a crash) fails with:
+
+```
+non-determinism at checkout:42#3: code expects "refund" but history recorded "charge". The workflow
+changed under an in-flight run — register a new workflow version.
+```
+
+**Cause:** replay pairs each step with the checkpoint recorded at its logical position (`seq`). The engine throws the moment the name at a position no longer matches — the workflow's code changed shape (a step inserted, removed or reordered) while this run was in flight, without a new version. Continuing would feed the wrong checkpoint into the wrong step, so it fails loudly. Other common causes of the same error:
+
+- a **stale worker** — an old build still running against a shared store or broker picks up a run whose history its code no longer matches;
+- a hand-rolled `catch` that ran cleanup on a suspend (see [below](#a-caught-suspend-runs-compensation-and-corrupts-the-run));
+- a non-deterministic value in the workflow body (`Date.now()`, `Math.random()`, `process.env`) that sent a replay down a different branch.
+
+**Fix:**
+
+- For a structural change, register the new version **alongside** the old one: in-flight runs finish on the version they started on, new runs get the newest. For a small change, guard it with `ctx.patched(id)` instead. See [Versioning & determinism](/docs/durable/authoring/versioning).
+- Deploy workers together with the web/engine processes, and kill stray local processes pointed at a shared backend — see the stale-worker pitfall in [Tenancy](/docs/durable/concepts/tenancy#pitfalls).
+- Catch it before production: the [ESLint plugin](/docs/durable/tooling/linting) flags non-deterministic sources at author time, and `node ace durable:export` + `assertReplayable` replays a real run's history against your current code in CI ([Replay CI](/docs/durable/testing#replay-ci--assertreplayable)).
+
+## `NestedWorkflowCallError`: a ctx call inside a step body
+
+**Symptom:** a run fails at a step with `NestedWorkflowCallError` (a `FatalError`, code `nested_workflow_call`).
+
+**Cause:** something inside a `ctx.localStep` / `ctx.transaction` / `ctx.sideEffect` / `ctx.now` body called a workflow primitive — `ctx.startChild`, `ctx.child`, `ctx.step`, `ctx.sleep`, … — directly or through a `BaseWorkflow.start()` / `.dispatch()` static that resolves the ambient ctx. A step body runs once and then replays from its checkpoint without re-running, so the nested call would claim a journal position that no replay claims again. Before this guard the run kept going and died later with a `NonDeterminismError`, far from the cause.
+
+**Fix:** move the call out of the step body into the workflow body (start the child before or after the step, passing what the step computed). From a dispatched step handler, `OtherWorkflow.dispatch()` starts a top-level run — handlers never see the workflow's ctx, in-process transports included. See [Workflow primitives inside a step body](/docs/durable/authoring/versioning#workflow-primitives-inside-a-step-body).
+
+## A caught suspend runs compensation and corrupts the run
+
+**Symptom:** a workflow with its own `try`/`catch` around a `ctx.step` (or `ctx.sleep`, `ctx.waitForSignal`, …) runs its cleanup on what was an ordinary suspend — a compensation fires on a run that was simply sleeping — and the run later fails on resume with `NonDeterminismError`.
+
+**Cause:** a durable sleep, a still-pending step and `ctx.continueAsNew` unwind the current turn by **throwing** a control-flow signal. A `catch` that does not tell the two apart treats the suspend as a failure and records extra steps into history that a later replay never produces.
+
+**Fix:** rethrow control-flow signals untouched before running any cleanup:
+
+```ts
+import { isWorkflowControlFlowSignal } from '@adonis-agora/durable'
+
+try {
+  await ctx.step('chargeCard', input)
+} catch (error) {
+  if (isWorkflowControlFlowSignal(error)) throw error // suspend / continue-as-new: rethrow as-is
+  await ctx.step('refund', input) // a real failure — safe to clean up
+  throw error
+}
+```
+
+Better still, use the built-in `compensate` option ([Sagas](/docs/durable/reliability/sagas)), which only ever runs on a genuine failure. The lint rule `rethrow-control-flow-signals` reports a `catch` missing this guard. See [Catching errors](/docs/durable/concepts/workflows-and-steps#catching-errors--rethrow-control-flow-signals).
+
+## `workflow … is not registered`
+
+**Symptom:** `start` throws `workflow <name> is not registered`, or a resume fails with `workflow <name>@<version> is not registered — keep the prior version deployed so in-flight runs can drain (skew protection)`.
+
+**Cause:**
+
+- **A version was removed while runs were still on it.** A run always replays on the version it started on; the second message is the engine refusing to replay it against a different one.
+- **Discovery registered nothing.** The class must be exported from a module under `workflowsPath` (default `app/workflows`) with a `static workflow = { name, version }`. `workflowsPath: false` turns discovery off. When the generated barrel `.adonisjs/durable/workflows.js` exists, the provider registers from it and skips the directory scan, so a barrel older than your newest workflow misses it — it is regenerated by the Assembler `init` hook when `serve`/`build` starts. Releases before the discovery fix skipped every `.ts` module in a dev app silently — upgrade if you are on one.
+- **Rolling-deploy skew.** On a shared broker, a step result can be consumed by a pod that does not have the workflow yet. The checkpoint is still written, and the next recovery tick on a pod that does have it replays past it.
+
+**Fix:** keep the old version registered until `node ace durable:runs --workflow=<name>` shows none of its runs in flight, then drop it; check the export and path for discovery. At boot the provider also warns, once, about `onError` routes naming a handler workflow that nothing here or in the live fleet serves — read that warning as the same typo caught earlier.
+
+## A run is stuck in `pending`
+
+**Symptom:** a run sits at `pending` instead of moving to `running` within moments.
+
+**Cause:** `pending` means persisted, not yet picked up. On the default dispatcher the starting process picks it up on a microtask, so a lingering `pending` means that did not happen and no worker loop picked it up afterwards:
+
+- **No dispatcher executes it, and no loop is running.** `role: 'control-plane'`, or a `runDispatcher` that does nothing, leaves every start `pending` for `engine.runPending()` — which only the worker loop calls. With no `durable:work` and no `worker: { embedded: true }`, nothing ever does.
+- **The starting process died or was draining.** A process that is shutting down refuses to pick up new runs, and one that crashed between the write and the pickup takes the microtask with it. The run stays `pending` for the next worker-loop tick.
+- **Namespace mismatch.** The poll paths only act on runs in the engine's own `namespace`. A run started with `opts.namespace` (or from a pool) that no engine polls just sits — see [Tenancy](/docs/durable/concepts/tenancy#pitfalls).
+
+**Fix:** make sure at least one process ticks the worker loop (`node ace durable:work`, or `worker: { embedded: true }` on a web process) in the run's namespace. The next tick picks the run up with no manual action.
+
+## A run is stuck in `running`
+
+**Symptom:** the dashboard shows `running` and nothing moves, typically after a deploy or a crash.
+
+**Cause:** the process that held the run's lease died. A live executor renews its lease every `leaseMs / 2`; a dead one stops, and `recoverIncomplete()` reclaims the run once the lease lapses — but only a ticking worker loop calls `recoverIncomplete()`. If the run's `recoveryAttempts` keeps climbing, it is being reclaimed and crashing the process every time: a poison pill.
+
+**Fix:** run a worker loop and wait about `leaseMs` (default 30 s). For a poison pill, set `maxRecoveryAttempts` so it moves to `dead` instead of crash-looping, then fix and `node ace durable:retry <runId>`. A run that is genuinely busy in a long `ctx.localStep` also reads `running` — its lease keeps renewing, so recovery leaves it alone.
+
+## A run is stuck in `suspended`
+
+**Symptom:** the run is parked at `suspended` and never resumes.
+
+**Cause:** `suspended` means it is durably waiting on something — a `ctx.sleep` timer, a `ctx.waitForSignal` token, a child, a webhook, or a dispatched `ctx.step` result. Find out which: the dashboard's run graph shows the pending node, and `durable:runs` shows the age of its oldest pending remote step. Then:
+
+- **A timer that never fires** — see [the next entry](#timers-sleeps-and-schedules-never-fire).
+- **A signal token mismatch.** `waitForSignal(token)` waits on a global string, not a run-scoped one. A sender that spells the token differently delivers to nobody — the payload is buffered under its own token and waits for a matching waiter that never comes. Derive the token from something both sides know (`approve:${orderId}`).
+- **A lost remote dispatch.** The worker died holding the job, or the transport dropped it: the step's checkpoint sits `pending` forever and, by design, the engine will not guess that a slow worker is dead. That is [the stranded signature](/docs/durable/reliability/failure-modes#the-stranded-signature).
+
+**Fix:** deliver the right signal (`engine.signal(token, payload)`); for a stranded step, `engine.redispatchPending(runId)` re-enqueues its pending remote checkpoints now, and `remoteRedispatchMs` self-heals future ones. `node ace durable:runs --stale` lists the candidates, and `engine.onStalled` pages you about them. If the wait can never be satisfied, cancel the run.
+
+## Timers, sleeps and schedules never fire
+
+**Symptom:** `ctx.sleep` never wakes, a retry backoff never retries, a `{ timeoutMs }` signal wait never times out, an `executionTimeout` never cancels, or a scheduled workflow never starts.
+
+**Cause:** all of them are driven by the worker loop's phases (`resumeDueTimers`, `sweepTimeouts`, schedules), not by in-process timers. A web process does not run that loop unless you ask it to:
+
+- no `node ace durable:work` process, and no `worker: { embedded: true }`;
+- `worker.embedded` set, but the process is not the `web` environment (the embedded loop deliberately never starts in a console process);
+- the loop runs, but in a different `namespace` from the runs;
+- for runtime schedules created through `engine.schedules`, `persistedSchedules: true` is not set; for `cron` schedules, the optional `cron-parser` peer is not installed.
+
+**Fix:** run the loop where the runs live — see [Scheduling → Running the loop in the web process](/docs/durable/authoring/scheduling#running-the-loop-in-the-web-process) and [`durable:work`](/docs/durable/cli#durablework--the-worker-loop).
+
+## `waitForRun` or `Workflow.start()` hangs on a multi-pod deployment
+
+**Symptom:** `await engine.waitForRun(runId)` — or the blocking `BaseWorkflow.start(input)`, which is built on it — never returns (or hits its timeout), although the dashboard shows the run `completed`.
+
+**Cause:** `waitForRun` reads the run once, then waits for its lifecycle events on **this** engine instance. Without a control plane, events stay on the process that produced them. If the run suspended and was resumed elsewhere — by `durable:work` after a `ctx.sleep`, by a signal handled on another pod, by a worker that consumed the step result — the waiting process never hears it settle.
+
+**Fix:** add [`controlPlanes.redis`](/docs/durable/transports/control-plane) so events fan out to every pod, or don't block a request on a long-lived run: `dispatch` it, return the run id, and poll `getRun`.
+
+## Cancelling a run does not stop the work in progress
+
+**Symptom:** you cancel a run, its status reads `cancelled` at once, yet the step it was executing on another pod keeps going.
+
+**Cause:** the cancel itself is durable — the run row is `cancelled`, the executing turn's later settle is refused, and nothing resumes it again. What reaches the executing process is a **broadcast**, and without a control plane it is local only. Even with one, the engine does not abort user code by itself: it fires `engine.onCancel(listener)` on every instance, and in-flight work stops only if you wired a listener that aborts it.
+
+**Fix:** add a control plane for cross-pod delivery, and use `engine.onCancel` to abort long work cooperatively. Make steps idempotent: a step that finishes after the cancel has done its side effect.
+
+## Jobs stuck in `active` on the queue transport
+
+**Symptom:** on `transports.queue(...)`, jobs sit in the backend's `active` state, checkpoints stay `pending`, and nothing completes.
+
+**Cause:** in rough order of likelihood:
+
+- **`@adonisjs/queue` 0.7 on a durable release older than 0.45.** The 0.7 adapter contract finishes a claim by its lease token; older durable releases passed the job id, which on Redis finished nothing and left every job `active` (and the stalled sweep then delivered it again, running each step twice).
+- **A worker vanished mid-step.** A claim is never renewed while a worker processes it, so the stalled-claim sweep only re-delivers it once it is older than `stalledThresholdMs` — **30 minutes** by default — and fails a job permanently after `maxStalledCount` (default 3) reclaims. Adapters without `recoverStalledJobs` are skipped, so their jobs are never re-delivered.
+- **A short-lived process claimed it and died.** Before `consumers` existed, any `node ace` command consumed broker jobs; the symptom was `active` jobs stamped with the ids of long-gone commands. `consumers: 'always'` brings that behaviour back.
+- **Older releases' results loop.** A result whose resumed turn awaited the next `timeoutMs` step on the same serial loop could deadlock until a liveness timer fired; fixed in 0.38.2.
+
+**Fix:** upgrade to a current release; wait out (or lower, carefully) `stalledThresholdMs`; for an adapter that cannot reclaim, `engine.redispatchPending(runId)` re-drives the run from its checkpoint, which is the source of truth. Keep `consumers` at `'auto'` (or `'never'` on web pods). See [Stalled-job reclaim](/docs/durable/transports/queue#stalled-job-reclaim).
+
+## A step runs twice
+
+**Symptom:** a side effect happens more than once for one logical run — an email sent twice, a charge attempted twice.
+
+**Cause:** rarely a completed step re-running on replay — a `completed` checkpoint short-circuits replay. The usual suspects:
+
+- **The side effect lives in the workflow body**, not in a step. The body re-runs from the top on every replay; only step results are checkpointed.
+- **A redelivery window shorter than the step.** On the queue transport, `stalledThresholdMs` below your longest step re-delivers a job whose worker is merely slow. Likewise `remoteRedispatchMs` below a step's real duration re-dispatches a live, non-heartbeating step.
+- **A crash between the work and its checkpoint.** If a process dies after a worker ran a step but before its result was recorded, the step runs again on recovery. That is inherent to at-least-once execution.
+
+**Fix:** move side effects into `ctx.localStep` / `ctx.step` (or `ctx.sideEffect` for a value); raise `stalledThresholdMs` / `remoteRedispatchMs` above the longest legitimate step; make handlers idempotent on the stable `stepId` (`runId:seq`) they receive.
+
+## A `node ace` command hangs, or waits forever for a step
+
+**Symptom:** a script that starts a run and awaits a remote step never gets the result; or a command such as `node ace codegen` never exits.
+
+**Cause:**
+
+- **The script is a pure producer.** With the default `consumers: 'auto'`, a `console`/`repl` process does not start the broker consumer loops — on purpose, because a one-off process that consumes claims jobs it then dies holding, steals results addressed to the long-lived engine, and never exits while jobs are queued. So nothing in the script hears the result.
+- **A warmup command on an older release** built the engine at boot, opening queue, Redis and database connections nothing closed. Fixed in 0.45.
+
+**Fix:** start the run and let the worker fleet do the work, or set `consumers: 'always'` for a script that genuinely must round-trip a step inline (it competes with the fleet while it runs). Upgrade for the warmup hang. See [`consumers`](/docs/durable/transports/queue#consumers--why-a-node-ace-script-does-not-drain-the-queue).
+
+## Web pods take step jobs and results away from the workers
+
+**Symptom:** on the queue transport, steps execute on web pods, or results are consumed by pods that then have to resume runs mid-request.
+
+**Cause:** web processes consume eagerly, and the queues are point-to-point, so each delivery lands on whichever process polls first. See [Delivery under multiple instances](/docs/durable/reliability/multi-instance).
+
+**Fix:** set `consumers: 'never'` on the web fleet — `durable:work` re-enables consumption for itself. This gate is implemented by the `queue` transport only; `db` and `bullmq` consume in every process that boots them.
+
+## Durable jobs fail under `queue:work`
+
+**Symptom:** after pointing `node ace queue:work` at every queue, durable step jobs end up failed.
+
+**Cause:** durable's jobs are never meant for `queue:work`. On `@adonisjs/queue` 0.7 a worker that meets a job class it does not know puts it back up to `unknownJobRetries` times, then fails it.
+
+**Fix:** keep `queue:work` off durable's `<prefix>:…` queues (default prefix `durable`); `durable:work` serves them.
+
+## A run went `dead`
+
+**Symptom:** the run's status is `dead`, a terminal state distinct from `failed`.
+
+**Cause:** `maxRecoveryAttempts` is set and the run exceeded it: crash recovery kept resuming it, and it kept taking the process down — a deserialization bug, an unguarded non-deterministic change, an infinite loop. The engine stopped touching it, with a `max_recovery_attempts` error.
+
+**Fix:** `dead` is terminal but not lost. Diagnose from its history, ship the fix, then `node ace durable:retry <runId>` (or the dashboard's Retry). Use `engine.onDead` or a DLQ workflow for alerting. See [Dead-letter queue](/docs/durable/reliability/dead-letter).
+
+## A step fails on its first attempt, or after exhausting retries
+
+**Symptom:** either the run fails after a step used up its `retries`, or it fails on the very first attempt even though `retries` is higher.
+
+**Cause:** both are correct behaviours. `retries` defaults to 1 (a single try); an ordinary throw is retried up to that budget with the step's backoff. A `FatalError` is never retried, whatever `retries` says — `NestedWorkflowCallError` is one too.
+
+**Fix:** for instant failures, check whether the step or a library it calls throws `FatalError` for that condition. For slow failures, raise `retries` / `backoffMaxMs` if the downstream is expected to recover. See [Retries & backoff](/docs/durable/reliability/retries).
+
+## `SignalTimeoutError`
+
+**Symptom:** `ctx.waitForSignal(token, { timeoutMs })` throws `timed out after 259200000ms waiting for signal "approve:order-42"`.
+
+**Cause:** expected — it is how a bounded wait reports that its deadline passed before a signal arrived. (`ctx.waitForEvent` with `timeoutMs` throws the same error.)
+
+**Fix:** catch it and branch:
+
+```ts
+import { SignalTimeoutError } from '@adonis-agora/durable'
+
+try {
+  const decision = await ctx.waitForSignal<Decision>(`approve:${order.id}`, {
+    timeoutMs: 3 * 24 * 60 * 60 * 1000,
+  })
+  return decision.approved ? { status: 'approved' } : { status: 'rejected' }
+} catch (err) {
+  if (err instanceof SignalTimeoutError) return { status: 'expired' }
+  throw err
+}
+```
+
+A bounded wait takes **two** logical positions (the deadline and the wait), so adding or removing `{ timeoutMs }` on a wait with runs in flight is a shape change: treat it like a version change. See [Sleep & signals](/docs/durable/concepts/sleep-and-signals).
+
+## `node ace migration:run` hangs on the durable migration
+
+**Symptom:** the durable tables migration never finishes, typically on SQLite or any `pool: { max: 1 }` setup.
+
+**Cause:** `createDurableTables` checks out its own connection from the pool. Inside the migrator's transaction, the single connection is already held, so it waits until the acquire timeout.
+
+**Fix:** keep `static disableTransactions = true` on the migration (the published one has it). See [Lucid → Run the migration](/docs/durable/stores/lucid).
+
+## A boot warning says the schema was repaired in place
+
+**Symptom:** at boot, `@adonis-agora/durable: repaired the durable schema in place — added …`.
+
+**Cause:** the database was behind the installed library version, and `autoSchema` (on by default) added the missing columns or indexes at runtime. Nothing recorded that in your migration history.
+
+**Fix:** run `node ace migration:run` so the change is recorded like any other. If your database user may not run DDL at boot, set `autoSchema: false` and run the migration after every upgrade. (On releases before 0.38.3, an index repair run inside an open transaction could abort it — `current transaction is aborted` on every later statement — upgrade if you see that.) See [Lucid → The repair warning](/docs/durable/stores/lucid#the-repair-warning).
+
+## The dashboard denies access, or shows no runs
+
+**Symptom:** the console answers with its access-denied page, or loads with an empty run list.
+
+**Cause:**
+
+- **Access denied.** The default `authorize` fails closed in every environment: it requires a bearer token equal to `DURABLE_DASHBOARD_TOKEN` and denies everything when that variable is unset.
+- **No runs.** With no `store` configured, the engine uses the in-memory store, so each process only sees its own runs — and loses them on restart. Two pools on different namespaces, or a dashboard pointed at a different Lucid connection, also see different sets.
+- **Empty worker health.** `engine.workerHealth()` and the `/api/health` panel read group health off the transport, and only `bullmq` reports it; on `queue`, `db` or `eventEmitter` it is empty, not "healthy".
+
+**Fix:** set the token or your own `authorize` ([Dashboard → Authorization](/docs/durable/observability/dashboard#authorization)); select the [Lucid store](/docs/durable/stores/lucid); for stranded-run detection off BullMQ, use `durable:runs --stale` or `engine.onStalled`.
+
+## Two pools execute each other's runs
+
+**Symptom:** a run started by one deployment executes on another that shares the database or broker, or a direct `resume` throws `NamespaceMismatch`.
+
+**Cause:** both engines left `namespace` unset, so both are `'default'` — by construction the same pool.
+
+**Fix:** set a distinct `namespace` per pool. See [the two-pools mistake](/docs/durable/reliability/failure-modes#namespaces-the-classic-two-pools-mistake).

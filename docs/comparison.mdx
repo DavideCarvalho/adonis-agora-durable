@@ -1,0 +1,132 @@
+---
+title: Comparison
+description: How @adonis-agora/durable compares to plain @adonisjs/queue jobs, Temporal, Inngest, and BullMQ — what the suspend-model library approach buys you, and when a dedicated orchestration cluster or a managed platform is the better call.
+icon: GitCompareArrows
+---
+
+Durable execution is a crowded space, and the honest answer to "which one?" is *it depends on your
+architecture*. This page positions `@adonis-agora/durable` against the tools people most often weigh
+it against — starting with the one every AdonisJS app already has, `@adonisjs/queue` — as fairly as we
+can manage.
+
+The short version: `@adonis-agora/durable` is a **library, not a platform**. It lives inside your AdonisJS
+app as a provider, persists state to the SQL database you already run through [Lucid](/docs/durable/stores/lucid),
+and dispatches steps over the queue you already have — or over that same database, with no broker at all.
+There is no extra server to deploy, no vendor to sign up with, and no new language runtime — the trade
+being that *you* own scaling and operations, the way you already do for the rest of your app.
+
+## At a glance
+
+| | @adonis-agora/durable | @adonisjs/queue | Temporal | Inngest | BullMQ |
+| --- | --- | --- | --- | --- | --- |
+| Shape | AdonisJS library (provider) | AdonisJS job queue | Orchestration cluster + SDKs | Managed platform (or self-host) | Queue library |
+| Extra infra | none — your DB + optional queue | its adapter (Redis or a database) | Temporal server + its DB | Inngest server / cloud | Redis |
+| State lives in | your Postgres/MySQL/SQLite | job payloads in the adapter | Temporal's persistence | Inngest's store | Redis |
+| Workflow model | replay + suspend, plain async code | independent jobs (no replay) | replay, plain code | step memoization over HTTP | jobs + flows (no replay) |
+| Waits (sleep/signal) | zero-compute suspend | delayed jobs only | zero-compute | zero-compute | delayed jobs only |
+| Sagas (compensation) | built-in — `{ compensate }` on any step | — | manual try/catch pattern | manual | — |
+| Event triggers | `onEvent` + `eventBatch` (debounce/batch), `@OnEvent` / `@OnDiagnostic` | dispatch by hand | schedules; signal-with-start by hand | core feature (debounce, batch) | — |
+| Per-key mutex | `singleton` (FIFO per key) | — | one run per workflow id | concurrency key = 1 | Pro only (groups) |
+| Durable entities | built-in (`engine.registerEntity`) | — | — | — | — |
+| Cross-language | TS + Python workers, one workflow | JS/TS only | per-language SDKs | HTTP (any language) | JS/TS only |
+| DI integration | AdonisJS container (`@inject()`) | AdonisJS container | manual | framework-agnostic | manual |
+| Dashboard | built in, plus a Telescope view | adapter tooling | Temporal Web | Inngest dashboard | third-party (Taskforce, Bull Board) |
+| Scale ceiling | your DB's write throughput | its adapter's throughput | very high (dedicated cluster) | managed for you | Redis throughput |
+
+## vs plain `@adonisjs/queue` jobs
+
+This is the comparison that matters most in practice, because `@adonisjs/queue` is what an AdonisJS app
+reaches for first — and this library **runs happily on top of it** as its cross-process
+[transport](/docs/durable/transports/queue).
+
+A queue gives you jobs: a class under `app/jobs/` with an `execute()`, dispatched to a worker. What it does
+not give you is a *durable function*: there is no replay, so a multi-step process must be modeled as a
+chain of independent jobs passing state through their payloads. The "what happened so far" lives
+implicitly across jobs; a crash between them leaves you reconstructing progress; waiting on a human
+approval or a payment callback means inventing a persistence scheme for the half-finished flow.
+
+`@adonis-agora/durable` keeps the queue underneath for what it's great at — moving step invocations
+between processes — and adds the durable layer on top: the whole flow is one readable `run(ctx, input)`,
+every step is checkpointed, waits are `await ctx.sleep(...)` / `await ctx.waitForSignal(...)` that survive
+deploys, and one [dashboard](/docs/durable/observability/dashboard) shows the end-to-end run. The authoring
+convention is a deliberate parallel — `app/jobs` → `app/workflows`, `make:job` → `make:workflow`,
+`Job.dispatch()` → `Workflow.dispatch(input)` — so moving a job over is mechanical (see
+[From a queue job to a durable workflow](/docs/durable/authoring/app-workflows#from-a-queue-job-to-a-durable-workflow)).
+
+Choose **a plain job** for fire-and-forget background work — a resize, an email, a webhook delivery — where
+each job is independent and "workflow" would be overkill. Choose **`@adonis-agora/durable`** the moment a
+process has *steps that must not re-run*, *waits*, or *state that outlives a deploy*.
+
+## vs Temporal
+
+Temporal is the reference implementation of durable execution, and its model — deterministic replay
+of plain code — is the same one this library uses. If you've written a Temporal workflow,
+`ctx.step` / `ctx.sleep` / signals / `ctx.patched` will all feel familiar; even the
+[query/update split](/docs/durable/authoring/queries-and-updates) is deliberately Temporal-shaped. A few
+things Temporal leaves as hand-rolled patterns are first-class here: [saga compensation](/docs/durable/reliability/sagas)
+is a `{ compensate }` option on any step (undone in reverse, durably) instead of a try/catch you write
+yourself, and [durable entities](/docs/durable/authoring/entities) — keyed, serialized actors — have no
+Temporal equivalent at all.
+
+The difference is operational. Temporal is a **separate orchestration cluster**: its own server,
+its own database, its own deployment lifecycle, workers connecting over gRPC. That buys enormous
+scale, multi-region namespaces, and battle-tested guarantees — and costs you a second distributed
+system to run (or a Temporal Cloud bill). `@adonis-agora/durable` inverts the trade: the engine is a
+provider in your app, state is rows in your existing database, and "deploying the orchestrator" is
+just deploying your app.
+
+Choose **Temporal** when workflow orchestration is a core, high-scale concern — millions of
+concurrent runs, many teams, many languages — and a dedicated cluster earns its keep.
+Choose **`@adonis-agora/durable`** when you're an AdonisJS shop that wants durable
+checkout/onboarding/pipeline flows without adopting and operating a second platform.
+
+## vs Inngest
+
+Inngest attacks the same problem from the serverless direction: your steps are memoized function
+invocations driven over HTTP by the Inngest server, which makes it a natural fit for
+Vercel/Netlify-style deployments and event-driven fan-out. It is excellent at what it does, and its
+managed offering removes the ops question entirely.
+
+The differences that matter here: `@adonis-agora/durable` workflows are **`BaseWorkflow` classes built
+by the AdonisJS container** — steps are `@Step` methods on injectable classes, tested like any other
+service — and the suspend model parks a waiting run as a database row rather than re-invoking a function
+per step. State stays in *your* database (a hard requirement in regulated or air-gapped environments), and
+step dispatch rides your own [transport](/docs/durable/transports) (in-process, `@adonisjs/queue`, plain
+DB polling, or BullMQ) instead of inbound HTTP. Inngest's signature event ergonomics have direct analogues
+too: [`onEvent` with `eventBatch`](/docs/durable/authoring/events#coalescing-bursts--eventbatch)
+starts workflows from published events with the same coalescing patterns ("reindex at most once the source
+goes quiet", "process uploads in batches"), and [`@OnEvent` / `@OnDiagnostic`](/docs/durable/authoring/event-triggers)
+bridge the Adonis emitter and diagnostics channels in without wiring.
+
+Choose **Inngest** for serverless/edge architectures or when you want a managed platform with
+event-driven ergonomics. Choose **`@adonis-agora/durable`** for long-running AdonisJS services,
+container-first codebases, and data-residency constraints.
+
+## vs BullMQ
+
+BullMQ gives you jobs and queues: retries, priorities, rate limits, delayed jobs, and flows for
+parent/child trees. Like a plain queue job, it has no replay, so the same limits apply: a multi-step
+process is a chain of handlers passing state through job data, and long waits need a persistence scheme
+of your own.
+
+In AdonisJS you'd usually meet BullMQ through `@adonisjs/queue`, which is this library's primary
+cross-process transport. A dedicated `transports.bullmq(...)` driver also exists for a specific reason:
+it is byte-compatible with the NestJS `nestjs-durable` BullMQ transport and its Python worker, so an
+AdonisJS engine and NestJS or [Python](/docs/durable/python) workers can share one Redis.
+
+Choose **plain BullMQ** for independent background jobs where "workflow" would be overkill. Choose
+**`@adonis-agora/durable`** — on whichever transport you already run — once a process has steps that must
+not re-run, waits, or state that outlives a deploy.
+
+## Where @adonis-agora/durable is honestly weaker
+
+- **Scale ceiling.** The engine writes checkpoints to your SQL database. That's a feature (one
+  source of truth, your backup story) until your run volume makes checkpoint writes a hot spot —
+  a dedicated cluster like Temporal moves that ceiling far higher.
+- **Ecosystem maturity.** Temporal has a decade of production hardening and a large community;
+  this library is younger and AdonisJS-scoped by design.
+- **Languages.** Cross-language support today means TypeScript workflows with Python workers (or
+  Python-authored workflows over the same protocol) — not the per-language SDK breadth of Temporal.
+
+If those are your constraints, use the bigger tool. If they aren't, skipping a second platform is
+a real simplification — in code, in ops, and in the audit story.
