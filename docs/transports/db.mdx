@@ -42,7 +42,7 @@ const transport = new DbTransport({ db }) // pass { partition } to isolate this 
 transport.handle('pipeline:extract', async (input) => extract(input))
 ```
 
-Each handler name maps to a routing token — the sanitized handler name, suffixed `@<partition>` when the instance sets `partition` — and one `DbTransport` instance claims rows for every token it registered. On the engine side the loops start when the engine registers its result, heartbeat, and control handlers; on the worker side the first `handle()` starts the task loop. `start()` is an explicit no-op convenience that reopens the pollers and waits for the schema; `stop()`/`close()` stop every loop and wait up to 5 seconds for in-flight ticks, so a claimed task mid-handler gets to write its result instead of being left to lease expiry. Neither closes the shared Lucid `Database`.
+Each handler name maps to a routing token — the sanitized handler name, suffixed `@<partition>` when the instance sets `partition` — and one `DbTransport` instance claims rows for every token it registered. On the engine side the loops start when the engine registers its result, heartbeat, and control handlers; on the worker side the first `handle()` starts the task loop. `start()` is an explicit no-op convenience that reopens the pollers and waits for the schema; `stop()`/`close()` stop every loop and wait up to `closeTimeoutMs` (5 seconds) for in-flight work, so a claimed task mid-handler gets to write its result. Anything still unfinished after that is [handed back](#closing-a-worker-hands-its-claims-back) for another worker to pick up at once. Neither closes the shared Lucid `Database`.
 
 Trade-off vs a real broker: throughput is bounded by polling + row contention — great for workflow/pipeline scale (modest rate, long steps), not for high-fanout firehoses. But it adds **zero new infrastructure** — no Redis, no SQS — which is often the right trade.
 
@@ -57,11 +57,17 @@ db: transports.db({
 }),
 ```
 
-The slots share the one poll loop. Each poll claims only as many rows as there are free slots (never more than `batchSize`), so a busy worker never holds rows an idle sibling could run, and when every slot is busy the loop waits for one to free instead of polling. Every claim the worker holds is renewed (see [the claim protocol](#the-claim-protocol)), and `stop()`/`close()` waits within its 5s budget for every running slot. Fleet-wide parallelism for a step is `concurrency × worker processes`; use a [flow-control queue](/docs/durable/reliability/flow-control) for a cap across the fleet.
+The slots share the one poll loop. Each poll claims only as many rows as there are free slots (never more than `batchSize`), so a busy worker never holds rows an idle sibling could run, and when every slot is busy the loop waits for one to free instead of polling. Every claim the worker holds is renewed (see [the claim protocol](#the-claim-protocol)), and `stop()`/`close()` waits within its `closeTimeoutMs` budget for every running slot. Fleet-wide parallelism for a step is `concurrency × worker processes`; use a [flow-control queue](/docs/durable/reliability/flow-control) for a cap across the fleet.
 
 `concurrency: 'adaptive'`, or `{ mode: 'adaptive', min, max, start, tickMs, ramCeilingPct, cpuCeilingPct }`, lets the worker tune its own limit with the controller the [queue](/docs/durable/transports/queue#adaptive-concurrency) and [BullMQ](/docs/durable/transports/bullmq#concurrency) transports use, with the same fields and defaults. It grows the limit while steps saturate it at a steady latency, and shrinks it when steps start to queue, on errors or stalls, at the CPU ceiling, or when RSS reaches `ramCeilingPct`. The task loop reads the live limit on every poll. A lower limit lets running tasks finish and claims nothing new until in-flight work is under it.
 
 Idle task, heartbeat and control loops **back off**: after each empty poll the sleep doubles, up to `idleBackoffMax × pollIntervalMs` (800ms by default), and the first row found resets it. The cost is up to that much extra pickup latency for the first task after a quiet spell; `idleBackoffMax: 1` restores the fixed cadence. The results loop never backs off, because every result is on its workflow's critical path.
+
+## Priority
+
+A dispatch's `priority` (from `ctx.step(..., { priority })`; higher is more urgent) is stored on the task row, and workers claim **higher priority first, then oldest**. A dispatch without a priority is stored as `0`, "normal": a positive priority runs ahead of it, a negative one behind it. The `queue` transport places an unprioritised job in the same middle position. The value is rounded and clamped to a 32-bit integer. Unlike the `queue` transport's 1–10 broker scale, the full range is kept, so `priority: 7` still runs ahead of `priority: 6`.
+
+Ordering is best-effort, like on the broker transports. It decides which row a free slot claims next, but it never interrupts a running step, and rows claimed in the same poll start together.
 
 ## Worker health
 
@@ -82,6 +88,12 @@ A task row whose claim lapses (its worker crashed, or blocked its event loop pas
 
 Only task rows are bounded. A result, heartbeat or control row whose engine dies while handling it is re-delivered after the lease, without a count.
 
+### Closing a worker hands its claims back
+
+Only a claim that *lapses* counts. When a worker shuts down cleanly (`close()`/`stop()`, which `durable:work` calls on SIGTERM), it waits up to `closeTimeoutMs` for in-flight work. Then it clears the claim on every row it still holds: running tasks, and any result, heartbeat or control batch it was still handling. It clears a claim only where `claimed_by` is still its own. The next poll on any worker claims those rows as fresh, at once rather than after `leaseMs`, and `reclaims` does not go up, so a long step that spans several deploys is never failed as poison. A worker that dies without closing (SIGKILL, OOM, a lost node) cannot hand anything back. Its rows wait out the lease, and each such takeover counts.
+
+A handler still running when its row is handed back keeps running in the closing process, since it cannot be aborted. Another worker may run the same step meanwhile. The closing worker then drops its own result and reports it to `onError`, so steps should be idempotent. Raise `closeTimeoutMs` if your steps usually finish within a longer drain.
+
 ## Options — `transports.db(config)`
 
 | Option | Default | Description |
@@ -97,6 +109,7 @@ Only task rows are bounded. A result, heartbeat or control row whose engine dies
 | `resultConcurrency` | `1` | How many step results the engine side settles at once. |
 | `idleBackoffMax` | `4` | Idle backoff for the task, heartbeat and control loops, in poll intervals. `1` disables it. The results loop never backs off. |
 | `maxStalledCount` | `3` | How many times a task row's lapsed claim may be taken over before the row is failed as a [poison task](#poison-tasks). |
+| `closeTimeoutMs` | `5000` | How long `close()`/`stop()` waits for in-flight work before [handing every remaining claim back](#closing-a-worker-hands-its-claims-back), uncounted. |
 | `workerHeartbeatIntervalMs` | `10000` | How often a worker refreshes its [liveness key](#worker-health) per served step name. Keys live at least 35s. |
 | `autoCreate` | `true` | Create the transport tables on first use, and add columns introduced by later releases to existing tables (in addition to the published migration). |
 | `instanceId` | random uuid | Stable process id stamped on claims, liveness keys and control messages. |
@@ -127,7 +140,7 @@ The published migrations create five tables (default names):
 | `durable_transport_control` | bidirectional | lifecycle events + cancellation (best-effort, single-consumer) |
 | `durable_transport_worker_keys` | worker → engine | the [worker advertisement](/docs/durable/transports#worker-advertisement): each live worker's descriptor and heartbeat, with an expiry |
 
-`durable_transport_tasks` carries `step_id` (`<runId>:<seq>`, the primary key and step identity), `run_id`, `seq`, `name` (the handler key), `grp` (the routing token workers claim by), `namespace`, `input`, `traceparent`, `context`, `transport`, `attempt`, `reclaims` (how many times a lapsed claim on the row was taken over), plus the claim columns `claimed_by`/`claimed_at` and `created_at`. The results table mirrors it with `status` (`completed` or `failed`), `output`, `error`, `events`, and `started_at` (when the worker picked the task up — what powers queue-wait timing in the dashboard). Heartbeats and control rows use an auto-increment `id` as their key; control rows carry the whole message as a JSON `payload`.
+`durable_transport_tasks` carries `step_id` (`<runId>:<seq>`, the primary key and step identity), `run_id`, `seq`, `name` (the handler key), `grp` (the routing token workers claim by), `namespace`, `input`, `traceparent`, `context`, `transport`, `attempt`, `reclaims` (how many times a lapsed claim on the row was taken over), `priority` (the dispatch priority rows are claimed by, `0` when absent), plus the claim columns `claimed_by`/`claimed_at` and `created_at`. The results table mirrors it with `status` (`completed` or `failed`), `output`, `error`, `events`, and `started_at` (when the worker picked the task up — what powers queue-wait timing in the dashboard). Heartbeats and control rows use an auto-increment `id` as their key; control rows carry the whole message as a JSON `payload`.
 
 Every channel table has a `namespace` column (default `'default'`) and an index leading with it; every claim is scoped to the instance's namespace.
 
@@ -139,8 +152,9 @@ Columns added after the first release are back-filled on existing tables by `cre
 | --- | --- | --- |
 | `namespace` | every channel table | `string`, not null, default `'default'`, so legacy rows stay in the default namespace |
 | `reclaims` | `durable_transport_tasks` | `integer`, not null, default `0`, so in-flight rows start uncounted |
+| `priority` | `durable_transport_tasks` | `integer`, not null, default `0`, so existing rows are "normal" priority |
 
-With `autoCreate: false`, add the columns yourself in a migration of your own (`table.integer('reclaims').notNullable().defaultTo(0)`). Until you do, tasks still run, but takeovers are not counted and the [poison bound](#poison-tasks) is off; the transport reports this once through `onError`.
+With `autoCreate: false`, add the columns yourself in a migration of your own (`table.integer('reclaims').notNullable().defaultTo(0)` and `table.integer('priority').notNullable().defaultTo(0)`). Until you do, tasks still run: without `reclaims`, takeovers are not counted and the [poison bound](#poison-tasks) is off; without `priority`, dispatch priority is ignored and rows are claimed oldest first. The transport reports each missing column once through `onError`.
 
 The worker-key table is a key/value board, not a message channel: `key` (primary key), `value`, and `expires_at`. Each write upserts its key and sweeps expired ones; it has no `namespace` column because the keys embed the namespace.
 
@@ -160,7 +174,7 @@ There is no dependency on a dialect's native JSON or date type, and no dialect-s
 
 A worker claims rows atomically, runs each task outside the lock, then records the result — portable across SQLite, Postgres, and MySQL without `FOR UPDATE SKIP LOCKED`:
 
-1. **Claim** — select candidate rows for the served tokens that are unclaimed *or* whose lease expired (`claimed_at IS NULL OR claimed_at < now − leaseMs`), oldest first, bounded by the free slots; then conditional `UPDATE`s stamp a unique per-round token into `claimed_by`/`claimed_at` (and add one to `reclaims` on a row whose lapsed claim it takes over); then select back the rows that match this round's token. Two instances can never claim the same row because the token is unique per claim round.
+1. **Claim** — select candidate rows for the served tokens that are unclaimed *or* whose lease expired (`claimed_at IS NULL OR claimed_at < now − leaseMs`), highest `priority` first and then oldest, bounded by the free slots; then conditional `UPDATE`s stamp a unique per-round token into `claimed_by`/`claimed_at` (and add one to `reclaims` on a row whose lapsed claim it takes over); then select back the rows that match this round's token. Two instances can never claim the same row because the token is unique per claim round.
 2. **Run** — re-check that the round still holds the row, then execute the handler for `name` with the parsed `input`.
 3. **Record** — in one transaction, delete the task row **where `claimed_by` is still this round's token** and, only if that deleted it, insert the result row (idempotent on `step_id`).
 

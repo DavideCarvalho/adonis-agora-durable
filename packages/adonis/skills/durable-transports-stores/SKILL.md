@@ -93,9 +93,14 @@ implements `groupHealth`: `depth` = pending + claimed task rows of the group.
 Each takeover of a lapsed claim bumps the row's `reclaims` column; past
 `maxStalledCount` (default 3) the row is deleted and a retryable failed
 `StepResult` (`remote step worker failed: claim lapsed more than N times`) is
-published. `autoCreate` / `createDurableTransportTables` add `reclaims` to an
-existing table; with `autoCreate: false` add it yourself (integer, not null,
-default 0) or the poison bound stays off.
+published. `close()` (after `closeTimeoutMs`, default 5s) clears every claim it
+still holds, uncounted, so another worker takes the rows at once and a deploy
+never pushes a step toward the poison bound; only a crash (no close) counts.
+Dispatch `priority` is stored on the row (`0` when absent = normal) and rows
+are claimed highest priority first, then oldest. `autoCreate` /
+`createDurableTransportTables` add `reclaims` and `priority` to an existing
+table; with `autoCreate: false` add them yourself (integer, not null, default
+0), or the poison bound / priority ordering stay off.
 
 Trade-off: throughput is bounded by polling + row contention — right for
 workflow-scale modest rates, not high-fanout firehoses. Delivery is

@@ -86,7 +86,7 @@ When the queue has a free slot, the call is admitted immediately. When it is con
 
 ### Priority
 
-`priority` on the call opts is admission priority *within a queue*: higher is admitted first when a slot is contended (absent = unprioritised). The same value also rides along as **broker** priority: it is carried onto the dispatched `RemoteTask`, and the [`bullmq` transport](/docs/durable/transports/bullmq#priority) translates it into a BullMQ job `priority` (BullMQ runs the lowest number first, so the engine maps "higher wins" onto it), so an urgent task can also jump ahead of already-enqueued lower-priority ones at the worker's own queue. Transports without broker priority ignore it.
+`priority` on the call opts is admission priority *within a queue*: higher is admitted first when a slot is contended (absent = unprioritised). The same value also rides along as **broker** priority: it is carried onto the dispatched `RemoteTask`, and the [`bullmq` transport](/docs/durable/transports/bullmq#priority) translates it into a BullMQ job `priority` (BullMQ runs the lowest number first, so the engine maps "higher wins" onto it), so an urgent task can also jump ahead of already-enqueued lower-priority ones at the worker's own queue. The `queue` transport maps it onto its adapter's job priority, and the [`db` transport](/docs/durable/transports/db#priority) stores it on the task row and claims higher priority first. Transports without broker priority ignore it.
 
 ### Fairness
 
