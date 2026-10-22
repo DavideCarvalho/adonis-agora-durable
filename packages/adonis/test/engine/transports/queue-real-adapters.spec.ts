@@ -261,5 +261,40 @@ describe.each(backends)(
         expect(await activeJobs(probe, `${prefix}:tasks:${sanitizeQueueToken(name)}`)).toBe(0);
       },
     );
+
+    it.skipIf(!backend.enabled)(
+      'runs `concurrency` jobs of one step at once and finalizes every claim',
+      async () => {
+        const name = `par-${randomUUID().slice(0, 6)}`;
+        const engine = make();
+        const worker = new QueueTransport({
+          adapter: factory,
+          prefix,
+          pollIntervalMs: 10,
+          stalledCheckIntervalMs: 0,
+          concurrency: 3,
+        });
+        transports.push(worker);
+        const results: StepResult[] = [];
+        engine.onResult(async (r) => void results.push(r));
+        let running = 0;
+        let peak = 0;
+        worker.handle(name, async () => {
+          running += 1;
+          peak = Math.max(peak, running);
+          await new Promise((r) => setTimeout(r, 150));
+          running -= 1;
+          return 'ok';
+        });
+
+        for (let seq = 1; seq <= 6; seq += 1) {
+          await engine.dispatch({ ...task(name), seq, stepId: `r1:${seq}` });
+        }
+        await until(() => results.length === 6, 10_000);
+        expect(peak).toBe(3);
+        await new Promise((r) => setTimeout(r, 50));
+        expect(await activeJobs(probe, `${prefix}:tasks:${sanitizeQueueToken(name)}`)).toBe(0);
+      },
+    );
   },
 );

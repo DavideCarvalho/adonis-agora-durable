@@ -102,11 +102,15 @@ export default defineConfig({
 ```
 
 One instance consumes engine-side results; run one or more `node ace
-durable:work` workers serving the step names. Source:
+durable:work` workers serving the step names. A worker runs ONE job of a step
+name at a time unless `concurrency` is raised (`transports.queue({ connection,
+concurrency: 8, resultConcurrency: 8 })`); the slots share one poll loop. Idle
+task/heartbeat/control loops back off up to `idleBackoffMax × pollIntervalMs`
+(default 4 × 200ms; `1` disables). Source:
 `docs/transports/queue.mdx`.
 
 For wide fans (`ctx.all` over thousands of steps), raise how many results an
-instance settles at once on `bullmq` (`queue` and `db` have no such option),
+instance settles at once on `bullmq` or `queue` (`resultConcurrency`; `db` has no such option),
 let its workers size their step concurrency, and size the engine's due-timer
 batch:
 

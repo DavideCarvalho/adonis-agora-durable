@@ -83,6 +83,9 @@ Upgrading an app from 0.6 to 0.7:
 | `namespace` | from the engine | Worker-pool namespace folded into every queue name. Setting it here is explicit and wins over the engine's propagation of `config.namespace` — see [Namespaces](#namespaces--sharing-one-broker-across-pools). |
 | `prefix` | `'durable'` | Namespaces the queues (`<prefix>:tasks:<token>`, `<prefix>:results`, …). |
 | `pollIntervalMs` | `200` | Poll interval in ms between queue reads. |
+| `concurrency` | `1` | How many jobs of one step name this worker runs at once. More slots share one poll loop, so raising it adds no polling. |
+| `resultConcurrency` | `1` | How many step results the engine side settles at once. |
+| `idleBackoffMax` | `4` | Idle backoff for the task, heartbeat and control loops, in poll intervals: empty polls double the sleep up to this multiple (800ms at the default interval), and a found job resets it. `1` disables it. The results loop never backs off. |
 | `stalledCheckIntervalMs` | `30_000` | How often the stalled-claim reclaim sweep runs. `0` disables it entirely. |
 | `stalledThresholdMs` | `120_000` (2min) | How long a claim may go without being renewed before the sweep presumes its worker dead and re-delivers the job. `1_800_000` (30min) on an adapter without `renewJobs`. |
 | `maxStalledCount` | `3` | How many times one job may be reclaimed before it is failed permanently — the bound on a poison job. |
@@ -91,6 +94,22 @@ Upgrading an app from 0.6 to 0.7:
 | `workerKeys` | the app database | Where the [worker advertisement](/docs/durable/transports#worker-advertisement) lives. Default: the `durable_transport_worker_keys` table through `@adonisjs/lucid`, when the app has it. Pass any `WorkerKeyStore` to keep the keys elsewhere, or `false` to advertise nothing. |
 | `workerKeysConnection` | default Lucid connection | Lucid connection the default worker-key table lives on. |
 | `workerKeysCacheMs` | `5000` | How long a read of the worker keys is reused. |
+
+### Concurrency and idle polling
+
+Every step name a worker serves gets its own task queue and poll loop. By default that loop runs **one job at a time**: a backlog of 100 `sendEmail` steps is worked through serially per worker process. Raise `concurrency` to run several at once:
+
+```ts title="config/durable.ts"
+queue: transports.queue({
+  connection: 'redis',
+  concurrency: 8,        // up to 8 jobs of each step name in flight per worker
+  resultConcurrency: 8,  // the engine settles up to 8 results at once (wide fans)
+}),
+```
+
+The slots share the step's single poll loop — it keeps popping while a slot is free and waits for one to free when all are busy — so `concurrency` costs no extra polling. Every in-flight claim is renewed, and `close()` waits (within its 5s budget) for all of them, like a single one. Fleet-wide parallelism for a step is `concurrency × worker processes`; use a [flow-control queue](/docs/durable/reliability/flow-control) when you need a cap across the fleet.
+
+Polling is the cost of a backend-agnostic queue: each loop asks the adapter for a job every `pollIntervalMs`, and a worker serving 30 step names runs 30 task loops. So idle task, heartbeat and control loops **back off** — the sleep doubles after each empty poll up to `idleBackoffMax × pollIntervalMs` (800ms by default), and the first job found snaps the loop back to the base interval and drains the backlog without sleeping. The price is up to that much pickup latency for the first job after a quiet spell; set `idleBackoffMax: 1` for the old fixed cadence. The results loop never backs off, since every step's result is on its workflow's critical path.
 
 ### Worker advertisement
 

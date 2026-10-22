@@ -1,3 +1,12 @@
+/**
+ * `value` as a count of at least 1, floored; anything else (absent, NaN, Infinity, below 1) is
+ * `fallback`. A NaN slipping through `Math.max(1, …)` turns a slot cap into "unbounded" or a backoff
+ * into a `setTimeout(NaN)` busy loop.
+ */
+export function atLeastOne(value: number | undefined, fallback: number): number {
+  return value !== undefined && Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
+}
+
 /** A running poll loop. Call {@link PollLoop.stop} to end just this one. */
 export interface PollLoop {
   stop(): void;
@@ -46,7 +55,7 @@ export class Pollers {
     this.#intervalMs = intervalMs;
     this.#onError = onError;
     this.#jitterRatio = Math.max(0, Math.min(options?.jitterRatio ?? 0.2, 1));
-    this.#idleBackoffMax = Math.max(1, options?.idleBackoffMax ?? 1);
+    this.#idleBackoffMax = atLeastOne(options?.idleBackoffMax, 1);
   }
 
   /** Whether {@link stopAll} has been called — loops won't run until {@link reopen}. */
@@ -60,8 +69,8 @@ export class Pollers {
   }
 
   /** The next sleep for a loop that has seen `idleRounds` consecutive empty rounds, jittered. */
-  #sleepMs(idleRounds: number): number {
-    const backoff = Math.min(2 ** Math.min(idleRounds, 30), this.#idleBackoffMax);
+  #sleepMs(idleRounds: number, idleBackoffMax = this.#idleBackoffMax): number {
+    const backoff = Math.min(2 ** Math.min(idleRounds, 30), idleBackoffMax);
     const base = this.#intervalMs * backoff;
     if (this.#jitterRatio === 0) return base;
     return Math.round(base * (1 - this.#jitterRatio + 2 * this.#jitterRatio * Math.random()));
@@ -71,8 +80,11 @@ export class Pollers {
    * Start a loop driven by `tick`. `tick` resolves to whether it did any work this round; while it
    * keeps returning `true` the loop drains without sleeping, then sleeps `intervalMs` once a round
    * is empty. Returns a handle that stops just this loop (also stopped by {@link stopAll}).
+   * `options.idleBackoffMax` overrides the instance's idle backoff for this loop only.
    */
-  start(tick: () => Promise<boolean>): PollLoop {
+  start(tick: () => Promise<boolean>, options?: { idleBackoffMax?: number }): PollLoop {
+    const idleBackoffMax =
+      options?.idleBackoffMax === undefined ? undefined : atLeastOne(options.idleBackoffMax, 1);
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let idleRounds = 0;
@@ -90,7 +102,7 @@ export class Pollers {
       }
       idleRounds += 1;
       if (!stopped && !this.#closed) {
-        timer = setTimeout(() => track(), this.#sleepMs(idleRounds - 1));
+        timer = setTimeout(() => track(), this.#sleepMs(idleRounds - 1, idleBackoffMax));
         timer.unref?.();
       }
     };

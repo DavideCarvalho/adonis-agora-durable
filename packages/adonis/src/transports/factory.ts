@@ -85,6 +85,19 @@ export interface QueueTransportConfig {
   /** Poll interval (ms) for the result/task/heartbeat/control loops. Default 200ms. */
   pollIntervalMs?: number;
   /**
+   * How many jobs of one step name a worker runs at once. Default 1. More slots share one poll loop,
+   * so raising it adds no polling.
+   */
+  concurrency?: number;
+  /** How many step results the engine side settles at once. Default 1. */
+  resultConcurrency?: number;
+  /**
+   * Idle backoff for the task, heartbeat and control loops, in poll intervals: empty polls double the
+   * sleep up to this multiple (default 4 — 800ms at the default interval) and a found job resets it.
+   * Bounds an idle worker's backend load; `1` disables it. The results loop never backs off.
+   */
+  idleBackoffMax?: number;
+  /**
    * How often (ms) the stalled-job reclaim sweep runs. On by default (30s); set `0` to disable it.
    * A coarse background check, not run on every poll tick.
    */
@@ -325,6 +338,11 @@ export const transports = {
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
         ...(config.prefix !== undefined ? { prefix: config.prefix } : {}),
         ...(config.pollIntervalMs !== undefined ? { pollIntervalMs: config.pollIntervalMs } : {}),
+        ...(config.concurrency !== undefined ? { concurrency: config.concurrency } : {}),
+        ...(config.resultConcurrency !== undefined
+          ? { resultConcurrency: config.resultConcurrency }
+          : {}),
+        ...(config.idleBackoffMax !== undefined ? { idleBackoffMax: config.idleBackoffMax } : {}),
         ...(config.stalledCheckIntervalMs !== undefined
           ? { stalledCheckIntervalMs: config.stalledCheckIntervalMs }
           : {}),
