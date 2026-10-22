@@ -204,7 +204,7 @@ const results = await ctx.allSettled(ProcessItemWorkflow, batch.items, { concurr
 const rejected = results.flatMap((r, i) =>
   r.status === 'rejected' ? [{ item: batch.items[i], error: r.error }] : []
 )
-if (rejected.length > 0) await ctx.step(recordDeadLetters, rejected)
+if (rejected.length > 0) await ctx.step(recordRejectedLines, rejected)
 ```
 
 It takes the same `concurrency` and lays the fan out exactly as `ctx.all` does (same child ids and
