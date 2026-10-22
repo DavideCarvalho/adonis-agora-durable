@@ -83,7 +83,7 @@ The descriptor carries the runtime (`node` or `python`), the SDK name and versio
 
 ## Executing workflow turns
 
-A thin worker can also execute **workflow bodies**, not just steps, when the transport carries turns — `bullmq` and `queue` do. That is the store-less execution model: the control plane sends the workflow's history, the worker replays the body against it and returns the commands it wants issued.
+A thin worker can also execute **workflow bodies**, not just steps, when the transport carries turns — `bullmq`, `queue` and `db` do. That is the store-less execution model: the control plane sends the workflow's history, the worker replays the body against it and returns the commands it wants issued.
 
 ```ts
 runtime.registerWorkflow('checkout', (ctx, input) => {

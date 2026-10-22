@@ -58,7 +58,7 @@ The seam is the **control plane ↔ worker** boundary on the transport:
 - A **worker** pulls a task, runs the body through the shared step handler, and publishes the result. It holds no durable state.
 - A **store-less api/dashboard pod** never executes anything; it turns every read/control/start into a wire request answered by the control plane's `RunRequestResponder`.
 
-Two bundled transports carry that seam for store-less pods: `bullmq` (Redis, and the wire NestJS and Python workers speak) and `queue` (any `@adonisjs/queue` adapter). See [Roles & config](/docs/durable/cluster/roles-and-config#control-plane) for choosing between them.
+Three bundled transports carry that seam for store-less pods: `bullmq` (Redis, and the wire NestJS and Python workers speak), `queue` (any `@adonisjs/queue` adapter) and `db` (the control plane's own database, for pods that can reach it). See [Roles & config](/docs/durable/cluster/roles-and-config#control-plane) for choosing between them.
 
 Your application code — `BaseWorkflow` subclasses in `app/workflows`, `@Step` handlers in `app/steps` — is **identical across every role**. The dashboard, routes, and `services/main` reads all go through one `RunGateway` interface that is either backed directly by the store or proxied over the wire, so nothing above that line can tell whether a store is present.
 
