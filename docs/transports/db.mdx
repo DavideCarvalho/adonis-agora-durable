@@ -15,7 +15,7 @@ node ace configure @adonis-agora/durable
 node ace migration:run
 ```
 
-`configure` publishes the durable-store migration **and** the transport-tables migration (which creates the four `db`-transport tables). If you don't use the `db` transport, delete the `create_durable_transport_tables` migration before running it.
+`configure` publishes three migrations: the durable-store migration, the transport-tables migration (`create_durable_transport_tables`, which creates the four `db`-transport channel tables), and the worker-advertisement migration (`create_durable_transport_worker_keys`, which creates `durable_transport_worker_keys`). If you don't use the `db` transport, delete `create_durable_transport_tables` before running it. Keep `create_durable_transport_worker_keys` if you run the `queue` transport with Lucid installed — its default worker advertisement lives in the same table.
 
 ## Wiring it up
 
@@ -42,7 +42,15 @@ const transport = new DbTransport({ db }) // pass { partition } to isolate this 
 transport.handle('pipeline:extract', async (input) => extract(input))
 ```
 
+Each handler name maps to a routing token — the sanitized handler name, suffixed `@<partition>` when the instance sets `partition` — and one `DbTransport` instance claims rows for every token it registered. On the engine side the loops start when the engine registers its result, heartbeat, and control handlers; on the worker side the first `handle()` starts the task loop. `start()` is an explicit no-op convenience that reopens the pollers and waits for the schema; `stop()`/`close()` stop every loop and wait up to 5 seconds for in-flight ticks, so a claimed task mid-handler gets to write its result instead of being left to lease expiry. Neither closes the shared Lucid `Database`.
+
 Trade-off vs a real broker: throughput is bounded by polling + row contention — great for workflow/pipeline scale (modest rate, long steps), not for high-fanout firehoses. But it adds **zero new infrastructure** — no Redis, no SQS — which is often the right trade.
+
+## Worker health
+
+`DbTransport` does not implement `groupHealth`, so the engine's `workerHealth()` query — and the dashboard and Telescope worker-health panels built on it — return **no entries** for this transport's groups; only a `groupHealth`-capable transport (BullMQ) reports backlog depth and live workers. `DbTransport` does implement `listWorkerGroups()` and `listWorkerDescriptors(token)`, read from the [worker advertisement](/docs/durable/transports#worker-advertisement) in `durable_transport_worker_keys`, so the engine still knows which tokens have a live worker for dispatch routing.
+
+Liveness of a claimed task is the lease itself, not a separate heartbeat: a task row whose `claimed_at` is older than `leaseMs` is treated as abandoned and reclaimed by the next poll (see [the claim protocol](#the-claim-protocol)). The `durable_transport_heartbeats` table is a different thing — the per-step liveness pings that `timeoutMs` steps send to the engine.
 
 ## Options — `transports.db(config)`
 
@@ -57,9 +65,19 @@ Trade-off vs a real broker: throughput is bounded by polling + row contention �
 | `batchSize` | `20` | Max rows claimed per poll. |
 | `autoCreate` | `true` | Create the transport tables on first use (in addition to the published migration). |
 | `instanceId` | random uuid | Stable process id stamped on claims and control messages. |
-| `workerKeysCacheMs` | `5000` | How long a read of the worker advertisement table is reused. The engine asks before every dispatch; `0` reads every time. |
+
 
 `transports.db(config)` returns the lazy driver thunk used in `config/durable.ts`; the underlying class is `DbTransport`, also exported from `@adonis-agora/durable` for constructing a worker-side instance directly. `@adonis-agora/durable` also exports `TRANSPORT_TABLES`, `createDurableTransportTables(db)`, and `dropDurableTransportTables(db)` for managing the schema yourself.
+
+Constructing `DbTransport` directly takes the same options with two differences: the Lucid `Database` goes in `db`, and the connection name is `connectionName` (not `connection`). It also accepts one option `transports.db()` does not forward:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `workerKeysCacheMs` | `5000` | How long a read of the worker advertisement table is reused. The engine asks before every dispatch; `0` reads every time. |
+
+<Callout type="warn">
+`autoCreate` runs its idempotent DDL through the `Database`'s **default** connection, even when you set `connection`. If the transport tables live on a non-default connection, run the published migration against that connection (or call `createDurableTransportTables` yourself) rather than relying on `autoCreate`.
+</Callout>
 
 ## The tables
 
@@ -73,7 +91,23 @@ The published migrations create five tables (default names):
 | `durable_transport_control` | bidirectional | lifecycle events + cancellation (best-effort, single-consumer) |
 | `durable_transport_worker_keys` | worker → engine | the [worker advertisement](/docs/durable/transports#worker-advertisement): each live worker's descriptor and heartbeat, with an expiry |
 
-`durable_transport_tasks` carries `step_id` (`<runId>:<seq>`, the primary key and step identity), `run_id`, `seq`, `name` (the handler key), `grp` (worker group), `input`, `attempt`, plus the claim columns `claimed_by`/`claimed_at` and `created_at`. The results table mirrors it with `status`, `output`, `error`, and `started_at` (when the worker picked the task up — what powers queue-wait timing in the dashboard).
+`durable_transport_tasks` carries `step_id` (`<runId>:<seq>`, the primary key and step identity), `run_id`, `seq`, `name` (the handler key), `grp` (the routing token workers claim by), `namespace`, `input`, `traceparent`, `context`, `transport`, `attempt`, plus the claim columns `claimed_by`/`claimed_at` and `created_at`. The results table mirrors it with `status` (`completed` or `failed`), `output`, `error`, `events`, and `started_at` (when the worker picked the task up — what powers queue-wait timing in the dashboard). Heartbeats and control rows use an auto-increment `id` as their key; control rows carry the whole message as a JSON `payload`.
+
+Every channel table has a `namespace` column (default `'default'`) and an index leading with it; every claim is scoped to the instance's namespace. Tables created before namespaces existed get the column back-filled by `createDurableTransportTables` (and so by `autoCreate`), stamping legacy rows `'default'`.
+
+The worker-key table is a key/value board, not a message channel: `key` (primary key), `value`, and `expires_at`. Each write upserts its key and sweeps expired ones; it has no `namespace` column because the keys embed the namespace.
+
+### Column types
+
+The schema is built with Lucid's schema builder (Knex), so the same DDL runs on SQLite, Postgres, and MySQL:
+
+| Kind | Stored as |
+| --- | --- |
+| JSON payloads (`input`, `context`, `output`, `error`, `events`, `payload`) | `text` — the transport `JSON.stringify`s on write and `JSON.parse`s on read, so only JSON-safe values survive |
+| Timestamps (`claimed_at`, `created_at`, `started_at`, `expires_at`) | `bigInteger`, epoch milliseconds |
+| Idempotent insert of a task or result | Knex `onConflict('step_id').ignore()`, which Knex renders per dialect |
+
+There is no dependency on a dialect's native JSON or date type, and no dialect-specific locking clause.
 
 ## The claim protocol
 
@@ -82,6 +116,10 @@ A worker claims a batch atomically, runs each task outside the lock, then record
 1. **Claim** — select candidate rows for the group that are unclaimed *or* whose lease expired (`claimed_at IS NULL OR claimed_at < now − leaseMs`), oldest first, bounded by `batchSize`; then a conditional `UPDATE` stamps a unique per-round token into `claimed_by`/`claimed_at`; then select back the rows that match this round's token. Two instances can never claim the same row because the token is unique per claim round.
 2. **Run** — execute the handler for `name` with the parsed `input`.
 3. **Record** — insert the result row (idempotent on `step_id`) and delete the task row.
+
+While a handler runs, the worker **renews** its claim — it re-stamps `claimed_at` right after the claim and then every `leaseMs / 2` (at least once a second), matching on its own claim token. A slow but alive worker therefore keeps the row for the whole step; only a worker that stopped renewing (crashed, or lost the database) has its row reclaimed.
+
+The engine side mirrors the protocol on the results table: claim a batch, deliver each result to the suspended `ctx.step`, then delete the delivered rows in one `WHERE IN` statement. Rows are deleted only after their handler ran. Heartbeats and control messages are drained the same way, keyed on `id`.
 
 <Callout type="info">
 The `claimed_at < now − leaseMs` clause is crash recovery in place of heartbeats: a row whose worker crashed mid-flight is reclaimed after `leaseMs`. Delivery is at-least-once (a crash between insert-result and delete-task can re-run a handler), so **handlers should be idempotent**, keyed on `step_id`.

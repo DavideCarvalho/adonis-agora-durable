@@ -89,6 +89,8 @@ export default class CheckoutController {
 Resume it later, from your approval webhook — this completes and ships the run:
 
 ```ts
+import engine from '@adonis-agora/durable/services/main'
+
 // engine.signal wakes the exact run suspended on this token
 await engine.signal(`approve:${order.id}`, { approved: true })
 ```
@@ -120,7 +122,9 @@ export const chargeCard = defineStep(
 const charge = await ctx.step(chargeCard, { orderId: order.id, amountCents: order.total })
 ```
 
-Steps under `app/steps` are served by name automatically; the escape hatch is `transport.handle(name, fn)`. With the in-process transport a step runs in the same process; swap the transport for the [queue transport](/docs/durable/transports/queue) to move it to a separate worker — without changing the workflow code.
+Steps under `app/steps` are served by name automatically; the escape hatch is `transport.handle(name, fn)`. With the in-process transport a step runs in the same process; swap the transport for the [queue transport](/docs/durable/transports/queue) to move it to a separate worker — or implement it in a [Python worker](/docs/durable/python) — without changing the workflow code.
+
+The split goes both ways: a separate worker can implement a step the AdonisJS workflow calls, *or* author the whole workflow itself in Python and call back into Adonis. Either way, the engine stays the single owner of durable state.
 
 ## What you get
 
@@ -133,11 +137,19 @@ Steps under `app/steps` are served by name automatically; the escape hatch is `t
 
 <Cards>
   <Card title="Getting Started" href="/docs/durable/getting-started" description="Install, configure, register a workflow, and start your first run — step by step." />
+  <Card title="Patterns" href="/docs/durable/patterns" description="A cookbook: human approval, webhook confirmation, batch fan-out, cron digests, booking sagas, rate-limited APIs, long-lived pollers." />
+  <Card title="Comparison" href="/docs/durable/comparison" description="How this library compares to plain @adonisjs/queue jobs, Temporal, Inngest, and BullMQ — honestly." />
   <Card title="Concepts" href="/docs/durable/concepts/durability" description="Durability, deterministic replay, and the mental model behind the engine." />
   <Card title="Authoring" href="/docs/durable/authoring/child-workflows" description="Child workflows, queries and updates, webhooks, versioning, scheduling, and event-triggered workflows." />
   <Card title="Reliability" href="/docs/durable/reliability" description="Retries, sagas, dead-letter, and flow control." />
   <Card title="Transports" href="/docs/durable/transports" description="The in-process default, the @adonisjs/queue transport, and the broker-less DB transport." />
   <Card title="State stores" href="/docs/durable/stores" description="Persist runs to Postgres, MySQL, or SQLite with Lucid." />
   <Card title="Observability" href="/docs/durable/observability/dashboard" description="The control-plane dashboard, OpenTelemetry traces, and the Telescope view." />
-  <Card title="Tooling" href="/docs/durable/tooling/linting" description="The CLI, the test harness, and the determinism linter." />
+  <Card title="Python" href="/docs/durable/python" description="Implement steps and author whole workflows from a Python worker, over the same Redis wire." />
+  <Card title="Tooling" href="/docs/durable/tooling" description="The determinism linter and build-time codegen (workflow/step barrels, a typed dashboard client)." />
+  <Card title="Testing" href="/docs/durable/testing" description="createTestEngine, a controllable clock, failure injection, assertions, and replay CI." />
+  <Card title="CLI" href="/docs/durable/cli" description="durable:work, durable:worker, durable:runs, durable:retry, durable:export and make:workflow." />
+  <Card title="Running in production" href="/docs/durable/production" description="The operational checklist: store and transport, topology, timers and recovery, draining on deploy, retention." />
+  <Card title="Troubleshooting" href="/docs/durable/troubleshooting" description="Symptom-first answers: NonDeterminismError, stuck runs, timers that never fire, steps that run twice." />
+  <Card title="API reference" href="/docs/durable/api-reference" description="Every WorkflowCtx member, BaseWorkflow, the engine surface, DurableConfig options, errors, and statuses — from source." />
 </Cards>

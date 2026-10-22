@@ -127,6 +127,42 @@ That signal wakes the exact run suspended on that token, and `hook.wait()` resum
 
 > The token embeds `runId:seq`, so treat it as a secret — this endpoint is reachable by external systems. Front it with signature verification in your own middleware.
 
+## External tasks — `ctx.task`
+
+`ctx.webhook()` is specifically for the HTTP-callback shape: the engine mints a URL, you hand it to a third party, and *they* deliver the callback. Not every async handoff looks like that — sometimes there is no URL at all, just a message you drop on a queue, a foreign process you kick off, or a legacy system you poke, and *you* report back when it is done. `ctx.task(name, dispatch, options?)` is the general form of "suspend until an external system finishes this":
+
+```ts title="app/workflows/video_transcode_workflow.ts"
+import { BaseWorkflow } from '@adonis-agora/durable'
+import type { WorkflowCtx } from '@adonis-agora/durable'
+
+export default class VideoTranscodeWorkflow extends BaseWorkflow {
+  static workflow = { name: 'video-transcode', version: '1' }
+
+  async run(ctx: WorkflowCtx, input: { videoId: string; s3Key: string }) {
+    // `dispatch` runs ONCE (checkpointed); the run then suspends until your code reports back.
+    return ctx.task<{ outputKey: string }>('transcode', async () => {
+      await transcodeQueue.enqueue({ runId: ctx.runId, videoId: input.videoId, s3Key: input.s3Key })
+    })
+  }
+}
+```
+
+Your own code reports the result by run id and task name — no minted URL involved:
+
+```ts title="start/routes.ts"
+import router from '@adonisjs/core/services/router'
+import engine from '@adonis-agora/durable/services/main'
+
+router.post('/transcode-callbacks', async ({ request, response }) => {
+  const { runId, outputKey, error } = request.body()
+  if (error) await engine.failTask(runId, 'transcode', error)
+  else await engine.completeTask(runId, 'transcode', { outputKey })
+  return response.noContent()
+})
+```
+
+`completeTask` resumes the run with the result as `ctx.task`'s return value; `failTask` makes `ctx.task` throw a `FatalError`. Both return `null` when no run is waiting on that task (a duplicate or late delivery), so a retried callback cannot corrupt an already-resumed run. `ctx.webhook` is the special case where the "external system" is an HTTP client and the engine builds the URL for you. See [External tasks](/docs/durable/authoring/external-tasks) for the full reference.
+
 ## Why this is better than rolling it yourself
 
 Done by hand, the "callback URL + wait" pattern leaks durability concerns into your application: you have to persist the run↔callback mapping, re-establish the wait after a crash, and guard the handoff against double-dispatch on recovery. `ctx.webhook()` folds all of that into the engine's checkpoint machinery. The token is deterministic, so it survives replay; the handoff lives in a step, so it fires exactly once; and `wait()` suspends durably, so a process restart costs nothing — the run resumes the instant the callback arrives, whenever that is.

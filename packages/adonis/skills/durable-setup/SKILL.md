@@ -144,7 +144,7 @@ export default defineConfig({
 ```
 
 ```bash title="a separate worker process"
-node ace durable:work --interval=500 --drainTimeout=15000
+node ace durable:work --interval=500 --drain-timeout=15000
 ```
 
 Each `durable:work` tick runs `engine.runPending()` → `recoverIncomplete()` →

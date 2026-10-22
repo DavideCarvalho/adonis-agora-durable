@@ -26,10 +26,10 @@ The `StepOptions` retry fields are:
 - `backoff` — how the delay between attempts grows: `'fixed'` keeps it constant, `'exp'` doubles it each attempt.
 - `backoffMs` — the base delay in ms. Omit (or set to 0) to retry with no delay.
 - `backoffMaxMs` — an upper bound, so an exponential backoff doesn't grow without limit.
-- `jitter` — adds random jitter so a fleet of runs retrying the same downstream don't synchronize into a thundering herd.
+- `jitter` — adds random jitter (the delay becomes 50–100% of the computed value) so a fleet of runs retrying the same downstream don't synchronize into a thundering herd.
 - `timeoutMs` — bound a single attempt; on a local step it caps how long `fn` may run.
 
-With `backoff: 'exp'`, `backoffMs: 200` the delays before attempts 2, 3, 4… are 200ms, 400ms, 800ms… until they hit `backoffMaxMs`. With `jitter: true` each of those is scaled to a random point in its top half.
+With `backoff: 'exp'`, `backoffMs: 200` the delays before attempts 2, 3, 4… are 200ms, 400ms, 800ms… until they hit `backoffMaxMs`. With `jitter: true` each of those is scaled to a random point in its top half, so two runs that failed at the same instant don't retry in lockstep. Every computed delay is also clamped to Node's `setTimeout` ceiling (2³¹−1 ms, about 24.8 days), so a very large exponential never overflows into an immediate retry.
 
 ### FatalError — never retried
 
@@ -45,7 +45,7 @@ await ctx.localStep('charge', async () => {
 })
 ```
 
-The optional second argument is a machine-readable `code` (here `'declined'`) that ends up on the run's structured error. Use `FatalError` for deterministic business verdicts; let ordinary throws (a timeout, a 502, a dropped connection) flow through the retry path.
+The optional second argument is a machine-readable `code` (here `'declined'`) that ends up on the run's structured error. Use `FatalError` for deterministic business verdicts; let ordinary throws (a timeout, a 502, a dropped connection) flow through the retry path. When the verdict is an expected outcome rather than a reason to fail the run, give the workflow an [`onError`](/docs/durable/reliability/on-error) handler for that `code`.
 
 ## Dispatched-step retries
 
@@ -74,6 +74,13 @@ export const chargeCard = defineStep(
 
 // in the workflow:
 const charge = await ctx.step(chargeCard, { orderId: order.id, amountCents: order.total })
+```
+
+Every retry field is also a per-call override on `ctx.step(handler, input, opts)`: the effective policy is the declared one with any `opts` field winning, so a single call site can tighten or relax the default without touching the step definition.
+
+```ts
+// same step, a more patient policy for this one call site
+await ctx.step(chargeCard, input, { retries: 8, backoffMaxMs: 120_000 })
 ```
 
 When a worker reports a **failed** result for a durable step, the engine consults `retries`. If the budget remains, it re-dispatches — but durably, not in a loop. It computes the next retry deadline as `now + backoffDelay(attempt)` and stamps it on the failed checkpoint's `wakeAt`, then suspends. Because that deadline is **persisted on the checkpoint** rather than living in a timer in memory, it is replay-stable and crash-safe (a process that dies before the retry fires picks it back up when the timer poller sees the `wakeAt` come due). Once the deadline passes, the poller resumes the run, the call re-dispatches with an incremented `attempt`, and the cycle continues until the result lands or `retries` is exhausted.
@@ -115,7 +122,7 @@ export const renderVideo = defineStep(
 )
 ```
 
-The crucial difference between the two paths: the durable path retries on a worker **reporting a failure** and suspends between attempts (crash-safe, not in memory); the liveness path retries on a worker **going silent** and awaits the result in memory between attempts. Reach for `timeoutMs` only when you genuinely need to detect and replace a stuck worker; otherwise leave it off and get the durable, crash-safe path.
+The crucial difference between the two paths: the durable path retries on a worker **reporting a failure** and suspends between attempts (crash-safe, not in memory); the liveness path retries on a worker **going silent** and awaits the result in memory between attempts. They also disagree on what a *reported* error means: the durable path retries it (subject to `retryable`), while a `timeoutMs` step only re-dispatches on a timeout and surfaces any reported error to the workflow on the first attempt. Reach for `timeoutMs` only when you genuinely need to detect and replace a stuck worker; otherwise leave it off and get the durable, crash-safe path.
 
 ### Queue wait vs. silence while running — `pickupTimeoutMs`
 
@@ -139,3 +146,27 @@ A worker emits an automatic beat the moment it claims the task, and **that first
 It defaults to `timeoutMs`, so leaving it off preserves the single-window behaviour. It is only consulted when `timeoutMs` is set — on a step with no `timeoutMs` there is no in-memory window at all, and `pickupTimeoutMs` does nothing.
 
 An expiry of either window raises the same retryable `RemoteStepTimeout`, so `retries` and `backoff` apply identically. To make either window meaningful, have the handler call [`log.heartbeat(progress?)`](/docs/durable/concepts/workflows-and-steps#reporting-liveness-from-inside-a-long-step) as it works.
+
+### A third case: the dispatch itself gets lost
+
+Neither path above covers a step whose job **never produces a result at all**: no failure, and no `timeoutMs` window to expire, because the worker crashed mid-step or the transport dropped the job (a Redis flush or eviction, or a stalled job moved to `failed` and removed). The reconcile re-drive is deliberately conservative here: it re-suspends a still-`pending` step rather than re-dispatching it, so a merely slow worker is never double-run. Without a `timeoutMs`, that means the run sits on `pending` until something re-dispatches it:
+
+- The [BullMQ transport](/docs/durable/transports/bullmq#crash-recovery) closes this gap for its own consumers: when a crashed or stalled task job ends `failed`, the worker publishes a synthetic, retryable failed result for it, so the checkpoint fails and the durable retry path above takes over. A worker on another SDK only gets this if that SDK implements the same bridge.
+- For any transport, `engine.redispatchPending(runId)` (or the dashboard's redispatch action) re-enqueues a run's stuck `pending` remote steps by hand.
+- `remoteRedispatchMs`, an **opt-in** setting in `config/durable.ts`, makes this self-healing. A dispatched remote step carries a **lease** on its `pending` checkpoint (`wakeAt`), and the run suspends on it. A result, or a step-scoped heartbeat, must land before the lease lapses; a heartbeat **renews** it, throttled to one write per half-window, so a worker beating every few seconds does not cause a write storm. A lapsed lease re-dispatches the same `stepId`, bounded by `remoteRedispatchMax` (default 10), after which the step fails with `remote_step_lost` and reaches the workflow's own error path. It is off by default because a re-dispatch can double-run a step that is merely slow **and does not beat**: the window must exceed the longest legitimate duration of a non-heartbeating step, and the step must be idempotent.
+
+  The same policy covers a polyglot workflow's `call` fan-out, not just `ctx.step`.
+
+  A re-drive is **observably different from a retry**: the `step.started` event carries `redispatched: true`, and the checkpoint's own event trail gets a `warn`-level `step.redispatched` (`step.lost` when the bound runs out). Alert on those to spot a worker dying under you, as opposed to steps that merely fail.
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  // ...
+  // Longer than your longest remote step. A step that heartbeats renews its own lease,
+  // so this window only has to cover steps that go silent.
+  remoteRedispatchMs: 45 * 60_000,
+  remoteRedispatchMax: 3,
+})
+```
+
+See [Lost remote dispatch](/docs/durable/reliability/failure-modes#lost-remote-dispatch-the-run-suspends-and-nothing-auto-redrives-it) for the operator view, and [Recovering a lost remote step dispatch](/docs/durable/observability/dashboard#recovering-a-lost-remote-step-dispatch) for the dashboard side.

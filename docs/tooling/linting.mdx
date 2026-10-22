@@ -12,6 +12,8 @@ The engine already detects this drift at runtime and throws a `NonDeterminismErr
 npm i -D @adonis-agora/durable-eslint-plugin
 ```
 
+The plugin's only peer is `eslint` (`^8.57`, `^9`, or `^10`); the rules are flat-config.
+
 ## What it flags
 
 Inside a workflow body, these are banned, and the fix is the engine's checkpointed equivalent — each is recorded once on the first execution and replayed verbatim afterwards:
@@ -27,7 +29,7 @@ Inside a workflow body, these are banned, and the fix is the engine's checkpoint
 | imported `randomUUID` from `node:crypto` | fresh entropy every replay | `await ctx.sideEffect(() => randomUUID())` |
 | `process.env` reads | a redeploy changes the value mid-run | `await ctx.sideEffect(() => process.env.X)`, or resolve config outside the workflow |
 
-The rule also sees through the easy disguises: `import { randomUUID as uuid }` aliases, a
+The rule also sees through the easy disguises: `globalThis.crypto.randomUUID()`, `import { randomUUID as uuid }` aliases, a
 default/namespace `crypto` import, and a same-file `const d = Date; d.now()` alias (simple `const`
 tracking — no data-flow analysis).
 
@@ -49,6 +51,19 @@ engine.register('checkout', '1', async (ctx, order) => {
 })
 ```
 
+The class form is checked the same way — inside the `run` method of a `BaseWorkflow` subclass:
+
+```ts title="app/workflows/checkout_workflow.ts"
+export default class CheckoutWorkflow extends BaseWorkflow {
+  static workflow = { name: 'checkout', version: '1' }
+
+  async run(ctx: WorkflowCtx, order: Order) {
+    const startedAt = Date.now()                                   // ✗ useNow
+    const idempotencyKey = await ctx.sideEffect(() => randomUUID()) // ✓ captured once
+  }
+}
+```
+
 `ctx.now()` covers timestamps; `ctx.sideEffect(fn)` captures any other generated value once and replays it verbatim — pass your own generator.
 
 ## Two more rules: swallowed signals and direct I/O
@@ -66,7 +81,7 @@ Every rule in the plugin is **AST-scoped** — it only fires *inside a workflow 
 - **The function form** — the function passed to `engine.register(name, version, fn)` (and `registerRemote` / `registerEntity`), where the receiver reads as a workflow engine (`engine`, `workflowEngine`, `this.engine`, …). An unrelated `someRegistry.register(...)` is left alone.
 - **The class form** — the `run` method of a workflow class: a `BaseWorkflow` subclass, or any class carrying a `static workflow = { name, … }` config.
 
-Crucially, the rules **stop at a `ctx.localStep(...)`, `ctx.task(...)`, or `ctx.sideEffect(...)` callback boundary**: those are the checkpoint-callback primitives whose body runs once and whose whole result is recorded, so a `Date.now()`, a `try/catch`, or a `fetch()` inside one is fine. (`ctx.step` is **not** a boundary — it is the always-dispatched step whose second argument is data, not a callback.) Only the deterministic orchestration prefix is checked, so you can enable the rules across your whole `**/*.ts` glob without false positives.
+Crucially, the rules **stop at a `ctx.localStep(...)`, `ctx.task(...)`, or `ctx.sideEffect(...)` callback boundary**: those are the checkpoint-callback primitives whose body runs once and whose whole result is recorded, so a `Date.now()`, a `try/catch`, or a `fetch()` inside one is fine. (`ctx.step` is **not** a boundary — it is the always-dispatched step whose second argument is data, not a callback.) Only the deterministic orchestration prefix is checked, so you can enable the rules across your whole `**/*.ts` glob without false positives. Code outside a workflow body — a controller, a service, a step handler under `app/steps` that runs once and checkpoints its result — is never touched, because it isn't replayed.
 
 ## ESLint (flat config)
 

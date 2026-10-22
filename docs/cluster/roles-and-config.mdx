@@ -46,8 +46,10 @@ export default defineConfig({
 ```
 
 <Callout type="info">
-For **cross-ecosystem** fleets (a Python or NestJS worker on the same control plane), select the [`bullmq` transport](/docs/durable/cluster/interop) — it speaks the aviary wire byte-for-byte. For an Adonis-only split, the [`queue`](/docs/durable/transports/queue) and [`db`](/docs/durable/transports/db) transports work too.
+For **cross-ecosystem** fleets (a Python or NestJS worker on the same control plane), select the [`bullmq` transport](/docs/durable/cluster/interop) — it speaks the aviary wire byte-for-byte. Store-less `tenant` pods also need `bullmq`: it is the only bundled transport that carries the run-request methods a `ProxyRunGateway` and the control plane's `RunRequestResponder` round-trip over. The [`queue`](/docs/durable/transports/queue) and [`db`](/docs/durable/transports/db) transports can still move step execution off the control plane to store-backed workers, but they cannot host `tenant` pods.
 </Callout>
+
+A `control-plane` serves no `app/steps` in-process (only `standalone` embeds a worker), and its engine uses a no-op run dispatcher: `start()` persists the run as `pending` and returns, and the `durable:work` dispatch/recovery/timers loop drives it from there instead of running the body inline on the request. The `RunRequestResponder` that answers tenant pods starts only when the selected transport carries the run-request methods; on any other transport the control plane simply has no tenant-facing surface.
 
 ## Tenant (store-less thin pod)
 
@@ -70,6 +72,18 @@ export default defineConfig({
 <Callout type="warn">
 The three layers of store-less isolation: **(1) type** — a `tenant` config cannot mention a store; **(2) container** — the provider registers no store binding for the tenant role, so resolving one throws; **(3) object** — the `WorkerRuntime` and `ProxyRunGateway` have no store field at all.
 </Callout>
+
+## What each role validates
+
+The checks split into compile-time (the config's type) and boot-time (the provider, when it builds the role's objects):
+
+| `role` | Requires | Forbids | Checked at boot |
+| --- | --- | --- | --- |
+| `standalone` (or omitted) | nothing — no `store` selects the in-memory store, no `transport` the in-memory transport | — | — |
+| `control-plane` | `store` **and** `transport` (both typed required) | — | The responder is started only on a transport with the run-request methods. |
+| `tenant` | `transport` and `partition` (both typed required) | `store`, `stores` (typed `never`) | Resolving the `RunGateway` throws when the transport lacks the store-less methods (`dispatchStartRun`, `dispatchRunRequest`, `onRunReply`, `onTenantEvent`). Resolving the worker runtime throws when the transport cannot serve handlers (`handle()`). No engine and no store are bound, so resolving either throws. |
+
+`partition` is the axis a `tenant` pod is named by: it suffixes the pod's `<name>@<partition>` routing tokens and is the tenant the proxy claims on the wire when no token is set. `namespace` stays a separate, optional field on every role (the operator's run scope); a tenant pod passes it to its transport and worker runtime. What each axis actually partitions is [Tenancy](/docs/durable/concepts/tenancy).
 
 ## Worker vs api — the entrypoint decides
 
@@ -149,6 +163,8 @@ The full surface:
 | `workerHealth()` | queue depth and live workers per group |
 | `subscribe(runId, onEvent)` | live-tail one run's lifecycle events; returns the unsubscribe |
 
+On a `tenant` pod every verb except `topology()` and `subscribe()` is a wire round-trip bounded by `requestTimeoutMs` (default `10_000`). A request whose reply never arrives rejects with an error naming the verb (`durable control plane did not answer getRun within 10000ms`) instead of hanging. A reply the control plane refuses rejects with an `Error` carrying a `code`: `unauthorized` for an invalid or tampered token, `cross-tenant` for a run owned by another tenant. Over a tenant proxy, `workerHealth()` is scoped to the tenant's own groups — the control plane keeps only groups ending in `@<tenant>`. `subscribe()` bridges onto the transport's per-tenant event stream, which the responder republishes for the tenant's own runs only.
+
 `getRunDetail` and `getFanMembers` are optional on the interface, and every built-in gateway implements them. A custom gateway without them still works: the dashboard and the responder build the same detail from `getRun`, `getCheckpoints` and `getRunChildren`, and the exported `loadRunDetail` / `loadFanMembers` helpers do it for your own code.
 
 ```ts
@@ -157,7 +173,7 @@ const detail = await runGateway.getRunDetail?.(params.id, { summarizeFansOver: 5
 ```
 
 <Callout type="warn" title="Upgrade the control plane before its tenants">
-On a store-less `tenant` pod the [dashboard](/docs/durable/observability/dashboard) reads run detail through the `getRunDetail` run-request verb, and pages a fan through `getFanMembers`, so the control plane summarizes a wide fan before it crosses the wire. A control plane on an older version rejects verbs it does not know, so run detail fails on an upgraded tenant until its control plane is upgraded too. Upgrade the control plane first, or with its tenants. Before answering either verb, the responder checks tenant ownership on the run alone, without loading its timeline.
+On a store-less `tenant` pod the [dashboard](/docs/durable/observability/dashboard) reads run detail through the `getRunDetail` run-request verb, and pages a fan through `getFanMembers`, so the control plane summarizes a wide fan before it crosses the wire. A control plane on an older version rejects verbs it does not know, so run detail fails on an upgraded tenant until its control plane is upgraded too. The responder answers an unknown verb with an `unknown run-request verb` error reply, so the tenant sees the failure at once rather than after `requestTimeoutMs`. Upgrade the control plane first, or with its tenants. Before answering either verb, the responder checks tenant ownership on the run alone, without loading its timeline.
 </Callout>
 
 On a store role, `engine` (the default export of `services/main`) is still there for everything the gateway does not cover — registering workflows, driving poll loops, `continue`, `retryWithInput`. On a `tenant` pod there is no engine to resolve, which is exactly the point: reach for `runGateway` in anything that must run on more than one role.

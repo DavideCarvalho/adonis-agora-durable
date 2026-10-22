@@ -8,6 +8,10 @@ import { Callout } from 'fumadocs-ui/components/callout';
 
 Some work must never overlap for a given key, even though many *different* keys should run freely in parallel — one inventory sync per store, one statement generation per account, one deploy per environment. `singleton` is a durable, FIFO mutex over a workflow's runs: declare a key function once, and the engine admits at most `limit` runs sharing that key at a time, across every instance that shares the store.
 
+As a live system: three keys, one mutex slot each. Burst `store:A` and only its lane backs up, while the waiters sit suspended with zero compute:
+
+<SingletonSim />
+
 ## Declaring a singleton
 
 Put `singleton` in the class's `static workflow` config:
@@ -68,6 +72,10 @@ await engine.start('sync-inventory', { storeId: 'B' }, 'run-3')
 ## Store support
 
 Admission is built on the store's ordinary `listRuns` (tag + workflow + status filters) and `updateRun`. There is no dedicated store method and no extra table or column — the key rides the run's existing tags — so the [Lucid store](/docs/durable/stores/lucid), the in-memory store and any custom `StateStore` all support singleton workflows without a migration.
+
+<Callout type="warn" title="A scan, not an atomic claim">
+Admission is a read of the store followed by a decision, not a locked claim, and it is re-derived from the `(createdAt, id)` order on every check. Two consequences follow. A run is only ordered once it has left `pending`, so an older run that a worker picks up *after* a younger one was admitted sorts ahead of it and is admitted too, so the key briefly has more than `limit` runs executing. The younger holder keeps running its current turn, then finds itself past `limit` on its next resume and gates until a slot frees again. And a holder that crashes stays `running` (so it keeps its slot) until recovery reclaims it. If two overlapping turns would be harmful, keep each step idempotent rather than relying on the gate alone.
+</Callout>
 
 ## Bounding the queue: `maxQueueDepth` and `SingletonQueueFullError`
 

@@ -112,7 +112,7 @@ A compensation can itself fail transiently — the refund API might be momentari
 ```ts title="config/durable.ts"
 export default defineConfig({
   // … plus your transport/store (see Getting Started)
-  compensationRetries: 5, // retry each saga undo up to 5 times before giving up on it
+  compensationRetries: 5, // up to 5 attempts per saga undo before giving up on it
 })
 ```
 

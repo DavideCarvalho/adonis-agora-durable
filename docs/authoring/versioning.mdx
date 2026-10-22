@@ -14,8 +14,10 @@ The engine pairs each replayed step with the checkpoint recorded at that logical
 
 ```text
 // On replay, a checkpoint recorded as `charge` at this position but now named `refund` is caught:
-// NonDeterminismError(runId, seq)
+// NonDeterminismError(runId, seq, expected: 'refund', recorded: 'charge')
 ```
+
+The error carries `runId` and `seq` (the logical position) and has `code: 'non_determinism'`. Its message names both sides — what the code expects and what history recorded — and tells you to register a new workflow version. Because it marks a broken deploy rather than a business failure, an [`onError`](/docs/durable/reliability/on-error) route never takes it.
 
 This is a guard, not a fix. It tells you a code change is incompatible with runs that started under the old code. The two tools below let you make the change *anyway* — safely.
 
@@ -52,7 +54,7 @@ engine.register('invoice', '1', async (ctx, order: Order) => {
 })
 ```
 
-`ctx.now()` is the deterministic wall-clock; `ctx.sideEffect(fn)` runs `fn` once, checkpoints its result, and replays that same value without re-running `fn` — wrap **any** non-determinism you control (a UUID/ULID, `Math.random()`, a config/env read) in it. Each is captured the first time and returned from the checkpoint on every replay. Reach for a raw `Date.now()`/`Math.random()`/`crypto.randomUUID()` only *inside* a step body (whose whole result is checkpointed) — never in the deterministic prefix of the workflow body.
+`ctx.now()` is the deterministic wall-clock and returns epoch milliseconds as a number, like `Date.now()` (for an ISO string, `new Date(await ctx.now()).toISOString()`); `ctx.sideEffect(fn)` runs `fn` once, checkpoints its result, and replays that same value without re-running `fn` — wrap **any** non-determinism you control (a UUID/ULID, `Math.random()`, a config/env read) in it. Each is captured the first time and returned from the checkpoint on every replay. Keep `fn` effectively pure: it produces a value, it is not a place for real work with side effects. For that (a DB write, an API call), use a full step, whose whole result is checkpointed. Reach for a raw `Date.now()`/`Math.random()`/`crypto.randomUUID()` only *inside* a step body (whose whole result is checkpointed) — never in the deterministic prefix of the workflow body.
 
 <Callout type="warn">
 Enable the [`@adonis-agora/durable-eslint-plugin`](/docs/durable/tooling/linting) so these mistakes are caught at author time, in your editor and CI, rather than at replay time.
@@ -61,6 +63,26 @@ Enable the [`@adonis-agora/durable-eslint-plugin`](/docs/durable/tooling/linting
 ## Workflow versions — for breaking changes
 
 When a change genuinely alters a workflow's shape — new steps, reordered logic, a different control flow — bump the version. Register the new version alongside the old:
+
+```ts
+// app/workflows/checkout_workflow_v1.ts
+export default class CheckoutWorkflowV1 extends BaseWorkflow {
+  static workflow = { name: 'checkout', version: '1' }
+  async run(ctx: WorkflowCtx, order: Order) {
+    /* the original body */
+  }
+}
+
+// app/workflows/checkout_workflow_v2.ts
+export default class CheckoutWorkflowV2 extends BaseWorkflow {
+  static workflow = { name: 'checkout', version: '2' }
+  async run(ctx: WorkflowCtx, order: Order) {
+    /* the new body, with the breaking change */
+  }
+}
+```
+
+`version` defaults to `'1'` when omitted. The low-level form is the same thing — one `engine.register` per version:
 
 ```ts
 engine.register('checkout', '1', async (ctx, order: Order) => {
@@ -72,7 +94,11 @@ engine.register('checkout', '2', async (ctx, order: Order) => {
 })
 ```
 
+Every registration is kept, keyed by `name@version`, so old versions stay runnable. "Latest" is decided by comparing version strings — numerically when both parse as numbers (`'10'` is newer than `'9'`), otherwise by natural sort — not by registration order.
+
 A run records the **code version it started on** (`workflowVersion` on the run). When the engine resumes it, it replays against the *same version it began on* — so in-flight runs drain on the code they started under, while new runs start on the latest version. This is skew protection: deploying v2 never breaks the v1 runs still in the system. Keep the old version registered until every run that started under it has reached a terminal state, then remove it.
+
+If a run's starting version is no longer registered when it resumes, the engine refuses to replay it on a different body and throws `workflow checkout@1 is not registered — keep the prior version deployed so in-flight runs can drain (skew protection)`. Execution timeouts (`executionTimeout`) follow the same rule: a run is timed out against the version it started on when that registration is known.
 
 Versioning is the right tool when the change is structural and you're prepared to keep both bodies around. For a small, surgical change, the version split is heavyweight — that's where `ctx.patched` comes in.
 

@@ -1,6 +1,6 @@
 ---
 title: Workflows & steps
-description: Registering workflows with engine.register, dispatched steps with ctx.step (string name, @Step, or defineStep), the in-process ctx.localStep escape hatch, ctx.sideEffect/ctx.now for determinism, retries, fan-out, fatal errors, sub-process events, and tags.
+description: Registering workflows with engine.register, dispatched steps with ctx.step (string name, @Step, or defineStep), the in-process ctx.localStep escape hatch, ctx.sideEffect/ctx.now for determinism, retries, fan-out, ctx.continueAsNew for long-running loops, fatal errors, sub-process events, step interceptors, tags, and search attributes.
 icon: Workflow
 ---
 
@@ -233,6 +233,32 @@ const results = await ctx.all(processLine, lines, { concurrency: 500, mode: 'fai
 
 Every result of a `Promise.all` replays the workflow, so a fan of N steps costs O(N²) checkpoint reads. `ctx.all` puts a join barrier in front of the workflow instead: a result resumes it only once no step of the fan is still `pending`, or when one fails, so the workflow replays once per settled wave. `concurrency` sends the steps in waves of that size, and `mode` is `waitAll` (the default: every step settles, then a `GatherError` lists the failed indexes) or `failFast` (throws on the first failed step). See [fanning out over a step](/docs/durable/authoring/child-workflows#fanning-out-over-a-step) for the full rules.
 
+## Long-running loops — `ctx.continueAsNew`
+
+A workflow that loops forever — polling for new work, or a long-lived accumulator parked on `ctx.waitForSignal` — writes checkpoints on every turn. Left unbounded, that history grows forever and every replay gets slower re-reading it. `ctx.continueAsNew(input?)` is the reset: it completes the **current** run and hands off to a fresh execution of the same workflow with a clean history, under a traceable id `<runId>` → `<runId>~1` → `<runId>~2` …
+
+```ts title="app/workflows/poll_inbox_workflow.ts"
+export default class PollInboxWorkflow extends BaseWorkflow {
+  static workflow = { name: 'poll-inbox', version: '1' }
+
+  async run(ctx: WorkflowCtx, input: { mailbox: string; cursor?: string }) {
+    const { messages, nextCursor } = await ctx.step(fetchSince, input)
+    for (const message of messages) await ProcessMessageWorkflow.dispatch(message)
+    await ctx.sleep('30s')
+    // End this run and start fresh with the new cursor — history resets instead of growing forever.
+    return ctx.continueAsNew({ mailbox: input.mailbox, cursor: nextCursor })
+  }
+}
+```
+
+It is terminal — it always throws internally, so code after it never runs. The current run completes with no output, and whatever the next iteration needs must be carried forward explicitly through `input`. Call it outside any `try/catch` of your own, or rethrow it with [`isWorkflowControlFlowSignal`](#catching-errors--rethrow-control-flow-signals).
+
+<Callout type="warn" title="A waiting parent resolves at this run, not the whole chain">
+If a parent awaits this workflow via `ctx.child` / `Inner.start`, it resolves (with `undefined`) as soon as **this** run completes — it does not follow the run into its continuation. `continueAsNew` is for standalone long-running workflows (pollers, accumulators, per-key entities), not one a parent needs a final result from.
+</Callout>
+
+See [Continue-as-new](/docs/durable/authoring/child-workflows#continue-as-new) for the crash-safe handoff and namespace inheritance.
+
 ## Fatal errors
 
 Any thrown error is retried up to the step's limit. To stop retrying a business failure that a retry can't fix, throw `FatalError` — it fails the run immediately:
@@ -326,6 +352,33 @@ Each beat does three things:
 Beat from a **dispatched** step, where there is a worker whose silence is meaningful. Inside `ctx.localStep`
 the body runs in the engine itself, so there is nothing to report liveness to and `log.heartbeat` is a no-op.
 
+## Step interceptors
+
+For cross-cutting concerns around step execution — timing, structured logging, tracing, error enrichment — register an onion-style interceptor instead of repeating the same wrapper in every step body. `engine.use(interceptor)` takes `(invocation, next) => Promise<unknown>`: call `next()` to run the step body (or the next interceptor) and return — or transform — its result; throw to fail the step. First registered runs outermost, and `use` returns a function that removes the interceptor.
+
+```ts title="start/durable.ts"
+import engine from '@adonis-agora/durable/services/main'
+import logger from '@adonisjs/core/services/logger'
+
+engine.use(async (invocation, next) => {
+  const startedAt = performance.now()
+  try {
+    return await next()
+  } finally {
+    logger.info(
+      { workflow: invocation.workflow, step: invocation.stepName, attempt: invocation.attempt },
+      `step took ${performance.now() - startedAt}ms`,
+    )
+  }
+})
+```
+
+`invocation` carries `runId`, `workflow`, `stepName`, `seq` and the 1-based `attempt`.
+
+<Callout title="Wraps ctx.localStep, not the dispatched ctx.step">
+An interceptor wraps **in-process** step execution — `ctx.localStep`, plus the deterministic helpers built on it (`ctx.now`, `ctx.sideEffect`, and a `ctx.task`'s dispatch). It does **not** wrap `ctx.step`, which runs on a worker; register an interceptor on the worker's engine for that. Interceptors only fire when a step **actually executes** — a replayed step returns its recorded output without running the body or the chain. See [`engine.use`](/docs/durable/observability/events-and-interceptors#engineuse--middleware-around-a-local-step).
+</Callout>
+
 ## Deterministic sources — `ctx.now` & `ctx.sideEffect`
 
 Because the body replays, never read a value that changes on each run. The context exposes deterministic, checkpointed sources — each records its value the first time and replays it afterwards:
@@ -352,6 +405,16 @@ await engine.start('pipeline', input, runId, { tags: ['nightly'] })
 ```
 
 The dashboard shows a run's tags and a tag filter. Programmatically, query by tag with `RunQuery.tag` (`engine.listRuns({ tag: 'etl' })`) or the dashboard API's `?tag=` param.
+
+## Search attributes
+
+Tags are a flat label; **search attributes** are typed, queryable key/value metadata on a run — an `amount`, a `tier`, a `customerId` — for the range and equality filters a tag can't express. Set them from inside the workflow with `ctx.upsertSearchAttributes(attrs)`, where `attrs` is a `Record<string, string | number | boolean>`:
+
+```ts
+await ctx.upsertSearchAttributes({ amount: order.total, tier: order.customer.tier })
+```
+
+It is a **shallow merge** into the run's `searchAttributes` (keys you don't pass are kept), and it is durable and exactly-once: recorded at this position on the first run and skipped on replay. Use it instead of reaching for `store.updateRun(ctx.runId, …)` from a workflow body. Query them with `engine.listRuns({ attributes: [{ key: 'amount', op: 'gte', value: 20000 }] })` — `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, and `in` with a `values` set, ANDed together. See [Search attributes](/docs/durable/authoring/queries-and-updates#search-attributes) for start-time attributes and the full query surface.
 
 ## Delayed starts — `startAt`
 

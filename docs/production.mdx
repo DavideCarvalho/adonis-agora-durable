@@ -148,7 +148,7 @@ export default defineConfig({
 
 On `SIGTERM` you want a process to stop picking up new runs and let in-flight ones finish, rather than die mid-step and leave the run to a `leaseMs` timeout.
 
-- **`durable:work`** handles `SIGINT`/`SIGTERM` itself: it finishes the current tick, stops leasing new work, and calls `engine.drain(--drainTimeout)` (default 10 000 ms) before exiting.
+- **`durable:work`** handles `SIGINT`/`SIGTERM` itself: it finishes the current tick, stops leasing new work, and calls `engine.drain(--drain-timeout)` (default 10 000 ms) before exiting.
 - **`worker: { embedded: true }`** drains the same way from the provider's `shutdown()`, bounded by `worker.drainTimeoutMs` (default 10 000). The loop is stopped and awaited **before** the transport and control plane close, so an in-flight run can still dispatch and await a remote step while it drains.
 - **A web process without the embedded worker does not drain on its own.** Its provider `shutdown()` closes the transport and control plane but never calls `engine.drain()`, so runs it was executing (started there by the in-process dispatcher, or resumed there by a signal) are left to lease expiry. Drain it from a terminating hook in a preload file — Adonis runs `terminating` hooks before providers shut down:
 

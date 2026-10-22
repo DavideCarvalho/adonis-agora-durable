@@ -12,7 +12,7 @@ Real workflows wait — for a delay, or for the outside world. Both kinds of pau
 
 ## Durable sleep
 
-`ctx.sleep(duration)` suspends the run until the timer is due. Accepts a duration string (`'30s'`, `'2h'`, `'7 days'`, `'7d'`, `'1w'`) or milliseconds:
+`ctx.sleep(duration: string | number): Promise<void>` suspends the run until the timer is due. Accepts milliseconds as a number, or a duration string such as `'500ms'`, `'30s'`, `'15m'`, `'2h'`, `'7d'`, `'7 days'`, `'1w'` or `'2 weeks'` (units `ms`, `s`/`sec`/`second(s)`, `m`/`min`/`minute(s)`, `h`/`hr`/`hour(s)`, `d`/`day(s)`, `w`/`week(s)`):
 
 ```ts
 await ctx.localStep('draft', () => generate(topic))
@@ -20,7 +20,11 @@ await ctx.sleep('7 days') // gather signals for a week — nothing running
 await ctx.localStep('refine', () => refine(topic))
 ```
 
-Under the hood the run becomes `suspended` with a `wakeAt`; a poller (the [`durable:work`](/docs/durable/cli) loop, via `engine.resumeDueTimers()`) resumes runs whose timer has come due. On resume, the steps before the sleep replay from their checkpoints.
+The first time this line runs, the engine computes the absolute wake time, records it as a `sleep`-kind checkpoint (`kind: 'sleep', wakeAt`), and suspends the run — the run becomes `suspended` and **no compute is consumed** while it waits.
+
+What wakes it: a poller (the [`durable:work`](/docs/durable/cli) loop, or the embedded worker, via `engine.resumeDueTimers()` on every tick — default every second, `--interval`) resumes runs whose stored wake time has passed. There is no `setTimeout` held in memory per sleep, so a restart loses nothing. On resume, the steps before the sleep replay from their checkpoints.
+
+**Replay:** on any re-run, the engine reads the recorded checkpoint first. If the clock has passed the recorded `wakeAt` it returns immediately (the sleep is done); otherwise it re-suspends on the *same* `wakeAt`. The wake time is fixed by the first run's checkpoint, not recomputed on replay — so a clock change or a redeploy can't shift an already-scheduled timer.
 
 To wait until a specific moment instead of for a duration, use `ctx.sleepUntil(when)` — it takes a `Date` or an epoch-ms number:
 
@@ -50,24 +54,52 @@ async approve({ params, request, response }: HttpContext) {
 }
 ```
 
-The payload is checkpointed like any step result, so the resumed run sees the same decision even if it replays again later.
+The payload is checkpointed like any step result, so the resumed run sees the same decision even if it replays again later. `engine.signal` returns the resumed run's result, or `null` when no run was waiting (the payload was buffered — see below).
+
+**The token is a global namespace, not run-scoped.** Unlike `ctx.onUpdate(name)` — where the engine prefixes `name` with the run id internally (`update:${runId}:${name}`) — `waitForSignal` uses the token you pass verbatim. On the Lucid store the waiter row is keyed by `token` alone (`token` is the primary key of `durable_signal_waiters`), so a second waiter registering an already-waited-on token replaces the first. **Always embed the run's identity in the token** (`` `approve:${order.id}` ``, not `'approve'`) so it is unique across the whole engine.
+
+**Replay:** the wait consumes one logical position (two with `{ timeoutMs }`, see below); on replay, a `completed` checkpoint at that position returns its saved payload instead of waiting again, exactly like a step.
 
 Pass `{ timeoutMs }` to bound the wait — if the deadline passes before a signal arrives, `waitForSignal` throws `SignalTimeoutError`, which you can catch to take a default branch:
 
 ```ts
+import { SignalTimeoutError } from '@adonis-agora/durable'
+
 try {
-  await ctx.waitForSignal('approve', { timeoutMs: 24 * 60 * 60 * 1000 })
+  const decision = await ctx.waitForSignal<{ approved: boolean }>(`approve:${order.id}`, {
+    timeoutMs: 24 * 60 * 60 * 1000,
+  })
+  return decision.approved ? { status: 'approved' } : { status: 'rejected' }
 } catch (err) {
   if (err instanceof SignalTimeoutError) return { status: 'expired' }
   throw err
 }
 ```
 
+This is the supported, replay-safe way to race "signal vs. deadline": the engine records the deadline as its own checkpoint (computed once, so a replay reuses it rather than restarting the clock) and the wait as a second one, and resumes on whichever comes first. Note the determinism cost: a bounded wait consumes **two** logical positions (deadline + wait) where an unbounded one consumes **one** — so adding or removing `{ timeoutMs }` on an existing `waitForSignal` shifts every later step and should be treated as a [versioned change](/docs/durable/authoring/versioning) for runs already in flight.
+
+<Callout type="warn" title="Don't build the race with Promise.race">
+Don't reach for `Promise.race([ctx.sleep(...), ctx.waitForSignal(...)])` to build "whichever happens first" by hand. Every suspending primitive resumes by *throwing* to unwind the run back to the engine — it isn't a promise that stays pending until the real-world event happens, so racing two of them doesn't compose the way ordinary I/O promises do. Use `waitForSignal`'s own `{ timeoutMs }`; it is the one built and checkpointed for this.
+</Callout>
+
+The same shape handles "let the customer cancel within N minutes, otherwise proceed":
+
+```ts
+try {
+  await ctx.waitForSignal(`cancel:${order.id}`, { timeoutMs: 10 * 60 * 1000 })
+  return { status: 'cancelled' } // a cancel signal arrived in time
+} catch (err) {
+  if (!(err instanceof SignalTimeoutError)) throw err
+  await ctx.step(shipOrder, order) // window closed — proceed
+  return { status: 'shipped' }
+}
+```
+
 ### Signal buffering & signal-with-start
 
-A signal sent **before** the run has reached its `waitForSignal` is **buffered**, not lost — the next `waitForSignal` for that token consumes it. This holds even under the tight race where the sender and the waiter arrive at almost the same instant: delivery uses a *take → buffer → re-check* sandwich on the send side that pairs with a *register → re-check* on the wait side, so a waiter that registers in the sliver between a "nobody's waiting" miss and the buffer write is still resumed instead of both rows being stranded (the lost-wake window is closed).
+A signal sent **before** the run has reached its `waitForSignal` is **buffered**, not lost — the next `waitForSignal` for that token consumes it. Delivery is to **exactly one** waiter, never a broadcast. Buffered payloads are FIFO per token (on the Lucid store, rows in `durable_buffered_signals`, consumed oldest first) and have no TTL or eviction: a buffered signal stays in the store until a matching `waitForSignal(token)` consumes it, however long that takes. This holds even under the tight race where the sender and the waiter arrive at almost the same instant: delivery uses a *take → buffer → re-check* sandwich on the send side that pairs with a *register → re-check* on the wait side, so a waiter that registers in the sliver between a "nobody's waiting" miss and the buffer write is still resumed instead of both rows being stranded (the lost-wake window is closed).
 
-And `engine.signalWithStart(workflow, input, runId, { token, payload })` starts a run *if it doesn't exist* and delivers a signal to it in one race-free call — ideal for an event-sourced entity that's driven entirely by incoming events:
+And `engine.signalWithStart(workflow, input, runId, { token, payload }, opts?)` starts a run *if it doesn't exist* and delivers a signal to it in one race-free call, resolving to `{ runId }`. It does two things in order: **start** the workflow at `runId` (idempotent — a no-op if the run already exists), then **signal** `token`. Because signals buffer, the order in which concurrent callers arrive doesn't matter. This is the durable-entity / accumulator pattern: one long-lived run per key looping on `waitForSignal`, fed by many callers that don't need to know whether the entity is already running:
 
 ```ts
 // Each event starts the run if needed, then delivers; ordering and exactly-once are preserved.
@@ -99,5 +131,17 @@ await engine.publishEvent('payment.settled', { orderId, amount })
 ### Reliable (buffered) events
 
 A publish that reaches **no** live recipient (no `waitForEvent` matched *and* no `onEvent` subscriber exists) is **buffered** rather than dropped. One copy is kept, and the first future `ctx.waitForEvent(name, { match })` that accepts its payload consumes it. This is the events equivalent of signal buffering, and it handles the publish/wait race in both directions. Pass `{ buffer: false }` to `publishEvent` for a live-only broadcast. On the [Lucid store](/docs/durable/stores/lucid), the copies live in the `durable_buffered_events` table. See [Reliable (buffered) delivery](/docs/durable/authoring/events#reliable-buffered-delivery) for the claim order and its limits.
+
+## Signals vs updates vs webhooks
+
+All three suspend a run with zero compute until an external call resumes it, but they differ in scope and guarantees:
+
+| | Scope | Validated before delivery | Typical use |
+|---|---|---|---|
+| **Signal** (`ctx.waitForSignal` / `engine.signal`) | Global token you choose | No — always lands, buffered if early | Point-to-point wakeup; the low-level primitive the other two build on |
+| **Update** (`ctx.onUpdate` / `engine.update`) | Run-scoped name | Yes — an optional validator can reject before touching the run | Steering a run from outside with a rejectable business rule |
+| **Webhook** (`ctx.webhook()` / `hook.wait()`) | Deterministic per-call token (`wh:<runId>:<seq>`), with a public URL | No — a raw signal under the hood | Third-party async callbacks |
+
+An update is a signal with a validator in front (rejection happens in the caller's request, before the run ever wakes) and a run-scoped name instead of a global token. A webhook is a signal with the token and callback URL minted for you — your route in `start/routes.ts` turns the third party's POST into `engine.signal(token, body)`.
 
 For a validated, rejectable steering primitive (Temporal-style updates) and a side-effect-free way to read a live run's state, see [Queries & updates](/docs/durable/authoring/queries-and-updates). For the deterministic callback-URL pattern, see [Durable webhooks](/docs/durable/authoring/webhooks).
