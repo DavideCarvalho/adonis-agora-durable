@@ -12,7 +12,7 @@ import {
   SCENARIO_RUNS_TABLE,
   SCENARIO_STEP,
   type StepInput,
-} from './db-scenario-worker.js';
+} from './db-scenario-shared.js';
 
 /**
  * The harness of the multi-process db transport scenarios (`test/engine/transports/db-multiprocess-*`):

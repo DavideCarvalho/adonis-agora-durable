@@ -16,31 +16,21 @@ import { DbTransport } from '../../src/transports/db.js';
 import { makePostgresDb } from '../../src/transports/db-helpers.js';
 import { createDurableTransportTables, TRANSPORT_TABLES } from '../../src/transports/db-schema.js';
 
-export const SCENARIO_STEP = 'scenario.step';
-export const SCENARIO_RUNS_TABLE = 'scenario_runs';
+import {
+  type Config,
+  SCENARIO_RUNS_TABLE,
+  SCENARIO_STEP,
+  type StepInput,
+} from './db-scenario-shared.js';
 
-export interface Config {
-  role: 'worker' | 'schema';
-  url: string;
-  schema: string;
-  instanceId: string;
-  concurrency?: number;
-  leaseMs?: number;
-  pollIntervalMs?: number;
-  maxStalledCount?: number;
-  closeTimeoutMs?: number;
+// Only ever a forked child: run nothing when imported (e.g. by a test reaching for the shared
+// constants) — an empty config would start a worker on Postgres' default settings.
+if (!process.env.DB_SCENARIO || !process.send) {
+  throw new Error(
+    'db-scenario-worker.ts is a child-process entry point; set DB_SCENARIO and fork it',
+  );
 }
-
-export interface StepInput {
-  seq: number;
-  /** The dispatched task's stepId (handlers are not told it). */
-  stepId: string;
-  ms?: number;
-  msOn?: Record<string, number>;
-  die?: boolean;
-}
-
-const config = JSON.parse(process.env.DB_SCENARIO ?? '{}') as Config;
+const config = JSON.parse(process.env.DB_SCENARIO) as Config;
 const send = (msg: unknown) => process.send?.(msg);
 
 async function runWorker(): Promise<void> {
