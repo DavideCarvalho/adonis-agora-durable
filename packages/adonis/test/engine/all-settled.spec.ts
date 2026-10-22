@@ -59,7 +59,7 @@ describe('ctx.allSettled', () => {
     await startRun(engine, 'file', {}, 'p');
     await until(async () => (await store.getRun('p'))?.status === 'completed');
 
-    const [invalid, down] = (await store.getRun('p'))?.output as Settled<number>[];
+    const [invalid, down] = ((await store.getRun('p'))?.output ?? []) as Settled<number>[];
     expect(invalid).toMatchObject({
       status: 'rejected',
       code: 'invalid_line',
