@@ -140,7 +140,7 @@ export const chargeCard = defineStep(
 await ctx.step(chargeCard, input, { queue: 'payments', priority: 10, retries: 5 })
 ```
 
-See [Retries & timeouts](/docs/durable/reliability/retries) for the durable-retry, `timeoutMs` and `pickupTimeoutMs` liveness semantics, [Flow control](/docs/durable/reliability/flow-control) for queues, and [Transports](/docs/durable/transports#pinning-a-transport-per-step-failover-pools) for pinning `transport`.
+See [Retries & timeouts](/docs/durable/reliability/retries) for the durable-retry, `timeoutMs` and `pickupTimeoutMs` liveness semantics, [Flow control](/docs/durable/reliability/flow-control) for queues, and [Transports](/docs/durable/transports#transport-pools-and-failover) for pinning `transport` (only on an engine built with a transport pool).
 
 #### `requires` — refuse to dispatch into a queue nobody serves
 

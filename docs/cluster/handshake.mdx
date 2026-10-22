@@ -39,15 +39,15 @@ It is advertised in **two tiers** to stay cheap at steady state and rich on chan
 
 ## Negotiation — three outcomes
 
-The control plane self-advertises its own descriptor, and both sides compute a **negotiated session**: the highest common protocol major plus the capability intersection. Each worker lands in one of three states:
+The control plane builds a descriptor of its own (it keeps it in memory; it does not publish it) and negotiates it against each worker's: the **negotiated session** is the highest common protocol major plus the capability intersection. The negotiation is pure (`negotiate(local, remote, { required })`, exported from `@adonis-agora/durable`), and each worker lands in one of three states:
 
 | Outcome | Meaning | Dispatch |
 |---------|---------|----------|
-| **Compatible** | protocol ranges overlap + required capabilities present | dispatch freely |
-| **Degraded** | ranges overlap but an *optional* capability is missing | dispatch, but route capability-requiring work only to capable workers; soft warning |
-| **Incompatible** | no protocol-range overlap | **do not dispatch** — red flag with the exact reason |
+| **Compatible** | protocol ranges overlap and both sides advertise the same capabilities | dispatch freely |
+| **Degraded** | ranges overlap, but the capability sets differ (or a capability the work requires is missing, reported as `capability.unavailable`) | the worker still counts as protocol-compatible; work that requires a capability it lacks is not counted against it |
+| **Incompatible** | no protocol-range overlap (`protocol.incompatible`) | the worker never counts as a target — red flag with the exact reason |
 
-An incompatible worker (say it speaks protocol `2` while the control plane speaks `1`) is never handed a task — the mismatch surfaces loudly instead of corrupting a run.
+Only the protocol range can rule a worker out on its own. A worker that speaks protocol `2` while the control plane speaks `1` is never counted as a live target, so if it is the only worker on a queue, the run parks instead of handing it a task.
 
 ## Capability-aware routing
 
@@ -64,11 +64,16 @@ export const settlePayment = defineStep(
 
 A workflow served by another process declares them on its registration — `engine.registerRemote(name, version, { group, executor, requires: ['saga'] })` — and a per-call `ctx.step(step, input, { requires })` overrides/augments the step's own list.
 
-The control plane dispatches such work **only** to workers whose descriptor advertises those capabilities. If **no live capable worker** exists, the run does not hang and does not dead-letter — it **parks as `blocked`**:
+Before each dispatch the engine reads the live descriptors published on the routing token it is about to dispatch to, through the primary transport's `listWorkerDescriptors` (`bullmq`, `db`, `eventEmitter`, and `queue` with a worker-key store implement it). It dispatches when **at least one** live worker on that token both advertises every required capability and is protocol-compatible. If none is, the run does not hang and does not dead-letter — it **parks as `blocked`**:
 
 <Callout type="warn">
-`blocked: no compatible worker (requires 'saga')` is a first-class run status, visible in the [dashboard](/docs/durable/observability/dashboard). The control plane re-checks blocked runs on a poll, so the moment a capable worker registers, the run resumes automatically. A capability mismatch is **never** a silent hang.
+`blocked: no compatible worker (requires saga)` (no live worker advertises the capability) and `blocked: no protocol-compatible worker` (capable workers exist, but none speaks a common protocol) are a first-class run status, visible in the [dashboard](/docs/durable/observability/dashboard). The control plane re-checks blocked runs every `blockedPollMs` (default `5000`, in `config/durable.ts`), so the moment a capable worker registers, the run resumes automatically. A capability mismatch is **never** a silent hang.
 </Callout>
+
+Two limits follow from the guard working per routing token:
+
+- **It engages only when a descriptor exists.** A token with no published descriptor (no worker yet, a worker on the `NoopWorkerRegistry`, or an SDK that predates descriptors) is dispatched to as before, and the task waits in the queue for a consumer. `requires` is enforced only against workers that describe themselves.
+- **It decides whether to dispatch, not which worker takes the task.** Every worker on a token consumes the same queue, so an incapable worker sharing a token with a capable one can still pick the task up. Keep the workers on one token homogeneous, or put capability-specific work on its own step name or partition.
 
 ## Announced registrations
 
@@ -143,9 +148,20 @@ const dir = await engine.workflowDirectory()
 ```
 
 - An **`observed`** entry is a live queue that no descriptor explains: a worker on an SDK too old to describe itself. It has no version, origin or runtime, because nobody stated one. A queue a descriptor declares as a **step** is left out, since a step cannot be called from outside a run.
-- **`supported: false`** means no transport in this process can read the fleet. The list is empty because nothing was asked, not because nothing runs. Today only the `bullmq` transport reads the fleet (`readAllWorkerDescriptors()` / `readAllWorkerHeartbeats()`).
+- **`supported: false`** means no transport in this process can read the fleet. The list is empty because nothing was asked, not because nothing runs. Today only the `bullmq` transport reads the whole fleet (`readAllWorkerDescriptors()` / `readAllWorkerHeartbeats()`); `queue`, `db` and `eventEmitter` answer per-token reads (`listWorkerDescriptors`) for the routing guard, but not the directory.
 - **`otherPartitions`** names workers that are live on a partition this engine does not route to. A worker on the wrong partition otherwise looks exactly like no worker at all. An engine with no namespace (an operator) serves every partition and reports none.
 - **`detail`** is one sentence saying which of these cases you are in, written for a human.
+
+So an empty list has distinct meanings, and the fields tell them apart:
+
+| `supported` | `workflows` | `otherPartitions` | Means | Do |
+| --- | --- | --- | --- | --- |
+| `false` | `[]` | `[]` | no transport here can read the fleet: nobody asked | use a transport that reads it (`bullmq`) |
+| `true` | `[]` | `[]` | the fleet was asked and nothing is live | start a worker |
+| `true` | `[]` | populated | workers are live, but on a partition this engine does not route to | fix the worker's or the engine's partition |
+| `true` | populated | any | here it is | — |
+
+Each call reads the advertisement keyspace once; nothing is added to the poll loop, and no process keeps the fleet's registrations in memory. There is deliberately no equivalent directory for steps: a step is identified by its position in one run's history and only `ctx.step` inside a replaying body can call it, so a picker offering steps would offer something no entry point can start.
 
 To start a run on the version a worker declares, register it with `engine.remote(name, { group, version })` and pin the start with `engine.start(name, input, id, { version })`. A pinned start throws when that version is not registered, and never falls back to the newest. Convention routing (calling an unregistered name that matches a live queue) cannot honour a pin, because nothing proves the version exists.
 
@@ -156,6 +172,8 @@ When negotiation rejects a worker or a run parks, durable emits structured diagn
 ## Backward compatibility
 
 A worker that advertises **no descriptor** (an older SDK, or a pre-handshake aviary worker) is treated as **legacy v1** with the v1 capability baseline, and assumed compatible. Existing workers keep flowing untouched; rich negotiation lights up as SDKs adopt it.
+
+The control plane's own descriptor speaks the current single major. Widening its band (to talk to workers on an older or newer major) is the engine constructor option `controlPlaneProtocol`; it is not a `config/durable.ts` field.
 
 The current wire protocol is **v1**. The whole point of the handshake is that a future **v2 breaking change is detectable** — an old worker and a new control plane discover the mismatch and refuse to corrupt each other, instead of failing in confusing ways at runtime.
 
