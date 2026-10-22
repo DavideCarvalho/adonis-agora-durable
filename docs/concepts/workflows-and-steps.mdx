@@ -158,6 +158,16 @@ const quote = await ctx.localStep('quote', () => pricing.fetch(order), { retries
 
 The body receives a [step logger](#steps-vs-sub-process-events) as its argument, so you can emit annotations from inside it. It supports the same `StepOptions` as a dispatched step (retries, backoff, timeout, and `compensate` for in-process [sagas](/docs/durable/reliability/sagas)) — see [Retries & backoff](/docs/durable/reliability/retries).
 
+### What gets persisted
+
+A local step is as durable as a dispatched one: when the body settles, the engine writes a checkpoint to the [store](/docs/durable/stores) — with `stores.lucid()`, a row in your database — holding the step's name, position, `output` (or error), attempts, timings and logger events. On every later pass, a `completed` checkpoint at that position is returned **without running the body again**, so a run that resumes after a `ctx.sleep('3d')` or a deploy reads the result from the database.
+
+Three consequences follow:
+
+- **A crash mid-body re-runs it.** Nothing is recorded until the body returns, so a process that dies inside it replays the step from scratch. Delivery is at-least-once: make side effects idempotent, e.g. key a charge on `` `${ctx.runId}:charge` `` so a re-run is deduplicated by the provider.
+- **The output must survive JSON.** The Lucid store serializes it with `JSON.stringify`. On the first pass the step hands back the value the body returned; on a replay it hands back the parsed copy — a `Date` comes back as an ISO string, a `Map`/`Set` as `{}`, a class instance as a plain object, `undefined` fields are dropped. Return plain data (convert dates with `toISOString()` and parse them where you use them) so both passes see the same shape. Payloads can be encrypted at rest with a [`CodecStateStore`](/docs/durable/stores#encrypting-payloads-at-rest).
+- **Position and name identify the checkpoint.** Renaming or reordering local steps while runs are in flight raises a `NonDeterminismError` on replay — see [Versioning](/docs/durable/authoring/versioning).
+
 ### In-flight visibility
 
 When a local step's body begins, the engine emits a `step.started` lifecycle event and (by default) writes a `running` checkpoint, so a long step shows up in the [dashboard](/docs/durable/observability/dashboard) the moment it starts — not only once it finishes. The `running` checkpoint is a placeholder overwritten by the step's `completed`/`failed` result; it never short-circuits [replay](/docs/durable/concepts/durability) (only a `completed` checkpoint does), so a crash mid-body simply re-runs the step.
