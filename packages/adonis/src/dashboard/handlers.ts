@@ -13,6 +13,7 @@ import type {
   RunValueAxis,
   RunValueFacetOptions,
   RunValueFacetRow,
+  RunWaiting,
   SignalWaiter,
   StepCheckpoint,
   UpdateResult,
@@ -125,6 +126,12 @@ export interface DashboardEngine {
    * full `listSignalWaiters('')` scan above.
    */
   listSignalWaitersByRunIds?(runIds: string[]): Promise<SignalWaiter[]>;
+  /**
+   * Already-resolved {@link RunWaiting} for the given runs — what a store-less `tenant` pod's
+   * gateway answers instead of raw waiter rows. Used by `listRuns` only when neither waiter scan
+   * above is available.
+   */
+  waitingFor?(runIds: string[]): Promise<Record<string, RunWaiting>>;
   /**
    * The distinct values of ONE filter axis over the runs matching `query`, with counts — what a
    * console's pickers list. Optional: absent on a port that can't do the scan yet (a store-less
@@ -363,12 +370,9 @@ export async function listRuns(deps: Deps, req: ApiRequest): Promise<ApiResponse
   // (...)`, indexed) over the legacy full-table waiter scan; absent on a topology that can't do
   // either yet (see `DashboardEngine.listSignalWaiters`'s doc), where the `waiting` stamp is
   // simply skipped, same as `@dudousxd/nestjs-durable-dashboard`.
-  const waiters = engine.listSignalWaitersByRunIds
-    ? await engine.listSignalWaitersByRunIds(runs.map((r) => r.id))
-    : await (engine.listSignalWaiters?.('') ?? Promise.resolve(undefined));
-  const waiterByRun = waiters ? indexWaitersByRun(waiters) : undefined;
+  const waitingOf = await waitingResolver(engine, runs);
   return ok({
-    runs: runs.map((run) => redacted(deps.redact?.run, summarizeRun(run, waiterByRun))),
+    runs: runs.map((run) => redacted(deps.redact?.run, summarizeRun(run, waitingOf))),
     meta: { page, size, count: runs.length },
     statuses: RUN_STATUSES,
   });
@@ -717,10 +721,35 @@ export function topology(
   return ok(tenant !== undefined ? { role, tenant } : { role });
 }
 
-/** Compact run shape for the list view. `waiterByRun`, when given, stamps `waiting` on a `suspended`
+/**
+ * How `listRuns` names what each run on a page is parked on: from the store's waiter rows (the
+ * targeted per-page lookup, else the full scan), or from a gateway's resolved `waitingFor`. Undefined
+ * when the port can do neither, and the `waiting` stamp is skipped.
+ */
+async function waitingResolver(
+  engine: DashboardEngine,
+  runs: readonly WorkflowRun[],
+): Promise<((run: WorkflowRun) => RunWaiting | undefined) | undefined> {
+  const ids = runs.map((r) => r.id);
+  const waiters = engine.listSignalWaitersByRunIds
+    ? await engine.listSignalWaitersByRunIds(ids)
+    : await (engine.listSignalWaiters?.('') ?? Promise.resolve(undefined));
+  if (waiters) {
+    const waiterByRun = indexWaitersByRun(waiters);
+    return (run) => resolveRunWaiting(run, waiterByRun);
+  }
+  if (engine.waitingFor) {
+    const suspended = runs.filter((r) => r.status === 'suspended').map((r) => r.id);
+    const byRun = suspended.length > 0 ? await engine.waitingFor(suspended) : {};
+    return (run) => byRun[run.id];
+  }
+  return undefined;
+}
+
+/** Compact run shape for the list view. `waitingOf`, when given, stamps `waiting` on a `suspended`
  *  run parked on a signal/webhook/child/breakpoint (see `listRuns`' bulk waiter scan). */
-function summarizeRun(run: WorkflowRun, waiterByRun?: ReadonlyMap<string, SignalWaiter>) {
-  const waiting = waiterByRun ? resolveRunWaiting(run, waiterByRun) : undefined;
+function summarizeRun(run: WorkflowRun, waitingOf?: (run: WorkflowRun) => RunWaiting | undefined) {
+  const waiting = waitingOf ? waitingOf(run) : undefined;
   return {
     id: run.id,
     workflow: run.workflow,

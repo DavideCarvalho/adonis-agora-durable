@@ -102,6 +102,13 @@ export * from './queue.js';
 export { isRemoteEvent } from './remote-event.js';
 export * from './remote-workflow-executor.js';
 export * from './run-detail-summary.js';
+export {
+  type RunFacetRow,
+  type RunFacetSource,
+  runFacetsOf,
+  type WaitingSource,
+  waitingForRuns,
+} from './run-facets.js';
 // --- store-less cluster: RunGateway (read/control surface) ------------------
 export type { DurableTopology, RunGateway, StartRunOptions } from './run-gateway/interface.js';
 export {
@@ -113,6 +120,7 @@ export {
   type ResponderTransport,
   RunRequestResponder,
   type RunRequestResponderOptions,
+  UNSUPPORTED_RUN_REQUEST,
 } from './run-gateway/run-request-responder.js';
 export {
   type RunGatewayEngine,

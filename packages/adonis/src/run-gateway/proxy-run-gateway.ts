@@ -2,11 +2,16 @@ import { childIdsOf } from '../fan-join.js';
 import type {
   EngineEvent,
   GroupHealth,
+  RunFacetQuery,
   RunQuery,
   RunReply,
   RunRequest,
   RunRequestKind,
   RunResult,
+  RunValueAxis,
+  RunValueFacetOptions,
+  RunValueFacetRow,
+  RunWaiting,
   SearchAttributes,
   StartRunMessage,
   StepCheckpoint,
@@ -22,6 +27,7 @@ import {
   type RunDetailOptions,
   type RunDetailSource,
 } from '../run-detail-summary.js';
+import type { RunFacetRow } from '../run-facets.js';
 import type { WorkflowRef } from '../workflow-ref.js';
 import type { DurableTopology, RunGateway, StartRunOptions } from './interface.js';
 import { UNSUPPORTED_RUN_REQUEST } from './run-request-responder.js';
@@ -92,8 +98,9 @@ interface PendingReply {
  * over the wire. It owns NO store (structural isolation, spec §5): every verb round-trips to the
  * control plane's `RunRequestResponder` and back.
  *
- * - read/control (`getRun`/`listRuns`/`getCheckpoints`/`getSearchAttributes`/`workerHealth`/`signal`/
- *   `cancel`/`redispatchPending`) → publish a {@link RunRequest} correlated by a minted `requestId`,
+ * - read/control (`getRun`/`listRuns`/`getCheckpoints`/`getRunChildren`/`getRunDetail`/
+ *   `getFanMembers`/`getSearchAttributes`/`runFacets`/`runValueFacets`/`waitingFor`/`workerHealth`/
+ *   `signal`/`cancel`/`retry`/`continue`/`retryWithInput`/`redispatchPending`) → publish a {@link RunRequest} correlated by a minted `requestId`,
  *   await the {@link RunReply} within `requestTimeoutMs`;
  * - `start` → publish a {@link StartRunMessage} (its own channel, byte-compatible with aviary), then
  *   await the reply the responder correlates by the minted `runId`;
@@ -325,6 +332,42 @@ export class ProxyRunGateway implements RunGateway {
       kind: 'redispatch',
       runId,
     });
+  }
+
+  retry(runId: string): Promise<RunResult | null> {
+    return this.#request<RunResult | null>({ kind: 'retry', runId });
+  }
+
+  continue(runId: string): Promise<RunResult | null> {
+    return this.#request<RunResult | null>({ kind: 'continue', runId });
+  }
+
+  retryWithInput(runId: string, input: unknown): Promise<{ runId: string } | null> {
+    return this.#request<{ runId: string } | null>({ kind: 'retryWithInput', runId, input });
+  }
+
+  /** Scoped by the control plane to this tenant's own runs (the query's namespace is replaced). */
+  runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
+    return this.#request<RunFacetRow[]>({ kind: 'runFacets', query });
+  }
+
+  /** Scoped by the control plane to this tenant's own runs (the query's namespace is replaced). */
+  runValueFacets(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]> {
+    return this.#request<RunValueFacetRow[]>(
+      opts === undefined
+        ? { kind: 'runValueFacets', axis, query }
+        : { kind: 'runValueFacets', axis, query, opts },
+    );
+  }
+
+  /** Only this tenant's own runs come back; another tenant's ids are silently absent. */
+  waitingFor(runIds: string[]): Promise<Record<string, RunWaiting>> {
+    if (runIds.length === 0) return Promise.resolve({});
+    return this.#request<Record<string, RunWaiting>>({ kind: 'waitingFor', runIds });
   }
 
   /** Live-tail ONE run by bridging onto this tenant's event channel and filtering by `runId`. */

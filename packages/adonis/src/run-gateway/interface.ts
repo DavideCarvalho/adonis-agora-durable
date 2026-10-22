@@ -2,13 +2,19 @@ import type { StartOptions } from '../engine.js';
 import type {
   EngineEvent,
   GroupHealth,
+  RunFacetQuery,
   RunQuery,
   RunResult,
+  RunValueAxis,
+  RunValueFacetOptions,
+  RunValueFacetRow,
+  RunWaiting,
   SearchAttributes,
   StepCheckpoint,
   WorkflowRun,
 } from '../interfaces.js';
 import type { FanPage, FanPageQuery, RunDetail, RunDetailOptions } from '../run-detail-summary.js';
+import type { RunFacetRow } from '../run-facets.js';
 import type { WorkflowRef } from '../workflow-ref.js';
 
 /**
@@ -113,6 +119,40 @@ export interface RunGateway {
    * re-dispatch. Byte-compatible with aviary's `redispatchPending`.
    */
   redispatchPending(runId: string): Promise<(RunResult & { redispatched: number }) | null>;
+
+  /**
+   * Retry a failed/dead run in place: it goes back to `pending` and a worker resumes it, replaying
+   * its checkpoints and re-attempting the failed step (`engine.requeue`). Returns the enqueued state,
+   * or null for an unknown run.
+   *
+   * This verb and the five below are aviary's, in aviary's shapes. They are optional so a gateway
+   * written against an earlier release keeps compiling; both shipped gateways implement them all.
+   */
+  retry?(runId: string): Promise<RunResult | null>;
+
+  /** Resume a run paused at a `ctx.breakpoint()`. Null if it is not paused at one. */
+  continue?(runId: string): Promise<RunResult | null>;
+
+  /** Fix-and-replay: a fresh linked run of the same workflow with a corrected `input`. Returns the
+   *  new run's id, or null for an unknown run. */
+  retryWithInput?(runId: string, input: unknown): Promise<{ runId: string } | null>;
+
+  /** Counts of the runs matching `query` by `(status, origin)` — a console's status and origin
+   *  chips, exact while the list is paginated. Zero-count cells are absent. A tenant proxy's answer
+   *  is scoped to the tenant's own runs. */
+  runFacets?(query: RunFacetQuery): Promise<RunFacetRow[]>;
+
+  /** The distinct values of one filter axis over the runs matching `query`, with counts — what a
+   *  console's pickers list. Scoped to the tenant's own runs over a proxy. */
+  runValueFacets?(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]>;
+
+  /** What each of `runIds` is parked on (signal, webhook, awaited child, breakpoint), for the ones
+   *  currently waiting; every other id is absent. A proxy only learns about the tenant's own runs. */
+  waitingFor?(runIds: string[]): Promise<Record<string, RunWaiting>>;
 
   /** Live lifecycle events for ONE run; returns an unsubscribe fn. Framework-agnostic (no rxjs). */
   subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void;

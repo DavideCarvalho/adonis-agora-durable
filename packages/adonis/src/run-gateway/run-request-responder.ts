@@ -5,11 +5,13 @@ import type {
   RunReplyResult,
   RunRequest,
   RunRequestKind,
+  RunWaiting,
   StartRunMessage,
   TenantEvent,
   WorkflowRun,
 } from '../interfaces.js';
 import { loadFanMembers, loadRunDetail, type RunDetailSource } from '../run-detail-summary.js';
+import { runFacetsOf } from '../run-facets.js';
 import type { RunGateway } from './interface.js';
 
 /**
@@ -46,7 +48,19 @@ const KNOWN_KINDS: ReadonlySet<string> = new Set<RunRequestKind['kind']>([
   'signal',
   'cancel',
   'redispatch',
+  'runFacets',
+  'runValueFacets',
+  'retry',
+  'continue',
+  'retryWithInput',
+  'waitingFor',
 ]);
+
+/** The verbs that carry no `runId` and are scoped some other way. */
+type UnscopedKind = Extract<
+  RunRequestKind,
+  { kind: 'listRuns' | 'workerHealth' | 'runFacets' | 'runValueFacets' | 'waitingFor' }
+>;
 
 /** Options for {@link RunRequestResponder}. */
 export interface RunRequestResponderOptions {
@@ -83,12 +97,14 @@ function isTerminalRunEvent(event: EngineEvent): boolean {
  * 1. **Authenticate + derive tenant.** With a {@link RunRequestResponderOptions.verifyTenant}, the
  *    signed token (carried in the wire `tenant` field) is verified and the real tenant is DERIVED from
  *    it; the body's claim is ignored. An invalid token short-circuits to an `unauthorized` reply.
- * 2. **`listRuns` is namespace-forced** to the derived tenant — the client's `namespace` is discarded,
- *    never merely validated, so a tenant cannot enumerate another's runs.
+ * 2. **`listRuns`, `runFacets` and `runValueFacets` are namespace-forced** to the derived tenant —
+ *    the client's `namespace` is discarded, never merely validated, so a tenant cannot enumerate (or
+ *    count, or read the tag vocabulary of) another's runs. **`waitingFor`** answers only the ids the
+ *    tenant owns.
  * 3. **`workerHealth` is group-scoped** to the tenant's own `@<tenant>` queues.
  * 4. **Every runId-bearing verb** (`getRun`/`getCheckpoints`/`getRunDetail`/`getFanMembers`/
- *    `getSearchAttributes`/`signal`/`cancel`/`redispatch`) loads the run alone FIRST — never its
- *    timeline — and rejects with `cross-tenant` when `run.namespace` isn't the derived tenant —
+ *    `getSearchAttributes`/`signal`/`cancel`/`redispatch`/`retry`/`continue`/`retryWithInput`)
+ *    loads the run alone FIRST — never its timeline — and rejects with `cross-tenant` when `run.namespace` isn't the derived tenant —
  *    anti-IDOR, so a tenant can never read OR act on another tenant's run.
  * 5. **`start` forces the run's namespace** to the derived tenant, so a started run is owned by, and
  *    later only reachable by, that tenant.
@@ -213,6 +229,12 @@ export class RunRequestResponder {
           error: { message: 'run belongs to another tenant', code: 'cross-tenant' },
         });
       }
+      if (err instanceof GatewayLacksVerbError) {
+        return reply(msg.requestId, {
+          ok: false,
+          error: { message: err.message, code: UNSUPPORTED_RUN_REQUEST },
+        });
+      }
       return reply(msg.requestId, { ok: false, error: { message: errorMessage(err) } });
     }
   }
@@ -234,9 +256,47 @@ export class RunRequestResponder {
       return all.filter((h) => h.group.endsWith(`@${tenant}`));
     }
 
+    if (body.kind === 'runFacets') {
+      // Forced to the tenant exactly like `listRuns`: the counts label the tenant's own list.
+      const scoped = { ...body.query, namespace: tenant };
+      if (this.#gateway.runFacets) return this.#gateway.runFacets(scoped);
+      const facets = this.#gateway.runValueFacets;
+      if (!facets) throw new GatewayLacksVerbError(body.kind);
+      return runFacetsOf(
+        { runValueFacets: (axis, q, opts) => facets.call(this.#gateway, axis, q, opts) },
+        scoped,
+      );
+    }
+
+    if (body.kind === 'runValueFacets') {
+      // Forced too: enumerating values over other tenants' runs would leak their tag and attribute
+      // vocabulary, and offer picks this tenant's list can never match.
+      if (!this.#gateway.runValueFacets) throw new GatewayLacksVerbError(body.kind);
+      return this.#gateway.runValueFacets(
+        body.axis,
+        { ...body.query, namespace: tenant },
+        body.opts,
+      );
+    }
+
+    if (body.kind === 'waitingFor') {
+      // Bulk and caller-chosen ids, which could probe another tenant's runs: keep only the matches
+      // the tenant owns, checked per MATCHED entry (bounded by how many ids are actually waiting).
+      if (!this.#gateway.waitingFor) throw new GatewayLacksVerbError(body.kind);
+      const all = await this.#gateway.waitingFor(body.runIds);
+      const owned: Record<string, RunWaiting> = {};
+      await Promise.all(
+        Object.entries(all).map(async ([runId, waiting]) => {
+          const owner = await this.#gateway.getRun(runId);
+          if (owner && owner.namespace === tenant) owned[runId] = waiting;
+        }),
+      );
+      return owned;
+    }
+
     // Every remaining verb is runId-bearing. Load the run FIRST — before calling the verb — so a
-    // cross-tenant request never reaches the gateway's mutating methods (signal/cancel/redispatch) or
-    // leaks another tenant's run via a read (getRun/getCheckpoints/getSearchAttributes).
+    // cross-tenant request never reaches the gateway's mutating methods (signal/cancel/redispatch/
+    // retry/continue/retryWithInput) or leaks another tenant's run via a read (getRun/getCheckpoints/getSearchAttributes).
     const run = await this.#gateway.getRun(body.runId);
     if (run && run.namespace !== tenant) throw new CrossTenantError();
     return this.#callVerb(body, run);
@@ -245,10 +305,19 @@ export class RunRequestResponder {
   /** Dispatch a runId-bearing verb. `run` is the already-loaded run (ownership-checked by the caller) —
    *  reused for `getRun` so it isn't fetched twice. An unknown verb is rejected, never silently dropped. */
   #callVerb(
-    body: Exclude<RunRequestKind, { kind: 'listRuns' } | { kind: 'workerHealth' }>,
+    body: Exclude<RunRequestKind, UnscopedKind>,
     run: WorkflowRun | null,
   ): Promise<unknown> {
     switch (body.kind) {
+      case 'retry':
+        if (!this.#gateway.retry) throw new GatewayLacksVerbError(body.kind);
+        return this.#gateway.retry(body.runId);
+      case 'continue':
+        if (!this.#gateway.continue) throw new GatewayLacksVerbError(body.kind);
+        return this.#gateway.continue(body.runId);
+      case 'retryWithInput':
+        if (!this.#gateway.retryWithInput) throw new GatewayLacksVerbError(body.kind);
+        return this.#gateway.retryWithInput(body.runId, body.input);
       case 'getRun':
         return Promise.resolve(run);
       case 'getCheckpoints':
@@ -377,6 +446,13 @@ export class RunRequestResponder {
 
 /** A runId-bearing request addressed a run of another tenant. */
 class CrossTenantError extends Error {}
+
+/** The control plane's gateway does not implement an optional verb (a hand-written gateway). */
+class GatewayLacksVerbError extends Error {
+  constructor(kind: string) {
+    super(`the control plane does not support the ${kind} run request`);
+  }
+}
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);

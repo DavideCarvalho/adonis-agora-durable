@@ -1,9 +1,15 @@
 import type {
   EngineEvent,
   GroupHealth,
+  RunFacetQuery,
   RunQuery,
   RunResult,
+  RunValueAxis,
+  RunValueFacetOptions,
+  RunValueFacetRow,
+  RunWaiting,
   SearchAttributes,
+  SignalWaiter,
   StepCheckpoint,
   WorkflowRun,
 } from '../interfaces.js';
@@ -15,6 +21,7 @@ import {
   type RunDetail,
   type RunDetailOptions,
 } from '../run-detail-summary.js';
+import { type RunFacetRow, runFacetsOf, waitingForRuns } from '../run-facets.js';
 import type { WorkflowRef } from '../workflow-ref.js';
 import type { DurableTopology, RunGateway, StartRunOptions } from './interface.js';
 
@@ -48,6 +55,17 @@ export interface RunGatewayEngine {
   subscribe(listener: (event: EngineEvent) => void): () => void;
   /** Optional — absent on the current AdonisJS engine; see {@link RunGatewayEngine} note. */
   redispatchPending?(runId: string): Promise<(RunResult & { redispatched: number }) | null>;
+  /** The aviary verbs below. Optional on the port so a narrower engine double still fits; the real
+   *  `WorkflowEngine` has every one. A missing one degrades to `null` / `[]` / `{}`. */
+  requeue?(runId: string): Promise<RunResult | null>;
+  continue?(runId: string): Promise<RunResult | null>;
+  retryWithInput?(runId: string, input: unknown): Promise<{ runId: string } | null>;
+  runValueFacets?(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]>;
+  listSignalWaitersByRunIds?(runIds: string[]): Promise<SignalWaiter[]>;
 }
 
 /** Options for {@link StoreRunGateway}. */
@@ -152,6 +170,49 @@ export class StoreRunGateway implements RunGateway {
     // The AdonisJS engine doesn't yet expose per-step re-dispatch; degrade to null when absent so the
     // verb stays byte-compatible for a proxy without inventing engine behaviour. See RunGatewayEngine.
     return this.#engine.redispatchPending?.(runId) ?? Promise.resolve(null);
+  }
+
+  retry(runId: string): Promise<RunResult | null> {
+    return this.#engine.requeue?.(runId) ?? Promise.resolve(null);
+  }
+
+  continue(runId: string): Promise<RunResult | null> {
+    return this.#engine.continue?.(runId) ?? Promise.resolve(null);
+  }
+
+  retryWithInput(runId: string, input: unknown): Promise<{ runId: string } | null> {
+    return this.#engine.retryWithInput?.(runId, input) ?? Promise.resolve(null);
+  }
+
+  runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
+    const engine = this.#engine;
+    const facets = engine.runValueFacets;
+    if (!facets) return Promise.resolve([]);
+    return runFacetsOf(
+      { runValueFacets: (axis, q, opts) => facets.call(engine, axis, q, opts) },
+      query,
+    );
+  }
+
+  runValueFacets(
+    axis: RunValueAxis,
+    query: RunFacetQuery,
+    opts?: RunValueFacetOptions,
+  ): Promise<RunValueFacetRow[]> {
+    return this.#engine.runValueFacets?.(axis, query, opts) ?? Promise.resolve([]);
+  }
+
+  waitingFor(runIds: string[]): Promise<Record<string, RunWaiting>> {
+    const engine = this.#engine;
+    const byRunIds = engine.listSignalWaitersByRunIds;
+    if (!byRunIds) return Promise.resolve({});
+    return waitingForRuns(
+      {
+        getRun: (runId) => engine.getRun(runId),
+        listSignalWaitersByRunIds: (ids) => byRunIds.call(engine, ids),
+      },
+      runIds,
+    );
   }
 
   subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void {
