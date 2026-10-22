@@ -1,4 +1,5 @@
 import type { IndexGenerator } from '@adonisjs/assembler/index_generator';
+import { addBarrelSources } from './barrel-sources.js';
 
 /**
  * Where the generated steps barrel is written, relative to the app root. The durable provider imports
@@ -9,9 +10,18 @@ export const GENERATED_STEPS_OUTPUT = '.adonisjs/durable/steps.ts';
 
 /** Options for {@link stepsHook} — mirror the relevant `IndexGenerator.add` knobs. */
 export interface StepsHookOptions {
-  /** Directory the generator scans for step modules, relative to the app root. Default `app/steps`. */
-  source?: string;
-  /** Import alias the generated barrel uses for each step module. Default `#steps`. */
+  /**
+   * Directory the generator scans for step modules, relative to the app root. Default `app/steps`.
+   * Pass several directories (a modular app: one per bounded context) to get ONE barrel covering
+   * all of them; list the same directories in `config/durable.ts` (`stepsPath`) so the
+   * runtime-scan fallback agrees with the barrel.
+   */
+  source?: string | readonly string[];
+  /**
+   * Import alias the generated barrel uses for each step module. Default `#steps`. Single
+   * `source` only: a multi-directory barrel imports through relative paths, and passing an alias
+   * with several directories throws.
+   */
   importAlias?: string;
   /** Output path for the generated barrel, relative to the app root. Default `.adonisjs/durable/steps.ts`. */
   output?: string;
@@ -35,10 +45,6 @@ export interface StepsHookOptions {
  * ```
  */
 export function stepsHook(options: StepsHookOptions = {}) {
-  const source = options.source ?? 'app/steps';
-  const importAlias = options.importAlias ?? '#steps';
-  const output = options.output ?? GENERATED_STEPS_OUTPUT;
-
   // A FUNCTION, not an object with a `run` method. `@poppinss/hooks` — the runner the
   // assembler drives its `init` hooks with — invokes a handler as
   //   `typeof handler === 'function' ? handler(...data) : handler.handle(action, ...data)`
@@ -50,15 +56,13 @@ export function stepsHook(options: StepsHookOptions = {}) {
     _hooks: unknown,
     indexGenerator: IndexGenerator,
   ): void {
-    indexGenerator.add('steps', {
-      source,
-      as: 'barrelFile',
-      exportName: 'steps',
-      importAlias,
+    addBarrelSources(indexGenerator, {
+      name: 'steps',
+      source: options.source ?? 'app/steps',
+      importAlias: options.importAlias,
+      defaultImportAlias: '#steps',
+      output: options.output ?? GENERATED_STEPS_OUTPUT,
       removeSuffix: 'step',
-      skipSegments: ['steps'],
-      output,
-      comment: true,
     });
   };
 }

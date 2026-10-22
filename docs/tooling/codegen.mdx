@@ -63,9 +63,9 @@ export const workflows = {
 
 At boot the provider imports `.adonisjs/durable/workflows.js`. It awaits each thunk and registers every `BaseWorkflow` subclass it finds, through the container so constructor injection works. Each class is registered once, even when it's re-exported from several modules. It does the same with `.adonisjs/durable/steps.js`, serving every `@Step` / `defineStep` export by name on the app's transport.
 
-When a barrel file doesn't exist (because the hook isn't registered), the provider **falls back** to scanning the configured directory at runtime (`workflowsPath`, default `app/workflows`; `stepsPath`, default `app/steps`). Registration is identical either way. Only a genuine "module not found" triggers the fallback: a barrel that exists but fails to import throws at boot instead of quietly degrading. Setting `workflowsPath: false` or `stepsPath: false` in `config/durable.ts` turns discovery off entirely, barrel included.
+When a barrel file doesn't exist (because the hook isn't registered), the provider **falls back** to scanning the configured directories at runtime (`workflowsPath`, default `app/workflows`; `stepsPath`, default `app/steps`). Registration is identical either way. Only a genuine "module not found" triggers the fallback: a barrel that exists but fails to import throws at boot instead of quietly degrading. Setting `workflowsPath: false` or `stepsPath: false` in `config/durable.ts` turns discovery off entirely, barrel included.
 
-The barrels serve the app process's provider. A dedicated worker process started with `node ace durable:worker` registers its step handlers by scanning `stepsPath` at runtime and doesn't read the steps barrel.
+The barrels serve the app process's provider. A dedicated worker process started with `node ace durable:worker` registers its step handlers by scanning every `stepsPath` directory at runtime and doesn't read the steps barrel.
 
 ### Options
 
@@ -79,13 +79,52 @@ export default workflowsHook({ source: 'app/flows', importAlias: '#flows' })
 
 | Option | `workflowsHook` default | `stepsHook` default | Description |
 | --- | --- | --- | --- |
-| `source` | `'app/workflows'` | `'app/steps'` | Directory scanned, relative to the app root. |
-| `importAlias` | `'#workflows'` | `'#steps'` | Import alias each barrel entry uses. Needs a matching `package.json` `imports` entry. |
+| `source` | `'app/workflows'` | `'app/steps'` | Directory scanned, relative to the app root, or an array of directories (see [Several directories](#several-directories)). |
+| `importAlias` | `'#workflows'` | `'#steps'` | Import alias each barrel entry uses. Needs a matching `package.json` `imports` entry. Single `source` only: passing it with several directories throws. |
 | `output` | `'.adonisjs/durable/workflows.ts'` | `'.adonisjs/durable/steps.ts'` | Where the barrel is written. |
 
 <Callout type="warn" title="Keep the default output path">
 The provider always imports the barrel from the fixed `.adonisjs/durable/workflows.js` / `.adonisjs/durable/steps.js` path. If you change `output`, the provider won't find the barrel and silently falls back to the runtime directory scan.
 </Callout>
+
+### Several directories
+
+A modular app with one folder per bounded context passes an array to `source`. Each hook still writes one barrel at the same output path, so the provider finds it as before:
+
+```ts title="hooks/durable_workflows.ts"
+import { workflowsHook } from '@adonis-agora/durable/hooks/workflows'
+
+export default workflowsHook({ source: ['app/orders/flows', 'app/billing/flows'] })
+```
+
+```ts title="hooks/durable_steps.ts"
+import { stepsHook } from '@adonis-agora/durable/hooks/steps'
+
+export default stepsHook({ source: ['app/orders/steps', 'app/billing/steps', 'app/engine'] })
+```
+
+Register those modules in `adonisrc.ts` in place of the package defaults. With several directories the barrel is an array with one entry per root. Each module is keyed by its path from the app root and imported through a path relative to the barrel, so you don't need a `package.json` `imports` entry per directory:
+
+```ts title=".adonisjs/durable/workflows.ts"
+export const workflows = [
+  {
+    root: 'app/orders/flows',
+    modules: {
+      'app/orders/flows/place_workflow.ts': () => import('../../app/orders/flows/place_workflow.js'),
+    },
+  },
+  {
+    root: 'app/billing/flows',
+    modules: {
+      'app/billing/flows/charge_workflow.ts': () => import('../../app/billing/flows/charge_workflow.js'),
+    },
+  },
+]
+```
+
+The file watcher regenerates the barrel when a file is added to or removed from any of the directories. A one-element array produces exactly the single-directory barrel, and an empty array throws: to turn a barrel off, remove its hook.
+
+The duplicate rule from the runtime scan applies here too. If two roots define the same workflow name and version, or the same step name, boot fails with a `DuplicateDiscoveryError` that names both module paths. Keep `workflowsPath` / `stepsPath` in `config/durable.ts` set to the same directories, so the runtime fallback (and `durable:worker`) agrees with the barrel.
 
 ## A typed client for the dashboard API
 

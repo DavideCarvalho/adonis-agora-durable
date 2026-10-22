@@ -36,7 +36,7 @@ Any [scheduled workflows](/docs/durable/authoring/scheduling) registered under `
 
 ## `durable:worker` — the store-less worker
 
-The worker for a `role: 'tenant'` pod: it serves step bodies and never touches a state store. It boots the container-bound `WorkerRuntime`, registers every handler under `app/steps`, advertises its descriptor and heartbeat so the control plane can route to it, and drains on `SIGINT`/`SIGTERM`.
+The worker for a `role: 'tenant'` pod: it serves step bodies and never touches a state store. It boots the container-bound `WorkerRuntime`, registers every handler under `stepsPath` (default `app/steps`; every directory when it's an array), advertises its descriptor and heartbeat so the control plane can route to it, and drains on `SIGINT`/`SIGTERM`.
 
 ```bash
 node ace durable:worker

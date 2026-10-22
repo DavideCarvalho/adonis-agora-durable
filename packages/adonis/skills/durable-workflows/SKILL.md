@@ -37,6 +37,14 @@ and registers every exported class — you never call `engine.register` by hand
 (it remains the low-level escape hatch). The convention mirrors `@adonisjs/queue`
 jobs under `app/jobs`; scaffold with `node ace make:workflow order`.
 
+A modular app (one folder per bounded context) lists several directories:
+`workflowsPath` and `stepsPath` in `config/durable.ts` take an array, and so
+does the `source` option of the `workflowsHook` / `stepsHook` codegen hooks.
+Names must be unique across those directories. To register one more directory
+from a preload, call `registerWorkflowsFromDir(engine, dir)` and
+`registerStepsFromDir(engine, dir)`. The engine serves steps through its
+transport (`engine.handle`).
+
 ## Setup
 
 ```ts title="app/workflows/checkout_workflow.ts"
@@ -418,6 +426,31 @@ Mechanism: a throwing handler fails the entity's immortal run, stranding every
 caller suspended on `ctx.callEntity`; model expected rejections as returned
 discriminated results and reserve throws for genuine programmer errors.
 Source: `docs/authoring/entities.mdx` (warning callout).
+
+### MEDIUM the same workflow or step name in two discovery directories
+
+Wrong:
+
+```ts
+// config/durable.ts — both contexts declare a workflow named 'charge' (version 1)
+export default defineConfig({
+  workflowsPath: ['app/orders/flows', 'app/billing/flows'],
+})
+```
+
+Correct:
+
+```ts
+// app/billing/flows/charge_workflow.ts
+static workflow = { name: 'billing.charge', version: '1' }
+```
+
+Mechanism: names route runs and steps, so with several `workflowsPath` /
+`stepsPath` directories boot throws `DuplicateDiscoveryError` naming both files
+when two directories define the same workflow name + version or step name with
+different classes. Prefix names by context. The hooks' `source` list must name
+the same directories, otherwise the barrel and the runtime scan disagree.
+Source: `docs/authoring/app-workflows.mdx` ("Several directories").
 
 See also: `durable-determinism` — why the body must stay deterministic and how
 to change it safely once live.

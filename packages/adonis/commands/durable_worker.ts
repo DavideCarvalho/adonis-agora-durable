@@ -1,6 +1,7 @@
 import { BaseCommand } from '@adonisjs/core/ace';
 import type { CommandOptions } from '@adonisjs/core/types/ace';
 import type { DurableConfig } from '../src/define_config.js';
+import { describeRoots, discoveryRoots } from '../src/discovery-roots.js';
 import type { ControlPlane, Transport } from '../src/interfaces.js';
 import { DURABLE_WORKER_RUNTIME } from '../src/role_bindings.js';
 import { InMemoryTransport } from '../src/testing/in-memory-transport.js';
@@ -44,19 +45,24 @@ export default class DurableWorker extends BaseCommand {
     const { runtime, partition } = await this.#resolveRuntime(config);
 
     // Register `app/steps` (served by the transport) + advertise `app/workflows` names.
-    if (config.stepsPath !== false) {
-      const stepsDir = this.app.makePath(config.stepsPath ?? 'app/steps');
-      const steps = await registerStepsFromDir(runtime, stepsDir);
+    const stepRoots = discoveryRoots(config.stepsPath, 'app/steps');
+    if (stepRoots.length > 0) {
+      const steps = await registerStepsFromDir(
+        runtime,
+        stepRoots.map((root) => this.app.makePath(root)),
+      );
       this.logger.info(
-        `registered ${steps.length} step handler(s) from ${config.stepsPath ?? 'app/steps'}`,
+        `registered ${steps.length} step handler(s) from ${describeRoots(stepRoots)}`,
       );
     }
-    if (config.workflowsPath !== false) {
-      const workflowsDir = this.app.makePath(config.workflowsPath ?? 'app/workflows');
-      const workflows = await discoverWorkflows(workflowsDir);
+    const workflowRoots = discoveryRoots(config.workflowsPath, 'app/workflows');
+    if (workflowRoots.length > 0) {
+      const workflows = await discoverWorkflows(
+        workflowRoots.map((root) => this.app.makePath(root)),
+      );
       runtime.registerWorkflowNames(workflows.map((w) => w.meta.name));
       this.logger.info(
-        `advertising ${workflows.length} workflow name(s) from ${config.workflowsPath ?? 'app/workflows'}`,
+        `advertising ${workflows.length} workflow name(s) from ${describeRoots(workflowRoots)}`,
       );
     }
 

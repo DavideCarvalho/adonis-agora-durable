@@ -209,6 +209,7 @@ import engine from '@adonis-agora/durable/services/main'
 | --- | --- | --- |
 | `register` | `register(name: string, version: string, fn: WorkflowFn, opts?: { tags?, singleton?, concurrency?, executionTimeout?, validateInput?, onEvent?, eventBatch?, requires?, origin?, onError? }): void` | Register a function-form workflow (`WorkflowFn` is `(ctx: WorkflowCtx, input: unknown) => Promise<unknown>`). `app/workflows` discovery calls this for you. See [Workflows & steps](/docs/durable/concepts/workflows-and-steps#workflows). |
 | `registerRemote` | `registerRemote(name: string, version: string, opts: { group: string; executor: WorkflowExecutor; tags?; singleton?; concurrency?; executionTimeout?; validateInput?; requires?; onError? }): void` | Register a workflow whose body runs in another SDK; the engine still owns its state. See [Cross-ecosystem interop](/docs/durable/cluster/interop). |
+| `handle` | `handle(name: string, fn: StepHandler): void` | Serve a step body by name on the engine's transport. It makes the engine a `StepServer`, so `registerStepsFromDir(engine, dir)` serves an extra directory from a preload. Throws when the transport can't serve handlers. See [Registering an extra directory by hand](/docs/durable/authoring/app-workflows#registering-an-extra-directory-by-hand). |
 | `registerQueue` | `registerQueue(config: QueueConfig): void` | Register a flow-control queue (`{ name, concurrency?, rateLimit?, retryMs?, fairness?, order? }`). See [Flow control](/docs/durable/reliability/flow-control). |
 | `registerEntity` | `registerEntity<S>(name: string, config: EntityConfig<S>): void` | Register a durable entity (`{ initialState: () => S; handlers: Record<string, EntityHandler<S>> }`). See [Durable entities](/docs/durable/authoring/entities). |
 | `registerUpdateValidator` | `registerUpdateValidator<TArg>(workflow: string, name: string, validate: UpdateValidator<TArg>): void` | Register (or replace) the validator gating `update` for a `(workflow, name)` pair. See [Queries & updates](/docs/durable/authoring/queries-and-updates). |
@@ -352,8 +353,8 @@ export default defineConfig({
 | `schedules` | `ScheduledWorkflow[]` | none | Recurring workflows (interval or cron), merged with colocated `static schedule`. See [Scheduling](/docs/durable/authoring/scheduling). |
 | `persistedSchedules` | `boolean` | `false` | Fire the runtime-managed `engine.schedules` on each worker tick. |
 | `worker` | `EmbeddedWorkerConfig` (`{ embedded?: boolean; intervalMs?: number; drainTimeoutMs?: number }`) | no embedded loop | Run the worker loop inside the web process. See [Running the loop in the web process](/docs/durable/authoring/scheduling#running-the-loop-in-the-web-process). |
-| `workflowsPath` | `string \| false` | `'app/workflows'` | Directory scanned for `BaseWorkflow` classes; `false` disables discovery. See [app/workflows](/docs/durable/authoring/app-workflows#auto-registration). |
-| `stepsPath` | `string \| false` | `'app/steps'` | Directory scanned for `@Step` classes and `defineStep` handlers. |
+| `workflowsPath` | `string \| string[] \| false` | `'app/workflows'` | Directory (or directories) scanned for `BaseWorkflow` classes; `false` or `[]` disables discovery. A workflow name + version defined in two directories fails boot. See [app/workflows](/docs/durable/authoring/app-workflows#several-directories-modular-apps). |
+| `stepsPath` | `string \| string[] \| false` | `'app/steps'` | Directory (or directories) scanned for `@Step` classes and `defineStep` handlers; `false` or `[]` disables. A step name defined in two directories fails boot. |
 
 Role-specific fields:
 
@@ -402,6 +403,7 @@ The concrete classes (`InMemoryTransport`, `EventEmitterTransport`, `QueueTransp
 | `RemoteStepTimeout` | A dispatched step produced no result or heartbeat within `timeoutMs` (`stepId`, `timeoutMs`). Retryable per the step's `retries`. See [Retries & backoff](/docs/durable/reliability/retries). |
 | `RemoteStepError` | Raised inside the workflow when a remote worker reports a step failure (`stepError?: StepError`). |
 | `NamespaceMismatch` | `engine.resume` on a run that belongs to a different namespace. See [Tenancy](/docs/durable/concepts/tenancy). |
+| `DuplicateDiscoveryError` | Boot, when two `workflowsPath` / `stepsPath` directories (or two roots of a generated barrel) define the same workflow name + version, or the same step name, with different classes or handlers (`kind`, `id`, `files`). The message names both files. See [Several directories](/docs/durable/authoring/app-workflows#several-directories-modular-apps). |
 | `ScheduleAlreadyExistsError` / `ScheduleNotFoundError` | `engine.schedules.create` on a taken id / any `engine.schedules.*` call on an unknown id (`scheduleId`). |
 | `ContinueAsNew` | Thrown by `ctx.continueAsNew(input)` to unwind the run and hand off to a fresh execution. A [control-flow signal](#control-flow-signals). |
 | `WorkflowSuspended` | Thrown by the engine to stop a turn and persist the suspension (`wakeAt`, `waitSeqs`). A [control-flow signal](#control-flow-signals). |

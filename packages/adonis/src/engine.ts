@@ -101,7 +101,7 @@ import {
   retiredHandoffName,
   routeFor,
 } from './on-error.js';
-import { breakpointToken, stepId } from './protocol.js';
+import { breakpointToken, type StepHandler, stepId } from './protocol.js';
 import type { QueueConfig } from './queue.js';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor.js';
 import { scanRunValueFacets } from './run-value-facets.js';
@@ -1261,6 +1261,31 @@ export class WorkflowEngine {
    */
   startConsumers(): void {
     this.pool.startConsumers();
+  }
+
+  /**
+   * Serve a step body by name on this engine's primary transport — the same
+   * `transport.handle(name, fn)` the provider calls for every `stepsPath` handler. It makes the
+   * engine a {@link import('./step-discovery.js').StepServer}, so app code can serve steps from an
+   * extra directory without reaching for the (provider-private) transport:
+   *
+   * ```ts
+   * // start/durable.ts (a preload)
+   * import engine from '@adonis-agora/durable/services/main'
+   * import { registerStepsFromDir } from '@adonis-agora/durable'
+   * await registerStepsFromDir(engine, app.makePath('app/engine/steps'))
+   * ```
+   *
+   * Throws when no transport is wired or the wired one can't serve handlers (no `handle`).
+   */
+  handle(name: string, fn: StepHandler): void {
+    const server = this.primaryTransport as (Transport & { handle?: unknown }) | undefined;
+    if (!server || typeof server.handle !== 'function') {
+      throw new Error(
+        `@agora/durable: cannot serve step "${name}": the engine has no transport that serves step handlers (no handle()).`,
+      );
+    }
+    (server as unknown as { handle(name: string, fn: StepHandler): void }).handle(name, fn);
   }
 
   /** Subscribe to lifecycle events. Returns an unsubscribe function. */

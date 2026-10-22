@@ -278,16 +278,24 @@ export interface BaseDurableConfig {
    * `app/workflows` convention, mirroring `@adonisjs/queue`'s
    * `app/jobs`. Default `'app/workflows'`. Set `false` to disable discovery entirely (register by
    * hand with `engine.register(...)`). A missing directory is fine — nothing to register.
+   *
+   * A modular app lists several directories (`['app/orders/flows', 'app/billing/flows']`): every
+   * root is scanned, and the same workflow name + version defined by two different classes in two
+   * roots throws at boot naming both files. An empty array is the same as `false`.
    */
-  workflowsPath?: string | false;
+  workflowsPath?: string | readonly string[] | false;
   /**
    * Directory (relative to the app root) the provider scans at boot for `@Step`-decorated classes and
    * `defineStep(...)` handlers to auto-register on the app's transport — the `app/steps` convention,
    * mirroring `app/workflows`. Each discovered handler is served by name so `ctx.step('name', input)`
    * (or a typed ref) routes to it with zero manual `transport.handle(...)`. Default `'app/steps'`. Set
    * `false` to disable (register by hand). A missing directory is fine — nothing to register.
+   *
+   * Accepts several directories too, like {@link workflowsPath}; the same step name defined by two
+   * different handlers in two roots throws at boot naming both files. An empty array is the same as
+   * `false`.
    */
-  stepsPath?: string | false;
+  stepsPath?: string | readonly string[] | false;
 }
 
 /**

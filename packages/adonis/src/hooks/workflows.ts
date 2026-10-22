@@ -1,4 +1,5 @@
 import type { IndexGenerator } from '@adonisjs/assembler/index_generator';
+import { addBarrelSources } from './barrel-sources.js';
 
 /**
  * Where the generated workflows barrel is written, relative to the app root. The durable provider
@@ -12,9 +13,18 @@ export const GENERATED_WORKFLOWS_OUTPUT = '.adonisjs/durable/workflows.ts';
  * point the generator at a non-default workflows directory or import alias.
  */
 export interface WorkflowsHookOptions {
-  /** Directory the generator scans for workflow modules, relative to the app root. Default `app/workflows`. */
-  source?: string;
-  /** Import alias the generated barrel uses for each workflow module. Default `#workflows`. */
+  /**
+   * Directory the generator scans for workflow modules, relative to the app root. Default `app/workflows`.
+   * Pass several directories (a modular app: one per bounded context) to get ONE barrel covering
+   * all of them; list the same directories in `config/durable.ts` (`workflowsPath`) so the
+   * runtime-scan fallback agrees with the barrel.
+   */
+  source?: string | readonly string[];
+  /**
+   * Import alias the generated barrel uses for each workflow module. Default `#workflows`. Single
+   * `source` only: a multi-directory barrel imports through relative paths, and passing an alias
+   * with several directories throws.
+   */
   importAlias?: string;
   /** Output path for the generated barrel, relative to the app root. Default `.adonisjs/durable/workflows.ts`. */
   output?: string;
@@ -46,10 +56,6 @@ export interface WorkflowsHookOptions {
  * The default export is the hook object the assembler expects (`{ run(parent, hooks, indexGenerator) }`).
  */
 export function workflowsHook(options: WorkflowsHookOptions = {}) {
-  const source = options.source ?? 'app/workflows';
-  const importAlias = options.importAlias ?? '#workflows';
-  const output = options.output ?? GENERATED_WORKFLOWS_OUTPUT;
-
   // A FUNCTION, not an object with a `run` method. `@poppinss/hooks` — the runner the
   // assembler drives its `init` hooks with — invokes a handler as
   //   `typeof handler === 'function' ? handler(...data) : handler.handle(action, ...data)`
@@ -61,17 +67,13 @@ export function workflowsHook(options: WorkflowsHookOptions = {}) {
     _hooks: unknown,
     indexGenerator: IndexGenerator,
   ): void {
-    indexGenerator.add('workflows', {
-      source,
-      as: 'barrelFile',
-      exportName: 'workflows',
-      importAlias,
-      // `app/workflows/billing/charge_workflow.ts` → key `Billing/Charge`; the `Workflow` suffix is
-      // dropped so a barrel key reads as the class, mirroring controllers' `removeSuffix: 'controller'`.
+    addBarrelSources(indexGenerator, {
+      name: 'workflows',
+      source: options.source ?? 'app/workflows',
+      importAlias: options.importAlias,
+      defaultImportAlias: '#workflows',
+      output: options.output ?? GENERATED_WORKFLOWS_OUTPUT,
       removeSuffix: 'workflow',
-      skipSegments: ['workflows'],
-      output,
-      comment: true,
     });
   };
 }
