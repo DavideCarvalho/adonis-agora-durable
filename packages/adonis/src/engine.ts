@@ -43,8 +43,9 @@ import {
   parseStepFanGroup,
   stepFanGroup,
 } from './fan-join.js';
-import { aggregateAnnouncements } from './handshake/announced.js';
+import { type AnnouncedWorkflow, aggregateAnnouncements } from './handshake/announced.js';
 import type { WorkerDescriptor } from './handshake/descriptor.js';
+import { buildWorkflowDirectory, type WorkflowDirectory } from './handshake/directory.js';
 import type {
   ControlPlane,
   EngineEvent,
@@ -131,6 +132,16 @@ type WorkflowFn = (ctx: WorkflowCtx, input: unknown) => Promise<unknown>;
 
 /** Options for {@link WorkflowEngine.start}. */
 export interface StartOptions {
+  /**
+   * Pin the run to this registered version of the workflow instead of the newest one. Resolved
+   * against the name@version registry ({@link WorkflowEngine.register}, `registerRemote`,
+   * {@link WorkflowEngine.remote}); a version that is not registered throws before any run row is
+   * created and never falls back to the newest (a caller that asked for `name@3` and silently got
+   * `name@4` could not tell). Not honoured by convention routing (an unregistered name routed to a
+   * live worker group), which invents its version: a pinned start there throws instead. Absent →
+   * the newest registered version, as before.
+   */
+  version?: string | undefined;
   /** Run-scoped tags, merged with the workflow's static `workflow` config `tags` onto the run. */
   tags?: string[] | undefined;
   /** Typed, queryable run data stamped on the run (e.g. `{ amount: 200, tier: 'pro' }`). */
@@ -1189,6 +1200,30 @@ export class WorkflowEngine {
   }
 
   /**
+   * Register a workflow whose body runs in another SDK, routed to worker `group` — {@link
+   * registerRemote} with the executor built for you over this engine's primary transport. `version`
+   * defaults to `'1'`; register `name` at a version explicitly to pin starts to it
+   * ({@link StartOptions.version}).
+   */
+  remote(
+    name: string,
+    opts: Omit<Parameters<WorkflowEngine['registerRemote']>[2], 'executor'> & {
+      version?: string | undefined;
+    },
+  ): void {
+    if (!this.primaryTransport) {
+      throw new Error(
+        `@agora/durable: engine.remote('${name}') needs a transport that carries workflow tasks.`,
+      );
+    }
+    const { version, ...rest } = opts;
+    this.registerRemote(name, version ?? '1', {
+      ...rest,
+      executor: new RemoteWorkflowExecutor(this.primaryTransport, opts.group),
+    });
+  }
+
+  /**
    * Convention-dispatch resolution: when `name` isn't locally registered but a LIVE worker group of
    * the same name exists, auto-register a remote workflow routed to that group (bare group, no
    * partition) so its runs advance over the broker like any `registerRemote`'d one. Always on — the
@@ -1426,14 +1461,24 @@ export class WorkflowEngine {
     dispatch: boolean,
   ): Promise<RunResult> {
     const name = workflowName(workflow);
-    let registered = this.latest.get(name);
+    // A pinned start (`opts.version`) resolves name@version and stops there: no newest, no
+    // convention fallback, since neither can prove that version exists.
+    const pinned = opts?.version;
+    let registered =
+      pinned === undefined ? this.latest.get(name) : this.workflows.get(versionKey(name, pinned));
     // Convention dispatch: an unregistered workflow whose name matches a LIVE worker group is routed
     // to it as a remote workflow (bare group). No registration needed — the queue name is the routing;
     // when no matching group is live this is a no-op and the "not registered" throw below fires.
-    if (!registered && (await this.ensureConventionWorkflow(name))) {
+    if (!registered && pinned === undefined && (await this.ensureConventionWorkflow(name))) {
       registered = this.latest.get(name);
     }
-    if (!registered) throw new Error(`workflow ${name} is not registered`);
+    if (!registered) {
+      throw new Error(
+        pinned === undefined
+          ? `workflow ${name} is not registered`
+          : `workflow ${name}@${pinned} is not registered`,
+      );
+    }
     // Validate the input up front — a bad payload is rejected before any run is created.
     await registered.validateInput?.(input);
     // Idempotent by run id: a redelivered trigger (at-least-once queues) or a scheduler re-tick for
@@ -3176,6 +3221,40 @@ export class WorkflowEngine {
    */
   countRuns(query: Omit<RunQuery, 'page' | 'size'>): Promise<number> {
     return countRuns(this.store, query);
+  }
+
+  /**
+   * Every workflow the live fleet can execute in this engine's partition: what workers DECLARE in
+   * their descriptors, plus the live routing tokens no descriptor explains (a worker too old to
+   * describe itself). Each entry says which kind of evidence it rests on. See
+   * {@link workflowDirectory} for why the list is the length it is.
+   */
+  async announcedWorkflows(): Promise<AnnouncedWorkflow[]> {
+    return (await this.workflowDirectory()).workflows;
+  }
+
+  /**
+   * {@link announcedWorkflows}, plus why it is empty when it is: no transport here can read the fleet
+   * (`supported: false`), nothing is live, or workers are live only on OTHER partitions
+   * (`otherPartitions`), which otherwise reads exactly like an empty fleet. Two live reads, neither
+   * retained: the descriptor advertisement and the heartbeat keyspace. Only the BullMQ transport reads
+   * them today.
+   */
+  async workflowDirectory(): Promise<WorkflowDirectory> {
+    const supported = this.pool.introspectsFleet;
+    const [descriptors, heartbeats] = supported
+      ? await Promise.all([
+          this.pool.readAllWorkerDescriptors(),
+          this.pool.readAllWorkerHeartbeats(),
+        ])
+      : [[], []];
+    return buildWorkflowDirectory({
+      descriptors,
+      heartbeats,
+      namespace: this.namespace,
+      supported,
+      sanitize: sanitizeQueueToken,
+    });
   }
 
   /** The worker groups this engine dispatches to: every registered remote workflow's group, plus any

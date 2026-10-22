@@ -1351,6 +1351,17 @@ export interface Transport {
    * `[]` (never throw) when the keyspace is empty or unreadable. Pairs with {@link listWorkerGroups}.
    */
   listWorkerDescriptors?(token: string): Promise<WorkerDescriptor[]>;
+  /**
+   * EVERY live worker descriptor, across all routing tokens — the fleet-wide read behind
+   * {@link WorkflowEngine.workflowDirectory}. Optional, and MUST degrade to `[]` when unreadable.
+   */
+  readAllWorkerDescriptors?(): Promise<WorkerDescriptor[]>;
+  /**
+   * EVERY live worker heartbeat, across all routing tokens — the liveness floor of
+   * {@link WorkflowEngine.workflowDirectory}, which is how a worker too old to publish a descriptor
+   * still shows up. Optional, same as {@link readAllWorkerDescriptors}.
+   */
+  readAllWorkerHeartbeats?(): Promise<WorkerHeartbeat[]>;
 
   // -------------------------------------------------------------------------
   // P4 — store-less read/control/start protocol (spec §6.2, §8). All OPTIONAL:

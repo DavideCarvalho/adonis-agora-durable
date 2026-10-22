@@ -878,6 +878,80 @@ export class BullMQTransport implements Transport {
     return descriptors;
   }
 
+  /** Every live descriptor on every token: SCAN `${P}-worker-descriptor:*`, MGET per page. Degrades
+   *  to `[]` (reported through `onError`) when the keyspace cannot be read. */
+  async readAllWorkerDescriptors(): Promise<WorkerDescriptor[]> {
+    const client = this.#workerRedisClient();
+    const descriptors: WorkerDescriptor[] = [];
+    try {
+      await this.#scanValues(
+        client,
+        `${this.#effectivePrefix()}-worker-descriptor:`,
+        (_key, raw) => {
+          if (raw == null) return;
+          try {
+            descriptors.push(JSON.parse(raw) as WorkerDescriptor);
+          } catch {
+            /* a malformed descriptor reads as absent */
+          }
+        },
+      );
+    } catch (err) {
+      this.#onError(err);
+      return [];
+    }
+    return descriptors;
+  }
+
+  /** Every live worker heartbeat on every token: SCAN `${P}-worker-heartbeat:*`. A key is
+   *  `<prefix><token>:<instance>` and neither segment carries a `:`. Degrades to `[]`. */
+  async readAllWorkerHeartbeats(): Promise<WorkerHeartbeat[]> {
+    const client = this.#workerRedisClient();
+    const prefix = workerHeartbeatKeyPrefix(this.#effectivePrefix());
+    const beats: WorkerHeartbeat[] = [];
+    try {
+      await this.#scanValues(client, prefix, (key, raw) => {
+        const rest = key.slice(prefix.length);
+        const sep = rest.indexOf(':');
+        if (sep <= 0) return;
+        const parsed = parseHeartbeatValue(raw);
+        beats.push({
+          group: rest.slice(0, sep),
+          instanceId: rest.slice(sep + 1),
+          lastBeatAt: parsed.lastBeatAt,
+          ...(parsed.status !== undefined
+            ? { status: parsed.status as unknown as WorkerStatus }
+            : {}),
+        });
+      });
+    } catch (err) {
+      this.#onError(err);
+      return [];
+    }
+    return beats;
+  }
+
+  /** SCAN every key under `prefix` (never KEYS) and hand each key and its value to `visit`. */
+  async #scanValues(
+    client: RedisLike,
+    prefix: string,
+    visit: (key: string, raw: string | null) => void,
+  ): Promise<void> {
+    let cursor = '0';
+    do {
+      const [next, keys] = await client.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', 100);
+      cursor = next;
+      if (keys.length === 0) continue;
+      const raws = client.mget
+        ? await client.mget(...keys)
+        : await Promise.all(keys.map((k) => client.get(k)));
+      for (let i = 0; i < keys.length; i += 1) {
+        const key = keys[i];
+        if (key !== undefined) visit(key, raws[i] ?? null);
+      }
+    } while (cursor !== '0');
+  }
+
   /** Per-group worker-health: queue depth (waiting+active+delayed+prioritized) + live workers (their
    *  non-expired heartbeat keys). `group` is a routing token — the same value a dispatch targets. */
   async groupHealth(group: string): Promise<GroupHealth> {

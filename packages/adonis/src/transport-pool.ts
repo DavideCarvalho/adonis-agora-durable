@@ -1,9 +1,11 @@
+import type { WorkerDescriptor } from './handshake/descriptor.js';
 import type {
   GroupHealth,
   Heartbeat,
   NamedTransport,
   RemoteTask,
   StepResult,
+  WorkerHeartbeat,
   WorkflowStepEvent,
 } from './interfaces.js';
 
@@ -79,6 +81,33 @@ export class TransportPool {
       }
     }
     return [...groups];
+  }
+
+  /** Whether any transport here can read the fleet's descriptor and heartbeat keyspaces. */
+  get introspectsFleet(): boolean {
+    return this.transports.some(
+      ({ transport }) => transport.readAllWorkerDescriptors || transport.readAllWorkerHeartbeats,
+    );
+  }
+
+  /** Every live worker descriptor, across every transport that can read them. */
+  async readAllWorkerDescriptors(): Promise<WorkerDescriptor[]> {
+    const out: WorkerDescriptor[] = [];
+    for (const { transport } of this.transports) {
+      if (transport.readAllWorkerDescriptors)
+        out.push(...(await transport.readAllWorkerDescriptors()));
+    }
+    return out;
+  }
+
+  /** Every live worker heartbeat, across every transport that can read them. */
+  async readAllWorkerHeartbeats(): Promise<WorkerHeartbeat[]> {
+    const out: WorkerHeartbeat[] = [];
+    for (const { transport } of this.transports) {
+      if (transport.readAllWorkerHeartbeats)
+        out.push(...(await transport.readAllWorkerHeartbeats()));
+    }
+    return out;
   }
 
   /**

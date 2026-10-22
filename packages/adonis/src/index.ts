@@ -90,6 +90,7 @@ export { childIdsOf, parentRunIdOf } from './fan-join.js';
 // --- store-less cluster: handshake & capability negotiation -----------------
 export * from './handshake/announced.js';
 export * from './handshake/descriptor.js';
+export * from './handshake/directory.js';
 export * from './handshake/negotiate.js';
 export * from './handshake/routing.js';
 export * from './interfaces.js';
