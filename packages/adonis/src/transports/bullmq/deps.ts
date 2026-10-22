@@ -42,7 +42,16 @@ export interface RedisLike {
   get(key: string): Promise<string | null>;
   /** Batched read — optional: a client without it falls back to per-key `get`. */
   mget?(...keys: string[]): Promise<(string | null)[]>;
-  disconnect(): void;
+  /**
+   * Liveness probe the subscriber watchdog sends (legal in subscriber mode). Optional: a client
+   * without it is simply never probed.
+   */
+  ping?(): Promise<unknown>;
+  /** ioredis connection state (`'ready'`, `'connecting'`, `'reconnecting'`, ...). The watchdog only
+   *  probes a `'ready'` connection; absent reads as ready. */
+  readonly status?: string | undefined;
+  /** `disconnect(true)` drops the socket and lets ioredis reconnect (and `autoResubscribe`). */
+  disconnect(reconnect?: boolean): void;
 }
 
 /**
