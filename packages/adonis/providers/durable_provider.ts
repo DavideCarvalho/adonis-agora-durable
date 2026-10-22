@@ -345,6 +345,8 @@ export default class DurableProvider {
       this.#tenantTransportPromise = (async () => {
         const transport = await this.#resolveTransport(config, { app: this.app });
         transport.useNamespace?.(config.namespace ?? 'default');
+        // A transport whose behaviour depends on serving a store-less pod adapts to it here.
+        transport.useTenantRole?.();
         this.#transport = transport;
         return transport;
       })();

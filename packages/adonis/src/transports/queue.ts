@@ -7,15 +7,23 @@ import {
   type GroupHealth,
   type Heartbeat,
   type RemoteTask,
+  type RunReply,
+  type RunRequest,
+  type StartRunMessage,
   type StepResult,
+  type TenantEvent,
   type Transport,
   type WorkerHeartbeat,
   type WorkerStatus,
+  type WorkflowDecision,
+  type WorkflowStepEvent,
+  type WorkflowTask,
 } from '../interfaces.js';
 import { atLeastOne, Pollers, type PollLoop } from '../pollers.js';
 import { runStepHandler, type StepHandler } from '../protocol.js';
 import { sanitizeQueueToken, tenantGroup } from '../tenant-group.js';
 import type { DescriptorRedis } from '../worker-runtime/registry.js';
+import { isWorkflowTask, type WorkflowTurnHandler } from '../workflow-turn.js';
 import { AdaptiveController, type ConcurrencyOption } from './adaptive-concurrency.js';
 import { workerHeartbeatKey } from './bullmq/naming.js';
 import {
@@ -24,6 +32,15 @@ import {
   WORKER_HEARTBEAT_INTERVAL_MS,
   WORKER_HEARTBEAT_TTL_SECONDS,
 } from './bullmq/serialization.js';
+import {
+  DEFAULT_INBOX_SWEEP_INTERVAL_MS,
+  DEFAULT_INBOX_TTL_MS,
+  DEFAULT_TENANT_SUBSCRIBERS_CACHE_MS,
+  InboxRegistry,
+  inboxRegistrationsQueue,
+  runRepliesQueue,
+  tenantEventsQueue,
+} from './queue-remote.js';
 import { failedTaskIdentity, infrastructureFailure } from './task-failure.js';
 import {
   cachedLiveKeys,
@@ -61,6 +78,11 @@ export type TaskPayload = RemoteTask;
 export type ResultPayload = StepResult;
 export type HeartbeatPayload = Heartbeat;
 export type ControlPayload = ControlMessage;
+/** A run-request / start-run as it crosses the queue: the DTO plus the requester's instance id, so the
+ *  control plane can route the reply to that requester's inbox (see `queue-remote.ts`). Private to this
+ *  transport's wire — the shared {@link RunRequest} / {@link StartRunMessage} DTOs are unchanged. */
+export type RunRequestPayload = RunRequest & { replyTo?: string };
+export type StartRunPayload = StartRunMessage & { replyTo?: string };
 
 /** How often the engine-side / worker-side poll loops ask the adapter for the next job. */
 const DEFAULT_POLL_INTERVAL_MS = 200;
@@ -292,6 +314,23 @@ export interface QueueTransportOptions {
    * {@link QueueTransport.groupHealth} within that.
    */
   workerHeartbeatIntervalMs?: number;
+  /**
+   * TTL (ms) of what an instance announces to the control plane for the store-less protocol: each
+   * tenant it subscribes to (`onTenantEvent`) and that its inboxes are being consumed. The control plane
+   * records both as keys in its {@link workerKeys} store; the instance re-announces every third of the
+   * TTL. A subscriber that dies stops receiving pushes within about this long. Default 30000.
+   */
+  inboxTtlMs?: number;
+  /**
+   * How long a publisher reuses its read of a tenant's live subscribers (ms). A subscription made
+   * within this window of an event may miss it. Default 1000; `0` reads the store on every event.
+   */
+  tenantSubscribersCacheMs?: number;
+  /**
+   * How often (ms) a publisher drains the inboxes it pushed run replies / tenant events to whose owner
+   * no longer advertises itself (a dead tenant pod). Default 30000; `0` disables the janitor.
+   */
+  inboxSweepIntervalMs?: number;
 }
 
 /**
@@ -305,6 +344,12 @@ export interface QueueTransportOptions {
  * directions are plain point-to-point queues we fully control. Notably the {@link ControlPlane} here
  * is single-consumer (point-to-point), so it is correct for a single engine instance but does NOT
  * fan out to every pod the way a real pub/sub does.
+ *
+ * It also carries remote workflow turns (`dispatchWorkflowTask` / `handleWorkflow` / `onDecision`,
+ * streamed step events) and the store-less tenant-pod protocol (start-run, run-request, run replies,
+ * tenant events), so a `tenant` pod can reach a `control-plane` over `@adonisjs/queue` alone. Run
+ * replies and tenant events, which BullMQ broadcasts on Redis PUB/SUB, ride per-instance inbox queues
+ * here — see `queue-remote.ts`.
  *
  * Run one instance engine-side (`onResult` + `dispatch`) and one per worker process (`handle()`).
  * The wire payloads are the documented `RemoteTask`/`StepResult` JSON, so non-Node workers on the
@@ -334,6 +379,8 @@ export class QueueTransport implements Transport, ControlPlane {
   readonly #heartbeatTokens = new Set<string>();
   readonly #workerHeartbeatIntervalMs: number;
   #workerHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
+  /** Liveness-key writes still in flight — `close()` lets them land before withdrawing the keys. */
+  readonly #livenessWrites = new Set<Promise<void>>();
   readonly #resultConcurrency: number;
   readonly #idleBackoffMax: number;
   /** Every job handler still running (any queue) — `close()` waits for these, bounded. */
@@ -372,6 +419,26 @@ export class QueueTransport implements Transport, ControlPlane {
   /** Whether a real key store was configured — without one there is no liveness to report. */
   readonly #hasWorkerKeys: boolean;
   readonly #liveWorkerKeys: () => Promise<{ key: string; value: string }[]>;
+  /** Workflow turn consumers by workflow name — a `workflow`-shaped task job routes here. */
+  readonly #workflowTurns = new Map<string, WorkflowTurnHandler>();
+  /** Every `onDecision` handler: each `RemoteWorkflowExecutor` resolves only its own task ids. */
+  readonly #decisionHandlers = new Set<(decision: WorkflowDecision) => Promise<void>>();
+  #decisionsLoop = false;
+  #stepEventsLoop = false;
+  #startRunLoop = false;
+  #runRequestLoop = false;
+  #runRepliesLoop = false;
+  #runReplyHandler: ((reply: RunReply) => void) | undefined;
+  #tenantEventsLoop = false;
+  #registrationsLoop = false;
+  #tenantRole = false;
+  /** Control-plane side: correlation id (requestId, or a start-run's runId) → the requester's instance
+   *  id, held while the request's handler runs so {@link publishRunReply} knows whose inbox to target. */
+  readonly #replyRoutes = new Map<string, string>();
+  readonly #tenantEventHandlers = new Map<string, Set<(evt: TenantEvent) => void>>();
+  /** Serializes {@link publishTenantEvent} so events reach every inbox in the order they were published. */
+  #tenantPublishChain: Promise<void> = Promise.resolve();
+  readonly #inboxes: InboxRegistry;
 
   /**
    * Per-group worker health, for `engine.workerHealth()` and the dashboard/Telescope worker panels.
@@ -430,11 +497,41 @@ export class QueueTransport implements Transport, ControlPlane {
       options.workerKeysCacheMs ?? 5_000,
       Date.now,
     );
+    this.#inboxes = new InboxRegistry({
+      store: this.#workerKeys,
+      prefix: () => this.#effectivePrefix(),
+      instanceId: this.#instanceId,
+      ttlMs: atLeastOne(options.inboxTtlMs, DEFAULT_INBOX_TTL_MS),
+      subscribersCacheMs: options.tenantSubscribersCacheMs ?? DEFAULT_TENANT_SUBSCRIBERS_CACHE_MS,
+      sweepIntervalMs: options.inboxSweepIntervalMs ?? DEFAULT_INBOX_SWEEP_INTERVAL_MS,
+      announce: (registration) =>
+        this.#adapter
+          .pushOn(
+            inboxRegistrationsQueue(this.#effectivePrefix()),
+            this.#job('inboxRegistration', registration),
+          )
+          .then(() => undefined),
+      drain: (queue, max) => this.#drainQueue(queue, max),
+      onError: this.#onError,
+    });
   }
 
-  /** The writer a worker runtime's registry advertises its descriptor and heartbeat through. */
+  /** The writer a worker runtime's registry advertises its descriptor and heartbeat through: the key
+   *  store when this instance has one. A store-less tenant pod (see {@link useTenantRole}) with no key
+   *  store forwards it to the control plane instead, which records it in its own — so the control plane
+   *  still sees the pod's workers. Otherwise, with no store, nothing is advertised. */
   createDescriptorRedis(): DescriptorRedis {
+    if (this.#workerKeys === NO_WORKER_KEYS && this.#tenantRole) {
+      return this.#inboxes.remoteKeyWriter();
+    }
     return workerKeyWriter(this.#workerKeys, Date.now);
+  }
+
+  /** Declare that this transport backs a store-less `tenant` pod (the provider calls it): worker
+   *  advertisement is then forwarded to the control plane when this instance has no key store. Only a
+   *  tenant pod is guaranteed a control plane that records the forwarded keys. */
+  useTenantRole(): void {
+    this.#tenantRole = true;
   }
 
   /** The live worker descriptors advertised on `token`. */
@@ -516,6 +613,18 @@ export class QueueTransport implements Transport, ControlPlane {
   #controlQueue(): string {
     return `${this.#effectivePrefix()}:control`;
   }
+  #decisionsQueue(): string {
+    return `${this.#effectivePrefix()}:decisions`;
+  }
+  #stepEventsQueue(): string {
+    return `${this.#effectivePrefix()}:step-events`;
+  }
+  #startRunQueue(): string {
+    return `${this.#effectivePrefix()}:start-run`;
+  }
+  #runRequestQueue(): string {
+    return `${this.#effectivePrefix()}:run-request`;
+  }
 
   /**
    * Build the adapter `JobData` envelope for a JSON-safe payload. A translated `priority` is added
@@ -556,7 +665,22 @@ export class QueueTransport implements Transport, ControlPlane {
    */
   handle(name: string, fn: StepHandler): void {
     this.#handlers.set(name, fn);
-    const token = tenantGroup(sanitizeQueueToken(name), this.#partition);
+    this.#ensureTaskLoop(tenantGroup(sanitizeQueueToken(name), this.#partition));
+  }
+
+  /**
+   * Register a WORKFLOW turn consumer (worker side). Shares the step task loop of the workflow name's
+   * routing token — the same queue {@link dispatchWorkflowTask} targets — and tells the two job kinds
+   * apart BY SHAPE: a `workflow`-shaped job runs `turn(task)` and its {@link WorkflowDecision} is pushed
+   * onto `${P}:decisions`. Re-registering swaps the turn fn.
+   */
+  handleWorkflow(name: string, turn: WorkflowTurnHandler): void {
+    this.#workflowTurns.set(name, turn);
+    this.#ensureTaskLoop(tenantGroup(sanitizeQueueToken(name), this.#partition));
+  }
+
+  /** Start (once per routing token) the task loop shared by {@link handle} and {@link handleWorkflow}. */
+  #ensureTaskLoop(token: string): void {
     if (this.#taskLoops.has(token)) return;
     const queue = this.#tasksQueue(token);
     this.#taskQueues.add(queue);
@@ -566,9 +690,20 @@ export class QueueTransport implements Transport, ControlPlane {
       this.#startLoop(
         queue,
         async (job) => {
-          const task = fromJson<TaskPayload>(job.payload);
+          const payload = fromJson<unknown>(job.payload);
           const startedAt = Date.now();
           controller.onStart();
+          // Only step durations feed the latency gradient; a workflow turn still counts as in-flight
+          // work and as forward progress for stall detection (as on bullmq).
+          if (isWorkflowTask(payload)) {
+            try {
+              await this.#runWorkflowTask(payload);
+            } finally {
+              controller.onSettle(Date.now() - startedAt, true, 'workflow');
+            }
+            return;
+          }
+          const task = payload as TaskPayload;
           let ok = false;
           try {
             const result = await runStepHandler(task, this.#handlers.get(task.name), (beat) =>
@@ -622,9 +757,11 @@ export class QueueTransport implements Transport, ControlPlane {
       const now = Date.now();
       const key = workerHeartbeatKey(this.#effectivePrefix(), t, this.#instanceId);
       const value = heartbeatKeyValue(now, this.#controller.snapshot());
-      void Promise.resolve()
+      const write = Promise.resolve()
         .then(() => this.#workerKeys.put(key, value, now + ttlMs))
         .catch((err) => this.#onError(err));
+      this.#livenessWrites.add(write);
+      void write.finally(() => this.#livenessWrites.delete(write));
     };
     const isNew = !this.#heartbeatTokens.has(token);
     this.#heartbeatTokens.add(token);
@@ -658,6 +795,37 @@ export class QueueTransport implements Transport, ControlPlane {
       });
     }
     return { group, depth: Number(depth) || 0, liveWorkers };
+  }
+
+  /** Replay one workflow turn and push its decision. An unknown workflow or a throwing turn still
+   *  yields a `failed` decision so the run settles; a failed push throws, so the job is redelivered. */
+  async #runWorkflowTask(task: WorkflowTask): Promise<void> {
+    let decision: WorkflowDecision;
+    const turn = this.#workflowTurns.get(task.workflow);
+    try {
+      decision = turn
+        ? await turn(task)
+        : {
+            taskId: task.taskId,
+            runId: task.runId,
+            status: 'failed',
+            commands: [],
+            error: {
+              message: `no workflow registered for '${task.workflow}'`,
+              code: 'no_workflow',
+            },
+          };
+    } catch (err) {
+      this.#onError(err);
+      decision = {
+        taskId: task.taskId,
+        runId: task.runId,
+        status: 'failed',
+        commands: [],
+        error: { message: err instanceof Error ? err.message : String(err) },
+      };
+    }
+    await this.#adapter.pushOn(this.#decisionsQueue(), this.#job('decision', decision));
   }
 
   /** Worker side: publish a liveness heartbeat for an in-flight long step. */
@@ -706,6 +874,285 @@ export class QueueTransport implements Transport, ControlPlane {
       },
       { idleBackoffMax: this.#idleBackoffMax },
     );
+  }
+
+  // ---------------------------------------------------------------------------
+  // remote workflows — engine ⇄ workflow worker (point-to-point, like the step queues)
+  // ---------------------------------------------------------------------------
+
+  /** engine → workflow worker: a {@link WorkflowTask} on the workflow's routing-token task queue (job
+   *  `workflow`), the queue a {@link handleWorkflow} consumer polls. */
+  async dispatchWorkflowTask(task: WorkflowTask): Promise<void> {
+    await this.#adapter.pushOn(
+      this.#tasksQueue(task.group),
+      this.#job('workflow', task, task.priority),
+    );
+  }
+
+  /**
+   * engine ← workflow worker: consume {@link WorkflowDecision}s from `${P}:decisions`. ONE loop per
+   * transport; every registered handler sees every decision (each `RemoteWorkflowExecutor` keeps its own
+   * pending task ids and ignores the rest), so several remote workflows can share the transport.
+   */
+  onDecision(handler: (decision: WorkflowDecision) => Promise<void>): void {
+    this.#decisionHandlers.add(handler);
+    if (this.#decisionsLoop) return;
+    this.#decisionsLoop = true;
+    this.#startLoop(
+      this.#decisionsQueue(),
+      async (job) => {
+        const decision = fromJson<WorkflowDecision>(job.payload);
+        for (const h of this.#decisionHandlers) await h(decision);
+      },
+      { idleBackoffMax: 1 },
+    );
+  }
+
+  /** workflow worker → engine: a local step's lifecycle on `${P}:step-events` (job `stepEvent`),
+   *  point-to-point so ONE engine instance checkpoints each event once. */
+  async dispatchStepEvent(event: WorkflowStepEvent): Promise<void> {
+    await this.#adapter.pushOn(this.#stepEventsQueue(), this.#job('stepEvent', event));
+  }
+
+  /** engine ← workflow worker: consume streamed step events. Idempotent — a second call is a no-op. */
+  onStepEvent(handler: (event: WorkflowStepEvent) => Promise<void>): void {
+    if (this.#stepEventsLoop) return;
+    this.#stepEventsLoop = true;
+    this.#startLoop(
+      this.#stepEventsQueue(),
+      async (job) => {
+        await handler(fromJson<WorkflowStepEvent>(job.payload));
+      },
+      { idleBackoffMax: this.#idleBackoffMax },
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // store-less protocol (P4) — tenant pod ⇄ control plane
+  //
+  // start-run and run-request are point-to-point queues consumed by the control plane, exactly as on
+  // BullMQ. Run replies and tenant events — Redis PUB/SUB on BullMQ — go to per-instance inbox queues
+  // instead, since a queue job has one consumer: a reply to the requester's inbox (its id rides the
+  // request as `replyTo`), a tenant event to the inbox of each live subscriber of that tenant (read from
+  // the worker-key store). See `queue-remote.ts` for the design and its limits.
+  // ---------------------------------------------------------------------------
+
+  /** tenant → control plane: enqueue a {@link StartRunMessage} on `${P}:start-run` (job `startRun`),
+   *  stamped with this instance as the reply target. */
+  async dispatchStartRun(msg: StartRunMessage): Promise<void> {
+    this.#ensureRunRepliesLoop();
+    const payload: StartRunPayload = { ...msg, replyTo: this.#instanceId };
+    await this.#adapter.pushOn(this.#startRunQueue(), this.#job('startRun', payload));
+  }
+
+  /** control plane ← tenant: consume {@link StartRunMessage}s. Idempotent — a second call is a no-op. */
+  onStartRun(handler: (msg: StartRunMessage) => Promise<void>): void {
+    this.#ensureRegistrationsLoop();
+    if (this.#startRunLoop) return;
+    this.#startRunLoop = true;
+    this.#startLoop(
+      this.#startRunQueue(),
+      async (job) => {
+        const { replyTo, ...msg } = fromJson<StartRunPayload>(job.payload);
+        await this.#withReplyRoute(msg.runId, replyTo, () => handler(msg));
+      },
+      { idleBackoffMax: this.#idleBackoffMax },
+    );
+  }
+
+  /** tenant → control plane: enqueue a {@link RunRequest} on `${P}:run-request` (job `runRequest`),
+   *  stamped with this instance as the reply target. */
+  async dispatchRunRequest(msg: RunRequest): Promise<void> {
+    this.#ensureRunRepliesLoop();
+    const payload: RunRequestPayload = { ...msg, replyTo: this.#instanceId };
+    await this.#adapter.pushOn(this.#runRequestQueue(), this.#job('runRequest', payload));
+  }
+
+  /** control plane ← tenant: consume {@link RunRequest}s. Idempotent — a second call is a no-op. */
+  onRunRequest(handler: (msg: RunRequest) => Promise<void>): void {
+    this.#ensureRegistrationsLoop();
+    if (this.#runRequestLoop) return;
+    this.#runRequestLoop = true;
+    this.#startLoop(
+      this.#runRequestQueue(),
+      async (job) => {
+        const { replyTo, ...msg } = fromJson<RunRequestPayload>(job.payload);
+        await this.#withReplyRoute(msg.requestId, replyTo, () => handler(msg));
+      },
+      { idleBackoffMax: this.#idleBackoffMax },
+    );
+  }
+
+  /** Remember who asked for `correlationId` while `work` (the responder, which replies inside it) runs. */
+  async #withReplyRoute(
+    correlationId: string | undefined,
+    replyTo: string | undefined,
+    work: () => Promise<void>,
+  ): Promise<void> {
+    if (correlationId === undefined || replyTo === undefined) return work();
+    this.#replyRoutes.set(correlationId, replyTo);
+    try {
+      await work();
+    } finally {
+      if (this.#replyRoutes.get(correlationId) === replyTo) this.#replyRoutes.delete(correlationId);
+    }
+  }
+
+  /**
+   * control plane → tenant: push a correlated {@link RunReply} onto the inbox of the instance that sent
+   * the request (`${P}:run-replies:<instance>`). Only the instance that consumed the request knows the
+   * requester, so this must run while that request is being handled — which is what the responder does.
+   * A reply with no known requester (a request that carried no `replyTo`) is dropped and reported.
+   */
+  async publishRunReply(reply: RunReply): Promise<void> {
+    const owner = this.#replyRoutes.get(reply.requestId);
+    if (owner === undefined) {
+      this.#onError(
+        new Error(
+          `[QueueTransport] dropped the run reply for "${reply.requestId}": no requester is known for it on this instance`,
+        ),
+      );
+      return;
+    }
+    const queue = runRepliesQueue(this.#effectivePrefix(), owner);
+    await this.#adapter.pushOn(queue, this.#job('runReply', reply));
+    this.#inboxes.notePush(queue, owner);
+  }
+
+  /**
+   * tenant ← control plane: consume this instance's reply inbox. Idempotent — a second call is a no-op
+   * (one gateway per transport matches every reply by id). The inbox is private to this instance, so it
+   * is consumed even when consumers are deferred: no other process could take its jobs.
+   */
+  onRunReply(handler: (reply: RunReply) => void): void {
+    if (this.#runReplyHandler) return;
+    this.#runReplyHandler = handler;
+    this.#ensureRunRepliesLoop();
+  }
+
+  /** Start consuming the reply inbox (once). Also started on the first request, so a reply is never
+   *  left for a dead queue just because the gateway subscribed late. */
+  #ensureRunRepliesLoop(): void {
+    if (this.#runRepliesLoop) return;
+    this.#runRepliesLoop = true;
+    this.#inboxes.activateInbox();
+    // On the critical path of every proxied call: never back off (like the results loop).
+    this.#reallyStartLoop(
+      runRepliesQueue(this.#effectivePrefix(), this.#instanceId),
+      async (job) => {
+        const reply = fromJson<RunReply>(job.payload);
+        try {
+          this.#runReplyHandler?.(reply);
+        } catch (err) {
+          this.#onError(err); // a throwing listener must not redeliver the reply
+        }
+      },
+      { idleBackoffMax: 1 },
+    );
+  }
+
+  /**
+   * control plane → tenant: push a {@link TenantEvent} onto the inbox of every instance with a live
+   * subscription to `evt.tenant` (none: nothing is pushed). Publishes are serialized, so each
+   * subscriber receives one publisher's events in publish order.
+   */
+  publishTenantEvent(evt: TenantEvent): Promise<void> {
+    this.#ensureRegistrationsLoop();
+    const run = this.#tenantPublishChain.then(async () => {
+      const owners = await this.#inboxes.subscribersOf(evt.tenant);
+      for (const owner of owners) {
+        const queue = tenantEventsQueue(this.#effectivePrefix(), owner);
+        await this.#adapter.pushOn(queue, this.#job('tenantEvent', evt));
+        this.#inboxes.notePush(queue, owner);
+      }
+    });
+    this.#tenantPublishChain = run.catch(() => undefined);
+    return run;
+  }
+
+  /**
+   * control plane: record the inbox registrations instances announce (their subscriptions and inbox
+   * liveness) in this instance's worker-key store, where {@link publishTenantEvent} and the janitor read
+   * them. Started by whichever control-plane surface comes up first (the responder's consumers, or the
+   * first publish). Point-to-point: control-plane replicas share the store, so one recording suffices.
+   */
+  #ensureRegistrationsLoop(): void {
+    if (this.#registrationsLoop) return;
+    this.#registrationsLoop = true;
+    this.#startLoop(
+      inboxRegistrationsQueue(this.#effectivePrefix()),
+      (job) => this.#inboxes.record(fromJson<unknown>(job.payload)),
+      { idleBackoffMax: this.#idleBackoffMax },
+    );
+  }
+
+  /**
+   * tenant ← control plane: subscribe to `tenant`'s events. Announces the subscription to the control
+   * plane (re-announced every third of {@link QueueTransportOptions.inboxTtlMs} while it lasts) and
+   * consumes this instance's event inbox. Needs no store on this side. Returns an unsubscribe fn that
+   * detaches only this handler; the last one withdraws the subscription.
+   */
+  onTenantEvent(tenant: string, handler: (evt: TenantEvent) => void): () => void {
+    let handlers = this.#tenantEventHandlers.get(tenant);
+    if (!handlers) {
+      handlers = new Set();
+      this.#tenantEventHandlers.set(tenant, handlers);
+    }
+    handlers.add(handler);
+    this.#inboxes.subscribe(tenant);
+    this.#ensureTenantEventsLoop();
+    return () => {
+      const set = this.#tenantEventHandlers.get(tenant);
+      if (!set?.delete(handler) || set.size > 0) return;
+      this.#tenantEventHandlers.delete(tenant);
+      this.#inboxes.unsubscribe(tenant);
+    };
+  }
+
+  /** Consume the tenant-event inbox (once; private to this instance, so never deferred). Keeps running
+   *  after the last unsubscribe so events pushed before the withdrawal are drained, not left behind. */
+  #ensureTenantEventsLoop(): void {
+    if (this.#tenantEventsLoop) return;
+    this.#tenantEventsLoop = true;
+    this.#reallyStartLoop(
+      tenantEventsQueue(this.#effectivePrefix(), this.#instanceId),
+      async (job) => {
+        const evt = fromJson<TenantEvent>(job.payload);
+        for (const h of this.#tenantEventHandlers.get(evt.tenant) ?? []) {
+          try {
+            h(evt);
+          } catch (err) {
+            this.#onError(err); // a throwing listener must not redeliver (and reorder) the event
+          }
+        }
+      },
+      { idleBackoffMax: this.#idleBackoffMax },
+    );
+  }
+
+  /** Withdraw this instance's advertisements, then drop what is left in its own inboxes: replies and
+   *  events addressed to a process that is going away have no one else to go to. */
+  async #closeInboxes(): Promise<void> {
+    await this.#inboxes.close();
+    const prefix = this.#effectivePrefix();
+    const own = [
+      ...(this.#runRepliesLoop ? [runRepliesQueue(prefix, this.#instanceId)] : []),
+      ...(this.#tenantEventsLoop ? [tenantEventsQueue(prefix, this.#instanceId)] : []),
+    ];
+    for (const queue of own) {
+      await this.#drainQueue(queue, 1_000).catch((err) => this.#onError(err));
+    }
+  }
+
+  /** Pop and finalize up to `max` jobs of `queue` without running them (the janitor, and close()).
+   *  Resolves `true` once the queue came back empty. */
+  async #drainQueue(queue: string, max: number): Promise<boolean> {
+    for (let i = 0; i < max; i += 1) {
+      const job = await this.#adapter.popFrom(queue);
+      if (!job) return true;
+      await this.#adapter.completeJob(jobHandle(job), queue);
+    }
+    return false;
   }
 
   // ---------------------------------------------------------------------------
@@ -1009,6 +1456,19 @@ export class QueueTransport implements Transport, ControlPlane {
     this.#taskLoops.clear();
     this.#controller.stop();
     if (this.#workerHeartbeatTimer) clearInterval(this.#workerHeartbeatTimer);
+    // A clean stop withdraws this instance's liveness keys at once, so the dashboard and
+    // `listWorkerGroups` drop it now instead of after the 35s TTL. In-flight beats land first, or one
+    // could re-create a key after its removal.
+    if (this.#heartbeatTokens.size > 0) {
+      await Promise.allSettled([...this.#livenessWrites]);
+      const keys = [...this.#heartbeatTokens].map((t) =>
+        workerHeartbeatKey(this.#effectivePrefix(), t, this.#instanceId),
+      );
+      this.#heartbeatTokens.clear();
+      await Promise.resolve()
+        .then(() => this.#workerKeys.remove(keys))
+        .catch((err) => this.#onError(err));
+    }
     this.#workerHeartbeatTimer = undefined;
     const drainDeadline = Date.now() + 5_000;
     await this.#pollers.drain(5_000);
@@ -1036,6 +1496,7 @@ export class QueueTransport implements Transport, ControlPlane {
       this.#openJobs.delete(jobId);
       await this.#adapter.retryJob(handle, queue, new Date()).catch((err) => this.#onError(err));
     }
+    await this.#closeInboxes();
     await this.#adapter.destroy();
   }
 }

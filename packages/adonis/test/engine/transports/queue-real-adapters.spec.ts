@@ -6,9 +6,22 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { Adapter } from '@adonisjs/queue/types';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import type { RemoteTask, StepResult } from '../../../src/interfaces.js';
+import type {
+  EngineEvent,
+  RemoteTask,
+  RunReply,
+  StepResult,
+  TenantEvent,
+  WorkflowDecision,
+} from '../../../src/interfaces.js';
 import { sanitizeQueueToken } from '../../../src/tenant-group.js';
-import { QueueTransport } from '../../../src/transports/queue.js';
+import { QueueTransport, type QueueTransportOptions } from '../../../src/transports/queue.js';
+import {
+  inboxKey,
+  runRepliesQueue,
+  tenantEventsQueue,
+  tenantSubscriberKey,
+} from '../../../src/transports/queue-remote.js';
 import { MemoryWorkerKeys } from '../../../src/transports/worker-keys.js';
 
 /**
@@ -176,12 +189,13 @@ describe.each(backends)(
       await backend.teardown();
     });
 
-    const make = (): QueueTransport => {
+    const make = (opts: Partial<QueueTransportOptions> = {}): QueueTransport => {
       const t = new QueueTransport({
         adapter: factory,
         prefix,
         pollIntervalMs: 10,
         stalledCheckIntervalMs: 0,
+        ...opts,
       });
       transports.push(t);
       return t;
@@ -431,6 +445,131 @@ describe.each(backends)(
         });
         expect(runs).toBe(0);
         expect(await activeJobs(probe, tasksQueue)).toBe(0);
+      },
+    );
+    it.skipIf(!backend.enabled)(
+      'routes run replies to each requester only, and finalizes every claim',
+      async () => {
+        const tag = randomUUID().slice(0, 6);
+        const cp = make({ instanceId: `cp-${tag}` });
+        const a = make({ instanceId: `a-${tag}` });
+        const b = make({ instanceId: `b-${tag}` });
+        cp.onRunRequest(async (msg) => {
+          await cp.publishRunReply({
+            requestId: msg.requestId,
+            result: { ok: true, data: msg.requestId },
+          });
+        });
+        const gotA: RunReply[] = [];
+        const gotB: RunReply[] = [];
+        a.onRunReply((r) => gotA.push(r));
+        b.onRunReply((r) => gotB.push(r));
+        for (let i = 0; i < 3; i += 1) {
+          await a.dispatchRunRequest({
+            requestId: `a${i}-${tag}`,
+            tenant: 'acme',
+            body: { kind: 'workerHealth' },
+          });
+          await b.dispatchRunRequest({
+            requestId: `b${i}-${tag}`,
+            tenant: 'acme',
+            body: { kind: 'workerHealth' },
+          });
+        }
+        await until(() => gotA.length === 3 && gotB.length === 3);
+        expect(gotA.map((r) => r.requestId).sort()).toEqual([0, 1, 2].map((i) => `a${i}-${tag}`));
+        expect(gotB.map((r) => r.requestId).sort()).toEqual([0, 1, 2].map((i) => `b${i}-${tag}`));
+        await new Promise((r) => setTimeout(r, 50));
+        expect(await activeJobs(probe, `${prefix}:run-request`)).toBe(0);
+        expect(await activeJobs(probe, runRepliesQueue(prefix, `a-${tag}`))).toBe(0);
+        expect(await activeJobs(probe, runRepliesQueue(prefix, `b-${tag}`))).toBe(0);
+      },
+    );
+
+    it.skipIf(!backend.enabled)(
+      'fans a tenant event out to every subscriber of that tenant; a dead one is drained',
+      async () => {
+        const tag = randomUUID().slice(0, 6);
+        const keys = new MemoryWorkerKeys();
+        // Only the control plane has a key store; the subscribers are store-less.
+        const cp = make({
+          workerKeys: keys,
+          tenantSubscribersCacheMs: 0,
+          inboxTtlMs: 200,
+          inboxSweepIntervalMs: 50,
+        });
+        cp.onRunRequest(async () => {}); // the responder's consumers start the subscription recorder
+        const s1 = make({ instanceId: `s1-${tag}` });
+        const s2 = make({ instanceId: `s2-${tag}` });
+        const other = make({ instanceId: `o-${tag}` });
+        const got1: TenantEvent[] = [];
+        const got2: TenantEvent[] = [];
+        const gotOther: TenantEvent[] = [];
+        s1.onTenantEvent(`acme-${tag}`, (e) => got1.push(e));
+        s2.onTenantEvent(`acme-${tag}`, (e) => got2.push(e));
+        other.onTenantEvent(`globex-${tag}`, (e) => gotOther.push(e));
+        // A subscriber that crashed: advertised, never consuming, never refreshing.
+        const ghost = `ghost-${tag}`;
+        const value = JSON.stringify({ instanceId: ghost });
+        await keys.put(tenantSubscriberKey(prefix, `acme-${tag}`, ghost), value, Date.now() + 200);
+        await keys.put(inboxKey(prefix, ghost), value, Date.now() + 200);
+        const recorded = async (tenant: string, instanceId: string) =>
+          (await keys.live(Date.now())).some(
+            (k) => k.key === tenantSubscriberKey(prefix, tenant, instanceId),
+          );
+        await until(
+          async () =>
+            (await recorded(`acme-${tag}`, `s1-${tag}`)) &&
+            (await recorded(`acme-${tag}`, `s2-${tag}`)) &&
+            (await recorded(`globex-${tag}`, `o-${tag}`)),
+        );
+
+        const evt = {
+          type: 'run.completed',
+          runId: 'r1',
+          at: new Date(0),
+        } as unknown as EngineEvent;
+        await cp.publishTenantEvent({ tenant: `acme-${tag}`, event: evt });
+        await until(() => got1.length === 1 && got2.length === 1);
+        expect(gotOther).toEqual([]);
+        expect(got1[0]?.event.runId).toBe('r1');
+        expect(await probe.sizeOf(tenantEventsQueue(prefix, ghost))).toBe(1);
+        // The ghost's keys expire; the janitor drains what it was sent.
+        await until(async () => (await probe.sizeOf(tenantEventsQueue(prefix, ghost))) === 0, 5000);
+        expect(await activeJobs(probe, tenantEventsQueue(prefix, ghost))).toBe(0);
+      },
+    );
+
+    it.skipIf(!backend.enabled)(
+      'round-trips a workflow turn (task → decision) and finalizes every claim',
+      async () => {
+        const name = `wf-${randomUUID().slice(0, 6)}`;
+        const engine = make();
+        const worker = make();
+        const decisions: WorkflowDecision[] = [];
+        engine.onDecision(async (d) => void decisions.push(d));
+        worker.handleWorkflow(name, async (t) => ({
+          taskId: t.taskId,
+          runId: t.runId,
+          status: 'completed',
+          commands: [],
+          output: t.input,
+        }));
+        await engine.dispatchWorkflowTask({
+          taskId: 't1',
+          runId: 'r1',
+          workflow: name,
+          workflowVersion: '1',
+          input: { n: 1 },
+          history: [],
+          group: sanitizeQueueToken(name),
+          attempt: 1,
+        });
+        await until(() => decisions.length === 1);
+        expect(decisions[0]).toMatchObject({ taskId: 't1', status: 'completed', output: { n: 1 } });
+        await new Promise((r) => setTimeout(r, 50));
+        expect(await activeJobs(probe, `${prefix}:tasks:${sanitizeQueueToken(name)}`)).toBe(0);
+        expect(await activeJobs(probe, `${prefix}:decisions`)).toBe(0);
       },
     );
   },

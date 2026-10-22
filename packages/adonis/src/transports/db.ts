@@ -321,6 +321,8 @@ export class DbTransport implements Transport, ControlPlane {
   readonly #heartbeatTokens = new Set<string>();
   readonly #workerHeartbeatIntervalMs: number;
   #workerHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
+  /** Liveness-key writes still in flight — `close()` lets them land before withdrawing the keys. */
+  readonly #livenessWrites = new Set<Promise<void>>();
 
   constructor(options: DbTransportOptions) {
     this.#db = options.db;
@@ -1067,9 +1069,11 @@ export class DbTransport implements Transport, ControlPlane {
       const now = this.#now();
       const key = workerHeartbeatKey(this.#keyPrefix(), t, this.#instanceId);
       const value = heartbeatKeyValue(now, this.#controller.snapshot());
-      void Promise.resolve()
+      const write = Promise.resolve()
         .then(() => this.#workerKeys().put(key, value, now + ttlMs))
         .catch((err) => this.#onError(err));
+      this.#livenessWrites.add(write);
+      void write.finally(() => this.#livenessWrites.delete(write));
     };
     if (!this.#heartbeatTokens.has(token)) {
       this.#heartbeatTokens.add(token);
@@ -1186,6 +1190,19 @@ export class DbTransport implements Transport, ControlPlane {
     this.#taskLoop = undefined;
     this.#controller.stop();
     if (this.#workerHeartbeatTimer) clearInterval(this.#workerHeartbeatTimer);
+    // A clean stop withdraws this instance's liveness keys at once, so the dashboard and
+    // `listWorkerGroups` drop it now instead of after the 35s TTL. In-flight beats land first, or one
+    // could re-create a key after its removal.
+    if (this.#heartbeatTokens.size > 0) {
+      await Promise.allSettled([...this.#livenessWrites]);
+      const keys = [...this.#heartbeatTokens].map((t) =>
+        workerHeartbeatKey(this.#keyPrefix(), t, this.#instanceId),
+      );
+      this.#heartbeatTokens.clear();
+      await Promise.resolve()
+        .then(() => this.#workerKeys().remove(keys))
+        .catch((err) => this.#onError(err));
+    }
     this.#workerHeartbeatTimer = undefined;
     this.#heartbeatTokens.clear();
     const deadline = Date.now() + this.#closeTimeoutMs;

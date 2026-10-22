@@ -141,6 +141,16 @@ export interface QueueTransportConfig {
   workerKeysConnection?: string;
   /** How long a read of the worker keys is reused (ms). Default 5000. */
   workerKeysCacheMs?: number;
+  /**
+   * Store-less protocol: TTL (ms) of the event subscriptions and inbox liveness an instance announces
+   * to the control plane (recorded in the control plane's worker-key store), re-announced every third
+   * of it. Default 30000.
+   */
+  inboxTtlMs?: number;
+  /** How long a control plane reuses its read of a tenant's live event subscribers (ms). Default 1000. */
+  tenantSubscribersCacheMs?: number;
+  /** How often (ms) a control plane drains the inboxes of tenant pods that died. Default 30000; `0` off. */
+  inboxSweepIntervalMs?: number;
 }
 
 /**
@@ -396,6 +406,13 @@ export const transports = {
           : {}),
         ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
         ...(config.onError !== undefined ? { onError: config.onError } : {}),
+        ...(config.inboxTtlMs !== undefined ? { inboxTtlMs: config.inboxTtlMs } : {}),
+        ...(config.tenantSubscribersCacheMs !== undefined
+          ? { tenantSubscribersCacheMs: config.tenantSubscribersCacheMs }
+          : {}),
+        ...(config.inboxSweepIntervalMs !== undefined
+          ? { inboxSweepIntervalMs: config.inboxSweepIntervalMs }
+          : {}),
       });
     };
   },

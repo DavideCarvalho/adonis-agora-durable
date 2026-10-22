@@ -8,7 +8,8 @@ description: >-
   (compatible/degraded/incompatible) and capability routing (requires → blocked
   runs), layered tenant auth (signTenantToken/hmacTenantVerifier/verifyTenant),
   runGateway as the role-portable read/control surface, namespace vs partition,
-  and Python (durable-worker) / NestJS interop over the bullmq wire. Use when
+  tenant pods over bullmq or the @adonisjs/queue transport, and Python
+  (durable-worker) / NestJS interop over the bullmq wire. Use when
   splitting web from workers, isolating tenants, or adding polyglot workers.
 license: MIT
 metadata:
@@ -48,7 +49,7 @@ import { defineConfig, stores, transports } from '@adonis-agora/durable'
 
 export default defineConfig({
   role: 'control-plane',
-  transport: 'bullmq', // cross-ecosystem wire; queue/db work for Adonis-only splits
+  transport: 'bullmq', // or 'queue' for Adonis-only fleets; db cannot host tenant pods
   transports: { bullmq: transports.bullmq({ connection: { host: '127.0.0.1', port: 6379 } }) },
   store: 'lucid',
   stores: { lucid: stores.lucid({ connection: 'pg' }) },
@@ -78,6 +79,30 @@ node ace durable:worker  # store-less tenant loop: serves app/steps, heartbeats,
 Isolation is three-layered: type (`store` is `never` on tenant), container (no
 store binding registered), object (`WorkerRuntime`/`ProxyRunGateway` have no
 store field).
+
+Tenant pods need a transport carrying the run-request protocol: `bullmq` or
+`queue` (the provider feature-detects the methods). Both sides use the same
+transport and backend. On `queue`, replies go to a per-pod
+`<prefix>:run-replies:<instanceId>` queue and live-tail events are pushed to
+each subscribed pod's `<prefix>:tenant-events:<instanceId>`; the pod announces
+its subscriptions and (with `workerKeys: false`) its worker advertisement to the
+control plane, which records them in its own key store — so the pod needs no
+database:
+
+```ts title="config/durable.ts (tenant pod, queue transport)"
+export default defineConfig({
+  role: 'tenant',
+  transport: 'queue',
+  transports: { queue: transports.queue({ connection: 'redis', workerKeys: false }) },
+  partition: 'acme-corp',
+  tenant: { token: process.env.DURABLE_TENANT_TOKEN },
+})
+```
+
+Queue-transport limits vs bullmq: replies/events are polled (not pushed), a new
+subscription can miss events for about a second, each event costs one job per
+subscribed pod, and live-tail needs a worker-key store on the control plane.
+Source: `docs/transports/queue.mdx` (tenant pods over the queue transport).
 
 ## Core patterns
 
@@ -293,6 +318,25 @@ Mechanism: a worker on no partition serves the bare `<name>` tokens — exactly
 the queues the deployed fleet consumes — so the local process steals production
 tasks; docs call this out under Tenancy pitfalls ("competes for, and steals, the
 deployed fleet's tasks"). Source: `docs/concepts/tenancy.mdx`.
+
+### HIGH hosting tenant pods on the db transport
+
+Wrong:
+
+```ts
+defineConfig({ role: 'tenant', transport: 'db', transports: { db: transports.db() }, partition: 'acme' })
+```
+
+Correct:
+
+```ts
+defineConfig({ role: 'tenant', transport: 'queue', transports: { queue: transports.queue({ connection: 'redis', workerKeys: false }) }, partition: 'acme' })
+```
+
+Mechanism: a tenant pod's `ProxyRunGateway` needs `dispatchStartRun` /
+`dispatchRunRequest` / `onRunReply` / `onTenantEvent` on its transport. `bullmq`
+and `queue` implement them; resolving the run gateway on any other transport
+throws at boot. Source: `docs/cluster/roles-and-config.mdx`.
 
 ### MEDIUM stamping runs into a namespace nothing polls
 
