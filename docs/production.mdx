@@ -213,7 +213,7 @@ export default defineConfig({
 })
 ```
 
-`durable:work` re-enables consumption for itself, so you can ship one config to both. The default `'auto'` already keeps `node ace` console/REPL processes from consuming. Today only the `queue` transport honours this gate — `db` and `bullmq` consume in every booted process, and the in-process transports have no broker to compete for. See [Delivery under multiple instances](/docs/durable/reliability/multi-instance) and [`consumers`](/docs/durable/transports/queue#consumers--why-a-node-ace-script-does-not-drain-the-queue).
+`durable:work` re-enables consumption for itself, so you can ship one config to both. The default `'auto'` already keeps `node ace` console/REPL processes from consuming. The `queue`, `db` and `bullmq` transports all honour this gate; the in-process transports have no broker to compete for. See [Delivery under multiple instances](/docs/durable/reliability/multi-instance) and [`consumers`](/docs/durable/transports/queue#consumers--why-a-node-ace-script-does-not-drain-the-queue).
 
 ## 10. Isolate environments and pools
 
