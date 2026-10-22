@@ -316,12 +316,15 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
     // Optional SPI: a store without it can't run singleton workflows, so these cases pass vacuously.
 
     const ADMITTED = 'durable:singleton:admitted';
+    const TRACKED = 'durable:singleton:tracked';
     const gated = (id: string, createdMs: number, over: Partial<WorkflowRun> = {}): WorkflowRun =>
       run({
         id,
         workflow: 'job',
         status: 'running',
-        tags: ['singleton:k'],
+        // `running` and tracked: the engine stamps the tracked marker on a singleton run's first
+        // execution, before it claims (an untracked, untagged running run reads as a pre-0.51 holder).
+        tags: ['singleton:k', TRACKED],
         createdAt: new Date(createdMs),
         updatedAt: new Date(createdMs),
         ...over,
@@ -348,7 +351,7 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       // Same createdAt, smaller id: it would sort first in a positional scan.
       await store.createRun(gated('a-waiter', 1000));
       expect(await store.tryAdmitSingleton('a-waiter', 'singleton:k', 'job', 1)).toBe(false);
-      expect((await store.getRun('a-waiter'))?.tags).toEqual(['singleton:k']);
+      expect((await store.getRun('a-waiter'))?.tags).toEqual(['singleton:k', TRACKED]);
       // A second slot goes to the waiter.
       expect(await store.tryAdmitSingleton('a-waiter', 'singleton:k', 'job', 2)).toBe(true);
     });
@@ -388,6 +391,69 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.tryAdmitSingleton('b', 'singleton:k', 'job', 1)).toBe(true);
       expect(await store.updateRunIf('b', ['running'], { status: 'completed' })).toBe(true);
       expect((await store.getRun('b'))?.tags).toEqual(['singleton:k']);
+    });
+
+    // A replica older than 0.51 admits by a scan (the `limit` oldest running/suspended runs of the
+    // key) and writes no admission tag. During a rolling upgrade such a holder still occupies its
+    // slot for the new replicas.
+    t('tryAdmitSingleton counts an untagged pre-0.51 holder (rolling upgrade)', async () => {
+      if (!store.tryAdmitSingleton) return;
+      const claim = (id: string, wakeAt?: number) =>
+        store.tryAdmitSingleton?.(id, 'singleton:k', 'job', 1, wakeAt);
+      // Written by an old replica: admitted by its scan, running, no tag at all. It is NEWER than the
+      // run below, which was still `pending` (invisible to the old scan) back then.
+      await store.createRun(gated('legacy', 2000, { tags: ['singleton:k'] }));
+      // The older run, now picked up by a new replica: tracked from its first execution.
+      await store.createRun(gated('new', 1000));
+      expect(await claim('new', 12_000)).toBe(false);
+      expect(await store.getRun('new')).toMatchObject({ status: 'suspended', wakeAt: 12_000 });
+      expect((await store.getRun('new'))?.tags).toContain(TRACKED);
+      // A legacy holder parked on its own sleep still holds the slot.
+      await store.updateRun('legacy', { status: 'suspended', wakeAt: 20_000 });
+      expect(await claim('new')).toBe(false);
+      // Once it settles, the new admission takes over, swapping the marker for the admitted tag.
+      await store.updateRun('legacy', { status: 'completed' });
+      expect(await claim('new')).toBe(true);
+      expect((await store.getRun('new'))?.tags).toEqual(['singleton:k', ADMITTED]);
+      await store.updateRun('new', { status: 'completed' });
+      expect((await store.getRun('new'))?.tags).toEqual(['singleton:k']);
+    });
+
+    t('legacy singleton waiters keep their FIFO place across the upgrade', async () => {
+      if (!store.tryAdmitSingleton) return;
+      const claim = (id: string, wakeAt?: number) =>
+        store.tryAdmitSingleton?.(id, 'singleton:k', 'job', 1, wakeAt);
+      await store.createRun(gated('holder', 1000, { tags: ['singleton:k'] }));
+      // Denied by an old replica: suspended on its retry timer, no tag.
+      await store.createRun(
+        gated('old-waiter', 2000, { status: 'suspended', wakeAt: 5_000, tags: ['singleton:k'] }),
+      );
+      await store.createRun(gated('new-run', 3000));
+      expect(await claim('new-run')).toBe(false);
+      expect(await claim('old-waiter')).toBe(false);
+      // A legacy waiter re-checked by a new replica is tracked from then on; it keeps its place.
+      expect(await claim('old-waiter', 6_000)).toBe(false);
+      expect((await store.getRun('old-waiter'))?.tags).toContain(TRACKED);
+      await store.updateRun('holder', { status: 'completed' });
+      expect(await claim('new-run')).toBe(false);
+      expect(await claim('old-waiter')).toBe(true);
+      expect(await claim('new-run')).toBe(false);
+      await store.updateRun('old-waiter', { status: 'completed' });
+      expect(await claim('new-run')).toBe(true);
+    });
+
+    t('concurrent claims never over-admit beside an untagged legacy holder', async () => {
+      if (!store.tryAdmitSingleton) return;
+      await store.createRun(gated('legacy', 1000, { tags: ['singleton:k'] }));
+      const ids = ['c1', 'c2', 'c3', 'c4'];
+      for (const [i, id] of ids.entries()) await store.createRun(gated(id, 2000 + i * 1000));
+      const results = await Promise.all(
+        [...ids].reverse().map((id) => store.tryAdmitSingleton?.(id, 'singleton:k', 'job', 2)),
+      );
+      // One slot is the legacy holder's; only the oldest new run takes the other.
+      expect(results).toEqual([false, false, false, true]);
+      const rows = await Promise.all(ids.map((id) => store.getRun(id)));
+      expect(rows.filter((r) => r?.tags?.includes(ADMITTED)).map((r) => r?.id)).toEqual(['c1']);
     });
 
     t('concurrent claims for one slot admit exactly one run', async () => {

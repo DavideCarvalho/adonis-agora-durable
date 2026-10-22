@@ -60,7 +60,14 @@ describe.each(stores)('entity lost-wake reconcile (%s)', (_label, makeStore) => 
     // A first op starts the entity and parks it on its wait.
     await engine.signalEntity('counter', 'k1', 'add', 1);
     await until(async () => (await engine.getEntityState<{ n: number }>('counter', 'k1'))?.n === 1);
-    await until(async () => (await store.listSignalWaiters('entity:counter:k1')).length === 1);
+    // Parked for real: the turn settled `suspended` (after its waiter's late buffer re-check), so a
+    // write to the buffer from here on is one nothing else will pick up.
+    await until(
+      async () =>
+        (await store.listSignalWaiters('entity:counter:k1')).length === 1 &&
+        (await store.getRun('entity:counter:k1'))?.status === 'suspended' &&
+        (await store.getRun('entity:counter:k1'))?.lockedBy === undefined,
+    );
 
     // The crash window: the op is in the buffer, the wake never happened.
     await store.bufferSignal('entity:counter:k1', { op: 'add', arg: 41, id: 'caller:7' });

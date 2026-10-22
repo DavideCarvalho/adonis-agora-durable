@@ -1,7 +1,11 @@
 import type { SingletonConfig } from './engine.js';
 import { SingletonQueueFullError } from './errors.js';
 import type { StateStore, WorkflowRun } from './interfaces.js';
-import { SINGLETON_ACTIVE_STATUSES, SINGLETON_ADMITTED_TAG } from './singleton-admission.js';
+import {
+  SINGLETON_ACTIVE_STATUSES,
+  SINGLETON_ADMITTED_TAG,
+  SINGLETON_TRACKED_TAG,
+} from './singleton-admission.js';
 
 const SINGLETON_RETRY_MS = 1000;
 /**
@@ -83,7 +87,10 @@ export class SingletonGate {
       this.retryWakeAt(),
     );
     if (admitted && !run.tags?.includes(SINGLETON_ADMITTED_TAG)) {
-      run.tags = [...(run.tags ?? []), SINGLETON_ADMITTED_TAG];
+      run.tags = [
+        ...(run.tags ?? []).filter((t) => t !== SINGLETON_TRACKED_TAG),
+        SINGLETON_ADMITTED_TAG,
+      ];
     }
     return admitted;
   }

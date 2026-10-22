@@ -8,6 +8,21 @@ import { type RunStatus, TERMINAL_RUN_STATUSES, type WorkflowRun } from './inter
  */
 export const SINGLETON_ADMITTED_TAG = 'durable:singleton:admitted';
 
+/**
+ * Reserved engine tag marking a not-yet-admitted singleton run whose admission is decided by the tag
+ * scheme: it holds no slot unless it also carries {@link SINGLETON_ADMITTED_TAG}. Stamped on the run's
+ * first execution (in the same write that sets it `running`, before it competes) and on every denial;
+ * removed on admission, terminal settlement and requeue. An untagged executed run WITHOUT it was
+ * executed (admitted) by a replica older than 0.51 — see {@link legacySingletonHolders}.
+ */
+export const SINGLETON_TRACKED_TAG = 'durable:singleton:tracked';
+
+/** Tags only the engine and the store may write; stripped from a fresh run's user-supplied tags. */
+export const SINGLETON_RESERVED_TAGS: readonly string[] = [
+  SINGLETON_ADMITTED_TAG,
+  SINGLETON_TRACKED_TAG,
+];
+
 /** The statuses a singleton run occupies its key in — as a holder or as a FIFO waiter. */
 export const SINGLETON_ACTIVE_STATUSES: RunStatus[] = [
   'pending',
@@ -24,47 +39,67 @@ function byCreation(a: WorkflowRun, b: WorkflowRun): number {
 /** The statuses the pre-0.51 scan admission ranked a key's runs in (it ignored `pending`/`blocked`). */
 const LEGACY_SCAN_STATUSES: RunStatus[] = ['running', 'suspended'];
 
+/** `tags` without the engine's singleton markers (admitted and tracked). */
+export function withoutSingletonMarkers(tags: string[] | undefined): string[] | undefined {
+  return tags?.filter((tag) => !SINGLETON_RESERVED_TAGS.includes(tag));
+}
+
+/** `tags` carrying {@link SINGLETON_TRACKED_TAG} (returned unchanged when admitted or already tracked). */
+export function withSingletonTracked(tags: string[] | undefined): string[] {
+  const current = tags ?? [];
+  if (current.includes(SINGLETON_ADMITTED_TAG) || current.includes(SINGLETON_TRACKED_TAG)) {
+    return current;
+  }
+  return [...current, SINGLETON_TRACKED_TAG];
+}
+
 /**
- * The runs of `active` holding a slot under the PRE-ATOMIC scheme (0.50 and older): untagged runs the
- * old scan admits. That scan wrote no marker — a run was admitted while it ranked among the `limit`
- * oldest `running`/`suspended` runs of the key by `(createdAt, id)` — so during a rolling upgrade a
- * holder admitted by an old replica carries no {@link SINGLETON_ADMITTED_TAG}.
+ * The runs of `active`, other than `runId`, that may hold a slot WITHOUT carrying
+ * {@link SINGLETON_ADMITTED_TAG}: holders admitted by a replica older than 0.51, during a rolling
+ * upgrade that mixes old and new replicas.
  *
- * The discriminator is POSITIONAL, not per-row: an old replica's denied waiters and the new scheme's
- * ({@link singletonAdmissionDenialPatch}) are written identically (`suspended`, retry `wakeAt`, no tag),
- * and an old holder that sleeps or waits on a signal is `suspended` too, so no column tells them apart.
- * What does is the old rule itself, applied to the current rows: the untagged runs ranked inside the
- * old scan's window — the `limit` oldest of the key's `running`/`suspended` runs plus every tagged
- * holder (so a tagged holder parked `blocked` keeps its seat). An untagged run in that window is
- * exactly a run an old replica treats as admitted.
+ * Old replicas admit by a scan: a run may execute while it ranks among the `limit` oldest
+ * `running`/`suspended` runs of the key by `(createdAt, id)`, and they write no tag. Among those
+ * statuses an untagged run counts as a legacy holder when either:
  *
- * The FIFO waiter queue alone already keeps a slot for an untagged holder OLDER than the candidate;
- * counting the window explicitly also covers the orders it misses — a tagged holder ranking after
- * untagged runs (createdAt skew between replicas), or an older still-`pending` run the old scan never
- * saw. A run the old scan itself admitted out of order (past an older `pending` run) sits outside the
- * window and stays invisible, exactly as it is to every old replica.
- *
- * In a fleet with no old replica left, the window can also contain new-scheme waiters. Counting them
- * as holders only ever errs towards denying, never towards over-admission, and keeps the FIFO order:
- * a window member is older than every `running`/`suspended` run outside it and the candidate never
- * counts itself. Without createdAt skew every tagged holder sits inside the window too (it was
- * admitted ahead of every younger waiter), so the oldest waiters are admitted on their own retry
- * exactly as before. Only when skew ranks a tagged holder behind `limit` untagged runs does the
- * window fill with waiters — precisely the runs an old replica would treat as admitted — and they
- * then wait for that holder to settle instead of risking a second executor.
+ * - it lacks {@link SINGLETON_TRACKED_TAG}. A new replica stamps that marker on a run's first
+ *   execution and on every denial, so an untagged executed run without it was executed — admitted —
+ *   by an old replica, wherever it ranks (an old replica can admit a run past an older `pending` one
+ *   it never saw). A denial alone can't be told from a holder (both park the run `suspended` on a
+ *   retry `wakeAt`, exactly like a holder sleeping in `ctx.sleep`), which is why the marker exists.
+ *   Waiters an old replica parked count too until a new replica re-checks them (one retry, ~1s):
+ *   that only delays, never over-admits.
+ * - it sits inside the old scan's own window (the `limit` oldest of those runs, every tagged holder
+ *   keeping its seat in it). An old replica can admit a run a new replica had marked without clearing
+ *   the marker; the window is what it admitted it on. With no old replica left this never changes a `limit: 1` decision (a run inside the window
+ *   is the head of the FIFO, admitted next anyway); with a larger limit it can only delay one.
  */
-function legacyHolders(active: WorkflowRun[], runId: string, limit: number): Set<string> {
-  const window = active
-    .filter(
-      (run) =>
-        LEGACY_SCAN_STATUSES.includes(run.status) || run.tags?.includes(SINGLETON_ADMITTED_TAG),
-    )
-    .sort(byCreation)
-    .slice(0, limit);
-  return new Set(
-    window
-      .filter((run) => run.id !== runId && !run.tags?.includes(SINGLETON_ADMITTED_TAG))
+export function legacySingletonHolders(
+  active: WorkflowRun[],
+  runId: string,
+  limit: number,
+): WorkflowRun[] {
+  const scanned = active
+    .filter((run) => LEGACY_SCAN_STATUSES.includes(run.status))
+    .sort(byCreation);
+  // The old scan's window, with every tagged holder given its seat in it whatever its status: a
+  // holder parked `blocked` is invisible to the old scan, and without its seat the window would fill
+  // with the tracked waiters behind it, each counting the next as a holder.
+  const window = new Set(
+    active
+      .filter(
+        (run) =>
+          LEGACY_SCAN_STATUSES.includes(run.status) || run.tags?.includes(SINGLETON_ADMITTED_TAG),
+      )
+      .sort(byCreation)
+      .slice(0, limit)
       .map((run) => run.id),
+  );
+  return scanned.filter(
+    (run) =>
+      run.id !== runId &&
+      !run.tags?.includes(SINGLETON_ADMITTED_TAG) &&
+      (!run.tags?.includes(SINGLETON_TRACKED_TAG) || window.has(run.id)),
   );
 }
 
@@ -77,7 +112,8 @@ function legacyHolders(active: WorkflowRun[], runId: string, limit: number): Set
  * Holders (runs carrying {@link SINGLETON_ADMITTED_TAG}) always keep their slot; only the slots they
  * leave free go to the oldest unadmitted waiters, so a later or same-millisecond start can never
  * displace a holder. Holders a pre-atomic (0.50 and older) replica admitted without the tag are
- * counted too (see {@link legacyHolders}), so a fleet mid rolling upgrade never admits past `limit`.
+ * counted too (see {@link legacySingletonHolders}), so a fleet mid rolling upgrade never admits past
+ * `limit`. Admission replaces the candidate's {@link SINGLETON_TRACKED_TAG} with the admitted tag.
  */
 export function singletonAdmissionTags(
   runs: WorkflowRun[],
@@ -98,7 +134,7 @@ export function singletonAdmissionTags(
   const candidate = active.find((run) => run.id === runId);
   if (!candidate) return null;
   if (candidate.tags?.includes(SINGLETON_ADMITTED_TAG)) return candidate.tags ?? [];
-  const legacy = legacyHolders(active, runId, limit);
+  const legacy = new Set(legacySingletonHolders(active, runId, limit).map((run) => run.id));
   const holders =
     active.filter((run) => run.tags?.includes(SINGLETON_ADMITTED_TAG)).length + legacy.size;
   const free = limit - holders;
@@ -107,7 +143,10 @@ export function singletonAdmissionTags(
     .filter((run) => !run.tags?.includes(SINGLETON_ADMITTED_TAG) && !legacy.has(run.id))
     .sort(byCreation);
   if (!waiters.slice(0, free).some((run) => run.id === runId)) return null;
-  return [...(candidate.tags ?? []), SINGLETON_ADMITTED_TAG];
+  return [
+    ...(candidate.tags ?? []).filter((t) => t !== SINGLETON_TRACKED_TAG),
+    SINGLETON_ADMITTED_TAG,
+  ];
 }
 
 /**
@@ -121,7 +160,7 @@ export function singletonAdmissionDenialPatch(
   tag: string,
   workflow: string,
   retryWakeAt?: number,
-): { status: 'suspended'; wakeAt: number; updatedAt: Date } | undefined {
+): { status: 'suspended'; wakeAt: number; tags: string[]; updatedAt: Date } | undefined {
   if (retryWakeAt === undefined) return undefined;
   const candidate = runs.find(
     (run) =>
@@ -131,7 +170,13 @@ export function singletonAdmissionDenialPatch(
       run.tags?.includes(tag),
   );
   if (!candidate) return undefined;
-  return { status: 'suspended', wakeAt: retryWakeAt, updatedAt: new Date() };
+  // Marked as a waiter the tag scheme tracks, so it is never mistaken for a legacy holder.
+  return {
+    status: 'suspended',
+    wakeAt: retryWakeAt,
+    tags: withSingletonTracked(candidate.tags),
+    updatedAt: new Date(),
+  };
 }
 
 /** Whether a run patch settles the run terminally (and so must release its singleton slot). */
@@ -142,8 +187,8 @@ export function settlesTerminally(patch: Partial<WorkflowRun>): boolean {
   );
 }
 
-/** `tags` without the admission marker, or `undefined` when nothing changes. */
+/** `tags` without the singleton markers (admitted and tracked), or `undefined` when nothing changes. */
 export function withoutAdmission(tags: string[] | undefined): string[] | undefined {
-  if (!tags?.includes(SINGLETON_ADMITTED_TAG)) return undefined;
-  return tags.filter((t) => t !== SINGLETON_ADMITTED_TAG);
+  if (!tags?.some((t) => SINGLETON_RESERVED_TAGS.includes(t))) return undefined;
+  return withoutSingletonMarkers(tags);
 }

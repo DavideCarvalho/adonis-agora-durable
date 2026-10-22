@@ -2,7 +2,11 @@ import type { Database } from '@adonisjs/lucid/database';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { WorkflowEngine } from '../../src/engine.js';
 import type { StateStore, WorkflowRun } from '../../src/interfaces.js';
-import { SINGLETON_ADMITTED_TAG, singletonAdmissionTags } from '../../src/singleton-admission.js';
+import {
+  SINGLETON_ADMITTED_TAG,
+  SINGLETON_TRACKED_TAG,
+  singletonAdmissionTags,
+} from '../../src/singleton-admission.js';
 import { LucidStateStore } from '../../src/stores/lucid.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
 import { dbBackends } from '../support/backends.js';
@@ -11,7 +15,9 @@ import { dbBackends } from '../support/backends.js';
  * Rolling upgrade from the pre-atomic scheme (0.50 and older): those replicas admit a singleton run by
  * a scan — it may run while it ranks among the `limit` oldest `running`/`suspended` runs of its key —
  * and write NO admission tag. A 0.51 claim must count such an untagged holder, or a mixed fleet runs
- * two runs of one key at once.
+ * two runs of one key at once. A 0.51 replica stamps `durable:singleton:tracked` on a singleton run's
+ * first execution and on every denial, so an untagged executed run WITHOUT that marker is one an old
+ * replica executed — a holder, wherever it ranks.
  */
 
 const KEY = 'singleton:k';
@@ -30,17 +36,21 @@ const legacy = (id: string, createdMs: number, over: Partial<WorkflowRun> = {}):
   ...over,
 });
 
+/** A run as a 0.51 replica leaves it before admission: the key tag plus the tracked marker. */
+const tracked = (id: string, createdMs: number, over: Partial<WorkflowRun> = {}): WorkflowRun =>
+  legacy(id, createdMs, { tags: [KEY, SINGLETON_TRACKED_TAG], ...over });
+
 describe('singletonAdmissionTags counts pre-atomic (untagged) holders', () => {
   const admitted = (runs: WorkflowRun[], id: string, limit = 1) =>
     singletonAdmissionTags(runs, id, KEY, 'job', limit) !== null;
 
   it('denies a new start while an old replica runs an untagged holder', () => {
-    const runs = [legacy('old-holder', 1000), legacy('new', 2000)];
+    const runs = [legacy('old-holder', 1000), tracked('new', 2000)];
     expect(admitted(runs, 'new')).toBe(false);
   });
 
   it('counts an untagged holder that sleeps or waits on a signal (suspended) too', () => {
-    const runs = [legacy('old-holder', 1000, { status: 'suspended' }), legacy('new', 2000)];
+    const runs = [legacy('old-holder', 1000, { status: 'suspended' }), tracked('new', 2000)];
     expect(admitted(runs, 'new')).toBe(false);
   });
 
@@ -48,7 +58,7 @@ describe('singletonAdmissionTags counts pre-atomic (untagged) holders', () => {
     // An old replica's denied waiter (suspended on its retry timer, untagged) queued behind its holder.
     const runs = [
       legacy('old-waiter', 2000, { status: 'suspended', wakeAt: 9000 }),
-      legacy('new', 3000),
+      tracked('new', 3000),
     ];
     expect(admitted(runs, 'new')).toBe(false);
     expect(admitted(runs, 'old-waiter')).toBe(true);
@@ -58,7 +68,7 @@ describe('singletonAdmissionTags counts pre-atomic (untagged) holders', () => {
     const runs = [
       legacy('old-holder', 1000),
       legacy('new-holder', 1500, { tags: [KEY, SINGLETON_ADMITTED_TAG] }),
-      legacy('c', 2000),
+      tracked('c', 2000),
     ];
     expect(admitted(runs, 'c', 2)).toBe(false);
     expect(admitted(runs, 'c', 3)).toBe(true);
@@ -68,7 +78,7 @@ describe('singletonAdmissionTags counts pre-atomic (untagged) holders', () => {
     // Positional FIFO alone hands `c` the second slot (only one tagged holder), putting three runs
     // in two slots: the untagged `old-holder` is one an old replica admitted, and it is counted.
     const runs = [
-      legacy('c', 1000),
+      tracked('c', 1000),
       legacy('old-holder', 2000),
       legacy('new-holder', 3000, { tags: [KEY, SINGLETON_ADMITTED_TAG] }),
     ];
@@ -80,13 +90,19 @@ describe('singletonAdmissionTags counts pre-atomic (untagged) holders', () => {
     // second slot is `p`'s (FIFO); admitting `c` too would put three runs in two slots once `p` runs.
     const runs = [
       legacy('p', 500, { status: 'pending' }),
-      legacy('c', 1000),
+      tracked('c', 1000),
       legacy('old-holder', 2000, { status: 'suspended' }),
     ];
     expect(admitted(runs, 'c', 2)).toBe(false);
-    expect(
-      admitted([{ ...runs[0], status: 'running' } as WorkflowRun, ...runs.slice(1)], 'p', 2),
-    ).toBe(true);
+    // Once `p` runs too, `p` and `c` fill the old scan's window: an old replica would run either, and
+    // `old-holder` still holds a slot — so neither is admitted until it settles. Safe, not stuck.
+    const running = [
+      { ...runs[0], status: 'running', tags: [KEY, SINGLETON_TRACKED_TAG] } as WorkflowRun,
+      ...runs.slice(1),
+    ];
+    expect(admitted(running, 'p', 2)).toBe(false);
+    const settled = running.filter((r) => r.id !== 'old-holder');
+    expect(admitted(settled, 'p', 2)).toBe(true);
   });
 
   it('a new-only fleet keeps admitting a waiter next to a holder parked blocked', () => {
@@ -94,11 +110,42 @@ describe('singletonAdmissionTags counts pre-atomic (untagged) holders', () => {
     // waiters behind it are not mistaken for untagged holders of the second slot.
     const runs = [
       legacy('holder', 1000, { status: 'blocked', tags: [KEY, SINGLETON_ADMITTED_TAG] }),
-      legacy('w1', 2000, { status: 'suspended' }),
-      legacy('w2', 3000, { status: 'suspended' }),
+      tracked('w1', 2000, { status: 'suspended' }),
+      tracked('w2', 3000, { status: 'suspended' }),
     ];
     expect(admitted(runs, 'w1', 2)).toBe(true);
     expect(admitted(runs, 'w2', 2)).toBe(false);
+  });
+
+  it('counts a holder an old replica admitted OUT OF ORDER, past an older waiter', () => {
+    // `w` is older and a 0.51 replica already denied it (tracked, suspended); an old replica's scan
+    // saw `w` first... and still admitted the younger `young`, e.g. while `w` was pending. The old
+    // scan's window is `[w]`, so a positional rule misses `young`; the missing marker does not.
+    const runs = [tracked('w', 1000, { status: 'suspended' }), legacy('young', 2000)];
+    expect(admitted(runs, 'w')).toBe(false);
+  });
+
+  it('a 0.51-only fleet admits by FIFO: tracked waiters never count as holders outside the window', () => {
+    const runs = [
+      tracked('w1', 1000, { status: 'suspended' }),
+      tracked('w2', 2000, { status: 'suspended' }),
+      tracked('w3', 3000),
+    ];
+    expect(admitted(runs, 'w1')).toBe(true);
+    expect(admitted(runs, 'w2')).toBe(false);
+    expect(admitted(runs, 'w3')).toBe(false);
+    // limit 2: the two oldest get the two slots.
+    expect(admitted(runs, 'w1', 2)).toBe(true);
+    expect(admitted(runs, 'w2', 2)).toBe(true);
+    expect(admitted(runs, 'w3', 2)).toBe(false);
+  });
+
+  it('admission swaps the tracked marker for the admitted tag', () => {
+    const runs = [tracked('w1', 1000)];
+    expect(singletonAdmissionTags(runs, 'w1', KEY, 'job', 1)).toEqual([
+      KEY,
+      SINGLETON_ADMITTED_TAG,
+    ]);
   });
 });
 
@@ -166,11 +213,43 @@ describe.each(backends)('mixed 0.50/0.51 fleet on $name', (backend) => {
     const denied = await store.getRun('new');
     expect(denied?.status).toBe('suspended');
     expect(denied?.tags).not.toContain(SINGLETON_ADMITTED_TAG);
+    // Stamped on its first execution, so an old replica's holder is never confused with it.
+    expect(denied?.tags).toContain(SINGLETON_TRACKED_TAG);
 
     await oldReplicaCompletes('old-holder');
     await engine.runOne('new');
     expect(entered).toEqual(['new']);
     expect((await store.getRun('new'))?.tags).toContain(SINGLETON_ADMITTED_TAG);
+    expect((await store.getRun('new'))?.tags).not.toContain(SINGLETON_TRACKED_TAG);
+  });
+
+  it('an old replica admitting a younger run past an older pending one never yields two executors', async () => {
+    const t0 = Date.now() - 1000;
+    const entered: string[] = [];
+    const engine = newReplica(entered);
+    // `older` was started first but still `pending` when an old replica's scan (blind to `pending`)
+    // admitted the younger `young` — out of FIFO order.
+    await engine.start('job', 'older', 'older');
+    await store.createRun(legacy('young', t0 + 5_000));
+    await engine.runOne('older');
+    expect(entered).toEqual([]);
+    expect((await store.getRun('older'))?.status).toBe('suspended');
+    await oldReplicaCompletes('young');
+    await engine.runOne('older');
+    expect(entered).toEqual(['older']);
+  });
+
+  it('settling a run drops both markers', async () => {
+    const entered: string[] = [];
+    const engine = newReplica(entered);
+    await engine.start('job', 'solo', 'solo');
+    await engine.runOne('solo');
+    expect(entered).toEqual(['solo']);
+    await engine.signal('release:solo', null);
+    await engine.waitForRun('solo');
+    const tags = (await store.getRun('solo'))?.tags ?? [];
+    expect(tags).not.toContain(SINGLETON_ADMITTED_TAG);
+    expect(tags).not.toContain(SINGLETON_TRACKED_TAG);
   });
 
   it('keeps the old FIFO across versions: an old denied waiter goes before a newer start', async () => {
@@ -206,7 +285,7 @@ describe.each(backends)('mixed 0.50/0.51 fleet on $name', (backend) => {
     await store.createRun(legacy('old-holder', 2000));
     await store.createRun(legacy('new-holder', 3000, { tags: [KEY, SINGLETON_ADMITTED_TAG] }));
     const ids = Array.from({ length: 6 }, (_, i) => `c${i}`);
-    for (const id of ids) await store.createRun(legacy(id, 1000));
+    for (const id of ids) await store.createRun(tracked(id, 1000));
     const claim = () =>
       Promise.all(ids.map((id) => store.tryAdmitSingleton?.(id, KEY, 'job', 2, 5000)));
     expect((await claim()).filter(Boolean)).toHaveLength(0);
@@ -233,7 +312,7 @@ describe.each(backends)('mixed 0.50/0.51 fleet on $name', (backend) => {
     await store.createRun(legacy('old-holder', 1000));
     const ids = Array.from({ length: 6 }, (_, i) => `c${i}`);
     // Same createdAt for all claimants: only the store's serialization orders them.
-    for (const id of ids) await store.createRun(legacy(id, 2000));
+    for (const id of ids) await store.createRun(tracked(id, 2000));
     const claim = () =>
       Promise.all(ids.map((id) => store.tryAdmitSingleton?.(id, KEY, 'job', 1, 5000)));
 

@@ -126,7 +126,12 @@ import { scanRunValueFacets } from './run-value-facets.js';
 import { listSignalWaitersOfRuns } from './run-waiting.js';
 import { type ScheduledWorkflow, scheduleWindow } from './scheduler.js';
 import { ScheduleClient } from './schedules.js';
-import { SINGLETON_ADMITTED_TAG, withoutAdmission } from './singleton-admission.js';
+import {
+  SINGLETON_RESERVED_TAGS,
+  SINGLETON_TRACKED_TAG,
+  withoutAdmission,
+  withSingletonTracked,
+} from './singleton-admission.js';
 import { SingletonGate } from './singleton-gate.js';
 import {
   type StandardSchemaV1,
@@ -1791,7 +1796,7 @@ export class WorkflowEngine {
     const tags = mergeTags(
       registered.tags,
       minted.length ? [...(opts?.tags ?? []), ...minted] : opts?.tags,
-    )?.filter((t) => t !== SINGLETON_ADMITTED_TAG);
+    )?.filter((t) => !SINGLETON_RESERVED_TAGS.includes(t));
     // Singleton back-pressure: reject a start that would grow the same-key backlog past
     // `limit + maxQueueDepth` (no-op when no maxQueueDepth is configured).
     if (registered.singleton) {
@@ -4442,6 +4447,24 @@ export class WorkflowEngine {
    * its retry timer INSIDE the admission claim (or left it alone, when a concurrent cancel had
    * settled it), so report what is persisted rather than writing over it.
    */
+  /**
+   * A run's first execution: `pending` -> `running`. A singleton run not yet admitted is stamped
+   * {@link SINGLETON_TRACKED_TAG} in the same write, BEFORE it competes for a slot, so a run this
+   * replica is about to admit or deny is never mistaken for a holder admitted by a replica older than
+   * 0.51 (see `legacySingletonHolders`).
+   */
+  private async markStarted(run: WorkflowRun, singleton: boolean): Promise<void> {
+    const tags = singleton ? withSingletonTracked(run.tags) : run.tags;
+    const retag = tags !== run.tags;
+    await this.store.updateRun(run.id, {
+      status: 'running',
+      ...(retag ? { tags } : {}),
+      updatedAt: new Date(),
+    });
+    run.status = 'running';
+    if (retag) run.tags = tags;
+  }
+
   private async singletonWaitResult(run: WorkflowRun): Promise<RunResult> {
     const current = await this.store.getRun(run.id);
     await this.store.releaseRunLock(run.id, this.instanceId);
@@ -4488,8 +4511,7 @@ export class WorkflowEngine {
       return { runId: run.id, status: 'suspended' };
     }
     if (run.status === 'pending') {
-      await this.store.updateRun(run.id, { status: 'running', updatedAt: new Date() });
-      run.status = 'running';
+      await this.markStarted(run, registered?.singleton !== undefined);
       this.emit({
         type: 'run.started',
         runId: run.id,
@@ -5516,8 +5538,7 @@ export class WorkflowEngine {
     // gate, so an admitted run's body never starts while it still reads `pending`. A resumed run is
     // already past `pending`, so this fires exactly once.
     if (run.status === 'pending') {
-      await this.store.updateRun(run.id, { status: 'running', updatedAt: new Date() });
-      run.status = 'running';
+      await this.markStarted(run, registered?.singleton !== undefined);
       this.emit({
         type: 'run.started',
         runId: run.id,
