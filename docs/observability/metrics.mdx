@@ -58,9 +58,13 @@ export interface MetricsSnapshot {
 }
 ```
 
+### Counting across a fleet
+
+Both collectors count only the events their own instance produced. With a [control plane](/docs/durable/transports/control-plane), every instance also hears every other instance's events (that is how a dashboard pod live-tails a run on a worker), but those are counted where they happened. Scrape every pod and sum the series: each run and each step is counted once. (Before, every pod counted what it heard as well, so a sum over N pods read N times too high.)
+
 ### Serving a scrape endpoint
 
-Create the collector **once**, at module scope, and serve `prometheus()` from a route:
+With the [dashboard](/docs/durable/observability/dashboard#live-queries-webhooks-and-metrics) mounted, `GET <path>/api/metrics` already serves these counters plus backlog and worker gauges, behind the console's guard. To serve them from your own route instead, create the collector **once**, at module scope, and serve `prometheus()` from a route:
 
 ```ts title="start/routes.ts"
 import router from '@adonisjs/core/services/router'

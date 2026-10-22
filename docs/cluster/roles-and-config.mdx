@@ -184,10 +184,18 @@ The full surface:
 | `signal(runId, signal, payload?)` | deliver a [signal](/docs/durable/concepts/sleep-and-signals) |
 | `cancel(runId, opts?)` | cancel a run, with `{ compensate: true }` to run its [saga undo](/docs/durable/reliability/sagas) first |
 | `redispatchPending(runId)` | re-enqueue every remote step still `pending` — [the operator escape hatch](/docs/durable/reliability/failure-modes) |
+| `retry?(runId)` | retry a failed or dead run in place: back to `pending`, a worker resumes it and re-attempts the failed step (`engine.requeue`) |
+| `continue?(runId)` | resume a run paused at a `ctx.breakpoint()`, or `null` when it is not paused at one |
+| `retryWithInput?(runId, input)` | fix and replay: a new linked run (`<runId>~retry~<id>`) with a corrected input, in the original's namespace |
+| `runFacets?(query)` | `[{ status, origin, count }]` over the runs matching `query`: the counts behind status and origin chips, exact while the list is paged |
+| `runValueFacets?(axis, query, opts?)` | the distinct values of one filter axis (`workflow`, `status`, `namespace`, `origin`, `tag`, `attributeKey`, `attributeValue`) with counts, for pickers |
+| `waitingFor?(runIds)` | `{ [runId]: { on, name } }` for the given runs that are parked on a signal, webhook, child or breakpoint; others are absent |
 | `workerHealth()` | queue depth and live workers per group |
 | `subscribe(runId, onEvent)` | live-tail one run's lifecycle events; returns the unsubscribe |
 
-On a `tenant` pod every verb except `topology()` and `subscribe()` is a wire round-trip bounded by `requestTimeoutMs` (default `10_000`). A request whose reply never arrives rejects with an error naming the verb (`durable control plane did not answer getRun within 10000ms`) instead of hanging. A reply the control plane refuses rejects with an `Error` carrying a `code`: `unauthorized` for an invalid or tampered token, `cross-tenant` for a run owned by another tenant. Over a tenant proxy, `workerHealth()` is scoped to the tenant's own groups — the control plane keeps only groups ending in `@<tenant>`. `subscribe()` bridges onto the transport's per-tenant event stream, which the responder republishes for the tenant's own runs only.
+On a `tenant` pod every verb except `topology()` and `subscribe()` is a wire round-trip bounded by `requestTimeoutMs` (default `10_000`). A request whose reply never arrives rejects with an error naming the verb (`durable control plane did not answer getRun within 10000ms`) instead of hanging. A reply the control plane refuses rejects with an `Error` carrying a `code`: `unauthorized` for an invalid or tampered token, `cross-tenant` for a run owned by another tenant, `unsupported-request` for a verb the control plane does not know. Over a tenant proxy, `workerHealth()` is scoped to the tenant's own groups — the control plane keeps only groups ending in `@<tenant>`. `listRuns`, `runFacets` and `runValueFacets` are scoped to the tenant's own runs (the query's `namespace` is replaced, not checked), `waitingFor` only answers for the tenant's own runs, and `retry`, `continue` and `retryWithInput` check ownership before they act, like every other run-scoped verb.
+
+`retry`, `continue`, `retryWithInput`, `runFacets`, `runValueFacets` and `waitingFor` are the NestJS gateway's verbs, in the same shapes, so a mixed fleet speaks one protocol. They are optional on the interface so a gateway you wrote yourself keeps compiling; both built-in gateways implement all of them. A control-plane gateway that lacks one answers `unsupported-request`. `subscribe()` bridges onto the transport's per-tenant event stream, which the responder republishes for the tenant's own runs only.
 
 `getRunDetail` and `getFanMembers` are optional on the interface, and every built-in gateway implements them. A custom gateway without them still works: the dashboard and the responder build the same detail from `getRun`, `getCheckpoints` and `getRunChildren`, and the exported `loadRunDetail` / `loadFanMembers` helpers do it for your own code.
 
@@ -196,11 +204,23 @@ const detail = await runGateway.getRunDetail?.(params.id, { summarizeFansOver: 5
 // detail.fans: [{ group: 'steps:3:40000', label: 'processLine', size: 600, total: 40000, counts: { completed: 580, pending: 20 }, … }]
 ```
 
-<Callout type="warn" title="Upgrade the control plane before its tenants">
-On a store-less `tenant` pod the [dashboard](/docs/durable/observability/dashboard) reads run detail through the `getRunDetail` run-request verb, and pages a fan through `getFanMembers`, so the control plane summarizes a wide fan before it crosses the wire. A control plane on an older version rejects verbs it does not know, so run detail fails on an upgraded tenant until its control plane is upgraded too. The responder answers an unknown verb with an `unknown run-request verb` error reply, so the tenant sees the failure at once rather than after `requestTimeoutMs`. Upgrade the control plane first, or with its tenants. Before answering either verb, the responder checks tenant ownership on the run alone, without loading its timeline.
-</Callout>
+On a store-less `tenant` pod the [dashboard](/docs/durable/observability/dashboard) reads run detail through the `getRunDetail` run-request verb, and pages a fan through `getFanMembers`, so the control plane summarizes a wide fan before it crosses the wire. Before answering either verb, the responder checks tenant ownership on the run alone, without loading its timeline. A control plane older than the tenant still serves both; see [Rolling upgrades](#rolling-upgrades).
 
-On a store role, `engine` (the default export of `services/main`) is still there for everything the gateway does not cover — registering workflows, driving poll loops, `continue`, `retryWithInput`. On a `tenant` pod there is no engine to resolve, which is exactly the point: reach for `runGateway` in anything that must run on more than one role.
+### Rolling upgrades
+
+Tenant pods and the control plane can be upgraded in either order.
+
+| Tenant | Control plane | What happens |
+| --- | --- | --- |
+| 0.50+ | 0.49.x | The old responder knows `getRunDetail` and `getFanMembers` but not the six newer verbs. It rejects those with an `unknown run-request verb` error, which `ProxyRunGateway` reads as `unsupported-request`; the tenant console degrades as described in [the dashboard docs](/docs/durable/observability/dashboard#fleet-health). |
+| 0.50+ | before 0.49 | Also no `getRunDetail` / `getFanMembers`. `ProxyRunGateway` builds the run detail itself from `getRun`, `getCheckpoints` and `getRunChildren` (each still ownership-checked by the responder), summarizes wide fans on the tenant, and pages fans out of the full timeline. |
+| 0.49.x | 0.50+ | An older proxy never sends the newer verbs; the new responder answers everything it sends exactly as before. |
+
+Every fallback happens on the reply, with no timeout wait. After the control plane answers that it does not know a verb, the proxy uses the fallback for the next minute before it asks again (`capabilityTtlMs` on a `ProxyRunGateway` you build yourself, default `60_000`): the control plane can be several pods of mixed versions behind one queue, and a reply does not say which pod sent it. The fallback for run detail moves every checkpoint of the run over the wire, so on a run with a very wide fan, finish upgrading the control plane soon.
+
+From 0.50 on, a responder answers a verb it does not know with an error whose `code` is `unsupported-request`, before it touches the store, so the next new verb can fall back the same way. And every request gets a reply: a gateway that throws (in `listRuns`, `workerHealth`, the ownership read, or a tenant verifier) becomes an error reply, so a tenant no longer waits out `requestTimeoutMs` for an answer that will never come.
+
+On a store role, `engine` (the default export of `services/main`) is still there for everything the gateway does not cover — registering workflows, driving poll loops, `getEvent`, `update`, the task verbs. On a `tenant` pod there is no engine to resolve, which is exactly the point: reach for `runGateway` in anything that must run on more than one role.
 
 ## Layered tenant authentication
 

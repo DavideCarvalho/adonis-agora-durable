@@ -113,6 +113,19 @@ The second argument a step handler (and a `ctx.localStep` body) receives. Events
 | `subEvent` | `subEvent(e: { id; name; group?; phase?; status?; message?; data? }): void` | Record a sub-process event (a `phase` transition or a terminal `status`). |
 | `subProcess` | `subProcess<T>(name: string, body: (sp: SubProcessHandle) => Promise<T> \| T, opts?: { group?: string; id?: string }): Promise<T>` | Time `body` and record `ok` or `failed`. `sp.phase(label)`, `sp.skip(reason)` and `sp.fail(reason)` mark other outcomes. |
 
+#### `currentStep()`
+
+`currentStep(): StepLogger | undefined`, exported from `@adonis-agora/durable`, returns the logger of the step body running on the current async path: the same instance the body received, so what it records lands in the same event list. Every step body has one, local (`ctx.step`, `ctx.localStep`) and remote (a handler on a worker). It is `undefined` outside a step, so a helper deep in your code can instrument itself without being handed the logger and still runs in a unit test:
+
+```ts
+import { currentStep } from '@adonis-agora/durable'
+
+export async function insertBatch(rows: Row[]) {
+  await db.table('lines').multiInsert(rows)
+  currentStep()?.info('inserted batch', { rows: rows.length })
+}
+```
+
 ## Authoring
 
 ### `BaseWorkflow`
@@ -209,6 +222,7 @@ import engine from '@adonis-agora/durable/services/main'
 | --- | --- | --- |
 | `register` | `register(name: string, version: string, fn: WorkflowFn, opts?: { tags?, singleton?, concurrency?, executionTimeout?, validateInput?, onEvent?, eventBatch?, requires?, origin?, onError? }): void` | Register a function-form workflow (`WorkflowFn` is `(ctx: WorkflowCtx, input: unknown) => Promise<unknown>`). `app/workflows` discovery calls this for you. See [Workflows & steps](/docs/durable/concepts/workflows-and-steps#workflows). |
 | `registerRemote` | `registerRemote(name: string, version: string, opts: { group: string; executor: WorkflowExecutor; tags?; singleton?; concurrency?; executionTimeout?; validateInput?; requires?; onError? }): void` | Register a workflow whose body runs in another SDK; the engine still owns its state. See [Cross-ecosystem interop](/docs/durable/cluster/interop). |
+| `remote` | `remote(name: string, opts: { group: string; version?: string; tags?; singleton?; concurrency?; executionTimeout?; validateInput?; requires?; onError? }): void` | `registerRemote` with the executor built over the engine's primary transport; `version` defaults to `'1'`. Throws without a transport. |
 | `handle` | `handle(name: string, fn: StepHandler): void` | Serve a step body by name on the engine's transport. It makes the engine a `StepServer`, so `registerStepsFromDir(engine, dir)` serves an extra directory from a preload. Throws when the transport can't serve handlers. See [Registering an extra directory by hand](/docs/durable/authoring/app-workflows#registering-an-extra-directory-by-hand). |
 | `registerQueue` | `registerQueue(config: QueueConfig): void` | Register a flow-control queue (`{ name, concurrency?, rateLimit?, retryMs?, fairness?, order? }`). See [Flow control](/docs/durable/reliability/flow-control). |
 | `registerEntity` | `registerEntity<S>(name: string, config: EntityConfig<S>): void` | Register a durable entity (`{ initialState: () => S; handlers: Record<string, EntityHandler<S>> }`). See [Durable entities](/docs/durable/authoring/entities). |
@@ -255,6 +269,8 @@ import engine from '@adonis-agora/durable/services/main'
 | `listCheckpoints` | `listCheckpoints(runId: string): Promise<StepCheckpoint[]>` | A run's checkpoint timeline. |
 | `getRunChildren` | `getRunChildren(parentRunId: string): Promise<string[]>` | Ids of the runs this run spawned, stable after they finish. |
 | `workerHealth` | `workerHealth(extra?: string[]): Promise<GroupHealth[]>` | Per-group queue backlog and live worker heartbeats, for transports that support introspection. |
+| `workflowDirectory` | `workflowDirectory(): Promise<WorkflowDirectory>` | Every workflow the live fleet can run in this engine's partition (`workflows`, each `declared` or `observed`), whether the fleet could be asked at all (`supported`), workers live on other partitions (`otherPartitions`) and a one-line `detail`. See [What can I call?](/docs/durable/cluster/handshake#what-can-i-call). |
+| `announcedWorkflows` | `announcedWorkflows(): Promise<AnnouncedWorkflow[]>` | `workflowDirectory()`'s `workflows`. |
 | `unservedOnErrorRoutes` | `unservedOnErrorRoutes(): Promise<{ workflow: string; route: OnErrorRoute }[]>` | onError routes whose handler nothing can run. See [Catching a misnamed handler](/docs/durable/reliability/on-error#catching-a-misnamed-handler). |
 
 ### Schedules
@@ -301,6 +317,7 @@ These are the phases `node ace durable:work` (or the [embedded worker](#durablec
 
 | Option | Type | Notes |
 | --- | --- | --- |
+| `version` | `string` | Pin the run to this registered version instead of the newest. An unregistered version throws before any run row exists; never falls back. Convention routing cannot honour a pin. |
 | `tags` | `string[]` | Merged with the workflow's static `tags`. |
 | `searchAttributes` | `SearchAttributes` | Typed, queryable run data (`Record<string, string \| number \| boolean>`). |
 | `priority` | `number` | Dispatch priority for a remote run; higher wins. |

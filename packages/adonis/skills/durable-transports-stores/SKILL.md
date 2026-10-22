@@ -199,6 +199,15 @@ work and progress); a non-finite or out-of-range field falls back to its default
 throughput covers the trailing minute, decaying while the worker is idle and reading 0 once a minute passes with no completed step; with a fixed limit the heartbeat still reports `cpuPct`, sampled at most once every 2s. In adaptive mode the decisions, step-events, start-run and run-request consumers run
 at 1 (results run at `resultConcurrency`). Sources: `docs/transports/index.mdx`, `docs/cluster/interop.mdx`.
 
+Two `bullmq` safety nets: `pingIntervalMs` (default 30s; `0`/`false` off) PINGs
+every pub/sub subscriber (heartbeats, run replies, tenant events) and reconnects
+one a VPN/NAT/idle timeout dropped silently, so autoResubscribe restores it; each
+subscriber also gets an `error` listener (reported once per burst to `onError`).
+`stepTimeoutMs` (off by default) fails a step handler still running at the
+ceiling as RETRYABLE, so a wedged `await` cannot hold its job forever (BullMQ
+renews the lock on a timer, so the job never stalls). Source:
+`docs/transports/bullmq.mdx`.
+
 ### Pattern 3 — multi-replica fan-out: the control plane
 
 The task transport is point-to-point; lifecycle events and cancellation need a

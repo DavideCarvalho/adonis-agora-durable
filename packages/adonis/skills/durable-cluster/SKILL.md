@@ -142,16 +142,22 @@ export default class RunsController {
 Verbs: `getRun`, `listRuns`, `getCheckpoints`, `getRunChildren`,
 `getRunDetail` / `getFanMembers` (optional; summarize and page wide fans),
 `getSearchAttributes`, `start`, `signal`, `cancel`, `redispatchPending`,
-`workerHealth`, `subscribe`, `topology()`. Never branch on `role`.
+`workerHealth`, `subscribe`, `topology()`, and the NestJS gateway's `retry`
+(in-place requeue), `continue` (breakpoint), `retryWithInput`, `runFacets`,
+`runValueFacets`, `waitingFor` (optional on the interface; both built-in
+gateways implement them, tenant-scoped by the responder). Never branch on `role`.
 
 ```ts
 // Each fan of more than 50 members — or declared wider than 50 — comes back as one FanSummary in `fans`.
 const detail = await runGateway.getRunDetail?.(params.id, { summarizeFansOver: 50 })
 ```
 
-A tenant pod's dashboard reads run detail through the `getRunDetail` verb, and
-an older control plane rejects unknown verbs: upgrade the control plane first,
-or with its tenants.
+Tenants and the control plane upgrade in either order. A verb the control plane
+does not know comes back as `unsupported-request` (or, before 0.50, an
+`unknown run-request verb` error) and the proxy falls back at once: run detail
+is built from `getRun` + `getCheckpoints` and summarized on the tenant, and the
+tenant console degrades `retry` to a re-dispatch; it remembers the old control
+plane for a minute. Every request gets a reply, even when the gateway throws.
 Source: `docs/cluster/roles-and-config.mdx`.
 
 ### Pattern 2 — capability-aware routing and blocked runs
