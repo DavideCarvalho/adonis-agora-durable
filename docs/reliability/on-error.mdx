@@ -22,11 +22,11 @@ export class InvalidLine extends FatalError {
   }
 }
 
-export class LineDeadLetterWorkflow extends BaseWorkflow {
-  static workflow = { name: 'line-dead-letter' }
+export class RejectedLineWorkflow extends BaseWorkflow {
+  static workflow = { name: 'line-rejected' }
 
   async run(ctx: WorkflowCtx, failure: OnErrorInput<Line>): Promise<LineResult> {
-    await ctx.step(recordDeadLetter, { line: failure.input, error: failure.error.message })
+    await ctx.step(recordRejectedLine, { line: failure.input, error: failure.error.message })
     return { ok: 0, failed: 1 }
   }
 }
@@ -34,7 +34,7 @@ export class LineDeadLetterWorkflow extends BaseWorkflow {
 export class LineWorkflow extends BaseWorkflow {
   static workflow = {
     name: 'line',
-    onError: [{ code: InvalidLine, workflow: LineDeadLetterWorkflow }],
+    onError: [{ code: InvalidLine, workflow: RejectedLineWorkflow }],
   }
 
   async run(ctx: WorkflowCtx, line: Line): Promise<LineResult> {
@@ -115,7 +115,7 @@ For a workflow the engine serves by convention (a Python body, or any worker it 
 queue name), the routes come from what its workers **announce** in their handshake descriptor. A TS
 worker announces them through `WorkerRuntime.registerWorkflow(name, body, meta)` —
 `workflowAnnouncement(MyWorkflow)` builds that `meta` from a class's `static workflow` — and the Python
-SDK through `@worker.workflow("line", on_error=[{"code": "invalid_line", "workflow": "line-dead-letter"}])`.
+SDK through `@worker.workflow("line", on_error=[{"code": "invalid_line", "workflow": "line-rejected"}])`.
 
 The handler can be a workflow of any runtime; the engine only starts a run by name. If the live workers
 announce different routes for the workflow (a rollout in progress), the failure is not routed and the
