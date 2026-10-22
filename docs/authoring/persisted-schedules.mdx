@@ -55,7 +55,8 @@ await engine.schedules.delete(`brief:${user.id}`)    // its past runs are left a
 ```
 
 - `create` throws `ScheduleAlreadyExistsError` on a taken id; `upsert` creates or replaces the definition while keeping history (last fire, last run, fire count) and — when `paused` is omitted — the current paused state.
-- Changing a definition recomputes the next fire from now, so an upsert never re-fires a window. An invalid cron or timezone is rejected up front, and exactly one of `cron` / `every` is required.
+- Changing a definition recomputes the next fire from now, so an upsert never re-fires a window. An invalid cron or timezone is rejected up front, exactly one of `cron` / `every` is required, and `every` must be a positive duration.
+- `create` and `upsert` return the resulting `ScheduleDescription`, as do `pause` and `resume`; `trigger` returns the started run's `RunResult`.
 - `pause`, `resume` and `trigger` throw `ScheduleNotFoundError` on an unknown id; `get` returns `null` and `delete` returns `false`.
 - `resume` continues from the next window after now — windows skipped while paused are **not** caught up.
 - `trigger` starts one run right now, paused or not, with the run id `sched:<id>:manual:<nowMs>`; it doesn't move the schedule's next fire.
@@ -70,9 +71,13 @@ await engine.schedules.delete(`brief:${user.id}`)    // its past runs are left a
 | `cron` / `every` | cron expression / duration (`'15m'` or ms) | Exactly one. Intervals are aligned to the epoch. Cron is 5 fields, or 6 with leading seconds, and needs the `cron-parser` peer. |
 | `timezone` | IANA zone, default `UTC` | Zone the cron is evaluated in (DST-aware). |
 | `jitter` | duration (`'30s'` or ms) | A stable per-(schedule, window) delay in `[0, jitter)` so schedules sharing a cron don't all start in the same second. The run id stays the nominal window. |
-| `overlap` | `'allow'` (default) / `'skip'` | `'skip'` skips a window while the previous run of this schedule is still in flight. |
-| `catchup` | `'latest'` (default) / `'skip'` | Windows missed while nothing polled: fire the most recent one once, or drop them. Never more than one catch-up run. |
+| `overlap` | `'allow'` (default) / `'skip'` | `'skip'` skips a window while the previous run of this schedule has not reached a terminal status (`completed` / `failed` / `cancelled` / `dead`). Unlike config schedules, this works for cron too. |
+| `catchup` | `'latest'` (default) / `'skip'` | Windows missed while nothing polled: fire the most recent one once, or drop them (`'skip'` still fires a window polled up to 60 s, plus `jitter`, after it came due). Never more than one catch-up run. |
 | `paused` | boolean | Create paused. On `upsert`, omit to keep the current state. |
+| `namespace` | string | Namespace of the schedule and of every run it starts. Defaults to the engine's own (`'default'` for an operator). |
+| `tags` | `string[]` | Find schedules by tag (`list({ tag })`); stamped on every run, plus `schedule:<id>`. |
+| `searchAttributes` / `priority` | as in `StartOptions` | Stamped on every run it starts. |
+| `note` | string | Free-form note shown by `get` / `list` (`pause(id, note)` overwrites it). |
 | `concurrency` | `{ key, limit, countStatuses? }` | A [concurrency quota](/docs/durable/reliability/concurrency-quotas) applied to every run it starts; an over-limit window is skipped and recorded as `lastError`. |
 
 A start that fails (unregistered workflow, input validation, a concurrency limit…) is recorded as the schedule's `lastError` and the schedule moves on to its next window; the next successful start clears it. A definition that stops evaluating (e.g. a timezone removed from the tz database) pauses the schedule with the reason in `lastError`.

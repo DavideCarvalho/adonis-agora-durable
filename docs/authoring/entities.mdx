@@ -16,12 +16,14 @@ A **durable entity** is the answer. It is a *keyed virtual actor*: a named objec
 
 ## How it works
 
-Under the hood an entity is not magic — it is one **long-lived run per key**. When you first touch `('account', 'acc_42')`, the engine starts a run with the id `entity:account:acc_42` whose body is a built-in loop:
+Under the hood an entity is not magic — it is one **long-lived run per key**. When you first touch `('account', 'acc_42')`, the engine starts a run with the id `entity:account:acc_42` (of the built-in `__entity` workflow, which is how it shows up in the dashboard) whose body is a built-in loop:
 
 1. Wait (with zero compute) for the next operation to arrive as a signal.
 2. Run the matching handler over the current in-memory `state`, capturing the handler's result **and** the mutated state in a single checkpoint.
 3. Publish the new state (so `getEntityState` can read it) and, if the caller asked for a reply, signal the result back.
 4. Loop.
+
+Every caller delivers its operation with `signalWithStart` on the token `entity:<name>:<key>`: the call starts the key's run if it doesn't exist yet (idempotent by run id) and signals it. Because signals buffer per token, an operation sent before the run reaches its wait point is queued, never dropped.
 
 Because each operation is one checkpoint on one run, and a run only ever advances one checkpoint at a time, operations on the same key are **totally ordered** and each runs **exactly once**. On replay the engine restores `state` from the checkpoint instead of re-invoking the handler, so a handler never double-applies. Different keys are different runs, so they run fully in parallel — the serialization is *per key*, never global.
 
@@ -77,6 +79,10 @@ preloads: [
 ]
 ```
 
+Keep the preload in every environment (don't restrict it to `web`). The handlers live in the process's
+memory, so every process that executes runs, `node ace durable:work` included, must register the entity.
+A process that picks up an entity run without it fails that run with `entity "account" is not registered`.
+
 <Callout type="warn">
 **Keep handlers pure state transitions, and model expected failures as return values.** A handler runs inside the entity's own run; if it *throws*, the entity run fails and every caller waiting on a `ctx.callEntity` reply is left suspended. So treat a handler like a reducer: read `arg`, transform `state`, return a value — and for a business rejection (insufficient funds, item not found) **return** a discriminated result (`{ ok: false, … }`) instead of throwing. Reserve throwing (e.g. `FatalError`) for genuine programmer errors. Handlers may be `async`, but keep real side effects (charging a card, sending mail) in a *workflow* that calls the entity — the entity is for the serialized state, not the I/O.
 </Callout>
@@ -86,23 +92,23 @@ preloads: [
 From a controller, a service, or any code holding the engine, send an operation fire-and-forget with `engine.signalEntity(name, key, op, arg)`. It is ordered and exactly-once per key; it returns as soon as the operation is durably enqueued, not when the handler finishes.
 
 ```ts title="app/controllers/wallet_controller.ts"
-import { WorkflowEngine } from '@adonis-agora/durable'
-import { inject } from '@adonisjs/core'
+import engine from '@adonis-agora/durable/services/main'
 import type { HttpContext } from '@adonisjs/core/http'
 
-@inject()
 export default class WalletController {
-  constructor(private engine: WorkflowEngine) {}
-
   // POST /wallet/:accountId/deposit  { amountCents }
   async deposit({ params, request, response }: HttpContext) {
     const { amountCents } = request.only(['amountCents'])
     // Fire-and-forget: the deposit is serialized against every other op on this key.
-    await this.engine.signalEntity('account', params.accountId, 'deposit', amountCents)
+    await engine.signalEntity('account', params.accountId, 'deposit', amountCents)
     return response.accepted({ queued: true })
   }
 }
 ```
+
+There is no outside "call and await the result". A controller has nothing to suspend the way a run does, so
+from outside a workflow you either signal and read the state back with `getEntityState`, or start a small
+workflow that uses [`ctx.callEntity`](#calling-an-entity-from-a-workflow--ctxcallentity) and wait for it.
 
 ## Reading entity state — `engine.getEntityState`
 
@@ -111,7 +117,7 @@ After each operation the runner publishes the current state, so any reader can f
 ```ts
 // GET /wallet/:accountId
 async show({ params, response }: HttpContext) {
-  const state = await this.engine.getEntityState<AccountState>('account', params.accountId)
+  const state = await engine.getEntityState<AccountState>('account', params.accountId)
   return response.ok(state ?? { balanceCents: 0, version: 0 })
 }
 ```
@@ -207,6 +213,31 @@ engine.getEntityState<S>(name: string, key: string): Promise<S | undefined>
 <Callout type="info">
 Under the hood an entity is an ordinary durable run like any other, so everything else in these docs applies to it unchanged: it appears in the [dashboard](/docs/durable/observability/dashboard), it can be inspected and cancelled, and its per-operation checkpoints are the same checkpoints a workflow writes. The five methods above are the supported surface — you never register or start the underlying run yourself.
 </Callout>
+
+## Guarantees
+
+- **Serialized per key.** Every operation for a given `(name, key)` goes to the same run on the same signal
+  token, so operations for one key run one at a time, in the order they arrived. Different keys are
+  independent runs and run concurrently.
+- **Ordering is per key only.** There is no cross-key ordering: don't rely on two entities observing
+  operations in the same relative order.
+- **Durable across restarts and replay.** The handler's result and the resulting state are captured in one
+  checkpoint per operation, so replay restores the state rather than re-running the handler.
+- **Exactly once from a workflow.** `ctx.callEntity` and `ctx.signalEntity` are checkpointed where they are
+  called: once the call has completed, a replay returns the recorded result instead of sending the
+  operation again.
+
+## Pitfalls
+
+- **Every op needs a handler.** Sending an operation the entity has no handler for throws a `FatalError`
+  (`entity "account" has no handler for op "…"`) inside the entity's run, which fails the run for that key.
+  There is no fallback handler.
+- **State must serialize.** `state` is checkpointed after every operation, so keep it plain data: no class
+  instances with behaviour, no connections, no functions.
+- **`callEntity` suspends the caller.** It costs nothing while parked, but the workflow does not proceed
+  until the entity replies. For a write whose result you don't need, use `ctx.signalEntity`.
+- **A failed entity run strands its callers.** Once a key's run has failed, workflows waiting on a
+  `callEntity` reply from it stay suspended. Keep handlers to pure state transitions, as above.
 
 ## A note on longevity and history
 

@@ -23,6 +23,8 @@ A useful shorthand: `namespace` is what a control plane **polls**; `partition` i
 ## `namespace` — the store poll scope
 
 ```ts title="config/durable.ts"
+import { defineConfig, stores, transports } from '@adonis-agora/durable'
+
 export default defineConfig({
   namespace: 'blue',      // this engine's pool
   transport: 'bullmq',
@@ -97,17 +99,35 @@ one step; omitted, it inherits the worker's partition, so a workflow and the ste
 in the same pool by default. The same suffix is what a
 [Python worker](/docs/durable/python) matches with `run_redis_worker(worker, partition=...)`.
 
+## The wire between control plane and tenant
+
+A store-less pod holds no database credentials. Everything it would otherwise read from or write to
+the store crosses the transport as plain JSON, in the same shapes the NestJS and Python SDKs use:
+
+- **`StartRunMessage`** on `<prefix>-start-run`: `{ tenant, workflow, input, runId?, tags?,
+  searchAttributes? }`. The control plane turns it into a durable run.
+- **`RunRequest` / `RunReply`** on `<prefix>-run-request` and `<prefix>-run-reply`, correlated by
+  `requestId`: every read and control verb (`getRunDetail`, `listRuns`, `cancel`, `retry`,
+  `continue`, `retryWithInput`, …) proxied to the control plane and answered on the reply.
+- **`TenantEvent`**: lifecycle events re-published per tenant, so a tenant's dashboard can tail its
+  own runs live.
+
+Which verbs each role exposes is covered in
+[Reading and steering runs](/docs/durable/cluster/roles-and-config#reading-and-steering-runs-rungateway).
+
 ## The isolation boundary
 
-A store-less pod holds no database credentials, so every read, control action and run-start it
-performs is a wire request answered by the control plane's `RunRequestResponder`. That responder — not
-the client — is the boundary, and it enforces:
+Every read, control action and run-start a store-less pod performs is a wire request answered by the
+control plane's `RunRequestResponder`. That responder — not the client — is the boundary, and it
+enforces:
 
-- **`listRuns` is namespace-forced** to the tenant it derived. The client's `namespace` is
-  *discarded*, never merely validated, so a tenant cannot widen its query into another's.
-- **Every runId-bearing verb** (`getRun`, `getCheckpoints`, `getSearchAttributes`, `signal`, `cancel`,
-  `redispatch`) loads the run **first** and rejects with `cross-tenant` when `run.namespace` isn't the
-  derived tenant — anti-IDOR, before anything mutates.
+- **`listRuns`, `runFacets` and `runValueFacets` are namespace-forced** to the tenant it derived. The
+  client's `namespace` is *discarded*, never merely validated, so a tenant cannot list, count or read
+  the tag vocabulary of another's runs. **`waitingFor`** answers only for the run ids the tenant owns.
+- **Every runId-bearing verb** (`getRun`, `getCheckpoints`, `getRunChildren`, `getRunDetail`,
+  `getFanMembers`, `getSearchAttributes`, `signal`, `cancel`, `redispatch`, `retry`, `continue`,
+  `retryWithInput`) loads the run **first** and rejects with `cross-tenant` when `run.namespace` isn't
+  the derived tenant — anti-IDOR, before anything is read or mutated.
 - **`workerHealth` is group-scoped** to the tenant's own `@<tenant>` queues; the operator's bare groups
   and every other tenant's are dropped.
 - **`start` forces the run's namespace** to the derived tenant, so a run a tenant starts is owned by,
@@ -123,6 +143,16 @@ Pair this with
 network/prefix segmentation, plus a signed token the control plane derives the tenant *from* instead of
 trusting the body.
 </Callout>
+
+## Read scoping: `scopeReads`
+
+The responder fences what a store-less pod can reach. A process that **does** hold the store can be
+fenced too: with `scopeReads: true` and a `namespace` set in `config/durable.ts`, the provider hands
+the engine a view of the store whose run reads (`getRun`, `listRuns`, the counts and facets, and the
+recovery, dispatch and timer scans) only see that namespace's runs. Writes are not fenced. It is off by
+default, because a control plane's own operator screens should see everything, and it has no effect on
+a store without scoping support (the Lucid and in-memory stores have it). See
+[Scoped reads](/docs/durable/stores/lucid#scoped-reads-scopereads).
 
 ## Which namespace a new run gets
 

@@ -49,17 +49,36 @@ workflow would break determinism. The static detects the ambient run and does th
 primitives and stay available.
 </Callout>
 
-<Callout type="warn" title="opts.runId — outside vs inside">
-`opts` is `{ runId? }` plus the usual start options (priority, namespace, …). **Outside** a workflow, `runId`
-is auto-generated when omitted, and acts as an idempotency key when you provide one. **Inside** a workflow the
-child id is derived deterministically from the call position (replay-stable) when omitted — do **not** pass a
-random one, as that would break replay. Pass an explicit stable id only when you deliberately want to join a
-specific child (see [scatter-gather](#scatter-gather-start-many-then-join)).
+**Which to reach for.** Outside a workflow, prefer the statics: a controller that only kicks off a run
+doesn't need the engine for it. Inside a body, prefer `ctx.child` / `ctx.startChild`. They do the same
+thing, but `ctx` is the visible determinism boundary: a reviewer scanning for `ctx.` sees every history
+operation at a glance, and `Inner.start()` no longer *looks* durable. The statics earn their place inside a
+body in deep helpers, a domain service a few calls below `run` that would otherwise thread `ctx` through
+several signatures just to spawn a child.
+
+<Callout type="warn" title="Where the statics see no workflow">
+"Inside" means the body's own async path, read from an `AsyncLocalStorage`. A dispatched step handler is
+not the body: the engine clears the ambient run around it, even on an in-process transport, so a static
+called from a `@Step` method starts a **top-level** run, not a child. Inside a `ctx.localStep` body the
+static resolves the ambient run and throws a `NestedWorkflowCallError` instead, since a step that replays
+from its checkpoint would never claim that child's position again.
+</Callout>
+
+<Callout type="warn" title="opts — outside vs inside">
+`opts` is `{ runId? }` plus the engine's start options (`version`, `priority`, `namespace`, `startAt`, …).
+**Outside** a workflow, all of them apply; `runId` is a random UUID when omitted and acts as an idempotency
+key when you provide one. **Inside** a workflow only `runId` is used, as the child id; the other start options
+are ignored. When omitted, the child id is derived deterministically from the call position (replay-stable).
+Do **not** pass a random one, as that would break replay. Pass an explicit stable id only when you
+deliberately want to join a specific child (see [Fanning out by hand](#fanning-out-by-hand)). For a child's
+dispatch priority, call `ctx.child` / `ctx.startChild` with `{ priority }` (see
+[Child call options](#child-call-options)).
 </Callout>
 
 The rest of this page documents `ctx.child` / `ctx.startChild` — the primitives the statics delegate to. Use
-them directly when you only have the child's **name** string (no class to import), or when the calling code is
-already an `engine.register(...)` body.
+them directly when you only have the child's **name** string (no class to import), when the calling code is
+already an `engine.register(...)` body, or when you need a [child call option](#child-call-options) the statics
+don't forward. Fanning out over a list (`ctx.all` / `ctx.allSettled`) has no static form either.
 
 ## `ctx.child` — run a child and await its result
 
@@ -85,7 +104,29 @@ const shipment = await ctx.child(ShippingWorkflow, { orderId: order.id })
 //    ^? the return type of ShippingWorkflow.run, inferred — and { orderId } is type-checked
 ```
 
-Both forms take an optional third `childId` argument; it defaults to a deterministic id derived from the parent run and the call position, so it's stable across replay.
+The name form is the only one for a **cross-runtime** child, such as a workflow implemented in
+[Python](/docs/durable/python). There you annotate the result yourself:
+
+```ts
+const result = await ctx.child<EnrichResult>('python-enrich', { recordId })
+```
+
+### Child call options
+
+Both forms take an optional third argument: a `childId` string, or a `ChildCallOptions` object.
+
+```ts
+await ctx.child('python-enrich', { recordId }, { childId: `enrich:${recordId}`, priority: 10 })
+```
+
+| Option | What it does |
+| --- | --- |
+| `childId` | The child's run id. Defaults to `<parentRunId>.child.<seq>`, derived from the parent run and the call position, so it's stable across replay. |
+| `priority` | Dispatch priority for a **remote** child workflow (another runtime), stamped on the child run and carried onto every task that advances it. Higher wins. Ignored for an in-process (TypeScript class) child. |
+
+`parentRunIdOf(runId)` (exported from `@adonis-agora/durable`) reads the parent back out of an engine-minted
+child id (`.child.<seq>`, `.all.<seq>.<i>`, `.onError.<n>`). It returns `undefined` for a child started with
+an id you chose.
 
 <CodeFlow scene="child-workflow" />
 
@@ -185,7 +226,8 @@ and finishing the rest is wasted work.
 
 <Callout type="warn">
 `failFast` cancellation is best-effort and carries **no saga compensation**: it is a plain cancel, and a
-sibling in the middle of a step only observes it at its next checkpoint. If a partially-run child needs to be
+sibling in the middle of a step only observes it at its next checkpoint, so a fast sibling can still slip
+through and complete. If a partially-run child needs to be
 undone, give the child its own [compensations](/docs/durable/reliability/sagas) and cancel it with
 `{ compensate: true }` yourself instead.
 </Callout>
@@ -283,8 +325,9 @@ children are still to be started. A run that began before the size was part of t
 
 ### Fanning out by hand
 
-`ctx.all` covers one workflow over N inputs. When the fan-out is heterogeneous — different workflows, or work
-interleaved between starting and joining — build it from `startChild` + `child`. Because `startChild` returns
+`ctx.all` covers one workflow over N inputs, dispatched and joined in one call. When you need something it
+doesn't give you — a different workflow per item, child ids you choose, or work interleaved between starting
+the children and joining them — build it from `startChild` + `child`. Because `startChild` returns
 the child id and the start is idempotent by that id, you can fan out first and join later with the **same
 id**: the child runs exactly once and the second call just attaches to it.
 
@@ -333,5 +376,14 @@ engine.register('counter', '1', async (ctx, input: { n: number }) => {
 ```
 
 Each generation completes cleanly, so the run never grows without bound — the durable equivalent of tail recursion.
+`continueAsNew` always throws, so code after it never runs. Carry everything the next generation needs in its
+`input`.
 
-The handoff itself is crash-safe: the continuation run is **persisted before** the parent's terminal write, so a crash in the gap between "generation N completed" and "generation N+1 started" cannot lose the chain — on recovery the already-persisted continuation is simply driven forward. The continuation also inherits the parent run's `namespace`, so a chain pinned to a worker pool stays in it across generations.
+A generation that continues completes with **no output**, so a parent awaiting it with `ctx.child` (or
+`Wf.start`) resolves with `undefined` as soon as the first generation hands off, not when the chain ends. Start
+a looping workflow with `startChild` / `dispatch`, or have the caller wait on something the last generation
+publishes (an [event](/docs/durable/authoring/events) or a [signal](/docs/durable/concepts/sleep-and-signals)).
+The next generation starts on the **newest** registered version of the workflow, so a continue-as-new is also
+how a long-lived loop picks up a [new version](/docs/durable/authoring/versioning).
+
+The handoff itself is crash-safe: the continuation run is **persisted before** the parent's terminal write, so a crash in the gap between "generation N completed" and "generation N+1 started" cannot lose the chain — on recovery the already-persisted continuation is simply driven forward. The continuation inherits the parent run's `namespace`, so a chain pinned to a worker pool stays in it across generations. Nothing else carries over: run-scoped tags, search attributes and priority from the original start are not copied to the next generation. A cancel requested while the generation runs wins over the continue-as-new: the run is cancelled and no next generation is started.

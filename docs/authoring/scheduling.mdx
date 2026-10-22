@@ -8,7 +8,7 @@ import { Callout } from 'fumadocs-ui/components/callout';
 
 A scheduled workflow is just a normal workflow that you **start on a recurring cadence** — a nightly report, an hourly sync, a cleanup every five minutes. You describe the cadence with a `ScheduledWorkflow` and register it under `schedules` in `config/durable.ts`; the `durable:work` worker loop then fires any due windows on every tick. The interesting part is the exactly-once guarantee: even with several worker instances racing on the same tick, each schedule window starts **exactly once**.
 
-Schedules trigger by **time**. To trigger a workflow when an **event** happens instead — an Adonis emitter event or a `@adonis-agora/diagnostics` channel — see [Event-triggered workflows](./event-triggers).
+Schedules trigger by **time**. To trigger a workflow when an **event** happens instead — an Adonis emitter event or a `@adonis-agora/diagnostics` channel — see [Event-triggered workflows](/docs/durable/authoring/event-triggers).
 
 For schedules created and managed **at runtime** — one per user or tenant, stored in the database — see [Persisted schedules](/docs/durable/authoring/persisted-schedules).
 
@@ -78,6 +78,7 @@ static schedule = [
 
 ```ts title="app/workflows/crawl_workflow.ts"
 import { BaseWorkflow, Scheduled } from '@adonis-agora/durable'
+import type { WorkflowCtx } from '@adonis-agora/durable'
 
 @Scheduled({ cron: '0 4 * * *', timezone: 'America/Sao_Paulo' })
 export default class CrawlWorkflow extends BaseWorkflow {
@@ -95,7 +96,7 @@ Colocated schedules are picked up by `app/workflows` auto-discovery and merged w
 
 ## Registering schedules — `config/durable.ts`
 
-Add a `schedules` array to your durable config. The `durable:work` worker loop reads it and fires any due windows on every tick — the 5th phase of the tick, right after it sweeps execution timeouts. No code to call yourself:
+Add a `schedules` array to your durable config. The `durable:work` worker loop reads it and fires any due windows on every tick — the `runSchedules` phase, right after it sweeps execution timeouts (and just before it fires [persisted schedules](/docs/durable/authoring/persisted-schedules)). No code to call yourself:
 
 ```ts title="config/durable.ts"
 import { defineConfig, transports } from '@adonis-agora/durable'
@@ -146,12 +147,12 @@ export default defineConfig({
 })
 ```
 
-That is the whole change — one image, one process, one `CMD`. The loop is the same one the command drives, with the same five phases and the same exactly-once guarantee.
+That is the whole change — one image, one process, one `CMD`. The loop is the same one the command drives, with the same phases and the same exactly-once guarantee.
 
 | Option | Default | |
 |---|---|---|
 | `embedded` | `false` | Start the loop in this process |
-| `intervalMs` | `1000` | Poll interval between ticks |
+| `intervalMs` | `1000` | Poll interval between ticks (same default as `durable:work --interval`) |
 | `drainTimeoutMs` | `10_000` | Shutdown budget: the wait for the tick in flight plus the drain |
 
 **The loop starts only in the `web` environment.** Without that gate, `node ace migration:run` would quietly become a worker, and `node ace durable:work` would run *two* loops in one process — the command's and the embedded one — ticking every phase twice. The gate is also what lets you keep `embedded: true` in config while still running dedicated worker pods: the command runs in the `console` environment, so no embedded loop competes with it.
@@ -203,7 +204,7 @@ rather than being detected and driven with the wrong entry point.
 ## Pausing and overlap
 
 - `paused: true` skips a schedule entirely while it's set — handy for disabling a job without removing it.
-- `overlap: 'skip'` won't start a new window while the previous run for that schedule is still in-flight (`pending`/`running`/`suspended`). The default, `'allow'`, starts each window regardless. It applies to fixed-interval schedules only.
+- `overlap: 'skip'` won't start a new window while the immediately preceding window's run is still `running` or `suspended`. The default, `'allow'`, starts each window regardless, so a slow run and a fresh one can be in flight together. It applies to fixed-interval schedules only (it checks the previous `everyMs` bucket) — cron windows aren't adjacent ids, so `overlap` has no effect on a `cron` schedule.
 
 ```ts
 { key: 'slow-sync', workflow: 'slow-sync', everyMs: 60_000, overlap: 'skip' }
@@ -261,7 +262,22 @@ When each window is genuinely distinct work (one report per day, one billing cyc
 }
 ```
 
-Each backfilled window has its own time-bucket run id, so it is started exactly once just like a live window — and re-running the worker does not re-fire it.
+At most `maxCatchup` missed windows start, oldest first, followed by the current one. Each backfilled window has its own time-bucket run id, so it is started exactly once just like a live window — if another instance already caught some up, start idempotency skips those — and re-running the worker does not re-fire it.
+
+## Putting it together
+
+The options compose — a schedule that skips pile-up, spreads load, and catches up after downtime:
+
+```ts
+{
+  key: 'hourly-rollup',
+  workflow: 'hourly-rollup',
+  everyMs: 60 * 60 * 1000,
+  overlap: 'skip', // don't pile up if a rollup runs long
+  jitter: 10_000, // spread dispatch across instances ticking the same hour
+  backfill: { maxCatchup: 6 }, // catch up on up to 6 hours missed while the fleet was down
+}
+```
 
 ## Pinning the runs to a pool — `namespace`
 
@@ -270,6 +286,8 @@ A colocated `static schedule` is discovered by **every** `durable:work` process 
 Pin the pool on the schedule and the fire becomes deterministic — whoever ticks, the run is stamped for (and thus polled and resumed only by) the named pool:
 
 ```ts
+import type { WorkflowScheduleConfig } from '@adonis-agora/durable'
+
 static schedule: WorkflowScheduleConfig = {
   cron: '0 3 * * *',
   timezone: 'America/Sao_Paulo',
@@ -291,10 +309,17 @@ The result for scheduling: **each window starts exactly once**, no matter how ma
 
 ## Lower-level — `runSchedules`
 
-The worker loop fires schedules for you, so registering them in `config/durable.ts` is all you normally need. If you drive ticks yourself (a custom loop, an external scheduler), call `runSchedules(engine, schedules, nowMs)` directly — it evaluates each schedule against `nowMs`, starts any due window, and returns the run ids it started:
+The worker loop fires schedules for you, so registering them in `config/durable.ts` is all you normally need. If you drive ticks yourself (a custom loop, an external scheduler, a serverless trigger), call `runSchedules(engine, schedules, nowMs, opts?)` directly — it evaluates each schedule against `nowMs` (applying `paused` and the runtime pause override, `overlap`, `jitter` and `backfill`), starts any due window that does not exist yet, and returns the run ids it started:
 
 ```ts
-import { WorkflowEngine, runSchedules, type ScheduledWorkflow } from '@adonis-agora/durable'
+import { runSchedules, type ScheduledWorkflow } from '@adonis-agora/durable'
+import engine from '@adonis-agora/durable/services/main'
+
+const schedules: ScheduledWorkflow[] = [
+  { key: 'cache-sync', workflow: 'cache-sync', everyMs: 5 * 60 * 1000 },
+]
 
 await runSchedules(engine, schedules, Date.now())
 ```
+
+`opts` (`{ random?, sleep? }`) overrides the `Math.random` / `setTimeout` used for `jitter`, so tests can make it deterministic and instant. Schedules you pass here directly are not seen by `listSchedules` / `setSchedulePaused` / `triggerSchedule`; those read the set the worker loop adopts (config plus colocated).
