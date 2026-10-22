@@ -622,11 +622,12 @@ function FanMembers({
   useEffect(() => {
     if (fetchedTotal !== undefined) setTotal(fetchedTotal);
   }, [fetchedTotal]);
-  const memberAt = (index: number): StepCheckpoint | undefined => {
-    const page = Math.floor(index / FAN_PAGE_SIZE);
-    const at = pages.indexOf(page);
-    return at < 0 ? undefined : results[at]?.data?.items[index % FAN_PAGE_SIZE];
+  const resultAt = (index: number) => {
+    const at = pages.indexOf(Math.floor(index / FAN_PAGE_SIZE));
+    return at < 0 ? undefined : results[at];
   };
+  const memberAt = (index: number): StepCheckpoint | undefined =>
+    resultAt(index)?.data?.items[index % FAN_PAGE_SIZE];
 
   const failedPage = results.find((r) => r.isError);
   if (total === undefined && failedPage) {
@@ -663,17 +664,53 @@ function FanMembers({
               {step ? (
                 <StepRow row={prepareRow(step, undefined, frame)} {...rowProps} />
               ) : (
-                <div
-                  className="mono px-2 text-[10px] leading-7 text-zinc-700"
-                  style={{ height: MEMBER_ROW_PX }}
-                >
-                  #{item.index + 1} loading…
-                </div>
+                <FanMemberPlaceholder index={item.index} page={resultAt(item.index)} />
               )}
             </div>
           );
         })}
       </div>
+    </div>
+  );
+}
+
+/**
+ * A fan member whose page has not landed: `loading…`, or the page's error with a retry. A finished
+ * run's pages are not polled, so without the retry a failed page would never load.
+ */
+export function FanMemberPlaceholder({
+  index,
+  page,
+}: {
+  index: number;
+  page?: { isError: boolean; error: unknown; refetch: () => unknown } | undefined;
+}) {
+  if (page?.isError) {
+    return (
+      <div
+        className="mono flex items-center gap-2 px-2 text-[10px] leading-7 text-red-400"
+        style={{ height: MEMBER_ROW_PX }}
+      >
+        <span className="truncate">
+          #{index + 1} couldn't load:{' '}
+          {page.error instanceof Error ? page.error.message : String(page.error)}
+        </span>
+        <button
+          type="button"
+          onClick={() => void page.refetch()}
+          className="rounded border border-red-500/40 px-1.5 text-red-300 hover:bg-red-500/15"
+        >
+          retry
+        </button>
+      </div>
+    );
+  }
+  return (
+    <div
+      className="mono px-2 text-[10px] leading-7 text-zinc-700"
+      style={{ height: MEMBER_ROW_PX }}
+    >
+      #{index + 1} loading…
     </div>
   );
 }
