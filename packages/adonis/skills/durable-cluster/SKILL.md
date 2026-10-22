@@ -110,7 +110,7 @@ Verbs: `getRun`, `listRuns`, `getCheckpoints`, `getRunChildren`,
 `workerHealth`, `subscribe`, `topology()`. Never branch on `role`.
 
 ```ts
-// Each fan of more than 50 members comes back as one FanSummary in `fans`.
+// Each fan of more than 50 members — or declared wider than 50 — comes back as one FanSummary in `fans`.
 const detail = await runGateway.getRunDetail?.(params.id, { summarizeFansOver: 50 })
 ```
 
