@@ -44,6 +44,8 @@ export interface EventEmitterTransportConfig {
   group?: string;
   /** Stable id for this process (stamped on control `from` when a publisher leaves it unset). Default random. */
   instanceId?: string;
+  /** Where a failing result/heartbeat handler is reported (a failed result is redelivered). Default `console.error`. */
+  onError?: (err: unknown) => void;
 }
 
 /** Options for the `@adonisjs/queue` transport. */
@@ -84,6 +86,8 @@ export interface QueueTransportConfig {
   prefix?: string;
   /** Poll interval (ms) for the result/task/heartbeat/control loops. Default 200ms. */
   pollIntervalMs?: number;
+  /** How long `close()` waits for in-flight jobs before handing them back (ms). Default 5000. */
+  closeTimeoutMs?: number;
   /**
    * How many jobs of one step name a worker runs at once. Default 1. More slots share one poll loop,
    * so raising it adds no polling.
@@ -379,6 +383,7 @@ export const transports = {
       return new EventEmitterTransport({
         ...(config.group !== undefined ? { group: config.group } : {}),
         ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+        ...(config.onError !== undefined ? { onError: config.onError } : {}),
       });
     };
   },
@@ -400,6 +405,7 @@ export const transports = {
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
         ...(config.prefix !== undefined ? { prefix: config.prefix } : {}),
         ...(config.pollIntervalMs !== undefined ? { pollIntervalMs: config.pollIntervalMs } : {}),
+        ...(config.closeTimeoutMs !== undefined ? { closeTimeoutMs: config.closeTimeoutMs } : {}),
         ...(config.concurrency !== undefined ? { concurrency: config.concurrency } : {}),
         ...(config.resultConcurrency !== undefined
           ? { resultConcurrency: config.resultConcurrency }

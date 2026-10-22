@@ -24,6 +24,62 @@ async function waitFor(predicate: () => boolean) {
 }
 
 describe('EventEmitterTransport', () => {
+  it('a result handler that throws is reported and the result redelivered — never an unhandled rejection', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const errors: unknown[] = [];
+      const transport = new EventEmitterTransport({ onError: (err) => errors.push(err) });
+      transport.handle('payments.charge-card', async () => 'ok');
+      let calls = 0;
+      const settled: StepResult[] = [];
+      transport.onResult(async (r) => {
+        calls += 1;
+        if (calls < 3) throw new Error('store down');
+        settled.push(r);
+      });
+      await transport.dispatch(task());
+      for (let i = 0; i < 100 && settled.length === 0; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(settled).toHaveLength(1);
+      expect(calls).toBe(3);
+      expect(errors).toHaveLength(2);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+      await transport.close();
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
+  it('a heartbeat handler that throws is reported, not left unhandled', async () => {
+    const errors: unknown[] = [];
+    const transport = new EventEmitterTransport({ onError: (err) => errors.push(err) });
+    transport.onHeartbeat(async () => {
+      throw new Error('store down');
+    });
+    await transport.heartbeat({ runId: 'r1', seq: 0, stepId: 'r1:0', group: 'payments' });
+    await waitFor(() => errors.length > 0);
+    expect(errors).toHaveLength(1);
+  });
+
+  it('close() stops redelivering a failing result', async () => {
+    const errors: unknown[] = [];
+    const transport = new EventEmitterTransport({ onError: (err) => errors.push(err) });
+    transport.handle('payments.charge-card', async () => 'ok');
+    transport.onResult(async () => {
+      throw new Error('store down');
+    });
+    await transport.dispatch(task());
+    await waitFor(() => errors.length > 0);
+    await transport.close();
+    const after = errors.length;
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(errors.length).toBeLessThanOrEqual(after + 1);
+  });
+
   it('routes a dispatched task to a registered handler and delivers the result', async () => {
     const transport = new EventEmitterTransport();
     transport.handle('payments.charge-card', async (input) => ({

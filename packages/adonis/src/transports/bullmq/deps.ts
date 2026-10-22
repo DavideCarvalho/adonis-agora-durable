@@ -81,7 +81,50 @@ export function workerConcurrency(value: number | undefined, fallback = 1): numb
  * an ioredis client with NO host/port, landing on ioredis's own default (`127.0.0.1:6379`) instead of
  * the caller's Redis.
  */
-export async function createBullMQDeps(connection: unknown, concurrency = 1): Promise<BullMQDeps> {
+/**
+ * A `redis://` / `rediss://` URL as ioredis `ConnectionOptions`. BullMQ's `Queue`/`Worker` and this
+ * module's own `{ keepAlive, ...connection }` spread only understand an options object or a `Redis`
+ * instance: a bare string was spread character by character and silently fell back to ioredis's
+ * default 127.0.0.1:6379. `rediss:` turns on TLS; the path's first segment selects the db.
+ */
+export function redisUrlToOptions(url: string): Record<string, unknown> {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`@agora/durable: transports.bullmq() got an invalid Redis URL: ${url}`);
+  }
+  if (parsed.protocol !== 'redis:' && parsed.protocol !== 'rediss:') {
+    throw new Error(
+      `@agora/durable: transports.bullmq() expects a redis:// or rediss:// URL, got ${parsed.protocol}`,
+    );
+  }
+  const options: Record<string, unknown> = {
+    host: parsed.hostname || '127.0.0.1',
+    port: parsed.port ? Number(parsed.port) : 6379,
+  };
+  if (parsed.username) options.username = decodeURIComponent(parsed.username);
+  if (parsed.password) options.password = decodeURIComponent(parsed.password);
+  const db = parsed.pathname.replace(/^\//, '').split('/')[0];
+  if (db) {
+    const n = Number(db);
+    if (!Number.isInteger(n) || n < 0) {
+      throw new Error(
+        `@agora/durable: transports.bullmq() got an invalid Redis db "${db}" in ${url}`,
+      );
+    }
+    options.db = n;
+  }
+  if (parsed.protocol === 'rediss:') options.tls = {};
+  return options;
+}
+
+export async function createBullMQDeps(
+  rawConnection: unknown,
+  concurrency = 1,
+): Promise<BullMQDeps> {
+  const connection =
+    typeof rawConnection === 'string' ? redisUrlToOptions(rawConnection) : rawConnection;
   const defaultConcurrency = workerConcurrency(concurrency);
   // Non-literal specifiers: keep `tsc` from resolving 'bullmq'/'ioredis' at build time (they are a
   // runtime-only dependency of the selected transport), so the wider package builds without them.
@@ -106,7 +149,6 @@ export async function createBullMQDeps(connection: unknown, concurrency = 1): Pr
   // existing `Redis` instance, a connection string, or a non-empty options object is required.
   const hasUsableConnection =
     isRedisInstance(connection) ||
-    typeof connection === 'string' ||
     (typeof connection === 'object' && connection !== null && Object.keys(connection).length > 0);
   if (!hasUsableConnection) {
     const got = connection === undefined ? 'undefined' : JSON.stringify(connection);

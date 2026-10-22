@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { createBullMQDeps } from '../../../../src/transports/bullmq/deps.js';
+import { createBullMQDeps, redisUrlToOptions } from '../../../../src/transports/bullmq/deps.js';
 
 /**
  * Regression test for the redis-connection-standalone bug: `createBullMQDeps()` used to build
@@ -58,5 +58,42 @@ describe('createBullMQDeps — connection validation', () => {
     expect(
       (duplicated as unknown as { options: { host: string; port: number } }).options,
     ).toMatchObject({ host: '127.0.0.1', port: 16382 });
+  });
+
+  it('honours a connection STRING instead of silently connecting to 127.0.0.1:6379', async () => {
+    // A string used to be spread character by character into the options, so every client — Redis,
+    // Queue and Worker — fell back to ioredis's default while the boot looked fine.
+    const deps = await createBullMQDeps('redis://:s3cret@10.0.0.7:16383/2');
+    const redis = deps.makeRedis();
+    clients.push(redis);
+    expect((redis as unknown as { options: Record<string, unknown> }).options).toMatchObject({
+      host: '10.0.0.7',
+      port: 16383,
+      password: 's3cret',
+      db: 2,
+    });
+  });
+
+  it('rejects a malformed or non-redis URL instead of falling back', async () => {
+    await expect(createBullMQDeps('')).rejects.toThrow(/Redis URL/);
+    await expect(createBullMQDeps('http://localhost:6379')).rejects.toThrow(/redis:\/\//);
+  });
+});
+
+describe('redisUrlToOptions', () => {
+  it('maps host, port, credentials, db and TLS', () => {
+    expect(redisUrlToOptions('redis://localhost')).toEqual({ host: 'localhost', port: 6379 });
+    expect(redisUrlToOptions('rediss://user:p%40ss@cache.internal:6380/5')).toEqual({
+      host: 'cache.internal',
+      port: 6380,
+      username: 'user',
+      password: 'p@ss',
+      db: 5,
+      tls: {},
+    });
+  });
+
+  it('rejects a non-numeric db', () => {
+    expect(() => redisUrlToOptions('redis://localhost/abc')).toThrow(/db/);
   });
 });

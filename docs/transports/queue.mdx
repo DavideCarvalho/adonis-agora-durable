@@ -33,7 +33,7 @@ export default defineConfig({
 - A dispatched `ctx.step` goes to a **per-name** task queue: `<prefix>:tasks:<token>`, where the routing token is `tenantGroup(sanitizeQueueToken(name), partition)` — a dedicated queue per handler name (with an optional `partition` suffix), never a single shared group queue.
 - A worker that serves that name consumes it, runs the handler, and adds the result to the shared `<prefix>:results` queue.
 - The engine-side instance consumes results and checkpoints them.
-- Liveness flows on `<prefix>:heartbeats`; cross-instance control on `<prefix>:control`.
+- Liveness flows on `<prefix>:heartbeats`. `<prefix>:control` exists for the `ControlPlane` interface, but it is point-to-point — one instance takes each message — so it does not fan out across pods; use [`controlPlanes.redis`](/docs/durable/transports/control-plane) for that.
 - A [remote workflow](/docs/durable/cluster/thin-workers#executing-workflow-turns) turn rides the same per-name task queue (the worker tells a turn from a step by its shape); its decision returns on `<prefix>:decisions`, and the local steps it runs mid-turn on `<prefix>:step-events`.
 - A [store-less `tenant` pod](#tenant-pods-over-the-queue-transport) reaches its control plane over the same backend.
 
@@ -85,6 +85,7 @@ Upgrading an app from 0.6 to 0.7:
 | `namespace` | from the engine | Worker-pool namespace folded into every queue name. Setting it here is explicit and wins over the engine's propagation of `config.namespace` — see [Namespaces](#namespaces--sharing-one-broker-across-pools). |
 | `prefix` | `'durable'` | Namespaces the queues (`<prefix>:tasks:<token>`, `<prefix>:results`, …). |
 | `pollIntervalMs` | `200` | Poll interval in ms between queue reads. |
+| `closeTimeoutMs` | `5000` | How long `close()` waits for jobs already in a handler before handing the rest back to the broker. |
 | `concurrency` | `1` | How many jobs of one step name this worker runs at once: a number (fixed), or `'adaptive'` / `{ mode: 'adaptive', min, max, start, tickMs, ramCeilingPct, cpuCeilingPct }` to let a control loop move it — see [Adaptive concurrency](#adaptive-concurrency). More slots share one poll loop, so raising it adds no polling. |
 | `resultConcurrency` | `1` | How many step results the engine side settles at once. |
 | `idleBackoffMax` | `4` | Idle backoff for the task, heartbeat and control loops, in poll intervals: empty polls double the sleep up to this multiple (800ms at the default interval), and a found job resets it. `1` disables it. The results loop never backs off. |

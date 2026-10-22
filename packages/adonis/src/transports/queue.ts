@@ -306,6 +306,11 @@ export interface QueueTransportOptions {
    * advertised, and the engine routes without descriptors.
    */
   workerKeys?: WorkerKeyStore;
+  /**
+   * How long `close()` waits (ms) for jobs already in a handler before handing the rest back to the
+   * broker. Default 5000 — the same option, and default, as the `bullmq` and `db` transports.
+   */
+  closeTimeoutMs?: number;
   /** How long a read of {@link workerKeys} is reused (ms). Default 5000; `0` reads every time. */
   workerKeysCacheMs?: number;
   /**
@@ -368,6 +373,7 @@ export class QueueTransport implements Transport, ControlPlane {
   #namespace: string | undefined;
   readonly #explicitNamespace: boolean;
   readonly #pollIntervalMs: number;
+  readonly #closeTimeoutMs: number;
   /** Fixed or adaptive task concurrency, plus the in-flight/latency/RSS/CPU telemetry the liveness
    *  heartbeat carries. One controller for every task loop of this instance, as on BullMQ. */
   readonly #controller: AdaptiveController;
@@ -463,6 +469,12 @@ export class QueueTransport implements Transport, ControlPlane {
     this.#namespace = options.namespace;
     this.#explicitNamespace = options.namespace !== undefined;
     this.#pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    this.#closeTimeoutMs =
+      options.closeTimeoutMs !== undefined &&
+      Number.isFinite(options.closeTimeoutMs) &&
+      options.closeTimeoutMs >= 0
+        ? options.closeTimeoutMs
+        : 5_000;
     this.#controller = new AdaptiveController({
       ...(options.concurrency !== undefined ? { concurrency: options.concurrency } : {}),
       apply: () => {
@@ -1470,8 +1482,8 @@ export class QueueTransport implements Transport, ControlPlane {
         .catch((err) => this.#onError(err));
     }
     this.#workerHeartbeatTimer = undefined;
-    const drainDeadline = Date.now() + 5_000;
-    await this.#pollers.drain(5_000);
+    const drainDeadline = Date.now() + this.#closeTimeoutMs;
+    await this.#pollers.drain(this.#closeTimeoutMs);
     // Jobs handed off by a multi-slot loop are not part of a poll tick: wait for them too, within the
     // same budget.
     if (this.#runningJobs.size > 0) {

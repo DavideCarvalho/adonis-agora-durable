@@ -40,6 +40,12 @@ export interface EventEmitterTransportOptions {
   namespace?: string;
   /** Stable id for this process (stamped on control `from` when a publisher leaves it unset). Default random. */
   instanceId?: string;
+  /**
+   * Where a failing result/heartbeat handler is reported. Default `console.error`. A result whose
+   * handler threw (a store error while settling the checkpoint) is redelivered with backoff — the
+   * in-memory copy is the only one, as on a broker whose job stays queued until it is settled.
+   */
+  onError?: (err: unknown) => void;
 }
 
 /** The minimal `on`/`emit` surface this transport needs — satisfied by Node's `EventEmitter` and
@@ -49,6 +55,10 @@ type EmitterLike = Pick<EventEmitter, 'on' | 'emit'>;
 // The worker advertisement keys, one board per emitter: every transport over the same in-process bus
 // (an engine's and a worker runtime's) reads and writes the same keys.
 const workerKeysByEmitter = new WeakMap<EmitterLike, MemoryWorkerKeys>();
+
+/** Backoff for redelivering a result whose handler failed: 100ms doubling, capped at 5s. */
+const RESULT_RETRY_BASE_MS = 100;
+const RESULT_RETRY_MAX_MS = 5_000;
 
 /**
  * A production **in-process** {@link Transport} (and {@link ControlPlane}) backed by a single Node
@@ -73,6 +83,8 @@ const workerKeysByEmitter = new WeakMap<EmitterLike, MemoryWorkerKeys>();
 export class EventEmitterTransport implements Transport, ControlPlane {
   readonly #emitter: EmitterLike;
   readonly #instanceId: string;
+  readonly #onError: (err: unknown) => void;
+  #closed = false;
   readonly #handlers = new Map<string, StepHandler>();
   // Logical deployment namespace folded into every channel name via `#suffix()`. Mutable so an engine
   // can push its namespace via `useNamespace()` — but only when one wasn't passed explicitly to the
@@ -91,6 +103,8 @@ export class EventEmitterTransport implements Transport, ControlPlane {
     if (emitter instanceof EventEmitter) emitter.setMaxListeners(0);
     this.#emitter = emitter;
     this.#instanceId = options.instanceId ?? randomUUID();
+    this.#onError =
+      options.onError ?? ((err) => console.error('[EventEmitterTransport] handler failed', err));
     this.#namespace = options.namespace;
     this.#explicitNamespace = options.namespace !== undefined;
   }
@@ -162,15 +176,46 @@ export class EventEmitterTransport implements Transport, ControlPlane {
   // worker → engine — the engine consumes results + heartbeats
   // ---------------------------------------------------------------------------
 
+  /** Stop redelivering failed results (the provider calls it on shutdown). Idempotent. */
+  async close(): Promise<void> {
+    this.#closed = true;
+  }
+
   onResult(handler: (result: StepResult) => Promise<void>): void {
     this.#emitter.on(`${RESULT_EVENT}${this.#suffix()}`, (result: StepResult) => {
-      void handler(result);
+      this.#settle(handler, result, 0);
     });
+  }
+
+  /**
+   * Hand `result` to the engine; if settling fails, report it and try again with backoff. The handler
+   * used to be called as `void handler(result)`: a rejection (the store briefly unreachable while the
+   * checkpoint is written) became an unhandled rejection — fatal under Node's default — and the result,
+   * whose only copy lived in this call, was lost. The engine's settle is idempotent per step, so a retry
+   * after a partial write is safe. Retries stop once the transport is closed.
+   */
+  #settle(
+    handler: (result: StepResult) => Promise<void>,
+    result: StepResult,
+    attempt: number,
+  ): void {
+    Promise.resolve()
+      .then(() => handler(result))
+      .catch((err) => {
+        this.#onError(err);
+        if (this.#closed) return;
+        const delay = Math.min(RESULT_RETRY_BASE_MS * 2 ** attempt, RESULT_RETRY_MAX_MS);
+        const timer = setTimeout(() => this.#settle(handler, result, attempt + 1), delay);
+        timer.unref?.();
+      });
   }
 
   onHeartbeat(handler: (beat: Heartbeat) => Promise<void>): void {
     this.#emitter.on(`${HEARTBEAT_EVENT}${this.#suffix()}`, (beat: Heartbeat) => {
-      void handler(beat);
+      // A lost beat only costs liveness for one interval; report it rather than crash the process.
+      Promise.resolve()
+        .then(() => handler(beat))
+        .catch((err) => this.#onError(err));
     });
   }
 

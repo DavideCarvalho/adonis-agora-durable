@@ -67,6 +67,7 @@ export default defineConfig({
 | --- | --- | --- |
 | `group` | — | Accepted for parity with the broker drivers. Handlers match by step name in-process, so it does not affect routing. |
 | `instanceId` | random | Stable id for this process, stamped on control messages. |
+| `onError` | `console.error` | Where a failing result or heartbeat handler is reported. A failed result is redelivered from memory with backoff (100ms doubling to 5s) until `close()`; a failed heartbeat is dropped. |
 
 Pair it with the [Lucid store](/docs/durable/stores/lucid) and the durability guarantees are the real ones: a crash mid-run resumes from the last checkpoint, because the checkpoints are in Postgres even though the steps never left the process.
 
