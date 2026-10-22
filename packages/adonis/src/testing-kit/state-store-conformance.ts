@@ -130,12 +130,17 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       };
     });
 
-    /** Register a contract case that no-ops (passes) when the backend was reported unavailable. */
-    const t = (label: string, fn: () => Promise<void>): void => {
-      it(label, async () => {
-        if (skipReason) return;
-        await fn();
-      });
+    /** Register a contract case that no-ops (passes) when the backend was reported unavailable.
+     *  `timeoutMs` widens the runner's per-test timeout for a case that does many round-trips. */
+    const t = (label: string, fn: () => Promise<void>, timeoutMs?: number): void => {
+      it(
+        label,
+        async () => {
+          if (skipReason) return;
+          await fn();
+        },
+        timeoutMs,
+      );
     };
 
     // ---- create / get / update --------------------------------------------------------------
@@ -537,22 +542,27 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect((await store.getCheckpoint('r1', 3))?.output).toEqual({ n: 3 });
     });
 
-    t('saveCheckpointsIfPending writes a wide batch', async () => {
-      if (!store.saveCheckpointsIfPending) return;
-      await store.createRun(run());
-      const n = 600;
-      const rows = Array.from({ length: n }, (_, seq) =>
-        checkpoint({ seq, stepId: `r1:${seq}`, status: 'pending', output: undefined }),
-      );
-      for (const row of rows) await store.saveCheckpoint(row);
-      const wrote = await store.saveCheckpointsIfPending(
-        rows.map((row) => ({ ...row, status: 'completed' as const, output: { seq: row.seq } })),
-      );
-      expect(wrote).toHaveLength(n);
-      expect(wrote.every((w) => w === true)).toBe(true);
-      expect(await store.countCheckpoints?.('r1', 0, n - 1, ['completed'])).toBe(n);
-      expect((await store.getCheckpoint('r1', n - 1))?.output).toEqual({ seq: n - 1 });
-    });
+    t(
+      'saveCheckpointsIfPending writes a wide batch',
+      async () => {
+        if (!store.saveCheckpointsIfPending) return;
+        await store.createRun(run());
+        const n = 600;
+        const rows = Array.from({ length: n }, (_, seq) =>
+          checkpoint({ seq, stepId: `r1:${seq}`, status: 'pending', output: undefined }),
+        );
+        for (const row of rows) await store.saveCheckpoint(row);
+        const wrote = await store.saveCheckpointsIfPending(
+          rows.map((row) => ({ ...row, status: 'completed' as const, output: { seq: row.seq } })),
+        );
+        expect(wrote).toHaveLength(n);
+        expect(wrote.every((w) => w === true)).toBe(true);
+        expect(await store.countCheckpoints?.('r1', 0, n - 1, ['completed'])).toBe(n);
+        expect((await store.getCheckpoint('r1', n - 1))?.output).toEqual({ seq: n - 1 });
+        // ~1,200 sequential round-trips: a networked store on a loaded runner needs more than 5s.
+      },
+      30_000,
+    );
 
     t('deleteRuns removes every listed run and its rows, and nothing else', async () => {
       expect(store.deleteRuns).toBeDefined();

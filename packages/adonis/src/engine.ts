@@ -474,12 +474,17 @@ export interface WorkflowEngineDeps {
    * (`runPending` / `recoverIncomplete` / `resumeDueTimers` / `sweepTimeouts`) only act on runs in
    * this namespace, and `resume` of a foreign run throws {@link NamespaceMismatch}.
    *
-   * **Leaving it UNSET makes this engine an operator**: it drives, recovers and resumes runs of EVERY
+   * **`undefined` here makes this engine an operator**: it drives, recovers and resumes runs of EVERY
    * namespace (the store's poll filters no-op on `undefined`) and leaves its transports on their bare
    * prefix. That is what lets one control plane serve many tenant pools — the queue a step lands on
    * is derived from the RUN's namespace, not this engine's. Set a value to scope the instance to one
    * pool instead, so ONE state store can be shared across non-interchangeable pools (e.g. local dev
    * vs a cluster). `'default'` and `''` are the bare pool, byte-identical to a single-pool deployment.
+   *
+   * The AdonisJS provider maps `config/durable.ts` onto this: an absent `namespace` is `'default'` on
+   * a `standalone` engine (it drives only the default pool, legacy rows included), and stays
+   * `undefined` — the operator — only on a `role: 'control-plane'` engine. Constructing the engine by
+   * hand keeps the raw meaning above.
    */
   namespace?: string | undefined;
   /** Recovery lease duration in ms — how long this instance owns a run it picked up. Default 30s. */

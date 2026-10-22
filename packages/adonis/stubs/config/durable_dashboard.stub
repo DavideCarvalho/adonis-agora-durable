@@ -2,13 +2,17 @@
   exports({ to: app.configPath('durable_dashboard.ts') })
 }}}
 import { defineConfig } from '@adonis-agora/durable/dashboard'
+// Used by the commented-out dashboardAuth example below.
+// import env from '#start/env'
 
 /**
  * Configuration for the @adonis-agora/durable dashboard.
  *
- * By default the dashboard is open OUTSIDE production, and in production it
- * requires a bearer token equal to \`DURABLE_DASHBOARD_TOKEN\` (deny if unset).
- * Replace \`authorize\` with your own guard (session, role, IP allow-list, …).
+ * By default the dashboard FAILS CLOSED in every environment: it requires a
+ * bearer token equal to \`DURABLE_DASHBOARD_TOKEN\`, and denies everything when
+ * that env var is unset. Replace \`authorize\` with your own guard (session,
+ * role, IP allow-list, …), or set \`allowUnauthenticated: true\` for a trusted
+ * local network only.
  *
  * \`dashboardAuth\` is an ADDITIVE, optional session gate on top of \`authorize\` —
  * a signed cookie minted via a built-in login page (Mode B: \`login\`) and/or a
