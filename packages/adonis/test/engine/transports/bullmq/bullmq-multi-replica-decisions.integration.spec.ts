@@ -5,6 +5,7 @@ import { RemoteWorkflowExecutor } from '../../../../src/remote-workflow-executor
 import { InMemoryStateStore } from '../../../../src/testing/in-memory-state-store.js';
 import { BullMQTransport } from '../../../../src/transports/bullmq/bullmq-transport.js';
 import { createBullMQDeps } from '../../../../src/transports/bullmq/deps.js';
+import { backendUrl, uniqueRedisPrefix } from '../../../support/backends.js';
 
 /**
  * Two engine replicas on one real Redis: `${P}-decisions` is ONE BullMQ queue both replicas' workers
@@ -14,7 +15,7 @@ import { createBullMQDeps } from '../../../../src/transports/bullmq/deps.js';
  *
  *   DURABLE_REDIS_URL=redis://localhost:6379 node_modules/.bin/vitest run bullmq-multi-replica
  */
-const REDIS_URL = process.env.DURABLE_REDIS_URL;
+const REDIS_URL = backendUrl('DURABLE_REDIS_URL');
 
 const closers: Array<() => Promise<void>> = [];
 afterAll(async () => {
@@ -32,7 +33,7 @@ async function settle(store: InMemoryStateStore, ids: string[]): Promise<Workflo
 
 describe.skipIf(!REDIS_URL)('BullMQ: remote workflow decisions across two engine replicas', () => {
   it('completes every run whichever replica consumes its decision', async () => {
-    const prefix = `durable-it-decisions-${Date.now()}`;
+    const prefix = uniqueRedisPrefix('durable-it-decisions');
     const connection = { url: REDIS_URL } as unknown;
     const transport = async (instanceId: string) => {
       const t = new BullMQTransport({

@@ -1,3 +1,5 @@
+import type { Database } from '@adonisjs/lucid/database';
+import { afterEach } from 'vitest';
 import { WorkflowEngine } from '../../src/engine.js';
 import type {
   RemoteTask,
@@ -8,8 +10,8 @@ import type {
 } from '../../src/interfaces.js';
 import { DURABLE_STEP_NAME, type StepRef } from '../../src/step-name-symbol.js';
 import { LucidStateStore } from '../../src/stores/lucid.js';
-import { makeStoreDb } from '../../src/stores/lucid-helpers.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
+import { dbBackends } from '../support/backends.js';
 
 /**
  * A run's step results that land together (a results consumer with `resultConcurrency > 1`, a wide
@@ -90,9 +92,22 @@ async function fanRun(store: StateStore, n: number) {
   return { engine, transport, turns: () => turns };
 }
 
+/** Lucid databases opened by a test, closed after it (a Postgres one drops its schema on close). */
+const opened: Database[] = [];
+afterEach(async () => {
+  while (opened.length) await opened.pop()?.manager.closeAll();
+});
+
 const stores: Array<[string, () => Promise<StateStore>]> = [
   ['in-memory', async () => new InMemoryStateStore()],
-  ['lucid (sqlite)', async () => new LucidStateStore(await makeStoreDb())],
+  ...dbBackends().map((backend): [string, () => Promise<StateStore>] => [
+    `lucid (${backend.name})`,
+    async () => {
+      const db = await backend.makeStoreDb();
+      opened.push(db);
+      return new LucidStateStore(db);
+    },
+  ]),
 ];
 
 describe.each(stores)('batched step results (%s)', (_label, makeStore) => {

@@ -13,7 +13,7 @@ import {
 import { StoreRunGateway } from '../../src/run-gateway/store-run-gateway.js';
 import { DURABLE_STEP_NAME, type StepRef } from '../../src/step-name-symbol.js';
 import { LucidStateStore } from '../../src/stores/lucid.js';
-import { makeStoreDb } from '../../src/stores/lucid-helpers.js';
+import { dbBackends } from '../support/backends.js';
 
 /**
  * The console polls `GET /runs/:id` every couple of seconds. With a store that aggregates checkpoints,
@@ -154,13 +154,20 @@ describe('run detail ETag / 304', () => {
     expect((await getRun(deps, req({ headers: { 'if-none-match': etag } }))).status).toBe(304);
   });
 
-  it('works on the Lucid store (SQLite)', async () => {
-    const { engine, release } = await wideRun(new LucidStateStore(await makeStoreDb()));
-    const deps = { engine: storeDashboardEngine(engine) };
-    const first = await getRun(deps, req());
-    const etag = first.headers?.etag as string;
-    expect(etag).toBeDefined();
-    expect((await getRun(deps, req({ headers: { 'if-none-match': etag } }))).status).toBe(304);
-    release();
+  it.each(dbBackends())('works on the Lucid store ($name)', async ({ makeStoreDb }) => {
+    const db = await makeStoreDb();
+    try {
+      const { engine, store, release, settle } = await wideRun(new LucidStateStore(db));
+      const deps = { engine: storeDashboardEngine(engine) };
+      const first = await getRun(deps, req());
+      const etag = first.headers?.etag as string;
+      expect(etag).toBeDefined();
+      expect((await getRun(deps, req({ headers: { 'if-none-match': etag } }))).status).toBe(304);
+      release();
+      // Let the fan finish before the database closes under it.
+      await settle(async () => (await store.getRun('p'))?.status === 'completed');
+    } finally {
+      await db.manager.closeAll();
+    }
   });
 });

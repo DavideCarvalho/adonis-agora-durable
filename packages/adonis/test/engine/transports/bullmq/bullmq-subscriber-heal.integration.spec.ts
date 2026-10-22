@@ -3,6 +3,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import type { RunReply } from '../../../../src/interfaces.js';
 import { BullMQTransport } from '../../../../src/transports/bullmq/bullmq-transport.js';
 import { createBullMQDeps } from '../../../../src/transports/bullmq/deps.js';
+import { backendUrl, uniqueRedisPrefix } from '../../../support/backends.js';
 
 /**
  * The bullmq subscriber watchdog against a REAL Redis. Gated on `DURABLE_REDIS_URL` (or `REDIS_URL`)
@@ -18,7 +19,7 @@ import { createBullMQDeps } from '../../../../src/transports/bullmq/deps.js';
  *   test pins that the transport keeps delivering afterwards and that the burst of connection
  *   errors is handled.
  */
-const REDIS_URL = process.env.DURABLE_REDIS_URL ?? process.env.REDIS_URL;
+const REDIS_URL = process.env.DURABLE_REDIS_URL ?? backendUrl('REDIS_URL');
 
 const closers: Array<() => Promise<void>> = [];
 afterAll(async () => {
@@ -118,7 +119,7 @@ describe.skipIf(!REDIS_URL)('BullMQTransport subscriber heal (real Redis)', () =
   const url = new URL(REDIS_URL ?? 'redis://127.0.0.1:6379');
 
   it('heals a silently-dropped run-reply subscriber and keeps delivering replies', async () => {
-    const prefix = `durable-heal-${Date.now()}`;
+    const prefix = uniqueRedisPrefix('durable-heal');
     const channel = `${prefix}-run-reply`;
     const proxy = await startSilentProxy(url.hostname, Number(url.port || 6379));
     const admin = await adminClient(url.toString());
@@ -161,7 +162,7 @@ describe.skipIf(!REDIS_URL)('BullMQTransport subscriber heal (real Redis)', () =
   }, 30_000);
 
   it('resubscribes the heartbeat and tenant-event subscribers after CLIENT KILL', async () => {
-    const prefix = `durable-kill-${Date.now()}`;
+    const prefix = uniqueRedisPrefix('durable-kill');
     const admin = await adminClient(url.toString());
     closers.push(async () => {
       await admin.quit();

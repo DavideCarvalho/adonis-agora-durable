@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { Database } from '@adonisjs/lucid/database';
 import { afterEach, describe, expect, it } from 'vitest';
-import { makeMemoryDb } from '../../../src/stores/lucid-helpers.js';
 import {
   createDurableTables,
   DURABLE_SCHEMA_META_TABLE,
@@ -9,13 +8,17 @@ import {
   DURABLE_TABLES,
   dropDurableTables,
 } from '../../../src/stores/lucid-schema.js';
+import { dbBackends } from '../../support/backends.js';
 
 /**
  * `createDurableTables` runs at every boot of every pod (`autoSchema`). Once the schema is current it
  * must cost a marker read, not a probe per table, column and index — and when it does have work to
  * do, it is serialized across processes (the lock itself is exercised against real Postgres/MySQL
- * in the PR's manual check; SQLite runs it without one).
+ * in the PR's manual check; SQLite runs it without one). Runs on SQLite and, with `DURABLE_PG_URL`,
+ * on Postgres (each database an isolated schema).
  */
+
+const isPostgres = (db: Database) => db.connection().dialect.name === 'postgres';
 
 /** Count the SQL statements `fn` sends on the default connection. */
 async function countQueries(db: Database, fn: () => Promise<void>): Promise<string[]> {
@@ -31,8 +34,53 @@ async function countQueries(db: Database, fn: () => Promise<void>): Promise<stri
   return sql;
 }
 
-/** The DDL SQLite holds for the durable tables and indexes, in a stable order. */
+/** Whether the index named `name` exists in the database's (current) schema. */
+async function hasIndex(db: Database, name: string): Promise<boolean> {
+  if (isPostgres(db)) {
+    const { rows } = (await db.rawQuery(
+      'select 1 from pg_indexes where schemaname = current_schema() and indexname = ?',
+      [name],
+    )) as { rows: unknown[] };
+    return rows.length > 0;
+  }
+  const rows = await db.from('sqlite_master').where('type', 'index').where('name', name);
+  return rows.length > 0;
+}
+
+/**
+ * The DDL the database holds for the durable tables and indexes, in a stable order. SQLite keeps the
+ * statements themselves; on Postgres it is rebuilt from the catalog (columns with their types,
+ * nullability and defaults, then each index definition with the per-test schema name stripped).
+ */
 async function durableDdl(db: Database): Promise<string> {
+  if (isPostgres(db)) {
+    const tables = Object.values(DURABLE_TABLES);
+    const columns = (await db
+      .connection()
+      .query()
+      .from('information_schema.columns')
+      .select('table_name', 'column_name', 'data_type', 'is_nullable', 'column_default')
+      .whereRaw('table_schema = current_schema()')
+      .whereIn('table_name', tables)
+      .orderBy([{ column: 'table_name' }, { column: 'column_name' }])) as Array<
+      Record<string, string | null>
+    >;
+    const { rows: indexes } = (await db.rawQuery(
+      `select indexname, indexdef from pg_indexes
+        where schemaname = current_schema() and tablename = any(?) order by indexname`,
+      [tables],
+    )) as { rows: Array<{ indexname: string; indexdef: string }> };
+    const schema = (db as Database & { schemaName?: string }).schemaName;
+    const strip = (sql: string) =>
+      schema ? sql.split(`"${schema}".`).join('').split(`${schema}.`).join('') : sql;
+    return [
+      ...columns.map(
+        (c) =>
+          `column ${c.table_name}.${c.column_name}: ${c.data_type} ${c.is_nullable} ${c.column_default ?? ''}`,
+      ),
+      ...indexes.map((i) => `index ${i.indexname}: ${strip(i.indexdef)}`),
+    ].join('\n');
+  }
   const rows = (await db
     .connection()
     .query()
@@ -43,91 +91,97 @@ async function durableDdl(db: Database): Promise<string> {
   return rows.map((r) => `${r.type} ${r.name}: ${r.sql ?? ''}`).join('\n');
 }
 
-describe('createDurableTables fingerprint gate', () => {
-  const open: Database[] = [];
-  afterEach(async () => {
-    while (open.length) await open.pop()?.manager.closeAll();
-  });
-  const fresh = () => {
-    const db = makeMemoryDb();
-    open.push(db);
-    return db;
-  };
-
-  it('records the fingerprint, then answers a current schema with the marker read alone', async () => {
-    const db = fresh();
-    const first = await countQueries(db, () => createDurableTables(db));
-    expect(first.length).toBeGreaterThan(10);
-    const marker = await db.from(DURABLE_SCHEMA_META_TABLE).select('id', 'fingerprint');
-    expect(marker).toEqual([
-      { id: 'durable', fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/) },
-    ]);
-
-    const steady = await countQueries(db, () => createDurableTables(db));
-    // One catalog probe for the marker table and one PK read — no table/column/index probes.
-    expect(steady).toHaveLength(2);
-    expect(steady.join('\n')).not.toMatch(/pragma|create|alter/i);
-  });
-
-  it('re-checks when the marker is stale, and when forced', async () => {
-    const db = fresh();
-    await createDurableTables(db);
-    await db.from(DURABLE_SCHEMA_META_TABLE).update({ fingerprint: 'stale' });
-    await db.rawQuery('drop index "durable_runs_created_idx"');
-    const warnings: string[] = [];
-    await createDurableTables(db, undefined, { logger: { warn: (m) => warnings.push(m) } });
-    expect(warnings.join('\n')).toContain('durable_runs_created_idx');
-    // Back to current: the stale row was rewritten.
-    expect(await countQueries(db, () => createDurableTables(db))).toHaveLength(2);
-
-    // A hand change behind a current marker is only seen with `force`.
-    await db.rawQuery('drop index "durable_runs_created_idx"');
-    await createDurableTables(db, undefined, { logger: { warn: () => {} } });
-    const index = () =>
-      db.from('sqlite_master').where('type', 'index').where('name', 'durable_runs_created_idx');
-    expect(await index()).toHaveLength(0);
-    await createDurableTables(db, undefined, { force: true, logger: { warn: () => {} } });
-    expect(await index()).toHaveLength(1);
-  });
-
-  it('dropDurableTables drops the marker too, so the next call re-creates everything', async () => {
-    const db = fresh();
-    await createDurableTables(db);
-    await dropDurableTables(db);
-    expect(await db.connection().schema.hasTable(DURABLE_SCHEMA_META_TABLE)).toBe(false);
-    await createDurableTables(db);
-    expect(await db.connection().schema.hasTable(DURABLE_TABLES.runs)).toBe(true);
-  });
-
-  it('creates the run-detail index on (run_id, parallel_group, seq), and repairs it', async () => {
-    const db = fresh();
-    await createDurableTables(db);
-    const ddl = await durableDdl(db);
-    expect(ddl).toContain('durable_step_checkpoints_group_idx');
-    expect(ddl).toMatch(
-      /durable_step_checkpoints_group_idx.*\(`run_id`, `parallel_group`, `seq`\)/,
-    );
-    await db.rawQuery('drop index "durable_step_checkpoints_group_idx"');
-    const warnings: string[] = [];
-    await createDurableTables(db, undefined, {
-      force: true,
-      logger: { warn: (m) => warnings.push(m) },
+describe.each(dbBackends())('on $name', ({ name: backend, makeMemoryDb }) => {
+  describe('createDurableTables fingerprint gate', () => {
+    const open: Database[] = [];
+    afterEach(async () => {
+      while (open.length) await open.pop()?.manager.closeAll();
     });
-    expect(warnings.join('\n')).toContain('durable_step_checkpoints_group_idx');
-  });
+    const fresh = async () => {
+      const db = await makeMemoryDb();
+      open.push(db);
+      return db;
+    };
 
-  it('pins the DDL to DURABLE_SCHEMA_REVISION', async () => {
-    const db = fresh();
-    await createDurableTables(db);
-    const digest = createHash('sha256')
-      .update(await durableDdl(db))
-      .digest('hex');
-    // A failure here means the DDL changed. Bump DURABLE_SCHEMA_REVISION in lucid-schema.ts (so
-    // every existing database runs the full check once) and update both values below. (If only a
-    // Knex upgrade changed how SQLite spells the same DDL, update the digest alone.)
-    expect({ revision: DURABLE_SCHEMA_REVISION, digest }).toEqual({
-      revision: 3,
-      digest: '004771001d3413ab12ae14444d47fc020402c902050282b14c0e955726943cd0',
+    it('records the fingerprint, then answers a current schema with the marker read alone', async () => {
+      const db = await fresh();
+      const first = await countQueries(db, () => createDurableTables(db));
+      expect(first.length).toBeGreaterThan(10);
+      const marker = await db.from(DURABLE_SCHEMA_META_TABLE).select('id', 'fingerprint');
+      expect(marker).toEqual([
+        { id: 'durable', fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/) },
+      ]);
+
+      const steady = await countQueries(db, () => createDurableTables(db));
+      // One catalog probe for the marker table and one PK read — no table/column/index probes.
+      expect(steady).toHaveLength(2);
+      expect(steady.join('\n')).not.toMatch(/pragma|create|alter/i);
+    });
+
+    it('re-checks when the marker is stale, and when forced', async () => {
+      const db = await fresh();
+      await createDurableTables(db);
+      await db.from(DURABLE_SCHEMA_META_TABLE).update({ fingerprint: 'stale' });
+      await db.rawQuery('drop index "durable_runs_created_idx"');
+      const warnings: string[] = [];
+      await createDurableTables(db, undefined, { logger: { warn: (m) => warnings.push(m) } });
+      expect(warnings.join('\n')).toContain('durable_runs_created_idx');
+      // Back to current: the stale row was rewritten.
+      expect(await countQueries(db, () => createDurableTables(db))).toHaveLength(2);
+
+      // A hand change behind a current marker is only seen with `force`.
+      await db.rawQuery('drop index "durable_runs_created_idx"');
+      await createDurableTables(db, undefined, { logger: { warn: () => {} } });
+      expect(await hasIndex(db, 'durable_runs_created_idx')).toBe(false);
+      await createDurableTables(db, undefined, { force: true, logger: { warn: () => {} } });
+      expect(await hasIndex(db, 'durable_runs_created_idx')).toBe(true);
+    });
+
+    it('dropDurableTables drops the marker too, so the next call re-creates everything', async () => {
+      const db = await fresh();
+      await createDurableTables(db);
+      await dropDurableTables(db);
+      expect(await db.connection().schema.hasTable(DURABLE_SCHEMA_META_TABLE)).toBe(false);
+      await createDurableTables(db);
+      expect(await db.connection().schema.hasTable(DURABLE_TABLES.runs)).toBe(true);
+    });
+
+    it('creates the run-detail index on (run_id, parallel_group, seq), and repairs it', async () => {
+      const db = await fresh();
+      await createDurableTables(db);
+      const ddl = await durableDdl(db);
+      expect(ddl).toContain('durable_step_checkpoints_group_idx');
+      expect(ddl).toMatch(
+        backend === 'postgres'
+          ? /durable_step_checkpoints_group_idx.*\(run_id, parallel_group, seq\)/
+          : /durable_step_checkpoints_group_idx.*\(`run_id`, `parallel_group`, `seq`\)/,
+      );
+      await db.rawQuery('drop index "durable_step_checkpoints_group_idx"');
+      const warnings: string[] = [];
+      await createDurableTables(db, undefined, {
+        force: true,
+        logger: { warn: (m) => warnings.push(m) },
+      });
+      expect(warnings.join('\n')).toContain('durable_step_checkpoints_group_idx');
+    });
+
+    it('pins the DDL to DURABLE_SCHEMA_REVISION', async () => {
+      const db = await fresh();
+      await createDurableTables(db);
+      const digest = createHash('sha256')
+        .update(await durableDdl(db))
+        .digest('hex');
+      // A failure here means the DDL changed. Bump DURABLE_SCHEMA_REVISION in lucid-schema.ts (so
+      // every existing database runs the full check once) and update both values below. (If only a
+      // Knex upgrade changed how SQLite spells the same DDL, update the digest alone.)
+      // One digest per backend: the same DDL, spelled by each dialect.
+      expect({ revision: DURABLE_SCHEMA_REVISION, digest }).toEqual({
+        revision: 3,
+        digest:
+          backend === 'postgres'
+            ? '25f0e4440d634e76499d0e32008d33085310aa2aea84627f5f14829d9536bc9a'
+            : '004771001d3413ab12ae14444d47fc020402c902050282b14c0e955726943cd0',
+      });
     });
   });
 });

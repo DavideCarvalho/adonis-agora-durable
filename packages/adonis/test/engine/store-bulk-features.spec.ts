@@ -1,10 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import type { Database } from '@adonisjs/lucid/database';
+import { afterEach, describe, expect, it } from 'vitest';
 import { WorkflowEngine } from '../../src/engine.js';
 import type { StateStore, WorkflowRun } from '../../src/interfaces.js';
 import { LucidStateStore } from '../../src/stores/lucid.js';
-import { makeStoreDb } from '../../src/stores/lucid-helpers.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
 import { InMemoryTransport } from '../../src/testing/in-memory-transport.js';
+import { dbBackends } from '../support/backends.js';
 
 const run = (over: Partial<WorkflowRun> & { id: string }): WorkflowRun => ({
   workflow: 'wf',
@@ -57,10 +58,25 @@ async function parentWithChild(store: StateStore, id: string, extra: Partial<Wor
   });
 }
 
-describe.each([
-  ['in-memory', async () => new InMemoryStateStore() as StateStore],
-  ['lucid (sqlite)', async () => new LucidStateStore(await makeStoreDb()) as StateStore],
-])('bulk deletes through StateStore.deleteRuns (%s)', (_label, makeStore) => {
+/** Lucid databases opened by a test, closed after it (a Postgres one drops its schema on close). */
+const opened: Database[] = [];
+afterEach(async () => {
+  while (opened.length) await opened.pop()?.manager.closeAll();
+});
+
+const stores: Array<[string, () => Promise<StateStore>]> = [
+  ['in-memory', async () => new InMemoryStateStore()],
+  ...dbBackends().map((backend): [string, () => Promise<StateStore>] => [
+    `lucid (${backend.name})`,
+    async () => {
+      const db = await backend.makeStoreDb();
+      opened.push(db);
+      return new LucidStateStore(db);
+    },
+  ]),
+];
+
+describe.each(stores)('bulk deletes through StateStore.deleteRuns (%s)', (_label, makeStore) => {
   it('purgeRuns deletes a page of runs, children first, with one deleteRuns call', async () => {
     const { store, calls } = counting(await makeStore());
     const engine = new WorkflowEngine({ store, transport: new InMemoryTransport() });
