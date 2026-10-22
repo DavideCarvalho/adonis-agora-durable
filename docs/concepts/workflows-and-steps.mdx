@@ -61,7 +61,7 @@ The handler is registered under that same name — see [serving a handler](#serv
 
 ### 2. `@Step` decorator (recommended)
 
-Mark a class method with `@Step`. Steps are discovered from `app/steps` (config `stepsPath`, plus the `@adonis-agora/durable/hooks/steps` assembler barrel) and served by name automatically. Pass the method **reference** to `ctx.step` for full input/output types:
+Mark a class method with `@Step`. Steps are discovered from `app/steps` (config `stepsPath`, which also takes [several directories](/docs/durable/authoring/app-workflows#several-directories-modular-apps), plus the `@adonis-agora/durable/hooks/steps` assembler barrel) and served by name automatically. Pass the method **reference** to `ctx.step` for full input/output types:
 
 ```ts title="app/steps/payment_steps.ts"
 import { Step } from '@adonis-agora/durable'

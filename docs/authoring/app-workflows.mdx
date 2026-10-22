@@ -146,6 +146,49 @@ export default defineConfig({
 })
 ```
 
+### Several directories (modular apps)
+
+An app split by bounded context (`app/orders/flows`, `app/billing/flows`, …) lists every directory.
+`stepsPath` takes an array the same way:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  workflowsPath: ['app/orders/flows', 'app/billing/flows'],
+  stepsPath: ['app/orders/steps', 'app/billing/steps'],
+})
+```
+
+Every directory is scanned, in order. An empty array is the same as `false`.
+
+Names must be unique **across** the directories. If two directories define the same workflow name and
+version, or the same step name, with different classes or handlers, boot fails with a
+`DuplicateDiscoveryError` that names both files. The same class reached from two directories (a
+re-export, or overlapping directories) is not a clash and registers once. Inside a single directory
+nothing changed: a duplicate there is not checked, and the later registration wins.
+
+If you use the [codegen barrels](/docs/durable/tooling/codegen), give the hooks the same directories
+through their `source` option. See [Several directories](/docs/durable/tooling/codegen#several-directories).
+
+### Registering an extra directory by hand
+
+To register a directory from a preload, call `registerWorkflowsFromDir` for workflows and
+`registerStepsFromDir` for steps. Pass the engine to both. For steps, the engine forwards each handler
+to its transport through `engine.handle(name, fn)`, so you don't need the transport the provider keeps
+private:
+
+```ts title="start/durable.ts (registered under preloads in adonisrc.ts)"
+import app from '@adonisjs/core/services/app'
+import engine from '@adonis-agora/durable/services/main'
+import { registerStepsFromDir, registerWorkflowsFromDir } from '@adonis-agora/durable'
+
+await registerWorkflowsFromDir(engine, app.makePath('app/engine/flows'))
+await registerStepsFromDir(engine, app.makePath('app/engine/steps'))
+```
+
+Both accept one directory or an array, and apply the same cross-directory duplicate check.
+`engine.handle` throws if the engine's transport can't serve handlers. A `tenant` pod has no engine:
+`node ace durable:worker` serves `stepsPath` there.
+
 <Callout type="info">
 `engine.register(name, version, fn)` remains the low-level escape hatch (cross-runtime workflows, dynamic
 registration). The `BaseWorkflow` class + `app/workflows` convention is the preferred authoring path for

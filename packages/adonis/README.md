@@ -73,6 +73,10 @@ If the hook is not registered (or the barrel hasn't been generated yet) the
 provider **falls back** to the runtime directory scan, so apps that don't opt in
 keep working unchanged. Opt out of discovery entirely with `workflowsPath: false`.
 
+A modular app can list several directories: `workflowsPath` / `stepsPath` take
+an array, and so does the hooks' `source` option. Names must be unique across
+those directories, and a clash fails boot naming both files.
+
 ## License
 
 MIT © Davi Carvalho
