@@ -1,7 +1,12 @@
 import { type AdmissionBackend, InMemoryAdmissionBackend } from './admission.js';
 import { backoffDelay, MAX_BACKOFF_MS } from './backoff.js';
 import { instantCheckpoint, lostStepEvent, stepCheckpoint } from './checkpoints.js';
-import { type Completion, isFailedCompletion } from './completion.js';
+import {
+  type Completion,
+  completionError,
+  failedCompletion,
+  isFailedCompletion,
+} from './completion.js';
 import {
   assertConcurrency,
   type ConcurrencyConfig,
@@ -23,6 +28,7 @@ import {
   ContinueAsNew,
   type FanJoin,
   GatherError,
+  type GatherItemFailure,
   NonDeterminismError,
   RemoteStepTimeout,
   type StepFanRange,
@@ -37,6 +43,7 @@ import {
   parseStepFanGroup,
   stepFanGroup,
 } from './fan-join.js';
+import { aggregateAnnouncements } from './handshake/announced.js';
 import type { WorkerDescriptor } from './handshake/descriptor.js';
 import type {
   ControlPlane,
@@ -58,6 +65,7 @@ import type {
   RunValueFacetRow,
   ScopedRetentionPolicy,
   SearchAttributes,
+  Settled,
   SignalWaiter,
   StateStore,
   StepCheckpoint,
@@ -81,6 +89,18 @@ import type {
 } from './interfaces.js';
 import { isNonEmptyRunScope, TERMINAL_RUN_STATUSES } from './interfaces.js';
 import { asHeartbeat } from './observability-scope.js';
+import {
+  assertRoutes,
+  codeAndDetails,
+  HANDOFF_SEQ_BASE,
+  handoffHandlerId,
+  handoffName,
+  liveHandoff,
+  type OnErrorRoute,
+  onErrorRunId,
+  retiredHandoffName,
+  routeFor,
+} from './on-error.js';
 import { breakpointToken, stepId } from './protocol.js';
 import type { QueueConfig } from './queue.js';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor.js';
@@ -245,10 +265,26 @@ const SETTLE_ELIGIBLE_STATUSES: RunStatus[] = [
   'failed',
 ];
 
+/** How long a read of the onError routes a fleet announces is reused. */
+const ANNOUNCED_ROUTES_TTL_MS = 5_000;
+
+/** What a run that handed its failure to an onError handler settles as, or that it keeps waiting. */
+type HandoffOutcome =
+  | { kind: 'completed'; output: unknown }
+  | { kind: 'suspended' }
+  | { kind: 'failed'; error: StepError };
+
+/** The name of the checkpoint a run waits on its onError handler under. */
+
 interface RegisteredWorkflow {
   name: string;
   version: string;
   fn: WorkflowFn;
+  /** Where a failed run of this workflow is routed instead of failing. See {@link OnErrorRoute}. */
+  onError?: OnErrorRoute[] | undefined;
+  /** Made by {@link WorkflowEngine.ensureConventionWorkflow}: its onError routes are the ones its live
+   *  workers announce, read when a run fails. */
+  convention?: true | undefined;
   /** Static `workflow` config `tags` — merged with per-run tags onto each run at start. */
   tags?: string[] | undefined;
   /** Package attribution stamped on every run this registration starts (see WorkflowRun.origin). */
@@ -678,6 +714,8 @@ export class WorkflowEngine {
   private readonly updateValidators = new Map<string, UpdateValidator>();
   /** Runs being cancelled WITH saga compensation — see `cancel({ compensate: true })`. */
   private readonly cancelRequested = new Set<string>();
+  /** {@link announcedRoutes} reads, by routing token + workflow + version. */
+  private readonly announcedRoutesCache = new Map<string, { at: number; sets: OnErrorRoute[][] }>();
   /** The merged schedule set the worker loop ticks with (see {@link adoptSchedules}). */
   #allSchedules: readonly ScheduledWorkflow[] = [];
   /** Runtime pause overrides by schedule key (console-issued; win over the config's `paused`). */
@@ -1060,12 +1098,15 @@ export class WorkflowEngine {
       requires?: string[] | undefined;
       /** Package attribution stamped on every run this registration starts (WorkflowRun.origin). */
       origin?: string | undefined;
+      /** Handler workflows a matching failure is routed to — see {@link OnErrorRoute}. */
+      onError?: OnErrorRoute[] | undefined;
     },
   ): void {
     const registered: RegisteredWorkflow = {
       name,
       version,
       fn,
+      onError: this.checkedRoutes(name, opts?.onError),
       tags: opts?.tags,
       origin: opts?.origin,
       singleton: opts?.singleton,
@@ -1105,11 +1146,14 @@ export class WorkflowEngine {
       executionTimeout?: string | number;
       validateInput?: (input: unknown) => void | Promise<void>;
       requires?: string[];
+      /** Handler workflows a matching failure is routed to — see {@link OnErrorRoute}. */
+      onError?: OnErrorRoute[];
     },
   ): void {
     const registered: RegisteredWorkflow = {
       name,
       version,
+      onError: this.checkedRoutes(name, opts.onError),
       // A remote workflow has no in-process body; execute() branches on `remote` before this is read.
       fn: () => {
         throw new Error(`workflow ${name} is remote — it has no in-process body`);
@@ -1146,6 +1190,8 @@ export class WorkflowEngine {
       group: name,
       executor: new RemoteWorkflowExecutor(this.primaryTransport, name),
     });
+    const registered = this.workflows.get(versionKey(name, '1'));
+    if (registered) registered.convention = true;
     return true;
   }
 
@@ -2326,6 +2372,24 @@ export class WorkflowEngine {
       const isFailureCompletion = (v: unknown): boolean =>
         typeof v === 'object' && v !== null && (v as { ok?: unknown }).ok === false;
       for (const cp of await this.store.listCheckpoints(runId)) {
+        // A retry runs the body again, so a failure it handed to an onError handler is retired: kept in
+        // the timeline under another name, never followed again, and the handler is not retried. Its
+        // `onError:<code>` tag goes too: the tag says how the run ended, and that is being redone.
+        const handlerId = handoffHandlerId(runId, cp);
+        if (handlerId !== undefined) {
+          await this.store.takeSignalWaiter(`child:${handlerId}`);
+          await this.store.saveCheckpoint({
+            ...cp,
+            name: retiredHandoffName(handlerId),
+            status: 'completed',
+          });
+          const tags = run.tags?.filter((t) => !t.startsWith('onError:'));
+          if (tags && tags.length !== run.tags?.length) {
+            await this.store.updateRun(runId, { tags, updatedAt: new Date() });
+            run.tags = tags;
+          }
+          continue;
+        }
         if (cp.status === 'failed') {
           await this.store.saveCheckpoint({
             ...cp,
@@ -2891,7 +2955,7 @@ export class WorkflowEngine {
       ? buffered.payload
       : settled.status === 'completed'
         ? { ok: true, value: settled.output }
-        : { ok: false, error: settled.error?.message ?? settled.status };
+        : failedCompletion(settled.error ?? { message: settled.status });
     await this.signal(token, completion);
   }
 
@@ -3318,6 +3382,179 @@ export class WorkflowEngine {
    * us back here (a remote step finished, a timer fired) goes through `resume` like any TS workflow.
    */
   /**
+   * The registered onError routes whose handler workflow nothing can run: not registered on this
+   * engine, and no live worker group serves it. Meant for a boot-time warning: a typo in a handler's
+   * name would otherwise surface only when the first run fails.
+   */
+  async unservedOnErrorRoutes(): Promise<{ workflow: string; route: OnErrorRoute }[]> {
+    const unserved: { workflow: string; route: OnErrorRoute }[] = [];
+    let groups: string[] | undefined;
+    for (const registered of this.workflows.values()) {
+      for (const route of registered.onError ?? []) {
+        if (this.latest.has(route.workflow)) continue;
+        groups ??= await this.pool.listWorkerGroups().catch(() => []);
+        if (groups.some((g) => g === route.workflow || g.startsWith(`${route.workflow}@`)))
+          continue;
+        unserved.push({ workflow: registered.name, route });
+      }
+    }
+    return unserved;
+  }
+
+  /**
+   * The onError routes the live workers on `token` announce for a workflow the engine serves by
+   * convention: the one set they agree on, or none when they state none or cannot be read. Workers
+   * that announce different sets (a rollout in progress) route nothing, and the run's failure is
+   * reported as a `run.unrouted` event. Announcers of another version of the workflow are ignored. The
+   * read is cached for {@link ANNOUNCED_ROUTES_TTL_MS}, so a burst of failures costs one read.
+   */
+  private async announcedRoutes(
+    run: WorkflowRun,
+    token: string,
+    error: StepError,
+  ): Promise<OnErrorRoute[] | undefined> {
+    const key = `${token}\n${run.workflow}\n${run.workflowVersion}`;
+    const now = this.clock();
+    let cached = this.announcedRoutesCache.get(key);
+    if (!cached || now - cached.at > ANNOUNCED_ROUTES_TTL_MS) {
+      const sets = new Map<string, OnErrorRoute[]>();
+      for (const announced of aggregateAnnouncements(await this.liveDescriptorsFor(token))) {
+        if (announced.name !== run.workflow) continue;
+        if (announced.version !== undefined && announced.version !== run.workflowVersion) continue;
+        for (const routes of announced.onError) sets.set(JSON.stringify(routes), routes);
+      }
+      cached = { at: now, sets: [...sets.values()] };
+      this.announcedRoutesCache.set(key, cached);
+    }
+    if (cached.sets.length > 1) {
+      this.emit({
+        type: 'run.unrouted',
+        runId: run.id,
+        workflow: run.workflow,
+        namespace: run.namespace,
+        error,
+        reason: `live workers announce ${cached.sets.length} different onError route sets`,
+      });
+      return undefined;
+    }
+    return cached.sets[0];
+  }
+
+  /** Validate a workflow's {@link OnErrorRoute}s at registration. */
+  private checkedRoutes(
+    name: string,
+    routes: OnErrorRoute[] | undefined,
+  ): OnErrorRoute[] | undefined {
+    if (!routes?.length) return undefined;
+    assertRoutes(name, routes);
+    return routes;
+  }
+
+  /**
+   * Route a failed run to its {@link OnErrorRoute} handler. Starts the handler run and waits for it the
+   * way a parent waits for a `ctx.child`: a `child:<handlerId>` waiter plus a `running` placeholder
+   * checkpoint carrying the handler's name and input, so the handler's terminal state wakes the run
+   * (buffered and reconciled like any child). From then on every execution of the run only follows the
+   * handler ({@link followHandoff}); the body never runs again. Undefined when no route matches: the
+   * run fails as usual.
+   *
+   * The placeholder sits past every seq the body used and is left out of {@link remoteHistory}.
+   */
+  private async routeFailure(
+    run: WorkflowRun,
+    error: StepError,
+  ): Promise<HandoffOutcome | undefined> {
+    const registered = this.workflows.get(versionKey(run.workflow, run.workflowVersion));
+    const routes = registered?.convention
+      ? await this.announcedRoutes(run, registered.remote?.group ?? run.workflow, error)
+      : registered?.onError;
+    const route = routeFor(routes, error);
+    if (!route) return undefined;
+    const checkpoints = await this.handoffCheckpoints(run.id);
+    const live = liveHandoff(run.id, checkpoints);
+    if (live) return this.followHandoff(run, live);
+    // One handoff per attempt: a retry retires the previous one, so the next sits past it.
+    const attempt = checkpoints.length;
+    const seq = HANDOFF_SEQ_BASE + attempt;
+    const handlerId = onErrorRunId(run.id, attempt);
+    const handler = {
+      workflow: route.workflow,
+      input: { runId: run.id, workflow: run.workflow, input: run.input, error },
+    };
+    await this.store.putSignalWaiter({ token: `child:${handlerId}`, runId: run.id, seq });
+    await this.store.saveCheckpoint({
+      ...instantCheckpoint({
+        runId: run.id,
+        seq,
+        name: handoffName(handlerId),
+        kind: 'signal',
+        status: 'running',
+      }),
+      input: handler,
+    });
+    // Tagged, so the runs whose failures were handed off are a filter away in the console.
+    const tag = `onError:${route.code ?? '*'}`;
+    if (!run.tags?.includes(tag)) {
+      const tags = [...(run.tags ?? []), tag];
+      await this.store.updateRun(run.id, { tags, updatedAt: new Date() });
+      run.tags = tags;
+    }
+    this.emit({
+      type: 'run.routed',
+      runId: run.id,
+      workflow: run.workflow,
+      namespace: run.namespace,
+      name: route.workflow,
+      error,
+    });
+    this.startChildDeferred(handler.workflow, handler.input, handlerId, {
+      namespace: run.namespace,
+    });
+    return { kind: 'suspended' };
+  }
+
+  /** A run's handoff checkpoints, live and retired: the only ones at {@link HANDOFF_SEQ_BASE} and up. */
+  private async handoffCheckpoints(runId: string): Promise<StepCheckpoint[]> {
+    const handoffs = await this.store.listCheckpointsByNamePrefix?.(runId, [
+      `signal:child:${runId}.onError.`,
+      `onError:retried:${runId}.onError.`,
+    ]);
+    return (handoffs ?? (await this.store.listCheckpoints(runId))).filter(
+      (cp) => cp.seq >= HANDOFF_SEQ_BASE,
+    );
+  }
+
+  /**
+   * Where a run that handed its failure off stands: the handler's outcome once it settled (from the
+   * wake's checkpoint, or off the handler run when the wake never arrived), else still waiting. Starts
+   * the handler if the turn that handed off crashed before its deferred start ran.
+   */
+  private async followHandoff(run: WorkflowRun, handoff: StepCheckpoint): Promise<HandoffOutcome> {
+    if (handoff.status === 'completed') {
+      const outcome = handoff.output as Completion<unknown>;
+      return outcome.ok
+        ? { kind: 'completed', output: outcome.value }
+        : { kind: 'failed', error: completionError(outcome) };
+    }
+    const handlerId = handoffHandlerId(run.id, handoff) as string;
+    const handlerRun = await this.store.getRun(handlerId);
+    if (handlerRun?.status === 'completed') return { kind: 'completed', output: handlerRun.output };
+    if (handlerRun && TERMINAL_RUN_STATUSES.includes(handlerRun.status as TerminalRunStatus)) {
+      return {
+        kind: 'failed',
+        error: handlerRun.error ?? { message: `onError handler ${handlerId} ${handlerRun.status}` },
+      };
+    }
+    if (!handlerRun) {
+      const handler = handoff.input as { workflow: string; input: unknown };
+      this.startChildDeferred(handler.workflow, handler.input, handlerId, {
+        namespace: run.namespace,
+      });
+    }
+    return { kind: 'suspended' };
+  }
+
+  /**
    * Apply a terminal/suspended transition once: persist the new run status, emit the matching
    * lifecycle event, and (on completion/failure) wake a waiting parent. Both the TS and remote
    * executors funnel their completed/failed/suspended outcomes through here so a status update can
@@ -3357,6 +3594,9 @@ export class WorkflowEngine {
       return { runId: run.id, status: 'completed', output: outcome.output };
     }
     if (outcome.kind === 'failed') {
+      const handed = await this.routeFailure(run, outcome.error);
+      if (handed && handed.kind !== 'failed') return this.settleRun(run, handed);
+      const error = handed?.error ?? outcome.error;
       // Same race as the `completed` branch above — guard identically. ADDITIONALLY exclude
       // `failed`: a stray resume of an already-failed run (a redelivered signal, the settle-recheck
       // re-drive) replays and deterministically re-fails — re-applying the settle would re-emit
@@ -3370,7 +3610,7 @@ export class WorkflowEngine {
         SETTLE_ELIGIBLE_STATUSES.filter((s) => s !== 'failed'),
         {
           status: 'failed',
-          error: outcome.error,
+          error,
           updatedAt,
         },
       );
@@ -3380,10 +3620,10 @@ export class WorkflowEngine {
         runId: run.id,
         workflow: run.workflow,
         namespace: run.namespace,
-        error: outcome.error,
+        error,
       });
-      this.notifyParent(run.id, { ok: false, error: outcome.error.message });
-      return { runId: run.id, status: 'failed', error: outcome.error };
+      this.notifyParent(run.id, failedCompletion(error));
+      return { runId: run.id, status: 'failed', error };
     }
     // This outcome was computed by a turn that started from a possibly-stale run snapshot. If the run
     // was cancelled WHILE that turn was still executing (e.g. `ctx.all`'s failFast cancelling a
@@ -3472,7 +3712,13 @@ export class WorkflowEngine {
     const routePlan = await this.planRoute(remote.group, registered.requires);
     if (routePlan?.status === 'blocked') return this.parkBlocked(run, routePlan);
 
-    const history = await this.remoteHistory(run.id);
+    const checkpoints = await this.store.listCheckpoints(run.id);
+    const handoff = liveHandoff(run.id, checkpoints);
+    if (handoff) {
+      // A run that handed its failure to an onError handler only follows the handler from here on.
+      return this.settleRun(run, await this.followHandoff(run, handoff));
+    }
+    const history = await this.remoteHistory(run.id, checkpoints);
     let decision: WorkflowDecision;
     try {
       decision = await remote.executor.advance(run, history);
@@ -3733,8 +3979,8 @@ export class WorkflowEngine {
   }
 
   /** The run's resolved durable ops as replay inputs: completed/failed steps + elapsed timers. */
-  private async remoteHistory(runId: string): Promise<HistoryEvent[]> {
-    const checkpoints = await this.store.listCheckpoints(runId);
+  private async remoteHistory(runId: string, listed?: StepCheckpoint[]): Promise<HistoryEvent[]> {
+    const checkpoints = listed ?? (await this.store.listCheckpoints(runId));
     const kindOf: Record<StepKind, HistoryEvent['kind']> = {
       remote: 'call',
       local: 'step',
@@ -3747,14 +3993,15 @@ export class WorkflowEngine {
         // A child run resolves THROUGH the signal machinery (a `child:<id>` waiter notified on the
         // child's terminal state), so its checkpoint is kind `signal` with a `signal:child:` name and
         // a Completion payload. Surface it as a `child` event with the value/error unwrapped.
+        // onError handoffs sit past every op a body can reach; no replay is told about them.
+        if (cp.seq >= HANDOFF_SEQ_BASE) continue;
         if (cp.kind === 'signal' && cp.name.startsWith('signal:child:')) {
           const completion = cp.output as Completion<unknown> | undefined;
           events.push({
             seq: cp.seq,
             kind: 'child',
             output: completion?.ok ? completion.value : undefined,
-            error:
-              completion && completion.ok === false ? { message: completion.error } : undefined,
+            error: completion && completion.ok === false ? completionError(completion) : undefined,
           });
           continue;
         }
@@ -4010,7 +4257,7 @@ export class WorkflowEngine {
             await deliverChild(
               child.status === 'completed'
                 ? { ok: true, value: child.output }
-                : { ok: false, error: child.error?.message ?? child.status },
+                : failedCompletion(child.error ?? { message: child.status }),
             );
           }
         }
@@ -4081,6 +4328,11 @@ export class WorkflowEngine {
     // counted an attempt (or dead-lettered it), flipped it to `pending` and re-enqueued a second
     // execution. The lease must outlive the state it protects.
     try {
+      // A run that handed its failure to an onError handler only follows the handler from here on.
+      const handoff = liveHandoff(run.id, snapshot);
+      if (handoff && !this.cancelRequested.has(run.id)) {
+        return await this.settleRun(run, await this.followHandoff(run, handoff));
+      }
       // Establish the ambient ctx for the duration of this body turn so context-aware statics
       // (`BaseWorkflow.start`/`dispatch`) reachable from `fn` route through this run's `ctx.child`/
       // `ctx.startChild`. Re-set on every replay turn (each is its own async scope) — correct.
@@ -4188,6 +4440,7 @@ export class WorkflowEngine {
       const error = {
         message: err instanceof Error ? err.message : String(err),
         stack: err instanceof Error ? err.stack : undefined,
+        ...codeAndDetails(err),
       };
       // Saga: undo completed steps in reverse, each retried up to `compensationRetries`. Outcomes
       // are emitted as `compensate:<step>` step events so a stranded undo is VISIBLE (not silently
@@ -4959,9 +5212,10 @@ export class WorkflowEngine {
       concurrency?: number | undefined;
       transport?: string | undefined;
       admission?: { priority?: number | undefined; fairnessKey?: string | undefined };
+      settle?: boolean | undefined;
     },
     runNamespace?: string | undefined,
-  ): Promise<TOutput[]> {
+  ): Promise<TOutput[] | Settled<TOutput>[]> {
     if (step.timeoutMs) {
       throw new Error(
         `ctx.all: step "${step.name}" has a liveness timeoutMs; a step fan needs durable steps`,
@@ -4983,7 +5237,7 @@ export class WorkflowEngine {
     }
 
     const outputs: TOutput[] = new Array(inputs.length);
-    const failures: { index: number; id: string; error: string }[] = [];
+    const failures: GatherItemFailure[] = [];
     const unsent: number[] = [];
     let inFlight = 0;
     let wakeAt: number | undefined;
@@ -5017,7 +5271,12 @@ export class WorkflowEngine {
           inFlight += 1;
           if (err.wakeAt !== undefined) wakeAt = Math.min(wakeAt ?? err.wakeAt, err.wakeAt);
         } else if (err instanceof RemoteStepError) {
-          const failure = { index: i, id: stepId(runId, seq), error: err.message };
+          const failure = {
+            index: i,
+            id: stepId(runId, seq),
+            error: err.message,
+            ...codeAndDetails(err),
+          };
           if (opts.mode === 'failFast') throw new GatherError([failure], inputs.length);
           failures.push(failure);
         } else {
@@ -5038,6 +5297,16 @@ export class WorkflowEngine {
 
     if (inFlight + batch.length > 0) {
       throw new WorkflowSuspended(wakeAt, undefined, undefined, [{ from: first, to: last }]);
+    }
+    if (opts.settle) {
+      const failed = new Map(failures.map((f) => [f.index, f]));
+      // `outputs` has a hole at every failed index, which `map` would skip.
+      return Array.from(outputs, (value, i): Settled<TOutput> => {
+        const f = failed.get(i);
+        if (!f) return { status: 'fulfilled', value };
+        const { index: _index, ...rejected } = f;
+        return { status: 'rejected', ...rejected };
+      });
     }
     if (failures.length > 0) throw new GatherError(failures, inputs.length);
     return outputs;

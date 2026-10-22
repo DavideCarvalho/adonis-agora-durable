@@ -76,7 +76,7 @@ Registering a handler after `start()` re-advertises automatically, so late regis
 
 A worker is only routable if the control plane can see it. `WorkerRegistry` is where the descriptor and heartbeat go:
 
-- **`RedisWorkerRegistry(redis, { ownsConnection })`** — the real one. It writes the descriptor and each heartbeat as TTL'd keys. Pass `ownsConnection: true` when the runtime should disconnect the client on `stop()`.
+- **`RedisWorkerRegistry(redis, { ownsConnection })`** — the real one. It writes the descriptor and each heartbeat as keys with an expiry. Pass `ownsConnection: true` when the runtime should disconnect the client on `stop()`. The `redis` argument is any writer with `set(key, value, 'EX', ttl)` and `del(...keys)`: a Redis client, or what `createDescriptorRedis()` returns on the `bullmq`, `db` and `eventEmitter` transports (see [worker advertisement](/docs/durable/transports#worker-advertisement)). The `tenant` provider picks it from the transport automatically.
 - **`NoopWorkerRegistry`** — the default. The descriptor is still built and observable through `runtime.descriptor()`, just not published. A worker on it executes fine but is invisible to [capability-aware routing](/docs/durable/cluster/handshake#capability-aware-routing), so a step with `requires` will never be dispatched to it.
 
 The descriptor carries the runtime (`node` or `python`), the SDK name and version, the protocol version and the range it can speak, the step and workflow names it serves, its capabilities, and its partition — the input to the [handshake](/docs/durable/cluster/handshake).

@@ -92,6 +92,9 @@ const DIAGNOSTICS_EMIT = Symbol.for('@agora/diagnostics:emit');
  * await engine.start('order', input, runId)
  * ```
  */
+/** How long after boot an onError route unserved at boot is checked again before it is reported. */
+const UNSERVED_ROUTES_RECHECK_MS = 30_000;
+
 export default class DurableProvider {
   #detachDiagnostics: (() => void) | null = null;
   #transport: (Transport & { close?: () => Promise<void> }) | null = null;
@@ -325,15 +328,13 @@ export default class DurableProvider {
 
   /**
    * Build the descriptor/heartbeat registry for a tenant worker: a real {@link RedisWorkerRegistry} when
-   * the transport can mint a descriptor-Redis client (design §7.2), else the {@link NoopWorkerRegistry}
-   * (the descriptor is still built + observable, just not published to the shared Redis).
+   * the transport can mint a writer for its advertisement keys (design §7.2) — BullMQ's Redis, the db
+   * and queue transports' key table, the event-emitter's in-memory board — else the
+   * {@link NoopWorkerRegistry}.
    */
   #buildWorkerRegistry(transport: Transport): WorkerRegistry {
     const redis = descriptorRedisFrom(transport);
     if (redis) return new RedisWorkerRegistry(redis, { ownsConnection: true });
-    // TODO(integrator): expose `createDescriptorRedis()` on the tenant broker transport
-    // (e.g. BullMQTransport, keyed off the same connection its queues use) so a real pod advertises its
-    // descriptor + heartbeat on the shared Redis instead of falling back to the no-op registry.
     return new NoopWorkerRegistry();
   }
 
@@ -393,6 +394,7 @@ export default class DurableProvider {
       const dir = this.app.makePath(config.workflowsPath ?? 'app/workflows');
       await registerWorkflowsFromDir(engine, dir, workflowFactory);
     }
+    void this.#reportUnservedOnErrorRoutes(engine);
 
     // Event-triggered workflows (`static on` / `@OnEvent` / `@OnDiagnostic`): bridge the
     // Adonis emitter + the diagnostics bus into the engine. Registered AFTER discovery so
@@ -412,6 +414,28 @@ export default class DurableProvider {
     if (role === 'standalone') await this.#registerSteps(config);
 
     await this.#startResponder();
+  }
+
+  /**
+   * Says, once after boot, which onError routes name a handler workflow nothing can run, so a typo is
+   * caught before the first failure goes nowhere. Routes unserved at boot are checked again after
+   * {@link UNSERVED_ROUTES_RECHECK_MS}, so a handler whose workers start after this process is not
+   * reported.
+   */
+  async #reportUnservedOnErrorRoutes(engine: WorkflowEngine): Promise<void> {
+    if ((await engine.unservedOnErrorRoutes().catch(() => [])).length === 0) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, UNSERVED_ROUTES_RECHECK_MS).unref());
+    const unserved = await engine.unservedOnErrorRoutes().catch(() => []);
+    if (unserved.length === 0) return;
+    const list = unserved
+      .map(({ workflow, route }) => `${workflow} → ${route.workflow} (code ${route.code ?? '*'})`)
+      .join(', ');
+    const message = `durable: ${unserved.length} onError route(s) name a handler workflow that is not registered here and has no live worker: ${list}.`;
+    const logger = (await this.app.container.make('logger').catch(() => undefined)) as
+      | { warn?: (message: string) => void }
+      | undefined;
+    if (typeof logger?.warn === 'function') logger.warn(message);
+    else console.warn(message);
   }
 
   /**

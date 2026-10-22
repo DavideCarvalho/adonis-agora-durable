@@ -1,0 +1,45 @@
+{
+  "instanceId": "py-pipeline-01-7742",
+  "runtime": "python",
+  "sdk": {
+    "name": "durable-worker",
+    "version": "0.23.0"
+  },
+  "protocol": {
+    "version": 1,
+    "range": [
+      1,
+      1
+    ]
+  },
+  "capabilities": [
+    "saga",
+    "signals",
+    "search-attributes",
+    "priority"
+  ],
+  "workflows": [
+    "extraction",
+    "pipeline"
+  ],
+  "steps": [
+    "extraction:page"
+  ],
+  "registrations": [
+    {
+      "name": "extraction",
+      "group": "extraction@acme"
+    },
+    {
+      "name": "pipeline",
+      "version": "2",
+      "group": "pipeline@acme",
+      "requires": [
+        "saga"
+      ],
+      "origin": "flip-python-db"
+    }
+  ],
+  "partition": "acme",
+  "startedAt": 1752710400000
+}

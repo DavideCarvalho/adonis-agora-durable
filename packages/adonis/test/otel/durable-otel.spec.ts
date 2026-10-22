@@ -6,7 +6,7 @@ import {
 } from '@opentelemetry/sdk-trace-base';
 import { describe, expect, it } from 'vitest';
 import type { WorkerDescriptor } from '../../src/handshake/descriptor.js';
-import { InMemoryStateStore, WorkflowEngine } from '../../src/index.js';
+import { FatalError, InMemoryStateStore, WorkflowEngine } from '../../src/index.js';
 import type {
   Heartbeat,
   RemoteTask,
@@ -185,5 +185,28 @@ describe('attachDurableOtel', () => {
       .getFinishedSpans()
       .filter((s) => s.name === 'workflow checkout');
     expect(runSpansAfterResume).toHaveLength(1);
+  });
+
+  it('marks the handoff to an onError handler on the run span', async () => {
+    const { tracer, exporter } = tracerWithExporter();
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
+    attachDurableOtel(engine, { tracer });
+    engine.register('dlq', '1', async () => 'handled');
+    engine.register(
+      'line',
+      '1',
+      async () => {
+        throw new FatalError('bad line', 'invalid_line');
+      },
+      { onError: [{ code: 'invalid_line', workflow: 'dlq' }] },
+    );
+    await engine.start('line', {}, 'r');
+    await engine.waitForRun('r', { terminal: true });
+
+    const run = exporter.getFinishedSpans().find((s) => s.name === 'workflow line');
+    expect(run?.events.find((e) => e.name === 'durable.run.routed')?.attributes).toMatchObject({
+      'durable.on_error.handler': 'dlq',
+      'durable.error.code': 'invalid_line',
+    });
   });
 });

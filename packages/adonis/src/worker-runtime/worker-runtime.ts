@@ -3,6 +3,7 @@ import {
   heartbeatStatus,
   type WorkerDescriptor,
   type WorkerLifecycle,
+  type WorkflowRegistration,
 } from '../handshake/descriptor.js';
 import type { WorkflowStepEvent } from '../interfaces.js';
 import type { StepHandler } from '../protocol.js';
@@ -106,6 +107,12 @@ const SILENT_LOGGER: WorkerRuntimeLogger = { info: () => {}, error: () => {} };
  * It holds no store and reads none — every durable decision stays on the control-plane; this object
  * only runs bodies and says who it is.
  */
+/**
+ * What a worker announces about a workflow beyond its name (design §7.9): version, capability demand,
+ * declaring package, and the onError routes the engine applies to it when serving it by convention.
+ */
+export type WorkflowRegistrationMeta = Omit<WorkflowRegistration, 'name' | 'group'>;
+
 export class WorkerRuntime {
   readonly #transport: WorkerTransport;
   readonly #partition: string;
@@ -125,6 +132,8 @@ export class WorkerRuntime {
   readonly #workflows = new Set<string>();
   // Worker-side workflow turn bodies, keyed by name — the resolver `runWorkflowTurn` replays against.
   readonly #workflowBodies = new Map<string, WorkflowBody>();
+  // What this worker announces about each workflow it runs, beyond its name (design §7.9).
+  readonly #workflowMeta = new Map<string, WorkflowRegistrationMeta>();
   readonly #startedAt: number;
 
   #beatTimer: ReturnType<typeof setInterval> | undefined;
@@ -196,9 +205,12 @@ export class WorkerRuntime {
    * authoring surface (they own the store). Re-registering swaps the body; if the transport can't carry
    * workflow tasks (`handleWorkflow` absent) the name is still advertised, just not executed here.
    */
-  registerWorkflow(name: string, body: WorkflowBody): void {
+  registerWorkflow(name: string, body: WorkflowBody, meta?: WorkflowRegistrationMeta): void {
     const firstBody = !this.#workflowBodies.has(name);
     this.#workflowBodies.set(name, body);
+    const metaChanged = JSON.stringify(meta) !== JSON.stringify(this.#workflowMeta.get(name));
+    if (meta) this.#workflowMeta.set(name, meta);
+    else this.#workflowMeta.delete(name);
     // Wire the transport's turn consumer ONCE per name (the resolver reads the live #workflowBodies map,
     // so a later re-register is picked up without re-wiring). No-op if the transport can't carry turns.
     if (firstBody && this.#transport.handleWorkflow) {
@@ -216,7 +228,7 @@ export class WorkerRuntime {
     }
     const isNew = !this.#workflows.has(name);
     this.#workflows.add(name);
-    if (isNew && this.#started) void this.#advertise();
+    if ((isNew || metaChanged) && this.#started) void this.#advertise();
   }
 
   /**
@@ -256,10 +268,24 @@ export class WorkerRuntime {
       capabilities: [...this.#capabilities],
       workflows: [...this.#workflows].sort(),
       steps: [...this.#steps].sort(),
+      ...(this.#workflowBodies.size > 0 ? { registrations: this.#registrations() } : {}),
       ...(this.#partition ? { partition: this.#partition } : {}),
       ...(this.#namespace !== undefined ? { namespace: this.#namespace } : {}),
       startedAt: this.#startedAt,
     };
+  }
+
+  /**
+   * The workflows this worker ANNOUNCES it can execute (design §7.9): only those it holds a body for —
+   * a name advertised through {@link registerWorkflowName} is routed elsewhere, not run here — each
+   * with the routing token it consumes and the meta it was registered with.
+   */
+  #registrations(): WorkflowRegistration[] {
+    return [...this.#workflowBodies.keys()].sort().map((name) => ({
+      name,
+      ...this.#workflowMeta.get(name),
+      group: routingToken(name, this.#partition),
+    }));
   }
 
   /** The `${P}-worker-descriptor:<token>:<instance>` / `${P}-worker-heartbeat:<token>:<instance>` keys

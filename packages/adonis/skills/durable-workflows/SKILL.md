@@ -176,7 +176,10 @@ if (input.n < 3) await ctx.continueAsNew({ n: input.n + 1 }) // clean history pe
 
 `ctx.all` default mode is `waitAll`: every sibling finishes, then the call throws
 a `GatherError` carrying `.failures`; `{ mode: 'failFast' }` cancels remaining
-siblings (plain cancel — no saga). Child ids derive from the call position and
+siblings (plain cancel — no saga). When some items failing is an expected outcome,
+use `ctx.allSettled(Workflow, inputs, { concurrency })` instead: the same fan,
+resolving with `{ status: 'fulfilled', value } | { status: 'rejected', id, error }`
+per input and never throwing for a child. Child ids derive from the call position and
 are replay-stable; never pass a random one. `{ concurrency: n }` caps how many
 children run at once (waves of `floor(n / 2)`, two at a time), and the wave goes into each child
 id), so changing it for an in-flight run is non-deterministic, like changing
@@ -191,6 +194,9 @@ carries the failed indexes, as for a child fan):
 ```ts
 const results = await ctx.all(processLine, lines, { concurrency: 500 })
 ```
+
+`ctx.allSettled(processLine, lines, { concurrency })` is the same step fan,
+resolving with a `Settled` per input instead of throwing.
 
 Prefer it to `Promise.all` past a handful of steps (every result of a
 `Promise.all` replays the workflow: O(N²) checkpoint reads), and to a

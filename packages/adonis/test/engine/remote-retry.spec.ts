@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from '../../src/engine.js';
+import { FatalError } from '../../src/errors.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
 import { InMemoryTransport } from '../../src/testing/in-memory-transport.js';
 
@@ -61,6 +62,23 @@ describe('durable remote step — retry with backoff', () => {
     await engine.start('wf', {}, 'r1');
     await flush();
     expect(attempts).toBe(1); // no retry despite retries: 5
+    expect((await store.getRun('r1'))?.status).toBe('failed');
+  });
+
+  it('does not retry a step that throws a FatalError', async () => {
+    const store = new InMemoryStateStore();
+    const transport = new InMemoryTransport();
+    let attempts = 0;
+    transport.handle('ext.invalid', async () => {
+      attempts += 1;
+      throw new FatalError('invalid line', 'invalid');
+    });
+    const engine = new WorkflowEngine({ store, transport });
+    engine.register('wf', '1', async (ctx) => ctx.step('ext.invalid', {}, { retries: 5 }));
+
+    await engine.start('wf', {}, 'r1');
+    await flush();
+    expect(attempts).toBe(1);
     expect((await store.getRun('r1'))?.status).toBe('failed');
   });
 });

@@ -90,6 +90,29 @@ export function attachDurableOtel(
         span.end(event.at);
         break;
       }
+      // Both are emitted while the run's span is still open: the handoff before the run suspends on its
+      // handler, the unrouted failure before the run fails.
+      case 'run.routed':
+        roots.get(event.runId)?.addEvent(
+          'durable.run.routed',
+          {
+            'durable.on_error.handler': event.name,
+            'durable.error.code': event.error?.code,
+            'durable.error.message': event.error?.message,
+          },
+          event.at,
+        );
+        break;
+      case 'run.unrouted':
+        roots.get(event.runId)?.addEvent(
+          'durable.run.unrouted',
+          {
+            'durable.on_error.reason': event.reason,
+            'durable.error.code': event.error?.code,
+          },
+          event.at,
+        );
+        break;
       case 'run.completed':
         endRoot(event);
         break;
