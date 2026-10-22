@@ -114,7 +114,7 @@ Where they live depends on the transport:
 | `bullmq` | TTL'd Redis keys, shared with NestJS and Python workers |
 | `db` | the `durable_transport_worker_keys` table |
 | `eventEmitter` | in memory, shared by every transport over the same emitter |
-| `queue` | none — its queues are point-to-point, so there is no key a control plane could read back |
+| `queue` | a key store beside the queues — by default the app database's `durable_transport_worker_keys` table (see [queue](/docs/durable/transports/queue#worker-advertisement)) |
 | `memory` | none |
 
 A worker that stops cleanly removes its keys; one that dies drops out when they expire.
