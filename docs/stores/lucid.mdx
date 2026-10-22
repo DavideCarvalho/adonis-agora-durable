@@ -174,7 +174,7 @@ The damaged run itself sees the field as missing: a completed step whose `output
 
 ## Scoped reads: `scopeReads`
 
-With `scopeReads: true` and a `namespace` set in `config/durable.ts`, the provider hands the engine `store.withScope({ namespace })`: a view of the same store whose run reads — `getRun`, `listRuns`, `countRuns`, the facet queries and the recovery, dispatch and timer scans — only see that namespace's runs. Writes are not fenced. Use it for a tenant-facing process that must never read another tenant's runs; the operator view (the default) sees every namespace. You can also build the view yourself: `new LucidStateStore(db, { scope: { namespace: 'acme' } })`.
+With `scopeReads: true` and a namespace in effect (the configured `namespace`, or `'default'` on a standalone engine that sets none), the provider hands the engine `store.withScope({ namespace })`: a view of the same store whose run reads — `getRun`, `listRuns`, `countRuns`, the facet queries and the recovery, dispatch and timer scans — only see that namespace's runs. Writes are not fenced. Use it for a tenant-facing process that must never read another tenant's runs; without `scopeReads` (the default) the store reads every namespace, and a `control-plane` with no `namespace` is never fenced. You can also build the view yourself: `new LucidStateStore(db, { scope: { namespace: 'acme' } })`.
 
 ## Read API for dashboards & tooling
 

@@ -5,9 +5,10 @@ description: >-
   backoff and jitter, FatalError and worker retryable:false, timeoutMs liveness
   vs the durable suspend path, pickupTimeoutMs, log.heartbeat, saga
   compensation (compensate callbacks/refs, UndoOf, compensationRetries,
-  cancel({compensate:true})), flow-control queues (registerQueue, concurrency,
+  cancel({compensate:true})), flow-control queues (config queues / registerQueue, concurrency,
   rateLimit, fairnessKey) with Redis-backed global admission (admission-redis),
-  the dead-letter queue (maxRecoveryAttempts, onDead, retryWithInput), the
+  the dead-letter queue (maxRecoveryAttempts, deadLetterWorkflow, deadLetter()
+  method, onDead, retryWithInput), retention (maxAge/maxCount policies), the
   stuck-run playbook (stranded signature, redispatchPending,
   remoteRedispatchMs, remoteAdvanceSilenceMs for remote workflow turns), ace ops commands (durable:work/runs/retry --stale), and
   the testing harness (createTestEngine, tick, failOnce, conformance kits).
@@ -22,6 +23,7 @@ sources:
   - 'DavideCarvalho/adonis-durable:docs/reliability/sagas.mdx'
   - 'DavideCarvalho/adonis-durable:docs/reliability/dead-letter.mdx'
   - 'DavideCarvalho/adonis-durable:docs/reliability/flow-control.mdx'
+  - 'DavideCarvalho/adonis-durable:docs/reliability/retention.mdx'
   - 'DavideCarvalho/adonis-durable:docs/reliability/failure-modes.mdx'
   - 'DavideCarvalho/adonis-durable:docs/cli.mdx'
   - 'DavideCarvalho/adonis-durable:docs/testing.mdx'
@@ -101,8 +103,9 @@ Source: `docs/reliability/sagas.mdx`.
 Cap concurrency/rate durably — a blocked call re-suspends with a persisted
 `retryAt`, driven by the timer poller (nothing waits in memory):
 
-```ts title="start/durable.ts"
-engine.registerQueue({ name: 'emails', concurrency: 10, rateLimit: { limit: 1000, periodMs: 3_600_000 } })
+```ts title="config/durable.ts"
+queues: [{ name: 'emails', concurrency: 10, rateLimit: { limit: 1000, periodMs: 3_600_000 } }],
+// or at runtime: engine.registerQueue({ name: 'emails', … }) — same shape, replaces a same-named one
 ```
 
 ```ts
@@ -133,7 +136,9 @@ Source: `docs/reliability/flow-control.mdx`.
 
 Crash-recovery reclaims orphaned runs within ~`leaseMs`; a run that crashes the
 process every time would loop forever. Cap it and route the terminal `dead`
-status into a handler workflow (idempotent by the `dlq:<runId>` start id). A run
+status into a handler workflow — the engine starts it as `dlq:<runId>`
+(idempotent) with a `DeadLetter` input `{ deadRunId, workflow, input, error }`
+in the dead run's namespace. A run
 whose remote step is still in flight is parked `suspended`, never counted, and a
 retry (`requeue` / `durable:retry`) of a `dead`/`failed` run resets
 `recoveryAttempts` to 0:
@@ -145,19 +150,39 @@ export default defineConfig({
 })
 ```
 
-```ts title="start/durable.ts"
-engine.onDead((run) => {
-  void engine.start(
-    'dlq',
-    { deadRunId: run.id, workflow: run.workflow, input: run.input, error: run.error },
-    `dlq:${run.id}`,
-  )
-})
+```ts title="app/workflows/pipeline_workflow.ts"
+export default class PipelineWorkflow extends BaseWorkflow {
+  static workflow = { name: 'pipeline', version: '1' }
+  async run(ctx: WorkflowCtx, input: PipelineInput) { /* … */ }
+  // registered as `pipeline.dlq`; shares this instance's injected services
+  async deadLetter(ctx: WorkflowCtx, dl: DeadLetter<PipelineInput>) { /* alert, ticket */ }
+}
 ```
+
+Precedence: inline `deadLetter()` > per-workflow `deadLetterWorkflow`
+(`static workflow` / `register` / `registerRemote` option) > config
+`deadLetterWorkflow` (fleet default). Declaring both a method and the option
+throws. A `dlq:` handler run that dies is not routed again; a failed start
+(handler not registered) is `console.warn`-ed. `engine.onDead(run => …)` still
+fires first and is the manual escape hatch (keep the `dlq:<runId>` id).
 
 A dead run stays inspectable and retriable (`durable:retry <runId>`, dashboard
 retry, or `engine.retryWithInput(runId, fixedInput)` for bad data).
 Source: `docs/reliability/dead-letter.mdx`.
+
+Retention bounds terminal history (swept by `durable:work`, once a minute,
+`onEvict` archives first). Scoped policies take `maxAge`, `maxCount` (keep the N
+newest by start time within the scope; `0` deletes all matching), or both (most
+restrictive wins); a policy with neither fails boot:
+
+```ts title="config/durable.ts"
+retention: {
+  completed: '30d',
+  policies: [{ statuses: ['completed', 'failed'], maxCount: 200, scope: { namespace: 'acme' } }],
+},
+```
+
+Source: `docs/reliability/retention.mdx`.
 
 ### Pattern 4 — the stuck-run playbook
 

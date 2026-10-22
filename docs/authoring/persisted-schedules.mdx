@@ -86,7 +86,7 @@ Any number of worker instances can run with `persistedSchedules` at once. Each t
 
 A crash between 1 and 2 just re-fires the same (idempotent) start on the next tick. No locks, no leases, no leader election. A draining engine stops firing.
 
-A tick fires the due schedules in the engine's own `namespace`; an engine with no `namespace` (an [operator](/docs/durable/concepts/tenancy)) fires them for every namespace.
+A tick fires the due schedules in the engine's own `namespace`; a control plane with no `namespace` (the [operator](/docs/durable/concepts/tenancy)) fires them for every namespace.
 
 ## Driving it yourself
 

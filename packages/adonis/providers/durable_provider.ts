@@ -109,7 +109,7 @@ export default class DurableProvider {
   #embeddedWorkerLoop: Promise<unknown> | null = null;
   /** The store-backed engine once resolved (store roles), drained on shutdown. */
   #engine: WorkflowEngine | null = null;
-  /** The shutdown budget for that drain: `drainTimeoutMs`, else `worker.drainTimeoutMs`, else 10s. */
+  /** The shutdown budget: `worker.drainTimeoutMs`, else `drainTimeoutMs`, else 10s. */
   #drainTimeoutMs = 10_000;
 
   constructor(protected app: ApplicationService) {}
@@ -129,7 +129,7 @@ export default class DurableProvider {
           '@agora/durable: `drive: false` and `worker: { embedded: true }` contradict each other — the embedded worker loop drives runs in this process. Drop one: keep `drive: false` on web pods and run `node ace durable:work` elsewhere, or keep the embedded worker and remove `drive: false`.',
         );
       }
-      this.#drainTimeoutMs = config.drainTimeoutMs ?? config.worker?.drainTimeoutMs ?? 10_000;
+      this.#drainTimeoutMs = config.worker?.drainTimeoutMs ?? config.drainTimeoutMs ?? 10_000;
       this.#registerStoreRole(config, role);
     }
   }

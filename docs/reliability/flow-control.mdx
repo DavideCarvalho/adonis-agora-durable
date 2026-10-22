@@ -23,7 +23,7 @@ Dots below are runs dispatching steps through a queue into a fixed pool of worke
 
 ## Registering a queue
 
-Register a queue on the engine with `engine.registerQueue`. A `QueueConfig` has:
+Declare queues in `config/durable.ts` with `queues`, or register them on the engine with `engine.registerQueue`. Both take the same `QueueConfig`:
 
 - `name` — the queue's name, referenced from `ctx.step(step, input, { queue: name })`.
 - `concurrency` — the maximum number of steps in flight at once for this queue. Omit for unlimited.
@@ -47,6 +47,19 @@ engine.registerQueue({ name: 'emails', concurrency: 10, rateLimit: { limit: 1000
 // A third-party cap enforced as a rolling window — never more than 100 in ANY 60s span:
 engine.registerQueue({ name: 'openai', rateLimit: { limit: 100, periodMs: 60_000, algorithm: 'sliding' } })
 ```
+
+The declarative form registers the same queues at boot, on every process that builds the engine:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  queues: [
+    { name: 'shipping-api', rateLimit: { limit: 100, periodMs: 60_000 } },
+    { name: 'pdf-render', concurrency: 5, retryMs: 500 },
+  ],
+})
+```
+
+Two `queues` entries with the same `name` throw at boot. A later `engine.registerQueue` of a name already in `queues` replaces it, like any re-registration.
 
 ### Concurrency caps
 
@@ -160,7 +173,7 @@ export default defineConfig({
 })
 ```
 
-`connection` names an `@adonisjs/redis` connection from `config/redis.ts`, exactly like `controlPlanes.redis(...)` and `stores.lucid(...)` — the host and credentials live in one place. The queues themselves are still declared with `engine.registerQueue(...)`; the backend only changes where the accounting happens.
+`connection` names an `@adonisjs/redis` connection from `config/redis.ts`, exactly like `controlPlanes.redis(...)` and `stores.lucid(...)` — the host and credentials live in one place. The queues themselves are still declared with `queues` or `engine.registerQueue(...)`; the backend only changes where the accounting happens.
 
 | Option | Default | Description |
 | --- | --- | --- |

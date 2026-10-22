@@ -37,7 +37,7 @@ A process executes a step body when, and only when, those two tokens match. Ther
 Two consequences of the roles above:
 
 - **`standalone` serves `app/steps` itself** (the embedded worker); **`control-plane` does not** — the provider skips step registration for it, so its steps only run where a worker consumes the matching token.
-- **A `control-plane` still runs the workflow bodies** — the deterministic coordinator code in `app/workflows` that decides which step to dispatch next. Unless you set `runDispatcher`, the role uses `NOOP_RUN_DISPATCHER`, so `engine.start()` never runs a body inline on the calling (e.g. HTTP) process; the run is left `pending` for the [`durable:work`](/docs/durable/cli) poll loop, which replays the body and dispatches each `ctx.step` to the workers. See [where a run actually executes](/docs/durable/reliability/failure-modes#where-a-run-actually-executes).
+- **A `control-plane` still runs the workflow bodies** — the deterministic coordinator code in `app/workflows` that decides which step to dispatch next. Unless you set `runDispatcher`, the role uses `NOOP_RUN_DISPATCHER`, so `engine.start()` never runs a body inline on the calling (e.g. HTTP) process; the run is left `pending` for the [`durable:work`](/docs/durable/cli) poll loop, which replays the body and dispatches each `ctx.step` to the workers. A standalone web pod gets the same behaviour with `drive: false`. A control plane with no `namespace` is the operator and drives every pool's runs; a standalone engine with no `namespace` drives only the `'default'` pool. See [where a run actually executes](/docs/durable/reliability/failure-modes#where-a-run-actually-executes).
 
 ## When to reach for each
 

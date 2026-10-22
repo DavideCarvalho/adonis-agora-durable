@@ -30,7 +30,7 @@ Durations go through the same parser as every other duration option: a number is
 
 ## Scoped policies — one tenant, one kind of run
 
-The per-status ages apply to every run the worker sees. `retention.policies` adds **scoped** rules next to them: each one hard-deletes terminal runs in its `statuses` that match its `scope` once their last activity is older than `maxAge`. The scope is the identity axes of a run query — `namespace`/`namespaces`, `workflow`/`workflows`, `tag`/`tags`, and search-attribute `attributes`:
+The per-status ages apply to every run the worker sees. `retention.policies` adds **scoped** rules next to them: each one hard-deletes terminal runs in its `statuses` that match its `scope` once their last activity is older than `maxAge`, and/or once more than `maxCount` newer ones exist (see [below](#keeping-the-newest-n--maxcount)). The scope is the identity axes of a run query — `namespace`/`namespaces`, `workflow`/`workflows`, `tag`/`tags`, and search-attribute `attributes`:
 
 ```ts title="config/durable.ts"
 export default defineConfig({
@@ -48,13 +48,34 @@ export default defineConfig({
 })
 ```
 
-Every policy needs all three fields — `statuses`, `maxAge` and `scope`. Only the terminal statuses (`completed`, `failed`, `cancelled`, `dead`) count; any other status in `statuses` is ignored, because pruning a live run would race the engine. Each per-status age and each policy is its own pass over the store, so a run matched by several rules is deleted by whichever one is strictest.
+Every policy needs `statuses`, `scope`, and at least one bound — `maxAge`, `maxCount`, or both. A policy with neither throws at boot (`each retention policy must set maxAge and/or maxCount`). Only the terminal statuses (`completed`, `failed`, `cancelled`, `dead`) count; any other status in `statuses` is ignored, because pruning a live run would race the engine. Each per-status age and each policy is its own pass over the store, so a run matched by several rules is deleted by whichever one is strictest.
 
 A scope matches each run by its **own** row. Children inherit their parent's `namespace` but not its `tags`. The child subtree is deleted along with a matched parent anyway, but a child is only matched *on its own* through a scope that fits it, so use `namespace` or `workflows` (listing the child workflows too) when a whole run tree has to age out on one clock.
 
 <Callout type="info" title="Namespaced workers sweep only their partition">
-A worker whose config sets `namespace` only ever prunes that namespace. The per-status ages are confined to it, and a policy whose `scope.namespace` names a *different* namespace is skipped. A worker with no `namespace` (the operator) sweeps every partition.
+A worker whose config sets `namespace` only ever prunes that namespace. The per-status ages are confined to it, and a policy whose `scope.namespace` names a *different* namespace is skipped. A standalone worker with no `namespace` is in `'default'` and prunes only that; a `control-plane` with no `namespace` (the operator) sweeps every partition.
 </Callout>
+
+### Keeping the newest N — `maxCount`
+
+A policy can bound by count instead of age, or as well:
+
+```ts title="config/durable.ts"
+retention: {
+  policies: [
+    // keep acme's 200 newest finished runs, delete the rest
+    { statuses: ['completed', 'failed'], maxCount: 200, scope: { namespace: 'acme' } },
+    // chat turns: at most a day old AND at most 1000 of them
+    { statuses: ['completed'], maxAge: '1d', maxCount: 1000, scope: { tags: ['chat'] } },
+  ],
+},
+```
+
+- `maxCount` keeps the N newest runs **by start time** (`createdAt`) across the policy's whole `statuses` set, counted **within its scope** — "acme's newest 200" counts acme's runs only. Older ones are deleted.
+- With both bounds the most restrictive wins: a run goes once it is past either.
+- A run that started in the same millisecond as the last kept run is kept too, so a tie never deletes one of the newest N.
+- `maxCount: 0` deletes every matching run. It must be a non-negative integer, or boot fails.
+- Deletion goes through the same sweep as everything else: `onEvict` archiving, the child subtree deleted with its parent, and the same per-pass batch and once-a-minute throttle, so a large overshoot drains over several passes.
 
 ## How the sweep runs
 

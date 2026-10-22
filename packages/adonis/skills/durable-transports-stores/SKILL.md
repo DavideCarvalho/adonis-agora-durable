@@ -410,7 +410,8 @@ transports.db({ partition: 'tenant-a' })
 Mechanism: routing is by handler name — an instance serves whatever names it
 registers, so there is no group to declare. Isolation comes from `partition`
 (suffixes routing tokens `<name>@<partition>`) plus `namespace` (scopes which
-runs this engine polls). Source: `docs/transports/db.mdx` options table,
+runs this engine polls; absent = `'default'` on standalone, every pool on a
+control plane). Source: `docs/transports/db.mdx` options table,
 `docs/concepts/tenancy.mdx`.
 
 ### MEDIUM wrapping a store in CodecStateStore and expecting heartbeats

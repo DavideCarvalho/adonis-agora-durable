@@ -226,10 +226,12 @@ export interface BaseDurableConfig {
   runDispatcher?: RunDispatcher;
   /**
    * Whether THIS process executes the runs it starts. `true` (the default): a started (or requeued,
-   * or recovered) run executes in-process right away. `false`: the process never drives a run — a
-   * started run stays `pending` until a driving instance's poll (`node ace durable:work`, or a
-   * `control-plane`) picks it up. For web pods whose workflow bodies are heavy: pair it with
-   * `consumers: 'never'` so the pod neither executes runs nor claims broker jobs.
+   * or recovered) run executes in-process right away. `false`: those runs stay `pending` until a
+   * driving instance's poll (`node ace durable:work`, or a `control-plane`) picks them up. For web
+   * pods whose workflow bodies are heavy: pair it with `consumers: 'never'` so the pod also claims no
+   * broker jobs (and so settles no step results). What still executes on such a pod is a resume it
+   * is asked for directly — an `engine.signal` / webhook it handles, a compensating cancel — under the
+   * run's lease, like on any instance.
    *
    * An explicit {@link runDispatcher} wins over `drive: false` (it already decides where a run goes,
    * and an enqueueing dispatcher drives nothing in-process either). `drive: false` together with
@@ -242,9 +244,9 @@ export interface BaseDurableConfig {
    * Shutdown budget (ms) for the engine's in-flight executions: on app shutdown the provider stops
    * picking up work and waits up to this long for the runs executing in this process before it
    * closes the transport and control plane. A run that does not finish in time is left to crash
-   * recovery on another instance. Default `10_000`. With the embedded worker on,
-   * `worker.drainTimeoutMs` takes precedence for that loop's drain, and the provider does not drain
-   * a second time.
+   * recovery on another instance. Default `10_000`. A `worker.drainTimeoutMs`, when set, takes
+   * precedence (it is the same budget); with the embedded worker on, that loop's drain is the one
+   * shutdown drain, never repeated.
    */
   drainTimeoutMs?: number;
   /**

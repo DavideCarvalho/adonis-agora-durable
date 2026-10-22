@@ -6,7 +6,7 @@ description: >-
   (memory, event-emitter, queue, db, bullmq; lucid store), the WorkflowEngine
   container singleton from @adonis-agora/durable/services/main,
   Workflow.dispatch vs .start, where runs execute (in-process dispatcher,
-  NOOP_RUN_DISPATCHER, durable:work), consumers, leaseMs. Use when setting up
+  drive: false, durable:work), consumers, leaseMs, shutdown drain. Use when setting up
   durable workflows for the first time, moving from dev defaults to production
   infrastructure, or diagnosing "runs vanish on restart" / "workflows compete
   with HTTP traffic".
@@ -128,20 +128,32 @@ Source: `docs/transports/index.mdx`.
 
 `engine.start()` never blocks the caller, but by default the body executes on a
 microtask **on the calling instance**. On an API/dashboard pod that means heavy
-runs compete with HTTP traffic and the DB pool. Pass `NOOP_RUN_DISPATCHER` so
-the API pod only creates runs, and let `durable:work` execute them:
+runs compete with HTTP traffic and the DB pool. Set `drive: false` (with
+`consumers: 'never'`) so the API pod only creates runs, and let `durable:work`
+execute them:
 
 ```ts title="config/durable.ts (API/dashboard pod)"
-import { NOOP_RUN_DISPATCHER, defineConfig, stores, transports } from '@adonis-agora/durable'
+import { defineConfig, stores, transports } from '@adonis-agora/durable'
 
 export default defineConfig({
   transport: 'queue',
   transports: { queue: transports.queue({ connection: 'redis' }) },
   store: 'lucid',
   stores: { lucid: stores.lucid() },
-  runDispatcher: NOOP_RUN_DISPATCHER, // create runs; never execute bodies here
+  drive: false, // create runs; never execute bodies here
+  consumers: 'never', // claim no broker jobs either
 })
 ```
+
+`durable:work` drives through its poll whatever `drive` says, so one config file
+can serve both pods (runs a worker pod starts itself, e.g. children, are picked
+up on its next tick rather than inline). A resume handled on the API pod (an
+`engine.signal` or webhook) still executes there under the run's lease. An
+explicit `runDispatcher` wins over `drive`; `drive: false` plus
+`worker: { embedded: true }` throws at boot. Every store-backed process drains
+in-flight runs on shutdown (`worker.drainTimeoutMs`, else `drainTimeoutMs`,
+default 10s) before the transport closes; no `app.terminating` hook
+needed.
 
 ```bash title="a separate worker process"
 node ace durable:work --interval=500 --drain-timeout=15000
@@ -252,12 +264,13 @@ export default defineConfig({ transport: 'queue', transports: { /* … */ } })
 Correct:
 
 ```ts
-import { NOOP_RUN_DISPATCHER, defineConfig } from '@adonis-agora/durable'
+import { defineConfig } from '@adonis-agora/durable'
 
 export default defineConfig({
   transport: 'queue',
   transports: { /* … */ },
-  runDispatcher: NOOP_RUN_DISPATCHER,
+  drive: false,
+  consumers: 'never',
 })
 ```
 

@@ -40,6 +40,12 @@ execute changes.
 | `control-plane` | ✅ required | ❌ | optional |
 | `tenant` | ❌ typed `never` | worker pods ✅ | api/dashboard pod |
 
+Namespace: an absent `namespace` is `'default'` on `standalone` (it drives only
+the default pool) and the **operator** (every pool) on `control-plane`. There is
+no standalone operator — a process that must drive every pool is a
+`control-plane`. A standalone web pod that should only start runs sets
+`drive: false` (plus `consumers: 'never'`) and leaves execution to `durable:work`.
+
 ## Setup
 
 Split fleet: a pure coordinator plus store-less tenant workers.
@@ -363,18 +369,19 @@ control plane's database need `queue` or `bullmq`. Source:
 Wrong:
 
 ```ts
-await engine.start('checkout', order, id, { namespace: 'eu-west' }) // no engine/operator polls eu-west
+await engine.start('checkout', order, id, { namespace: 'eu-west' }) // no engine on eu-west, no operator control plane
 ```
 
 Correct:
 
 ```ts
-// Run at least one engine on 'eu-west' (or an operator above it) first:
+// Run at least one engine on 'eu-west' (or a control-plane with no namespace) first:
 await engine.start('checkout', order, id, { namespace: 'eu-west' })
 ```
 
 Mechanism: between namespaced engines there is no fallback owner; a namespace
-with neither an engine of its own nor an operator above it is a dead end where
+with neither an engine of its own nor an operator (a `control-plane` with no
+`namespace`) above it is a dead end where
 runs sit `pending` forever. Source: `docs/concepts/tenancy.mdx` (pitfalls).
 
 See also: `durable-setup` — the standalone execution model this scales out of.

@@ -102,16 +102,17 @@ export default defineConfig({
 
 Run the step handlers on `node ace durable:work` pods, which also tick the loop. The [`queue`](/docs/durable/transports/queue) driver rides `@adonisjs/queue`; [`db`](/docs/durable/transports/db) needs no broker at all; [`bullmq`](/docs/durable/transports/bullmq) is the one to pick for a [cross-ecosystem fleet](/docs/durable/cluster/interop). For a store-less worker fleet, see [roles](/docs/durable/cluster/roles-and-config).
 
-**Keep workflow bodies off the web pods if they are heavy.** The default run dispatcher executes a freshly started run on the pod that called `start`. A web pod that should only enqueue can opt out, leaving the run `pending` for a `durable:work` pod's next poll:
+**Keep workflow bodies off the web pods if they are heavy.** By default a pod executes the runs it starts (and the ones it requeues or recovers) right away, in-process. A web pod that should only enqueue sets `drive: false`, and `consumers: 'never'` so it claims no broker jobs either:
 
-```ts title="config/durable.ts (web pods)"
+```ts title="config/durable.ts"
 export default defineConfig({
   // …store, transport, controlPlane as above
-  runDispatcher: { dispatch: () => {} }, // start() persists the run; durable:work executes it
+  drive: process.env.DURABLE_DRIVE !== 'false', // 'false' on web pods: start() persists, durable:work executes
+  consumers: 'never', // web pods never claim step jobs or results; durable:work consumes regardless
 })
 ```
 
-This only covers fresh starts: a resume triggered on that pod — an `engine.signal` call handled there, say — still executes the body there under the lease. `role: 'control-plane'` applies the same no-op dispatcher and also stops serving `app/steps` in that process.
+A started run then stays `pending` until a `durable:work` pod's next poll picks it up. `durable:work` drives through that poll whatever `drive` says, so one config file serves both kinds of pod. What still executes on a `drive: false` pod is a resume it is asked for directly — an `engine.signal` or webhook it handles, a compensating cancel — under the run's lease, like on any instance. `drive: false` together with `worker: { embedded: true }` is a contradiction and throws at boot, and an explicit `runDispatcher` still wins over it. `role: 'control-plane'` never drives in-process either, and also stops serving `app/steps` in that process.
 
 ## 3. Crash recovery is a lease
 
@@ -123,7 +124,7 @@ Running more than one process is safe by design:
 - **A dispatched step is not a crash.** A run found `running` with a free lease while one of its remote steps is still `pending` on the transport is not counted as a recovery attempt. Its work is with a worker that holds no run lease. Recovery parks it `suspended` on the step's deadline or the `reconcileMs` wake instead, and the worker's result resumes it. Only runs with no step in flight count toward `maxRecoveryAttempts`.
 - **One bad run doesn't stop the sweep.** A run that throws while a recovery, timer or pending pass resumes it (a workflow this pod doesn't have mid-deploy, a store error on one row) is logged with its id and `workflow@version` and skipped. The rest of the batch still runs, and the skipped run is picked up again once its lease expires.
 
-Give each process a stable, unique `instanceId` — leases are held by it, so two processes sharing one id could execute the same run at once. The orchestrator's pod name is a good fit:
+Give each process a stable, unique `instanceId`. Leases are held by it, so two processes sharing one id could execute the same run at once. And it is how you find a pod again: the run's lease owner (`lockedBy`), the worker heartbeats, the dashboard's Workers table and the control-plane events all name it, so a random id that changes on every restart turns each deploy into a fresh set of anonymous workers. The orchestrator's pod name is a good fit:
 
 ```ts title="config/durable.ts"
 export default defineConfig({
@@ -144,7 +145,28 @@ export default defineConfig({
 })
 ```
 
-`maxRecoveryAttempts` is unlimited by default. Past the cap the run moves to the terminal `dead` status with a `max_recovery_attempts` error: still inspectable and retriable (`node ace durable:retry <runId>`), but no longer crash-looping. A retry resets the run's `recoveryAttempts` to 0, so the retried run gets a fresh budget instead of being dead-lettered again on the next recovery pass. Route dead runs to an alert or a DLQ workflow with `engine.onDead`; see [Dead-letter queue](/docs/durable/reliability/dead-letter).
+`maxRecoveryAttempts` is unlimited by default. Past the cap the run moves to the terminal `dead` status with a `max_recovery_attempts` error: still inspectable and retriable (`node ace durable:retry <runId>`), but no longer crash-looping. A retry resets the run's `recoveryAttempts` to 0, so the retried run gets a fresh budget instead of being dead-lettered again on the next recovery pass.
+
+Hand dead runs to a workflow that triages them — pages someone, opens a ticket, compensates. Name a fleet-wide default in config, and override it per workflow:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  maxRecoveryAttempts: 5,
+  deadLetterWorkflow: 'global-dlq', // a name, or the workflow class
+})
+```
+
+```ts title="app/workflows/pipeline_workflow.ts"
+import { BaseWorkflow } from '@adonis-agora/durable'
+
+export default class PipelineWorkflow extends BaseWorkflow {
+  static workflow = { name: 'pipeline', version: '1', deadLetterWorkflow: 'pipeline-dlq' }
+  // …or handle it inline instead (registered as `pipeline.dlq`, sharing this class's services):
+  // async deadLetter(ctx: WorkflowCtx, dead: DeadLetter) { … }
+}
+```
+
+A run that goes `dead` starts its handler as `dlq:<runId>` (idempotent, so a run dead-lettered twice is handled once; the dashboard links the pair by that id), in the dead run's namespace, with a `DeadLetter` input: `{ deadRunId, workflow, input, error }`. The inline `deadLetter()` method wins over `static workflow.deadLetterWorkflow`, which wins over the config default; declaring both the method and the option throws at boot. A handler run that itself goes dead is not routed again. `engine.onDead` still fires first, for alerting or routing of your own. See [Dead-letter queue](/docs/durable/reliability/dead-letter).
 
 ## 5. Drain on deploy
 
@@ -152,25 +174,21 @@ On `SIGTERM` you want a process to stop picking up new runs and let in-flight on
 
 - **`durable:work`** handles `SIGINT`/`SIGTERM` itself: it stops leasing new work at once, waits for the tick in flight, then calls `engine.drain(--drain-timeout)` (default 10 000 ms) before exiting. The drain timeout is the budget for the whole shutdown: the time spent waiting for the tick is deducted from the drain (`engine.beginDrain(spentMs)`), and a tick still running when the budget is spent is no longer waited for. From the stop request to the end of the drain takes at most `--drain-timeout`.
 - **`worker: { embedded: true }`** drains the same way from the provider's `shutdown()`, bounded as a whole by `worker.drainTimeoutMs` (default 10 000). The loop is stopped and awaited **before** the transport and control plane close, so an in-flight run can still dispatch and await a remote step while it drains.
-- **A web process without the embedded worker does not drain on its own.** Its provider `shutdown()` closes the transport and control plane but never calls `engine.drain()`, so runs it was executing (started there by the in-process dispatcher, or resumed there by a signal) are left to lease expiry. Drain it from a terminating hook in a preload file — Adonis runs `terminating` hooks before providers shut down:
+- **Every other process drains from the provider's `shutdown()` too** — a web process (whose in-process dispatcher may be mid-turn), a `drive: false` pod handling a signal, a control plane. On `app.terminate()` (the web environment turns `SIGTERM` into it) the provider drains the engine before it closes the transport and control plane, bounded by `drainTimeoutMs` (default 10 000; `worker.drainTimeoutMs` when set). A process running the embedded loop is drained once, by the loop.
 
-```ts title="start/durable.ts (registered under preloads in adonisrc.ts)"
-import app from '@adonisjs/core/services/app'
-import { WorkflowEngine } from '@adonis-agora/durable'
-
-app.terminating(async () => {
-  const engine = await app.container.make(WorkflowEngine)
-  await engine.drain(15_000)
+```ts title="config/durable.ts"
+export default defineConfig({
+  drainTimeoutMs: 15_000, // above your typical in-flight turn
 })
 ```
 
-`drain(timeoutMs)` stops recovery, timer and pending pickups, then waits for every in-flight execution — including continue-as-new links and deferred children — to settle. It does not cancel anything: if the timeout wins, it releases the leases this process still holds, so the next process's `recoverIncomplete()` replays those runs from their last checkpoint immediately instead of after `leaseMs`. Size the timeout above your typical in-flight turn. (Skip this hook on a `role: 'tenant'` pod, which binds no engine.)
+`drain(timeoutMs)` stops recovery, timer and pending pickups, then waits for every in-flight execution — including continue-as-new links and deferred children — to settle. It does not cancel anything: if the timeout wins, it releases the leases this process still holds, so the next process's `recoverIncomplete()` replays those runs from their last checkpoint immediately instead of after `leaseMs`. Size the timeout above your typical in-flight turn, and below the orchestrator's grace period (Kubernetes' `terminationGracePeriodSeconds`, 30s by default). A `role: 'tenant'` pod binds no engine and has nothing to drain.
 
 ## 6. Replay-safe deploys
 
 Replay is positional, and a deploy is exactly when in-flight runs meet new code. Three layers catch a breaking change at different points:
 
-- **Lint at author time.** [`@adonis-agora/durable-eslint-plugin`](/docs/durable/tooling/linting) flags `Date.now()`, `Math.random()`, `new Date()`, `crypto.randomUUID()` in a workflow body, a `catch` that swallows control-flow signals, and global `fetch(...)` / raw `engine.*` calls in the body. Wire it into CI.
+- **Lint at author time.** [`@adonis-agora/durable-eslint-plugin`](/docs/durable/tooling/linting) flags `Date.now()`, `performance.now()`, `Math.random()`, `new Date()`, `crypto.randomUUID()` in a workflow body, a `catch` that swallows control-flow signals, and global `fetch(...)` / raw `engine.*` calls in the body. Wire it into CI.
 - **Regression-test replay.** `node ace durable:export <runId> --out tests/fixtures/x.json` captures a real run's history; `assertReplayable` replays it against your current code in CI and throws `NonDeterminismError` on divergence. See [Replay CI](/docs/durable/testing#replay-ci--assertreplayable).
 - **Version breaking changes.** A run always resumes on the version it started on. When a change inserts, removes or reorders steps, register the new version alongside the old one and keep both deployed until the old runs drain — or guard a surgical change with `ctx.patched(id)`. A run whose version is no longer registered fails with `workflow <name>@<version> is not registered — keep the prior version deployed`. See [Versioning & determinism](/docs/durable/authoring/versioning).
 
@@ -188,6 +206,10 @@ export default defineConfig({
 
 With `autoSchema: false`, run `node ace migration:run` after every upgrade. With it on, watch for the one-shot `repaired the durable schema in place` warning — it means the database was behind the library and your migration history does not know. See [Lucid → autoSchema](/docs/durable/stores/lucid#who-provisions-the-schema-autoschema).
 
+The boot check is cheap and safe to run on every pod. A fingerprint row in `durable_schema_meta` (the library's `DURABLE_SCHEMA_REVISION` plus your collation) answers a current schema in two statements; only a missing or stale marker — a fresh database, or an upgrade that changed the DDL — runs the full check, under `pg_advisory_xact_lock` on Postgres or `GET_LOCK` on MySQL, so pods booting together don't race the same `CREATE TABLE`. A table you changed by hand behind a current marker needs `createDurableTables(db, connectionName, { force: true })`.
+
+**On MySQL, plan the first upgrade to a release with `longtext` columns.** The JSON columns are `longtext` there (MySQL `text` stops at 64KB), and an older table's `text` columns are widened with an `ALTER TABLE … MODIFY` that rebuilds the table and locks its writes. On a large `durable_step_checkpoints`, run `node ace migration:run` in a maintenance window instead of letting the first booting pod do it. See [MySQL: longtext and collation](/docs/durable/stores/lucid#mysql-longtext-and-collation).
+
 ## 8. Retention
 
 Without a policy, terminal runs accumulate in `durable_workflow_runs` and its child tables forever, and the worker loop's status scans grow with them. Set an age per terminal status, plus scoped policies where one kind of run deserves its own window:
@@ -198,12 +220,18 @@ export default defineConfig({
     completed: '14d',
     cancelled: '14d',
     failed: '90d', // keep failures longer for debugging
-    policies: [{ statuses: ['completed'], maxAge: '1d', scope: { tags: ['chat'] } }],
+    policies: [
+      { statuses: ['completed'], maxAge: '1d', scope: { tags: ['chat'] } },
+      // Bound by count instead of (or as well as) age: keep acme's 200 newest settled runs.
+      { statuses: ['completed', 'cancelled'], maxAge: '30d', maxCount: 200, scope: { namespace: 'acme' } },
+    ],
   },
 })
 ```
 
-The sweep runs in the worker loop (`durable:work` or the embedded loop), throttled to one pass a minute. Pair it with `engine.onEvict` to archive a run before it is deleted. See [Retention](/docs/durable/reliability/retention).
+`maxCount` keeps the newest runs (by start time) of the policy's whole status set within its scope and deletes the older ones; with `maxAge` as well, a run goes once it is past either bound. A policy needs at least one of the two, or the app fails at boot. The sweep runs in the worker loop (`durable:work` or the embedded loop), throttled to one pass a minute, and deletes a run together with its child runs. Pair it with `engine.onEvict` to archive a run before it is deleted. See [Retention](/docs/durable/reliability/retention).
+
+When data has to go now rather than age out — a tenant deleted their account — `engine.purgeRuns(scope)` hard-deletes everything matching a scope in bounded batches (cancelling live runs first unless `cancelLive: false`), and `engine.purgeNamespace(namespace)` is the shortcut for one pool. See [Purging on demand](/docs/durable/reliability/retention#purging-on-demand--enginepurgeruns).
 
 ## 9. Stop web pods from racing the worker fleet
 
@@ -219,29 +247,67 @@ export default defineConfig({
 
 ## 10. Isolate environments and pools
 
-A staging deploy, a second pool, or a developer laptop pointed at the **same** database or broker is not an observer — with the same `namespace` (default `'default'`) it polls the same rows and the same queues, and it will execute other pools' runs. Give each pool its own `namespace` (and a `partition` for workers sharing handler names):
+A staging deploy, a second pool, or a developer laptop pointed at the **same** database or broker is not an observer — with the same `namespace` it polls the same rows and the same queues, and it will execute that pool's runs. Give each pool its own `namespace` (and a `partition` for workers sharing handler names):
 
 ```ts title="config/durable.ts"
 export default defineConfig({
-  namespace: process.env.DURABLE_NAMESPACE ?? 'default',
+  namespace: process.env.DURABLE_NAMESPACE, // unset = the 'default' pool
 })
 ```
+
+Unset, a standalone engine is in the `'default'` pool: it drives only runs stamped `'default'` (and rows written before namespaces existed, which read back as `'default'`), never another pool's. Only a `role: 'control-plane'` engine with no namespace is the operator that drives every pool — that is how one control plane serves many tenant pools.
 
 See [Tenancy](/docs/durable/concepts/tenancy) and the [two-pools mistake](/docs/durable/reliability/failure-modes#namespaces-the-classic-two-pools-mistake).
 
 ## 11. Flow control across replicas
 
-Queue caps on `ctx.step(…, { queue })` are counted **per engine instance** by default — `concurrency: 5` admits five per replica. For a fleet-wide cap, back admission with Redis:
+Two different knobs limit how much work runs at once, and they answer different questions:
+
+- **Worker concurrency** — how many steps one worker process runs at a time. It is a transport option on `bullmq`, `queue` and `db`: a number (fixed, no control loop), or `'adaptive'` to let the worker grow its limit while steps saturate it at a steady latency and shrink it on queueing, errors, stalls, the CPU ceiling or RSS. It protects the **worker**: its memory, its CPU, its event loop.
+- **Admission queues** — how many calls to one *downstream* may be in flight, or how fast, across every workflow that uses it. Declare them in config and reference one from a step with `ctx.step(step, input, { queue: 'emails' })`. They protect the **dependency**: a rate-limited API, a database that falls over past N connections.
 
 ```ts title="config/durable.ts"
-import { admissions, defineConfig } from '@adonis-agora/durable'
+import { admissions, defineConfig, transports } from '@adonis-agora/durable'
 
 export default defineConfig({
+  transport: 'bullmq',
+  transports: {
+    bullmq: transports.bullmq({ connection: { host: 'redis', port: 6379 }, concurrency: 'adaptive' }), // per worker
+  },
+
+  queues: [
+    { name: 'emails', concurrency: 10, rateLimit: { limit: 1000, periodMs: 3_600_000 } },
+    { name: 'reports', concurrency: 2 },
+  ],
+  // Without this the queue caps count per engine instance: `concurrency: 10` admits ten per replica.
   admission: admissions.redis({ connection: 'main' }),
 })
 ```
 
-When thousands of runs come due at once (recovery after an outage, a fan's children waking together), each timer pass loads at most `timerBatchSize` of them (default 500), most overdue first, shuffled so instances don't contend row by row. See [Flow control](/docs/durable/reliability/flow-control) and [wide fans](/docs/durable/transports#wide-fans-results-and-timers).
+`queues` is the declarative form of `engine.registerQueue(...)`, with the same fields (`name`, `concurrency`, `rateLimit`, `retryMs`, `fairness`, `order`); naming one queue twice throws at boot. A call the queue does not admit is not dispatched: the run re-suspends on a short wake and asks again. Worker concurrency multiplies by replicas (eight pods at `concurrency: 4` run 32 steps at once); an admission cap backed by Redis does not.
+
+When thousands of runs come due at once (recovery after an outage, a fan's children waking together), each timer pass loads at most `timerBatchSize` of them (default 500), most overdue first, shuffled so instances don't contend row by row. See [Flow control](/docs/durable/reliability/flow-control).
+
+### Wide fans
+
+A workflow that fans out over thousands of items is where the defaults stop being enough. In order:
+
+1. **Fan out over a step, not a child workflow, when each item is one unit of work.** `ctx.all(processRecord, records, { concurrency: 500 })` costs one checkpoint and one dispatch per item; a child fan (`ctx.all(ItemWorkflow, items)`) costs a whole run per item — its row, a turn, a lease, a completion signal. Use child runs when each item is a workflow of its own (several steps, its own retries, its own timeline). See [Fanning out over a step](/docs/durable/authoring/child-workflows#fanning-out-over-a-step).
+2. **Cap the fan with `concurrency`.** Unset, every step is dispatched at once. A step fan sends waves of that size and resumes the workflow once per settled wave, not once per result. Never fan out with `Promise.all` over `ctx.step`, which replays the workflow once per result.
+3. **Size the workers.** Steps in flight is worker `concurrency` × replicas. Start from what the downstream and the worker's memory allow, or use `'adaptive'`.
+4. **Raise `resultConcurrency` on the engine side.** Results come back as fast as the workers produce them. `resultConcurrency` on the `bullmq`, `queue` and `db` transports settles that many at once per instance (default `1`), and one run's results that arrive together are settled in batches of up to 256: one conditional write, one barrier count and one resume per batch.
+5. **Let the dashboard read aggregates.** On the Lucid store the run detail is built from per-group checkpoint counts and a few paged reads instead of every checkpoint, and it carries an `ETag`: a poll that finds nothing changed gets a bare `304`. See [Polling the run detail](/docs/durable/observability/dashboard#polling-the-run-detail-etag-and-304).
+
+See [wide fans](/docs/durable/transports#wide-fans-results-and-timers) for the transport side.
+
+### Remote work that goes quiet
+
+Two opt-in self-heals cover work a remote process dropped without a word:
+
+- **`remoteRedispatchMs`** — a remote **step** with no `timeoutMs` still `pending` past this window is dispatched again (up to `remoteRedispatchMax`, default 10). The step must be idempotent. See [Failure modes](/docs/durable/reliability/failure-modes).
+- **`remoteAdvanceSilenceMs`** — a remote **workflow turn** (a Python or NestJS workflow advanced by a worker) with no decision and no run-scoped heartbeat for this long is re-driven: a fresh turn is dispatched with the same history, and a late decision of the old one is dropped. Workers beat every few seconds while a turn runs, so a long replay is not re-driven. See [Remote workflow turns](/docs/durable/reliability/multi-instance#remote-workflow-turns).
+
+On `bullmq`, two worker-side guards complete the picture. `stepTimeoutMs` puts a wall-clock ceiling on each step handler: a step still running at the ceiling publishes a retryable failure, so the engine's retry dispatches it again. And a watchdog `PING`s every pub/sub connection each `pingIntervalMs` (default 30s) and reconnects one that stopped answering, so a half-open connection can't silently stop heartbeats and events. See [Wedged steps](/docs/durable/transports/bullmq#wedged-steps-steptimeoutms) and [Subscriber health](/docs/durable/transports/bullmq#subscriber-health-pingintervalms).
 
 ## 12. Encrypt payloads at rest
 
@@ -252,7 +318,7 @@ Run and step inputs and outputs are stored as JSON. To keep them out of the data
 Two registration options catch incidents before they become stuck runs:
 
 - **`executionTimeout`** (`'72h'` or ms, on `engine.register` options or a class's `static workflow`) bounds a run's wall-clock life. The worker loop's `sweepTimeouts` moves an overrunning run to `cancelled` with code `execution_timeout` and cancels its child subtree.
-- **`inputSchema`** (any Standard Schema, on `static workflow` or `engine.register` options) and **`validateInput`** (a function) reject a bad payload at `start`, before a run is created.
+- **`inputSchema`** (any Standard Schema — zod, valibot, arktype — on `static workflow` or `engine.register` options) and **`validateInput`** (a function) reject a bad payload at `start`, before a run is created. The schema runs first, and its output (parsed, coerced, defaulted) is what the run stores; `validateInput` then sees that parsed value, so keep the structural checks in the schema and the cross-field or lookup checks in `validateInput`. A schema failure throws a `SchemaValidationError` (a `FatalError`, code `schema_validation`).
 
 Both depend on the worker loop running somewhere, like timers and retention.
 
@@ -261,6 +327,8 @@ Both depend on the worker loop running somewhere, like timers and retention.
 - **The [dashboard](/docs/durable/observability/dashboard)** is the operating surface — run list, step graph, retry/cancel/fix-and-replay. It fails closed by default: set `DURABLE_DASHBOARD_TOKEN`, or supply your own `authorize` guard or the [session layer](/docs/durable/observability/dashboard-auth).
 - **Page on stranded runs.** `suspended` is not an error, so a lost dispatch alerts nobody. Register `engine.onStalled` (and tune `stalledAfter`, default `'15m'`) so the worker loop pages you once per stranded episode; `node ace durable:runs --stale` is the same query by hand. See [the stalled-run pager](/docs/durable/reliability/failure-modes#the-stalled-run-pager--onstalled--stalledafter).
 - **Dead runs.** `engine.onDead` fires for every run that crosses `maxRecoveryAttempts`.
-- **Traces and metrics.** [OpenTelemetry](/docs/durable/observability/otel) turns runs into traces and continues them on remote workers; [lifecycle events](/docs/durable/observability/events-and-interceptors) feed counters; with `@adonis-agora/diagnostics` installed the provider bridges engine events onto the diagnostics bus automatically, and [Telescope](/docs/durable/observability/telescope) shows runs next to your requests and jobs.
+- **Traces.** [OpenTelemetry](/docs/durable/observability/otel) turns runs into traces — a root span per run, a child span per step — and continues them on remote workers through `traceparent`. One caveat before you build a latency dashboard on it: the root span ends when the run first suspends and is not reopened on resume, so steps that settle after a sleep, a signal wait or a remote dispatch show up as spans without that parent.
+- **Metrics.** `attachDurableMetrics(engine)` (from `@adonis-agora/durable/otel`, no OTel SDK needed) keeps run and step counters with p50/p95/max durations, and `collectMetrics` serves a Prometheus scrape. Both count only the events this instance produced, so a fleet behind a control plane is not double-counted. See [Metrics](/docs/durable/observability/metrics).
+- **Telescope.** Register `durableTelescopeExtension()` under Telescope's `extensions` for a Workflows dashboard (golden signals, current-state gauges, recent failures, the worker fleet) next to your requests and jobs. With `@adonis-agora/diagnostics` installed the provider bridges engine events onto the diagnostics bus automatically. See [Telescope](/docs/durable/observability/telescope) and [lifecycle events](/docs/durable/observability/events-and-interceptors).
 
 When something does go wrong, start from the symptom: [Troubleshooting](/docs/durable/troubleshooting) and [Failure modes & recovery](/docs/durable/reliability/failure-modes).

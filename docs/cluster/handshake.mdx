@@ -144,7 +144,7 @@ const dir = await engine.workflowDirectory()
 
 - An **`observed`** entry is a live queue that no descriptor explains: a worker on an SDK too old to describe itself. It has no version, origin or runtime, because nobody stated one. A queue a descriptor declares as a **step** is left out, since a step cannot be called from outside a run.
 - **`supported: false`** means no transport in this process can read the fleet. The list is empty because nothing was asked, not because nothing runs. Today only the `bullmq` transport reads the fleet (`readAllWorkerDescriptors()` / `readAllWorkerHeartbeats()`).
-- **`otherPartitions`** names workers that are live on a partition this engine does not route to. A worker on the wrong partition otherwise looks exactly like no worker at all. An engine with no namespace (an operator) serves every partition and reports none.
+- **`otherPartitions`** names workers that are live on a partition this engine does not route to. A worker on the wrong partition otherwise looks exactly like no worker at all. A control plane with no namespace (the operator) serves every partition and reports none.
 - **`detail`** is one sentence saying which of these cases you are in, written for a human.
 
 To start a run on the version a worker declares, register it with `engine.remote(name, { group, version })` and pin the start with `engine.start(name, input, id, { version })`. A pinned start throws when that version is not registered, and never falls back to the newest. Convention routing (calling an unregistered name that matches a live queue) cannot honour a pin, because nothing proves the version exists.

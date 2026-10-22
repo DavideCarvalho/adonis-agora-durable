@@ -11,9 +11,8 @@ node ace configure @adonis-agora/durable
 ```
 
 ```ts
-import { WorkflowEngine } from '@adonis-agora/durable'
+import engine from '@adonis-agora/durable/services/main'
 
-const engine = await app.container.make(WorkflowEngine)
 engine.register('order', '1', async (ctx) => {
   const charge = await ctx.step('charge', () => chargeCard(ctx.input))
   await ctx.step('ship', () => ship(charge))

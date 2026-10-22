@@ -44,16 +44,25 @@ It isolates two things at once:
 Both follow one **default-is-bare** rule: `'default'` (the default value) leaves every name
 byte-identical to a single-pool deployment. Only a real, non-default namespace prefixes anything.
 
-**Leaving `namespace` unset makes the engine an operator.** It then scopes nothing: the store's poll
-filters no-op, so it drives, recovers and resumes runs of *every* namespace, and its transports stay on
-the bare prefix. "Seeing everyone" is the absence of a namespace, not a wildcard value — `'default'` is
-an ordinary namespace like any other, and an engine set to it sees only its own runs.
+**What an unset `namespace` means depends on the role.** On a `standalone` engine (the default role)
+it means `'default'`: the engine drives, recovers and resumes only the default pool's runs, including
+legacy rows stored without a namespace, which every shipped store reads back as `'default'`. On a
+`control-plane` it makes the engine the **operator**: it scopes nothing, so the store's poll filters
+no-op, it drives runs of *every* namespace, and its transports stay on the bare prefix. "Seeing
+everyone" is the absence of a namespace on a control plane, not a wildcard value. There is no standalone
+operator: a process that must drive every pool is a `control-plane`.
+
+<Callout type="warn">
+Behaviour change. A standalone engine without a `namespace` used to be the operator, driving every
+pool's runs on a shared store. It now stays in `'default'`. If you relied on that, move the process to
+`role: 'control-plane'`.
+</Callout>
 
 <Callout type="info">
-The engine's namespace and a run's namespace are not the same kind of value. The engine's may be
+The engine's namespace and a run's namespace are not the same kind of value. A control plane's may be
 `undefined` (the operator). A **stored run's** never is: every store normalizes it to `'default'` on
-write, matching the SQL column default. So "an engine with no namespace" and "a run with no namespace"
-mean different things, and only the first one means *all*.
+write, matching the SQL column default. So "a control plane with no namespace" and "a run with no
+namespace" mean different things, and only the first one means *all*.
 </Callout>
 
 ## `partition` — the queue suffix
@@ -139,8 +148,9 @@ pools:
   [cluster docs](/docs/durable/cluster) describe.
 - **Fully separate pools.** Give each pool its own `namespace`. Runs, queues and keys are all prefixed,
   so a dev cluster and a developer's laptop can share infrastructure without either driving the other's
-  runs. Each namespaced engine drives only its own; an operator alongside them drives all of them, which
-  is what lets one deployed control plane orchestrate work that executes on many pools.
+  runs. Each namespaced engine drives only its own; an operator (a `control-plane` with no `namespace`)
+  alongside them drives all of them, which is what lets one deployed control plane orchestrate work
+  that executes on many pools.
 
 <Callout type="info">
 The two combine, and they answer different questions. Reach for `partition` when the runs are the same
@@ -156,7 +166,7 @@ to different deployments.
   the deployed fleet's tasks. Give it a real partition.
 - **A run stamped into a namespace nothing polls sits pending forever.** Passing `opts.namespace` (or
   starting from a tenant pod) routes the run to a pool that must actually have someone polling it —
-  either an engine on that namespace, or an operator. Between namespaced engines there is no fallback
+  either an engine on that namespace, or an operator control plane. Between namespaced engines there is no fallback
   owner, so a namespace with no operator above it and no engine of its own is a dead end.
 - **A stale local worker with an old build can misroute a run even when partitioned.** A process left
   running after a step or workflow rename can pick up a run with code that no longer matches its
