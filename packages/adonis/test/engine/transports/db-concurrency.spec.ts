@@ -285,7 +285,14 @@ describe.each(dbBackends())('on $name', ({ name: backendName, makeTransportDb })
           },
           20,
         );
-        await until(async () => (await statusOf(engine))?.concurrency.limit === 1);
+        let last: WorkerStatus | undefined;
+        await until(
+          async () => (last = await statusOf(engine))?.concurrency.limit === 1,
+          20_000,
+          'the braked limit',
+        ).catch((err) => {
+          throw new Error(`${err.message}; last status ${JSON.stringify(last)}`);
+        });
         for (let i = 1; i <= 6; i += 1) await engine.dispatch(task(i));
         await until(() => results.length === 6);
         expect(stats.peak).toBe(1);

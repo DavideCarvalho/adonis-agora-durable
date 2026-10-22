@@ -389,6 +389,8 @@ export class DbTransport implements Transport, ControlPlane {
   #workerHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
   /** Liveness-key writes still in flight — `close()` lets them land before withdrawing the keys. */
   readonly #livenessWrites = new Set<Promise<void>>();
+  /** Routing tokens whose liveness-key write is still in flight (see `#startWorkerHeartbeat`). */
+  readonly #beatsInFlight = new Set<string>();
   /** Workflow turn consumers by workflow name — a `workflow` task row routes here. */
   readonly #workflowTurns = new Map<string, WorkflowTurnHandler>();
   /** Every `onDecision` handler: each `RemoteWorkflowExecutor` resolves only its own task ids. */
@@ -1787,12 +1789,19 @@ export class DbTransport implements Transport, ControlPlane {
       this.#workerHeartbeatIntervalMs * 3,
     );
     const beatOne = (t: string): void => {
+      // One write per token at a time: a beat due while the last one is still in flight is skipped.
+      // Beats are not queued behind a slow store — every interval used to start a write regardless,
+      // so a store slower than the interval piled up writes without bound, each holding a pool
+      // connection the reads (groupHealth, the claim loop) then waited behind.
+      if (this.#beatsInFlight.has(t)) return;
+      this.#beatsInFlight.add(t);
       const now = this.#now();
       const key = workerHeartbeatKey(this.#keyPrefix(), t, this.#instanceId);
       const value = heartbeatKeyValue(now, this.#controller.snapshot());
       const write = Promise.resolve()
         .then(() => this.#workerKeys().put(key, value, now + ttlMs))
-        .catch((err) => this.#onError(err));
+        .catch((err) => this.#onError(err))
+        .finally(() => this.#beatsInFlight.delete(t));
       this.#livenessWrites.add(write);
       void write.finally(() => this.#livenessWrites.delete(write));
     };
