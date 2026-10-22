@@ -7,6 +7,7 @@ import type {
   StartRunMessage,
   StepResult,
   TenantEvent,
+  WorkflowDecision,
 } from '../../../../src/interfaces.js';
 import { BullMQTransport } from '../../../../src/transports/bullmq/bullmq-transport.js';
 import type {
@@ -217,6 +218,20 @@ describe('BullMQTransport', () => {
       transport.onStepEvent(async () => {});
       expect(broker.workers.has('durable-decisions')).toBe(true);
       expect(broker.workers.has('durable-step-events')).toBe(true);
+    });
+
+    it('delivers every decision to EVERY onDecision handler (one per remote workflow)', async () => {
+      // The engine builds one RemoteWorkflowExecutor per remote workflow, each subscribing here and
+      // ignoring taskIds it isn't awaiting — a transport keeping only the first handler starved the rest.
+      const first = vi.fn(async () => {});
+      const second = vi.fn(async () => {});
+      transport.onDecision(first);
+      transport.onDecision(second);
+      const decision = { taskId: 'r2:wf:1', commands: [] } as unknown as WorkflowDecision;
+      await broker.workers.get('durable-decisions')!.process({ data: decision });
+      expect(first).toHaveBeenCalledWith(decision);
+      expect(second).toHaveBeenCalledWith(decision);
+      expect([...broker.workers.keys()].filter((k) => k === 'durable-decisions')).toHaveLength(1);
     });
 
     it('dispatchStepEvent adds a `stepEvent` job with non-task opts', async () => {
