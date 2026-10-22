@@ -76,19 +76,20 @@ describe('QueueTransport adaptive concurrency', () => {
     const engine = make(adapter, { workerKeys: keys });
     const results: StepResult[] = [];
     engine.onResult(async (r) => void results.push(r));
-    // The backlog is queued before the worker starts, so every tick sees the limit saturated. The
-    // tick is slow next to the step: the controller calls a step outliving two ticks a stall
-    // (backpressure), and a 25ms sleep often outlives a 15ms × 2 window on a loaded machine.
-    const jobs = 40;
+    // Shaped so a loaded machine cannot starve the growth signal (see the db transport's twin): the
+    // backlog is queued first (saturated at every tick), steps are long next to event-loop jitter
+    // (steady latency), and the tick outlasts a step (never two ticks without a completion, which
+    // reads as a stall).
+    const jobs = 20;
     for (let i = 1; i <= jobs; i += 1) await engine.dispatch(task(i));
     const { stats } = workerWith(
       adapter,
       {
         workerKeys: keys,
         workerHeartbeatIntervalMs: 10,
-        concurrency: { mode: 'adaptive', min: 1, max: 4, start: 1, tickMs: 60 },
+        concurrency: { mode: 'adaptive', min: 1, max: 4, start: 1, tickMs: 300 },
       },
-      25,
+      200,
     );
     await until(() => results.length === jobs, 60_000);
 

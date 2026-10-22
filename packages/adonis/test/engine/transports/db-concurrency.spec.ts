@@ -141,10 +141,15 @@ describe.each(dbBackends())('on $name', ({ name: backendName, makeTransportDb })
       const withEight = countSelects(TRANSPORT_TABLES.tasks, sanitizeQueueToken('ext.eight'));
       one.handle('ext.one', async () => 'x');
       eight.handle('ext.eight', async () => 'x');
-      await until(() => withOne() >= 20 && withEight() >= 1);
+      // Counted from the moment both poll: a worker that came up later (its first round's schema
+      // probes) would otherwise lose a head start worth dozens of 5ms rounds.
+      await until(() => withOne() >= 1 && withEight() >= 1);
+      const [oneAt, eightAt] = [withOne(), withEight()];
+      await until(() => withOne() - oneAt >= 40);
+      const [polledOne, polledEight] = [withOne() - oneAt, withEight() - eightAt];
       await Promise.all([one.close(), eight.close()]);
       // One loop per worker whatever its slots: eight slots polling on their own would be ~8×.
-      expect(withEight()).toBeLessThan(withOne() * 2);
+      expect(polledEight).toBeLessThan(polledOne * 2);
     });
 
     it('an idle task loop backs off; the results loop never does', async () => {
@@ -232,17 +237,20 @@ describe.each(dbBackends())('on $name', ({ name: backendName, makeTransportDb })
         const engine = make();
         const results: StepResult[] = [];
         engine.onResult(async (r) => void results.push(r));
-        // The backlog is queued before the worker starts, so every tick sees the limit saturated. The
-        // tick is slow next to the step: the controller calls a step outliving two ticks a stall
-        // (backpressure), and a 25ms sleep often outlives a 15ms × 2 window on a loaded machine.
-        const jobs = 40;
+        // Shaped so a loaded machine cannot starve the growth signal. The backlog is queued before the
+        // worker starts, so the slot is busy at every tick (saturated). Steps are long next to the
+        // timer jitter of a busy event loop, so their latency reads as steady (the gradient that
+        // gates growth compares the median step to the fastest, and 10ms of lag on a 25ms step read
+        // as queuing). The tick outlasts a step, so a busy slot always completes within two ticks —
+        // two ticks without a completion read as a stall (backpressure, which only ever sheds).
+        const jobs = 20;
         for (let i = 1; i <= jobs; i += 1) await engine.dispatch(task(i));
         const stats = workerWith(
           {
             workerHeartbeatIntervalMs: 10,
-            concurrency: { mode: 'adaptive', min: 1, max: 4, start: 1, tickMs: 60 },
+            concurrency: { mode: 'adaptive', min: 1, max: 4, start: 1, tickMs: 300 },
           },
-          25,
+          200,
         );
         await until(() => results.length === jobs, 60_000);
         // It grew, and the slot loop followed: only a `grow` raises the limit above its start of 1.
@@ -256,7 +264,7 @@ describe.each(dbBackends())('on $name', ({ name: backendName, makeTransportDb })
         // legitimate as the growth itself — so only its presence is pinned here; the decision rules
         // are unit-tested on the controller with a fake clock.
         expect(status?.lastAdjust?.reason).toBeDefined();
-      });
+      }, 90_000);
 
       it('shrinks the live limit under the RAM brake, and the slot loop obeys it', async () => {
         db = await makeTransportDb();
@@ -281,7 +289,7 @@ describe.each(dbBackends())('on $name', ({ name: backendName, makeTransportDb })
         for (let i = 1; i <= 6; i += 1) await engine.dispatch(task(i));
         await until(() => results.length === 6);
         expect(stats.peak).toBe(1);
-      });
+      }, 90_000);
 
       // The race behind the flake above: a round sizes its claim from the limit it read BEFORE the
       // claim's round trips, and the RAM brake fires on its own timer. A claim still in flight when

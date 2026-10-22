@@ -105,9 +105,12 @@ describe('QueueTransport concurrency and idle backoff', () => {
     };
     const one = pollsWith(1);
     const eight = pollsWith(8);
-    await until(() => one() >= 20 && eight() >= 1);
+    // Counted from the moment both poll, so neither gets a head start.
+    await until(() => one() >= 1 && eight() >= 1);
+    const [oneAt, eightAt] = [one(), eight()];
+    await until(() => one() - oneAt >= 40);
     // One loop per worker whatever its slots: eight slots polling on their own would be ~8×.
-    expect(eight()).toBeLessThan(one() * 2);
+    expect(eight() - eightAt).toBeLessThan((one() - oneAt) * 2);
   });
 
   it('an idle task loop backs off; the results loop never does', async () => {

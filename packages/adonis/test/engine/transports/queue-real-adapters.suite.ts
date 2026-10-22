@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { Adapter } from '@adonisjs/queue/types';
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type {
   EngineEvent,
   RemoteTask,
@@ -139,7 +139,8 @@ let redisClient:
       del(...k: string[]): Promise<unknown>;
     }
   | undefined;
-const prefix = `durable-it-${randomUUID().slice(0, 8)}`;
+/** The file's key prefix; each test runs under its own extension of it (see `describeBackend`). */
+const basePrefix = `durable-it-${randomUUID().slice(0, 8)}`;
 
 const backends: Backend[] = [
   {
@@ -199,7 +200,7 @@ const backends: Backend[] = [
     },
     async teardown() {
       if (!redisClient) return;
-      const keys = await redisClient.keys(`*${prefix}*`);
+      const keys = await redisClient.keys(`*${basePrefix}*`);
       if (keys.length > 0) await redisClient.del(...keys);
       await redisClient.quit();
     },
@@ -224,6 +225,13 @@ function describeBackend(backend: Backend): void {
     let factory: AnyAdapterFactory;
     const transports: QueueTransport[] = [];
     let probe: Adapter;
+    // A prefix — so a results queue, decisions queue, inboxes — of each test's own. Shared across the
+    // file, a result published late by one test (a re-run it just failed on) was consumed by the
+    // next test's engine as one of its own.
+    let prefix = basePrefix;
+    beforeEach(() => {
+      prefix = `${basePrefix}-${randomUUID().slice(0, 6)}`;
+    });
 
     beforeAll(async () => {
       if (!backend.enabled) return;
@@ -315,9 +323,10 @@ function describeBackend(backend: Backend): void {
             prefix,
             pollIntervalMs: 10,
             stalledCheckIntervalMs: 50,
-            // Renewal runs every half threshold; 1.5s tolerates the event-loop stalls of a shared CI
-            // runner, while the 5s step still outlives the threshold 3× — without renewal it is re-run.
-            stalledThresholdMs: 1_500,
+            // Renewal runs every half threshold; 3s tolerates the event-loop stalls of a loaded CI
+            // runner (1.5s was seen to lapse), while the 9s step still outlives the threshold 3× —
+            // without renewal it is re-run.
+            stalledThresholdMs: 3_000,
           });
           transports.push(t);
           return t;
@@ -329,18 +338,18 @@ function describeBackend(backend: Backend): void {
         let runs = 0;
         worker.handle(name, async () => {
           runs += 1;
-          await new Promise((r) => setTimeout(r, 5_000));
+          await new Promise((r) => setTimeout(r, 9_000));
           return 'done';
         });
 
         await engine.dispatch(task(name));
-        await until(() => results.length === 1, 10_000);
+        await until(() => results.length === 1, 30_000);
         expect(runs).toBe(1);
         expect(results[0]).toMatchObject({ status: 'completed', output: 'done' });
         await closeAll();
         expect(await activeJobs(probe, `${prefix}:tasks:${sanitizeQueueToken(name)}`)).toBe(0);
       },
-      20_000,
+      45_000,
     );
 
     it.skipIf(!backend.enabled)(
@@ -358,20 +367,25 @@ function describeBackend(backend: Backend): void {
         transports.push(worker);
         const results: StepResult[] = [];
         engine.onResult(async (r) => void results.push(r));
-        let running = 0;
-        let peak = 0;
-        worker.handle(name, async () => {
-          running += 1;
-          peak = Math.max(peak, running);
-          await new Promise((r) => setTimeout(r, 150));
-          running -= 1;
-          return 'ok';
-        });
-
+        // The backlog first, and each step holds its slot until three run together (bounded): the
+        // peak then depends on the slot loop, not on dispatches overlapping 150ms sleeps.
         for (let seq = 1; seq <= 6; seq += 1) {
           await engine.dispatch({ ...task(name), seq, stepId: `r1:${seq}` });
         }
-        await until(() => results.length === 6, 10_000);
+        let running = 0;
+        let peak = 0;
+        let done = 0;
+        worker.handle(name, async () => {
+          running += 1;
+          peak = Math.max(peak, running);
+          await until(() => running >= Math.min(3, 6 - done), 3000).catch(() => undefined);
+          await new Promise((r) => setTimeout(r, 150));
+          running -= 1;
+          done += 1;
+          return 'ok';
+        });
+
+        await until(() => results.length === 6, 30_000);
         expect(peak).toBe(3);
         await closeAll();
         expect(await activeJobs(probe, `${prefix}:tasks:${sanitizeQueueToken(name)}`)).toBe(0);
@@ -531,9 +545,10 @@ function describeBackend(backend: Backend): void {
           prefix,
           pollIntervalMs: 5,
           stalledCheckIntervalMs: 0,
-          // A tick well past the 40ms step: two ticks without a completion read as a stall
-          // (backpressure, which only ever shrinks), and a loaded machine stretches the step.
-          concurrency: { mode: 'adaptive', min: 1, max: 4, start: 1, tickMs: 100 },
+          // Shaped so a loaded machine cannot starve the growth signal: steps long next to event-loop
+          // jitter (steady latency), and a tick that outlasts a step (never two ticks without a
+          // completion, which reads as a stall — backpressure, which only ever sheds).
+          concurrency: { mode: 'adaptive', min: 1, max: 4, start: 1, tickMs: 300 },
         });
         transports.push(worker);
         const results: StepResult[] = [];
@@ -543,14 +558,14 @@ function describeBackend(backend: Backend): void {
         worker.handle(name, async () => {
           running += 1;
           peak = Math.max(peak, running);
-          await new Promise((r) => setTimeout(r, 40));
+          await new Promise((r) => setTimeout(r, 200));
           running -= 1;
           return 'ok';
         });
-        for (let seq = 1; seq <= 30; seq += 1) {
+        for (let seq = 1; seq <= 20; seq += 1) {
           await engine.dispatch({ ...task(name), seq, stepId: `r1:${seq}` });
         }
-        await until(() => results.length === 30, 15_000);
+        await until(() => results.length === 20, 60_000);
         expect(peak).toBeGreaterThan(1);
         expect(peak).toBeLessThanOrEqual(4);
         await closeAll();
