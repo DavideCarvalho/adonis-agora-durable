@@ -25,6 +25,29 @@ export interface ResponderTransport {
   publishTenantEvent(evt: TenantEvent): Promise<void>;
 }
 
+/**
+ * The error `code` a responder answers a verb it does not know with, so a newer tenant can tell
+ * "this control plane is older than me" from a real failure and fall back at once instead of
+ * waiting out its timeout. Responders before 0.50 answered with an error message
+ * (`unknown run-request verb: <kind>`) and no code; `ProxyRunGateway` recognizes both.
+ */
+export const UNSUPPORTED_RUN_REQUEST = 'unsupported-request';
+
+/** Every verb this responder answers. Checked before the gateway is touched. */
+const KNOWN_KINDS: ReadonlySet<string> = new Set<RunRequestKind['kind']>([
+  'getRun',
+  'listRuns',
+  'getCheckpoints',
+  'getSearchAttributes',
+  'getRunChildren',
+  'getRunDetail',
+  'getFanMembers',
+  'workerHealth',
+  'signal',
+  'cancel',
+  'redispatch',
+]);
+
 /** Options for {@link RunRequestResponder}. */
 export interface RunRequestResponderOptions {
   /**
@@ -69,7 +92,11 @@ function isTerminalRunEvent(event: EngineEvent): boolean {
  *    anti-IDOR, so a tenant can never read OR act on another tenant's run.
  * 5. **`start` forces the run's namespace** to the derived tenant, so a started run is owned by, and
  *    later only reachable by, that tenant.
- * 6. **Unknown verbs are rejected** rather than silently ignored.
+ * 6. **Unknown verbs are rejected** rather than silently ignored, with the
+ *    {@link UNSUPPORTED_RUN_REQUEST} code and before the gateway is touched.
+ *
+ * Every request gets a reply: a gateway (or verifier) that throws becomes an error reply, because a
+ * request left unanswered makes the tenant wait out its whole timeout.
  *
  * Do not weaken any of these — they are the isolation guarantee of the store-less cluster.
  */
@@ -117,12 +144,26 @@ export class RunRequestResponder {
    */
   start(): void {
     this.#transport.onRunRequest(async (msg) => {
-      const reply = await this.#handleRequest(msg);
-      await this.#transport.publishRunReply(reply);
+      let answer: RunReply;
+      try {
+        answer = await this.#handleRequest(msg);
+      } catch (err) {
+        // Without a reply the tenant waits out its whole timeout for an answer that never comes.
+        answer = reply(msg.requestId, { ok: false, error: { message: errorMessage(err) } });
+      }
+      await this.#transport.publishRunReply(answer);
     });
     this.#transport.onStartRun(async (msg) => {
-      const reply = await this.#handleStart(msg);
-      if (reply) await this.#transport.publishRunReply(reply);
+      let answer: RunReply | undefined;
+      try {
+        answer = await this.#handleStart(msg);
+      } catch (err) {
+        answer =
+          msg.runId === undefined
+            ? undefined
+            : reply(msg.runId, { ok: false, error: { message: errorMessage(err) } });
+      }
+      if (answer) await this.#transport.publishRunReply(answer);
     });
     if (this.#subscribeEngineEvents) {
       this.#unsubscribeEvents = this.#subscribeEngineEvents((event) => {
@@ -153,11 +194,36 @@ export class RunRequestResponder {
 
     const { body } = msg;
 
+    if (!KNOWN_KINDS.has(body.kind)) {
+      return reply(msg.requestId, {
+        ok: false,
+        error: {
+          message: `the control plane does not support the ${String(body.kind)} run request`,
+          code: UNSUPPORTED_RUN_REQUEST,
+        },
+      });
+    }
+
+    try {
+      return reply(msg.requestId, { ok: true, data: await this.#answer(body, tenant) });
+    } catch (err) {
+      if (err instanceof CrossTenantError) {
+        return reply(msg.requestId, {
+          ok: false,
+          error: { message: 'run belongs to another tenant', code: 'cross-tenant' },
+        });
+      }
+      return reply(msg.requestId, { ok: false, error: { message: errorMessage(err) } });
+    }
+  }
+
+  /** Answer a known verb for the verified `tenant`. A run of another tenant throws
+   *  {@link CrossTenantError} before the verb runs. */
+  async #answer(body: RunRequestKind, tenant: string): Promise<unknown> {
     if (body.kind === 'listRuns') {
       // Force the namespace to the verified tenant — the client value is DISCARDED, never validated, so
       // a tenant can't widen its own query into another's namespace.
-      const data = await this.#gateway.listRuns({ ...body.query, namespace: tenant });
-      return reply(msg.requestId, { ok: true, data });
+      return this.#gateway.listRuns({ ...body.query, namespace: tenant });
     }
 
     if (body.kind === 'workerHealth') {
@@ -165,30 +231,15 @@ export class RunRequestResponder {
       // `<name>@<tenant>`, so keep only groups ending in `@<tenant>` — the operator's own bare groups
       // and every other tenant's are dropped.
       const all = await this.#gateway.workerHealth();
-      const data = all.filter((h) => h.group.endsWith(`@${tenant}`));
-      return reply(msg.requestId, { ok: true, data });
+      return all.filter((h) => h.group.endsWith(`@${tenant}`));
     }
 
     // Every remaining verb is runId-bearing. Load the run FIRST — before calling the verb — so a
     // cross-tenant request never reaches the gateway's mutating methods (signal/cancel/redispatch) or
     // leaks another tenant's run via a read (getRun/getCheckpoints/getSearchAttributes).
     const run = await this.#gateway.getRun(body.runId);
-    if (run && run.namespace !== tenant) {
-      return reply(msg.requestId, {
-        ok: false,
-        error: { message: 'run belongs to another tenant', code: 'cross-tenant' },
-      });
-    }
-
-    try {
-      const data = await this.#callVerb(body, run);
-      return reply(msg.requestId, { ok: true, data });
-    } catch (err) {
-      return reply(msg.requestId, {
-        ok: false,
-        error: { message: err instanceof Error ? err.message : String(err) },
-      });
-    }
+    if (run && run.namespace !== tenant) throw new CrossTenantError();
+    return this.#callVerb(body, run);
   }
 
   /** Dispatch a runId-bearing verb. `run` is the already-loaded run (ownership-checked by the caller) —
@@ -322,6 +373,13 @@ export class RunRequestResponder {
     const verified = await this.#verifyTenant({ token: wireTenant, tenant: wireTenant });
     return verified ? verified.tenant : null;
   }
+}
+
+/** A runId-bearing request addressed a run of another tenant. */
+class CrossTenantError extends Error {}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 /** Build a correlated {@link RunReply}. */
