@@ -83,12 +83,12 @@ Upgrading an app from 0.6 to 0.7:
 | `namespace` | from the engine | Worker-pool namespace folded into every queue name. Setting it here is explicit and wins over the engine's propagation of `config.namespace` — see [Namespaces](#namespaces--sharing-one-broker-across-pools). |
 | `prefix` | `'durable'` | Namespaces the queues (`<prefix>:tasks:<token>`, `<prefix>:results`, …). |
 | `pollIntervalMs` | `200` | Poll interval in ms between queue reads. |
-| `concurrency` | `1` | How many jobs of one step name this worker runs at once. More slots share one poll loop, so raising it adds no polling. |
+| `concurrency` | `1` | How many jobs of one step name this worker runs at once: a number (fixed), or `'adaptive'` / `{ mode: 'adaptive', min, max, start, tickMs, ramCeilingPct, cpuCeilingPct }` to let a control loop move it — see [Adaptive concurrency](#adaptive-concurrency). More slots share one poll loop, so raising it adds no polling. |
 | `resultConcurrency` | `1` | How many step results the engine side settles at once. |
 | `idleBackoffMax` | `4` | Idle backoff for the task, heartbeat and control loops, in poll intervals: empty polls double the sleep up to this multiple (800ms at the default interval), and a found job resets it. `1` disables it. The results loop never backs off. |
 | `stalledCheckIntervalMs` | `30_000` | How often the stalled-claim reclaim sweep runs. `0` disables it entirely. |
 | `stalledThresholdMs` | `120_000` (2min) | How long a claim may go without being renewed before the sweep presumes its worker dead and re-delivers the job. `1_800_000` (30min) on an adapter without `renewJobs`. |
-| `maxStalledCount` | `3` | How many times one job may be reclaimed before it is failed permanently — the bound on a poison job. |
+| `maxStalledCount` | `3` | How many times one job may be reclaimed before it is failed permanently — the bound on a poison job. A step task failed this way is reported to its run as a failed step (see [Poison jobs](#poison-jobs)). |
 | `onError` | `console.error` | Where a poll-loop failure is reported. Point it at your app's logger. |
 | `instanceId` | random uuid | Stable process id stamped on heartbeats and control messages. |
 | `workerKeys` | the app database | Where the [worker advertisement](/docs/durable/transports#worker-advertisement) lives. Default: the `durable_transport_worker_keys` table through `@adonisjs/lucid`, when the app has it. Pass any `WorkerKeyStore` to keep the keys elsewhere, or `false` to advertise nothing. |
@@ -109,6 +109,32 @@ queue: transports.queue({
 
 The slots share the step's single poll loop — it keeps popping while a slot is free and waits for one to free when all are busy — so `concurrency` costs no extra polling. Every in-flight claim is renewed, and `close()` waits (within its 5s budget) for all of them, like a single one. Fleet-wide parallelism for a step is `concurrency × worker processes`; use a [flow-control queue](/docs/durable/reliability/flow-control) when you need a cap across the fleet.
 
+#### Adaptive concurrency
+
+Pass `'adaptive'` instead of a number to let the worker tune its own limit. It is the same controller the [BullMQ transport](/docs/durable/transports/bullmq#concurrency) uses: every `tickMs` it grows the limit by one while steps saturate it at a steady latency, shrinks it by the latency gradient when steps start to queue, sheds one on a >20% error rate, a stall or the CPU ceiling, and cuts it by 20% when RSS reaches `ramCeilingPct` of the memory limit (the cgroup limit, else the host's memory).
+
+```ts title="config/durable.ts"
+queue: transports.queue({
+  connection: 'redis',
+  concurrency: { mode: 'adaptive', min: 1, max: 16, start: 2, tickMs: 2000, ramCeilingPct: 85, cpuCeilingPct: 90 },
+}),
+```
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `min` | `1` | Floor the limit never goes below. |
+| `max` | `32` | Ceiling the limit never exceeds. |
+| `start` | `min` | Initial limit, clamped into `[min, max]`. |
+| `tickMs` | `2000` | Control-loop period. |
+| `ramCeilingPct` | `85` | RSS percent of the memory limit at which the hard brake fires. |
+| `cpuCeilingPct` | off | Process CPU percent (normalised over cores) above which the limit never grows and sheds one. |
+
+A non-finite or out-of-range field falls back to its default. One controller serves every step name of the worker, and each step name's task loop reads the live limit on every poll, so a move applies at once — a lower limit lets jobs already running finish and stops taking new ones until in-flight work is under it. Only step durations feed the latency window. The results, heartbeat and control loops are not affected (`resultConcurrency` stays fixed).
+
+Whatever the mode, each worker's [liveness heartbeat](#worker-health) carries the controller's snapshot — mode and live limit (with `min`/`max` when adaptive), in-flight count, RSS, CPU, throughput, p95 and the last adjustment with its reason — which the [dashboard's worker cards](/docs/durable/observability/dashboard#fleet-and-topology) render.
+
+#### Idle polling
+
 Polling is the cost of a backend-agnostic queue: each loop asks the adapter for a job every `pollIntervalMs`, and a worker serving 30 step names runs 30 task loops. So idle task, heartbeat and control loops **back off** — the sleep doubles after each empty poll up to `idleBackoffMax × pollIntervalMs` (800ms by default), and the first job found snaps the loop back to the base interval and drains the backlog without sleeping. The price is up to that much pickup latency for the first job after a quiet spell; set `idleBackoffMax: 1` for the old fixed cadence. The results loop never backs off, since every step's result is on its workflow's critical path.
 
 ### Worker advertisement
@@ -118,6 +144,17 @@ every engine has to read every worker's. They go to a key store instead — by d
 `durable_transport_worker_keys` table (created on first use, and by the migration `configure`
 publishes), the same one the [db transport](/docs/durable/transports/db) uses. With no database and no
 `workerKeys`, nothing is advertised and the engine routes without descriptors, as before.
+
+### Worker health
+
+Every worker process beats a liveness key for each step name it serves — `<prefix>-worker-heartbeat:<token>:<instanceId>` in the worker-key store, refreshed every 10s and live for 35s, carrying the `WorkerStatus` snapshot described [above](#adaptive-concurrency). A process that only produces (a `console`/`repl` process with [deferred consumers](#consumers--why-a-node-ace-script-does-not-drain-the-queue)) beats nothing until it starts consuming.
+
+From those keys and the queue, the transport implements `groupHealth`, so `engine.workerHealth()`, the dashboard's `/api/workers` and `/api/health` and the [Telescope](/docs/durable/observability/telescope) worker panel report queue-transport groups:
+
+- `liveWorkers`: the unexpired liveness keys of the group, with each worker's `instanceId`, `lastBeatAt` and `status`. A worker that dies drops out within 35s.
+- `depth`: the task queue's **pending** jobs, from the adapter's `sizeOf`. This is narrower than BullMQ's depth (waiting + active + delayed + prioritized): the `@adonisjs/queue` adapter contract has no count for jobs in flight or delayed retries, so those are not included. `depth > 0` with no live worker is still the alert state, since pending jobs are the ones no worker has picked up.
+
+`groupHealth` needs the worker-key store: with `workerKeys: false` (or no database and no store), no worker can advertise liveness, so the transport does not implement it and the panels stay empty rather than flagging every group as starved.
 
 ### Stalled-job reclaim
 
@@ -146,6 +183,12 @@ Older releases never renewed a claim and defaulted the threshold to 30 minutes. 
 </Callout>
 
 Set `stalledCheckIntervalMs: 0` to switch the sweep off — reasonable when an adapter already redelivers stalled jobs itself. Adapters that cannot report stalled jobs are detected and skipped silently, in which case [`engine.redispatchPending(runId)`](/docs/durable/reliability/failure-modes#lost-remote-dispatch-the-run-suspends-and-nothing-auto-redrives-it) is the recovery path.
+
+### Poison jobs
+
+A job reclaimed more than `maxStalledCount` times is one whose workers keep vanishing while they hold it, so the sweep fails it instead of re-delivering it again. For a step task, the transport then publishes a failed result for that step (`remote step worker failed: stalled more than N times`, marked retryable) on the results queue, the same bridge the BullMQ transport runs for a task job that fails terminally. The engine treats it like any failed attempt: it re-dispatches while the step has `retries` left, then fails the step into the workflow (a `try/catch` around the step sees a `RemoteStepError`; uncaught, the run fails). Without this, the run would wait on that step forever.
+
+This needs `@adonisjs/queue` **0.7**: there the adapter hands a job that stalled too often back to the transport to fail. On **0.6** the adapter deletes such a job inside its own sweep and returns only a count, so the transport never sees it and no result is published. On 0.6, set the step's `timeoutMs` or the engine's `remoteRedispatchMs` (see [lost remote dispatch](/docs/durable/reliability/failure-modes#lost-remote-dispatch-the-run-suspends-and-nothing-auto-redrives-it)) so such a step does not wait forever. Stalled result, heartbeat and control jobs are failed without publishing anything.
 
 ### `consumers` — why a `node ace` script does not drain the queue
 

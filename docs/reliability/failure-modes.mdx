@@ -29,7 +29,7 @@ Before diagnosing anything, know which of the three `runDispatcher` modes your a
 | Run stuck `running` forever after a deploy/crash | Worker crashed mid-run (leased run) | `recoveryAttempts` climbing on the run; dashboard shows `running` with no progress | Nothing to do — `recoverIncomplete()` self-heals within `leaseMs`. Cap poison pills with `maxRecoveryAttempts` |
 | Run stuck `suspended`, one step frozen `pending`, nothing happens for hours | Lost remote dispatch (worker died after claiming the job, or the transport dropped it) | See [the stranded signature](#the-stranded-signature) below | `engine.redispatchPending(runId)` now; `remoteRedispatchMs` to self-heal future ones |
 | Remote step just... never fails or completes, run `running` the whole time, no dashboard `pending` step | `timeoutMs` step whose coordinating process crashed (the liveness timer died with it) | Run's lease is stale (`lockedUntil` passed) — same signature as any crashed leased run | `recoverIncomplete()` reclaims it like any other orphaned run; the step re-dispatches from scratch on replay |
-| `/durable/api/health` shows nothing for a pool you know is stalled | You're on the `queue` or `db` transport — `groupHealth` is BullMQ-only | `engine.workerHealth()` returns `[]` | Use the stranded-signature query instead of the health panel |
+| `/durable/api/health` shows nothing for a pool you know is stalled | You're on the `db` transport, or on `queue` with no worker-key store (`workerKeys: false`, or no database) — only `bullmq` and `queue` implement `groupHealth` | `engine.workerHealth()` returns `[]` | Use the stranded-signature query instead of the health panel |
 | You learned about a stuck run from a customer, not an alert | Nothing pages on the stranded signature — `suspended` is not an error | Nothing, until you query for it | Wire [`engine.onStalled`](#the-stalled-run-pager--onstalled--stalledafter) to your pager |
 | Two pools sharing one Redis/DB seem to steal each other's runs | No `namespace` set — both engines default to `'default'` | A run started by pool A gets executed by a worker in pool B | Set a distinct `namespace` per pool (see below) |
 
@@ -102,7 +102,7 @@ For contrast, the [`db` transport](/docs/durable/transports/db) claims rows with
 </Callout>
 
 <Callout type="warn">
-`engine.workerHealth()` (and the dashboard's `/durable/api/workers` and `/durable/api/health`) reads group health off the transport, and only the BullMQ transport reports it. On `queue`, `db`, or `eventEmitter` it returns an empty list, not an error. Don't read "no stalled groups reported" as "nothing is stalled" on those transports — use the stranded-signature query above instead.
+`engine.workerHealth()` (and the dashboard's `/durable/api/workers` and `/durable/api/health`) reads group health off the transport, and only the `bullmq` and `queue` transports report it (`queue` only with a worker-key store, its default when the app has a database). On `db` or `eventEmitter` it returns an empty list, not an error. Don't read "no stalled groups reported" as "nothing is stalled" on those transports — use the stranded-signature query above instead. On `queue`, a group's `depth` counts only pending jobs, not jobs in flight (see [worker health](/docs/durable/transports/queue#worker-health)).
 </Callout>
 
 ## Namespaces: the classic two-pools mistake

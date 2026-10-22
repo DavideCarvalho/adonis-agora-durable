@@ -48,7 +48,7 @@ Trade-off vs a real broker: throughput is bounded by polling + row contention �
 
 ## Worker health
 
-`DbTransport` does not implement `groupHealth`, so the engine's `workerHealth()` query — and the dashboard and Telescope worker-health panels built on it — return **no entries** for this transport's groups; only a `groupHealth`-capable transport (BullMQ) reports backlog depth and live workers. `DbTransport` does implement `listWorkerGroups()` and `listWorkerDescriptors(token)`, read from the [worker advertisement](/docs/durable/transports#worker-advertisement) in `durable_transport_worker_keys`, so the engine still knows which tokens have a live worker for dispatch routing.
+`DbTransport` does not implement `groupHealth`, so the engine's `workerHealth()` query — and the dashboard and Telescope worker-health panels built on it — return **no entries** for this transport's groups; only a `groupHealth`-capable transport (BullMQ, queue) reports backlog depth and live workers. `DbTransport` does implement `listWorkerGroups()` and `listWorkerDescriptors(token)`, read from the [worker advertisement](/docs/durable/transports#worker-advertisement) in `durable_transport_worker_keys`, so the engine still knows which tokens have a live worker for dispatch routing.
 
 Liveness of a claimed task is the lease itself, not a separate heartbeat: a task row whose `claimed_at` is older than `leaseMs` is treated as abandoned and reclaimed by the next poll (see [the claim protocol](#the-claim-protocol)). The `durable_transport_heartbeats` table is a different thing — the per-step liveness pings that `timeoutMs` steps send to the engine.
 

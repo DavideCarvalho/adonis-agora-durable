@@ -129,7 +129,7 @@ By default, flow-control accounting is **per engine instance**. For the common s
 
 ## Worker / transport concurrency
 
-A queue's `concurrency` caps what the engine *admits*. How many already-dispatched tasks a worker *executes* at once is a separate, transport-level knob — [`transports.bullmq({ concurrency })`](/docs/durable/transports/bullmq#concurrency), or a fixed [`transports.queue({ concurrency })`](/docs/durable/transports/queue#concurrency-and-idle-polling):
+A queue's `concurrency` caps what the engine *admits*. How many already-dispatched tasks a worker *executes* at once is a separate, transport-level knob — [`transports.bullmq({ concurrency })`](/docs/durable/transports/bullmq#concurrency) or [`transports.queue({ concurrency })`](/docs/durable/transports/queue#concurrency-and-idle-polling):
 
 ```ts title="config/durable.ts"
 bullmq: transports.bullmq({
@@ -199,7 +199,7 @@ A held slot is reclaimed only once its owner's heartbeat lapses: a **live** pod 
 | Break remaining ties newest-first instead of oldest-first | `order: 'lifo'` | `engine.registerQueue` |
 | Cap one fan within a single run | `ctx.all(step, inputs, { concurrency })` | the call |
 | Refuse new *runs* once a tenant/key has N in flight | a concurrency quota — see [Concurrency quotas](/docs/durable/reliability/concurrency-quotas) | `static workflow` / `StartOptions` |
-| Raise how much work *this process* runs at once | `concurrency` (number) | `transports.bullmq(...)` |
-| Let the process self-tune under CPU/RAM pressure | `concurrency: 'adaptive'` | `transports.bullmq(...)` |
+| Raise how much work *this process* runs at once | `concurrency` (number) | `transports.bullmq(...)` / `transports.queue(...)` |
+| Let the process self-tune under CPU/RAM pressure | `concurrency: 'adaptive'` | `transports.bullmq(...)` / `transports.queue(...)` |
 | Enforce a cap/rate limit across every replica, not per pod | `admission: admissions.redis(...)` | `config/durable.ts` |
 | Retry a failed step with backoff | `retries` / `backoff` — not flow control | see [Retries & backoff](/docs/durable/reliability/retries) |

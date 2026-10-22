@@ -104,9 +104,22 @@ export default defineConfig({
 One instance consumes engine-side results; run one or more `node ace
 durable:work` workers serving the step names. A worker runs ONE job of a step
 name at a time unless `concurrency` is raised (`transports.queue({ connection,
-concurrency: 8, resultConcurrency: 8 })`); the slots share one poll loop. Idle
+concurrency: 8, resultConcurrency: 8 })`); the slots share one poll loop.
+`concurrency: 'adaptive'` (or `{ mode: 'adaptive', min, max, start, tickMs,
+ramCeilingPct, cpuCeilingPct }`) runs the same controller as `bullmq` (below);
+each step name's loop reads the live limit every poll. Idle
 task/heartbeat/control loops back off up to `idleBackoffMax × pollIntervalMs`
-(default 4 × 200ms; `1` disables). Source:
+(default 4 × 200ms; `1` disables).
+
+A `queue` worker beats `<prefix>-worker-heartbeat:<token>:<instance>` into the
+worker-key store (10s, live 35s) with its `WorkerStatus`, and the transport
+implements `groupHealth` when a store is configured (the default with a database;
+absent with `workerKeys: false`). Its `depth` is the PENDING count (`sizeOf`) only —
+the adapter contract can't count jobs in flight or delayed retries. A task that
+stalls past `maxStalledCount` is failed AND bridged into a retryable failed
+`StepResult` (`remote step worker failed: stalled more than N times`) on
+`@adonisjs/queue` 0.7; on 0.6 the adapter deletes it internally and nothing is
+published, so rely on `timeoutMs` / `remoteRedispatchMs` there. Source:
 `docs/transports/queue.mdx`.
 
 For wide fans (`ctx.all` over thousands of steps), raise how many results an
