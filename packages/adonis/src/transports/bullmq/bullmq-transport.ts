@@ -148,6 +148,7 @@ export class BullMQTransport implements Transport {
   readonly #taskWorkers = new Map<string, WorkerLike>();
   #resultsWorker: WorkerLike | undefined;
   #decisionsWorker: WorkerLike | undefined;
+  readonly #decisionHandlers = new Set<(decision: WorkflowDecision) => Promise<void>>();
   #stepEventsWorker: WorkerLike | undefined;
 
   // Long-step heartbeat pub/sub (distinct from the worker-liveness key registry below).
@@ -556,9 +557,18 @@ export class BullMQTransport implements Transport {
   }
 
   onDecision(handler: (decision: WorkflowDecision) => Promise<void>): void {
+    // EVERY handler gets every decision: the engine builds one RemoteWorkflowExecutor per remote
+    // workflow and each subscribes here, ignoring decisions whose taskId it isn't awaiting. Keeping
+    // only the first handler (the old behaviour) silently dropped every decision of the second and
+    // later remote workflows, so their runs never advanced.
+    this.#decisionHandlers.add(handler);
     if (this.#decisionsWorker) return;
-    this.#decisionsWorker = this.#makeWorker(decisionsName(this.#effectivePrefix()), (job) =>
-      handler(job.data as WorkflowDecision),
+    this.#decisionsWorker = this.#makeWorker(
+      decisionsName(this.#effectivePrefix()),
+      async (job) => {
+        const decision = job.data as WorkflowDecision;
+        await Promise.all([...this.#decisionHandlers].map((h) => h(decision)));
+      },
     );
   }
 
