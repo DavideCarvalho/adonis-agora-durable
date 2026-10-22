@@ -126,6 +126,11 @@ describe('QueueTransport concurrency and idle backoff', () => {
     await until(() => results.length === 5, 500);
   });
 
+  it('a non-finite concurrency falls back to one slot instead of popping the backlog unbounded', async () => {
+    const { peak } = await peakInFlight(Number.NaN, 4);
+    expect(peak).toBe(1);
+  });
+
   it('close() waits for every in-flight slot and completes those jobs instead of re-queueing them', async () => {
     const adapter = new MockAdapter();
     const engine = make(adapter);

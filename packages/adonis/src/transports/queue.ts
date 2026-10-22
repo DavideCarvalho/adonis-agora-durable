@@ -9,7 +9,7 @@ import {
   type StepResult,
   type Transport,
 } from '../interfaces.js';
-import { Pollers, type PollLoop } from '../pollers.js';
+import { atLeastOne, Pollers, type PollLoop } from '../pollers.js';
 import { runStepHandler, type StepHandler } from '../protocol.js';
 import { sanitizeQueueToken, tenantGroup } from '../tenant-group.js';
 import type { DescriptorRedis } from '../worker-runtime/registry.js';
@@ -341,9 +341,9 @@ export class QueueTransport implements Transport, ControlPlane {
     this.#namespace = options.namespace;
     this.#explicitNamespace = options.namespace !== undefined;
     this.#pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-    this.#concurrency = Math.max(1, Math.floor(options.concurrency ?? 1));
-    this.#resultConcurrency = Math.max(1, Math.floor(options.resultConcurrency ?? 1));
-    this.#idleBackoffMax = Math.max(1, options.idleBackoffMax ?? DEFAULT_IDLE_BACKOFF_MAX);
+    this.#concurrency = atLeastOne(options.concurrency, 1);
+    this.#resultConcurrency = atLeastOne(options.resultConcurrency, 1);
+    this.#idleBackoffMax = atLeastOne(options.idleBackoffMax, DEFAULT_IDLE_BACKOFF_MAX);
     const canRenew = typeof this.#adapter.renewJobs === 'function';
     this.#stalledThresholdMs =
       options.stalledThresholdMs ??
