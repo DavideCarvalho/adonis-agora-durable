@@ -178,7 +178,7 @@ if (input.n < 3) await ctx.continueAsNew({ n: input.n + 1 }) // clean history pe
 a `GatherError` carrying `.failures`; `{ mode: 'failFast' }` cancels remaining
 siblings (plain cancel — no saga). When some items failing is an expected outcome,
 use `ctx.allSettled(Workflow, inputs, { concurrency })` instead: the same fan,
-resolving with `{ status: 'fulfilled', value } | { status: 'rejected', id, error }`
+resolving with `{ status: 'fulfilled', value } | { status: 'rejected', id, error, code?, details? }`
 per input and never throwing for a child. Child ids derive from the call position and
 are replay-stable; never pass a random one. `{ concurrency: n }` caps how many
 children run at once (waves of `floor(n / 2)`, two at a time), and the wave goes into each child
