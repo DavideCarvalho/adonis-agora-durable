@@ -178,7 +178,9 @@ the tick in flight is deducted from the drain. The recovery fallbacks are
 One rule: `.dispatch(input)` = fire-and-forget (`{ runId }`); `.start(input)` =
 block until the run is **terminal** (it waits through sleeps/signals) and get its
 output; `engine.waitForRun(runId)` resolves a previously started run once it
-**settles** (terminal or suspended) — pass `{ terminal: true }` to wait for the end.
+**settles** (terminal or suspended — except a `suspended` run still awaiting a
+remote workflow turn's decision, which keeps waiting until the decision lands) —
+pass `{ terminal: true }` to wait for the end.
 
 ```ts
 const { runId } = await OrderWorkflow.dispatch(order) // hot path — respond now
