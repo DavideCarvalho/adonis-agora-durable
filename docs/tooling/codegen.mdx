@@ -175,7 +175,10 @@ if (detail?.run?.status === 'failed') {
 
 What the generated types cover:
 
-- **Fully shaped:** the components `RunStatus`, `RunSummary`, `Checkpoint`, `RunResult` and `Error`, the `GET /runs` page (`runs`, `meta`, `statuses`), the `GET /runs/{id}` detail (`run`, `timeline`, `children`, `fans`, `childCount`), path and query parameters, and request bodies.
+- **Fully shaped:** the components `RunStatus`, `RunSummary`, `Checkpoint`, `RunResult` and `Error`, the `GET /runs` page (`runs`, `meta`, `statuses`), the `GET /runs/{id}` detail (`run`, `timeline`, `children`, `fans`, `childCount`) and its `GET /runs/{id}/fans/{group}` page, path and query parameters, and request bodies.
+- **Conditional run detail:** `GET /runs/{id}` declares an `If-None-Match` header parameter and a bodiless `304`. The `200` carries an `ETag` with `Cache-Control: private, no-cache`, so a poller that sends the last `ETag` back pays nothing for an unchanged run; with `openapi-fetch`, check `response.status === 304` before reading `data`.
+- **Non-JSON routes:** `GET /metrics` is Prometheus text (`text/plain`, format 0.0.4), not JSON — fetch it as text or point a scraper at it (see [Metrics](/docs/durable/observability/metrics)).
+- **Other 0.51 routes:** `GET /runs/{id}/events/{key}` returns `{ value }` (the latest value the run published with `ctx.setEvent`, `value` absent when never published), and `POST /webhooks/{token}` delivers a `ctx.webhook()` callback (`404` for an unknown or no-longer-waiting token, `413` for an oversized body).
 - **Loosely typed:** many action and fleet responses (retry, cancel, bulk, schedules, health, workers, topology, compat, …) are declared as a plain `object`, so you get the route and its parameters typed but should narrow the response yourself. The [dashboard page](/docs/durable/observability/dashboard#where-it-mounts) documents what each returns.
 - Filters beyond `page` / `size` on `GET /runs` (the `filter[...]` envelope and flat `status` / `workflow` / `tag` / … params) are described in prose rather than as declared parameters. Pass them as extra query keys.
 
@@ -185,4 +188,4 @@ What the generated types cover:
 A generated client talks to the same routes the console does, including retry, cancel, bulk and the human-in-the-loop verbs. A browser client in your own frontend needs the dashboard to accept its requests: configure [`dashboardAuth`](/docs/durable/observability/dashboard-auth) or a custom `authorize` that recognises your app's session rather than shipping the bearer token to the browser. Mutating requests are also subject to the dashboard's cross-site rejection and session-role checks.
 </Callout>
 
-For server-side code in the same app, you don't need HTTP at all. The handlers behind the routes (`listRuns`, `getRun`, `retryRun`, `cancelRun`, …) are exported from `@adonis-agora/durable/dashboard`, and `runGateway` from `@adonis-agora/durable/services/main` is the role-agnostic read/control surface. See [Calling the API directly](/docs/durable/observability/dashboard#calling-the-api-directly).
+For server-side code in the same app, you don't need HTTP at all. The handlers behind the routes (`listRuns`, `getRun`, `getRunEvent`, `retryRun`, `cancelRun`, `deliverWebhook`, `metricsText`, …) are exported from `@adonis-agora/durable/dashboard`, and `runGateway` from `@adonis-agora/durable/services/main` is the role-agnostic read/control surface. See [Calling the API directly](/docs/durable/observability/dashboard#calling-the-api-directly).

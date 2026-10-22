@@ -150,7 +150,10 @@ router.post('/durable/webhooks/:token', async ({ params, request, response }) =>
 checkpointed and replay-safe. `hook.wait({ timeoutMs })` bounds the wait with a checkpointed deadline, so a
 run resumed after a crash still times out when it originally would have. The callback lands as
 `engine.signal(token, body)` from your own route — front it with signature verification, since the token is
-effectively a secret. Full details on minting, the handle shape, and delivering the callback:
+effectively a secret. Since 0.51 the [dashboard](/docs/durable/observability/dashboard) also mounts
+`POST <path>/api/webhooks/:token`, which only accepts a `wh:` token a run is actually waiting on (a stale or
+guessed one answers `404`) and sits behind the dashboard's own guard — so let the provider through in
+`authorize`, or keep your own route as above. Full details on minting, the handle shape, and delivering the callback:
 [Durable webhooks](/docs/durable/authoring/webhooks).
 
 ## 3. Fan-out/fan-in over a batch

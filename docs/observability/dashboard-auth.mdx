@@ -51,9 +51,11 @@ Both hooks are plain functions — they may be `async` and close over your app's
 | `secret` | yes | — | HMAC-SHA256 key the session cookie is signed with. Missing or empty fails closed at boot. |
 | `session` | one of the two | — | `(request) => DashboardSessionUser \| null` (may be async). Receives the raw Node request. Mode A. |
 | `login` | one of the two | — | `(username, password) => DashboardSessionUser \| null` (may be async). Mode B. |
-| `ttl` | no | `'8h'` | Cookie lifetime as a duration string (`'30m'`, `'8h'`, `'7d'`). |
+| `ttl` | no | `'8h'` | Cookie lifetime as `<integer><s\|m\|h\|d>` (`'30m'`, `'8h'`, `'7d'`). Any other spelling (`'1.5h'`, `'8 hours'`) silently falls back to 8 hours. |
 
-A hook returns a session user shaped `{ id: string; name?: string; roles?: string[] }`, or `null` to deny. `roles` is carried in the cookie for your own use — the console does not interpret it.
+A hook returns a session user shaped `{ id: string; name?: string; roles?: string[] }`, or `null` to deny. `name` (else `id`) is the actor the [audit log](/docs/durable/observability/dashboard#authorization) records for every mutating action.
+
+`roles` **is** interpreted. A session with an empty or absent `roles` list has full access. A session with a non-empty list is a **viewer** unless the list contains `operator` or `admin` (case-insensitive): it can read everything, but every mutating API route (retry, cancel, bulk, fix-and-replay, signal, update, task completion, schedule control) answers `403`. So map your own roles onto these two names, or leave `roles` out, rather than passing your app's role names through unchanged.
 
 <Callout type="warn" title="Validated at boot, so a mis-wired gate cannot ship">
 Two conditions throw at boot rather than at the first request: an absent or empty `secret`, and **neither** `session` nor `login` being a function. Keep `secret` out of source — read it from an env var.
@@ -61,7 +63,7 @@ Two conditions throw at boot rather than at the first request: an absent or empt
 
 ## What it adds
 
-When `dashboardAuth` is configured, the provider mounts up to four **public** endpoints under the console's `path`. They mint or clear the session the guard checks for, so they sit in front of it — and, importantly, in front of `authorize` too.
+When `dashboardAuth` is configured, the provider mounts up to five **public** endpoints under the console's `path`. They mint or clear the session the guard checks for, so they sit in front of it — and, importantly, in front of `authorize` too.
 
 | Method | Route | Mounted when | Purpose |
 | --- | --- | --- | --- |
@@ -69,6 +71,7 @@ When `dashboardAuth` is configured, the provider mounts up to four **public** en
 | `GET` | `<path>/login` | `login` is configured | the server-rendered sign-in page |
 | `POST` | `<path>/login` | `login` is configured | verifies credentials via your `login` hook and sets the cookie |
 | `GET` | `<path>/logout` | always | clears the cookie and redirects |
+| `POST` | `<path>/logout` | always | the same, for clients that prefer a non-`GET` logout |
 
 And it stamps a **session guard** onto every console route. Without a valid cookie:
 
@@ -77,9 +80,15 @@ And it stamps a **session guard** onto every console route. Without a valid cook
 
 `logout` redirects to `<path>/login` when a login page exists, and to the console root otherwise.
 
-The login page is a plain HTML form that works without JavaScript: a form submit is answered with a redirect — to the page the operator came from (`returnTo`, same-origin only), or back to the form with the error shown. Its inline script (which upgrades the submit to a `fetch`) and style carry `@adonisjs/shield`'s request nonce, so a `script-src 'self' @nonce` policy keeps the page working.
+`POST <path>/login` and `POST <path>/session` are rate-limited per client IP: past **10 attempts a minute** they answer `429`. The window is kept in memory per instance, so a cluster multiplies the budget by its pod count.
 
-The session is a stateless, signed HMAC-SHA256 cookie (`durable_dashboard_session`) — no server-side session store. It carries the user id, optional name and roles, plus issued-at and expiry, and is rejected once tampered with or expired. It is `httpOnly`, `sameSite=lax`, scoped to `/`, and `secure` on an HTTPS request.
+The routes are named `durable_dashboard.login.page`, `durable_dashboard.login.submit`, `durable_dashboard.session.mint`, `durable_dashboard.logout` and `durable_dashboard.logout.post`.
+
+The login page is a plain HTML form that works without JavaScript: a form submit is answered with a redirect — to the page the operator came from (`returnTo`, same-origin only), or back to the form with the error shown. The page's own `fetch` sends JSON instead and gets JSON back: `200 { redirectTo }` on success, `400` when `username` or `password` is not a string, `401 { error }` otherwise. The password is passed to your hook as typed (an empty string when blank), so a hook that gates on the username alone works with the same page. Its inline script (which upgrades the submit to a `fetch`) and style carry `@adonisjs/shield`'s request nonce, so a `script-src 'self' @nonce` policy keeps the page working.
+
+The session is a stateless, signed HMAC-SHA256 cookie (`durable_dashboard_session`) — no server-side session store. It carries the user id, optional name and roles, plus issued-at and expiry, and is rejected once tampered with or expired. It is `httpOnly`, `sameSite=lax`, scoped to `/`, and `secure` on an HTTPS request — and always `secure` under `NODE_ENV=production`, even when a TLS-terminating proxy hides the scheme from AdonisJS.
+
+The cookie is not renewed while the operator works: it expires `ttl` after it was minted, and the operator signs in (or is sent through your app) again. A user you deactivate or demote in your app keeps the access the cookie carries until it expires, so keep `ttl` short when that matters.
 
 <Callout type="info">
 Every credential failure — unknown user, wrong password, or a throwing hook — returns the **same** uniform `401` ("Invalid username or password."), so the endpoint does not leak whether a username exists. A throwing hook is warn-logged once per process server-side, but never changes the client-visible response.
@@ -90,7 +99,7 @@ Every credential failure — unknown user, wrong password, or a throwing hook �
 This is the flow where the operator never sees a second login. Your app already knows who they are; the console's job is to accept that.
 
 <Callout type="warn" title="Your integration point is the route, not a helper">
-The supported, stable contract is **`POST <path>/session`**. The console's SPA package ships a browser helper that calls it, and you are welcome to use it, but it is a convenience wrapper — an internal detail of the bundled client, not the API. Anything that can issue an HTTP request can open the console.
+The supported, stable contract is **`POST <path>/session`**. The bundled console has an internal helper that calls it, but it is not published as an importable entry point. Write the call yourself, as below — anything that can issue an HTTP request can open the console.
 </Callout>
 
 ### 1. Write the `session` hook
@@ -119,7 +128,8 @@ export default defineConfig({
       const user = await verifyAppSession(token)
       if (!user || !user.roles.includes('ops')) return null
 
-      return { id: user.id, name: user.name, roles: user.roles }
+      // Map onto the console's two roles: `operator` may act, anything else is read-only.
+      return { id: user.id, name: user.name, roles: user.roles.includes('ops-admin') ? ['operator'] : ['viewer'] }
     },
   },
 })
@@ -150,7 +160,7 @@ export async function openDurableConsole() {
 }
 ```
 
-A successful mint answers `204` with an empty body. It takes **no request body** — everything your hook needs is already on the request.
+A successful mint answers `204` with an empty body; a denial (the hook returned `null` or threw) answers `401 { "error": "unauthorized" }`. It takes **no request body** — everything your hook needs is already on the request.
 
 Handle the redirect case deliberately: if your own auth middleware turns an unauthenticated `POST` into a `302` to your sign-in page, `fetch` would follow it and report a cheerful `200` for an HTML login form. `redirect: 'manual'` turns that into the failure it actually is.
 

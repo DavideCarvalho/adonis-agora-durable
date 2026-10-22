@@ -14,7 +14,7 @@ license: MIT
 metadata:
   type: core
   library: "@adonis-agora/durable"
-  library_version: "0.25.0"
+  library_version: "0.51.0"
   framework: adonisjs
 sources:
   - 'DavideCarvalho/adonis-durable:docs/transports/index.mdx'
@@ -59,6 +59,11 @@ export default defineConfig({
 
 Switching transports is a one-line change; workflow code never changes.
 
+`transports.eventEmitter({ onError })` reports a failing result/heartbeat
+handler (default `console.error`) and redelivers a failed result from memory
+with backoff until `close()`. Before 0.50 such a failure was an unhandled
+rejection — fatal under Node's default — and the result was lost.
+
 ## Core patterns
 
 ### Pattern 1 — cross-process steps without new infrastructure (`db`)
@@ -82,9 +87,9 @@ handler name and claims only as many rows as it has free slots. Every held
 claim is renewed every `leaseMs / 3`, and a row is recorded (task delete +
 result insert, one transaction) only while `claimed_by` is still the worker's
 token — a worker whose claim was taken over drops its result and reports it to
-`onError`. (Releases before this claimed 20 rows per poll, renewed only the
+`onError`. (Before 0.50 the loop claimed 20 rows per poll, renewed only the
 running one, and double-ran the rest of the batch when a step outlived
-`leaseMs`.) Idle task/heartbeat/control loops back off up to `idleBackoffMax`
+`leaseMs` — upgrade if `db` steps run twice.) Idle task/heartbeat/control loops back off up to `idleBackoffMax`
 (default 4) poll intervals; results never back off.
 
 Workers beat `durable[-<ns>]-worker-heartbeat:<token>:<instance>` into
@@ -182,7 +187,7 @@ export default defineConfig({
   timerBatchSize: 1000, // due runs per timer pass, most overdue first (default 500)
   transports: {
     bullmq: transports.bullmq({
-      connection: { host: '127.0.0.1', port: 6379 },
+      connection: { host: '127.0.0.1', port: 6379 }, // or 'redis://…' / 'rediss://…' (0.50+)
       resultConcurrency: 16, // default 1
       // A number pins each task queue's concurrency (default 1). 'adaptive' moves it
       // every tickMs: +1 while steps saturate the limit at steady latency, down by the
@@ -206,8 +211,10 @@ one a VPN/NAT/idle timeout dropped silently, so autoResubscribe restores it; eac
 subscriber also gets an `error` listener (reported once per burst to `onError`).
 `stepTimeoutMs` (off by default) fails a step handler still running at the
 ceiling as RETRYABLE, so a wedged `await` cannot hold its job forever (BullMQ
-renews the lock on a timer, so the job never stalls). Source:
-`docs/transports/bullmq.mdx`.
+renews the lock on a timer, so the job never stalls). A `redis://` /
+`rediss://` connection string is parsed into ioredis options since 0.50; before
+0.50 it was silently ignored and every client connected to `127.0.0.1:6379`.
+Source: `docs/transports/bullmq.mdx`.
 
 ### Pattern 3 — multi-replica fan-out: the control plane
 
@@ -338,7 +345,8 @@ Mechanism: the transport renews every in-flight claim each half threshold
 synchronous body starves the renewal timer; once the claim goes unrenewed past
 the threshold the sweep re-delivers it and the step runs twice — reported to
 `onError` as `lost N of M claim(s)`. Raising the threshold to cover step LENGTH
-is no longer needed (that was the pre-renewal rule).
+is no longer needed: before 0.50 the `queue` transport never renewed claims
+(30min default threshold, long steps re-delivered); upgrade instead.
 Source: `docs/transports/queue.mdx` ("Stalled-job reclaim").
 
 ### HIGH hand-copying the DDL into the migration

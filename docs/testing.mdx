@@ -4,10 +4,10 @@ description: Unit-test workflows with an in-memory engine harness, a clock you c
 icon: FlaskConical
 ---
 
-The `@adonis-agora/durable/testing` subpath runs a whole workflow in a unit test — in-memory store and transport, a clock you control, and assertions that read back the recorded state. It ships in the main `@adonis-agora/durable` package; install `vitest` as the only extra peer.
+The `@adonis-agora/durable/testing` subpath runs a whole workflow in a unit test — in-memory store and transport, a clock you control, and assertions that read back the recorded state. It ships in the main `@adonis-agora/durable` package and imports no test runner, so it works under Japa, vitest or anything that fails a test on a thrown error. `vitest` is an **optional** peer, needed only for the [conformance suites](#conformance-kits) on `@adonis-agora/durable/testing/conformance`:
 
 ```bash
-npm i -D vitest
+npm i -D vitest # only if you run the conformance suites
 ```
 
 ## A test engine
@@ -31,6 +31,25 @@ test('checkout completes', async () => {
 ```
 
 `t.run(workflow, input, runId, opts?)` enqueues and waits for the run to settle (terminal or suspended) — use it when a test needs the outcome synchronously, since `engine.start` only enqueues. It is exactly `await t.engine.start(workflow, input, runId, opts)` followed by `t.engine.waitForRun(runId)`, and resolves to the same `RunResult` (`{ runId, status, output, error }`).
+
+### Testing a `BaseWorkflow` class
+
+An [`app/workflows` class](/docs/durable/authoring/app-workflows) registers on the test engine with `registerWorkflowClass(engine, Class)` from `@adonis-agora/durable` — the same call the provider makes at boot, so the class's `static workflow` identity, tags, singleton, concurrency, `inputSchema`, `onError` routes and colocated `static schedule` / `static on` triggers all come along. Then start it by class or by name:
+
+```ts
+import { registerWorkflowClass } from '@adonis-agora/durable'
+import { createTestEngine, assertRunStatus } from '@adonis-agora/durable/testing'
+import OrderWorkflow from '#workflows/order_workflow'
+
+test('order workflow completes', async () => {
+  const t = createTestEngine()
+  await registerWorkflowClass(t.engine, OrderWorkflow) // async: it may resolve the instance through a factory
+  await t.run(OrderWorkflow, { orderId: 'o1' }, 'run1')
+  await assertRunStatus(t.store, 'run1', 'completed')
+})
+```
+
+Pass a third `factory` argument (`(Ctor) => instance`, may be async) when the class needs constructor-injected dependencies — hand it fakes, or `(Ctor) => app.container.make(Ctor)` in an app-level test.
 
 ### Dispatched steps — `t.transport.handle`
 
@@ -190,6 +209,7 @@ Or in code, `captureHistory(engine, runId)` returns the same `RunHistory` (`{ ru
 
 ```ts title="tests/replay.spec.ts"
 import { readFileSync } from 'node:fs'
+import { test } from '@japa/runner'
 import { assertReplayable, parseRunHistory } from '@adonis-agora/durable/testing'
 import { checkout } from '../app/workflows/checkout.js'
 
@@ -197,6 +217,19 @@ test('checkout replays its recorded production history', async () => {
   const fixture = parseRunHistory(readFileSync('tests/fixtures/checkout-run.json', 'utf8'))
   await assertReplayable((engine) => engine.register('checkout', '1', checkout), fixture)
 })
+```
+
+`register` is called synchronously, so for a `BaseWorkflow` class bind its `run` with `engine.register` rather than the async `registerWorkflowClass`:
+
+```ts
+import { workflowMeta } from '@adonis-agora/durable'
+import CheckoutWorkflow from '#workflows/checkout_workflow'
+
+const meta = workflowMeta(CheckoutWorkflow)! // { name, version } from `static workflow` (version defaults to '1')
+await assertReplayable(
+  (engine) => engine.register(meta.name, meta.version, (ctx, input) => new CheckoutWorkflow().run(ctx, input)),
+  fixture,
+)
 ```
 
 A passing test means the current code replays the recorded history checkpoint-for-checkpoint. A failing one is the exact break that would have corrupted an in-flight run on deploy — fix it with a [version bump or a `ctx.patched` gate](/docs/durable/authoring/versioning) rather than by re-recording the fixture, unless no runs of the old shape can still be in flight.

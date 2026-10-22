@@ -41,7 +41,11 @@ export default defineConfig({
 
 ### Authorization
 
-The default `authorize` **fails closed in every environment**: it requires a bearer token equal to the `DURABLE_DASHBOARD_TOKEN` env var, and denies everything when that var is unset. (Before 0.37 it was open outside `NODE_ENV=production` — which left dev boxes, staging, and any deployment with a misspelled/unset `NODE_ENV` serving an unauthenticated console.) The token is accepted from an `Authorization: Bearer <token>` header or an `x-durable-token` header; the `?token=` query param works on **GET only** (it exists for the SSE live-tail, whose `EventSource` cannot set headers) — never on a mutating route, so a leaked/logged URL can't act as a destructive magic link.
+The default `authorize` **fails closed in every environment**: it requires a bearer token equal to the `DURABLE_DASHBOARD_TOKEN` env var, and denies everything when that var is unset. (Before 0.37 it was open outside `NODE_ENV=production` — which left dev boxes, staging, and any deployment with a misspelled/unset `NODE_ENV` serving an unauthenticated console.) The token is accepted from an `Authorization: Bearer <token>` header or an `x-durable-token` header, compared in constant time; the `?token=` query param works on **GET and HEAD only** (it exists for the SSE live-tail, whose `EventSource` cannot set headers) — never on a mutating route, so a leaked/logged URL can't act as a destructive magic link.
+
+<Callout type="info" title="The token gate is for scripts and proxies, not browsers">
+The bundled console never attaches a token: its page navigation, its `fetch` calls and its `EventSource` carry only the browser's cookies. The default token gate therefore suits machine clients (a script, a Prometheus scrape of [`/api/metrics`](#live-queries-webhooks-and-metrics)) or a reverse proxy that injects the header. For operators in a browser, use [`dashboardAuth`](/docs/durable/observability/dashboard-auth) or an `authorize` hook that reads your app's own session cookie.
+</Callout>
 
 Three ways to open the console up, in order of preference:
 
@@ -51,10 +55,10 @@ Three ways to open the console up, in order of preference:
 
 Two request-level guards apply on top of whatever gate you pick:
 
-- **Cross-site rejection** — a browser-originated cross-site mutating request (by `Sec-Fetch-Site`, else `Origin` vs `Host`) gets a `403` before any handler runs, closing the drive-by CSRF shape (the mutating endpoints need no body, so they used to be firable as simple cross-origin POSTs). Non-browser clients send neither header and pass.
-- **Session roles** — a `dashboardAuth` session whose `roles` list is **non-empty** must include `operator` (or `admin`) to hit a mutating route; everything else is a viewer (`403`). An empty/absent roles list keeps full access, so existing hooks that never set roles are unchanged.
+- **Cross-site rejection** — a browser-originated cross-site mutating request (by `Sec-Fetch-Site`, else `Origin` vs `Host`) gets `403 { "error": "cross-site request rejected" }` before any handler runs, closing the drive-by CSRF shape (the mutating endpoints need no body, so they used to be firable as simple cross-origin POSTs). `Sec-Fetch-Site: same-site` counts as cross-site on purpose, so a sibling subdomain cannot drive the console's actions either; an `Origin: null` is rejected too. Non-browser clients send neither header and pass.
+- **Session roles** — a `dashboardAuth` session whose `roles` list is **non-empty** must include `operator` or `admin` (compared case-insensitively) to hit a mutating route; everything else is a viewer (`403`). An empty/absent roles list keeps full access, so existing hooks that never set roles are unchanged.
 
-Every mutating attempt is also **audited** — actor (session name/id, `token`, or `anonymous`), method and path — through the app logger, or your own `audit` hook on the config. Payloads an operator submits (fix-and-replay input, signal/update/task bodies) are capped at 1 MiB (`413`).
+Every mutating attempt is also **audited** before its handler runs — actor (session name/id, `token`, or `anonymous`), method and path without the query string — through the app logger, or your own `audit` hook on the config. Reads are not audited. Payloads an operator submits (fix-and-replay input, signal/update/task bodies, webhook callbacks) are capped at 1 MiB (`413`). A handler that throws answers a generic `500 { "error": "internal error" }`; the detail goes to the app logger, never to the client.
 
 Override `authorize` with your own session/role/IP guard — a denied request gets a `403`: JSON for an API call, the [access-denied page](#the-access-denied-page) for a browser:
 
@@ -177,13 +181,13 @@ The console routes client-side on the URL hash (`#/run/<id>`), so a deep link ne
 | `workflow` | exact workflow-name match. Repeatable — repeats match ANY of them. |
 | `tag` | exact match against the run's tags. Repeatable — repeats match runs carrying ANY of them. |
 | `namespace` | exact match against the run's [worker-pool namespace](/docs/durable/cluster/roles-and-config) — omit it and the listing spans every namespace. Repeatable — repeats match ANY of them. |
-| `origin` | exact match against the run's [package attribution](/docs/durable/concepts/workflows-and-steps#run-origin--package-attribution). The "unknown" bucket (absent origin) can't be expressed as an exact match — the console filters that one client-side. |
+| `origin` | exact match against the run's [package attribution](/docs/durable/concepts/workflows-and-steps#run-origin--package-attribution). One value only: a repeat keeps the first. The "unknown" bucket (absent origin) can't be expressed as an exact match — the console filters that one client-side. |
 | `createdAfter` / `createdBefore` | time-range bounds on the run's creation, as epoch ms or an ISO date string — pushed down server-side. |
 | `attr` | a [search-attribute](/docs/durable/authoring/queries-and-updates) filter, `key:op:value`. Repeatable, and repeats are ANDed — opaque in the envelope too (`filter[attr]`), since attribute keys are dynamic; `filter[attr.<key>][<op>]=value` works as well. |
 | `page` | 1-based page number, default `1` |
 | `size` | page size, default `50`, capped at `200` |
 
-The `attr` ops are `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in` — opaque through both spellings (`filter[attr.<key>]` takes the canonical `equals`/`notEquals`/`in`/`isAnyOf` aliases). Values are coerced: `true`/`false` become booleans, anything numeric becomes a number, everything else stays a string. Only the first two colons delimit, so a value may contain colons of its own. `in` takes a `|`-separated set (`tier:in:pro|enterprise`) and matches it as OR inside the one predicate — two `eq` predicates on one key are ANDed like every other pair, which no run can satisfy.
+The `attr` ops are `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in` — opaque through both spellings (`filter[attr.<key>][<op>]` takes the filter lib's canonical names: `equals`, `notEquals`, `gt`, `gte`, `lt`, `lte`, and `in`/`isAnyOf`). Values are coerced: `true`/`false` become booleans, anything numeric becomes a number, everything else stays a string. Only the first two colons delimit, so a value may contain colons of its own. `in` takes a `|`-separated set (`tier:in:pro|enterprise`) and matches it as OR inside the one predicate — two `eq` predicates on one key are ANDed like every other pair, which no run can satisfy.
 
 ```
 GET /durable/api/runs?namespace=eu-west&attr=amount:gte:5000&attr=tier:eq:enterprise&status=failed
@@ -227,7 +231,8 @@ const source = new EventSource(`/durable/api/runs/${runId}/stream`)
 source.onmessage = (msg) => {
   const event = JSON.parse(msg.data)
   // event.type is one of run.started / run.completed / run.failed / run.suspended /
-  // step.started / step.completed / step.failed / capability.unavailable / protocol.incompatible
+  // run.routed / run.unrouted / step.started / step.completed / step.failed /
+  // step.progress (a live step event, never persisted) / capability.unavailable / protocol.incompatible
   console.log(event.type, event.name, event.durationMs)
 }
 ```
@@ -288,13 +293,13 @@ The runs list already *names* what a suspended run is parked on (the [`waiting`]
 
 - **`POST /api/runs/:id/signal`** delivers `{ token, payload? }` to a [`ctx.waitForSignal`](/docs/durable/concepts/sleep-and-signals#signals-human-in-the-loop) rendezvous. It is **guarded**: unless you pass `force: true`, the token must be one the run is *currently waiting on* — a typo'd token would otherwise buffer a stray payload silently instead of resuming anything. A mismatch answers `409` carrying the `waitingOn` token list, so a client can offer the real choices; `force: true` buffers the payload anyway (the reliable-delivery path).
 - **`POST /api/runs/:id/update/:name`** delivers `{ arg? }` to a [`ctx.onUpdate(name)`](/docs/durable/authoring/queries-and-updates#updates) point. The workflow's registered validator arbitrates **server-side**: a rejection answers `422` with the reason, and nothing is delivered.
-- **`POST /api/runs/:id/tasks/:name/complete`** (body `{ result? }`) and **`.../fail`** (body `{ error }`) settle an external [`ctx.task`](/docs/durable/authoring/external-tasks#external-async-completion-tasks--ctxtask) — the console equivalents of `engine.completeTask` / `engine.failTask`. The response is honest about delivery: `{ result, delivered: true }` when a live waiter consumed it, `{ result: null, delivered: false }` when no waiter was live *yet* and the completion was **buffered** for the run to consume when it reaches the task's wait — buffered is success, not a 404.
+- **`POST /api/runs/:id/tasks/:name/complete`** (body `{ result? }`) and **`.../fail`** (body `{ error }`, a string; it defaults to `failed from console`) settle an external [`ctx.task`](/docs/durable/authoring/external-tasks#external-async-completion-tasks--ctxtask) — the console equivalents of `engine.completeTask` / `engine.failTask`. The response is honest about delivery: `{ result, delivered: true }` when a live waiter consumed it, `{ result: null, delivered: false }` when no waiter was live *yet* and the completion was **buffered** for the run to consume when it reaches the task's wait — buffered is success, not a 404.
 
 On a store-less `tenant` pod these verbs answer `404`: they need the engine's signal surface. `retry`, `retry-with-input` and `continue` do work there; they ride the wire to the control plane (see [the gateway verbs](/docs/durable/cluster/roles-and-config#reading-and-steering-runs-rungateway)).
 
 #### Bulk actions
 
-`POST /api/bulk/:action` applies one action to **everything a filter matches**, where `:action` is `retry` or `cancel` (anything else is a `400`). The selection comes from the query string, using the same `status` / `workflow` / `tag` / `namespace` / `attr` filters as `GET /api/runs` — there is no id list to assemble:
+`POST /api/bulk/:action` applies one action to **everything a filter matches**, where `:action` is `retry` or `cancel` (anything else is a `400`). The selection comes from the query string, using the same filters as `GET /api/runs` (`status`, `workflow`, `tag`, `namespace`, `origin`, `createdAfter` / `createdBefore`, `attr`, in either spelling) — there is no id list to assemble:
 
 ```
 POST /durable/api/bulk/retry?status=failed&workflow=charge-order&namespace=eu-west
@@ -310,7 +315,7 @@ Both cancel routes read `compensate` from **either** the query string or the JSO
 Anything else is a `400`. That is deliberate: the two ways to guess at an unreadable value are "skip an undo the operator asked for" and "run an undo they did not", and both would be silent. An explicit rejection is the only answer that cannot mislead.
 
 <Callout type="info">
-A compensating cancel answers with the run's **pre-cancel** status, not `cancelled`. The undo replays the workflow's saga in the background so the HTTP request never blocks on it, and the run reaches `cancelled` once the compensations finish — watch the run's [stream](#live-tailing-one-run) or poll it rather than reading the response body as the final state. A plain cancel is terminal in the response itself.
+A compensating cancel answers with the run's **pre-cancel** status, not `cancelled`. The undo replays the workflow's saga in the background so the HTTP request never blocks on it: the completed steps' compensations run in reverse order, each visible as a `compensate:<step>` event in the timeline, and the run reaches `cancelled` once they finish — watch the run's [stream](#live-tailing-one-run) or poll it rather than reading the response body as the final state. A plain cancel is terminal in the response itself.
 </Callout>
 
 The response is `{ matched, applied }`. `matched` is how many runs the filter returned; `applied` is how many the action actually changed. They differ when a run has already moved on — a run that throws or answers "nothing to do" is skipped rather than aborting the batch.
@@ -382,7 +387,7 @@ These are the console's Schedules tab, riding [`engine.listSchedules` / `setSche
 
 `GET /api/workers` returns the raw `GroupHealth[]` — for each routing token, its queue `depth` and the **individual live workers** with their `instanceId` and `lastBeatAt`. That is what tells "one worker is wedged" apart from "the whole group is down".
 
-On the [BullMQ](/docs/durable/cluster/interop) and [queue](/docs/durable/transports/queue#worker-health) transports, each worker's heartbeat also carries a live `status` telemetry snapshot (`WorkerStatus`) that the console renders on its worker cards: the concurrency mode and limit (`fixed` or `adaptive`, with `min`/`max`), `inFlight`, RSS (`rssBytes`, plus `rssLimitBytes`/`rssPct` when a ceiling is known), `cpuPct`, `throughputPerMin`, `p95Ms`, and the last adaptive concurrency adjustment with its reason. Workers that beat without one (a thin worker runtime's compact beat) omit `status` — the cards degrade to liveness only.
+On the [BullMQ](/docs/durable/cluster/interop), [queue](/docs/durable/transports/queue#worker-health) and db transports, each worker's heartbeat also carries a live `status` telemetry snapshot (`WorkerStatus`) that the console renders on its worker cards: the concurrency mode and limit (`fixed` or `adaptive`, with `min`/`max`), `inFlight`, RSS (`rssBytes`, plus `rssLimitBytes`/`rssPct` when a ceiling is known), `cpuPct`, `throughputPerMin`, `p95Ms`, and the last adaptive concurrency adjustment with its reason. Workers that beat without one (a thin worker runtime's compact beat) omit `status` — the cards degrade to liveness only.
 
 `GET /api/health` is the older, compact view of the same data: it collapses `liveWorkers` to a count and adds `stalled: depth > 0 && liveWorkers === 0`. It stays for hand-written clients and probes; prefer `/api/workers` for anything new.
 
@@ -400,7 +405,7 @@ The routes are all named (`durable_dashboard.index`, `durable_dashboard.runs.sho
 - **Wide fans** — a fan of more than 50 members draws as one node in the graph and one row in the timeline, labelled `label ×total`, with a segmented progress bar against its declared size, a legend (`done`, `failed`, `running`, `pending`, `not started`), `600 of 40000 started`, and its sampled failures. Once the run has finished (`completed`, `failed`, `cancelled` or `dead`), members still running or pending read as `interrupted` and the ones never sent as `never ran`, marked `(failFast)` when a failFast fan stopped early. A `blocked` or `suspended` run is not finished, so its fans stay in flight. Expanding it lists the members in a virtualized list that pages them in as you scroll, with a failed-only toggle. The run header lists the first 12 children and counts the rest, and only the first 50 children's details are fetched to label their rows.
 - **Actions** — retry, cancel, cancel + undo ([saga compensation](/docs/durable/reliability/sagas)), fix-and-replay, redispatch, continue, the [human-in-the-loop verbs](#human-in-the-loop-signals-updates-and-tasks) (deliver a signal, a validated update, or a task completion), and the bulk equivalents of retry and cancel.
 - **Schedules** — the ticked [scheduled workflows](/docs/durable/authoring/scheduling) with their fire windows and effective pause state, plus pause / resume / run-now controls that apply fleet-wide at runtime.
-- **Worker cards** — on the BullMQ transport, each worker's live telemetry: concurrency, in-flight, RSS/CPU, throughput and p95.
+- **Worker cards** — on the BullMQ, queue and db transports, each worker's live telemetry: concurrency, in-flight, RSS/CPU, throughput and p95.
 
 ### The `waiting` state
 
@@ -412,6 +417,8 @@ The routes are all named (`durable_dashboard.index`, `durable_dashboard.runs.sho
 | `webhook` | a [`ctx.webhook().wait()`](/docs/durable/authoring/webhooks) callback |
 | `child` | a [child run](/docs/durable/authoring/child-workflows); `name` is the child's run id |
 | `breakpoint` | a `ctx.breakpoint()` — a human has to release it |
+
+The kind comes from the waiter token's prefix, so no extra store read is needed: `wh:` is a webhook, `child:` a child run, `bp:` a breakpoint (named `breakpoint` rather than its raw `bp:<runId>:<seq>` token), an `event:` token a `ctx.waitForEvent` (named by its decoded event name), and anything else a signal named by the token itself. `engine.continue` resumes a breakpoint through the same signal machinery.
 
 A `suspended` run with no waiter gets no `waiting` value, and that absence is itself informative: a bare `ctx.sleep`, an in-flight remote step and a run whose wake was lost all fall into that bucket. Use [`durable:runs --stale`](/docs/durable/cli) to separate the last one from the first two.
 
@@ -478,7 +485,8 @@ The timeline flags this instead of drawing it as a healthy in-flight step. A rem
 A live heartbeat proves the worker *process* is alive, not that the step is progressing. From a lost row you have two ways to recover:
 
 - **Re-dispatch** — `POST /api/runs/:id/redispatch` (the console's *Re-dispatch* action) re-enqueues every `pending` remote step on the run, bumping its `attempts`, so the idempotent step re-runs and its result resumes the run. It is the same as `engine.redispatchPending(runId)`.
-- **Self-heal** — set `remoteRedispatchMs` (and optionally `remoteRedispatchMax`, default `10`) in `config/durable.ts`, and a reconcile pass re-dispatches a remote step still `pending` past the window by itself, recording a `warn`-level `step.redispatched` event on the checkpoint. Once the bound is spent, the step fails with `remote_step_lost`. This is off by default. See [Failure modes](/docs/durable/reliability/failure-modes#lost-remote-dispatch-the-run-suspends-and-nothing-auto-redrives-it) for the window-sizing rules.
+- **Broker bridge (BullMQ and queue)** — when a task job reaches a terminal `failed` state with no result (its worker crashed, or it stalled past the broker's stalled-count limit), the transport publishes a retryable failed result for the step, so the engine settles the checkpoint and its normal retry re-dispatches. That bridge lives in the consumer: a worker on another SDK that does not implement it still leaves the step `pending`.
+- **Self-heal** — set `remoteRedispatchMs` (and optionally `remoteRedispatchMax`, default `10`) in `config/durable.ts`, and a reconcile pass re-dispatches a remote step still `pending` past the window by itself, recording a `warn`-level `step.redispatched` event on the checkpoint; the `step.started` event of that re-drive carries `redispatched: true`, so an alert can tell "re-driven after a lost worker" apart from "retried after a failure". Once the bound is spent, the step fails with `remote_step_lost`. This is off by default. See [Failure modes](/docs/durable/reliability/failure-modes#lost-remote-dispatch-the-run-suspends-and-nothing-auto-redrives-it) for the window-sizing rules.
 
 ## Fleet health
 
@@ -499,7 +507,7 @@ The console's worker cards and its actions are a thin layer over methods `Workfl
 interface GroupHealth {
   group: string
   /** Outstanding jobs in the group's task queue: waiting + active + delayed + prioritized on BullMQ,
-   *  pending only on the queue transport. */
+   *  pending only on the queue transport, pending + claimed task rows on the db transport. */
   depth: number
   /** Workers with a non-expired heartbeat for this group. */
   liveWorkers: WorkerHeartbeat[]
@@ -519,7 +527,7 @@ interface WorkerHeartbeat {
 
 **Bulk and tree operations:**
 
-- `engine.cancelWhere(filter, opts?)` cancels every run matching a run query (workflow, status, tag, namespace, search-attribute predicates), each through the normal `cancel` path: child cascade, optional `{ compensate: true }` saga undo, cancel listeners and the control-plane broadcast. It is the scriptable form of the console's bulk cancel, without the 500-run cap. It returns one `RunResult` per matched run.
+- `engine.cancelWhere(filter, opts?)` cancels every run matching a run query (workflow, status, tag, namespace, search-attribute predicates), each through the normal `cancel` path: child cascade, optional `{ compensate: true }` saga undo, cancel listeners and the control-plane broadcast. It is the scriptable form of the console's bulk cancel, without the 500-run cap. It returns one `RunResult` per run it cancelled (a run that no longer exists is skipped).
 - `engine.deleteRun(runId)` hard-deletes a run and its whole child subtree (checkpoints, signal waiters, search-attribute rows) and returns the number of runs deleted. Unlike `cancel`, the run disappears from the listing. Cancel a live run first, since deleting one mid-flight orphans its worker. For deleting by scope, see [`engine.purgeRuns`](/docs/durable/reliability/retention#purging-on-demand--enginepurgeruns).
 - `engine.getRunChildren(parentRunId)` returns the ids a run spawned via `ctx.child` or `ctx.startChild`. The console's run tree and the `cancel` cascade walk the same parent-to-children edge.
 

@@ -15,7 +15,7 @@ license: MIT
 metadata:
   type: core
   library: "@adonis-agora/durable"
-  library_version: "0.25.0"
+  library_version: "0.51.0"
   framework: adonisjs
 sources:
   - 'DavideCarvalho/adonis-durable:docs/reliability/retries.mdx'
@@ -40,7 +40,7 @@ Retries are declared per step; `FatalError` opts a deterministic business
 failure out of the retry path:
 
 ```ts title="app/steps/charge.ts"
-import { defineStep } from '@adonis-agora/durable'
+import { FatalError, defineStep } from '@adonis-agora/durable'
 
 export const chargeCard = defineStep(
   'payments:charge-card',
@@ -48,7 +48,7 @@ export const chargeCard = defineStep(
     const res = await stripe.charge(input)
     if (res.declined) {
       // deterministic verdict — don't make the engine retry it
-      throw Object.assign(new Error('card declined'), { code: 'declined', retryable: false })
+      throw new FatalError('card declined', 'declined')
     }
     return { chargeId: res.id }
   },
@@ -56,7 +56,9 @@ export const chargeCard = defineStep(
 )
 ```
 
-A dispatched step WITHOUT `timeoutMs` takes the durable path: failure → persist
+`FatalError` carries `retryable: false`, which the step result builders read; a
+worker in another runtime gets the same effect by throwing any error with
+`retryable: false` (and an optional `code`). A dispatched step WITHOUT `timeoutMs` takes the durable path: failure → persist
 `wakeAt = now + backoff(attempt)` on the checkpoint → suspend → the timer poller
 re-dispatches. Crash-safe, never held in memory.
 
@@ -172,22 +174,14 @@ node ace durable:retry checkout:1234
 ```
 
 ```ts title="app/controllers/ops_controller.ts"
-import { inject } from '@adonisjs/core'
-import {
-  DEFAULT_STALE_MS,
-  WorkflowEngine,
-  attachLiveness,
-  filterStale,
-  listRuns,
-} from '@adonis-agora/durable'
+import type { HttpContext } from '@adonisjs/core/http'
+import { DEFAULT_STALE_MS, attachLiveness, filterStale, listRuns } from '@adonis-agora/durable'
+import engine from '@adonis-agora/durable/services/main'
 
-@inject()
 export default class OpsController {
-  constructor(private engine: WorkflowEngine) {}
-
   async strandedRuns({ response }: HttpContext) {
-    const runs = await listRuns(this.engine, { statuses: ['running', 'suspended'], limit: 200 })
-    const stale = filterStale(await attachLiveness(this.engine, runs), DEFAULT_STALE_MS)
+    const runs = await listRuns(engine, { statuses: ['running', 'suspended'], limit: 200 })
+    const stale = filterStale(await attachLiveness(engine, runs), DEFAULT_STALE_MS)
     return response.ok({ stranded: stale.map(({ run }) => run.id) })
   }
 }
@@ -209,7 +203,10 @@ Remote (polyglot) workflow TURNS have their own net: `remoteAdvanceSilenceMs`
 engine records the turn's random `taskId` on the run (`awaitingDecisionTaskId`),
 releases the lease, then enqueues; whichever replica consumes the decision
 applies it by run id (stale/duplicate decisions dropped), so a point-to-point
-`<P>-decisions` queue across replicas is safe. A turn with no decision and no
+`<P>-decisions` queue across replicas is safe. That is 0.51+: before 0.51 a
+replica that had not dispatched the turn consumed the decision, found no waiter
+and dropped it, leaving the run leased forever — upgrade any multi-replica fleet
+running remote (Python/NestJS) workflows. A turn with no decision and no
 run-scoped heartbeat (`{ runId, seq: 0, group }`, sent every 5s by the Python
 and TS workers) for the window is re-dispatched by the timer poller — never
 failed. Unset = wait for the decision forever. Source:
@@ -299,7 +296,7 @@ Correct:
 
 ```ts
 const inFlight = counts['run.started'] - (counts['run.completed'] + counts['run.failed'])
-// or read the store: listRuns({ status: ['running', 'suspended'] })
+// or read the store: listRuns(engine, { statuses: ['running', 'suspended'] })
 ```
 
 Mechanism: `run.suspended` fires on EVERY park — each sleep, signal wait, child
