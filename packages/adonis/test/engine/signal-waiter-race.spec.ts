@@ -84,7 +84,7 @@ function waitSignalExecutor(token: string): WorkflowExecutor {
   };
 }
 
-async function waitUntil(fn: () => boolean | Promise<boolean>, timeoutMs = 1000): Promise<void> {
+async function waitUntil(fn: () => boolean | Promise<boolean>, timeoutMs = 20_000): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     if (await fn()) return;

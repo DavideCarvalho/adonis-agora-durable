@@ -35,7 +35,7 @@ import { WorkerRuntime } from '../../../src/worker-runtime/worker-runtime.js';
 
 const POLL = 5;
 
-async function until(cond: () => boolean, budgetMs = 1500): Promise<void> {
+async function until(cond: () => boolean, budgetMs = 20_000): Promise<void> {
   const start = Date.now();
   while (!cond()) {
     if (Date.now() - start > budgetMs) throw new Error('timed out waiting for condition');
@@ -348,7 +348,7 @@ describe('QueueTransport — store-less protocol and remote workflows', () => {
       return cp;
     };
     /** Wait until `cond` (async) holds. */
-    const eventually = async (cond: () => Promise<boolean>, budgetMs = 1500) => {
+    const eventually = async (cond: () => Promise<boolean>, budgetMs = 20_000) => {
       const at = Date.now();
       while (!(await cond())) {
         if (Date.now() - at > budgetMs) throw new Error('timed out waiting for condition');
@@ -658,7 +658,7 @@ describe('QueueTransport — store-less protocol and remote workflows', () => {
   });
 
   describe('worker advertisement from a store-less tenant pod', () => {
-    const eventually = async (cond: () => Promise<boolean>, budgetMs = 1500) => {
+    const eventually = async (cond: () => Promise<boolean>, budgetMs = 20_000) => {
       const at = Date.now();
       while (!(await cond())) {
         if (Date.now() - at > budgetMs) throw new Error('timed out waiting for condition');

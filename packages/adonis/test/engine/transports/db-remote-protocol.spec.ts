@@ -32,7 +32,7 @@ import { dbBackends } from '../../support/backends.js';
 const POLL = 5;
 const M = TRANSPORT_TABLES.messages;
 
-async function until(cond: () => boolean | Promise<boolean>, budgetMs = 2000): Promise<void> {
+async function until(cond: () => boolean | Promise<boolean>, budgetMs = 20_000): Promise<void> {
   const start = Date.now();
   while (!(await cond())) {
     if (Date.now() - start > budgetMs) throw new Error('timed out waiting for condition');
@@ -508,6 +508,10 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb, makeTransportDb }) => {
         await cp.publishTenantEvent({ tenant: 'acme', event: event('r1', 1) });
         await cp.publishTenantEvent({ tenant: 'globex', event: event('r2', 1) });
         await until(() => got1.length === 1 && got2.length === 1 && got3.length === 1);
+        // A row is deleted once its handler ran, so the handler can be seen before the delete lands
+        // (CI caught rows still claimed after a fixed 30ms beat): wait for the table to drain, then a
+        // beat for a would-be extra delivery.
+        await until(async () => (await rows()).length === 0);
         await sleep(30);
         expect(got1.map((e) => e.event.runId)).toEqual(['r1']);
         expect(got2.map((e) => e.event.runId)).toEqual(['r1']);
@@ -587,21 +591,26 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb, makeTransportDb }) => {
         await freshDb();
         const cp = make({ inboxTtlMs: 60, inboxSweepIntervalMs: 20 });
         // A pod that subscribed and then crashed: its keys are there, nothing consumes its rows, and it
-        // never refreshes them.
-        // Long-lived enough that a slow database (Postgres on a loaded CI box) still publishes to it
-        // before it expires.
+        // never refreshes them. Its keys stay live until the first publishes are seen addressed to it,
+        // then are rewritten already expired — the state a crashed pod's keys reach on their own.
+        // (A fixed 500ms lifetime raced the publishes on a loaded machine: the third found it gone.)
         const keys = lucidWorkerKeys(db);
         const value = JSON.stringify({ instanceId: 'ghost' });
-        const expiresAt = Date.now() + 500;
-        await keys.put(inboxKey('durable', 'ghost'), value, expiresAt);
-        await keys.put(tenantSubscriberKey('durable', 'acme', 'ghost'), value, expiresAt);
+        const ghostKeys = [
+          inboxKey('durable', 'ghost'),
+          tenantSubscriberKey('durable', 'acme', 'ghost'),
+        ];
+        for (const key of ghostKeys) await keys.put(key, value, Date.now() + 60_000);
 
         for (let i = 0; i < 3; i += 1) {
           await cp.publishTenantEvent({ tenant: 'acme', event: event('r1', i) });
         }
         expect(await rows({ recipient: 'ghost' })).toHaveLength(3);
 
-        await sleep(expiresAt - Date.now() + 20); // the keys expire
+        // The keys expire.
+        const expiresAt = Date.now();
+        for (const key of ghostKeys) await keys.put(key, value, expiresAt);
+        await sleep(20);
         for (let i = 3; i < 6; i += 1) {
           await cp.publishTenantEvent({ tenant: 'acme', event: event('r1', i) });
         }
@@ -617,23 +626,35 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb, makeTransportDb }) => {
 
       it('the janitor leaves a LIVE subscriber’s rows alone', async () => {
         await freshDb();
-        // TTLs wide enough that a loaded machine refreshes the keys in time on a real database.
-        const cp = make({ inboxTtlMs: 300, inboxSweepIntervalMs: 20 });
-        // Consumes slowly but keeps its keys fresh (every 100ms).
+        // TTLs wide enough that a loaded machine refreshes the keys in time on a real database: the
+        // refresh (every TTL / 3) shares a small pool with a janitor sweeping every 20ms.
+        const cp = make({ inboxTtlMs: 600, inboxSweepIntervalMs: 20 });
+        // Consumes slowly but keeps its keys fresh (every 200ms).
         const sub = make({
           instanceId: 'pod',
-          inboxTtlMs: 300,
-          pollIntervalMs: 2_000,
+          inboxTtlMs: 600,
+          pollIntervalMs: 5_000,
           idleBackoffMax: 1,
         });
+        // The subscriber's message polls, seen as they COMPLETE (not as they are sent).
+        let polled = 0;
+        db.connection()
+          .getWriteClient()
+          .on('query-response', (_res: unknown, q: { sql: string; bindings?: unknown[] }) => {
+            if (q.sql.startsWith('select') && q.sql.includes(M) && q.bindings?.includes('pod')) {
+              polled += 1;
+            }
+          });
         const got: number[] = [];
         sub.onTenantEvent('acme', (e) => got.push((e.event as unknown as { seq: number }).seq));
         await recorded('acme', 'pod');
-        await sleep(20); // the subscriber's first (empty) poll is done
+        // Its inbox key too — the janitor judges a recipient by that one.
+        await until(async () => (await liveKeys()).includes(inboxKey('durable', 'pod')));
+        await until(() => polled > 0); // its first (empty) poll is done; the next is 5s away
         for (let i = 0; i < 3; i += 1) {
           await cp.publishTenantEvent({ tenant: 'acme', event: event('r1', i) });
         }
-        await sleep(800); // several TTLs and sweeps
+        await sleep(1_500); // several TTLs and sweeps
         expect(got).toEqual([]);
         expect(await rows({ recipient: 'pod' })).toHaveLength(3);
         await until(() => got.length === 3);

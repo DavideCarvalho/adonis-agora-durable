@@ -1007,11 +1007,29 @@ export class WorkflowEngine {
     this.stalledAfterMs = Math.max(60_000, deps.stalledAfterMs ?? 900_000);
     this.trackStepStart = deps.trackStepStart ?? true;
     // Default: execute the run on this instance, asynchronously, so `start` never blocks on the body.
-    // A failed pickup is swallowed here (the run stays `pending` for a `runPending` poll to retry);
-    // run failures themselves are handled inside `execute` and surfaced as the run's `failed` state.
+    // A failed pickup is reported, never thrown (the run stays `pending`, or leased until its lease
+    // lapses, for a `runPending` poll or recovery to retry); run failures themselves are handled
+    // inside `execute` and surfaced as the run's `failed` state. What reaches here is the store or
+    // the registry refusing the pickup — a lost connection, a missing table, an unregistered version.
     this.usesInProcessDispatch = deps.runDispatcher === undefined;
+    //
+    // Tracked from the moment of dispatch (see {@link trackEffect}): the pickup leases and reads the
+    // run before its execution enters `inflight`, so a bare `queueMicrotask` let `drain()` find both
+    // registries empty in that gap and return while the pickup was still about to write — onto a
+    // closed connection, or a dropped schema. The one-microtask defer is kept.
     this.runDispatcher = deps.runDispatcher ?? {
-      dispatch: (runId) => queueMicrotask(() => void this.runOne(runId).catch(() => {})),
+      dispatch: (runId) =>
+        this.trackEffect(
+          Promise.resolve()
+            .then(() => this.runOne(runId))
+            .catch((err) => {
+              console.warn(
+                `[adonis-durable] in-process pickup of run ${runId} failed (a pending-run poll or recovery retries it): ${
+                  err instanceof Error ? err.message : String(err)
+                }`,
+              );
+            }),
+        ),
     };
     this.singletons = new SingletonGate({
       store: this.store,
@@ -2529,16 +2547,21 @@ export class WorkflowEngine {
     ).length;
   }
 
-  /** Track an in-flight execution so {@link drain} can wait for it. */
+  /**
+   * Track an in-flight execution so {@link drain} can wait for it.
+   *
+   * The bookkeeping chain must not re-raise: `p.finally(...)` returns a NEW promise that rejects
+   * whenever `p` does, and nothing awaits it. So a turn whose store write failed (a dropped
+   * connection, a missing table) became a process-level unhandled rejection even though the caller
+   * awaiting `p` handled the very same error — fatal under Node's default `--unhandled-rejections`.
+   * The rejection is reported once, to the caller that owns `p`.
+   */
   private track(runId: string, p: Promise<RunResult>): Promise<RunResult> {
     this.inflight.set(p, runId);
-    // Not `p.finally(...)`: that derives a NEW promise which re-rejects when the turn fails, and
-    // nobody awaits it — every failed turn became a process-level unhandled rejection. The caller
-    // handles `p`'s rejection; this bookkeeping must not create a second one.
-    const done = (): void => {
+    const untrack = (): void => {
       this.inflight.delete(p);
     };
-    void p.then(done, done);
+    p.then(untrack, untrack);
     return p;
   }
 

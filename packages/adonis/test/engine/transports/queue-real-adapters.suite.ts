@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { Adapter } from '@adonisjs/queue/types';
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type {
   EngineEvent,
   RemoteTask,
@@ -15,7 +15,7 @@ import type {
   WorkflowDecision,
 } from '../../../src/interfaces.js';
 import { sanitizeQueueToken } from '../../../src/tenant-group.js';
-import { POSTGRES_TEST_SCHEMA_PREFIX } from '../../../src/transports/db-helpers.js';
+import { postgresTestSchemaPrefix } from '../../../src/transports/db-helpers.js';
 import { QueueTransport, type QueueTransportOptions } from '../../../src/transports/queue.js';
 import {
   inboxKey,
@@ -83,7 +83,7 @@ const task = (name: string): RemoteTask => ({
   attempt: 1,
 });
 
-async function until(cond: () => boolean | Promise<boolean>, budgetMs = 5000): Promise<void> {
+async function until(cond: () => boolean | Promise<boolean>, budgetMs = 20_000): Promise<void> {
   const start = Date.now();
   while (!(await cond())) {
     if (Date.now() - start > budgetMs) throw new Error('timed out waiting for condition');
@@ -131,7 +131,7 @@ let dir: string | undefined;
 let knexInstance: KnexLike | undefined;
 let pgKnex: (KnexLike & { raw(sql: string): Promise<unknown> }) | undefined;
 let pgAdmin: (KnexLike & { raw(sql: string): Promise<unknown> }) | undefined;
-const pgSchema = `${POSTGRES_TEST_SCHEMA_PREFIX}queue_${process.pid}_${randomUUID().slice(0, 8)}`;
+const pgSchema = `${postgresTestSchemaPrefix()}queue_${process.pid}_${randomUUID().slice(0, 8)}`;
 let redisClient:
   | {
       quit(): Promise<unknown>;
@@ -139,7 +139,8 @@ let redisClient:
       del(...k: string[]): Promise<unknown>;
     }
   | undefined;
-const prefix = `durable-it-${randomUUID().slice(0, 8)}`;
+/** The file's key prefix; each test runs under its own extension of it (see `describeBackend`). */
+const basePrefix = `durable-it-${randomUUID().slice(0, 8)}`;
 
 const backends: Backend[] = [
   {
@@ -199,7 +200,7 @@ const backends: Backend[] = [
     },
     async teardown() {
       if (!redisClient) return;
-      const keys = await redisClient.keys(`*${prefix}*`);
+      const keys = await redisClient.keys(`*${basePrefix}*`);
       if (keys.length > 0) await redisClient.del(...keys);
       await redisClient.quit();
     },
@@ -224,6 +225,13 @@ function describeBackend(backend: Backend): void {
     let factory: AnyAdapterFactory;
     const transports: QueueTransport[] = [];
     let probe: Adapter;
+    // A prefix — so a results queue, decisions queue, inboxes — of each test's own. Shared across the
+    // file, a result published late by one test (a re-run it just failed on) was consumed by the
+    // next test's engine as one of its own.
+    let prefix = basePrefix;
+    beforeEach(() => {
+      prefix = `${basePrefix}-${randomUUID().slice(0, 6)}`;
+    });
 
     beforeAll(async () => {
       if (!backend.enabled) return;
@@ -238,6 +246,16 @@ function describeBackend(backend: Backend): void {
       if (!backend.enabled) return;
       await backend.teardown();
     });
+
+    /**
+     * Close every transport of the test before probing its claims: close() waits for a job still in a
+     * handler or finalizing, so the probe reads settled claims rather than a `completeJob` in flight.
+     * (A fixed beat was not enough on a loaded machine — and the probe RECOVERS what it finds active,
+     * so a probe that raced a finalize also re-delivered the job.)
+     */
+    const closeAll = async (): Promise<void> => {
+      await Promise.all(transports.splice(0).map((t) => t.close()));
+    };
 
     const make = (opts: Partial<QueueTransportOptions> = {}): QueueTransport => {
       const t = new QueueTransport({
@@ -267,8 +285,7 @@ function describeBackend(backend: Backend): void {
           status: 'completed',
           output: { echoed: { hello: 'world', at: '2026-10-18T00:00:00.000Z' } },
         });
-        // Give the result loop's completeJob a beat, then: no claim left behind on either queue.
-        await new Promise((r) => setTimeout(r, 50));
+        await closeAll();
         expect(await activeJobs(probe, `${prefix}:tasks:${sanitizeQueueToken(name)}`)).toBe(0);
         expect(await activeJobs(probe, `${prefix}:results`)).toBe(0);
       },
@@ -291,7 +308,7 @@ function describeBackend(backend: Backend): void {
         await engine.dispatch(task(name));
         await until(() => settled.length === 1);
         expect(calls).toBe(2);
-        await new Promise((r) => setTimeout(r, 50));
+        await closeAll();
         expect(await activeJobs(probe, `${prefix}:results`)).toBe(0);
       },
     );
@@ -306,9 +323,10 @@ function describeBackend(backend: Backend): void {
             prefix,
             pollIntervalMs: 10,
             stalledCheckIntervalMs: 50,
-            // Renewal runs every half threshold; 1.5s tolerates the event-loop stalls of a shared CI
-            // runner, while the 5s step still outlives the threshold 3× — without renewal it is re-run.
-            stalledThresholdMs: 1_500,
+            // Renewal runs every half threshold; 3s tolerates the event-loop stalls of a loaded CI
+            // runner (1.5s was seen to lapse), while the 9s step still outlives the threshold 3× —
+            // without renewal it is re-run.
+            stalledThresholdMs: 3_000,
           });
           transports.push(t);
           return t;
@@ -320,18 +338,18 @@ function describeBackend(backend: Backend): void {
         let runs = 0;
         worker.handle(name, async () => {
           runs += 1;
-          await new Promise((r) => setTimeout(r, 5_000));
+          await new Promise((r) => setTimeout(r, 9_000));
           return 'done';
         });
 
         await engine.dispatch(task(name));
-        await until(() => results.length === 1, 10_000);
+        await until(() => results.length === 1, 30_000);
         expect(runs).toBe(1);
         expect(results[0]).toMatchObject({ status: 'completed', output: 'done' });
-        await new Promise((r) => setTimeout(r, 50));
+        await closeAll();
         expect(await activeJobs(probe, `${prefix}:tasks:${sanitizeQueueToken(name)}`)).toBe(0);
       },
-      20_000,
+      45_000,
     );
 
     it.skipIf(!backend.enabled)(
@@ -349,22 +367,27 @@ function describeBackend(backend: Backend): void {
         transports.push(worker);
         const results: StepResult[] = [];
         engine.onResult(async (r) => void results.push(r));
-        let running = 0;
-        let peak = 0;
-        worker.handle(name, async () => {
-          running += 1;
-          peak = Math.max(peak, running);
-          await new Promise((r) => setTimeout(r, 150));
-          running -= 1;
-          return 'ok';
-        });
-
+        // The backlog first, and each step holds its slot until three run together (bounded): the
+        // peak then depends on the slot loop, not on dispatches overlapping 150ms sleeps.
         for (let seq = 1; seq <= 6; seq += 1) {
           await engine.dispatch({ ...task(name), seq, stepId: `r1:${seq}` });
         }
-        await until(() => results.length === 6, 10_000);
+        let running = 0;
+        let peak = 0;
+        let done = 0;
+        worker.handle(name, async () => {
+          running += 1;
+          peak = Math.max(peak, running);
+          await until(() => running >= Math.min(3, 6 - done), 3000).catch(() => undefined);
+          await new Promise((r) => setTimeout(r, 150));
+          running -= 1;
+          done += 1;
+          return 'ok';
+        });
+
+        await until(() => results.length === 6, 30_000);
         expect(peak).toBe(3);
-        await new Promise((r) => setTimeout(r, 50));
+        await closeAll();
         expect(await activeJobs(probe, `${prefix}:tasks:${sanitizeQueueToken(name)}`)).toBe(0);
       },
     );
@@ -387,10 +410,11 @@ function describeBackend(backend: Backend): void {
             // Sweeping often: a job handed to two workers would show up as a second run. The
             // threshold leaves headroom over the one-connection SQLite pool, which every poll of
             // three transports shares — on a loaded machine a finalize can queue behind them for
-            // longer than a short threshold, and the sweep then re-delivers a job that DID finish
-            // (claim renewal under a short threshold is pinned by the long-step test above).
+            // longer than a short threshold (3s was seen to), and the sweep then re-delivers a job
+            // that DID finish (claim renewal under a short threshold is pinned by the long-step
+            // test above).
             stalledCheckIntervalMs: 50,
-            stalledThresholdMs: 3_000,
+            stalledThresholdMs: 10_000,
             concurrency: 4,
           });
           transports.push(worker);
@@ -412,6 +436,7 @@ function describeBackend(backend: Backend): void {
         expect(runs.size).toBe(40);
         expect([...runs.values()].every((n) => n === 1)).toBe(true);
         expect(ranOn).toEqual(new Set(['w1', 'w2']));
+        await closeAll();
         expect(await activeJobs(probe, `${prefix}:tasks:${sanitizeQueueToken(name)}`)).toBe(0);
         expect(await activeJobs(probe, `${prefix}:results`)).toBe(0);
       },
@@ -449,6 +474,7 @@ function describeBackend(backend: Backend): void {
         expect(results[0]).toMatchObject({ status: 'completed', output: 'recovered' });
         await new Promise((r) => setTimeout(r, 100));
         expect(runs).toBe(1);
+        await closeAll();
         expect(await activeJobs(probe, tasksQueue)).toBe(0);
         expect(await activeJobs(probe, `${prefix}:results`)).toBe(0);
       },
@@ -519,7 +545,10 @@ function describeBackend(backend: Backend): void {
           prefix,
           pollIntervalMs: 5,
           stalledCheckIntervalMs: 0,
-          concurrency: { mode: 'adaptive', min: 1, max: 4, start: 1, tickMs: 20 },
+          // Shaped so a loaded machine cannot starve the growth signal: steps long next to event-loop
+          // jitter (steady latency), and a tick that outlasts a step (never two ticks without a
+          // completion, which reads as a stall — backpressure, which only ever sheds).
+          concurrency: { mode: 'adaptive', min: 1, max: 4, start: 1, tickMs: 300 },
         });
         transports.push(worker);
         const results: StepResult[] = [];
@@ -529,17 +558,17 @@ function describeBackend(backend: Backend): void {
         worker.handle(name, async () => {
           running += 1;
           peak = Math.max(peak, running);
-          await new Promise((r) => setTimeout(r, 40));
+          await new Promise((r) => setTimeout(r, 200));
           running -= 1;
           return 'ok';
         });
-        for (let seq = 1; seq <= 30; seq += 1) {
+        for (let seq = 1; seq <= 20; seq += 1) {
           await engine.dispatch({ ...task(name), seq, stepId: `r1:${seq}` });
         }
-        await until(() => results.length === 30, 15_000);
+        await until(() => results.length === 20, 60_000);
         expect(peak).toBeGreaterThan(1);
         expect(peak).toBeLessThanOrEqual(4);
-        await new Promise((r) => setTimeout(r, 50));
+        await closeAll();
         expect(await activeJobs(probe, `${prefix}:tasks:${sanitizeQueueToken(name)}`)).toBe(0);
       },
     );
@@ -583,6 +612,7 @@ function describeBackend(backend: Backend): void {
           },
         });
         expect(runs).toBe(0);
+        await closeAll();
         expect(await activeJobs(probe, tasksQueue)).toBe(0);
       },
     );
@@ -618,7 +648,7 @@ function describeBackend(backend: Backend): void {
         await until(() => gotA.length === 3 && gotB.length === 3);
         expect(gotA.map((r) => r.requestId).sort()).toEqual([0, 1, 2].map((i) => `a${i}-${tag}`));
         expect(gotB.map((r) => r.requestId).sort()).toEqual([0, 1, 2].map((i) => `b${i}-${tag}`));
-        await new Promise((r) => setTimeout(r, 50));
+        await closeAll();
         expect(await activeJobs(probe, `${prefix}:run-request`)).toBe(0);
         expect(await activeJobs(probe, runRepliesQueue(prefix, `a-${tag}`))).toBe(0);
         expect(await activeJobs(probe, runRepliesQueue(prefix, `b-${tag}`))).toBe(0);
@@ -658,13 +688,17 @@ function describeBackend(backend: Backend): void {
             (await recorded(`globex-${tag}`, `o-${tag}`)),
         );
 
-        // A subscriber that crashed: advertised, never consuming, never refreshing. Written right before
-        // the publish (not before the wait above) so a slow CI can't expire it before it is pushed to,
-        // and short-lived (under inboxTtlMs) so the janitor sees it dead and drains its inbox.
+        // A subscriber that crashed: advertised, never consuming. Kept live until the publish is seen
+        // in its inbox, then killed — its keys removed — so the janitor sees it dead and drains the
+        // inbox. (Keys that merely expired on their own raced the check: on a loaded machine the
+        // janitor could drain the inbox before the test looked at it.)
         const ghost = `ghost-${tag}`;
         const value = JSON.stringify({ instanceId: ghost });
-        await keys.put(tenantSubscriberKey(prefix, `acme-${tag}`, ghost), value, Date.now() + 150);
-        await keys.put(inboxKey(prefix, ghost), value, Date.now() + 150);
+        const ghostKeys = [
+          tenantSubscriberKey(prefix, `acme-${tag}`, ghost),
+          inboxKey(prefix, ghost),
+        ];
+        for (const key of ghostKeys) await keys.put(key, value, Date.now() + 60_000);
         const evt = {
           type: 'run.completed',
           runId: 'r1',
@@ -675,8 +709,10 @@ function describeBackend(backend: Backend): void {
         expect(gotOther).toEqual([]);
         expect(got1[0]?.event.runId).toBe('r1');
         expect(await probe.sizeOf(tenantEventsQueue(prefix, ghost))).toBe(1);
-        // The ghost's keys expire; the janitor drains what it was sent.
-        await until(async () => (await probe.sizeOf(tenantEventsQueue(prefix, ghost))) === 0, 5000);
+        // The ghost dies; the janitor drains what it was sent.
+        await keys.remove(ghostKeys);
+        await until(async () => (await probe.sizeOf(tenantEventsQueue(prefix, ghost))) === 0);
+        await closeAll();
         expect(await activeJobs(probe, tenantEventsQueue(prefix, ghost))).toBe(0);
       },
     );
@@ -708,7 +744,7 @@ function describeBackend(backend: Backend): void {
         });
         await until(() => decisions.length === 1);
         expect(decisions[0]).toMatchObject({ taskId: 't1', status: 'completed', output: { n: 1 } });
-        await new Promise((r) => setTimeout(r, 50));
+        await closeAll();
         expect(await activeJobs(probe, `${prefix}:tasks:${sanitizeQueueToken(name)}`)).toBe(0);
         expect(await activeJobs(probe, `${prefix}:decisions`)).toBe(0);
       },

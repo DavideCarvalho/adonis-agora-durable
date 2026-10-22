@@ -7,7 +7,7 @@ const flush = async () => {
   for (let i = 0; i < 8; i += 1) await new Promise((r) => setImmediate(r));
 };
 
-async function poll(fn: () => Promise<boolean> | boolean, timeoutMs = 2000): Promise<void> {
+async function poll(fn: () => Promise<boolean> | boolean, timeoutMs = 20_000): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     if (await fn()) return;

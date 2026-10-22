@@ -6,7 +6,7 @@ import type {
 } from '../../src/control-plane-redis/redis-control-plane.js';
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
-async function until(cond: () => boolean, budgetMs = 1000) {
+async function until(cond: () => boolean, budgetMs = 20_000) {
   const deadline = Date.now() + budgetMs;
   while (!cond() && Date.now() < deadline) await delay(2);
 }

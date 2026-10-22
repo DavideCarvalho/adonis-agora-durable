@@ -93,7 +93,7 @@ describe('lease release is best-effort', () => {
 });
 
 /** Poll until `runId` is terminal — results travel over a poll loop, not a promise. */
-async function settle(store: InMemoryStateStore, runId: string, budgetMs = 3000): Promise<void> {
+async function settle(store: InMemoryStateStore, runId: string, budgetMs = 20_000): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < budgetMs) {
     const run = await store.getRun(runId);

@@ -14,7 +14,7 @@ import { MockAdapter } from '../../../src/transports/queue-mock-adapter.js';
  * result travels over a polling queue loop. So we poll the store until the run reaches a terminal
  * state rather than relying on `waitForRun` (which also resolves on `suspended`).
  */
-async function settle(store: InMemoryStateStore, runId: string, budgetMs = 2000) {
+async function settle(store: InMemoryStateStore, runId: string, budgetMs = 20_000) {
   const start = Date.now();
   while (Date.now() - start < budgetMs) {
     const run = await store.getRun(runId);

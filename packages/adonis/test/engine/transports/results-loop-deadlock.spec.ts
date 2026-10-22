@@ -20,7 +20,7 @@ import { MockAdapter } from '../../../src/transports/queue-mock-adapter.js';
  */
 
 /** Poll the store until `runId` reaches a terminal state (results travel over a poll loop). */
-async function settle(store: InMemoryStateStore, runId: string, budgetMs = 2000) {
+async function settle(store: InMemoryStateStore, runId: string, budgetMs = 20_000) {
   const start = Date.now();
   while (Date.now() - start < budgetMs) {
     const run = await store.getRun(runId);

@@ -18,7 +18,7 @@ const REDIS_URL = backendUrl('REDIS_URL');
 const PREFIX = uniqueRedisPrefix('cp');
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** Poll until `cond()` is true or the budget lapses (events arrive async over pub/sub). */
-async function until(cond: () => boolean, budgetMs = 2000) {
+async function until(cond: () => boolean, budgetMs = 20_000) {
   const deadline = Date.now() + budgetMs;
   while (!cond() && Date.now() < deadline) await delay(20);
 }
@@ -48,6 +48,23 @@ describe.skipIf(!REDIS_URL)('RedisControlPlane (real Redis)', () => {
     return c;
   }
 
+  /**
+   * Wait until `count` control planes are subscribed to `prefix`'s channel, as the SERVER sees it.
+   * Pub/sub is fire-and-forget: a message published before a subscription lands is simply lost, and
+   * a fixed beat for the connections to come up was not always enough on a loaded runner.
+   */
+  async function subscribed(prefix: string, count: number): Promise<void> {
+    const c = client();
+    const deadline = Date.now() + 20_000;
+    for (;;) {
+      const [, n] = (await c.pubsub('NUMSUB', `${prefix}-control`)) as [string, number];
+      if (Number(n) >= count) return;
+      if (Date.now() > deadline)
+        throw new Error(`${prefix}-control never reached ${count} subscribers`);
+      await delay(10);
+    }
+  }
+
   /** A control plane on its own connection, sharing the test's channel prefix. */
   function plane(prefix: string) {
     // A real ioredis client goes in unassisted: the port's ioredis arm declares `subscribe(channel)`
@@ -75,10 +92,11 @@ describe.skipIf(!REDIS_URL)('RedisControlPlane (real Redis)', () => {
   }
 
   it('delivers a cancel from one pod to the pod running the work', async () => {
-    const { worker, dashboard } = twoPods(`${PREFIX}-${++ns}`);
+    const prefix = `${PREFIX}-${++ns}`;
+    const { worker, dashboard } = twoPods(prefix);
     const aborted: string[] = [];
     worker.onCancel((runId) => aborted.push(runId));
-    await delay(100); // let both subscribers connect
+    await subscribed(prefix, 2);
 
     worker.register('wf', '1', async (ctx) => ctx.waitForSignal('go'));
     await startRun(worker, 'wf', {}, 'run1'); // suspends, "work" in flight on the worker
@@ -89,12 +107,13 @@ describe.skipIf(!REDIS_URL)('RedisControlPlane (real Redis)', () => {
   });
 
   it('fans out lifecycle events to another pod, each exactly once (from dedupe)', async () => {
-    const { worker, dashboard } = twoPods(`${PREFIX}-${++ns}`);
+    const prefix = `${PREFIX}-${++ns}`;
+    const { worker, dashboard } = twoPods(prefix);
     const onWorker: string[] = [];
     const onDashboard: string[] = [];
     worker.subscribe((e) => onWorker.push(e.type));
     dashboard.subscribe((e) => onDashboard.push(e.type));
-    await delay(100); // let both subscribers connect
+    await subscribed(prefix, 2);
 
     worker.register('wf', '1', async (ctx) => {
       await ctx.localStep('a', async () => 1);
@@ -115,7 +134,7 @@ describe.skipIf(!REDIS_URL)('RedisControlPlane (real Redis)', () => {
     const received: string[] = [];
     const sub = plane(prefix);
     sub.onControl((m) => received.push(m.kind));
-    await delay(100); // let the subscriber connect
+    await subscribed(prefix, 1);
 
     // Raw garbage on the channel must be swallowed (never throw / crash the engine)...
     await client().publish(`${prefix}-control`, 'not-json{');

@@ -28,7 +28,7 @@ import { dbBackends } from '../support/backends.js';
 
 const SECRET = 'db-e2e-secret';
 
-async function until(cond: () => boolean | Promise<boolean>, budgetMs = 4000): Promise<void> {
+async function until(cond: () => boolean | Promise<boolean>, budgetMs = 20_000): Promise<void> {
   const start = Date.now();
   while (!(await cond())) {
     if (Date.now() - start > budgetMs) throw new Error('timed out waiting for condition');

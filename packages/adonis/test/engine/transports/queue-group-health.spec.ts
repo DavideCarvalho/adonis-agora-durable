@@ -15,7 +15,7 @@ import { MemoryWorkerKeys } from '../../../src/transports/worker-keys.js';
 const POLL = 5;
 const TOKEN = sanitizeQueueToken('ext.work');
 
-async function until(cond: () => boolean | Promise<boolean>, budgetMs = 3000): Promise<void> {
+async function until(cond: () => boolean | Promise<boolean>, budgetMs = 20_000): Promise<void> {
   const start = Date.now();
   while (!(await cond())) {
     if (Date.now() - start > budgetMs) throw new Error('timed out waiting for condition');

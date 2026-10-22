@@ -6,6 +6,14 @@ import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+async function until(cond: () => boolean, budgetMs = 20_000): Promise<void> {
+  const start = Date.now();
+  while (!cond()) {
+    if (Date.now() - start > budgetMs) throw new Error('timed out waiting for condition');
+    await sleep(1);
+  }
+}
+
 /** A transport whose result/heartbeat delivery the test drives by hand. */
 class ControlTransport implements Transport {
   resultHandler?: (r: StepResult) => Promise<void>;
@@ -37,17 +45,23 @@ describe('remote-step liveness (heartbeats)', () => {
   it('a heartbeat rearms the window so a beating worker survives past timeoutMs', async () => {
     const transport = new ControlTransport();
     const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport });
-    engine.register('wf2', '1', async (ctx) => ctx.step('job', {}, { timeoutMs: 600 }));
+    // One attempt: a window that lapses fails the run instead of re-dispatching.
+    const timeoutMs = 1000;
+    engine.register('wf2', '1', async (ctx) => ctx.step('job', {}, { timeoutMs, retries: 1 }));
 
     await engine.start('wf2', {}, 'r2');
     const runPromise = engine.waitForRun('r2');
-    await sleep(0); // let the dispatch happen
+    await until(() => transport.dispatched.length > 0);
+    const dispatchedAt = Date.now();
     const id = transport.dispatched[0]?.stepId as string;
 
-    // Wide margins (10x the old 60ms window): a loaded CI runner can stall a timer by tens of ms.
-    await sleep(400);
-    await transport.heartbeatHandler?.({ runId: 'r2', seq: 0, stepId: id, group: 'g' }); // rearm
-    await sleep(300); // 700ms total — past 600ms, but only 300ms since the last beat
+    // Beat well inside the window until the step has outlived it 2.5 times over: only the rearm keeps
+    // it alive. Anchored on real elapsed time, so a slow machine stretches the run, not the verdict
+    // (a gap between beats would have to exceed the whole 1s window to lapse it).
+    while (Date.now() - dispatchedAt < timeoutMs * 2.5) {
+      await transport.heartbeatHandler?.({ runId: 'r2', seq: 0, stepId: id, group: 'g' });
+      await sleep(50);
+    }
     await transport.resultHandler?.({
       runId: 'r2',
       seq: 0,

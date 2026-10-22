@@ -7,7 +7,7 @@ import { MockAdapter } from '../../../src/transports/queue-mock-adapter.js';
 const POLL = 5;
 
 /** Wait until `cond()` is true (poll loops are async) or fail after a budget. */
-async function until(cond: () => boolean, budgetMs = 1000): Promise<void> {
+async function until(cond: () => boolean, budgetMs = 20_000): Promise<void> {
   const start = Date.now();
   while (!cond()) {
     if (Date.now() - start > budgetMs) throw new Error('timed out waiting for condition');

@@ -389,6 +389,8 @@ export class DbTransport implements Transport, ControlPlane {
   #workerHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
   /** Liveness-key writes still in flight — `close()` lets them land before withdrawing the keys. */
   readonly #livenessWrites = new Set<Promise<void>>();
+  /** Routing tokens whose liveness-key write is still in flight (see `#startWorkerHeartbeat`). */
+  readonly #beatsInFlight = new Set<string>();
   /** Workflow turn consumers by workflow name — a `workflow` task row routes here. */
   readonly #workflowTurns = new Map<string, WorkflowTurnHandler>();
   /** Every `onDecision` handler (an engine subscribes one; it applies a decision by run id). */
@@ -666,6 +668,25 @@ export class DbTransport implements Transport, ControlPlane {
       // close() began while this round was claiming: don't start work it would only abandon.
       await this.#handBack(TRANSPORT_TABLES.tasks, [token]);
       return false;
+    }
+    // `free` was read before the claim's round trips. The adaptive limit may have dropped meanwhile
+    // (the RAM brake fires on its own timer), and a round sized for the old limit would run past the
+    // new one. Un-claim what no longer fits, so the slot loop never runs more than the LIVE limit.
+    // (A lapsed row handed back this way keeps the reclaim its takeover counted: rare — a limit drop
+    // inside one claim round — and only ever early toward the poison bound, never past it unnoticed.)
+    const fits = Math.max(0, this.#controller.limit - this.#runningTasks.size);
+    if (rows.length > fits) {
+      const excess = rows.splice(fits);
+      await this.#client()
+        .knexQuery()
+        .from(TRANSPORT_TABLES.tasks)
+        .where('claimed_by', token)
+        .whereIn(
+          'step_id',
+          excess.map((row) => row.step_id),
+        )
+        .update({ claimed_by: null, claimed_at: null });
+      if (rows.length === 0) return true;
     }
     this.#hold(
       TRANSPORT_TABLES.tasks,
@@ -1776,12 +1797,19 @@ export class DbTransport implements Transport, ControlPlane {
       this.#workerHeartbeatIntervalMs * 3,
     );
     const beatOne = (t: string): void => {
+      // One write per token at a time: a beat due while the last one is still in flight is skipped.
+      // Beats are not queued behind a slow store — every interval used to start a write regardless,
+      // so a store slower than the interval piled up writes without bound, each holding a pool
+      // connection the reads (groupHealth, the claim loop) then waited behind.
+      if (this.#beatsInFlight.has(t)) return;
+      this.#beatsInFlight.add(t);
       const now = this.#now();
       const key = workerHeartbeatKey(this.#keyPrefix(), t, this.#instanceId);
       const value = heartbeatKeyValue(now, this.#controller.snapshot());
       const write = Promise.resolve()
         .then(() => this.#workerKeys().put(key, value, now + ttlMs))
-        .catch((err) => this.#onError(err));
+        .catch((err) => this.#onError(err))
+        .finally(() => this.#beatsInFlight.delete(t));
       this.#livenessWrites.add(write);
       void write.finally(() => this.#livenessWrites.delete(write));
     };

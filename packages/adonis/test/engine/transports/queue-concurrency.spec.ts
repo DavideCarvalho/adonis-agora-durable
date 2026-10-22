@@ -11,7 +11,7 @@ import { MockAdapter } from '../../../src/transports/queue-mock-adapter.js';
 
 const POLL = 5;
 
-async function until(cond: () => boolean, budgetMs = 3000): Promise<void> {
+async function until(cond: () => boolean, budgetMs = 20_000): Promise<void> {
   const start = Date.now();
   while (!cond()) {
     if (Date.now() - start > budgetMs) throw new Error('timed out waiting for condition');
@@ -52,64 +52,80 @@ describe('QueueTransport concurrency and idle backoff', () => {
     return t;
   };
 
-  /** Run `jobs` slow steps through a worker with `concurrency` slots; report the peak in flight. */
-  async function peakInFlight(concurrency: number | undefined, jobs: number) {
+  /**
+   * Run `jobs` slow steps through a worker with `concurrency` slots; report the peak in flight. The
+   * backlog is queued before the worker starts, and each step holds its slot until `expected` steps
+   * run together (bounded), so the peak depends on the slot loop alone, not on how dispatches and
+   * 30ms sleeps overlapped on a loaded machine. The barrier never caps the peak: over-running shows.
+   */
+  async function peakInFlight(concurrency: number | undefined, jobs: number, expected: number) {
     const adapter = new MockAdapter();
     const engine = make(adapter);
     const results: StepResult[] = [];
     engine.onResult(async (r) => void results.push(r));
+    for (let i = 1; i <= jobs; i += 1) await engine.dispatch(task(i));
     let running = 0;
     let peak = 0;
+    let done = 0;
     const worker = make(adapter, concurrency === undefined ? {} : { concurrency });
     worker.handle('ext.work', async (input) => {
       running += 1;
       peak = Math.max(peak, running);
+      await until(() => running >= Math.min(expected, jobs - done), 3000).catch(() => undefined);
       await sleep(30);
       running -= 1;
+      done += 1;
       return input;
     });
-    for (let i = 1; i <= jobs; i += 1) await engine.dispatch(task(i));
     await until(() => results.length === jobs);
     return { peak, results, adapter };
   }
 
   it('runs one job at a time by default', async () => {
-    const { peak } = await peakInFlight(undefined, 4);
+    const { peak } = await peakInFlight(undefined, 4, 1);
     expect(peak).toBe(1);
   });
 
   it('runs up to `concurrency` jobs of one step at once, and never more', async () => {
-    const { peak, results, adapter } = await peakInFlight(3, 10);
+    const { peak, results, adapter } = await peakInFlight(3, 10, 3);
     expect(peak).toBe(3);
     expect(results.every((r) => r.status === 'completed')).toBe(true);
     expect(adapter.active.size).toBe(0);
   });
 
   it('more slots do not add polling: an idle worker polls the same with 1 or 8 slots', async () => {
-    const pollsWith = async (concurrency: number) => {
+    // Side by side over the same window, so a loaded machine slows both alike instead of skewing one
+    // fixed-length window against the other.
+    const pollsWith = (concurrency: number) => {
       const adapter = new MockAdapter();
       const pop = vi.spyOn(adapter, 'popFrom');
       const worker = make(adapter, { concurrency, idleBackoffMax: 1 });
       worker.handle('ext.work', async () => 'x');
-      await sleep(100);
-      return pop.mock.calls.length;
+      return () => pop.mock.calls.length;
     };
-    const one = await pollsWith(1);
-    const eight = await pollsWith(8);
-    expect(eight).toBeLessThan(one * 2);
+    const one = pollsWith(1);
+    const eight = pollsWith(8);
+    // Counted from the moment both poll, so neither gets a head start.
+    await until(() => one() >= 1 && eight() >= 1);
+    const [oneAt, eightAt] = [one(), eight()];
+    await until(() => one() - oneAt >= 40);
+    // One loop per worker whatever its slots: eight slots polling on their own would be ~8×.
+    expect(eight() - eightAt).toBeLessThan((one() - oneAt) * 2);
   });
 
   it('an idle task loop backs off; the results loop never does', async () => {
     const adapter = new MockAdapter();
     const pop = vi.spyOn(adapter, 'popFrom');
-    const t = make(adapter, { idleBackoffMax: 8 });
+    // Backing off to 32 × 5ms = 160ms between idle task rounds, against 5ms for results: the ratio
+    // stays far above 2 even when a loaded machine stretches every timer.
+    const t = make(adapter, { idleBackoffMax: 32 });
     t.handle('ext.work', async () => 'x');
     t.onResult(async () => {});
-    await sleep(200);
     const callsOn = (queue: string) => pop.mock.calls.filter(([q]) => q === queue).length;
+    // Counted, not timed: enough result rounds for the task loop to have reached its ceiling.
+    await until(() => callsOn('durable:results') >= 80);
     const taskPolls = callsOn('durable:tasks:ext.work');
     const resultPolls = callsOn('durable:results');
-    // Base interval 5ms: ~40 polls in 200ms without backoff, ~5-8 with it capped at 8 intervals.
     expect(resultPolls).toBeGreaterThan(taskPolls * 2);
   });
 
@@ -127,7 +143,7 @@ describe('QueueTransport concurrency and idle backoff', () => {
   });
 
   it('a non-finite concurrency falls back to one slot instead of popping the backlog unbounded', async () => {
-    const { peak } = await peakInFlight(Number.NaN, 4);
+    const { peak } = await peakInFlight(Number.NaN, 4, 1);
     expect(peak).toBe(1);
   });
 

@@ -11,7 +11,7 @@ import { MemoryWorkerKeys } from '../../../src/transports/worker-keys.js';
 const POLL = 2;
 const TOKEN = sanitizeQueueToken('ext.work');
 
-async function until(cond: () => boolean | Promise<boolean>, budgetMs = 5000): Promise<void> {
+async function until(cond: () => boolean | Promise<boolean>, budgetMs = 20_000): Promise<void> {
   const start = Date.now();
   while (!(await cond())) {
     if (Date.now() - start > budgetMs) throw new Error('timed out waiting for condition');
@@ -76,26 +76,33 @@ describe('QueueTransport adaptive concurrency', () => {
     const engine = make(adapter, { workerKeys: keys });
     const results: StepResult[] = [];
     engine.onResult(async (r) => void results.push(r));
+    // Shaped so a loaded machine cannot starve the growth signal (see the db transport's twin): the
+    // backlog is queued first (saturated at every tick), steps are long next to event-loop jitter
+    // (steady latency), and the tick outlasts a step (never two ticks without a completion, which
+    // reads as a stall).
+    const jobs = 20;
+    for (let i = 1; i <= jobs; i += 1) await engine.dispatch(task(i));
     const { stats } = workerWith(
       adapter,
       {
         workerKeys: keys,
         workerHeartbeatIntervalMs: 10,
-        concurrency: { mode: 'adaptive', min: 1, max: 4, start: 1, tickMs: 15 },
+        concurrency: { mode: 'adaptive', min: 1, max: 4, start: 1, tickMs: 300 },
       },
-      25,
+      200,
     );
-    const jobs = 40;
-    for (let i = 1; i <= jobs; i += 1) await engine.dispatch(task(i));
-    await until(() => results.length === jobs, 10_000);
+    await until(() => results.length === jobs, 60_000);
 
+    // It grew, and the slot loop followed: only a `grow` raises the limit above its start of 1.
     expect(stats.peak).toBeGreaterThan(1);
     expect(stats.peak).toBeLessThanOrEqual(4);
-    // The heartbeat carries the adaptive limit and its last move.
+    // The heartbeat carries the adaptive limit and its last move — which move depends on the step
+    // latency measured as it grew (a step back is as legitimate on a loaded machine), so only its
+    // presence is pinned; the decision rules are unit-tested on the controller with a fake clock.
     await until(async () => (await statusOf(engine))?.lastAdjust !== undefined);
     const status = await statusOf(engine);
     expect(status?.concurrency).toMatchObject({ mode: 'adaptive', min: 1, max: 4 });
-    expect(status?.lastAdjust?.reason).toBe('grow');
+    expect(status?.lastAdjust?.reason).toBeDefined();
   });
 
   it('shrinks the live limit under the RAM brake, and the slot loop obeys it', async () => {

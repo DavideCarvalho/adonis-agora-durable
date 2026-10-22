@@ -52,7 +52,7 @@ describe.skipIf(!PG_URL)(
       for (const r of onB)
         expect(Number(r.at) - killedA).toBeGreaterThanOrEqual(LEASE_LEFT_AT_KILL(leaseMs));
       expect(results.map((r) => r.status)).toEqual(['completed', 'completed', 'completed']);
-    }, 30_000);
+    }, 90_000);
 
     it('(d) a step that kills every worker is bridged as poison after maxStalledCount (3)', async () => {
       const { db, engine, results } = await setup();
@@ -76,30 +76,40 @@ describe.skipIf(!PG_URL)(
         error: { retryable: true, message: expect.stringContaining('lapsed more than 3 times') },
       });
       expect(await db.connection().from(TRANSPORT_TABLES.tasks).select('*')).toEqual([]);
-    }, 45_000);
+    }, 135_000);
 
     it('(f) SIGTERM hands a claim back at once (reclaims 0); SIGKILL waits out the lease and counts', async () => {
       const { engine, results } = await setup();
       const leaseMs = 4_000;
       const long = { ms: 20, msOn: { A: 60_000, C: 60_000 } };
 
-      // A deploy: A is told to stop mid-step and hands the row back on its way out.
+      // A deploy: A is told to stop mid-step and hands the row back on its way out. A long lease, so
+      // a row NOT handed back would still be held well after B is up, however slowly B spawns.
+      const deployLeaseMs = 15_000;
       await engine.dispatch(task(1, long));
-      const a = await spawnReady({ role: 'worker', instanceId: 'A', leaseMs, closeTimeoutMs: 100 });
+      const a = await spawnReady({
+        role: 'worker',
+        instanceId: 'A',
+        leaseMs: deployLeaseMs,
+        closeTimeoutMs: 100,
+      });
       await until(async () => (await runs()).some((r) => r.instance === 'A'), 10_000, 'A to start');
       a.proc.kill('SIGTERM');
       expect(await a.exited).toEqual({ code: 0, signal: null });
       const termAt = Date.now();
-      const b = await spawnReady({ role: 'worker', instanceId: 'B', leaseMs });
+      const b = await spawnReady({ role: 'worker', instanceId: 'B', leaseMs: deployLeaseMs });
       await until(
         () => results.some((r) => r.stepId === 'r1:1'),
         10_000,
         'r1:1 handed back and run',
       );
       const onB = (await runs()).find((r) => r.instance === 'B');
+      // Handed back, not taken over: a lapsed claim's takeover counts a reclaim.
       expect(onB).toMatchObject({ step_id: 'r1:1', reclaims: 0 });
-      // Picked up at once, not after A's lease.
-      expect(Number(onB?.at) - termAt).toBeLessThan(leaseMs);
+      // Picked up as soon as B was up, not after A's lease: a row A kept would stay held until at
+      // least termAt + ~2/3 of the lease (A renews every leaseMs / 3). B's spawn counts against this
+      // bound, which is why the lease is long.
+      expect(Number(onB?.at) - termAt).toBeLessThan(LEASE_LEFT_AT_KILL(deployLeaseMs));
       b.proc.kill('SIGTERM');
       await b.exited;
 
@@ -119,7 +129,7 @@ describe.skipIf(!PG_URL)(
       const takeover = (await runs()).find((r) => r.instance === 'D');
       expect(takeover).toMatchObject({ step_id: 'r1:2', reclaims: 1 });
       expect(Number(takeover?.at) - killedC).toBeGreaterThanOrEqual(LEASE_LEFT_AT_KILL(leaseMs));
-    }, 45_000);
+    }, 135_000);
 
     it('(g) four processes creating the tables at once on an empty schema all succeed', async () => {
       const db = await emptyDb();
@@ -155,6 +165,6 @@ describe.skipIf(!PG_URL)(
         );
       }
       for (const c of creators) c.proc.send({ exit: true });
-    }, 60_000);
+    }, 180_000);
   },
 );

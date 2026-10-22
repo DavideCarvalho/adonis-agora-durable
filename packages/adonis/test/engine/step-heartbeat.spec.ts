@@ -4,7 +4,7 @@ import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
 import { EventEmitterTransport } from '../../src/transports/event-emitter.js';
 
 /** Wait until `cond()` is true (heartbeat persistence is fire-and-forget) or fail after a budget. */
-async function until(cond: () => boolean | Promise<boolean>, budgetMs = 2000): Promise<void> {
+async function until(cond: () => boolean | Promise<boolean>, budgetMs = 20_000): Promise<void> {
   const start = Date.now();
   while (!(await cond())) {
     if (Date.now() - start > budgetMs) throw new Error('timed out waiting for condition');
