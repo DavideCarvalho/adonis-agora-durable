@@ -508,6 +508,10 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb, makeTransportDb }) => {
         await cp.publishTenantEvent({ tenant: 'acme', event: event('r1', 1) });
         await cp.publishTenantEvent({ tenant: 'globex', event: event('r2', 1) });
         await until(() => got1.length === 1 && got2.length === 1 && got3.length === 1);
+        // A row is deleted once its handler ran, so the handler can be seen before the delete lands
+        // (CI caught rows still claimed after a fixed 30ms beat): wait for the table to drain, then a
+        // beat for a would-be extra delivery.
+        await until(async () => (await rows()).length === 0);
         await sleep(30);
         expect(got1.map((e) => e.event.runId)).toEqual(['r1']);
         expect(got2.map((e) => e.event.runId)).toEqual(['r1']);
