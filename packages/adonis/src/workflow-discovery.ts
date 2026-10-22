@@ -95,6 +95,8 @@ export async function registerWorkflowClass(
       ...(meta.concurrency ? { concurrency: meta.concurrency } : {}),
       ...(meta.origin ? { origin: meta.origin } : {}),
       ...(meta.onError?.length ? { onError: onErrorRoutesOf(meta) } : {}),
+      ...(meta.inputSchema ? { inputSchema: meta.inputSchema } : {}),
+      ...(meta.searchAttributes ? { searchAttributesSchema: meta.searchAttributes } : {}),
     },
   );
   // Collect any colocated `static schedule` on the class so the worker loop can fire it alongside the

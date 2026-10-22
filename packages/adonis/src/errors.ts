@@ -149,6 +149,49 @@ export class NestedWorkflowCallError extends FatalError {
   }
 }
 
+/** One Standard Schema issue in JSON-safe form: its message and the dotted-path segments. */
+export interface SchemaIssue {
+  message: string;
+  path: string[];
+}
+
+/**
+ * Thrown when a value fails a Standard Schema (zod / valibot / arktype / …) the app declared: a
+ * `@Step({ input, output })` schema, a workflow's `inputSchema`, or its typed `searchAttributes`.
+ * A `FatalError` (code `schema_validation`), so it is NOT retried — retrying cannot fix a payload
+ * that doesn't match its schema. `issues` (also in `details.issues`, so it survives the transport
+ * to the run's error / an `onError` handler) lists every issue with a JSON-safe `path`. Route it
+ * with `onError: [{ code: SchemaValidationError, workflow: … }]`.
+ */
+export class SchemaValidationError extends FatalError {
+  static readonly code = 'schema_validation';
+  readonly issues: SchemaIssue[];
+  constructor(
+    label: string,
+    issues: ReadonlyArray<{
+      readonly message: string;
+      readonly path?: ReadonlyArray<PropertyKey | { readonly key: PropertyKey }> | undefined;
+    }>,
+  ) {
+    const normalized = issues.map((issue) => ({
+      message: issue.message,
+      path: (issue.path ?? []).map((segment) =>
+        String(typeof segment === 'object' && segment !== null ? segment.key : segment),
+      ),
+    }));
+    const summary = normalized
+      .map(
+        (issue) => `${issue.path.length > 0 ? issue.path.join('.') : '(root)'}: ${issue.message}`,
+      )
+      .join('; ');
+    super(`${label} failed schema validation — ${summary}`, SchemaValidationError.code, {
+      issues: normalized,
+    });
+    this.name = 'SchemaValidationError';
+    this.issues = normalized;
+  }
+}
+
 /**
  * Thrown by `ctx.all` when one or more parallel child workflows fail. Carries the per-item failures
  * (input index, child run id, error message) and presents an aggregate message summarizing the count
