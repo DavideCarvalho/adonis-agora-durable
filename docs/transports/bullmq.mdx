@@ -20,7 +20,7 @@ For an **Adonis-only** fleet, the [`queue`](/docs/durable/transports/queue) and 
 
 ## How it works
 
-- `ctx.step` dispatches a task to a **per-name** queue, `<P>-tasks-<token>`. The routing token is the step name with `:` replaced by `-` (BullMQ does not allow `:` in a queue name), plus `@<partition>` when a partition is set.
+- `ctx.step` dispatches a task to a **per-name** queue, `<P>-tasks-<token>`. The routing token is the step name with `:` replaced by `-` (BullMQ does not allow `:` in a queue name), plus `@<partition>` when a partition other than `'default'` is set.
 - A worker that registered that step name consumes the queue, runs the handler, and adds the result to the shared `<P>-results` queue.
 - The engine-side instance consumes `<P>-results` and checkpoints each result.
 - Heartbeats from long steps (`timeoutMs`) travel on the `<P>-heartbeat` pub/sub channel. Workers advertise themselves with TTL'd Redis keys.
@@ -56,12 +56,16 @@ This transport only carries tasks, results and heartbeats. Cross-instance lifecy
 
 The `consumers` setting in `config/durable.ts` works on `bullmq` as on [the queue driver](/docs/durable/transports/queue#consumers--why-a-node-ace-script-does-not-drain-the-queue). A BullMQ `Worker` starts fetching as soon as it is built, so a deferred process builds none: its task, results, decisions, step-events, start-run and run-request workers are created only when `durable:work` calls `engine.startConsumers()`. With the default `'auto'`, a `node ace` console or REPL process is a pure producer — it dispatches and publishes, and never claims a job. `'never'` makes every process a producer (for web fleets); `'always'` opts a process in. Pub/sub subscriptions — heartbeats, run replies, tenant events — are broadcast and start regardless.
 
+<Callout type="warn" title="A deferred process still looks like a worker">
+The transport starts a step name's [liveness key](#worker-liveness) when the handler is registered, before its BullMQ worker exists. A `node ace` process that boots the app registers `app/steps`, so while it runs it beats `<P>-worker-heartbeat:<token>:<instanceId>` for every step name and counts as a live worker in `groupHealth` and the dashboard, though it takes no job. The keys expire 35 s after the process exits. The `queue` and `db` transports start beating only once they really consume.
+</Callout>
+
 ## Connection
 
 `connection` is required. It is passed directly to BullMQ and ioredis, and accepts:
 
 - ioredis `ConnectionOptions` (`host`, `port`, `password`, `db`, `sentinels`, ...),
-- a `redis://` or `rediss://` URL — host, port, username, password, the db in the path, and TLS for `rediss:`; query parameters are refused (pass `ConnectionOptions` for anything else) — or
+- a `redis://` or `rediss://` URL — host (default `127.0.0.1`), port (default `6379`), URL-decoded username and password, the db from the first path segment, and TLS (`tls: {}`) for `rediss:`. Query parameters are refused, and so are other schemes and a db that isn't a non-negative integer, all at boot; pass `ConnectionOptions` for anything else — or
 - an existing ioredis `Redis` instance.
 
 BullMQ workers need `maxRetriesPerRequest: null`. When you pass an options object, the transport sets that for its worker connections. A `Redis` instance you pass in is used as-is, so configure it yourself. Pub/sub, heartbeat and liveness clients are `duplicate()`s of a passed instance, or fresh clients with a 10s keep-alive.
@@ -149,7 +153,7 @@ An engine and its workers must agree on all three, or they end up on different q
 
 If a worker crashes or stalls mid-step, it never produces a `StepResult`, and the step's checkpoint would stay `pending`. The transport handles this case **automatically**:
 
-- BullMQ's own stalled-job check, run by a **peer** worker on the same queue, marks the crashed worker's job `failed` once its stall limit is reached.
+- BullMQ's own stalled-job check, run every 30 s by a **peer** worker on the same queue (or by the crashed worker once it restarts), finds the job whose 30 s lock lapsed. The first stall puts the job back in the queue to run again; a job that stalls more than BullMQ's `maxStalledCount` (default `1`, so on its second stall) is marked `failed`. With the defaults a crashed worker's step is re-delivered in about 30–60 s.
 - Every task worker listens for `failed`. When a task job ends `failed`, the listener publishes a synthetic, **retryable** failed `StepResult` for it on `<P>-results`. The engine then settles the checkpoint as failed, and its normal durable retry re-dispatches the step.
 - Task jobs are enqueued with `removeOnFail: { age: 86400 }`, so a failed job's payload stays in Redis for 24 hours. That gives the bridge time to read the `runId` / `seq` / `stepId` it needs before BullMQ removes the job.
 
@@ -197,20 +201,20 @@ The transport runs one shared watchdog that `PING`s every subscriber connection 
 
 Each subscriber connection also gets an `error` listener. The first error of each reconnect burst goes to `onError`, or to `console.warn` without one, instead of surfacing as an unhandled `error` event.
 
-A real close (a Redis restart, `CLIENT KILL`) needs no watchdog: ioredis reconnects and resubscribes by itself. The watchdog is for the silent drop. [`controlPlanes.redis`](/docs/durable/transports/control-plane) runs the same watchdog on the control channel.
+A real close (a Redis restart, `CLIENT KILL`) needs no watchdog: ioredis reconnects and resubscribes by itself. The watchdog is for the silent drop. A `RedisControlPlane` built on a raw ioredis instance runs the same watchdog on its control channel; the `controlPlanes.redis()` factory form, which rides an `@adonisjs/redis` connection, does not (see [Control plane](/docs/durable/transports/control-plane#subscriber-health)).
 
 ## Beyond steps
 
 The same transport also carries:
 
-- **Workflow turns** for workflows whose body runs in another SDK. A `workflow` job goes on the workflow's own `<P>-tasks-<token>` queue (workers tell step jobs and workflow jobs apart by shape), and the worker's decision returns on `<P>-decisions`. Local-step lifecycle events from those workers come back on `<P>-step-events`. See [Python workers & workflows](/docs/durable/python).
+- **Workflow turns** for workflows whose body runs in another SDK or a [worker runtime](/docs/durable/cluster/thin-workers). A `workflow` job goes on the workflow's own `<P>-tasks-<token>` queue (workers tell step jobs and workflow jobs apart by shape), and the worker's decision returns on `<P>-decisions`. Every engine replica consumes that queue, and whichever takes a decision applies it by run id, only while the run still awaits that turn's `taskId` (a stale or duplicate decision is dropped). Local-step lifecycle events from those workers come back on `<P>-step-events`. See [Python workers & workflows](/docs/durable/python) and [Remote workflow turns](/docs/durable/reliability/multi-instance#remote-workflow-turns).
 - **The store-less tenant protocol**. A [tenant pod](/docs/durable/cluster/roles-and-config#tenant-store-less-thin-pod) enqueues start requests on `<P>-start-run` and read/control requests on `<P>-run-request`. The control plane replies on the `<P>-run-reply` pub/sub channel and re-publishes each tenant's lifecycle events on `<P>-tenant-events-<tenant>`.
 
 [How the wire lines up](/docs/durable/cluster/interop#how-the-wire-lines-up) lists every channel next to its NestJS and Python counterpart.
 
 ## Shutdown
 
-`closeTimeoutMs` (default `5000` ms) limits how long `close()` waits for a graceful shutdown. `0` skips the wait. Workers close first, concurrently, so a step that is still running can publish its result. The queues close after that. Both phases share one deadline. When the deadline passes, the transport disconnects its pub/sub, heartbeat and liveness connections anyway. Abandoned BullMQ workers may keep running their jobs on their own connections until the process exits. A job that did not finish is recovered through BullMQ's stalled-job handling and the [crash-recovery bridge](#crash-recovery). The provider calls `close()` on app shutdown.
+`closeTimeoutMs` (default `5000` ms) limits how long `close()` waits for a graceful shutdown. `0` skips the wait. Workers close first, concurrently, so a step that is still running can publish its result. The queues close after that. Both phases share one deadline. When the deadline passes, the transport disconnects its pub/sub, heartbeat and liveness connections anyway. Abandoned BullMQ workers may keep running their jobs on their own connections until the process exits. A job that did not finish is recovered through BullMQ's stalled-job handling and the [crash-recovery bridge](#crash-recovery). `close()` does not delete the process's liveness keys: the worker stays listed for up to 35 s after it stops. The provider calls `close()` on app shutdown.
 
 ## Options — `transports.bullmq(config)`
 
@@ -240,6 +244,7 @@ The same transport also carries:
 | `<P>-step-events` | queue | workers → engine | streamed local-step lifecycle from remote workflows |
 | `<P>-heartbeat` | pub/sub | workers → engine | liveness for `timeoutMs` steps |
 | `<P>-worker-heartbeat:<token>:<instance>` | key, `EX 35` | workers → engine | worker liveness + live status |
+| `<P>-worker-descriptor:<token>:<instance>` | key, TTL'd | workers → engine | a [worker runtime](/docs/durable/cluster/thin-workers)'s handshake descriptor |
 | `<P>-start-run`, `<P>-run-request` | queue | tenant → control plane | store-less start / read / control requests |
 | `<P>-run-reply`, `<P>-tenant-events-<tenant>` | pub/sub | control plane → tenant | correlated replies, per-tenant lifecycle events |
 

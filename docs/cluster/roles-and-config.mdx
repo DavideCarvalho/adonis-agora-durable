@@ -51,7 +51,7 @@ export default defineConfig({
 Store-less `tenant` pods need a transport that carries the run-request protocol a `ProxyRunGateway` and the control plane's `RunRequestResponder` round-trip over: [`bullmq`](/docs/durable/transports/bullmq), [`queue`](/docs/durable/transports/queue#tenant-pods-over-the-queue-transport) or [`db`](/docs/durable/transports/db#remote-workflows-and-tenant-pods). The provider checks the transport for those methods rather than its name. For **cross-ecosystem** fleets (a Python or NestJS worker on the same control plane), select [`bullmq`](/docs/durable/cluster/interop) — it speaks the aviary wire byte-for-byte. On `db` the pod owns no durable store but reaches the control plane's database for the transport tables; choose it when the pods can reach that database and you want no broker at all.
 </Callout>
 
-A `control-plane` serves no `app/steps` in-process (only `standalone` embeds a worker), and its engine uses a no-op run dispatcher: `start()` persists the run as `pending` and returns, and the `durable:work` dispatch/recovery/timers loop drives it from there instead of running the body inline on the request. A control plane with no `namespace` is the **operator**: it drives, recovers and resumes the runs of every pool, which is what lets one control plane serve many tenant pools. It is the only operator there is — a standalone engine never drives every pool. The `RunRequestResponder` that answers tenant pods starts only when the selected transport carries the run-request methods; on any other transport the control plane simply has no tenant-facing surface.
+A `control-plane` serves no `app/steps` in-process (only `standalone` embeds a worker), and unless you set `runDispatcher` its engine uses a no-op run dispatcher: `start()` persists the run as `pending` and returns, and the `durable:work` dispatch/recovery/timers loop drives it from there instead of running the body inline on the request. A control plane with no `namespace` is the **operator**: it drives, recovers and resumes the runs of every pool, which is what lets one control plane serve many tenant pools. It is the only operator there is — a standalone engine never drives every pool. The `RunRequestResponder` that answers tenant pods starts only when the selected transport carries the run-request methods; on any other transport the control plane simply has no tenant-facing surface.
 
 ## Tenant (store-less thin pod)
 
@@ -63,13 +63,23 @@ import { defineConfig, transports } from '@adonis-agora/durable'
 export default defineConfig({
   role: 'tenant',
   transport: 'bullmq',
-  transports: { bullmq: transports.bullmq({ connection: process.env.REDIS_URL }) },
+  transports: {
+    // The transport's own `partition` decides which `<name>@<partition>` queues this pod consumes.
+    bullmq: transports.bullmq({ connection: process.env.REDIS_URL!, partition: 'acme-corp' }),
+  },
   partition: 'acme-corp',            // which tenant this pod serves (required) — see Tenancy
   tenant: { token: process.env.DURABLE_TENANT_TOKEN }, // its signed claim
-  requestTimeoutMs: 10_000,          // ProxyRunGateway round-trip timeout
+  requestTimeoutMs: 10_000,          // ProxyRunGateway round-trip timeout (default 10_000)
+  capabilities: ['gpu'],             // optional: extra capabilities the worker advertises
   // store: 'lucid'                  // ❌ compile error — a tenant pod may not name a store
 })
 ```
+
+<Callout type="warn" title="Set the partition on the transport too">
+The provider passes the top-level `partition` to the `ProxyRunGateway` (the tenant it claims on the wire) and to the worker runtime (the routing tokens its descriptor advertises). It does **not** pass it to the transport, and the transport is what subscribes the task queues. Give the transport the same `partition`, or the pod consumes the bare `<name>` queues while the control plane dispatches the tenant's steps to `<name>@acme-corp`. The same applies to `instanceId`: the top-level value reaches the worker runtime only, so when you set one, set it on the transport as well, so the runtime's and the transport's liveness keys carry the same id.
+</Callout>
+
+`capabilities` lists what the pod advertises beyond its handler names in its [descriptor](/docs/durable/cluster/handshake#the-worker-descriptor); a step's [`requires`](/docs/durable/cluster/handshake#capability-aware-routing) is matched against it.
 
 On the `queue` transport the pod needs no database either: pass `workerKeys: false` and it forwards its worker advertisement and its live-tail subscriptions to the control plane, which records them in its own key store. See [tenant pods over the queue transport](/docs/durable/transports/queue#tenant-pods-over-the-queue-transport).
 
@@ -77,7 +87,7 @@ On the `queue` transport the pod needs no database either: pass `workerKeys: fal
 export default defineConfig({
   role: 'tenant',
   transport: 'queue',
-  transports: { queue: transports.queue({ connection: 'redis', workerKeys: false }) },
+  transports: { queue: transports.queue({ connection: 'redis', workerKeys: false, partition: 'acme-corp' }) },
   partition: 'acme-corp',
   tenant: { token: process.env.DURABLE_TENANT_TOKEN },
 })
@@ -89,7 +99,7 @@ On the `db` transport the pod reaches the control plane's database for the trans
 export default defineConfig({
   role: 'tenant',
   transport: 'db',
-  transports: { db: transports.db() },
+  transports: { db: transports.db({ partition: 'acme-corp' }) },
   partition: 'acme-corp',
   tenant: { token: process.env.DURABLE_TENANT_TOKEN },
 })
@@ -105,11 +115,11 @@ The checks split into compile-time (the config's type) and boot-time (the provid
 
 | `role` | Requires | Forbids | Checked at boot |
 | --- | --- | --- | --- |
-| `standalone` (or omitted) | nothing — no `store` selects the in-memory store, no `transport` the in-memory transport | — | — |
-| `control-plane` | `store` **and** `transport` (both typed required) | — | The responder is started only on a transport with the run-request methods. |
-| `tenant` | `transport` and `partition` (both typed required) | `store`, `stores` (typed `never`) | Resolving the `RunGateway` throws when the transport lacks the store-less methods (`dispatchStartRun`, `dispatchRunRequest`, `onRunReply`, `onTenantEvent`). Resolving the worker runtime throws when the transport cannot serve handlers (`handle()`). No engine and no store are bound, so resolving either throws. |
+| `standalone` (or omitted) | nothing — no `store` selects the in-memory store, no `transport` the in-memory transport | — | Serves `app/steps` in-process. Starts the `RunRequestResponder` (and honours `verifyTenant`) when the transport carries the run-request methods, like a `control-plane`. |
+| `control-plane` | `store` **and** `transport` (both typed required) | — | Serves no `app/steps`. Uses `NOOP_RUN_DISPATCHER` unless `runDispatcher` is set. The responder is started only on a transport with the run-request methods (`onRunRequest`, `onStartRun`, `publishRunReply`, `publishTenantEvent`). |
+| `tenant` | `transport` and `partition` (both typed required); optional `tenant.token`, `requestTimeoutMs`, `capabilities` | `store`, `stores` (typed `never`) | Resolving the `RunGateway` throws when the transport lacks the store-less methods (`dispatchStartRun`, `dispatchRunRequest`, `onRunReply`, `onTenantEvent`). Resolving the worker runtime throws when the transport cannot serve handlers (`handle()`). No engine and no store are bound, so resolving either throws. |
 
-`partition` is the axis a `tenant` pod is named by: it suffixes the pod's `<name>@<partition>` routing tokens and is the tenant the proxy claims on the wire when no token is set. `namespace` stays a separate, optional field on every role (a run scope; absent, it is `'default'` on `standalone` and every pool on `control-plane`); a tenant pod passes it to its transport and worker runtime. What each axis actually partitions is [Tenancy](/docs/durable/concepts/tenancy).
+`partition` is the axis a `tenant` pod is named by: it suffixes the routing tokens the pod's descriptor advertises and is the tenant the proxy claims on the wire when no token is set (the transport's own `partition` decides the queues it consumes, see above). `namespace` stays a separate, optional field on every role (a run scope; absent, it is `'default'` on `standalone` and every pool on `control-plane`); a tenant pod passes it to its transport and worker runtime. What each axis actually partitions is [Tenancy](/docs/durable/concepts/tenancy).
 
 ## Worker vs api — the entrypoint decides
 
@@ -137,7 +147,7 @@ The ordinary **HTTP server**. Every durable read, control action, and run-start 
 node bin/server.js
 ```
 
-Mount the [dashboard](/docs/durable/observability/dashboard) and it works unchanged — its reads proxy to the control plane over the wire.
+Mount the [dashboard](/docs/durable/observability/dashboard) and it works unchanged — its reads proxy to the control plane over the wire. One exception: the fleet panel's live worker list reads the store role's transport, which a `tenant` pod does not bind, so on a tenant pod that panel shows diagnostics only.
 
 </Tab>
 
@@ -268,7 +278,7 @@ Without `verifyTenant`, the wire `tenant` field is trusted **verbatim** — any 
 
 </Steps>
 
-The `RunRequestResponder` is the **trust boundary**. Beyond checking the token, it forces `listRuns` to the requester's own tenant (no cross-tenant enumeration), validates `run.namespace === tenant` on every get/signal/cancel (anti-IDOR), and rejects unknown verbs and tampered tokens.
+The `RunRequestResponder` is the **trust boundary**. Beyond checking the token, it forces `listRuns` to the requester's own tenant (no cross-tenant enumeration), validates `run.namespace === tenant` on every run-scoped verb before it acts (anti-IDOR), stamps the verified tenant as the namespace of every run a pod starts, republishes live-tail events only to the tenant that owns the run, and rejects unknown verbs and tampered tokens.
 
 ## Next steps
 

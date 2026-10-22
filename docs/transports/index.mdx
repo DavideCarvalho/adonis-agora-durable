@@ -1,6 +1,6 @@
 ---
 title: Overview
-description: How remote steps travel to workers. Transports are config-driven drivers selected by name in config/durable.ts — from the in-process memory driver for zero-infra single-process handlers, to the queue driver over @adonisjs/queue, and a broker-less SQL driver that rides the database you already run.
+description: How remote steps travel to workers. Transports are config-driven drivers selected by name in config/durable.ts — the in-process memory and eventEmitter drivers, the queue driver over @adonisjs/queue, a broker-less SQL driver on the database you already run, and the BullMQ driver shared with NestJS and Python workers.
 icon: Truck
 ---
 
@@ -12,7 +12,7 @@ For a capability-by-capability matrix of every driver, its limitations and which
 
 A **transport** is how a dispatched `ctx.step` reaches a step handler and how the result comes back. It's a pluggable driver (`dispatch`, `onResult`, `onHeartbeat`), independent of the [state store](/docs/durable/stores) — mix any transport with any store.
 
-Transports are **config-driven drivers**: list the ones you use under `transports` in `config/durable.ts`, built with the `transports` factory, and pick the active one by name with `transport`. Each driver lazily imports its optional peer (`@adonisjs/queue`, `@adonisjs/lucid`) **only when selected**, so nothing extra is loaded for the drivers you don't use.
+Transports are **config-driven drivers**: list the ones you use under `transports` in `config/durable.ts`, built with the `transports` factory, and pick the active one by name with `transport`. Each driver lazily imports its optional peer (`@adonisjs/queue`, `@adonisjs/lucid`, `bullmq` + `ioredis`) **only when selected**, so nothing extra is loaded for the drivers you don't use. Only the selected entry is built: a process runs exactly one transport.
 
 ## The drivers
 
@@ -25,7 +25,7 @@ Transports are **config-driven drivers**: list the ones you use under `transport
 | `transports.bullmq(...)` | Redis + the `bullmq` package | Yes | **Cross-ecosystem**: byte-compatible with the NestJS `nestjs-durable` BullMQ transport and its Python worker, so an AdonisJS engine and a Python or NestJS worker interoperate on one Redis. See [Python interop](/docs/durable/python). |
 
 <Callout type="warn" title="memory is for tests; eventEmitter is the single-process production driver">
-The two look interchangeable and are not. `transports.memory()` executes the handler **inline in the dispatch call**, which is exactly what makes a test deterministic — and exactly what makes it a poor model of production, since a real dispatch is always asynchronous. `transports.eventEmitter()` delivers the result on a later tick, so a workflow that behaves correctly on it behaves correctly on a broker too. Reach for `eventEmitter` for any single-process app you actually deploy.
+The two look interchangeable and are not. `transports.memory()` runs the handler **inside the dispatch call** (the engine's `dispatch` awaits it, and throws if no result handler is registered yet), which is exactly what makes a test deterministic — and a poor model of production, where a dispatch returns before any worker runs. It also drops heartbeats. `transports.eventEmitter()` returns from `dispatch` at once, runs the handler concurrently, delivers heartbeats, and retries a result whose settling failed, so a workflow that behaves correctly on it behaves correctly on a broker too. Reach for `eventEmitter` for any single-process app you actually deploy.
 </Callout>
 
 ## Selecting a transport in config
@@ -67,11 +67,12 @@ export default defineConfig({
 | --- | --- | --- |
 | `group` | — | Accepted for parity with the broker drivers. Handlers match by step name in-process, so it does not affect routing. |
 | `instanceId` | random | Stable id for this process, stamped on control messages. |
+| (namespace) | the engine's | Not a factory option: the engine pushes its `namespace` onto the transport, which folds it into its internal channel names. |
 | `onError` | `console.error` | Where a failing result or heartbeat handler is reported. A failed result is redelivered from memory with backoff (100ms doubling to 5s) until `close()`; a failed heartbeat is dropped. |
 
 Pair it with the [Lucid store](/docs/durable/stores/lucid) and the durability guarantees are the real ones: a crash mid-run resumes from the last checkpoint, because the checkpoints are in Postgres even though the steps never left the process.
 
-What you do **not** get is a second process serving your steps: a `ctx.step` dispatched over `eventEmitter` is handled only by the process that dispatched it. It also doubles as a local control plane, broadcasting to every subscriber in this process — it does not fan out across pods.
+What you do **not** get is a second process serving your steps: a `ctx.step` dispatched over `eventEmitter` is handled only by the process that dispatched it. A dispatched step with no registered handler is ignored silently (another subscriber on the same emitter might own it), so the run waits on it. Lifecycle events and cancellation reach subscribers in this process with no control plane at all; they do not fan out across pods.
 
 Several replicas can still share `eventEmitter` + a shared Lucid store **when every step is a `ctx.localStep`**: leases, checkpoints, signals and cancellation all go through the store, so two replicas never execute the same run. What you lose without a [control plane](/docs/durable/transports/control-plane) is cross-pod fan-out — live-tail, `onCancel` listeners, schedule pause and a `waitForRun` (or a blocking `start()`) that waits on a run resumed by another pod. Add `controlPlanes.redis` for those, and move to `queue`, `db` or `bullmq` once steps must run in another process. See [Pick a topology](/docs/durable/production#2-pick-a-topology).
 
@@ -81,16 +82,22 @@ Several replicas can still share `eventEmitter` + a shared Lucid store **when ev
 
 <CodeFlow scene="transport-dispatch" />
 
-## Pinning a transport per step (failover pools)
+## Transport pools and failover
 
-At the **engine** level a single instance can dispatch over an ordered pool of named transports and fail over between them; a step pins one with `ctx.step(step, input, { transport: id })`:
+`config/durable.ts` builds **one** transport per process: the `transport` you select. The provider hands it to the engine as a one-entry pool with the id `default`, and the other entries of `transports` are never built.
+
+The engine itself can dispatch over an ordered **pool** of named transports, but only when you construct a `WorkflowEngine` yourself and pass `transports: [{ id, transport }, …]` instead of `transport`. It dispatches each step on the first transport and fails over to the next on a dispatch error, throwing only when every one fails. A step pins one by id, tried first with the rest as failover:
 
 ```ts
-// force this dispatch onto the 'db' transport:
+// only with an engine built with transports: [{ id: 'redis', … }, { id: 'db', … }]
 const result = await ctx.step(heavyStep, input, { transport: 'db' })
 ```
 
-The id of the transport that accepted the dispatch is stamped on the task as `task.transport`, so a worker consuming several transports replies on the **matching** one — failover is symmetric.
+<Callout type="warn" title="Don't pin a transport in a config-driven app">
+With the provider's engine the only id is `default`. A `{ transport: 'db' }` pin there fails the dispatch with `transport "db" is not registered`, even when `config.transports` has a `db` entry.
+</Callout>
+
+The id of the transport that accepted the dispatch is stamped on the task as `task.transport`, so a worker consuming several transports replies on the **matching** one, and the engine registers its result and heartbeat handlers on every transport of the pool. Failover is symmetric. Worker health (`groupHealth`) and the worker directory are merged across every transport of the pool.
 
 ## Control plane (separate from the transport)
 
@@ -106,7 +113,7 @@ export default defineConfig({
 })
 ```
 
-Omit it and the engine is **local-only**: events and cancellation reach subscribers on this instance but don't fan out to other processes (fine for a single-instance app). Supply one and lifecycle events broadcast to every process and a `cancel` reaches the process running the run. See [Control plane](/docs/durable/transports/control-plane) for the `controlPlanes.redis` driver (multi-replica, NestJS-interoperable).
+Omit it and the engine is **local-only**: events and cancellation reach subscribers on this instance but don't fan out to other processes (fine for a single-instance app). Selecting a transport never makes it the control plane, even one that implements `publishControl` / `onControl`. Supply one and lifecycle events broadcast to every process and a `cancel` reaches the process running the run. See [Control plane](/docs/durable/transports/control-plane) for the `controlPlanes.redis` driver (multi-replica, NestJS-interoperable).
 
 ## Wide fans: results and timers
 
@@ -141,11 +148,13 @@ Where they live depends on the transport:
 | `queue` | a key store beside the queues — by default the app database's `durable_transport_worker_keys` table (see [queue](/docs/durable/transports/queue#worker-advertisement)); a `tenant` pod with none forwards it to the control plane's |
 | `memory` | none |
 
-A worker that stops cleanly removes its keys; one that dies drops out when they expire.
+A [worker runtime](/docs/durable/cluster/thin-workers) that stops cleanly removes its keys, and so do the `queue` and `db` transports for their own per-step-name liveness keys; the `bullmq` transport's liveness keys expire 35 s after the last beat. A worker that dies drops out when its keys expire.
 
 ## Wire protocol
 
-Every transport carries the same JSON `RemoteTask` (dispatch) and `StepResult` (reply). The task also carries an optional `transport` (the pool id it was dispatched on) and an optional `traceparent` (see [distributed tracing](/docs/durable/observability/otel#distributed-tracing-across-workers)).
+Every transport carries the same JSON `RemoteTask` (dispatch) and `StepResult` (reply). The task also carries an optional `transport` (the pool id it was dispatched on) and an optional `traceparent` (see [distributed tracing](/docs/durable/observability/otel#distributed-tracing-across-workers)). The JSON is the same everywhere, but the wire around it is not: only `bullmq` shares its queue names and job shapes with the NestJS and Python workers. The `queue` and `db` layouts are this package's own.
+
+Several engine instances can share one transport safely: an engine settles a result with a conditional write on the step's checkpoint that succeeds only while it is still `pending` (`saveCheckpointIfPending` on the Lucid store), so a duplicate or redelivered result does nothing, and over one store only one engine's write lands.
 
 <Callout type="info">
 A worker process is the [`durable:work`](/docs/durable/cli) command plus the step handlers it serves (from `app/steps`, discovered automatically). Run one engine-side process, which consumes results, and one or more worker processes.

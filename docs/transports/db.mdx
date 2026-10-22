@@ -32,9 +32,15 @@ export default defineConfig({
 })
 ```
 
-A worker process constructs the transport and registers handlers — served by name, one claim loop per handler name:
+The idiomatic worker is the bundled ace command. It boots the app from the same `config/durable.ts` and serves the step handlers under `app/steps`:
 
-```ts title="start/worker.ts (a separate worker process)"
+```bash title="a separate worker process"
+node ace durable:work
+```
+
+Outside that command you can construct the transport yourself and register handlers by name. Do it after the app has booted (Lucid's `db` service is `undefined` before that):
+
+```ts title="a hand-built worker, after app boot"
 import db from '@adonisjs/lucid/services/db'
 import { DbTransport } from '@adonis-agora/durable'
 
@@ -42,7 +48,7 @@ const transport = new DbTransport({ db }) // pass { partition } to isolate this 
 transport.handle('pipeline:extract', async (input) => extract(input))
 ```
 
-Each handler name maps to a routing token — the sanitized handler name, suffixed `@<partition>` when the instance sets `partition` — and one `DbTransport` instance claims rows for every token it registered. On the engine side the loops start when the engine registers its result, heartbeat, and control handlers; on the worker side the first `handle()` starts the task loop. `start()` is an explicit no-op convenience that reopens the pollers and waits for the schema; `stop()`/`close()` stop every loop and wait up to `closeTimeoutMs` (5 seconds) for in-flight work, so a claimed task mid-handler gets to write its result. Anything still unfinished after that is [handed back](#closing-a-worker-hands-its-claims-back) for another worker to pick up at once. Neither closes the shared Lucid `Database`.
+Each handler name maps to a routing token — the handler name with `:` replaced by `-`, suffixed `@<partition>` when the instance sets a `partition` other than `'default'` — and one `DbTransport` instance claims rows for every token it registered, in **one** claim loop. On the engine side the loops start when the engine registers its result, heartbeat, and control handlers; on the worker side the first `handle()` starts the task loop. `start()` is an explicit no-op convenience that reopens the pollers and waits for the schema; `stop()`/`close()` stop every loop and wait up to `closeTimeoutMs` (5 seconds) for in-flight work, so a claimed task mid-handler gets to write its result. Anything still unfinished after that is [handed back](#closing-a-worker-hands-its-claims-back) for another worker to pick up at once. Neither closes the shared Lucid `Database`.
 
 Trade-off vs a real broker: throughput is bounded by polling + row contention — great for workflow/pipeline scale (modest rate, long steps), not for high-fanout firehoses. But it adds **zero new infrastructure** — no Redis, no SQS — which is often the right trade.
 
@@ -61,7 +67,9 @@ The slots share the one poll loop. Each poll claims only as many rows as there a
 
 `concurrency: 'adaptive'`, or `{ mode: 'adaptive', min, max, start, tickMs, ramCeilingPct, cpuCeilingPct }`, lets the worker tune its own limit with the controller the [queue](/docs/durable/transports/queue#adaptive-concurrency) and [BullMQ](/docs/durable/transports/bullmq#concurrency) transports use, with the same fields and defaults. It grows the limit while steps saturate it at a steady latency, and shrinks it when steps start to queue, on errors or stalls, at the CPU ceiling, or when RSS reaches `ramCeilingPct`. The task loop reads the live limit on every poll. A lower limit lets running tasks finish and claims nothing new until in-flight work is under it.
 
-Idle task, heartbeat and control loops **back off**: after each empty poll the sleep doubles, up to `idleBackoffMax × pollIntervalMs` (800ms by default), and the first row found resets it. The cost is up to that much extra pickup latency for the first task after a quiet spell; `idleBackoffMax: 1` restores the fixed cadence. The results loop never backs off, because every result is on its workflow's critical path.
+Idle task, heartbeat, control, step-event and tenant-protocol loops **back off**: after each empty poll the sleep doubles, up to `idleBackoffMax × pollIntervalMs` (800ms by default), and the first row found resets it. The cost is up to that much extra pickup latency for the first task after a quiet spell; `idleBackoffMax: 1` restores the fixed cadence. The results, decisions and run-reply loops never back off, because each is on a waiting run's or call's critical path.
+
+The [`consumers`](/docs/durable/transports/queue#consumers--why-a-node-ace-script-does-not-drain-the-queue) setting applies here too. A deferred process (a `node ace` command or REPL under the default `'auto'`) starts no task, result, heartbeat or control loop, writes no liveness key, and claims nothing. It still consumes the message rows addressed to it alone (its run replies, tenant events and decisions), because no other process could take them.
 
 ## Priority
 
@@ -120,7 +128,8 @@ export default defineConfig({
 export default defineConfig({
   role: 'tenant',
   transport: 'db',
-  transports: { db: transports.db() },
+  // The transport's `partition` decides which `<name>@acme-corp` rows the pod claims.
+  transports: { db: transports.db({ partition: 'acme-corp' }) },
   partition: 'acme-corp',
   tenant: { token: process.env.DURABLE_TENANT_TOKEN },
 })
@@ -153,7 +162,7 @@ Without the messages table (`autoCreate: false` and no `create_durable_transport
 | Option | Default | Description |
 | --- | --- | --- |
 | `group` | — | **Deprecated.** Steps route by handler name, so an instance serves whatever names it registers — no group to declare. Accepted for back-compat and otherwise ignored; use `partition` for isolation. |
-| `partition` | — | Optional isolation partition suffixing every per-handler routing token (`<name>@<partition>`) this worker serves, matching a dispatch's `partition`. |
+| `partition` | — | Optional isolation partition suffixing every per-handler routing token (`<name>@<partition>`) this worker serves, matching a dispatch's `partition`. `'default'` and `''` mean no partition. |
 | `namespace` | from the engine | Worker-pool namespace stamped on every row this instance writes and required on every row it claims, so one set of tables can host several pools. Setting it here is explicit and wins over the engine's propagation of `config.namespace`. |
 | `connection` | Lucid default | The Lucid connection to use. |
 | `pollIntervalMs` | `200` | Poll interval in ms. |
@@ -161,7 +170,7 @@ Without the messages table (`autoCreate: false` and no `create_durable_transport
 | `batchSize` | `20` | Max rows claimed per poll by the results, heartbeat and control loops. The task loop claims only as many rows as it has free slots, capped by this. |
 | `concurrency` | `1` | How many task rows a worker runs at once: a number (fixed), or `'adaptive'` / `{ mode: 'adaptive', min, max, start, tickMs, ramCeilingPct, cpuCeilingPct }` — see [Concurrency and idle polling](#concurrency-and-idle-polling). More slots share one poll loop. A non-finite or sub-1 value falls back to `1`. |
 | `resultConcurrency` | `1` | How many step results the engine side settles at once. |
-| `idleBackoffMax` | `4` | Idle backoff for the task, heartbeat and control loops, in poll intervals. `1` disables it. The results loop never backs off. |
+| `idleBackoffMax` | `4` | Idle backoff for the task, heartbeat, control, step-event and tenant-protocol loops, in poll intervals. `1` disables it. The results, decisions and run-reply loops never back off. |
 | `maxStalledCount` | `3` | How many times a task row's lapsed claim may be taken over before the row is failed as a [poison task](#poison-tasks). |
 | `closeTimeoutMs` | `5000` | How long `close()`/`stop()` waits for in-flight work before [handing every remaining claim back](#closing-a-worker-hands-its-claims-back), uncounted. |
 | `workerHeartbeatIntervalMs` | `10000` | How often a worker refreshes its [liveness key](#worker-health) per served step name. Keys live at least 35s. |
@@ -225,11 +234,15 @@ The schema is built with Lucid's schema builder (Knex), so the same DDL runs on 
 
 | Kind | Stored as |
 | --- | --- |
-| JSON payloads (`input`, `context`, `output`, `error`, `events`, `payload`) | `text` — the transport `JSON.stringify`s on write and `JSON.parse`s on read, so only JSON-safe values survive |
+| JSON payloads (`input`, `context`, `output`, `error`, `events`, `payload`) | `text` — the transport `JSON.stringify`s on write and `JSON.parse`s on read, so only JSON-safe values survive. On MySQL, `text` holds at most 64 KB (see below) |
 | Timestamps (`claimed_at`, `created_at`, `started_at`, `expires_at`) | `bigInteger`, epoch milliseconds |
 | Idempotent insert of a task or result | Knex `onConflict('step_id').ignore()`, which Knex renders per dialect |
 
 There is no dependency on a dialect's native JSON or date type, and no dialect-specific locking clause.
+
+<Callout type="warn" title="MySQL: payloads over 64 KB">
+Unlike the [Lucid store](/docs/durable/stores/lucid), which makes its payload columns `longtext` on MySQL, the transport tables use plain `text` on every dialect. On MySQL that column stops at 65,535 bytes, so a step whose input, output or events serialize larger fails to dispatch or to record its result (or, with MySQL's strict mode off, is truncated and can't be parsed back). On MySQL, either keep step payloads small (pass ids, not documents), or widen the columns yourself in a migration of your own, for example `ALTER TABLE durable_transport_tasks MODIFY input LONGTEXT` (and `context` there; `output`, `error` and `events` on `durable_transport_results`; `payload` on `durable_transport_control` and `durable_transport_messages`). Postgres and SQLite `text` has no such limit.
+</Callout>
 
 ## The claim protocol
 

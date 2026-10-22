@@ -11,6 +11,7 @@ The task [transport](/docs/durable/transports) is **point-to-point**: it carries
 - **Lifecycle events** — so a dashboard-only pod can live-tail a run executing on a worker pod.
 - **Cancellation** — so the pod actually running a run learns it was cancelled elsewhere.
 - **Enqueue nudges** — so a worker picks up a freshly enqueued run now instead of on the next poll.
+- **Schedule pause/resume** — so a schedule paused or resumed at runtime (from the dashboard or the API) stops or restarts ticking on every instance. This is runtime state: a deploy resets it to the config's `paused`.
 
 This is purely out-of-band signalling. It carries **no replay/determinism weight** — the deterministic engine never depends on it; the engine dedupes its own broadcasts by the originating `instanceId`, so a publish that Redis echoes back to its own subscriber is ignored.
 
@@ -40,12 +41,18 @@ export default defineConfig({
 })
 ```
 
-`connection` names a connection from `config/redis.ts` (defaults to `'main'`). Like the other drivers, `@adonisjs/redis` is imported **lazily** — only when this driver is selected — so it stays an optional peer. The provider tears down the subscriber connection on shutdown.
+`connection` names a connection from `config/redis.ts` (defaults to `'main'`). Like the other drivers, `@adonisjs/redis` is imported **lazily** — only when this driver is selected — so it stays an optional peer. The subscription rides that connection's own subscriber, which `@adonisjs/redis` manages and closes with the app.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `connection` | `'main'` | `config/redis.ts` connection used for pub/sub. |
-| `prefix` | `'durable'` | Channel is `` `${prefix}-control` ``. |
+| `prefix` | `'durable'` | Channel is `` `${prefix}-control` ``. The engine's `namespace` is **not** folded in. |
+
+Every instance that should hear each other must use the same channel, so give every engine (and every NestJS or Python process on the same Redis) the same `prefix`. The engine drops a message whose `from` is its own `instanceId`, so its own publishes echoed back by Redis are ignored.
+
+<Callout type="info" title="Namespaces share the channel">
+The `bullmq` transport puts an engine's `namespace` into every queue name (`durable-<namespace>-…`), but the control channel stays `` `${prefix}-control` `` whatever the namespace. Engines of different namespaces on one Redis therefore share it unless you give each its own `prefix`. A Python or NestJS process pointed at the namespaced prefix (`durable-<namespace>`) listens on `durable-<namespace>-control`, so for cancellation to reach it, set `prefix: 'durable-<namespace>'` here too. See [Python interop](/docs/durable/python).
+</Callout>
 
 <Callout type="info">
 **Interoperates with a NestJS fleet.** The channel (`` `${prefix}-control` ``) and the JSON payload match the NestJS BullMQ transport's control plane, so an AdonisJS fleet and a NestJS fleet sharing one Redis fan out across both runtimes on the same channel.
@@ -53,7 +60,7 @@ export default defineConfig({
 
 ## Passing an instance directly
 
-`controlPlane` also accepts a ready `ControlPlane` instance instead of a factory — useful for tests or a bespoke broker. A broadcast-capable transport that also implements `ControlPlane` can be passed as both.
+`controlPlane` also accepts a ready `ControlPlane` instance instead of a factory — useful for tests or a bespoke broker. Any object with `publishControl(msg)` and `onControl(handler)` works, as long as every instance receives every message. None of the shipped broker transports qualifies: `bullmq` has no control plane, and `queue` and `db` implement the two methods over a single-consumer queue or table, so each message reaches one instance only.
 
 ```ts
 import { RedisControlPlane } from '@adonis-agora/durable'
@@ -63,4 +70,17 @@ const controlPlane = new RedisControlPlane({ connection: new Redis(), prefix: 'd
 export default defineConfig({ controlPlane })
 ```
 
-`RedisControlPlane` accepts **either** a raw `ioredis` instance (it duplicates a dedicated subscriber connection) **or** an `@adonisjs/redis` connection (which manages its own subscriber) — it detects which by feature, so the factory form and the manual form behave identically.
+`RedisControlPlane` accepts **either** a raw `ioredis` instance (it duplicates a dedicated subscriber connection) **or** an `@adonisjs/redis` connection (which manages its own subscriber); it detects which by feature. The two carry the same messages on the same channel and differ only in who owns the subscriber connection, which decides the subscriber health check below.
+
+| Constructor option | Default | Meaning |
+| --- | --- | --- |
+| `connection` | — (required) | A raw `ioredis` client or an `@adonisjs/redis` connection. |
+| `prefix` | `'durable'` | Channel is `` `${prefix}-control` ``. |
+| `pingIntervalMs` | `30_000` | Raw `ioredis` form only: how often the watchdog pings the subscriber connection. `0` or `false` disables it. |
+
+## Subscriber health
+
+A pub/sub subscriber connection never writes on its own, so when a VPN, NAT gateway or idle timeout drops it silently, it stays "subscribed" while Redis has already dropped the subscription, and cancellations and live-tail events stop arriving.
+
+- **Raw `ioredis` form.** The control plane `PING`s its dedicated subscriber every `pingIntervalMs`. A ping that fails, or takes longer than the smaller of 5 s and the interval, disconnects it so ioredis reconnects and resubscribes. The first subscriber error of each reconnect burst is logged with `console.warn`. This is the same watchdog the [`bullmq` transport](/docs/durable/transports/bullmq#subscriber-health-pingintervalms) runs.
+- **`controlPlanes.redis()` (the `@adonisjs/redis` form).** There is no watchdog and no `pingIntervalMs`: `@adonisjs/redis` owns the subscriber connection and its reconnects. If your network drops idle connections silently, build a `RedisControlPlane` on a raw `ioredis` client instead.

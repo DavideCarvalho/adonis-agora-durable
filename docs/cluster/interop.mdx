@@ -46,23 +46,23 @@ The transport's own options (connection, fixed and adaptive `concurrency`, `resu
 `closeTimeoutMs` (default `5000` ms) limits how long a graceful `close()` waits before the transport disconnects anyway. See [Shutdown](/docs/durable/transports/bullmq#shutdown).
 
 <Callout type="warn">
-The `queue` and `db` transports remain the right choice for **Adonis-only** fleets. `bullmq` is required **only** for cross-ecosystem interop — it is the one wire all three runtimes share.
+`bullmq` is the **only** transport all three runtimes share. The `queue` and `db` transports carry steps, remote workflow turns and tenant pods between Adonis processes only; a Python or NestJS worker cannot consume them (see [Choosing a transport](/docs/durable/transports/choosing)).
 </Callout>
 
 ## How the wire lines up
 
-The control-plane pub/sub channel and every cross-process DTO already match the aviary field-for-field. The BullMQ transport adds the aviary-compatible task/result queues and worker registry:
+Every cross-process DTO matches the aviary field-for-field. The BullMQ transport carries the task, result and decision queues and the worker registry; the control broadcast comes from [`controlPlanes.redis`](/docs/durable/transports/control-plane), which you configure alongside it (the transport does not publish that channel):
 
 | Purpose | Channel | Mechanism |
 |---------|---------|-----------|
 | Task dispatch (step + workflow) | `${P}-tasks-${token}` | BullMQ queue |
 | Step result | `${P}-results` | queue |
 | Workflow decision | `${P}-decisions` | queue |
-| Control broadcast | `${P}-control` | Redis pub/sub |
+| Control broadcast (`controlPlanes.redis`) | `${prefix}-control` | Redis pub/sub |
 | Worker liveness | `${P}-worker-heartbeat:${token}:${instance}` | Redis key, `EX 35` |
 | Worker descriptor | `${P}-worker-descriptor:${token}:${instance}` | Redis key |
 
-where `P` is the effective prefix (`durable`, or `durable-<namespace>`), and the routing `token` is `<name>@<tenant>` when a partition is set. Serialization is plain JSON with the DTO **as** the job data — the worker discriminates step vs workflow by shape. Dates are epoch-ms on cross-process DTOs (ISO only where nested in an `EngineEvent`/`WorkflowRun`), and BullMQ priority is inverted the same way on every side. The [handshake](/docs/durable/cluster/handshake) descriptor's `descriptorHash` even agrees three-way (Python folds UTF-16 code units to match JS `charCodeAt`), so negotiation is cross-SDK.
+where `P` is the effective prefix (`durable`, or `durable-<namespace>`), `prefix` is the control plane's own `prefix` option (default `durable`), and the routing `token` is `<name>@<partition>` when a partition is set. Serialization is plain JSON with the DTO **as** the job data — the worker discriminates step vs workflow by shape. Dates are epoch-ms on cross-process DTOs (ISO only where nested in an `EngineEvent`/`WorkflowRun`), and BullMQ priority is inverted the same way on every side. The [handshake](/docs/durable/cluster/handshake) descriptor's `descriptorHash` even agrees three-way (Python folds UTF-16 code units to match JS `charCodeAt`), so negotiation is cross-SDK.
 
 ## Running a polyglot fleet
 
@@ -70,7 +70,7 @@ where `P` is the effective prefix (`durable`, or `durable-<namespace>`), and the
 
 <Tab value="Adonis CP → Python worker">
 
-1. **Adonis control plane** — configure the `bullmq` transport (above) and run the store-backed loop:
+1. **Adonis control plane** — configure the `bullmq` transport (above), add `controlPlane: controlPlanes.redis({ connection: 'main' })` on the same Redis if Python handlers should observe cancellation, and run the store-backed loop:
 
    ```bash
    node ace durable:work
@@ -102,7 +102,7 @@ where `P` is the effective prefix (`durable`, or `durable-<namespace>`), and the
 
 <Tab value="NestJS CP → Adonis worker">
 
-Point a store-less **Adonis** `tenant` worker (see [Roles & config](/docs/durable/cluster/roles-and-config)) at the same Redis a NestJS/aviary control plane dispatches over. Register the handler names the NestJS workflows call; the Adonis worker advertises its descriptor, the aviary control plane negotiates it as routable, and steps it dispatches execute on the Adonis worker with the result flowing back.
+Point a store-less **Adonis** `tenant` worker (see [Roles & config](/docs/durable/cluster/roles-and-config)) at the same Redis and `prefix` a NestJS/aviary control plane dispatches over, with the same `partition` on `transports.bullmq()` that the NestJS side routes to (`default` keeps the queues bare). Register the handler names the NestJS workflows call; the Adonis worker advertises its descriptor, the aviary control plane negotiates it as routable, and steps it dispatches execute on the Adonis worker with the result flowing back.
 
 ```bash
 # On the Adonis worker pod (role: 'tenant', bullmq transport, same Redis)

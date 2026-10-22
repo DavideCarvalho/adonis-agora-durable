@@ -81,19 +81,20 @@ Upgrading an app from 0.6 to 0.7:
 | `connection` | `config/queue.ts` `default` | Name of the `@adonisjs/queue` connection (a key of that file's `adapters`) whose adapter this transport uses. |
 | `adapter` | — | Escape hatch: a raw `@adonisjs/queue` adapter factory, used instead of resolving from `config/queue.ts`. Takes precedence over `connection`. |
 | `group` | — | **Deprecated.** Steps route by handler name, so an instance serves whatever names it registers — no group to declare. Accepted for back-compat and otherwise ignored; use `partition` for isolation. |
-| `partition` | — | Optional isolation partition suffixing every per-handler task queue this worker subscribes to (`<name>@<partition>`), matching a dispatch's `partition` — so one backend can host several pools serving the same handler name without their tasks crossing. |
+| `partition` | — | Optional isolation partition suffixing every per-handler task queue this worker subscribes to (`<name>@<partition>`), matching a dispatch's `partition` — so one backend can host several pools serving the same handler name without their tasks crossing. `'default'` and `''` mean no partition. |
 | `namespace` | from the engine | Worker-pool namespace folded into every queue name. Setting it here is explicit and wins over the engine's propagation of `config.namespace` — see [Namespaces](#namespaces--sharing-one-broker-across-pools). |
 | `prefix` | `'durable'` | Namespaces the queues (`<prefix>:tasks:<token>`, `<prefix>:results`, …). |
 | `pollIntervalMs` | `200` | Poll interval in ms between queue reads. |
 | `closeTimeoutMs` | `5000` | How long `close()` waits for jobs already in a handler before handing the rest back to the broker. |
 | `concurrency` | `1` | How many jobs of one step name this worker runs at once: a number (fixed), or `'adaptive'` / `{ mode: 'adaptive', min, max, start, tickMs, ramCeilingPct, cpuCeilingPct }` to let a control loop move it — see [Adaptive concurrency](#adaptive-concurrency). More slots share one poll loop, so raising it adds no polling. |
 | `resultConcurrency` | `1` | How many step results the engine side settles at once. |
-| `idleBackoffMax` | `4` | Idle backoff for the task, heartbeat and control loops, in poll intervals: empty polls double the sleep up to this multiple (800ms at the default interval), and a found job resets it. `1` disables it. The results loop never backs off. |
+| `idleBackoffMax` | `4` | Idle backoff for the task, heartbeat, control, step-event and tenant-protocol loops, in poll intervals: empty polls double the sleep up to this multiple (800ms at the default interval), and a found job resets it. `1` disables it. The results, decisions and run-reply loops never back off. |
 | `stalledCheckIntervalMs` | `30_000` | How often the stalled-claim reclaim sweep runs. `0` disables it entirely. |
 | `stalledThresholdMs` | `120_000` (2min) | How long a claim may go without being renewed before the sweep presumes its worker dead and re-delivers the job. `1_800_000` (30min) on an adapter without `renewJobs`. |
 | `maxStalledCount` | `3` | How many times one job may be reclaimed before it is failed permanently — the bound on a poison job. A step task failed this way is reported to its run as a failed step (see [Poison jobs](#poison-jobs)). |
 | `onError` | `console.error` | Where a poll-loop failure is reported. Point it at your app's logger. |
-| `instanceId` | random uuid | Stable process id stamped on heartbeats and control messages. |
+| `instanceId` | random uuid | Stable process id stamped on heartbeats, control messages, liveness keys and the adapter's worker id (the `workerId` on a claimed job). On a `tenant` pod it is also the inbox the control plane replies to. |
+| `workerHeartbeatIntervalMs` | `10000` | How often a worker refreshes the [liveness key](#worker-health) of each step name it serves. A key lives at least 35s (three intervals when that is longer). |
 | `workerKeys` | the app database | Where the [worker advertisement](/docs/durable/transports#worker-advertisement) lives. Default: the `durable_transport_worker_keys` table through `@adonisjs/lucid`, when the app has it. Pass any `WorkerKeyStore` to keep the keys elsewhere, or `false` to advertise nothing. |
 | `workerKeysConnection` | default Lucid connection | Lucid connection the default worker-key table lives on. |
 | `workerKeysCacheMs` | `5000` | How long a read of the worker keys is reused. |
@@ -153,11 +154,11 @@ publishes), the same one the [db transport](/docs/durable/transports/db) uses. W
 
 ### Worker health
 
-Every worker process beats a liveness key for each step name it serves — `<prefix>-worker-heartbeat:<token>:<instanceId>` in the worker-key store, refreshed every 10s and live for 35s, carrying the `WorkerStatus` snapshot described [above](#adaptive-concurrency). A process that only produces (a `console`/`repl` process with [deferred consumers](#consumers--why-a-node-ace-script-does-not-drain-the-queue)) beats nothing until it starts consuming.
+Every worker process beats a liveness key for each step name it serves — `<prefix>-worker-heartbeat:<token>:<instanceId>` in the worker-key store, refreshed every `workerHeartbeatIntervalMs` (10s) and live for 35s, carrying the `WorkerStatus` snapshot described [above](#adaptive-concurrency). A process that only produces (a `console`/`repl` process with [deferred consumers](#consumers--why-a-node-ace-script-does-not-drain-the-queue)) beats nothing until it starts consuming.
 
 From those keys and the queue, the transport implements `groupHealth`, so `engine.workerHealth()`, the dashboard's `/api/workers` and `/api/health` and the [Telescope](/docs/durable/observability/telescope) worker panel report queue-transport groups:
 
-- `liveWorkers`: the unexpired liveness keys of the group, with each worker's `instanceId`, `lastBeatAt` and `status`. A worker that dies drops out within 35s.
+- `liveWorkers`: the unexpired liveness keys of the group, with each worker's `instanceId`, `lastBeatAt` and `status`. A worker that stops cleanly removes its keys at once; one that dies drops out within 35s. Reads of the keys are reused for `workerKeysCacheMs` (5s).
 - `depth`: the task queue's **pending** jobs, from the adapter's `sizeOf`. This is narrower than BullMQ's depth (waiting + active + delayed + prioritized): the `@adonisjs/queue` adapter contract has no count for jobs in flight or delayed retries, so those are not included. `depth > 0` with no live worker is still the alert state, since pending jobs are the ones no worker has picked up.
 
 `groupHealth` needs the worker-key store: with `workerKeys: false` (or no database and no store), no worker can advertise liveness, so the transport does not implement it and the panels stay empty rather than flagging every group as starved.
@@ -200,7 +201,15 @@ This needs `@adonisjs/queue` **0.7**: there the adapter hands a job that stalled
 
 Broker queues are point-to-point: a job goes to exactly one consumer. That makes a short-lived process subscribing to them actively harmful — it claims step jobs it then dies holding, steals results addressed to the long-lived engine, and, with jobs queued, never exits because the drain loop keeps feeding it.
 
-So by default a **`console` or `repl` process does not start the broker consumer loops**. It can still dispatch runs and read the store — it is a pure producer. `durable:work` re-enables consumption for itself, so the worker command behaves identically either way, and web and test processes always consume eagerly.
+So by default a **`console` or `repl` process does not start the broker consumer loops**. It can still dispatch runs and read the store — it is a pure producer. `durable:work` re-enables consumption for itself, so the worker command behaves identically either way, and web and test processes consume eagerly. The setting has three values:
+
+| `consumers` | Behaviour |
+| --- | --- |
+| `'auto'` (default) | `console` and `repl` processes defer consumption; every other environment consumes. |
+| `'always'` | Every process consumes eagerly. |
+| `'never'` | Every process defers, so it is a pure producer. Use it for a web fleet that must never take jobs; only `durable:work` (which calls `engine.startConsumers()`) consumes. |
+
+A deferred `queue` transport still consumes the inboxes that belong to it alone (its run-reply and tenant-event queues), since no other process could take those jobs.
 
 What this changes in practice: a `node ace` script that starts a run and waits for a remote step to come back will wait forever, because nothing in that process is listening for the result. Either let the worker fleet do the work (start the run and exit), or opt the process back in:
 
@@ -210,7 +219,7 @@ export default defineConfig({
 })
 ```
 
-Reach for `'always'` only for a script that genuinely must round-trip a remote step inline, and be aware it competes with the real worker fleet for jobs while it runs. In-process transports (`memory`, `event-emitter`) are unaffected — there is no broker to compete for.
+Reach for `'always'` only for a script that genuinely must round-trip a remote step inline, and be aware it competes with the real worker fleet for jobs while it runs. In-process transports (`memory`, `eventEmitter`) are unaffected — there is no broker to compete for. The same setting works on [`db`](/docs/durable/transports/db) and [`bullmq`](/docs/durable/transports/bullmq#how-it-works).
 
 `transports.queue(config)` returns the lazy driver thunk used in `config/durable.ts`; the underlying class is `QueueTransport`, also exported from `@adonis-agora/durable` for constructing a worker-side instance directly.
 
@@ -234,11 +243,14 @@ export default defineConfig({
   role: 'tenant',
   transport: 'queue',
   // No database on the pod: its advertisement and subscriptions go to the control plane.
-  transports: { queue: transports.queue({ connection: 'redis', workerKeys: false }) },
+  // The transport's `partition` decides which `<name>@acme-corp` task queues the pod consumes.
+  transports: { queue: transports.queue({ connection: 'redis', workerKeys: false, partition: 'acme-corp' }) },
   partition: 'acme-corp',
   tenant: { token: process.env.DURABLE_TENANT_TOKEN },
 })
 ```
+
+Set `partition` on the transport as well as at the top level: the provider passes the top-level one to the run gateway and the worker runtime, not to the transport that subscribes the task queues (see [Roles and config](/docs/durable/cluster/roles-and-config#tenant-store-less-thin-pod)).
 
 Starting a run and sending a read or control request are plain jobs on `<prefix>:start-run` and `<prefix>:run-request`, which one control-plane instance consumes. The two parts BullMQ broadcasts on Redis pub/sub are different here, because a queue job has exactly one consumer:
 
