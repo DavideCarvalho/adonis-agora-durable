@@ -206,6 +206,37 @@ describe('WorkerRuntime — execute WORKFLOW turns (store-less replay → decisi
     expect(runtime.descriptor().workflows).toEqual(['checkout', 'refund']);
   });
 
+  it('announces the workflows it runs, with the token it consumes and their onError routes', () => {
+    const transport = new WorkflowFakeTransport();
+    const runtime = new WorkerRuntime({ transport, partition: 'acme' });
+    runtime.registerWorkflow('line', () => 'done', {
+      version: '2',
+      onError: [{ code: 'invalid_line', workflow: 'line-dead-letter' }],
+    });
+    runtime.registerWorkflow('plain', () => 'done');
+    // Routed elsewhere, not run here: advertised by name, never announced.
+    runtime.registerWorkflowName('elsewhere');
+
+    expect(runtime.descriptor().registrations).toEqual([
+      {
+        name: 'line',
+        version: '2',
+        onError: [{ code: 'invalid_line', workflow: 'line-dead-letter' }],
+        group: 'line@acme',
+      },
+      { name: 'plain', group: 'plain@acme' },
+    ]);
+  });
+
+  it('announces nothing when it runs no workflow body, keeping its pre-announcement hash', () => {
+    const runtime = new WorkerRuntime({
+      transport: new WorkflowFakeTransport(),
+      partition: 'acme',
+    });
+    runtime.registerWorkflowName('elsewhere');
+    expect(runtime.descriptor()).not.toHaveProperty('registrations');
+  });
+
   it('streams a local step (ctx.sideEffect) lifecycle to the transport mid-turn', async () => {
     const transport = new WorkflowFakeTransport();
     const runtime = new WorkerRuntime({ transport, partition: 'acme' });

@@ -1,6 +1,6 @@
 import type { WorkflowRun } from '../client/durable-client';
 import { XIcon } from './icons';
-import { Json } from './StepDetailPanel';
+import { ErrorBlock, Json } from './StepDetailPanel';
 
 /** Slide-over for the run as a whole — its input, output and (when failed) error. */
 export function RunInfoPanel({ run, onClose }: { run: WorkflowRun; onClose: () => void }) {
@@ -26,16 +26,7 @@ export function RunInfoPanel({ run, onClose }: { run: WorkflowRun; onClose: () =
         </button>
       </div>
       <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-auto px-5 py-4">
-        {run.error && (
-          <section className="rise">
-            <div className="mono mb-1.5 text-[10px] uppercase tracking-[0.18em] text-red-400/80">
-              error
-            </div>
-            <div className="mono rounded-lg border border-red-500/25 bg-red-500/10 p-3 text-[11.5px] leading-relaxed text-red-200">
-              {run.error.message}
-            </div>
-          </section>
-        )}
+        {run.error && <ErrorBlock error={run.error} />}
         {run.input !== undefined && <Json label="input" value={run.input} />}
         {run.output !== undefined && <Json label="output" value={run.output} />}
         {hasNothing && <div className="text-sm text-zinc-600">No input/output recorded.</div>}

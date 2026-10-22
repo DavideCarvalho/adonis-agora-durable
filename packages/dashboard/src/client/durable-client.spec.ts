@@ -540,7 +540,7 @@ describe('deriveRunState: a run waiting on its onError handler', () => {
       { seq: 0, name: 'validate', kind: 'remote' as const, status: 'failed' as const, attempts: 1 },
       {
         seq: 1,
-        name: 'signal:child:r1.onError',
+        name: 'signal:child:r1.onError.0',
         kind: 'signal' as const,
         status: 'running' as const,
         attempts: 0,

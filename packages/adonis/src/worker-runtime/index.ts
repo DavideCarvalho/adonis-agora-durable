@@ -73,4 +73,5 @@ export {
   type WorkerRuntimeLogger,
   type WorkerRuntimeOptions,
   type WorkerTransport,
+  type WorkflowRegistrationMeta,
 } from './worker-runtime.js';
