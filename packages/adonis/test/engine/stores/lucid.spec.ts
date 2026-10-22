@@ -118,6 +118,15 @@ describe('LucidStateStore — runs & checkpoints', () => {
     expect(prefixed.map((c) => c.seq)).toEqual([1]);
     expect(await store.listCheckpointsByNamePrefix('r1', [])).toEqual([]);
   });
+
+  it('matches a checkpoint name prefix literally — `_` and `%` are not wildcards', async () => {
+    await store.createRun(run());
+    await store.saveCheckpoint(checkpoint({ seq: 0, name: 'signal:child:job_1.onError.0' }));
+    await store.saveCheckpoint(checkpoint({ seq: 1, name: 'signal:child:jobX1.onError.0' }));
+
+    const matches = await store.listCheckpointsByNamePrefix('r1', ['signal:child:job_1.']);
+    expect(matches.map((c) => c.name)).toEqual(['signal:child:job_1.onError.0']);
+  });
 });
 
 describe('LucidStateStore — recovery / dispatch queries', () => {

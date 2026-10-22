@@ -46,6 +46,14 @@ export interface WorkflowOptions {
    * facet; omit for an app-local workflow (renders as "unknown" until attributed).
    */
   origin?: string;
+  /**
+   * Route failed runs to a handler workflow by error `code`, instead of failing them: when a run ends
+   * `failed` with a matching code, the engine starts `workflow` with an `OnErrorInput`
+   * (`{ runId, workflow, input, error }`), the run waits for it, and settles with its outcome. `code`
+   * is a string or an error class with a `static code`; omit it for the catch-all. e.g.
+   * `onError: [{ code: InvalidLine, workflow: LineDeadLetterWorkflow }]`.
+   */
+  onError?: { code?: string | { readonly code: string }; workflow: WorkflowRef }[];
 }
 
 /** The metadata read off a workflow class's `static workflow` config for discovery + registration. */
@@ -174,4 +182,31 @@ export function workflowName(ref: WorkflowRef): string {
     );
   }
   return name;
+}
+
+/** A class's `onError` routes, with class refs resolved to names and error classes to their codes. */
+export function onErrorRoutesOf(meta: WorkflowOptions): { code?: string; workflow: string }[] {
+  return (meta.onError ?? []).map(({ code, workflow }) => ({
+    ...(code === undefined ? {} : { code: typeof code === 'string' ? code : code.code }),
+    workflow: workflowName(workflow),
+  }));
+}
+
+/**
+ * What a worker announces about a workflow class it runs (design §7.9): its version, declaring package
+ * and onError routes — pass it as `WorkerRuntime.registerWorkflow`'s `meta`. Undefined for a class
+ * carrying no `static workflow` config.
+ */
+export function workflowAnnouncement(
+  target: unknown,
+):
+  | { version: string; origin?: string; onError?: { code?: string; workflow: string }[] }
+  | undefined {
+  const meta = workflowMeta(target);
+  if (!meta) return undefined;
+  return {
+    version: meta.version,
+    ...(meta.origin ? { origin: meta.origin } : {}),
+    ...(meta.onError?.length ? { onError: onErrorRoutesOf(meta) } : {}),
+  };
 }

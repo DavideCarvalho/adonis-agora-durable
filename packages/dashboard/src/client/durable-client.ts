@@ -44,6 +44,8 @@ export type StepKind = 'local' | 'remote' | 'sleep' | 'signal';
 export interface StepError {
   message: string;
   code?: string;
+  /** Structured, JSON-serializable detail of the failure (e.g. validation issues). */
+  details?: unknown;
   retryable?: boolean;
   stack?: string;
 }
@@ -388,6 +390,14 @@ export function deriveRunState(
 
   const pending = ctx.timeline?.find((s) => s.status === 'pending' || s.status === 'running');
   if (pending) {
+    // The run failed and handed its failure to an onError handler, whose name the waiter's input holds.
+    if (pending.name.startsWith(`signal:child:${run.id}.onError.`)) {
+      const handler = (pending.input as { workflow?: unknown } | undefined)?.workflow;
+      return {
+        status: 'awaiting',
+        detail: typeof handler === 'string' ? `failure handler ${handler}` : 'failure handler',
+      };
+    }
     if (pending.kind === 'signal') return { status: 'awaiting', detail: tokenDetail(pending.name) };
     if (pending.kind === 'sleep') return { status: 'sleeping' };
     if (pending.workerGroup && groupIsStalled(pending.workerGroup, ctx.health)) {

@@ -6,6 +6,7 @@
     "retries",
     "sagas",
     "flow-control",
+    "on-error",
     "dead-letter",
     "retention",
     "failure-modes",

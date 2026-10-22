@@ -199,7 +199,7 @@ the parent to decide what a failure means:
 
 ```ts
 const results = await ctx.allSettled(ProcessItemWorkflow, batch.items, { concurrency: 1000 })
-// results[i]: { status: 'fulfilled', value } | { status: 'rejected', id, error }
+// results[i]: { status: 'fulfilled', value } | { status: 'rejected', id, error, code?, details? }
 
 const rejected = results.flatMap((r, i) =>
   r.status === 'rejected' ? [{ item: batch.items[i], error: r.error }] : []
@@ -210,7 +210,9 @@ if (rejected.length > 0) await ctx.step(recordDeadLetters, rejected)
 It takes the same `concurrency` and lays the fan out exactly as `ctx.all` does (same child ids and
 `parallelGroup`). There is no `mode`: it always waits for every child. Cancelling the parent still cancels
 the run; only the children's failures are collected. For a failure that retrying can't fix, throw
-`FatalError` in the child's step: it skips the retries and the child settles as `rejected` straight away.
+`FatalError` in the child's step: it skips the retries and the child settles as `rejected` straight away,
+with the error's `code` and `details` on the item. A failed `ctx.child` throws a `FatalError` carrying them
+too.
 
 ### Capping how many children run at once — `concurrency`
 

@@ -1,0 +1,55 @@
+{
+  "instanceId": "py-lines-01-3310",
+  "runtime": "python",
+  "sdk": {
+    "name": "durable-worker",
+    "version": "0.23.0"
+  },
+  "protocol": {
+    "version": 1,
+    "range": [
+      1,
+      1
+    ]
+  },
+  "capabilities": [
+    "saga",
+    "signals",
+    "search-attributes",
+    "priority"
+  ],
+  "workflows": [
+    "line",
+    "pipeline"
+  ],
+  "steps": [
+    "extraction:page"
+  ],
+  "registrations": [
+    {
+      "name": "line",
+      "version": "1",
+      "group": "line@acme",
+      "onError": [
+        {
+          "code": "invalid_line",
+          "workflow": "line-dead-letter"
+        },
+        {
+          "workflow": "line-failure"
+        }
+      ]
+    },
+    {
+      "name": "pipeline",
+      "version": "2",
+      "group": "pipeline@acme",
+      "requires": [
+        "saga"
+      ],
+      "origin": "flip-python-db"
+    }
+  ],
+  "partition": "acme",
+  "startedAt": 1752710400000
+}

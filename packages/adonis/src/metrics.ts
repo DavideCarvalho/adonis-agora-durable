@@ -1,7 +1,17 @@
 import type { EngineEvent } from './interfaces.js';
 
 export interface MetricsSnapshot {
-  runs: { started: number; completed: number; failed: number; suspended: number };
+  /** `routed`: failures handed to an onError handler; `unrouted`: routes the engine could not apply. */
+  runs: {
+    started: number;
+    completed: number;
+    failed: number;
+    suspended: number;
+    routed: number;
+    unrouted: number;
+  };
+  /** Routed failures by error code (`*` for a failure without one). */
+  routedByCode: Record<string, number>;
   steps: { started: number; completed: number; failed: number };
   /** Per-workflow run counters, keyed by workflow name. */
   byWorkflow: Record<string, { started: number; completed: number; failed: number }>;
@@ -27,7 +37,8 @@ type Subscribable = { subscribe(listener: (event: EngineEvent) => void): () => v
  */
 export function collectMetrics(engine: Subscribable): MetricsCollector {
   const m: MetricsSnapshot = {
-    runs: { started: 0, completed: 0, failed: 0, suspended: 0 },
+    runs: { started: 0, completed: 0, failed: 0, suspended: 0, routed: 0, unrouted: 0 },
+    routedByCode: {},
     steps: { started: 0, completed: 0, failed: 0 },
     byWorkflow: {},
     stepDuration: { sumMs: 0, count: 0 },
@@ -58,6 +69,15 @@ export function collectMetrics(engine: Subscribable): MetricsCollector {
         break;
       case 'run.suspended':
         m.runs.suspended += 1;
+        break;
+      case 'run.routed': {
+        m.runs.routed += 1;
+        const code = e.error?.code ?? '*';
+        m.routedByCode[code] = (m.routedByCode[code] ?? 0) + 1;
+        break;
+      }
+      case 'run.unrouted':
+        m.runs.unrouted += 1;
         break;
       case 'step.started':
         m.steps.started += 1;
@@ -90,6 +110,9 @@ export function collectMetrics(engine: Subscribable): MetricsCollector {
       for (const [name, v] of Object.entries(m.byWorkflow))
         for (const [event, n] of Object.entries(v))
           lines.push(`durable_runs_by_workflow_total{workflow="${name}",event="${event}"} ${n}`);
+      lines.push('# TYPE durable_runs_routed_total counter');
+      for (const [code, n] of Object.entries(m.routedByCode))
+        lines.push(`durable_runs_routed_total{code="${code}"} ${n}`);
       lines.push('# TYPE durable_step_duration_ms_sum counter');
       lines.push(`durable_step_duration_ms_sum ${m.stepDuration.sumMs}`);
       lines.push('# TYPE durable_step_duration_count counter');

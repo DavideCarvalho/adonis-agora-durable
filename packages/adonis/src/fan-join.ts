@@ -79,13 +79,14 @@ export function allWaves(
   return { waveSize: Math.floor(concurrency / 2), maxWaves: 2 };
 }
 
-const ENGINE_CHILD_ID = /^(.+)\.(?:all\.\d+\.(?:w\d+\.)?\d+|child\.\d+)$/;
+const ENGINE_CHILD_ID = /^(.+)\.(?:all\.\d+\.(?:w\d+\.)?\d+|child\.\d+|onError\.\d+)$/;
 
 /**
  * The parent of a child run whose id the engine minted: a `ctx.all` child
- * (`<parent>.all.<seq>.<i>`, or `.w<k>.<i>` under a `concurrency` limit) or a `ctx.child` /
- * `ctx.startChild` child without an explicit id (`<parent>.child.<seq>`). Undefined for any other
- * run, including a child started with a caller-chosen id.
+ * (`<parent>.all.<seq>.<i>`, or `.w<k>.<i>` under a `concurrency` limit), a `ctx.child` /
+ * `ctx.startChild` child without an explicit id (`<parent>.child.<seq>`), or the onError handler of
+ * a failed run (`<parent>.onError.<attempt>`). Undefined for any other run, including a child started with a
+ * caller-chosen id.
  */
 export function parentRunIdOf(runId: string): string | undefined {
   return ENGINE_CHILD_ID.exec(runId)?.[1];
