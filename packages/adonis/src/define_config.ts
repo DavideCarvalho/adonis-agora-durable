@@ -19,6 +19,7 @@ import type {
 } from './control-planes/factory.js';
 import { controlPlanes } from './control-planes/factory.js';
 import type { ControlPlane, RunDispatcher, RunScope, TerminalRunStatus } from './interfaces.js';
+import type { QueueConfig } from './queue.js';
 import type { ScheduledWorkflow } from './scheduler.js';
 import type { LucidStoreConfig, StoreContext, StoreFactory } from './stores/factory.js';
 import { stores } from './stores/factory.js';
@@ -31,6 +32,7 @@ import type {
   TransportFactory,
 } from './transports/factory.js';
 import { transports } from './transports/factory.js';
+import type { WorkflowRef } from './workflow-ref.js';
 
 /**
  * The **shared** fields of `config/durable.ts`, common to every {@link DurableConfig} role. Everything
@@ -121,6 +123,21 @@ export interface BaseDurableConfig {
    */
   admission?: AdmissionBackend | AdmissionFactory;
   /**
+   * Flow-control queues, registered on the engine at boot — the declarative form of
+   * `engine.registerQueue(...)`, same {@link QueueConfig} shape (`{ name, concurrency?, rateLimit?,
+   * retryMs?, fairness?, order? }`). Reference one from a step with `ctx.step(step, input, { queue:
+   * name })`. Caps count per engine instance unless {@link admission} is a shared backend. Two entries
+   * with the same `name` throw at boot; a later `engine.registerQueue` of the same name replaces it.
+   */
+  queues?: QueueConfig[];
+  /**
+   * The fleet-default dead-letter workflow (a name, or a workflow class / ref): a run that goes `dead`
+   * (past `maxRecoveryAttempts`) is handed to it — started with a `DeadLetter` input
+   * (`{ deadRunId, workflow, input, error }`) under the run id `dlq:<deadRunId>`, in the dead run's
+   * namespace. A workflow's own `deadLetter()` method or `static workflow.deadLetterWorkflow` wins.
+   */
+  deadLetterWorkflow?: WorkflowRef;
+  /**
    * Build the public callback URL for a `ctx.webhook()` token, e.g.
    * ``(token) => `https://api.example.com/durable/webhooks/${token}` ``. It populates the `url` field
    * of the object `ctx.webhook()` returns, so a step can hand a third party a ready callback address.
@@ -152,8 +169,16 @@ export interface BaseDurableConfig {
   /**
    * Worker-pool partition for this engine. Stamped on every run it creates; the poll/recovery paths
    * only act on runs in this namespace, and a non-`'default'` namespace also segments the transport's
-   * queue names. Default `'default'` — byte-identical to a single-pool deployment. Set distinct values
-   * to safely share ONE state store + broker across non-interchangeable pools (e.g. local dev vs a cluster).
+   * queue names. Set distinct values to safely share ONE state store + broker across
+   * non-interchangeable pools (e.g. local dev vs a cluster).
+   *
+   * Absent, it depends on the role. A `standalone` engine (the default role) is in `'default'`: it
+   * drives only the default pool (runs stamped `'default'`, and legacy rows stored without a
+   * namespace, which every shipped store reads back as `'default'`) — byte-identical to a
+   * single-pool deployment. A `control-plane` engine with no namespace is the OPERATOR: it drives,
+   * recovers and resumes the runs of every pool, which is what lets one control plane serve many
+   * tenant pools. There is no standalone operator: a process that must drive every pool is a
+   * `control-plane`.
    */
   namespace?: string;
   /** Cap crash-recovery pickups before dead-lettering a poison run. Omit for unlimited. */
@@ -174,14 +199,22 @@ export interface BaseDurableConfig {
    *
    * `policies` adds SCOPED rules next to the per-status ages — each deletes terminal runs in its
    * `statuses` that match its `scope` (namespace / tags / workflows / search attributes) once older
-   * than `maxAge`: `{ statuses: ['completed'], maxAge: '1d', scope: { tags: ['chat'] } }`.
+   * than `maxAge`: `{ statuses: ['completed'], maxAge: '1d', scope: { tags: ['chat'] } }`. A
+   * policy can bound by count instead (or as well): `maxCount: 200` keeps the 200 newest runs (by
+   * start time) of its status set within its scope and deletes the rest; with both bounds a run goes
+   * once it is past either. A policy with neither throws at boot.
    */
   retention?: {
     completed?: string | number;
     failed?: string | number;
     cancelled?: string | number;
     dead?: string | number;
-    policies?: Array<{ statuses: TerminalRunStatus[]; maxAge: string | number; scope: RunScope }>;
+    policies?: Array<{
+      statuses: TerminalRunStatus[];
+      maxAge?: string | number;
+      maxCount?: number;
+      scope: RunScope;
+    }>;
   };
   /**
    * How long an in-flight run must sit untouched, with the stranded signature, before
@@ -191,6 +224,29 @@ export interface BaseDurableConfig {
   stalledAfter?: string | number;
   /** Where a freshly-started run executes. Defaults to in-process (microtask). */
   runDispatcher?: RunDispatcher;
+  /**
+   * Whether THIS process executes the runs it starts. `true` (the default): a started (or requeued,
+   * or recovered) run executes in-process right away. `false`: the process never drives a run — a
+   * started run stays `pending` until a driving instance's poll (`node ace durable:work`, or a
+   * `control-plane`) picks it up. For web pods whose workflow bodies are heavy: pair it with
+   * `consumers: 'never'` so the pod neither executes runs nor claims broker jobs.
+   *
+   * An explicit {@link runDispatcher} wins over `drive: false` (it already decides where a run goes,
+   * and an enqueueing dispatcher drives nothing in-process either). `drive: false` together with
+   * `worker.embedded: true` is a contradiction and throws at boot. `node ace durable:work` drives
+   * through its poll whatever the value, so the same config file serves web and worker pods. A
+   * `control-plane` already never drives in-process; a `tenant` pod has no engine, so it ignores this.
+   */
+  drive?: boolean;
+  /**
+   * Shutdown budget (ms) for the engine's in-flight executions: on app shutdown the provider stops
+   * picking up work and waits up to this long for the runs executing in this process before it
+   * closes the transport and control plane. A run that does not finish in time is left to crash
+   * recovery on another instance. Default `10_000`. With the embedded worker on,
+   * `worker.drainTimeoutMs` takes precedence for that loop's drain, and the provider does not drain
+   * a second time.
+   */
+  drainTimeoutMs?: number;
   /**
    * When this process's transport starts its broker **consumer** loops. `'auto'` (default): a
    * `console`/`repl` process defers consumption — it can dispatch runs and read the store, but never

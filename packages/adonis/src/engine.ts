@@ -50,6 +50,7 @@ import type { WorkerDescriptor } from './handshake/descriptor.js';
 import { buildWorkflowDirectory, type WorkflowDirectory } from './handshake/directory.js';
 import type {
   ControlPlane,
+  DeadLetter,
   EngineEvent,
   EngineListener,
   GroupHealth,
@@ -315,6 +316,8 @@ interface RegisteredWorkflow {
   fn: WorkflowFn;
   /** Where a failed run of this workflow is routed instead of failing. See {@link OnErrorRoute}. */
   onError?: OnErrorRoute[] | undefined;
+  /** The workflow a `dead` run of this one is handed to (name). Overrides the engine's default. */
+  deadLetterWorkflow?: string | undefined;
   /** Made by {@link WorkflowEngine.ensureConventionWorkflow}: its onError routes are the ones its live
    *  workers announce, read when a run fails. */
   convention?: true | undefined;
@@ -631,6 +634,14 @@ export interface WorkflowEngineDeps {
    */
   retentionPolicies?: ScopedRetentionPolicy[] | undefined;
   /**
+   * The fleet-default dead-letter workflow: a run that goes `dead` (past `maxRecoveryAttempts`) is
+   * handed to it — started with a {@link DeadLetter} input under the run id `dlq:<deadRunId>`, in the
+   * dead run's namespace. A workflow's own `deadLetterWorkflow` (register option / static config)
+   * wins. Idempotent by that run id, so a run dead-lettered twice is handled once. A handler run
+   * (`dlq:…`) that itself goes dead is not routed again.
+   */
+  deadLetterWorkflow?: WorkflowRef | undefined;
+  /**
    * How long an in-flight run must sit untouched — with the stranded signature (a wake-forever
    * suspension, or an old pending remote step whose worker heartbeat is silent) — before the
    * {@link WorkflowEngine.onStalled} listeners are notified. Default 900 000 (15 min, matching the
@@ -804,6 +815,8 @@ export class WorkflowEngine {
   private readonly enqueuedListeners = new Set<(runId: string) => void>();
   /** Notified when a run is dead-lettered (moved to `dead`) — a hook for a DLQ handler. */
   private readonly deadListeners = new Set<(run: WorkflowRun) => void>();
+  /** The fleet-default dead-letter workflow's name — see {@link WorkflowEngineDeps.deadLetterWorkflow}. */
+  private readonly deadLetterWorkflow: string | undefined;
   /** Validators gating `engine.update`, keyed by `<workflow>:<updateName>`. */
   private readonly updateValidators = new Map<string, UpdateValidator>();
   /** Runs being cancelled WITH saga compensation — see `cancel({ compensate: true })`. */
@@ -958,6 +971,8 @@ export class WorkflowEngine {
     this.compensationTimeoutMs = Math.max(1_000, deps.compensationTimeoutMs ?? 300_000);
     this.retention = deps.retention;
     this.retentionPolicies = deps.retentionPolicies ?? [];
+    this.deadLetterWorkflow =
+      deps.deadLetterWorkflow !== undefined ? workflowName(deps.deadLetterWorkflow) : undefined;
     this.persistedSchedulesEnabled = deps.persistedSchedules ?? false;
     this.schedules = new ScheduleClient(
       this.store,
@@ -1256,6 +1271,8 @@ export class WorkflowEngine {
       origin?: string | undefined;
       /** Handler workflows a matching failure is routed to — see {@link OnErrorRoute}. */
       onError?: OnErrorRoute[] | undefined;
+      /** Where a `dead` run of this workflow is handed (overrides the engine's default). */
+      deadLetterWorkflow?: WorkflowRef | undefined;
     },
   ): void {
     const registered: RegisteredWorkflow = {
@@ -1263,6 +1280,8 @@ export class WorkflowEngine {
       version,
       fn,
       onError: this.checkedRoutes(name, opts?.onError),
+      deadLetterWorkflow:
+        opts?.deadLetterWorkflow !== undefined ? workflowName(opts.deadLetterWorkflow) : undefined,
       tags: opts?.tags,
       origin: opts?.origin,
       singleton: opts?.singleton,
@@ -1308,12 +1327,16 @@ export class WorkflowEngine {
       requires?: string[];
       /** Handler workflows a matching failure is routed to — see {@link OnErrorRoute}. */
       onError?: OnErrorRoute[];
+      /** Where a `dead` run of this workflow is handed (overrides the engine's default). */
+      deadLetterWorkflow?: WorkflowRef;
     },
   ): void {
     const registered: RegisteredWorkflow = {
       name,
       version,
       onError: this.checkedRoutes(name, opts.onError),
+      deadLetterWorkflow:
+        opts.deadLetterWorkflow !== undefined ? workflowName(opts.deadLetterWorkflow) : undefined,
       // A remote workflow has no in-process body; execute() branches on `remote` before this is read.
       fn: () => {
         throw new Error(`workflow ${name} is remote — it has no in-process body`);
@@ -1549,6 +1572,41 @@ export class WorkflowEngine {
         /* a dead-letter handler must not break recovery */
       }
     }
+    this.routeDeadLetter(run);
+  }
+
+  /**
+   * Hand a `dead` run to its dead-letter workflow, when one is configured: the workflow's own
+   * `deadLetterWorkflow`, else the engine's default. Started as `dlq:<runId>` (idempotent: a run
+   * dead-lettered twice is handled once; the dashboard links the pair by that id) in the dead run's
+   * namespace, with a {@link DeadLetter} input. Tracked, so a drain waits for the start; a failure
+   * (e.g. the handler is not registered here) is warned, never thrown into recovery. A handler run
+   * that itself goes dead is not routed again — no `dlq:dlq:…` chain.
+   */
+  private routeDeadLetter(run: WorkflowRun): void {
+    if (run.id.startsWith('dlq:')) return;
+    const registered =
+      this.workflows.get(versionKey(run.workflow, run.workflowVersion)) ??
+      this.latest.get(run.workflow);
+    const target = registered?.deadLetterWorkflow ?? this.deadLetterWorkflow;
+    if (!target) return;
+    const input: DeadLetter = {
+      deadRunId: run.id,
+      workflow: run.workflow,
+      input: run.input,
+      ...(run.error ? { error: run.error } : {}),
+    };
+    this.trackEffect(
+      this.start(target, input, `dlq:${run.id}`, {
+        ...(run.namespace !== undefined ? { namespace: run.namespace } : {}),
+      }).catch((err: unknown) => {
+        console.warn(
+          `[adonis-durable] could not start dead-letter workflow ${target} for run ${run.id}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }),
+    );
   }
 
   /** Emit a locally-produced lifecycle event: deliver to subscribers AND broadcast it on the
@@ -1997,7 +2055,9 @@ export class WorkflowEngine {
     }
     for (const policy of this.retentionPolicies) {
       const statuses = policy.statuses.filter((s) => TERMINAL_RUN_STATUSES.includes(s));
-      if (statuses.length === 0 || !(policy.maxAgeMs > 0)) continue;
+      const byAge = policy.maxAgeMs !== undefined && policy.maxAgeMs > 0;
+      const byCount = policy.maxCount !== undefined && policy.maxCount >= 0;
+      if (statuses.length === 0 || (!byAge && !byCount)) continue;
       // A namespaced worker only ever prunes its own partition: a scope naming another one is not its
       // to sweep (the operator, `namespace: undefined`, sweeps every partition).
       if (
@@ -2007,12 +2067,26 @@ export class WorkflowEngine {
       ) {
         continue;
       }
-      passes.push({
+      const scoped: RunQuery = {
         ...policy.scope,
         namespace: policy.scope.namespace ?? this.namespace,
         statuses,
-        updatedBefore: now - policy.maxAgeMs,
-      });
+      };
+      if (byAge) passes.push({ ...scoped, updatedBefore: now - (policy.maxAgeMs as number) });
+      if (byCount) {
+        // Keep the `maxCount` newest (listRuns is newest-first by createdAt): the last one kept marks
+        // the cutoff, and every run created strictly before it goes. A run sharing that start
+        // millisecond is kept too, so a tie never deletes one of the newest `maxCount`.
+        const maxCount = policy.maxCount as number;
+        if (maxCount === 0) {
+          passes.push(scoped);
+        } else {
+          const [lastKept] = await this.store.listRuns({ ...scoped, page: maxCount, size: 1 });
+          if (lastKept) {
+            passes.push({ ...scoped, createdBefore: lastKept.createdAt.getTime() - 1 });
+          }
+        }
+      }
     }
     for (const pass of passes) {
       const candidates = await this.store.listRuns({ ...pass, size: 100 });

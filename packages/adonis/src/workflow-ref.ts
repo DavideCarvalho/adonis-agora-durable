@@ -57,6 +57,14 @@ export interface WorkflowOptions {
    */
   onError?: { code?: string | { readonly code: string }; workflow: WorkflowRef }[];
   /**
+   * Where a run of this workflow that goes `dead` (past `maxRecoveryAttempts`) is handed: the engine
+   * starts this workflow with a `DeadLetter` input (`{ deadRunId, workflow, input, error }`) under
+   * the run id `dlq:<deadRunId>`, in the dead run's namespace. Overrides the config-level
+   * `deadLetterWorkflow`. A class can instead define a `deadLetter(ctx, dead)` method (registered as
+   * `<name>.dlq`); declaring both is an error at boot.
+   */
+  deadLetterWorkflow?: WorkflowRef;
+  /**
    * Validate the run input at start against any Standard Schema (zod, valibot, arktype, …). A bad
    * payload throws a `SchemaValidationError` from `start` and no run is created (an `onEvent`
    * trigger with a rejected payload simply doesn't start this workflow). The schema's OUTPUT value

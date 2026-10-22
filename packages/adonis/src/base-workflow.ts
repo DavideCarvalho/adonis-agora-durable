@@ -1,6 +1,6 @@
 import type { StartOptions } from './engine.js';
 import { WorkflowEngine } from './engine.js';
-import type { WorkflowCtx } from './interfaces.js';
+import type { DeadLetter, WorkflowCtx } from './interfaces.js';
 import type { WorkflowScheduleConfig } from './scheduler.js';
 import { getCurrentWorkflowCtx } from './workflow-als.js';
 import type {
@@ -94,6 +94,16 @@ export abstract class BaseWorkflow {
 
   /** The workflow body. `ctx` is the durable context; `input` is the run's typed input. */
   abstract run(ctx: WorkflowCtx, input: unknown): unknown;
+
+  /**
+   * Optional inline dead-letter handler. When defined, discovery registers it as the workflow
+   * `<name>.dlq` (same version and origin) and routes this workflow's `dead` runs to it: it runs as a
+   * durable workflow of its own (`ctx` is ITS context) under the id `dlq:<deadRunId>`, with the
+   * dead run's {@link DeadLetter} as input, sharing this instance's constructor-injected services.
+   * Takes precedence over the config-level `deadLetterWorkflow`; declaring it together with
+   * `static workflow.deadLetterWorkflow` throws at boot.
+   */
+  deadLetter?(ctx: WorkflowCtx, dead: DeadLetter): unknown;
 
   /**
    * Start a run and **wait for its result**. Outside a workflow, enqueues via the engine and blocks

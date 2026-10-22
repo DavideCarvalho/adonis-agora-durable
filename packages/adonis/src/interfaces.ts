@@ -972,6 +972,19 @@ export function isNonEmptyRunScope(scope: RunScope | undefined): boolean {
   );
 }
 
+/**
+ * The input a dead-letter workflow is started with when a run goes `dead` (see the engine's
+ * `deadLetterWorkflow` and a workflow's own `deadLetterWorkflow` / `deadLetter()` method): which run
+ * died, of which workflow, with what input, and why (`max_recovery_attempts`). The handler run's id is
+ * `dlq:<deadRunId>`.
+ */
+export interface DeadLetter<TInput = unknown> {
+  deadRunId: string;
+  workflow: string;
+  input: TInput;
+  error?: StepError | undefined;
+}
+
 /** The terminal run statuses — the only ones retention may delete. */
 export type TerminalRunStatus = 'completed' | 'failed' | 'cancelled' | 'dead';
 export const TERMINAL_RUN_STATUSES: readonly TerminalRunStatus[] = [
@@ -983,12 +996,19 @@ export const TERMINAL_RUN_STATUSES: readonly TerminalRunStatus[] = [
 
 /**
  * A retention rule confined to a {@link RunScope}: terminal runs in `statuses` matching `scope` are
- * hard-deleted once their last activity is older than `maxAgeMs`. Sits next to the per-status
- * `retention` ages, so e.g. chat turns can age out after a day while everything else keeps 30.
+ * hard-deleted once their last activity is older than `maxAgeMs`, and/or once more than `maxCount`
+ * newer ones exist. Sits next to the per-status `retention` ages, so e.g. chat turns can age out
+ * after a day while everything else keeps 30.
+ *
+ * `maxCount` keeps the `maxCount` newest runs (by start time, `createdAt`) of the whole status set
+ * WITHIN the scope — "keep acme's newest 100" counts acme's runs only — and deletes the older ones.
+ * With both bounds the most restrictive wins: a run goes once it is past either. At least one of the
+ * two must be set.
  */
 export interface ScopedRetentionPolicy {
   statuses: TerminalRunStatus[];
-  maxAgeMs: number;
+  maxAgeMs?: number | undefined;
+  maxCount?: number | undefined;
   scope: RunScope;
 }
 

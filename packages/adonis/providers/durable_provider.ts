@@ -107,6 +107,10 @@ export default class DurableProvider {
   #stopEmbeddedWorker: (() => void) | null = null;
   /** The embedded loop itself, awaited on shutdown so it drains before the transport closes. */
   #embeddedWorkerLoop: Promise<unknown> | null = null;
+  /** The store-backed engine once resolved (store roles), drained on shutdown. */
+  #engine: WorkflowEngine | null = null;
+  /** The shutdown budget for that drain: `drainTimeoutMs`, else `worker.drainTimeoutMs`, else 10s. */
+  #drainTimeoutMs = 10_000;
 
   constructor(protected app: ApplicationService) {}
 
@@ -119,6 +123,13 @@ export default class DurableProvider {
     if (role === 'tenant') {
       this.#registerTenantRole(config as TenantConfig);
     } else {
+      // A process that must not drive runs cannot host the loop that drives them.
+      if (config.drive === false && config.worker?.embedded) {
+        throw new Error(
+          '@agora/durable: `drive: false` and `worker: { embedded: true }` contradict each other — the embedded worker loop drives runs in this process. Drop one: keep `drive: false` on web pods and run `node ace durable:work` elsewhere, or keep the embedded worker and remove `drive: false`.',
+        );
+      }
+      this.#drainTimeoutMs = config.drainTimeoutMs ?? config.worker?.drainTimeoutMs ?? 10_000;
       this.#registerStoreRole(config, role);
     }
   }
@@ -188,7 +199,11 @@ export default class DurableProvider {
       const ctx: TransportContext & StoreContext & ControlPlaneContext & AdmissionContext = {
         app: this.app,
       };
-      const store = await this.#resolveStore(config, ctx);
+      // An absent namespace is the default pool on a standalone engine, and the operator (every pool)
+      // only on a control plane: a standalone process sharing a store with other pools must never
+      // drive their runs.
+      const namespace = config.namespace ?? (role === 'standalone' ? 'default' : undefined);
+      const store = await this.#resolveStore(config, ctx, namespace);
       const transport = await this.#resolveTransport(config, ctx);
       // Console/REPL processes must not become broker consumers (`consumers: 'auto'`, the default):
       // a one-off `node ace` process that subscribes competes with the worker fleet for point-to-point
@@ -218,7 +233,7 @@ export default class DurableProvider {
         ...(controlPlane ? { controlPlane } : {}),
         ...(config.leaseMs !== undefined ? { leaseMs: config.leaseMs } : {}),
         ...(config.instanceId ? { instanceId: config.instanceId } : {}),
-        ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
+        ...(namespace !== undefined ? { namespace } : {}),
         ...(config.maxRecoveryAttempts !== undefined
           ? { maxRecoveryAttempts: config.maxRecoveryAttempts }
           : {}),
@@ -231,11 +246,27 @@ export default class DurableProvider {
         ...(config.retention !== undefined ? { retention: parseRetention(config.retention) } : {}),
         ...(config.retention?.policies?.length
           ? {
-              retentionPolicies: config.retention.policies.map((p) => ({
-                statuses: p.statuses,
-                maxAgeMs: parseDuration(p.maxAge),
-                scope: p.scope,
-              })),
+              retentionPolicies: config.retention.policies.map((p) => {
+                if (p.maxAge === undefined && p.maxCount === undefined) {
+                  throw new Error(
+                    '@agora/durable: each retention policy must set maxAge and/or maxCount',
+                  );
+                }
+                if (
+                  p.maxCount !== undefined &&
+                  !(Number.isInteger(p.maxCount) && p.maxCount >= 0)
+                ) {
+                  throw new Error(
+                    `@agora/durable: retention policy maxCount must be a non-negative integer (got ${String(p.maxCount)})`,
+                  );
+                }
+                return {
+                  statuses: p.statuses,
+                  ...(p.maxAge !== undefined ? { maxAgeMs: parseDuration(p.maxAge) } : {}),
+                  ...(p.maxCount !== undefined ? { maxCount: p.maxCount } : {}),
+                  scope: p.scope,
+                };
+              }),
             }
           : {}),
         ...(config.persistedSchedules ? { persistedSchedules: true } : {}),
@@ -245,6 +276,9 @@ export default class DurableProvider {
         // Fleet-wide flow control: the configured admission backend replaces the engine's in-process
         // default, so `{ queue }` caps count across every replica instead of per pod.
         ...(admission ? { admission } : {}),
+        ...(config.deadLetterWorkflow !== undefined
+          ? { deadLetterWorkflow: config.deadLetterWorkflow }
+          : {}),
         // Public callback URL builder for `ctx.webhook()` tokens.
         ...(config.webhookUrl ? { webhookUrl: config.webhookUrl } : {}),
         ...(config.trackStepStart !== undefined ? { trackStepStart: config.trackStepStart } : {}),
@@ -267,12 +301,12 @@ export default class DurableProvider {
         // Engine tuning; the engine guards the values (non-finite/out-of-range → its default).
         ...(config.reconcileMs !== undefined ? { reconcileMs: config.reconcileMs } : {}),
         ...(config.blockedPollMs !== undefined ? { blockedPollMs: config.blockedPollMs } : {}),
-        // Where a freshly-started run executes: explicit config wins; else `control-plane` leaves it
-        // pending for the poll loop (no inline execution), and `standalone` uses the engine's in-process
-        // default (embedded worker).
+        // Where a freshly-started run executes: explicit config wins; else `control-plane` and a
+        // `drive: false` process leave it pending for a driving instance's poll (no inline execution),
+        // and `standalone` uses the engine's in-process default.
         ...(config.runDispatcher
           ? { runDispatcher: config.runDispatcher }
-          : role === 'control-plane'
+          : role === 'control-plane' || config.drive === false
             ? { runDispatcher: NOOP_RUN_DISPATCHER }
             : {}),
         // Best-effort context propagation from @adonis-agora/context (no hard dep): pass the opaque
@@ -288,7 +322,20 @@ export default class DurableProvider {
             : {}),
       };
 
-      return new WorkflowEngine(deps);
+      const engine = new WorkflowEngine(deps);
+      // Declarative flow-control queues (`config.queues`): the same registerQueue a caller would make.
+      const queueNames = new Set<string>();
+      for (const queue of config.queues ?? []) {
+        if (queueNames.has(queue.name)) {
+          throw new Error(
+            `@agora/durable: config.queues declares the queue "${queue.name}" twice; give each queue one entry`,
+          );
+        }
+        queueNames.add(queue.name);
+        engine.registerQueue(queue);
+      }
+      this.#engine = engine;
+      return engine;
     });
   }
 
@@ -511,7 +558,7 @@ export default class DurableProvider {
     );
     this.#embeddedWorkerLoop = runWorkerLoop(engine, {
       intervalMs: config.worker.intervalMs ?? 1000,
-      drainTimeoutMs: config.worker.drainTimeoutMs ?? 10_000,
+      drainTimeoutMs: this.#drainTimeoutMs,
       stopSignal,
       schedules,
       logger,
@@ -615,7 +662,11 @@ export default class DurableProvider {
   }
 
   /** Resolve the configured state store (a key of `config.stores`), or the in-memory default. */
-  async #resolveStore(config: DurableConfig, ctx: StoreContext): Promise<StateStore> {
+  async #resolveStore(
+    config: DurableConfig,
+    ctx: StoreContext,
+    namespace: string | undefined,
+  ): Promise<StateStore> {
     const name = config.store;
     if (!name) return new InMemoryStateStore();
     const factory = config.stores?.[name];
@@ -634,12 +685,12 @@ export default class DurableProvider {
       await store.ensureSchema?.();
     }
     // `scopeReads`: a tenant-boundary view of the store, fenced to this engine's namespace.
-    if (config.scopeReads === true && config.namespace !== undefined) {
+    if (config.scopeReads === true && namespace !== undefined) {
       const scopeable = store as StateStore & {
         withScope?: (scope: { namespace?: string | undefined }) => StateStore;
       };
       if (typeof scopeable.withScope === 'function') {
-        return scopeable.withScope({ namespace: config.namespace });
+        return scopeable.withScope({ namespace });
       }
     }
     return store;
@@ -710,10 +761,19 @@ export default class DurableProvider {
   async shutdown() {
     // The embedded loop goes first and is AWAITED: it drains in-flight executions, and a tick
     // still running would otherwise find the transport closed underneath it a few lines below.
+    const embedded = this.#embeddedWorkerLoop !== null;
     this.#stopEmbeddedWorker?.();
     this.#stopEmbeddedWorker = null;
     await this.#embeddedWorkerLoop;
     this.#embeddedWorkerLoop = null;
+    // Every store-backed process drains, not only one running the embedded loop: a web process with
+    // the in-process dispatcher may be mid-turn, and closing the transport under that turn strands
+    // it until its lease expires. The embedded loop already drained (within the same budget), so it
+    // is not drained twice. `drain` releases the leases of runs still executing when time runs out,
+    // so another instance recovers them at once.
+    const engine = this.#engine;
+    this.#engine = null;
+    if (engine && !embedded) await engine.drain(this.#drainTimeoutMs).catch(() => undefined);
     // Stop republishing tenant events before the transport connections drop.
     this.#responder?.stop();
     this.#responder = null;
