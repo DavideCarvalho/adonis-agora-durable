@@ -33,10 +33,49 @@ import {
  * A non-durable, in-process `StateStore` for tests and local development.
  * The shipped `@dudousxd/nestjs-durable-store` package re-exports an equivalent.
  */
+/**
+ * Everything an {@link InMemoryStateStore} holds, in ONE object, so a {@link InMemoryStateStore.withScope}
+ * view can share it by reference: a write through either is visible through both, and the read
+ * counters are one set. Only the scope is per view.
+ */
+interface InMemoryState {
+  readonly runs: Map<string, WorkflowRun>;
+  readonly checkpoints: Map<string, StepCheckpoint>;
+  readonly signalWaiters: Map<string, SignalWaiter>;
+  readonly attributeIndex: Map<string, Map<string, RunAttributeRow>>;
+  readonly bufferedSignals: Map<string, unknown[]>;
+  readonly bufferedEvents: Map<string, { name: string; payload: unknown; publishedAt: number }>;
+  readonly schedules: Map<string, ScheduleRecord>;
+  readonly stats: {
+    lastAttributeCandidates: number;
+    lastCheckpointRowsRead: number;
+    checkpointRowsRead: number;
+  };
+}
+
+const freshState = (): InMemoryState => ({
+  runs: new Map(),
+  checkpoints: new Map(),
+  signalWaiters: new Map(),
+  attributeIndex: new Map(),
+  bufferedSignals: new Map(),
+  bufferedEvents: new Map(),
+  schedules: new Map(),
+  stats: { lastAttributeCandidates: 0, lastCheckpointRowsRead: 0, checkpointRowsRead: 0 },
+});
+
 export class InMemoryStateStore implements StateStore {
-  private readonly runs = new Map<string, WorkflowRun>();
-  private readonly checkpoints = new Map<string, StepCheckpoint>();
-  private readonly signalWaiters = new Map<string, SignalWaiter>();
+  /** All of this store's data; shared by reference with every {@link withScope} view. */
+  private state: InMemoryState = freshState();
+  private get runs(): Map<string, WorkflowRun> {
+    return this.state.runs;
+  }
+  private get checkpoints(): Map<string, StepCheckpoint> {
+    return this.state.checkpoints;
+  }
+  private get signalWaiters(): Map<string, SignalWaiter> {
+    return this.state.signalWaiters;
+  }
 
   /**
    * Normalized search-attribute side-table, the in-memory analog of the SQL stores'
@@ -44,21 +83,38 @@ export class InMemoryStateStore implements StateStore {
    * attribute query can be pushed DOWN to a key-indexed candidate set instead of scanning every run
    * and comparing in-process. Mirrors {@link normalizeAttributeRows} so behavior matches the SQL path.
    */
-  private readonly attributeIndex = new Map<string, Map<string, RunAttributeRow>>();
+  private get attributeIndex(): Map<string, Map<string, RunAttributeRow>> {
+    return this.state.attributeIndex;
+  }
   /** Test/observability hook: how many candidate runs the last attribute query's index produced. */
-  lastAttributeCandidates = 0;
+  get lastAttributeCandidates(): number {
+    return this.state.stats.lastAttributeCandidates;
+  }
+  set lastAttributeCandidates(value: number) {
+    this.state.stats.lastAttributeCandidates = value;
+  }
   /**
    * Test/observability hook: how many checkpoint rows the LAST checkpoint read materialized (the rows
    * actually returned to the caller). `listCheckpoints` returns all rows for the run; the targeted
    * {@link getLatestCheckpointByName} / {@link listCheckpointsByNamePrefix} return only the matches —
    * so this lets the benchmark contrast "fetch N, scan in JS" against "fetch the k that match".
    */
-  lastCheckpointRowsRead = 0;
+  get lastCheckpointRowsRead(): number {
+    return this.state.stats.lastCheckpointRowsRead;
+  }
+  set lastCheckpointRowsRead(value: number) {
+    this.state.stats.lastCheckpointRowsRead = value;
+  }
   /**
    * Test/observability hook: checkpoint rows materialized since construction, across every
    * checkpoint read that returns rows — what a run-detail test compares between paths.
    */
-  checkpointRowsRead = 0;
+  get checkpointRowsRead(): number {
+    return this.state.stats.checkpointRowsRead;
+  }
+  set checkpointRowsRead(value: number) {
+    this.state.stats.checkpointRowsRead = value;
+  }
   /** The namespace run reads are fenced to (see {@link withScope}); undefined sees every run. */
   private scopeNamespace: string | undefined;
 
@@ -68,7 +124,11 @@ export class InMemoryStateStore implements StateStore {
    * `LucidStateStore.withScope`; `{ namespace: undefined }` is the operator view.
    */
   withScope(scope: { namespace?: string | undefined }): InMemoryStateStore {
-    const view = Object.create(this) as InMemoryStateStore;
+    // A plain store holding the SAME state object by reference (not an `Object.create(this)` child,
+    // whose own-property writes — a counter bump — would shadow the base's, and which would break on
+    // any `#private` field). Overrides of a subclass are not carried over to the view.
+    const view = new InMemoryStateStore();
+    view.state = this.state;
     view.scopeNamespace = scope.namespace;
     return view;
   }
@@ -355,7 +415,9 @@ export class InMemoryStateStore implements StateStore {
     return work({ raw: this, saveCheckpoint: (cp) => this.saveCheckpoint(cp) });
   }
 
-  private readonly bufferedSignals = new Map<string, unknown[]>();
+  private get bufferedSignals(): Map<string, unknown[]> {
+    return this.state.bufferedSignals;
+  }
   async bufferSignal(token: string, payload: unknown): Promise<void> {
     const queue = this.bufferedSignals.get(token) ?? [];
     queue.push(payload);
@@ -371,10 +433,9 @@ export class InMemoryStateStore implements StateStore {
 
   /** `id -> row`, so {@link removeBufferedEvent} can delete an exact row regardless of iteration
    *  order — mirrors the SQL store's PK-by-id delete. */
-  private readonly bufferedEvents = new Map<
-    string,
-    { name: string; payload: unknown; publishedAt: number }
-  >();
+  private get bufferedEvents(): InMemoryState['bufferedEvents'] {
+    return this.state.bufferedEvents;
+  }
   async bufferEvent(input: {
     name: string;
     payload: unknown;
@@ -472,7 +533,9 @@ export class InMemoryStateStore implements StateStore {
     return mergeRunFacetRows(runs.map((r) => ({ status: r.status, origin: r.origin, count: 1 })));
   }
 
-  private readonly schedules = new Map<string, ScheduleRecord>();
+  private get schedules(): Map<string, ScheduleRecord> {
+    return this.state.schedules;
+  }
 
   async saveSchedule(record: ScheduleRecord): Promise<void> {
     this.schedules.set(record.id, structuredClone(record));
