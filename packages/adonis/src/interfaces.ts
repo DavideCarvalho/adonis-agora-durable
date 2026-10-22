@@ -544,6 +544,13 @@ export interface StateStore {
   bufferSignal(token: string, payload: unknown): Promise<void>;
   /** Take the oldest buffered signal for `token` (FIFO), or null if none is buffered. */
   takeBufferedSignal(token: string): Promise<{ payload: unknown } | null>;
+  /**
+   * Up to `limit` distinct tokens starting with `prefix` that have at least one buffered signal.
+   * Reads no payload and consumes nothing. Optional: the entity lost-wake reconcile
+   * (`engine.reconcileEntityWakes`) uses it to find entity ops buffered while no wake reached their
+   * entity; without it that reconcile is a no-op.
+   */
+  listBufferedSignalTokens?(prefix: string, limit: number): Promise<string[]>;
 
   /**
    * Buffer a published event that matched NO live waiter, so a LATER `ctx.waitForEvent(name, { match })`

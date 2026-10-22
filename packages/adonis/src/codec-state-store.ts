@@ -116,6 +116,8 @@ export class CodecStateStore implements StateStore {
     limit: number,
     retryWakeAt?: number,
   ) => Promise<boolean>;
+  /** Forwarded verbatim — reads tokens, never a payload. Bound only when the inner store has it. */
+  readonly listBufferedSignalTokens?: (prefix: string, limit: number) => Promise<string[]>;
   /** Forwarded verbatim — a count reads no payload. Bound only when the inner store has it. */
   readonly countCheckpoints?: (
     runId: string,
@@ -168,6 +170,10 @@ export class CodecStateStore implements StateStore {
     if (tryAdmitSingleton) {
       this.tryAdmitSingleton = (runId, tag, workflow, limit, retryWakeAt) =>
         tryAdmitSingleton.call(inner, runId, tag, workflow, limit, retryWakeAt);
+    }
+    const listTokens = inner.listBufferedSignalTokens;
+    if (listTokens) {
+      this.listBufferedSignalTokens = (prefix, limit) => listTokens.call(inner, prefix, limit);
     }
     const countCheckpoints = inner.countCheckpoints;
     if (countCheckpoints) {

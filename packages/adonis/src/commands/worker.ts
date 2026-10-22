@@ -126,6 +126,10 @@ async function runTickInScope(engine: WorkflowEngine, options: TickOptions): Pro
   // 7th phase — stalled detection: page onStalled listeners about stranded runs. Self-throttled
   // inside the engine (one pass a minute); a no-op without listeners.
   await phase('sweepStalled', async () => (await engine.sweepStalled(now)).length);
+  // 8th phase — entity lost-wake reconcile: wake entities whose ops sit in their buffer with no wake
+  // coming (a process died between storing an op and waking its entity). Self-throttled (once a
+  // minute); a no-op on a store that cannot list buffered tokens.
+  await phase('sweepEntityWakes', async () => engine.sweepEntityWakes(now));
   return result;
 }
 

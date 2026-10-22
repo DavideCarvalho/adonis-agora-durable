@@ -543,6 +543,27 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
     });
 
     t(
+      'listBufferedSignalTokens lists distinct prefixed tokens with a buffered signal (when implemented)',
+      async () => {
+        if (!store.listBufferedSignalTokens) return;
+        await store.bufferSignal('entity:a:1', { op: 'x' });
+        await store.bufferSignal('entity:a:1', { op: 'y' });
+        await store.bufferSignal('entity:b:2', { op: 'z' });
+        await store.bufferSignal('other', 1);
+        expect([...(await store.listBufferedSignalTokens('entity:', 10))].sort()).toEqual([
+          'entity:a:1',
+          'entity:b:2',
+        ]);
+        expect(await store.listBufferedSignalTokens('entity:', 1)).toHaveLength(1);
+        // Listing consumes nothing; a drained token drops out.
+        await store.takeBufferedSignal('entity:b:2');
+        expect(await store.listBufferedSignalTokens('entity:', 10)).toEqual(['entity:a:1']);
+        // `%` / `_` in the prefix are literal.
+        expect(await store.listBufferedSignalTokens('entity_', 10)).toEqual([]);
+      },
+    );
+
+    t(
       'saveCheckpointsIfPending writes a wide batch',
       async () => {
         if (!store.saveCheckpointsIfPending) return;

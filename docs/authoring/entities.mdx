@@ -229,6 +229,15 @@ Under the hood an entity is an ordinary durable run like any other, so everythin
   is still waiting for its reply. If the caller dies between storing the operation and checkpointing it,
   the replay sends the same id again and the entity skips the copy. From outside a workflow,
   `engine.signalEntity` has no such id: retrying a failed call can apply the operation twice.
+- **A lost wake is reconciled.** A send from a workflow stores the operation in the entity's buffer and
+  then wakes the entity (starting its run if it has none). If the process dies between the two, the
+  operation sits in the buffer while the entity sleeps. The worker loop (`durable:work`, or the embedded
+  loop) runs an entity reconcile at most once a minute: it lists entity tokens with buffered operations
+  (up to 100 per pass) and wakes their entities, which read the buffer in arrival order and skip an
+  operation they already applied. So the operation is applied within about a minute, without waiting
+  for the next send to that key. You can run a pass by hand with `engine.reconcileEntityWakes()`. It
+  needs a store that implements `listBufferedSignalTokens` (the Lucid and in-memory stores do); on any
+  other store a lost wake waits for the entity's next wake.
 
 ## Pitfalls
 

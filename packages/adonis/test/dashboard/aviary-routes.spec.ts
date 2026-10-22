@@ -30,9 +30,17 @@ function setup() {
     return wh.wait();
   });
   raw.register('waiter', '1', async (ctx) => ctx.waitForSignal('go'));
+  // Mints the webhook, publishes its token, then waits for a signal BEFORE wait(): a callback in
+  // that window lands while nothing waits on the webhook yet.
+  raw.register('late-hook', '1', async (ctx) => {
+    const wh = ctx.webhook<{ paid: boolean }>();
+    await ctx.setEvent('token', wh.token);
+    await ctx.waitForSignal('continue');
+    return wh.wait();
+  });
   raw.register('ok', '1', async () => 'done');
   const deps: Deps = { engine: storeDashboardEngine(raw) };
-  return { raw, deps };
+  return { raw, deps, store };
 }
 
 const settle = () => new Promise((r) => setTimeout(r, 15));
@@ -105,13 +113,48 @@ describe('POST /webhooks/:token', () => {
     expect((await raw.getRun('w1'))?.status).toBe('suspended');
   });
 
-  it('a well-formed token nobody waits on is 404 and buffers nothing', async () => {
+  it('buffers an early callback for a live run, and the later wait() consumes it', async () => {
     const { raw, deps } = setup();
-    await raw.start('hook', {}, 'h2');
+    await raw.start('late-hook', {}, 'h2');
     await settle();
-    const res = await deliverWebhook(deps, { params: { token: 'wh:h2:99' }, query: {}, body: 1 });
-    expect(res.status).toBe(404);
-    expect(await raw.listSignalWaiters('wh:h2:99')).toEqual([]);
+    const token = (await raw.getEvent<string>('h2', 'token')) as string;
+
+    // Nothing waits on the webhook yet (the run is parked on `continue`): buffered, 202.
+    const early = await deliverWebhook(deps, {
+      params: { token },
+      query: {},
+      body: { paid: true },
+    });
+    expect(early.status).toBe(202);
+    expect(early.body).toEqual({ buffered: true });
+
+    await raw.signal('continue', null);
+    expect((await raw.waitForRun('h2')).output).toEqual({ paid: true });
+    // Delivered once: a duplicate after the run settled is 404.
+    const again = await deliverWebhook(deps, { params: { token }, query: {}, body: {} });
+    expect(again.status).toBe(404);
+  });
+
+  it('a webhook token of an unknown or terminal run is 404 and buffers nothing', async () => {
+    const { raw, deps, store } = setup();
+    const unknown = await deliverWebhook(deps, {
+      params: { token: 'wh:nobody:3' },
+      query: {},
+      body: 1,
+    });
+    expect(unknown.status).toBe(404);
+
+    await raw.start('ok', {}, 'done1');
+    await raw.waitForRun('done1');
+    const terminal = await deliverWebhook(deps, {
+      params: { token: 'wh:done1:0' },
+      query: {},
+      body: 1,
+    });
+    expect(terminal.status).toBe(404);
+    // Nothing was buffered for either.
+    expect(await store.takeBufferedSignal('wh:done1:0')).toBeFalsy();
+    expect(await store.takeBufferedSignal('wh:nobody:3')).toBeFalsy();
   });
 });
 

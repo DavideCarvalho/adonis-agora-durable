@@ -1231,6 +1231,44 @@ export class WorkflowEngine {
   }
 
   /** Read an entity's current durable state (published after each op), or undefined if it has none yet. */
+  /**
+   * The entity lost-wake reconcile: wake (start, if need be) every entity that has ops sitting in its
+   * buffer, up to `limit` of them. A workflow-side send stores the op and THEN wakes the entity, so a
+   * process that dies in between leaves the op buffered while the entity sleeps; this pass is what
+   * applies it. Idempotent — a wake carries a no-op nudge, and the entity reads its buffer in arrival
+   * order, consuming each op once (an op with a stable id is skipped if already applied). The worker
+   * tick runs it, throttled to one pass a minute. Returns how many entities were woken. A no-op on a
+   * store without `listBufferedSignalTokens`.
+   */
+  async reconcileEntityWakes(limit = 100): Promise<number> {
+    if (this.draining || !this.store.listBufferedSignalTokens) return 0;
+    const tokens = await this.store.listBufferedSignalTokens('entity:', limit);
+    let woken = 0;
+    for (const token of tokens) {
+      if (this.draining) break;
+      try {
+        if (await this.entities.kickRunId(token)) woken += 1;
+      } catch (err) {
+        console.warn(
+          `[adonis-durable] entity reconcile of ${token} skipped: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+    return woken;
+  }
+
+  /** Throttle stamp for the tick's {@link reconcileEntityWakes} pass. */
+  #lastEntityReconcileAt = Number.NEGATIVE_INFINITY;
+
+  /** {@link reconcileEntityWakes}, at most once a minute — the worker tick's entry point. */
+  async sweepEntityWakes(now: number = this.clock()): Promise<number> {
+    if (now - this.#lastEntityReconcileAt < 60_000) return 0;
+    this.#lastEntityReconcileAt = now;
+    return this.reconcileEntityWakes();
+  }
+
   getEntityState<S = unknown>(name: string, key: string): Promise<S | undefined> {
     return this.entities.getState<S>(name, key);
   }

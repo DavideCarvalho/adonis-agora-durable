@@ -640,6 +640,16 @@ export class LucidStateStore implements StateStore {
       .insert({ token, payload: payload === undefined ? null : JSON.stringify(payload) });
   }
 
+  async listBufferedSignalTokens(prefix: string, limit: number): Promise<string[]> {
+    const rows = (await this.client()
+      .from(DURABLE_TABLES.bufferedSignals)
+      .whereRaw(`token like ? escape '!'`, [`${escapeLike(prefix)}%`])
+      .distinct('token')
+      .orderBy('token', 'asc')
+      .limit(limit)) as Array<{ token: string }>;
+    return rows.map((r) => r.token);
+  }
+
   async takeBufferedSignal(token: string): Promise<{ payload: unknown } | null> {
     return this.client().transaction(async (trx) => {
       const row = await trx

@@ -448,6 +448,14 @@ export class InMemoryStateStore implements StateStore {
     queue.push(payload);
     this.bufferedSignals.set(token, queue);
   }
+  async listBufferedSignalTokens(prefix: string, limit: number): Promise<string[]> {
+    const out: string[] = [];
+    for (const [token, queue] of this.bufferedSignals) {
+      if (out.length >= limit) break;
+      if (token.startsWith(prefix) && queue.length > 0) out.push(token);
+    }
+    return out;
+  }
   async takeBufferedSignal(token: string): Promise<{ payload: unknown } | null> {
     const queue = this.bufferedSignals.get(token);
     if (!queue || queue.length === 0) return null;

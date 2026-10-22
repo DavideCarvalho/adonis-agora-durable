@@ -125,7 +125,7 @@ If you mount the [dashboard](/docs/durable/observability/dashboard#live-queries-
 webhookUrl: (token) => `https://api.example.com/durable/api/webhooks/${token}`,
 ```
 
-The route accepts only webhook tokens (`wh:<runId>:<seq>`), and only while a run is actually waiting on that token: a duplicate, stale or guessed callback answers `404` and buffers nothing. It answers `{ result }` on delivery and `413` past the 1 MiB payload limit. It sits behind the console's `authorize` guard like every dashboard route, so let the provider through there (a shared header or a signature check on that path).
+The route accepts only webhook tokens (`wh:<runId>:<seq>`). A callback for a run waiting on that token resumes it and answers `{ result }`. One that lands before the run reaches `hook.wait()` is buffered and answers `202 { buffered: true }`, when the run exists, is not terminal and has not consumed that webhook yet; the later `wait()` consumes it. A callback for an unknown or terminal run, or a duplicate of one already delivered, answers `404` and buffers nothing, and the route answers `413` past the 1 MiB payload limit. It sits behind the console's `authorize` guard like every dashboard route, so let the provider through there (a shared header or a signature check on that path).
 
 ### From your own route
 
@@ -151,7 +151,7 @@ The token is `wh:<runId>:<seq>`, derived from the run id, which a caller may kno
 
 The provider may call back before the run reaches `hook.wait()`, for example while the step that handed out the URL is still waiting for its result. `engine.signal` then finds no waiter and buffers the body, the same [signal buffering](/docs/durable/concepts/sleep-and-signals#signal-buffering--signal-with-start) `ctx.waitForSignal` uses, and returns `null`. When the run gets to `hook.wait()`, the wait consumes the buffered body and resumes at once instead of suspending. The wait also re-checks the buffer after it registers, so a callback that lands in between is not lost either. With your own route, answer `2xx` whether or not `engine.signal` returned a result.
 
-The dashboard route is stricter: it delivers only to a run that is already waiting, and answers `404` to an early callback without buffering it, so a provider that retries on a non-2xx delivers it again once the run waits. If your provider doesn't retry, receive the callback on your own route.
+The dashboard route buffers an early callback the same way, but only for a live run that has not consumed that webhook (see above), so a guessed or stale token can't leave a payload behind. A duplicate early callback, sent twice before the run waits, is buffered twice; the wait consumes one.
 
 ## External tasks — `ctx.task`
 

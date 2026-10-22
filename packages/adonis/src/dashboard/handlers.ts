@@ -940,8 +940,10 @@ function webhookRunId(token: string): string | undefined {
 /**
  * `POST /webhooks/:token` — deliver a `ctx.webhook()` callback: the body resumes the run parked on
  * that webhook. Only webhook tokens (`wh:<runId>:<seq>`) are accepted, so this is not a generic
- * signal endpoint, and only while the run is actually waiting on that token: a stale, duplicate or
- * guessed callback answers 404 instead of buffering a payload for a waiter that will never come.
+ * signal endpoint. A callback for a run waiting on that token resumes it (200). One that lands
+ * before the run reaches `wait()` is buffered (202) when the run exists, is not terminal and has not
+ * consumed this webhook yet, and the later `wait()` consumes it; anything else — an unknown run, a
+ * terminal one, a duplicate — answers 404 and buffers nothing.
  *
  * The route sits behind the console's own guard (`authorize`, CSRF, roles), like every other
  * route: a webhook token embeds the run id, which a caller may know, so it is not a secret to rest
@@ -961,9 +963,26 @@ export async function deliverWebhook(deps: Deps, req: ApiRequest): Promise<ApiRe
     ? await engine.listSignalWaitersByRunIds([runId])
     : await engine.listSignalWaiters?.(token);
   if (!waiters?.some((w) => w.token === token)) {
-    return notFound(`no run is waiting on webhook ${token}`);
+    // Nothing waits on it YET: a callback may legitimately land before the run reaches `wait()`
+    // (the url was handed out, then the run kept going). Buffer it like `engine.signal` does — but
+    // only for a run that exists, is not terminal, and has not already consumed this webhook, so a
+    // guessed, stale or duplicate token buffers nothing.
+    const run = await engine.getRun(runId);
+    if (!run || TERMINAL_STATUSES.has(run.status)) {
+      return notFound(`no live run is waiting on webhook ${token}`);
+    }
+    const seq = Number(token.slice(token.lastIndexOf(':') + 1));
+    const delivered = (await engine.listCheckpoints(runId)).some(
+      (cp) => cp.seq === seq && cp.status === 'completed',
+    );
+    if (delivered) return notFound(`webhook ${token} was already delivered`);
+    const result = await engine.signal(token, req.body);
+    if (result) return ok({ result });
+    return { status: 202, body: { buffered: true } };
   }
   const result = await engine.signal(token, req.body);
   if (!result) return notFound(`no run is waiting on webhook ${token}`);
   return ok({ result });
 }
+
+const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'dead']);

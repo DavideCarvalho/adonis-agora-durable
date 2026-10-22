@@ -8,7 +8,10 @@ describe.each(dbBackends())('on $name', ({ makeTransportDb }) => {
   describe('transports.db — option passthrough', () => {
     const closers: Array<() => Promise<void>> = [];
     afterEach(async () => {
-      await Promise.all(closers.splice(0).map((c) => c()));
+      // In order — the transport (unshifted first) before its database. Closing both at once let
+      // the Postgres pool shut down under a poll still in flight, and the transport's close then
+      // waited on a connection that never came (a 10s hook timeout on a loaded runner).
+      for (const close of closers.splice(0)) await close();
     });
 
     it('forwards concurrency and the worker-health options to the DbTransport', async () => {

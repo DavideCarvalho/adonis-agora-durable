@@ -132,6 +132,21 @@ export class Entities {
     await host.wakeWaiter(runId, NUDGE);
   }
 
+  /**
+   * {@link kick} by the entity's run id (`entity:<name>:<key>`), for the lost-wake reconcile. Returns
+   * false for a run id that is not an entity's, or an entity this process does not know.
+   */
+  async kickRunId(runId: string): Promise<boolean> {
+    if (!runId.startsWith('entity:')) return false;
+    const rest = runId.slice('entity:'.length);
+    const sep = rest.indexOf(':');
+    if (sep <= 0) return false;
+    const name = rest.slice(0, sep);
+    if (!this.configs.has(name)) return false;
+    await this.kick(name, rest.slice(sep + 1));
+    return true;
+  }
+
   async signal(name: string, key: string, op: string, arg?: unknown): Promise<void> {
     await this.dispatch(name, key, op, arg);
   }

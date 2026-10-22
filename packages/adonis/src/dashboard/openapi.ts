@@ -465,8 +465,12 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
           ],
           requestBody: { required: false, content: { 'application/json': { schema: {} } } },
           responses: {
-            '200': jsonResponse('`{ result }`.', { type: 'object' }),
-            '404': err('Not a webhook token, or no run is waiting on it.'),
+            '200': jsonResponse('`{ result }` — the waiting run was resumed.', { type: 'object' }),
+            '202': jsonResponse(
+              '`{ buffered: true }` — the run is live but not waiting yet; its `wait()` consumes it.',
+              { type: 'object' },
+            ),
+            '404': err('Not a webhook token, an unknown or terminal run, or already delivered.'),
             '413': err('Payload too large.'),
           },
         },
