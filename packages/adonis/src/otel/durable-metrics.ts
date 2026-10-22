@@ -9,7 +9,18 @@ export interface DurationStats {
 }
 
 export interface DurableMetricsSnapshot {
-  runs: { started: number; completed: number; failed: number; suspended: number };
+  runs: {
+    started: number;
+    completed: number;
+    failed: number;
+    suspended: number;
+    /** Failures handed to an onError handler instead of failing the run. */
+    routed: number;
+    /** Failures that had onError routes the engine could not apply (workers disagree). */
+    unrouted: number;
+  };
+  /** Routed failures by error code (`*` for a failure without one). */
+  routedByCode: Record<string, number>;
   steps: { completed: number; failed: number };
   /** Per-step wall-clock (from the `durationMs` on step events). */
   stepDurationMs: DurationStats;
@@ -43,7 +54,16 @@ function stats(xs: number[]): DurationStats {
  * its own.
  */
 export function attachDurableMetrics(engine: WorkflowEngine): DurableMetrics {
-  let runs = { started: 0, completed: 0, failed: 0, suspended: 0 };
+  const zeroRuns = () => ({
+    started: 0,
+    completed: 0,
+    failed: 0,
+    suspended: 0,
+    routed: 0,
+    unrouted: 0,
+  });
+  let runs = zeroRuns();
+  let routedByCode: Record<string, number> = {};
   let steps = { completed: 0, failed: 0 };
   let stepDur: number[] = [];
   let runDur: number[] = [];
@@ -74,6 +94,15 @@ export function attachDurableMetrics(engine: WorkflowEngine): DurableMetrics {
       case 'run.suspended':
         runs.suspended += 1;
         break;
+      case 'run.routed': {
+        runs.routed += 1;
+        const code = e.error?.code ?? '*';
+        routedByCode[code] = (routedByCode[code] ?? 0) + 1;
+        break;
+      }
+      case 'run.unrouted':
+        runs.unrouted += 1;
+        break;
       case 'step.completed':
         steps.completed += 1;
         if (e.durationMs != null) stepDur.push(e.durationMs);
@@ -88,12 +117,14 @@ export function attachDurableMetrics(engine: WorkflowEngine): DurableMetrics {
   return {
     snapshot: () => ({
       runs: { ...runs },
+      routedByCode: { ...routedByCode },
       steps: { ...steps },
       stepDurationMs: stats(stepDur),
       runDurationMs: stats(runDur),
     }),
     reset: () => {
-      runs = { started: 0, completed: 0, failed: 0, suspended: 0 };
+      runs = zeroRuns();
+      routedByCode = {};
       steps = { completed: 0, failed: 0 };
       stepDur = [];
       runDur = [];

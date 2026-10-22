@@ -4,6 +4,7 @@ import type {
   QueryClientContract,
   TransactionClientContract,
 } from '@adonisjs/lucid/types/database';
+import type { WorkerDescriptor } from '../handshake/descriptor.js';
 import {
   type ControlMessage,
   type ControlPlane,
@@ -15,7 +16,14 @@ import {
 import { Pollers, type PollLoop } from '../pollers.js';
 import { runStepHandler, type StepHandler } from '../protocol.js';
 import { sanitizeQueueToken, tenantGroup } from '../tenant-group.js';
-import { createDurableTransportTables, TRANSPORT_TABLES } from './db-schema.js';
+import type { DescriptorRedis } from '../worker-runtime/registry.js';
+import { createDurableTransportTables, TRANSPORT_TABLES, WORKER_KEYS_TABLE } from './db-schema.js';
+import {
+  descriptorsOn,
+  liveGroupsOf,
+  type WorkerKeyStore,
+  workerKeyWriter,
+} from './worker-keys.js';
 
 /**
  * The wire payloads carried in the DB transport's table rows. Everything crossing the DB is plain
@@ -121,6 +129,12 @@ export interface DbTransportOptions {
   batchSize?: number;
   /** Create the transport tables on first use if missing. Default true. */
   autoCreate?: boolean;
+  /**
+   * How long a read of the worker advertisement table is reused (ms). The engine asks for a token's
+   * descriptors before every dispatch; the fleet changes on the advertisement cadence (seconds), so
+   * one read serves a burst. Default 5000; `0` reads every time.
+   */
+  workerKeysCacheMs?: number;
   /** Stable id for this process (stamped on heartbeats / control `from` / `claimed_by`). Default random. */
   instanceId?: string;
 }
@@ -172,6 +186,8 @@ export class DbTransport implements Transport, ControlPlane {
   readonly #batchSize: number;
   readonly #autoCreate: boolean;
   readonly #instanceId: string;
+  readonly #workerKeysCacheMs: number;
+  #workerKeysRead: { at: number; entries: { key: string; value: string }[] } | undefined;
   readonly #handlers = new Map<string, StepHandler>();
   readonly #pollers: Pollers;
   #schemaReady: Promise<void> | undefined;
@@ -188,6 +204,7 @@ export class DbTransport implements Transport, ControlPlane {
     this.#batchSize = options.batchSize ?? DEFAULT_BATCH_SIZE;
     this.#autoCreate = options.autoCreate ?? true;
     this.#instanceId = options.instanceId ?? randomUUID();
+    this.#workerKeysCacheMs = options.workerKeysCacheMs ?? 5_000;
     this.#pollers = new Pollers(this.#pollIntervalMs, DEFAULT_LOG);
   }
 
@@ -529,6 +546,69 @@ export class DbTransport implements Transport, ControlPlane {
       .where('claimed_by', token)
       .where('claimed_at', at)) as T[];
     return { rows, token };
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // worker advertisement (design §7.2) — a key/value table with an expiry per key
+  // ───────────────────────────────────────────────────────────────────────────
+
+  #workerKeys(): WorkerKeyStore {
+    return {
+      put: async (key, value, expiresAt) => {
+        await this.#ensureSchema();
+        const now = this.#now();
+        await this.#client().from(WORKER_KEYS_TABLE).where('expires_at', '<=', now).delete();
+        await this.#client()
+          .insertQuery()
+          .table(WORKER_KEYS_TABLE)
+          .knexQuery.insert({ key, value, expires_at: expiresAt })
+          .onConflict('key')
+          .merge();
+      },
+      remove: async (keys) => {
+        if (keys.length === 0) return;
+        await this.#ensureSchema();
+        await this.#client().from(WORKER_KEYS_TABLE).whereIn('key', keys).delete();
+      },
+      live: async (now) => {
+        await this.#ensureSchema();
+        const rows = (await this.#client()
+          .from(WORKER_KEYS_TABLE)
+          .where('expires_at', '>', now)
+          .select('key', 'value')) as { key: string; value: string }[];
+        return rows;
+      },
+    };
+  }
+
+  /** The writer a worker runtime's registry advertises its descriptor and heartbeat through. */
+  createDescriptorRedis(): DescriptorRedis {
+    return workerKeyWriter(this.#workerKeys(), () => this.#now());
+  }
+
+  /** The live advertisement keys, reused for {@link DbTransportOptions.workerKeysCacheMs}. `[]` when
+   *  the table cannot be read, so routing falls back to what it does with no advertisement. */
+  async #liveWorkerKeys(): Promise<{ key: string; value: string }[]> {
+    const now = this.#now();
+    const read = this.#workerKeysRead;
+    if (read && now - read.at < this.#workerKeysCacheMs) return read.entries;
+    try {
+      const entries = await this.#workerKeys().live(now);
+      this.#workerKeysRead = { at: now, entries };
+      return entries;
+    } catch {
+      return [];
+    }
+  }
+
+  /** The live worker descriptors advertised on `token`. */
+  async listWorkerDescriptors(token: string): Promise<WorkerDescriptor[]> {
+    return descriptorsOn(await this.#liveWorkerKeys(), token);
+  }
+
+  /** The routing tokens a live worker beats on. */
+  async listWorkerGroups(): Promise<string[]> {
+    return liveGroupsOf(await this.#liveWorkerKeys());
   }
 
   // ───────────────────────────────────────────────────────────────────────────

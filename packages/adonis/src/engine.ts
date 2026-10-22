@@ -34,6 +34,7 @@ import {
 import { EventAccumulators, type EventBatchConfig } from './event-accumulators.js';
 import { eventMatches, eventMatchOf, eventPrefix } from './events.js';
 import { FOLDED_PREFIX, fanOfWaiter, foldedChildIds } from './fan-join.js';
+import { aggregateAnnouncements } from './handshake/announced.js';
 import type { WorkerDescriptor } from './handshake/descriptor.js';
 import type {
   ControlPlane,
@@ -254,6 +255,9 @@ const SETTLE_ELIGIBLE_STATUSES: RunStatus[] = [
   'failed',
 ];
 
+/** How long a read of the onError routes a fleet announces is reused. */
+const ANNOUNCED_ROUTES_TTL_MS = 5_000;
+
 /** What a run that handed its failure to an onError handler settles as, or that it keeps waiting. */
 type HandoffOutcome =
   | { kind: 'completed'; output: unknown }
@@ -268,6 +272,9 @@ interface RegisteredWorkflow {
   fn: WorkflowFn;
   /** Where a failed run of this workflow is routed instead of failing. See {@link OnErrorRoute}. */
   onError?: OnErrorRoute[] | undefined;
+  /** Made by {@link WorkflowEngine.ensureConventionWorkflow}: its onError routes are the ones its live
+   *  workers announce, read when a run fails. */
+  convention?: true | undefined;
   /** Static `workflow` config `tags` — merged with per-run tags onto each run at start. */
   tags?: string[] | undefined;
   /** Package attribution stamped on every run this registration starts (see WorkflowRun.origin). */
@@ -673,6 +680,8 @@ export class WorkflowEngine {
   private readonly updateValidators = new Map<string, UpdateValidator>();
   /** Runs being cancelled WITH saga compensation — see `cancel({ compensate: true })`. */
   private readonly cancelRequested = new Set<string>();
+  /** {@link announcedRoutes} reads, by routing token + workflow + version. */
+  private readonly announcedRoutesCache = new Map<string, { at: number; sets: OnErrorRoute[][] }>();
   /** The merged schedule set the worker loop ticks with (see {@link adoptSchedules}). */
   #allSchedules: readonly ScheduledWorkflow[] = [];
   /** Runtime pause overrides by schedule key (console-issued; win over the config's `paused`). */
@@ -1141,6 +1150,8 @@ export class WorkflowEngine {
       group: name,
       executor: new RemoteWorkflowExecutor(this.primaryTransport, name),
     });
+    const registered = this.workflows.get(versionKey(name, '1'));
+    if (registered) registered.convention = true;
     return true;
   }
 
@@ -2287,7 +2298,8 @@ export class WorkflowEngine {
         typeof v === 'object' && v !== null && (v as { ok?: unknown }).ok === false;
       for (const cp of await this.store.listCheckpoints(runId)) {
         // A retry runs the body again, so a failure it handed to an onError handler is retired: kept in
-        // the timeline under another name, never followed again, and the handler is not retried.
+        // the timeline under another name, never followed again, and the handler is not retried. Its
+        // `onError:<code>` tag goes too: the tag says how the run ended, and that is being redone.
         const handlerId = handoffHandlerId(runId, cp);
         if (handlerId !== undefined) {
           await this.store.takeSignalWaiter(`child:${handlerId}`);
@@ -2296,6 +2308,11 @@ export class WorkflowEngine {
             name: retiredHandoffName(handlerId),
             status: 'completed',
           });
+          const tags = run.tags?.filter((t) => !t.startsWith('onError:'));
+          if (tags && tags.length !== run.tags?.length) {
+            await this.store.updateRun(runId, { tags, updatedAt: new Date() });
+            run.tags = tags;
+          }
           continue;
         }
         if (cp.status === 'failed') {
@@ -3309,6 +3326,45 @@ export class WorkflowEngine {
     return unserved;
   }
 
+  /**
+   * The onError routes the live workers on `token` announce for a workflow the engine serves by
+   * convention: the one set they agree on, or none when they state none or cannot be read. Workers
+   * that announce different sets (a rollout in progress) route nothing, and the run's failure is
+   * reported as a `run.unrouted` event. Announcers of another version of the workflow are ignored. The
+   * read is cached for {@link ANNOUNCED_ROUTES_TTL_MS}, so a burst of failures costs one read.
+   */
+  private async announcedRoutes(
+    run: WorkflowRun,
+    token: string,
+    error: StepError,
+  ): Promise<OnErrorRoute[] | undefined> {
+    const key = `${token}\n${run.workflow}\n${run.workflowVersion}`;
+    const now = this.clock();
+    let cached = this.announcedRoutesCache.get(key);
+    if (!cached || now - cached.at > ANNOUNCED_ROUTES_TTL_MS) {
+      const sets = new Map<string, OnErrorRoute[]>();
+      for (const announced of aggregateAnnouncements(await this.liveDescriptorsFor(token))) {
+        if (announced.name !== run.workflow) continue;
+        if (announced.version !== undefined && announced.version !== run.workflowVersion) continue;
+        for (const routes of announced.onError) sets.set(JSON.stringify(routes), routes);
+      }
+      cached = { at: now, sets: [...sets.values()] };
+      this.announcedRoutesCache.set(key, cached);
+    }
+    if (cached.sets.length > 1) {
+      this.emit({
+        type: 'run.unrouted',
+        runId: run.id,
+        workflow: run.workflow,
+        namespace: run.namespace,
+        error,
+        reason: `live workers announce ${cached.sets.length} different onError route sets`,
+      });
+      return undefined;
+    }
+    return cached.sets[0];
+  }
+
   /** Validate a workflow's {@link OnErrorRoute}s at registration. */
   private checkedRoutes(
     name: string,
@@ -3334,7 +3390,10 @@ export class WorkflowEngine {
     error: StepError,
   ): Promise<HandoffOutcome | undefined> {
     const registered = this.workflows.get(versionKey(run.workflow, run.workflowVersion));
-    const route = routeFor(registered?.onError, error);
+    const routes = registered?.convention
+      ? await this.announcedRoutes(run, registered.remote?.group ?? run.workflow, error)
+      : registered?.onError;
+    const route = routeFor(routes, error);
     if (!route) return undefined;
     const checkpoints = await this.handoffCheckpoints(run.id);
     const live = liveHandoff(run.id, checkpoints);

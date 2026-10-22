@@ -288,3 +288,35 @@ describe('static workflow onError', () => {
     expect(r2.output).toBe('outage');
   });
 });
+
+describe('workflowAnnouncement', () => {
+  it('derives what a worker announces from a class: version, origin and resolved routes', async () => {
+    const { workflowAnnouncement } = await import('../../src/workflow-ref.js');
+    class InvalidLine extends Error {
+      static readonly code = 'invalid_line';
+    }
+    class DeadLetter {
+      static workflow = { name: 'line-dead-letter' };
+      async run() {
+        return null;
+      }
+    }
+    class Line {
+      static workflow = {
+        name: 'line',
+        version: '3',
+        origin: '@acme/lines',
+        onError: [{ code: InvalidLine, workflow: DeadLetter }, { workflow: 'outage' }],
+      };
+      async run() {
+        return null;
+      }
+    }
+    expect(workflowAnnouncement(Line)).toEqual({
+      version: '3',
+      origin: '@acme/lines',
+      onError: [{ code: 'invalid_line', workflow: 'line-dead-letter' }, { workflow: 'outage' }],
+    });
+    expect(workflowAnnouncement(class {})).toBeUndefined();
+  });
+});

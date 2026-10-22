@@ -1,0 +1,24 @@
+{{{
+  exports({ to: app.migrationsPath(`${new Date().getTime()}_create_durable_transport_worker_keys.ts`) })
+}}}
+import { BaseSchema } from '@adonisjs/lucid/schema'
+
+/**
+ * The worker advertisement keys for the @adonis-agora/durable \`db\` transport: the descriptor and
+ * heartbeat a worker runtime publishes (what it serves, and that it is alive), each with an expiry so a
+ * dead worker drops out. Only needed when you select the \`db\` transport in config/durable.ts.
+ */
+export default class extends BaseSchema {
+  async up() {
+    this.schema.createTable('durable_transport_worker_keys', (table) => {
+      table.string('key', 512).primary()
+      table.text('value').notNullable()
+      table.bigInteger('expires_at').notNullable()
+      table.index(['expires_at'], 'durable_transport_worker_keys_expires_idx')
+    })
+  }
+
+  async down() {
+    this.schema.dropTableIfExists('durable_transport_worker_keys')
+  }
+}

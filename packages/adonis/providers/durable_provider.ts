@@ -92,6 +92,9 @@ const DIAGNOSTICS_EMIT = Symbol.for('@agora/diagnostics:emit');
  * await engine.start('order', input, runId)
  * ```
  */
+/** How long after boot an onError route unserved at boot is checked again before it is reported. */
+const UNSERVED_ROUTES_RECHECK_MS = 30_000;
+
 export default class DurableProvider {
   #detachDiagnostics: (() => void) | null = null;
   #transport: (Transport & { close?: () => Promise<void> }) | null = null;
@@ -324,15 +327,13 @@ export default class DurableProvider {
 
   /**
    * Build the descriptor/heartbeat registry for a tenant worker: a real {@link RedisWorkerRegistry} when
-   * the transport can mint a descriptor-Redis client (design §7.2), else the {@link NoopWorkerRegistry}
-   * (the descriptor is still built + observable, just not published to the shared Redis).
+   * the transport can mint a writer for its advertisement keys (design §7.2) — BullMQ's Redis, the db
+   * transport's key table, the event-emitter's in-memory board — else the {@link NoopWorkerRegistry}
+   * (the queue transport: point-to-point queues hold no key a control plane could read back).
    */
   #buildWorkerRegistry(transport: Transport): WorkerRegistry {
     const redis = descriptorRedisFrom(transport);
     if (redis) return new RedisWorkerRegistry(redis, { ownsConnection: true });
-    // TODO(integrator): expose `createDescriptorRedis()` on the tenant broker transport
-    // (e.g. BullMQTransport, keyed off the same connection its queues use) so a real pod advertises its
-    // descriptor + heartbeat on the shared Redis instead of falling back to the no-op registry.
     return new NoopWorkerRegistry();
   }
 
@@ -415,11 +416,14 @@ export default class DurableProvider {
   }
 
   /**
-   * Says, once at boot, which onError routes name a handler workflow nothing can run yet, so a typo is
-   * caught before the first failure goes nowhere. A handler served by workers that start later also
-   * shows up here; the route still works once they are live.
+   * Says, once after boot, which onError routes name a handler workflow nothing can run, so a typo is
+   * caught before the first failure goes nowhere. Routes unserved at boot are checked again after
+   * {@link UNSERVED_ROUTES_RECHECK_MS}, so a handler whose workers start after this process is not
+   * reported.
    */
   async #reportUnservedOnErrorRoutes(engine: WorkflowEngine): Promise<void> {
+    if ((await engine.unservedOnErrorRoutes().catch(() => [])).length === 0) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, UNSERVED_ROUTES_RECHECK_MS).unref());
     const unserved = await engine.unservedOnErrorRoutes().catch(() => []);
     if (unserved.length === 0) return;
     const list = unserved

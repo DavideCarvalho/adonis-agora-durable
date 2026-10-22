@@ -57,12 +57,13 @@ Trade-off vs a real broker: throughput is bounded by polling + row contention �
 | `batchSize` | `20` | Max rows claimed per poll. |
 | `autoCreate` | `true` | Create the transport tables on first use (in addition to the published migration). |
 | `instanceId` | random uuid | Stable process id stamped on claims and control messages. |
+| `workerKeysCacheMs` | `5000` | How long a read of the worker advertisement table is reused. The engine asks before every dispatch; `0` reads every time. |
 
 `transports.db(config)` returns the lazy driver thunk used in `config/durable.ts`; the underlying class is `DbTransport`, also exported from `@adonis-agora/durable` for constructing a worker-side instance directly. `@adonis-agora/durable` also exports `TRANSPORT_TABLES`, `createDurableTransportTables(db)`, and `dropDurableTransportTables(db)` for managing the schema yourself.
 
 ## The tables
 
-The published migration creates four tables (default names):
+The published migrations create five tables (default names):
 
 | Table | Direction | Purpose |
 | --- | --- | --- |
@@ -70,6 +71,7 @@ The published migration creates four tables (default names):
 | `durable_transport_results` | worker → engine | step results |
 | `durable_transport_heartbeats` | worker → engine | liveness for `timeoutMs` steps |
 | `durable_transport_control` | bidirectional | lifecycle events + cancellation (best-effort, single-consumer) |
+| `durable_transport_worker_keys` | worker → engine | the [worker advertisement](/docs/durable/transports#worker-advertisement): each live worker's descriptor and heartbeat, with an expiry |
 
 `durable_transport_tasks` carries `step_id` (`<runId>:<seq>`, the primary key and step identity), `run_id`, `seq`, `name` (the handler key), `grp` (worker group), `input`, `attempt`, plus the claim columns `claimed_by`/`claimed_at` and `created_at`. The results table mirrors it with `status`, `output`, `error`, and `started_at` (when the worker picked the task up — what powers queue-wait timing in the dashboard).
 

@@ -2,12 +2,11 @@ import { readdir } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { WorkflowEngine } from './engine.js';
-import type { OnErrorRoute } from './on-error.js';
 import { eventTriggerCanonicalName, workflowEvents } from './workflow-events.js';
 import {
+  onErrorRoutesOf,
   type WorkflowMeta,
   workflowMeta,
-  workflowName,
   workflowSchedules,
 } from './workflow-ref.js';
 
@@ -88,7 +87,7 @@ export async function registerWorkflowClass(
       ...(meta.singleton ? { singleton: meta.singleton } : {}),
       ...(meta.concurrency ? { concurrency: meta.concurrency } : {}),
       ...(meta.origin ? { origin: meta.origin } : {}),
-      ...(meta.onError?.length ? { onError: onErrorRoutes(meta) } : {}),
+      ...(meta.onError?.length ? { onError: onErrorRoutesOf(meta) } : {}),
     },
   );
   // Collect any colocated `static schedule` on the class so the worker loop can fire it alongside the
@@ -219,12 +218,4 @@ export async function registerWorkflowsFromBarrel(
     }
   }
   return registered;
-}
-
-/** A class's `onError` routes, with class refs resolved to names and error classes to their codes. */
-function onErrorRoutes(meta: WorkflowMeta): OnErrorRoute[] {
-  return (meta.onError ?? []).map(({ code, workflow }) => ({
-    ...(code === undefined ? {} : { code: typeof code === 'string' ? code : code.code }),
-    workflow: workflowName(workflow),
-  }));
 }
