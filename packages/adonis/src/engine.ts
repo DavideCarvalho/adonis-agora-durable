@@ -2826,6 +2826,9 @@ export class WorkflowEngine {
         error,
       });
       this.notifyDead({ ...run, status: 'dead', error, recoveryAttempts: attempts });
+      // `dead` is terminal like `failed`: a parent awaiting this run as a child (ctx.child, a ctx.all /
+      // allSettled fan) must learn it now, as a failed child, not on its next reconcile wake.
+      this.notifyParent(run.id, failedCompletion(error));
       return { runId: run.id, status: 'dead', error };
     }
     // Count BEFORE resuming, so a crash mid-resume still advances the counter.
