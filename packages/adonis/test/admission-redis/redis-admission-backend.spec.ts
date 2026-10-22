@@ -4,14 +4,17 @@ import {
   RedisAdmissionBackend,
   type RedisAdmissionOptions,
 } from '../../src/admission-redis/index.js';
+import { backendUrl, deleteRedisKeys, uniqueRedisPrefix } from '../support/backends.js';
 
 /**
  * Redis-specific behaviour of the global admission backend, run against a REAL Redis (set REDIS_URL,
- * e.g. `redis://127.0.0.1:6399`). Self-skips when REDIS_URL is unset so the default suite stays green
+ * e.g. `redis://127.0.0.1:6399`). Self-skips when REDIS_URL is unset (locally; CI requires it) so the default suite stays green
  * without a server. Covers what's unique to the distributed backend: cross-pod globality,
  * liveness-based slot reclaim, the freed-slot pub/sub, and arrival ordering.
  */
-const REDIS_URL = process.env.REDIS_URL;
+const REDIS_URL = backendUrl('REDIS_URL');
+// Every key this file writes starts with PREFIX, so cleanup never touches another file's keys.
+const PREFIX = uniqueRedisPrefix('adm');
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 describe.skipIf(!REDIS_URL)('RedisAdmissionBackend (real Redis)', () => {
@@ -26,7 +29,7 @@ describe.skipIf(!REDIS_URL)('RedisAdmissionBackend (real Redis)', () => {
   afterEach(async () => {
     for (const b of open) await b.close();
     open.length = 0;
-    await redis.flushall();
+    await deleteRedisKeys(redis, PREFIX);
   });
 
   /** A backend bound to a distinct instanceId, sharing the one Redis (each test gets a fresh prefix). */
@@ -37,7 +40,7 @@ describe.skipIf(!REDIS_URL)('RedisAdmissionBackend (real Redis)', () => {
   }
 
   it('enforces concurrency GLOBALLY across pods, freed on release', async () => {
-    const p = `t${++ns}`;
+    const p = `${PREFIX}-t${++ns}`;
     const a = pod('A', p);
     const b = pod('B', p);
     a.register({ name: 'q', concurrency: 1 });
@@ -50,7 +53,7 @@ describe.skipIf(!REDIS_URL)('RedisAdmissionBackend (real Redis)', () => {
   });
 
   it('admits blocked waiters in arrival order (FIFO)', async () => {
-    const p = `t${++ns}`;
+    const p = `${PREFIX}-t${++ns}`;
     const a = pod('A', p);
     a.register({ name: 'q', concurrency: 1 });
     expect((await a.tryAdmit('q', { waiterId: 'first' })).ok).toBe(true);
@@ -62,7 +65,7 @@ describe.skipIf(!REDIS_URL)('RedisAdmissionBackend (real Redis)', () => {
   });
 
   it('admits the most recent arrival first with order: lifo', async () => {
-    const p = `t${++ns}`;
+    const p = `${PREFIX}-t${++ns}`;
     const a = pod('A', p);
     a.register({ name: 'q', concurrency: 1, order: 'lifo' });
     expect((await a.tryAdmit('q', { waiterId: 'first' })).ok).toBe(true);
@@ -74,7 +77,7 @@ describe.skipIf(!REDIS_URL)('RedisAdmissionBackend (real Redis)', () => {
   });
 
   it('enforces a fixed-window rate limit', async () => {
-    const p = `t${++ns}`;
+    const p = `${PREFIX}-t${++ns}`;
     const a = pod('A', p);
     a.register({ name: 'q', rateLimit: { limit: 2, periodMs: 60_000 } });
     expect((await a.tryAdmit('q', { waiterId: 'r1' })).ok).toBe(true);
@@ -83,7 +86,7 @@ describe.skipIf(!REDIS_URL)('RedisAdmissionBackend (real Redis)', () => {
   });
 
   it("reclaims a crashed pod's slot once its liveness lapses", async () => {
-    const p = `t${++ns}`;
+    const p = `${PREFIX}-t${++ns}`;
     const a = pod('A', p, { instanceTtlMs: 300 });
     const b = pod('B', p, { instanceTtlMs: 300 });
     a.register({ name: 'q', concurrency: 1 });
@@ -97,7 +100,7 @@ describe.skipIf(!REDIS_URL)('RedisAdmissionBackend (real Redis)', () => {
   });
 
   it('publishes a freed-slot signal on release that onFreed receives', async () => {
-    const p = `t${++ns}`;
+    const p = `${PREFIX}-t${++ns}`;
     const a = pod('A', p);
     a.register({ name: 'q', concurrency: 1 });
     const freed: string[] = [];
