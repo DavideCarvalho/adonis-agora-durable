@@ -132,6 +132,10 @@ describe.each(dbBackends())('on $name', ({ makeStoreDb }) => {
       });
       await engine.start('approval', {}, 'run-5');
       expect((await engine.waitForRun('run-5')).status).toBe('suspended');
+      // Same window as below: let the turn release its lease before the signal arrives.
+      for (let i = 0; i < 200 && (await store.getRun('run-5'))?.lockedBy; i += 1) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
       // A waiter is durably recorded against the token.
       expect((await store.listSignalWaiters('approve:')).map((w) => w.runId)).toContain('run-5');
 
@@ -150,6 +154,12 @@ describe.each(dbBackends())('on $name', ({ makeStoreDb }) => {
       });
       await engineA.start('wf', {}, 'run-6');
       expect((await engineA.waitForRun('run-6')).status).toBe('suspended');
+      // Engine A announces the suspension just BEFORE releasing its lease. A restarted process holds
+      // no lease, so wait it out: otherwise engine B's signal finds the run still leased (A's own
+      // post-release re-check then resumes it, but not inside this signal call).
+      for (let i = 0; i < 200 && (await store.getRun('run-6'))?.lockedBy; i += 1) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
 
       // A brand-new engine (simulating a process restart) sees the suspended run in the store and
       // resumes it on signal — durability across instances.
