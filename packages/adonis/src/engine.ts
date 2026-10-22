@@ -69,6 +69,7 @@ import type {
   RunValueFacetRow,
   ScopedRetentionPolicy,
   SearchAttributes,
+  SearchAttributesSchema,
   Settled,
   SignalWaiter,
   StateStore,
@@ -125,6 +126,11 @@ import { type ScheduledWorkflow, scheduleWindow } from './scheduler.js';
 import { ScheduleClient } from './schedules.js';
 import { SINGLETON_ADMITTED_TAG, withoutAdmission } from './singleton-admission.js';
 import { SingletonGate } from './singleton-gate.js';
+import {
+  type StandardSchemaV1,
+  validateStandard,
+  validateStandardSync,
+} from './standard-schema.js';
 import { sanitizeQueueToken, tenantGroup } from './tenant-group.js';
 import { TransportPool } from './transport-pool.js';
 import { workflowAls } from './workflow-als.js';
@@ -324,6 +330,13 @@ interface RegisteredWorkflow {
   executionTimeoutMs?: number | undefined;
   /** Validate the input at start; throw to reject before a run is created. Validator-agnostic. */
   validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
+  /** Standard Schema (zod / valibot / arktype / …) the input is validated against at start, BEFORE
+   *  `validateInput`; its OUTPUT value becomes the run's input. A failure throws a
+   *  `SchemaValidationError` and no run is created. */
+  inputSchema?: StandardSchemaV1 | undefined;
+  /** Typed search-attributes shape: `ctx.upsertSearchAttributes` validates the MERGED attributes
+   *  against it and rejects a non-conforming write. See {@link SearchAttributesSchema}. */
+  searchAttributesSchema?: SearchAttributesSchema | undefined;
   /** Event names that start a fresh run of this workflow when published. See `publishEvent`. */
   onEvent?: string[] | undefined;
   /** Coalesce `onEvent` triggers: debounce (fire once it's quiet) or batch (fire on size/window). */
@@ -1224,6 +1237,10 @@ export class WorkflowEngine {
       concurrency?: ConcurrencyConfig | undefined;
       executionTimeout?: string | number | undefined;
       validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
+      /** Standard Schema validated at start, before `validateInput` — see `RegisteredWorkflow.inputSchema`. */
+      inputSchema?: StandardSchemaV1 | undefined;
+      /** Typed/validated `searchAttributes` shape — see `RegisteredWorkflow.searchAttributesSchema`. */
+      searchAttributesSchema?: SearchAttributesSchema | undefined;
       onEvent?: string[] | undefined;
       eventBatch?: EventBatchConfig | undefined;
       requires?: string[] | undefined;
@@ -1245,6 +1262,8 @@ export class WorkflowEngine {
       executionTimeoutMs:
         opts?.executionTimeout != null ? parseDuration(opts.executionTimeout) : undefined,
       validateInput: opts?.validateInput,
+      inputSchema: opts?.inputSchema,
+      searchAttributesSchema: opts?.searchAttributesSchema,
       onEvent: opts?.onEvent,
       eventBatch: opts?.eventBatch,
       requires: opts?.requires,
@@ -1276,6 +1295,8 @@ export class WorkflowEngine {
       concurrency?: ConcurrencyConfig;
       executionTimeout?: string | number;
       validateInput?: (input: unknown) => void | Promise<void>;
+      /** Standard Schema validated at start, before `validateInput` — see `RegisteredWorkflow.inputSchema`. */
+      inputSchema?: StandardSchemaV1;
       requires?: string[];
       /** Handler workflows a matching failure is routed to — see {@link OnErrorRoute}. */
       onError?: OnErrorRoute[];
@@ -1295,6 +1316,7 @@ export class WorkflowEngine {
       executionTimeoutMs:
         opts.executionTimeout != null ? parseDuration(opts.executionTimeout) : undefined,
       validateInput: opts.validateInput,
+      inputSchema: opts.inputSchema,
       remote: { group: opts.group, executor: opts.executor },
       requires: opts.requires,
     };
@@ -1609,7 +1631,11 @@ export class WorkflowEngine {
           : `workflow ${name}@${pinned} is not registered`,
       );
     }
-    // Validate the input up front — a bad payload is rejected before any run is created.
+    // Validate the input up front — a bad payload is rejected before any run is created. The schema
+    // runs first and its OUTPUT (parsed/coerced) is what the run stores; `validateInput` then sees it.
+    if (registered.inputSchema) {
+      input = await validateStandard(registered.inputSchema, input, `workflow "${name}" input`);
+    }
     await registered.validateInput?.(input);
     // Idempotent by run id: a redelivered trigger (at-least-once queues) or a scheduler re-tick for
     // the same id is a no-op, returning the existing run's state instead of starting a duplicate.
@@ -5544,7 +5570,9 @@ export class WorkflowEngine {
   ): Promise<void> {
     if (this.pool.size === 0) throw new Error('dispatched compensation requires a Transport');
     const token = stepGroup(def, run.namespace);
-    const validInput = def.input ? def.input.parse(args) : args;
+    const validInput = def.input
+      ? await validateStandard(def.input, args, `step "${def.name}" input`)
+      : args;
     const id = `${run.id}:compensate:${def.name}:${attempt}`;
     const name = `compensate:${def.name}`;
     const existing = await this.store.getCheckpoint(run.id, seq);
@@ -5730,8 +5758,23 @@ export class WorkflowEngine {
       // Shallow-merge into the run's searchAttributes (the ctx primitive makes this exactly-once).
       upsertSearchAttributes: async (runId, attrs) => {
         const run = await this.store.getRun(runId);
+        const merged = { ...(run?.searchAttributes ?? {}), ...attrs };
+        // A declared `searchAttributesSchema` validates the MERGED bag (the schema describes the whole
+        // run's shape, optional keys included) — before the write, so the ctx primitive records no
+        // checkpoint and a rejected write throws in the body (non-retryable SchemaValidationError).
+        const schema = run
+          ? this.workflows.get(versionKey(run.workflow, run.workflowVersion))
+              ?.searchAttributesSchema
+          : undefined;
+        if (schema) {
+          validateStandardSync(
+            schema,
+            merged,
+            `workflow "${run?.workflow}": ctx.upsertSearchAttributes`,
+          );
+        }
         await this.store.updateRun(runId, {
-          searchAttributes: { ...(run?.searchAttributes ?? {}), ...attrs },
+          searchAttributes: merged,
           updatedAt: new Date(),
         });
       },
@@ -6100,7 +6143,9 @@ export class WorkflowEngine {
 
     // Optional runtime schema: validate only when the def carries one (a bare `@Step()` / string-name
     // call carries none — the engine passes the input through untouched then).
-    const validInput = step.input ? step.input.parse(input) : input;
+    const validInput = step.input
+      ? await validateStandard(step.input, input, `step "${step.name}" input`)
+      : input;
     // Routing token: BY NAME (sanitized for brokers), optionally partition-suffixed. Computed once and
     // used at BOTH the checkpoint's workerGroup and the dispatched task's routing `group`, so the same
     // token the worker subscribes to per handler name serves this step.
@@ -6284,9 +6329,10 @@ export class WorkflowEngine {
   ): Promise<void> {
     const token = stepGroup(step, runNamespace);
     await this.ensureRoutable(token, step.requires);
-    const input = (i: number): unknown =>
-      step.input ? step.input.parse(inputs[i] as TInput) : inputs[i];
-    const validInputs = new Map(batch.map((i) => [i, input(i)]));
+    const input = (i: number): unknown | Promise<unknown> =>
+      step.input ? validateStandard(step.input, inputs[i], `step "${step.name}" input`) : inputs[i];
+    const validInputs = new Map<number, unknown>();
+    for (const i of batch) validInputs.set(i, await input(i));
     const enqueuedAt = new Date();
     for (let at = 0; at < batch.length; at += STEP_FAN_CHUNK) {
       await Promise.all(
@@ -6756,7 +6802,9 @@ export class WorkflowEngine {
     admission?: { priority?: number | undefined; fairnessKey?: string | undefined },
   ): Promise<TOutput> {
     if (this.pool.size === 0) throw new Error('remote steps require a Transport');
-    const validInput = step.input ? step.input.parse(input) : input;
+    const validInput = step.input
+      ? await validateStandard(step.input, input, `step "${step.name}" input`)
+      : input;
     const token = stepGroup(step, runNamespace);
     // Capability/protocol guard (design §7.5) — same as the durable path, before the `step.started`
     // emit + dispatch, so a step nobody can run parks `blocked` instead of awaiting a phantom worker.
@@ -6927,7 +6975,9 @@ export class WorkflowEngine {
     enqueuedAt: Date,
   ): Promise<TOutput> {
     const output = (
-      step.output ? step.output.parse(resolution.output) : resolution.output
+      step.output
+        ? await validateStandard(step.output, resolution.output, `step "${step.name}" output`)
+        : resolution.output
     ) as TOutput;
     // The worker reports when it actually picked the task up; fall back to dispatch time if a
     // transport doesn't carry it (queue-wait then reads as zero rather than going negative).

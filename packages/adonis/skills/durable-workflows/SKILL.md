@@ -128,6 +128,26 @@ constructor as wiring; keep per-run state in input and step outputs, never on
 `this`. Injected services are for **composing**, not doing work: reach them
 through step refs so the work is checkpointed.
 
+Schemas are **any Standard Schema** (zod 3.24+/4, valibot, arktype, effect
+schema, …) — the package depends on none of them. They fit every schema slot:
+`@Step({ input, output })` / `defineStep` (with an unannotated handler the types
+are inferred from the schema), `static workflow = { inputSchema }` (validated at
+`start`, nothing created on failure; the schema's output value is the run's
+input), and `static workflow = { searchAttributes }` (every
+`ctx.upsertSearchAttributes` is validated against the merged attributes; type
+the ctx as `WorkflowCtx<InferSearchAttributes<typeof schema>>` and read back with
+`attributesOf(WorkflowClass, run)`). A failure is a `SchemaValidationError`
+(`FatalError`, code `schema_validation`, issues in `details.issues`) — never
+retried.
+
+```ts
+import * as v from 'valibot'
+
+export const charge = defineStep('billing:charge', async (input) => input.amount * 100, {
+  input: v.object({ amount: v.number() }), // input: { amount: number }, inferred
+})
+```
+
 ### Pattern 2 — pausing durably: sleeps, signals, events
 
 All three suspend the run with zero compute and survive restarts.

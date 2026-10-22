@@ -1,7 +1,7 @@
-import type { z } from 'zod';
 import type { DispatchDiagnostics } from './dispatch-routing.js';
 import type { WorkerDescriptor } from './handshake/descriptor.js';
 import type { FanPageQuery, RunDetailOptions } from './run-detail-summary.js';
+import type { StandardSchemaV1 } from './standard-schema.js';
 import type { StepRef } from './step-name-symbol.js';
 import type { WorkflowClass, WorkflowInputOf, WorkflowOutputOf } from './workflow-ref.js';
 
@@ -796,6 +796,42 @@ export interface RunFacetRow {
 
 /** Typed, queryable per-run data — exact values for `eq`/`ne`, numbers/strings for range ops. */
 export type SearchAttributes = Record<string, string | number | boolean>;
+
+/**
+ * A Standard Schema (https://standardschema.dev — zod, valibot, arktype, …) whose validated OUTPUT is
+ * search-attribute-shaped: flat `string`/`number`/`boolean` values only. Declared via
+ * `static workflow = { searchAttributes }` (or `register(..., { searchAttributesSchema })`), it makes
+ * `ctx.upsertSearchAttributes` validate the MERGED attributes and reject a non-conforming write with a
+ * `SchemaValidationError`. The `Output extends SearchAttributes` bound is enforced at the declaration
+ * site — a schema whose output has a nested object/array value is a compile-time error. Its
+ * `validate` must be synchronous (an async refinement could make replay nondeterministic).
+ *
+ * @example
+ * ```ts
+ * const orderAttrs = z.object({ tier: z.enum(['free', 'pro']), amount: z.number() })
+ *
+ * export default class CheckoutWorkflow extends BaseWorkflow {
+ *   static workflow = { name: 'checkout', searchAttributes: orderAttrs }
+ *   async run(ctx: WorkflowCtx<InferSearchAttributes<typeof orderAttrs>>, input: Order) {
+ *     await ctx.upsertSearchAttributes({ tier: input.tier, amount: input.total })
+ *   }
+ * }
+ * ```
+ */
+export type SearchAttributesSchema<A extends SearchAttributesShape = SearchAttributesShape> =
+  StandardSchemaV1<unknown, A>;
+
+/**
+ * The bound a TYPED search-attributes shape must satisfy: {@link SearchAttributes} whose values may
+ * also be `undefined` — so an optional key (`v.optional(v.number())`, `z.number().optional()`), which
+ * infers as `key?: number | undefined`, still type-checks under `exactOptionalPropertyTypes`.
+ */
+export type SearchAttributesShape = Record<string, string | number | boolean | undefined>;
+
+/** Infer the validated OUTPUT shape of a {@link SearchAttributesSchema} — feed it to
+ *  `WorkflowCtx<A>`: `WorkflowCtx<InferSearchAttributes<typeof mySchema>>`. */
+export type InferSearchAttributes<S extends StandardSchemaV1<unknown, SearchAttributesShape>> =
+  StandardSchemaV1.InferOutput<S>;
 
 export type AttributeOp = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' | 'in';
 
@@ -1761,7 +1797,8 @@ export interface StepOptions {
  * name (a worker subscribes per registered handler name, not a hand-declared group). There is no
  * public factory for this anymore — `ctx.step(ref, input)` builds one internally from the
  * `@Step`-stamped name (see {@link StepRef}/`stepNameOf`) and a `ctx.step(name, input)` from the
- * literal string. `input`/`output` are OPTIONAL runtime zod schemas an authoring layer MAY attach
+ * literal string. `input`/`output` are OPTIONAL runtime Standard Schemas (zod, valibot, arktype, …)
+ * an authoring layer MAY attach
  * (e.g. `@Step({ input, output })`) for validation at the dispatch boundary — a bare `@Step()`
  * carries neither, and the engine skips validation when they're absent. The `StepOptions` fields
  * (retries/backoff/timeoutMs …) carry the merged per-call/def dispatch policy.
@@ -1771,8 +1808,8 @@ export interface StepDef<TInput = unknown, TOutput = unknown> extends StepOption
   /** Optional isolation partition; routing is by `name`. Suffixes the routing token as
    *  `<name>@<partition>` (via `tenantGroup`) — omit to route by the bare (sanitized) `name`. */
   partition?: string | undefined;
-  input?: z.ZodType<TInput> | undefined;
-  output?: z.ZodType<TOutput> | undefined;
+  input?: StandardSchemaV1<unknown, TInput> | undefined;
+  output?: StandardSchemaV1<unknown, TOutput> | undefined;
 }
 
 /**
@@ -1864,8 +1901,13 @@ export interface DurableWebhook<TPayload = unknown> {
 /**
  * The context handed to a workflow function. Every interaction with the outside world goes
  * through it so the engine can checkpoint — the workflow body itself stays deterministic.
+ *
+ * Generic over `A`, the run's {@link SearchAttributes} shape — narrows {@link upsertSearchAttributes}
+ * to a `Partial<A>` (pair it with a {@link SearchAttributesSchema}: annotate `run`'s ctx as
+ * `WorkflowCtx<InferSearchAttributes<typeof mySchema>>`). Defaults to the untyped bag, so a bare
+ * `WorkflowCtx` behaves exactly as before.
  */
-export interface WorkflowCtx {
+export interface WorkflowCtx<A extends SearchAttributesShape = SearchAttributes> {
   readonly runId: string;
   /**
    * Run a durable step — always dispatched, always engine-scheduled: the ONE step primitive (no
@@ -2143,8 +2185,10 @@ export interface WorkflowCtx {
    * exactly-once — recorded at this position on the first run and SKIPPED on replay, so it does one
    * write, not one per turn. Use this instead of injecting the {@link StateStore} to mutate the run
    * you're executing (`store.updateRun(ctx.runId, …)` becomes `ctx.upsertSearchAttributes(…)`).
+   * With a declared {@link SearchAttributesSchema}, the merged result is validated first and a
+   * non-conforming write throws a `SchemaValidationError` (nothing is written or recorded).
    */
-  upsertSearchAttributes(attrs: SearchAttributes): Promise<void>;
+  upsertSearchAttributes(attrs: Partial<A>): Promise<void>;
 }
 
 /**
@@ -2163,8 +2207,8 @@ export interface WorkflowCtx {
  *
  * Every `WorkflowCtx` is assignable to it (guarded by `test/types/dynamic-workflow-ctx.ts`).
  */
-export interface DynamicWorkflowCtx
-  extends Omit<WorkflowCtx, 'step' | 'child' | 'startChild' | 'all' | 'allSettled'> {
+export interface DynamicWorkflowCtx<A extends SearchAttributesShape = SearchAttributes>
+  extends Omit<WorkflowCtx<A>, 'step' | 'child' | 'startChild' | 'all' | 'allSettled'> {
   /** {@link WorkflowCtx.step} by step name. */
   step<TOutput = unknown>(
     name: string,

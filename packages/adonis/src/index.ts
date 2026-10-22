@@ -130,7 +130,9 @@ export * from './run-waiting.js';
 export * from './scheduler.js';
 export * from './schedules.js';
 export * from './search-attributes.js';
+export * from './search-attributes-schema.js';
 export * from './singleton-admission.js';
+export * from './standard-schema.js';
 export * from './step-discovery.js';
 export {
   DURABLE_STEP_CONFIG,

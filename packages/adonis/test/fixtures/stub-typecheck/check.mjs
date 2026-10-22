@@ -57,7 +57,7 @@ const STUBS = [
 /**
  * Mirror the package's `node_modules` into the scratch app, entry by entry, so the stubs resolve
  * every peer they import (`@adonisjs/lucid`, `@adonisjs/core`) plus anything the published
- * declarations transitively reference (`zod`, luxon via Lucid's types). Scoped directories are
+ * declarations transitively reference (luxon via Lucid's types). Scoped directories are
  * recreated as real directories so `@adonis-agora/durable` can be added alongside without writing
  * into the package's own tree.
  *

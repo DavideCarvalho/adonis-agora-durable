@@ -83,7 +83,7 @@ export default class PaymentSteps {
 const charge = await ctx.step(this.payments.chargeCard, { orderId: order.id, amountCents: order.total })
 ```
 
-Bare `@Step()` derives the routing name as `` `${ClassName}.${method}` `` (refactor-safe); `@Step('custom:name')` overrides it; the object form adds opt-in `input`/`output` zod schemas and a def-level retry/liveness policy.
+Bare `@Step()` derives the routing name as `` `${ClassName}.${method}` `` (refactor-safe); `@Step('custom:name')` overrides it; the object form adds opt-in `input`/`output` schemas (any [Standard Schema](#validation-with-any-standard-schema-library) — zod, valibot, arktype, …) and a def-level retry/liveness policy.
 
 ### 3. `defineStep`
 
@@ -107,7 +107,30 @@ export const chargeCard = defineStep(
 const charge = await ctx.step(chargeCard, { orderId: order.id, amountCents: order.total })
 ```
 
-Step schemas are **optional** — a bare `@Step()` or `defineStep(name, fn)` carries none, and the engine skips validation when they're absent. When present, `input` is parsed before the handler runs and `output` before its result is returned (at the serve boundary).
+Step schemas are **optional** — a bare `@Step()` or `defineStep(name, fn)` carries none, and the engine skips validation when they're absent. When present, `input` is validated before the handler runs and `output` before its result is returned (at the serve boundary). The handler receives the input schema's **output** value (parsed / coerced / defaulted), and the caller receives the output schema's output value.
+
+### Validation with any Standard Schema library
+
+Every schema slot — `@Step({ input, output })`, `defineStep`, a workflow's [`inputSchema`](/docs/durable/authoring/app-workflows#validating-the-input) and its [typed `searchAttributes`](#typed-search-attributes) — takes any [Standard Schema](https://standardschema.dev): **zod** (3.24+ / 4), **valibot**, **arktype**, **effect schema**, and every other library that implements the `~standard` interface. The package depends on none of them; bring the one your app already uses.
+
+```ts title="app/steps/charge.ts"
+import { defineStep } from '@adonis-agora/durable'
+import * as v from 'valibot'
+
+export const chargeCard = defineStep(
+  'payments:charge-card',
+  // `input` is inferred from the schema: { orderId: number; amountCents: number }
+  async (input) => ({ chargeId: await stripe.charge(input) }),
+  {
+    input: v.object({ orderId: v.pipe(v.number(), v.integer()), amountCents: v.number() }),
+    retries: 3,
+  },
+)
+```
+
+- **Types are inferred** from the schema when the handler is unannotated: the handler's argument is the schema's output type, and the returned ref takes the schema's input type (so `ctx.step(chargeCard, …)` checks the call site). An annotated handler keeps its own types, exactly as before.
+- **Sync and async** validators both work (a schema whose `validate` returns a `Promise` is awaited).
+- **A failure is not retried.** It throws a `SchemaValidationError` — a `FatalError` with code `schema_validation` and the issues in `details.issues` (`[{ message, path }]`) — so the step fails once and the run fails (or routes via `onError: [{ code: SchemaValidationError, workflow }]`). Retrying cannot fix a payload that doesn't match its schema.
 
 ### Dispatch options
 
@@ -415,6 +438,31 @@ await ctx.upsertSearchAttributes({ amount: order.total, tier: order.customer.tie
 ```
 
 It is a **shallow merge** into the run's `searchAttributes` (keys you don't pass are kept), and it is durable and exactly-once: recorded at this position on the first run and skipped on replay. Use it instead of reaching for `store.updateRun(ctx.runId, …)` from a workflow body. Query them with `engine.listRuns({ attributes: [{ key: 'amount', op: 'gte', value: 20000 }] })` — `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, and `in` with a `values` set, ANDed together. See [Search attributes](/docs/durable/authoring/queries-and-updates#search-attributes) for start-time attributes and the full query surface.
+
+### Typed search attributes
+
+Declare the run's attribute shape with a [Standard Schema](#validation-with-any-standard-schema-library) whose output is flat (`string` / `number` / `boolean` values; optional keys allowed) and every `ctx.upsertSearchAttributes` is checked — at compile time through `WorkflowCtx<A>`, and at runtime against the **merged** attributes:
+
+```ts title="app/workflows/checkout_workflow.ts"
+import { BaseWorkflow, attributesOf, type InferSearchAttributes, type WorkflowCtx } from '@adonis-agora/durable'
+import { z } from 'zod'
+
+const checkoutAttrs = z.object({ tier: z.enum(['free', 'pro']), amount: z.number().optional() })
+type CheckoutAttrs = InferSearchAttributes<typeof checkoutAttrs>
+
+export default class CheckoutWorkflow extends BaseWorkflow {
+  static workflow = { name: 'checkout', searchAttributes: checkoutAttrs }
+
+  async run(ctx: WorkflowCtx<CheckoutAttrs>, input: Order) {
+    await ctx.upsertSearchAttributes({ tier: input.tier }) // { tier: 'enterprise' } is a type error
+  }
+}
+
+// Read them back typed — the schema is resolved from the class:
+const attrs = attributesOf(CheckoutWorkflow, run) // CheckoutAttrs, or {} for history that predates the schema
+```
+
+A write whose merged result fails the schema throws a `SchemaValidationError` in the body: nothing is written and nothing is recorded, so the run fails (it is not retried). The schema must validate **synchronously** — an async refinement could make replay nondeterministic — and `readSearchAttributes(schema, run)` / `attributesOf` are deliberately lenient (old history that doesn't match reads as `{}`). With `engine.register`, pass the schema as `searchAttributesSchema`. A bare `WorkflowCtx` (no type argument) accepts any attribute bag, exactly as before.
 
 ## Delayed starts — `startAt`
 
