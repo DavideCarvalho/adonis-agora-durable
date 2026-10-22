@@ -76,13 +76,23 @@ exactly what went wrong (e.g. a schema's validation issues).
 ## Retrying a run
 
 Retrying a failed run runs its **body** again. A handoff the run made before is retired: it stays in
-the timeline, renamed `onError:retried:<handler id>`, and is never followed again. If the body fails
-again, the engine hands the new failure to a new handler run (`<runId>.onError.1`, then `.2`, …).
+the timeline, renamed `onError:retried:<handler id>`, and is never followed again, and the run's
+`onError:<code>` tag is removed. If the body fails again, the engine hands the new failure to a new
+handler run (`<runId>.onError.1`, then `.2`, …), tagged again.
 
 ## Catching a misnamed handler
 
-At boot, the provider warns about any route whose handler workflow is neither registered in the app nor
-served by a live worker. The same check is `engine.unservedOnErrorRoutes()`.
+After boot, the provider warns about any route whose handler workflow is neither registered in the app
+nor served by a live worker. A route unserved at boot is checked again 30 seconds later before it is
+reported, so a handler whose workers start after the app is not flagged. The same check is
+`engine.unservedOnErrorRoutes()`.
+
+## Seeing it
+
+The dashboard shows the failure's `code` and its `details` (as JSON) on the failed step and run.
+Handoffs are counted as `routed` (by code) in `collectMetrics` and `attachDurableMetrics`, marked as a
+`durable.run.routed` event on the run's OpenTelemetry span, and reach Telescope through the diagnostics
+bridge as `agora:durable:run.routed` / `run.unrouted`.
 
 ## Matching
 
@@ -111,6 +121,10 @@ The handler can be a workflow of any runtime; the engine only starts a run by na
 announce different routes for the workflow (a rollout in progress), the failure is not routed and the
 engine emits `run.unrouted` with the reason. The engine reuses what it read for a few seconds, so a
 burst of failures costs one read.
+
+Routes are read from the [worker advertisement](/docs/durable/transports#worker-advertisement), which
+the `bullmq`, `db` and `eventEmitter` transports carry. On the `queue` transport a convention workflow's
+failures are not routed: declare its routes where it is registered instead.
 
 ## On the engine directly
 
