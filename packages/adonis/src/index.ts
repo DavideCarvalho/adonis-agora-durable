@@ -14,6 +14,7 @@ export type {
 } from './admissions/factory.js';
 // --- config-driven admission drivers ----------------------------------------
 export { admissions } from './admissions/factory.js';
+export { currentStep } from './ambient-step.js';
 export {
   BaseWorkflow,
   setWorkflowEngineResolver,

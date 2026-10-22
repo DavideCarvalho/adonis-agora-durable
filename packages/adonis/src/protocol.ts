@@ -1,3 +1,4 @@
+import { runInStepLogger } from './ambient-step.js';
 import type { Heartbeat, RemoteTask, StepEvent, StepLogger, StepResult } from './interfaces.js';
 import { createStepLogger } from './step-logger.js';
 import { runOutsideWorkflowCtx } from './workflow-als.js';
@@ -98,8 +99,9 @@ export async function runStepHandler(
     try {
       // Outside any ambient workflow ctx: an in-process transport runs the handler on the parent
       // body's async path, but a handler is not the body (see `runOutsideWorkflowCtx`).
+      const logger = createStepLogger(events, Date.now, beat);
       const output = await runOutsideWorkflowCtx(() =>
-        handler(task.input, createStepLogger(events, Date.now, beat)),
+        runInStepLogger(logger, () => handler(task.input, logger)),
       );
       return withEvents({ ...base, status: 'completed', output });
     } catch (err) {
