@@ -93,7 +93,7 @@ async function cluster(gatewayOverride?: (g: StoreRunGateway) => RunGateway) {
   const wire = new Wire();
   const base = new StoreRunGateway(acmeEngine, { role: 'control-plane' });
   new RunRequestResponder(wire, gatewayOverride ? gatewayOverride(base) : base, {
-    verifyTenant: async ({ tenant }) => ({ tenant }),
+    verifyTenant: async ({ tenant }) => (tenant ? { tenant } : null),
   }).start();
   const acme = new ProxyRunGateway(wire, { partition: 'acme', requestTimeoutMs: 2_000 });
   const globex = new ProxyRunGateway(wire, { partition: 'globex', requestTimeoutMs: 2_000 });

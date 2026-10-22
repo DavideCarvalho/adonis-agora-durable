@@ -23,7 +23,7 @@ async function until(cond: () => boolean, budgetMs = 1_000): Promise<void> {
 }
 
 /** An EventEmitter-backed client: like ioredis, an `error` with no listener throws. */
-class FakeSub extends EventEmitter implements RedisLike {
+class FakeSub extends EventEmitter {
   status = 'ready';
   pings = 0;
   disconnects: boolean[] = [];
@@ -65,7 +65,7 @@ function brokerWith(clients: FakeSub[]): BullMQDeps {
     makeRedis: () => {
       const c = new FakeSub();
       clients.push(c);
-      return c;
+      return c as unknown as RedisLike;
     },
   };
 }
