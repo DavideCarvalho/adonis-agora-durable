@@ -1,6 +1,7 @@
 import { Emitter } from '@adonisjs/core/events';
 import { Logger } from '@adonisjs/core/logger';
 import { Database } from '@adonisjs/lucid/database';
+import { makeIsolatedPostgresDb } from '../transports/db-helpers.js';
 import { createDurableTables } from './lucid-schema.js';
 
 /**
@@ -38,6 +39,13 @@ export function makeMemoryDb(): Database {
 /** A fresh in-memory db with the durable tables already created. */
 export async function makeStoreDb(): Promise<Database> {
   const db = makeMemoryDb();
+  await createDurableTables(db);
+  return db;
+}
+
+/** A fresh isolated Postgres schema (see `makeIsolatedPostgresDb`) with the durable tables created. */
+export async function makePostgresStoreDb(url: string): Promise<Database> {
+  const db = await makeIsolatedPostgresDb(url);
   await createDurableTables(db);
   return db;
 }

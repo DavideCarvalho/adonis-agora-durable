@@ -8,6 +8,6 @@ export default defineConfig({
     globals: true,
     include: ['test/**/*.{spec,test}.ts'],
     pool: 'forks',
-    globalSetup: ['./test/setup/sqlite-preflight.ts'],
+    globalSetup: ['./test/setup/sqlite-preflight.ts', './test/setup/postgres-cleanup.ts'],
   },
 });
