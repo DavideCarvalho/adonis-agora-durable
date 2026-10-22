@@ -42,13 +42,42 @@ The class's `run(ctx, input)` **is** the workflow body — the same deterministi
 [`engine.register`](/docs/durable/concepts/workflows-and-steps) takes, just attached to a class so a class
 ref (`OrderWorkflow.dispatch(input)`, `ctx.child(OrderWorkflow)`) carries its input/output types. The
 `static workflow` object accepts the same options as `engine.register` — `name`, `version`, and
-optional `tags` / `onEvent` / `executionTimeout`.
+optional `tags` / `onEvent` / `executionTimeout` / `inputSchema` / `searchAttributes`.
+
+## Validating the input
+
+Declare an `inputSchema` — any [Standard Schema](/docs/durable/concepts/workflows-and-steps#validation-with-any-standard-schema-library)
+(zod, valibot, arktype, …) — and every start is validated **before a run is created**:
+
+```ts title="app/workflows/order_workflow.ts"
+import { BaseWorkflow } from '@adonis-agora/durable'
+import type { WorkflowCtx } from '@adonis-agora/durable'
+import { type } from 'arktype'
+
+const OrderInput = type({ orderId: 'string', amount: 'number > 0' })
+
+export default class OrderWorkflow extends BaseWorkflow {
+  static workflow = { name: 'order', version: '1', inputSchema: OrderInput }
+
+  async run(ctx: WorkflowCtx, input: typeof OrderInput.infer) {
+    // …
+  }
+}
+```
+
+A bad payload makes `start` / `dispatch` throw a `SchemaValidationError` (code `schema_validation`,
+issues in `details.issues`) and nothing is persisted; an [`onEvent`](/docs/durable/authoring/events)
+subscriber whose schema rejects the payload simply doesn't start. The schema's **output** value
+(parsed / coerced / defaulted) is what the run stores and `run` receives. The same option exists on
+`engine.register(name, version, fn, { inputSchema })` and `engine.registerRemote(...)`, next to the
+function-form `validateInput` — when both are set the schema runs first and `validateInput` sees the
+parsed value.
 
 ## Auto-registration
 
 At boot the provider scans the configured directory (default `app/workflows`), imports each module, and
 registers every exported workflow class from its `static workflow` config — including the version,
-`tags`, `executionTimeout`, `onEvent` and `singleton` from its options, plus any
+`tags`, `executionTimeout`, `onEvent`, `singleton`, `inputSchema` and `searchAttributes` from its options, plus any
 [colocated schedule](/docs/durable/authoring/scheduling#colocate-the-schedule-with-the-workflow).
 
 ## Dependency injection in the constructor

@@ -61,7 +61,7 @@ The provider binds a singleton [`WorkflowEngine`](/docs/durable/concepts/workflo
 
 ## 2. Define a step (optional)
 
-`ctx.step(refOrName, input)` is the durable step primitive — always dispatched, routed to a handler by **name**. Author the handler as a `@Step` class under `app/steps`, or with `defineStep` for a typed ref. Schemas are optional — add [zod](https://zod.dev) `input`/`output` to validate at the serve boundary:
+`ctx.step(refOrName, input)` is the durable step primitive — always dispatched, routed to a handler by **name**. Author the handler as a `@Step` class under `app/steps`, or with `defineStep` for a typed ref. Schemas are optional — add `input`/`output` from any [Standard Schema](https://standardschema.dev) library (zod, valibot, arktype, …) to validate at the serve boundary:
 
 ```ts title="app/steps/charge.ts"
 import { defineStep } from '@adonis-agora/durable'

@@ -73,7 +73,7 @@ The context handed to a workflow's `run(ctx, input)`. Every interaction with the
 | `patched` | `patched(id: string): Promise<boolean>` | Guard an in-place change without a new version: `true` for a fresh run (new branch), `false` for a run whose history predates the guard. See [Versioning](/docs/durable/authoring/versioning). |
 | `continueAsNew` | `continueAsNew(input?: unknown): Promise<never>` | End this run and start a fresh execution of the same workflow with clean history (id `<runId>~N`). Always throws. See [Continue-as-new](/docs/durable/authoring/child-workflows#continue-as-new). |
 | `sideEffect` | `sideEffect<TValue>(fn: () => TValue \| Promise<TValue>): Promise<TValue>` | Deterministic capture: runs `fn` once, checkpoints the result, and replay returns the same value without re-running `fn` (e.g. `uuidv7()`, `Math.random()`). |
-| `upsertSearchAttributes` | `upsertSearchAttributes(attrs: SearchAttributes): Promise<void>` | Shallow-merge queryable metadata onto this run's `searchAttributes`. Exactly-once: skipped on replay. See [Search attributes](/docs/durable/authoring/queries-and-updates#search-attributes). |
+| `upsertSearchAttributes` | `upsertSearchAttributes(attrs: Partial<A>): Promise<void>` | Shallow-merge queryable metadata onto this run's `searchAttributes` (`A` is `WorkflowCtx<A>`'s attribute shape, default `SearchAttributes`). Exactly-once: skipped on replay. With a declared `searchAttributes` schema the merged result is validated first (`SchemaValidationError` on failure). See [Typed search attributes](/docs/durable/concepts/workflows-and-steps#typed-search-attributes) and See [Search attributes](/docs/durable/authoring/queries-and-updates#search-attributes). |
 | `breakpoint` | `breakpoint(label?: string): Promise<void>` | Pause the run here until a human resumes it with `engine.continue(runId)` or the [dashboard](/docs/durable/observability/dashboard). See [Human-in-the-loop pauses](/docs/durable/authoring/external-tasks). |
 
 ### Supporting option types
@@ -151,6 +151,8 @@ Related helpers:
 | `concurrency` | `ConcurrencyConfig` (`{ key: (input: unknown) => string \| undefined; limit: number \| ((key: string) => number \| Promise<number>); countStatuses?: RunStatus[] }`) | Start-time quota per key, shared across workflows. An over-limit start throws `ConcurrencyLimitError`. See [Concurrency quotas](/docs/durable/reliability/concurrency-quotas). |
 | `origin` | `string` | Package attribution stamped on every run (`WorkflowRun.origin`). See [Run origin](/docs/durable/concepts/workflows-and-steps#run-origin--package-attribution). |
 | `onError` | `{ code?: string \| { readonly code: string }; workflow: WorkflowRef }[]` | Route a failed run to a handler workflow by error `code` (string or an error class with a `static code`; omit for the catch-all). See [Routing a run's failure](/docs/durable/reliability/on-error). |
+| `inputSchema` | `StandardSchemaV1` | Any Standard Schema (zod, valibot, arktype, …). Validated at start before a run is created; its output value is the run's input. A failure throws `SchemaValidationError`. See [Validating the input](/docs/durable/authoring/app-workflows#validating-the-input). |
+| `searchAttributes` | `SearchAttributesSchema` | A Standard Schema with a flat output: every `ctx.upsertSearchAttributes` is validated against the merged attributes. Must validate synchronously. See [Typed search attributes](/docs/durable/concepts/workflows-and-steps#typed-search-attributes). |
 
 ### `@Step(nameOrOptions?)` and `defineStep`
 
@@ -160,12 +162,12 @@ Related helpers:
 | --- | --- |
 | `@Step()` | Name derived as `` `${ClassName}.${method}` ``. |
 | `@Step('custom:name')` | Explicit name, a stable cross-runtime contract. |
-| `@Step({ name?, input?, output?, retries?, backoff?, backoffMs?, backoffMaxMs?, jitter?, timeoutMs?, pickupTimeoutMs?, requires? })` | `input` / `output` are opt-in zod schemas validated at the serve boundary. The rest is the def-level dispatch policy `ctx.step` reads (a per-call `opts` overrides it field by field). See [Retries & backoff](/docs/durable/reliability/retries). |
+| `@Step({ name?, input?, output?, retries?, backoff?, backoffMs?, backoffMaxMs?, jitter?, timeoutMs?, pickupTimeoutMs?, requires? })` | `input` / `output` are opt-in [Standard Schemas](/docs/durable/concepts/workflows-and-steps#validation-with-any-standard-schema-library) (zod, valibot, arktype, …) validated at the serve boundary; a failure is a non-retryable `SchemaValidationError`. The rest is the def-level dispatch policy `ctx.step` reads (a per-call `opts` overrides it field by field). See [Retries & backoff](/docs/durable/reliability/retries). |
 
 | `StepDecoratorOptions` field | Type | Notes |
 | --- | --- | --- |
 | `name` | `string` | Explicit routing name. |
-| `input` / `output` | `z.ZodType` | Runtime schemas for the step's input and output. |
+| `input` / `output` | `StandardSchemaV1` | Runtime schemas for the step's input and output — any Standard Schema library. The handler gets the input schema's output value; the caller gets the output schema's output value. |
 | `retries` | `number` | Max attempts before the step (and run) fails. |
 | `backoff` | `BackoffStrategy` | `'fixed'` or `'exp'`. |
 | `backoffMs` / `backoffMaxMs` | `number` | Base delay and upper bound in ms. |
@@ -176,8 +178,10 @@ Related helpers:
 
 | Export | Signature | Notes |
 | --- | --- | --- |
-| `defineStep` | `defineStep<TInput, TOutput>(name: string, fn: (input: TInput, log: StepLogger) => TOutput \| Promise<TOutput>, config?: Omit<StepDecoratorOptions, 'name'>): StepRef<TInput, TOutput>` | A step handler without a class or decorator. See [`defineStep`](/docs/durable/concepts/workflows-and-steps#3-definestep). |
+| `defineStep` | `defineStep<TInput, TOutput>(name: string, fn: (input: TInput, log: StepLogger) => TOutput \| Promise<TOutput>, config?: Omit<StepDecoratorOptions, 'name'>): StepRef<TInput, TOutput>` | A step handler without a class or decorator. With an `input` / `output` schema and an unannotated handler, the types are inferred: `StepRef<InferInput<input>, InferOutput<output>>`, handler argument `InferOutput<input>`. See [`defineStep`](/docs/durable/concepts/workflows-and-steps#3-definestep). |
 | `StepRef<TInput, TOutput>` | `((input: TInput) => Promise<TOutput> \| TOutput) & { [DURABLE_STEP_NAME]?: string; [DURABLE_STEP_CONFIG]?: StepConfig }` | A typed handle onto a stamped step name and policy. |
+| `StandardSchemaV1` / `validateStandard` | `validateStandard(schema, value, label): Promise<InferOutput<schema>>` | The vendored [Standard Schema](https://standardschema.dev) V1 type, and the helper every schema slot uses (sync or async `validate`; throws `SchemaValidationError`). |
+| `InferSearchAttributes` / `readSearchAttributes` / `attributesOf` | `attributesOf(WorkflowClass, run): A` | Infer a `searchAttributes` schema's shape; read a run's attributes typed through a schema or by workflow class (lenient: history that fails the schema reads as `{}`). |
 | `stepNameOf` / `stepConfigOf` | `stepNameOf(ref: unknown): string \| undefined` / `stepConfigOf(ref: unknown): StepConfig \| undefined` | Read the stamped name or policy off a reference. |
 
 ### Class decorators
@@ -207,8 +211,8 @@ import engine from '@adonis-agora/durable/services/main'
 
 | Member | Signature | Notes |
 | --- | --- | --- |
-| `register` | `register(name: string, version: string, fn: WorkflowFn, opts?: { tags?, singleton?, concurrency?, executionTimeout?, validateInput?, onEvent?, eventBatch?, requires?, origin?, onError? }): void` | Register a function-form workflow (`WorkflowFn` is `(ctx: WorkflowCtx, input: unknown) => Promise<unknown>`). `app/workflows` discovery calls this for you. See [Workflows & steps](/docs/durable/concepts/workflows-and-steps#workflows). |
-| `registerRemote` | `registerRemote(name: string, version: string, opts: { group: string; executor: WorkflowExecutor; tags?; singleton?; concurrency?; executionTimeout?; validateInput?; requires?; onError? }): void` | Register a workflow whose body runs in another SDK; the engine still owns its state. See [Cross-ecosystem interop](/docs/durable/cluster/interop). |
+| `register` | `register(name: string, version: string, fn: WorkflowFn, opts?: { tags?, singleton?, concurrency?, executionTimeout?, validateInput?, inputSchema?, searchAttributesSchema?, onEvent?, eventBatch?, requires?, origin?, onError? }): void` | Register a function-form workflow (`WorkflowFn` is `(ctx: WorkflowCtx, input: unknown) => Promise<unknown>`). `app/workflows` discovery calls this for you. See [Workflows & steps](/docs/durable/concepts/workflows-and-steps#workflows). |
+| `registerRemote` | `registerRemote(name: string, version: string, opts: { group: string; executor: WorkflowExecutor; tags?; singleton?; concurrency?; executionTimeout?; validateInput?; inputSchema?; requires?; onError? }): void` | Register a workflow whose body runs in another SDK; the engine still owns its state. `inputSchema` (any Standard Schema) runs before `validateInput`, which sees the parsed value. See [Cross-ecosystem interop](/docs/durable/cluster/interop). |
 | `handle` | `handle(name: string, fn: StepHandler): void` | Serve a step body by name on the engine's transport. It makes the engine a `StepServer`, so `registerStepsFromDir(engine, dir)` serves an extra directory from a preload. Throws when the transport can't serve handlers. See [Registering an extra directory by hand](/docs/durable/authoring/app-workflows#registering-an-extra-directory-by-hand). |
 | `registerQueue` | `registerQueue(config: QueueConfig): void` | Register a flow-control queue (`{ name, concurrency?, rateLimit?, retryMs?, fairness?, order? }`). See [Flow control](/docs/durable/reliability/flow-control). |
 | `registerEntity` | `registerEntity<S>(name: string, config: EntityConfig<S>): void` | Register a durable entity (`{ initialState: () => S; handlers: Record<string, EntityHandler<S>> }`). See [Durable entities](/docs/durable/authoring/entities). |
@@ -397,6 +401,7 @@ The concrete classes (`InMemoryTransport`, `EventEmitterTransport`, `QueueTransp
 | `SignalTimeoutError` | The `timeoutMs` of `ctx.waitForSignal`, `ctx.waitForEvent`, `ctx.onUpdate` or a webhook's `wait` passes before delivery (`token`, `timeoutMs`). Catch it to take a default branch. |
 | `NonDeterminismError` | On resume, the step at a position has a different name or kind than its checkpoint: the code changed under an in-flight run without a new version (`code: 'non_determinism'`, `runId`, `seq`). Never routed by onError. See [The non-determinism guard](/docs/durable/authoring/versioning#the-non-determinism-guard). |
 | `NestedWorkflowCallError` | A ctx primitive (or a `BaseWorkflow.start()` / `.dispatch()` through the ambient ctx) was called from inside a step body (`ctx.localStep`, `transaction`, `sideEffect`, `now`, `task`'s dispatch). A `FatalError` with code `nested_workflow_call` (`runId`, `primitive`, `step`). See [Workflow primitives inside a step body](/docs/durable/authoring/versioning#workflow-primitives-inside-a-step-body). |
+| `SchemaValidationError` | A value failed a declared Standard Schema: a step's `input` / `output`, a workflow's `inputSchema` (thrown by `start`, nothing created), or its `searchAttributes` schema (thrown by `ctx.upsertSearchAttributes`). A `FatalError` with code `schema_validation` (also its `static code`, for `onError`), never retried; `issues` / `details.issues` hold `{ message, path: string[] }[]`. |
 | `ConcurrencyLimitError` | `start` whose quota key already has `limit` runs in flight (`workflow`, `key`, `limit`, `active`). Nothing was created. See [Concurrency quotas](/docs/durable/reliability/concurrency-quotas). |
 | `SingletonQueueFullError` | `start` on a singleton workflow whose in-flight plus gated backlog equals `limit + maxQueueDepth` (`workflow`, `key`, `maxQueueDepth`). See [Singleton workflows](/docs/durable/reliability/singleton). |
 | `GatherError` | `ctx.all`: one or more children or steps of a fan failed. `failures` holds `GatherItemFailure` items (`{ index, id, error, code?, details? }`). See [Child workflows](/docs/durable/authoring/child-workflows). |

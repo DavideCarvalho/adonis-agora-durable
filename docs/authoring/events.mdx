@@ -41,7 +41,7 @@ export default class PaymentsController {
 | `id` | a fresh uuid per publish | Dedupes the subscriber *start* half across redeliveries. See [Idempotent publishing](#idempotent-publishing--optsid). |
 | `buffer` | `true` | Set `false` to drop a publish that reached nobody instead of buffering it. |
 
-A subscriber whose `validateInput` rejects the payload, or whose start throws for any other reason, is skipped. It does not block the other subscribers, and it is not counted in the returned total.
+A subscriber whose `inputSchema` or `validateInput` rejects the payload, or whose start throws for any other reason, is skipped. It does not block the other subscribers, and it is not counted in the returned total.
 
 ## Starting a workflow from an event
 
