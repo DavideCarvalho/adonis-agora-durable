@@ -410,6 +410,58 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
           responses: { '200': jsonResponse('Groups.', { type: 'object' }) },
         },
       },
+      '/runs/{id}/events/{key}': {
+        get: {
+          summary: 'The latest value the run published for `key` via ctx.setEvent',
+          parameters: [
+            idParam,
+            {
+              name: 'key',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'The event key.',
+            },
+          ],
+          responses: {
+            '200': jsonResponse('`{ value }`; `value` absent when never published.', {
+              type: 'object',
+            }),
+            '404': err('Unknown run, or unavailable on this topology.'),
+          },
+        },
+      },
+      '/webhooks/{token}': {
+        post: {
+          summary: 'Deliver a ctx.webhook() callback; the body resumes the waiting run',
+          parameters: [
+            {
+              name: 'token',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'The webhook token (`wh:<runId>:<seq>`).',
+            },
+          ],
+          requestBody: { required: false, content: { 'application/json': { schema: {} } } },
+          responses: {
+            '200': jsonResponse('`{ result }`.', { type: 'object' }),
+            '404': err('Not a webhook token, or no run is waiting on it.'),
+            '413': err('Payload too large.'),
+          },
+        },
+      },
+      '/metrics': {
+        get: {
+          summary: 'Prometheus text exposition: event counters plus backlog and worker gauges',
+          responses: {
+            '200': {
+              description: 'Prometheus text format 0.0.4.',
+              content: { 'text/plain': { schema: { type: 'string' } } },
+            },
+          },
+        },
+      },
       '/workers': {
         get: {
           summary: 'Worker-group health with full heartbeats (incl. WorkerStatus telemetry)',

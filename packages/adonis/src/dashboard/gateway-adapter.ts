@@ -2,6 +2,7 @@ import type { ScheduleInfo } from '../engine.js';
 import type {
   EngineEvent,
   RunFacetQuery,
+  RunQuery,
   RunResult,
   RunValueAxis,
   RunValueFacetOptions,
@@ -56,6 +57,9 @@ export interface StoreEngineLike {
   listSignalWaiters?(prefix: string): Promise<SignalWaiter[]>;
   /** Targeted per-page variant (`run_id IN (...)`, indexed) — forwarded when the engine has it. */
   listSignalWaitersByRunIds?(runIds: string[]): Promise<SignalWaiter[]>;
+  /** Backlog gauges for `GET /metrics` and the `ctx.setEvent` live query — forwarded 1:1. */
+  countRuns?(query: Omit<RunQuery, 'page' | 'size'>): Promise<number>;
+  getEvent?(runId: string, key: string): Promise<unknown>;
   /** Value enumeration for the console's pickers — forwarded 1:1 when the engine has it. */
   runValueFacets?(
     axis: RunValueAxis,
@@ -99,6 +103,18 @@ export function storeDashboardEngine(engine: StoreEngineLike): DashboardEngine {
       engine.subscribe((event) => {
         if (event.runId === runId) onEvent(event);
       }),
+    ...(engine.countRuns
+      ? {
+          countRuns: (query: Omit<RunQuery, 'page' | 'size'>) =>
+            (engine.countRuns as NonNullable<StoreEngineLike['countRuns']>)(query),
+        }
+      : {}),
+    ...(engine.getEvent
+      ? {
+          getEvent: (runId: string, key: string) =>
+            (engine.getEvent as NonNullable<StoreEngineLike['getEvent']>)(runId, key),
+        }
+      : {}),
     ...(engine.listSignalWaiters
       ? {
           listSignalWaiters: (prefix: string) =>
@@ -205,6 +221,22 @@ export function gatewayDashboardEngine(gateway: RunGateway): DashboardEngine {
               ),
               () => scanRunValueFacets({ listRuns: (q) => gateway.listRuns(q) }, axis, query, opts),
             ),
+        }
+      : {}),
+    ...(gateway.runFacets
+      ? {
+          // The metrics backlog gauges, scoped to the tenant by the control plane.
+          countRuns: async ({
+            status,
+            statuses,
+            ...rest
+          }: Omit<RunQuery, 'page' | 'size'>): Promise<number> => {
+            const wanted = new Set(statuses ?? (status ? [status] : []));
+            const cells = await (gateway.runFacets as NonNullable<RunGateway['runFacets']>)(rest);
+            return cells
+              .filter((c) => wanted.size === 0 || wanted.has(c.status))
+              .reduce((n, c) => n + c.count, 0);
+          },
         }
       : {}),
     ...(gateway.waitingFor

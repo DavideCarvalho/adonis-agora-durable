@@ -1,4 +1,5 @@
 import type { WorkflowEngine } from '../index.js';
+import { isRemoteEvent } from '../remote-event.js';
 
 export interface DurationStats {
   count: number;
@@ -78,6 +79,9 @@ export function attachDurableMetrics(engine: WorkflowEngine): DurableMetrics {
   };
 
   const unsubscribe = engine.subscribe((e) => {
+    // Only events this instance produced: another instance's arrive over the control plane and are
+    // counted there, so counting them here too would multiply every number by the fleet size.
+    if (isRemoteEvent(e)) return;
     switch (e.type) {
       case 'run.started':
         runs.started += 1;

@@ -132,6 +132,12 @@ export interface DashboardEngine {
    * above is available.
    */
   waitingFor?(runIds: string[]): Promise<Record<string, RunWaiting>>;
+  /** How many runs match `query` — the backlog gauges of `GET /metrics`. Optional: without it the
+   *  gauges are left out of the scrape. */
+  countRuns?(query: Omit<RunQuery, 'page' | 'size'>): Promise<number>;
+  /** The latest value a run published for `key` via `ctx.setEvent` (a side-effect-free live query).
+   *  Optional: absent on a store-less `tenant` pod, where `GET /runs/:id/events/:key` answers 404. */
+  getEvent?(runId: string, key: string): Promise<unknown>;
   /**
    * The distinct values of ONE filter axis over the runs matching `query`, with counts — what a
    * console's pickers list. Optional: absent on a port that can't do the scan yet (a store-less
@@ -148,6 +154,8 @@ export interface DashboardEngine {
 /** The read/control port the handlers operate over (a store engine or a tenant gateway adapter). */
 export interface Deps {
   engine: DashboardEngine;
+  /** This process's event counters (`collectMetrics`), prepended to `GET /metrics`. */
+  metrics?: { prometheus(): string } | undefined;
   /** Host redaction hooks over the SERIALIZED run/checkpoint shapes (see the config's `redact`). */
   redact?: {
     run?: (run: Record<string, unknown>) => Record<string, unknown>;
@@ -809,4 +817,121 @@ function summarizeCheckpoint(cp: StepCheckpoint) {
     durationMs: durationMs >= 0 ? durationMs : 0,
     queueMs: queueMs >= 0 ? queueMs : 0,
   };
+}
+
+/** Escape a Prometheus label value (backslash, double quote, newline). */
+function promLabel(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+}
+
+/**
+ * `GET /metrics` — Prometheus text exposition: this process's event counters (runs and steps by
+ * outcome, per-workflow counts, step durations; see `collectMetrics`) plus gauges read at scrape
+ * time: `durable_pending_runs` (the dispatch backlog), `durable_running_runs`, `durable_dead_runs`
+ * (the dead-letter queue) and, per worker group, `durable_group_queue_depth` and
+ * `durable_group_live_workers` (`depth > 0` with zero live workers is the alert). The counters only
+ * count the events this process produced, so summing a scrape of every pod counts each event once.
+ * Returns the text body; the route sets the `text/plain; version=0.0.4` content type.
+ */
+export async function metricsText(deps: Deps): Promise<string> {
+  const { engine } = deps;
+  const gauges: string[] = [];
+  const count = engine.countRuns?.bind(engine);
+  // A count that fails (a control plane too old to answer it, from a tenant pod) leaves the backlog
+  // gauges out rather than reporting a backlog of 0.
+  const counts = count
+    ? await Promise.all([
+        count({ status: 'pending' }),
+        count({ status: 'running' }),
+        count({ status: 'dead' }),
+      ]).catch(() => undefined)
+    : undefined;
+  if (counts) {
+    const [pending, running, dead] = counts;
+    gauges.push(
+      '# TYPE durable_pending_runs gauge',
+      `durable_pending_runs ${pending}`,
+      '# TYPE durable_running_runs gauge',
+      `durable_running_runs ${running}`,
+      '# TYPE durable_dead_runs gauge',
+      `durable_dead_runs ${dead}`,
+    );
+  }
+  const health = await engine.workerHealth();
+  if (health.length > 0) {
+    gauges.push('# TYPE durable_group_queue_depth gauge');
+    for (const h of health) {
+      gauges.push(`durable_group_queue_depth{group="${promLabel(h.group)}"} ${h.depth}`);
+    }
+    gauges.push('# TYPE durable_group_live_workers gauge');
+    for (const h of health) {
+      gauges.push(
+        `durable_group_live_workers{group="${promLabel(h.group)}"} ${h.liveWorkers.length}`,
+      );
+    }
+  }
+  const counters = deps.metrics?.prometheus() ?? '';
+  return `${counters}${gauges.length > 0 ? `${gauges.join('\n')}\n` : ''}`;
+}
+
+/**
+ * `GET /runs/:id/events/:key` — the latest value run `id` published for `key` via `ctx.setEvent`:
+ * a side-effect-free query of a live (or finished) run. `{ value }`, with `value` absent when the
+ * run never published that key. 404 for an unknown run, and on a topology without the read (a
+ * store-less `tenant` pod). The value passes through the `checkpoint` redaction hook as the
+ * `event:<key>` checkpoint's `output`, since that is where it is stored.
+ */
+export async function getRunEvent(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
+  const { engine } = deps;
+  const id = req.params.id;
+  const key = req.params.key;
+  if (!id) return notFound('run id is required');
+  if (!key) return notFound('event key is required');
+  if (!engine.getEvent) return notFound('run events are not available on this topology');
+  if (!(await engine.getRun(id))) return notFound(`run ${id} not found`);
+  const value = await engine.getEvent(id, key);
+  if (value === undefined) return ok({});
+  const hook = deps.redact?.checkpoint;
+  if (!hook) return ok({ value });
+  return ok({ value: hook({ name: `event:${key}`, output: value }).output });
+}
+
+/** The run a `ctx.webhook()` token belongs to: `wh:<runId>:<seq>`. */
+function webhookRunId(token: string): string | undefined {
+  if (!token.startsWith('wh:')) return undefined;
+  const rest = token.slice(3);
+  const sep = rest.lastIndexOf(':');
+  if (sep <= 0 || !/^\d+$/.test(rest.slice(sep + 1))) return undefined;
+  return rest.slice(0, sep);
+}
+
+/**
+ * `POST /webhooks/:token` — deliver a `ctx.webhook()` callback: the body resumes the run parked on
+ * that webhook. Only webhook tokens (`wh:<runId>:<seq>`) are accepted, so this is not a generic
+ * signal endpoint, and only while the run is actually waiting on that token: a stale, duplicate or
+ * guessed callback answers 404 instead of buffering a payload for a waiter that will never come.
+ *
+ * The route sits behind the console's own guard (`authorize`, CSRF, roles), like every other
+ * route: a webhook token embeds the run id, which a caller may know, so it is not a secret to rest
+ * on. Let your callers through in `authorize` (a shared header, an IP range, a signature check), or
+ * mount your own public route that verifies the sender and calls `engine.signal(token, body)`.
+ */
+export async function deliverWebhook(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
+  const { engine } = deps;
+  const token = req.params.token;
+  if (!token) return notFound('webhook token is required');
+  const runId = webhookRunId(token);
+  if (runId === undefined) return notFound(`${token} is not a webhook token`);
+  if (!engine.signal) return notFound('webhooks are not available on this topology');
+  const tooLarge = payloadTooLarge(req.body);
+  if (tooLarge) return tooLarge;
+  const waiters = engine.listSignalWaitersByRunIds
+    ? await engine.listSignalWaitersByRunIds([runId])
+    : await engine.listSignalWaiters?.(token);
+  if (!waiters?.some((w) => w.token === token)) {
+    return notFound(`no run is waiting on webhook ${token}`);
+  }
+  const result = await engine.signal(token, req.body);
+  if (!result) return notFound(`no run is waiting on webhook ${token}`);
+  return ok({ result });
 }
