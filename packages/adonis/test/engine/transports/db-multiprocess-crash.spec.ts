@@ -32,13 +32,13 @@ describe.skipIf(!PG_URL)(
         await engine.dispatch(task(seq, { ms: 50, msOn: { A: 60_000 } }));
       }
       const a = await spawnReady({ role: 'worker', instanceId: 'A', concurrency: 3, leaseMs });
-      await until(async () => (await runs()).length === 3, 10_000);
+      await until(async () => (await runs()).length === 3, 10_000, 'A to start 3 steps');
       const startedOnA = Math.max(...(await runs()).map((r) => Number(r.at)));
       a.proc.kill('SIGKILL');
       expect((await a.exited).signal).toBe('SIGKILL');
       await spawnReady({ role: 'worker', instanceId: 'B', concurrency: 3, leaseMs });
 
-      await until(() => distinctResults(results) === 3, 15_000);
+      await until(() => distinctResults(results) === 3, 15_000, '3 results after the takeover');
       const onB = (await runs()).filter((r) => r.instance === 'B');
       expect(onB.map((r) => r.step_id).sort()).toEqual(['r1:1', 'r1:2', 'r1:3']);
       // A takeover of a lapsed claim, counted toward the poison bound.
@@ -59,7 +59,7 @@ describe.skipIf(!PG_URL)(
         const child = await spawnReady({ role: 'worker', instanceId: `W${spawned}`, ...worker });
         await Promise.race([child.exited, until(() => results.length > 0, 10_000).catch(() => {})]);
       }
-      await until(() => results.length > 0, 10_000);
+      await until(() => results.length > 0, 10_000, 'the poison result');
 
       // The first claim and three takeovers each ran it (and died); the fourth takeover bridges it.
       expect((await runs()).map((r) => r.reclaims)).toEqual([0, 1, 2, 3]);
@@ -80,12 +80,16 @@ describe.skipIf(!PG_URL)(
       // A deploy: A is told to stop mid-step and hands the row back on its way out.
       await engine.dispatch(task(1, long));
       const a = await spawnReady({ role: 'worker', instanceId: 'A', leaseMs, closeTimeoutMs: 100 });
-      await until(async () => (await runs()).some((r) => r.instance === 'A'), 10_000);
+      await until(async () => (await runs()).some((r) => r.instance === 'A'), 10_000, 'A to start');
       a.proc.kill('SIGTERM');
       expect(await a.exited).toEqual({ code: 0, signal: null });
       const termAt = Date.now();
       const b = await spawnReady({ role: 'worker', instanceId: 'B', leaseMs });
-      await until(() => results.some((r) => r.stepId === 'r1:1'), 10_000);
+      await until(
+        () => results.some((r) => r.stepId === 'r1:1'),
+        10_000,
+        'r1:1 handed back and run',
+      );
       const onB = (await runs()).find((r) => r.instance === 'B');
       expect(onB).toMatchObject({ step_id: 'r1:1', reclaims: 0 });
       // Picked up at once, not after A's lease.
@@ -96,12 +100,16 @@ describe.skipIf(!PG_URL)(
       // A crash: C dies holding a row, which waits out the lease and counts as a reclaim.
       await engine.dispatch(task(2, long));
       const c = await spawnReady({ role: 'worker', instanceId: 'C', leaseMs });
-      await until(async () => (await runs()).some((r) => r.instance === 'C'), 10_000);
+      await until(async () => (await runs()).some((r) => r.instance === 'C'), 10_000, 'C to start');
       const startedOnC = Number((await runs()).find((r) => r.instance === 'C')?.at);
       c.proc.kill('SIGKILL');
       await c.exited;
       await spawnReady({ role: 'worker', instanceId: 'D', leaseMs });
-      await until(() => results.some((r) => r.stepId === 'r1:2'), 15_000);
+      await until(
+        () => results.some((r) => r.stepId === 'r1:2'),
+        15_000,
+        'r1:2 taken over and run',
+      );
       const takeover = (await runs()).find((r) => r.instance === 'D');
       expect(takeover).toMatchObject({ step_id: 'r1:2', reclaims: 1 });
       expect(Number(takeover?.at) - startedOnC).toBeGreaterThanOrEqual(leaseMs - 100);
@@ -112,14 +120,22 @@ describe.skipIf(!PG_URL)(
       const creators = Array.from({ length: 4 }, (_, i) =>
         spawn({ role: 'schema', instanceId: `S${i}` }),
       );
-      await until(() => creators.every((c) => c.messages.some((m) => m.ready)), 15_000);
+      await until(
+        () => creators.every((c) => c.messages.some((m) => m.ready)),
+        15_000,
+        'creators ready',
+      );
       // Several rounds, each on a fresh empty schema, all four released at once.
       for (let round = 0; round < 3; round += 1) {
         const schema = `${db.schemaName}_${round}`;
         await db.rawQuery(`create schema "${schema}"`);
         cleanups.push(async () => void (await db.rawQuery(`drop schema "${schema}" cascade`)));
         for (const c of creators) c.proc.send({ go: schema });
-        await until(() => creators.every((c) => c.messages.some((m) => m.done === schema)), 15_000);
+        await until(
+          () => creators.every((c) => c.messages.some((m) => m.done === schema)),
+          15_000,
+          `round ${round} done`,
+        );
         const outcomes = creators.map((c) => c.messages.find((m) => m.done === schema));
         expect(outcomes, `round ${round}`).toEqual(
           creators.map(() => expect.objectContaining({ ok: true })),

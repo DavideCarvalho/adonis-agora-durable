@@ -73,6 +73,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
 
+      # Every Postgres test gets its own schema and pool, test files run in parallel and the
+      # multi-process scenarios fork workers with pools of their own: the image's default of 100
+      # connections is too tight for that. A service can't take server flags, so raise it here.
+      - name: Raise the Postgres connection limit
+        run: |
+          docker exec ${{ job.services.postgres.id }} psql -U postgres -c "ALTER SYSTEM SET max_connections = 300"
+          docker restart ${{ job.services.postgres.id }}
+          for _ in $(seq 1 30); do
+            docker exec ${{ job.services.postgres.id }} pg_isready -U postgres -h 127.0.0.1 && break
+            sleep 1
+          done
+          docker exec ${{ job.services.postgres.id }} psql -U postgres -tAc "show max_connections"
+
       - uses: pnpm/action-setup@v6.1.0
 
       - uses: actions/setup-node@v7.1.0
@@ -122,6 +135,19 @@ jobs:
       DURABLE_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
     steps:
       - uses: actions/checkout@v7.0.1
+
+      # Every Postgres test gets its own schema and pool, test files run in parallel and the
+      # multi-process scenarios fork workers with pools of their own: the image's default of 100
+      # connections is too tight for that. A service can't take server flags, so raise it here.
+      - name: Raise the Postgres connection limit
+        run: |
+          docker exec ${{ job.services.postgres.id }} psql -U postgres -c "ALTER SYSTEM SET max_connections = 300"
+          docker restart ${{ job.services.postgres.id }}
+          for _ in $(seq 1 30); do
+            docker exec ${{ job.services.postgres.id }} pg_isready -U postgres -h 127.0.0.1 && break
+            sleep 1
+          done
+          docker exec ${{ job.services.postgres.id }} psql -U postgres -tAc "show max_connections"
 
       - uses: pnpm/action-setup@v6.1.0
 

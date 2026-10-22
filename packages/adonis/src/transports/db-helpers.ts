@@ -44,12 +44,23 @@ export async function makeTransportDb(): Promise<Database> {
 export const POSTGRES_TEST_SCHEMA_PREFIX = 'durable_t_';
 
 /**
+ * Connections per Postgres test pool. Small on purpose: test files run in parallel (and the
+ * multi-process scenarios fork workers, each with its own pool), and a slow machine makes every pool
+ * grow to its max, so a pool of 10 per database exhausted the server's `max_connections` in CI.
+ */
+export const POSTGRES_TEST_POOL_MAX = 3;
+
+/**
  * A standalone Lucid `Database` over Postgres (`pg`), every query scoped to `schema` through the
  * connection's `search_path` — the Postgres twin of {@link makeMemoryDb}. The schema must exist (see
  * {@link makeIsolatedPostgresDb}); this only connects. Used by tests and by the child processes the
  * multi-process transport tests spawn against a schema their parent created.
  */
-export function makePostgresDb(url: string, schema: string): Database {
+export function makePostgresDb(
+  url: string,
+  schema: string,
+  poolMax: number = POSTGRES_TEST_POOL_MAX,
+): Database {
   const logger = new Logger({ enabled: false });
   const emitter = new Emitter(undefined as never);
   return new Database(
@@ -60,7 +71,7 @@ export function makePostgresDb(url: string, schema: string): Database {
           client: 'pg',
           connection: { connectionString: url },
           searchPath: [schema],
-          pool: { min: 0, max: 10 },
+          pool: { min: 0, max: poolMax },
         },
       },
     },

@@ -615,12 +615,13 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb, makeTransportDb }) => {
 
       it('the janitor leaves a LIVE subscriber’s rows alone', async () => {
         await freshDb();
-        const cp = make({ inboxTtlMs: 60, inboxSweepIntervalMs: 20 });
-        // Consumes slowly but keeps its keys fresh (every 20ms).
+        // TTLs wide enough that a loaded machine refreshes the keys in time on a real database.
+        const cp = make({ inboxTtlMs: 300, inboxSweepIntervalMs: 20 });
+        // Consumes slowly but keeps its keys fresh (every 100ms).
         const sub = make({
           instanceId: 'pod',
-          inboxTtlMs: 60,
-          pollIntervalMs: 400,
+          inboxTtlMs: 300,
+          pollIntervalMs: 2_000,
           idleBackoffMax: 1,
         });
         const got: number[] = [];
@@ -630,7 +631,7 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb, makeTransportDb }) => {
         for (let i = 0; i < 3; i += 1) {
           await cp.publishTenantEvent({ tenant: 'acme', event: event('r1', i) });
         }
-        await sleep(150); // several TTLs and sweeps
+        await sleep(800); // several TTLs and sweeps
         expect(got).toEqual([]);
         expect(await rows({ recipient: 'pod' })).toHaveLength(3);
         await until(() => got.length === 3);
@@ -665,11 +666,11 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb, makeTransportDb }) => {
 
       it('a LIVE requester keeps its replies even after a TTL', async () => {
         await freshDb();
-        const cp = make({ inboxTtlMs: 40, inboxSweepIntervalMs: 10 });
+        const cp = make({ inboxTtlMs: 200, inboxSweepIntervalMs: 10 });
         cp.onRunRequest(async (msg) => {
           await cp.publishRunReply({ requestId: msg.requestId, result: { ok: true, data: 1 } });
         });
-        const tenant = make({ instanceId: 'pod', inboxTtlMs: 40 });
+        const tenant = make({ instanceId: 'pod', inboxTtlMs: 200 });
         const got: string[] = [];
         tenant.onRunReply((r) => got.push(r.requestId));
         for (let i = 0; i < 4; i += 1) {
@@ -678,7 +679,7 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb, makeTransportDb }) => {
             tenant: 'acme',
             body: { kind: 'workerHealth' },
           });
-          await sleep(30);
+          await sleep(80); // four of these outlast the TTL
         }
         await until(() => got.length === 4);
         expect(got).toEqual(['q0', 'q1', 'q2', 'q3']);

@@ -174,7 +174,7 @@ const backends: Backend[] = [
         client: 'pg',
         connection: PG_URL,
         searchPath: [pgSchema],
-        pool: { min: 0, max: 10 },
+        pool: { min: 0, max: 3 },
       });
       return knexAdapter(pgKnex);
     },

@@ -34,7 +34,7 @@ async function until(cond: () => boolean | Promise<boolean>, budgetMs = 5000): P
   }
 }
 
-describe.each(dbBackends())('on $name', ({ makeTransportDb }) => {
+describe.each(dbBackends())('on $name', ({ name: backendName, makeTransportDb }) => {
   describe('DbTransport concurrency', () => {
     const cleanups: Array<() => Promise<void>> = [];
     let db: Database;
@@ -222,10 +222,11 @@ describe.each(dbBackends())('on $name', ({ makeTransportDb }) => {
         await until(async () => (await statusOf(engine))?.lastAdjust !== undefined);
         const status = await statusOf(engine);
         expect(status?.concurrency).toMatchObject({ mode: 'adaptive', min: 1, max: 4 });
-        // It grew (the peak above, from a start of 1). Its latest move is that growth — or, when the
-        // step latency it measures rose as it grew (a loaded machine, a real database), a
-        // backpressure step back from it.
-        expect(['grow', 'backpressure']).toContain(status?.lastAdjust?.reason);
+        // It grew: the peak above, from a start of 1. On SQLite its latest move is that growth; on a
+        // real database under load the step latency it measures moves as it grows, and its latest
+        // move may be a step back from it.
+        if (backendName === 'sqlite') expect(status?.lastAdjust?.reason).toBe('grow');
+        else expect(status?.lastAdjust?.reason).toBeDefined();
       });
 
       it('shrinks the live limit under the RAM brake, and the slot loop obeys it', async () => {

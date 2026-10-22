@@ -33,10 +33,10 @@ describe.skipIf(!PG_URL)('DbTransport claims across real worker processes (Postg
     const worker = { concurrency: 3, leaseMs: 1_000, pollIntervalMs: 50 };
     await spawnReady({ role: 'worker', instanceId: 'A', ...worker });
     // Only once A is busy does B come up: whatever A holds beyond its running steps goes stale.
-    await until(async () => (await runs()).length > 0, 10_000);
+    await until(async () => (await runs()).length > 0, 10_000, 'A to start a step');
     await spawnReady({ role: 'worker', instanceId: 'B', ...worker });
 
-    await until(() => distinctResults(results) === 6, 25_000);
+    await until(() => distinctResults(results) === 6, 25_000, '6 distinct results');
     await sleep(1_500); // a would-be double run lands within a lease or two
 
     const per = runsPerStep(await runs());
@@ -55,7 +55,7 @@ describe.skipIf(!PG_URL)('DbTransport claims across real worker processes (Postg
       spawnReady({ role: 'worker', instanceId: 'B', ...worker }),
     ]);
 
-    await until(() => distinctResults(results) === 300, 40_000);
+    await until(() => distinctResults(results) === 300, 40_000, '300 distinct results');
     await sleep(300);
 
     const rows = await runs();
@@ -78,7 +78,7 @@ describe.skipIf(!PG_URL)('DbTransport claims across real worker processes (Postg
       await sleep(5); // distinct created_at, so "oldest" is well defined
     }
     await spawnReady({ role: 'worker', instanceId: 'A', concurrency: 1 });
-    await until(() => results.length === 6, 15_000);
+    await until(() => results.length === 6, 15_000, '6 results');
     // 10, then the two 5s oldest first, then the absent (= 0) before the explicit 0, then -2.
     expect((await runs()).map((r) => r.step_id)).toEqual([5, 2, 4, 1, 6, 3].map((s) => `r1:${s}`));
   }, 30_000);

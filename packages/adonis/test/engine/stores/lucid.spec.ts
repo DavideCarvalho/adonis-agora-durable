@@ -14,7 +14,7 @@ describe.each(dbBackends())('on $name', ({ makeStoreDb }) => {
   });
 
   afterEach(async () => {
-    await db.manager.closeAll();
+    await db?.manager.closeAll();
   });
 
   const at = new Date('2026-06-11T00:00:00.000Z');

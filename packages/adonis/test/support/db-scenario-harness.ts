@@ -31,10 +31,11 @@ export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 export async function until(
   cond: () => boolean | Promise<boolean>,
   budgetMs: number,
+  label = 'condition',
 ): Promise<void> {
   const start = Date.now();
   while (!(await cond())) {
-    if (Date.now() - start > budgetMs) throw new Error('timed out waiting for condition');
+    if (Date.now() - start > budgetMs) throw new Error(`timed out waiting for ${label}`);
     await sleep(20);
   }
 }
@@ -148,7 +149,7 @@ export function scenarioHarness(pgUrl: string) {
   /** {@link spawn}, resolved once the worker is consuming. */
   async function spawnReady(config: Omit<Config, 'url' | 'schema'>): Promise<Child> {
     const child = spawn(config);
-    await until(() => child.messages.some((m) => m.ready), 15_000);
+    await until(() => child.messages.some((m) => m.ready), 15_000, `${config.instanceId} ready`);
     return child;
   }
 

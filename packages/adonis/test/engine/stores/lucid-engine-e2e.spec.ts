@@ -20,7 +20,7 @@ describe.each(dbBackends())('on $name', ({ makeStoreDb }) => {
   });
 
   afterEach(async () => {
-    await db.manager.closeAll();
+    await db?.manager.closeAll();
   });
 
   describe('WorkflowEngine over LucidStateStore', () => {

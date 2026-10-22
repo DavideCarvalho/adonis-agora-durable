@@ -9,13 +9,15 @@ export default function globalSetup(): (() => Promise<void>) | undefined {
   const url = process.env.DURABLE_PG_URL;
   if (!url) return undefined;
   return async () => {
-    const db = makePostgresDb(url, 'public');
+    const db = makePostgresDb(url, 'public', 1);
     try {
-      const { rows } = (await db.rawQuery('select nspname from pg_namespace where nspname like ?', [
-        `${POSTGRES_TEST_SCHEMA_PREFIX}%`,
-      ])) as { rows: Array<{ nspname: string }> };
+      // `starts_with`, not LIKE: the prefix's `_` would be a single-character wildcard there.
+      const { rows } = (await db.rawQuery(
+        'select nspname from pg_namespace where starts_with(nspname, ?)',
+        [POSTGRES_TEST_SCHEMA_PREFIX],
+      )) as { rows: Array<{ nspname: string }> };
       for (const { nspname } of rows) {
-        await db.rawQuery(`drop schema if exists "${nspname}" cascade`);
+        await db.rawQuery(`drop schema if exists "${nspname.replaceAll('"', '""')}" cascade`);
       }
     } finally {
       await db.manager.closeAll();
