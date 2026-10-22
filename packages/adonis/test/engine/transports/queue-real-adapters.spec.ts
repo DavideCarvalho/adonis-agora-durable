@@ -9,6 +9,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import type { RemoteTask, StepResult } from '../../../src/interfaces.js';
 import { sanitizeQueueToken } from '../../../src/tenant-group.js';
 import { QueueTransport } from '../../../src/transports/queue.js';
+import { MemoryWorkerKeys } from '../../../src/transports/worker-keys.js';
 
 /**
  * The QueueTransport against the REAL adapters of whichever `@adonisjs/queue` is installed (0.6 or
@@ -33,6 +34,10 @@ const boringnodeVersion = (
     readFileSync(join(knexDriverPath.split('/build/')[0] as string, 'package.json'), 'utf8'),
   ) as { version: string }
 ).version;
+
+// `@boringnode/queue` >= 0.8 hands a job that stalled too often back to the caller to fail; 0.6 deletes
+// it inside `recoverStalledJobs`, so there is nothing to bridge there.
+const handsBackExceeded = Number(boringnodeVersion.split('.')[1]) >= 8;
 
 type AnyAdapterFactory = () => Adapter;
 interface KnexLike {
@@ -294,6 +299,138 @@ describe.each(backends)(
         expect(peak).toBe(3);
         await new Promise((r) => setTimeout(r, 50));
         expect(await activeJobs(probe, `${prefix}:tasks:${sanitizeQueueToken(name)}`)).toBe(0);
+      },
+    );
+
+    it.skipIf(!backend.enabled)(
+      'groupHealth reports the pending backlog and the live worker with its status',
+      async () => {
+        const name = `health-${randomUUID().slice(0, 6)}`;
+        const token = sanitizeQueueToken(name);
+        const keys = new MemoryWorkerKeys();
+        const withKeys = (extra: Partial<ConstructorParameters<typeof QueueTransport>[0]> = {}) => {
+          const t = new QueueTransport({
+            adapter: factory,
+            prefix,
+            pollIntervalMs: 10,
+            stalledCheckIntervalMs: 0,
+            workerKeys: keys,
+            workerKeysCacheMs: 0,
+            ...extra,
+          });
+          transports.push(t);
+          return t;
+        };
+        const engine = withKeys();
+        const results: StepResult[] = [];
+        engine.onResult(async (r) => void results.push(r));
+        for (let seq = 1; seq <= 3; seq += 1) {
+          await engine.dispatch({ ...task(name), seq, stepId: `r1:${seq}` });
+        }
+        expect(await engine.groupHealth?.(token)).toEqual({
+          group: token,
+          depth: 3,
+          liveWorkers: [],
+        });
+
+        let release: () => void = () => {};
+        const gate = new Promise<void>((r) => {
+          release = r;
+        });
+        const worker = withKeys({ instanceId: 'w1', workerHeartbeatIntervalMs: 20 });
+        worker.handle(name, async () => {
+          await gate;
+          return 'ok';
+        });
+        await until(async () => {
+          const h = await engine.groupHealth?.(token);
+          return h?.depth === 2 && h.liveWorkers[0]?.status?.inFlight === 1;
+        });
+        expect((await engine.groupHealth?.(token))?.liveWorkers[0]).toMatchObject({
+          instanceId: 'w1',
+          status: { concurrency: { mode: 'fixed', limit: 1 } },
+        });
+        release();
+        await until(() => results.length === 3, 10_000);
+        expect((await engine.groupHealth?.(token))?.depth).toBe(0);
+      },
+    );
+
+    it.skipIf(!backend.enabled)(
+      'adaptive concurrency raises the slot count on a saturated backlog',
+      async () => {
+        const name = `adapt-${randomUUID().slice(0, 6)}`;
+        const engine = make();
+        const worker = new QueueTransport({
+          adapter: factory,
+          prefix,
+          pollIntervalMs: 5,
+          stalledCheckIntervalMs: 0,
+          concurrency: { mode: 'adaptive', min: 1, max: 4, start: 1, tickMs: 20 },
+        });
+        transports.push(worker);
+        const results: StepResult[] = [];
+        engine.onResult(async (r) => void results.push(r));
+        let running = 0;
+        let peak = 0;
+        worker.handle(name, async () => {
+          running += 1;
+          peak = Math.max(peak, running);
+          await new Promise((r) => setTimeout(r, 40));
+          running -= 1;
+          return 'ok';
+        });
+        for (let seq = 1; seq <= 30; seq += 1) {
+          await engine.dispatch({ ...task(name), seq, stepId: `r1:${seq}` });
+        }
+        await until(() => results.length === 30, 15_000);
+        expect(peak).toBeGreaterThan(1);
+        expect(peak).toBeLessThanOrEqual(4);
+        await new Promise((r) => setTimeout(r, 50));
+        expect(await activeJobs(probe, `${prefix}:tasks:${sanitizeQueueToken(name)}`)).toBe(0);
+      },
+    );
+
+    it.skipIf(!backend.enabled || !handsBackExceeded)(
+      'a task that stalled past maxStalledCount is failed and bridged into a failed StepResult',
+      async () => {
+        const name = `poison-${randomUUID().slice(0, 6)}`;
+        const tasksQueue = `${prefix}:tasks:${sanitizeQueueToken(name)}`;
+        const engine = make();
+        const results: StepResult[] = [];
+        engine.onResult(async (r) => void results.push(r));
+        await engine.dispatch(task(name));
+        // A worker claims the task and dies on it (never finalizes, never renews).
+        expect(await probe.popFrom(tasksQueue)).not.toBeNull();
+
+        const worker = new QueueTransport({
+          adapter: factory,
+          prefix,
+          pollIntervalMs: 10,
+          stalledCheckIntervalMs: 50,
+          stalledThresholdMs: 50,
+          maxStalledCount: 0,
+        });
+        transports.push(worker);
+        let runs = 0;
+        worker.handle(name, async () => {
+          runs += 1;
+          return 'ok';
+        });
+
+        await until(() => results.length === 1, 10_000);
+        expect(results[0]).toEqual({
+          runId: 'r1',
+          seq: 1,
+          stepId: 'r1:1',
+          status: 'failed',
+          error: {
+            message: 'remote step worker failed: stalled more than 0 times',
+            retryable: true,
+          },
+        });
+        expect(runs).toBe(0);
+        expect(await activeJobs(probe, tasksQueue)).toBe(0);
       },
     );
   },

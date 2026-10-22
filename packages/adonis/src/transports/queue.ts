@@ -4,15 +4,27 @@ import type { WorkerDescriptor } from '../handshake/descriptor.js';
 import {
   type ControlMessage,
   type ControlPlane,
+  type GroupHealth,
   type Heartbeat,
   type RemoteTask,
   type StepResult,
   type Transport,
+  type WorkerHeartbeat,
+  type WorkerStatus,
 } from '../interfaces.js';
 import { atLeastOne, Pollers, type PollLoop } from '../pollers.js';
 import { runStepHandler, type StepHandler } from '../protocol.js';
 import { sanitizeQueueToken, tenantGroup } from '../tenant-group.js';
 import type { DescriptorRedis } from '../worker-runtime/registry.js';
+import { AdaptiveController, type ConcurrencyOption } from './adaptive-concurrency.js';
+import { workerHeartbeatKey } from './bullmq/naming.js';
+import {
+  heartbeatKeyValue,
+  parseHeartbeatValue,
+  WORKER_HEARTBEAT_INTERVAL_MS,
+  WORKER_HEARTBEAT_TTL_SECONDS,
+} from './bullmq/serialization.js';
+import { failedTaskIdentity, infrastructureFailure } from './task-failure.js';
 import {
   cachedLiveKeys,
   descriptorsOn,
@@ -98,9 +110,10 @@ interface JobLeaseLike {
   leaseToken: string;
 }
 
-/** Per-loop knobs: how many jobs it keeps in flight, and its idle backoff (instance default if unset). */
+/** Per-loop knobs: how many jobs it keeps in flight, and its idle backoff (instance default if unset).
+ *  A function `concurrency` is a LIVE limit (the adaptive controller's), read on every tick. */
 interface LoopOptions {
-  concurrency?: number;
+  concurrency?: number | (() => number);
   idleBackoffMax?: number;
 }
 
@@ -132,6 +145,9 @@ interface CompatAdapter {
     maxStalledCount: number,
     maxExceeded: number,
   ): Promise<number | { recovered: number; exceeded: AcquiredJob[] }>;
+  /** How many jobs of `queue` are `pending` (ready to pop). Same on both contracts; excludes jobs in
+   *  flight and delayed retries. */
+  sizeOf?(queue: string): Promise<number>;
   destroy(): Promise<void>;
 }
 
@@ -208,8 +224,14 @@ export interface QueueTransportOptions {
    * behavior). Each handler name's task loop keeps up to this many jobs in flight from a single poll
    * loop — more slots do not add polling — and every in-flight claim is renewed and drained on
    * `close()` like a single one.
+   *
+   * `'adaptive'`, or `{ mode: 'adaptive', min, max, start, tickMs, ramCeilingPct, cpuCeilingPct }`,
+   * lets the same {@link AdaptiveController} the BullMQ transport uses move the limit at runtime (from
+   * step latency, errors/stalls, RSS and optionally CPU); every task loop reads the live limit on each
+   * tick. Either way the limit, in-flight count, RSS, CPU, throughput and p95 ride this worker's
+   * liveness heartbeat (see {@link QueueTransport.groupHealth}).
    */
-  concurrency?: number;
+  concurrency?: ConcurrencyOption;
   /** How many step results the engine side settles at once. Default 1. */
   resultConcurrency?: number;
   /**
@@ -264,6 +286,12 @@ export interface QueueTransportOptions {
   workerKeys?: WorkerKeyStore;
   /** How long a read of {@link workerKeys} is reused (ms). Default 5000; `0` reads every time. */
   workerKeysCacheMs?: number;
+  /**
+   * How often (ms) a worker refreshes the liveness key of each step name it serves. Default 10000;
+   * each key lives at least 35s (three intervals when longer), so a worker that dies drops out of
+   * {@link QueueTransport.groupHealth} within that.
+   */
+  workerHeartbeatIntervalMs?: number;
 }
 
 /**
@@ -295,7 +323,17 @@ export class QueueTransport implements Transport, ControlPlane {
   #namespace: string | undefined;
   readonly #explicitNamespace: boolean;
   readonly #pollIntervalMs: number;
-  readonly #concurrency: number;
+  /** Fixed or adaptive task concurrency, plus the in-flight/latency/RSS/CPU telemetry the liveness
+   *  heartbeat carries. One controller for every task loop of this instance, as on BullMQ. */
+  readonly #controller: AdaptiveController;
+  /** Task loops parked on "every slot busy", woken when an adaptive move raises the limit. */
+  readonly #limitWaiters = new Set<() => void>();
+  /** The task queues this instance consumes — the reclaim sweep bridges a poison job only on these. */
+  readonly #taskQueues = new Set<string>();
+  /** Routing tokens this instance beats a liveness key for (one per handled step name). */
+  readonly #heartbeatTokens = new Set<string>();
+  readonly #workerHeartbeatIntervalMs: number;
+  #workerHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
   readonly #resultConcurrency: number;
   readonly #idleBackoffMax: number;
   /** Every job handler still running (any queue) — `close()` waits for these, bounded. */
@@ -331,7 +369,24 @@ export class QueueTransport implements Transport, ControlPlane {
   #consumersDeferred = false;
   readonly #deferredStarts: Array<() => void> = [];
   readonly #workerKeys: WorkerKeyStore;
+  /** Whether a real key store was configured — without one there is no liveness to report. */
+  readonly #hasWorkerKeys: boolean;
   readonly #liveWorkerKeys: () => Promise<{ key: string; value: string }[]>;
+
+  /**
+   * Per-group worker health, for `engine.workerHealth()` and the dashboard/Telescope worker panels.
+   * Present only when a {@link QueueTransportOptions.workerKeys} store is configured (the
+   * `transports.queue()` default) — without one no worker can advertise liveness, and reporting
+   * "backlog, zero workers" for every group would be a false alarm.
+   *
+   * - `depth` is the task queue's PENDING count (`adapter.sizeOf`), the jobs waiting for a worker.
+   *   Unlike BullMQ's waiting+active+delayed+prioritized it leaves out jobs in flight and delayed
+   *   retries: the `@adonisjs/queue` adapter contract has no count for those. Priorities are included
+   *   (they are pending jobs). An adapter without `sizeOf` reports `0`.
+   * - `liveWorkers` are the unexpired `${P}-worker-heartbeat:<group>:<instance>` keys, each with the
+   *   worker's {@link WorkerStatus} when it carries one (this transport's own beats do).
+   */
+  readonly groupHealth?: (group: string) => Promise<GroupHealth>;
 
   constructor(options: QueueTransportOptions) {
     // Typed through CompatAdapter so the same code drives the 0.6 (job-id) and 0.7 (lease) contracts.
@@ -341,7 +396,12 @@ export class QueueTransport implements Transport, ControlPlane {
     this.#namespace = options.namespace;
     this.#explicitNamespace = options.namespace !== undefined;
     this.#pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-    this.#concurrency = atLeastOne(options.concurrency, 1);
+    this.#controller = new AdaptiveController({
+      ...(options.concurrency !== undefined ? { concurrency: options.concurrency } : {}),
+      apply: () => {
+        for (const wake of this.#limitWaiters) wake();
+      },
+    });
     this.#resultConcurrency = atLeastOne(options.resultConcurrency, 1);
     this.#idleBackoffMax = atLeastOne(options.idleBackoffMax, DEFAULT_IDLE_BACKOFF_MAX);
     const canRenew = typeof this.#adapter.renewJobs === 'function';
@@ -358,6 +418,12 @@ export class QueueTransport implements Transport, ControlPlane {
       options.stalledCheckIntervalMs ?? DEFAULT_STALLED_CHECK_INTERVAL_MS,
     );
     if (canRenew) this.#startClaimRenewal();
+    this.#hasWorkerKeys = options.workerKeys !== undefined;
+    if (this.#hasWorkerKeys) this.groupHealth = (group) => this.#groupHealth(group);
+    this.#workerHeartbeatIntervalMs = atLeastOne(
+      options.workerHeartbeatIntervalMs,
+      WORKER_HEARTBEAT_INTERVAL_MS,
+    );
     this.#workerKeys = options.workerKeys ?? NO_WORKER_KEYS;
     this.#liveWorkerKeys = cachedLiveKeys(
       this.#workerKeys,
@@ -492,20 +558,106 @@ export class QueueTransport implements Transport, ControlPlane {
     this.#handlers.set(name, fn);
     const token = tenantGroup(sanitizeQueueToken(name), this.#partition);
     if (this.#taskLoops.has(token)) return;
+    const queue = this.#tasksQueue(token);
+    this.#taskQueues.add(queue);
+    const controller = this.#controller;
     this.#taskLoops.set(
       token,
       this.#startLoop(
-        this.#tasksQueue(token),
+        queue,
         async (job) => {
           const task = fromJson<TaskPayload>(job.payload);
-          const result = await runStepHandler(task, this.#handlers.get(task.name), (beat) =>
-            this.heartbeat(beat),
-          );
-          await this.#adapter.pushOn(this.#resultsQueue(), this.#job('result', result));
+          const startedAt = Date.now();
+          controller.onStart();
+          let ok = false;
+          try {
+            const result = await runStepHandler(task, this.#handlers.get(task.name), (beat) =>
+              this.heartbeat(beat),
+            );
+            await this.#adapter.pushOn(this.#resultsQueue(), this.#job('result', result));
+            ok = result.status === 'completed';
+          } finally {
+            controller.onSettle(Date.now() - startedAt, ok, 'step');
+          }
         },
-        { concurrency: this.#concurrency, idleBackoffMax: this.#idleBackoffMax },
+        {
+          // Adaptive: every tick reads the controller's live limit. Fixed: the plain number, so the
+          // one-slot loop keeps its historical inline shape.
+          concurrency: controller.isAdaptive ? () => controller.limit : controller.limit,
+          idleBackoffMax: this.#idleBackoffMax,
+        },
       ),
     );
+    // Advertise liveness only once the loop really consumes: a deferred (producer-only) process must
+    // not look like a live worker.
+    if (this.#consumersDeferred) this.#deferredStarts.push(() => this.#beginServing(token));
+    else this.#beginServing(token);
+  }
+
+  /** A task loop for `token` is consuming: run the concurrency controller and beat its liveness key. */
+  #beginServing(token: string): void {
+    this.#controller.start();
+    this.#startWorkerHeartbeat(token);
+  }
+
+  // ---------------------------------------------------------------------------
+  // worker liveness + health — `${P}-worker-heartbeat:<token>:<instanceId>` in the worker-key store
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Refresh every served routing token's liveness key on one shared interval (default 10s, live 35s),
+   * stamped with the controller's {@link WorkerStatus} snapshot (concurrency mode and live limit,
+   * in-flight, RSS/CPU, throughput, p95, last adjustment) — the same `{ ts, status }` value and key
+   * the BullMQ transport writes, so the dashboard's worker cards read both alike. A new token beats
+   * at once. Best-effort: a failed write goes to `onError` and the key simply expires. A no-op without
+   * a configured {@link QueueTransportOptions.workerKeys} store.
+   */
+  #startWorkerHeartbeat(token: string): void {
+    if (!this.#hasWorkerKeys) return;
+    const ttlMs = Math.max(
+      WORKER_HEARTBEAT_TTL_SECONDS * 1000,
+      this.#workerHeartbeatIntervalMs * 3,
+    );
+    const beatOne = (t: string): void => {
+      const now = Date.now();
+      const key = workerHeartbeatKey(this.#effectivePrefix(), t, this.#instanceId);
+      const value = heartbeatKeyValue(now, this.#controller.snapshot());
+      void Promise.resolve()
+        .then(() => this.#workerKeys.put(key, value, now + ttlMs))
+        .catch((err) => this.#onError(err));
+    };
+    const isNew = !this.#heartbeatTokens.has(token);
+    this.#heartbeatTokens.add(token);
+    if (isNew) beatOne(token);
+    if (this.#workerHeartbeatTimer) return;
+    this.#workerHeartbeatTimer = setInterval(() => {
+      for (const t of this.#heartbeatTokens) beatOne(t);
+    }, this.#workerHeartbeatIntervalMs);
+    this.#workerHeartbeatTimer.unref?.();
+  }
+
+  async #groupHealth(group: string): Promise<GroupHealth> {
+    const [depth, entries] = await Promise.all([
+      this.#adapter.sizeOf ? this.#adapter.sizeOf(this.#tasksQueue(group)) : Promise.resolve(0),
+      this.#liveWorkerKeys(),
+    ]);
+    const marker = workerHeartbeatKey(this.#effectivePrefix(), group, '');
+    const liveWorkers: WorkerHeartbeat[] = [];
+    for (const { key, value } of entries) {
+      if (!key.startsWith(marker)) continue;
+      const parsed = parseHeartbeatValue(value);
+      liveWorkers.push({
+        group,
+        instanceId: key.slice(marker.length),
+        lastBeatAt: parsed.lastBeatAt,
+        // Passed through as-is (worker-authored); a worker runtime's compact `{ ts, status: 'up' }`
+        // beat carries no status object and reads as liveness only.
+        ...(parsed.status !== undefined
+          ? { status: parsed.status as unknown as WorkerStatus }
+          : {}),
+      });
+    }
+    return { group, depth: Number(depth) || 0, liveWorkers };
   }
 
   /** Worker side: publish a liveness heartbeat for an in-flight long step. */
@@ -605,15 +757,17 @@ export class QueueTransport implements Transport, ControlPlane {
   ): PollLoop {
     // Record every queue we consume from so the reclaim sweep can walk exactly this set.
     this.#poppedQueues.add(queue);
-    // This loop's jobs still in a handler. With one slot the tick awaits its job (the historical
-    // shape); with more it hands each job off and keeps popping until every slot is taken, so N
-    // slots cost ONE poll loop, not N.
+    // This loop's jobs still in a handler. With one fixed slot the tick awaits its job (the historical
+    // shape); otherwise it hands each job off and keeps popping until every slot is taken, so N
+    // slots cost ONE poll loop, not N. A live (adaptive) limit is re-read on every tick.
+    const limit = typeof concurrency === 'function' ? concurrency : () => concurrency;
     const inFlight = new Set<Promise<void>>();
     return this.#pollers.start(
       async () => {
-        if (inFlight.size >= concurrency) {
-          // Every slot busy: wait for one to free, then report work so the loop re-ticks at once.
-          await Promise.race(inFlight);
+        if (inFlight.size >= limit()) {
+          // Every slot busy: wait for one to free (or the limit to move), then report work so the
+          // loop re-ticks at once.
+          await this.#slotFreed(inFlight);
           return true;
         }
         let job: AcquiredJob | null;
@@ -635,6 +789,20 @@ export class QueueTransport implements Transport, ControlPlane {
       },
       idleBackoffMax === undefined ? undefined : { idleBackoffMax },
     );
+  }
+
+  /** Resolve when one of `inFlight` settles or the adaptive controller moves the limit. */
+  async #slotFreed(inFlight: Set<Promise<void>>): Promise<void> {
+    let wake: () => void = () => {};
+    const moved = new Promise<void>((resolve) => {
+      wake = resolve;
+    });
+    this.#limitWaiters.add(wake);
+    try {
+      await Promise.race([...inFlight, moved]);
+    } finally {
+      this.#limitWaiters.delete(wake);
+    }
   }
 
   /**
@@ -716,17 +884,9 @@ export class QueueTransport implements Transport, ControlPlane {
           // `@adonisjs/queue` 0.7 (`@boringnode/queue` >= 0.8) no longer fails a job that stalled too
           // many times: it keeps it `active`, re-leases it to us and returns it in `exceeded`, so the
           // caller fails it. Left alone it would stay `active` forever. 0.6 returns a count and has
-          // already failed them — nothing to do.
+          // already failed (deleted) them — nothing to do, and nothing left to bridge.
           if (outcome && typeof outcome === 'object') {
-            for (const job of outcome.exceeded) {
-              await this.#adapter
-                .failJob(
-                  jobHandle(job),
-                  queue,
-                  new Error(`stalled more than ${this.#maxStalledCount} times`),
-                )
-                .catch((err) => this.#onError(err));
-            }
+            for (const job of outcome.exceeded) await this.#failPoisonJob(queue, job);
           }
         } catch (err) {
           this.#onError(err);
@@ -735,6 +895,43 @@ export class QueueTransport implements Transport, ControlPlane {
       return false;
     });
     return pollers;
+  }
+
+  /**
+   * Fail a job that stalled more than `maxStalledCount` times and, for a STEP task, publish a failed
+   * {@link StepResult} for it — the queue twin of the BullMQ transport's `worker.on('failed')` bridge.
+   * No handler produced a result for that step (its workers kept dying), so without one the run would
+   * wait on its `pending` checkpoint forever. The result is RETRYABLE: the engine re-dispatches while
+   * the step has attempts left, then fails it into the workflow's error path. Only after `failJob`
+   * succeeded (a lost lease means another sweep owns the job), and only for task queues: a stalled
+   * result/heartbeat/control job carries no step to fail, and a workflow-turn payload has no step
+   * identity, so both are just failed.
+   */
+  async #failPoisonJob(queue: string, job: AcquiredJob): Promise<void> {
+    const reason = `stalled more than ${this.#maxStalledCount} times`;
+    let failed: unknown;
+    try {
+      failed = await this.#adapter.failJob(jobHandle(job), queue, new Error(reason));
+    } catch (err) {
+      this.#onError(err);
+      return;
+    }
+    if (failed === false || !this.#taskQueues.has(queue)) return;
+    let identity: ReturnType<typeof failedTaskIdentity>;
+    try {
+      identity = failedTaskIdentity(fromJson<unknown>(job.payload));
+    } catch {
+      return; // an unparseable payload: nothing safe to publish
+    }
+    if (!identity) return;
+    try {
+      await this.#adapter.pushOn(
+        this.#resultsQueue(),
+        this.#job('result', infrastructureFailure(identity, reason)),
+      );
+    } catch (err) {
+      this.#onError(err);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -810,6 +1007,9 @@ export class QueueTransport implements Transport, ControlPlane {
     this.#pollers.stopAll();
     this.#reclaimPollers?.stopAll();
     this.#taskLoops.clear();
+    this.#controller.stop();
+    if (this.#workerHeartbeatTimer) clearInterval(this.#workerHeartbeatTimer);
+    this.#workerHeartbeatTimer = undefined;
     const drainDeadline = Date.now() + 5_000;
     await this.#pollers.drain(5_000);
     // Jobs handed off by a multi-slot loop are not part of a poll tick: wait for them too, within the

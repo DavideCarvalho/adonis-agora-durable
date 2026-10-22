@@ -87,8 +87,16 @@ export interface QueueTransportConfig {
   /**
    * How many jobs of one step name a worker runs at once. Default 1. More slots share one poll loop,
    * so raising it adds no polling.
+   *
+   * `'adaptive'`, or `{ mode: 'adaptive', min, max, start, tickMs, ramCeilingPct, cpuCeilingPct }`,
+   * moves the limit at runtime with the same controller as `transports.bullmq({ concurrency })`: up by
+   * one while steps saturate it at a steady latency, down by the latency gradient when they queue, down
+   * by one on a >20% error rate, a stall or the CPU ceiling, and down by 20% when RSS reaches
+   * `ramCeilingPct` of the memory limit. Defaults: `min` 1, `max` 32, `start` `min`, `tickMs` 2000,
+   * `ramCeilingPct` 85, `cpuCeilingPct` off. The limit applies to each step name's task loop; the
+   * results, heartbeat and control loops are unaffected.
    */
-  concurrency?: number;
+  concurrency?: ConcurrencyOption;
   /** How many step results the engine side settles at once. Default 1. */
   resultConcurrency?: number;
   /**

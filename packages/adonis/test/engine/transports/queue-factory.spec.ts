@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { transports } from '../../../src/transports/factory.js';
 import { MockAdapter } from '../../../src/transports/queue-mock-adapter.js';
+import { MemoryWorkerKeys } from '../../../src/transports/worker-keys.js';
 
 /** A fake booted app exposing only `config.get('queue', …)` — what the factory reads. */
 function fakeCtx(queueConfig: unknown) {
@@ -124,6 +125,40 @@ describe('transports.queue — options reaching the transport', () => {
     });
     await vi.waitFor(() => expect(errors.length).toBeGreaterThan(0));
     expect((errors[0] as Error).message).toBe('boom');
+    await transport.close?.();
+  });
+
+  it('passes an adaptive `concurrency` through; the worker beats it into groupHealth', async () => {
+    const ctx = fakeCtx({ adapters: {} });
+    const transport = await transports.queue({
+      adapter: () => new MockAdapter(),
+      concurrency: { mode: 'adaptive', min: 2, max: 6 },
+      workerKeys: new MemoryWorkerKeys(),
+      workerKeysCacheMs: 0,
+    })(ctx);
+    (transport as unknown as { handle(name: string, fn: unknown): void }).handle(
+      'ship',
+      async () => 'ok',
+    );
+    await vi.waitFor(async () => {
+      const health = await transport.groupHealth?.('ship');
+      expect(health?.liveWorkers[0]?.status?.concurrency).toEqual({
+        mode: 'adaptive',
+        limit: 2,
+        min: 2,
+        max: 6,
+      });
+    });
+    await transport.close?.();
+  });
+
+  it('offers no groupHealth with `workerKeys: false` (nothing could report liveness)', async () => {
+    const ctx = fakeCtx({ adapters: {} });
+    const transport = await transports.queue({
+      adapter: () => new MockAdapter(),
+      workerKeys: false,
+    })(ctx);
+    expect(transport.groupHealth).toBeUndefined();
     await transport.close?.();
   });
 
