@@ -72,6 +72,12 @@ export type { DurableConfig } from './define_config.js';
 // --- AdonisJS integration ---------------------------------------------------
 export { defineConfig } from './define_config.js';
 export * from './diagnostics-bridge.js';
+export {
+  type BarrelModuleLoader,
+  type BarrelTree,
+  DuplicateDiscoveryError,
+  type RootedBarrel,
+} from './discovery-roots.js';
 export * from './dispatch-routing.js';
 export * from './duration.js';
 export * from './engine.js';

@@ -1,6 +1,11 @@
-import { readdir } from 'node:fs/promises';
-import { extname, join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import {
+  type BarrelTree,
+  barrelModules,
+  type DiscoveryModule,
+  DuplicateDiscoveryError,
+  type RootedBarrel,
+  scanDirsModules,
+} from './discovery-roots.js';
 import type { WorkflowEngine } from './engine.js';
 import { eventTriggerCanonicalName, workflowEvents } from './workflow-events.js';
 import {
@@ -27,6 +32,8 @@ export type DiscoveredWorkflowClass = new () => {
 export interface DiscoveredWorkflow {
   meta: WorkflowMeta;
   cls: DiscoveredWorkflowClass;
+  /** The module it was found in: an absolute path for a directory scan, the key for a barrel. */
+  file: string;
 }
 
 /**
@@ -98,83 +105,72 @@ export async function registerWorkflowClass(
   return true;
 }
 
-/**
- * Pick the module extension a directory scan should import, from the `readdir` entries already in
- * hand — NOT from this library's own compiled file. A consuming app resolves this library as built
- * `.js` from `node_modules`, but its own `app/workflows` / `app/steps` are `.ts` in dev; deriving the
- * extension from `import.meta.url` (the old bug) always picked `.js` in that setup and silently
- * discovered nothing, because every entry was then skipped.
- *
- * Rules, in order:
- * 1. `.d.ts` entries are never importable modules — ignored entirely.
- * 2. If any remaining entry ends in `.ts`, the scan imports `.ts` files.
- * 3. Otherwise, if any entry ends in `.js`, the scan imports `.js` files.
- * 4. If neither is present, returns `null` (the scan registers nothing).
- *
- * This preserves the original de-duplication intent: a directory containing both a built `foo.js`
- * and its source `foo.ts` resolves to `.ts` only, so the same module is never registered twice.
- * Shared with {@link import('./step-discovery.js').registerStepsFromDir} so the two scanners can't
- * drift apart again.
- */
-export function pickModuleExt(entries: readonly string[]): '.ts' | '.js' | null {
-  let hasTs = false;
-  let hasJs = false;
-  for (const entry of entries) {
-    if (entry.endsWith('.d.ts')) continue;
-    const ext = extname(entry);
-    if (ext === '.ts') hasTs = true;
-    else if (ext === '.js') hasJs = true;
-  }
-  if (hasTs) return '.ts';
-  if (hasJs) return '.js';
-  return null;
-}
+/** Re-exported from its shared home so existing `pickModuleExt` imports keep working. */
+export { pickModuleExt } from './discovery-roots.js';
 
 /**
- * Scan a directory RECURSIVELY for modules and collect every exported workflow class — a
- * `BaseWorkflow` subclass (the default export and any named export are considered) — so nested
- * conventions like
- * `app/workflows/billing/charge_workflow.ts` are found, matching `make:workflow`'s nested-path
- * scaffolding. Only the extension present in `dir` is imported (see {@link pickModuleExt}), and
- * each module path is visited once, so a built `.js` and a dev `.ts` of the same module never both
- * register. Missing directory → empty list (the convention is opt-in: no `app/workflows`, nothing to
- * register).
+ * Collect every workflow class reachable from `modules`, in order: each export is considered
+ * (default and named), and a class seen twice (re-exported from several modules, or reachable from
+ * two overlapping roots) is kept once.
+ *
+ * Two DIFFERENT classes claiming the same name + version from two different roots throw a
+ * {@link DuplicateDiscoveryError} quoting both files — before anything is registered. Within a single
+ * root nothing changes from the single-directory behaviour (both are kept; the later registration
+ * wins on the engine).
  */
-export async function discoverWorkflows(dir: string): Promise<DiscoveredWorkflow[]> {
-  let entries: string[];
-  try {
-    entries = await readdir(dir, { recursive: true });
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
-    throw err;
-  }
-
-  const moduleExt = pickModuleExt(entries);
+async function collectWorkflows(
+  modules: readonly DiscoveryModule[],
+): Promise<DiscoveredWorkflow[]> {
   const found: DiscoveredWorkflow[] = [];
-  if (moduleExt === null) return found;
   const seen = new Set<unknown>();
-  for (const entry of entries.sort()) {
-    if (extname(entry) !== moduleExt || entry.endsWith(`.d${moduleExt}`)) continue;
-    const mod = (await import(pathToFileURL(join(dir, entry)).href)) as Record<string, unknown>;
+  const owners = new Map<string, { root: string; file: string }>();
+  for (const { root, file, load } of modules) {
+    const mod = await load();
     for (const exported of Object.values(mod)) {
       if (seen.has(exported)) continue;
       const meta = workflowMeta(exported);
       if (!meta) continue;
+      const id = `${meta.name}@${meta.version}`;
+      const owner = owners.get(id);
+      if (owner && owner.root !== root) {
+        throw new DuplicateDiscoveryError('workflow', id, [owner.file, file]);
+      }
+      if (!owner) owners.set(id, { root, file });
       seen.add(exported);
-      found.push({ meta, cls: exported as DiscoveredWorkflowClass });
+      found.push({ meta, cls: exported as DiscoveredWorkflowClass, file });
     }
   }
   return found;
 }
 
 /**
- * Discover every workflow class (`BaseWorkflow` subclass) under `dir` and register each on the
- * engine. Returns the registered metadata so the caller can log what was wired.
- * Best-effort over a missing directory.
+ * Scan one directory — or several — RECURSIVELY for modules and collect every exported workflow
+ * class — a `BaseWorkflow` subclass (the default export and any named export are considered) — so
+ * nested conventions like `app/workflows/billing/charge_workflow.ts` are found, matching
+ * `make:workflow`'s nested-path scaffolding. Only the extension present in each directory is
+ * imported (see {@link pickModuleExt}), and each module path is visited once, so a built `.js` and a
+ * dev `.ts` of the same module never both register. Missing directory → nothing from it (the
+ * convention is opt-in: no `app/workflows`, nothing to register).
+ *
+ * With several directories (a modular app: `['app/orders/flows', 'app/billing/flows']`) every root
+ * is walked in order, and the same workflow name + version defined by different classes in two
+ * roots throws a {@link DuplicateDiscoveryError} naming both files.
+ */
+export async function discoverWorkflows(
+  dir: string | readonly string[],
+): Promise<DiscoveredWorkflow[]> {
+  return collectWorkflows(await scanDirsModules(typeof dir === 'string' ? [dir] : dir));
+}
+
+/**
+ * Discover every workflow class (`BaseWorkflow` subclass) under `dir` — one directory or several,
+ * see {@link discoverWorkflows} — and register each on the engine. Returns the registered metadata
+ * so the caller can log what was wired. Best-effort over a missing directory; throws a
+ * {@link DuplicateDiscoveryError} (registering nothing) on a cross-directory name clash.
  */
 export async function registerWorkflowsFromDir(
   engine: WorkflowEngine,
-  dir: string,
+  dir: string | readonly string[],
   factory?: WorkflowClassFactory,
 ): Promise<WorkflowMeta[]> {
   const discovered = await discoverWorkflows(dir);
@@ -185,37 +181,27 @@ export async function registerWorkflowsFromDir(
 /**
  * The shape of the build-time barrel generated by the Assembler `init` hook
  * (`@adonis-agora/durable/hooks/workflows`): a map of stable key → lazy module import, e.g.
- * `{ Charge: () => import('#workflows/charge_workflow') }`. The exact key is irrelevant here — we
- * register every workflow export of every module (`BaseWorkflow` subclass), identical to the runtime
- * scan.
+ * `{ Charge: () => import('#workflows/charge_workflow') }`, nested one level per sub-directory
+ * (`{ billing: { Refund: () => import(...) } }`). The exact key is irrelevant here — we register
+ * every workflow export of every module (`BaseWorkflow` subclass), identical to the runtime scan.
+ * When the hook's `source` lists several directories it writes a {@link RootedBarrel} array instead.
  */
-export type WorkflowsBarrel = Record<string, () => Promise<Record<string, unknown>>>;
+export type WorkflowsBarrel = BarrelTree;
 
 /**
  * Register every workflow class reachable from a generated {@link WorkflowsBarrel} (`BaseWorkflow`
- * subclass), by awaiting each lazy module import and registering each
- * workflow export — the build-time equivalent of {@link registerWorkflowsFromDir}, with no runtime
- * `readdir`. Each module is imported once and each class registered once (deduped), so a class
- * re-exported from several modules is safe. Returns the registered metadata so the caller can log
- * what was wired.
+ * subclass) — or from the multi-root {@link RootedBarrel} array — by awaiting each lazy module import
+ * and registering each workflow export: the build-time equivalent of {@link registerWorkflowsFromDir},
+ * with no runtime `readdir`. Each module is imported once and each class registered once (deduped),
+ * so a class re-exported from several modules is safe. Same cross-root duplicate rule as the scan.
+ * Returns the registered metadata so the caller can log what was wired.
  */
 export async function registerWorkflowsFromBarrel(
   engine: WorkflowEngine,
-  barrel: WorkflowsBarrel,
+  barrel: WorkflowsBarrel | readonly RootedBarrel[],
   factory?: WorkflowClassFactory,
 ): Promise<WorkflowMeta[]> {
-  const registered: WorkflowMeta[] = [];
-  const seen = new Set<unknown>();
-  for (const load of Object.values(barrel)) {
-    const mod = await load();
-    for (const exported of Object.values(mod)) {
-      if (seen.has(exported)) continue;
-      const meta = workflowMeta(exported);
-      if (!meta) continue;
-      seen.add(exported);
-      await registerWorkflowClass(engine, exported, factory);
-      registered.push(meta);
-    }
-  }
-  return registered;
+  const discovered = await collectWorkflows(barrelModules(barrel));
+  for (const { cls } of discovered) await registerWorkflowClass(engine, cls, factory);
+  return discovered.map((d) => d.meta);
 }

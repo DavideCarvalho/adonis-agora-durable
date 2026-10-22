@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -307,6 +307,76 @@ describe('DurableProvider — app/workflows auto-discovery (boot)', () => {
     const provider = new DurableProvider(app);
     provider.register();
     await expect(provider.boot()).resolves.toBeUndefined();
+  });
+
+  const workflowFile = (cls: string, name: string, body: string) =>
+    `import { BaseWorkflow } from '${SRC}/base-workflow.js'
+     export default class ${cls} extends BaseWorkflow {
+       static workflow = { name: '${name}', version: '1' }
+       async run(ctx, input) { ${body} }
+     }`;
+
+  it('scans every directory of a workflowsPath / stepsPath array (no barrel)', async () => {
+    await mkdir(join(dir, 'orders/flows'), { recursive: true });
+    await mkdir(join(dir, 'billing/flows'), { recursive: true });
+    await mkdir(join(dir, 'billing/steps'), { recursive: true });
+    await writeFile(
+      join(dir, 'orders/flows/order_workflow.ts'),
+      workflowFile('OrderWorkflow', 'order', "return ctx.step('charge', input)"),
+    );
+    await writeFile(
+      join(dir, 'billing/flows/refund_workflow.ts'),
+      workflowFile('RefundWorkflow', 'refund', "return 'refund:' + input"),
+    );
+    await writeFile(
+      join(dir, 'billing/steps/charge_step.ts'),
+      `import { defineStep } from '${SRC}/step-ref.js'
+       export const charge = defineStep('charge', async (input) => 'charged:' + input)`,
+    );
+
+    const { app, resolve } = fakeApp(
+      {
+        workflowsPath: ['orders/flows', 'billing/flows'],
+        stepsPath: ['orders/steps', 'billing/steps'],
+      },
+      dir,
+    );
+    const provider = new DurableProvider(app);
+    provider.register();
+    await provider.boot();
+
+    const engine = await resolve();
+    await engine.start('order', 'x', 'o1');
+    expect((await engine.waitForRun('o1', { terminal: true, timeoutMs: 5000 })).output).toBe(
+      'charged:x',
+    );
+    await engine.start('refund', 'y', 'r1');
+    expect((await engine.waitForRun('r1')).output).toBe('refund:y');
+  });
+
+  it('an empty workflowsPath array is the same as false (nothing discovered)', async () => {
+    await writeFile(
+      join(dir, 'order_workflow.ts'),
+      workflowFile('OrderWorkflow', 'order', "return 'x'"),
+    );
+    const { app, resolve } = fakeApp({ workflowsPath: [] }, dir);
+    const provider = new DurableProvider(app);
+    provider.register();
+    await provider.boot();
+    await expect((await resolve()).start('order', {}, 'o1')).rejects.toThrow();
+  });
+
+  it('fails boot when two workflowsPath roots define the same workflow, naming both files', async () => {
+    await mkdir(join(dir, 'a'), { recursive: true });
+    await mkdir(join(dir, 'b'), { recursive: true });
+    await writeFile(join(dir, 'a/charge_workflow.ts'), workflowFile('A', 'charge', "return 'a'"));
+    await writeFile(join(dir, 'b/charge_workflow.ts'), workflowFile('B', 'charge', "return 'b'"));
+    const { app } = fakeApp({ workflowsPath: ['a', 'b'] }, dir);
+    const provider = new DurableProvider(app);
+    provider.register();
+    await expect(provider.boot()).rejects.toThrow(
+      `${join(dir, 'a/charge_workflow.ts')} and ${join(dir, 'b/charge_workflow.ts')}`,
+    );
   });
 });
 

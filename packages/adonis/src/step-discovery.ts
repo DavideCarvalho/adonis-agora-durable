@@ -1,11 +1,15 @@
-import { readdir } from 'node:fs/promises';
-import { extname, join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import {
+  type BarrelTree,
+  barrelModules,
+  type DiscoveryModule,
+  DuplicateDiscoveryError,
+  type RootedBarrel,
+  scanDirsModules,
+} from './discovery-roots.js';
 import type { StepLogger } from './interfaces.js';
 import type { StepHandler } from './protocol.js';
 import { DURABLE_STEP_NAME } from './step-name-symbol.js';
 import { type DurableStepMeta, stepMetaOf } from './step-ref.js';
-import { pickModuleExt } from './workflow-discovery.js';
 
 /** The narrow serve surface step discovery registers handlers on — satisfied by every transport
  *  (`InMemoryTransport`, `EventEmitterTransport`, `QueueTransport`, `DbTransport`). */
@@ -95,31 +99,63 @@ export function registerSteps(server: StepServer, exports: Iterable<unknown>): D
   return registered;
 }
 
-/**
- * Scan `dir` RECURSIVELY for modules and register every exported `@Step` class / `defineStep`
- * handler on `server` — the `app/steps` convention, mirroring `app/workflows` discovery. Only the
- * extension present in `dir` is imported (see {@link pickModuleExt}). Missing directory → no-op
- * (the convention is opt-in). Returns the registered metadata.
- */
-export async function registerStepsFromDir(
-  server: StepServer,
-  dir: string,
-): Promise<DurableStepMeta[]> {
-  let entries: string[];
-  try {
-    entries = await readdir(dir, { recursive: true });
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
-    throw err;
+/** The routing names an export would serve, read off its stamps WITHOUT instantiating anything. */
+function stepNamesOf(exported: unknown): string[] {
+  const direct = stepMetaOf(exported);
+  if (direct) return [direct.name];
+  if (typeof exported !== 'function' || !exported.prototype) return [];
+  const proto = exported.prototype as Record<string, unknown>;
+  const names: string[] = [];
+  for (const key of Object.getOwnPropertyNames(proto)) {
+    const value = proto[key];
+    if (typeof value !== 'function') continue;
+    const name = stepMetaOf(value)?.name;
+    if (name) names.push(name);
   }
-  const moduleExt = pickModuleExt(entries);
+  return names;
+}
+
+/**
+ * Register every step reachable from `modules`, in order. Per module this is exactly
+ * {@link registerSteps} — the single-directory behaviour, kept as-is: inside one root a name served
+ * twice is served by the later module.
+ *
+ * Across roots, a step name already served from another root by a DIFFERENT export throws a
+ * {@link DuplicateDiscoveryError} naming both files — checked for every module BEFORE any handler is
+ * registered, so a clash never leaves a half-served transport. The same export reachable from two
+ * roots (a re-export, or overlapping roots) is served once.
+ */
+async function registerStepModules(
+  server: StepServer,
+  modules: readonly DiscoveryModule[],
+): Promise<DurableStepMeta[]> {
+  const owners = new Map<string, { root: string; file: string; source: unknown }>();
+  const plan: unknown[][] = [];
+  for (const { root, file, load } of modules) {
+    const mod = await load();
+    const exports: unknown[] = [];
+    for (const exported of Object.values(mod)) {
+      let servedElsewhere = false;
+      for (const name of stepNamesOf(exported)) {
+        const owner = owners.get(name);
+        if (!owner) {
+          owners.set(name, { root, file, source: exported });
+          continue;
+        }
+        if (owner.root === root) continue;
+        if (owner.source !== exported) {
+          throw new DuplicateDiscoveryError('step', name, [owner.file, file]);
+        }
+        servedElsewhere = true;
+      }
+      if (!servedElsewhere) exports.push(exported);
+    }
+    plan.push(exports);
+  }
   const registered: DurableStepMeta[] = [];
-  if (moduleExt === null) return registered;
   const seen = new Set<string>();
-  for (const entry of entries.sort()) {
-    if (extname(entry) !== moduleExt || entry.endsWith(`.d${moduleExt}`)) continue;
-    const mod = (await import(pathToFileURL(join(dir, entry)).href)) as Record<string, unknown>;
-    for (const meta of registerSteps(server, Object.values(mod))) {
+  for (const exports of plan) {
+    for (const meta of registerSteps(server, exports)) {
       if (seen.has(meta.name)) continue;
       seen.add(meta.name);
       registered.push(meta);
@@ -128,25 +164,37 @@ export async function registerStepsFromDir(
   return registered;
 }
 
-/** The build-time barrel shape the Assembler `init` hook generates for `app/steps` (key → lazy
- *  module import), mirroring {@link import('./workflow-discovery.js').WorkflowsBarrel}. */
-export type StepsBarrel = Record<string, () => Promise<Record<string, unknown>>>;
+/**
+ * Scan `dir` — one directory or several — RECURSIVELY and register every exported `@Step` class /
+ * `defineStep` handler on `server`: the `app/steps` convention, mirroring `app/workflows` discovery.
+ * Only the extension present in each directory is imported (see `pickModuleExt`). Missing
+ * directory → nothing from it (the convention is opt-in). With several directories the same step
+ * name defined by different handlers in two of them throws a {@link DuplicateDiscoveryError}.
+ * Returns the registered metadata.
+ *
+ * `server` is anything with `handle(name, fn)`: a transport, the store-less `WorkerRuntime`, or the
+ * `WorkflowEngine` itself (it forwards to its primary transport) — the latter is how app code
+ * serves an extra directory from a preload: `await registerStepsFromDir(engine, dir)`.
+ */
+export async function registerStepsFromDir(
+  server: StepServer,
+  dir: string | readonly string[],
+): Promise<DurableStepMeta[]> {
+  return registerStepModules(server, await scanDirsModules(typeof dir === 'string' ? [dir] : dir));
+}
 
-/** Register every `@Step`/`defineStep` reachable from a generated {@link StepsBarrel} onto `server`
- *  — the build-time equivalent of {@link registerStepsFromDir} with no runtime `readdir`. */
+/** The build-time barrel shape the Assembler `init` hook generates for `app/steps` (key → lazy
+ *  module import, nested per sub-directory), mirroring
+ *  {@link import('./workflow-discovery.js').WorkflowsBarrel}. A multi-root hook writes a
+ *  {@link RootedBarrel} array instead. */
+export type StepsBarrel = BarrelTree;
+
+/** Register every `@Step`/`defineStep` reachable from a generated {@link StepsBarrel} (or a
+ *  multi-root {@link RootedBarrel} array) onto `server` — the build-time equivalent of
+ *  {@link registerStepsFromDir} with no runtime `readdir`, same cross-root duplicate rule. */
 export async function registerStepsFromBarrel(
   server: StepServer,
-  barrel: StepsBarrel,
+  barrel: StepsBarrel | readonly RootedBarrel[],
 ): Promise<DurableStepMeta[]> {
-  const registered: DurableStepMeta[] = [];
-  const seen = new Set<string>();
-  for (const load of Object.values(barrel)) {
-    const mod = await load();
-    for (const meta of registerSteps(server, Object.values(mod))) {
-      if (seen.has(meta.name)) continue;
-      seen.add(meta.name);
-      registered.push(meta);
-    }
-  }
-  return registered;
+  return registerStepModules(server, barrelModules(barrel));
 }

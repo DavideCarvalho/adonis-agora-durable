@@ -5,6 +5,7 @@ import { mergeSchedules, runWorkerLoop, type WorkerLogger } from '../src/command
 import type { ControlPlaneConfig, TenantConfig } from '../src/config_types.js';
 import type { ControlPlaneContext } from '../src/control-planes/factory.js';
 import type { DurableConfig } from '../src/define_config.js';
+import { discoveryRoots, type RootedBarrel } from '../src/discovery-roots.js';
 import { parseDuration } from '../src/duration.js';
 import { attachEventTriggerBridge, type EmitterLike } from '../src/event-trigger-bridge.js';
 import {
@@ -380,7 +381,8 @@ export default class DurableProvider {
     const config = this.app.config.get<DurableConfig>('durable', {});
     const role = config.role ?? 'standalone';
     if (role === 'tenant') return;
-    if (config.workflowsPath === false) return;
+    const workflowRoots = discoveryRoots(config.workflowsPath, 'app/workflows');
+    if (workflowRoots.length === 0) return;
     const engine = await this.app.container.make(WorkflowEngine);
 
     // Instantiate workflows through the container, so a workflow class gets constructor dependency
@@ -392,9 +394,9 @@ export default class DurableProvider {
     if (barrel) {
       await registerWorkflowsFromBarrel(engine, barrel, workflowFactory);
     } else {
-      // Fallback: no generated barrel — scan the configured directory at runtime.
-      const dir = this.app.makePath(config.workflowsPath ?? 'app/workflows');
-      await registerWorkflowsFromDir(engine, dir, workflowFactory);
+      // Fallback: no generated barrel — scan every configured directory at runtime.
+      const dirs = workflowRoots.map((root) => this.app.makePath(root));
+      await registerWorkflowsFromDir(engine, dirs, workflowFactory);
     }
     void this.#reportUnservedOnErrorRoutes(engine);
 
@@ -553,7 +555,8 @@ export default class DurableProvider {
    * A transport that can't serve handlers (no `handle`) is skipped.
    */
   async #registerSteps(config: DurableConfig) {
-    if (config.stepsPath === false) return;
+    const stepRoots = discoveryRoots(config.stepsPath, 'app/steps');
+    if (stepRoots.length === 0) return;
     const server = this.#transport as (Transport & Partial<StepServer>) | null;
     if (!server || typeof server.handle !== 'function') return;
     const barrel = await this.#loadGeneratedStepsBarrel();
@@ -561,15 +564,17 @@ export default class DurableProvider {
       await registerStepsFromBarrel(server as StepServer, barrel);
       return;
     }
-    const dir = this.app.makePath(config.stepsPath ?? 'app/steps');
-    await registerStepsFromDir(server as StepServer, dir);
+    const dirs = stepRoots.map((root) => this.app.makePath(root));
+    await registerStepsFromDir(server as StepServer, dirs);
   }
 
   /** Best-effort import of the build-time steps barrel; `null` when absent (fall back to the scan). */
-  async #loadGeneratedStepsBarrel(): Promise<StepsBarrel | null> {
+  async #loadGeneratedStepsBarrel(): Promise<StepsBarrel | readonly RootedBarrel[] | null> {
     const path = this.app.makePath('.adonisjs/durable/steps.js');
     try {
-      const mod = (await import(pathToFileURL(path).href)) as { steps?: StepsBarrel };
+      const mod = (await import(pathToFileURL(path).href)) as {
+        steps?: StepsBarrel | readonly RootedBarrel[];
+      };
       return mod.steps ?? null;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
@@ -585,10 +590,12 @@ export default class DurableProvider {
    * "module not found" is swallowed; any other import error propagates (a broken generated barrel
    * should surface, not silently degrade).
    */
-  async #loadGeneratedWorkflowsBarrel(): Promise<WorkflowsBarrel | null> {
+  async #loadGeneratedWorkflowsBarrel(): Promise<WorkflowsBarrel | readonly RootedBarrel[] | null> {
     const path = this.app.makePath('.adonisjs/durable/workflows.js');
     try {
-      const mod = (await import(pathToFileURL(path).href)) as { workflows?: WorkflowsBarrel };
+      const mod = (await import(pathToFileURL(path).href)) as {
+        workflows?: WorkflowsBarrel | readonly RootedBarrel[];
+      };
       return mod.workflows ?? null;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
