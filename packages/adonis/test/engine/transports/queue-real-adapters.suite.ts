@@ -15,6 +15,7 @@ import type {
   WorkflowDecision,
 } from '../../../src/interfaces.js';
 import { sanitizeQueueToken } from '../../../src/tenant-group.js';
+import { POSTGRES_TEST_SCHEMA_PREFIX } from '../../../src/transports/db-helpers.js';
 import { QueueTransport, type QueueTransportOptions } from '../../../src/transports/queue.js';
 import {
   inboxKey,
@@ -23,6 +24,7 @@ import {
   tenantSubscriberKey,
 } from '../../../src/transports/queue-remote.js';
 import { MemoryWorkerKeys } from '../../../src/transports/worker-keys.js';
+import { backendUrl } from '../../support/backends.js';
 
 /**
  * The QueueTransport against the REAL adapters of whichever `@adonisjs/queue` is installed (0.6 or
@@ -32,7 +34,11 @@ import { MemoryWorkerKeys } from '../../../src/transports/worker-keys.js';
  * the stalled sweep re-runs it (a double-executed step on every dispatch).
  *
  * - Knex on SQLite (better-sqlite3): always runs, no infrastructure.
- * - Redis: runs when REDIS_URL is set (e.g. `redis://127.0.0.1:6379`), self-skips otherwise.
+ * - Knex on Postgres (pg): runs when DURABLE_PG_URL is set, in a schema of its own.
+ * - Redis: runs when REDIS_URL is set (e.g. `redis://127.0.0.1:6379`).
+ *
+ * Without the URL a backend self-skips locally; in CI a missing one fails the file (see
+ * `test/support/backends.ts`). One spec file per backend (`queue-real-adapters.<backend>.spec.ts`).
  */
 
 // Resolve `@boringnode/queue` (and its knex/ioredis) THROUGH the installed `@adonisjs/queue`, so the
@@ -65,6 +71,7 @@ async function importFromQueue<T>(specifier: string): Promise<T> {
 }
 
 const REDIS_URL = process.env.REDIS_URL;
+const PG_URL = process.env.DURABLE_PG_URL;
 
 const task = (name: string): RemoteTask => ({
   runId: 'r1',
@@ -95,6 +102,24 @@ async function activeJobs(adapter: Adapter, queue: string): Promise<number> {
   return typeof outcome === 'number' ? outcome : outcome.recovered + outcome.exceeded.length;
 }
 
+/** The installed Knex driver over `k`, with its jobs table created. */
+async function knexAdapter(k: unknown): Promise<AnyAdapterFactory> {
+  const driver = await importFromQueue<{
+    knex: (k: unknown, table?: string) => AnyAdapterFactory;
+    KnexQueueSchemaService?: new (k: unknown) => SchemaServiceLike;
+  }>('@boringnode/queue/drivers/knex_adapter');
+  // 0.9 ships the schema service with the driver; 0.6 exports `QueueSchemaService` from the root.
+  const Schema =
+    driver.KnexQueueSchemaService ??
+    (
+      await importFromQueue<{ QueueSchemaService: new (k: unknown) => SchemaServiceLike }>(
+        '@boringnode/queue',
+      )
+    ).QueueSchemaService;
+  await new Schema(k).createJobsTable('queue_jobs');
+  return driver.knex(k, 'queue_jobs');
+}
+
 interface Backend {
   name: string;
   enabled: boolean;
@@ -104,6 +129,9 @@ interface Backend {
 
 let dir: string | undefined;
 let knexInstance: KnexLike | undefined;
+let pgKnex: (KnexLike & { raw(sql: string): Promise<unknown> }) | undefined;
+let pgAdmin: (KnexLike & { raw(sql: string): Promise<unknown> }) | undefined;
+const pgSchema = `${POSTGRES_TEST_SCHEMA_PREFIX}queue_${process.pid}_${randomUUID().slice(0, 8)}`;
 let redisClient:
   | {
       quit(): Promise<unknown>;
@@ -126,24 +154,34 @@ const backends: Backend[] = [
         useNullAsDefault: true,
         pool: { min: 1, max: 1 },
       });
-      const driver = await importFromQueue<{
-        knex: (k: unknown, table?: string) => AnyAdapterFactory;
-        KnexQueueSchemaService?: new (k: unknown) => SchemaServiceLike;
-      }>('@boringnode/queue/drivers/knex_adapter');
-      // 0.9 ships the schema service with the driver; 0.6 exports `QueueSchemaService` from the root.
-      const Schema =
-        driver.KnexQueueSchemaService ??
-        (
-          await importFromQueue<{ QueueSchemaService: new (k: unknown) => SchemaServiceLike }>(
-            '@boringnode/queue',
-          )
-        ).QueueSchemaService;
-      await new Schema(knexInstance).createJobsTable('queue_jobs');
-      return driver.knex(knexInstance, 'queue_jobs');
+      return knexAdapter(knexInstance);
     },
     async teardown() {
       await knexInstance?.destroy();
       if (dir) rmSync(dir, { recursive: true, force: true });
+    },
+  },
+  {
+    name: 'knex (postgres)',
+    enabled: Boolean(PG_URL),
+    async setup() {
+      type PgKnex = NonNullable<typeof pgKnex>;
+      const knexMod = requireFromBoringnode('knex') as (config: unknown) => PgKnex;
+      // A schema of its own, so parallel files (and the db transport's schemas) never share a table.
+      pgAdmin = knexMod({ client: 'pg', connection: PG_URL, pool: { min: 0, max: 1 } });
+      await pgAdmin.raw(`create schema "${pgSchema}"`);
+      pgKnex = knexMod({
+        client: 'pg',
+        connection: PG_URL,
+        searchPath: [pgSchema],
+        pool: { min: 0, max: 10 },
+      });
+      return knexAdapter(pgKnex);
+    },
+    async teardown() {
+      await pgKnex?.destroy();
+      await pgAdmin?.raw(`drop schema if exists "${pgSchema}" cascade`);
+      await pgAdmin?.destroy();
     },
   },
   {
@@ -168,9 +206,21 @@ const backends: Backend[] = [
   },
 ];
 
-describe.each(backends)(
-  `QueueTransport on the real $name adapter (@boringnode/queue ${boringnodeVersion})`,
-  (backend) => {
+/**
+ * The suite on one backend. Each backend has its own spec file (`queue-real-adapters.<backend>.spec.ts`)
+ * so vitest runs the three in parallel processes instead of one after the other.
+ */
+export function queueRealAdapterSuite(name: Backend['name']): void {
+  const backend = backends.find((b) => b.name === name);
+  if (!backend) throw new Error(`unknown backend ${name}`);
+  // Without its URL a backend skips locally, and fails the file in CI.
+  if (name === 'redis') backendUrl('REDIS_URL');
+  if (name === 'knex (postgres)') backendUrl('DURABLE_PG_URL');
+  describeBackend(backend);
+}
+
+function describeBackend(backend: Backend): void {
+  describe(`QueueTransport on the real ${backend.name} adapter (@boringnode/queue ${boringnodeVersion})`, () => {
     let factory: AnyAdapterFactory;
     const transports: QueueTransport[] = [];
     let probe: Adapter;
@@ -314,6 +364,92 @@ describe.each(backends)(
         await new Promise((r) => setTimeout(r, 50));
         expect(await activeJobs(probe, `${prefix}:tasks:${sanitizeQueueToken(name)}`)).toBe(0);
       },
+    );
+
+    it.skipIf(!backend.enabled)(
+      'two workers × 4 slots share 40 jobs and never run one twice',
+      async () => {
+        const name = `fleet-${randomUUID().slice(0, 6)}`;
+        const engine = make();
+        const results: StepResult[] = [];
+        engine.onResult(async (r) => void results.push(r));
+        const runs = new Map<number, number>();
+        const ranOn = new Set<string>();
+        for (const id of ['w1', 'w2']) {
+          const worker = new QueueTransport({
+            adapter: factory,
+            prefix,
+            instanceId: `${id}-${name}`,
+            pollIntervalMs: 20,
+            // Sweeping often: a job handed to two workers would show up as a second run. The
+            // threshold leaves headroom over the one-connection SQLite pool, which every poll of
+            // three transports shares — on a loaded machine a finalize can queue behind them for
+            // longer than a short threshold, and the sweep then re-delivers a job that DID finish
+            // (claim renewal under a short threshold is pinned by the long-step test above).
+            stalledCheckIntervalMs: 50,
+            stalledThresholdMs: 3_000,
+            concurrency: 4,
+          });
+          transports.push(worker);
+          worker.handle(name, async (input) => {
+            const { seq } = input as { seq: number };
+            runs.set(seq, (runs.get(seq) ?? 0) + 1);
+            ranOn.add(id);
+            await new Promise((r) => setTimeout(r, 60));
+            return seq;
+          });
+        }
+        for (let seq = 1; seq <= 40; seq += 1) {
+          await engine.dispatch({ ...task(name), seq, stepId: `r1:${seq}`, input: { seq } });
+        }
+        await until(() => results.length >= 40, 20_000);
+        // A would-be duplicate gets time to land.
+        await new Promise((r) => setTimeout(r, 300));
+        expect(results).toHaveLength(40);
+        expect(runs.size).toBe(40);
+        expect([...runs.values()].every((n) => n === 1)).toBe(true);
+        expect(ranOn).toEqual(new Set(['w1', 'w2']));
+        expect(await activeJobs(probe, `${prefix}:tasks:${sanitizeQueueToken(name)}`)).toBe(0);
+        expect(await activeJobs(probe, `${prefix}:results`)).toBe(0);
+      },
+      30_000,
+    );
+
+    it.skipIf(!backend.enabled)(
+      "recovers a dead worker's claim: the task runs once elsewhere and nothing stays active",
+      async () => {
+        const name = `dead-${randomUUID().slice(0, 6)}`;
+        const tasksQueue = `${prefix}:tasks:${sanitizeQueueToken(name)}`;
+        const engine = make();
+        const results: StepResult[] = [];
+        engine.onResult(async (r) => void results.push(r));
+        await engine.dispatch(task(name));
+        // A worker claims the task and dies on it: never finalizes, never renews.
+        expect(await probe.popFrom(tasksQueue)).not.toBeNull();
+
+        const survivor = new QueueTransport({
+          adapter: factory,
+          prefix,
+          pollIntervalMs: 10,
+          stalledCheckIntervalMs: 50,
+          stalledThresholdMs: 200,
+          maxStalledCount: 3,
+        });
+        transports.push(survivor);
+        let runs = 0;
+        survivor.handle(name, async () => {
+          runs += 1;
+          return 'recovered';
+        });
+
+        await until(() => results.length === 1, 10_000);
+        expect(results[0]).toMatchObject({ status: 'completed', output: 'recovered' });
+        await new Promise((r) => setTimeout(r, 100));
+        expect(runs).toBe(1);
+        expect(await activeJobs(probe, tasksQueue)).toBe(0);
+        expect(await activeJobs(probe, `${prefix}:results`)).toBe(0);
+      },
+      20_000,
     );
 
     it.skipIf(!backend.enabled)(
@@ -574,5 +710,5 @@ describe.each(backends)(
         expect(await activeJobs(probe, `${prefix}:decisions`)).toBe(0);
       },
     );
-  },
-);
+  });
+}
