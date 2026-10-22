@@ -3,7 +3,6 @@ import type { Database } from '@adonisjs/lucid/database';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { WorkerDescriptor } from '../../../src/handshake/descriptor.js';
 import { DbTransport } from '../../../src/transports/db.js';
-import { makeTransportDb } from '../../../src/transports/db-helpers.js';
 import { EventEmitterTransport } from '../../../src/transports/event-emitter.js';
 import { transports } from '../../../src/transports/factory.js';
 import { QueueTransport } from '../../../src/transports/queue.js';
@@ -11,6 +10,7 @@ import { MockAdapter } from '../../../src/transports/queue-mock-adapter.js';
 import { MemoryWorkerKeys } from '../../../src/transports/worker-keys.js';
 import { lucidWorkerKeys } from '../../../src/transports/worker-keys-db.js';
 import { RedisWorkerRegistry, WorkerRuntime } from '../../../src/worker-runtime/index.js';
+import { dbBackends } from '../../support/backends.js';
 
 interface Advertising {
   createDescriptorRedis(): ConstructorParameters<typeof RedisWorkerRegistry>[0];
@@ -82,10 +82,11 @@ function advertisementContract(
     it('drops a worker that dies without stopping once its keys expire', async () => {
       const t = await make();
       cleanup = t.cleanup;
-      await workerOn(t.worker, { ttlSeconds: 0.05 }).start();
+      // Long enough to read the keys back over a real database on a loaded machine.
+      await workerOn(t.worker, { ttlSeconds: 0.4 }).start();
       expect(await t.engine.listWorkerDescriptors('line@acme')).toHaveLength(1);
 
-      await sleep(120);
+      await sleep(600);
 
       // The runtime's advertisement expired. (A transport that beats its own liveness per consumed
       // queue — bullmq, queue, db — still lists the loop it keeps consuming: that process is alive.)
@@ -103,21 +104,6 @@ advertisementContract('event-emitter', async () => {
   };
 });
 
-advertisementContract('db', async () => {
-  const db: Database = await makeTransportDb();
-  const engine = new DbTransport({ db, workerKeysCacheMs: 0, pollIntervalMs: 10 });
-  const worker = new DbTransport({ db, workerKeysCacheMs: 0, pollIntervalMs: 10 });
-  return {
-    engine,
-    worker,
-    cleanup: async () => {
-      await engine.close();
-      await worker.close();
-      await db.manager.closeAll();
-    },
-  };
-});
-
 advertisementContract('queue (in-memory keys)', async () => {
   const adapter = new MockAdapter();
   const workerKeys = new MemoryWorkerKeys();
@@ -129,26 +115,6 @@ advertisementContract('queue (in-memory keys)', async () => {
     cleanup: async () => {
       await engine.close();
       await worker.close();
-    },
-  };
-});
-
-advertisementContract('queue (database keys)', async () => {
-  const db: Database = await makeTransportDb();
-  const adapter = new MockAdapter();
-  const engine = new QueueTransport({
-    adapter: () => adapter,
-    workerKeys: lucidWorkerKeys(db),
-    workerKeysCacheMs: 0,
-  });
-  const worker = new QueueTransport({ adapter: () => adapter, workerKeys: lucidWorkerKeys(db) });
-  return {
-    engine,
-    worker,
-    cleanup: async () => {
-      await engine.close();
-      await worker.close();
-      await db.manager.closeAll();
     },
   };
 });
@@ -189,31 +155,6 @@ describe('queue: with nowhere to keep the keys', () => {
   });
 });
 
-describe('queue: transports.queue() with the app database', () => {
-  it('advertises through the database worker-key table by default', async () => {
-    const db: Database = await makeTransportDb();
-    const adapter = new MockAdapter();
-    const app = {
-      config: { get: <T>(_key: string, fallback: T) => fallback },
-      container: { make: async () => db },
-    };
-    const build = () =>
-      transports.queue({ adapter: () => adapter, workerKeysCacheMs: 0 })({
-        app,
-      } as never) as Promise<QueueTransport>;
-    const engine = await build();
-    const worker = await build();
-    try {
-      await workerOn(worker).start();
-      expect(await engine.listWorkerGroups()).toContain('line@acme');
-    } finally {
-      await engine.close();
-      await worker.close();
-      await db.manager.closeAll();
-    }
-  });
-});
-
 describe('event-emitter: separate emitters do not share workers', () => {
   it('keeps one bus’s advertisement off another', async () => {
     const worker = new EventEmitterTransport({ emitter: new EventEmitter() });
@@ -224,20 +165,83 @@ describe('event-emitter: separate emitters do not share workers', () => {
   });
 });
 
-describe('db: the advertisement read is reused for a burst', () => {
-  it('serves descriptors from one read inside the cache window', async () => {
-    const db = await makeTransportDb();
-    const engine = new DbTransport({ db, workerKeysCacheMs: 60_000 });
-    const worker = new DbTransport({ db });
-    try {
-      expect(await engine.listWorkerDescriptors('line@acme')).toEqual([]);
-      await workerOn(worker).start();
-      // Still the empty read from before the worker started.
-      expect(await engine.listWorkerDescriptors('line@acme')).toEqual([]);
-    } finally {
-      await engine.close();
-      await worker.close();
-      await db.manager.closeAll();
-    }
+// The database-backed advertisement (the worker-key table, `lucidWorkerKeys`) on every Lucid backend.
+for (const { name, makeTransportDb } of dbBackends()) {
+  advertisementContract(`db (${name})`, async () => {
+    const db: Database = await makeTransportDb();
+    const engine = new DbTransport({ db, workerKeysCacheMs: 0, pollIntervalMs: 10 });
+    const worker = new DbTransport({ db, workerKeysCacheMs: 0, pollIntervalMs: 10 });
+    return {
+      engine,
+      worker,
+      cleanup: async () => {
+        await engine.close();
+        await worker.close();
+        await db.manager.closeAll();
+      },
+    };
   });
-});
+
+  advertisementContract(`queue (database keys on ${name})`, async () => {
+    const db: Database = await makeTransportDb();
+    const adapter = new MockAdapter();
+    const engine = new QueueTransport({
+      adapter: () => adapter,
+      workerKeys: lucidWorkerKeys(db),
+      workerKeysCacheMs: 0,
+    });
+    const worker = new QueueTransport({ adapter: () => adapter, workerKeys: lucidWorkerKeys(db) });
+    return {
+      engine,
+      worker,
+      cleanup: async () => {
+        await engine.close();
+        await worker.close();
+        await db.manager.closeAll();
+      },
+    };
+  });
+
+  describe(`queue: transports.queue() with the app database (${name})`, () => {
+    it('advertises through the database worker-key table by default', async () => {
+      const db: Database = await makeTransportDb();
+      const adapter = new MockAdapter();
+      const app = {
+        config: { get: <T>(_key: string, fallback: T) => fallback },
+        container: { make: async () => db },
+      };
+      const build = () =>
+        transports.queue({ adapter: () => adapter, workerKeysCacheMs: 0 })({
+          app,
+        } as never) as Promise<QueueTransport>;
+      const engine = await build();
+      const worker = await build();
+      try {
+        await workerOn(worker).start();
+        expect(await engine.listWorkerGroups()).toContain('line@acme');
+      } finally {
+        await engine.close();
+        await worker.close();
+        await db.manager.closeAll();
+      }
+    });
+  });
+
+  describe(`db: the advertisement read is reused for a burst (${name})`, () => {
+    it('serves descriptors from one read inside the cache window', async () => {
+      const db = await makeTransportDb();
+      const engine = new DbTransport({ db, workerKeysCacheMs: 60_000 });
+      const worker = new DbTransport({ db });
+      try {
+        expect(await engine.listWorkerDescriptors('line@acme')).toEqual([]);
+        await workerOn(worker).start();
+        // Still the empty read from before the worker started.
+        expect(await engine.listWorkerDescriptors('line@acme')).toEqual([]);
+      } finally {
+        await engine.close();
+        await worker.close();
+        await db.manager.closeAll();
+      }
+    });
+  });
+}
