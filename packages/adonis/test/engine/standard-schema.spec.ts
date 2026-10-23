@@ -165,7 +165,7 @@ describe('step schemas — any Standard Schema', () => {
 });
 
 describe('workflow inputSchema', () => {
-  it('valibot: rejects before a run is created; stores the schema OUTPUT; then validateInput', async () => {
+  it('valibot: rejects before a run is created; stores the input as sent; then validateInput', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });
     const order: string[] = [];
@@ -193,8 +193,8 @@ describe('workflow inputSchema', () => {
 
     const ok = await startRun(engine, 'checkout', { qty: '3' }, 'good');
     expect(ok.status).toBe('completed');
-    expect(received).toEqual({ qty: 3 });
-    expect((await store.getRun('good'))?.input).toEqual({ qty: 3 });
+    expect(received).toEqual({ qty: 3 }); // the body gets the schema's OUTPUT…
+    expect((await store.getRun('good'))?.input).toEqual({ qty: '3' }); // …the run keeps what was sent
     expect(order).toEqual(['validateInput:{"qty":3}']); // sees the parsed value
   });
 

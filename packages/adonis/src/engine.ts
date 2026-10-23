@@ -340,8 +340,9 @@ interface RegisteredWorkflow {
   /** Validate the input at start; throw to reject before a run is created. Validator-agnostic. */
   validateInput?: ((input: unknown) => void | Promise<void>) | undefined;
   /** Standard Schema (zod / valibot / arktype / …) the input is validated against at start, BEFORE
-   *  `validateInput`; its OUTPUT value becomes the run's input. A failure throws a
-   *  `SchemaValidationError` and no run is created. */
+   *  `validateInput`; a failure throws a `SchemaValidationError` and no run is created. The run
+   *  stores the input AS SENT; the body receives the schema's OUTPUT, re-parsed from the stored
+   *  input before every turn (see {@link WorkflowEngine.turnInput}). */
   inputSchema?: StandardSchemaV1 | undefined;
   /** Typed search-attributes shape: `ctx.upsertSearchAttributes` validates the MERGED attributes
    *  against it and rejects a non-conforming write. See {@link SearchAttributesSchema}. */
@@ -1779,11 +1780,15 @@ export class WorkflowEngine {
       );
     }
     // Validate the input up front — a bad payload is rejected before any run is created. The schema
-    // runs first and its OUTPUT (parsed/coerced) is what the run stores; `validateInput` then sees it.
-    if (registered.inputSchema) {
-      input = await validateStandard(registered.inputSchema, input, `workflow "${name}" input`);
-    }
-    await registered.validateInput?.(input);
+    // runs first and `validateInput` sees its OUTPUT (parsed/coerced), but the run stores the input
+    // AS SENT: the body gets the parsed value by re-parsing it before every turn (`turnInput`), so a
+    // value JSON can't carry (a `Date` from `z.coerce.date()`) reaches it the same way on every
+    // turn, whichever store holds the row. Everything else here — singleton and concurrency keys
+    // included — reads the stored input, the one value the singleton gate re-reads later.
+    const parsed = registered.inputSchema
+      ? await validateStandard(registered.inputSchema, input, `workflow "${name}" input`)
+      : input;
+    await registered.validateInput?.(parsed);
     // Idempotent by run id: a redelivered trigger (at-least-once queues) or a scheduler re-tick for
     // the same id is a no-op, returning the existing run's state instead of starting a duplicate.
     const prior = await this.store.getRun(runId);
@@ -4562,9 +4567,26 @@ export class WorkflowEngine {
       return this.settleRun(run, await this.followHandoff(run, handoff));
     }
     const history = await this.remoteHistory(run.id, checkpoints);
+    // The remote body gets the parsed input too, re-parsed here each turn like an inline one. It
+    // travels as JSON, so a value JSON can't carry arrives as its JSON form — but coercions and
+    // defaults do apply. Only the TASK carries it: `run` (and so the store) keeps the input as sent.
+    let turnRun: WorkflowRun;
+    try {
+      turnRun = registered.inputSchema
+        ? { ...run, input: await this.turnInput(run, registered) }
+        : run;
+    } catch (err) {
+      return this.settleRun(run, {
+        kind: 'failed',
+        error: {
+          message: err instanceof Error ? err.message : String(err),
+          ...codeAndDetails(err),
+        },
+      });
+    }
     // Broker-backed executors: dispatch the turn and suspend on it. The decision is applied by
     // whichever replica consumes it (completeRemoteDecision), never awaited here.
-    if (remote.executor.dispatch) return this.dispatchRemoteTurn(run, registered, history);
+    if (remote.executor.dispatch) return this.dispatchRemoteTurn(turnRun, registered, history);
 
     // INLINE advance (an executor that produces the decision in-process): await it under the lease.
     const advance = remote.executor.advance;
@@ -4576,7 +4598,7 @@ export class WorkflowEngine {
     let decision: WorkflowDecision;
     try {
       const silenceMs = this.remoteAdvanceSilenceMs;
-      const pending = advance.call(remote.executor, run, history);
+      const pending = advance.call(remote.executor, turnRun, history);
       decision =
         silenceMs != null
           ? await this.awaitTurnWithSilence(run.id, pending, silenceMs)
@@ -5552,6 +5574,22 @@ export class WorkflowEngine {
   }
 
   /** The run body, lease held + renewed by {@link execute}. */
+  /**
+   * The input a turn's body receives: the stored input parsed by the workflow's `inputSchema`, or the
+   * stored input itself without one. Re-parsed on every turn rather than stored parsed, because the
+   * store round-trips the row through JSON (on the SQL stores) or a structured clone (in memory): a
+   * stored parsed value would reach the body as a `Date` in tests and a string in production. A
+   * stored input that no longer parses — its schema changed without a version bump — throws the same
+   * `SchemaValidationError` (`schema_validation`, never retried) that fails the run.
+   */
+  private async turnInput(
+    run: WorkflowRun,
+    registered: RegisteredWorkflow | undefined,
+  ): Promise<unknown> {
+    if (!registered?.inputSchema) return run.input;
+    return validateStandard(registered.inputSchema, run.input, `workflow "${run.workflow}" input`);
+  }
+
   private async runExecution(
     run: WorkflowRun,
     fn: WorkflowFn,
@@ -5607,7 +5645,8 @@ export class WorkflowEngine {
       // Establish the ambient ctx for the duration of this body turn so context-aware statics
       // (`BaseWorkflow.start`/`dispatch`) reachable from `fn` route through this run's `ctx.child`/
       // `ctx.startChild`. Re-set on every replay turn (each is its own async scope) — correct.
-      const output = await workflowAls.run(ctx, () => fn(ctx, run.input));
+      const input = await this.turnInput(run, registered);
+      const output = await workflowAls.run(ctx, () => fn(ctx, input));
       // A compensating cancel requested while this turn ran (or one whose resume replays straight to
       // `return`, with no suspension point left) still wins: undo + settle cancelled, never completed.
       if (await this.takeCancelIntent(run.id)) {
