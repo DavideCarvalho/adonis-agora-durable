@@ -149,62 +149,82 @@ describe('runSchedules', () => {
 });
 
 describe('runSchedules — jitter', () => {
-  it('delays the dispatch by up to the jitter bound before firing (never exceeds it)', async () => {
+  it('defers the window to its jittered fire time instead of sleeping in the tick', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });
     engine.register('beat', '1', async () => 'tick');
+    const schedules = [{ key: 'b', workflow: 'beat', everyMs: 1000, jitter: 500 }];
+    const opts = { random: () => 0.5 }; // deterministic: half of the bound, so fire at 1000 + 250
 
-    const sleeps: number[] = [];
-    const ids = await runSchedules(
-      engine,
-      [{ key: 'b', workflow: 'beat', everyMs: 1000, jitter: 500 }],
-      1000,
-      {
-        random: () => 0.5, // deterministic: half of the bound
-        sleep: async (ms) => void sleeps.push(ms),
-      },
-    );
-
-    expect(sleeps).toEqual([250]); // 0.5 * 500, applied before start
-    expect(ids).toEqual(['sched:b:1']);
+    expect(await runSchedules(engine, schedules, 1000, opts)).toEqual([]);
+    expect(await runSchedules(engine, schedules, 1249, opts)).toEqual([]);
+    expect(await store.getRun('sched:b:1')).toBeFalsy();
+    expect(await runSchedules(engine, schedules, 1250, opts)).toEqual(['sched:b:1']);
     await engine.waitForRun('sched:b:1');
     expect((await store.getRun('sched:b:1'))?.output).toBe('tick');
+    // Fired once: later ticks in the same window start nothing.
+    expect(await runSchedules(engine, schedules, 1400, opts)).toEqual([]);
   });
 
-  it('keeps the jittered delay within [0, jitter) for any random value', async () => {
+  it('draws the delay once per window, within [0, jitter)', async () => {
     for (const rnd of [0, 0.1, 0.9, 0.999999]) {
-      // Engine NOVO a cada iteração. Todas usam o mesmo `nowMs`, ou seja, a mesma
-      // janela: reusando o engine, só a primeira teria algo a disparar, e o jitter
-      // (que existe para espalhar disparos) corretamente não aconteceria nas outras.
-      // O que este teste mede é a FAIXA do atraso, não a frequência dele.
       const store = new InMemoryStateStore();
       const engine = new WorkflowEngine({ store });
       engine.register('beat', '1', async () => 'tick');
-      const sleeps: number[] = [];
-      await runSchedules(
-        engine,
-        [{ key: 'b', workflow: 'beat', everyMs: 1000, jitter: 300 }],
-        1000,
-        {
-          random: () => rnd,
-          sleep: async (ms) => void sleeps.push(ms),
-        },
-      );
-      expect(sleeps[0]).toBeGreaterThanOrEqual(0);
-      expect(sleeps[0]).toBeLessThan(300);
+      const schedules = [{ key: 'b', workflow: 'beat', everyMs: 1000, jitter: 300 }];
+      let draws = 0;
+      const random = () => {
+        draws += 1;
+        return rnd;
+      };
+      const delay = Math.floor(rnd * 300);
+      let fired: string[] = [];
+      for (let t = 1000; t < 1300 && fired.length === 0; t += 1) {
+        fired = await runSchedules(engine, schedules, t, { random });
+        if (fired.length > 0) expect(t - 1000).toBe(delay);
+      }
+      expect(fired).toEqual(['sched:b:1']);
+      expect(draws).toBe(1);
+      expect(delay).toBeLessThan(300);
     }
   });
 
-  it('does not sleep when jitter is absent (default behavior preserved)', async () => {
+  it('a jittered schedule does not hold up the others in the same tick', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });
     engine.register('beat', '1', async () => 'tick');
-    const sleeps: number[] = [];
-    await runSchedules(engine, [{ key: 'b', workflow: 'beat', everyMs: 1000 }], 1000, {
-      random: () => 0.5,
-      sleep: async (ms) => void sleeps.push(ms),
-    });
-    expect(sleeps).toEqual([]);
+    const schedules = [
+      { key: 'slow', workflow: 'beat', everyMs: 1000, jitter: 60_000 },
+      { key: 'fast', workflow: 'beat', everyMs: 1000 },
+    ];
+    const started = Date.now();
+    const ids = await runSchedules(engine, schedules, 1000, { random: () => 0.99 });
+    expect(ids).toEqual(['sched:fast:1']);
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  it('still fires a deferred window after the schedule moved on (jitter longer than the interval)', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    engine.register('beat', '1', async () => 'tick');
+    const beat = [{ key: 'b', workflow: 'beat', everyMs: 1000, jitter: 5000 }];
+    const opts = { random: () => 0.9 }; // 4500 ms after first seen due
+
+    expect(await runSchedules(engine, beat, 1000, opts)).toEqual([]);
+    expect(await runSchedules(engine, beat, 2000, opts)).toEqual([]); // window 2 deferred too
+    expect(await runSchedules(engine, beat, 5500, opts)).toEqual(['sched:b:1']);
+    expect(await runSchedules(engine, beat, 6500, opts)).toEqual(['sched:b:2']);
+  });
+
+  it('fires at once when jitter is absent (default behavior preserved)', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    engine.register('beat', '1', async () => 'tick');
+    expect(
+      await runSchedules(engine, [{ key: 'b', workflow: 'beat', everyMs: 1000 }], 1000, {
+        random: () => 0.5,
+      }),
+    ).toEqual(['sched:b:1']);
   });
 });
 
