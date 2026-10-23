@@ -203,6 +203,19 @@ describe('runSchedules — jitter', () => {
     expect(Date.now() - started).toBeLessThan(1_000);
   });
 
+  it('still fires a deferred window after the schedule moved on (jitter longer than the interval)', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    engine.register('beat', '1', async () => 'tick');
+    const beat = [{ key: 'b', workflow: 'beat', everyMs: 1000, jitter: 5000 }];
+    const opts = { random: () => 0.9 }; // 4500 ms after first seen due
+
+    expect(await runSchedules(engine, beat, 1000, opts)).toEqual([]);
+    expect(await runSchedules(engine, beat, 2000, opts)).toEqual([]); // window 2 deferred too
+    expect(await runSchedules(engine, beat, 5500, opts)).toEqual(['sched:b:1']);
+    expect(await runSchedules(engine, beat, 6500, opts)).toEqual(['sched:b:2']);
+  });
+
   it('fires at once when jitter is absent (default behavior preserved)', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });

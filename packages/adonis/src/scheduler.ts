@@ -128,11 +128,17 @@ export interface RunSchedulesOptions {
 /** Per engine, per schedule key: the jittered fire time of each window this process has seen due. */
 const jitterFireAt = new WeakMap<object, Map<string, Map<string, number>>>();
 
+/** Windows of `key` an earlier tick deferred for jitter and that have not fired yet. */
+function deferredWindows(engine: object, key: string): string[] {
+  return [...(jitterFireAt.get(engine)?.get(key)?.keys() ?? [])];
+}
+
 /**
  * The candidate windows whose jittered fire time has arrived. A window first seen due gets
  * `now + random() * jitter`, kept until it fires, so the delay is drawn once per window per process
  * (instances still draw independently and the earliest one wins, as before). Only the current
- * candidates are kept for a key, so a window that rolled out of reach is dropped, not leaked.
+ * candidates are kept for a key, so a window that fired (here or on another instance) is dropped,
+ * not leaked.
  */
 function jitterDue(
   engine: object,
@@ -385,7 +391,12 @@ export async function runSchedules(
     // the window's fire time, so it is CONSTANT for the whole window, and asking the
     // store about it again on the next tick can only produce the answer we already
     // got. See {@link settledIdsFor}.
-    const candidates = scheduleRunIdsAt(s, nowMs).filter((id) => !settled.get(s.key)?.has(id));
+    // A jittered window deferred by an earlier tick stays a candidate until it fires, even once the
+    // schedule has moved on to the next window (a jitter longer than the interval).
+    const due = scheduleRunIdsAt(s, nowMs);
+    const windows =
+      s.jitter && s.jitter > 0 ? [...new Set([...deferredWindows(engine, s.key), ...due])] : due;
+    const candidates = windows.filter((id) => !settled.get(s.key)?.has(id));
     // Nothing to do this tick — and, crucially, no I/O to prove it. A cron that fires
     // hourly is not due in 3.599 of every 3.600 seconds; the old code still asked the
     // database in each of them.
