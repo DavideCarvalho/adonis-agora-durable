@@ -3,6 +3,7 @@ import type { CommandOptions } from '@adonisjs/core/types/ace';
 import { mergeSchedules, runWorkerLoop } from '../src/commands/worker.js';
 import type { DurableConfig } from '../src/define_config.js';
 import { WorkflowEngine } from '../src/index.js';
+import { resolveSchedules } from '../src/scheduler.js';
 
 /**
  * `node ace durable:work` — the long-running worker loop. Resolves the {@link WorkflowEngine} bound by
@@ -29,7 +30,11 @@ export default class DurableWork extends BaseCommand {
     // merged with any colocated `static schedule` discovered on workflow classes at boot. Config wins
     // on a key collision (see `mergeSchedules`).
     const config = this.app.config.get<DurableConfig>('durable', {});
-    const schedules = mergeSchedules(config.schedules ?? [], engine.discoveredSchedules);
+    // `resolveSchedules` calls the lazy `() => import('#workflows/…')` entries — now, after boot.
+    const schedules = mergeSchedules(
+      await resolveSchedules(config.schedules ?? []),
+      engine.discoveredSchedules,
+    );
 
     // Resolve `stopSignal` once a termination signal arrives, so the loop finishes its current tick,
     // drains, and exits cleanly instead of being hard-killed mid-run.

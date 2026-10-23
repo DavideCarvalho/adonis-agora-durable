@@ -291,6 +291,16 @@ export default class DailyReportWorkflow extends BaseWorkflow {
 }
 ```
 
+In `config/durable.ts`, name the workflow with a lazy import, as Adonis does for
+controllers — never a direct class import, which can hang the boot (a service the
+workflow imports awaits `app.booted` while the config is still loading):
+
+```ts
+schedules: [
+  { key: 'daily-report', workflow: () => import('#workflows/daily_report_workflow'), cron: '0 2 * * *' },
+]
+```
+
 Each schedule window starts exactly once across a fleet via an idempotent
 time-bucket run id.
 
