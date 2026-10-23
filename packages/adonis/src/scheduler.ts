@@ -1,5 +1,29 @@
 import { createRequire } from 'node:module';
 import type { WorkflowEngine } from './engine.js';
+import {
+  type WorkflowClass,
+  type WorkflowInputOf,
+  type WorkflowRef,
+  workflowName,
+} from './workflow-ref.js';
+
+/**
+ * A lazy import of a workflow class's module, the way Adonis's router takes controllers:
+ * `() => import('#workflows/daily_report_workflow')`. What `config/durable.ts` should use: a config
+ * file is loaded while the app boots, and a workflow module that imports a service (`db`, `logger`,
+ * anything that awaits `app.booted`) would wait on a boot that is waiting on the config — the app
+ * hangs. The lazy import is only called once the worker loop starts, after boot.
+ */
+export type LazyWorkflowImport<C extends WorkflowClass = WorkflowClass> = () => Promise<{
+  default: C;
+}>;
+
+/** What a schedule's `workflow` takes: a workflow class, a registered name, or a lazy import. */
+export type ScheduleWorkflowRef = WorkflowRef | LazyWorkflowImport;
+
+/** The input a schedule's runs start with, typed against `run` when the workflow is a class. */
+export type ScheduleInputOf<W> =
+  W extends LazyWorkflowImport<infer C> ? WorkflowInputOf<C> : WorkflowInputOf<W>;
 
 // Resolve the optional `cron-parser` peer dependency in a way that works in BOTH the ESM and CJS
 // builds of this package (dual publish). `createRequire(import.meta.url)` gives a real `require` in
@@ -7,11 +31,24 @@ import type { WorkflowEngine } from './engine.js';
 // call resolves there too. This keeps the load synchronous (no async leak into the scheduler API).
 const nodeRequire = createRequire(import.meta.url);
 
-export interface ScheduledWorkflow {
+/**
+ * A recurring start of `workflow`, fired on a fixed interval or a cron.
+ *
+ * `workflow` is a lazy import of the workflow's module (what `config/durable.ts` should use — see
+ * {@link LazyWorkflowImport}), a workflow class, or a registered name. A class or a lazy import types
+ * `input` against `run` when the schedule is annotated, as in
+ * `ScheduledWorkflow<LazyWorkflowImport<typeof ReportWorkflow>>` (with `import type`).
+ */
+export interface ScheduledWorkflow<W extends ScheduleWorkflowRef = ScheduleWorkflowRef> {
   /** Stable key identifying this schedule — part of the deterministic run id. */
   key: string;
-  workflow: string;
-  input?: unknown;
+  /**
+   * The workflow to start: `() => import('#workflows/…')`, a workflow class
+   * (`static workflow = { name }`), or a registered name.
+   */
+  workflow: W;
+  /** The input every run starts with — typed against `run` when `workflow` names a class. */
+  input?: ScheduleInputOf<W>;
   /** Start one run every `everyMs`. Mutually exclusive with `cron`. */
   everyMs?: number;
   /**
@@ -201,6 +238,49 @@ export function scheduleWindow(
   throw new Error(`schedule "${s.key}" needs either "everyMs" or "cron"`);
 }
 
+/** A lazy import is an arrow function; a class always has a `prototype`. */
+function isLazyImport(ref: ScheduleWorkflowRef): ref is LazyWorkflowImport {
+  return typeof ref === 'function' && ref.prototype === undefined;
+}
+
+/**
+ * The schedule with its `workflow` resolved to the registered name. Throws for a class that carries
+ * no `static workflow = { name }`, which is how a misconfigured schedule fails the worker's start
+ * instead of failing on every tick. A lazy import can't be resolved synchronously: pass the list
+ * through {@link resolveSchedules} first.
+ */
+export function resolveSchedule(s: ScheduledWorkflow): ScheduledWorkflow<string> {
+  if (typeof s.workflow === 'string') return s as ScheduledWorkflow<string>;
+  if (isLazyImport(s.workflow)) {
+    throw new Error(
+      `schedule "${s.key}" names its workflow with a lazy import — resolve the list with resolveSchedules() first`,
+    );
+  }
+  return { ...s, workflow: workflowName(s.workflow) };
+}
+
+/**
+ * Resolve every schedule's `workflow` to its registered name, calling each lazy import. Throws for a
+ * module with no default export, or a class with no `static workflow = { name }`, so the worker fails
+ * to start on a misconfigured schedule. The worker loop calls this once, after the app has booted.
+ */
+export async function resolveSchedules(
+  schedules: readonly ScheduledWorkflow[],
+): Promise<ScheduledWorkflow<string>[]> {
+  return Promise.all(
+    schedules.map(async (s) => {
+      if (!isLazyImport(s.workflow)) return resolveSchedule(s);
+      const mod = await s.workflow();
+      if (typeof mod?.default !== 'function') {
+        throw new Error(
+          `schedule "${s.key}": the lazily imported module has no default export — export the workflow class as default`,
+        );
+      }
+      return { ...s, workflow: workflowName(mod.default) };
+    }),
+  );
+}
+
 /** The deterministic, idempotent run id for a schedule at `nowMs` — its current fire window. */
 function scheduleRunIdAt(s: ScheduledWorkflow, nowMs: number): string {
   if (s.cron != null) return `sched:${s.key}:${prevCronFireMs(s.cron, nowMs, s.timezone)}`;
@@ -306,7 +386,7 @@ export async function runSchedules(
       // window — so a capability-less pool winning the race can't strand the run in a pool that
       // can't service it. Unset → `{ namespace: undefined }` → `startCore` falls back to the
       // ticking engine's own namespace (historical behavior, byte-identical).
-      await engine.start(s.workflow, s.input, runId, { namespace: s.namespace });
+      await engine.start(resolveSchedule(s).workflow, s.input, runId, { namespace: s.namespace });
       ids.push(runId);
     }
   }

@@ -8,9 +8,24 @@ import {
 import {
   InMemoryStateStore,
   InMemoryTransport,
+  type LazyWorkflowImport,
+  resolveSchedules,
   type ScheduledWorkflow,
   WorkflowEngine,
 } from '../../src/index.js';
+
+class ReportWorkflow {
+  static workflow = { name: 'report' };
+  async run(_ctx: unknown, input: { region: string }) {
+    return `report for ${input.region}`;
+  }
+}
+
+class NotAWorkflow {
+  async run() {
+    return 'never';
+  }
+}
 
 function makeEngine() {
   const store = new InMemoryStateStore();
@@ -75,6 +90,31 @@ describe('runTick', () => {
     expect(await store.getRun('sched:cache-sync:2')).not.toBeNull();
   });
 
+  it('fires a schedule that names its workflow by class', async () => {
+    const { engine, store } = makeEngine();
+    engine.register(
+      'report',
+      '1',
+      async (_ctx, input) => `report for ${(input as { region: string }).region}`,
+    );
+    const report: ScheduledWorkflow<typeof ReportWorkflow> = {
+      key: 'report',
+      workflow: ReportWorkflow,
+      input: { region: 'eu' },
+      everyMs: 60_000,
+    };
+    const result = await runTick(engine, { schedules: [report], now: 120_000 });
+
+    expect(result.errors).toHaveLength(0);
+    await engine.waitForRun('sched:report:2');
+    expect(await store.getRun('sched:report:2')).toMatchObject({
+      workflow: 'report',
+      output: 'report for eu',
+    });
+    const [listed] = await engine.listSchedules(120_000);
+    expect(listed?.workflow).toBe('report');
+  });
+
   it('skips the schedules phase entirely when none are registered', async () => {
     const { engine } = makeEngine();
     const result = await runTick(engine);
@@ -116,6 +156,41 @@ describe('mergeSchedules (config + colocated `static schedule`)', () => {
     expect(mergeSchedules(config, discovered)).toEqual([
       { key: 'report', workflow: 'report', everyMs: 5000 },
     ]);
+  });
+
+  it('resolves a config schedule that names its workflow by class', () => {
+    expect(
+      mergeSchedules(
+        [{ key: 'r', workflow: ReportWorkflow, input: { region: 'eu' }, everyMs: 1000 }],
+        [],
+      ),
+    ).toEqual([{ key: 'r', workflow: 'report', input: { region: 'eu' }, everyMs: 1000 }]);
+  });
+
+  it('throws for a class that is not a workflow, so the worker fails to start', () => {
+    expect(() => mergeSchedules([{ key: 'n', workflow: NotAWorkflow, everyMs: 1000 }], [])).toThrow(
+      'workflow class NotAWorkflow has no registered name',
+    );
+  });
+
+  it('types input against the class run when the schedule is annotated', () => {
+    const wrong: ScheduledWorkflow<typeof ReportWorkflow> = {
+      key: 'r',
+      workflow: ReportWorkflow,
+      // @ts-expect-error `input` is checked against ReportWorkflow.run's input
+      input: { region: 1 },
+      everyMs: 1000,
+    };
+    // An annotated schedule still fits the plain list config.schedules takes.
+    const list: ScheduledWorkflow[] = [wrong, { key: 'b', workflow: 'b', everyMs: 1000 }];
+    expect(list).toHaveLength(2);
+  });
+
+  it('refuses a lazy import that has not been through resolveSchedules', () => {
+    const lazy = () => Promise.resolve({ default: ReportWorkflow });
+    expect(() => mergeSchedules([{ key: 'r', workflow: lazy, everyMs: 1000 }], [])).toThrow(
+      'resolve the list with resolveSchedules() first',
+    );
   });
 
   it('returns colocated schedules alone when config has none', () => {
@@ -205,5 +280,61 @@ describe('runWorkerLoop', () => {
     expect(runs).toBe(1);
     const ids = (await store.listRuns({})).map((r) => r.id);
     expect(ids.some((id) => id.startsWith('sched:cache-sync:'))).toBe(true);
+  });
+});
+
+describe('resolveSchedules (lazy `() => import(...)` in config.schedules)', () => {
+  it('calls the lazy import and resolves the default export to its registered name', async () => {
+    let imported = 0;
+    const lazy: LazyWorkflowImport<typeof ReportWorkflow> = async () => {
+      imported += 1;
+      return { default: ReportWorkflow };
+    };
+    const report: ScheduledWorkflow<typeof lazy> = {
+      key: 'r',
+      workflow: lazy,
+      input: { region: 'eu' },
+      everyMs: 1000,
+    };
+
+    expect(imported).toBe(0); // declaring the schedule imports nothing
+    expect(await resolveSchedules([report, { key: 'b', workflow: 'b', everyMs: 1000 }])).toEqual([
+      { key: 'r', workflow: 'report', input: { region: 'eu' }, everyMs: 1000 },
+      { key: 'b', workflow: 'b', everyMs: 1000 },
+    ]);
+    expect(imported).toBe(1);
+  });
+
+  it('resolves a real dynamic import of a workflow module', async () => {
+    const [resolved] = await resolveSchedules([
+      { key: 'f', workflow: () => import('../fixtures/scheduled_workflow.js'), everyMs: 1000 },
+    ]);
+    expect(resolved?.workflow).toBe('fixture-scheduled');
+  });
+
+  it('types input against the lazily imported class', () => {
+    const wrong: ScheduledWorkflow<LazyWorkflowImport<typeof ReportWorkflow>> = {
+      key: 'r',
+      workflow: async () => ({ default: ReportWorkflow }),
+      // @ts-expect-error `input` is checked against ReportWorkflow.run's input
+      input: { region: 1 },
+      everyMs: 1000,
+    };
+    expect(wrong.key).toBe('r');
+  });
+
+  it('throws for a module without a default export, so the worker fails to start', async () => {
+    const noDefault = (async () => ({})) as unknown as LazyWorkflowImport;
+    await expect(
+      resolveSchedules([{ key: 'x', workflow: noDefault, everyMs: 1000 }]),
+    ).rejects.toThrow('schedule "x": the lazily imported module has no default export');
+  });
+
+  it('throws for a default export that is not a workflow', async () => {
+    await expect(
+      resolveSchedules([
+        { key: 'n', workflow: async () => ({ default: NotAWorkflow }), everyMs: 1000 },
+      ]),
+    ).rejects.toThrow('workflow class NotAWorkflow has no registered name');
   });
 });

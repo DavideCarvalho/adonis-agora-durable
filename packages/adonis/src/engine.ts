@@ -124,7 +124,7 @@ import {
 import { runFacetsOf } from './run-facets.js';
 import { scanRunValueFacets } from './run-value-facets.js';
 import { listSignalWaitersOfRuns } from './run-waiting.js';
-import { type ScheduledWorkflow, scheduleWindow } from './scheduler.js';
+import { resolveSchedule, type ScheduledWorkflow, scheduleWindow } from './scheduler.js';
 import { ScheduleClient } from './schedules.js';
 import {
   SINGLETON_RESERVED_TAGS,
@@ -815,7 +815,7 @@ export class WorkflowEngine {
   /** Durable-entity subsystem (registers the `__entity` runner; see `registerEntity`). */
   private readonly entities: Entities;
   /** Colocated schedules (from `static schedule`) collected during auto-discovery; see `registerSchedules`. */
-  readonly #discoveredSchedules: ScheduledWorkflow[] = [];
+  readonly #discoveredSchedules: ScheduledWorkflow<string>[] = [];
   /** Event debounce/batch accumulators (register the `__evt_*` runners; see `accumulators.route`). */
   private readonly accumulators: EventAccumulators;
   /** In-flight remote steps awaiting a worker result, keyed by stepId. */
@@ -843,7 +843,7 @@ export class WorkflowEngine {
   /** {@link announcedRoutes} reads, by routing token + workflow + version. */
   private readonly announcedRoutesCache = new Map<string, { at: number; sets: OnErrorRoute[][] }>();
   /** The merged schedule set the worker loop ticks with (see {@link adoptSchedules}). */
-  #allSchedules: readonly ScheduledWorkflow[] = [];
+  #allSchedules: readonly ScheduledWorkflow<string>[] = [];
   /** Runtime pause overrides by schedule key (console-issued; win over the config's `paused`). */
   readonly #schedulePauseOverrides = new Map<string, boolean>();
   /** Flow-control admission backend for remote steps (see {@link registerQueue}). */
@@ -1150,7 +1150,7 @@ export class WorkflowEngine {
    * Called by `runTick`; idempotent.
    */
   adoptSchedules(schedules: readonly ScheduledWorkflow[]): void {
-    this.#allSchedules = schedules;
+    this.#allSchedules = schedules.map(resolveSchedule);
   }
 
   /**
@@ -1235,12 +1235,12 @@ export class WorkflowEngine {
         continue;
       }
       seen.add(schedule.key);
-      this.#discoveredSchedules.push(schedule);
+      this.#discoveredSchedules.push(resolveSchedule(schedule));
     }
   }
 
   /** Colocated schedules discovered from `static schedule`, for the worker loop to merge with config. */
-  get discoveredSchedules(): readonly ScheduledWorkflow[] {
+  get discoveredSchedules(): readonly ScheduledWorkflow<string>[] {
     return this.#discoveredSchedules;
   }
 

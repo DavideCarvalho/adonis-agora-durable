@@ -18,7 +18,8 @@ For schedules created and managed **at runtime** — one per user or tenant, sto
 interface ScheduledWorkflow {
   /** Stable key identifying this schedule — part of the deterministic run id. */
   key: string
-  workflow: string
+  /** `() => import('#workflows/…')`, a workflow class, or a registered name. */
+  workflow: (() => Promise<{ default: WorkflowClass }>) | WorkflowClass | string
   input?: unknown
   /** Start one run every `everyMs`. Mutually exclusive with `cron`. */
   everyMs?: number
@@ -39,7 +40,7 @@ interface ScheduledWorkflow {
 }
 ```
 
-Every schedule has a stable `key`, the `workflow` name to start, and an optional `input`. The cadence is either `everyMs` (a fixed interval) **or** `cron` + `timezone` (a calendar expression) — they are mutually exclusive.
+Every schedule has a stable `key`, the `workflow` to start, and an optional `input`. The cadence is either `everyMs` (a fixed interval) **or** `cron` + `timezone` (a calendar expression) — they are mutually exclusive.
 
 ## Colocate the schedule with the workflow
 
@@ -101,19 +102,49 @@ Add a `schedules` array to your durable config. The `durable:work` worker loop r
 ```ts title="config/durable.ts"
 import { defineConfig, transports } from '@adonis-agora/durable'
 
+const DailyReportWorkflow = () => import('#workflows/daily_report_workflow')
+const CacheSyncWorkflow = () => import('#workflows/cache_sync_workflow')
+
 export default defineConfig({
   transport: 'memory',
   transports: { memory: transports.memory() },
   schedules: [
     // Nightly report at 02:00 in São Paulo — DST-aware.
-    { key: 'nightly-report', workflow: 'daily-report', cron: '0 2 * * *', timezone: 'America/Sao_Paulo' },
+    { key: 'nightly-report', workflow: DailyReportWorkflow, cron: '0 2 * * *', timezone: 'America/Sao_Paulo' },
     // Sync the cache every five minutes.
-    { key: 'cache-sync', workflow: 'cache-sync', everyMs: 5 * 60 * 1000 },
+    { key: 'cache-sync', workflow: CacheSyncWorkflow, everyMs: 5 * 60 * 1000 },
   ],
 })
 ```
 
 Then run the worker: `node ace durable:work`. The loop fires the schedules each tick on **worker** instances; the idempotent time-bucket run id (below) keeps each window to exactly one run no matter how many workers tick at once.
+
+### Name the workflow with a lazy import
+
+`workflow` takes a **lazy import** of the workflow's module — `() => import('#workflows/daily_report_workflow')` — the same way the Adonis router [recommends lazy-loading controllers](https://docs.adonisjs.com/guides/basics/controllers). Import the class directly and the config can hang the app on boot:
+
+- a config file is loaded **while the app boots**;
+- a workflow module usually imports something that imports a service — `db`, `logger`, `redis` — and an Adonis service waits for the boot to finish (`await app.booted(...)`) the moment it is imported;
+- so the import waits for the boot, the boot waits for the config, and the process hangs, with no error.
+
+A lazy import is only a function until the worker loop starts. `durable:work` and the [embedded worker](#running-the-loop-in-the-web-process) call it once, after boot, and resolve the class to its registered name. A module with no default export, or a default export with no `static workflow = { name }`, stops the worker from starting instead of failing on every tick.
+
+To have `input` checked against the workflow's `run`, annotate the schedule with an `import type` — it is erased at runtime, so it imports nothing at boot:
+
+```ts title="config/durable.ts"
+import type { LazyWorkflowImport, ScheduledWorkflow } from '@adonis-agora/durable'
+import type DailyReportWorkflow from '#workflows/daily_report_workflow'
+
+const nightlyReport: ScheduledWorkflow<LazyWorkflowImport<typeof DailyReportWorkflow>> = {
+  key: 'nightly-report',
+  workflow: () => import('#workflows/daily_report_workflow'),
+  input: { recipients: ['ops@example.com'] }, // checked against DailyReportWorkflow's run
+  cron: '0 2 * * *',
+  timezone: 'America/Sao_Paulo',
+}
+```
+
+`workflow` also takes the registered **name** as a string — for a workflow that runs in another runtime (a Python worker, say) — or the class itself, where the module you import from imports no service.
 
 ### Config wins over a colocated schedule
 
@@ -122,7 +153,7 @@ The two sources are merged by `key`, and **an entry in `config/durable.ts` wins*
 ```ts title="config/durable.ts"
 schedules: [
   // The class says `cron: '0 2 * * *'`; this environment says "not at all".
-  { key: 'daily-report', workflow: 'daily-report', cron: '0 2 * * *', paused: true },
+  { key: 'daily-report', workflow: () => import('#workflows/daily_report_workflow'), cron: '0 2 * * *', paused: true },
 ]
 ```
 
@@ -142,7 +173,12 @@ For that case, run the loop **inside the web process**:
 export default defineConfig({
   worker: { embedded: true },
   schedules: [
-    { key: 'daily-report', workflow: 'daily-report', cron: '0 2 * * *', timezone: 'America/Sao_Paulo' },
+    {
+      key: 'daily-report',
+      workflow: () => import('#workflows/daily_report_workflow'),
+      cron: '0 2 * * *',
+      timezone: 'America/Sao_Paulo',
+    },
   ],
 })
 ```
@@ -321,5 +357,7 @@ const schedules: ScheduledWorkflow[] = [
 
 await runSchedules(engine, schedules, Date.now())
 ```
+
+A schedule that names its workflow with a lazy import must go through `await resolveSchedules(schedules)` first, which calls the imports and returns the list with registered names; `runSchedules` refuses an unresolved one.
 
 `opts` (`{ random?, sleep? }`) overrides the `Math.random` / `setTimeout` used for `jitter`, so tests can make it deterministic and instant. Schedules you pass here directly are not seen by `listSchedules` / `setSchedulePaused` / `triggerSchedule`; those read the set the worker loop adopts (config plus colocated).

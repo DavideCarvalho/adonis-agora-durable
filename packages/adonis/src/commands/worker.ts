@@ -1,6 +1,6 @@
 import type { RunResult, WorkflowEngine } from '../index.js';
 import { withScheduleOrigin } from '../observability-scope.js';
-import { runSchedules, type ScheduledWorkflow } from '../scheduler.js';
+import { resolveSchedule, runSchedules, type ScheduledWorkflow } from '../scheduler.js';
 
 /** A minimal logger the worker loop writes progress to (the ace command's `this.logger` fits). */
 export interface WorkerLogger {
@@ -45,15 +45,18 @@ export interface TickOptions {
  * workflow classes' `static schedule` (colocation). **Config wins on a key collision**: a config entry
  * is an explicit, reviewed declaration and overrides a colocated schedule that shares its `key`
  * (the colocated one is dropped so the window isn't double-registered). Config schedules come first,
- * then the surviving discovered ones. Pure — the command wires it, the tests assert on it.
+ * then the surviving discovered ones. A schedule whose `workflow` is a class comes back with its
+ * registered name, and a class with no `static workflow = { name }` throws here, so the worker fails
+ * to start instead of failing on every tick. Pure — the command wires it, the tests assert on it.
  */
 export function mergeSchedules(
   configSchedules: readonly ScheduledWorkflow[],
   discovered: readonly ScheduledWorkflow[],
-): ScheduledWorkflow[] {
-  const configKeys = new Set(configSchedules.map((s) => s.key));
-  const surviving = discovered.filter((s) => !configKeys.has(s.key));
-  return [...configSchedules, ...surviving];
+): ScheduledWorkflow<string>[] {
+  const resolved = configSchedules.map(resolveSchedule);
+  const configKeys = new Set(resolved.map((s) => s.key));
+  const surviving = discovered.filter((s) => !configKeys.has(s.key)).map(resolveSchedule);
+  return [...resolved, ...surviving];
 }
 
 const settledCount = (results: RunResult[]): number => results.length;

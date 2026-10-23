@@ -42,6 +42,7 @@ import {
   hasResponderCapability,
   NOOP_RUN_DISPATCHER,
 } from '../src/role_bindings.js';
+import { resolveSchedules } from '../src/scheduler.js';
 import { setBootedApp } from '../src/services/booted_app.js';
 import {
   NoopWorkerRegistry,
@@ -586,7 +587,11 @@ export default class DurableProvider {
     const engine = await this.app.container.make(WorkflowEngine);
     // Same merge the command performs: `config.schedules` wins over a colocated `static schedule`
     // on a `key` collision.
-    const schedules = mergeSchedules(config.schedules ?? [], engine.discoveredSchedules);
+    // `resolveSchedules` calls the lazy `() => import('#workflows/…')` entries — now, after boot.
+    const schedules = mergeSchedules(
+      await resolveSchedules(config.schedules ?? []),
+      engine.discoveredSchedules,
+    );
     const logger = await this.#resolveLogger();
 
     let stop!: () => void;
