@@ -4519,10 +4519,10 @@ export class WorkflowEngine {
    * scale-down mid-turn, an OOM): its lease lapses with the run `suspended` on something that has
    * finished, and nothing wakes it before its timer.
    *
-   * So the dropped wake is kept here: once the lease is free (looked at every
-   * {@link LEASE_RECHECK_MAX_MS} at most, {@link LEASE_RECHECK_ATTEMPTS} times at most, whatever the
-   * run's status while it is leased: a wake that lands mid-turn finds it `running`), a run that is
-   * `suspended` (or `blocked`) is woken. A holder that already moved the run on makes this one spare replay that
+   * So the dropped wake is kept here and looked at again every {@link LEASE_RECHECK_MAX_MS} at most,
+   * {@link LEASE_RECHECK_ATTEMPTS} times at most, for as long as the run is leased, whatever its status
+   * (a wake that lands mid-turn finds it `running`). Once the lease is free, a run that is `suspended`
+   * or `blocked` is woken. A holder that already moved the run on makes this one spare replay that
    * re-parks. Best effort; the run's timer remains the fallback if this instance goes down too.
    */
   private recheckAfterLease(runId: string, lockedUntil: number | undefined, attempt = 1): void {

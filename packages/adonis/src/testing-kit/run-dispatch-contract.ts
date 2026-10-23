@@ -161,6 +161,18 @@ export async function assertMidTurnChildWake(opts: {
             return inner.saveCheckpoint(cp as never);
           };
         }
+        // The waiter and placeholder of a child sent together: once the turn is past sending, any
+        // placeholder written over a completion this way erases the child too.
+        if (prop === 'registerChildWaits') {
+          return async (entries: Array<{ checkpoint: { runId: string; seq: number } }>) => {
+            for (const { checkpoint } of entries) {
+              if (checkpoint.runId !== 'p') continue;
+              const current = await inner.getCheckpoint('p', checkpoint.seq);
+              if (current?.status === 'completed') erased.push(checkpoint.seq);
+            }
+            return inner.registerChildWaits(entries as never);
+          };
+        }
         if (prop === 'tryLockRun') {
           return async (runId: string, owner: string, until: number, now: number) => {
             const got = await inner.tryLockRun(runId, owner, until, now);
