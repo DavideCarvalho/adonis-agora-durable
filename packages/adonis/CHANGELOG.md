@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 0.53.0
+
+### Minor Changes
+
+- [#396](https://github.com/DavideCarvalho/adonis-agora-durable/pull/396) [`26acf04`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/26acf0477f64352266cafca50140bf63b01de5c0) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Derive every workflow's `origin` (the npm package that declared it) instead of requiring an opt-in. The engine resolves the nearest `package.json` `name` from, in order: the class's declaring file (captured by `@Scheduled` / `@OnEvent` / `@OnDiagnostic`), the discovered module's file (`app/workflows/…`, a built `build/…`, the generated barrel via the app root), or the file calling `registerWorkflowClass` / `engine.register` (a lib registering its own workflows is attributed to the lib). An explicit `static workflow.origin` / `register` `origin` option still wins, and `workflowAnnouncement` applies the same precedence. Derivation never guesses: an unresolvable workflow has no origin, and the provider logs the discovered workflows it couldn't attribute once at boot. `registerWorkflowsFromBarrel` takes an optional `{ appRoot }`, and `registerWorkflowsFromDir` / `registerWorkflowsFromBarrel` now return each workflow's resolved `origin`.
+
 ## 0.52.5
 
 ### Patch Changes
