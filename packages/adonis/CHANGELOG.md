@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 0.52.5
+
+### Patch Changes
+
+- [#395](https://github.com/DavideCarvalho/adonis-agora-durable/pull/395) [`00be2b0`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/00be2b08e8333ee4257917ec1c3a35c39f0ca182) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The engine's built-in workflows — the entity runner (`__entity`) and the `onEvent` accumulators (`__evt_debounce`, `__evt_batch`) — are now registered with `origin: '@adonis-agora/durable'`, so their runs land under the library in the console's ORIGIN facet instead of looking like the app's own. Target runs keep their own registration's origin.
+
 ## 0.52.4
 
 ### Patch Changes
