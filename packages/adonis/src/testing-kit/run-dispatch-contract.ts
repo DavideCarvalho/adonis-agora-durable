@@ -107,6 +107,11 @@ export async function assertMidTurnChildWake(opts: {
    * whose clock is past the lease, must find the run due on its timer poll.
    */
   holderGoesDownAfterSettle?: boolean;
+  /**
+   * The store refuses the refused-wake stamp (a schema without the column): only the in-memory
+   * re-check of the refused instance can resume the parent.
+   */
+  storeRefusesTheStamp?: boolean;
   /** The engines' `leaseMs`. Default 30 000. */
   leaseMs?: number;
   /** How long the turn stays held once the wake was refused. Default 2 500 ms. */
@@ -156,6 +161,9 @@ export async function assertMidTurnChildWake(opts: {
         }
         if (prop === 'updateRunIf') {
           return async (runId: string, statuses: never, patch: { status?: string }) => {
+            if (opts.storeRefusesTheStamp && 'wakeRequestedAt' in patch) {
+              throw new Error('no column wake_requested_at');
+            }
             if (runId === 'p' && patch.status === 'suspended' && !parked) {
               parked = true;
               await gate;
@@ -445,6 +453,11 @@ export const MID_TURN_VARIANTS = [
     label: 'the refused instance goes down',
     holderSkipsItsRecheck: true,
     refuserGoesDown: true,
+  },
+  {
+    label: 'the store cannot keep the request',
+    holderSkipsItsRecheck: true,
+    storeRefusesTheStamp: true,
   },
   {
     label: 'both instances go down',

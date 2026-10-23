@@ -4534,13 +4534,14 @@ export class WorkflowEngine {
         wakeRequestedAt: this.clock(),
       });
     } catch {
+      // Not kept (a schema without the column, a store error): the in-memory re-check is all there is.
       this.recheckAfterLease(runId, lockedUntil);
       return;
     }
     if (!marked) return;
     // The fast path for a holder that went down mid-turn: look again in memory too (it stops once a
     // turn served the request).
-    this.recheckAfterLease(runId, lockedUntil);
+    this.recheckAfterLease(runId, lockedUntil, 1, true);
     const nowMs = this.clock();
     if (!(await this.store.tryLockRun(runId, this.instanceId, nowMs + this.leaseMs, nowMs))) return;
     const fresh = await this.store.getRun(runId);
@@ -4577,28 +4578,34 @@ export class WorkflowEngine {
    * is free, a run that is `suspended` or `blocked` is woken. A holder that already moved the run on
    * makes this one spare replay that re-parks.
    */
-  private recheckAfterLease(runId: string, lockedUntil: number | undefined, attempt = 1): void {
+  private recheckAfterLease(
+    runId: string,
+    lockedUntil: number | undefined,
+    attempt = 1,
+    stamped = false,
+  ): void {
     if (this.draining || this.leaseRetries.has(runId)) return;
     const remaining = Math.max(0, (lockedUntil ?? this.clock()) - this.clock());
     const timer = setTimeout(() => {
       this.leaseRetries.delete(runId);
-      this.trackEffect(this.retryDroppedWake(runId, attempt));
+      this.trackEffect(this.retryDroppedWake(runId, attempt, stamped));
     }, Math.min(remaining, LEASE_RECHECK_MAX_MS) + LEASE_RECHECK_SLACK_MS);
     (timer as { unref?: () => void }).unref?.();
     this.leaseRetries.set(runId, timer);
   }
 
-  private async retryDroppedWake(runId: string, attempt: number): Promise<void> {
+  private async retryDroppedWake(runId: string, attempt: number, stamped: boolean): Promise<void> {
     if (this.draining) return;
     const run = await this.store.getRun(runId);
     if (!run || isTerminalRun(run.status)) return;
-    // A turn that started after the request served it (it cleared the stamp).
-    if (this.store.releaseRunLockUnlessWakeRequested && run.wakeRequestedAt === undefined) return;
+    // A turn that started after the request served it (it cleared the stamp). Only when the request
+    // was stamped: a wake whose stamp could not be written has nothing else looking for it.
+    if (stamped && run.wakeRequestedAt === undefined) return;
     const nowMs = this.clock();
     // Still leased: the holder's turn is still executing (status `running`), or another wake's turn
     // took it. Look again; giving up here is how a wake that landed mid-turn was lost.
     if (run.lockedUntil !== undefined && run.lockedUntil > nowMs) {
-      this.recheckAfterLease(runId, run.lockedUntil, attempt + 1);
+      this.recheckAfterLease(runId, run.lockedUntil, attempt + 1, stamped);
       return;
     }
     // Free, and `pending` (its dispatch or the pending-run poll runs it) or `running` with no lease
