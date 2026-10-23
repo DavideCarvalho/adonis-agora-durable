@@ -7,7 +7,7 @@
     },
     "test": {
       "dependsOn": ["build", "^build"],
-      "env": ["CI", "REDIS_URL", "DURABLE_REDIS_URL", "DURABLE_PG_URL"],
+      "env": ["CI", "REDIS_URL", "DURABLE_REDIS_URL", "DURABLE_PG_URL", "DURABLE_MYSQL_URL"],
       "outputs": ["coverage/**"]
     },
     "test:watch": {
