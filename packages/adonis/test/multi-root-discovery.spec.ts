@@ -177,7 +177,8 @@ describe('generated barrels', () => {
     const meta = await registerWorkflowsFromBarrel(engine, {
       billing: { Nested: async () => ({ default: Nested }) },
     });
-    expect(meta).toEqual([{ name: 'nested', version: '1' }]);
+    // No `appRoot`: attributed to the calling package (this test tree).
+    expect(meta).toEqual([{ name: 'nested', version: '1', origin: '@adonis-agora/durable' }]);
   });
 
   it('a multi-root barrel registers every root and rejects a cross-root clash with both keys', async () => {

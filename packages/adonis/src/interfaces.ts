@@ -44,12 +44,21 @@ export interface WorkflowRun {
   workflowVersion: string;
   status: RunStatus;
   /**
-   * Which package's code produced this run — free-form attribution (e.g.
-   * `@adonis-agora/catalog-pipeline`), stamped at start from the workflow registration's `origin`
-   * (or a per-start override). `undefined` for the app's own workflows (a registration that declares
-   * no origin) and on runs created before the field existed — the console labels those `app`. Powers
-   * the console's origin facet (shown only once some run has a named origin); parity with the
-   * NestJS twin's `origin` column.
+   * Which package's code produced this run — e.g. `@adonis-agora/catalog-pipeline` for a workflow
+   * shipped by a lib, or the host app's own `package.json` `name` for one written in the app. Stamped
+   * at start from the workflow registration's `origin` (or a per-start override).
+   *
+   * The registration's origin is DERIVED unless declared: the nearest `package.json` `name` of the
+   * class's declaring file (captured by `@Scheduled` / `@OnEvent` / `@OnDiagnostic`), else of the
+   * discovered module (`app/workflows/…`, a built `build/…`), else of the code calling
+   * `registerWorkflowClass` / `engine.register`. An explicit `static workflow.origin` or `register`
+   * `origin` option always wins. Derivation never guesses: when nothing resolves, the run has none.
+   *
+   * `undefined` therefore means "couldn't derive" (no usable stack frame, no named `package.json`
+   * above the file, a `registerRemote` / convention-routed registration) or a run created before the
+   * field existed — the console groups those under `app`. Powers the console's origin facet (shown only once some run
+   * has a named origin); parity
+   * with the NestJS twin's `origin` column. See `./origin.ts` for the derivation and its limits.
    */
   origin?: string | undefined;
   /**

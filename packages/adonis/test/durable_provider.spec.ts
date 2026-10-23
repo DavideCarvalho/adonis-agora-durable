@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ApplicationService } from '@adonisjs/core/types';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import DurableProvider from '../providers/durable_provider.js';
 import type { DurableConfig } from '../src/define_config.js';
 import {
@@ -375,6 +375,41 @@ describe('DurableProvider — app/workflows auto-discovery (boot)', () => {
     const result = await engine.waitForRun('o1');
     expect(result.status).toBe('completed');
     expect(result.output).toBe('order:abc');
+  });
+
+  it('stamps discovered workflows with the app origin and reports unattributed ones once at boot', async () => {
+    const source = (name: string) =>
+      `export default class W { static workflow = { name: '${name}' }; async run() { return 'ok' } }`;
+    // `attributed/` sits under a package.json; the temp root above it has none.
+    await mkdir(join(dir, 'attributed'));
+    await writeFile(join(dir, 'attributed/package.json'), JSON.stringify({ name: 'origin-app' }));
+    await writeFile(join(dir, 'attributed/a_workflow.ts'), source('attributed-wf'));
+    await mkdir(join(dir, 'orphan'));
+    await writeFile(join(dir, 'orphan/b_workflow.ts'), source('orphan-wf'));
+
+    const warned: string[] = [];
+    const warn = vi.spyOn(console, 'warn').mockImplementation((message: unknown) => {
+      warned.push(String(message));
+    });
+    try {
+      const { app, resolve } = fakeApp({ workflowsPath: ['attributed', 'orphan'] }, dir);
+      const provider = new DurableProvider(app);
+      provider.register();
+      await provider.boot();
+      await vi.waitFor(() => expect(warned.join('\n')).toContain('could not derive an origin'));
+
+      const engine = await resolve();
+      await engine.start('attributed-wf', {}, 'a1');
+      await engine.start('orphan-wf', {}, 'b1');
+      expect((await engine.getRun('a1'))?.origin).toBe('origin-app');
+      expect((await engine.getRun('b1'))?.origin).toBeUndefined();
+      const report = warned.filter((m) => m.includes('could not derive an origin'));
+      expect(report).toHaveLength(1);
+      expect(report[0]).toContain('orphan-wf');
+      expect(report[0]).not.toContain('attributed-wf');
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('skips discovery when workflowsPath is false', async () => {

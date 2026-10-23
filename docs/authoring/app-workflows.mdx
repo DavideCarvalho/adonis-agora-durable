@@ -64,7 +64,7 @@ ref (`OrderWorkflow.dispatch(input)`, `ctx.child(OrderWorkflow)`) carries its in
 | `onError` | Route a failed run to a handler workflow by error `code`. See [onError routing](/docs/durable/reliability/on-error). |
 | `inputSchema` | A Standard Schema validated at start. See [below](#validating-the-input). |
 | `searchAttributes` | A typed search-attributes schema. See [Typed search attributes](/docs/durable/concepts/workflows-and-steps#typed-search-attributes). |
-| `origin` | Package attribution stamped on every run (the console's origin facet). Omit it for an app-local workflow. |
+| `origin` | Package attribution stamped on every run (the console's origin facet). Usually omitted: it is derived from the nearest `package.json` `name` (your app's, for a workflow in `app/workflows`). Set it to override. See [Run origin](/docs/durable/concepts/workflows-and-steps#run-origin--package-attribution). |
 
 Discovery forwards each of these to `engine.register`. Two names differ between the two forms:
 `searchAttributes` here is `searchAttributesSchema` on `engine.register`. And three `engine.register`

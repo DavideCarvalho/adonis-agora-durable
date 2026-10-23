@@ -163,7 +163,7 @@ Related helpers:
 | `onEvent` | `string[]` | Event names whose `engine.publishEvent` starts a run of this workflow. See [Named events](/docs/durable/concepts/sleep-and-signals#named-events). |
 | `singleton` | `SingletonConfig` (`{ key: (input: unknown) => string; limit?: number; maxQueueDepth?: number }`) | Durable FIFO mutex per key. See [Singleton workflows](/docs/durable/reliability/singleton). |
 | `concurrency` | `ConcurrencyConfig` (`{ key: (input: unknown) => string \| undefined; limit: number \| ((key: string) => number \| Promise<number>); countStatuses?: RunStatus[] }`) | Start-time quota per key, shared across workflows. An over-limit start throws `ConcurrencyLimitError`. See [Concurrency quotas](/docs/durable/reliability/concurrency-quotas). |
-| `origin` | `string` | Package attribution stamped on every run (`WorkflowRun.origin`). See [Run origin](/docs/durable/concepts/workflows-and-steps#run-origin--package-attribution). |
+| `origin` | `string` | Package attribution stamped on every run (`WorkflowRun.origin`). Overrides the origin derived from the nearest `package.json` `name`. See [Run origin](/docs/durable/concepts/workflows-and-steps#run-origin--package-attribution). |
 | `onError` | `{ code?: string \| { readonly code: string }; workflow: WorkflowRef }[]` | Route a failed run to a handler workflow by error `code` (string or an error class with a `static code`; omit for the catch-all). See [Routing a run's failure](/docs/durable/reliability/on-error). |
 | `deadLetterWorkflow` | `WorkflowRef` | The workflow a `dead` run of this one is handed to (overrides the config default). Mutually exclusive with a `deadLetter()` method. See [Dead-letter queue](/docs/durable/reliability/dead-letter#a-deadletterworkflow-reference). |
 | `inputSchema` | `StandardSchemaV1` | Any Standard Schema (zod, valibot, arktype, …). Validated at start before a run is created. The run stores the input as sent; `run` receives the schema's output, re-parsed before every turn. A failure throws `SchemaValidationError`. See [Validating the input](/docs/durable/authoring/app-workflows#validating-the-input). |
@@ -507,8 +507,8 @@ What the provider runs over `workflowsPath` / `stepsPath`, for a directory it do
 
 | Export | Signature | Notes |
 | --- | --- | --- |
-| `registerWorkflowsFromDir` | `registerWorkflowsFromDir(engine, dir: string \| string[], factory?): Promise<WorkflowMeta[]>` | Import every module under `dir` and register its `BaseWorkflow` classes. |
-| `registerWorkflowsFromBarrel` | `registerWorkflowsFromBarrel(engine, barrel, factory?): Promise<WorkflowMeta[]>` | The same over a generated barrel (`hooks/workflows`). |
+| `registerWorkflowsFromDir` | `registerWorkflowsFromDir(engine, dir: string \| string[], factory?): Promise<WorkflowMeta[]>` | Import every module under `dir` and register its `BaseWorkflow` classes. The returned metadata carries each workflow's resolved `origin`. |
+| `registerWorkflowsFromBarrel` | `registerWorkflowsFromBarrel(engine, barrel, factory?, options?: { appRoot?: string \| URL }): Promise<WorkflowMeta[]>` | The same over a generated barrel (`hooks/workflows`). `appRoot` is the app the barrel was generated for: its modules derive their [origin](/docs/durable/concepts/workflows-and-steps#run-origin--package-attribution) from it. Without it they're attributed to the calling package. |
 | `registerStepsFromDir` / `registerStepsFromBarrel` | `(server: StepServer, dir \| barrel) => Promise<DurableStepMeta[]>` | Serve every `@Step` class and `defineStep` handler found. The engine is a `StepServer`. |
 | `registerWorkflowClass` / `registerSteps` | `registerWorkflowClass(engine, cls, factory?)` / `registerSteps(server, exports)` | Register one class, or the steps in a list of module exports. |
 | `parseDuration` | `parseDuration(duration: string \| number): number` | The duration parser every `'30s'` / `'7 days'` option goes through. |

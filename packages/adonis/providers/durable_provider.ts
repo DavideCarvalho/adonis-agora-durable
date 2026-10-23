@@ -30,6 +30,7 @@ import {
   type TransportContext,
   WorkflowEngine,
   type WorkflowEngineDeps,
+  type WorkflowMeta,
   type WorkflowsBarrel,
 } from '../src/index.js';
 import {
@@ -500,13 +501,19 @@ export default class DurableProvider {
     const workflowFactory = (ctor: { new (): unknown }) => this.app.container.make(ctor);
 
     const barrel = await this.#loadGeneratedWorkflowsBarrel();
-    if (barrel) {
-      await registerWorkflowsFromBarrel(engine, barrel, workflowFactory);
-    } else {
-      // Fallback: no generated barrel — scan every configured directory at runtime.
-      const dirs = workflowRoots.map((root) => this.app.makePath(root));
-      await registerWorkflowsFromDir(engine, dirs, workflowFactory);
-    }
+    // `appRoot` lets the barrel's path-less modules derive their origin from the app's own
+    // `package.json` (a built app's `build/package.json` carries the same name).
+    const registered = barrel
+      ? await registerWorkflowsFromBarrel(engine, barrel, workflowFactory, {
+          appRoot: this.app.makePath(),
+        })
+      : // Fallback: no generated barrel — scan every configured directory at runtime.
+        await registerWorkflowsFromDir(
+          engine,
+          workflowRoots.map((root) => this.app.makePath(root)),
+          workflowFactory,
+        );
+    void this.#reportUnattributedWorkflows(registered).catch(() => undefined);
     void this.#reportUnservedOnErrorRoutes(engine).catch(() => undefined);
 
     // Event-triggered workflows (`static on` / `@OnEvent` / `@OnDiagnostic`): bridge the
@@ -520,6 +527,22 @@ export default class DurableProvider {
         ...(emitter !== undefined ? { emitter } : {}),
       });
     }
+  }
+
+  /**
+   * Says, once at boot, which discovered workflows came back with no origin — neither an explicit
+   * `static workflow.origin` nor a `package.json` `name` derivable from their files (see
+   * `src/origin.ts`). Their runs carry no origin (the console's `app` bucket) rather than a guess.
+   */
+  async #reportUnattributedWorkflows(registered: readonly WorkflowMeta[]): Promise<void> {
+    const unattributed = registered.filter((meta) => !meta.origin).map((meta) => meta.name);
+    if (unattributed.length === 0) return;
+    const message = `durable: could not derive an origin for ${unattributed.length} workflow(s): ${unattributed.join(', ')}. Their runs will carry no origin; set \`static workflow = { origin }\` to attribute them.`;
+    const logger = (await this.app.container.make('logger').catch(() => undefined)) as
+      | { warn?: (message: string) => void }
+      | undefined;
+    if (typeof logger?.warn === 'function') logger.warn(message);
+    else console.warn(message);
   }
 
   /**

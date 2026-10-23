@@ -1,3 +1,4 @@
+import { callerFile, rememberDeclaringFile } from './origin.js';
 import { type WorkflowClass, workflowMeta } from './workflow-ref.js';
 
 /**
@@ -88,7 +89,12 @@ function stampOn(target: unknown, config: WorkflowEventTrigger | WorkflowEventTr
  * ```
  */
 export function OnEvent(config: EmitterTriggerConfig): ClassDecorator {
-  return (target) => stampOn(target, { source: 'emitter', ...config });
+  // The declaring module is the caller of this factory: the class's origin (see `./origin.ts`).
+  const declaredIn = callerFile(OnEvent);
+  return (target) => {
+    rememberDeclaringFile(target, declaredIn);
+    stampOn(target, { source: 'emitter', ...config });
+  };
 }
 
 /**
@@ -102,7 +108,12 @@ export function OnEvent(config: EmitterTriggerConfig): ClassDecorator {
  * ```
  */
 export function OnDiagnostic(config: DiagnosticsTriggerConfig): ClassDecorator {
-  return (target) => stampOn(target, { source: 'diagnostics', ...config });
+  // The declaring module is the caller of this factory: the class's origin (see `./origin.ts`).
+  const declaredIn = callerFile(OnDiagnostic);
+  return (target) => {
+    rememberDeclaringFile(target, declaredIn);
+    stampOn(target, { source: 'diagnostics', ...config });
+  };
 }
 
 /** Workflow-class shape used by the bridge to start a run on a matching event. */

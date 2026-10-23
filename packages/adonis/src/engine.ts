@@ -111,6 +111,7 @@ import {
   retiredHandoffName,
   routeFor,
 } from './on-error.js';
+import { ORIGIN_RESOLVED, originOfCaller } from './origin.js';
 import { breakpointToken, type StepHandler, stepId } from './protocol.js';
 import type { QueueConfig } from './queue.js';
 import { markRemoteEvent } from './remote-event.js';
@@ -1626,14 +1627,25 @@ export class WorkflowEngine {
       onEvent?: string[] | undefined;
       eventBatch?: EventBatchConfig | undefined;
       requires?: string[] | undefined;
-      /** Package attribution stamped on every run this registration starts (WorkflowRun.origin). */
+      /**
+       * Package attribution stamped on every run this registration starts (WorkflowRun.origin).
+       * Omit it and the origin is DERIVED from the calling file's nearest `package.json` `name` (a
+       * lib registering its own workflow is attributed to the lib) — `undefined` when that cannot be
+       * resolved with confidence. An explicit value always wins. See `./origin.ts`.
+       */
       origin?: string | undefined;
       /** Handler workflows a matching failure is routed to — see {@link OnErrorRoute}. */
       onError?: OnErrorRoute[] | undefined;
       /** Where a `dead` run of this workflow is handed (overrides the engine's default). */
       deadLetterWorkflow?: WorkflowRef | undefined;
+      /** @internal `origin` was already resolved by the caller (class / discovery paths): don't derive. */
+      [ORIGIN_RESOLVED]?: true | undefined;
     },
   ): void {
+    // Derived HERE, synchronously, so the first frame above `register` is the registering caller.
+    const origin =
+      opts?.origin ||
+      (opts?.[ORIGIN_RESOLVED] ? undefined : originOfCaller(WorkflowEngine.prototype.register));
     const registered: RegisteredWorkflow = {
       name,
       version,
@@ -1642,7 +1654,7 @@ export class WorkflowEngine {
       deadLetterWorkflow:
         opts?.deadLetterWorkflow !== undefined ? workflowName(opts.deadLetterWorkflow) : undefined,
       tags: opts?.tags,
-      origin: opts?.origin,
+      origin,
       singleton: opts?.singleton,
       concurrency: opts?.concurrency,
       executionTimeoutMs:

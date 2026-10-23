@@ -97,7 +97,8 @@ describe('registerWorkflowsFromBarrel (provider consumes the generated barrel)',
     const engine = new WorkflowEngine({ store });
     const meta = await registerWorkflowsFromBarrel(engine, barrel);
 
-    expect(meta).toEqual([{ name: 'greet', version: '1' }]);
+    // No `appRoot`: attributed to the calling package (this test tree).
+    expect(meta).toEqual([{ name: 'greet', version: '1', origin: '@adonis-agora/durable' }]);
 
     const run = await startRun(engine, 'greet', { name: 'ada' }, 'r1');
     expect(run.status).toBe('completed');
@@ -120,7 +121,7 @@ describe('registerWorkflowsFromBarrel (provider consumes the generated barrel)',
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });
     const meta = await registerWorkflowsFromBarrel(engine, barrel);
-    expect(meta).toEqual([{ name: 'once', version: '1' }]);
+    expect(meta).toEqual([{ name: 'once', version: '1', origin: '@adonis-agora/durable' }]);
   });
 
   it('ignores non-workflow exports in a barrel module', async () => {
