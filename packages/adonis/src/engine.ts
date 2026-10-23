@@ -4520,8 +4520,9 @@ export class WorkflowEngine {
    * finished, and nothing wakes it before its timer.
    *
    * So the dropped wake is kept here: once the lease is free (looked at every
-   * {@link LEASE_RECHECK_MAX_MS} at most, {@link LEASE_RECHECK_ATTEMPTS} times at most), a run still
-   * `suspended` is woken. A holder that already moved the run on makes this one spare replay that
+   * {@link LEASE_RECHECK_MAX_MS} at most, {@link LEASE_RECHECK_ATTEMPTS} times at most, whatever the
+   * run's status while it is leased: a wake that lands mid-turn finds it `running`), a run that is
+   * `suspended` (or `blocked`) is woken. A holder that already moved the run on makes this one spare replay that
    * re-parks. Best effort; the run's timer remains the fallback if this instance goes down too.
    */
   private recheckAfterLease(runId: string, lockedUntil: number | undefined, attempt = 1): void {
@@ -4538,14 +4539,19 @@ export class WorkflowEngine {
   private async retryDroppedWake(runId: string, attempt: number): Promise<void> {
     if (this.draining) return;
     const run = await this.store.getRun(runId);
-    if (run?.status !== 'suspended') return;
+    if (!run || isTerminalRun(run.status)) return;
     const nowMs = this.clock();
+    // Still leased: the holder's turn is still executing (status `running`), or another wake's turn
+    // took it. Look again; giving up here is how a wake that landed mid-turn was lost.
     if (run.lockedUntil !== undefined && run.lockedUntil > nowMs) {
       if (attempt < LEASE_RECHECK_ATTEMPTS) {
         this.recheckAfterLease(runId, run.lockedUntil, attempt + 1);
       }
       return;
     }
+    // Free, and `pending` (its dispatch or the pending-run poll runs it) or `running` with no lease
+    // (a holder that died mid-turn: crash recovery takes it): nothing for a wake to do.
+    if (run.status !== 'suspended' && run.status !== 'blocked') return;
     if (this.runQueue) {
       this.enqueueRun(
         {
@@ -4559,7 +4565,7 @@ export class WorkflowEngine {
     }
     if (!(await this.store.tryLockRun(runId, this.instanceId, nowMs + this.leaseMs, nowMs))) return;
     const fresh = await this.store.getRun(runId);
-    if (fresh?.status !== 'suspended') {
+    if (fresh?.status !== 'suspended' && fresh?.status !== 'blocked') {
       await this.store.releaseRunLock(runId, this.instanceId);
       return;
     }
