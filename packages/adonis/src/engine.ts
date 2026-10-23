@@ -6088,7 +6088,7 @@ export class WorkflowEngine {
           validateStandardSync(
             schema,
             merged,
-            `workflow "${run?.workflow}": ctx.upsertSearchAttributes`,
+            `workflow "${run?.workflow}" ctx.upsertSearchAttributes`,
           );
         }
         await this.store.updateRun(runId, {

@@ -73,7 +73,7 @@ describe('validateStandard', () => {
     expect(err.retryable).toBe(false);
     expect(err.issues).toEqual([{ message: 'must be a positive number', path: ['n'] }]);
     expect(err.details).toEqual({ issues: err.issues });
-    expect(err.message).toMatch(/thing failed schema validation — n: must be a positive number/);
+    expect(err.message).toBe('invalid thing: n: must be a positive number');
   });
 });
 
@@ -127,7 +127,7 @@ describe('step schemas — any Standard Schema', () => {
     expect(run.status).toBe('failed');
     expect(cp?.attempts).toBe(1);
     expect(cp?.error?.code).toBe('invalid_output');
-    expect(cp?.error?.message).toMatch(/step "v:out-bad" output/);
+    expect(cp?.error?.message).toMatch(/^invalid step "v:out-bad" output: /);
   });
 
   it('arktype: input + output schemas', async () => {
@@ -187,7 +187,7 @@ describe('workflow inputSchema', () => {
 
     const err = await engine.start('checkout', { qty: 3 }, 'bad').catch((e) => e);
     expect(err).toBeInstanceOf(SchemaValidationError);
-    expect(err.message).toMatch(/workflow "checkout" input/);
+    expect(err.message).toMatch(/^invalid workflow "checkout" input: qty: /);
     expect(err.code).toBe('invalid_input');
     expect(await store.getRun('bad')).toBeNull();
     expect(order).toEqual([]); // the schema runs first; validateInput never saw the bad payload

@@ -212,12 +212,13 @@ export class SchemaValidationError extends FatalError {
         String(typeof segment === 'object' && segment !== null ? segment.key : segment),
       ),
     }));
+    // The message format `@dudousxd/nestjs-durable` uses: `invalid <label>: <path>: <message>; …`.
     const summary = normalized
-      .map(
-        (issue) => `${issue.path.length > 0 ? issue.path.join('.') : '(root)'}: ${issue.message}`,
+      .map((issue) =>
+        issue.path.length > 0 ? `${issue.path.join('.')}: ${issue.message}` : issue.message,
       )
       .join('; ');
-    super(`${label} failed schema validation — ${summary}`, code, {
+    super(`invalid ${label}: ${summary}`, code, {
       issues: normalized,
     });
     this.name = 'SchemaValidationError';
