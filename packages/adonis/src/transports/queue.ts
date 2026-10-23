@@ -440,8 +440,8 @@ export class QueueTransport implements Transport, ControlPlane {
   #decisionsLoop = false;
   #stepEventsLoop = false;
   #startRunLoop = false;
-  /** Stops the run-queue consumer (see {@link onRun}). */
-  #stopRuns: (() => Promise<void>) | undefined;
+  /** Stops each run-queue consumer (see {@link onDispatchedRun}), by queue name. */
+  readonly #stopRuns = new Map<string, () => Promise<void>>();
   #runRequestLoop = false;
   #runRepliesLoop = false;
   #runReplyHandler: ((reply: RunReply) => void) | undefined;
@@ -641,8 +641,11 @@ export class QueueTransport implements Transport, ControlPlane {
   #stepEventsQueue(): string {
     return `${this.#effectivePrefix()}:step-events`;
   }
-  #runsQueue(): string {
-    return `${this.#effectivePrefix()}:runs`;
+  /** `${P}:runs` of `namespace` (absent: this transport's own namespace). */
+  #runsQueue(namespace?: string): string {
+    const ns = namespace ?? this.#namespace;
+    const prefix = ns && ns !== 'default' ? `${this.#prefix}-${ns}` : this.#prefix;
+    return `${prefix}:runs`;
   }
   #startRunQueue(): string {
     return `${this.#effectivePrefix()}:start-run`;
@@ -975,35 +978,41 @@ export class QueueTransport implements Transport, ControlPlane {
   // ---------------------------------------------------------------------------
 
   /**
-   * engine → engines: enqueue runs on `${P}:runs` (job `run`), {@link RUN_PUSH_CHUNK} per
-   * `pushManyOn` when the adapter has it.
+   * engine → engines: enqueue runs on `${P}:runs` of `opts.namespace` (job `run`, with the run's
+   * priority), {@link RUN_PUSH_CHUNK} per `pushManyOn` when the adapter has it.
    */
-  async dispatchRuns(runs: readonly RunDispatch[]): Promise<void> {
-    const queue = this.#runsQueue();
+  async dispatchRuns(
+    runs: readonly RunDispatch[],
+    opts?: { namespace?: string | undefined },
+  ): Promise<void> {
+    const queue = this.#runsQueue(opts?.namespace);
     for (let at = 0; at < runs.length; at += RUN_PUSH_CHUNK) {
       const jobs = runs
         .slice(at, at + RUN_PUSH_CHUNK)
-        .map((run) => this.#job('run', run satisfies RunDispatch));
+        .map((run) => this.#job('run', run satisfies RunDispatch, run.priority));
       if (this.#adapter.pushManyOn) await this.#adapter.pushManyOn(queue, jobs);
       else await Promise.all(jobs.map((job) => this.#adapter.pushOn(queue, job)));
     }
   }
 
   /**
-   * engine ← run queue: consume `${P}:runs`, at most `opts.concurrency` (default 1) jobs at once.
-   * Parked while consumers are deferred. A second call returns the first one's stop, which stops
-   * popping and waits for the jobs in a handler.
+   * engine ← run queue: consume `${P}:runs` of `opts.namespace`, at most `opts.concurrency` jobs at
+   * once, handing each run id to `handler`. Parked while consumers are deferred. A second call for
+   * the same queue returns the first one's stop, which stops popping and waits for the jobs in a
+   * handler.
    */
-  onRun(
-    handler: (run: RunDispatch) => Promise<void>,
-    opts?: { concurrency?: number | undefined },
+  onDispatchedRun(
+    handler: (runId: string) => Promise<void>,
+    opts: { concurrency: number; namespace?: string | undefined },
   ): () => Promise<void> {
-    if (this.#stopRuns) return this.#stopRuns;
+    const name = this.#runsQueue(opts.namespace);
+    const existing = this.#stopRuns.get(name);
+    if (existing) return existing;
     const running = new Set<Promise<void>>();
     const loop = this.#startLoop(
-      this.#runsQueue(),
+      name,
       async (job) => {
-        const work = handler(fromJson<RunDispatch>(job.payload));
+        const work = handler(fromJson<RunDispatch>(job.payload).runId);
         running.add(work);
         try {
           await work;
@@ -1011,17 +1020,18 @@ export class QueueTransport implements Transport, ControlPlane {
           running.delete(work);
         }
       },
-      { concurrency: atLeastOne(opts?.concurrency, 1), idleBackoffMax: this.#idleBackoffMax },
+      { concurrency: atLeastOne(opts.concurrency, 1), idleBackoffMax: this.#idleBackoffMax },
     );
     let stopped: Promise<void> | undefined;
-    this.#stopRuns = () => {
+    const stop = () => {
       stopped ??= (async () => {
         loop.stop();
         await Promise.allSettled([...running]);
       })();
       return stopped;
     };
-    return this.#stopRuns;
+    this.#stopRuns.set(name, stop);
+    return stop;
   }
 
   /** tenant → control plane: enqueue a {@link StartRunMessage} on `${P}:start-run` (job `startRun`),

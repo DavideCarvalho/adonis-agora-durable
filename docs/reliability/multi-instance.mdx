@@ -31,6 +31,8 @@ What stays on the instance that already holds the run: a step result resumes the
 
 On a run-queue transport, `engine.signal()` resolves once the wake is handed to the queue (`status: 'suspended'`), not after the resumed turn. Use `waitForRun` for the outcome. `eventEmitter` and `memory` have no run queue: runs execute on the instance that triggers them, as before.
 
+Each [namespace](/docs/durable/transports/queue#namespaces--sharing-one-broker-across-pools) has its own run queue: an engine dispatches to, and consumes, its own namespace's queue, so a pool's runs stay on that pool's instances. An operator (an engine with no `namespace`) drives every pool's runs and uses the transport's own queue. A run's `priority` is carried along: on `bullmq` and `queue` the more urgent run is taken first; `db` takes the oldest first.
+
 The queue is at-least-once and every delivery is checked against the store: a start whose run is no longer `pending` (another instance's pending-run poll took it first, or it already ran) is skipped, a wake for a finished run is skipped, and the run lease admits one executor either way.
 
 - **A failed enqueue loses nothing.** A start that could not be enqueued stays `pending`, and the next pending-run poll (`durable:work`, the embedded worker) runs it. A wake that could not be enqueued resumes the run on the instance that delivered it. The engine reports the failures at most once a minute.

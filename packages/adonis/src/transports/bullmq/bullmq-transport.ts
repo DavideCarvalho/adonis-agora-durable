@@ -212,9 +212,8 @@ export class BullMQTransport implements Transport {
 
   // P4 store-less protocol: start-run / run-request queues + consumers, run-reply / tenant-events pub/sub.
   #startRunWorker: WorkerLike | undefined;
-  // The run queue consumer (see onRun), and the stop() it handed out.
-  #runsWorker: WorkerLike | undefined;
-  #stopRuns: (() => Promise<void>) | undefined;
+  // The run queue consumers (see onDispatchedRun), by queue name, and the stop() each handed out.
+  readonly #runsWorkers = new Map<string, { worker: WorkerLike; stop: () => Promise<void> }>();
   #runRequestWorker: WorkerLike | undefined;
   #runReplyPub: RedisLike | undefined;
   #runReplySub: RedisLike | undefined;
@@ -1054,16 +1053,19 @@ export class BullMQTransport implements Transport {
    * key (the run went `pending` again) is a new job even while the earlier one is active. A `wake`
    * carries none: a wake that lands while an earlier one is being processed must not be dropped.
    */
-  async dispatchRuns(runs: readonly RunDispatch[]): Promise<void> {
+  async dispatchRuns(
+    runs: readonly RunDispatch[],
+    opts?: { namespace?: string | undefined },
+  ): Promise<void> {
     if (runs.length === 0) return;
-    const queue = this.#queue(runsName(this.#effectivePrefix()));
+    const queue = this.#queue(this.#runsQueueName(opts?.namespace));
     const jobs = runs.map((run) => ({
       name: 'run',
       data: run satisfies RunDispatch,
       opts:
         run.reason === 'start' && run.key !== undefined
-          ? { ...jobOptions(), jobId: runStartJobId(run.runId, run.key) }
-          : jobOptions(),
+          ? { ...jobOptions(run.priority), jobId: runStartJobId(run.runId, run.key) }
+          : jobOptions(run.priority),
     }));
     for (let at = 0; at < jobs.length; at += RUN_ADD_BULK_CHUNK) {
       const chunk = jobs.slice(at, at + RUN_ADD_BULK_CHUNK);
@@ -1072,31 +1074,36 @@ export class BullMQTransport implements Transport {
     }
   }
 
+  /** `${P}-runs` of `namespace` (absent: this transport's own namespace). */
+  #runsQueueName(namespace: string | undefined): string {
+    return runsName(effectivePrefix(this.#prefix, namespace ?? this.#namespace));
+  }
+
   /**
-   * engine ← run queue: consume `${P}-runs`, `opts.concurrency` jobs at once (default 1). A second
-   * call returns the first one's stop. The stop closes the worker: BullMQ fetches nothing more and
-   * waits for the jobs in flight.
+   * engine ← run queue: consume `${P}-runs` of `opts.namespace`, `opts.concurrency` jobs at once,
+   * handing each run id to `handler`. A second call for the same queue returns the first one's stop.
+   * The stop closes the worker: BullMQ fetches nothing more and waits for the jobs in flight.
    */
-  onRun(
-    handler: (run: RunDispatch) => Promise<void>,
-    opts?: { concurrency?: number | undefined },
+  onDispatchedRun(
+    handler: (runId: string) => Promise<void>,
+    opts: { concurrency: number; namespace?: string | undefined },
   ): () => Promise<void> {
-    if (this.#stopRuns) return this.#stopRuns;
-    const worker = this.#makeWorker(
-      runsName(this.#effectivePrefix()),
-      (job) => handler(job.data as RunDispatch),
-      { concurrency: workerConcurrency(opts?.concurrency) },
-    );
-    this.#runsWorker = worker;
+    const name = this.#runsQueueName(opts.namespace);
+    const existing = this.#runsWorkers.get(name);
+    if (existing) return existing.stop;
+    const worker = this.#makeWorker(name, (job) => handler((job.data as RunDispatch).runId), {
+      concurrency: workerConcurrency(opts.concurrency),
+    });
     let stopped: Promise<void> | undefined;
-    this.#stopRuns = () => {
+    const stop = () => {
       stopped ??= worker.close().then(
         () => undefined,
         () => undefined,
       );
       return stopped;
     };
-    return this.#stopRuns;
+    this.#runsWorkers.set(name, { worker, stop });
+    return stop;
   }
 
   /** tenant → control plane: enqueue a {@link StartRunMessage} on `${P}-start-run` (job `startRun`). */
@@ -1239,7 +1246,7 @@ export class BullMQTransport implements Transport {
       this.#stepEventsWorker?.close(),
       this.#startRunWorker?.close(),
       this.#runRequestWorker?.close(),
-      this.#runsWorker?.close(),
+      ...[...this.#runsWorkers.values()].map((r) => r.worker.close()),
     ];
     await withTimeout(Promise.allSettled(workers.filter((p) => p !== undefined)), remaining());
     await withTimeout(

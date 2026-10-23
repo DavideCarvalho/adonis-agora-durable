@@ -14,22 +14,22 @@ import { InMemoryTransport } from '../src/testing/in-memory-transport.js';
  */
 class RunQueueTransport extends InMemoryTransport {
   readonly dispatched: RunDispatch[] = [];
-  handler: ((run: RunDispatch) => Promise<void>) | undefined;
+  handler: ((runId: string) => Promise<void>) | undefined;
   consumerConcurrency: number | undefined;
   stopped = 0;
   closedAfterStop: boolean | undefined;
 
   async dispatchRuns(runs: readonly RunDispatch[]): Promise<void> {
     this.dispatched.push(...runs);
-    for (const run of runs) setImmediate(() => void this.handler?.(run));
+    for (const run of runs) setImmediate(() => void this.handler?.(run.runId));
   }
 
-  onRun(
-    handler: (run: RunDispatch) => Promise<void>,
-    opts?: { concurrency?: number | undefined },
+  onDispatchedRun(
+    handler: (runId: string) => Promise<void>,
+    opts: { concurrency: number; namespace?: string | undefined },
   ): () => Promise<void> {
     this.handler = handler;
-    this.consumerConcurrency = opts?.concurrency;
+    this.consumerConcurrency = opts.concurrency;
     return async () => {
       this.stopped += 1;
       this.handler = undefined;

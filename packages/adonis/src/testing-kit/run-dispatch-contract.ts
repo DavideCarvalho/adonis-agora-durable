@@ -9,9 +9,9 @@ import {
 } from '../index.js';
 import { DURABLE_STEP_NAME } from '../step-name-symbol.js';
 
-/** A transport carrying the run queue ({@link Transport.dispatchRuns} + {@link Transport.onRun}). */
+/** A transport carrying the run queue ({@link Transport.dispatchRuns} + {@link Transport.onDispatchedRun}). */
 export type RunQueueTransport = Transport &
-  Required<Pick<Transport, 'dispatchRuns' | 'onRun'>> & { close?(): Promise<void> };
+  Required<Pick<Transport, 'dispatchRuns' | 'onDispatchedRun'>> & { close?(): Promise<void> };
 
 /**
  * Builds the transports of one test. Every transport {@link make} returns within a test must share
@@ -34,6 +34,8 @@ interface Recorded {
   transport: RunQueueTransport;
   dispatched: RunDispatch[];
   calls: RunDispatch[][];
+  /** The namespace each recorded call went to (`undefined`: the transport's own). */
+  namespaces: Array<string | undefined>;
   /** Make the next `n` `dispatchRuns` calls reject without enqueueing anything. */
   failNext(n: number): void;
 }
@@ -44,19 +46,21 @@ function record(transport: RunQueueTransport): Recorded {
     transport,
     dispatched: [],
     calls: [],
+    namespaces: [],
     failNext: (n) => {
       failures = n;
     },
   };
   let failures = 0;
-  transport.dispatchRuns = async (runs) => {
+  transport.dispatchRuns = async (runs, opts) => {
     if (failures > 0) {
       failures -= 1;
       throw new Error('run queue unavailable');
     }
     out.calls.push([...runs]);
+    out.namespaces.push(opts?.namespace);
     out.dispatched.push(...runs);
-    await original(runs);
+    await original(runs, opts);
   };
   return out;
 }
@@ -77,7 +81,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * The contract of the run queue a transport offers the engine ({@link Transport.dispatchRuns} /
- * {@link Transport.onRun}), run end to end through real engines sharing one in-memory store: every
+ * {@link Transport.onDispatchedRun}), run end to end through real engines sharing one in-memory store: every
  * run the engine would execute on itself goes through the queue, the instances consuming it split
  * the work without running anything twice, and nothing is lost when the queue fails or an instance
  * shuts down. Call it from a spec file with a factory for the transport under test.
@@ -103,7 +107,7 @@ export function runRunDispatchContract(name: string, factory: RunDispatchTranspo
     });
 
     /** An engine on a fresh transport of this test, with its transport's dispatches recorded. */
-    const instance = async (opts: { reconcileMs?: number } = {}) => {
+    const instance = async (opts: { reconcileMs?: number; namespace?: string } = {}) => {
       const transport = await factory.make();
       transports.push(transport);
       const recorded = record(transport);
@@ -111,6 +115,7 @@ export function runRunDispatchContract(name: string, factory: RunDispatchTranspo
         store,
         transport,
         reconcileMs: opts.reconcileMs ?? 0,
+        ...(opts.namespace !== undefined ? { namespace: opts.namespace } : {}),
       });
       engines.push(engine);
       return { engine, recorded };
@@ -141,26 +146,94 @@ export function runRunDispatchContract(name: string, factory: RunDispatchTranspo
       async () => {
         const transport = await factory.make();
         transports.push(transport);
-        const seen: RunDispatch[] = [];
+        const seen: string[] = [];
         let release!: () => void;
         const gate = new Promise<void>((r) => {
           release = r;
         });
-        transport.onRun(async (run) => {
-          seen.push(run);
-          if (seen.length === 1) await gate;
-        });
+        transport.onDispatchedRun(
+          async (runId) => {
+            seen.push(runId);
+            if (seen.length === 1) await gate;
+          },
+          { concurrency: 2 },
+        );
         await transport.dispatchRuns([{ runId: 'again', reason: 'start', key: '1' }]);
         await until(() => seen.length === 1, timeout, 'the first delivery');
         // The run went `pending` again (a retry) while the first delivery is still being handled.
         await transport.dispatchRuns([{ runId: 'again', reason: 'start', key: '2' }]);
+        await until(() => seen.length === 2, timeout, 'the start of the new pending state');
         release();
+        // A marker dispatched last: once it is handled, nothing else is coming.
+        await transport.dispatchRuns([{ runId: 'marker', reason: 'wake' }]);
+        await until(() => seen.includes('marker'), timeout, 'the marker');
+        expect(seen.filter((id) => id === 'again')).toHaveLength(2);
+      },
+      timeout * 2,
+    );
+
+    it(
+      'keeps the run queues of different namespaces apart',
+      async () => {
+        const transport = await factory.make();
+        transports.push(transport);
+        const byNamespace: Record<string, string[]> = { blue: [], green: [] };
+        for (const ns of ['blue', 'green'] as const) {
+          transport.onDispatchedRun(
+            async (runId) => {
+              byNamespace[ns]?.push(runId);
+            },
+            { concurrency: 4, namespace: ns },
+          );
+        }
+        await transport.dispatchRuns([{ runId: 'b1' }, { runId: 'b2' }], { namespace: 'blue' });
+        await transport.dispatchRuns([{ runId: 'g1' }], { namespace: 'green' });
         await until(
-          () => seen.some((r) => r.key === '2'),
+          () => (byNamespace.blue?.length ?? 0) + (byNamespace.green?.length ?? 0) === 3,
           timeout,
-          'the start of the new pending state',
+          'every run',
         );
-        expect(seen.map((r) => r.key)).toEqual(['1', '2']);
+        expect(byNamespace.blue?.sort()).toEqual(['b1', 'b2']);
+        expect(byNamespace.green).toEqual(['g1']);
+      },
+      timeout * 2,
+    );
+
+    it(
+      "keeps a pool's runs on the instances of its namespace",
+      async () => {
+        const blue1 = await instance({ namespace: 'blue' });
+        const blue2 = await instance({ namespace: 'blue' });
+        const green = await instance({ namespace: 'green' });
+        const by: Record<string, string> = {};
+        for (const [label, { engine }] of [
+          ['blue1', blue1],
+          ['blue2', blue2],
+          ['green', green],
+        ] as const) {
+          engine.register('w', '1', async (ctx) => {
+            by[ctx.runId] = label;
+            return label;
+          });
+        }
+        await blue1.engine.start('w', {}, 'b');
+        await green.engine.start('w', {}, 'g');
+        expect(['blue1', 'blue2']).toContain((await settled('b'))?.output);
+        expect((await settled('g'))?.output).toBe('green');
+        expect(blue1.recorded.namespaces).toEqual(['blue']);
+        expect(green.recorded.namespaces).toEqual(['green']);
+      },
+      timeout * 2,
+    );
+
+    it(
+      "carries the run's priority",
+      async () => {
+        const { engine, recorded } = await instance();
+        engine.register('w', '1', async () => 'ok');
+        await engine.start('w', {}, 'urgent', { priority: 7 });
+        await settled('urgent');
+        expect(recorded.dispatched.find((d) => d.runId === 'urgent')?.priority).toBe(7);
       },
       timeout * 2,
     );

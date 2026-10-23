@@ -123,23 +123,56 @@ describe('BullMQTransport run queue', () => {
   it('consumes with the requested concurrency, hands each job to the handler, and stops', async () => {
     const { deps, workers } = broker();
     const transport = new BullMQTransport({ deps, prefix: 'p' });
-    const seen: RunDispatch[] = [];
-    const stop = transport.onRun(async (run) => void seen.push(run), { concurrency: 64 });
-    expect(transport.onRun(async () => {})).toBe(stop);
+    const seen: string[] = [];
+    const stop = transport.onDispatchedRun(async (runId) => void seen.push(runId), {
+      concurrency: 64,
+    });
+    expect(transport.onDispatchedRun(async () => {}, { concurrency: 1 })).toBe(stop);
     const worker = workers.find((w) => w.name === 'p-runs') as FakeWorker;
     expect(worker.concurrency).toBe(64);
     await worker.process({ data: { runId: 'x', reason: 'wake' } } as JobLike);
-    expect(seen).toEqual([{ runId: 'x', reason: 'wake' }]);
+    expect(seen).toEqual(['x']);
     await stop();
     await stop();
     expect(worker.closed).toBe(1);
+  });
+
+  it('maps the run priority onto the job priority (higher = more urgent)', async () => {
+    const { deps, queues } = broker();
+    const transport = new BullMQTransport({ deps, prefix: 'p' });
+    await transport.dispatchRuns([
+      { runId: 'a', reason: 'start', key: '1', priority: 10 },
+      { runId: 'b', reason: 'wake', priority: 1 },
+      { runId: 'c', reason: 'wake' },
+    ]);
+    const priorities = ((queues.get('p-runs') as FakeQueue).bulks[0] as Job[]).map(
+      (job) => (job.opts as { priority?: number }).priority,
+    );
+    // BullMQ runs the LOWEST number first, so the more urgent run gets the smaller one.
+    expect((priorities[0] as number) < (priorities[1] as number)).toBe(true);
+    expect(priorities[2]).toBeUndefined();
+  });
+
+  it("uses each namespace's own run queue", async () => {
+    const { deps, queues, workers } = broker();
+    const transport = new BullMQTransport({ deps, prefix: 'p' });
+    await transport.dispatchRuns([{ runId: 'a' }], { namespace: 'blue' });
+    await transport.dispatchRuns([{ runId: 'b' }], { namespace: 'default' });
+    await transport.dispatchRuns([{ runId: 'c' }]);
+    expect((queues.get('p-blue-runs') as FakeQueue).bulks.flat().map((j) => j.data)).toEqual([
+      { runId: 'a' },
+    ]);
+    expect((queues.get('p-runs') as FakeQueue).bulks.flat()).toHaveLength(2);
+    transport.onDispatchedRun(async () => {}, { concurrency: 1, namespace: 'blue' });
+    transport.onDispatchedRun(async () => {}, { concurrency: 1 });
+    expect(workers.map((w) => w.name).sort()).toEqual(['p-blue-runs', 'p-runs']);
   });
 
   it('parks the run consumer while consumers are deferred', async () => {
     const { deps, workers } = broker();
     const transport = new BullMQTransport({ deps, prefix: 'p' });
     transport.deferConsumers();
-    transport.onRun(async () => {});
+    transport.onDispatchedRun(async () => {}, { concurrency: 1 });
     expect(workers.filter((w) => w.name === 'p-runs')).toHaveLength(0);
     transport.startConsumers();
     expect(workers.filter((w) => w.name === 'p-runs')).toHaveLength(1);
@@ -185,7 +218,7 @@ describe.skipIf(!REDIS_URL)('BullMQTransport run queue over real Redis', () => {
     let peak = 0;
     let done = 0;
     try {
-      transport.onRun(
+      transport.onDispatchedRun(
         async () => {
           active += 1;
           peak = Math.max(peak, active);

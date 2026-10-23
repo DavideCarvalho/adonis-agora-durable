@@ -954,7 +954,10 @@ export class WorkflowEngine {
   /** Stops this instance's run-queue consumer (see {@link Transport.onRun}); unset once stopped. */
   private stopRunConsumer: (() => Promise<void>) | undefined;
   /** Runs waiting to go out in the next {@link Transport.dispatchRuns} batch, by run id. */
-  private readonly runBuffer = new Map<string, RunDispatch>();
+  private readonly runBuffer = new Map<
+    string,
+    { run: RunDispatch; namespace: string | undefined }
+  >();
   private runFlushScheduled = false;
   /** When a failed {@link Transport.dispatchRuns} was last reported, and how many failed since. */
   private runEnqueueWarnedAt = Number.NEGATIVE_INFINITY;
@@ -1096,14 +1099,14 @@ export class WorkflowEngine {
     this.runQueue =
       this.usesInProcessDispatch &&
       typeof runQueue?.dispatchRuns === 'function' &&
-      typeof runQueue.onRun === 'function'
+      typeof runQueue.onDispatchedRun === 'function'
         ? runQueue
         : undefined;
     this.singletons = new SingletonGate({
       store: this.store,
       clock: this.clock,
       dispatch: (runId) => {
-        void this.dispatchRun(runId, 'wake');
+        void this.dispatchRun(runId, 'wake', { lookup: true });
       },
       configFor: (run) =>
         (
@@ -1196,39 +1199,60 @@ export class WorkflowEngine {
     // Consume the run queue last, once the transport has this engine's namespace. A process whose
     // transport defers its consumers (an ace command) still dispatches through the queue and leaves
     // the runs to the instances that consume it.
-    if (this.runQueue?.onRun) {
-      this.stopRunConsumer = this.runQueue.onRun((run) => this.runEnqueued(run), {
+    if (this.runQueue?.onDispatchedRun) {
+      this.stopRunConsumer = this.runQueue.onDispatchedRun((runId) => this.runEnqueued(runId), {
         concurrency: RUN_CONSUMER_CONCURRENCY,
+        namespace: this.namespace,
       });
     }
   }
 
   /**
    * Execute `runId` wherever this engine executes runs: through the transport's run queue when it has
-   * one (see {@link runQueue}), else through the {@link RunDispatcher}. `reason` tells the consumer
-   * what to expect (see {@link RunDispatch}); a custom dispatcher receives the run id alone.
+   * one (see {@link runQueue}), else through the {@link RunDispatcher}. The queue is this engine's
+   * namespace's, the one its instances consume (an operator, with no namespace, drives every pool's
+   * runs from the transport's own queue). The caller passes the run when it has it at hand, for its
+   * `priority`, or `lookup` to read it. A custom dispatcher receives the run id alone.
    */
   private dispatchRun(
     runId: string,
-    reason: RunDispatch['reason'],
-    key?: string,
+    reason: NonNullable<RunDispatch['reason']>,
+    opts: {
+      key?: string;
+      run?: Pick<WorkflowRun, 'namespace' | 'priority'>;
+      lookup?: boolean;
+    } = {},
   ): void | Promise<void> {
-    if (this.runQueue) {
-      this.enqueueRun(key === undefined ? { runId, reason } : { runId, reason, key });
+    if (!this.runQueue) return this.runDispatcher.dispatch(runId);
+    const enqueue = (run: Pick<WorkflowRun, 'namespace' | 'priority'> | undefined) =>
+      this.enqueueRun(
+        {
+          runId,
+          reason,
+          ...(opts.key !== undefined ? { key: opts.key } : {}),
+          ...(run?.priority !== undefined ? { priority: run.priority } : {}),
+        },
+        this.namespace,
+      );
+    if (opts.run || !opts.lookup) {
+      enqueue(opts.run);
       return;
     }
-    return this.runDispatcher.dispatch(runId);
+    return this.store.getRun(runId).then(
+      (run) => enqueue(run ?? undefined),
+      () => enqueue(undefined),
+    );
   }
 
   /**
-   * Add `run` to the next {@link Transport.dispatchRuns} batch. A batch goes out when it reaches
-   * {@link RUN_DISPATCH_BATCH} runs or on the next macrotask, so the starts of a fan's children,
-   * which land over many store round trips, are sent together. A wake for a run already in the batch
-   * replaces its start: a wake also runs a `pending` run.
+   * Add `run` to the next {@link Transport.dispatchRuns} batch of `namespace` (this engine's). A batch goes out when
+   * the buffer reaches {@link RUN_DISPATCH_BATCH} runs or on the next macrotask, so the starts of a
+   * fan's children, which land over many store round trips, are sent together. A wake for a run
+   * already in the batch replaces its start: the consumer acts on the run's state either way.
    */
-  private enqueueRun(run: RunDispatch): void {
+  private enqueueRun(run: RunDispatch, namespace: string | undefined): void {
     const prior = this.runBuffer.get(run.runId);
-    if (!prior || run.reason === 'wake') this.runBuffer.set(run.runId, run);
+    if (!prior || run.reason === 'wake') this.runBuffer.set(run.runId, { run, namespace });
     if (this.runBuffer.size >= RUN_DISPATCH_BATCH) {
       this.flushRuns();
       return;
@@ -1246,38 +1270,39 @@ export class WorkflowEngine {
     );
   }
 
-  /** Send every buffered run (see {@link enqueueRun}) now, in batches of {@link RUN_DISPATCH_BATCH}. */
+  /**
+   * Send every buffered run (see {@link enqueueRun}) now: one {@link Transport.dispatchRuns} per
+   * namespace and {@link RUN_DISPATCH_BATCH} runs.
+   */
   private flushRuns(): void {
     const queue = this.runQueue;
     if (!queue?.dispatchRuns || this.runBuffer.size === 0) return;
-    const runs = [...this.runBuffer.values()];
+    const byNamespace = new Map<string | undefined, RunDispatch[]>();
+    for (const { run, namespace } of this.runBuffer.values()) {
+      const list = byNamespace.get(namespace) ?? [];
+      list.push(run);
+      byNamespace.set(namespace, list);
+    }
     this.runBuffer.clear();
     this.trackEffect(
       (async () => {
-        for (let at = 0; at < runs.length; at += RUN_DISPATCH_BATCH) {
-          const batch = runs.slice(at, at + RUN_DISPATCH_BATCH);
-          try {
-            await queue.dispatchRuns?.(batch);
-          } catch (err) {
-            // A start stays `pending` for the pending-run poll. A wake is not left to the run's timer
-            // (minutes away): it resumes the run here, as it would without a run queue. Reported at
-            // most once a minute: a queue that is down fails every batch.
-            for (const run of batch) {
-              if (run.reason === 'wake' && !this.draining) {
-                this.trackEffect(this.resumeImplicit(run.runId).catch(() => undefined));
-              }
-            }
-            this.runEnqueueFailures += 1;
-            const now = Date.now();
-            if (now - this.runEnqueueWarnedAt >= 60_000) {
-              this.runEnqueueWarnedAt = now;
-              const failures = this.runEnqueueFailures;
-              this.runEnqueueFailures = 0;
-              console.warn(
-                `[adonis-durable] could not enqueue runs on the run queue (${failures} batch(es) since the last report; a pending-run poll or the runs' timers pick them up): ${
-                  err instanceof Error ? err.message : String(err)
-                }`,
+        for (const [namespace, runs] of byNamespace) {
+          for (let at = 0; at < runs.length; at += RUN_DISPATCH_BATCH) {
+            const batch = runs.slice(at, at + RUN_DISPATCH_BATCH);
+            try {
+              await queue.dispatchRuns?.(
+                batch,
+                namespace !== undefined ? { namespace } : undefined,
               );
+            } catch (err) {
+              // A start stays `pending` for the pending-run poll. A wake is not left to the run's
+              // timer (minutes away): it resumes the run here, as it would without a run queue.
+              for (const run of batch) {
+                if (run.reason === 'wake' && !this.draining) {
+                  this.trackEffect(this.resumeImplicit(run.runId).catch(() => undefined));
+                }
+              }
+              this.reportEnqueueFailure(err, "a pending-run poll or the runs' timers pick them up");
             }
           }
         }
@@ -1285,49 +1310,88 @@ export class WorkflowEngine {
     );
   }
 
+  /** Report a failed {@link Transport.dispatchRuns}, at most once a minute: a queue that is down fails every batch. */
+  private reportEnqueueFailure(err: unknown, fallback: string): void {
+    this.runEnqueueFailures += 1;
+    const now = Date.now();
+    if (now - this.runEnqueueWarnedAt < 60_000) return;
+    this.runEnqueueWarnedAt = now;
+    const failures = this.runEnqueueFailures;
+    this.runEnqueueFailures = 0;
+    console.warn(
+      `[adonis-durable] could not enqueue runs on the run queue (${failures} failure(s) since the last report; ${fallback}): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+
   /**
-   * Take a run dispatched through the transport's run queue (see {@link Transport.onRun}): a start
-   * runs only while the run is still `pending` (another instance may have taken it, through its own
-   * consumer or its pending-run poll); a wake leases and resumes the run unless it is finished. The
-   * run lease admits one executor either way. Resolves once the turn settled here.
+   * Take a run dispatched through the transport's run queue (see {@link Transport.onDispatchedRun})
+   * and act on its state: a `pending` run is run, a suspended (or blocked) one is leased and resumed,
+   * a finished one is skipped. A run another instance already took (through its own consumer or its
+   * pending-run poll) is no longer `pending`, and its lease admits one executor either way; a resume
+   * that finds the lease held looks again once it is free. Resolves once the turn settled here.
    */
-  async runEnqueued(dispatch: RunDispatch | string): Promise<void> {
-    const run: RunDispatch =
-      typeof dispatch === 'string' ? { runId: dispatch, reason: 'start' } : dispatch;
+  async runEnqueued(runId: string): Promise<void> {
     // Taken from the queue while this instance shuts down: hand it back for another instance.
-    const handBack = () => this.runQueue?.dispatchRuns?.([run]).catch(() => undefined);
+    const handBack = async (run: WorkflowRun | null | undefined) => {
+      const queue = this.runQueue;
+      if (!queue?.dispatchRuns) return;
+      const namespace = this.namespace;
+      try {
+        await queue.dispatchRuns(
+          [
+            {
+              runId,
+              reason: run?.status === 'pending' ? 'start' : 'wake',
+              ...(run?.priority !== undefined ? { priority: run.priority } : {}),
+            },
+          ],
+          namespace !== undefined ? { namespace } : undefined,
+        );
+      } catch (err) {
+        this.reportEnqueueFailure(
+          err,
+          `run ${runId} handed back while draining waits for a pending-run poll or its timer`,
+        );
+      }
+    };
     if (this.draining) {
-      await handBack();
+      await handBack(await this.store.getRun(runId).catch(() => undefined));
       return;
     }
-    await this.localRuns.submit(run.runId, async () => {
+    await this.localRuns.submit(runId, async () => {
       try {
-        const current = await this.store.getRun(run.runId);
-        if (!current) return;
-        if (run.reason === 'start' ? current.status !== 'pending' : isTerminalRun(current.status)) {
-          return;
-        }
+        const current = await this.store.getRun(runId);
+        if (!current || isTerminalRun(current.status)) return;
         if (this.draining) {
-          await handBack();
+          await handBack(current);
           return;
         }
-        await this.leaseAndResume(run.runId, run.reason === 'wake');
+        await this.leaseAndResume(runId, current.status !== 'pending');
       } catch (error) {
-        console.error(`[adonis-durable] could not run dispatched run ${run.runId}:`, error);
+        console.error(`[adonis-durable] could not run dispatched run ${runId}:`, error);
       }
     });
   }
 
   /**
    * Wake a suspended run that has something new to see: resume it here, or, with a run queue, on
-   * whichever instance takes it from the queue (the result then only says it was handed over).
+   * whichever instance of this engine's namespace takes it from the queue (the result then only says
+   * it was handed over).
    */
-  private wake(runId: string): Promise<RunResult> {
-    if (this.runQueue) {
-      this.enqueueRun({ runId, reason: 'wake' });
-      return Promise.resolve({ runId, status: 'suspended' });
+  private async wake(runId: string): Promise<RunResult> {
+    if (!this.runQueue) return this.resumeImplicit(runId);
+    const run = await this.store.getRun(runId);
+    if (!run) return { runId, status: 'cancelled' };
+    if (isTerminalRun(run.status)) {
+      return { runId, status: run.status, output: run.output, error: run.error };
     }
-    return this.resumeImplicit(runId);
+    this.enqueueRun(
+      { runId, reason: 'wake', ...(run.priority !== undefined ? { priority: run.priority } : {}) },
+      this.namespace,
+    );
+    return { runId, status: run.status };
   }
 
   /**
@@ -1996,7 +2060,10 @@ export class WorkflowEngine {
       // dispatcher — doesn't sit `pending` until the next poll. Idempotent: execution is leased, so
       // a duplicate dispatch is a cheap no-op at the worker.
       if (dispatch && prior.status === 'pending') {
-        await this.dispatchRun(runId, 'start', String(prior.updatedAt.getTime()));
+        await this.dispatchRun(runId, 'start', {
+          key: String(prior.updatedAt.getTime()),
+          run: prior,
+        });
       }
       return { runId, status: prior.status, output: prior.output, error: prior.error };
     }
@@ -2064,7 +2131,7 @@ export class WorkflowEngine {
     // NOT run the body inline. Await the terminal/suspended state with `waitForRun(runId)` if needed.
     // An internal in-process handoff persists with `dispatch: false` and drives the pickup itself.
     if (dispatch && !delayed) {
-      await this.dispatchRun(runId, 'start', String(run.updatedAt.getTime()));
+      await this.dispatchRun(runId, 'start', { key: String(run.updatedAt.getTime()), run });
       // Nudge worker instances to pick it up now instead of on their next poll (no-op without a control
       // plane; self-receipt is filtered, so it only helps OTHER pods — e.g. an API pod's enqueue). A run
       // queue already delivers it to a consuming instance.
@@ -3096,7 +3163,7 @@ export class WorkflowEngine {
       });
       await this.store.releaseRunLock(run.id, this.instanceId);
       if (!applied) continue;
-      await this.dispatchRun(run.id, 'start', pendingKey(repended));
+      await this.dispatchRun(run.id, 'start', { key: pendingKey(repended), run });
       results.push({ runId: run.id, status: 'pending' });
     }
     return results;
@@ -3239,7 +3306,14 @@ export class WorkflowEngine {
           } finally {
             await this.store.releaseRunLock(run.id, this.instanceId);
           }
-          this.enqueueRun({ runId: run.id, reason: 'wake' });
+          this.enqueueRun(
+            {
+              runId: run.id,
+              reason: 'wake',
+              ...(run.priority !== undefined ? { priority: run.priority } : {}),
+            },
+            this.namespace,
+          );
           results.push({ runId: run.id, status: run.status });
         } catch (error) {
           console.error(
@@ -3432,7 +3506,7 @@ export class WorkflowEngine {
       ...(staleAdmission ? { tags: staleAdmission } : {}),
       updatedAt: requeuedAt,
     });
-    await this.dispatchRun(runId, 'start', pendingKey(requeuedAt));
+    await this.dispatchRun(runId, 'start', { key: pendingKey(requeuedAt), run });
     return { runId, status: 'pending' };
   }
 
@@ -3929,11 +4003,17 @@ export class WorkflowEngine {
         }
         // No waiter: the parent may already have settled this child from its run row (see
         // `markChildDelivered`); a buffered copy would then never be consumed.
-        if (childId !== undefined) {
-          const child = await this.store.getRun(childId);
-          if (child?.tags?.includes(CHILD_DELIVERED_TAG)) return;
+        const delivered = async () =>
+          childId !== undefined &&
+          ((await this.store.getRun(childId))?.tags?.includes(CHILD_DELIVERED_TAG) ?? false);
+        if (await delivered()) return;
+        const resumed = await this.signal(token, completion);
+        // The parent may settle the child from its run row between the look above and the buffer
+        // write (a join that registers its waiter only now): it then stamped the child first, and the
+        // copy just buffered would never be read.
+        if (resumed === null && (await delivered())) {
+          await this.store.takeBufferedSignal(token);
         }
-        await this.signal(token, completion);
         return;
       } catch (err) {
         if (err instanceof NamespaceMismatch) return;
@@ -4446,7 +4526,14 @@ export class WorkflowEngine {
       return;
     }
     if (this.runQueue) {
-      this.enqueueRun({ runId, reason: 'wake' });
+      this.enqueueRun(
+        {
+          runId,
+          reason: 'wake',
+          ...(run.priority !== undefined ? { priority: run.priority } : {}),
+        },
+        this.namespace,
+      );
       return;
     }
     if (!(await this.store.tryLockRun(runId, this.instanceId, nowMs + this.leaseMs, nowMs))) return;

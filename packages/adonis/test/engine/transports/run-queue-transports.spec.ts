@@ -57,7 +57,7 @@ describe('QueueTransport run queue', () => {
     const adapter = new MockAdapter();
     const transport = make(adapter);
     const { state, handler } = overlapping();
-    const stop = transport.onRun(handler, { concurrency: 3 });
+    const stop = transport.onDispatchedRun(handler, { concurrency: 3 });
     await transport.dispatchRuns(runs(12));
     await until(() => state.done === 12);
     expect(state.peak).toBe(3);
@@ -68,12 +68,29 @@ describe('QueueTransport run queue', () => {
     expect(await adapter.sizeOf('app:runs')).toBe(2);
   });
 
+  it('takes the more urgent run first, from its namespace queue', async () => {
+    const adapter = new MockAdapter();
+    const transport = make(adapter);
+    await transport.dispatchRuns(
+      [{ runId: 'low', priority: -3 }, { runId: 'normal' }, { runId: 'high', priority: 3 }],
+      { namespace: 'blue' },
+    );
+    expect(await adapter.sizeOf('app-blue:runs')).toBe(3);
+    const seen: string[] = [];
+    transport.onDispatchedRun(async (runId) => void seen.push(runId), {
+      concurrency: 1,
+      namespace: 'blue',
+    });
+    await until(() => seen.length === 3);
+    expect(seen).toEqual(['high', 'normal', 'low']);
+  });
+
   it('parks the run consumer while consumers are deferred', async () => {
     const adapter = new MockAdapter();
     const transport = make(adapter);
     transport.deferConsumers();
     const { state, handler } = overlapping(1);
-    transport.onRun(handler, { concurrency: 2 });
+    transport.onDispatchedRun(handler, { concurrency: 2 });
     await transport.dispatchRuns(runs(2));
     await new Promise((r) => setTimeout(r, 80));
     expect(state.done).toBe(0);
@@ -110,7 +127,7 @@ describe.each(dbBackends({ mysql: true }))('DbTransport run queue on $name', ({ 
   it('runs at most `concurrency` handlers at once, and stops taking rows on stop', async () => {
     const transport = await make();
     const { state, handler } = overlapping();
-    const stop = transport.onRun(handler, { concurrency: 3 });
+    const stop = transport.onDispatchedRun(handler, { concurrency: 3 });
     await transport.dispatchRuns(runs(12));
     await until(() => state.done === 12);
     expect(state.peak).toBe(3);
@@ -120,16 +137,32 @@ describe.each(dbBackends({ mysql: true }))('DbTransport run queue on $name', ({ 
     expect(state.done).toBe(12);
   });
 
+  it("claims only its namespace's rows", async () => {
+    const transport = await make();
+    const seen: Record<string, string[]> = { blue: [], green: [] };
+    for (const ns of ['blue', 'green'] as const) {
+      transport.onDispatchedRun(async (runId) => void seen[ns]?.push(runId), {
+        concurrency: 2,
+        namespace: ns,
+      });
+    }
+    await transport.dispatchRuns([{ runId: 'b1' }], { namespace: 'blue' });
+    await transport.dispatchRuns([{ runId: 'g1' }, { runId: 'g2' }], { namespace: 'green' });
+    await until(() => (seen.blue?.length ?? 0) + (seen.green?.length ?? 0) === 3);
+    expect(seen.blue).toEqual(['b1']);
+    expect(seen.green?.sort()).toEqual(['g1', 'g2']);
+  });
+
   it('two consumers never take the same row', async () => {
     const a = await make();
     const b = await make();
     const seen: string[] = [];
-    const take = async (run: RunDispatch) => {
-      seen.push(run.runId);
+    const take = async (runId: string) => {
+      seen.push(runId);
       await new Promise((r) => setTimeout(r, 5));
     };
-    a.onRun(take, { concurrency: 4 });
-    b.onRun(take, { concurrency: 4 });
+    a.onDispatchedRun(take, { concurrency: 4 });
+    b.onDispatchedRun(take, { concurrency: 4 });
     await a.dispatchRuns(runs(60));
     await until(() => seen.length >= 60);
     await new Promise((r) => setTimeout(r, 100));

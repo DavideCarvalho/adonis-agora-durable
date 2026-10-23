@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { instantCheckpoint } from '../../src/checkpoints.js';
 import { CHILD_DELIVERED_TAG } from '../../src/child-delivery.js';
 import { allChildId, allGroup } from '../../src/fan-join.js';
@@ -711,7 +711,7 @@ describe('in-process transports keep running the fan on the instance', () => {
     const store = new InMemoryStateStore();
     const transport = make();
     expect('dispatchRuns' in transport).toBe(false);
-    expect('onRun' in transport).toBe(false);
+    expect('onDispatchedRun' in transport).toBe(false);
     const engine = new WorkflowEngine({ store, transport, reconcileMs: 0 });
     engine.register('child', '1', async (_ctx, input) => {
       if (input === 2) throw new Error('two');
@@ -735,6 +735,84 @@ describe('in-process transports keep running the fan on the instance', () => {
         expect.objectContaining({ status: 'rejected', error: 'two' }),
         { status: 'fulfilled', value: 3 },
       ]);
+    }
+  });
+});
+
+describe('review: races around a child completion', () => {
+  it('a completion buffered while a late join settles the child from its row is removed', async () => {
+    const inner = new InMemoryStateStore();
+    let release!: () => void;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    let buffering = false;
+    const store = new Proxy(inner, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver);
+        if (prop === 'bufferSignal') {
+          return async (token: string, payload: unknown) => {
+            if (token === 'child:c1') {
+              // The child's notification found no waiter and is about to buffer: hold it there.
+              buffering = true;
+              await held;
+            }
+            return inner.bufferSignal(token, payload);
+          };
+        }
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as InMemoryStateStore;
+    const engine = new WorkflowEngine({ store, reconcileMs: 0 });
+    engine.register('child', '1', async () => 'spawned');
+    engine.register('parent', '1', async (ctx) => {
+      await ctx.startChild('child', {}, 'c1');
+      await ctx.waitForSignal('join');
+      return ctx.child<string>('child', {}, 'c1');
+    });
+    await engine.start('parent', {}, 'p');
+    await until(() => buffering, 10_000, 'the notification to reach the buffer write');
+    // The join registers its waiter now, finds no buffered copy yet, and settles from the child's row.
+    await engine.signal('join', undefined);
+    await until(() => finished(store, 'p'), 10_000, 'the parent');
+    expect((await store.getRun('p'))?.output).toBe('spawned');
+    release();
+    await engine.drain(10_000);
+    expect(await inner.takeBufferedSignal('child:c1')).toBeNull();
+  });
+
+  it('a run handed back while draining that cannot be enqueued is reported', async () => {
+    const store = new InMemoryStateStore();
+    class FailingRunQueue extends InMemoryTransport {
+      async dispatchRuns(): Promise<void> {
+        throw new Error('queue down');
+      }
+      onDispatchedRun(): () => Promise<void> {
+        return async () => undefined;
+      }
+    }
+    const engine = new WorkflowEngine({ store, transport: new FailingRunQueue(), reconcileMs: 0 });
+    engine.register('w', '1', async () => 'ok');
+    const at = new Date();
+    await store.createRun({
+      id: 'r',
+      workflow: 'w',
+      workflowVersion: '1',
+      status: 'pending',
+      input: {},
+      namespace: 'default',
+      createdAt: at,
+      updatedAt: at,
+    });
+    await engine.drain(1_000);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      // The consumer still delivers a run it had taken before it stopped.
+      await engine.runEnqueued('r');
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('handed back while draining'));
+      expect((await store.getRun('r'))?.status).toBe('pending');
+    } finally {
+      warn.mockRestore();
     }
   });
 });

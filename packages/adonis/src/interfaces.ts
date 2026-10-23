@@ -1689,35 +1689,47 @@ export interface Transport {
   // -------------------------------------------------------------------------
 
   /**
-   * engine → engines: hand runs to the shared run queue. At-least-once: a run delivered twice is
-   * harmless (the consumer re-reads the run and the run lease admits one executor). A rejection
-   * means some runs may not have been enqueued; the engine leaves them for its pending-run poll.
+   * engine → engines: hand runs to the shared run queue of `opts.namespace` (the runs' pool; absent:
+   * this transport's own). At-least-once: a run delivered twice is harmless (the consumer re-reads
+   * the run and the run lease admits one executor). A rejection means some runs may not have been
+   * enqueued; the engine leaves them for its pending-run poll.
    */
-  dispatchRuns?(runs: readonly RunDispatch[]): Promise<void>;
+  dispatchRuns?(
+    runs: readonly RunDispatch[],
+    opts?: { namespace?: string | undefined },
+  ): Promise<void>;
   /**
-   * engine ← run queue: consume dispatched runs, at most `opts.concurrency` handler calls at once on
-   * this instance. Parked by {@link deferConsumers} like every other point-to-point consumer.
-   * Returns a stop function: no new run is taken from then on, and its promise resolves once the
-   * handler calls in flight settle. Pair with {@link dispatchRuns}.
+   * engine ← run queue: consume the run ids dispatched to `opts.namespace` (absent: this transport's
+   * own), at most `opts.concurrency` handler calls at once on this instance. Parked by
+   * {@link deferConsumers} like every other point-to-point consumer. Returns a stop function: no new
+   * run is taken from then on, and its promise resolves once the handler calls in flight settle. Pair
+   * with {@link dispatchRuns}.
    */
-  onRun?(
-    handler: (run: RunDispatch) => Promise<void>,
-    opts?: { concurrency?: number | undefined },
+  onDispatchedRun?(
+    handler: (runId: string) => Promise<void>,
+    opts: { concurrency: number; namespace?: string | undefined },
   ): () => Promise<void>;
 }
 
 /**
- * One run handed to a transport's run queue (see {@link Transport.dispatchRuns}).
- *
- * - `start`: a freshly created (or re-queued) `pending` run. The consumer runs it only while it is
- *   still `pending`; any other state means another instance already took it.
- * - `wake`: a suspended run with something new to see (a delivered signal or child completion, a
- *   due timer, a freed singleton or queue slot). The consumer leases and resumes it unless it is
- *   finished.
+ * One run handed to a transport's run queue (see {@link Transport.dispatchRuns}). The consumer gets
+ * the run id alone and acts on the run's state: a `pending` run is run, a suspended one is leased and
+ * resumed, a finished one is skipped.
  */
 export interface RunDispatch {
   runId: string;
-  reason: 'start' | 'wake';
+  /**
+   * The run's dispatch priority (higher = more urgent; see {@link WorkflowRun.priority}). A
+   * transport with a prioritised queue takes higher ones first; absent = unprioritised.
+   */
+  priority?: number | undefined;
+  /**
+   * Why the run is dispatched: `start` for a freshly created (or re-queued) `pending` run, `wake` for
+   * a suspended run with something new to see (a delivered signal or child completion, a due timer,
+   * a freed singleton or queue slot). Informational for the consumer; a transport may use it to
+   * deduplicate starts (see {@link key}).
+   */
+  reason?: 'start' | 'wake' | undefined;
   /**
    * Which `pending` state of the run a `start` is for: the same for every dispatch of one pending
    * state (a re-sent start), different once the run went `pending` again (a retry, a recovery). A
