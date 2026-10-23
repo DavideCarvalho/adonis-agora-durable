@@ -3,7 +3,7 @@ import { LucidStateStore } from '../../../src/stores/lucid.js';
 import { runStateStoreContract } from '../../../src/testing-kit/conformance.js';
 import { dbBackends } from '../../support/backends.js';
 
-describe.each(dbBackends())('on $name', ({ makeStoreDb }) => {
+describe.each(dbBackends({ mysql: true }))('on $name', ({ makeStoreDb }) => {
   /**
    * Run the shared cross-store contract against the real Lucid store on an in-memory SQLite, so the
    * production store's behaviour is pinned identical to the canonical in-memory reference — including
@@ -30,6 +30,7 @@ describe.each(dbBackends())('on $name', ({ makeStoreDb }) => {
         expect(store.listSignalWaitersByRunIds).toBeTypeOf('function');
         expect(store.countCheckpoints).toBeTypeOf('function');
         expect(store.saveCheckpointIfPending).toBeTypeOf('function');
+        expect(store.getRuns).toBeTypeOf('function');
       } finally {
         await db.manager.closeAll();
       }

@@ -92,6 +92,8 @@ export class CodecStateStore implements StateStore {
   /** Forwarded verbatim — deletes read no payload. Bound only when the inner store has it, so the
    *  engine's one-`deleteRun`-per-id fallback still applies through the wrapper. */
   readonly deleteRuns?: (runIds: string[]) => Promise<void>;
+  /** Decodes each run like {@link getRun}. Bound only when the inner store has it. */
+  readonly getRuns?: (runIds: string[]) => Promise<WorkflowRun[]>;
   /** Forwarded verbatim — a `GROUP BY` reads no payload. Bound only when the inner store has it. */
   readonly runFacets?: (query: RunFacetQuery) => Promise<RunFacetRow[]>;
   /** Forwarded verbatim — the buckets aggregate names, statuses and timestamps, never a payload.
@@ -144,6 +146,9 @@ export class CodecStateStore implements StateStore {
           cps.map((cp) => this.encCp(cp)),
         );
     }
+    const getRuns = inner.getRuns;
+    if (getRuns)
+      this.getRuns = async (ids) => (await getRuns.call(inner, ids)).map((r) => this.decRun(r));
     const deleteRuns = inner.deleteRuns;
     if (deleteRuns) this.deleteRuns = (ids) => deleteRuns.call(inner, ids);
     const runFacets = inner.runFacets;

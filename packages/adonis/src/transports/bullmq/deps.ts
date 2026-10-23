@@ -20,6 +20,8 @@ export type ProcessFn = (job: JobLike) => Promise<unknown>;
 /** The subset of a BullMQ `Queue` this transport uses. */
 export interface QueueLike {
   add(name: string, data: unknown, opts?: unknown): Promise<unknown>;
+  /** Several jobs in one round trip. Optional: a queue without it gets one `add` per job. */
+  addBulk?(jobs: Array<{ name: string; data: unknown; opts?: unknown }>): Promise<unknown>;
   getJobCounts(...types: string[]): Promise<Record<string, number>>;
   close(): Promise<unknown>;
 }

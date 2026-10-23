@@ -11,6 +11,7 @@ import {
   type GroupHealth,
   type Heartbeat,
   type RemoteTask,
+  type RunDispatch,
   type RunReply,
   type RunRequest,
   type StartRunMessage,
@@ -172,6 +173,9 @@ interface ControlRow {
   id: number;
   payload: string;
 }
+/** The most `run` rows one insert carries (see {@link DbTransport.dispatchRuns}). */
+const RUN_INSERT_CHUNK = 200;
+
 interface MessageRow {
   id: number;
   kind: string;
@@ -183,6 +187,8 @@ interface MessageRow {
 interface MessageScope {
   kind: MessageKind;
   recipients: string[];
+  /** The namespace the rows belong to; absent: this transport's own. */
+  namespace?: string | undefined;
 }
 
 const DEFAULT_LOG = (err: unknown): void => console.error('[DbTransport] poll failed', err);
@@ -397,6 +403,8 @@ export class DbTransport implements Transport, ControlPlane {
   readonly #decisionHandlers = new Set<(decision: WorkflowDecision) => Promise<void>>();
   /** Which message loops run (each starts once). */
   readonly #messageLoops = new Set<MessageKind>();
+  /** Stops each run-queue consumer (see {@link onDispatchedRun}), by namespace. */
+  readonly #stopRuns = new Map<string, () => Promise<void>>();
   #runReplyHandler: ((reply: RunReply) => void) | undefined;
   /** Control-plane side: correlation id (requestId, or a start-run's runId) → the requester's instance
    *  id, held while the request's handler runs so {@link publishRunReply} knows whom to address. */
@@ -1047,8 +1055,9 @@ export class DbTransport implements Transport, ControlPlane {
     concurrency: number,
     each: (row: T) => Promise<void>,
     scope?: MessageScope,
+    limit: number = this.#batchSize,
   ): Promise<number> {
-    const { rows, token } = await this.#claim<T>(table, this.#batchSize, undefined, idCol, {
+    const { rows, token } = await this.#claim<T>(table, limit, undefined, idCol, {
       scope,
     });
     if (rows.length === 0) return 0;
@@ -1150,6 +1159,7 @@ export class DbTransport implements Transport, ControlPlane {
     kind: MessageKind,
     rows: Array<{ recipient?: string; replyTo?: string; payload: unknown }>,
     client: Client = this.#client(),
+    namespace: string = this.#namespaceValue(),
   ): Promise<void> {
     if (rows.length === 0) return;
     const at = this.#now();
@@ -1159,7 +1169,7 @@ export class DbTransport implements Transport, ControlPlane {
       .knexQuery.insert(
         rows.map((row) => ({
           kind,
-          namespace: this.#namespaceValue(),
+          namespace,
           recipient: row.recipient ?? '',
           reply_to: row.replyTo ?? null,
           payload: JSON.stringify(row.payload),
@@ -1359,6 +1369,110 @@ export class DbTransport implements Transport, ControlPlane {
       idleBackoffMax: this.#idleBackoffMax,
       each: (event) => handler(event),
     });
+  }
+
+  /**
+   * engine → engines: one `run` row per run in the messages table, {@link RUN_INSERT_CHUNK} per
+   * insert, stamped with `opts.namespace` (absent: this transport's own), for any instance consuming
+   * that namespace's run queue ({@link onDispatchedRun}). Rows are claimed oldest first: the messages
+   * table has no priority column, so `priority` is carried but not ordered on. Throws when the
+   * messages table is missing.
+   */
+  async dispatchRuns(
+    runs: readonly RunDispatch[],
+    opts?: { namespace?: string | undefined },
+  ): Promise<void> {
+    if (runs.length === 0) return;
+    if (!(await this.#messagesReady(true))) throw new Error(this.#messagesMissing());
+    for (let at = 0; at < runs.length; at += RUN_INSERT_CHUNK) {
+      await this.#insertMessages(
+        MESSAGE_KINDS.run,
+        runs.slice(at, at + RUN_INSERT_CHUNK).map((run) => ({
+          payload: run satisfies RunDispatch,
+        })),
+        undefined,
+        opts?.namespace ?? this.#namespaceValue(),
+      );
+    }
+  }
+
+  /**
+   * engine ← run queue: claim the `run` rows of `opts.namespace` (absent: this transport's own), at
+   * most `opts.concurrency` in a handler at once, and hand each run to `handler`. Claims are
+   * leased like every other row, so a crashed consumer's rows go to another instance after the lease.
+   * Parked while consumers are deferred. A second call for the same namespace returns the first
+   * one's stop, which stops polling and waits for the handlers in flight.
+   */
+  onDispatchedRun(
+    handler: (run: RunDispatch) => Promise<void>,
+    opts: { concurrency: number; namespace?: string | undefined },
+  ): () => Promise<void> {
+    const namespace = opts.namespace ?? this.#namespaceValue();
+    const existing = this.#stopRuns.get(namespace);
+    if (existing) return existing;
+    const concurrency = atLeastOne(opts.concurrency, 1);
+    const table = TRANSPORT_TABLES.messages;
+    // Rows in a handler. A poll claims only as many rows as there are free slots and hands each off,
+    // so one long turn never keeps the other slots (or a run dispatched meanwhile) waiting.
+    const inFlight = new Set<Promise<void>>();
+    const take = (row: MessageRow, token: string): Promise<void> =>
+      (async () => {
+        try {
+          let run: RunDispatch;
+          try {
+            run = JSON.parse(row.payload) as RunDispatch;
+          } catch (err) {
+            this.#onError(new Error(`[DbTransport] dropped run message ${row.id}: ${String(err)}`));
+            run = { runId: '' };
+          }
+          if (run.runId) await handler(run);
+          await this.#client()
+            .knexQuery()
+            .from(table)
+            .where('id', row.id)
+            .where('claimed_by', token)
+            .delete();
+        } catch (err) {
+          // Left claimed, and no longer renewed: delivered again once its lease lapses.
+          this.#onError(err);
+        } finally {
+          this.#release(table, token, row.id);
+        }
+      })();
+    const tick = async (): Promise<boolean> => {
+      if (!(await this.#messagesReady(false))) return false;
+      const free = concurrency - inFlight.size;
+      if (free <= 0) {
+        await Promise.race(inFlight);
+        return true;
+      }
+      const { rows, token } = await this.#claim<MessageRow>(table, free, undefined, 'id', {
+        scope: { kind: MESSAGE_KINDS.run, recipients: [''], namespace },
+      });
+      if (rows.length === 0) return false;
+      this.#hold(
+        table,
+        token,
+        rows.map((row) => row.id),
+      );
+      for (const row of rows) {
+        const work = take(row, token);
+        inFlight.add(work);
+        void work.finally(() => inFlight.delete(work));
+      }
+      return true;
+    };
+    const loop = this.#startLoop(tick, this.#idleBackoffMax);
+    let stopped: Promise<void> | undefined;
+    const stop = () => {
+      stopped ??= (async () => {
+        loop.stop();
+        await Promise.allSettled([...inFlight]);
+      })();
+      return stopped;
+    };
+    this.#stopRuns.set(namespace, stop);
+    return stop;
   }
 
   /** tenant → control plane: a {@link StartRunMessage} for any control plane, with this instance as
@@ -1579,7 +1693,7 @@ export class DbTransport implements Transport, ControlPlane {
     // Every claim is namespace-scoped: this instance only ever sees rows stamped with its own
     // namespace, so two engines/workers on different namespaces sharing one table set never
     // cross-claim each other's tasks/results/heartbeats/control.
-    const namespace = this.#namespaceValue();
+    const namespace = scope?.namespace ?? this.#namespaceValue();
     // Unique claim token for THIS round: instance id + a nanosecond stamp. Stored in `claimed_by` so
     // the SELECT-back returns only the rows this exact round won (never another round's, even from
     // the same instance).

@@ -243,6 +243,7 @@ The same transport also carries:
 | `<P>-heartbeat` | pub/sub | workers → engine | liveness for `timeoutMs` steps |
 | `<P>-worker-heartbeat:<token>:<instance>` | key, `EX 35` | workers → engine | worker liveness + live status |
 | `<P>-worker-descriptor:<token>:<instance>` | key, TTL'd | workers → engine | a [worker runtime](/docs/durable/cluster/thin-workers)'s handshake descriptor |
+| `<P>-runs` | queue | engine → engines | the [run queue](/docs/durable/reliability/multi-instance#where-a-run-executes) of the namespace in `<P>`: runs for any driving instance of that namespace to execute (job `run`, a `RunDispatch`; a start's job id is `start-<runId>-<key>`; the run's `priority` becomes the job priority) |
 | `<P>-start-run`, `<P>-run-request` | queue | tenant → control plane | store-less start / read / control requests |
 | `<P>-run-reply`, `<P>-tenant-events-<tenant>` | pub/sub | control plane → tenant | correlated replies, per-tenant lifecycle events |
 

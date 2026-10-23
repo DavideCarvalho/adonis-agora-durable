@@ -3,6 +3,7 @@ import type {
   GroupHealth,
   Heartbeat,
   RemoteTask,
+  RunDispatch,
   RunReply,
   RunRequest,
   StartRunMessage,
@@ -41,6 +42,8 @@ import {
   routingToken,
   runReplyChannel,
   runRequestName,
+  runStartJobId,
+  runsName,
   startRunName,
   stepEventsName,
   tasksName,
@@ -209,6 +212,8 @@ export class BullMQTransport implements Transport {
 
   // P4 store-less protocol: start-run / run-request queues + consumers, run-reply / tenant-events pub/sub.
   #startRunWorker: WorkerLike | undefined;
+  // The run queue consumers (see onDispatchedRun), by queue name, and the stop() each handed out.
+  readonly #runsWorkers = new Map<string, { worker: WorkerLike; stop: () => Promise<void> }>();
   #runRequestWorker: WorkerLike | undefined;
   #runReplyPub: RedisLike | undefined;
   #runReplySub: RedisLike | undefined;
@@ -1041,6 +1046,66 @@ export class BullMQTransport implements Transport {
   // lives with the rest of the naming contract in `naming.ts`.
   // ---------------------------------------------------------------------------
 
+  /**
+   * engine → engines: enqueue runs on `${P}-runs` (job `run`), {@link RUN_ADD_BULK_CHUNK} per
+   * `addBulk`. A `start` with a key carries a job id derived from its run id and key
+   * ({@link runStartJobId}), so a start re-sent for the same pending state is not queued twice; a new
+   * key (the run went `pending` again) is a new job even while the earlier one is active. A `wake`
+   * carries none: a wake that lands while an earlier one is being processed must not be dropped.
+   */
+  async dispatchRuns(
+    runs: readonly RunDispatch[],
+    opts?: { namespace?: string | undefined },
+  ): Promise<void> {
+    if (runs.length === 0) return;
+    const queue = this.#queue(this.#runsQueueName(opts?.namespace));
+    const jobs = runs.map((run) => ({
+      name: 'run',
+      data: run satisfies RunDispatch,
+      opts:
+        run.reason === 'start' && run.key !== undefined
+          ? { ...jobOptions(run.priority), jobId: runStartJobId(run.runId, run.key) }
+          : jobOptions(run.priority),
+    }));
+    for (let at = 0; at < jobs.length; at += RUN_ADD_BULK_CHUNK) {
+      const chunk = jobs.slice(at, at + RUN_ADD_BULK_CHUNK);
+      if (queue.addBulk) await queue.addBulk(chunk);
+      else await Promise.all(chunk.map((job) => queue.add(job.name, job.data, job.opts)));
+    }
+  }
+
+  /** `${P}-runs` of `namespace` (absent: this transport's own namespace). */
+  #runsQueueName(namespace: string | undefined): string {
+    return runsName(effectivePrefix(this.#prefix, namespace ?? this.#namespace));
+  }
+
+  /**
+   * engine ← run queue: consume `${P}-runs` of `opts.namespace`, `opts.concurrency` jobs at once,
+   * handing each run to `handler`. A second call for the same queue returns the first one's stop.
+   * The stop closes the worker: BullMQ fetches nothing more and waits for the jobs in flight.
+   */
+  onDispatchedRun(
+    handler: (run: RunDispatch) => Promise<void>,
+    opts: { concurrency: number; namespace?: string | undefined },
+  ): () => Promise<void> {
+    const name = this.#runsQueueName(opts.namespace);
+    const existing = this.#runsWorkers.get(name);
+    if (existing) return existing.stop;
+    const worker = this.#makeWorker(name, (job) => handler(job.data as RunDispatch), {
+      concurrency: workerConcurrency(opts.concurrency),
+    });
+    let stopped: Promise<void> | undefined;
+    const stop = () => {
+      stopped ??= worker.close().then(
+        () => undefined,
+        () => undefined,
+      );
+      return stopped;
+    };
+    this.#runsWorkers.set(name, { worker, stop });
+    return stop;
+  }
+
   /** tenant → control plane: enqueue a {@link StartRunMessage} on `${P}-start-run` (job `startRun`). */
   async dispatchStartRun(msg: StartRunMessage): Promise<void> {
     await this.#queue(startRunName(this.#effectivePrefix())).add('startRun', msg, jobOptions());
@@ -1181,6 +1246,7 @@ export class BullMQTransport implements Transport {
       this.#stepEventsWorker?.close(),
       this.#startRunWorker?.close(),
       this.#runRequestWorker?.close(),
+      ...[...this.#runsWorkers.values()].map((r) => r.worker.close()),
     ];
     await withTimeout(Promise.allSettled(workers.filter((p) => p !== undefined)), remaining());
     await withTimeout(
@@ -1212,3 +1278,5 @@ async function withTimeout(work: Promise<unknown>, ms: number): Promise<void> {
   }
 }
 const DEFAULT_CLOSE_TIMEOUT_MS = 5_000;
+/** The most run jobs one `addBulk` carries (see {@link BullMQTransport.dispatchRuns}). */
+const RUN_ADD_BULK_CHUNK = 500;

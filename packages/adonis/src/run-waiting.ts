@@ -81,3 +81,29 @@ export function indexWaitersByRun(waiters: readonly SignalWaiter[]): Map<string,
   for (const w of waiters) if (!byRun.has(w.runId)) byRun.set(w.runId, w);
   return byRun;
 }
+
+/** How many single-run reads the {@link getRunsByIds} fallback has in flight at once. */
+const GET_RUN_FALLBACK_PARALLEL = 50;
+
+/**
+ * The runs with these ids that exist: through the store's {@link StateStore.getRuns} in batches of
+ * 500, or, for a store without it, one {@link StateStore.getRun} per id, 50 at a time.
+ */
+export async function getRunsByIds(
+  store: StateStore,
+  runIds: readonly string[],
+): Promise<Map<string, WorkflowRun>> {
+  const unique = [...new Set(runIds)];
+  const byId = new Map<string, WorkflowRun>();
+  const batch = store.getRuns ? RUN_ID_BATCH : GET_RUN_FALLBACK_PARALLEL;
+  for (let at = 0; at < unique.length; at += batch) {
+    const ids = unique.slice(at, at + batch);
+    const runs = store.getRuns
+      ? await store.getRuns(ids)
+      : (await Promise.all(ids.map((id) => store.getRun(id)))).filter(
+          (r): r is WorkflowRun => r !== null,
+        );
+    for (const run of runs) byId.set(run.id, run);
+  }
+  return byId;
+}

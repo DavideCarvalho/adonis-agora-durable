@@ -17,6 +17,39 @@ Practical rules:
 4. **Due timers come in batches**: each timer pass loads at most `timerBatchSize` (config option, default 500) due runs, most overdue first, and walks them in a shuffled order, so a recovery wave of thousands of due runs drains over a few ticks and the instances don't contend for the same leases row by row.
 5. **Processes that never execute steps should set `consumers: 'never'`** (a pure producer): no point-to-point delivery lands on them, so the race with the worker fleet is over. `durable:work` re-enables consumption for itself via `engine.startConsumers()`. The `queue`, `db` and `bullmq` transports all defer their consumers this way.
 
+## Where a run executes
+
+On `bullmq`, `queue` and `db`, runs are spread over the instances the same way steps are. These transports carry a **run queue** that every driving instance consumes (`<P>-runs` on `bullmq`, `<prefix>:runs` on `queue`, `run` rows of `durable_transport_messages` on `db`). Every run the engine would otherwise execute on the instance that triggered it goes through it, and whichever instance takes it from the queue executes the turn:
+
+- a `start` (including a schedule, an event trigger, `signalWithStart`, a dead-letter handler, an `onError` handler) and the starts of `ctx.child` / `ctx.all` children;
+- the next run of a `continue-as-new`, a `requeue` (dashboard retry), and a run that crash recovery puts back to `pending`;
+- a wake: a delivered signal or event, a finished child waking its parent, a due timer, a freed singleton or flow-control slot.
+
+There is nothing to configure: the engine picks this up from the transport, on every instance that drives runs (`standalone`, without `drive: false`). An instance with `drive: false` and a control plane never consume the run queue. Runs started in the same burst go out together: a fan's 40,000 child starts become a few dozen `addBulk` / `pushManyOn` / multi-row inserts, not 40,000 round trips. On `bullmq`, a start's job id is derived from its run id and the `pending` state it is for, so a start sent twice for the same state is queued once, while a run that went `pending` again (a retry, a recovery) gets a job of its own even if the previous one is still being processed.
+
+What stays on the instance that already holds the run: a step result resumes the run on the instance that consumed the result, a turn's own re-check after it suspends, and an explicit `engine.resume()` or cancellation. Results are already spread over the instances by their own queue, and a second hop would add a poll interval (up to 200 ms, 800 ms after a quiet spell) to every step of a sequential workflow on `queue` and `db`.
+
+On a run-queue transport, `engine.signal()` resolves once the wake is handed to the queue (`status: 'suspended'`), not after the resumed turn. Use `waitForRun` for the outcome. `eventEmitter` and `memory` have no run queue: runs execute on the instance that triggers them, as before.
+
+Each [namespace](/docs/durable/transports/queue#namespaces--sharing-one-broker-across-pools) has its own run queue: an engine dispatches to, and consumes, its own namespace's queue, so a pool's runs stay on that pool's instances. An operator (an engine with no `namespace`) drives every pool's runs and uses the transport's own queue. A run's `priority` is carried along: on `bullmq` and `queue` the more urgent run is taken first; `db` takes the oldest first.
+
+The queue is at-least-once and every delivery is checked against the store: a start whose run is no longer `pending` (another instance's pending-run poll took it first, or it already ran) is skipped, a wake for a finished run is skipped, and the run lease admits one executor either way.
+
+- **A failed enqueue loses nothing.** A start that could not be enqueued stays `pending`, and the next pending-run poll (`durable:work`, the embedded worker) runs it. A wake that could not be enqueued resumes the run on the instance that delivered it. The engine reports the failures at most once a minute.
+- **A due timer is claimed before it is handed off.** The timer poll that finds a due run moves its `wakeAt` one `leaseMs` ahead under the run's lease, then enqueues a wake, so the other instances' polls do not hand it off again. A wake lost on the way comes due again after `leaseMs`.
+- **Shutdown.** `drain()` stops the instance's run-queue consumer first, then waits for the turns it is executing. A run taken from the queue during the drain is handed back to the queue.
+- **Each instance bounds what it executes.** An instance takes at most 64 runs from the run queue at once, and executes at most 256 in-process runs it dispatched to itself (no run queue) or child starts at once; the rest wait as run ids. A run id still waiting when the instance drains is dropped, not lost: the run is persisted, so the pending-run poll or the parent's next turn picks it up.
+
+## Wide fans and lost completions
+
+A child persists its terminal state first and tells its parent after. A crash, a scale-down or a store error between the two leaves the parent waiting on a child that already finished. Three things make sure it is not stranded:
+
+1. **The notification retries.** A store error while delivering a child's completion is retried with backoff (250 ms, 1 s, 4 s), and `drain()` waits for a delivery in progress. Every way a child can finish notifies: completed, failed, dead, and cancelled (by `cancel()`, a compensating cancel, or the execution-timeout sweep).
+2. **The parent's next turn reconciles.** Every turn of a `ctx.all` or `ctx.allSettled` parent reads the children it still waits on in batches of 500 (`StateStore.getRuns`, one `IN (...)` query per batch; one `getRun` per child on a store without it), lists the fan's buffered completions once (`listBufferedSignalTokens`), and settles the children that already finished exactly as their notifications would have: a completed child as its output, a failed, cancelled or dead one as a failure (a `rejected` entry of `ctx.allSettled`, a `GatherError` of `ctx.all`). The parent's next turn is its `reconcileMs` wake at the latest. A child settled this way is tagged `durable:child:delivered` first, so its notification, if it arrives later, is dropped instead of being buffered where nothing would read it.
+3. **A wake dropped on a held lease looks again.** A wake that finds the run leased by another instance is normally covered by that instance's own re-check once it releases the lease. If that instance goes down first, the dropped wake is retried here once the lease is free (checked at most every 2 s, 30 times), so the run does not wait for its timer.
+
+A redelivered step result whose step already settled resumes a `suspended` run too (the instance that settled it may have died before resuming), and with `remoteRedispatchMs` set a run waiting on a dispatched step parks no later than `reconcileMs`, even when the redispatch deadline is an hour away.
+
 ## Remote workflow turns
 
 A [remote workflow](/docs/durable/python) advances one turn at a time: the engine sends the run's history to a workflow worker, which replays the body and sends back a **decision**. The decisions queue (`<P>-decisions` on `bullmq`, `<prefix>:decisions` on `queue`) is point-to-point too, so with several engine replicas the replica that takes a decision is often not the one that dispatched the turn. Nothing waits for the decision in memory:

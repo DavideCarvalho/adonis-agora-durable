@@ -157,6 +157,8 @@ How this compares with the other transports carrying the same protocol:
 
 Without the messages table (`autoCreate: false` and no `create_durable_transport_messages` migration), the transport reports it once through `onError` the first time something uses the protocol, and run starts, requests and remote turns fail at once instead of timing out. A deployment that never uses the protocol hears nothing.
 
+The run queue lives in the same table. Without it every run start falls back to the pending-run poll (the run is still executed, one poll interval later), and the engine reports the failed enqueues at most once a minute.
+
 ## Options — `transports.db(config)`
 
 | Option | Default | Description |
@@ -205,7 +207,7 @@ The published migrations create six tables (default names):
 | `durable_transport_heartbeats` | worker → engine | liveness for `timeoutMs` steps |
 | `durable_transport_control` | bidirectional | lifecycle events + cancellation (best-effort, single-consumer) |
 | `durable_transport_worker_keys` | worker → engine | the [worker advertisement](/docs/durable/transports#worker-advertisement): each live worker's descriptor and heartbeat, with an expiry; and the inbox and subscriber keys of [tenant pods](#remote-workflows-and-tenant-pods) |
-| `durable_transport_messages` | both | remote-workflow decisions and step events, and the tenant-pod protocol's start-run, run-request, run-reply and tenant-event rows |
+| `durable_transport_messages` | both | the [run queue](/docs/durable/reliability/multi-instance#where-a-run-executes) (`run` rows any driving instance claims), remote-workflow decisions and step events, and the tenant-pod protocol's start-run, run-request, run-reply and tenant-event rows |
 
 `durable_transport_tasks` carries `step_id` (`<runId>:<seq>`, the primary key and step identity), `run_id`, `seq`, `name` (the handler key), `grp` (the routing token workers claim by), `namespace`, `input`, `traceparent`, `context`, `transport`, `attempt`, `reclaims` (how many times a lapsed claim on the row was taken over), `priority` (the dispatch priority rows are claimed by, `0` when absent), `kind` (`step`, or `workflow` for a remote workflow turn whose `WorkflowTask` is the `input`), plus the claim columns `claimed_by`/`claimed_at` and `created_at`. The results table mirrors it with `status` (`completed` or `failed`), `output`, `error`, `events`, and `started_at` (when the worker picked the task up — what powers queue-wait timing in the dashboard). Heartbeats, control and message rows use an auto-increment `id` as their key; control and message rows carry the whole message as a JSON `payload`. A message row also has `kind` (`decision`, `stepEvent`, `startRun`, `runRequest`, `runReply`, `tenantEvent`), `recipient` (`''` for a row any consumer of its kind may take, else the instance id it is addressed to), and `reply_to` (the requester of a start-run or run-request).
 

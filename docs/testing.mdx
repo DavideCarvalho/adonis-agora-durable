@@ -156,8 +156,9 @@ They live on **two different subpaths**, and which one a kit is on is not arbitr
 | `assertTransportConformance(transport, idPrefix?)` | `@adonis-agora/durable/testing` | a custom `Transport` |
 | `runStateStoreContract(name, factory)` | `@adonis-agora/durable/testing/conformance` | a custom `StateStore` |
 | `runAdmissionBackendContract(name, factory)` | `@adonis-agora/durable/testing/conformance` | a custom `AdmissionBackend` |
+| `runRunDispatchContract(name, factory)` | `@adonis-agora/durable/testing/conformance` | a custom `Transport` with a [run queue](/docs/durable/reliability/multi-instance#where-a-run-executes) (`dispatchRuns` + `onDispatchedRun`) |
 
-The two on `/conformance` **generate** their suite with vitest's `describe` / `it`, so they genuinely require vitest at import time. Keeping them on their own subpath is what lets `createTestEngine` and the assertions above stay importable from a Japa suite — a barrel re-exports everything, so a single subpath would have forced vitest on everyone. `assertTransportConformance` stays on `/testing` because it is a plain async function with no test-runner bindings, so it never needed vitest to begin with.
+The ones on `/conformance` **generate** their suite with vitest's `describe` / `it`, so they genuinely require vitest at import time. Keeping them on their own subpath is what lets `createTestEngine` and the assertions above stay importable from a Japa suite — a barrel re-exports everything, so a single subpath would have forced vitest on everyone. `assertTransportConformance` stays on `/testing` because it is a plain async function with no test-runner bindings, so it never needed vitest to begin with.
 
 ```ts title="tests/my_transport.spec.ts"
 import { assertTransportConformance } from '@adonis-agora/durable/testing'
@@ -180,6 +181,23 @@ runStateStoreContract('MyStateStore', async () => {
 ```
 
 The factory runs before **every** case and must return a fresh, empty store plus a `cleanup`. If it can't reach its backend at all (no Docker, no local Postgres), throw `StateStoreUnavailableError` (from `@adonis-agora/durable/testing/conformance`) instead of letting the connection error fail the suite — every case catches it, logs one `SKIPPING` warning, and passes as a no-op rather than reporting a false failure. The returned context can also opt out of two capabilities a driver genuinely lacks: `supportsAsyncTransaction: false` (a synchronous driver whose `transaction()` rejects a promise-returning callback) and `supportsTagFilter: false` (no `listRuns({ tag })` filter); both default to `true`.
+
+```ts title="tests/my_run_queue.spec.ts"
+import { runRunDispatchContract } from '@adonis-agora/durable/testing/conformance'
+import { MyTransport } from '../src/my_transport.js'
+
+// Every transport `make()` returns within one case must share that case's queue (two engines on two
+// of them are two instances); `setup` runs before each case to give it a queue of its own.
+let prefix = ''
+runRunDispatchContract('MyTransport', {
+  setup: () => {
+    prefix = `runs-${crypto.randomUUID()}`
+  },
+  make: () => new MyTransport({ prefix }),
+})
+```
+
+The run-dispatch contract runs real engines over an in-memory store: a start for a new `pending` state is delivered while the previous one is still being handled, a `ctx.all` and `ctx.allSettled` fan's child starts go through the queue in batches (with and without `concurrency`), two instances split a fan and run every child (and every step of a step fan) once, each namespace keeps its own queue, a run carries its priority, a failed enqueue leaves the run for the pending-run poll, the consumer skips a run that is no longer `pending`, a draining instance takes no more runs, and starts, child starts, `continue-as-new`, retries, recovery, signal and child-completion wakes, due timers and freed singleton slots all go through the queue.
 
 ```ts title="tests/my_admission.spec.ts"
 import { runAdmissionBackendContract } from '@adonis-agora/durable/testing/conformance'

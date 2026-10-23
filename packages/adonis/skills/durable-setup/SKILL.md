@@ -132,8 +132,9 @@ Source: `docs/transports/index.mdx`.
 
 ### Pattern 2 — split web from workers
 
-`engine.start()` never blocks the caller, but by default the body executes on a
-microtask **on the calling instance**. On an API/dashboard pod that means heavy
+`engine.start()` never blocks the caller, but on `eventEmitter`/`memory` the body executes on a
+microtask **on the calling instance** (on `bullmq`/`queue`/`db` a driving instance sends it through the
+transport's run queue instead, so any driving instance may execute it). On an API/dashboard pod that means heavy
 runs compete with HTTP traffic and the DB pool. Set `drive: false` (with
 `consumers: 'never'`) so the API pod only creates runs, and let `durable:work`
 execute them:
@@ -152,8 +153,8 @@ export default defineConfig({
 ```
 
 `durable:work` drives through its poll whatever `drive` says, so one config file
-can serve both pods (runs a worker pod starts itself, e.g. children, are picked
-up on its next tick rather than inline). A resume handled on the API pod (an
+can serve both pods (on `eventEmitter`/`memory` runs a worker pod starts itself, e.g. children, are picked
+up on its next tick rather than inline; on `bullmq`/`queue`/`db` they go through the transport's run queue). A resume handled on the API pod (an
 `engine.signal` or webhook) still executes there under the run's lease. An
 explicit `runDispatcher` wins over `drive`; `drive: false` plus
 `worker: { embedded: true }` throws at boot. Every store-backed process drains
@@ -284,9 +285,12 @@ export default defineConfig({
 })
 ```
 
-plus `node ace durable:work` as its own process. Mechanism: the default
-in-process dispatcher executes bodies on the same instance, event loop and DB
-pool as the HTTP handler that called `start()`; a saturated pool starves both.
+plus `node ace durable:work` as its own process. Mechanism: on `eventEmitter`
+and `memory` the default in-process dispatcher executes bodies on the same
+instance, event loop and DB pool as the HTTP handler that called `start()`; a
+saturated pool starves both. On `bullmq`, `queue` and `db` a driving instance
+sends runs through the transport's run queue instead, so any driving instance
+may execute them, the web pod included unless it sets `drive: false`.
 Source: `docs/reliability/failure-modes.mdx` ("The in-process default
 surprise"), `docs/concepts/durability.mdx`.
 

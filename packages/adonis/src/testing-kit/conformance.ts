@@ -9,4 +9,5 @@
  * custo.
  */
 export * from './admission-backend-conformance.js';
+export * from './run-dispatch-contract.js';
 export * from './state-store-conformance.js';
