@@ -46,9 +46,10 @@ export interface WorkflowRun {
   /**
    * Which package's code produced this run — free-form attribution (e.g.
    * `@adonis-agora/catalog-pipeline`), stamped at start from the workflow registration's `origin`
-   * (or a per-start override). `undefined` on runs created before the field existed or by an
-   * unattributed registration — the console renders those as "unknown". Powers the console's origin
-   * facet; parity with the NestJS twin's `origin` column.
+   * (or a per-start override). `undefined` for the app's own workflows (a registration that declares
+   * no origin) and on runs created before the field existed — the console labels those `app`. Powers
+   * the console's origin facet (shown only once some run has a named origin); parity with the
+   * NestJS twin's `origin` column.
    */
   origin?: string | undefined;
   /**
@@ -921,7 +922,7 @@ export interface RunQuery {
    */
   statuses?: RunStatus[] | undefined;
   /** Exact-match origin attribution (see {@link WorkflowRun.origin}). Cannot express "absent" —
-   *  an unknown-origin facet filters client-side over the page it already holds. */
+   *  the console's `app` (no-origin) facet filters client-side over the page it already holds. */
   origin?: string | undefined;
   /** Only runs carrying this tag (exact match against {@link WorkflowRun.tags}). */
   tag?: string | undefined;

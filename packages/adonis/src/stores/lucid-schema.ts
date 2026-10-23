@@ -415,7 +415,7 @@ async function healDurableTables(
       repairs.push(`${DURABLE_TABLES.runs}.namespace`);
     }
     if (!(await conn().hasColumn(DURABLE_TABLES.runs, 'origin'))) {
-      // Origin attribution wave: nullable, so an unattributed/legacy run reads back as "unknown".
+      // Origin attribution wave: nullable, so an app-own/legacy run reads back with no origin.
       await conn().alterTable(DURABLE_TABLES.runs, (table) => {
         table.string('origin');
       });

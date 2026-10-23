@@ -45,11 +45,11 @@ describe('<OriginFacets>', () => {
       'all6',
       'agent1',
       'catalog-pipeline2',
-      'unknown3',
+      'app3',
     ]);
   });
 
-  it('keeps the unknown count on screen even while a package is selected', () => {
+  it('keeps the app count on screen even while a package is selected', () => {
     // This is the reason the facet counts client-side instead of pushing `RunQuery.origin` down: a
     // store-filtered list would report zero unattributed runs, so they would look like they had
     // ceased to exist the moment an operator picked a library.
@@ -57,7 +57,7 @@ describe('<OriginFacets>', () => {
       <OriginFacets runs={runs} value={{ kind: 'origin', origin: CATALOG }} onChange={vi.fn()} />,
     );
 
-    expect(chipByLabel('unknown').textContent).toBe('unknown3');
+    expect(chipByLabel('app').textContent).toBe('app3');
   });
 
   it('marks the selected facet as pressed, and only that one', () => {
@@ -79,11 +79,11 @@ describe('<OriginFacets>', () => {
     expect(chipByLabel('all').getAttribute('aria-pressed')).toBe('true');
   });
 
-  it('selects the unattributed bucket by value, so unclassified runs are reachable', () => {
+  it('selects the app bucket by value, so runs with no origin are reachable', () => {
     const onChange = vi.fn<(filter: OriginFilter) => void>();
     render(<OriginFacets runs={runs} value={ALL_ORIGINS} onChange={onChange} />);
 
-    chipByLabel('unknown').click();
+    chipByLabel('app').click();
 
     expect(onChange).toHaveBeenCalledWith({ kind: 'unknown' });
   });
@@ -98,10 +98,12 @@ describe('<OriginFacets>', () => {
     expect(onChange).toHaveBeenCalledWith({ kind: 'origin', origin: CATALOG });
   });
 
-  it('spells out what unknown means rather than leaving a bare word', () => {
+  it("spells out that the app chip is the app's own workflows (no package origin)", () => {
     render(<OriginFacets runs={runs} value={ALL_ORIGINS} onChange={vi.fn()} />);
 
-    expect(chipByLabel('unknown').getAttribute('title')).toMatch(/no recorded origin/i);
+    const title = chipByLabel('app').getAttribute('title');
+    expect(title).toMatch(/app's own workflows/i);
+    expect(title).toMatch(/no package origin/i);
   });
 
   it('carries the full package name as a title, so shortening hides nothing', () => {
@@ -114,5 +116,36 @@ describe('<OriginFacets>', () => {
     const { container } = render(<OriginFacets runs={[]} value={ALL_ORIGINS} onChange={vi.fn()} />);
 
     expect(container.innerHTML).toBe('');
+  });
+
+  it("renders nothing when no run carries a named origin (only the app's own runs)", () => {
+    // The plain-app case: no workflow declares an origin, so `all 3 | app 3` would be pure noise.
+    const appOnly = [{ origin: undefined }, { origin: '' }, { origin: undefined }];
+    const { container } = render(
+      <OriginFacets runs={appOnly} value={ALL_ORIGINS} onChange={vi.fn()} />,
+    );
+
+    expect(container.innerHTML).toBe('');
+  });
+
+  it('shows the row once a single run has a named origin, with app carrying the rest', () => {
+    const mixed = [{ origin: CATALOG }, { origin: undefined }, { origin: undefined }];
+    render(<OriginFacets runs={mixed} value={ALL_ORIGINS} onChange={vi.fn()} />);
+
+    expect(chips().map((c) => c.textContent)).toEqual(['all3', 'catalog-pipeline1', 'app2']);
+  });
+
+  it('keeps the row while a non-default facet is selected, so the operator can get back to all', () => {
+    const onChange = vi.fn<(filter: OriginFilter) => void>();
+    render(
+      <OriginFacets
+        runs={[{ origin: undefined }]}
+        value={{ kind: 'unknown' }}
+        onChange={onChange}
+      />,
+    );
+
+    chipByLabel('all').click();
+    expect(onChange).toHaveBeenCalledWith(ALL_ORIGINS);
   });
 });

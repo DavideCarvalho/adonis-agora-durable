@@ -18,8 +18,8 @@ export const badgeVariants = cva(
         /** The package that declared the run's workflow (`WorkflowRun.origin`) — a CODE-provenance
          *  axis, so it gets its own hue rather than sharing the tenant's sky. */
         origin: 'border-teal-500/30 bg-teal-500/10 text-teal-300',
-        /** An UNKNOWN origin. Deliberately drawn as absence (dim, no hue) instead of borrowing the
-         *  `origin` teal — a run nobody could attribute must not look like an attributed one. */
+        /** No package origin — the app's own workflow (`origin app`). Drawn dim, with no hue, instead
+         *  of borrowing the `origin` teal — an app-own run must not look like a package's. */
         'origin-unknown': 'border-line bg-zinc-800/40 italic text-zinc-500',
         /** Typed search attribute. */
         attr: 'border-indigo-500/30 bg-indigo-500/10 text-indigo-300',

@@ -524,4 +524,4 @@ engine.register('sync-catalog', '1', fn, { origin: '@acme/catalog-pipeline' })
 await engine.start('sync-catalog', input, runId, { origin: '@acme/billing' })
 ```
 
-The origin lands on `run.origin`, is filterable (`engine.listRuns({ origin: '@acme/catalog-pipeline' })`, the dashboard API's `?origin=` param), and powers the console's origin facet — runs with no origin render as "unknown" there. It's attribution, not routing: use [`namespace`](/docs/durable/transports/queue#namespaces--sharing-one-broker-across-pools) to pin *where* a run executes.
+The origin lands on `run.origin`, is filterable (`engine.listRuns({ origin: '@acme/catalog-pipeline' })`, the dashboard API's `?origin=` param), and powers the console's origin facet — runs with no origin are the app's own and show as `app` there (the facet only appears once some run has a named origin). It's attribution, not routing: use [`namespace`](/docs/durable/transports/queue#namespaces--sharing-one-broker-across-pools) to pin *where* a run executes.

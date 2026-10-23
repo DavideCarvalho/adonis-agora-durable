@@ -153,7 +153,7 @@ export class RunFilter extends BaseFilter<RunQueryDraft> {
   }
 
   /** Exact-match origin attribution — pushed down now that the engine has an `origin` column.
-   *  The "unknown" bucket (absent origin) still filters client-side: an exact match can't express
+   *  The `app` bucket (absent origin) still filters client-side: an exact match can't express
    *  absence, exactly as the NestJS API behaves. */
   origin(value: unknown, operator: string): void {
     assertSetOperator('origin', operator);

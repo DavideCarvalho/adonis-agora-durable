@@ -20,8 +20,8 @@ import type {
  *
  * It is also deliberately MIXED on the two provenance axes, because a snapshot where every run is
  * attributed would hide the case that matters: two runs (`inv-2b91ee70`, `bck-4410aa03`) carry no
- * `origin` at all — the "unknown" bucket a real deployment is mostly made of — and two sit in a named
- * tenant rather than `default`.
+ * `origin` at all — the `app` bucket (the app's own workflows) a real deployment is mostly made
+ * of — and two sit in a named tenant rather than `default`.
  */
 
 const T0 = Date.parse('2026-07-29T09:14:00.000Z');

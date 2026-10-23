@@ -4,6 +4,7 @@ import {
   ALL_ORIGINS,
   emptyRunsNotice,
   filterByOrigin,
+  hasNamedOrigin,
   isUnknownOrigin,
   knownOrigin,
   matchesOrigin,
@@ -58,9 +59,9 @@ describe('originLabel', () => {
     expect(originLabel('acme-storefront')).toBe('acme-storefront');
   });
 
-  it('says "unknown" for an absent origin — never "app", never blank', () => {
-    expect(originLabel(undefined)).toBe('unknown');
-    expect(originLabel('')).toBe('unknown');
+  it('says "app" for an absent origin (the app\'s own workflow) — never blank', () => {
+    expect(originLabel(undefined)).toBe('app');
+    expect(originLabel('')).toBe('app');
   });
 
   it('keeps a trailing-slash oddity whole rather than rendering nothing', () => {
@@ -132,11 +133,11 @@ describe('originFacets', () => {
       ['all', 5],
       ['agent', 1],
       ['catalog-pipeline', 2],
-      ['unknown', 2],
+      ['app', 2],
     ]);
   });
 
-  it('orders all → packages (alphabetical) → unknown last', () => {
+  it('orders all → packages (alphabetical) → app (no origin) last', () => {
     const kinds = originFacets(runs).map((f) => f.filter.kind);
     expect(kinds).toEqual(['all', 'origin', 'origin', 'unknown']);
   });
@@ -146,7 +147,7 @@ describe('originFacets', () => {
     expect(facet?.title).toBe(CATALOG);
   });
 
-  it('omits the unknown chip when every run is attributed', () => {
+  it('omits the app chip when every run is attributed', () => {
     expect(originFacets([run({ origin: CATALOG })]).map((f) => f.filter.kind)).toEqual([
       'all',
       'origin',
@@ -157,9 +158,22 @@ describe('originFacets', () => {
     expect(originFacets([])).toHaveLength(1);
   });
 
-  it('explains what unknown means instead of leaving it a bare word', () => {
-    const unknown = originFacets(runs).find((f) => f.filter.kind === 'unknown');
-    expect(unknown?.title).toMatch(/no recorded origin/i);
+  it("explains that the app chip is the app's own workflows, with no package origin", () => {
+    const app = originFacets(runs).find((f) => f.filter.kind === 'unknown');
+    expect(app?.label).toBe('app');
+    expect(app?.title).toMatch(/app's own workflows/i);
+    expect(app?.title).toMatch(/no package origin/i);
+  });
+});
+
+describe('hasNamedOrigin', () => {
+  it('is false when no run carries a package origin (blank counts as none)', () => {
+    expect(hasNamedOrigin([])).toBe(false);
+    expect(hasNamedOrigin([run({}), run({ origin: '' }), run({ origin: '  ' })])).toBe(false);
+  });
+
+  it('is true as soon as one run carries a named origin', () => {
+    expect(hasNamedOrigin([run({}), run({ origin: CATALOG })])).toBe(true);
   });
 });
 
@@ -219,13 +233,13 @@ describe('emptyRunsNotice', () => {
     expect(notice.unclassified).toBeUndefined();
   });
 
-  it('an empty unknown facet says everything is attributed, rather than looking swallowed', () => {
+  it('an empty app facet says everything is attributed, rather than looking swallowed', () => {
     const notice = emptyRunsNotice({
       anyFilter: true,
       origin: { kind: 'unknown' },
       unknownCount: 0,
     });
-    expect(notice.message).toMatch(/none are unclassified/i);
+    expect(notice.message).toMatch(/none are the app's own/i);
     expect(notice.unclassified).toBeUndefined();
   });
 
@@ -235,7 +249,7 @@ describe('emptyRunsNotice', () => {
       origin: { kind: 'unknown' },
       unknownCount: 4,
     });
-    expect(notice.message).toMatch(/No unclassified runs match the other filters/i);
+    expect(notice.message).toMatch(/No app runs match the other filters/i);
   });
 
   it('falls back to a plain message when origin is not the narrowing axis', () => {

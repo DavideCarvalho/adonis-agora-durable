@@ -45,7 +45,7 @@ export interface WorkflowOptions {
   /**
    * Package attribution stamped on every run of this workflow (see `WorkflowRun.origin`) — which
    * package's code produced it, e.g. `@adonis-agora/catalog-pipeline`. Powers the console's origin
-   * facet; omit for an app-local workflow (renders as "unknown" until attributed).
+   * facet; omit for an app-local workflow (the console labels it `app`, the app's own workflow).
    */
   origin?: string;
   /**

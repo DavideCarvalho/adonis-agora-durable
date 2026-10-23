@@ -856,8 +856,8 @@ function RunRow({
               {tenant}
             </Chip>
           )}
-          {/* Origin, when the run HAS one. An unattributed run shows no chip here rather than
-              a row of `unknown` noise — the facet above keeps its count on screen, the empty
+          {/* Origin, when the run HAS one. An app-own run shows no chip here rather than
+              a row of `app` noise — the facet above keeps its count on screen, the empty
               state names it, and the run's own detail header states it outright. */}
           {origin && (
             <Chip
@@ -1005,8 +1005,8 @@ export function RunsList({
           <>
             <span className="text-[11px] text-zinc-500">
               {emptyNotice.unclassified} run{emptyNotice.unclassified === 1 ? '' : 's'} here{' '}
-              {emptyNotice.unclassified === 1 ? 'has' : 'have'} no recorded origin, so no package
-              filter can match {emptyNotice.unclassified === 1 ? 'it' : 'them'}.
+              {emptyNotice.unclassified === 1 ? 'is' : 'are'} the app's own (no package origin), so
+              no package filter can match {emptyNotice.unclassified === 1 ? 'it' : 'them'}.
             </span>
             <Button
               variant="chip"
@@ -1015,7 +1015,7 @@ export function RunsList({
               title={UNKNOWN_ORIGIN_TITLE}
               onClick={() => onSelectOrigin({ kind: 'unknown' })}
             >
-              show unclassified
+              show app runs
             </Button>
           </>
         )}
@@ -1349,8 +1349,8 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   const detailState = deriveRunState(run, { runs: siblingRuns, health, timeline: body });
   // Show the tenant/partition only when it's a real named one (not the single-pool `default`).
   const tenant = run.namespace && run.namespace !== 'default' ? run.namespace : undefined;
-  // The declaring package, or `undefined` for UNKNOWN — which the header states outright rather
-  // than omitting, so "we don't know" never reads as "the app".
+  // The declaring package, or `undefined` for the app's own workflow — which the header states
+  // outright (as `origin app`) rather than omitting.
   const origin = knownOrigin(run.origin);
   // What a human can DO about a suspended run's wait (deliver signal / send update / complete or
   // fail a task). Tokens come from the timeline's in-flight signal checkpoints, with the run's
@@ -1408,8 +1408,8 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
               </Chip>
             )}
             {/* WHICH LIBRARY declared this workflow — stated on every run, including the ones nobody
-                could attribute. Unlike the list row (dense, scannable), the detail view has room to
-                be explicit, and "unknown" is the honest answer here: not the host app, not blank. */}
+                declared without a package. Unlike the list row (dense, scannable), the detail view has
+                room to be explicit: a run with no package origin is the app's own, so it says `app`. */}
             {origin ? (
               <Chip variant="origin" className="mono py-0.5" title={`Declared by ${origin}`}>
                 {originLabel(origin)}
@@ -1912,12 +1912,12 @@ export function App() {
   const addNamespace = useCallback((namespace: string) => {
     setNamespaceFilter((prev) => (prev.includes(namespace) ? prev : [...prev, namespace]));
   }, []);
-  // Why "retry all"/"cancel all" are off, or `undefined` when they're fine. The `unknown` facet is
+  // Why "retry all"/"cancel all" are off, or `undefined` when they're fine. The `app` facet is
   // the one filter the server cannot be told about, so a bulk action launched under it would act on
   // runs that are NOT on screen. Refusing loudly beats acting wider than the operator can see.
   const bulkBlocked =
     originFilter.kind === 'unknown'
-      ? 'Bulk actions cannot be scoped to unclassified runs — runs with no origin have no server-side filter. Retry or cancel them from their own run view.'
+      ? "Bulk actions cannot be scoped to the app's own runs — runs with no package origin have no server-side filter. Retry or cancel them from their own run view."
       : undefined;
   // Workflows with runs waiting on a handler that has NO live worker — surfaced as a banner so it's
   // obvious nothing will progress until a worker rejoins (the "control plane up, no worker" case).
