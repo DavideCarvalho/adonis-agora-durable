@@ -163,6 +163,8 @@ export default class DurableProvider {
         const verifyTenant = (config as ControlPlaneConfig).verifyTenant;
         return new RunRequestResponder(transport, gateway, {
           ...(verifyTenant ? { verifyTenant } : {}),
+          // Only an explicit control plane is a tenant deployment; a standalone app boots quietly.
+          warnWithoutVerifier: role === 'control-plane',
           // Republish the engine's lifecycle events, scoped by namespace, so tenants can live-tail.
           subscribeEngineEvents: (listener) => engine.subscribe(listener),
         });

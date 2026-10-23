@@ -78,6 +78,13 @@ export interface RunRequestResponderOptions {
    * that only answers read/control, with live-tail served elsewhere).
    */
   subscribeEngineEvents?: ((listener: (event: EngineEvent) => void) => () => void) | undefined;
+  /**
+   * Warn at construction when no {@link verifyTenant} is set. Default `true`. The durable provider
+   * passes `false` for a `standalone` engine: there the responder only answers tenant pods if you run
+   * some, and anyone with broker access can already enqueue steps and results, so the warning was
+   * noise on every boot of an app that never uses tenants. An explicit `role: 'control-plane'` keeps it.
+   */
+  warnWithoutVerifier?: boolean | undefined;
 }
 
 /** `EngineEvent` types that END a run's lifecycle — no further event for that `runId` follows, so it is
@@ -138,7 +145,7 @@ export class RunRequestResponder {
     this.#transport = transport;
     this.#gateway = gateway;
     this.#verifyTenant = options.verifyTenant;
-    if (!this.#verifyTenant) {
+    if (!this.#verifyTenant && options.warnWithoutVerifier !== false) {
       // Loud on purpose: without a verifier the anti-IDOR machinery below is bypassable by simply
       // CLAIMING another tenant's name in the wire `tenant` field — any process with broker access
       // can then list/signal/cancel/start runs as any tenant. Prefix/network isolation may be an

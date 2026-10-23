@@ -165,9 +165,14 @@ describe('DurableProvider — role branching (standalone)', () => {
       transport: 'p4',
       transports: { p4: async () => transport },
     });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const provider = new DurableProvider(app);
     provider.register();
     await provider.boot();
+    // A standalone app that never runs tenant pods boots without the missing-verifier warning.
+    const warned = warn.mock.calls.some((args) => String(args[0]).includes('tenant verifier'));
+    warn.mockRestore();
+    expect(warned).toBe(false);
 
     const responder = await container.make(DURABLE_RUN_REQUEST_RESPONDER);
     expect(responder).toBeInstanceOf(RunRequestResponder);
@@ -191,9 +196,14 @@ describe('DurableProvider — role branching (control-plane)', () => {
   it('binds a control-plane StoreRunGateway + a started responder', async () => {
     const transport = new P4Transport();
     const { app, container } = makeApp(controlPlaneConfig(transport));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const provider = new DurableProvider(app);
     provider.register();
     await provider.boot();
+    // An explicit control plane without `verifyTenant` still warns: tenants are the point of it.
+    const warned = warn.mock.calls.some((args) => String(args[0]).includes('tenant verifier'));
+    warn.mockRestore();
+    expect(warned).toBe(true);
 
     const gateway = await container.make(DURABLE_RUN_GATEWAY);
     expect(gateway).toBeInstanceOf(StoreRunGateway);
