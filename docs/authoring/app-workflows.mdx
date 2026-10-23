@@ -95,11 +95,30 @@ export default class OrderWorkflow extends BaseWorkflow {
 
 A bad payload makes `start` / `dispatch` throw a `SchemaValidationError` (code `schema_validation`,
 issues in `details.issues`) and nothing is persisted; an [`onEvent`](/docs/durable/authoring/events)
-subscriber whose schema rejects the payload simply doesn't start. The schema's **output** value
-(parsed / coerced / defaulted) is what the run stores and `run` receives. The same option exists on
+subscriber whose schema rejects the payload simply doesn't start. The same option exists on
 `engine.register(name, version, fn, { inputSchema })` and `engine.registerRemote(...)`, next to the
 function-form `validateInput` — when both are set the schema runs first and `validateInput` sees the
 parsed value.
+
+**The run stores what was sent; `run` receives what was parsed.** The run's stored `input` is the
+payload exactly as the caller sent it. `run(ctx, input)` receives the schema's **output** value
+(parsed / coerced / defaulted), re-parsed from the stored input before every turn, replays included.
+That is what makes a value JSON can't carry — a `Date` from `z.coerce.date()` — reach `run` as a
+`Date` on every turn: the SQL stores keep the input in a JSON column, so a stored parsed value would
+come back as a string. Two rules follow:
+
+- **The schema must be deterministic.** No `default(() => Date.now())`, no random ids: a replay must
+  parse the same value the first execution did.
+- **Changing the schema is a breaking change to the workflow** — bump `version`, as for any change to
+  the body. An in-flight run whose stored input no longer parses fails with a `SchemaValidationError`
+  (`schema_validation`).
+
+A [remote](/docs/durable/cluster/interop) workflow's body gets the parsed value too: the engine
+re-parses the stored input each turn and puts the result in the task. The task travels as JSON, so
+there coercions and defaults apply but a non-JSON value arrives as its JSON form.
+
+Singleton and concurrency keys (`singleton.key(input)`, `concurrency.key(input)`) are computed from
+the stored input — the value the singleton gate re-reads when it re-checks admission later.
 
 ## Auto-registration
 

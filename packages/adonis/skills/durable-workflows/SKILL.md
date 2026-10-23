@@ -132,8 +132,9 @@ Schemas are **any Standard Schema** (zod 3.24+/4, valibot, arktype, effect
 schema, …) — the package depends on none of them. They fit every schema slot:
 `@Step({ input, output })` / `defineStep` (with an unannotated handler the types
 are inferred from the schema), `static workflow = { inputSchema }` (validated at
-`start`, nothing created on failure; the schema's output value is the run's
-input), and `static workflow = { searchAttributes }` (every
+`start`, nothing created on failure; the run stores the input as sent and
+`run` receives the schema's output, re-parsed before every turn — keep the schema
+deterministic and bump `version` when it changes), and `static workflow = { searchAttributes }` (every
 `ctx.upsertSearchAttributes` is validated against the merged attributes; type
 the ctx as `WorkflowCtx<InferSearchAttributes<typeof schema>>` and read back with
 `attributesOf(WorkflowClass, run)`). A failure is a `SchemaValidationError`

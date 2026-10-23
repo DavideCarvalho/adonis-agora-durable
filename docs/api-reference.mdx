@@ -166,7 +166,7 @@ Related helpers:
 | `origin` | `string` | Package attribution stamped on every run (`WorkflowRun.origin`). See [Run origin](/docs/durable/concepts/workflows-and-steps#run-origin--package-attribution). |
 | `onError` | `{ code?: string \| { readonly code: string }; workflow: WorkflowRef }[]` | Route a failed run to a handler workflow by error `code` (string or an error class with a `static code`; omit for the catch-all). See [Routing a run's failure](/docs/durable/reliability/on-error). |
 | `deadLetterWorkflow` | `WorkflowRef` | The workflow a `dead` run of this one is handed to (overrides the config default). Mutually exclusive with a `deadLetter()` method. See [Dead-letter queue](/docs/durable/reliability/dead-letter#a-deadletterworkflow-reference). |
-| `inputSchema` | `StandardSchemaV1` | Any Standard Schema (zod, valibot, arktype, …). Validated at start before a run is created; its output value is the run's input. A failure throws `SchemaValidationError`. See [Validating the input](/docs/durable/authoring/app-workflows#validating-the-input). |
+| `inputSchema` | `StandardSchemaV1` | Any Standard Schema (zod, valibot, arktype, …). Validated at start before a run is created. The run stores the input as sent; `run` receives the schema's output, re-parsed before every turn. A failure throws `SchemaValidationError`. See [Validating the input](/docs/durable/authoring/app-workflows#validating-the-input). |
 | `searchAttributes` | `SearchAttributesSchema` | A Standard Schema with a flat output: every `ctx.upsertSearchAttributes` is validated against the merged attributes. Must validate synchronously. See [Typed search attributes](/docs/durable/concepts/workflows-and-steps#typed-search-attributes). |
 
 ### `@Step(nameOrOptions?)` and `defineStep`

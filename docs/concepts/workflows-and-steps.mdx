@@ -27,7 +27,7 @@ engine.register('checkout', '1', async (ctx: WorkflowCtx, order: Order) => {
 | `executionTimeout` | `'30s'` or ms. A run still in flight past it is cancelled with an `execution_timeout` error by the worker's timeout sweep. |
 | `singleton` | [One run per key](#singleton-workflows-one-run-per-key). |
 | `concurrency` | A start-time [concurrency quota](/docs/durable/reliability/concurrency-quotas). |
-| `inputSchema` | A [Standard Schema](#validation-with-any-standard-schema-library) the input is validated against at `start`, before any run exists. Its output is what the run stores. |
+| `inputSchema` | A [Standard Schema](#validation-with-any-standard-schema-library) the input is validated against at `start`, before any run exists. The run stores the input as sent; the body receives the schema's output, re-parsed before every turn. |
 | `validateInput` | `(input) => void \| Promise<void>`, run after `inputSchema`. Throw to reject the start. |
 | `searchAttributesSchema` | The [typed search attributes](#typed-search-attributes) shape. |
 | `onEvent`, `eventBatch` | Start a run per [published event](/docs/durable/authoring/events), optionally debounced or batched. |

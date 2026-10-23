@@ -67,8 +67,10 @@ export interface WorkflowOptions {
   /**
    * Validate the run input at start against any Standard Schema (zod, valibot, arktype, …). A bad
    * payload throws a `SchemaValidationError` from `start` and no run is created (an `onEvent`
-   * trigger with a rejected payload simply doesn't start this workflow). The schema's OUTPUT value
-   * (parsed / coerced / defaulted) is what the run stores and `run(ctx, input)` receives.
+   * trigger with a rejected payload simply doesn't start this workflow). The run stores the input
+   * AS SENT; `run(ctx, input)` receives the schema's OUTPUT value (parsed / coerced / defaulted),
+   * re-parsed from the stored input before every turn, so a replay sees what the first turn saw.
+   * Keep the schema deterministic, and bump `version` when it changes.
    */
   inputSchema?: StandardSchemaV1;
   /**

@@ -322,7 +322,7 @@ Run and step inputs and outputs are stored as JSON. To keep them out of the data
 Two registration options catch incidents before they become stuck runs:
 
 - **`executionTimeout`** (`'72h'` or ms, on `engine.register` options or a class's `static workflow`) bounds a run's wall-clock life. The worker loop's `sweepTimeouts` moves an overrunning run to `cancelled` with code `execution_timeout` and cancels its child subtree.
-- **`inputSchema`** (any Standard Schema — zod, valibot, arktype — on `static workflow` or `engine.register` options) and **`validateInput`** (a function) reject a bad payload at `start`, before a run is created. The schema runs first, and its output (parsed, coerced, defaulted) is what the run stores; `validateInput` then sees that parsed value, so keep the structural checks in the schema and the cross-field or lookup checks in `validateInput`. A schema failure throws a `SchemaValidationError` (a `FatalError`, code `schema_validation`).
+- **`inputSchema`** (any Standard Schema — zod, valibot, arktype — on `static workflow` or `engine.register` options) and **`validateInput`** (a function) reject a bad payload at `start`, before a run is created. The schema runs first and `validateInput` then sees its output (parsed, coerced, defaulted), so keep the structural checks in the schema and the cross-field or lookup checks in `validateInput`. The run stores the input as sent, and the body receives the parsed value, re-parsed before every turn — keep the schema deterministic and bump `version` when it changes. A schema failure throws a `SchemaValidationError` (a `FatalError`, code `schema_validation`).
 
 Both depend on the worker loop running somewhere, like timers and retention.
 
