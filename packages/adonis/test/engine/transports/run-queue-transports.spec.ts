@@ -77,7 +77,7 @@ describe('QueueTransport run queue', () => {
     );
     expect(await adapter.sizeOf('app-blue:runs')).toBe(3);
     const seen: string[] = [];
-    transport.onDispatchedRun(async (runId) => void seen.push(runId), {
+    transport.onDispatchedRun(async (run) => void seen.push(run.runId), {
       concurrency: 1,
       namespace: 'blue',
     });
@@ -141,7 +141,7 @@ describe.each(dbBackends({ mysql: true }))('DbTransport run queue on $name', ({ 
     const transport = await make();
     const seen: Record<string, string[]> = { blue: [], green: [] };
     for (const ns of ['blue', 'green'] as const) {
-      transport.onDispatchedRun(async (runId) => void seen[ns]?.push(runId), {
+      transport.onDispatchedRun(async (run) => void seen[ns]?.push(run.runId), {
         concurrency: 2,
         namespace: ns,
       });
@@ -157,8 +157,8 @@ describe.each(dbBackends({ mysql: true }))('DbTransport run queue on $name', ({ 
     const a = await make();
     const b = await make();
     const seen: string[] = [];
-    const take = async (runId: string) => {
-      seen.push(runId);
+    const take = async (run: RunDispatch) => {
+      seen.push(run.runId);
       await new Promise((r) => setTimeout(r, 5));
     };
     a.onDispatchedRun(take, { concurrency: 4 });

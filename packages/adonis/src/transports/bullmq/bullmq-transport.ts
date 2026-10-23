@@ -1081,17 +1081,17 @@ export class BullMQTransport implements Transport {
 
   /**
    * engine ← run queue: consume `${P}-runs` of `opts.namespace`, `opts.concurrency` jobs at once,
-   * handing each run id to `handler`. A second call for the same queue returns the first one's stop.
+   * handing each run to `handler`. A second call for the same queue returns the first one's stop.
    * The stop closes the worker: BullMQ fetches nothing more and waits for the jobs in flight.
    */
   onDispatchedRun(
-    handler: (runId: string) => Promise<void>,
+    handler: (run: RunDispatch) => Promise<void>,
     opts: { concurrency: number; namespace?: string | undefined },
   ): () => Promise<void> {
     const name = this.#runsQueueName(opts.namespace);
     const existing = this.#runsWorkers.get(name);
     if (existing) return existing.stop;
-    const worker = this.#makeWorker(name, (job) => handler((job.data as RunDispatch).runId), {
+    const worker = this.#makeWorker(name, (job) => handler(job.data as RunDispatch), {
       concurrency: workerConcurrency(opts.concurrency),
     });
     let stopped: Promise<void> | undefined;

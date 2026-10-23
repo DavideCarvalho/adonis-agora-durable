@@ -1699,21 +1699,21 @@ export interface Transport {
     opts?: { namespace?: string | undefined },
   ): Promise<void>;
   /**
-   * engine ← run queue: consume the run ids dispatched to `opts.namespace` (absent: this transport's
+   * engine ← run queue: consume the runs dispatched to `opts.namespace` (absent: this transport's
    * own), at most `opts.concurrency` handler calls at once on this instance. Parked by
    * {@link deferConsumers} like every other point-to-point consumer. Returns a stop function: no new
    * run is taken from then on, and its promise resolves once the handler calls in flight settle. Pair
    * with {@link dispatchRuns}.
    */
   onDispatchedRun?(
-    handler: (runId: string) => Promise<void>,
+    handler: (run: RunDispatch) => Promise<void>,
     opts: { concurrency: number; namespace?: string | undefined },
   ): () => Promise<void>;
 }
 
 /**
- * One run handed to a transport's run queue (see {@link Transport.dispatchRuns}). The consumer gets
- * the run id alone and acts on the run's state: a `pending` run is run, a suspended one is leased and
+ * One run handed to a transport's run queue (see {@link Transport.dispatchRuns}). The consumer acts
+ * on the run's state, whatever the `reason`: a `pending` run is run, a suspended one is leased and
  * resumed, a finished one is skipped.
  */
 export interface RunDispatch {

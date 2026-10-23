@@ -997,12 +997,12 @@ export class QueueTransport implements Transport, ControlPlane {
 
   /**
    * engine ← run queue: consume `${P}:runs` of `opts.namespace`, at most `opts.concurrency` jobs at
-   * once, handing each run id to `handler`. Parked while consumers are deferred. A second call for
+   * once, handing each run to `handler`. Parked while consumers are deferred. A second call for
    * the same queue returns the first one's stop, which stops popping and waits for the jobs in a
    * handler.
    */
   onDispatchedRun(
-    handler: (runId: string) => Promise<void>,
+    handler: (run: RunDispatch) => Promise<void>,
     opts: { concurrency: number; namespace?: string | undefined },
   ): () => Promise<void> {
     const name = this.#runsQueue(opts.namespace);
@@ -1012,7 +1012,7 @@ export class QueueTransport implements Transport, ControlPlane {
     const loop = this.#startLoop(
       name,
       async (job) => {
-        const work = handler(fromJson<RunDispatch>(job.payload).runId);
+        const work = handler(fromJson<RunDispatch>(job.payload));
         running.add(work);
         try {
           await work;

@@ -1398,13 +1398,13 @@ export class DbTransport implements Transport, ControlPlane {
 
   /**
    * engine ← run queue: claim the `run` rows of `opts.namespace` (absent: this transport's own), at
-   * most `opts.concurrency` in a handler at once, and hand each run id to `handler`. Claims are
+   * most `opts.concurrency` in a handler at once, and hand each run to `handler`. Claims are
    * leased like every other row, so a crashed consumer's rows go to another instance after the lease.
    * Parked while consumers are deferred. A second call for the same namespace returns the first
    * one's stop, which stops polling and waits for the handlers in flight.
    */
   onDispatchedRun(
-    handler: (runId: string) => Promise<void>,
+    handler: (run: RunDispatch) => Promise<void>,
     opts: { concurrency: number; namespace?: string | undefined },
   ): () => Promise<void> {
     const namespace = opts.namespace ?? this.#namespaceValue();
@@ -1425,7 +1425,7 @@ export class DbTransport implements Transport, ControlPlane {
             this.#onError(new Error(`[DbTransport] dropped run message ${row.id}: ${String(err)}`));
             run = { runId: '' };
           }
-          if (run.runId) await handler(run.runId);
+          if (run.runId) await handler(run);
           await this.#client()
             .knexQuery()
             .from(table)

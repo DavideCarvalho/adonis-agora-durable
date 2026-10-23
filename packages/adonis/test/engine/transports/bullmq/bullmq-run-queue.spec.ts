@@ -123,15 +123,15 @@ describe('BullMQTransport run queue', () => {
   it('consumes with the requested concurrency, hands each job to the handler, and stops', async () => {
     const { deps, workers } = broker();
     const transport = new BullMQTransport({ deps, prefix: 'p' });
-    const seen: string[] = [];
-    const stop = transport.onDispatchedRun(async (runId) => void seen.push(runId), {
+    const seen: RunDispatch[] = [];
+    const stop = transport.onDispatchedRun(async (run) => void seen.push(run), {
       concurrency: 64,
     });
     expect(transport.onDispatchedRun(async () => {}, { concurrency: 1 })).toBe(stop);
     const worker = workers.find((w) => w.name === 'p-runs') as FakeWorker;
     expect(worker.concurrency).toBe(64);
     await worker.process({ data: { runId: 'x', reason: 'wake' } } as JobLike);
-    expect(seen).toEqual(['x']);
+    expect(seen).toEqual([{ runId: 'x', reason: 'wake' }]);
     await stop();
     await stop();
     expect(worker.closed).toBe(1);

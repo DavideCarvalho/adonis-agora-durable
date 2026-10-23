@@ -146,14 +146,14 @@ export function runRunDispatchContract(name: string, factory: RunDispatchTranspo
       async () => {
         const transport = await factory.make();
         transports.push(transport);
-        const seen: string[] = [];
+        const seen: RunDispatch[] = [];
         let release!: () => void;
         const gate = new Promise<void>((r) => {
           release = r;
         });
         transport.onDispatchedRun(
-          async (runId) => {
-            seen.push(runId);
+          async (run) => {
+            seen.push(run);
             if (seen.length === 1) await gate;
           },
           { concurrency: 2 },
@@ -166,8 +166,11 @@ export function runRunDispatchContract(name: string, factory: RunDispatchTranspo
         release();
         // A marker dispatched last: once it is handled, nothing else is coming.
         await transport.dispatchRuns([{ runId: 'marker', reason: 'wake' }]);
-        await until(() => seen.includes('marker'), timeout, 'the marker');
-        expect(seen.filter((id) => id === 'again')).toHaveLength(2);
+        await until(() => seen.some((r) => r.runId === 'marker'), timeout, 'the marker');
+        expect(seen.filter((r) => r.runId === 'again').map((r) => [r.reason, r.key])).toEqual([
+          ['start', '1'],
+          ['start', '2'],
+        ]);
       },
       timeout * 2,
     );
@@ -180,8 +183,8 @@ export function runRunDispatchContract(name: string, factory: RunDispatchTranspo
         const byNamespace: Record<string, string[]> = { blue: [], green: [] };
         for (const ns of ['blue', 'green'] as const) {
           transport.onDispatchedRun(
-            async (runId) => {
-              byNamespace[ns]?.push(runId);
+            async (run) => {
+              byNamespace[ns]?.push(run.runId);
             },
             { concurrency: 4, namespace: ns },
           );

@@ -14,18 +14,18 @@ import { InMemoryTransport } from '../src/testing/in-memory-transport.js';
  */
 class RunQueueTransport extends InMemoryTransport {
   readonly dispatched: RunDispatch[] = [];
-  handler: ((runId: string) => Promise<void>) | undefined;
+  handler: ((run: RunDispatch) => Promise<void>) | undefined;
   consumerConcurrency: number | undefined;
   stopped = 0;
   closedAfterStop: boolean | undefined;
 
   async dispatchRuns(runs: readonly RunDispatch[]): Promise<void> {
     this.dispatched.push(...runs);
-    for (const run of runs) setImmediate(() => void this.handler?.(run.runId));
+    for (const run of runs) setImmediate(() => void this.handler?.(run));
   }
 
   onDispatchedRun(
-    handler: (runId: string) => Promise<void>,
+    handler: (run: RunDispatch) => Promise<void>,
     opts: { concurrency: number; namespace?: string | undefined },
   ): () => Promise<void> {
     this.handler = handler;
@@ -135,5 +135,38 @@ describe('DurableProvider and the transport run queue', () => {
     await resolve();
     expect(transport.handler).toBeUndefined();
     await provider.shutdown();
+  });
+});
+
+describe('engine.consumeRuns', () => {
+  it('returns the stop of the consumer the engine started for itself, the same on every call', async () => {
+    const transport = new RunQueueTransport();
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore(), transport });
+    const stop = engine.consumeRuns();
+    expect(stop).toBeTypeOf('function');
+    expect(engine.consumeRuns()).toBe(stop);
+    expect(transport.handler).toBeTypeOf('function');
+    await engine.drain(1_000);
+    expect(transport.stopped).toBe(1);
+    // A drained engine consumes no more.
+    expect(engine.consumeRuns()).toBeUndefined();
+  });
+
+  it('is undefined without a run queue or with a custom dispatcher', () => {
+    expect(
+      new WorkflowEngine({
+        store: new InMemoryStateStore(),
+        transport: new InMemoryTransport(),
+      }).consumeRuns(),
+    ).toBeUndefined();
+    const transport = new RunQueueTransport();
+    expect(
+      new WorkflowEngine({
+        store: new InMemoryStateStore(),
+        transport,
+        runDispatcher: { dispatch: () => {} },
+      }).consumeRuns(),
+    ).toBeUndefined();
+    expect(transport.handler).toBeUndefined();
   });
 });

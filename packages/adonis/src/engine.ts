@@ -1199,12 +1199,22 @@ export class WorkflowEngine {
     // Consume the run queue last, once the transport has this engine's namespace. A process whose
     // transport defers its consumers (an ace command) still dispatches through the queue and leaves
     // the runs to the instances that consume it.
-    if (this.runQueue?.onDispatchedRun) {
-      this.stopRunConsumer = this.runQueue.onDispatchedRun((runId) => this.runEnqueued(runId), {
-        concurrency: RUN_CONSUMER_CONCURRENCY,
-        namespace: this.namespace,
-      });
-    }
+    this.consumeRuns();
+  }
+
+  /**
+   * Consume this engine's namespace's run queue (see {@link Transport.onDispatchedRun}), and return
+   * the function that stops it; `undefined` when the engine dispatches runs without one (no run queue
+   * on the transport, or a custom `runDispatcher`). The engine calls it itself when it is built, so a
+   * driving instance consumes with no setup; a second call returns the same stop. {@link drain} stops it.
+   */
+  consumeRuns(): (() => Promise<void>) | undefined {
+    if (!this.runQueue?.onDispatchedRun || this.draining) return this.stopRunConsumer;
+    this.stopRunConsumer ??= this.runQueue.onDispatchedRun((run) => this.runEnqueued(run), {
+      concurrency: RUN_CONSUMER_CONCURRENCY,
+      namespace: this.namespace,
+    });
+    return this.stopRunConsumer;
   }
 
   /**
@@ -1332,7 +1342,8 @@ export class WorkflowEngine {
    * pending-run poll) is no longer `pending`, and its lease admits one executor either way; a resume
    * that finds the lease held looks again once it is free. Resolves once the turn settled here.
    */
-  async runEnqueued(runId: string): Promise<void> {
+  async runEnqueued(dispatch: RunDispatch | string): Promise<void> {
+    const runId = typeof dispatch === 'string' ? dispatch : dispatch.runId;
     // Taken from the queue while this instance shuts down: hand it back for another instance.
     const handBack = async (run: WorkflowRun | null | undefined) => {
       const queue = this.runQueue;
