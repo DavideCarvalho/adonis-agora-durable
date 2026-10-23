@@ -390,8 +390,14 @@ describe.each(stores)('%s', (_label, makeStore) => {
       const cancelled = await settled(store, 'run1');
       expect(cancelled.status).toBe('cancelled');
       expect(cancelled.awaitingDecisionTaskId).toBeUndefined();
-      // The durable cancel intent was consumed once `cancelled` was recorded.
-      expect(await store.takeBufferedSignal('cancel:run1')).toBeFalsy();
+      // The durable cancel intent is drained right AFTER `cancelled` is recorded (it must survive a
+      // crash mid-unwind), so wait for the drain — peeking (take + re-buffer) without consuming it.
+      await until(async () => {
+        const marker = await store.takeBufferedSignal('cancel:run1');
+        if (!marker) return true;
+        await store.bufferSignal('cancel:run1', marker.payload);
+        return false;
+      });
 
       await t.decide(completed(turn));
       await new Promise((r) => setTimeout(r, 20));
