@@ -28,7 +28,7 @@ function useDebounced<T>(value: T, ms: number): T {
 /**
  * A value's options, from the server. `null` is dropped: it is a real bucket for counting (a run
  * with no origin) but not something an operator can select as text — the origin facet has its own
- * "unknown" chip for exactly that.
+ * `app` chip for exactly that.
  */
 function selectable(rows: RunValueRow[]): MultiSelectOption[] {
   return rows

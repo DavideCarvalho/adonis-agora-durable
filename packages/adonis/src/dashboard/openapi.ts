@@ -23,7 +23,10 @@ const runSummary = {
     workflowVersion: { type: 'string' },
     status: runStatus,
     namespace: { type: 'string' },
-    origin: { type: 'string', description: 'Package attribution; absent = unknown.' },
+    origin: {
+      type: 'string',
+      description: "Package attribution; absent = the app's own workflow (no package origin).",
+    },
     tags: { type: 'array', items: { type: 'string' } },
     createdAt: { type: 'string', format: 'date-time' },
     updatedAt: { type: 'string', format: 'date-time' },

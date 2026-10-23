@@ -922,6 +922,7 @@ export {
   type EmptyRunsNotice,
   emptyRunsNotice,
   filterByOrigin,
+  hasNamedOrigin,
   isUnknownOrigin,
   knownOrigin,
   matchesOrigin,

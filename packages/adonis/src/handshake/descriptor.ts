@@ -29,7 +29,7 @@ export interface WorkflowRegistration {
   group?: string;
   /** Capabilities a worker must advertise to run it (design §7.5), as the announcer declares them. */
   requires?: string[];
-  /** The package that DECLARED the workflow (see `WorkflowRun.origin`). Absent = unknown; nothing
+  /** The package that DECLARED the workflow (see `WorkflowRun.origin`). Absent = no package (`app`); nothing
    *  ever substitutes a default, because a wrong origin is worse than no origin. */
   origin?: string;
   /**

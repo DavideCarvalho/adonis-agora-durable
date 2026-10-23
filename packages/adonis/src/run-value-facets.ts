@@ -62,7 +62,7 @@ function valuesOf(run: WorkflowRun, axis: RunValueAxis): Array<string | null> {
     case 'namespace':
       return run.namespace === undefined ? [] : [run.namespace];
     case 'origin':
-      // `null` is origin's absent bucket ("unknown") — the console must be able to count it.
+      // `null` is origin's absent bucket (`app`, the app's own runs) — the console must count it.
       return [run.origin ?? null];
     case 'tag':
       return run.tags ?? [];

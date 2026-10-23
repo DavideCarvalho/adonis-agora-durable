@@ -10,9 +10,11 @@ import type { WorkflowRun } from './durable-client.js';
  *    explicit that a facet built on it must keep this option, because an exact-match origin filter
  *    hides every unattributed run.
  *  - `origin` — one concrete package (`@adonis-agora/catalog-pipeline`).
- *  - `unknown` — runs with NO recorded origin. `RunQuery.origin` is an exact-match string and so
- *    cannot express "absent", which is exactly why this case is applied here, over the run list the
- *    console already holds, instead of being pushed down to the store.
+ *  - `unknown` — runs with NO recorded origin: the app's own workflows (no package declared them).
+ *    Labelled `app` in the UI ({@link UNKNOWN_ORIGIN}); the `kind` keeps its historical name so
+ *    existing callers stay stable. `RunQuery.origin` is an exact-match string and so cannot express
+ *    "absent", which is exactly why this case is applied here, over the run list the console
+ *    already holds, instead of being pushed down to the store.
  */
 export type OriginFilter =
   | { kind: 'all' }
@@ -22,8 +24,12 @@ export type OriginFilter =
 /** The default facet: every origin, including runs that carry none. */
 export const ALL_ORIGINS: OriginFilter = { kind: 'all' };
 
-/** How an absent origin is spelled in the UI. Never "app", never blank — see {@link originLabel}. */
-export const UNKNOWN_ORIGIN = 'unknown';
+/**
+ * How an absent origin is spelled in the UI: `app`. A run with no package origin is the host app's
+ * own workflow — nothing is missing, so it is not called "unknown". Never blank — see
+ * {@link originLabel}.
+ */
+export const UNKNOWN_ORIGIN = 'app';
 
 /**
  * The run's origin if it has a usable one, else `undefined` — the single place "unknown" is decided.
@@ -38,7 +44,7 @@ export function knownOrigin(origin: string | undefined): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
-/** Whether a run carries no usable origin — UNKNOWN. See {@link knownOrigin}. */
+/** Whether a run carries no usable origin — the app's own workflow. See {@link knownOrigin}. */
 export function isUnknownOrigin(origin: string | undefined): boolean {
   return knownOrigin(origin) === undefined;
 }
@@ -47,8 +53,8 @@ export function isUnknownOrigin(origin: string | undefined): boolean {
  * Short display label for an origin: the package name without its npm scope
  * (`@adonis-agora/catalog-pipeline` → `catalog-pipeline`), so a sidebar chip is readable at
  * 10px. Every call site pairs it with the FULL string as a `title`, so nothing is lost. An absent
- * origin renders as {@link UNKNOWN_ORIGIN} — an operator must be able to see that a run is
- * unattributed, and folding it into a real package name would be a lie.
+ * origin renders as {@link UNKNOWN_ORIGIN} (`app`) — an operator must be able to see that a run is
+ * the app's own rather than a package's, and folding it into a real package name would be a lie.
  */
 export function originLabel(origin: string | undefined): string {
   const known = knownOrigin(origin);
@@ -66,7 +72,7 @@ export function sameOriginFilter(a: OriginFilter, b: OriginFilter): boolean {
   return true;
 }
 
-/** A stable React key / test handle for a facet (`origin:@scope/pkg`, `all`, `unknown`). */
+/** A stable React key / test handle for a facet (`origin:@scope/pkg`, `all`, `unknown` — the `app` chip). */
 export function originFilterKey(filter: OriginFilter): string {
   return filter.kind === 'origin' ? `origin:${filter.origin}` : filter.kind;
 }
@@ -90,20 +96,20 @@ export function filterByOrigin<T extends Pick<WorkflowRun, 'origin'>>(
 /** One selectable origin chip: what to show, what it means, and how many runs it covers. */
 export interface OriginFacet {
   filter: OriginFilter;
-  /** Short chip text — the scope-less package name, `all`, or `unknown`. */
+  /** Short chip text — the scope-less package name, `all`, or `app` (no origin). */
   label: string;
-  /** Full text for the chip's `title`: the unabbreviated package, or what unknown actually means. */
+  /** Full text for the chip's `title`: the unabbreviated package, or what `app` actually means. */
   title: string;
   count: number;
 }
 
-/** What the `unknown` chip's tooltip says — the one place the absent case is explained in prose. */
+/** What the `app` chip's tooltip says — the one place the no-origin case is explained in prose. */
 export const UNKNOWN_ORIGIN_TITLE =
-  'Runs with no recorded origin: started before origins were stamped, or registered through a path whose declaring package could not be resolved. Not attributed to any library.';
+  "The app's own workflows: runs with no package origin, i.e. not declared by any library.";
 
 /**
  * The origin chips for a run list: `all` first, then every attributed package (alphabetical), then
- * `unknown` LAST and only when there is something in it.
+ * `app` (no origin) LAST and only when there is something in it.
  *
  * Counted over the runs the console currently holds, the same way the header's status chips are — so
  * the counts and the list always agree, and (unlike a store-side facet) the unattributed bucket stays
@@ -147,6 +153,15 @@ export function originFacets(runs: readonly Pick<WorkflowRun, 'origin'>[]): Orig
   return facets;
 }
 
+/**
+ * Whether the origin facet is worth showing: only when at least one run carries a NAMED (package)
+ * origin. On an app where no workflow declares an origin, every run is the app's own and a row of
+ * `all N | app N` says nothing. `app` alone is not a choice.
+ */
+export function hasNamedOrigin(runs: readonly Pick<WorkflowRun, 'origin'>[]): boolean {
+  return runs.some((r) => knownOrigin(r.origin) !== undefined);
+}
+
 /** How many of these runs carry no origin — the size of the unattributed bucket. */
 export function unknownOriginCount(runs: readonly Pick<WorkflowRun, 'origin'>[]): number {
   return runs.reduce((n, r) => n + (isUnknownOrigin(r.origin) ? 1 : 0), 0);
@@ -155,7 +170,7 @@ export function unknownOriginCount(runs: readonly Pick<WorkflowRun, 'origin'>[])
 /** What an empty run list should say, and whether to offer a jump to the unattributed runs. */
 export interface EmptyRunsNotice {
   message: string;
-  /** When set, the list offers "show unclassified" — this many runs carry no origin. */
+  /** When set, the list offers "show app runs" — this many runs carry no origin. */
   unclassified?: number;
 }
 
@@ -164,8 +179,8 @@ export interface EmptyRunsNotice {
  *
  * The case this exists for: an operator filters by a package, sees nothing, and cannot tell "no run
  * matched" from "these runs are unattributable, and an exact-match origin filter can never match
- * them". So a package filter that comes back empty NAMES the unattributed bucket and offers to open
- * it, and an empty `unknown` facet says in words that everything here is attributed rather than
+ * them". So a package filter that comes back empty NAMES the app bucket and offers to open
+ * it, and an empty `app` facet says in words that everything here is attributed rather than
  * looking like a filter that swallowed the runs.
  *
  * `unknownCount` is counted over the runs BEFORE the origin facet is applied — otherwise it would be
@@ -182,8 +197,8 @@ export function emptyRunsNotice(opts: {
     return {
       message:
         opts.unknownCount > 0
-          ? 'No unclassified runs match the other filters.'
-          : 'Every run here has a recorded origin — none are unclassified.',
+          ? 'No app runs match the other filters.'
+          : "Every run here comes from a package — none are the app's own.",
     };
   }
   if (opts.origin.kind === 'origin' && opts.unknownCount > 0) {
