@@ -282,7 +282,7 @@ Every worker ticks on its own clock, but a schedule's window is shared, so a fle
 
 The delay never changes the run id — the window still maps to the same time bucket, so the exactly-once guarantee is untouched. Off by default; a schedule with no `jitter` fires immediately.
 
-The worker does not wait out the delay. A due window gets its own fire time, up to `jitter` after the worker first saw it, and later ticks start it once that time arrives. Other schedules and the rest of the tick (pending runs, timers, recovery) carry on in the meantime, even when several jittered windows come due together, as after a restart.
+The worker does not wait out the delay. A due window gets its own fire time, up to `jitter` after the worker first saw it, and later ticks start it once that time arrives; a window deferred past the end of its interval still fires. Other schedules and the rest of the tick (pending runs, timers, recovery) carry on in the meantime, even when several jittered windows come due together, as after a restart.
 
 ## Catching up after downtime — `backfill`
 
