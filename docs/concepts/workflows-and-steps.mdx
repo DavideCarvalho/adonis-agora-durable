@@ -511,7 +511,13 @@ The run is created immediately but parked `suspended` with its wake timer set to
 
 ## Run origin — package attribution
 
-When several packages start workflows on one engine — your app plus a couple of `@adonis-agora/*` libraries — "whose code produced this run?" is worth answering without archaeology. Stamp it with `origin`, at any of three levels (most specific wins):
+When several packages start workflows on one engine — your app plus a couple of `@adonis-agora/*` libraries — "whose code produced this run?" is worth answering without archaeology. Every run carries an `origin`: the npm package that declared its workflow. You normally don't set it. The engine **derives** it from the nearest `package.json` `name` above a file that belongs to the workflow, using the first of these that is available:
+
+1. **The class's declaring file**, when the class carries `@Scheduled`, `@OnEvent` or `@OnDiagnostic`. The decorator records where the class was defined, so the origin follows the class no matter who registers it.
+2. **The discovered module's file.** `app/workflows/charge_workflow.ts` resolves to your app's `name`. A built app resolves the same way, because `build/` carries a copy of the app's `package.json`. The generated barrel resolves from the app root.
+3. **The file calling `registerWorkflowClass(engine, Cls)` or `engine.register(...)`.** A library that registers its own workflows is attributed to the library. In a pnpm layout, `node_modules/.pnpm/…/node_modules/@scope/lib/dist/x.js` resolves to `@scope/lib`.
+
+An explicit `origin` always wins over the derived one. It is accepted at three levels, and the most specific wins:
 
 ```ts
 // On the class — every run of this workflow:
@@ -524,4 +530,8 @@ engine.register('sync-catalog', '1', fn, { origin: '@acme/catalog-pipeline' })
 await engine.start('sync-catalog', input, runId, { origin: '@acme/billing' })
 ```
 
-The origin lands on `run.origin`, is filterable (`engine.listRuns({ origin: '@acme/catalog-pipeline' })`, the dashboard API's `?origin=` param), and powers the console's origin facet — runs with no origin are the app's own and show as `app` there (the facet only appears once some run has a named origin). It's attribution, not routing: use [`namespace`](/docs/durable/transports/queue#namespaces--sharing-one-broker-across-pools) to pin *where* a run executes.
+Set it explicitly when the derived answer would be wrong. The usual case is an app that hand-registers an undecorated class shipped by a library: signal 3 credits the app with it.
+
+Derivation never guesses. When nothing resolves, the run has no origin. That happens when the runtime gives no usable stack frame (a non-V8 runtime, `Error.stackTraceLimit = 0`), when no `package.json` with a `name` sits above the file, and for `registerRemote` registrations. A single-file bundle that folds several packages into one file is attributed to the bundle's package; that one case can't be detected. At boot the provider logs, once, the discovered workflows it couldn't attribute.
+
+The origin lands on `run.origin`, is filterable (`engine.listRuns({ origin: '@acme/catalog-pipeline' })`, the dashboard API's `?origin=` param), and powers the console's origin facet. Runs with no origin are grouped under `app` there, and the facet only appears once some run has a named origin. With derivation, those are mostly runs whose package couldn't be derived, plus runs created before the field existed. It's attribution, not routing: use [`namespace`](/docs/durable/transports/queue#namespaces--sharing-one-broker-across-pools) to pin *where* a run executes.

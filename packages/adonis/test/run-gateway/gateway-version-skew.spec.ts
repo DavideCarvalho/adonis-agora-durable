@@ -249,7 +249,8 @@ describe('ProxyRunGateway against an older control plane', () => {
     await controlPlane(wire);
     const proxy = new ProxyRunGateway(wire, { partition: 'acme', requestTimeoutMs: 2_000 });
     const current = sort(await proxy.runFacets({}));
-    expect(current).toEqual([{ status: 'completed', origin: null, count: 81 }]);
+    // The fixture's workflows declare no origin: derived from their registering file (this package).
+    expect(current).toEqual([{ status: 'completed', origin: '@adonis-agora/durable', count: 81 }]);
 
     // Before 0.51: no runFacets verb, but runValueFacets exists.
     const older = new Wire();
@@ -271,7 +272,7 @@ describe('ProxyRunGateway against an older control plane', () => {
     const viaList = new ProxyRunGateway(oldest, { partition: 'acme', requestTimeoutMs: 2_000 });
     expect(sort(await viaList.runFacets({}))).toEqual(current);
     expect(sort(await viaList.runFacets({ workflow: 'parent' }))).toEqual([
-      { status: 'completed', origin: null, count: 1 },
+      { status: 'completed', origin: '@adonis-agora/durable', count: 1 },
     ]);
     expect(oldest.requests).toContain('listRuns');
   });

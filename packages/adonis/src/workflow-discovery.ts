@@ -1,3 +1,5 @@
+import { isAbsolute, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   type BarrelTree,
   barrelModules,
@@ -7,6 +9,13 @@ import {
   scanDirsModules,
 } from './discovery-roots.js';
 import type { WorkflowEngine } from './engine.js';
+import {
+  declaredOriginOf,
+  ORIGIN_RESOLVED,
+  originOfCaller,
+  originOfDir,
+  originOfFile,
+} from './origin.js';
 import { eventTriggerCanonicalName, workflowEvents } from './workflow-events.js';
 import {
   onErrorRoutesOf,
@@ -34,6 +43,13 @@ export interface DiscoveredWorkflow {
   cls: DiscoveredWorkflowClass;
   /** The module it was found in: an absolute path for a directory scan, the key for a barrel. */
   file: string;
+  /**
+   * The package the workflow's runs are attributed to (`WorkflowRun.origin`): the class's explicit
+   * `static workflow.origin`, else DERIVED — its decorator-captured declaring file, else this
+   * module's file — mapped to the nearest `package.json` `name`. `undefined` when none of those
+   * resolves with confidence (see `./origin.ts`).
+   */
+  origin?: string;
 }
 
 /**
@@ -63,14 +79,49 @@ function defaultWorkflowFactory(
  * `factory` lets the host resolve the instance via the IoC container (constructor injection); when
  * omitted, the class is instantiated directly with `new Ctor()` (no args). The factory may be async
  * (the Adonis container's `make` resolves async), so this function is async.
+ *
+ * Origin: the class's explicit `static workflow.origin` wins; else the package that DECLARED it, when
+ * a class decorator (`@Scheduled`, `@OnEvent`, `@OnDiagnostic`) captured its file; else the package
+ * whose code is CALLING this function (a lib registering its own workflows → the lib). `undefined`
+ * when none resolves. See `./origin.ts`.
  */
 export async function registerWorkflowClass(
   engine: WorkflowEngine,
   cls: unknown,
   factory: WorkflowClassFactory = defaultWorkflowFactory,
 ): Promise<boolean> {
+  // Derived synchronously, before the first `await`, so the frame above this call is the CALLER's
+  // (a lib registering its own class is attributed to the lib). Only the fallback: an explicit
+  // `static workflow.origin` and a decorator-captured declaring file both outrank it.
+  const callerOrigin = originOfCaller(registerWorkflowClass);
+  return registerClass(engine, cls, factory, callerOrigin);
+}
+
+/**
+ * Resolve a workflow class's origin: explicit `static workflow.origin` > the class's decorator-
+ * captured declaring file > `fallback` (the discovered module's file, or the registering caller).
+ */
+function resolveClassOrigin(
+  meta: WorkflowMeta,
+  cls: unknown,
+  fallback: string | undefined,
+): string | undefined {
+  return meta.origin || declaredOriginOf(cls) || fallback;
+}
+
+/** {@link registerWorkflowClass} with the derived-origin fallback already computed by the caller. */
+async function registerClass(
+  engine: WorkflowEngine,
+  cls: unknown,
+  factory: WorkflowClassFactory,
+  derivedOrigin: string | undefined,
+): Promise<boolean> {
   const meta = workflowMeta(cls);
   if (!meta) return false;
+  const origin = resolveClassOrigin(meta, cls, derivedOrigin);
+  // Passed on EVERY registration (the `.dlq` one included), resolved or not, so the engine never
+  // re-derives from its own caller — which would be this file, not the workflow's package.
+  const originOpts = { ...(origin ? { origin } : {}), [ORIGIN_RESOLVED]: true as const };
   const Ctor = cls as DiscoveredWorkflowClass;
   const instance = await factory(Ctor);
   // Colocated `static on` event triggers: exact-string ones register under the engine's
@@ -95,7 +146,7 @@ export async function registerWorkflowClass(
       dlqName,
       meta.version,
       (ctx, input) => Promise.resolve(inlineDeadLetter.call(instance, ctx, input)),
-      meta.origin ? { origin: meta.origin } : undefined,
+      originOpts,
     );
     deadLetterWorkflow = dlqName;
   }
@@ -112,7 +163,7 @@ export async function registerWorkflowClass(
         : {}),
       ...(meta.singleton ? { singleton: meta.singleton } : {}),
       ...(meta.concurrency ? { concurrency: meta.concurrency } : {}),
-      ...(meta.origin ? { origin: meta.origin } : {}),
+      ...originOpts,
       ...(meta.onError?.length ? { onError: onErrorRoutesOf(meta) } : {}),
       ...(meta.inputSchema ? { inputSchema: meta.inputSchema } : {}),
       ...(meta.searchAttributes ? { searchAttributesSchema: meta.searchAttributes } : {}),
@@ -141,11 +192,13 @@ export { pickModuleExt } from './discovery-roots.js';
  */
 async function collectWorkflows(
   modules: readonly DiscoveryModule[],
+  moduleOrigin: (module: DiscoveryModule) => string | undefined,
 ): Promise<DiscoveredWorkflow[]> {
   const found: DiscoveredWorkflow[] = [];
   const seen = new Set<unknown>();
   const owners = new Map<string, { root: string; file: string }>();
-  for (const { root, file, load } of modules) {
+  for (const module of modules) {
+    const { root, file, load } = module;
     const mod = await load();
     for (const exported of Object.values(mod)) {
       if (seen.has(exported)) continue;
@@ -158,7 +211,13 @@ async function collectWorkflows(
       }
       if (!owner) owners.set(id, { root, file });
       seen.add(exported);
-      found.push({ meta, cls: exported as DiscoveredWorkflowClass, file });
+      const origin = resolveClassOrigin(meta, exported, moduleOrigin(module));
+      found.push({
+        meta,
+        cls: exported as DiscoveredWorkflowClass,
+        file,
+        ...(origin ? { origin } : {}),
+      });
     }
   }
   return found;
@@ -180,7 +239,17 @@ async function collectWorkflows(
 export async function discoverWorkflows(
   dir: string | readonly string[],
 ): Promise<DiscoveredWorkflow[]> {
-  return collectWorkflows(await scanDirsModules(typeof dir === 'string' ? [dir] : dir));
+  // A scanned module's path is a real file of the package that owns it: `app/workflows/x.ts` (or a
+  // built `build/app/workflows/x.js`, whose `build/package.json` carries the app's name) → the app.
+  return collectWorkflows(await scanDirsModules(typeof dir === 'string' ? [dir] : dir), (module) =>
+    originOfFile(module.file),
+  );
+}
+
+/** The registered metadata a discovery entry reports, with its RESOLVED origin. */
+function registeredMeta({ meta, origin }: DiscoveredWorkflow): WorkflowMeta {
+  const { origin: _explicit, ...rest } = meta;
+  return origin ? { ...rest, origin } : rest;
 }
 
 /**
@@ -195,8 +264,9 @@ export async function registerWorkflowsFromDir(
   factory?: WorkflowClassFactory,
 ): Promise<WorkflowMeta[]> {
   const discovered = await discoverWorkflows(dir);
-  for (const { cls } of discovered) await registerWorkflowClass(engine, cls, factory);
-  return discovered.map((d) => d.meta);
+  for (const d of discovered)
+    await registerClass(engine, d.cls, factory ?? defaultWorkflowFactory, d.origin);
+  return discovered.map(registeredMeta);
 }
 
 /**
@@ -215,14 +285,42 @@ export type WorkflowsBarrel = BarrelTree;
  * and registering each workflow export: the build-time equivalent of {@link registerWorkflowsFromDir},
  * with no runtime `readdir`. Each module is imported once and each class registered once (deduped),
  * so a class re-exported from several modules is safe. Same cross-root duplicate rule as the scan.
- * Returns the registered metadata so the caller can log what was wired.
+ * Returns the registered metadata (with each workflow's resolved `origin`) so the caller can log
+ * what was wired.
+ *
+ * `options.appRoot` is the app root the barrel was generated for (a path or `file:` URL — the durable
+ * provider passes `app.appRoot`). It is what derives an origin for the barrel's modules, which carry
+ * no absolute file: a multi-root barrel's app-relative file keys are resolved against it, and a
+ * single-root barrel's name-only keys resolve to the app root itself (its sources are the app's own
+ * directories). Without it, modules are attributed to the package CALLING this function.
  */
 export async function registerWorkflowsFromBarrel(
   engine: WorkflowEngine,
   barrel: WorkflowsBarrel | readonly RootedBarrel[],
   factory?: WorkflowClassFactory,
+  options?: { appRoot?: string | URL },
 ): Promise<WorkflowMeta[]> {
-  const discovered = await collectWorkflows(barrelModules(barrel));
-  for (const { cls } of discovered) await registerWorkflowClass(engine, cls, factory);
-  return discovered.map((d) => d.meta);
+  const appRoot = toPath(options?.appRoot);
+  const callerOrigin =
+    appRoot === undefined ? originOfCaller(registerWorkflowsFromBarrel) : undefined;
+  const discovered = await collectWorkflows(barrelModules(barrel), ({ root, file }) => {
+    if (appRoot === undefined) return callerOrigin;
+    // A single-root barrel (`root: ''`) keys modules by NAME, not path: resolve from the app root.
+    if (root === '') return originOfDir(appRoot);
+    return originOfFile(isAbsolute(file) ? file : join(appRoot, file));
+  });
+  for (const d of discovered)
+    await registerClass(engine, d.cls, factory ?? defaultWorkflowFactory, d.origin);
+  return discovered.map(registeredMeta);
+}
+
+/** A path or `file:` URL (string or `URL`) → a filesystem path; anything unusable → `undefined`. */
+function toPath(value: string | URL | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  try {
+    if (value instanceof URL) return fileURLToPath(value);
+    return value.startsWith('file:') ? fileURLToPath(value) : value;
+  } catch {
+    return undefined;
+  }
 }

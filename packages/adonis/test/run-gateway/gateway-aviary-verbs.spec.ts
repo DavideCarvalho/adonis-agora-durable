@@ -145,7 +145,8 @@ describe('aviary RunGateway verbs over the wire', () => {
     expect(facets).toEqual(
       expect.arrayContaining([
         { status: 'completed', origin: '@acme/billing', count: 1 },
-        { status: 'completed', origin: null, count: 1 },
+        // `echo` declares no origin: derived from its registering file (this package's test tree).
+        { status: 'completed', origin: '@adonis-agora/durable', count: 1 },
       ]),
     );
     expect(facets.reduce((n, f) => n + f.count, 0)).toBe(2);

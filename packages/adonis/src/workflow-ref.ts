@@ -9,6 +9,7 @@
 import type { ConcurrencyConfig } from './concurrency.js';
 import type { SingletonConfig } from './engine.js';
 import type { SearchAttributesSchema } from './interfaces.js';
+import { callerFile, declaredOriginOf, originOfCaller, rememberDeclaringFile } from './origin.js';
 import type { ScheduledWorkflow, WorkflowScheduleConfig } from './scheduler.js';
 import type { StandardSchemaV1 } from './standard-schema.js';
 
@@ -45,7 +46,12 @@ export interface WorkflowOptions {
   /**
    * Package attribution stamped on every run of this workflow (see `WorkflowRun.origin`) — which
    * package's code produced it, e.g. `@adonis-agora/catalog-pipeline`. Powers the console's origin
-   * facet; omit for an app-local workflow (the console labels it `app`, the app's own workflow).
+   * facet. Usually OMITTED: the origin is derived from the nearest `package.json` `name` of the
+   * class's declaring file (captured by `@Scheduled` / `@OnEvent` / `@OnDiagnostic`), else of the
+   * discovered module (`app/workflows/…` → the app), else of the code calling
+   * `registerWorkflowClass` (a lib → the lib). Set it only to override that — e.g. an app that
+   * hand-registers a lib's undecorated class would otherwise be credited with it. A value here
+   * always wins; a workflow nothing can attribute has no origin (shown as `app` in the console).
    */
   origin?: string;
   /**
@@ -153,7 +159,11 @@ export function workflowSchedules(target: unknown): ScheduledWorkflow[] {
 export function Scheduled(
   config: WorkflowScheduleConfig | WorkflowScheduleConfig[],
 ): ClassDecorator {
+  // Captured in the FACTORY, which runs in the declaring module (the returned decorator may be
+  // applied from a `__decorate` helper in another package): the class's origin (see `./origin.ts`).
+  const declaredIn = callerFile(Scheduled);
   return (target) => {
+    rememberDeclaringFile(target, declaredIn);
     const cls = target as unknown as {
       schedule?: WorkflowScheduleConfig | WorkflowScheduleConfig[];
     };
@@ -228,11 +238,16 @@ export function workflowAnnouncement(
 ):
   | { version: string; origin?: string; onError?: { code?: string; workflow: string }[] }
   | undefined {
+  // Same precedence as registration: explicit `origin` > the class's decorator-captured declaring
+  // file > the package calling this (a lib announcing its own workflow). Derived before anything
+  // else so the captured frame is the caller's.
+  const callerOrigin = originOfCaller(workflowAnnouncement);
   const meta = workflowMeta(target);
   if (!meta) return undefined;
+  const origin = meta.origin || declaredOriginOf(target) || callerOrigin;
   return {
     version: meta.version,
-    ...(meta.origin ? { origin: meta.origin } : {}),
+    ...(origin ? { origin } : {}),
     ...(meta.onError?.length ? { onError: onErrorRoutesOf(meta) } : {}),
   };
 }
