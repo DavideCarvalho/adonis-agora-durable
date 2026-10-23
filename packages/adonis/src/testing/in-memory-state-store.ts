@@ -330,8 +330,7 @@ export class InMemoryStateStore implements StateStore {
     const due = this.visibleRuns().filter(
       (r) =>
         r.status === 'suspended' &&
-        r.wakeAt !== undefined &&
-        r.wakeAt <= nowMs &&
+        (r.wakeRequestedAt !== undefined || (r.wakeAt !== undefined && r.wakeAt <= nowMs)) &&
         (namespace === undefined || namespaceMatches(r.namespace, namespace)),
     );
     // Most overdue first (mirrors the SQL stores' ORDER BY wake_at).
@@ -370,6 +369,15 @@ export class InMemoryStateStore implements StateStore {
     if (run.lockedUntil !== undefined && run.lockedUntil > nowMs) return false;
     run.lockedBy = owner;
     run.lockedUntil = leaseUntilMs;
+    return true;
+  }
+
+  async releaseRunLockUnlessWakeRequested(runId: string, owner: string): Promise<boolean> {
+    const run = this.runs.get(runId);
+    if (!run || run.lockedBy !== owner) return true;
+    if (run.wakeRequestedAt !== undefined) return false;
+    run.lockedBy = undefined;
+    run.lockedUntil = undefined;
     return true;
   }
 

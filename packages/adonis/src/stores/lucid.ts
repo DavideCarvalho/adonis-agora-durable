@@ -238,6 +238,14 @@ export class LucidStateStore implements StateStore {
     ) {
       delete row.awaiting_decision_task_id;
     }
+    // Same for the refused-wake marker.
+    if (
+      'wake_requested_at' in row &&
+      row.wake_requested_at == null &&
+      !(await this.hasWakeMarkerColumnIn(trx))
+    ) {
+      delete row.wake_requested_at;
+    }
     if (!settlesTerminally(patch)) return row;
     let tags: string[] | undefined;
     if ('tags' in patch) {
@@ -450,12 +458,16 @@ export class LucidStateStore implements StateStore {
   }
 
   async listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]> {
+    const marker = await this.hasWakeMarkerColumn();
     const q = this.fenced(
       this.client()
         .from(DURABLE_TABLES.runs)
         .where('status', 'suspended')
-        .whereNotNull('wake_at')
-        .andWhere('wake_at', '<=', nowMs),
+        .where((w) => {
+          w.where((d) => d.whereNotNull('wake_at').andWhere('wake_at', '<=', nowMs));
+          // A refused wake asked for a turn: due now, whatever the run's timer says.
+          if (marker) w.orWhereNotNull('wake_requested_at');
+        }),
     );
     if (namespace !== undefined) q.whereIn('namespace', namespaceFilterValues(namespace));
     // Most overdue first, bounded: a backlog drains over several polls instead of one unbounded
@@ -493,6 +505,49 @@ export class LucidStateStore implements StateStore {
     const q = this.client().from(DURABLE_TABLES.runs).where('id', runId);
     if (owner !== undefined) q.andWhere('locked_by', owner);
     await q.update({ locked_by: null, locked_until: null });
+  }
+
+  async releaseRunLockUnlessWakeRequested(runId: string, owner: string): Promise<boolean> {
+    // One conditional UPDATE: a marker a refused wake set after the holder's last look keeps the
+    // lease where it is, and the holder runs another turn.
+    const marker = await this.hasWakeMarkerColumn();
+    const q = this.client()
+      .from(DURABLE_TABLES.runs)
+      .where('id', runId)
+      .andWhere('locked_by', owner);
+    if (marker) q.whereNull('wake_requested_at');
+    const affected = await q.update({ locked_by: null, locked_until: null });
+    if (rowsAffected(affected) === 1) return true;
+    // Nothing matched: the lease is not ours (any more), or a turn was asked for.
+    const row = (await this.client()
+      .from(DURABLE_TABLES.runs)
+      .where('id', runId)
+      .select('locked_by')
+      .first()) as Pick<RunRow, 'locked_by'> | null;
+    return row?.locked_by !== owner;
+  }
+
+  /** {@link hasWakeMarkerColumn} on the caller's transaction (a single-connection pool has no other). */
+  private hasWakeMarkerColumnIn(trx: TransactionClientContract): Promise<boolean> {
+    this.wakeMarkerColumn ??= trx.schema
+      .hasColumn(DURABLE_TABLES.runs, 'wake_requested_at')
+      .catch(() => {
+        this.wakeMarkerColumn = undefined;
+        return false;
+      });
+    return this.wakeMarkerColumn;
+  }
+
+  /** Whether the runs table has `wake_requested_at`, probed once per store and cached. */
+  private wakeMarkerColumn: Promise<boolean> | undefined;
+  private hasWakeMarkerColumn(): Promise<boolean> {
+    this.wakeMarkerColumn ??= this.client()
+      .schema.hasColumn(DURABLE_TABLES.runs, 'wake_requested_at')
+      .catch(() => {
+        this.wakeMarkerColumn = undefined;
+        return false;
+      });
+    return this.wakeMarkerColumn;
   }
 
   async renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {

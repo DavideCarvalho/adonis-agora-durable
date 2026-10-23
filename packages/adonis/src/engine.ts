@@ -412,7 +412,6 @@ const PARENT_NOTIFY_BACKOFF_MS = 250;
 /** How often, at most, and how many times a wake dropped on a held lease looks again (see `recheckAfterLease`). */
 const LEASE_RECHECK_MAX_MS = 2_000;
 const LEASE_RECHECK_SLACK_MS = 100;
-const LEASE_RECHECK_ATTEMPTS = 30;
 
 /**
  * How soon (ms) orphan recovery re-drives a REMOTE workflow run found `running` with a call in flight:
@@ -3320,8 +3319,11 @@ export class WorkflowEngine {
             continue;
           }
           try {
+            // The lease-long `wakeAt` keeps the run due if the wake is lost on the way, so a refused
+            // wake's request it answers is not needed any more (and would keep it due every poll).
             const claimed = await this.store.updateRunIf(run.id, [run.status], {
               wakeAt: nowMs + this.leaseMs,
+              ...(run.wakeRequestedAt !== undefined ? { wakeRequestedAt: undefined } : {}),
             });
             if (!claimed) continue;
           } finally {
@@ -3376,7 +3378,7 @@ export class WorkflowEngine {
     );
     if (!acquired) {
       // A wake (not a start) that lost the lease race may postdate the holder's snapshot.
-      if (recheck) this.recheckAfterLease(runId, undefined);
+      if (recheck) this.trackEffect(this.requestWake(runId, undefined));
       return null;
     }
     // resume() checks the namespace and throws NamespaceMismatch when it doesn't match (releasing the
@@ -4513,17 +4515,67 @@ export class WorkflowEngine {
   }
 
   /**
-   * A wake that found the run leased by another instance is dropped, and normally that is fine: the
-   * holder's turn either sees what the wake wrote, or re-checks once it releases the lease
-   * ({@link recheckWaitSeqs}, {@link redriveSettledChildren}). Not if the holder goes down first (a
-   * scale-down mid-turn, an OOM): its lease lapses with the run `suspended` on something that has
-   * finished, and nothing wakes it before its timer.
+   * A wake that found the run leased by another instance (its turn is executing) asks for another
+   * turn, durably: it stamps {@link WorkflowRun.wakeRequestedAt} on the run. The holder does not let
+   * go of the lease while the stamp is there ({@link releaseSuspendedLease}) and runs another turn,
+   * which sees what the wake wrote; and a `suspended` run carrying it is due for the timer poll, so
+   * the request survives both this instance and the holder going down.
    *
-   * So the dropped wake is kept here and looked at again every {@link LEASE_RECHECK_MAX_MS} at most,
-   * {@link LEASE_RECHECK_ATTEMPTS} times at most, for as long as the run is leased, whatever its status
-   * (a wake that lands mid-turn finds it `running`). Once the lease is free, a run that is `suspended`
-   * or `blocked` is woken. A holder that already moved the run on makes this one spare replay that
-   * re-parks. Best effort; the run's timer remains the fallback if this instance goes down too.
+   * The holder may have let go between the refused lease and the stamp: nobody but the timer poll
+   * would see it then, so the lease is tried once more here. The in-memory re-check
+   * ({@link recheckAfterLease}) runs too, as the fast path when the holder goes down mid-turn; it
+   * stops as soon as a turn served the request.
+   */
+  private async requestWake(runId: string, lockedUntil: number | undefined): Promise<void> {
+    if (this.draining) return;
+    let marked: boolean;
+    try {
+      marked = await this.store.updateRunIf(runId, ['running', 'suspended', 'blocked'], {
+        wakeRequestedAt: this.clock(),
+      });
+    } catch {
+      this.recheckAfterLease(runId, lockedUntil);
+      return;
+    }
+    if (!marked) return;
+    // The fast path for a holder that went down mid-turn: look again in memory too (it stops once a
+    // turn served the request).
+    this.recheckAfterLease(runId, lockedUntil);
+    const nowMs = this.clock();
+    if (!(await this.store.tryLockRun(runId, this.instanceId, nowMs + this.leaseMs, nowMs))) return;
+    const fresh = await this.store.getRun(runId);
+    if (fresh?.status !== 'suspended' && fresh?.status !== 'blocked') {
+      await this.store.releaseRunLock(runId, this.instanceId);
+      return;
+    }
+    await this.resumeImplicit(runId).catch((err) => {
+      if (!(err instanceof NamespaceMismatch)) throw err;
+    });
+  }
+
+  /**
+   * Let go of the lease of a run this instance's turn just suspended, unless a wake refused during
+   * the turn asked for another one ({@link requestWake}): then keep it and resolve `false`, and the
+   * caller runs that turn. Through the store's conditional release when it has one; otherwise
+   * release, then read the run back and wake it if a request landed meanwhile.
+   */
+  private async releaseSuspendedLease(runId: string): Promise<boolean> {
+    const conditional = this.store.releaseRunLockUnlessWakeRequested;
+    if (conditional) return conditional.call(this.store, runId, this.instanceId);
+    const before = await this.store.getRun(runId);
+    if (before?.wakeRequestedAt !== undefined && before.lockedBy === this.instanceId) return false;
+    await this.store.releaseRunLock(runId, this.instanceId);
+    const after = await this.store.getRun(runId);
+    if (after?.wakeRequestedAt !== undefined) this.trackEffect(this.wake(runId));
+    return true;
+  }
+
+  /**
+   * The in-memory half of a refused wake, for a store that cannot keep the request durably (see
+   * {@link requestWake}): look again every {@link LEASE_RECHECK_MAX_MS} at most for as long as the
+   * run is leased, whatever its status (a wake that lands mid-turn finds it `running`). Once the lease
+   * is free, a run that is `suspended` or `blocked` is woken. A holder that already moved the run on
+   * makes this one spare replay that re-parks.
    */
   private recheckAfterLease(runId: string, lockedUntil: number | undefined, attempt = 1): void {
     if (this.draining || this.leaseRetries.has(runId)) return;
@@ -4540,13 +4592,13 @@ export class WorkflowEngine {
     if (this.draining) return;
     const run = await this.store.getRun(runId);
     if (!run || isTerminalRun(run.status)) return;
+    // A turn that started after the request served it (it cleared the stamp).
+    if (this.store.releaseRunLockUnlessWakeRequested && run.wakeRequestedAt === undefined) return;
     const nowMs = this.clock();
     // Still leased: the holder's turn is still executing (status `running`), or another wake's turn
     // took it. Look again; giving up here is how a wake that landed mid-turn was lost.
     if (run.lockedUntil !== undefined && run.lockedUntil > nowMs) {
-      if (attempt < LEASE_RECHECK_ATTEMPTS) {
-        this.recheckAfterLease(runId, run.lockedUntil, attempt + 1);
-      }
+      this.recheckAfterLease(runId, run.lockedUntil, attempt + 1);
       return;
     }
     // Free, and `pending` (its dispatch or the pending-run poll runs it) or `running` with no lease
@@ -4586,9 +4638,14 @@ export class WorkflowEngine {
       if (
         !(await this.store.tryLockRun(run.id, this.instanceId, lockNow + this.leaseMs, lockNow))
       ) {
-        this.recheckAfterLease(run.id, run.lockedUntil);
+        this.trackEffect(this.requestWake(run.id, run.lockedUntil));
         return { runId: run.id, status: run.status };
       }
+    }
+    // This turn reads the run's checkpoints after this point, so it sees whatever the wakes that
+    // asked for it wrote: their request is served.
+    if (run.wakeRequestedAt !== undefined) {
+      await this.store.updateRun(run.id, { wakeRequestedAt: undefined });
     }
     const lease = { handedOff: false };
     this.executionLeases.set(run.id, lease);
@@ -6102,6 +6159,7 @@ export class WorkflowEngine {
     const replay = new Map<number, StepCheckpoint>();
     for (const cp of snapshot) replay.set(cp.seq, cp);
     let suspendedOnFan: FanJoin | undefined;
+    let settledSuspended = false;
     const ctx = createWorkflowCtx(
       this.ctxHostFor(replay, run.namespace),
       run.id,
@@ -6197,7 +6255,10 @@ export class WorkflowEngine {
         if (settled.status === 'suspended' && err.stepFans?.length) {
           this.recheckStepFans(run.id, err.stepFans);
         }
-        if (settled.status === 'suspended') suspendedOnFan = err.fan;
+        if (settled.status === 'suspended') {
+          suspendedOnFan = err.fan;
+          settledSuspended = true;
+        }
         return settled;
       }
       // A cancel in flight that surfaced as a thrown error settles `cancelled`, not `failed`: the saga
@@ -6236,8 +6297,13 @@ export class WorkflowEngine {
       // Letting it go is safe by the same argument `releaseInflightLocks` already makes: the
       // lease is a lease. It expires, and `recoverIncomplete` re-drives whatever is still held.
       // A lost release costs one lease window of latency; a masked error costs the diagnosis.
+      //
+      // A suspended turn keeps the lease instead when a wake it refused asked for another turn, and
+      // runs that turn (see `requestWake`).
+      let released = true;
       try {
-        await this.store.releaseRunLock(run.id, this.instanceId);
+        if (settledSuspended) released = await this.releaseSuspendedLease(run.id);
+        else await this.store.releaseRunLock(run.id, this.instanceId);
       } catch (releaseErr) {
         console.warn(
           `[adonis-durable] releasing the lease of run ${run.id} failed (it expires on its own and recovery re-drives): ${
@@ -6245,7 +6311,17 @@ export class WorkflowEngine {
           }`,
         );
       }
-      if (suspendedOnFan) {
+      if (!released) {
+        this.trackEffect(
+          this.resumeImplicit(run.id).catch((err) => {
+            console.warn(
+              `[adonis-durable] the turn a refused wake asked for of run ${run.id} failed (it is due for the timer poll): ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+          }),
+        );
+      } else if (suspendedOnFan) {
         const fan = suspendedOnFan;
         this.trackEffect(this.redriveSettledChildren(run.id, fan));
       }

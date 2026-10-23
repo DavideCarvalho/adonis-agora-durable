@@ -87,6 +87,8 @@ export class CodecStateStore implements StateStore {
   /** Encodes like {@link saveCheckpoint}. Bound only when the inner store has it, so the engine's
    *  plain-save fallback still kicks in through the wrapper. */
   readonly saveCheckpointIfPending?: (checkpoint: StepCheckpoint) => Promise<boolean>;
+  /** Forwarded verbatim — a lease carries no payload. Bound only when the inner store has it. */
+  readonly releaseRunLockUnlessWakeRequested?: (runId: string, owner: string) => Promise<boolean>;
   /** Encodes each checkpoint like {@link saveCheckpoint}. Bound only when the inner store has it. */
   readonly saveCheckpointsIfPending?: (checkpoints: StepCheckpoint[]) => Promise<boolean[]>;
   /** Forwarded verbatim — deletes read no payload. Bound only when the inner store has it, so the
@@ -134,6 +136,11 @@ export class CodecStateStore implements StateStore {
     options: CodecStateStoreOptions = {},
   ) {
     this.extended = options.coverage === 'extended';
+    const releaseUnlessWake = inner.releaseRunLockUnlessWakeRequested;
+    if (releaseUnlessWake) {
+      this.releaseRunLockUnlessWakeRequested = (runId, owner) =>
+        releaseUnlessWake.call(inner, runId, owner);
+    }
     const saveIfPending = inner.saveCheckpointIfPending;
     if (saveIfPending) {
       this.saveCheckpointIfPending = (cp) => saveIfPending.call(inner, this.encCp(cp));
