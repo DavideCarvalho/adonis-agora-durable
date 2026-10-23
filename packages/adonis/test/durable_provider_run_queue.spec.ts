@@ -104,7 +104,9 @@ describe('DurableProvider and the transport run queue', () => {
     engine.register('echo', '1', async (_ctx, input) => input);
     await engine.start('echo', 'hi', 'r1');
     await until(async () => (await store.getRun('r1'))?.status === 'completed');
-    expect(transport.dispatched).toEqual([{ runId: 'r1', reason: 'start', key: expect.any(String) }]);
+    expect(transport.dispatched).toEqual([
+      { runId: 'r1', reason: 'start', key: expect.any(String) },
+    ]);
     await provider.shutdown();
     // The consumer stopped before the transport closed.
     expect(transport.stopped).toBe(1);
