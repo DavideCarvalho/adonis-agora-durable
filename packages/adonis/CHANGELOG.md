@@ -1,5 +1,33 @@
 # @adonis-agora/durable
 
+## 0.51.0
+
+### Minor Changes
+
+- [#376](https://github.com/DavideCarvalho/adonis-agora-durable/pull/376) [`6fb9c6c`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/6fb9c6c72a595ea140c0bea17390fedee1e4bbe5) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `config.schedules` names the workflow with a lazy import, the way the Adonis router takes controllers: `{ key: 'nightly-report', workflow: () => import('#workflows/daily_report_workflow'), cron: '0 2 * * *' }`. A workflow class or a registered name works too.
+  
+  - The import is called once, when `durable:work` or the embedded worker starts, after boot. Importing the class directly into `config/durable.ts` can hang the boot, because a service the workflow imports (`db`, `logger`) waits for the boot the config is part of.
+  - A module without a default export, or a class without `static workflow = { name }`, stops the worker from starting instead of failing on every tick.
+  - `ScheduledWorkflow<LazyWorkflowImport<typeof DailyReportWorkflow>>` (with `import type`) checks `input` against the class's `run`.
+  - New exports: `resolveSchedules` (resolves the lazy imports and classes to registered names; `runSchedules` refuses an unresolved lazy import), `resolveSchedule`, `LazyWorkflowImport`, `ScheduleWorkflowRef`, `ScheduleInputOf`. `mergeSchedules` returns the schedules with registered names.
+
+- [#375](https://github.com/DavideCarvalho/adonis-agora-durable/pull/375) [`f5ff558`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/f5ff5586b765cba0f43c1cb65f349506cfeeceb8) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `SchemaValidationError` now says which schema rejected the value, with the codes `@dudousxd/nestjs-durable` uses: `invalid_input` for a step's `input` schema or a workflow's `inputSchema` (at `start` and when a stored input no longer parses), `invalid_output` for a step's `output` schema. A rejected `searchAttributes` write and a direct `validateStandard` call keep `schema_validation`.
+  
+  An `onError` route for `schema_validation` (or `code: SchemaValidationError`, whose `static code` is still `schema_validation`) keeps catching input and output failures when no route names `invalid_input` or `invalid_output`. Code that compares `error.code === 'schema_validation'` on a run, a checkpoint or a caught error — an alert, a test — must also accept the new codes. `validateStandard` and `validateStandardSync` take an optional fourth argument, the code.
+  
+  The message changes to the `@dudousxd/nestjs-durable` format as well: `invalid step "billing:charge" input: amount: Expected number` (was `step "billing:charge" input failed schema validation — amount: Expected number`); an issue with no path is just its message (was `(root): …`). A test or an alert matching the old message must be updated. `code` and `details.issues` are the fields to match on.
+
+- [#371](https://github.com/DavideCarvalho/adonis-agora-durable/pull/371) [`3e0181c`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/3e0181ca64a54ebe3f5431e3aa610af1e8f8f3df) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A workflow's `inputSchema` no longer stores its parsed value. The run stores the input as it was sent, and `run(ctx, input)` receives the schema's output, re-parsed from the stored input before every turn, replays included.
+  
+  Storing the parsed value broke any schema whose output isn't plain JSON. The SQL stores keep the input in a JSON column, so a `Date` from `z.coerce.date()` came back as a string on Lucid (in production) while the in-memory store kept it a `Date` (in tests). A body calling `input.placedAt.toISOString()` passed its tests and failed in production. Re-parsing gives every turn the same value on every store.
+  
+  - The schema must be deterministic (no `default(() => Date.now())`, no random ids), and changing it is a breaking change to the workflow: bump `version`. An in-flight run whose stored input no longer parses fails with a `SchemaValidationError`.
+  - A remote workflow's task carries the parsed input, re-parsed each turn. It travels as JSON, so coercions and defaults apply but a non-JSON value arrives as its JSON form. The run keeps the input as sent.
+  - `validateInput` still receives the parsed value.
+  - Singleton and concurrency keys are now computed from the stored input, which is the value the singleton gate re-reads when it re-checks admission.
+  
+  This matches `@dudousxd/nestjs-durable`'s `@Workflow({ input })`.
+
 ## 0.50.0
 
 ### Minor Changes
