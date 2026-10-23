@@ -177,6 +177,10 @@ jobs:
           git commit -m "chore: version packages"
           git pull --rebase origin ${{ github.ref_name }}
           git push origin HEAD:${{ github.ref_name }}
+        env:
+          # `@changesets/changelog-github` looks up each changeset's PR and author while writing the
+          # changelogs, and throws without a token.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # No changesets are left by now, so the action takes its publish path: `pnpm release` (build
       # all + `changeset publish`) publishes every package whose version is not on npm yet, then
