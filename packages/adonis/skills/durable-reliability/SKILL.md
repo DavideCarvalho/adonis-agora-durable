@@ -259,8 +259,9 @@ test('checkout completes', async () => {
 ```
 
 Custom adapters prove themselves against the shipped contracts:
-`runStateStoreContract(name, factory)` and
-`runAdmissionBackendContract(name, factory)` live on
+`runStateStoreContract(name, factory)`,
+`runAdmissionBackendContract(name, factory)` and
+`runRunDispatchContract(name, factory)` (transports with a run queue: `dispatchRuns` + `onRun`) live on
 `@adonis-agora/durable/testing/conformance` (they generate vitest suites);
 `assertTransportConformance(transport)` stays on `/testing` as a plain async
 call. Source: `docs/testing.mdx`.
