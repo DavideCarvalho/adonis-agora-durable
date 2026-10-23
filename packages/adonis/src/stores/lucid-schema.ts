@@ -60,7 +60,7 @@ export const DURABLE_SCHEMA_META_TABLE = 'durable_schema_meta';
  * once on its next boot and then goes back to the one-row read. A test pins the SQLite DDL to this
  * number, so a schema change without a bump fails CI.
  */
-export const DURABLE_SCHEMA_REVISION = 3;
+export const DURABLE_SCHEMA_REVISION = 4;
 
 const SCHEMA_META_ROW = 'durable';
 
@@ -382,10 +382,12 @@ async function healDurableTables(
       table.text('search_attributes', 'longtext');
       table.integer('priority');
       table.text('awaiting_decision_task_id');
+      table.bigInteger('wake_requested_at');
       table.bigInteger('created_at').notNullable();
       table.bigInteger('updated_at').notNullable();
       table.index(['status'], 'durable_runs_status_idx');
       table.index(['status', 'wake_at'], 'durable_runs_due_idx');
+      table.index(['status', 'wake_requested_at'], 'durable_runs_wake_requested_idx');
       // Worker-pool partition: scopes the poll/recovery queries (namespace + status + createdAt).
       table.index(['namespace', 'status', 'created_at'], 'durable_runs_namespace_idx');
       // The dashboard's default (unfiltered) listing orders by created_at DESC — without this a
@@ -426,6 +428,15 @@ async function healDurableTables(
         table.text('awaiting_decision_task_id');
       });
       repairs.push(`${DURABLE_TABLES.runs}.awaiting_decision_task_id`);
+    }
+    if (!(await conn().hasColumn(DURABLE_TABLES.runs, 'wake_requested_at'))) {
+      // Refused-wake marker (a wake that found another instance's lease): nullable, so an existing
+      // run reads back as "no turn requested".
+      await conn().alterTable(DURABLE_TABLES.runs, (table) => {
+        table.bigInteger('wake_requested_at');
+        table.index(['status', 'wake_requested_at'], 'durable_runs_wake_requested_idx');
+      });
+      repairs.push(`${DURABLE_TABLES.runs}.wake_requested_at`);
     }
     // Index-only repair: the dashboard's default (unfiltered) listing orders by created_at DESC —
     // without this a page load over a large table is a full sort.

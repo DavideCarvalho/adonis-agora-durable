@@ -36,6 +36,8 @@ export interface RunRow {
   priority: number | string | null;
   /** Nullable + optional: the column arrived in a later schema wave (multi-instance remote decisions). */
   awaiting_decision_task_id?: string | null;
+  /** Nullable + optional: the column arrived in a later schema wave (durable refused wakes). */
+  wake_requested_at?: number | string | null;
   created_at: number | string;
   updated_at: number | string;
 }
@@ -217,6 +219,7 @@ export function runPatchToRow(patch: Partial<WorkflowRun>): Partial<RunRow> {
   if ('awaitingDecisionTaskId' in patch) {
     row.awaiting_decision_task_id = patch.awaitingDecisionTaskId ?? null;
   }
+  if ('wakeRequestedAt' in patch) row.wake_requested_at = patch.wakeRequestedAt ?? null;
   if (patch.createdAt != null) row.created_at = patch.createdAt.getTime();
   if (patch.updatedAt != null) row.updated_at = patch.updatedAt.getTime();
   return row;
@@ -258,6 +261,8 @@ export function rowToRun(row: RunRow): WorkflowRun {
   if (row.awaiting_decision_task_id != null) {
     run.awaitingDecisionTaskId = row.awaiting_decision_task_id;
   }
+  const wakeRequestedAt = toNum(row.wake_requested_at ?? null);
+  if (wakeRequestedAt !== undefined) run.wakeRequestedAt = wakeRequestedAt;
   return run;
 }
 

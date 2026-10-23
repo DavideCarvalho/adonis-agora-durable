@@ -643,9 +643,27 @@ export function createWorkflowCtx(
     if (existing && existing.status === 'completed') {
       return unwrapCompletion<T>(existing.output, `child "${id}"`);
     }
-    // A placeholder proves the waiter was put; re-putting it could leave one for a child that
-    // already settled after this execution's snapshot, which nothing would ever take.
-    if (!existing) await store.putSignalWaiter({ token: `child:${id}`, runId, seq: current });
+    // The waiter and a `running` placeholder at this seq go in together (one transaction when the
+    // store can), BEFORE anything below can start the child: the child's completion overwrites the
+    // placeholder, so a placeholder written after the start could land on top of a child that already
+    // finished, and erase its completion. The placeholder also shows the child in the parent's
+    // timeline while it runs; `running` is ignored by replay history. A placeholder proves the waiter
+    // was put; re-putting it could leave one for a child that already settled after this execution's
+    // snapshot, which nothing would ever take.
+    if (!existing) {
+      await registerChildWaits([
+        {
+          waiter: { token: `child:${id}`, runId, seq: current },
+          checkpoint: instantCheckpoint({
+            runId,
+            seq: current,
+            name: `signal:child:${id}`,
+            kind: 'signal',
+            status: 'running',
+          }),
+        },
+      ]);
+    }
     // Lost-wake guard (mirrors the engine's remote `startChild` command path): the child may have
     // ALREADY completed while no waiter was registered — e.g. this run failed on the child's
     // failure, the child was retried to completion, and this run is now being retried — leaving its
@@ -697,22 +715,6 @@ export function createWorkflowCtx(
         }),
       );
       return unwrapCompletion<T>(completion, `child "${id}"`);
-    }
-    // Make the awaited child visible in the parent's timeline WHILE it runs: a `running` placeholder
-    // at this seq with the same `signal:child:<id>` name the signal resolution later overwrites as
-    // `completed`. So the dashboard shows the child node (and can inline-expand it) live, instead of
-    // it appearing only when it finishes. Written once (skipped on replay, where `existing` is set);
-    // `running` is ignored by replay history, so it never short-circuits determinism.
-    if (!existing) {
-      await writeCheckpoint(
-        instantCheckpoint({
-          runId,
-          seq: current,
-          name: `signal:child:${id}`,
-          kind: 'signal',
-          status: 'running',
-        }),
-      );
     }
     throw new WorkflowSuspended(
       undefined,

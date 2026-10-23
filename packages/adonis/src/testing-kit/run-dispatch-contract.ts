@@ -79,6 +79,393 @@ async function until(
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** The shapes of an awaited child the mid-turn wake case runs: a fan, a settled fan, one child. */
+export type AwaitedChildShape = 'all' | 'allSettled' | 'child';
+
+/**
+ * A child finishes while its parent's turn, on another instance, still holds the parent's lease: the
+ * parent's turn is held at its first write after it sent the children (its settle, or a `running`
+ * placeholder written on its own) until the child's completion was written and its wake was refused
+ * by the lease, then released. The parent must then finish on its own, long before `reconcileMs`:
+ * the engines' clock never moves, so nothing but the wake (or the turn's own re-check) resumes it.
+ *
+ * Instance `a` executes the parent's turn and, with a run queue, takes nothing from the queue;
+ * instance `b` takes everything else, so the child's wake lands on the instance without the lease.
+ * The options take instances down at the worst moments, so that only a wake kept durably survives.
+ */
+export async function assertMidTurnChildWake(opts: {
+  shape: AwaitedChildShape;
+  /**
+   * The holder skips its own re-check of what its turn waits on once it lets go of the lease (its
+   * reads fail): only the refused wake can resume the parent.
+   */
+  holderSkipsItsRecheck?: boolean;
+  /** The refused instance goes down (it drains) right after the refusal, taking anything it held in memory. */
+  refuserGoesDown?: boolean;
+  /**
+   * The holder goes down right after its settle, before it lets go of the lease: a third instance,
+   * whose clock is past the lease, must find the run due on its timer poll.
+   */
+  holderGoesDownAfterSettle?: boolean;
+  /**
+   * The store refuses the refused-wake stamp (a schema without the column): only the in-memory
+   * re-check of the refused instance can resume the parent.
+   */
+  storeRefusesTheStamp?: boolean;
+  /** The engines' `leaseMs`. Default 30 000. */
+  leaseMs?: number;
+  /** How long the turn stays held once the wake was refused. Default 2 500 ms. */
+  holdMs?: number;
+  makeTransport: () => Promise<Transport> | Transport;
+  timeoutMs?: number;
+  track?: { engines: WorkflowEngine[]; transports: Transport[] };
+}): Promise<void> {
+  const timeout = opts.timeoutMs ?? 20_000;
+  const leaseMs = opts.leaseMs ?? 30_000;
+  const inner = new InMemoryStateStore();
+  let parked = false;
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const refusedLeases: string[] = [];
+  // Completions written over by a `running` placeholder: each one erases a finished child.
+  const erased: number[] = [];
+  let settled = false;
+  // What a holder that went down is stuck in; let go once the case is over, so its drain can end.
+  let endHang!: () => void;
+  const hang = new Promise<void>((r) => {
+    endHang = r;
+  });
+  const storeFor = (label: string) =>
+    new Proxy(inner, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver);
+        if (label === 'a' && settled) {
+          // The holder's post-turn re-check reads `hasSignalWaiter` first: refused.
+          if (opts.holderSkipsItsRecheck && prop === 'hasSignalWaiter') {
+            return async () => {
+              throw new Error("the holder's re-check failed");
+            };
+          }
+          // A holder that went down never gets to its release (nor anything after).
+          if (
+            opts.holderGoesDownAfterSettle &&
+            (prop === 'releaseRunLock' || prop === 'releaseRunLockUnlessWakeRequested')
+          ) {
+            return async () => {
+              await hang;
+              return false;
+            };
+          }
+        }
+        if (prop === 'updateRunIf') {
+          return async (runId: string, statuses: never, patch: { status?: string }) => {
+            if (opts.storeRefusesTheStamp && 'wakeRequestedAt' in patch) {
+              throw new Error('no column wake_requested_at');
+            }
+            if (runId === 'p' && patch.status === 'suspended' && !parked) {
+              parked = true;
+              await gate;
+            }
+            const applied = await inner.updateRunIf(runId, statuses, patch as never);
+            if (runId === 'p' && patch.status === 'suspended') settled = true;
+            return applied;
+          };
+        }
+        if (prop === 'saveCheckpoint') {
+          return async (cp: { runId: string; seq: number; name: string; status: string }) => {
+            if (
+              cp.runId === 'p' &&
+              cp.name.startsWith('signal:child:') &&
+              cp.status === 'running' &&
+              !parked
+            ) {
+              parked = true;
+              await gate;
+            }
+            if (cp.runId === 'p' && cp.status === 'running') {
+              if ((await inner.getCheckpoint('p', cp.seq))?.status === 'completed')
+                erased.push(cp.seq);
+            }
+            return inner.saveCheckpoint(cp as never);
+          };
+        }
+        // The waiter and placeholder of a child sent together: once the turn is past sending, any
+        // placeholder written over a completion this way erases the child too.
+        if (prop === 'registerChildWaits') {
+          return async (entries: Array<{ checkpoint: { runId: string; seq: number } }>) => {
+            for (const { checkpoint } of entries) {
+              if (checkpoint.runId !== 'p') continue;
+              const current = await inner.getCheckpoint('p', checkpoint.seq);
+              if (current?.status === 'completed') erased.push(checkpoint.seq);
+            }
+            return inner.registerChildWaits(entries as never);
+          };
+        }
+        if (prop === 'tryLockRun') {
+          return async (runId: string, owner: string, until: number, now: number) => {
+            const got = await inner.tryLockRun(runId, owner, until, now);
+            if (runId === 'p' && !got) refusedLeases.push(owner);
+            return got;
+          };
+        }
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as InMemoryStateStore;
+  const store = storeFor('b');
+  const now = Date.now();
+  const n = opts.shape === 'child' ? 1 : 3;
+  const build = async (label: string, clock: () => number) => {
+    const transport = await opts.makeTransport();
+    opts.track?.transports.push(transport);
+    const engine = new WorkflowEngine({
+      store: storeFor(label),
+      transport,
+      clock,
+      leaseMs,
+      reconcileMs: 300_000,
+      instanceId: `mid-turn-${label}`,
+    });
+    opts.track?.engines.push(engine);
+    engine.register('child', '1', async (ctx, input) => {
+      await ctx.waitForSignal(`go:${input as number}`);
+      return input;
+    });
+    engine.register('parent', '1', async (ctx) => {
+      const inputs = Array.from({ length: n }, (_, i) => i);
+      if (opts.shape === 'all') return ctx.all('child', inputs);
+      if (opts.shape === 'allSettled') return ctx.allSettled('child', inputs);
+      return ctx.child('child', 0);
+    });
+    return engine;
+  };
+  const a = await build('a', () => now);
+  const b = await build('b', () => now);
+  // `a` takes nothing from the run queue: the child wakes land on `b`.
+  await a.consumeRuns()?.();
+  const at = new Date(now);
+  await store.createRun({
+    id: 'p',
+    workflow: 'parent',
+    workflowVersion: '1',
+    status: 'pending',
+    input: {},
+    namespace: 'default',
+    createdAt: at,
+    updatedAt: at,
+  });
+  try {
+    await midTurnCase();
+  } finally {
+    endHang();
+  }
+
+  async function midTurnCase(): Promise<void> {
+    const turn = a.runOne('p');
+    await until(() => parked, timeout, "the parent's turn to be held");
+    // The children were sent: each waits for its signal. Instance `b` delivers them, so each child
+    // finishes there (or on whichever instance takes it from the queue), never on `a`.
+    await until(
+      async () => (await store.listSignalWaiters('go:')).length === n,
+      timeout,
+      'the children to wait',
+    );
+    for (let i = 0; i < n; i += 1) await b.signal(`go:${i}`, undefined);
+    // Every child finished and its completion reached the parent...
+    await until(
+      async () =>
+        (await store.listRuns({ workflow: 'child', statuses: ['completed'] })).length === n &&
+        (await store.listSignalWaiters('child:p')).length === 0,
+      timeout,
+      "the children's completions",
+    );
+    // ...and the parent's wake was refused by the lease the turn still holds.
+    await until(() => refusedLeases.length > 0, timeout, 'the wake to find the lease held');
+    if (opts.refuserGoesDown) await b.drain(timeout);
+    // Long enough for any re-check of the refused wake to look while the turn still holds the lease.
+    await sleep(opts.holdMs ?? 2_500);
+    release();
+    if (opts.holderGoesDownAfterSettle) {
+      await until(() => settled, timeout, "the parent's settle");
+      // Another instance, after the holder's lease ran out, polls its due timers.
+      const c = await build('c', () => now + leaseMs + 1);
+      await until(
+        async () => {
+          await c.resumeDueTimers();
+          return (await store.getRun('p'))?.status === 'completed';
+        },
+        timeout,
+        'the parent to finish on the timer poll of another instance',
+      );
+    } else {
+      await turn;
+    }
+    await until(
+      async () => (await store.getRun('p'))?.status === 'completed',
+      timeout,
+      'the parent to finish without its reconcile wake',
+    );
+    expect(erased).toEqual([]);
+    const output = (await store.getRun('p'))?.output;
+    if (opts.shape === 'child') expect(output).toBe(0);
+    else if (opts.shape === 'all') expect(output).toEqual([0, 1, 2]);
+    else expect(output).toEqual([0, 1, 2].map((value) => ({ status: 'fulfilled', value })));
+  }
+}
+
+/**
+ * One instance, a `singleton` parent with search attributes and remote steps before and after a
+ * child fan, children that upsert search attributes and run a remote step: the shape of a real
+ * fan-out pipeline. The parent's turn is held at the fan's settle until every child finished (and,
+ * with a run queue, until this same instance took the child's wake and found the lease held by its
+ * own turn), then released. The parent must finish without its reconcile wake.
+ */
+export async function assertSingleInstanceSingletonFan(opts: {
+  mode: 'all' | 'allSettled';
+  concurrency?: number | undefined;
+  makeTransport: () => Promise<Transport> | Transport;
+  holdMs?: number;
+  timeoutMs?: number;
+  track?: { engines: WorkflowEngine[]; transports: Transport[] };
+}): Promise<void> {
+  const timeout = opts.timeoutMs ?? 20_000;
+  const n = 4;
+  const inner = new InMemoryStateStore();
+  let parked = false;
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  let refused = 0;
+  const store = new Proxy(inner, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver);
+      if (prop === 'updateRunIf') {
+        return async (runId: string, statuses: never, patch: { status?: string }) => {
+          // The fan's suspend: the first one with a child out (a `running` placeholder).
+          if (runId === 'p' && patch.status === 'suspended' && !parked) {
+            const cps = await inner.listCheckpoints('p');
+            if (cps.some((cp) => cp.name.startsWith('signal:child:') && cp.status === 'running')) {
+              parked = true;
+              await gate;
+            }
+          }
+          return inner.updateRunIf(runId, statuses, patch as never);
+        };
+      }
+      if (prop === 'tryLockRun') {
+        return async (runId: string, owner: string, until: number, now: number) => {
+          const got = await inner.tryLockRun(runId, owner, until, now);
+          if (runId === 'p' && !got && parked) refused += 1;
+          return got;
+        };
+      }
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  }) as InMemoryStateStore;
+  const transport = (await opts.makeTransport()) as Transport & {
+    handle?: (name: string, fn: (input: unknown) => Promise<unknown>) => void;
+  };
+  opts.track?.transports.push(transport);
+  if (typeof transport.handle !== 'function') throw new Error('the transport cannot serve steps');
+  transport.handle('pipeline.prepare', async () => 'prepared');
+  transport.handle('pipeline.finish', async (input) => `finished:${JSON.stringify(input)}`);
+  transport.handle('pipeline.item', async (input) => {
+    await sleep(50);
+    return (input as { i: number }).i * 10;
+  });
+  const now = Date.now();
+  const engine = new WorkflowEngine({
+    store,
+    transport,
+    clock: () => now,
+    reconcileMs: 300_000,
+    instanceId: 'single-instance',
+  });
+  opts.track?.engines.push(engine);
+  engine.register('child', '1', async (ctx, input) => {
+    const i = (input as { i: number }).i;
+    await ctx.upsertSearchAttributes({ item: i });
+    return ctx.step<number>('pipeline.item', { i });
+  });
+  engine.register(
+    'parent',
+    '1',
+    async (ctx, input) => {
+      await ctx.step('pipeline.prepare', input);
+      await ctx.upsertSearchAttributes({ phase: 'fan' });
+      const inputs = Array.from({ length: n }, (_, i) => ({ i }));
+      const fanOpts =
+        opts.concurrency === undefined ? undefined : { concurrency: opts.concurrency };
+      const out =
+        opts.mode === 'all'
+          ? await ctx.all('child', inputs, fanOpts)
+          : await ctx.allSettled('child', inputs, fanOpts);
+      await ctx.upsertSearchAttributes({ phase: 'done' });
+      return ctx.step('pipeline.finish', out);
+    },
+    { singleton: { key: (input) => (input as { base: string }).base } },
+  );
+  await engine.start('parent', { base: 'base-1' }, 'p', { searchAttributes: { base: 'base-1' } });
+  await until(() => parked, timeout, "the fan's turn to be held");
+  const firstWave = opts.concurrency === undefined ? n : Math.min(n, opts.concurrency);
+  await until(
+    async () =>
+      (await store.listRuns({ workflow: 'child', statuses: ['completed'] })).length >=
+      Math.min(firstWave, (await store.listRuns({ workflow: 'child' })).length),
+    timeout,
+    'the sent children to finish',
+  );
+  // With a run queue the child's wake reaches this same instance's consumer, which finds the
+  // lease held by its own turn.
+  if (typeof (transport as { dispatchRuns?: unknown }).dispatchRuns === 'function') {
+    await until(() => refused > 0, timeout, 'the wake to find the lease held');
+  }
+  await sleep(opts.holdMs ?? 2_500);
+  release();
+  await until(
+    async () => (await store.getRun('p'))?.status === 'completed',
+    timeout,
+    'the parent to finish without its reconcile wake',
+  );
+  const values = Array.from({ length: n }, (_, i) => i * 10);
+  const expected =
+    opts.mode === 'all' ? values : values.map((value) => ({ status: 'fulfilled', value }));
+  expect((await store.getRun('p'))?.output).toBe(`finished:${JSON.stringify(expected)}`);
+  expect((await store.getRun('p'))?.searchAttributes).toMatchObject({
+    base: 'base-1',
+    phase: 'done',
+  });
+}
+
+/** The holder/refuser failures every mid-turn case runs under (see {@link assertMidTurnChildWake}). */
+export const MID_TURN_VARIANTS = [
+  { label: 'both alive' },
+  { label: 'the holder skips its re-check', holderSkipsItsRecheck: true },
+  {
+    label: 'the holder keeps the lease past 30 re-checks',
+    holderSkipsItsRecheck: true,
+    leaseMs: 1,
+    holdMs: 5_000,
+  },
+  {
+    label: 'the refused instance goes down',
+    holderSkipsItsRecheck: true,
+    refuserGoesDown: true,
+  },
+  {
+    label: 'the store cannot keep the request',
+    holderSkipsItsRecheck: true,
+    storeRefusesTheStamp: true,
+  },
+  {
+    label: 'both instances go down',
+    refuserGoesDown: true,
+    holderGoesDownAfterSettle: true,
+  },
+] as const;
+
 /**
  * The contract of the run queue a transport offers the engine ({@link Transport.dispatchRuns} /
  * {@link Transport.onDispatchedRun}), run end to end through real engines sharing one in-memory store: every
@@ -678,5 +1065,41 @@ export function runRunDispatchContract(name: string, factory: RunDispatchTranspo
       },
       timeout * 2,
     );
+
+    for (const shape of ['all', 'allSettled', 'child'] as const) {
+      for (const variant of MID_TURN_VARIANTS) {
+        it(
+          `a child finishing while its parent's turn still holds the lease wakes the parent (${shape}, ${variant.label})`,
+          async () => {
+            await assertMidTurnChildWake({
+              shape,
+              ...variant,
+              makeTransport: () => factory.make(),
+              timeoutMs: timeout,
+              track: { engines, transports: transports as Transport[] },
+            });
+          },
+          timeout * 3,
+        );
+      }
+    }
+
+    for (const mode of ['all', 'allSettled'] as const) {
+      for (const concurrency of [undefined, 2]) {
+        it(
+          `one instance: a singleton parent's ctx.${mode} fan (concurrency ${concurrency}) of children that finish mid-turn completes`,
+          async () => {
+            await assertSingleInstanceSingletonFan({
+              mode,
+              concurrency,
+              makeTransport: () => factory.make(),
+              timeoutMs: timeout,
+              track: { engines, transports: transports as Transport[] },
+            });
+          },
+          timeout * 3,
+        );
+      }
+    }
   });
 }

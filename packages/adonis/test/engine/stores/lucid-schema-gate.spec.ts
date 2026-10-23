@@ -176,11 +176,11 @@ describe.each(dbBackends())('on $name', ({ name: backend, makeMemoryDb }) => {
       // Knex upgrade changed how SQLite spells the same DDL, update the digest alone.)
       // One digest per backend: the same DDL, spelled by each dialect.
       expect({ revision: DURABLE_SCHEMA_REVISION, digest }).toEqual({
-        revision: 3,
+        revision: 4,
         digest:
           backend === 'postgres'
-            ? '25f0e4440d634e76499d0e32008d33085310aa2aea84627f5f14829d9536bc9a'
-            : '004771001d3413ab12ae14444d47fc020402c902050282b14c0e955726943cd0',
+            ? '8c982a7021829ae0fa0ca09be6622abed6ba3229b0616ad8370d64355797e4e9'
+            : '4aae89959954329e70c1c6b03444d0c266c850fab7d7bf9f9926c66887439284',
       });
     });
   });

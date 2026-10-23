@@ -156,6 +156,53 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.getRun('nope')).toBeNull();
     });
 
+    t('round-trips a refused wake request (wakeRequestedAt), and clears it', async () => {
+      await store.createRun(run({ status: 'suspended' }));
+      await store.updateRun('r1', { wakeRequestedAt: 1234 });
+      expect((await store.getRun('r1'))?.wakeRequestedAt).toBe(1234);
+      expect(await store.updateRunIf('r1', ['suspended'], { wakeRequestedAt: 99 })).toBe(true);
+      expect((await store.getRun('r1'))?.wakeRequestedAt).toBe(99);
+      await store.updateRun('r1', { wakeRequestedAt: undefined });
+      expect((await store.getRun('r1'))?.wakeRequestedAt).toBeUndefined();
+    });
+
+    t('a suspended run that asked for a turn is due, whatever its timer says', async () => {
+      const far = 9_999_999_999_999;
+      await store.createRun(run({ id: 'asked', status: 'suspended', wakeAt: far }));
+      await store.createRun(run({ id: 'untimed', status: 'suspended' }));
+      await store.createRun(run({ id: 'quiet', status: 'suspended', wakeAt: far }));
+      await store.createRun(run({ id: 'busy', status: 'running' }));
+      await store.updateRun('asked', { wakeRequestedAt: 1 });
+      await store.updateRun('untimed', { wakeRequestedAt: 1 });
+      await store.updateRun('busy', { wakeRequestedAt: 1 });
+      const due = (await store.listDueTimers(1_000)).map((r) => r.id).sort();
+      expect(due).toEqual(['asked', 'untimed']);
+    });
+
+    t(
+      'releaseRunLockUnlessWakeRequested (when implemented) keeps the lease while a turn is asked for',
+      async () => {
+        if (!store.releaseRunLockUnlessWakeRequested) return;
+        await store.createRun(run({ status: 'suspended' }));
+        expect(await store.tryLockRun('r1', 'holder', 10_000, 0)).toBe(true);
+        expect(await store.releaseRunLockUnlessWakeRequested('r1', 'holder')).toBe(true);
+        expect((await store.getRun('r1'))?.lockedBy).toBeUndefined();
+
+        expect(await store.tryLockRun('r1', 'holder', 10_000, 0)).toBe(true);
+        await store.updateRun('r1', { wakeRequestedAt: 5 });
+        expect(await store.releaseRunLockUnlessWakeRequested('r1', 'holder')).toBe(false);
+        expect((await store.getRun('r1'))?.lockedBy).toBe('holder');
+
+        // Not the holder: nothing to release, and the holder's lease stays.
+        expect(await store.releaseRunLockUnlessWakeRequested('r1', 'someone-else')).toBe(true);
+        expect((await store.getRun('r1'))?.lockedBy).toBe('holder');
+
+        await store.updateRun('r1', { wakeRequestedAt: undefined });
+        expect(await store.releaseRunLockUnlessWakeRequested('r1', 'holder')).toBe(true);
+        expect((await store.getRun('r1'))?.lockedBy).toBeUndefined();
+      },
+    );
+
     t(
       'getRuns (when implemented) reads several runs at once, leaving out unknown ids',
       async () => {

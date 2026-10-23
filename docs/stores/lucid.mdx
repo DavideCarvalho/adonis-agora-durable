@@ -95,7 +95,7 @@ The migration creates seven tables (default names, from the `DURABLE_TABLES` con
 
 | Table | Purpose |
 | --- | --- |
-| `durable_workflow_runs` | one row per run: workflow and version, status, `namespace`, `origin`, `priority`, input/output/error, `wake_at`, lock columns (`locked_by`, `locked_until`), `recovery_attempts`, tags, search attributes, and `awaiting_decision_task_id` (the remote workflow turn the run waits on, see [Remote workflow turns](/docs/durable/reliability/multi-instance#remote-workflow-turns)) |
+| `durable_workflow_runs` | one row per run: workflow and version, status, `namespace`, `origin`, `priority`, input/output/error, `wake_at`, lock columns (`locked_by`, `locked_until`), `recovery_attempts`, tags, search attributes, `awaiting_decision_task_id` (the remote workflow turn the run waits on, see [Remote workflow turns](/docs/durable/reliability/multi-instance#remote-workflow-turns)), and `wake_requested_at` (a wake refused by another instance's lease asked for a turn, see [Wide fans and lost completions](/docs/durable/reliability/multi-instance#wide-fans-and-lost-completions)) |
 | `durable_step_checkpoints` | one row per step `(run_id, seq)`: name, kind, `step_id`, status, input/output/error, attempts, events, `worker_group`, the admitted flow-control `queue`, `parallel_group`, `wake_at`, timing (`enqueued_at`, `started_at`, `finished_at`) and the last heartbeat (`last_heartbeat_at`, `heartbeat_progress`) |
 | `durable_run_attributes` | normalized side-table of searchable attributes (`key` + `str_value`/`num_value`) for fast filtering |
 | `durable_signal_waiters` | runs parked on a [signal](/docs/durable/concepts/sleep-and-signals) token |

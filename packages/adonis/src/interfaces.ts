@@ -96,6 +96,15 @@ export interface WorkflowRun {
    * Absent on non-remote runs and on runs not currently awaiting a turn.
    */
   awaitingDecisionTaskId?: string | undefined;
+  /**
+   * A wake that could not take the run's lease (another instance's turn held it) asked for another
+   * turn: the engine clock ms it asked at. Written by the refused wake, cleared by the turn that
+   * starts next. The holder does not let go of the lease while it is set (see
+   * {@link StateStore.releaseRunLockUnlessWakeRequested}) and runs another turn instead; a
+   * `suspended` run carrying it is due (see {@link StateStore.listDueTimers}), so the wake survives
+   * the instance that was refused going down. Absent when nothing is waiting for a turn.
+   */
+  wakeRequestedAt?: number | undefined;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -456,7 +465,8 @@ export interface StateStore {
   listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]>;
 
   /**
-   * Suspended runs whose durable timer is due (`wakeAt <= nowMs`), ready to resume. When `namespace`
+   * Suspended runs whose durable timer is due (`wakeAt <= nowMs`), or that carry a
+   * {@link WorkflowRun.wakeRequestedAt}, ready to resume. When `namespace`
    * is given, restrict to runs in that worker-pool partition (ANDed); omit it to return all. `limit`
    * (when given) caps the batch — a backlog drains over several polls; a store may ignore it
    * (back-compat), the engine tolerates larger batches.
@@ -482,6 +492,14 @@ export interface StateStore {
    * behavior, never breaks.
    */
   releaseRunLock(runId: string, owner?: string): Promise<void>;
+  /**
+   * Release `owner`'s lease on `runId` only while the run carries no
+   * {@link WorkflowRun.wakeRequestedAt}, in one conditional write; resolve whether it released. A turn
+   * that suspends lets go through it, so a wake refused during the turn (it set the marker) is never
+   * lost between the holder's last look and its release: the holder keeps the lease and runs another
+   * turn instead. Optional: without it the engine releases, then reads the run back.
+   */
+  releaseRunLockUnlessWakeRequested?(runId: string, owner: string): Promise<boolean>;
 
   /**
    * Extend a run's lease to `leaseUntilMs`, but ONLY if `owner` still holds it — so a live worker
