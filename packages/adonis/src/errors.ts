@@ -177,12 +177,23 @@ export interface SchemaIssue {
 }
 
 /**
+ * The code a {@link SchemaValidationError} carries: `invalid_input` for a step's `input` or a
+ * workflow's `inputSchema`, `invalid_output` for a step's `output`, `schema_validation` for anything
+ * else (a typed `searchAttributes` write, a direct `validateStandard` call). The same codes
+ * `@dudousxd/nestjs-durable` uses.
+ */
+export type SchemaValidationCode = 'invalid_input' | 'invalid_output' | 'schema_validation';
+
+/**
  * Thrown when a value fails a Standard Schema (zod / valibot / arktype / …) the app declared: a
  * `@Step({ input, output })` schema, a workflow's `inputSchema`, or its typed `searchAttributes`.
- * A `FatalError` (code `schema_validation`), so it is NOT retried — retrying cannot fix a payload
- * that doesn't match its schema. `issues` (also in `details.issues`, so it survives the transport
- * to the run's error / an `onError` handler) lists every issue with a JSON-safe `path`. Route it
- * with `onError: [{ code: SchemaValidationError, workflow: … }]`.
+ * A `FatalError`, so it is NOT retried — retrying cannot fix a payload that doesn't match its
+ * schema. Its `code` says which schema rejected the value ({@link SchemaValidationCode}). `issues`
+ * (also in `details.issues`, so it survives the transport to the run's error / an `onError`
+ * handler) lists every issue with a JSON-safe `path`. Route one code with
+ * `onError: [{ code: 'invalid_input', workflow: … }]`, or all three with
+ * `onError: [{ code: SchemaValidationError, workflow: … }]` (its `static code`, `schema_validation`,
+ * also catches `invalid_input` and `invalid_output` that no route of their own matches).
  */
 export class SchemaValidationError extends FatalError {
   static readonly code = 'schema_validation';
@@ -193,6 +204,7 @@ export class SchemaValidationError extends FatalError {
       readonly message: string;
       readonly path?: ReadonlyArray<PropertyKey | { readonly key: PropertyKey }> | undefined;
     }>,
+    code: SchemaValidationCode = 'schema_validation',
   ) {
     const normalized = issues.map((issue) => ({
       message: issue.message,
@@ -205,7 +217,7 @@ export class SchemaValidationError extends FatalError {
         (issue) => `${issue.path.length > 0 ? issue.path.join('.') : '(root)'}: ${issue.message}`,
       )
       .join('; ');
-    super(`${label} failed schema validation — ${summary}`, SchemaValidationError.code, {
+    super(`${label} failed schema validation — ${summary}`, code, {
       issues: normalized,
     });
     this.name = 'SchemaValidationError';

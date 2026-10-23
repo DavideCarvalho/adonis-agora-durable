@@ -125,8 +125,18 @@ several codes to one handler, list one route per code with the same `workflow`.
 The code comes from `FatalError`'s second argument, from a `code` on whatever a step handler threw, or
 from the code a remote worker reported for the failed step. A failure from a step reaches the route once
 the step's retries are spent; a `FatalError` skips them (in a dispatched handler too, because it carries
-`retryable: false`). A `SchemaValidationError` thrown in the body (a step's input or output schema rejected a value) is a
-`FatalError` with the code `schema_validation`, so it can be routed like any other code.
+`retryable: false`). A `SchemaValidationError` thrown in the body is a `FatalError` with the code `invalid_input` (a step's
+input schema, or the workflow's stored input no longer parsing) or `invalid_output` (a step's output
+schema), so it can be routed like any other code. A route for `schema_validation` — or
+`code: SchemaValidationError`, whose `static code` it is — catches both when no route names them, as
+well as a rejected `searchAttributes` write:
+
+```ts
+onError: [
+  { code: 'invalid_output', workflow: ReportBadProviderResponse }, // just this one
+  { code: SchemaValidationError, workflow: QuarantineRun },        // every other schema failure
+]
+```
 
 Never routed: cancellation (a run past its `executionTimeout` is cancelled too), dead-lettering, and the
 failures that mean the deployment is broken (non-determinism, a ctx call nested in a step). Those keep

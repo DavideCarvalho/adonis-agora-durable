@@ -70,14 +70,28 @@ export function liveHandoff<C extends { seq: number; name: string }>(
   return live;
 }
 
-/** The route a failure takes: the one for its exact code, else the catch-all, else none. */
+/**
+ * Codes a `schema_validation` route also catches: `SchemaValidationError`'s `static code`, which
+ * input and output schema failures carried before they got codes of their own, so a route written
+ * for it keeps catching them.
+ */
+const SCHEMA_VALIDATION_CODES = new Set(['invalid_input', 'invalid_output']);
+
+/**
+ * The route a failure takes: the one for its exact code, else (for an `invalid_input` /
+ * `invalid_output` failure) a `schema_validation` route, else the catch-all, else none.
+ */
 export function routeFor(
   routes: OnErrorRoute[] | undefined,
   error: StepError,
 ): OnErrorRoute | undefined {
   if (!routes?.length || (error.code && UNROUTABLE_CODES.has(error.code))) return undefined;
+  const { code } = error;
   return (
-    (error.code ? routes.find((r) => r.code === error.code) : undefined) ??
+    (code ? routes.find((r) => r.code === code) : undefined) ??
+    (code && SCHEMA_VALIDATION_CODES.has(code)
+      ? routes.find((r) => r.code === 'schema_validation')
+      : undefined) ??
     routes.find((r) => r.code === undefined)
   );
 }

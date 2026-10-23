@@ -33,11 +33,11 @@ function validating(step: DiscoveredStep): StepHandler {
   if (!meta.input && !meta.output) return handler;
   return async (input: unknown, log: StepLogger) => {
     const parsed = meta.input
-      ? await validateStandard(meta.input, input, `step "${meta.name}" input`)
+      ? await validateStandard(meta.input, input, `step "${meta.name}" input`, 'invalid_input')
       : input;
     const output = await handler(parsed, log);
     return meta.output
-      ? validateStandard(meta.output, output, `step "${meta.name}" output`)
+      ? validateStandard(meta.output, output, `step "${meta.name}" output`, 'invalid_output')
       : output;
   };
 }

@@ -108,10 +108,10 @@ describe('step schemas — any Standard Schema', () => {
     expect(run.status).toBe('failed');
     expect(calls).toBe(0); // body never ran
     expect(cp?.attempts).toBe(1); // not retried despite retries: 5
-    expect(cp?.error?.code).toBe('schema_validation');
+    expect(cp?.error?.code).toBe('invalid_input');
     expect(cp?.error?.retryable).toBe(false);
     expect(cp?.error?.details).toMatchObject({ issues: [{ path: ['n'] }] });
-    expect(run.error?.code).toBe('schema_validation');
+    expect(run.error?.code).toBe('invalid_input');
   });
 
   it('valibot: the output schema validates (and transforms) the result', async () => {
@@ -126,7 +126,7 @@ describe('step schemas — any Standard Schema', () => {
     const { run, step: cp } = await runStep(bad, {}, { retries: 3 });
     expect(run.status).toBe('failed');
     expect(cp?.attempts).toBe(1);
-    expect(cp?.error?.code).toBe('schema_validation');
+    expect(cp?.error?.code).toBe('invalid_output');
     expect(cp?.error?.message).toMatch(/step "v:out-bad" output/);
   });
 
@@ -139,7 +139,7 @@ describe('step schemas — any Standard Schema', () => {
     const { run, step: cp } = await runStep(step, { name: 1 }, { retries: 3 });
     expect(run.status).toBe('failed');
     expect(cp?.attempts).toBe(1);
-    expect(cp?.error?.code).toBe('schema_validation');
+    expect(cp?.error?.code).toBe('invalid_input');
   });
 
   it('async validate: awaited at the serve boundary', async () => {
@@ -160,7 +160,7 @@ describe('step schemas — any Standard Schema', () => {
     expect((await runStep(step, { n: 'a' })).run.output).toBe('A');
     const { run } = await runStep(step, { n: 1 });
     expect(run.status).toBe('failed');
-    expect(run.error?.code).toBe('schema_validation');
+    expect(run.error?.code).toBe('invalid_input');
   });
 });
 
@@ -188,6 +188,7 @@ describe('workflow inputSchema', () => {
     const err = await engine.start('checkout', { qty: 3 }, 'bad').catch((e) => e);
     expect(err).toBeInstanceOf(SchemaValidationError);
     expect(err.message).toMatch(/workflow "checkout" input/);
+    expect(err.code).toBe('invalid_input');
     expect(await store.getRun('bad')).toBeNull();
     expect(order).toEqual([]); // the schema runs first; validateInput never saw the bad payload
 

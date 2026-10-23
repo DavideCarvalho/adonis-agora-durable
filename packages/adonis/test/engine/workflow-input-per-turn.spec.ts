@@ -78,7 +78,7 @@ describe.each(backends)('workflow inputSchema, parsed per turn, on $name', (back
     for (const placedAt of seen) expect(placedAt).toBeInstanceOf(Date);
   });
 
-  it('fails a run whose stored input no longer parses, with schema_validation', async () => {
+  it('fails a run whose stored input no longer parses, with invalid_input', async () => {
     const engine = new WorkflowEngine({ store });
     engine.register(
       'order',
@@ -98,7 +98,7 @@ describe.each(backends)('workflow inputSchema, parsed per turn, on $name', (back
     const result = await engine.waitForRun('r2', { terminal: true });
 
     expect(result.status).toBe('failed');
-    expect(result.error).toMatchObject({ code: 'schema_validation' });
+    expect(result.error).toMatchObject({ code: 'invalid_input' });
   });
 });
 
@@ -156,6 +156,6 @@ describe('workflow inputSchema on a remote workflow', () => {
 
     expect(advanced).toBe(0);
     expect(result.status).toBe('failed');
-    expect(result.error).toMatchObject({ code: 'schema_validation' });
+    expect(result.error).toMatchObject({ code: 'invalid_input' });
   });
 });

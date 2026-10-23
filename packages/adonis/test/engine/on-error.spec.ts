@@ -418,6 +418,19 @@ describe('routeFor', () => {
     expect(routeFor(routes, { message: 'x', code: 'nested_workflow_call' })).toBeUndefined();
     expect(routeFor(routes, { message: 'x' })).toEqual({ workflow: 'catch-all' });
   });
+  it('sends invalid_input and invalid_output to a schema_validation route, after their own', () => {
+    const family = [{ code: 'schema_validation', workflow: 'schema' }, { workflow: 'catch-all' }];
+    expect(routeFor(family, { message: 'x', code: 'invalid_input' })).toEqual(family[0]);
+    expect(routeFor(family, { message: 'x', code: 'invalid_output' })).toEqual(family[0]);
+    expect(routeFor(family, { message: 'x', code: 'boom' })).toEqual(family[1]);
+
+    const exact = [
+      { code: 'schema_validation', workflow: 'schema' },
+      { code: 'invalid_input', workflow: 'input' },
+    ];
+    expect(routeFor(exact, { message: 'x', code: 'invalid_input' })).toEqual(exact[1]);
+    expect(routeFor(exact, { message: 'x', code: 'invalid_output' })).toEqual(exact[0]);
+  });
 });
 
 describe('assertRoutes', () => {

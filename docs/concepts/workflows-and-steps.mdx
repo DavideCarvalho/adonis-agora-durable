@@ -146,7 +146,7 @@ export const chargeCard = defineStep(
 
 - **Types are inferred** from the schema when the handler is unannotated: the handler's argument is the schema's output type, and the returned ref takes the schema's input type (so `ctx.step(chargeCard, …)` checks the call site). An annotated handler keeps its own types, exactly as before.
 - **Sync and async** validators both work (a schema whose `validate` returns a `Promise` is awaited).
-- **A failure is not retried.** It throws a `SchemaValidationError` — a `FatalError` with code `schema_validation` and the issues in `details.issues` (`[{ message, path }]`) — so the step fails once and the run fails (or routes via `onError: [{ code: SchemaValidationError, workflow }]`). Retrying cannot fix a payload that doesn't match its schema.
+- **A failure is not retried.** It throws a `SchemaValidationError` — a `FatalError` with code `invalid_input` or `invalid_output` and the issues in `details.issues` (`[{ message, path }]`) — so the step fails once and the run fails (or routes via `onError: [{ code: 'invalid_input', workflow }]`, or `code: SchemaValidationError` for both). Retrying cannot fix a payload that doesn't match its schema.
 
 ### Dispatch options
 
