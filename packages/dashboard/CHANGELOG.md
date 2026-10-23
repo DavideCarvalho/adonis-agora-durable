@@ -1,5 +1,11 @@
 # @adonis-agora/durable-dashboard
 
+## 0.8.1
+
+### Patch Changes
+
+- [#368](https://github.com/DavideCarvalho/adonis-agora-durable/pull/368) [`7ca58b5`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/7ca58b5901e042e605c567caf9fb85b8f693ce64) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The "queued — behind leader" badge now names the run that holds the singleton slot (the `durable:singleton:admitted` tag) instead of the oldest in-flight run, never shows a sleeping holder as queued, and counts `blocked` runs.
+
 ## 0.8.0
 
 ### Minor Changes
