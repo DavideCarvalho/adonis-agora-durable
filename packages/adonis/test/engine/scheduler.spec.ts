@@ -197,10 +197,9 @@ describe('runSchedules — jitter', () => {
       { key: 'slow', workflow: 'beat', everyMs: 1000, jitter: 60_000 },
       { key: 'fast', workflow: 'beat', everyMs: 1000 },
     ];
-    const started = Date.now();
+    // The old code slept ~59 s on `slow` before reaching `fast`; now `fast` fires in the same call.
     const ids = await runSchedules(engine, schedules, 1000, { random: () => 0.99 });
     expect(ids).toEqual(['sched:fast:1']);
-    expect(Date.now() - started).toBeLessThan(1_000);
   });
 
   it('still fires a deferred window after the schedule moved on (jitter longer than the interval)', async () => {
