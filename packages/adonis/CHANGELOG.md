@@ -1,5 +1,13 @@
 # @adonis-agora/durable
 
+## 0.51.1
+
+### Patch Changes
+
+- [#382](https://github.com/DavideCarvalho/adonis-agora-durable/pull/382) [`42db817`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/42db817b2d9daebd459842a1be712bdfaf1e1db8) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A `standalone` engine on a broker transport (`bullmq`, `queue`, `db`) no longer logs `run-request responder started WITHOUT a tenant verifier` on every boot. Apps that never run tenant pods saw it as noise, and broker access already grants full trust there. An explicit `role: 'control-plane'` without `verifyTenant` still warns. `RunRequestResponder` gains a `warnWithoutVerifier` option (default `true`) for direct use.
+
+- [#379](https://github.com/DavideCarvalho/adonis-agora-durable/pull/379) [`dda3a1b`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/dda3a1bc8ca6ef4feea0796f048eaaf4ba254318) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Fix `controlPlanes.redis()` and `admissions.redis()` crashing app boot with `Cannot read properties of undefined (reading 'connection')`. Both read `@adonisjs/redis/services/main`, which is only assigned after the app has booted, while the durable provider builds them during its own boot. They now resolve the Redis manager from the container (`'redis'`), and fail with an actionable error when `@adonisjs/redis` is not registered.
+
 ## 0.51.0
 
 ### Minor Changes
