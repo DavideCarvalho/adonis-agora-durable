@@ -48,4 +48,20 @@ describe('onEvent debounce / batch', () => {
     await until(() => fired.length > 0);
     expect(fired).toEqual([{ events: [{ n: 1 }, { n: 2 }, { n: 3 }] }]);
   });
+
+  it("stamps the built-in accumulator run with durable's origin, not the target's", async () => {
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore(), clock: () => 1000 });
+    const fired: unknown[] = [];
+    engine.register('app-target', '1', async (_ctx, input) => void fired.push(input), {
+      onEvent: ['hit'],
+      eventBatch: { mode: 'batch', maxSize: 1, windowMs: 60_000 },
+      origin: 'my-app',
+    });
+
+    await engine.publishEvent('hit', { n: 1 });
+    await until(() => fired.length > 0);
+    expect((await engine.getRun('__evtacc__:app-target'))?.origin).toBe('@adonis-agora/durable');
+    const [target] = await engine.listRuns({ workflow: 'app-target' });
+    expect(target?.origin).toBe('my-app');
+  });
 });

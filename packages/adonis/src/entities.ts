@@ -1,5 +1,6 @@
 import { FatalError } from './errors.js';
 import type { WorkflowCtx } from './interfaces.js';
+import { PACKAGE_ORIGIN } from './package-origin.js';
 
 /** One operation on a durable entity: mutate `state` in place and/or return a result. */
 export type EntityHandler<S = unknown> = (state: S, arg: unknown) => unknown | Promise<unknown>;
@@ -18,6 +19,7 @@ export interface EntityHost {
     name: string,
     version: string,
     fn: (ctx: WorkflowCtx, input: unknown) => Promise<unknown>,
+    opts?: { origin?: string | undefined },
   ): void;
   signalWithStart(
     workflow: string,
@@ -73,7 +75,9 @@ export class Entities {
     private readonly host: EntityHost,
     private readonly workflowHost?: EntityWorkflowHost,
   ) {
-    host.register(ENTITY_WORKFLOW, '1', (ctx, input) => this.run(ctx, input));
+    host.register(ENTITY_WORKFLOW, '1', (ctx, input) => this.run(ctx, input), {
+      origin: PACKAGE_ORIGIN,
+    });
   }
 
   register<S>(name: string, config: EntityConfig<S>): void {
