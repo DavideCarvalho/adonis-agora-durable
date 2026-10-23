@@ -303,6 +303,13 @@ export class LucidStateStore implements StateStore {
     return row ? rowToRun(row as RunRow) : null;
   }
 
+  async getRuns(runIds: string[]): Promise<WorkflowRun[]> {
+    const ids = [...new Set(runIds)];
+    if (ids.length === 0) return [];
+    const rows = await this.fenced(this.client().from(DURABLE_TABLES.runs).whereIn('id', ids));
+    return (rows as RunRow[]).map(rowToRun);
+  }
+
   async deleteRun(runId: string): Promise<void> {
     // Child rows first, then the run — checkpoints, signal waiters, attribute rows — all in one
     // transaction so a crash can't leave a half-deleted run. (Buffered signals are token-keyed,

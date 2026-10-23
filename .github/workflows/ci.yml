@@ -62,14 +62,30 @@ jobs:
           --health-interval 2s
           --health-timeout 3s
           --health-retries 15
+      # MySQL for the specs that opt into it (`dbBackends({ mysql: true })`): the Lucid store contract
+      # and the db transport's run queue. Data on tmpfs, so the per-test DDL
+      # stays fast; every test gets a database of its own.
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --tmpfs /var/lib/mysql
+          --health-cmd "mysqladmin ping -uroot -proot --silent"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 60
     # The real backends. With CI set, a suite gated on one of these FAILS when it is missing instead
     # of skipping (test/support/backends.ts), so a dropped service cannot silently shrink the run.
-    # Test files share each server: Redis keys carry a per-file prefix, and every Postgres test gets
-    # a schema of its own.
+    # Test files share each server: Redis keys carry a per-file prefix, every Postgres test gets a
+    # schema of its own, and every MySQL test a database of its own.
     env:
       REDIS_URL: redis://127.0.0.1:6379
       DURABLE_REDIS_URL: redis://127.0.0.1:6379
       DURABLE_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+      DURABLE_MYSQL_URL: mysql://root:root@127.0.0.1:3306
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -112,14 +128,30 @@ jobs:
           --health-interval 2s
           --health-timeout 3s
           --health-retries 15
+      # MySQL for the specs that opt into it (`dbBackends({ mysql: true })`): the Lucid store contract
+      # and the db transport's run queue. Data on tmpfs, so the per-test DDL
+      # stays fast; every test gets a database of its own.
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --tmpfs /var/lib/mysql
+          --health-cmd "mysqladmin ping -uroot -proot --silent"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 60
     # The real backends. With CI set, a suite gated on one of these FAILS when it is missing instead
     # of skipping (test/support/backends.ts), so a dropped service cannot silently shrink the run.
-    # Test files share each server: Redis keys carry a per-file prefix, and every Postgres test gets
-    # a schema of its own.
+    # Test files share each server: Redis keys carry a per-file prefix, every Postgres test gets a
+    # schema of its own, and every MySQL test a database of its own.
     env:
       REDIS_URL: redis://127.0.0.1:6379
       DURABLE_REDIS_URL: redis://127.0.0.1:6379
       DURABLE_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+      DURABLE_MYSQL_URL: mysql://root:root@127.0.0.1:3306
     steps:
       - uses: actions/checkout@v7.0.1
 

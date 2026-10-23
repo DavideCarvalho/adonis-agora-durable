@@ -14,7 +14,8 @@ Before diagnosing anything, know which of the three `runDispatcher` modes your a
 
 | Dispatcher | What happens on `engine.start()` | Who runs the body |
 | --- | --- | --- |
-| **In-process (default)** | The run is created `'pending'` and dispatched on a microtask *on the calling instance* | Whatever process called `start` — an HTTP handler included |
+| **In-process (default on `eventEmitter`, `memory`)** | The run is created `'pending'` and dispatched on a microtask *on the calling instance* | Whatever process called `start` — an HTTP handler included |
+| **Run queue (default on `bullmq`, `queue`, `db`)** | The run is created `'pending'` and enqueued on the transport's [run queue](/docs/durable/reliability/multi-instance#where-a-run-executes) | Whichever driving instance takes it from the queue |
 | **No-op** (`drive: false`, `runDispatcher: { dispatch: () => {} }`, or `NOOP_RUN_DISPATCHER`; the `control-plane` role's default) | The run is created `'pending'` and left there | Nothing, until a worker's `engine.runPending()` poll picks it up |
 | **Broker-backed** | Custom `RunDispatcher.dispatch(runId)` hands the run id to a queue | Whatever consumes that queue |
 

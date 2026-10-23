@@ -282,6 +282,7 @@ How this compares with `bullmq`, which carries the same protocol over Redis pub/
 | `<prefix>:step-events` | workers → engine | local steps of a remote workflow turn, streamed mid-turn |
 | `<prefix>:heartbeats` | workers → engine | liveness for `timeoutMs` steps |
 | `<prefix>:control` | bidirectional | lifecycle events + cancellation (best-effort) |
+| `<prefix>:runs` | engine → engines | the [run queue](/docs/durable/reliability/multi-instance#where-a-run-executes): runs for any driving instance to execute (job `run`, `{ runId, reason }`) |
 | `<prefix>:start-run`, `<prefix>:run-request` | tenant pods → control plane | run starts, reads and control actions |
 | `<prefix>:run-replies:<instanceId>` | control plane → one pod | the replies to that pod's requests |
 | `<prefix>:tenant-events:<instanceId>` | control plane → one pod | live-tail events of the tenants that pod subscribed to |

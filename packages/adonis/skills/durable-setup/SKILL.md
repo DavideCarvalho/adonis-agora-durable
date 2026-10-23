@@ -284,9 +284,12 @@ export default defineConfig({
 })
 ```
 
-plus `node ace durable:work` as its own process. Mechanism: the default
-in-process dispatcher executes bodies on the same instance, event loop and DB
-pool as the HTTP handler that called `start()`; a saturated pool starves both.
+plus `node ace durable:work` as its own process. Mechanism: on `eventEmitter`
+and `memory` the default in-process dispatcher executes bodies on the same
+instance, event loop and DB pool as the HTTP handler that called `start()`; a
+saturated pool starves both. On `bullmq`, `queue` and `db` a driving instance
+sends runs through the transport's run queue instead, so any driving instance
+may execute them, the web pod included unless it sets `drive: false`.
 Source: `docs/reliability/failure-modes.mdx` ("The in-process default
 surprise"), `docs/concepts/durability.mdx`.
 

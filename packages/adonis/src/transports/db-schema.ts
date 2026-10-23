@@ -53,6 +53,8 @@ export const MESSAGE_KINDS = {
   runRequest: 'runRequest',
   runReply: 'runReply',
   tenantEvent: 'tenantEvent',
+  /** A {@link import('../interfaces.js').RunDispatch} for any engine consuming the run queue. */
+  run: 'run',
 } as const;
 export type MessageKind = (typeof MESSAGE_KINDS)[keyof typeof MESSAGE_KINDS];
 

@@ -13,6 +13,10 @@ export default defineConfig({
     // it checks; these only stop a genuinely hung one.
     testTimeout: 30_000,
     hookTimeout: 60_000,
-    globalSetup: ['./test/setup/sqlite-preflight.ts', './test/setup/postgres-cleanup.ts'],
+    globalSetup: [
+      './test/setup/sqlite-preflight.ts',
+      './test/setup/postgres-cleanup.ts',
+      './test/setup/mysql-cleanup.ts',
+    ],
   },
 });

@@ -53,6 +53,7 @@ This page compares the five drivers side by side. Every cell reflects what the t
 | | `bullmq` | `queue` | `db` (Lucid) | `eventEmitter` | `memory` (tests) |
 | --- | --- | --- | --- | --- | --- |
 | Steps in another process | ✅ | ✅ | ✅ | ❌ | ❌ |
+| Runs spread over the engine instances ([run queue](/docs/durable/reliability/multi-instance#where-a-run-executes)) | ✅ `<P>-runs`, batched with `addBulk` | ✅ `<prefix>:runs`, batched with `pushManyOn` when the adapter has it | ✅ `run` rows, claimed with a lease | ❌ the triggering instance | ❌ the triggering instance |
 | Python and NestJS workers on the same wire | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Remote workflows (`dispatchWorkflowTask` / `onDecision` / `onStepEvent`) | ✅ including Python `@workflow` | ✅ TypeScript worker runtime | ✅ TypeScript worker runtime | ❌ | ❌ |
 | A turn's decision is applied whichever engine replica consumes it | ✅ any replica applies it⁹ | ✅ any replica applies it⁹ | ✅ addressed to the dispatching instance; any replica could apply it⁹ | n/a | n/a |

@@ -369,6 +369,14 @@ export interface StateStore {
   ): Promise<boolean>;
 
   getRun(runId: string): Promise<WorkflowRun | null>;
+  /**
+   * The runs with these ids, in any order; an id with no run (or one outside the store's read scope)
+   * is left out. One `IN (...)` read: the engine looks up a fan's children with it (which to start,
+   * which already finished) instead of one {@link getRun} per child. Callers pass bounded batches.
+   *
+   * Optional: without it the engine reads each run with {@link getRun}, a few at a time.
+   */
+  getRuns?(runIds: string[]): Promise<WorkflowRun[]>;
 
   /**
    * Hard-delete a run and everything tied to it (its checkpoints, signal waiters, and search-attribute
@@ -1672,6 +1680,51 @@ export interface Transport {
   /** tenant ← control plane: subscribe to THIS tenant's event channel. Returns an unsubscribe fn.
    *  Several tenants (or several callers per tenant) may subscribe independently. */
   onTenantEvent?(tenant: string, handler: (evt: TenantEvent) => void): () => void;
+
+  // -------------------------------------------------------------------------
+  // Run dispatch — where a run's turn executes. OPTIONAL: a transport with a queue shared by every
+  // engine instance implements both, and the engine then sends every run it would otherwise execute
+  // on itself (a start, a child, a signal or child-completion wake, a due timer) through it, so the
+  // turns spread over the instances consuming it. Without them the engine executes on itself.
+  // -------------------------------------------------------------------------
+
+  /**
+   * engine → engines: hand runs to the shared run queue. At-least-once: a run delivered twice is
+   * harmless (the consumer re-reads the run and the run lease admits one executor). A rejection
+   * means some runs may not have been enqueued; the engine leaves them for its pending-run poll.
+   */
+  dispatchRuns?(runs: readonly RunDispatch[]): Promise<void>;
+  /**
+   * engine ← run queue: consume dispatched runs, at most `opts.concurrency` handler calls at once on
+   * this instance. Parked by {@link deferConsumers} like every other point-to-point consumer.
+   * Returns a stop function: no new run is taken from then on, and its promise resolves once the
+   * handler calls in flight settle. Pair with {@link dispatchRuns}.
+   */
+  onRun?(
+    handler: (run: RunDispatch) => Promise<void>,
+    opts?: { concurrency?: number | undefined },
+  ): () => Promise<void>;
+}
+
+/**
+ * One run handed to a transport's run queue (see {@link Transport.dispatchRuns}).
+ *
+ * - `start`: a freshly created (or re-queued) `pending` run. The consumer runs it only while it is
+ *   still `pending`; any other state means another instance already took it.
+ * - `wake`: a suspended run with something new to see (a delivered signal or child completion, a
+ *   due timer, a freed singleton or queue slot). The consumer leases and resumes it unless it is
+ *   finished.
+ */
+export interface RunDispatch {
+  runId: string;
+  reason: 'start' | 'wake';
+  /**
+   * Which `pending` state of the run a `start` is for: the same for every dispatch of one pending
+   * state (a re-sent start), different once the run went `pending` again (a retry, a recovery). A
+   * transport that deduplicates may drop a start whose `runId` and `key` match one it still holds; it
+   * must not drop one with a new key, even while the earlier one is being processed. Absent on a wake.
+   */
+  key?: string | undefined;
 }
 
 /** One worker's liveness record — a TTL'd heartbeat a worker refreshes while it's consuming. Its

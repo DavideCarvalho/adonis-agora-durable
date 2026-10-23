@@ -50,6 +50,18 @@ function staleReadStore(staleId: string): {
   const store = new Proxy(inner, {
     get(target, prop, receiver) {
       const value = Reflect.get(target, prop, receiver);
+      if (prop === 'getRuns') {
+        // The fan reads its children in a batch: stale for the armed id the same way.
+        return async (runIds: string[]): Promise<WorkflowRun[]> => {
+          const read = await inner.getRuns(runIds);
+          const hook = runIds.includes(staleId) ? armed : undefined;
+          if (hook) {
+            armed = undefined;
+            await hook();
+          }
+          return read;
+        };
+      }
       if (prop !== 'getRun') return value;
       return async (runId: string): Promise<WorkflowRun | null> => {
         const read = await inner.getRun(runId);

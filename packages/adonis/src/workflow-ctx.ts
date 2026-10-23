@@ -1,6 +1,7 @@
 import { runInStepLogger } from './ambient-step.js';
 import { backoffDelay } from './backoff.js';
 import { instantCheckpoint } from './checkpoints.js';
+import { markChildDelivered } from './child-delivery.js';
 import { type Completion, completionError, unwrapCompletion } from './completion.js';
 import { parseDuration } from './duration.js';
 import {
@@ -24,31 +25,34 @@ import {
   type FoldedChildren,
   fanJoin,
 } from './fan-join.js';
-import type {
-  AllOptions,
-  AllSettledOptions,
-  AllStepsOptions,
-  AllStepsSettledOptions,
-  ChildCallOptions,
-  ChildWait,
-  DurableWebhook,
-  SearchAttributes,
-  Settled,
-  StateStore,
-  StepCheckpoint,
-  StepDef,
-  StepDispatchOpts,
-  StepError,
-  StepEvent,
-  StepInvocation,
-  StepKind,
-  StepLogger,
-  StepOptions,
-  StepUndo,
-  WorkflowCtx,
+import {
+  type AllOptions,
+  type AllSettledOptions,
+  type AllStepsOptions,
+  type AllStepsSettledOptions,
+  type ChildCallOptions,
+  type ChildWait,
+  type DurableWebhook,
+  type SearchAttributes,
+  type Settled,
+  type StateStore,
+  type StepCheckpoint,
+  type StepDef,
+  type StepDispatchOpts,
+  type StepError,
+  type StepEvent,
+  type StepInvocation,
+  type StepKind,
+  type StepLogger,
+  type StepOptions,
+  type StepUndo,
+  TERMINAL_RUN_STATUSES,
+  type WorkflowCtx,
+  type WorkflowRun,
 } from './interfaces.js';
 import { codeAndDetails } from './on-error.js';
 import { breakpointToken } from './protocol.js';
+import { getRunsByIds } from './run-waiting.js';
 import { createStepLogger } from './step-logger.js';
 import { type StepConfig, type StepRef, stepConfigOf, stepNameOf } from './step-name-symbol.js';
 import { currentStepScope, runInStepScope } from './workflow-als.js';
@@ -86,6 +90,9 @@ function resolveStepPolicy(
 
 /** How many children of a fan are registered per store round trip. */
 const FAN_CHUNK = 500;
+
+const isTerminalStatus = (status: WorkflowRun['status']): boolean =>
+  (TERMINAL_RUN_STATUSES as readonly string[]).includes(status);
 /** The smallest fan whose settled waves are folded; a smaller one keeps per-child detail for the dashboard. */
 const FOLD_MIN_FAN = 100;
 
@@ -678,6 +685,7 @@ export function createWorkflowCtx(
         childRun.status === 'completed'
           ? { ok: true as const, value: childRun.output }
           : { ok: false as const, error: childRun.error?.message ?? childRun.status };
+      await markChildDelivered(store, childRun);
       await store.removeSignalWaiter({ token: `child:${id}`, runId, seq: current });
       await writeCheckpoint(
         instantCheckpoint({
@@ -776,27 +784,47 @@ export function createWorkflowCtx(
     const placeholders = inputs
       .map((_, i) => i)
       .filter((i) => existing[i] && existing[i]?.status !== 'completed');
-    for (let at = 0; at < placeholders.length; at += FAN_CHUNK) {
+    // The children are read in batches (`getRuns`), not one by one: a replay of a wide fan has
+    // thousands of placeholders, and this runs on every turn. Only a child that is finished or has no
+    // run can have a completion to deliver, so only those are looked at further.
+    const children =
+      placeholders.length > 0
+        ? await getRunsByIds(
+            store,
+            placeholders.map((i) => id(i)),
+          )
+        : new Map<string, WorkflowRun>();
+    const deliverable = placeholders.filter((i) => {
+      const childRun = children.get(id(i));
+      return childRun === undefined || isTerminalStatus(childRun.status);
+    });
+    // Which of them have a buffered completion: one read for the fan when the store can list buffered
+    // tokens (the fan's ids share `allChildId`'s prefix), else one take per child.
+    let bufferedTokens: Set<string> | undefined;
+    if (deliverable.length > 0 && store.listBufferedSignalTokens) {
+      const limit = inputs.length + 1;
+      const tokens = await store.listBufferedSignalTokens(`child:${runId}.all.${firstSeq}.`, limit);
+      if (tokens.length < limit) bufferedTokens = new Set(tokens);
+    }
+    for (let at = 0; at < deliverable.length; at += FAN_CHUNK) {
       await Promise.all(
-        placeholders.slice(at, at + FAN_CHUNK).map(async (i) => {
-          const buffered = await store.takeBufferedSignal(`child:${id(i)}`);
+        deliverable.slice(at, at + FAN_CHUNK).map(async (i) => {
+          const token = `child:${id(i)}`;
+          const buffered =
+            bufferedTokens === undefined || bufferedTokens.has(token)
+              ? await store.takeBufferedSignal(token)
+              : null;
           if (buffered) return resolve(i, buffered.payload);
-          const childRun = await store.getRun(id(i));
+          const childRun = children.get(id(i));
           // A placeholder written by a turn that crashed before the deferred start ran.
           if (!childRun) return host.startChild(name, inputs[i], id(i));
-          if (
-            childRun.status === 'completed' ||
-            childRun.status === 'failed' ||
-            childRun.status === 'cancelled' ||
-            childRun.status === 'dead'
-          ) {
-            return resolve(
-              i,
-              childRun.status === 'completed'
-                ? { ok: true, value: childRun.output }
-                : { ok: false, error: childRun.error?.message ?? childRun.status },
-            );
-          }
+          await markChildDelivered(store, childRun);
+          return resolve(
+            i,
+            childRun.status === 'completed'
+              ? { ok: true, value: childRun.output }
+              : { ok: false, error: childRun.error?.message ?? childRun.status },
+          );
         }),
       );
     }

@@ -7,6 +7,7 @@ import {
   type GroupHealth,
   type Heartbeat,
   type RemoteTask,
+  type RunDispatch,
   type RunReply,
   type RunRequest,
   type StartRunMessage,
@@ -152,6 +153,8 @@ type JobHandle = JobLeaseLike | string;
 interface CompatAdapter {
   setWorkerId(workerId: string): void;
   pushOn(queue: string, jobData: JobData): Promise<unknown>;
+  /** Several jobs in one call (`@boringnode/queue` 0.9+). Absent: one {@link pushOn} per job. */
+  pushManyOn?(queue: string, jobs: JobData[]): Promise<unknown>;
   popFrom(queue: string): Promise<AcquiredJob | null>;
   completeJob(job: JobHandle, queue: string): Promise<unknown>;
   failJob(job: JobHandle, queue: string, error?: Error): Promise<unknown>;
@@ -187,6 +190,9 @@ export function jobHandle(job: AcquiredJob): JobHandle {
 /** Where a poll-loop failure goes when the caller doesn't supply an `onError`. Mirrors `DbTransport`:
  *  a transport error must never vanish — an invisible one is how a stalled run stays invisible. */
 const DEFAULT_LOG = (err: unknown): void => console.error('[QueueTransport] poll failed', err);
+
+/** The most run jobs one `pushManyOn` carries (see {@link QueueTransport.dispatchRuns}). */
+const RUN_PUSH_CHUNK = 500;
 
 // `@adonisjs/queue` job priority is the INVERSE of the durable engine's: a queue job runs the LOWEST
 // number first (1..10, default 5), while the engine's admission `priority` is "higher wins". We map
@@ -434,6 +440,8 @@ export class QueueTransport implements Transport, ControlPlane {
   #decisionsLoop = false;
   #stepEventsLoop = false;
   #startRunLoop = false;
+  /** Stops the run-queue consumer (see {@link onRun}). */
+  #stopRuns: (() => Promise<void>) | undefined;
   #runRequestLoop = false;
   #runRepliesLoop = false;
   #runReplyHandler: ((reply: RunReply) => void) | undefined;
@@ -632,6 +640,9 @@ export class QueueTransport implements Transport, ControlPlane {
   }
   #stepEventsQueue(): string {
     return `${this.#effectivePrefix()}:step-events`;
+  }
+  #runsQueue(): string {
+    return `${this.#effectivePrefix()}:runs`;
   }
   #startRunQueue(): string {
     return `${this.#effectivePrefix()}:start-run`;
@@ -962,6 +973,56 @@ export class QueueTransport implements Transport, ControlPlane {
   // request as `replyTo`), a tenant event to the inbox of each live subscriber of that tenant (read from
   // the worker-key store). See `queue-remote.ts` for the design and its limits.
   // ---------------------------------------------------------------------------
+
+  /**
+   * engine → engines: enqueue runs on `${P}:runs` (job `run`), {@link RUN_PUSH_CHUNK} per
+   * `pushManyOn` when the adapter has it.
+   */
+  async dispatchRuns(runs: readonly RunDispatch[]): Promise<void> {
+    const queue = this.#runsQueue();
+    for (let at = 0; at < runs.length; at += RUN_PUSH_CHUNK) {
+      const jobs = runs
+        .slice(at, at + RUN_PUSH_CHUNK)
+        .map((run) => this.#job('run', run satisfies RunDispatch));
+      if (this.#adapter.pushManyOn) await this.#adapter.pushManyOn(queue, jobs);
+      else await Promise.all(jobs.map((job) => this.#adapter.pushOn(queue, job)));
+    }
+  }
+
+  /**
+   * engine ← run queue: consume `${P}:runs`, at most `opts.concurrency` (default 1) jobs at once.
+   * Parked while consumers are deferred. A second call returns the first one's stop, which stops
+   * popping and waits for the jobs in a handler.
+   */
+  onRun(
+    handler: (run: RunDispatch) => Promise<void>,
+    opts?: { concurrency?: number | undefined },
+  ): () => Promise<void> {
+    if (this.#stopRuns) return this.#stopRuns;
+    const running = new Set<Promise<void>>();
+    const loop = this.#startLoop(
+      this.#runsQueue(),
+      async (job) => {
+        const work = handler(fromJson<RunDispatch>(job.payload));
+        running.add(work);
+        try {
+          await work;
+        } finally {
+          running.delete(work);
+        }
+      },
+      { concurrency: atLeastOne(opts?.concurrency, 1), idleBackoffMax: this.#idleBackoffMax },
+    );
+    let stopped: Promise<void> | undefined;
+    this.#stopRuns = () => {
+      stopped ??= (async () => {
+        loop.stop();
+        await Promise.allSettled([...running]);
+      })();
+      return stopped;
+    };
+    return this.#stopRuns;
+  }
 
   /** tenant → control plane: enqueue a {@link StartRunMessage} on `${P}:start-run` (job `startRun`),
    *  stamped with this instance as the reply target. */

@@ -38,6 +38,14 @@ export class MockAdapter implements Adapter {
     this.workerId = id;
   }
 
+  /** Calls of {@link pushManyOn}, by queue: what a test reads to see a batch went out as one. */
+  readonly pushManyCalls: Array<{ queue: string; count: number }> = [];
+
+  async pushManyOn(queue: string, jobs: JobData[]): Promise<void> {
+    this.pushManyCalls.push({ queue, count: jobs.length });
+    for (const job of jobs) await this.pushOn(queue, job);
+  }
+
   async pushOn(queue: string, jobData: JobData): Promise<void> {
     const list = this.pending.get(queue) ?? [];
     list.push(jobData);
@@ -215,7 +223,6 @@ export class MockAdapter implements Adapter {
   pushLater = this.#unsupported('pushLater');
   pushLaterOn = this.#unsupported('pushLaterOn');
   pushMany = this.#unsupported('pushMany');
-  pushManyOn = this.#unsupported('pushManyOn');
   getJob = this.#unsupported('getJob');
   migrate = async (): Promise<void> => {};
   upsertSchedule = this.#unsupported('upsertSchedule');

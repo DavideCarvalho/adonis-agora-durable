@@ -11,6 +11,7 @@ import {
   type GroupHealth,
   type Heartbeat,
   type RemoteTask,
+  type RunDispatch,
   type RunReply,
   type RunRequest,
   type StartRunMessage,
@@ -172,6 +173,9 @@ interface ControlRow {
   id: number;
   payload: string;
 }
+/** The most `run` rows one insert carries (see {@link DbTransport.dispatchRuns}). */
+const RUN_INSERT_CHUNK = 200;
+
 interface MessageRow {
   id: number;
   kind: string;
@@ -397,6 +401,8 @@ export class DbTransport implements Transport, ControlPlane {
   readonly #decisionHandlers = new Set<(decision: WorkflowDecision) => Promise<void>>();
   /** Which message loops run (each starts once). */
   readonly #messageLoops = new Set<MessageKind>();
+  /** Stops the run-queue consumer (see {@link onRun}). */
+  #stopRuns: (() => Promise<void>) | undefined;
   #runReplyHandler: ((reply: RunReply) => void) | undefined;
   /** Control-plane side: correlation id (requestId, or a start-run's runId) → the requester's instance
    *  id, held while the request's handler runs so {@link publishRunReply} knows whom to address. */
@@ -1047,8 +1053,9 @@ export class DbTransport implements Transport, ControlPlane {
     concurrency: number,
     each: (row: T) => Promise<void>,
     scope?: MessageScope,
+    limit: number = this.#batchSize,
   ): Promise<number> {
-    const { rows, token } = await this.#claim<T>(table, this.#batchSize, undefined, idCol, {
+    const { rows, token } = await this.#claim<T>(table, limit, undefined, idCol, {
       scope,
     });
     if (rows.length === 0) return 0;
@@ -1359,6 +1366,74 @@ export class DbTransport implements Transport, ControlPlane {
       idleBackoffMax: this.#idleBackoffMax,
       each: (event) => handler(event),
     });
+  }
+
+  /**
+   * engine → engines: one `run` row per run in the messages table, {@link RUN_INSERT_CHUNK} per
+   * insert, for any instance consuming the run queue ({@link onRun}). Throws when the messages table
+   * is missing.
+   */
+  async dispatchRuns(runs: readonly RunDispatch[]): Promise<void> {
+    if (runs.length === 0) return;
+    if (!(await this.#messagesReady(true))) throw new Error(this.#messagesMissing());
+    for (let at = 0; at < runs.length; at += RUN_INSERT_CHUNK) {
+      await this.#insertMessages(
+        MESSAGE_KINDS.run,
+        runs.slice(at, at + RUN_INSERT_CHUNK).map((run) => ({
+          payload: run satisfies RunDispatch,
+        })),
+      );
+    }
+  }
+
+  /**
+   * engine ← run queue: claim `run` rows, at most `opts.concurrency` (default 1) per poll, and hand
+   * each to `handler` concurrently. Claims are leased like every other row, so a crashed consumer's
+   * rows go to another instance after the lease. Parked while consumers are deferred. A second call
+   * returns the first one's stop, which stops polling and waits for the poll in flight.
+   */
+  onRun(
+    handler: (run: RunDispatch) => Promise<void>,
+    opts?: { concurrency?: number | undefined },
+  ): () => Promise<void> {
+    if (this.#stopRuns) return this.#stopRuns;
+    const concurrency = atLeastOne(opts?.concurrency, 1);
+    let current: Promise<number> | undefined;
+    const tick = async (): Promise<boolean> => {
+      if (!(await this.#messagesReady(false))) return false;
+      current = this.#drain<MessageRow>(
+        TRANSPORT_TABLES.messages,
+        'id',
+        concurrency,
+        async (row) => {
+          let run: RunDispatch;
+          try {
+            run = JSON.parse(row.payload) as RunDispatch;
+          } catch (err) {
+            this.#onError(new Error(`[DbTransport] dropped run message ${row.id}: ${String(err)}`));
+            return;
+          }
+          await handler(run);
+        },
+        { kind: MESSAGE_KINDS.run, recipients: [''] },
+        concurrency,
+      );
+      try {
+        return (await current) > 0;
+      } finally {
+        current = undefined;
+      }
+    };
+    const loop = this.#startLoop(tick, this.#idleBackoffMax);
+    let stopped: Promise<void> | undefined;
+    this.#stopRuns = () => {
+      stopped ??= (async () => {
+        loop.stop();
+        await current?.catch(() => undefined);
+      })();
+      return stopped;
+    };
+    return this.#stopRuns;
   }
 
   /** tenant → control plane: a {@link StartRunMessage} for any control plane, with this instance as

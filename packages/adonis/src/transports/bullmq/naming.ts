@@ -73,6 +73,23 @@ export function startRunName(effPrefix: string): string {
   return `${effPrefix}-start-run`;
 }
 
+/** `${P}-runs` — the run queue every driving engine consumes (job `run`, a {@link RunDispatch}). */
+export function runsName(effPrefix: string): string {
+  return `${effPrefix}-runs`;
+}
+
+/**
+ * The BullMQ job id of a run's `start` dispatch for one pending state (its `RunDispatch.key`):
+ * a start re-sent for the same state while the first one waits or runs is not queued twice, and a
+ * start for a new state (a retry while the previous job is still active) gets a job of its own.
+ * BullMQ refuses an id that parses as an integer or holds a `:`, so the id is prefixed and `%`/`:` are
+ * escaped.
+ */
+export function runStartJobId(runId: string, key: string): string {
+  const esc = (v: string) => v.replaceAll('%', '%25').replaceAll(':', '%3A');
+  return `start-${esc(runId)}-${esc(key)}`;
+}
+
 /** `${P}-run-request` — the queue a store-less tenant enqueues read/control requests on (job `runRequest`). */
 export function runRequestName(effPrefix: string): string {
   return `${effPrefix}-run-request`;

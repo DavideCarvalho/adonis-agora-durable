@@ -157,6 +157,27 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
     });
 
     t(
+      'getRuns (when implemented) reads several runs at once, leaving out unknown ids',
+      async () => {
+        if (!store.getRuns) return;
+        await store.createRun(run());
+        await store.createRun(
+          run({ id: 'r2', status: 'completed', input: { orderId: 'o2' }, output: { total: 2 } }),
+        );
+        expect(await store.getRuns([])).toEqual([]);
+        const got = (await store.getRuns(['r2', 'nope', 'r1', 'r2'])).sort((a, b) =>
+          a.id.localeCompare(b.id),
+        );
+        expect(got.map((r) => r.id)).toEqual(['r1', 'r2']);
+        expect(got[0]?.input).toEqual({ orderId: 'o1' });
+        expect(got[1]?.status).toBe('completed');
+        expect(got[1]?.output).toEqual({ total: 2 });
+        // The same run as getRun reads it.
+        expect(got[1]).toEqual(await store.getRun('r2'));
+      },
+    );
+
+    t(
       'createRun rejects a duplicate id (the engine converges racing starts on the winner)',
       async () => {
         await store.createRun(run({ status: 'completed', output: { total: 1 } }));

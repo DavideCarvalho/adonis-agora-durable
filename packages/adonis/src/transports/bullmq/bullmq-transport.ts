@@ -3,6 +3,7 @@ import type {
   GroupHealth,
   Heartbeat,
   RemoteTask,
+  RunDispatch,
   RunReply,
   RunRequest,
   StartRunMessage,
@@ -41,6 +42,8 @@ import {
   routingToken,
   runReplyChannel,
   runRequestName,
+  runStartJobId,
+  runsName,
   startRunName,
   stepEventsName,
   tasksName,
@@ -209,6 +212,9 @@ export class BullMQTransport implements Transport {
 
   // P4 store-less protocol: start-run / run-request queues + consumers, run-reply / tenant-events pub/sub.
   #startRunWorker: WorkerLike | undefined;
+  // The run queue consumer (see onRun), and the stop() it handed out.
+  #runsWorker: WorkerLike | undefined;
+  #stopRuns: (() => Promise<void>) | undefined;
   #runRequestWorker: WorkerLike | undefined;
   #runReplyPub: RedisLike | undefined;
   #runReplySub: RedisLike | undefined;
@@ -1041,6 +1047,58 @@ export class BullMQTransport implements Transport {
   // lives with the rest of the naming contract in `naming.ts`.
   // ---------------------------------------------------------------------------
 
+  /**
+   * engine → engines: enqueue runs on `${P}-runs` (job `run`), {@link RUN_ADD_BULK_CHUNK} per
+   * `addBulk`. A `start` with a key carries a job id derived from its run id and key
+   * ({@link runStartJobId}), so a start re-sent for the same pending state is not queued twice; a new
+   * key (the run went `pending` again) is a new job even while the earlier one is active. A `wake`
+   * carries none: a wake that lands while an earlier one is being processed must not be dropped.
+   */
+  async dispatchRuns(runs: readonly RunDispatch[]): Promise<void> {
+    if (runs.length === 0) return;
+    const queue = this.#queue(runsName(this.#effectivePrefix()));
+    const jobs = runs.map((run) => ({
+      name: 'run',
+      data: run satisfies RunDispatch,
+      opts:
+        run.reason === 'start' && run.key !== undefined
+          ? { ...jobOptions(), jobId: runStartJobId(run.runId, run.key) }
+          : jobOptions(),
+    }));
+    for (let at = 0; at < jobs.length; at += RUN_ADD_BULK_CHUNK) {
+      const chunk = jobs.slice(at, at + RUN_ADD_BULK_CHUNK);
+      if (queue.addBulk) await queue.addBulk(chunk);
+      else await Promise.all(chunk.map((job) => queue.add(job.name, job.data, job.opts)));
+    }
+  }
+
+  /**
+   * engine ← run queue: consume `${P}-runs`, `opts.concurrency` jobs at once (default 1). A second
+   * call returns the first one's stop. The stop closes the worker: BullMQ fetches nothing more and
+   * waits for the jobs in flight.
+   */
+  onRun(
+    handler: (run: RunDispatch) => Promise<void>,
+    opts?: { concurrency?: number | undefined },
+  ): () => Promise<void> {
+    if (this.#stopRuns) return this.#stopRuns;
+    const worker = this.#makeWorker(
+      runsName(this.#effectivePrefix()),
+      (job) => handler(job.data as RunDispatch),
+      { concurrency: workerConcurrency(opts?.concurrency) },
+    );
+    this.#runsWorker = worker;
+    let stopped: Promise<void> | undefined;
+    this.#stopRuns = () => {
+      stopped ??= worker.close().then(
+        () => undefined,
+        () => undefined,
+      );
+      return stopped;
+    };
+    return this.#stopRuns;
+  }
+
   /** tenant → control plane: enqueue a {@link StartRunMessage} on `${P}-start-run` (job `startRun`). */
   async dispatchStartRun(msg: StartRunMessage): Promise<void> {
     await this.#queue(startRunName(this.#effectivePrefix())).add('startRun', msg, jobOptions());
@@ -1181,6 +1239,7 @@ export class BullMQTransport implements Transport {
       this.#stepEventsWorker?.close(),
       this.#startRunWorker?.close(),
       this.#runRequestWorker?.close(),
+      this.#runsWorker?.close(),
     ];
     await withTimeout(Promise.allSettled(workers.filter((p) => p !== undefined)), remaining());
     await withTimeout(
@@ -1212,3 +1271,5 @@ async function withTimeout(work: Promise<unknown>, ms: number): Promise<void> {
   }
 }
 const DEFAULT_CLOSE_TIMEOUT_MS = 5_000;
+/** The most run jobs one `addBulk` carries (see {@link BullMQTransport.dispatchRuns}). */
+const RUN_ADD_BULK_CHUNK = 500;

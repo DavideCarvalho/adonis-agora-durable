@@ -58,10 +58,12 @@ describe('settleRun — a cancel landing mid-turn is not clobbered by a stale "c
     // The persisted status must still be 'cancelled' — not resurrected to 'completed'.
     expect((await store.getRun('child1'))?.status).toBe('cancelled');
 
-    // The parent must NOT have been told the child succeeded: nothing else resumes a run suspended on
-    // ctx.child, so if it's still 'suspended' the parent was never notified of a (fake) success. Under
-    // the bug this assertion fails too — the parent runs to completion with the child's stale output.
+    // The parent must NOT have been told the child succeeded: the cancel tells it the child was
+    // cancelled, so it fails on that. Under the bug it runs to completion with the child's stale
+    // output instead.
     const parent = await store.getRun('p1');
-    expect(parent?.status).toBe('suspended');
+    expect(parent?.status).toBe('failed');
+    expect(parent?.output).toBeUndefined();
+    expect(parent?.error?.message).toContain('cancelled');
   });
 });

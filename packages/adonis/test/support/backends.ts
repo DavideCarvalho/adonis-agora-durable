@@ -7,6 +7,7 @@ import {
   makePostgresTransportDb,
   makeTransportDb,
 } from '../../src/transports/db-helpers.js';
+import { makeIsolatedMysqlDb, makeMysqlStoreDb, makeMysqlTransportDb } from './mysql.js';
 
 /**
  * The real backends the suite runs against, and the guard that keeps CI from silently skipping them.
@@ -17,7 +18,7 @@ import {
  */
 
 /** The env vars naming a real backend. */
-export type BackendEnv = 'REDIS_URL' | 'DURABLE_REDIS_URL' | 'DURABLE_PG_URL';
+export type BackendEnv = 'REDIS_URL' | 'DURABLE_REDIS_URL' | 'DURABLE_PG_URL' | 'DURABLE_MYSQL_URL';
 
 /**
  * The URL of a real backend, or `undefined` to skip — except in CI, where a missing one throws.
@@ -37,7 +38,7 @@ export function backendUrl(name: BackendEnv): string | undefined {
 
 /** A Lucid database backend the db transport and the Lucid store are exercised on. */
 export interface DbBackend {
-  name: 'sqlite' | 'postgres';
+  name: 'sqlite' | 'postgres' | 'mysql';
   /** An empty database (no tables). */
   makeMemoryDb(): Promise<Database>;
   /** A database with the transport tables created. */
@@ -63,13 +64,29 @@ function postgres(url: string): DbBackend {
 }
 
 /**
- * SQLite always, plus Postgres when `DURABLE_PG_URL` is set (required in CI). Each Postgres database
+ * SQLite always, plus Postgres when `DURABLE_PG_URL` is set (required in CI), plus — for a spec that
+ * passes `{ mysql: true }` — MySQL when `DURABLE_MYSQL_URL` is set (required in CI then). Each Postgres database
  * is a fresh schema dropped when the database is closed, so parallel files never share tables.
  * Use with `describe.each(dbBackends())('... on $name', (backend) => ...)`.
  */
-export function dbBackends(): DbBackend[] {
+export function dbBackends(opts: { mysql?: boolean } = {}): DbBackend[] {
   const url = backendUrl('DURABLE_PG_URL');
-  return url ? [sqlite, postgres(url)] : [sqlite];
+  const backends = url ? [sqlite, postgres(url)] : [sqlite];
+  if (opts.mysql) {
+    const mysqlUrl = backendUrl('DURABLE_MYSQL_URL');
+    if (mysqlUrl) backends.push(mysql(mysqlUrl));
+  }
+  return backends;
+}
+
+/** MySQL (`DURABLE_MYSQL_URL`, `mysql://user:password@host:port`), one database per test. */
+function mysql(url: string): DbBackend {
+  return {
+    name: 'mysql',
+    makeMemoryDb: () => makeIsolatedMysqlDb(url),
+    makeTransportDb: () => makeMysqlTransportDb(url),
+    makeStoreDb: () => makeMysqlStoreDb(url),
+  };
 }
 
 /** A key prefix unique to this test file's process, for suites that share one Redis. */

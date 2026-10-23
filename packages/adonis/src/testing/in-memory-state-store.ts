@@ -241,6 +241,15 @@ export class InMemoryStateStore implements StateStore {
     return run && this.inScope(run) ? copyRun(run) : null;
   }
 
+  async getRuns(runIds: string[]): Promise<WorkflowRun[]> {
+    const out: WorkflowRun[] = [];
+    for (const id of new Set(runIds)) {
+      const run = this.runs.get(id);
+      if (run && this.inScope(run)) out.push(copyRun(run));
+    }
+    return out;
+  }
+
   async deleteRun(runId: string): Promise<void> {
     this.runs.delete(runId);
     for (const [key, cp] of this.checkpoints) {
