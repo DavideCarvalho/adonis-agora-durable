@@ -57,6 +57,18 @@ jobs:
           --health-interval 2s
           --health-timeout 3s
           --health-retries 15
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --tmpfs /var/lib/mysql
+          --health-cmd "mysqladmin ping -uroot -proot --silent"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 60
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -91,6 +103,7 @@ jobs:
           REDIS_URL: redis://127.0.0.1:6379
           DURABLE_REDIS_URL: redis://127.0.0.1:6379
           DURABLE_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+          DURABLE_MYSQL_URL: mysql://root:root@127.0.0.1:3306
 
       # A Renovate patch/minor bump automerges on its own and brings no changeset with it, so
       # the new dependency would reach npm only with the next hand-written changeset. This writes
