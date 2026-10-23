@@ -43,6 +43,15 @@ describe('durable entities', () => {
     expect(await engine.getEntityState('counter', 'other')).toEqual({ count: 100 });
   });
 
+  it("stamps the built-in entity runner with durable's origin", async () => {
+    const engine = counterEngine();
+    await engine.signalEntity('counter', 'k1', 'increment', 1);
+    await until(
+      async () => (await engine.getEntityState<{ count: number }>('counter', 'k1'))?.count === 1,
+    );
+    expect((await engine.getRun('entity:counter:k1'))?.origin).toBe('@adonis-agora/durable');
+  });
+
   it('ctx.callEntity awaits a handler result from inside a workflow', async () => {
     const store = new InMemoryStateStore();
     const engine = counterEngine(store);
