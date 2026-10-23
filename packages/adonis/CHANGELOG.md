@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 0.52.2
+
+### Patch Changes
+
+- [#390](https://github.com/DavideCarvalho/adonis-agora-durable/pull/390) [`83bf740`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/83bf7406538916d22cae0245b99b7aff321b92b7) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Schedule jitter follow-ups: `runSchedules` documents that it must be called with the same `engine` object every time (deferred windows are remembered per engine), and it drops a schedule's jitter memo once the schedule no longer has a jitter.
+
 ## 0.52.1
 
 ### Patch Changes
