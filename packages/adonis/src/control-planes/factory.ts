@@ -1,4 +1,5 @@
 import type { ControlPlane } from '../interfaces.js';
+import { resolveRedisService } from '../redis-service.js';
 
 /**
  * The minimal application surface a {@link ControlPlaneFactory} thunk needs at boot to resolve an
@@ -42,11 +43,6 @@ export interface RedisControlPlaneConfig {
   pingIntervalMs?: number | false;
 }
 
-/** The read view of `@adonisjs/redis`'s service: `connection(name)` returns a pub/sub-capable client. */
-interface RedisServiceLike {
-  connection(name?: string): unknown;
-}
-
 /**
  * The control-plane factory namespace used in `config/durable.ts`:
  *
@@ -72,9 +68,9 @@ export const controlPlanes = {
    * via the shared `` `${prefix}-control` `` channel.
    */
   redis(config: RedisControlPlaneConfig = {}): ControlPlaneFactory {
-    return async () => {
+    return async (ctx) => {
       const { RedisControlPlane } = await import('../control-plane-redis/redis-control-plane.js');
-      const redis = (await import('@adonisjs/redis/services/main')).default as RedisServiceLike;
+      const redis = await resolveRedisService(ctx);
       const connection = redis.connection(config.connection ?? 'main') as never;
       return new RedisControlPlane({
         connection,

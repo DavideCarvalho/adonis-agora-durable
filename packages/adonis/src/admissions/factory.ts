@@ -1,4 +1,5 @@
 import type { AdmissionBackend } from '../admission.js';
+import { resolveRedisService } from '../redis-service.js';
 
 /**
  * The minimal application surface an {@link AdmissionFactory} thunk needs at boot to resolve an
@@ -44,11 +45,6 @@ export interface RedisAdmissionConfig {
   retryMs?: number;
 }
 
-/** The read view of `@adonisjs/redis`'s service: `connection(name)` returns an ioredis-compatible client. */
-interface RedisServiceLike {
-  connection(name?: string): unknown;
-}
-
 /**
  * The admission-backend factory namespace used in `config/durable.ts`:
  *
@@ -74,9 +70,9 @@ export const admissions = {
    * fleet rather than five per pod. Slots held by a pod that dies are reclaimed once its heartbeat lapses.
    */
   redis(config: RedisAdmissionConfig = {}): AdmissionFactory {
-    return async () => {
+    return async (ctx) => {
       const { RedisAdmissionBackend } = await import('../admission-redis/index.js');
-      const redis = (await import('@adonisjs/redis/services/main')).default as RedisServiceLike;
+      const redis = await resolveRedisService(ctx);
       const connection = redis.connection(config.connection ?? 'main') as never;
       return new RedisAdmissionBackend({
         connection,
