@@ -1,5 +1,11 @@
 # @adonis-agora/durable-dashboard
 
+## 0.8.2
+
+### Patch Changes
+
+- [#394](https://github.com/DavideCarvalho/adonis-agora-durable/pull/394) [`f0071ee`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/f0071ee6aa141af14f45a2bbfcc4f5e2c4882e42) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Console ORIGIN facet: the row is now hidden unless at least one run has a named (package) origin, so a plain app no longer shows a useless `all N | unknown N`. Runs with no origin are labelled `app` (the app's own workflows) instead of `unknown`, with an updated tooltip, empty-state and run-header wording. The filter kind (`{ kind: 'unknown' }`) is unchanged.
+
 ## 0.8.1
 
 ### Patch Changes
