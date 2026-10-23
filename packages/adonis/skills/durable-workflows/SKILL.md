@@ -138,7 +138,8 @@ deterministic and bump `version` when it changes), and `static workflow = { sear
 `ctx.upsertSearchAttributes` is validated against the merged attributes; type
 the ctx as `WorkflowCtx<InferSearchAttributes<typeof schema>>` and read back with
 `attributesOf(WorkflowClass, run)`). A failure is a `SchemaValidationError`
-(`FatalError`, code `schema_validation`, issues in `details.issues`) — never
+(`FatalError`, code `invalid_input` / `invalid_output` — `schema_validation` for a
+`searchAttributes` write — issues in `details.issues`) — never
 retried.
 
 ```ts

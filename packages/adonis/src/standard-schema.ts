@@ -1,4 +1,4 @@
-import { SchemaValidationError } from './errors.js';
+import { type SchemaValidationCode, SchemaValidationError } from './errors.js';
 
 /**
  * Vendored subset of the Standard Schema spec (https://standardschema.dev) — the `~standard`
@@ -84,18 +84,21 @@ export declare namespace StandardSchemaV1 {
  * Validate `value` against any Standard Schema and return the schema's OUTPUT value (parsed /
  * coerced / defaulted — e.g. zod's `.transform`, valibot's `pipe`, arktype morphs). Both a sync and
  * an async (`Promise`-returning) `~standard.validate` are supported. On failure throws a
- * {@link SchemaValidationError} — a non-retryable `FatalError` (code `schema_validation`) carrying the
- * issues in `details`, so a bad payload fails fast instead of being retried forever.
+ * {@link SchemaValidationError} — a non-retryable `FatalError` carrying the issues in `details`, so a
+ * bad payload fails fast instead of being retried forever.
  *
- * `label` names what was validated in the error message, e.g. `step "billing:charge" input`.
+ * `label` names what was validated in the error message, e.g. `step "billing:charge" input`. `code`
+ * is the error's code: `invalid_input` / `invalid_output` for an input or output schema, and
+ * `schema_validation` (the default) otherwise.
  */
 export async function validateStandard<S extends StandardSchemaV1>(
   schema: S,
   value: unknown,
   label: string,
+  code?: SchemaValidationCode,
 ): Promise<StandardSchemaV1.InferOutput<S>> {
   const result = await schema['~standard'].validate(value);
-  if (result.issues) throw new SchemaValidationError(label, result.issues);
+  if (result.issues) throw new SchemaValidationError(label, result.issues, code);
   return result.value as StandardSchemaV1.InferOutput<S>;
 }
 
@@ -108,6 +111,7 @@ export function validateStandardSync<S extends StandardSchemaV1>(
   schema: S,
   value: unknown,
   label: string,
+  code?: SchemaValidationCode,
 ): StandardSchemaV1.InferOutput<S> {
   const result = schema['~standard'].validate(value);
   if (result instanceof Promise) {
@@ -115,6 +119,6 @@ export function validateStandardSync<S extends StandardSchemaV1>(
       `${label}: schema validation must be synchronous (the schema's \`~standard.validate\` returned a Promise) — drop any async refinement from it.`,
     );
   }
-  if (result.issues) throw new SchemaValidationError(label, result.issues);
+  if (result.issues) throw new SchemaValidationError(label, result.issues, code);
   return result.value as StandardSchemaV1.InferOutput<S>;
 }

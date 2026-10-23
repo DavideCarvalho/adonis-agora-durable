@@ -1786,7 +1786,12 @@ export class WorkflowEngine {
     // turn, whichever store holds the row. Everything else here — singleton and concurrency keys
     // included — reads the stored input, the one value the singleton gate re-reads later.
     const parsed = registered.inputSchema
-      ? await validateStandard(registered.inputSchema, input, `workflow "${name}" input`)
+      ? await validateStandard(
+          registered.inputSchema,
+          input,
+          `workflow "${name}" input`,
+          'invalid_input',
+        )
       : input;
     await registered.validateInput?.(parsed);
     // Idempotent by run id: a redelivered trigger (at-least-once queues) or a scheduler re-tick for
@@ -5580,14 +5585,19 @@ export class WorkflowEngine {
    * store round-trips the row through JSON (on the SQL stores) or a structured clone (in memory): a
    * stored parsed value would reach the body as a `Date` in tests and a string in production. A
    * stored input that no longer parses — its schema changed without a version bump — throws the same
-   * `SchemaValidationError` (`schema_validation`, never retried) that fails the run.
+   * `SchemaValidationError` (`invalid_input`, never retried) that fails the run.
    */
   private async turnInput(
     run: WorkflowRun,
     registered: RegisteredWorkflow | undefined,
   ): Promise<unknown> {
     if (!registered?.inputSchema) return run.input;
-    return validateStandard(registered.inputSchema, run.input, `workflow "${run.workflow}" input`);
+    return validateStandard(
+      registered.inputSchema,
+      run.input,
+      `workflow "${run.workflow}" input`,
+      'invalid_input',
+    );
   }
 
   private async runExecution(
@@ -5879,7 +5889,7 @@ export class WorkflowEngine {
     if (this.pool.size === 0) throw new Error('dispatched compensation requires a Transport');
     const token = stepGroup(def, run.namespace);
     const validInput = def.input
-      ? await validateStandard(def.input, args, `step "${def.name}" input`)
+      ? await validateStandard(def.input, args, `step "${def.name}" input`, 'invalid_input')
       : args;
     const id = `${run.id}:compensate:${def.name}:${attempt}`;
     const name = `compensate:${def.name}`;
@@ -6078,7 +6088,7 @@ export class WorkflowEngine {
           validateStandardSync(
             schema,
             merged,
-            `workflow "${run?.workflow}": ctx.upsertSearchAttributes`,
+            `workflow "${run?.workflow}" ctx.upsertSearchAttributes`,
           );
         }
         await this.store.updateRun(runId, {
@@ -6470,7 +6480,7 @@ export class WorkflowEngine {
     // Optional runtime schema: validate only when the def carries one (a bare `@Step()` / string-name
     // call carries none — the engine passes the input through untouched then).
     const validInput = step.input
-      ? await validateStandard(step.input, input, `step "${step.name}" input`)
+      ? await validateStandard(step.input, input, `step "${step.name}" input`, 'invalid_input')
       : input;
     // Routing token: BY NAME (sanitized for brokers), optionally partition-suffixed. Computed once and
     // used at BOTH the checkpoint's workerGroup and the dispatched task's routing `group`, so the same
@@ -6656,7 +6666,9 @@ export class WorkflowEngine {
     const token = stepGroup(step, runNamespace);
     await this.ensureRoutable(token, step.requires);
     const input = (i: number): unknown | Promise<unknown> =>
-      step.input ? validateStandard(step.input, inputs[i], `step "${step.name}" input`) : inputs[i];
+      step.input
+        ? validateStandard(step.input, inputs[i], `step "${step.name}" input`, 'invalid_input')
+        : inputs[i];
     const validInputs = new Map<number, unknown>();
     for (const i of batch) validInputs.set(i, await input(i));
     const enqueuedAt = new Date();
@@ -7129,7 +7141,7 @@ export class WorkflowEngine {
   ): Promise<TOutput> {
     if (this.pool.size === 0) throw new Error('remote steps require a Transport');
     const validInput = step.input
-      ? await validateStandard(step.input, input, `step "${step.name}" input`)
+      ? await validateStandard(step.input, input, `step "${step.name}" input`, 'invalid_input')
       : input;
     const token = stepGroup(step, runNamespace);
     // Capability/protocol guard (design §7.5) — same as the durable path, before the `step.started`
@@ -7302,7 +7314,12 @@ export class WorkflowEngine {
   ): Promise<TOutput> {
     const output = (
       step.output
-        ? await validateStandard(step.output, resolution.output, `step "${step.name}" output`)
+        ? await validateStandard(
+            step.output,
+            resolution.output,
+            `step "${step.name}" output`,
+            'invalid_output',
+          )
         : resolution.output
     ) as TOutput;
     // The worker reports when it actually picked the task up; fall back to dispatch time if a
