@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 0.52.1
+
+### Patch Changes
+
+- [#389](https://github.com/DavideCarvalho/adonis-agora-durable/pull/389) [`0343752`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/034375223d1a78ff058a1d99b9cb3ef23cf7bac1) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Schedule `jitter` no longer blocks the worker tick. `runSchedules` used to `sleep` each due schedule's jitter inside the tick, one schedule after another, so every other schedule and the rest of the tick (pending runs, timers, recovery) waited behind it. After a restart, with several jittered windows due at once, schedules fired many minutes late: about 7, then 5 minutes, on an app with 90–120 s jitters. Each window now gets its own fire time, up to `jitter` after the worker first sees it due, and a later tick starts it once that time has arrived. A window deferred past its interval still fires. Run ids and exactly-once are unchanged. The `sleep` option of `runSchedules` is deprecated and no longer called.
+
 ## 0.52.0
 
 ### Minor Changes
