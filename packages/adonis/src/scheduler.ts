@@ -366,7 +366,11 @@ function scheduleRunIdsAt(s: ScheduledWorkflow, nowMs: number): string[] {
  * Start each schedule's current-window run. The run id is the time bucket (a fixed-interval index,
  * or the cron fire time) and `engine.start` is idempotent, so firing this on an interval — or
  * racing two instances on the same tick — starts **each window exactly once**. Wire it to a
- * `setInterval`, the durable timer poller, or `@nestjs/schedule`. Returns the run ids for the
+ * `setInterval`, the durable timer poller, or `@nestjs/schedule`.
+ *
+ * Pass the SAME `engine` object on every call: which windows already fired, and the jittered fire
+ * time of each deferred window, are remembered per engine object. A fresh wrapper per call would
+ * redraw a deferred window's fire time on every tick, so it might never fire. Returns the run ids for the
  * current windows.
  */
 export async function runSchedules(
@@ -421,6 +425,7 @@ export async function runSchedules(
     // schedule, runPending, timers, recovery) for the jitter of every due schedule in turn: after a
     // restart, with a few windows due at once, schedules fired many minutes late. The run ids below
     // are unaffected, so idempotency holds.
+    if (!(s.jitter && s.jitter > 0)) jitterFireAt.get(engine)?.delete(s.key); // jitter removed
     const firing =
       s.jitter && s.jitter > 0 ? jitterDue(engine, s, candidates, nowMs, random) : candidates;
     if (firing.length === 0) continue;

@@ -362,4 +362,4 @@ await runSchedules(engine, schedules, Date.now())
 
 A schedule that names its workflow with a lazy import must go through `await resolveSchedules(schedules)` first, which calls the imports and returns the list with registered names; `runSchedules` refuses an unresolved one.
 
-`opts` (`{ random?, sleep? }`) overrides the `Math.random` / `setTimeout` used for `jitter`, so tests can make it deterministic and instant. Schedules you pass here directly are not seen by `listSchedules` / `setSchedulePaused` / `triggerSchedule`; those read the set the worker loop adopts (config plus colocated).
+`opts.random` overrides the `Math.random` used to draw each window's `jitter` delay, so tests can make it deterministic (`opts.sleep` is deprecated and no longer called). Pass the same `engine` on every call: fired windows and deferred jittered windows are remembered per engine object. Schedules you pass here directly are not seen by `listSchedules` / `setSchedulePaused` / `triggerSchedule`; those read the set the worker loop adopts (config plus colocated).
