@@ -217,6 +217,8 @@ export class AdaptiveController {
   private stallTicks = 0;
   // Set the first time the limit moves down. Until then growth doubles the limit (slow start).
   private backedOff = false;
+  // Steps settled since the limit was last decided (see `onSettle`).
+  private settledSinceDecide = 0;
   private lastCpuUsage?: NodeJS.CpuUsage;
   private lastCpuSampleAt = 0;
   private timer: ReturnType<typeof setInterval> | undefined;
@@ -287,13 +289,23 @@ export class AdaptiveController {
    * pool measuring steps only; the transport tags the kind when it routes a job by shape.
    */
   onSettle(durationMs: number, ok: boolean, kind: 'workflow' | 'step'): void {
-    this.inFlightCount = Math.max(0, this.inFlightCount - 1);
     // Forward progress for stall detection counts BOTH kinds — a worker churning workflow turns is
     // not stalled even when no step settles this tick.
     this.completionsThisTick += 1;
-    if (kind !== 'step') return;
-    this.window.push({ durationMs, ok, at: this.now() });
-    if (this.window.length > WINDOW_SIZE) this.window.shift();
+    if (kind === 'step') {
+      this.window.push({ durationMs, ok, at: this.now() });
+      if (this.window.length > WINDOW_SIZE) this.window.shift();
+      // Slow start: until it first backs off, growth is re-decided after each limit's worth of
+      // steps instead of on the next tick, so a worker of fast steps doubles every few milliseconds
+      // rather than every `tickMs`. Only growth: shrinking and the brakes stay on the tick. Decided
+      // before this task leaves `inFlight`, whose slot the consumer refills at once.
+      this.settledSinceDecide += 1;
+      if (this.isAdaptive && !this.backedOff && this.settledSinceDecide >= this.currentLimit) {
+        if (this.rttLongMs === undefined) this.refreshRttLong();
+        this.decide(this.resolved.adaptive as AdaptiveConfig, false, true);
+      }
+    }
+    this.inFlightCount = Math.max(0, this.inFlightCount - 1);
   }
 
   /**
@@ -359,7 +371,8 @@ export class AdaptiveController {
     return (100 * this.readRss()) / this.memoryLimitBytes;
   }
 
-  private decide(cfg: AdaptiveConfig, stalled: boolean): void {
+  private decide(cfg: AdaptiveConfig, stalled: boolean, growOnly = false): void {
+    this.settledSinceDecide = 0;
     const current = this.currentLimit;
     const durations = this.window.map((c) => c.durationMs).sort((a, b) => a - b);
     const p50 = percentile(durations, 50);
@@ -397,6 +410,7 @@ export class AdaptiveController {
 
     next = clamp(next, cfg.min, cfg.max);
     if (next === current || reason === undefined) return;
+    if (growOnly && reason !== 'grow') return;
 
     if (next < current) this.backedOff = true;
     this.currentLimit = next;

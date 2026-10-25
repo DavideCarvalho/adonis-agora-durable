@@ -173,6 +173,42 @@ describe('AdaptiveController.tick — AIMD decisions', () => {
     expect(controller.limit).toBe(10); // capped at max
   });
 
+  it('in slow start, grows after each limit of settled steps without waiting for a tick', () => {
+    const { controller, applied } = makeController({
+      concurrency: { mode: 'adaptive', min: 1, max: 32, start: 4 },
+    });
+    // A consumer that keeps every slot busy: each settled step is replaced by the next one.
+    let inFlight = 0;
+    const fillSlots = () => {
+      for (; inFlight < controller.limit; inFlight++) controller.onStart();
+    };
+    fillSlots();
+    for (let settled = 0; settled < 28; settled++) {
+      controller.onSettle(2, true, 'step');
+      inFlight -= 1;
+      fillSlots();
+    }
+    expect(applied).toEqual([8, 16, 32]); // after 4, then 8, then 16 settled steps
+  });
+
+  it('in slow start, never shrinks or brakes between ticks', () => {
+    const { controller, applied } = makeController({
+      concurrency: { mode: 'adaptive', min: 1, max: 32, start: 4 },
+      rss: 950_000_000,
+      memLimit: 1_000_000_000, // over the RAM ceiling: no growth
+    });
+    for (let i = 0; i < 4; i++) controller.onStart();
+    controller.onSettle(1, true, 'step');
+    controller.onStart();
+    for (let settled = 0; settled < 20; settled++) {
+      controller.onSettle(500, true, 'step'); // latency far past the tolerance
+      controller.onStart();
+    }
+    expect(applied).toEqual([]);
+    controller.tick(); // the tick is where it backs off
+    expect(controller.snapshot().lastAdjust?.reason).toBe('ram_ceiling');
+  });
+
   it('after backing off, grows by √limit a tick', () => {
     const { controller, applied } = makeController({
       concurrency: { mode: 'adaptive', min: 1, max: 64, start: 20 },
