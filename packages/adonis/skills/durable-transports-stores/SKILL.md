@@ -177,10 +177,10 @@ on `<prefix>:inbox-registrations`, recorded in the control plane's key store;
 tune with `inboxTtlMs`, `tenantSubscribersCacheMs`, `inboxSweepIntervalMs`).
 See `durable-cluster`.
 
-For wide fans (`ctx.all` over thousands of steps), raise how many results an
-instance settles at once on `bullmq`, `queue` or `db` (`resultConcurrency`),
-let its workers size their step concurrency, and size the engine's due-timer
-batch:
+For wide fans (`ctx.all` over thousands of steps), the `bullmq`, `queue` and
+`db` transports hand the engine at least 512 step results at once per instance
+(`resultConcurrency` only raises it), let its workers size their step
+concurrency, and size the engine's due-timer batch:
 
 ```ts title="config/durable.ts"
 export default defineConfig({
@@ -188,7 +188,7 @@ export default defineConfig({
   transports: {
     bullmq: transports.bullmq({
       connection: { host: '127.0.0.1', port: 6379 }, // or 'redis://…' / 'rediss://…' (0.50+)
-      resultConcurrency: 16, // default 1
+      resultConcurrency: 2048, // more results in hand at once (at least 512 held)
       // A number pins each task queue's concurrency (default 1). 'adaptive' moves it
       // every tickMs: +1 while steps saturate the limit at steady latency, down by the
       // latency gradient when they queue, -1 on >20% errors / a stall / the CPU ceiling,
@@ -203,7 +203,7 @@ Only step durations feed the adaptive window (workflow turns count as in-flight
 work and progress); a non-finite or out-of-range field falls back to its default, and
 `cpuCeilingPct` is off unless set. A number runs no control loop. The heartbeat's
 throughput covers the trailing minute, decaying while the worker is idle and reading 0 once a minute passes with no completed step; with a fixed limit the heartbeat still reports `cpuPct`, sampled at most once every 2s. In adaptive mode the decisions, step-events, start-run and run-request consumers run
-at 1 (results run at `resultConcurrency`). Sources: `docs/transports/index.mdx`, `docs/cluster/interop.mdx`.
+at 1 (results run at at least 512, `resultConcurrency` when higher). Sources: `docs/transports/index.mdx`, `docs/cluster/interop.mdx`.
 
 Two `bullmq` safety nets: `pingIntervalMs` (default 30s; `0`/`false` off) PINGs
 every pub/sub subscriber (heartbeats, run replies, tenant events) and reconnects
@@ -291,8 +291,9 @@ export default defineConfig({
 ```
 
 A custom store should implement `countCheckpoints(runId, fromSeq, toSeq,
-statuses)` as a `COUNT` (the step-fan join barrier calls it on every result;
-without it the engine loads the run's checkpoints per result), implement
+statuses)` as a `COUNT` (the step-fan join barrier asks it once per fan per
+batch, skipped while more of the same fan's results are queued behind the batch;
+without it the engine loads the run's checkpoints to count), implement
 `saveCheckpointIfPending` as one conditional `UPDATE ... WHERE status = 'pending'`
 (without it a blind save can put a settled step back to `pending`), and return
 `listDueTimers` most overdue first, with or without a `limit`. Run
