@@ -264,11 +264,18 @@ export async function runWorkerLoop(
   }
   // A sweep still running beside the last tick stops at its next page (the engine is draining); wait
   // for it within the same budget, so the store is not closed under it.
-  const sweep = bufferedSweeps.get(engine)?.running;
-  if (sweep && stoppedAt > 0 && (await Promise.race([sweep, outOfBudget])) === 'timeout') {
-    options.logger.error(
-      `buffered-signal sweep still running ${drainTimeoutMs}ms after the stop request; draining without waiting for it`,
-    );
+  const sweep = bufferedSweeps.get(engine);
+  if (sweep?.running && stoppedAt > 0) {
+    if ((await Promise.race([sweep.running, outOfBudget])) === 'timeout') {
+      options.logger.error(
+        `buffered-signal sweep still running ${drainTimeoutMs}ms after the stop request; draining without waiting for it`,
+      );
+    }
+  }
+  // No tick follows to report a failure of the last sweep.
+  if (sweep?.failed) {
+    options.logger.error(`tick phase sweepBufferedSignals failed: ${sweep.failed.message}`);
+    sweep.failed = undefined;
   }
   // Charge the drain for the time already spent waiting on the in-flight tick, so the stop request
   // to the end of the drain stays within ONE `drainTimeoutMs`.

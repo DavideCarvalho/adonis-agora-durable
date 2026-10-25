@@ -152,6 +152,27 @@ describe('the buffered-signal sweep is off the critical path of a worker tick', 
       'sweep boom',
     ]);
   });
+
+  it('a sweep that fails on the last tick before shutdown is logged', async () => {
+    const { engine } = makeEngine();
+    (engine as unknown as { sweepBufferedSignals: () => Promise<number> }).sweepBufferedSignals =
+      async () => {
+        await new Promise((r) => setTimeout(r, 20));
+        throw new Error('last sweep boom');
+      };
+    const logger = captureLogger();
+    let stop!: () => void;
+    const stopSignal = new Promise<void>((resolve) => {
+      stop = resolve;
+    });
+    const sleep = async (): Promise<void> => {
+      stop();
+    };
+
+    await runWorkerLoop(engine, { intervalMs: 1, stopSignal, logger, drainTimeoutMs: 500, sleep });
+
+    expect(logger.errors).toContain('tick phase sweepBufferedSignals failed: last sweep boom');
+  });
 });
 
 describe('DurableProvider boot with the embedded worker and a hanging sweep', () => {
