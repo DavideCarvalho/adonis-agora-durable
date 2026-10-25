@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { RemoteTask, Transport } from '../../src/interfaces.js';
 import { TransportPool } from '../../src/transport-pool.js';
 
@@ -70,6 +70,22 @@ describe('TransportPool.dispatchMany', () => {
     await pool.dispatchMany(tasks(450));
     expect(b.one.map((t) => t.seq)).toEqual(Array.from({ length: 450 }, (_, i) => i + 1));
     expect(b.one.every((t) => t.transport === 'b')).toBe(true);
+  });
+
+  it('reports a refused bulk send once, however often it is refused', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const a = new Recording({ refuseMany: true });
+      const pool = new TransportPool([{ id: 'a', transport: a }]);
+      await pool.dispatchMany(tasks(3));
+      await pool.dispatchMany(tasks(3));
+      expect(a.one).toHaveLength(6);
+      const reports = warn.mock.calls.filter(([m]) => String(m).includes('bulk dispatch'));
+      expect(reports).toHaveLength(1);
+      expect(String(reports[0]?.[0])).toContain('bulk refused');
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('a transport without bulk sending gets every task one by one', async () => {

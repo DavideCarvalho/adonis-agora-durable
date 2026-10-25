@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { canonicalJson } from '../../src/buffered-child-signals.js';
+import { canonicalJson, childCompletionNeedsBuffer } from '../../src/buffered-child-signals.js';
 import { WorkflowEngine } from '../../src/engine.js';
 import { startRun } from '../../src/test-helpers.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
@@ -218,6 +218,39 @@ describe('sweepBufferedSignals', () => {
     await store.bufferSignal('child:root', { ok: true });
     expect(await engine.sweepBufferedSignals()).toBe(0);
     expect(await bufferedChildTokens(store)).toEqual(['child:root']);
+  });
+});
+
+describe('childCompletionNeedsBuffer', () => {
+  it('keeps a completion it cannot compare for a live parent that holds a checkpoint for the child', async () => {
+    const store = new InMemoryStateStore();
+    const at = new Date();
+    await store.createRun({
+      id: 'p',
+      workflow: 'parent',
+      workflowVersion: '1',
+      status: 'suspended',
+      input: {},
+      createdAt: at,
+      updatedAt: at,
+    });
+    await store.saveCheckpoint({
+      runId: 'p',
+      seq: 0,
+      name: 'signal:child:p.child.0',
+      kind: 'local',
+      stepId: 'p:0',
+      status: 'completed',
+      output: { ok: true, value: 1 },
+      attempts: 1,
+      enqueuedAt: at,
+      startedAt: at,
+      finishedAt: at,
+    });
+    // JSON cannot hold a BigInt: the compare throws, and the completion is kept rather than lost.
+    await expect(
+      childCompletionNeedsBuffer(store, 'p.child.0', { ok: true, value: 1n }),
+    ).resolves.toBe(true);
   });
 });
 

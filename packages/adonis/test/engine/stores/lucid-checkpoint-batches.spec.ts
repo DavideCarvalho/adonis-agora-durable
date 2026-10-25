@@ -39,7 +39,7 @@ const cp = (seq: number, over: Partial<StepCheckpoint> = {}): StepCheckpoint => 
 });
 const seqs = Array.from({ length: ROWS }, (_, i) => i);
 
-describe.each(dbBackends({ mysql: true }))('on $name', ({ makeStoreDb }) => {
+describe.each(dbBackends({ mysql: true }))('on $name', ({ name, makeStoreDb }) => {
   it(`writes, reads and settles ${ROWS} checkpoints in a few dozen statements`, async () => {
     const db = await makeStoreDb();
     try {
@@ -69,6 +69,13 @@ describe.each(dbBackends({ mysql: true }))('on $name', ({ makeStoreDb }) => {
       });
       expect((await store.getCheckpoint('r1', ROWS - 1))?.output).toEqual({ n: ROWS - 1 });
 
+      // Before reading which rows are still pending, the settle holds them: row locks on Postgres
+      // and MySQL, the database write lock (a no-op write) on SQLite.
+      const statements = settled.filter(
+        (q) => !/^(begin|commit|savepoint|release|BEGIN|COMMIT)/i.test(q),
+      );
+      if (name === 'sqlite') expect(statements[0]).toMatch(/^update/i);
+      else expect(statements[0]).toMatch(/for update$/i);
       // One statement per row would be 600+ each.
       for (const sql of [wrote, read, settled]) expect(sql.length).toBeGreaterThan(0);
       expect(wrote.length).toBeLessThanOrEqual(30);

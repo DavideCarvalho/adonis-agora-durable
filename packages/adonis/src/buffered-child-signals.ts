@@ -117,7 +117,13 @@ export async function childCompletionNeedsBuffer(
   ) {
     return false;
   }
-  return !parentHoldsChild(await parentCheckpoints(store, parentId, childId), childId, completion);
+  const checkpoints = await parentCheckpoints(store, parentId, childId);
+  try {
+    return !parentHoldsChild(checkpoints, childId, completion);
+  } catch {
+    // A completion JSON cannot hold (a BigInt, a cycle) cannot be compared: keep it for the parent.
+    return true;
+  }
 }
 
 /** Read `ids` in batches; the ids of a batch that could not be read are reported, not guessed. */

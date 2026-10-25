@@ -400,6 +400,17 @@ export class LucidStateStore implements StateStore {
       const key = (runId: string, seq: number) => `${runId}\u0000${seq}`;
       const byRun = new Map<string, number[]>();
       for (const cp of checkpoints) byRun.set(cp.runId, [...(byRun.get(cp.runId) ?? []), cp.seq]);
+      const first = checkpoints[0];
+      if (first && !locksRows(trx)) {
+        // SQLite has no row locks: take the database write lock FIRST with a no-op write, so no
+        // other connection or process settles a row between the read below and the writes.
+        await trx
+          .from(DURABLE_TABLES.checkpoints)
+          .where('run_id', first.runId)
+          .andWhere('seq', first.seq)
+          .andWhere('status', 'pending')
+          .update({ status: 'pending' });
+      }
       for (const [runId, seqs] of byRun) {
         const unique = [...new Set(seqs)];
         for (let at = 0; at < unique.length; at += CHECKPOINT_BATCH) {

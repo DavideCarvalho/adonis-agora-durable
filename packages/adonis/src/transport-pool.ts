@@ -19,6 +19,8 @@ const DISPATCH_CHUNK = 200;
  * so it lives apart from the engine.
  */
 export class TransportPool {
+  private warnedBulkRefusal = false;
+
   constructor(private readonly transports: NamedTransport[]) {}
 
   get size(): number {
@@ -72,8 +74,15 @@ export class TransportPool {
       try {
         await first.transport.dispatchMany(tasks.map((task) => ({ ...task, transport: first.id })));
         return;
-      } catch {
-        // Fall through: one by one.
+      } catch (err) {
+        if (!this.warnedBulkRefusal) {
+          this.warnedBulkRefusal = true;
+          console.warn(
+            `[adonis-durable] transport '${first.id}' refused a bulk dispatch; sending the tasks one by one (reported once): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
       }
     }
     for (let at = 0; at < tasks.length; at += DISPATCH_CHUNK) {
