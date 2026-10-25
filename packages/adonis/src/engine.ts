@@ -56,6 +56,7 @@ import { type AnnouncedWorkflow, aggregateAnnouncements } from './handshake/anno
 import type { WorkerDescriptor } from './handshake/descriptor.js';
 import { buildWorkflowDirectory, type WorkflowDirectory } from './handshake/directory.js';
 import type {
+  BufferedSignalRow,
   ControlPlane,
   DeadLetter,
   EngineEvent,
@@ -442,6 +443,11 @@ const DEFAULT_TIMER_BATCH = 500;
 const BUFFERED_SWEEP_PAGE = 500;
 /** {@link WorkflowEngine.sweepBufferedSignals}: pages per call, so one tick stays short. */
 const BUFFERED_SWEEP_PAGES_PER_CALL = 4;
+/**
+ * {@link WorkflowEngine.sweepBufferedSignals}: wall-clock budget of one call. Past it the sweep
+ * starts no further page or parent read, and the next call resumes where this one stopped.
+ */
+const BUFFERED_SWEEP_BUDGET_MS = 250;
 /** {@link WorkflowEngine.sweepBufferedSignals}: rest between two full passes over the table. */
 const BUFFERED_SWEEP_REST_MS = 10 * 60_000;
 
@@ -2399,13 +2405,21 @@ export class WorkflowEngine {
    *
    * Walks the buffered signals by primary key, {@link BUFFERED_SWEEP_PAGE} rows at a time and at most
    * {@link BUFFERED_SWEEP_PAGES_PER_CALL} pages per call, so a large backlog drains over a few worker
-   * ticks without a long query or a big delete. A pass that reaches the end rests
-   * {@link BUFFERED_SWEEP_REST_MS} before the next. The worker loop calls it every tick. Skipped while
-   * draining, on a namespaced engine (a buffered signal carries no namespace, and a scoped read would
-   * report another tenant's parent as gone), and on a store without
-   * `listBufferedSignals`/`deleteBufferedSignals`. Returns how many rows it deleted.
+   * ticks without a long query or a big delete. Each page is decided set-based (see
+   * `unneededChildSignals`): a handful of store calls per page and per open parent, none of them a
+   * read by checkpoint name for an id that names its seq. A call stops once `budgetMs` of wall-clock
+   * time is spent (default {@link BUFFERED_SWEEP_BUDGET_MS}), between pages or between two parents'
+   * reads, and the next call resumes there. A pass that reaches the end rests
+   * {@link BUFFERED_SWEEP_REST_MS} before the next. The worker loop starts it every tick without
+   * waiting for it; a call made while another is running returns 0. Skipped while draining, on a
+   * namespaced engine (a buffered signal carries no namespace, and a scoped read would report another
+   * tenant's parent as gone), and on a store without `listBufferedSignals`/`deleteBufferedSignals`.
+   * Returns how many rows it deleted.
    */
-  async sweepBufferedSignals(now: number = this.clock()): Promise<number> {
+  async sweepBufferedSignals(
+    now: number = this.clock(),
+    budgetMs: number = BUFFERED_SWEEP_BUDGET_MS,
+  ): Promise<number> {
     const { listBufferedSignals, deleteBufferedSignals } = this.store;
     if (!listBufferedSignals || !deleteBufferedSignals) return 0;
     if (this.draining || this.namespace !== undefined || this.bufferedSweepActive) return 0;
@@ -2416,22 +2430,29 @@ export class WorkflowEngine {
       return 0;
     }
     this.bufferedSweepActive = true;
+    const deadline = Date.now() + budgetMs;
     let deleted = 0;
     try {
       for (let page = 0; page < BUFFERED_SWEEP_PAGES_PER_CALL; page += 1) {
+        if (page > 0 && (Date.now() >= deadline || this.draining)) break;
         const rows = await listBufferedSignals.call(
           this.store,
           CHILD_TOKEN_PREFIX,
           this.bufferedSweepCursor,
           BUFFERED_SWEEP_PAGE,
         );
-        const doomed = await unneededChildSignals(this.store, rows);
+        const { doomed, decided } = await unneededChildSignals(this.store, rows, deadline);
         if (doomed.length > 0) {
           await deleteBufferedSignals.call(
             this.store,
             doomed.map((row) => row.id),
           );
           deleted += doomed.length;
+        }
+        if (decided < rows.length) {
+          // Out of time mid-page: resume after the last row decided.
+          if (decided > 0) this.bufferedSweepCursor = (rows[decided - 1] as BufferedSignalRow).id;
+          break;
         }
         const last = rows.at(-1);
         if (rows.length < BUFFERED_SWEEP_PAGE || !last) {

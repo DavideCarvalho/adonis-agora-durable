@@ -11,9 +11,17 @@ describe.each(dbBackends({ mysql: true }))('on $name', ({ makeStoreDb }) => {
    */
   runStateStoreContract('LucidStateStore', async () => {
     const db = await makeStoreDb();
+    let sent = 0;
+    const count = () => {
+      sent += 1;
+    };
+    const clients = new Set([db.connection().getWriteClient(), db.connection().getReadClient()]);
+    for (const client of clients) client.on('query', count);
     return {
       store: new LucidStateStore(db),
+      statements: () => sent,
       cleanup: async () => {
+        for (const client of clients) client.off('query', count);
         await db.manager.closeAll();
       },
     };
