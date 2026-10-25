@@ -190,8 +190,9 @@ export default defineConfig({
       connection: { host: '127.0.0.1', port: 6379 }, // or 'redis://…' / 'rediss://…' (0.50+)
       resultConcurrency: 2048, // more results in hand at once (at least 512 held)
       // A number pins each task queue's concurrency (default 1). 'adaptive' moves it
-      // every tickMs: +1 while steps saturate the limit at steady latency, down by the
-      // latency gradient when they queue, -1 on >20% errors / a stall / the CPU ceiling,
+      // every tickMs: doubles while steps saturate the limit at steady latency until the first back-off,
+      // then +√limit a tick, down by the latency gradient once p50 passes 2× baseline + 5 ms,
+      // -1 on >20% errors / a stall / the CPU ceiling,
       // -20% at ramCeilingPct of the cgroup (else host) memory limit.
       concurrency: { mode: 'adaptive', min: 1, max: 32, start: 1, tickMs: 2000, ramCeilingPct: 85 },
     }),
