@@ -746,7 +746,7 @@ export class QueueTransport implements Transport, ControlPlane {
         queue,
         async (job) => {
           const payload = fromJson<unknown>(job.payload);
-          const startedAt = Date.now();
+          const startedAt = performance.now();
           controller.onStart();
           // Only step durations feed the latency gradient; a workflow turn still counts as in-flight
           // work and as forward progress for stall detection (as on bullmq).
@@ -754,7 +754,7 @@ export class QueueTransport implements Transport, ControlPlane {
             try {
               await this.#runWorkflowTask(payload);
             } finally {
-              controller.onSettle(Date.now() - startedAt, true, 'workflow');
+              controller.onSettle(performance.now() - startedAt, true, 'workflow');
             }
             return;
           }
@@ -767,7 +767,7 @@ export class QueueTransport implements Transport, ControlPlane {
             await this.#adapter.pushOn(this.#resultsQueue(), this.#job('result', result));
             ok = result.status === 'completed';
           } finally {
-            controller.onSettle(Date.now() - startedAt, ok, 'step');
+            controller.onSettle(performance.now() - startedAt, ok, 'step');
           }
         },
         {

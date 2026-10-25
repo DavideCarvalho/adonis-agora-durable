@@ -158,16 +158,71 @@ describe('AdaptiveController.snapshot — the WorkerStatus contract', () => {
 });
 
 describe('AdaptiveController.tick — AIMD decisions', () => {
-  it('grows by 1 when gradient is healthy AND saturated', () => {
+  it('doubles when gradient is healthy AND saturated, until it first backs off', () => {
     const { controller, applied } = makeController({
       concurrency: { mode: 'adaptive', min: 1, max: 10, start: 4 },
     });
     fill(controller, 20, 100); // equal durations → rttLong≈p50 → gradient≈1
     for (let i = 0; i < 4; i++) controller.onStart(); // inFlight=4 ≥ 4*0.8 → saturated
     controller.tick();
-    expect(controller.limit).toBe(5);
-    expect(applied).toEqual([5]);
-    expect(controller.snapshot().lastAdjust).toMatchObject({ from: 4, to: 5, reason: 'grow' });
+    expect(controller.limit).toBe(8);
+    expect(applied).toEqual([8]);
+    expect(controller.snapshot().lastAdjust).toMatchObject({ from: 4, to: 8, reason: 'grow' });
+    for (let i = 0; i < 4; i++) controller.onStart(); // inFlight=8 → saturated again
+    controller.tick();
+    expect(controller.limit).toBe(10); // capped at max
+  });
+
+  it('after backing off, grows by √limit a tick', () => {
+    const { controller, applied } = makeController({
+      concurrency: { mode: 'adaptive', min: 1, max: 64, start: 20 },
+    });
+    fill(controller, 20, 100, 0.5); // 50% errors → backpressure: 20 → 19
+    controller.tick();
+    expect(controller.limit).toBe(19);
+    fill(controller, 100, 100); // a healthy window again
+    for (let i = 0; i < 19; i++) controller.onStart();
+    controller.tick();
+    expect(controller.limit).toBe(23); // 19 + floor(√19)
+    expect(applied).toEqual([19, 23]);
+  });
+
+  it('does not shrink a worker of fast steps on latency jitter', () => {
+    const { controller, applied } = makeController({
+      concurrency: { mode: 'adaptive', min: 1, max: 32, start: 8 },
+    });
+    // 1–5 ms steps: the fastest is a fifth of the slowest, but none of it is queuing.
+    for (let i = 0; i < 100; i++) {
+      controller.onStart();
+      controller.onSettle(1 + (i % 5), true, 'step');
+    }
+    for (let tick = 0; tick < 5; tick++) controller.tick();
+    expect(controller.limit).toBe(8);
+    expect(applied).toEqual([]);
+  });
+
+  it('holds while p50 stays within twice the no-queuing baseline', () => {
+    const { controller, applied } = makeController({
+      concurrency: { mode: 'adaptive', min: 1, max: 32, start: 8 },
+    });
+    controller.onStart();
+    controller.onSettle(100, true, 'step'); // baseline 100 ms
+    fill(controller, 99, 200); // p50 200 ms: (2 × 100 + 5) / 200 ≈ 1
+    controller.tick();
+    expect(controller.limit).toBe(8);
+    expect(applied).toEqual([]);
+  });
+
+  it('still shrinks fast steps whose latency grows past the noise', () => {
+    const { controller } = makeController({
+      concurrency: { mode: 'adaptive', min: 1, max: 32, start: 16 },
+    });
+    controller.onStart();
+    controller.onSettle(1, true, 'step'); // the no-queuing baseline: 1 ms
+    fill(controller, 99, 30); // p50 30 ms: (1 + 5) / 30 = 0.2
+    controller.tick();
+    expect(controller.limit).toBe(3); // floor(16 × 0.2)
+    expect(controller.snapshot().lastAdjust?.reason).toBe('shrink');
   });
 
   it('does NOT grow when healthy but not saturated (raising a ceiling no one hits is meaningless)', () => {
@@ -404,7 +459,7 @@ describe('AdaptiveController.tick — CPU ceiling', () => {
   it('grows as usual when CPU is under the ceiling', () => {
     const { controller } = saturatedAtCpu(25);
     expect(controller.snapshot().cpuPct).toBeCloseTo(25);
-    expect(controller.limit).toBe(5);
+    expect(controller.limit).toBe(8);
     expect(controller.snapshot().lastAdjust?.reason).toBe('grow');
   });
 

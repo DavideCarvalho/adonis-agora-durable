@@ -609,7 +609,7 @@ export class BullMQTransport implements Transport {
    *  runs the `runStepHandler` → result path. Both kinds share a token's queue but never each other's. */
   async #runJob(data: unknown): Promise<void> {
     const controller = this.#concurrencyController();
-    const startedAt = Date.now();
+    const startedAt = performance.now();
     controller.onStart();
     // Only step durations feed the latency gradient; a workflow turn still counts as in-flight work
     // and as forward progress for stall detection.
@@ -617,14 +617,14 @@ export class BullMQTransport implements Transport {
       try {
         return await this.#runWorkflowTask(data);
       } finally {
-        controller.onSettle(Date.now() - startedAt, true, 'workflow');
+        controller.onSettle(performance.now() - startedAt, true, 'workflow');
       }
     }
     let ok = false;
     try {
       ok = await this.#runTask(data as RemoteTask);
     } finally {
-      controller.onSettle(Date.now() - startedAt, ok, 'step');
+      controller.onSettle(performance.now() - startedAt, ok, 'step');
     }
   }
 

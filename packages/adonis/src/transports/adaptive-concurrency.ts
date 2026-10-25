@@ -139,6 +139,13 @@ const WINDOW_SIZE = 100;
 // EWMA smoothing for the "no-queuing" baseline (rttLong): low weight so a single fast sample doesn't
 // reset the baseline, but it still tracks a genuine floor shift.
 const RTT_LONG_EWMA_ALPHA = 0.2;
+// How far p50 may rise over the no-queuing baseline before the gradient reads it as queuing: a
+// multiple of the baseline, plus a fixed amount of noise. The baseline is the fastest completion of
+// the window, which p50 always sits above, and a step of a millisecond or two that sometimes takes
+// five says nothing about load. Read as a plain ratio, both shrank a worker of fast steps to one at
+// a time while the pod sat idle.
+const LATENCY_TOLERANCE = 2;
+const LATENCY_NOISE_MS = 5;
 // Consecutive ticks with in-flight work but zero completions before we call the worker stalled.
 const STALL_TICKS = 2;
 // Throughput is a rate over the trailing minute: a window whose newest completion is older than this
@@ -208,6 +215,8 @@ export class AdaptiveController {
 
   private completionsThisTick = 0;
   private stallTicks = 0;
+  // Set the first time the limit moves down. Until then growth doubles the limit (slow start).
+  private backedOff = false;
   private lastCpuUsage?: NodeJS.CpuUsage;
   private lastCpuSampleAt = 0;
   private timer: ReturnType<typeof setInterval> | undefined;
@@ -357,7 +366,9 @@ export class AdaptiveController {
     const errors = this.window.reduce((n, c) => n + (c.ok ? 0 : 1), 0);
     const errorRate = this.window.length === 0 ? 0 : errors / this.window.length;
     const gradient =
-      this.rttLongMs !== undefined && p50 > 0 ? Math.min(1, this.rttLongMs / p50) : 1;
+      this.rttLongMs !== undefined && p50 > 0
+        ? Math.min(1, (LATENCY_TOLERANCE * this.rttLongMs + LATENCY_NOISE_MS) / p50)
+        : 1;
     const rssPct = this.rssPct();
     const saturated = this.inFlightCount >= current * 0.8;
 
@@ -378,13 +389,16 @@ export class AdaptiveController {
       next = Math.max(cfg.min, Math.floor(current * gradient));
       reason = 'shrink';
     } else if (gradient >= 0.9 && saturated) {
-      next = Math.min(cfg.max, current + 1);
+      // Doubles until the first time it backs off, then grows by √limit a tick.
+      const step = this.backedOff ? Math.max(1, Math.floor(Math.sqrt(current))) : current;
+      next = Math.min(cfg.max, current + step);
       reason = 'grow';
     }
 
     next = clamp(next, cfg.min, cfg.max);
     if (next === current || reason === undefined) return;
 
+    if (next < current) this.backedOff = true;
     this.currentLimit = next;
     this.lastAdjust = { at: this.now(), from: current, to: next, reason };
     this.apply(next);
