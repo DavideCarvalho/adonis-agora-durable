@@ -14,7 +14,8 @@ export interface WorkerLogger {
  * timeout, and finally fire any due `schedules` (the 5th phase — see {@link TickOptions.schedules}).
  * Returns a per-phase count of the runs each phase touched — the unit the `durable:work` command logs
  * and the tests assert on. Each phase is awaited independently so one phase throwing does not abort the
- * rest of the tick (the error is collected and surfaced).
+ * rest of the tick (the error is collected and surfaced). The buffered-signal sweep is started, not
+ * awaited: it runs beside the tick, one at a time, and a failure of it is reported by the next tick.
  */
 export interface TickResult {
   pending: number;
@@ -109,9 +110,9 @@ async function runTickInScope(engine: WorkflowEngine, options: TickOptions): Pro
     await engine.sweepTimeouts(now);
     return 0;
   });
-  // Buffered child completions nothing will consume (left by earlier versions): a bounded slice per
-  // tick, self-throttled between full passes.
-  await phase('sweepBufferedSignals', async () => engine.sweepBufferedSignals(now));
+  // Buffered child completions nothing will consume: a bounded slice per tick, self-throttled
+  // between full passes. Housekeeping, so it runs beside the tick instead of inside it.
+  startBufferedSweep(engine, now, result);
   // 5th phase — fire any due recurring schedules (mirrors the NestJS timer poller). Skipped entirely
   // when none are registered; idempotent by the schedule's time-bucket run id, so racing workers
   // start each window exactly once.
@@ -137,6 +138,45 @@ async function runTickInScope(engine: WorkflowEngine, options: TickOptions): Pro
   // minute); a no-op on a store that cannot list buffered tokens.
   await phase('sweepEntityWakes', async () => engine.sweepEntityWakes(now));
   return result;
+}
+
+/** Per engine: the buffered-signal sweep a tick started that has not finished, and its failure. */
+const bufferedSweeps = new WeakMap<
+  WorkflowEngine,
+  { running: Promise<void> | undefined; failed: Error | undefined }
+>();
+
+/**
+ * Start `engine.sweepBufferedSignals` unless the one a previous tick started is still running, and
+ * report into `result` the failure of one that ended since the last tick.
+ */
+function startBufferedSweep(
+  engine: WorkflowEngine,
+  now: number | undefined,
+  result: TickResult,
+): void {
+  let state = bufferedSweeps.get(engine);
+  if (!state) {
+    state = { running: undefined, failed: undefined };
+    bufferedSweeps.set(engine, state);
+  }
+  const sweep = state;
+  if (sweep.failed) {
+    result.errors.push({ phase: 'sweepBufferedSignals', error: sweep.failed });
+    sweep.failed = undefined;
+  }
+  if (sweep.running) return;
+  sweep.running = Promise.resolve()
+    .then(() => engine.sweepBufferedSignals(now))
+    .then(
+      () => {
+        sweep.running = undefined;
+      },
+      (error: unknown) => {
+        sweep.running = undefined;
+        sweep.failed = toError(error);
+      },
+    );
 }
 
 function toError(value: unknown): Error {
@@ -221,6 +261,14 @@ export async function runWorkerLoop(
     if (stopped) break;
     // Race the interval against the stop signal so shutdown is prompt, not interval-latent.
     await Promise.race([sleep(options.intervalMs), options.stopSignal.catch(() => undefined)]);
+  }
+  // A sweep still running beside the last tick stops at its next page (the engine is draining); wait
+  // for it within the same budget, so the store is not closed under it.
+  const sweep = bufferedSweeps.get(engine)?.running;
+  if (sweep && stoppedAt > 0 && (await Promise.race([sweep, outOfBudget])) === 'timeout') {
+    options.logger.error(
+      `buffered-signal sweep still running ${drainTimeoutMs}ms after the stop request; draining without waiting for it`,
+    );
   }
   // Charge the drain for the time already spent waiting on the in-flight tick, so the stop request
   // to the end of the drain stays within ONE `drainTimeoutMs`.
