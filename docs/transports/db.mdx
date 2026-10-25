@@ -59,7 +59,7 @@ One `DbTransport` runs **one task loop** for every handler name it serves, and b
 ```ts title="config/durable.ts"
 db: transports.db({
   concurrency: 8,        // up to 8 task rows in flight per worker process
-  resultConcurrency: 8,  // the engine settles up to 8 results at once (wide fans)
+  resultConcurrency: 1024, // the engine holds up to 1024 results at once (at least 512)
 }),
 ```
 
@@ -171,7 +171,7 @@ The run queue lives in the same table. Without it every run start falls back to 
 | `leaseMs` | `30000` | Claim lease for crash recovery. Held claims are renewed every `leaseMs / 3`, so a row is reclaimed only once its worker has stopped renewing for this long (crashed, or blocked its event loop). |
 | `batchSize` | `20` | Max rows claimed per poll by the results, heartbeat and control loops. The task loop claims only as many rows as it has free slots, capped by this. |
 | `concurrency` | `1` | How many task rows a worker runs at once: a number (fixed), or `'adaptive'` / `{ mode: 'adaptive', min, max, start, tickMs, ramCeilingPct, cpuCeilingPct }` — see [Concurrency and idle polling](#concurrency-and-idle-polling). More slots share one poll loop. A non-finite or sub-1 value falls back to `1`. |
-| `resultConcurrency` | `1` | How many step results the engine side settles at once. |
+| `resultConcurrency` | `512` | How many step results the engine side holds at once; never fewer than 512. |
 | `idleBackoffMax` | `4` | Idle backoff for the task, heartbeat, control, step-event and tenant-protocol loops, in poll intervals. `1` disables it. The results, decisions and run-reply loops never back off. |
 | `maxStalledCount` | `3` | How many times a task row's lapsed claim may be taken over before the row is failed as a [poison task](#poison-tasks). |
 | `closeTimeoutMs` | `5000` | How long `close()`/`stop()` waits for in-flight work before [handing every remaining claim back](#closing-a-worker-hands-its-claims-back), uncounted. |
@@ -252,7 +252,7 @@ A worker claims rows atomically, runs each task outside the lock, then records t
 
 While rows are held, the worker **renews every claim it holds** — running or not — every `leaseMs / 3`, with one `UPDATE` per table matched on its claim tokens. A slow but alive worker therefore keeps all its rows for as long as it needs them; only a worker that stopped renewing (crashed, lost the database, or blocked its event loop past the lease) has its rows reclaimed. If that happens to a live worker, it finds the claim gone when it finishes, drops its result instead of writing a second one, and reports the lost claim to `onError`. The step may then have run twice, so steps should still be idempotent.
 
-The engine side mirrors the protocol on the results table: claim up to `batchSize` rows, deliver each result to the suspended `ctx.step` (up to `resultConcurrency` at once), then delete the delivered rows in one `WHERE IN` statement, again only where `claimed_by` is still its token. The batch is renewed while it is being delivered, so a slow settle never hands the rest of the batch to another engine. Rows are deleted only after their handler ran. Heartbeats and control messages are drained the same way, keyed on `id`.
+The engine side mirrors the protocol on the results table: claim up to 256 rows a round, with rounds pipelined so at least 512 results (or `resultConcurrency`) are in the engine's hands at once, deliver each result, then delete each round's delivered rows in one `WHERE IN` statement, again only where `claimed_by` is still its token. The batch is renewed while it is being delivered, so a slow settle never hands the rest of the batch to another engine. Rows are deleted only after their handler ran. Heartbeats and control messages are drained the same way, keyed on `id`.
 
 <Callout type="info" title="Fixed in this release: double runs under a slow step">
 Earlier releases claimed up to `batchSize` (20) task rows per poll, ran them one by one, and renewed only the row in hand. When a step outlived `leaseMs`, an idle sibling reclaimed the rest of the batch and ran it, and the first worker then ran those rows again and wrote a second result. A worker also held up to 20 rows while others idled. The task loop now claims only free slots, renews every held claim, and records a result only while holding the claim.

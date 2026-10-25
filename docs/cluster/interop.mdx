@@ -39,7 +39,7 @@ The transport's own options (connection, fixed and adaptive `concurrency`, `resu
 
 ### Results: `resultConcurrency`
 
-`resultConcurrency` sets how many step results an engine-side instance settles at once from the shared results queue (default `1`). Results from Python or NestJS workers land on the same queue and are settled the same way. See [Result concurrency](/docs/durable/transports/bullmq#result-concurrency).
+`resultConcurrency` raises how many step results an engine-side instance holds at once from the shared results queue (at least 512). Results from Python or NestJS workers land on the same queue and are settled the same way. See [Result concurrency](/docs/durable/transports/bullmq#result-concurrency).
 
 ### Shutdown: `closeTimeoutMs`
 

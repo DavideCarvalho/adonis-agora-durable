@@ -87,7 +87,7 @@ Upgrading an app from 0.6 to 0.7:
 | `pollIntervalMs` | `200` | Poll interval in ms between queue reads. |
 | `closeTimeoutMs` | `5000` | How long `close()` waits for jobs already in a handler before handing the rest back to the broker. |
 | `concurrency` | `1` | How many jobs of one step name this worker runs at once: a number (fixed), or `'adaptive'` / `{ mode: 'adaptive', min, max, start, tickMs, ramCeilingPct, cpuCeilingPct }` to let a control loop move it — see [Adaptive concurrency](#adaptive-concurrency). More slots share one poll loop, so raising it adds no polling. |
-| `resultConcurrency` | `1` | How many step results the engine side settles at once. |
+| `resultConcurrency` | `512` | How many step results the engine side holds at once; never fewer than 512. |
 | `idleBackoffMax` | `4` | Idle backoff for the task, heartbeat, control, step-event and tenant-protocol loops, in poll intervals: empty polls double the sleep up to this multiple (800ms at the default interval), and a found job resets it. `1` disables it. The results, decisions and run-reply loops never back off. |
 | `stalledCheckIntervalMs` | `30_000` | How often the stalled-claim reclaim sweep runs. `0` disables it entirely. |
 | `stalledThresholdMs` | `120_000` (2min) | How long a claim may go without being renewed before the sweep presumes its worker dead and re-delivers the job. `1_800_000` (30min) on an adapter without `renewJobs`. |
@@ -110,7 +110,7 @@ Every step name a worker serves gets its own task queue and poll loop. By defaul
 queue: transports.queue({
   connection: 'redis',
   concurrency: 8,        // up to 8 jobs of each step name in flight per worker
-  resultConcurrency: 8,  // the engine settles up to 8 results at once (wide fans)
+  resultConcurrency: 1024, // the engine holds up to 1024 results at once (at least 512)
 }),
 ```
 

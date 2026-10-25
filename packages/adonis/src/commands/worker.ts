@@ -109,6 +109,9 @@ async function runTickInScope(engine: WorkflowEngine, options: TickOptions): Pro
     await engine.sweepTimeouts(now);
     return 0;
   });
+  // Buffered child completions nothing will consume (left by earlier versions): a bounded slice per
+  // tick, self-throttled between full passes.
+  await phase('sweepBufferedSignals', async () => engine.sweepBufferedSignals(now));
   // 5th phase — fire any due recurring schedules (mirrors the NestJS timer poller). Skipped entirely
   // when none are registered; idempotent by the schedule's time-bucket run id, so racing workers
   // start each window exactly once.

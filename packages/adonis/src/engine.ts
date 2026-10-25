@@ -2,6 +2,11 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { type AdmissionBackend, InMemoryAdmissionBackend } from './admission.js';
 import { backoffDelay, MAX_BACKOFF_MS } from './backoff.js';
 import { BoundedRunner } from './bounded-runner.js';
+import {
+  CHILD_TOKEN_PREFIX,
+  childCompletionNeedsBuffer,
+  unneededChildSignals,
+} from './buffered-child-signals.js';
 import { instantCheckpoint, lostStepEvent, stepCheckpoint } from './checkpoints.js';
 import { CHILD_DELIVERED_TAG, markChildDelivered } from './child-delivery.js';
 import {
@@ -373,6 +378,48 @@ const versionKey = (name: string, version: string): string => `${name}@${version
 const pendingKey = (at: Date): string =>
   `${at.getTime()}-${globalThis.crypto.randomUUID().slice(0, 8)}`;
 
+/** A step fan's barrier opening: the fan's first seq, and the highest seq of the batch that opened it. */
+interface FanWake {
+  first: number;
+  seq: number;
+}
+
+/** Why a run is being woken: a step fan's barrier opening (`fans`: first seq -> seq), or anything else. */
+interface WakeReason {
+  generic: boolean;
+  fans: Map<number, number>;
+}
+
+/** The buffered-event name under which the reasons of a run's refused wakes are kept (see `requestWake`). */
+const wakeRequestName = (runId: string): string => `durable:wake-request:${runId}`;
+
+/** The most kept wake reasons of one run read at once. */
+const WAKE_REQUEST_SCAN = 100;
+
+/** The fan wake a settled step result brings: none for a step outside a fan, or a failure. */
+function fanWakeOf(cp: StepCheckpoint, result: StepResult): FanWake | undefined {
+  const fan = parseStepFanGroup(cp.parallelGroup);
+  if (!fan || result.status === 'failed') return undefined;
+  return { first: fan.firstSeq, seq: cp.seq };
+}
+
+/**
+ * Whether a kept wake reason (`payload` of a wake-request event) was already seen by a turn that read
+ * the fans in `settledFans` (first seq -> the highest seq it read with nothing in flight): a fan
+ * wake the turn read settled at least that far. A generic reason (`null`) is never seen.
+ */
+function wakeReasonSeen(payload: unknown, settledFans: ReadonlyMap<number, number>): boolean {
+  const fans = (payload as { fans?: unknown } | null)?.fans;
+  if (!Array.isArray(fans) || fans.length === 0) return false;
+  return fans.every(
+    (pair) =>
+      Array.isArray(pair) &&
+      typeof pair[0] === 'number' &&
+      typeof pair[1] === 'number' &&
+      (settledFans.get(pair[0]) ?? -1) >= pair[1],
+  );
+}
+
 /** Whether `status` is one a run never leaves on its own. */
 const isTerminalRun = (status: RunStatus): boolean =>
   TERMINAL_RUN_STATUSES.includes(status as TerminalRunStatus);
@@ -390,6 +437,13 @@ const STEP_FAN_CHUNK = 200;
 
 /** The default {@link WorkflowEngineDeps.timerBatchSize}. */
 const DEFAULT_TIMER_BATCH = 500;
+
+/** {@link WorkflowEngine.sweepBufferedSignals}: rows read per page. */
+const BUFFERED_SWEEP_PAGE = 500;
+/** {@link WorkflowEngine.sweepBufferedSignals}: pages per call, so one tick stays short. */
+const BUFFERED_SWEEP_PAGES_PER_CALL = 4;
+/** {@link WorkflowEngine.sweepBufferedSignals}: rest between two full passes over the table. */
+const BUFFERED_SWEEP_REST_MS = 10 * 60_000;
 
 /** The most results of one run settled by one batched write (see `completeRemoteResult`). */
 const RESULT_BATCH_MAX = 256;
@@ -965,6 +1019,19 @@ export class WorkflowEngine {
   private runEnqueueFailures = 0;
   /** Re-checks scheduled for runs whose wake found another instance's lease (see {@link recheckAfterLease}). */
   private readonly leaseRetries = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Why each run is being woken on this instance, until the turn that answers it starts. */
+  private readonly wakeReasons = new Map<string, WakeReason>();
+  /**
+   * The step fans each executing turn on this instance read with nothing in flight: first seq -> the
+   * highest seq read. Written by {@link callRemoteAll}, read when the turn lets go of the lease.
+   */
+  private readonly turnSettledFans = new Map<string, Map<number, number>>();
+  /** The kept wake reasons each executing turn on this instance serves (see {@link execute}). */
+  private readonly turnServedWakes = new Map<string, Set<string>>();
+  /** {@link sweepBufferedSignals}: the id the pass in progress resumes after, `undefined` between passes. */
+  private bufferedSweepCursor: string | undefined;
+  private bufferedSweepActive = false;
+  private lastBufferedSweepEndedAt = Number.NEGATIVE_INFINITY;
   private draining = false;
   /** Shutdown wait already spent before/alongside {@link drain} (see {@link beginDrain}). */
   private drainSpentMs = 0;
@@ -2325,6 +2392,62 @@ export class WorkflowEngine {
    * destructive store operation, not a cancellation — a running run should be {@link cancel}led first.
    */
   /**
+   * Delete buffered child completions no parent will ever consume (see
+   * `childCompletionNeedsBuffer`): those of root runs, of children whose parent already settled them
+   * or is gone, or terminal for good. Earlier versions buffered every completion that found no
+   * waiter, and nothing else ever removes such rows.
+   *
+   * Walks the buffered signals by primary key, {@link BUFFERED_SWEEP_PAGE} rows at a time and at most
+   * {@link BUFFERED_SWEEP_PAGES_PER_CALL} pages per call, so a large backlog drains over a few worker
+   * ticks without a long query or a big delete. A pass that reaches the end rests
+   * {@link BUFFERED_SWEEP_REST_MS} before the next. The worker loop calls it every tick. Skipped while
+   * draining, on a namespaced engine (a buffered signal carries no namespace, and a scoped read would
+   * report another tenant's parent as gone), and on a store without
+   * `listBufferedSignals`/`deleteBufferedSignals`. Returns how many rows it deleted.
+   */
+  async sweepBufferedSignals(now: number = this.clock()): Promise<number> {
+    const { listBufferedSignals, deleteBufferedSignals } = this.store;
+    if (!listBufferedSignals || !deleteBufferedSignals) return 0;
+    if (this.draining || this.namespace !== undefined || this.bufferedSweepActive) return 0;
+    if (
+      this.bufferedSweepCursor === undefined &&
+      now - this.lastBufferedSweepEndedAt < BUFFERED_SWEEP_REST_MS
+    ) {
+      return 0;
+    }
+    this.bufferedSweepActive = true;
+    let deleted = 0;
+    try {
+      for (let page = 0; page < BUFFERED_SWEEP_PAGES_PER_CALL; page += 1) {
+        const rows = await listBufferedSignals.call(
+          this.store,
+          CHILD_TOKEN_PREFIX,
+          this.bufferedSweepCursor,
+          BUFFERED_SWEEP_PAGE,
+        );
+        const doomed = await unneededChildSignals(this.store, rows);
+        if (doomed.length > 0) {
+          await deleteBufferedSignals.call(
+            this.store,
+            doomed.map((row) => row.id),
+          );
+          deleted += doomed.length;
+        }
+        const last = rows.at(-1);
+        if (rows.length < BUFFERED_SWEEP_PAGE || !last) {
+          this.bufferedSweepCursor = undefined;
+          this.lastBufferedSweepEndedAt = now;
+          break;
+        }
+        this.bufferedSweepCursor = last.id;
+      }
+    } finally {
+      this.bufferedSweepActive = false;
+    }
+    return deleted;
+  }
+
+  /**
    * Register a pager hook for STRANDED runs — the failure `docs/reliability/failure-modes.mdx` calls
    * "the stranded signature": an in-flight run untouched past `stalledAfterMs` that is either
    * suspended with NO wake timer (wake-forever) or parked on an old pending remote step whose worker
@@ -2693,8 +2816,17 @@ export class WorkflowEngine {
    * {@link resume}) may re-drive it. Otherwise a stale waiter or a late result left behind by a
    * failed run silently re-executes its body.
    */
-  private resumeImplicit(runId: string): Promise<RunResult> {
+  private resumeImplicit(runId: string, fan?: FanWake): Promise<RunResult> {
+    this.noteWakeReason(runId, fan);
     return this.resumeRun(runId, false);
+  }
+
+  /** Record why `runId` is being woken: a step fan's barrier opening, or (`undefined`) anything else. */
+  private noteWakeReason(runId: string, fan: FanWake | undefined): void {
+    const reason = this.wakeReasons.get(runId) ?? { generic: false, fans: new Map() };
+    if (fan) reason.fans.set(fan.first, Math.max(reason.fans.get(fan.first) ?? fan.seq, fan.seq));
+    else reason.generic = true;
+    this.wakeReasons.set(runId, reason);
   }
 
   /**
@@ -4042,6 +4174,18 @@ export class WorkflowEngine {
           childId !== undefined &&
           ((await this.store.getRun(childId))?.tags?.includes(CHILD_DELIVERED_TAG) ?? false);
         if (await delivered()) return;
+        // Buffer it only for a parent that can still consume it (see childCompletionNeedsBuffer): a
+        // root run, a child whose parent is gone, finished for good or already holds the outcome
+        // would leave a row nothing ever takes.
+        if (
+          !(await childCompletionNeedsBuffer(
+            this.store,
+            token.slice(CHILD_TOKEN_PREFIX.length),
+            completion,
+          ))
+        ) {
+          return;
+        }
         const resumed = await this.signal(token, completion);
         // The parent may settle the child from its run row between the look above and the buffer
         // write (a join that registers its waiter only now): it then stamped the child first, and the
@@ -4538,10 +4682,23 @@ export class WorkflowEngine {
    * ({@link recheckAfterLease}) runs too, as the fast path when the holder goes down mid-turn; it
    * stops as soon as a turn served the request.
    */
-  private async requestWake(runId: string, lockedUntil: number | undefined): Promise<void> {
+  private async requestWake(
+    runId: string,
+    lockedUntil: number | undefined,
+    reason: WakeReason = { generic: true, fans: new Map() },
+  ): Promise<void> {
     if (this.draining) return;
     let marked: boolean;
     try {
+      // The reason first, the stamp second: a holder that finds the stamp finds the reason too.
+      await this.store
+        .bufferEvent({
+          name: wakeRequestName(runId),
+          payload: reason.generic ? null : { fans: [...reason.fans] },
+          id: globalThis.crypto.randomUUID(),
+          publishedAt: this.clock(),
+        })
+        .catch(() => undefined);
       marked = await this.store.updateRunIf(runId, ['running', 'suspended', 'blocked'], {
         wakeRequestedAt: this.clock(),
       });
@@ -4564,6 +4721,40 @@ export class WorkflowEngine {
     await this.resumeImplicit(runId).catch((err) => {
       if (!(err instanceof NamespaceMismatch)) throw err;
     });
+  }
+
+  /**
+   * Let go of the lease of a run this instance's turn just suspended ({@link releaseSuspendedLease}),
+   * unless a wake refused during the turn asked for another one. A wake whose every kept reason this
+   * turn already saw (a step fan's barrier opening for a fan the turn read settled at least that far,
+   * or a reason the turn found kept when it started) is spent instead: its reasons are deleted, its
+   * stamp cleared, and the lease let go of again. That is the second instance that saw a wave settle
+   * at the same moment: the turn holding the lease already ran it. Resolves `false` when another turn
+   * is owed.
+   */
+  private async letGoOfSuspendedTurn(runId: string): Promise<boolean> {
+    const served = this.turnServedWakes.get(runId) ?? new Set<string>();
+    const settledFans = this.turnSettledFans.get(runId) ?? new Map<number, number>();
+    for (let round = 0; round < 5; round += 1) {
+      if (await this.releaseSuspendedLease(runId)) {
+        if (served.size > 0) this.trackEffect(this.dropWakeReasons(runId, served));
+        return true;
+      }
+      const kept = await this.store.listBufferedEvents(wakeRequestName(runId), WAKE_REQUEST_SCAN);
+      const seen = kept.filter((k) => served.has(k.id) || wakeReasonSeen(k.payload, settledFans));
+      // No reason kept (an older engine stamped it), or one this turn has not seen: run again.
+      if (kept.length === 0 || seen.length < kept.length) return false;
+      await Promise.all(seen.map((k) => this.store.removeBufferedEvent(k.id).catch(() => false)));
+      await this.store.updateRun(runId, { wakeRequestedAt: undefined });
+      // A reason kept after the look above may have had its stamp cleared just now: look again.
+      const spent = new Set(seen.map((k) => k.id));
+      const later = await this.store.listBufferedEvents(wakeRequestName(runId), WAKE_REQUEST_SCAN);
+      if (later.some((k) => !spent.has(k.id) && !wakeReasonSeen(k.payload, settledFans))) {
+        await this.store.updateRun(runId, { wakeRequestedAt: this.clock() });
+        return false;
+      }
+    }
+    return false;
   }
 
   /**
@@ -4653,18 +4844,30 @@ export class WorkflowEngine {
     // the lease periodically so a long run keeps it (a crashed worker's lease still expires and is
     // reclaimed by periodic recovery).
     const lockNow = this.clock();
+    // The wakes this turn answers: it reads the store after they were recorded.
+    const reason = this.wakeReasons.get(run.id) ?? { generic: true, fans: new Map() };
+    this.wakeReasons.delete(run.id);
     if (run.lockedBy !== this.instanceId || (run.lockedUntil ?? 0) <= lockNow) {
       if (
         !(await this.store.tryLockRun(run.id, this.instanceId, lockNow + this.leaseMs, lockNow))
       ) {
-        this.trackEffect(this.requestWake(run.id, run.lockedUntil));
+        this.trackEffect(this.requestWake(run.id, run.lockedUntil, reason));
         return { runId: run.id, status: run.status };
       }
     }
     // This turn reads the run's checkpoints after this point, so it sees whatever the wakes that
-    // asked for it wrote: their request is served.
+    // asked for it wrote: their request is served. Cleared before the reasons are read, so a request
+    // whose reason this misses has its stamp land after the clear (see `requestWake`).
+    const served = new Set<string>();
+    this.turnServedWakes.set(run.id, served);
+    this.turnSettledFans.set(run.id, new Map());
     if (run.wakeRequestedAt !== undefined) {
       await this.store.updateRun(run.id, { wakeRequestedAt: undefined });
+      for (const kept of await this.store
+        .listBufferedEvents(wakeRequestName(run.id), WAKE_REQUEST_SCAN)
+        .catch(() => [])) {
+        served.add(kept.id);
+      }
     }
     const lease = { handedOff: false };
     this.executionLeases.set(run.id, lease);
@@ -4707,12 +4910,26 @@ export class WorkflowEngine {
       ) {
         this.trackEffect(this.singletons.wakeNext(run));
       }
+      // A finished run takes no more turns: the reasons kept for one are spent.
+      if (isTerminalRun(result.status)) this.trackEffect(this.dropWakeReasons(run.id));
       return result;
     } finally {
       clearInterval(renew);
       this.leaseLostRuns.delete(run.id);
       if (this.executionLeases.get(run.id) === lease) this.executionLeases.delete(run.id);
+      if (this.turnServedWakes.get(run.id) === served) this.turnServedWakes.delete(run.id);
+      this.turnSettledFans.delete(run.id);
     }
+  }
+
+  /** Delete the kept wake reasons of `runId` (all, or the ones in `only`). */
+  private async dropWakeReasons(runId: string, only?: ReadonlySet<string>): Promise<void> {
+    const kept = await this.store.listBufferedEvents(wakeRequestName(runId), WAKE_REQUEST_SCAN);
+    await Promise.all(
+      kept
+        .filter((k) => !only || only.has(k.id))
+        .map((k) => this.store.removeBufferedEvent(k.id).catch(() => false)),
+    );
   }
 
   /**
@@ -6321,7 +6538,7 @@ export class WorkflowEngine {
       // runs that turn (see `requestWake`).
       let released = true;
       try {
-        if (settledSuspended) released = await this.releaseSuspendedLease(run.id);
+        if (settledSuspended) released = await this.letGoOfSuspendedTurn(run.id);
         else await this.store.releaseRunLock(run.id, this.instanceId);
       } catch (releaseErr) {
         console.warn(
@@ -7146,6 +7363,7 @@ export class WorkflowEngine {
     const failures: GatherItemFailure[] = [];
     const unsent: number[] = [];
     let inFlight = 0;
+    let highest = -1;
     let wakeAt: number | undefined;
     for (let i = 0; i < inputs.length; i += 1) {
       const seq = positions[i] as number;
@@ -7155,8 +7373,19 @@ export class WorkflowEngine {
         continue;
       }
       if (cp.name !== step.name) throw new NonDeterminismError(runId, seq, step.name, cp.name);
+      if (seq > highest) highest = seq;
       if (cp.status === 'completed') {
         outputs[i] = cp.output as TOutput;
+        continue;
+      }
+      // Still out, and nothing to write for it: this turn read it a moment ago, so it waits on it
+      // without reading it again. A result landing since then wakes the run once this turn ends.
+      if (cp.status === 'pending' && this.stepIsWaiting(cp)) {
+        inFlight += 1;
+        if (cp.wakeAt != null) {
+          const at = this.stepLeaseWakeAt(cp.wakeAt);
+          wakeAt = Math.min(wakeAt ?? at, at);
+        }
         continue;
       }
       try {
@@ -7191,6 +7420,11 @@ export class WorkflowEngine {
       }
     }
 
+    // Read with nothing in flight: a fan wake asking to look at it this far has been seen.
+    if (inFlight === 0 && highest >= 0) {
+      const settled = this.turnSettledFans.get(runId);
+      settled?.set(first, Math.max(settled.get(first) ?? highest, highest));
+    }
     const batch =
       inFlight > 0
         ? []
@@ -7218,7 +7452,20 @@ export class WorkflowEngine {
     return outputs;
   }
 
-  /** Write the `pending` checkpoints of a step fan's new steps, then dispatch them. */
+  /**
+   * Whether a `pending` step a turn just read only waits for its result: {@link callRemote} would
+   * suspend on it without writing (no redispatch deadline to stamp, the one stamped not yet due).
+   */
+  private stepIsWaiting(cp: StepCheckpoint): boolean {
+    if (this.remoteRedispatchMs == null) return true;
+    return cp.wakeAt != null && this.clock() < cp.wakeAt;
+  }
+
+  /**
+   * Write the `pending` checkpoints of a step fan's new steps, then dispatch them: one
+   * {@link StateStore.saveCheckpoints} call and one {@link TransportPool.dispatchMany} for the batch,
+   * where the store and transport have them.
+   */
   private async sendStepFan<TInput, TOutput>(
     runId: string,
     positions: number[],
@@ -7241,46 +7488,52 @@ export class WorkflowEngine {
     const validInputs = new Map<number, unknown>();
     for (const i of batch) validInputs.set(i, await input(i));
     const enqueuedAt = new Date();
-    for (let at = 0; at < batch.length; at += STEP_FAN_CHUNK) {
-      await Promise.all(
-        batch.slice(at, at + STEP_FAN_CHUNK).map((i) => {
-          const seq = positions[i] as number;
-          return this.store.saveCheckpoint({
-            runId,
-            seq,
-            name: step.name,
-            kind: 'remote',
-            stepId: stepId(runId, seq),
-            status: 'pending',
-            input: validInputs.get(i),
-            attempts: 1,
-            workerGroup: token,
-            parallelGroup: group,
-            enqueuedAt,
-            startedAt: enqueuedAt,
-            finishedAt: enqueuedAt,
-          });
-        }),
-      );
+    const checkpoints = batch.map((i): StepCheckpoint => {
+      const seq = positions[i] as number;
+      return {
+        runId,
+        seq,
+        name: step.name,
+        kind: 'remote',
+        stepId: stepId(runId, seq),
+        status: 'pending',
+        input: validInputs.get(i),
+        attempts: 1,
+        workerGroup: token,
+        parallelGroup: group,
+        enqueuedAt,
+        startedAt: enqueuedAt,
+        finishedAt: enqueuedAt,
+      };
+    });
+    if (this.store.saveCheckpoints) {
+      await this.store.saveCheckpoints(checkpoints);
+    } else {
+      for (let at = 0; at < checkpoints.length; at += STEP_FAN_CHUNK) {
+        await Promise.all(
+          checkpoints.slice(at, at + STEP_FAN_CHUNK).map((cp) => this.store.saveCheckpoint(cp)),
+        );
+      }
     }
-    for (let at = 0; at < batch.length; at += STEP_FAN_CHUNK) {
-      await Promise.all(
-        batch.slice(at, at + STEP_FAN_CHUNK).map(async (i) => {
-          const seq = positions[i] as number;
-          await this.dispatchRemoteTask({
-            runId,
-            seq,
-            name: step.name,
-            stepId: stepId(runId, seq),
-            group: token,
-            input: validInputs.get(i),
-            priority: opts.admission?.priority,
-            attempt: 1,
-            transport: opts.transport,
-          });
-          this.emit({ type: 'step.started', runId, seq, name: step.name, kind: 'remote' });
-        }),
-      );
+    const traceparent = this.traceparent?.();
+    const context = this.context?.();
+    await this.pool.dispatchMany(
+      checkpoints.map((cp) => ({
+        runId,
+        seq: cp.seq,
+        name: step.name,
+        stepId: cp.stepId as string,
+        group: token,
+        input: cp.input,
+        traceparent,
+        context,
+        priority: opts.admission?.priority,
+        attempt: 1,
+      })),
+      opts.transport,
+    );
+    for (const cp of checkpoints) {
+      this.emit({ type: 'step.started', runId, seq: cp.seq, name: step.name, kind: 'remote' });
     }
   }
 
@@ -7380,6 +7633,7 @@ export class WorkflowEngine {
         outcomes = await this.completeRemoteResults(
           runId,
           batch.map((q) => q.result),
+          (from, to) => queue.some(({ result }) => result.seq >= from && result.seq <= to),
         );
       } catch (error) {
         outcomes = batch.map(() => ({ error }));
@@ -7395,16 +7649,19 @@ export class WorkflowEngine {
   }
 
   /** The single-result path: settle `result`, then resume its run unless its fan is still running. */
-  private async completeOneRemoteResult(result: StepResult): Promise<void> {
+  private async completeOneRemoteResult(
+    result: StepResult,
+    queuedIn: (from: number, to: number) => boolean,
+  ): Promise<void> {
     const cp = await this.settleRemoteCheckpoint(result);
     if (cp === undefined) return;
-    if (await this.stepFanStillRunning(cp, result)) return;
-    this.resumeInBackground(result.runId);
+    if (await this.stepFanStillRunning(cp, result, queuedIn)) return;
+    this.resumeInBackground(result.runId, fanWakeOf(cp, result));
   }
 
-  private resumeInBackground(runId: string): void {
+  private resumeInBackground(runId: string, fan?: FanWake): void {
     this.trackEffect(
-      this.resumeImplicit(runId).catch((err) => {
+      this.resumeImplicit(runId, fan).catch((err) => {
         console.warn(
           `[adonis-durable] background resume of run ${runId} failed (the run recovers on its next reconcile wake): ${
             err instanceof Error ? err.message : String(err)
@@ -7423,12 +7680,13 @@ export class WorkflowEngine {
   private async completeRemoteResults(
     runId: string,
     results: StepResult[],
+    queuedIn: (from: number, to: number) => boolean = () => false,
   ): Promise<Array<true | { error: unknown }>> {
     const outcomes: Array<true | { error: unknown }> = results.map(() => true);
     const settleOneByOne = async (indexes: number[]) => {
       for (const i of indexes) {
         try {
-          await this.completeOneRemoteResult(results[i] as StepResult);
+          await this.completeOneRemoteResult(results[i] as StepResult, queuedIn);
         } catch (error) {
           outcomes[i] = { error };
         }
@@ -7456,8 +7714,9 @@ export class WorkflowEngine {
     ) {
       return settleOneByOne(live);
     }
-    const reads = await Promise.allSettled(
-      live.map((i) => this.store.getCheckpoint(runId, (results[i] as StepResult).seq)),
+    const reads = await this.readCheckpoints(
+      runId,
+      live.map((i) => (results[i] as StepResult).seq),
     );
     // Checkpoints whose result should resume the run (barrier permitting): the ones this batch
     // settled, and redeliveries of ones settled before — whose resume may never have happened.
@@ -7518,9 +7777,17 @@ export class WorkflowEngine {
       resumable.push({ cp, result });
     }
     // Asked after every write of the batch committed, so the batch holding a fan's last step sees
-    // its barrier open; once per fan. A barrier that cannot be read counts as open: a spare resume
-    // replays and re-suspends, a lost one strands the run.
+    // its barrier open; once per fan, and not at all while another of the fan's results is queued
+    // behind this batch on this instance: that result asks it after its own write (a settle, or a
+    // redelivery of a settled step), so under a backlog the barrier is read once per drained queue,
+    // not once per batch. A barrier that cannot be read counts as open: a spare resume replays and
+    // re-suspends, a lost one strands the run.
     const barriers = new Map<number, Promise<boolean>>();
+    const highest = new Map<number, number>();
+    for (const { cp } of resumable) {
+      const fan = parseStepFanGroup(cp.parallelGroup);
+      if (fan) highest.set(fan.firstSeq, Math.max(highest.get(fan.firstSeq) ?? cp.seq, cp.seq));
+    }
     for (const { cp, result } of resumable) {
       const fan = parseStepFanGroup(cp.parallelGroup);
       if (!fan || result.status === 'failed') {
@@ -7529,14 +7796,20 @@ export class WorkflowEngine {
       }
       let closed = barriers.get(fan.firstSeq);
       if (!closed) {
-        closed = this.countPendingSteps(runId, fan.firstSeq, fan.firstSeq + fan.size - 1).then(
-          (n) => n > 0,
-          () => false,
-        );
+        const lastSeq = fan.firstSeq + fan.size - 1;
+        closed = queuedIn(fan.firstSeq, lastSeq)
+          ? Promise.resolve(true)
+          : this.countPendingSteps(runId, fan.firstSeq, lastSeq).then(
+              (n) => n > 0,
+              () => false,
+            );
         barriers.set(fan.firstSeq, closed);
       }
       if (!(await closed)) {
-        this.resumeInBackground(runId);
+        this.resumeInBackground(runId, {
+          first: fan.firstSeq,
+          seq: highest.get(fan.firstSeq) ?? cp.seq,
+        });
         return outcomes;
       }
     }
@@ -7573,12 +7846,39 @@ export class WorkflowEngine {
    * which makes a fan of N steps cost O(N²) checkpoint reads. A redelivered result goes through it
    * too: its re-driven resume is only owed once the fan has settled.
    */
-  private async stepFanStillRunning(cp: StepCheckpoint, result: StepResult): Promise<boolean> {
+  private async stepFanStillRunning(
+    cp: StepCheckpoint,
+    result: StepResult,
+    queuedIn: (from: number, to: number) => boolean = () => false,
+  ): Promise<boolean> {
     const fan = parseStepFanGroup(cp.parallelGroup);
     if (!fan || result.status === 'failed') return false;
-    return (
-      (await this.countPendingSteps(result.runId, fan.firstSeq, fan.firstSeq + fan.size - 1)) > 0
-    );
+    const lastSeq = fan.firstSeq + fan.size - 1;
+    // Left to the result of this fan queued behind this one (see `completeRemoteResults`).
+    if (queuedIn(fan.firstSeq, lastSeq)) return true;
+    return (await this.countPendingSteps(result.runId, fan.firstSeq, lastSeq)) > 0;
+  }
+
+  /**
+   * The checkpoints of one run at `seqs`, each as its own outcome: one
+   * {@link StateStore.getCheckpoints} call when the store has it, else one read each. The batch
+   * call rejecting falls back to one read each, so a failing read fails only its own entry.
+   */
+  private async readCheckpoints(
+    runId: string,
+    seqs: number[],
+  ): Promise<PromiseSettledResult<StepCheckpoint | null>[]> {
+    if (seqs.length > 1 && this.store.getCheckpoints) {
+      try {
+        const bySeq = new Map(
+          (await this.store.getCheckpoints(runId, seqs)).map((cp) => [cp.seq, cp]),
+        );
+        return seqs.map((seq) => ({ status: 'fulfilled', value: bySeq.get(seq) ?? null }));
+      } catch {
+        // Fall through: one by one.
+      }
+    }
+    return Promise.allSettled(seqs.map((seq) => this.store.getCheckpoint(runId, seq)));
   }
 
   /**

@@ -31,7 +31,7 @@ This page compares the five drivers side by side. Every cell reflects what the t
 | --- | --- | --- | --- | --- | --- |
 | Steps run concurrently per process | ✅ `concurrency` per step-name queue (default 1) | ✅ `concurrency` per step-name loop (default 1) | ✅ `concurrency` across every served step name (default 1) | ⚠️ unbounded² | ⚠️ inline in `dispatch` |
 | Adaptive concurrency (`concurrency: 'adaptive'`) | ✅ | ✅ | ✅ | ❌ | ❌ |
-| Results settled concurrently (engine side) | ✅ `resultConcurrency` (default 1) | ✅ `resultConcurrency` (default 1) | ✅ `resultConcurrency` (default 1), claimed `batchSize` (20) at a time | ⚠️ unbounded² | ⚠️ unbounded |
+| Results settled concurrently (engine side) | ✅ at least 512 at once (`resultConcurrency` raises it) | ✅ at least 512 at once (`resultConcurrency` raises it) | ✅ at least 512 at once (`resultConcurrency` raises it), claimed 256 a round | ⚠️ unbounded² | ⚠️ unbounded |
 | Broker-level step priority | ✅ mapped onto BullMQ job priority, full range | ⚠️ mapped onto the adapter's 1–10 scale³ | ✅ `priority` column, 32-bit range, claimed highest first | ❌ | ❌ |
 
 ### Reliability

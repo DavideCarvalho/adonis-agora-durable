@@ -118,14 +118,14 @@ The transport's `concurrency` is separate from a [flow-control queue](/docs/dura
 
 ## Result concurrency
 
-`concurrency` applies to the **task** queues a worker consumes. The engine side consumes the shared `<P>-results` queue, and `resultConcurrency` sets how many results this instance settles at once. The default is `1`. A non-finite or sub-1 value falls back to `1`, and a fractional value is rounded down.
+`concurrency` applies to the **task** queues a worker consumes. The engine side consumes the shared `<P>-results` queue, and holds at least 512 results at once per instance, or `resultConcurrency` when that is higher. A non-finite or sub-1 value is ignored, and a fractional value is rounded down.
 
-With one result at a time, the results of a wide fan wait in line for one checkpoint write at a time on each pod. Raise it on the instances that consume results:
+The engine settles one run's results that are in hand together, so the results of a wide fan land a few hundred per checkpoint write rather than one at a time. Raise it past 512 only on instances that consume results of many runs at once:
 
 ```ts title="config/durable.ts"
 bullmq: transports.bullmq({
   connection: { host: '127.0.0.1', port: 6379 },
-  resultConcurrency: 16, // results of different runs settle in parallel
+  resultConcurrency: 2048, // more results in hand at once, across runs
 }),
 ```
 
@@ -220,7 +220,7 @@ The same transport also carries:
 | --- | --- | --- |
 | `connection` | — (required) | ioredis `ConnectionOptions`, a connection string, or a `Redis` instance. See [Connection](#connection). |
 | `concurrency` | `1` | Task-queue concurrency: a number, `'adaptive'`, or `{ mode: 'adaptive', ... }`. See [Concurrency](#concurrency). |
-| `resultConcurrency` | `1` | How many step results this instance settles at once. See [Result concurrency](#result-concurrency). |
+| `resultConcurrency` | `512` | How many step results this instance holds at once; never fewer than 512. See [Result concurrency](#result-concurrency). |
 | `prefix` | `'durable'` | Root of every queue, channel and key name. |
 | `namespace` | the engine's | Deployment namespace folded into every name. An explicit value wins over the engine's. |
 | `partition` | — | Isolation suffix (`@<partition>`) on every per-name task queue this instance subscribes to. |

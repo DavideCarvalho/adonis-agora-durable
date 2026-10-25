@@ -1,4 +1,5 @@
 import type {
+  BufferedSignalRow,
   CheckpointQuery,
   CheckpointStat,
   ChildWait,
@@ -122,6 +123,14 @@ export class CodecStateStore implements StateStore {
   ) => Promise<boolean>;
   /** Forwarded verbatim — reads tokens, never a payload. Bound only when the inner store has it. */
   readonly listBufferedSignalTokens?: (prefix: string, limit: number) => Promise<string[]>;
+  /** Decodes each payload. Bound only when the inner store has it. */
+  readonly listBufferedSignals?: (
+    tokenPrefix: string,
+    afterId: string | undefined,
+    limit: number,
+  ) => Promise<BufferedSignalRow[]>;
+  /** Forwarded verbatim. Bound only when the inner store has it. */
+  readonly deleteBufferedSignals?: (ids: string[]) => Promise<void>;
   /** Forwarded verbatim — a count reads no payload. Bound only when the inner store has it. */
   readonly countCheckpoints?: (
     runId: string,
@@ -129,6 +138,10 @@ export class CodecStateStore implements StateStore {
     toSeq: number,
     statuses: StepCheckpoint['status'][],
   ) => Promise<number>;
+  /** Decodes each checkpoint. Bound only when the inner store has it. */
+  readonly getCheckpoints?: (runId: string, seqs: number[]) => Promise<StepCheckpoint[]>;
+  /** Encodes each checkpoint. Bound only when the inner store has it. */
+  readonly saveCheckpoints?: (checkpoints: StepCheckpoint[]) => Promise<void>;
 
   constructor(
     private readonly inner: StateStore,
@@ -136,6 +149,19 @@ export class CodecStateStore implements StateStore {
     options: CodecStateStoreOptions = {},
   ) {
     this.extended = options.coverage === 'extended';
+    const getMany = inner.getCheckpoints;
+    if (getMany) {
+      this.getCheckpoints = async (runId, seqs) =>
+        (await getMany.call(inner, runId, seqs)).map((cp) => this.decCp(cp) as StepCheckpoint);
+    }
+    const saveMany = inner.saveCheckpoints;
+    if (saveMany) {
+      this.saveCheckpoints = (cps) =>
+        saveMany.call(
+          inner,
+          cps.map((cp) => this.encCp(cp)),
+        );
+    }
     const releaseUnlessWake = inner.releaseRunLockUnlessWakeRequested;
     if (releaseUnlessWake) {
       this.releaseRunLockUnlessWakeRequested = (runId, owner) =>
@@ -183,6 +209,16 @@ export class CodecStateStore implements StateStore {
       this.tryAdmitSingleton = (runId, tag, workflow, limit, retryWakeAt) =>
         tryAdmitSingleton.call(inner, runId, tag, workflow, limit, retryWakeAt);
     }
+    const listSignals = inner.listBufferedSignals;
+    if (listSignals) {
+      this.listBufferedSignals = async (prefix, afterId, limit) =>
+        (await listSignals.call(inner, prefix, afterId, limit)).map((row) => ({
+          ...row,
+          payload: this.dec(row.payload),
+        }));
+    }
+    const deleteSignals = inner.deleteBufferedSignals;
+    if (deleteSignals) this.deleteBufferedSignals = (ids) => deleteSignals.call(inner, ids);
     const listTokens = inner.listBufferedSignalTokens;
     if (listTokens) {
       this.listBufferedSignalTokens = (prefix, limit) => listTokens.call(inner, prefix, limit);

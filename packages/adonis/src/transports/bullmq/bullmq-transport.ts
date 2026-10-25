@@ -95,10 +95,10 @@ export interface BullMQTransportOptions {
   /** Where a background failure (a failed heartbeat refresh, a result-publish error) is reported. */
   onError?: ((err: unknown) => void) | undefined;
   /**
-   * How many step results this instance settles at once from the results queue. With the default
-   * of 1, a wide fan's results queue up behind one checkpoint write at a time on each pod. The engine
-   * still resumes one run's turns in order on an instance, so a run never gets two concurrent turns
-   * from it. A non-finite or sub-1 value falls back to the default. Default 1.
+   * Raises how many step results this instance takes from the results queue at once above its
+   * floor of 512. The engine writes one run's results that are in hand together (one write, one
+   * barrier read per batch), so a wide fan's results settle at the rate its steps finish; there is
+   * rarely a reason to set this. A non-finite or sub-1 value is ignored.
    */
   resultConcurrency?: number | undefined;
   /**
@@ -241,7 +241,13 @@ export class BullMQTransport implements Transport {
     this.#onError = options.onError ?? (() => {});
     this.#hasOnError = options.onError !== undefined;
     this.#closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
-    this.#resultConcurrency = workerConcurrency(options.resultConcurrency);
+    // At least RESULT_CONSUMER_MIN in flight: the engine settles one run's results in batches of
+    // whatever has arrived, so a consumer handing over a few at a time makes a wide fan settle a few
+    // results per write. `resultConcurrency` only raises it.
+    this.#resultConcurrency = Math.max(
+      RESULT_CONSUMER_MIN,
+      workerConcurrency(options.resultConcurrency),
+    );
     this.#concurrency = options.concurrency;
     this.#pingIntervalMs = normalizePingInterval(options.pingIntervalMs);
     this.#stepTimeoutMs =
@@ -481,6 +487,46 @@ export class BullMQTransport implements Transport {
       'task',
       task,
       taskJobOptions(task.priority),
+    );
+  }
+
+  /**
+   * {@link dispatch} for many tasks: `addBulk` per task queue, {@link TASK_ADD_BULK_CHUNK} jobs a
+   * call, {@link TASK_ADD_BULK_IN_FLIGHT} calls at once. A queue without `addBulk` gets one `add` per
+   * task.
+   */
+  async dispatchMany(tasks: RemoteTask[]): Promise<void> {
+    const byQueue = new Map<string, RemoteTask[]>();
+    for (const task of tasks) {
+      const name = tasksName(this.#effectivePrefix(), task.group);
+      byQueue.set(name, [...(byQueue.get(name) ?? []), task]);
+    }
+    const calls: Array<() => Promise<unknown>> = [];
+    for (const [name, queued] of byQueue) {
+      const queue = this.#queue(name);
+      for (let at = 0; at < queued.length; at += TASK_ADD_BULK_CHUNK) {
+        const chunk = queued.slice(at, at + TASK_ADD_BULK_CHUNK).map((task) => ({
+          name: 'task',
+          data: task,
+          opts: taskJobOptions(task.priority),
+        }));
+        calls.push(() =>
+          queue.addBulk
+            ? queue.addBulk(chunk)
+            : Promise.all(chunk.map((job) => queue.add(job.name, job.data, job.opts))),
+        );
+      }
+    }
+    let next = 0;
+    const lane = async () => {
+      while (next < calls.length) {
+        const call = calls[next] as () => Promise<unknown>;
+        next += 1;
+        await call();
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(TASK_ADD_BULK_IN_FLIGHT, calls.length) }, lane),
     );
   }
 
@@ -1278,5 +1324,11 @@ async function withTimeout(work: Promise<unknown>, ms: number): Promise<void> {
   }
 }
 const DEFAULT_CLOSE_TIMEOUT_MS = 5_000;
+/** The fewest step results a results consumer holds at once (see `resultConcurrency`). */
+const RESULT_CONSUMER_MIN = 512;
+/** The most task jobs one `addBulk` carries, and how many such calls run at once (`dispatchMany`). */
+const TASK_ADD_BULK_CHUNK = 500;
+const TASK_ADD_BULK_IN_FLIGHT = 4;
+
 /** The most run jobs one `addBulk` carries (see {@link BullMQTransport.dispatchRuns}). */
 const RUN_ADD_BULK_CHUNK = 500;

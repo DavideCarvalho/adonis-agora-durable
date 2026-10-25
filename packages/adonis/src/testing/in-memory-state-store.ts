@@ -1,5 +1,6 @@
 import type {
   AttributeFilter,
+  BufferedSignalRow,
   CheckpointQuery,
   CheckpointStat,
   ChildWait,
@@ -44,7 +45,9 @@ interface InMemoryState {
   readonly checkpoints: Map<string, StepCheckpoint>;
   readonly signalWaiters: Map<string, SignalWaiter>;
   readonly attributeIndex: Map<string, Map<string, RunAttributeRow>>;
-  readonly bufferedSignals: Map<string, unknown[]>;
+  readonly bufferedSignals: Map<string, Array<{ id: number; payload: unknown }>>;
+  /** The last buffered signal id handed out (an auto-increment, like the SQL stores'). */
+  bufferedSignalSeq: number;
   readonly bufferedEvents: Map<string, { name: string; payload: unknown; publishedAt: number }>;
   readonly schedules: Map<string, ScheduleRecord>;
   readonly stats: {
@@ -70,6 +73,7 @@ const freshState = (): InMemoryState => ({
   signalWaiters: new Map(),
   attributeIndex: new Map(),
   bufferedSignals: new Map(),
+  bufferedSignalSeq: 0,
   bufferedEvents: new Map(),
   schedules: new Map(),
   stats: { lastAttributeCandidates: 0, lastCheckpointRowsRead: 0, checkpointRowsRead: 0 },
@@ -271,8 +275,23 @@ export class InMemoryStateStore implements StateStore {
     return cp ? { ...cp } : null;
   }
 
+  async getCheckpoints(runId: string, seqs: number[]): Promise<StepCheckpoint[]> {
+    const out: StepCheckpoint[] = [];
+    for (const seq of [...new Set(seqs)].sort((a, b) => a - b)) {
+      const cp = this.checkpoints.get(this.key(runId, seq));
+      if (cp) out.push({ ...cp });
+    }
+    return out;
+  }
+
   async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
     this.checkpoints.set(this.key(checkpoint.runId, checkpoint.seq), { ...checkpoint });
+  }
+
+  async saveCheckpoints(checkpoints: StepCheckpoint[]): Promise<void> {
+    for (const checkpoint of checkpoints) {
+      this.checkpoints.set(this.key(checkpoint.runId, checkpoint.seq), { ...checkpoint });
+    }
   }
 
   async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {
@@ -464,13 +483,37 @@ export class InMemoryStateStore implements StateStore {
     return work({ raw: this, saveCheckpoint: (cp) => this.saveCheckpoint(cp) });
   }
 
-  private get bufferedSignals(): Map<string, unknown[]> {
+  private get bufferedSignals(): Map<string, Array<{ id: number; payload: unknown }>> {
     return this.state.bufferedSignals;
   }
   async bufferSignal(token: string, payload: unknown): Promise<void> {
     const queue = this.bufferedSignals.get(token) ?? [];
-    queue.push(payload);
+    this.state.bufferedSignalSeq += 1;
+    queue.push({ id: this.state.bufferedSignalSeq, payload });
     this.bufferedSignals.set(token, queue);
+  }
+  async listBufferedSignals(
+    tokenPrefix: string,
+    afterId: string | undefined,
+    limit: number,
+  ): Promise<BufferedSignalRow[]> {
+    const after = afterId === undefined ? 0 : Number(afterId);
+    const rows: BufferedSignalRow[] = [];
+    for (const [token, queue] of this.bufferedSignals) {
+      if (!token.startsWith(tokenPrefix)) continue;
+      for (const { id, payload } of queue) {
+        if (id > after) rows.push({ id: String(id), token, payload });
+      }
+    }
+    return rows.sort((a, b) => Number(a.id) - Number(b.id)).slice(0, limit);
+  }
+  async deleteBufferedSignals(ids: string[]): Promise<void> {
+    const doomed = new Set(ids.map(Number));
+    for (const [token, queue] of this.bufferedSignals) {
+      const kept = queue.filter((row) => !doomed.has(row.id));
+      if (kept.length === 0) this.bufferedSignals.delete(token);
+      else this.bufferedSignals.set(token, kept);
+    }
   }
   async listBufferedSignalTokens(prefix: string, limit: number): Promise<string[]> {
     const out: string[] = [];
@@ -483,9 +526,9 @@ export class InMemoryStateStore implements StateStore {
   async takeBufferedSignal(token: string): Promise<{ payload: unknown } | null> {
     const queue = this.bufferedSignals.get(token);
     if (!queue || queue.length === 0) return null;
-    const payload = queue.shift();
+    const head = queue.shift() as { payload: unknown };
     if (queue.length === 0) this.bufferedSignals.delete(token);
-    return { payload };
+    return { payload: head.payload };
   }
 
   /** `id -> row`, so {@link removeBufferedEvent} can delete an exact row regardless of iteration

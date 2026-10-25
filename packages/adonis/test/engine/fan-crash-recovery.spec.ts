@@ -752,7 +752,7 @@ describe('review: races around a child completion', () => {
         const value = Reflect.get(target, prop, receiver);
         if (prop === 'bufferSignal') {
           return async (token: string, payload: unknown) => {
-            if (token === 'child:c1') {
+            if (token === 'child:p.child.0') {
               // The child's notification found no waiter and is about to buffer: hold it there.
               buffering = true;
               await held;
@@ -764,11 +764,12 @@ describe('review: races around a child completion', () => {
       },
     }) as InMemoryStateStore;
     const engine = new WorkflowEngine({ store, reconcileMs: 0 });
+    // An engine-minted child id names its parent, so its completion is buffered for that parent.
     engine.register('child', '1', async () => 'spawned');
     engine.register('parent', '1', async (ctx) => {
-      await ctx.startChild('child', {}, 'c1');
+      await ctx.startChild('child', {}, 'p.child.0');
       await ctx.waitForSignal('join');
-      return ctx.child<string>('child', {}, 'c1');
+      return ctx.child<string>('child', {}, 'p.child.0');
     });
     await engine.start('parent', {}, 'p');
     await until(() => buffering, 10_000, 'the notification to reach the buffer write');
@@ -778,7 +779,7 @@ describe('review: races around a child completion', () => {
     expect((await store.getRun('p'))?.output).toBe('spawned');
     release();
     await engine.drain(10_000);
-    expect(await inner.takeBufferedSignal('child:c1')).toBeNull();
+    expect(await inner.takeBufferedSignal('child:p.child.0')).toBeNull();
   });
 
   it('a run handed back while draining that cannot be enqueued is reported', async () => {
