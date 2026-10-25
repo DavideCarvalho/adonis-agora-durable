@@ -81,7 +81,7 @@ transport.handle('pipeline:extract', async (input) => extract(input))
 ```
 
 A worker runs ONE task row at a time unless `concurrency` is raised
-(`transports.db({ concurrency: 8, resultConcurrency: 8 })`, or `'adaptive'` with
+(`transports.db({ concurrency: 8, resultConcurrency: 1024 })`, or `'adaptive'` with
 the same controller and fields as `queue`/`bullmq`); one poll loop serves every
 handler name and claims only as many rows as it has free slots. Every held
 claim is renewed every `leaseMs / 3`, and a row is recorded (task delete +
@@ -150,7 +150,7 @@ export default defineConfig({
 One instance consumes engine-side results; run one or more `node ace
 durable:work` workers serving the step names. A worker runs ONE job of a step
 name at a time unless `concurrency` is raised (`transports.queue({ connection,
-concurrency: 8, resultConcurrency: 8 })`); the slots share one poll loop.
+concurrency: 8, resultConcurrency: 1024 })`); the slots share one poll loop.
 `concurrency: 'adaptive'` (or `{ mode: 'adaptive', min, max, start, tickMs,
 ramCeilingPct, cpuCeilingPct }`) runs the same controller as `bullmq` (below);
 each step name's loop reads the live limit every poll. Idle
