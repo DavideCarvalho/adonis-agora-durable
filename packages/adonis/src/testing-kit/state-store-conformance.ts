@@ -156,6 +156,95 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.getRun('nope')).toBeNull();
     });
 
+    t(
+      'lists buffered signals by token prefix in insertion order, a page at a time (when implemented)',
+      async () => {
+        if (!store.listBufferedSignals) return;
+        const list = (prefix: string, after: string | undefined, limit: number) =>
+          store.listBufferedSignals?.(prefix, after, limit) ?? Promise.resolve([]);
+        await store.bufferSignal('child:a', { ok: true, value: { n: 1 } });
+        await store.bufferSignal('order:1', { paid: true });
+        await store.bufferSignal('child:b', { ok: false, error: 'x' });
+        await store.bufferSignal('child:a', { ok: true, value: { n: 2 } });
+        // `_` and `%` in a prefix are literal, not LIKE wildcards.
+        await store.bufferSignal('wake_x:1', null);
+        await store.bufferSignal('wakeyx:1', null);
+
+        const all = await list('child:', undefined, 10);
+        expect(all.map((r) => [r.token, r.payload])).toEqual([
+          ['child:a', { ok: true, value: { n: 1 } }],
+          ['child:b', { ok: false, error: 'x' }],
+          ['child:a', { ok: true, value: { n: 2 } }],
+        ]);
+        expect(all.map((r) => typeof r.id)).toEqual(['string', 'string', 'string']);
+        const first = await list('child:', undefined, 2);
+        expect(first.map((r) => r.id)).toEqual(all.slice(0, 2).map((r) => r.id));
+        const rest = await list('child:', first.at(-1)?.id, 2);
+        expect(rest.map((r) => r.id)).toEqual([all[2]?.id]);
+        expect(await list('child:', all[2]?.id, 2)).toEqual([]);
+        expect((await list('wake_x:', undefined, 10)).map((r) => r.token)).toEqual(['wake_x:1']);
+      },
+    );
+
+    t(
+      'deletes buffered signals by id and leaves the rest in FIFO order (when implemented)',
+      async () => {
+        if (!store.listBufferedSignals || !store.deleteBufferedSignals) return;
+        await store.bufferSignal('child:a', { n: 1 });
+        await store.bufferSignal('child:a', { n: 2 });
+        await store.bufferSignal('child:a', { n: 3 });
+        await store.bufferSignal('child:b', { n: 4 });
+        const rows = await store.listBufferedSignals('child:', undefined, 10);
+        await store.deleteBufferedSignals([
+          rows[1]?.id as string,
+          rows[3]?.id as string,
+          '999999999',
+        ]);
+        await store.deleteBufferedSignals([]);
+        expect(await store.takeBufferedSignal('child:a')).toEqual({ payload: { n: 1 } });
+        expect(await store.takeBufferedSignal('child:a')).toEqual({ payload: { n: 3 } });
+        expect(await store.takeBufferedSignal('child:a')).toBeNull();
+        expect(await store.takeBufferedSignal('child:b')).toBeNull();
+      },
+    );
+
+    t(
+      'a parent joining children that already finished settles them from their rows',
+      async () => {
+        const engine = new WorkflowEngine({ store, reconcileMs: 0 });
+        engine.register('j-child', '1', async (_ctx, input) => ({ n: (input as { n: number }).n }));
+        engine.register('j-parent', '1', async (ctx) => {
+          const lone = await ctx.child('j-child', { n: 9 }, 'j-own-id');
+          const fan = await ctx.allSettled('j-child', [{ n: 0 }, { n: 1 }]);
+          return { lone, fan };
+        });
+        // Both finish before the parent exists: their notifications find no waiter.
+        await engine.start('j-child', { n: 9 }, 'j-own-id');
+        await engine.start('j-child', { n: 1 }, 'jp.all.1.1');
+        expect((await engine.waitForRun('j-own-id', { timeoutMs: 20_000 })).status).toBe(
+          'completed',
+        );
+        expect((await engine.waitForRun('jp.all.1.1', { timeoutMs: 20_000 })).status).toBe(
+          'completed',
+        );
+        await engine.start('j-parent', {}, 'jp');
+        const deadline = Date.now() + 20_000;
+        while ((await store.getRun('jp'))?.status !== 'completed') {
+          if (Date.now() > deadline) throw new Error('parent never completed');
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        expect((await store.getRun('jp'))?.output).toEqual({
+          lone: { n: 9 },
+          fan: [
+            { status: 'fulfilled', value: { n: 0 } },
+            { status: 'fulfilled', value: { n: 1 } },
+          ],
+        });
+        await engine.drain(5_000);
+      },
+      60_000,
+    );
+
     t('round-trips a refused wake request (wakeRequestedAt), and clears it', async () => {
       await store.createRun(run({ status: 'suspended' }));
       await store.updateRun('r1', { wakeRequestedAt: 1234 });
@@ -674,6 +763,109 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         ]),
       ).toEqual([true, true]);
       expect((await store.getCheckpoint('r1', 3))?.output).toEqual({ n: 3 });
+    });
+
+    t(
+      'saveCheckpoints writes many rows and getCheckpoints reads them back (when implemented)',
+      async () => {
+        if (!store.saveCheckpoints || !store.getCheckpoints) return;
+        await store.createRun(run());
+        await store.createRun(run({ id: 'r2' }));
+        await store.saveCheckpoints([]);
+        expect(await store.getCheckpoints('r1', [])).toEqual([]);
+        // Wider than any one statement a store batches, so the batches' seams are crossed.
+        const wide = Array.from({ length: 600 }, (_, seq) =>
+          checkpoint({ seq, stepId: `r1:${seq}`, status: 'pending', output: undefined }),
+        );
+        await store.saveCheckpoint(checkpoint({ runId: 'r2', seq: 5, stepId: 'r2:5' }));
+        await store.saveCheckpoints(wide);
+        // Overwrites the row at the same (runId, seq).
+        await store.saveCheckpoints([
+          checkpoint({ seq: 7, stepId: 'r1:7', output: { n: 7 } }),
+          checkpoint({ seq: 599, stepId: 'r1:599', status: 'failed', error: { message: 'x' } }),
+        ]);
+        expect(await store.listCheckpoints('r1')).toHaveLength(600);
+
+        const read = await store.getCheckpoints('r1', [599, 7, 0, 7, 1000, 550]);
+        expect(read.map((c) => [c.seq, c.status])).toEqual([
+          [0, 'pending'],
+          [7, 'completed'],
+          [550, 'pending'],
+          [599, 'failed'],
+        ]);
+        expect(read[1]?.output).toEqual({ n: 7 });
+        expect(read[3]?.error).toEqual({ message: 'x' });
+        const all = await store.getCheckpoints(
+          'r1',
+          Array.from({ length: 600 }, (_, i) => i),
+        );
+        expect(all.map((c) => c.seq)).toEqual(Array.from({ length: 600 }, (_, i) => i));
+        // Another run's row at a seq it shares is not this run's.
+        expect((await store.getCheckpoints('r2', [5, 7])).map((c) => c.stepId)).toEqual(['r2:5']);
+      },
+      30_000,
+    );
+
+    t(
+      'saveCheckpointsIfPending settles a batch wider than one statement',
+      async () => {
+        if (!store.saveCheckpointsIfPending) return;
+        await store.createRun(run());
+        for (let seq = 0; seq < 600; seq += 1) {
+          await store.saveCheckpoint(
+            checkpoint({ seq, stepId: `r1:${seq}`, status: 'pending', output: undefined }),
+          );
+        }
+        await store.saveCheckpoint(
+          checkpoint({ seq: 300, stepId: 'r1:300', output: { early: true } }),
+        );
+        const wrote = await store.saveCheckpointsIfPending(
+          Array.from({ length: 600 }, (_, seq) =>
+            checkpoint({ seq, stepId: `r1:${seq}`, output: { n: seq } }),
+          ),
+        );
+        expect(wrote.filter((w) => !w)).toHaveLength(1);
+        expect(wrote[300]).toBe(false);
+        const rows = await store.listCheckpoints('r1');
+        expect(rows.every((c) => c.status === 'completed')).toBe(true);
+        expect(rows[300]?.output).toEqual({ early: true });
+        expect(rows[599]?.output).toEqual({ n: 599 });
+      },
+      30_000,
+    );
+
+    t('keeps millisecond precision on every run and checkpoint timestamp', async () => {
+      const ms = (iso: string) => new Date(iso);
+      await store.createRun(
+        run({
+          createdAt: ms('2026-06-11T10:00:00.123Z'),
+          updatedAt: ms('2026-06-11T10:00:00.456Z'),
+          wakeAt: Date.parse('2026-06-11T10:05:00.789Z'),
+          lockedUntil: Date.parse('2026-06-11T10:01:00.007Z'),
+        }),
+      );
+      await store.updateRun('r1', { wakeRequestedAt: Date.parse('2026-06-11T10:00:30.999Z') });
+      const loaded = await store.getRun('r1');
+      expect(loaded?.createdAt.getTime()).toBe(Date.parse('2026-06-11T10:00:00.123Z'));
+      expect(loaded?.wakeAt).toBe(Date.parse('2026-06-11T10:05:00.789Z'));
+      expect(loaded?.lockedUntil).toBe(Date.parse('2026-06-11T10:01:00.007Z'));
+      expect(loaded?.wakeRequestedAt).toBe(Date.parse('2026-06-11T10:00:30.999Z'));
+      // A store may stamp updatedAt itself, but whatever it holds keeps its milliseconds.
+      expect(loaded?.updatedAt).toBeInstanceOf(Date);
+
+      await store.saveCheckpoint(
+        checkpoint({
+          enqueuedAt: ms('2026-06-11T10:00:01.001Z'),
+          startedAt: ms('2026-06-11T10:00:01.502Z'),
+          finishedAt: ms('2026-06-11T10:00:02.003Z'),
+          wakeAt: Date.parse('2026-06-11T10:09:00.044Z'),
+        }),
+      );
+      const cp = await store.getCheckpoint('r1', 0);
+      expect(cp?.enqueuedAt.getTime()).toBe(Date.parse('2026-06-11T10:00:01.001Z'));
+      expect(cp?.startedAt.getTime()).toBe(Date.parse('2026-06-11T10:00:01.502Z'));
+      expect(cp?.finishedAt.getTime()).toBe(Date.parse('2026-06-11T10:00:02.003Z'));
+      expect(cp?.wakeAt).toBe(Date.parse('2026-06-11T10:09:00.044Z'));
     });
 
     t(

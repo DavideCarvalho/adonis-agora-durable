@@ -5,6 +5,7 @@ import type {
 } from '@adonisjs/lucid/types/database';
 import type {
   AttributeFilter,
+  BufferedSignalRow,
   CheckpointNameKind,
   CheckpointQuery,
   CheckpointStat,
@@ -357,8 +358,31 @@ export class LucidStateStore implements StateStore {
     return row ? rowToCheckpoint(row as CheckpointRow) : null;
   }
 
+  async getCheckpoints(runId: string, seqs: number[]): Promise<StepCheckpoint[]> {
+    const unique = [...new Set(seqs)];
+    const out: StepCheckpoint[] = [];
+    for (let at = 0; at < unique.length; at += CHECKPOINT_BATCH) {
+      const rows = (await this.client()
+        .from(DURABLE_TABLES.checkpoints)
+        .where('run_id', runId)
+        .whereIn('seq', unique.slice(at, at + CHECKPOINT_BATCH))) as CheckpointRow[];
+      out.push(...rows.map(rowToCheckpoint));
+    }
+    return out.sort((a, b) => a.seq - b.seq);
+  }
+
   async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
     await this.upsertCheckpoint(this.client(), checkpoint);
+  }
+
+  async saveCheckpoints(checkpoints: StepCheckpoint[]): Promise<void> {
+    if (checkpoints.length === 0) return;
+    // One multi-row upsert per chunk, in one transaction: a rejection writes nothing.
+    await this.client().transaction(async (trx) => {
+      for (let at = 0; at < checkpoints.length; at += CHECKPOINT_UPSERT_BATCH) {
+        await upsertCheckpointRows(trx, checkpoints.slice(at, at + CHECKPOINT_UPSERT_BATCH));
+      }
+    });
   }
 
   async saveCheckpointIfPending(checkpoint: StepCheckpoint): Promise<boolean> {
@@ -367,13 +391,56 @@ export class LucidStateStore implements StateStore {
 
   async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
     if (checkpoints.length === 0) return [];
-    // The conditional UPDATE of `saveCheckpointIfPending`, once per entry and in order, in one
-    // transaction: one commit for the batch, and a rejection writes nothing. In order, so a second
-    // entry for the same row is compared against the first one's write.
+    // Set-based, in one transaction (a rejection writes nothing): read which of the rows are still
+    // `pending` (locked on Postgres and MySQL, so a concurrent settle waits), decide each entry in
+    // order (a second entry for a row is compared against the first one's write), then write every
+    // winner with one multi-row upsert per chunk.
     return this.client().transaction(async (trx) => {
+      const pending = new Set<string>();
+      const key = (runId: string, seq: number) => `${runId}\u0000${seq}`;
+      const byRun = new Map<string, number[]>();
+      for (const cp of checkpoints) byRun.set(cp.runId, [...(byRun.get(cp.runId) ?? []), cp.seq]);
+      const first = checkpoints[0];
+      if (first && !locksRows(trx)) {
+        // SQLite has no row locks: take the database write lock FIRST with a no-op write, so no
+        // other connection or process settles a row between the read below and the writes.
+        await trx
+          .from(DURABLE_TABLES.checkpoints)
+          .where('run_id', first.runId)
+          .andWhere('seq', first.seq)
+          .andWhere('status', 'pending')
+          .update({ status: 'pending' });
+      }
+      for (const [runId, seqs] of byRun) {
+        const unique = [...new Set(seqs)];
+        for (let at = 0; at < unique.length; at += CHECKPOINT_BATCH) {
+          const q = trx
+            .from(DURABLE_TABLES.checkpoints)
+            .where('run_id', runId)
+            .whereIn('seq', unique.slice(at, at + CHECKPOINT_BATCH))
+            .andWhere('status', 'pending')
+            .select('seq');
+          if (locksRows(trx)) q.forUpdate();
+          for (const row of (await q) as Array<{ seq: number | string }>) {
+            pending.add(key(runId, Number(row.seq)));
+          }
+        }
+      }
       const wrote: boolean[] = [];
-      for (const checkpoint of checkpoints) {
-        wrote.push(await updateCheckpointIfPending(trx, checkpoint));
+      const writes = new Map<string, StepCheckpoint>();
+      for (const cp of checkpoints) {
+        const k = key(cp.runId, cp.seq);
+        if (!pending.has(k)) {
+          wrote.push(false);
+          continue;
+        }
+        wrote.push(true);
+        writes.set(k, cp);
+        if (cp.status !== 'pending') pending.delete(k);
+      }
+      const rows = [...writes.values()];
+      for (let at = 0; at < rows.length; at += CHECKPOINT_UPSERT_BATCH) {
+        await upsertCheckpointRows(trx, rows.slice(at, at + CHECKPOINT_UPSERT_BATCH));
       }
       return wrote;
     });
@@ -717,6 +784,45 @@ export class LucidStateStore implements StateStore {
       .orderBy('token', 'asc')
       .limit(limit)) as Array<{ token: string }>;
     return rows.map((r) => r.token);
+  }
+
+  async listBufferedSignals(
+    tokenPrefix: string,
+    afterId: string | undefined,
+    limit: number,
+  ): Promise<BufferedSignalRow[]> {
+    const q = this.client()
+      .from(DURABLE_TABLES.bufferedSignals)
+      .whereRaw(`token like ? escape '!'`, [`${escapeLike(tokenPrefix)}%`]);
+    if (afterId !== undefined) q.where('id', '>', Number(afterId));
+    const rows = (await q.orderBy('id', 'asc').limit(limit)) as Array<{
+      id: number | string;
+      token: string;
+      payload: string | null;
+    }>;
+    return rows
+      .filter((row) => row.token.startsWith(tokenPrefix))
+      .map((row) => ({
+        id: String(row.id),
+        token: row.token,
+        payload: parseJsonColumn(
+          row.payload,
+          `${DURABLE_TABLES.bufferedSignals}.payload`,
+          String(row.id),
+        ),
+      }));
+  }
+
+  async deleteBufferedSignals(ids: string[]): Promise<void> {
+    for (let at = 0; at < ids.length; at += 500) {
+      await this.client()
+        .from(DURABLE_TABLES.bufferedSignals)
+        .whereIn(
+          'id',
+          ids.slice(at, at + 500).map((id) => Number(id)),
+        )
+        .delete();
+    }
   }
 
   async takeBufferedSignal(token: string): Promise<{ payload: unknown } | null> {
@@ -1245,6 +1351,22 @@ const DELETE_RUNS_CHUNK = 500;
  * One conditional UPDATE: the `status = 'pending'` predicate is the compare, the affected-row count
  * the answer. A missing row matches nothing, so it is never created.
  */
+/** Most seqs one `IN (...)` read of checkpoints carries. */
+const CHECKPOINT_BATCH = 500;
+/** Most checkpoint rows one multi-row upsert writes (kept under every dialect's bind limit). */
+const CHECKPOINT_UPSERT_BATCH = 200;
+
+/** One multi-row `INSERT … ON CONFLICT (run_id, seq) DO UPDATE` (MySQL: `ON DUPLICATE KEY`). */
+async function upsertCheckpointRows(client: Client, checkpoints: StepCheckpoint[]): Promise<void> {
+  if (checkpoints.length === 0) return;
+  await client
+    .insertQuery()
+    .table(DURABLE_TABLES.checkpoints)
+    .knexQuery.insert(checkpoints.map(checkpointToRow))
+    .onConflict(['run_id', 'seq'])
+    .merge();
+}
+
 async function updateCheckpointIfPending(
   client: Client,
   checkpoint: StepCheckpoint,

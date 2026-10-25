@@ -19,7 +19,11 @@ export function mysqlTestDatabasePrefix(): string {
 const MYSQL_TEST_POOL_MAX = 3;
 
 /** A standalone Lucid `Database` over MySQL (`mysql2`) on `database` of the server at `url`. */
-export function makeMysqlDb(url: string, database: string | undefined): Database {
+export function makeMysqlDb(
+  url: string,
+  database: string | undefined,
+  poolMax: number = MYSQL_TEST_POOL_MAX,
+): Database {
   const parsed = new URL(url);
   return new Database(
     {
@@ -34,7 +38,7 @@ export function makeMysqlDb(url: string, database: string | undefined): Database
             password: decodeURIComponent(parsed.password),
             ...(database ? { database } : {}),
           },
-          pool: { min: 0, max: MYSQL_TEST_POOL_MAX },
+          pool: { min: 0, max: poolMax },
         },
       },
     },
@@ -49,7 +53,9 @@ export function makeMysqlDb(url: string, database: string | undefined): Database
  * `makeIsolatedPostgresDb`. `url` is `mysql://user:password@host:port`; a database in its path is
  * ignored.
  */
-export async function makeIsolatedMysqlDb(url: string): Promise<Database> {
+export async function makeIsolatedMysqlDb(
+  url: string,
+): Promise<Database & { databaseName: string }> {
   const name = `${mysqlTestDatabasePrefix()}${process.pid}_${Math.random().toString(36).slice(2, 10)}`;
   const admin = makeMysqlDb(url, undefined);
   try {
@@ -57,7 +63,8 @@ export async function makeIsolatedMysqlDb(url: string): Promise<Database> {
   } finally {
     await admin.manager.closeAll();
   }
-  const db = makeMysqlDb(url, name);
+  const db = makeMysqlDb(url, name) as Database & { databaseName: string };
+  db.databaseName = name;
   const closeAll = db.manager.closeAll.bind(db.manager);
   let dropped = false;
   db.manager.closeAll = async (...args: Parameters<typeof closeAll>) => {

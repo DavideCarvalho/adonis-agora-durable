@@ -191,6 +191,9 @@ export function jobHandle(job: AcquiredJob): JobHandle {
  *  a transport error must never vanish — an invisible one is how a stalled run stays invisible. */
 const DEFAULT_LOG = (err: unknown): void => console.error('[QueueTransport] poll failed', err);
 
+/** The fewest step results the results loop holds in a handler at once (see `resultConcurrency`). */
+const RESULT_IN_FLIGHT = 512;
+
 /** The most run jobs one `pushManyOn` carries (see {@link QueueTransport.dispatchRuns}). */
 const RUN_PUSH_CHUNK = 500;
 
@@ -260,7 +263,10 @@ export interface QueueTransportOptions {
    * liveness heartbeat (see {@link QueueTransport.groupHealth}).
    */
   concurrency?: ConcurrencyOption;
-  /** How many step results the engine side settles at once. Default 1. */
+  /**
+   * How many step results the engine side holds in a handler at once. Never fewer than 512: a wide
+   * fan's results are applied together per run, so a smaller limit only slows them. Default 512.
+   */
   resultConcurrency?: number;
   /**
    * Idle backoff for the task, heartbeat and control loops, as a multiple of {@link pollIntervalMs}:
@@ -681,6 +687,27 @@ export class QueueTransport implements Transport, ControlPlane {
     );
   }
 
+  /**
+   * {@link dispatch} for many tasks: `pushManyOn` per task queue, {@link RUN_PUSH_CHUNK} jobs a call,
+   * when the adapter has it; one `pushOn` per task otherwise.
+   */
+  async dispatchMany(tasks: RemoteTask[]): Promise<void> {
+    const byQueue = new Map<string, RemoteTask[]>();
+    for (const task of tasks) {
+      const queue = this.#tasksQueue(task.group);
+      byQueue.set(queue, [...(byQueue.get(queue) ?? []), task]);
+    }
+    for (const [queue, queued] of byQueue) {
+      for (let at = 0; at < queued.length; at += RUN_PUSH_CHUNK) {
+        const jobs = queued
+          .slice(at, at + RUN_PUSH_CHUNK)
+          .map((task) => this.#job('task', task, task.priority));
+        if (this.#adapter.pushManyOn) await this.#adapter.pushManyOn(queue, jobs);
+        else await Promise.all(jobs.map((job) => this.#adapter.pushOn(queue, job)));
+      }
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // worker side — register a step handler, run it, push the result back
   // ---------------------------------------------------------------------------
@@ -882,7 +909,9 @@ export class QueueTransport implements Transport, ControlPlane {
       async (job) => {
         await handler(fromJson<ResultPayload>(job.payload));
       },
-      { concurrency: this.#resultConcurrency, idleBackoffMax: 1 },
+      // At least RESULT_IN_FLIGHT results in a handler at once: the engine writes one run's results
+      // that are in hand together, so taking a few at a time made a wide fan settle a few per write.
+      { concurrency: Math.max(RESULT_IN_FLIGHT, this.#resultConcurrency), idleBackoffMax: 1 },
     );
   }
 

@@ -28,6 +28,8 @@ describe('InMemoryStateStore fan methods', () => {
     expect(store.listSignalWaitersByRunIds).toBeTypeOf('function');
     expect(store.getRuns).toBeTypeOf('function');
     expect(store.releaseRunLockUnlessWakeRequested).toBeTypeOf('function');
+    expect(store.listBufferedSignals).toBeTypeOf('function');
+    expect(store.deleteBufferedSignals).toBeTypeOf('function');
   });
 });
 

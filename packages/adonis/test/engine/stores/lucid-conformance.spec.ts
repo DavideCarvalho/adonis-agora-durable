@@ -32,6 +32,8 @@ describe.each(dbBackends({ mysql: true }))('on $name', ({ makeStoreDb }) => {
         expect(store.saveCheckpointIfPending).toBeTypeOf('function');
         expect(store.getRuns).toBeTypeOf('function');
         expect(store.releaseRunLockUnlessWakeRequested).toBeTypeOf('function');
+        expect(store.listBufferedSignals).toBeTypeOf('function');
+        expect(store.deleteBufferedSignals).toBeTypeOf('function');
       } finally {
         await db.manager.closeAll();
       }

@@ -135,7 +135,7 @@ describe.each(dbBackends())('on $name', ({ makeTransportDb }) => {
       };
       const a = transport({ instanceId: 'A', leaseMs: 300 });
       a.onResult(settle);
-      await until(() => delivered.length === 1);
+      await until(() => delivered.length >= 1);
       const b = transport({ instanceId: 'B', leaseMs: 300 });
       b.onResult(settle);
 

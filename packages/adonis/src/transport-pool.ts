@@ -10,12 +10,17 @@ import type {
   WorkflowStepEvent,
 } from './interfaces.js';
 
+/** Most tasks {@link TransportPool.dispatchMany} dispatches at once when it sends them one by one. */
+const DISPATCH_CHUNK = 200;
+
 /**
  * An ordered pool of named transports. The engine dispatches on the first and fails over to the
  * next on a dispatch error; a step can pin one by id. Pure transport plumbing — no run lifecycle —
  * so it lives apart from the engine.
  */
 export class TransportPool {
+  private warnedBulkRefusal = false;
+
   constructor(private readonly transports: NamedTransport[]) {}
 
   get size(): number {
@@ -55,6 +60,36 @@ export class TransportPool {
       }
     }
     throw lastErr ?? new Error('no transport accepted the dispatch');
+  }
+
+  /**
+   * {@link dispatch} for many tasks: one {@link Transport.dispatchMany} call on the preferred (or
+   * first) transport when it has one, else (or when that call rejects) each task through
+   * {@link dispatch}, {@link DISPATCH_CHUNK} at a time, failing over per task.
+   */
+  async dispatchMany(tasks: Omit<RemoteTask, 'transport'>[], preferId?: string): Promise<void> {
+    if (tasks.length === 0) return;
+    const first = this.ordered(preferId)[0];
+    if (first?.transport.dispatchMany) {
+      try {
+        await first.transport.dispatchMany(tasks.map((task) => ({ ...task, transport: first.id })));
+        return;
+      } catch (err) {
+        if (!this.warnedBulkRefusal) {
+          this.warnedBulkRefusal = true;
+          console.warn(
+            `[adonis-durable] transport '${first.id}' refused a bulk dispatch; sending the tasks one by one (reported once): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+      }
+    }
+    for (let at = 0; at < tasks.length; at += DISPATCH_CHUNK) {
+      await Promise.all(
+        tasks.slice(at, at + DISPATCH_CHUNK).map((task) => this.dispatch(task, preferId)),
+      );
+    }
   }
 
   /** Worker-health for `group`, merged across every transport that can report it (a group's queue

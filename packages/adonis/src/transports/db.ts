@@ -86,6 +86,11 @@ const DEFAULT_LEASE_MS = 30_000;
 /** Default max rows claimed per poll (results / heartbeats / control; the task loop claims only as
  *  many rows as it has free slots, never more than this). */
 const DEFAULT_BATCH_SIZE = 20;
+/** The most result rows one claim round takes, and the fewest results in a handler at once. */
+const RESULT_ROUND = 256;
+/** The most task rows one insert carries (kept under every dialect's bind limit). */
+const TASK_INSERT_CHUNK = 200;
+const RESULT_IN_FLIGHT = 512;
 /** Idle backoff for the task, heartbeat and control loops (the results loop is exempt): after
  *  consecutive empty polls the sleep doubles up to this many poll intervals. Same default as the
  *  queue transport. */
@@ -244,7 +249,10 @@ export interface DbTransportOptions {
    * RSS, CPU, throughput and p95 ride this worker's liveness key (see {@link DbTransport.groupHealth}).
    */
   concurrency?: ConcurrencyOption;
-  /** How many step results the engine side settles at once. Default 1. */
+  /**
+   * How many step results the engine side holds in a handler at once. Never fewer than 512: a wide
+   * fan's results are applied together per run, so a smaller limit only slows them. Default 512.
+   */
   resultConcurrency?: number;
   /**
    * Idle backoff for the task, heartbeat and control loops, as a multiple of {@link pollIntervalMs}:
@@ -374,6 +382,8 @@ export class DbTransport implements Transport, ControlPlane {
   readonly #limitWaiters = new Set<() => void>();
   /** Every task row still in a handler — the slots in use, and what `stop()` waits for (bounded). */
   readonly #runningTasks = new Set<Promise<void>>();
+  /** Result rounds in a handler (see {@link onResult}): waited for by {@link stop}, like tasks. */
+  readonly #settlingRounds = new Set<Promise<void>>();
   readonly #resultConcurrency: number;
   readonly #idleBackoffMax: number;
   readonly #maxStalledCount: number;
@@ -513,33 +523,46 @@ export class DbTransport implements Transport, ControlPlane {
   // ───────────────────────────────────────────────────────────────────────────
 
   async dispatch(task: RemoteTask): Promise<void> {
+    await this.dispatchMany([task]);
+  }
+
+  /**
+   * Insert task rows, {@link TASK_INSERT_CHUNK} per multi-row insert. Idempotent: a redelivered
+   * dispatch for the same `step_id` is ignored (the PK already exists).
+   */
+  async dispatchMany(tasks: RemoteTask[]): Promise<void> {
+    if (tasks.length === 0) return;
     await this.#ensureSchema();
     const withPriority = await this.#hasTaskColumn('priority');
-    // Idempotent: a redelivered dispatch for the same step_id is ignored (the PK already exists).
+    const createdAt = this.#now();
     // `onConflict().ignore()` is a Knex feature not surfaced on Lucid's insert contract, so we use
     // the underlying Knex builder (`.knexQuery`).
-    await this.#client()
-      .insertQuery()
-      .table(TRANSPORT_TABLES.tasks)
-      .knexQuery.insert({
-        step_id: task.stepId,
-        run_id: task.runId,
-        seq: task.seq,
-        name: task.name,
-        grp: task.group,
-        namespace: this.#namespaceValue(),
-        input: toJson(task.input),
-        traceparent: task.traceparent ?? null,
-        context: toJson(task.context),
-        transport: task.transport ?? null,
-        attempt: task.attempt,
-        ...(withPriority ? { priority: toDbPriority(task.priority) } : {}),
-        claimed_by: null,
-        claimed_at: null,
-        created_at: this.#now(),
-      })
-      .onConflict('step_id')
-      .ignore();
+    for (let at = 0; at < tasks.length; at += TASK_INSERT_CHUNK) {
+      await this.#client()
+        .insertQuery()
+        .table(TRANSPORT_TABLES.tasks)
+        .knexQuery.insert(
+          tasks.slice(at, at + TASK_INSERT_CHUNK).map((task) => ({
+            step_id: task.stepId,
+            run_id: task.runId,
+            seq: task.seq,
+            name: task.name,
+            grp: task.group,
+            namespace: this.#namespaceValue(),
+            input: toJson(task.input),
+            traceparent: task.traceparent ?? null,
+            context: toJson(task.context),
+            transport: task.transport ?? null,
+            attempt: task.attempt,
+            ...(withPriority ? { priority: toDbPriority(task.priority) } : {}),
+            claimed_by: null,
+            claimed_at: null,
+            created_at: createdAt,
+          })),
+        )
+        .onConflict('step_id')
+        .ignore();
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -1004,27 +1027,78 @@ export class DbTransport implements Transport, ControlPlane {
   /** Engine side: settle step results, up to {@link DbTransportOptions.resultConcurrency} at once. The
    *  results loop never backs off when idle — a result is on the critical path of every step. */
   onResult(handler: (result: StepResult) => Promise<void>): void {
-    this.#startLoop(
-      async () =>
-        (await this.#drain<ResultRow>(
-          TRANSPORT_TABLES.results,
-          'step_id',
-          this.#resultConcurrency,
-          async (row) => {
-            await handler({
-              runId: row.run_id,
-              seq: Number(row.seq),
-              stepId: row.step_id,
-              status: row.status as StepResult['status'],
-              output: fromJson(row.output),
-              error: fromJson(row.error),
-              startedAt: row.started_at == null ? undefined : Number(row.started_at),
-              events: fromJson(row.events),
-            });
-          },
-        )) > 0,
-      1,
-    );
+    const table = TRANSPORT_TABLES.results;
+    // Rounds of up to RESULT_ROUND rows, up to max(RESULT_IN_FLIGHT, resultConcurrency) in a handler
+    // at once: the engine writes one run's results that are in hand together, so handing over a few
+    // at a time made a wide fan settle a few per write. A round's settled rows go in one DELETE.
+    const limit = Math.max(RESULT_IN_FLIGHT, this.#resultConcurrency);
+    const inFlight = new Set<Promise<void>>();
+    let active = 0;
+    const settleRound = async (rows: ResultRow[], token: string): Promise<void> => {
+      const done: string[] = [];
+      try {
+        await Promise.all(
+          rows.map(async (row) => {
+            try {
+              await handler({
+                runId: row.run_id,
+                seq: Number(row.seq),
+                stepId: row.step_id,
+                status: row.status as StepResult['status'],
+                output: fromJson(row.output),
+                error: fromJson(row.error),
+                startedAt: row.started_at == null ? undefined : Number(row.started_at),
+                events: fromJson(row.events),
+              });
+              done.push(row.step_id);
+            } catch (err) {
+              // Left claimed, and no longer renewed: delivered again once its lease lapses.
+              this.#onError(err);
+            }
+          }),
+        );
+      } finally {
+        this.#releaseToken(table, token);
+        active -= rows.length;
+        if (done.length > 0) {
+          await this.#client()
+            .knexQuery()
+            .from(table)
+            .whereIn('step_id', done)
+            .where('claimed_by', token)
+            .delete()
+            .catch((err: unknown) => this.#onError(err));
+        }
+      }
+    };
+    this.#startLoop(async () => {
+      const free = limit - active;
+      if (free <= 0) {
+        await Promise.race(inFlight);
+        return true;
+      }
+      const { rows, token } = await this.#claim<ResultRow>(
+        table,
+        Math.min(free, RESULT_ROUND),
+        undefined,
+        'step_id',
+      );
+      if (rows.length === 0) return false;
+      this.#hold(
+        table,
+        token,
+        rows.map((row) => row.step_id),
+      );
+      active += rows.length;
+      const round = settleRound(rows, token);
+      inFlight.add(round);
+      this.#settlingRounds.add(round);
+      void round.finally(() => {
+        inFlight.delete(round);
+        this.#settlingRounds.delete(round);
+      });
+      return true;
+    }, 1);
   }
 
   onHeartbeat(handler: (beat: Heartbeat) => Promise<void>): void {
@@ -2079,10 +2153,10 @@ export class DbTransport implements Transport, ControlPlane {
     this.#heartbeatTokens.clear();
     const deadline = Date.now() + this.#closeTimeoutMs;
     await this.#pollers.drain(this.#closeTimeoutMs);
-    if (this.#runningTasks.size > 0) {
+    if (this.#runningTasks.size > 0 || this.#settlingRounds.size > 0) {
       let timer: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([
-        Promise.allSettled([...this.#runningTasks]),
+        Promise.allSettled([...this.#runningTasks, ...this.#settlingRounds]),
         new Promise((resolve) => {
           timer = setTimeout(resolve, Math.max(deadline - Date.now(), 0));
         }),

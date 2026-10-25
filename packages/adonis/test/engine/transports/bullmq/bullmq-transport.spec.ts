@@ -201,15 +201,15 @@ describe('BullMQTransport', () => {
       expect(handler).toHaveBeenCalledWith(result);
     });
 
-    it('consumes results at `resultConcurrency`, falling back to 1 for a non-finite value', () => {
-      const wide = new BullMQTransport({ deps: broker, resultConcurrency: 8 });
+    it('consumes at least 512 results at once; `resultConcurrency` only raises it', () => {
+      const wide = new BullMQTransport({ deps: broker, resultConcurrency: 2_000 });
       wide.onResult(async () => {});
-      expect(broker.workers.get('durable-results')?.concurrency).toBe(8);
+      expect(broker.workers.get('durable-results')?.concurrency).toBe(2_000);
 
-      for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, 0, undefined]) {
+      for (const low of [Number.NaN, Number.POSITIVE_INFINITY, 0, undefined, 8]) {
         const other = new FakeBroker();
-        new BullMQTransport({ deps: other, resultConcurrency: bad }).onResult(async () => {});
-        expect(other.workers.get('durable-results')?.concurrency).toBe(1);
+        new BullMQTransport({ deps: other, resultConcurrency: low }).onResult(async () => {});
+        expect(other.workers.get('durable-results')?.concurrency).toBe(512);
       }
     });
 

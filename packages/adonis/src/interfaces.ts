@@ -322,6 +322,14 @@ export interface StepError {
 // StateStore — where runs and checkpoints live (Postgres / MySQL / SQLite via ORM adapters)
 // ---------------------------------------------------------------------------
 
+/** One buffered signal, as {@link StateStore.listBufferedSignals} returns it. */
+export interface BufferedSignalRow {
+  /** The store's row id (an auto-increment), as a string. Orders rows by insertion. */
+  id: string;
+  token: string;
+  payload: unknown;
+}
+
 export interface StateStore {
   /**
    * Provision the tables/collections this store needs, idempotently. Called on boot when the
@@ -416,10 +424,24 @@ export interface StateStore {
 
   getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null>;
   /**
+   * The run's checkpoints at `seqs`, in `seq` order; a seq with no checkpoint is left out, and an
+   * empty `seqs` reads nothing. The engine reads a batch of one run's step results' checkpoints
+   * through it, one call per batch. Optional: without it, one {@link getCheckpoint} per seq.
+   */
+  getCheckpoints?(runId: string, seqs: number[]): Promise<StepCheckpoint[]>;
+  /**
    * Persist a checkpoint and advance the run atomically. Durable semantics depend on this
    * being a single transaction; stores without transactions cannot give the strong guarantee.
    */
   saveCheckpoint(checkpoint: StepCheckpoint): Promise<void>;
+  /**
+   * {@link saveCheckpoint} for many checkpoints in one call: each is written (inserted, or
+   * overwriting the row at its `(runId, seq)`), in a few statements and one transaction, so a
+   * rejection writes nothing. The entries name distinct rows. The engine writes a step fan's new
+   * `pending` checkpoints through it before dispatching them. Optional: without it, one
+   * {@link saveCheckpoint} per checkpoint.
+   */
+  saveCheckpoints?(checkpoints: StepCheckpoint[]): Promise<void>;
   /**
    * Overwrite the checkpoint at `(runId, seq)` with `checkpoint`, but only while the stored row is
    * still `pending`; resolves whether it wrote. The engine writes a dispatched step's row from two
@@ -592,6 +614,20 @@ export interface StateStore {
   bufferSignal(token: string, payload: unknown): Promise<void>;
   /** Take the oldest buffered signal for `token` (FIFO), or null if none is buffered. */
   takeBufferedSignal(token: string): Promise<{ payload: unknown } | null>;
+  /**
+   * A page of buffered signals whose token starts with `tokenPrefix` (matched literally, `%` and `_`
+   * included), in insertion (`id`) order, after `afterId` (exclusive; `undefined` = from the start),
+   * at most `limit` rows. The read behind {@link WorkflowEngine.sweepBufferedSignals}, which deletes
+   * buffered child completions nothing will consume; it pages by primary key, so it stays cheap on a
+   * large table. Optional: without it (or {@link deleteBufferedSignals}) the sweep does nothing.
+   */
+  listBufferedSignals?(
+    tokenPrefix: string,
+    afterId: string | undefined,
+    limit: number,
+  ): Promise<BufferedSignalRow[]>;
+  /** Delete the buffered signals with these {@link BufferedSignalRow.id}s; unknown ids are ignored. */
+  deleteBufferedSignals?(ids: string[]): Promise<void>;
   /**
    * Up to `limit` distinct tokens starting with `prefix` that have at least one buffered signal.
    * Reads no payload and consumes nothing. Optional: the entity lost-wake reconcile
@@ -1598,6 +1634,13 @@ export interface TenantEvent {
 export interface Transport {
   /** engine → worker */
   dispatch(task: RemoteTask): Promise<void>;
+  /**
+   * {@link dispatch} for many tasks in a few broker calls. Rejects if any task may not have been
+   * dispatched (some may have been: the engine then dispatches the batch again one task at a time,
+   * and a task delivered twice runs twice, as any redelivery does). The engine sends a step fan's new
+   * steps through it. Optional: without it, one {@link dispatch} per task.
+   */
+  dispatchMany?(tasks: RemoteTask[]): Promise<void>;
   /** worker → engine: a step finished (ok or error). */
   onResult(handler: (result: StepResult) => Promise<void>): void;
   /** worker → engine: liveness signal for an in-flight long step. */

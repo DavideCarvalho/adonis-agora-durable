@@ -628,6 +628,38 @@ export function runRunDispatchContract(name: string, factory: RunDispatchTranspo
       timeout * 2,
     );
 
+    for (const mode of ['all', 'allSettled'] as const) {
+      it(
+        `a ctx.${mode} fan joined after some of its children finished settles them at once (reconcile off)`,
+        async () => {
+          const a = await instance();
+          const b = await instance();
+          for (const { engine } of [a, b]) {
+            engine.register('child', '1', async (_ctx, input) => (input as number) * 10);
+            engine.register('parent', '1', async (ctx) =>
+              mode === 'all'
+                ? ctx.all('child', [0, 1, 2, 3])
+                : ctx.allSettled('child', [0, 1, 2, 3]),
+            );
+          }
+          // Children 0 and 2 run (and finish) before the parent's fan registers its waiters: their
+          // completions find no waiter, and are not buffered for a parent that does not exist yet.
+          for (const i of [0, 2]) await a.engine.start('child', i, `joined.all.0.${i}`);
+          for (const i of [0, 2]) {
+            expect((await settled(`joined.all.0.${i}`))?.status).toBe('completed');
+          }
+          await a.engine.start('parent', {}, 'joined');
+          const run = await settled('joined');
+          expect(run?.output).toEqual(
+            mode === 'all'
+              ? [0, 10, 20, 30]
+              : [0, 10, 20, 30].map((value) => ({ status: 'fulfilled', value })),
+          );
+        },
+        timeout * 2,
+      );
+    }
+
     /** The fan forms every child-fan case runs: both combinators, with and without waves. */
     const FANS = [
       { mode: 'all', concurrency: undefined },
@@ -780,6 +812,85 @@ export function runRunDispatchContract(name: string, factory: RunDispatchTranspo
         timeout * 3,
       );
     }
+
+    it(
+      "sends a step fan's tasks in bulk and hands its results to the engine together",
+      async () => {
+        const transport = await factory.make();
+        transports.push(transport);
+        const serve = (
+          transport as { handle?: (n: string, fn: (i: unknown) => Promise<unknown>) => void }
+        ).handle;
+        if (typeof serve !== 'function') return;
+        const n = 300;
+        const name = 'contract.line.bulk';
+        serve.call(transport, name, async (input) => (input as number) * 2);
+        // Every result the transport has handed to the engine so far.
+        let handedOver = 0;
+        const bindResults = transport.onResult.bind(transport);
+        transport.onResult = (handler) =>
+          bindResults(async (result) => {
+            handedOver += 1;
+            await handler(result);
+          });
+        const sent = { one: 0, many: [] as number[] };
+        const dispatchOne = transport.dispatch.bind(transport);
+        transport.dispatch = async (task) => {
+          sent.one += 1;
+          await dispatchOne(task);
+        };
+        const dispatchMany = transport.dispatchMany?.bind(transport);
+        if (dispatchMany) {
+          transport.dispatchMany = async (tasks) => {
+            sent.many.push(tasks.length);
+            await dispatchMany(tasks);
+          };
+        }
+        // The first batch of results waits until the transport has handed the engine every one, so
+        // the rest of the fan is in hand when it lands.
+        const writes: number[] = [];
+        const settleBatch = store.saveCheckpointsIfPending?.bind(store);
+        let allInHand!: () => void;
+        const inHand = new Promise<void>((resolve) => {
+          allInHand = resolve;
+        });
+        if (settleBatch) {
+          store.saveCheckpointsIfPending = async (cps) => {
+            if (writes.length === 0) await inHand;
+            writes.push(cps.length);
+            return settleBatch(cps);
+          };
+        }
+        const settleOne = store.saveCheckpointIfPending?.bind(store);
+        if (settleOne) {
+          store.saveCheckpointIfPending = async (cp) => {
+            if (cp.runId === 'bulkfan' && cp.status !== 'pending') {
+              if (writes.length === 0) await inHand;
+              writes.push(1);
+            }
+            return settleOne(cp);
+          };
+        }
+        const engine = new WorkflowEngine({ store, transport, reconcileMs: 0 });
+        engines.push(engine);
+        const step = Object.assign(() => undefined, { [DURABLE_STEP_NAME]: name });
+        const inputs = Array.from({ length: n }, (_, i) => i);
+        engine.register('bulkfan', '1', async (ctx) => ctx.all(step as never, inputs));
+        await engine.start('bulkfan', {}, 'bulkfan');
+        await until(() => handedOver >= n, timeout, `all ${n} results handed to the engine`);
+        allInHand();
+        const run = await settled('bulkfan');
+        expect(run?.output).toEqual(inputs.map((i) => i * 2));
+        if (dispatchMany) {
+          expect(sent.many.reduce((a, b) => a + b, 0)).toBe(n);
+          expect(sent.one).toBe(0);
+        }
+        // One write for the batch that waited, and the rest of the fan in about one more.
+        expect(writes.reduce((a, b) => a + b, 0)).toBe(n);
+        expect(writes.length, `writes: ${writes.join(',')}`).toBeLessThanOrEqual(4);
+      },
+      timeout * 2,
+    );
 
     it(
       'a failed enqueue leaves the run pending, and the pending-run poll runs it',
