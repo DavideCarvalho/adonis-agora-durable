@@ -1190,6 +1190,7 @@ export class WorkflowEngine {
     });
     this.pool.bind(
       async (result) => {
+        this.heartbeatWrites.delete(result.stepId);
         // In-memory path (a `timeoutMs` step awaiting on THIS instance): resolve its pending promise.
         const waiter = this.pending.get(result.stepId);
         if (waiter) {
@@ -1905,9 +1906,40 @@ export class WorkflowEngine {
       return;
     if (this.heartbeatPersists.size > 1024) this.heartbeatPersists.clear();
     this.heartbeatPersists.set(id, { at: now, hadProgress: beat.progress !== undefined });
-    void this.store
-      .recordStepHeartbeat(beat.runId, beat.seq, new Date(beat.at ?? now), beat.progress)
-      .catch(() => undefined);
+    this.heartbeatWrites.set(id, {
+      runId: beat.runId,
+      seq: beat.seq,
+      at: new Date(beat.at ?? now),
+      progress: beat.progress,
+    });
+    if (!this.heartbeatWriter) {
+      this.heartbeatWriter = this.writeHeartbeats().finally(() => {
+        this.heartbeatWriter = undefined;
+      });
+      this.trackEffect(this.heartbeatWriter);
+    }
+  }
+
+  /** Beats {@link persistHeartbeat} let through and {@link writeHeartbeats} has not written yet, by
+   *  stepId: a newer beat of the same step replaces the queued one, a step's result drops it. */
+  private readonly heartbeatWrites = new Map<
+    string,
+    { runId: string; seq: number; at: Date; progress: unknown }
+  >();
+  private heartbeatWriter: Promise<void> | undefined;
+
+  /**
+   * Write the queued beats one at a time, oldest first, until none is left. One write in flight keeps
+   * a burst of beats (every step of a wide fan sends one when a worker picks it up) from taking the
+   * store's connections away from the turns and results, and a step that finishes while its beat
+   * waits never has it written: nothing reads a settled step's liveness.
+   */
+  private async writeHeartbeats(): Promise<void> {
+    const record = this.store.recordStepHeartbeat?.bind(this.store);
+    for (const [id, beat] of this.heartbeatWrites) {
+      this.heartbeatWrites.delete(id);
+      await record?.(beat.runId, beat.seq, beat.at, beat.progress).catch(() => undefined);
+    }
   }
 
   /**
@@ -5936,6 +5968,40 @@ export class WorkflowEngine {
   private readonly stepLeaseRearms = new Map<string, number>();
 
   /**
+   * {@link stepLeaseRearms} for the steps of a fan this instance sent, by run: one entry per sent
+   * block of consecutive seqs instead of one per step, since they share the lease stamped at send.
+   */
+  private readonly fanLeaseRearms = new Map<
+    string,
+    Array<{ from: number; to: number; lookAgainAt: number }>
+  >();
+
+  private noteFanLease(runId: string, seqs: number[], lease: number): void {
+    if (this.remoteRedispatchMs == null || seqs.length === 0) return;
+    let from = seqs[0] as number;
+    let to = from;
+    for (const seq of seqs) {
+      if (seq < from) from = seq;
+      if (seq > to) to = seq;
+    }
+    // A gap would cover steps sent earlier, under an older lease.
+    if (to - from + 1 !== seqs.length) return;
+    if (this.fanLeaseRearms.size > 1024) this.fanLeaseRearms.clear();
+    const blocks = this.fanLeaseRearms.get(runId) ?? [];
+    blocks.push({ from, to, lookAgainAt: lease - Math.ceil(this.remoteRedispatchMs / 2) });
+    this.fanLeaseRearms.set(runId, blocks);
+  }
+
+  private fanLeaseLookAgainAt(runId: string, seq: number, now: number): number | undefined {
+    const blocks = this.fanLeaseRearms.get(runId);
+    if (!blocks) return undefined;
+    const live = blocks.filter((b) => now < b.lookAgainAt);
+    if (live.length === 0) this.fanLeaseRearms.delete(runId);
+    else if (live.length < blocks.length) this.fanLeaseRearms.set(runId, live);
+    return live.find((b) => seq >= b.from && seq <= b.to)?.lookAgainAt;
+  }
+
+  /**
    * A step-scoped heartbeat for a durably-suspended remote step: push its LEASE forward so a worker
    * that is still working on it is never presumed dead and double-dispatched. The durable counterpart
    * of the in-memory `heartbeatResets` rearm (which only exists on the instance that dispatched a
@@ -5979,7 +6045,7 @@ export class WorkflowEngine {
     if (this.remoteRedispatchMs == null) return;
     const id = stepId(runId, seq);
     const now = this.clock();
-    const lookAgainAt = this.stepLeaseRearms.get(id);
+    const lookAgainAt = this.stepLeaseRearms.get(id) ?? this.fanLeaseLookAgainAt(runId, seq, now);
     if (lookAgainAt !== undefined && now < lookAgainAt) return;
     const cp = await this.store.getCheckpoint(runId, seq);
     if (cp?.kind !== 'remote' || cp.status !== 'pending') {
@@ -7453,7 +7519,20 @@ export class WorkflowEngine {
           ? unsent
           : unsent.slice(0, opts.concurrency);
     if (batch.length > 0) {
-      await this.sendStepFan(runId, positions, step, inputs, batch, group, opts, runNamespace);
+      const lease = await this.sendStepFan(
+        runId,
+        positions,
+        step,
+        inputs,
+        batch,
+        group,
+        opts,
+        runNamespace,
+      );
+      if (lease !== undefined) {
+        const at = this.stepLeaseWakeAt(lease);
+        wakeAt = Math.min(wakeAt ?? at, at);
+      }
     }
 
     if (inFlight + batch.length > 0) {
@@ -7485,7 +7564,8 @@ export class WorkflowEngine {
   /**
    * Write the `pending` checkpoints of a step fan's new steps, then dispatch them: one
    * {@link StateStore.saveCheckpoints} call and one {@link TransportPool.dispatchMany} for the batch,
-   * where the store and transport have them.
+   * where the store and transport have them. With the lost-dispatch self-heal on, each step is
+   * written with its lease already stamped, and the lease is returned for the run to park on.
    */
   private async sendStepFan<TInput, TOutput>(
     runId: string,
@@ -7499,7 +7579,7 @@ export class WorkflowEngine {
       admission?: { priority?: number | undefined; fairnessKey?: string | undefined };
     },
     runNamespace?: string | undefined,
-  ): Promise<void> {
+  ): Promise<number | undefined> {
     const token = stepGroup(step, runNamespace);
     await this.ensureRoutable(token, step.requires);
     const input = (i: number): unknown | Promise<unknown> =>
@@ -7509,6 +7589,8 @@ export class WorkflowEngine {
     const validInputs = new Map<number, unknown>();
     for (const i of batch) validInputs.set(i, await input(i));
     const enqueuedAt = new Date();
+    const lease =
+      this.remoteRedispatchMs == null ? undefined : this.clock() + this.remoteRedispatchMs;
     const checkpoints = batch.map((i): StepCheckpoint => {
       const seq = positions[i] as number;
       return {
@@ -7525,6 +7607,7 @@ export class WorkflowEngine {
         enqueuedAt,
         startedAt: enqueuedAt,
         finishedAt: enqueuedAt,
+        ...(lease !== undefined ? { wakeAt: lease } : {}),
       };
     });
     if (this.store.saveCheckpoints) {
@@ -7556,6 +7639,14 @@ export class WorkflowEngine {
     for (const cp of checkpoints) {
       this.emit({ type: 'step.started', runId, seq: cp.seq, name: step.name, kind: 'remote' });
     }
+    if (lease !== undefined) {
+      this.noteFanLease(
+        runId,
+        checkpoints.map((cp) => cp.seq),
+        lease,
+      );
+    }
+    return lease;
   }
 
   /**

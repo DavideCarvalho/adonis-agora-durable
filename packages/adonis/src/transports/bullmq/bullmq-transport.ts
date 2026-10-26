@@ -499,7 +499,9 @@ export class BullMQTransport implements Transport {
     const byQueue = new Map<string, RemoteTask[]>();
     for (const task of tasks) {
       const name = tasksName(this.#effectivePrefix(), task.group);
-      byQueue.set(name, [...(byQueue.get(name) ?? []), task]);
+      const queued = byQueue.get(name);
+      if (queued) queued.push(task);
+      else byQueue.set(name, [task]);
     }
     const calls: Array<() => Promise<unknown>> = [];
     for (const [name, queued] of byQueue) {

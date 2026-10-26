@@ -695,7 +695,9 @@ export class QueueTransport implements Transport, ControlPlane {
     const byQueue = new Map<string, RemoteTask[]>();
     for (const task of tasks) {
       const queue = this.#tasksQueue(task.group);
-      byQueue.set(queue, [...(byQueue.get(queue) ?? []), task]);
+      const queued = byQueue.get(queue);
+      if (queued) queued.push(task);
+      else byQueue.set(queue, [task]);
     }
     for (const [queue, queued] of byQueue) {
       for (let at = 0; at < queued.length; at += RUN_PUSH_CHUNK) {

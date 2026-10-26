@@ -399,7 +399,11 @@ export class LucidStateStore implements StateStore {
       const pending = new Set<string>();
       const key = (runId: string, seq: number) => `${runId}\u0000${seq}`;
       const byRun = new Map<string, number[]>();
-      for (const cp of checkpoints) byRun.set(cp.runId, [...(byRun.get(cp.runId) ?? []), cp.seq]);
+      for (const cp of checkpoints) {
+        const seqs = byRun.get(cp.runId);
+        if (seqs) seqs.push(cp.seq);
+        else byRun.set(cp.runId, [cp.seq]);
+      }
       const first = checkpoints[0];
       if (first && !locksRows(trx)) {
         // SQLite has no row locks: take the database write lock FIRST with a no-op write, so no
