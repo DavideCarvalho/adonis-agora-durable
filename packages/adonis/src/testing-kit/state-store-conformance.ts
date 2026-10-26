@@ -949,6 +949,61 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
     );
 
     t(
+      "listCheckpointsForReplay leaves out only a completed row's input (when implemented)",
+      async () => {
+        if (!store.listCheckpointsForReplay) return;
+        await store.createRun(run());
+        const input = (seq: number) => ({ prompt: `p${seq}` });
+        await store.saveCheckpoint(
+          checkpoint({ seq: 0, stepId: 'r1:0', input: input(0), output: { a: 0 } }),
+        );
+        await store.saveCheckpoint(
+          checkpoint({
+            seq: 1,
+            stepId: 'r1:1',
+            status: 'pending',
+            input: input(1),
+            output: undefined,
+          }),
+        );
+        await store.saveCheckpoint(
+          checkpoint({
+            seq: 2,
+            stepId: 'r1:2',
+            status: 'failed',
+            input: input(2),
+            output: undefined,
+            error: { message: 'boom' },
+            wakeAt: 7_000,
+          }),
+        );
+        await store.saveCheckpoint(
+          checkpoint({
+            seq: 3,
+            stepId: 'r1:3',
+            status: 'running',
+            input: input(3),
+            output: undefined,
+          }),
+        );
+        const full = await store.listCheckpoints('r1');
+        const replay = await store.listCheckpointsForReplay('r1');
+        expect(replay.map((c) => [c.seq, c.status, c.input])).toEqual([
+          [0, 'completed', undefined],
+          [1, 'pending', input(1)],
+          [2, 'failed', input(2)],
+          [3, 'running', input(3)],
+        ]);
+        // Every other field reads as listCheckpoints reads it.
+        const withoutInput = ({ input: _input, ...rest }: StepCheckpoint) => rest;
+        expect(replay.map(withoutInput)).toEqual(full.map(withoutInput));
+        // The full read still carries every input.
+        expect(full.map((c) => c.input)).toEqual([input(0), input(1), input(2), input(3)]);
+        expect(await store.listCheckpointsForReplay('nope')).toEqual([]);
+      },
+    );
+
+    t(
       'saveCheckpoints writes many rows and getCheckpoints reads them back (when implemented)',
       async () => {
         if (!store.saveCheckpoints || !store.getCheckpoints) return;

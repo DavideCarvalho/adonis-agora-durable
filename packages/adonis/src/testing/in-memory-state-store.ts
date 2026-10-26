@@ -797,6 +797,14 @@ export class InMemoryStateStore implements StateStore {
     return rows;
   }
 
+  async listCheckpointsForReplay(runId: string): Promise<StepCheckpoint[]> {
+    return (await this.listCheckpoints(runId)).map((cp) => {
+      if (cp.status !== 'completed') return cp;
+      const { input: _input, ...rest } = cp;
+      return rest;
+    });
+  }
+
   async checkpointStats(
     runId: string,
     opts?: { group?: string | undefined },

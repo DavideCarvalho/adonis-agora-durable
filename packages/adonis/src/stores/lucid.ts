@@ -50,6 +50,7 @@ import {
   withoutAdmission,
 } from '../singleton-admission.js';
 import {
+  CHECKPOINT_COLUMNS_BUT_INPUT,
   type CheckpointRow,
   checkpointToRow,
   parseJsonColumn,
@@ -1209,6 +1210,34 @@ export class LucidStateStore implements StateStore {
       .where('run_id', runId)
       .orderBy('seq', 'asc');
     return (rows as CheckpointRow[]).map(rowToCheckpoint);
+  }
+
+  async listCheckpointsForReplay(runId: string): Promise<StepCheckpoint[]> {
+    const rows = (await this.client()
+      .from(DURABLE_TABLES.checkpoints)
+      .where('run_id', runId)
+      .orderBy('seq', 'asc')
+      .select(...CHECKPOINT_COLUMNS_BUT_INPUT)) as CheckpointRow[];
+    // The input of every row but a completed one, read by seq: a row that completed since the read
+    // above still gets its input, as that read reported it unsettled.
+    const unsettled = rows
+      .filter((row) => row.status !== 'completed')
+      .map((row) => Number(row.seq));
+    if (unsettled.length > 0) {
+      const inputs = new Map<number, string | null>();
+      for (let at = 0; at < unsettled.length; at += CHECKPOINT_BATCH) {
+        const found = (await this.client()
+          .from(DURABLE_TABLES.checkpoints)
+          .where('run_id', runId)
+          .whereIn('seq', unsettled.slice(at, at + CHECKPOINT_BATCH))
+          .select('seq', 'input')) as Array<{ seq: number | string; input: string | null }>;
+        for (const { seq, input } of found) inputs.set(Number(seq), input);
+      }
+      for (const row of rows) {
+        if (row.status !== 'completed') row.input = inputs.get(Number(row.seq)) ?? null;
+      }
+    }
+    return rows.map(rowToCheckpoint);
   }
 
   async getLatestCheckpointByName(

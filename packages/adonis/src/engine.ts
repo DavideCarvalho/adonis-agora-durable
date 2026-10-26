@@ -5379,7 +5379,7 @@ export class WorkflowEngine {
     );
     if (routePlan?.status === 'blocked') return this.parkBlocked(run, routePlan);
 
-    const checkpoints = await this.store.listCheckpoints(run.id);
+    const checkpoints = await this.replayCheckpoints(run.id);
     const handoff = liveHandoff(run.id, checkpoints);
     if (handoff) {
       // A run that handed its failure to an onError handler only follows the handler from here on.
@@ -6479,7 +6479,7 @@ export class WorkflowEngine {
     // Read once at execution start: a checkpoint written AFTER this snapshot (the signal/timer/child
     // this resume wakes on, or one written later in this same execution) is absent from the map, and
     // the ctx falls back to the live store for any absent seq — so replay semantics are unchanged.
-    const snapshot = await this.store.listCheckpoints(run.id);
+    const snapshot = await this.replayCheckpoints(run.id);
     const replay = new Map<number, StepCheckpoint>();
     for (const cp of snapshot) replay.set(cp.seq, cp);
     let suspendedOnFan: FanJoin | undefined;
@@ -7681,6 +7681,14 @@ export class WorkflowEngine {
       },
       task.transport,
     );
+  }
+
+  /** A turn's read of its run's checkpoints: {@link StateStore.listCheckpointsForReplay}, or every
+   *  column through {@link StateStore.listCheckpoints} on a store without it. */
+  private replayCheckpoints(runId: string): Promise<StepCheckpoint[]> {
+    return this.store.listCheckpointsForReplay
+      ? this.store.listCheckpointsForReplay(runId)
+      : this.store.listCheckpoints(runId);
   }
 
   /**

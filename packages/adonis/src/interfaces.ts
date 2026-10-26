@@ -756,6 +756,16 @@ export interface StateStore {
   /** Schedules matching `query`, ordered by `nextFireAt` ascending (never-firing last), then `id`. */
   listSchedules?(query: ScheduleQuery): Promise<ScheduleRecord[]>;
   listCheckpoints(runId: string): Promise<StepCheckpoint[]>;
+  /**
+   * {@link listCheckpoints}, except that a `completed` row comes back without its `input`. The
+   * engine reads a run's checkpoints through it at the start of every turn, and replaying a
+   * completed step needs only its output; a `pending`, `running` or `failed` row keeps its `input`,
+   * which a re-dispatch or a retry sends again. The input is left out of the query itself, so it is
+   * never read from the database.
+   *
+   * Optional: a store that omits it gets {@link listCheckpoints}.
+   */
+  listCheckpointsForReplay?(runId: string): Promise<StepCheckpoint[]>;
 
   /**
    * The distinct values of ONE filter axis over the runs matching `query`, with counts — what a

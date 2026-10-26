@@ -315,6 +315,29 @@ export function settlementToRow(
   };
 }
 
+/** Every checkpoint column but `input`, the one a completed step's replay never reads. */
+export const CHECKPOINT_COLUMNS_BUT_INPUT = [
+  'run_id',
+  'seq',
+  'name',
+  'kind',
+  'step_id',
+  'status',
+  'output',
+  'error',
+  'events',
+  'attempts',
+  'worker_group',
+  'queue',
+  'wake_at',
+  'parallel_group',
+  'enqueued_at',
+  'started_at',
+  'finished_at',
+  'last_heartbeat_at',
+  'heartbeat_progress',
+] as const;
+
 export function rowToCheckpoint(row: CheckpointRow): StepCheckpoint {
   const key = `${row.run_id}#${row.seq}`;
   const cp: StepCheckpoint = {
