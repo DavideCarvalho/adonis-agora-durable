@@ -49,6 +49,24 @@ describe.each(dbBackends({ mysql: true }))('on $name', ({ makeStoreDb }) => {
     sql.stop();
   });
 
+  it('settling a result reads none of the step input', async () => {
+    const { store, sql } = await lucid();
+    const { engine, transport } = engineOn(store);
+    engine.register('chat', '1', async (ctx) => ctx.step(STEP, { prompt: PROMPT }));
+    await startRun(engine, 'chat', {}, 'r1');
+    const task = transport.dispatched[0] as RemoteTask;
+    await until(async () => (await store.getRun('r1'))?.status === 'suspended');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    sql.reset();
+    await transport.result?.(ok(task));
+    await until(async () => (await store.getRun('r1'))?.status === 'completed');
+
+    expect(sql.bytesRead()).toBeLessThan(20_000);
+    expect((await store.getCheckpoint('r1', task.seq))?.input).toEqual({ prompt: PROMPT });
+    sql.stop();
+  });
+
   it('settling a batch of results writes none of their inputs', async () => {
     const { store, sql } = await lucid();
     const { engine, transport } = engineOn(store);
@@ -167,5 +185,30 @@ describe('CodecStateStore settleCheckpointsIfPending', () => {
       settleCheckpointsIfPending: { value: undefined },
     }) as StateStore;
     expect(new CodecStateStore(inner, codec).settleCheckpointsIfPending).toBeUndefined();
+  });
+
+  it("decodes the rows a settle reads, which carry no input, and is absent when the inner store's read is", async () => {
+    const inner = new InMemoryStateStore();
+    const store = new CodecStateStore(inner, codec);
+    await store.saveCheckpoint({
+      runId: 'r1',
+      seq: 0,
+      name: STEP,
+      kind: 'remote',
+      stepId: 'r1:0',
+      status: 'pending',
+      input: { prompt: 'p' },
+      attempts: 1,
+      enqueuedAt: new Date(0),
+      startedAt: new Date(0),
+      finishedAt: new Date(0),
+    });
+    const [cp] = (await store.getCheckpointsForSettle?.('r1', [0])) ?? [];
+    expect(cp?.name).toBe(STEP);
+    expect(cp?.input).toBeUndefined();
+    const without = Object.create(inner, { getCheckpointsForSettle: { value: undefined } });
+    expect(
+      new CodecStateStore(without as StateStore, codec).getCheckpointsForSettle,
+    ).toBeUndefined();
   });
 });

@@ -375,6 +375,20 @@ export class LucidStateStore implements StateStore {
     return out.sort((a, b) => a.seq - b.seq);
   }
 
+  async getCheckpointsForSettle(runId: string, seqs: number[]): Promise<StepCheckpoint[]> {
+    const unique = [...new Set(seqs)];
+    const out: StepCheckpoint[] = [];
+    for (let at = 0; at < unique.length; at += CHECKPOINT_BATCH) {
+      const rows = (await this.client()
+        .from(DURABLE_TABLES.checkpoints)
+        .where('run_id', runId)
+        .whereIn('seq', unique.slice(at, at + CHECKPOINT_BATCH))
+        .select(...CHECKPOINT_COLUMNS_BUT_INPUT)) as CheckpointRow[];
+      out.push(...rows.map(rowToCheckpoint));
+    }
+    return out.sort((a, b) => a.seq - b.seq);
+  }
+
   async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
     await this.upsertCheckpoint(this.client(), checkpoint);
   }

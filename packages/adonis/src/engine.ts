@@ -8010,6 +8010,19 @@ export class WorkflowEngine {
   }
 
   /**
+   * {@link StateStore.getCheckpointsForSettle}, when the store can use what it leaves out: only
+   * with {@link StateStore.settleCheckpointsIfPending}, since a settle without it (and the salvage
+   * of a late success onto a failed run) writes back the whole row it read.
+   */
+  private settleReader():
+    | ((runId: string, seqs: number[]) => Promise<StepCheckpoint[]>)
+    | undefined {
+    return this.store.settleCheckpointsIfPending
+      ? this.store.getCheckpointsForSettle?.bind(this.store)
+      : undefined;
+  }
+
+  /**
    * The checkpoints of one run at `seqs`, each as its own outcome: one
    * {@link StateStore.getCheckpoints} call when the store has it, else one read each. The batch
    * call rejecting falls back to one read each, so a failing read fails only its own entry.
@@ -8018,6 +8031,20 @@ export class WorkflowEngine {
     runId: string,
     seqs: number[],
   ): Promise<PromiseSettledResult<StepCheckpoint | null>[]> {
+    const forSettle = this.settleReader();
+    if (forSettle) {
+      if (seqs.length > 1) {
+        try {
+          const bySeq = new Map((await forSettle(runId, seqs)).map((cp) => [cp.seq, cp]));
+          return seqs.map((seq) => ({ status: 'fulfilled', value: bySeq.get(seq) ?? null }));
+        } catch {
+          // Fall through: one by one.
+        }
+      }
+      return Promise.allSettled(
+        seqs.map(async (seq) => (await forSettle(runId, [seq]))[0] ?? null),
+      );
+    }
     if (seqs.length > 1 && this.store.getCheckpoints) {
       try {
         const bySeq = new Map(
@@ -8038,7 +8065,10 @@ export class WorkflowEngine {
    * late result for a terminal run — terminal is terminal).
    */
   private async settleRemoteCheckpoint(result: StepResult): Promise<StepCheckpoint | undefined> {
-    const cp = await this.store.getCheckpoint(result.runId, result.seq);
+    const forSettle = this.settleReader();
+    const cp = forSettle
+      ? ((await forSettle(result.runId, [result.seq]))[0] ?? null)
+      : await this.store.getCheckpoint(result.runId, result.seq);
     if (!cp) return undefined;
     const run = await this.store.getRun(result.runId);
     const terminal =

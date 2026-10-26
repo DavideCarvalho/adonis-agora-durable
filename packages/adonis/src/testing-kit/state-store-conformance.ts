@@ -948,6 +948,36 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       30_000,
     );
 
+    t('getCheckpointsForSettle reads the rows without their input (when implemented)', async () => {
+      if (!store.getCheckpointsForSettle) return;
+      expect(await store.getCheckpointsForSettle('r1', [])).toEqual([]);
+      await store.createRun(run());
+      for (const seq of [0, 1, 2]) {
+        await store.saveCheckpoint(
+          checkpoint({
+            seq,
+            stepId: `r1:${seq}`,
+            status: seq === 0 ? 'completed' : 'pending',
+            input: { prompt: `p${seq}` },
+            output: seq === 0 ? { a: 0 } : undefined,
+            wakeAt: 5_000 + seq,
+          }),
+        );
+      }
+      const full = (await store.getCheckpoints?.('r1', [2, 0, 9])) ?? [
+        (await store.getCheckpoint('r1', 0)) as StepCheckpoint,
+        (await store.getCheckpoint('r1', 2)) as StepCheckpoint,
+      ];
+      const read = await store.getCheckpointsForSettle('r1', [2, 0, 9]);
+      expect(read.map((c) => [c.seq, c.input])).toEqual([
+        [0, undefined],
+        [2, undefined],
+      ]);
+      const withoutInput = ({ input: _input, ...rest }: StepCheckpoint) => rest;
+      expect(read.map(withoutInput)).toEqual(full.map(withoutInput));
+      expect((await store.getCheckpoint('r1', 2))?.input).toEqual({ prompt: 'p2' });
+    });
+
     t(
       "listCheckpointsForReplay leaves out only a completed row's input (when implemented)",
       async () => {

@@ -285,6 +285,17 @@ export class InMemoryStateStore implements StateStore {
     return out;
   }
 
+  async getCheckpointsForSettle(runId: string, seqs: number[]): Promise<StepCheckpoint[]> {
+    const out: StepCheckpoint[] = [];
+    for (const seq of [...new Set(seqs)].sort((a, b) => a - b)) {
+      const cp = this.checkpoints.get(this.key(runId, seq));
+      if (!cp) continue;
+      const { input: _input, ...rest } = cp;
+      out.push(rest);
+    }
+    return out;
+  }
+
   async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
     this.checkpoints.set(this.key(checkpoint.runId, checkpoint.seq), { ...checkpoint });
   }

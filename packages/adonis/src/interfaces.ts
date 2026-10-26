@@ -445,6 +445,16 @@ export interface StateStore {
    */
   getCheckpoints?(runId: string, seqs: number[]): Promise<StepCheckpoint[]>;
   /**
+   * {@link getCheckpoints} as a step result's settle reads them: the same rows, each without its
+   * `input` (left out of the read, not dropped after it). A settle needs the row's status, name,
+   * group, queue and timings, never what the step was called with, and the step being settled is the
+   * one whose input is still fresh: an LLM step's prompt was otherwise read back on every result.
+   * The engine reads through it only when the store also has {@link settleCheckpointsIfPending},
+   * since the whole-row write it falls back to needs the input. Optional: without it,
+   * {@link getCheckpoints} (or {@link getCheckpoint} per result).
+   */
+  getCheckpointsForSettle?(runId: string, seqs: number[]): Promise<StepCheckpoint[]>;
+  /**
    * Persist a checkpoint and advance the run atomically. Durable semantics depend on this
    * being a single transaction; stores without transactions cannot give the strong guarantee.
    */
