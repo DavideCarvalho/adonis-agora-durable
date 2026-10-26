@@ -140,7 +140,8 @@ export function redisUrlToOptions(url: string): Record<string, unknown> {
 /**
  * Options carrying a `url` (`{ url: 'redis://…', … }`) with the URL read into host, port, credentials,
  * db and TLS. BullMQ reads `url` itself, but ioredis ignores it, so the pub/sub and heartbeat clients
- * would otherwise land on ioredis's default 127.0.0.1:6379 while the queues use the URL.
+ * would otherwise land on ioredis's default 127.0.0.1:6379 while the queues use the URL. A key the
+ * caller set explicitly (a `tls` with its own CA, a `db`) wins over the one the URL implies.
  */
 function withUrlResolved(connection: unknown): unknown {
   if (typeof connection !== 'object' || connection === null || 'options' in connection) {
@@ -148,7 +149,7 @@ function withUrlResolved(connection: unknown): unknown {
   }
   const { url, ...rest } = connection as { url?: unknown };
   if (typeof url !== 'string') return connection;
-  return { ...rest, ...redisUrlToOptions(url) };
+  return { ...redisUrlToOptions(url), ...rest };
 }
 
 export async function createBullMQDeps(

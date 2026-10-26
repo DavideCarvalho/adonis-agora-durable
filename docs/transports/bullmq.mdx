@@ -66,7 +66,7 @@ A deferred process also stamps no [liveness key](#worker-liveness): a step name'
 - a `redis://` or `rediss://` URL — host (default `127.0.0.1`), port (default `6379`), URL-decoded username and password, the db from the first path segment, and TLS (`tls: {}`) for `rediss:`. Query parameters are refused, and so are other schemes and a db that isn't a non-negative integer, all at boot; pass `ConnectionOptions` for anything else — or
 - an existing ioredis `Redis` instance.
 
-An options object can also carry a `url` (`{ url: 'redis://…', keepAlive: 10_000 }`). The transport reads that URL into host, port, credentials, db and TLS the same way, and those fields win over the same keys set beside it in the object, so the pub/sub, heartbeat and liveness clients reach the same Redis as the queues. ioredis on its own ignores `url`.
+An options object can also carry a `url` (`{ url: 'redis://…', keepAlive: 10_000 }`). The transport reads that URL into host, port, credentials, db and TLS the same way, so the pub/sub, heartbeat and liveness clients reach the same Redis as the queues. A key set beside the `url` wins over the one the URL implies, so `{ url: 'rediss://…', tls: { ca } }` keeps its CA. ioredis on its own ignores `url`.
 
 BullMQ workers need `maxRetriesPerRequest: null`. When you pass an options object, the transport sets that for its worker connections. A `Redis` instance you pass in is used as-is, so configure it yourself. Pub/sub, heartbeat and liveness clients are `duplicate()`s of a passed instance, or fresh clients with a 10s keep-alive.
 
