@@ -118,7 +118,7 @@ The slots share the step's single poll loop — it keeps popping while a slot is
 
 #### Adaptive concurrency
 
-Pass `'adaptive'` instead of a number to let the worker tune its own limit. It is the same controller the [BullMQ transport](/docs/durable/transports/bullmq#concurrency) uses: every `tickMs` it grows the limit by one while steps saturate it at a steady latency, shrinks it by the latency gradient when steps start to queue, sheds one on a >20% error rate, a stall or the CPU ceiling, and cuts it by 20% when RSS reaches `ramCeilingPct` of the memory limit (the cgroup limit, else the host's memory).
+Pass `'adaptive'` instead of a number to let the worker tune its own limit. It is the same controller the [BullMQ transport](/docs/durable/transports/bullmq#concurrency) uses: while steps saturate the limit at a steady latency it doubles it until the first move down (re-deciding after each limit's worth of settled steps, not only on the tick), then grows by `⌊√limit⌋` a tick; every `tickMs` it shrinks it by the latency gradient when steps start to queue (the gradient `(2 × baseline + 5 ms) / p50` below 0.7, so the jitter of millisecond steps is not read as queuing), sheds one on a >20% error rate, a stall or the CPU ceiling, and cuts it by 20% when RSS reaches `ramCeilingPct` of the memory limit (the cgroup limit, else the host's memory).
 
 ```ts title="config/durable.ts"
 queue: transports.queue({
