@@ -2999,8 +2999,7 @@ export class WorkflowEngine {
       (async () => {
         await new Promise((r) => setTimeout(r, 0));
         for (const seq of seqs) {
-          const cp = await this.store.getCheckpoint(runId, seq).catch(() => null);
-          if (cp && (cp.status === 'completed' || cp.status === 'failed')) {
+          if (await this.checkpointSettled(runId, seq).catch(() => false)) {
             await this.resumeImplicit(runId).catch(() => undefined);
             return;
           }
@@ -3031,6 +3030,15 @@ export class WorkflowEngine {
   }
 
   /** {@link StateStore.countCheckpoints} of `pending` steps, or a JS count on a store without it. */
+  /** Whether the checkpoint at `seq` is settled: a `COUNT` when the store has one, else the row. */
+  private async checkpointSettled(runId: string, seq: number): Promise<boolean> {
+    if (this.store.countCheckpoints) {
+      return (await this.store.countCheckpoints(runId, seq, seq, ['completed', 'failed'])) > 0;
+    }
+    const cp = await this.store.getCheckpoint(runId, seq);
+    return cp?.status === 'completed' || cp?.status === 'failed';
+  }
+
   private async countPendingSteps(runId: string, from: number, to: number): Promise<number> {
     if (this.store.countCheckpoints) {
       return this.store.countCheckpoints(runId, from, to, ['pending']);

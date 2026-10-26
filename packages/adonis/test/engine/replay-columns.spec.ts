@@ -63,6 +63,35 @@ describe.each(dbBackends({ mysql: true }))('on $name', ({ makeStoreDb }) => {
     sql.stop();
   });
 
+  it('a resume that dispatches the next large step reads only the settled step once', async () => {
+    const { store, sql } = await lucid();
+    const { engine, transport } = engineOn(store);
+    engine.register('chat', '1', async (ctx) => {
+      const answers: unknown[] = [];
+      for (let turn = 0; turn < 3; turn += 1) {
+        answers.push(await ctx.step(STEP, { prompt: PROMPT, turn }));
+      }
+      return answers;
+    });
+    await startRun(engine, 'chat', {}, 'r1');
+    await transport.result?.(ok(transport.dispatched[0] as RemoteTask, 'one'));
+    await until(async () => transport.dispatched.length === 2);
+    await until(async () => (await store.getRun('r1'))?.status === 'suspended');
+    // Past the suspended turn's own re-check of the step it waits on.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // The settle reads the pending step it settles; the turn it drives replays both settled steps
+    // from their outputs and sends the third, then checks whether that step settled meanwhile
+    // without reading its input.
+    sql.reset();
+    await transport.result?.(ok(transport.dispatched[1] as RemoteTask, 'two'));
+    await until(async () => transport.dispatched.length === 3);
+    await until(async () => (await store.getRun('r1'))?.status === 'suspended');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(sql.bytesRead()).toBeLessThan(PROMPT.length * 1.5);
+    sql.stop();
+  });
+
   it('a pending step whose dispatch was lost is re-dispatched with its input', async () => {
     const { store } = await lucid();
     let now = 1_000_000;
