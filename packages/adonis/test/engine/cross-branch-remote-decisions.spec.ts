@@ -297,7 +297,7 @@ describe.each(stores)('%s', (_label, makeStore) => {
       expect((await store.getRun('run1'))?.awaitingDecisionTaskId).toBe(turn2.taskId);
 
       // The rest land together, while turn 2 is still out.
-      const batched = vi.spyOn(store, 'saveCheckpointsIfPending');
+      const batched = vi.spyOn(store, 'settleCheckpointsIfPending');
       await Promise.all(t.steps.slice(1).map((s) => t.result(resultOf(s, s.seq))));
       expect(batched).toHaveBeenCalledTimes(1);
       expect(batched.mock.calls[0]?.[0]).toHaveLength(N - 1);

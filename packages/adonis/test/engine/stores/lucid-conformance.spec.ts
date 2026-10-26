@@ -38,6 +38,7 @@ describe.each(dbBackends({ mysql: true }))('on $name', ({ makeStoreDb }) => {
         expect(store.listSignalWaitersByRunIds).toBeTypeOf('function');
         expect(store.countCheckpoints).toBeTypeOf('function');
         expect(store.saveCheckpointIfPending).toBeTypeOf('function');
+        expect(store.settleCheckpointsIfPending).toBeTypeOf('function');
         expect(store.getRuns).toBeTypeOf('function');
         expect(store.releaseRunLockUnlessWakeRequested).toBeTypeOf('function');
         expect(store.listBufferedSignals).toBeTypeOf('function');

@@ -16,6 +16,7 @@ import type {
   SignalWaiter,
   StateStore,
   StepCheckpoint,
+  StepSettlement,
   WorkflowRun,
 } from '../interfaces.js';
 import { namespaceMatches, normalizeNamespace } from '../namespaces.js';
@@ -306,6 +307,16 @@ export class InMemoryStateStore implements StateStore {
       const key = this.key(checkpoint.runId, checkpoint.seq);
       if (this.checkpoints.get(key)?.status !== 'pending') return false;
       this.checkpoints.set(key, { ...checkpoint });
+      return true;
+    });
+  }
+
+  async settleCheckpointsIfPending(settlements: StepSettlement[]): Promise<boolean[]> {
+    return settlements.map(({ runId, seq, ...settled }) => {
+      const key = this.key(runId, seq);
+      const row = this.checkpoints.get(key);
+      if (row?.status !== 'pending') return false;
+      this.checkpoints.set(key, { ...row, ...settled });
       return true;
     });
   }

@@ -309,6 +309,10 @@ requires `saveCheckpointsIfPending` (batched result settling), `deleteRuns`
 (batched retention/purge deletes), `runFacets`, `pruneBufferedEvents`
 (`eventBufferTtl`) and the `checkpointStats` + `queryCheckpoints` pair (the run
 detail from aggregates, with an ETag the console polls with `If-None-Match`).
+Implement `settleCheckpointsIfPending` (write only a result's status, output,
+error, events and timestamps, while the row is `pending`) too: without it every
+result rewrites the step's `input`. The contract runs its cases when a store has
+it.
 
 The Lucid schema check runs at every boot but is gated by a fingerprint row in
 `durable_schema_meta`: a current schema costs two statements. A stale or missing

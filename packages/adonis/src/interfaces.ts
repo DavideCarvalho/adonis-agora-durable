@@ -205,6 +205,21 @@ export interface StepCheckpoint {
 }
 
 /**
+ * What a worker's result changes on its step's checkpoint (see
+ * {@link StateStore.settleCheckpointsIfPending}): every other column of the row stays as stored.
+ */
+export interface StepSettlement {
+  runId: string;
+  seq: number;
+  status: 'completed' | 'failed';
+  output?: unknown;
+  error?: StepError | undefined;
+  events?: StepEvent[] | undefined;
+  startedAt: Date;
+  finishedAt: Date;
+}
+
+/**
  * A structured event a step (or its worker) emits while running — a log line and/or a sub-step
  * outcome. The dashboard renders these under the step, so you can see what happened inside a step
  * that the workflow treats as one unit (e.g. which of N parallel sub-processes ok/failed/skipped).
@@ -462,6 +477,19 @@ export interface StateStore {
    * Optional: a store that omits it gets one {@link saveCheckpointIfPending} per entry.
    */
   saveCheckpointsIfPending?(checkpoints: StepCheckpoint[]): Promise<boolean[]>;
+  /**
+   * Settle step results onto their checkpoints: per entry and in input order, while the row at
+   * `(runId, seq)` is still `pending`, write the entry's `status`, `output`, `error`, `events`,
+   * `startedAt` and `finishedAt` (an absent value is written as absent) and leave every other column
+   * as stored; resolves whether each entry wrote. Same claim as {@link saveCheckpointsIfPending}: a
+   * later entry for a row an earlier one settled loses, and a rejection writes nothing. The engine
+   * settles worker results through it, so a step's `input` (an LLM step carries its whole prompt)
+   * is written once, when the step is dispatched, not again when its result lands.
+   *
+   * Optional: a store that omits it gets the whole row rewritten through
+   * {@link saveCheckpointsIfPending} / {@link saveCheckpointIfPending}.
+   */
+  settleCheckpointsIfPending?(settlements: StepSettlement[]): Promise<boolean[]>;
 
   /**
    * Used by recovery on boot to find runs to resume (crashed, left `running`). When `namespace` is

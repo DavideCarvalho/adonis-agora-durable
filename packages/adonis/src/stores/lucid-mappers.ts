@@ -3,6 +3,7 @@ import type {
   StepCheckpoint,
   StepError,
   StepEvent,
+  StepSettlement,
   WorkflowRun,
 } from '../interfaces.js';
 import { normalizeNamespace } from '../namespaces.js';
@@ -288,6 +289,29 @@ export function checkpointToRow(cp: StepCheckpoint): CheckpointRow {
     enqueued_at: (cp.enqueuedAt ?? cp.startedAt).getTime(),
     started_at: cp.startedAt.getTime(),
     finished_at: cp.finishedAt.getTime(),
+  };
+}
+
+/** The checkpoint columns a {@link StepSettlement} writes, by column name. */
+export const SETTLED_CHECKPOINT_COLUMNS = [
+  'status',
+  'output',
+  'error',
+  'events',
+  'started_at',
+  'finished_at',
+] as const;
+
+export function settlementToRow(
+  s: StepSettlement,
+): Pick<CheckpointRow, (typeof SETTLED_CHECKPOINT_COLUMNS)[number]> {
+  return {
+    status: s.status,
+    output: toJson(s.output),
+    error: toJson(s.error),
+    events: toJson(s.events),
+    started_at: s.startedAt.getTime(),
+    finished_at: s.finishedAt.getTime(),
   };
 }
 

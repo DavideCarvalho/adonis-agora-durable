@@ -91,6 +91,7 @@ import type {
   StepInvocation,
   StepKind,
   StepResult,
+  StepSettlement,
   TerminalRunStatus,
   Transport,
   UpdateResult,
@@ -7843,20 +7844,13 @@ export class WorkflowEngine {
       else resumable.push({ cp: read.value, result });
     });
     const finishedAt = new Date();
-    const writes = pending.map(({ index, cp }) => {
-      const result = results[index] as StepResult;
-      return {
-        ...cp,
-        status: result.status,
-        output: result.status === 'completed' ? result.output : cp.output,
-        error: result.error,
-        events: result.events ?? cp.events,
-        startedAt: result.startedAt ? new Date(result.startedAt) : cp.startedAt,
-        finishedAt,
-      };
-    });
     // Claimed, not blindly written: a duplicate delivery may have settled a step first.
-    const claims = await this.savePendingCheckpoints(writes);
+    const claims = await this.settlePendingCheckpoints(
+      pending.map(({ index, cp }) => ({
+        cp,
+        settlement: settlementOf(cp, results[index] as StepResult, finishedAt),
+      })),
+    );
     for (const [k, claim] of claims.entries()) {
       const { index, cp } = pending[k] as { index: number; cp: StepCheckpoint };
       const result = results[index] as StepResult;
@@ -7926,6 +7920,34 @@ export class WorkflowEngine {
       }
     }
     return outcomes;
+  }
+
+  /**
+   * Settle pending steps, each only while its row is still `pending`; per entry, whether it wrote
+   * or the error that kept it from writing. Through {@link StateStore.settleCheckpointsIfPending}
+   * when the store has it: one call, or one per entry when that call rejects (it then wrote
+   * nothing). Else each step's whole row is written through {@link savePendingCheckpoints}.
+   */
+  private async settlePendingCheckpoints(
+    entries: Array<{ cp: StepCheckpoint; settlement: StepSettlement }>,
+  ): Promise<Array<boolean | { error: unknown }>> {
+    const settle = this.store.settleCheckpointsIfPending?.bind(this.store);
+    if (!settle) {
+      return this.savePendingCheckpoints(
+        entries.map(({ cp, settlement }) => ({ ...cp, ...settlement })),
+      );
+    }
+    const settlements = entries.map((e) => e.settlement);
+    try {
+      const wrote = await settle(settlements);
+      return settlements.map((_, i) => wrote[i] === true);
+    } catch (error) {
+      if (settlements.length === 1) return [{ error }];
+    }
+    const settled = await Promise.allSettled(settlements.map((s) => settle([s])));
+    return settled.map((r) =>
+      r.status === 'fulfilled' ? r.value[0] === true : { error: r.reason },
+    );
   }
 
   /**
@@ -8042,31 +8064,23 @@ export class WorkflowEngine {
     if (run && (run.status === 'failed' || run.status === 'dead')) {
       await this.releaseQueueSlot(cp);
       if (result.status === 'completed') {
-        await this.store.saveCheckpoint({
-          ...cp,
-          status: 'completed',
-          output: result.output,
-          events: result.events ?? cp.events,
-          startedAt: result.startedAt ? new Date(result.startedAt) : cp.startedAt,
-          finishedAt: new Date(),
-        });
+        const salvage = { ...settlementOf(cp, result, new Date()), error: cp.error };
+        if (this.store.settleCheckpointsIfPending) {
+          await this.store.settleCheckpointsIfPending([salvage]);
+        } else {
+          await this.store.saveCheckpoint({ ...cp, ...salvage });
+        }
       }
       return undefined;
     }
     const finishedAt = new Date();
-    const startedAt = result.startedAt ? new Date(result.startedAt) : cp.startedAt;
+    const settlement = settlementOf(cp, result, finishedAt);
+    const startedAt = settlement.startedAt;
     // Claimed, not blindly written: another delivery settled it first, which is the redelivery case
     // above — re-drive the resume rather than settle twice.
-    const claimed = await this.savePendingCheckpoint({
-      ...cp,
-      status: result.status,
-      output: result.status === 'completed' ? result.output : cp.output,
-      error: result.error,
-      events: result.events ?? cp.events,
-      startedAt,
-      finishedAt,
-    });
-    if (!claimed) return terminal ? undefined : cp;
+    const [claim] = await this.settlePendingCheckpoints([{ cp, settlement }]);
+    if (typeof claim === 'object') throw claim.error;
+    if (!claim) return terminal ? undefined : cp;
     await this.releaseQueueSlot(cp);
     this.emit({
       type: result.status === 'completed' ? 'step.completed' : 'step.failed',
@@ -8426,6 +8440,20 @@ export class WorkflowEngine {
  *  the run's namespace (bare for absent/`''`/`default`) — the token a tenant worker serves. */
 function conventionGroup(name: string, namespace: string | undefined): string {
   return tenantGroup(sanitizeQueueToken(name), namespace);
+}
+
+/** What `result` settles onto its step's pending checkpoint `cp`. */
+function settlementOf(cp: StepCheckpoint, result: StepResult, finishedAt: Date): StepSettlement {
+  return {
+    runId: cp.runId,
+    seq: cp.seq,
+    status: result.status,
+    output: result.status === 'completed' ? result.output : cp.output,
+    error: result.error,
+    events: result.events ?? cp.events,
+    startedAt: result.startedAt ? new Date(result.startedAt) : cp.startedAt,
+    finishedAt,
+  };
 }
 
 /** Key of an inline remote turn's liveness reset in `heartbeatResets` (step keys are `runId:seq`). */

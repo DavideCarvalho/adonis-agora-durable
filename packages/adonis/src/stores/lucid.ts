@@ -22,6 +22,7 @@ import type {
   SignalWaiter,
   StateStore,
   StepCheckpoint,
+  StepSettlement,
   WorkflowRun,
 } from '../interfaces.js';
 import { namespaceFilterValues, normalizeNamespace } from '../namespaces.js';
@@ -58,6 +59,8 @@ import {
   rowToSignalWaiter,
   runPatchToRow,
   runToRow,
+  SETTLED_CHECKPOINT_COLUMNS,
+  settlementToRow,
 } from './lucid-mappers.js';
 import { createDurableTables, DURABLE_TABLES } from './lucid-schema.js';
 
@@ -392,48 +395,15 @@ export class LucidStateStore implements StateStore {
   async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
     if (checkpoints.length === 0) return [];
     // Set-based, in one transaction (a rejection writes nothing): read which of the rows are still
-    // `pending` (locked on Postgres and MySQL, so a concurrent settle waits), decide each entry in
-    // order (a second entry for a row is compared against the first one's write), then write every
-    // winner with one multi-row upsert per chunk.
+    // `pending` (locked, see `lockPendingCheckpoints`), decide each entry in order (a second entry
+    // for a row is compared against the first one's write), then write every winner with one
+    // multi-row upsert per chunk.
     return this.client().transaction(async (trx) => {
-      const pending = new Set<string>();
-      const key = (runId: string, seq: number) => `${runId}\u0000${seq}`;
-      const byRun = new Map<string, number[]>();
-      for (const cp of checkpoints) {
-        const seqs = byRun.get(cp.runId);
-        if (seqs) seqs.push(cp.seq);
-        else byRun.set(cp.runId, [cp.seq]);
-      }
-      const first = checkpoints[0];
-      if (first && !locksRows(trx)) {
-        // SQLite has no row locks: take the database write lock FIRST with a no-op write, so no
-        // other connection or process settles a row between the read below and the writes.
-        await trx
-          .from(DURABLE_TABLES.checkpoints)
-          .where('run_id', first.runId)
-          .andWhere('seq', first.seq)
-          .andWhere('status', 'pending')
-          .update({ status: 'pending' });
-      }
-      for (const [runId, seqs] of byRun) {
-        const unique = [...new Set(seqs)];
-        for (let at = 0; at < unique.length; at += CHECKPOINT_BATCH) {
-          const q = trx
-            .from(DURABLE_TABLES.checkpoints)
-            .where('run_id', runId)
-            .whereIn('seq', unique.slice(at, at + CHECKPOINT_BATCH))
-            .andWhere('status', 'pending')
-            .select('seq');
-          if (locksRows(trx)) q.forUpdate();
-          for (const row of (await q) as Array<{ seq: number | string }>) {
-            pending.add(key(runId, Number(row.seq)));
-          }
-        }
-      }
+      const pending = await lockPendingCheckpoints(trx, checkpoints, ['seq']);
       const wrote: boolean[] = [];
       const writes = new Map<string, StepCheckpoint>();
       for (const cp of checkpoints) {
-        const k = key(cp.runId, cp.seq);
+        const k = checkpointKey(cp.runId, cp.seq);
         if (!pending.has(k)) {
           wrote.push(false);
           continue;
@@ -445,6 +415,61 @@ export class LucidStateStore implements StateStore {
       const rows = [...writes.values()];
       for (let at = 0; at < rows.length; at += CHECKPOINT_UPSERT_BATCH) {
         await upsertCheckpointRows(trx, rows.slice(at, at + CHECKPOINT_UPSERT_BATCH));
+      }
+      return wrote;
+    });
+  }
+
+  async settleCheckpointsIfPending(settlements: StepSettlement[]): Promise<boolean[]> {
+    const [only] = settlements;
+    if (!only) return [];
+    if (settlements.length === 1) {
+      const affected = await this.client()
+        .from(DURABLE_TABLES.checkpoints)
+        .where('run_id', only.runId)
+        .andWhere('seq', only.seq)
+        .andWhere('status', 'pending')
+        .update(settlementToRow(only));
+      return [rowsAffected(affected) > 0];
+    }
+    // In one transaction (a rejection writes nothing): lock the rows still `pending`, decide each
+    // entry in order (a settled row makes a later entry for it lose), then write the winners with one
+    // multi-row upsert per chunk that updates only the settled columns. The rows exist and are
+    // locked, so the upsert never inserts: its row carries just the columns an insert would require,
+    // and `input` is neither sent nor rewritten.
+    return this.client().transaction(async (trx) => {
+      const pending = await lockPendingCheckpoints(trx, settlements, [
+        'seq',
+        'name',
+        'kind',
+        'step_id',
+        'attempts',
+      ]);
+      const wrote: boolean[] = [];
+      const rows: Array<Record<string, unknown>> = [];
+      for (const s of settlements) {
+        const k = checkpointKey(s.runId, s.seq);
+        const row = pending.get(k);
+        wrote.push(row !== undefined);
+        if (row === undefined) continue;
+        pending.delete(k);
+        rows.push({
+          run_id: s.runId,
+          seq: s.seq,
+          name: row.name,
+          kind: row.kind,
+          step_id: row.step_id,
+          attempts: row.attempts,
+          ...settlementToRow(s),
+        });
+      }
+      for (let at = 0; at < rows.length; at += CHECKPOINT_UPSERT_BATCH) {
+        await trx
+          .insertQuery()
+          .table(DURABLE_TABLES.checkpoints)
+          .knexQuery.insert(rows.slice(at, at + CHECKPOINT_UPSERT_BATCH))
+          .onConflict(['run_id', 'seq'])
+          .merge([...SETTLED_CHECKPOINT_COLUMNS]);
       }
       return wrote;
     });
@@ -1410,6 +1435,55 @@ function nameKindSql(dialect: string): string {
 
 function escapeLike(value: string): string {
   return value.replace(/[!%_]/g, (c) => `!${c}`);
+}
+
+function checkpointKey(runId: string, seq: number): string {
+  return `${runId}\u0000${seq}`;
+}
+
+/**
+ * Inside `trx`, the rows among `entries` still `pending`, keyed by {@link checkpointKey}, with
+ * `columns` read. Locked on Postgres and MySQL, so a concurrent settle waits; SQLite has no row locks,
+ * so the database write lock is taken FIRST with a no-op write, and no other connection or process
+ * settles a row between the read and the caller's writes.
+ */
+async function lockPendingCheckpoints(
+  trx: Client,
+  entries: Array<{ runId: string; seq: number }>,
+  columns: string[],
+): Promise<Map<string, Record<string, unknown>>> {
+  const first = entries[0];
+  if (first && !locksRows(trx)) {
+    await trx
+      .from(DURABLE_TABLES.checkpoints)
+      .where('run_id', first.runId)
+      .andWhere('seq', first.seq)
+      .andWhere('status', 'pending')
+      .update({ status: 'pending' });
+  }
+  const byRun = new Map<string, Set<number>>();
+  for (const { runId, seq } of entries) {
+    const seqs = byRun.get(runId) ?? new Set<number>();
+    seqs.add(seq);
+    byRun.set(runId, seqs);
+  }
+  const pending = new Map<string, Record<string, unknown>>();
+  for (const [runId, seqSet] of byRun) {
+    const seqs = [...seqSet];
+    for (let at = 0; at < seqs.length; at += CHECKPOINT_BATCH) {
+      const q = trx
+        .from(DURABLE_TABLES.checkpoints)
+        .where('run_id', runId)
+        .whereIn('seq', seqs.slice(at, at + CHECKPOINT_BATCH))
+        .andWhere('status', 'pending')
+        .select(...columns);
+      if (locksRows(trx)) q.forUpdate();
+      for (const row of (await q) as Array<Record<string, unknown>>) {
+        pending.set(checkpointKey(runId, Number(row.seq)), row);
+      }
+    }
+  }
+  return pending;
 }
 
 /** Whether this connection's dialect supports `SELECT … FOR UPDATE` row locks. */

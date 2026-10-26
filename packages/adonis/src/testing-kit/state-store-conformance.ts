@@ -5,6 +5,7 @@ import {
   type ScheduleRecord,
   type StateStore,
   type StepCheckpoint,
+  type StepSettlement,
   WorkflowEngine,
   type WorkflowRun,
 } from '../index.js';
@@ -818,6 +819,134 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       ).toEqual([true, true]);
       expect((await store.getCheckpoint('r1', 3))?.output).toEqual({ n: 3 });
     });
+
+    t(
+      'settleCheckpointsIfPending writes only the result columns, row by row (when implemented)',
+      async () => {
+        if (!store.settleCheckpointsIfPending) return;
+        expect(await store.settleCheckpointsIfPending([])).toEqual([]);
+        await store.createRun(run());
+        await store.createRun(run({ id: 'r2' }));
+        const pending = (runId: string, seq: number) =>
+          checkpoint({
+            runId,
+            seq,
+            stepId: `${runId}:${seq}`,
+            status: 'pending',
+            input: { prompt: `${runId}:${seq}` },
+            output: undefined,
+            attempts: 2,
+            workerGroup: 'g',
+            parallelGroup: 'fan:0:4',
+            wakeAt: 5_000,
+          });
+        for (const seq of [0, 1, 2, 3]) await store.saveCheckpoint(pending('r1', seq));
+        await store.saveCheckpoint(pending('r2', 0));
+        await store.saveCheckpoint({
+          ...pending('r1', 1),
+          status: 'completed',
+          output: { first: 1 },
+        });
+        const startedAt = new Date('2026-05-01T00:00:01.000Z');
+        const finishedAt = new Date('2026-05-01T00:00:02.000Z');
+        const done = (runId: string, seq: number, output: unknown): StepSettlement => ({
+          runId,
+          seq,
+          status: 'completed',
+          output,
+          events: [{ at: 1, level: 'info', message: `done ${seq}` }],
+          startedAt,
+          finishedAt,
+        });
+
+        const wrote = await store.settleCheckpointsIfPending([
+          done('r1', 0, { n: 0 }),
+          // Already settled: the result is refused.
+          done('r1', 1, { n: 1 }),
+          // A second copy of a row settled earlier in the call: refused.
+          done('r1', 0, { n: 'dup' }),
+          {
+            runId: 'r1',
+            seq: 2,
+            status: 'failed',
+            error: { message: 'boom' },
+            startedAt,
+            finishedAt,
+          },
+          // No such row: nothing is written.
+          done('r1', 9, { n: 9 }),
+          done('r2', 0, { n: 'r2' }),
+        ]);
+        expect(wrote).toEqual([true, false, false, true, false, true]);
+
+        const r1 = await store.listCheckpoints('r1');
+        expect(r1.map((c) => [c.seq, c.status, c.output])).toEqual([
+          [0, 'completed', { n: 0 }],
+          [1, 'completed', { first: 1 }],
+          [2, 'failed', undefined],
+          [3, 'pending', undefined],
+        ]);
+        const settled = r1[0] as StepCheckpoint;
+        expect(settled.events).toEqual([{ at: 1, level: 'info', message: 'done 0' }]);
+        expect(settled.startedAt.getTime()).toBe(startedAt.getTime());
+        expect(settled.finishedAt.getTime()).toBe(finishedAt.getTime());
+        // Every column the result does not carry is left as it was.
+        expect(settled.input).toEqual({ prompt: 'r1:0' });
+        expect(settled.attempts).toBe(2);
+        expect(settled.workerGroup).toBe('g');
+        expect(settled.parallelGroup).toBe('fan:0:4');
+        expect(settled.wakeAt).toBe(5_000);
+        expect(settled.stepId).toBe('r1:0');
+        expect(r1[2]?.error).toEqual({ message: 'boom' });
+        expect(r1[2]?.input).toEqual({ prompt: 'r1:2' });
+        expect(await store.getCheckpoint('r1', 9)).toBeNull();
+        expect((await store.getCheckpoint('r2', 0))?.output).toEqual({ n: 'r2' });
+
+        // One entry alone is the same compare-and-set.
+        expect(await store.settleCheckpointsIfPending([done('r1', 3, { n: 3 })])).toEqual([true]);
+        expect(await store.settleCheckpointsIfPending([done('r1', 3, { n: 'again' })])).toEqual([
+          false,
+        ]);
+        const third = await store.getCheckpoint('r1', 3);
+        expect(third?.output).toEqual({ n: 3 });
+        expect(third?.input).toEqual({ prompt: 'r1:3' });
+      },
+    );
+
+    t(
+      'settleCheckpointsIfPending settles a batch wider than one statement (when implemented)',
+      async () => {
+        if (!store.settleCheckpointsIfPending) return;
+        await store.createRun(run());
+        const rows = Array.from({ length: 600 }, (_, seq) =>
+          checkpoint({
+            seq,
+            stepId: `r1:${seq}`,
+            status: 'pending',
+            input: { seq },
+            output: undefined,
+          }),
+        );
+        if (store.saveCheckpoints) await store.saveCheckpoints(rows);
+        else for (const row of rows) await store.saveCheckpoint(row);
+        const at = new Date('2026-05-01T00:00:03.000Z');
+        const wrote = await store.settleCheckpointsIfPending(
+          rows.map(({ seq }) => ({
+            runId: 'r1',
+            seq,
+            status: 'completed',
+            output: seq * 2,
+            startedAt: at,
+            finishedAt: at,
+          })),
+        );
+        expect(wrote.every((w) => w)).toBe(true);
+        const all = await store.listCheckpoints('r1');
+        expect(all.every((c, i) => c.status === 'completed' && c.output === i * 2)).toBe(true);
+        expect(all.every((c, i) => (c.input as { seq: number }).seq === i)).toBe(true);
+      },
+      30_000,
+    );
 
     t(
       'saveCheckpoints writes many rows and getCheckpoints reads them back (when implemented)',

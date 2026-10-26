@@ -15,6 +15,7 @@ import type {
   SignalWaiter,
   StateStore,
   StepCheckpoint,
+  StepSettlement,
   WorkflowRun,
 } from './interfaces.js';
 import { scanRunValueFacets } from './run-value-facets.js';
@@ -92,6 +93,9 @@ export class CodecStateStore implements StateStore {
   readonly releaseRunLockUnlessWakeRequested?: (runId: string, owner: string) => Promise<boolean>;
   /** Encodes each checkpoint like {@link saveCheckpoint}. Bound only when the inner store has it. */
   readonly saveCheckpointsIfPending?: (checkpoints: StepCheckpoint[]) => Promise<boolean[]>;
+  /** Encodes each settlement's `output` (and `events`/`error` under `extended` coverage) like
+   *  {@link saveCheckpoint}. Bound only when the inner store has it. */
+  readonly settleCheckpointsIfPending?: (settlements: StepSettlement[]) => Promise<boolean[]>;
   /** Forwarded verbatim — deletes read no payload. Bound only when the inner store has it, so the
    *  engine's one-`deleteRun`-per-id fallback still applies through the wrapper. */
   readonly deleteRuns?: (runIds: string[]) => Promise<void>;
@@ -177,6 +181,14 @@ export class CodecStateStore implements StateStore {
         saveManyIfPending.call(
           inner,
           cps.map((cp) => this.encCp(cp)),
+        );
+    }
+    const settleIfPending = inner.settleCheckpointsIfPending;
+    if (settleIfPending) {
+      this.settleCheckpointsIfPending = (settlements) =>
+        settleIfPending.call(
+          inner,
+          settlements.map((s) => this.encSettlement(s)),
         );
     }
     const getRuns = inner.getRuns;
@@ -302,6 +314,18 @@ export class CodecStateStore implements StateStore {
       if (cp.error !== undefined) next.error = this.enc(cp.error) as StepCheckpoint['error'];
       if (cp.heartbeatProgress !== undefined) {
         next.heartbeatProgress = this.enc(cp.heartbeatProgress);
+      }
+    }
+    return next;
+  }
+  private encSettlement(settlement: StepSettlement): StepSettlement {
+    const next: StepSettlement = { ...settlement, output: this.enc(settlement.output) };
+    if (this.extended) {
+      if (settlement.events !== undefined) {
+        next.events = this.enc(settlement.events) as StepSettlement['events'];
+      }
+      if (settlement.error !== undefined) {
+        next.error = this.enc(settlement.error) as StepSettlement['error'];
       }
     }
     return next;

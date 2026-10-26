@@ -163,7 +163,7 @@ A [worker runtime](/docs/durable/cluster/thin-workers) that stops cleanly remove
 
 Every transport carries the same JSON `RemoteTask` (dispatch) and `StepResult` (reply). The task also carries an optional `transport` (the pool id it was dispatched on) and an optional `traceparent` (see [distributed tracing](/docs/durable/observability/otel#distributed-tracing-across-workers)). The JSON is the same everywhere, but the wire around it is not: only `bullmq` shares its queue names and job shapes with the NestJS and Python workers. The `queue` and `db` layouts are this package's own.
 
-Several engine instances can share one transport safely: an engine settles a result with a conditional write on the step's checkpoint that succeeds only while it is still `pending` (`saveCheckpointIfPending` on the Lucid store), so a duplicate or redelivered result does nothing, and over one store only one engine's write lands.
+Several engine instances can share one transport safely: an engine settles a result with a conditional write on the step's checkpoint that succeeds only while it is still `pending` (`settleCheckpointsIfPending` on the Lucid store), so a duplicate or redelivered result does nothing, and over one store only one engine's write lands.
 
 <Callout type="info">
 A worker process is the [`durable:work`](/docs/durable/cli) command plus the step handlers it serves (from `app/steps`, discovered automatically). Run one engine-side process, which consumes results, and one or more worker processes.

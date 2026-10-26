@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from '../../src/engine.js';
-import type { StateStore, StepCheckpoint } from '../../src/interfaces.js';
+import type { StateStore, StepCheckpoint, StepSettlement } from '../../src/interfaces.js';
 import { DURABLE_STEP_NAME, type StepRef } from '../../src/step-name-symbol.js';
 import { LucidStateStore } from '../../src/stores/lucid.js';
 import { createDurableTables } from '../../src/stores/lucid-schema.js';
@@ -54,6 +54,12 @@ function counted(store: StateStore, counts: Counts): StateStore {
         return (cps: StepCheckpoint[]) => {
           counts.batches.push(cps.length);
           return value.call(target, cps);
+        };
+      }
+      if (prop === 'settleCheckpointsIfPending') {
+        return (settlements: StepSettlement[]) => {
+          counts.batches.push(settlements.length);
+          return value.call(target, settlements);
         };
       }
       if (prop === 'saveCheckpointIfPending') {
