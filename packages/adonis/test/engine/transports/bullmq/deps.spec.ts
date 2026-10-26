@@ -74,6 +74,23 @@ describe('createBullMQDeps — connection validation', () => {
     });
   });
 
+  it('honours a `url` in the options for every client, not only the queues', async () => {
+    // BullMQ reads `url` itself; ioredis ignores it, so the pub/sub and heartbeat clients used to
+    // reach 127.0.0.1:6379 while the queues used the URL.
+    const deps = await createBullMQDeps({
+      url: 'redis://10.0.0.7:16384/3',
+      lazyConnect: true,
+    });
+    const redis = deps.makeRedis();
+    clients.push(redis);
+    expect((redis as unknown as { options: Record<string, unknown> }).options).toMatchObject({
+      host: '10.0.0.7',
+      port: 16384,
+      db: 3,
+      lazyConnect: true,
+    });
+  });
+
   it('rejects a malformed or non-redis URL instead of falling back', async () => {
     await expect(createBullMQDeps('')).rejects.toThrow(/Redis URL/);
     await expect(createBullMQDeps('http://localhost:6379')).rejects.toThrow(/redis:\/\//);

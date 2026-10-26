@@ -137,12 +137,28 @@ export function redisUrlToOptions(url: string): Record<string, unknown> {
   return options;
 }
 
+/**
+ * Options carrying a `url` (`{ url: 'redis://…', … }`) with the URL read into host, port, credentials,
+ * db and TLS. BullMQ reads `url` itself, but ioredis ignores it, so the pub/sub and heartbeat clients
+ * would otherwise land on ioredis's default 127.0.0.1:6379 while the queues use the URL.
+ */
+function withUrlResolved(connection: unknown): unknown {
+  if (typeof connection !== 'object' || connection === null || 'options' in connection) {
+    return connection;
+  }
+  const { url, ...rest } = connection as { url?: unknown };
+  if (typeof url !== 'string') return connection;
+  return { ...rest, ...redisUrlToOptions(url) };
+}
+
 export async function createBullMQDeps(
   rawConnection: unknown,
   concurrency = 1,
 ): Promise<BullMQDeps> {
   const connection =
-    typeof rawConnection === 'string' ? redisUrlToOptions(rawConnection) : rawConnection;
+    typeof rawConnection === 'string'
+      ? redisUrlToOptions(rawConnection)
+      : withUrlResolved(rawConnection);
   const defaultConcurrency = workerConcurrency(concurrency);
   // Non-literal specifiers: keep `tsc` from resolving 'bullmq'/'ioredis' at build time (they are a
   // runtime-only dependency of the selected transport), so the wider package builds without them.
