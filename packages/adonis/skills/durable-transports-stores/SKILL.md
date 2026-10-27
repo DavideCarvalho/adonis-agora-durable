@@ -195,8 +195,8 @@ export default defineConfig({
       // every tickMs — except before the first back-off, when growth is re-decided after
       // each limit's worth of settled steps instead of waiting for the tick (shrinking and
       // the brakes stay on the tick): doubles while steps saturate the limit at steady
-      // latency until the first back-off, then +√limit a tick, down by the latency gradient
-      // (2 × baseline + 5 ms) / p50 once it drops below 0.7,
+      // latency until the first back-off, then +√limit a tick, down a quarter (at least 1)
+      // when the latency gradient (2 × baseline + 5 ms) / p50 drops below 0.7,
       // -1 on >20% errors / a stall / the CPU ceiling,
       // -20% at ramCeilingPct of the cgroup (else host) memory limit.
       concurrency: { mode: 'adaptive', min: 1, max: 32, start: 1, tickMs: 2000, ramCeilingPct: 85 },
