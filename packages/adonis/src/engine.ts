@@ -49,6 +49,7 @@ import {
   childIdsOf,
   FOLDED_PREFIX,
   fanOfWaiter,
+  parentRunIdOf,
   parseStepFanGroup,
   stepFanGroup,
 } from './fan-join.js';
@@ -2199,8 +2200,7 @@ export class WorkflowEngine {
     await registered.validateInput?.(parsed);
     // Idempotent by run id: a redelivered trigger (at-least-once queues) or a scheduler re-tick for
     // the same id is a no-op, returning the existing run's state instead of starting a duplicate.
-    const prior = await this.store.getRun(runId);
-    if (prior) {
+    const existing = async (prior: WorkflowRun): Promise<RunResult> => {
       // A PENDING prior still needs an executor: re-nudge the dispatcher so a redelivered trigger —
       // or a continuation persisted pre-settle (see the ContinueAsNew handoff) picked up by a custom
       // dispatcher — doesn't sit `pending` until the next poll. Idempotent: execution is leased, so
@@ -2212,6 +2212,14 @@ export class WorkflowEngine {
         });
       }
       return { runId, status: prior.status, output: prior.output, error: prior.error };
+    };
+    // A quota or a singleton can reject a start, and must not reject one for a run that already
+    // exists, so those workflows look the run up first. Any other start goes straight to the insert,
+    // whose duplicate-id rejection finds the existing run below.
+    const admits = registered.singleton || registered.concurrency || opts?.concurrency;
+    if (admits) {
+      const prior = await this.store.getRun(runId);
+      if (prior) return existing(prior);
     }
     // Start-time concurrency quota (per-start override, else the workflow's): reject BEFORE creating
     // anything when the key's in-flight runs already reach the limit. See {@link ConcurrencyQuota}.
@@ -2260,17 +2268,14 @@ export class WorkflowEngine {
     try {
       await this.store.createRun(run);
     } catch (err) {
-      // Lost a true createRun RACE (two pods scheduler-ticking the same window, concurrent
-      // `signalWithStart`s for one entity id): the read-before-create above saw no prior, but the
-      // store's duplicate-id rejection says someone else won the insert in the gap. Converge on the
-      // winner — re-read and report ITS state, exactly like the prior-run branch — instead of
-      // surfacing a unique-constraint error (which would abort a scheduler tick, or worse, lose the
-      // signal half of a signalWithStart). A re-read that finds nothing means the throw was a real
-      // store failure: rethrow it.
+      // The run id exists: a redelivered trigger, or a start that lost the insert to a racing one
+      // (two pods scheduler-ticking the same window, concurrent `signalWithStart`s for one entity id).
+      // Converge on the existing run — re-read and report ITS state, exactly like the prior-run
+      // branch — instead of surfacing a unique-constraint error (which would abort a scheduler tick,
+      // or worse, lose the signal half of a signalWithStart). A re-read that finds nothing means the
+      // throw was a real store failure: rethrow it.
       const winner = await this.store.getRun(runId);
-      if (winner) {
-        return { runId, status: winner.status, output: winner.output, error: winner.error };
-      }
+      if (winner) return existing(winner);
       throw err;
     }
     // The run is durably enqueued; a dispatcher (in-process by default) executes it — `start` does
@@ -4247,6 +4252,8 @@ export class WorkflowEngine {
           await this.deliverSignal(waiter, completion);
           return;
         }
+        // No waiter, and no parent that could consume a buffered copy (a root run): nothing to do.
+        if (parentRunIdOf(token.slice(CHILD_TOKEN_PREFIX.length)) === undefined) return;
         // No waiter: the parent may already have settled this child from its run row (see
         // `markChildDelivered`); a buffered copy would then never be consumed.
         const delivered = async () =>
