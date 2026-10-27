@@ -788,7 +788,7 @@ export class DbTransport implements Transport, ControlPlane {
         );
         return;
       }
-      const startedAt = Date.now();
+      const startedAt = performance.now();
       this.#controller.onStart();
       let ok = false;
       try {
@@ -815,7 +815,7 @@ export class DbTransport implements Transport, ControlPlane {
           );
         }
       } finally {
-        this.#controller.onSettle(Date.now() - startedAt, ok, 'step');
+        this.#controller.onSettle(performance.now() - startedAt, ok, 'step');
       }
     } catch (err) {
       // A database error settling the row: it stays claimed, unrenewed, and is reclaimed after the
@@ -872,7 +872,7 @@ export class DbTransport implements Transport, ControlPlane {
         );
         return;
       }
-      const startedAt = Date.now();
+      const startedAt = performance.now();
       this.#controller.onStart();
       try {
         const decision = await this.#replayTurn(task);
@@ -888,7 +888,7 @@ export class DbTransport implements Transport, ControlPlane {
         }
       } finally {
         // Only step durations feed the latency gradient; a turn still counts as in-flight work.
-        this.#controller.onSettle(Date.now() - startedAt, true, 'workflow');
+        this.#controller.onSettle(performance.now() - startedAt, true, 'workflow');
       }
     } catch (err) {
       this.#onError(err);

@@ -16,6 +16,7 @@ import type {
   SignalWaiter,
   StateStore,
   StepCheckpoint,
+  StepSettlement,
   WorkflowRun,
 } from '../interfaces.js';
 import { namespaceMatches, normalizeNamespace } from '../namespaces.js';
@@ -284,6 +285,17 @@ export class InMemoryStateStore implements StateStore {
     return out;
   }
 
+  async getCheckpointsForSettle(runId: string, seqs: number[]): Promise<StepCheckpoint[]> {
+    const out: StepCheckpoint[] = [];
+    for (const seq of [...new Set(seqs)].sort((a, b) => a - b)) {
+      const cp = this.checkpoints.get(this.key(runId, seq));
+      if (!cp) continue;
+      const { input: _input, ...rest } = cp;
+      out.push(rest);
+    }
+    return out;
+  }
+
   async saveCheckpoint(checkpoint: StepCheckpoint): Promise<void> {
     this.checkpoints.set(this.key(checkpoint.runId, checkpoint.seq), { ...checkpoint });
   }
@@ -306,6 +318,16 @@ export class InMemoryStateStore implements StateStore {
       const key = this.key(checkpoint.runId, checkpoint.seq);
       if (this.checkpoints.get(key)?.status !== 'pending') return false;
       this.checkpoints.set(key, { ...checkpoint });
+      return true;
+    });
+  }
+
+  async settleCheckpointsIfPending(settlements: StepSettlement[]): Promise<boolean[]> {
+    return settlements.map(({ runId, seq, ...settled }) => {
+      const key = this.key(runId, seq);
+      const row = this.checkpoints.get(key);
+      if (row?.status !== 'pending') return false;
+      this.checkpoints.set(key, { ...row, ...settled });
       return true;
     });
   }
@@ -784,6 +806,14 @@ export class InMemoryStateStore implements StateStore {
     this.lastCheckpointRowsRead = rows.length;
     this.checkpointRowsRead += rows.length;
     return rows;
+  }
+
+  async listCheckpointsForReplay(runId: string): Promise<StepCheckpoint[]> {
+    return (await this.listCheckpoints(runId)).map((cp) => {
+      if (cp.status !== 'completed') return cp;
+      const { input: _input, ...rest } = cp;
+      return rest;
+    });
   }
 
   async checkpointStats(

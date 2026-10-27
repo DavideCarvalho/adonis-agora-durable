@@ -66,6 +66,8 @@ A deferred process also stamps no [liveness key](#worker-liveness): a step name'
 - a `redis://` or `rediss://` URL — host (default `127.0.0.1`), port (default `6379`), URL-decoded username and password, the db from the first path segment, and TLS (`tls: {}`) for `rediss:`. Query parameters are refused, and so are other schemes and a db that isn't a non-negative integer, all at boot; pass `ConnectionOptions` for anything else — or
 - an existing ioredis `Redis` instance.
 
+An options object can also carry a `url` (`{ url: 'redis://…', keepAlive: 10_000 }`). The transport reads that URL into host, port, credentials, db and TLS the same way, so the pub/sub, heartbeat and liveness clients reach the same Redis as the queues. A key set beside the `url` wins over the one the URL implies, so `{ url: 'rediss://…', tls: { ca } }` keeps its CA. ioredis on its own ignores `url`.
+
 BullMQ workers need `maxRetriesPerRequest: null`. When you pass an options object, the transport sets that for its worker connections. A `Redis` instance you pass in is used as-is, so configure it yourself. Pub/sub, heartbeat and liveness clients are `duplicate()`s of a passed instance, or fresh clients with a 10s keep-alive.
 
 A missing or empty `connection` throws at boot. Without that check, ioredis would silently connect to its own default, `127.0.0.1:6379`, instead of your Redis.
@@ -82,15 +84,17 @@ Unlike `stores.lucid({ connection })` or `controlPlanes.redis({ connection })`, 
 - **`'adaptive'`** lets an `AdaptiveController` move the limit at runtime, using the defaults below.
 - **`{ mode: 'adaptive', ... }`** is adaptive mode with overrides.
 
-Every `tickMs`, an adaptive worker compares the steps' median latency with their no-queuing baseline, and checks the memory and CPU it is using. Then it moves the limit:
+Every `tickMs`, an adaptive worker compares the steps' median latency (p50) with their no-queuing baseline, and checks the memory and CPU it is using. The baseline tracks the fastest step of the window, and p50 always sits above it, so the latency gradient allows for that: it is `(2 × baseline + 5 ms) / p50`, capped at 1. A step of 1–2 ms that sometimes takes 5 ms reads as noise, not as queuing. The first matching signal moves the limit:
 
 | Signal | Move |
 | --- | --- |
 | RSS at or above `ramCeilingPct` of the memory limit (cgroup v2, then cgroup v1, then host total) | down 20% |
 | CPU at or above `cpuCeilingPct` | down 1 |
 | more than 20% of recent steps failed, or work in flight with no completion for two ticks | down 1 |
-| median latency above 1/0.7 of the baseline (steps are queuing) | down by that ratio |
-| median latency within 1/0.9 of the baseline while in-flight work fills at least 80% of the limit | up 1 |
+| gradient below 0.7 (steps are queuing) | multiplied by the gradient, rounded down |
+| gradient at or above 0.9 while in-flight work fills at least 80% of the limit | up: doubles until the first move down, then `+⌊√limit⌋` |
+
+Until the limit first moves down, growth works like slow start: the worker re-decides it after each limit's worth of settled steps instead of waiting for the next tick, so a worker of fast steps reaches its working limit within milliseconds rather than after many ticks. Only growth is decided early; every move down waits for the tick. Once the limit has moved down, growth happens on the tick, by `⌊√limit⌋` (at least 1).
 
 ```ts title="config/durable.ts"
 bullmq: transports.bullmq({

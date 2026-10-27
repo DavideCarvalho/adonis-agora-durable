@@ -5,6 +5,7 @@ import type {
   StateStore,
   StepCheckpoint,
   StepResult,
+  StepSettlement,
   Transport,
   WorkflowRun,
 } from '../../src/interfaces.js';
@@ -101,13 +102,20 @@ describe('a step fan barrier', () => {
       this.open = resolve;
     });
     failReads = new Set<number>();
-    override async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
-      await this.gate;
-      return super.saveCheckpointsIfPending(checkpoints);
+    override async settleCheckpointsIfPending(settlements: StepSettlement[]): Promise<boolean[]> {
+      if (settlements.length > 1) await this.gate;
+      return super.settleCheckpointsIfPending(settlements);
     }
     override async getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null> {
       if (this.failReads.delete(seq)) throw new Error('connection lost');
       return super.getCheckpoint(runId, seq);
+    }
+    override async getCheckpointsForSettle(
+      runId: string,
+      seqs: number[],
+    ): Promise<StepCheckpoint[]> {
+      if (seqs.some((seq) => this.failReads.delete(seq))) throw new Error('connection lost');
+      return super.getCheckpointsForSettle(runId, seqs);
     }
   }
 

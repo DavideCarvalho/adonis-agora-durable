@@ -695,7 +695,9 @@ export class QueueTransport implements Transport, ControlPlane {
     const byQueue = new Map<string, RemoteTask[]>();
     for (const task of tasks) {
       const queue = this.#tasksQueue(task.group);
-      byQueue.set(queue, [...(byQueue.get(queue) ?? []), task]);
+      const queued = byQueue.get(queue);
+      if (queued) queued.push(task);
+      else byQueue.set(queue, [task]);
     }
     for (const [queue, queued] of byQueue) {
       for (let at = 0; at < queued.length; at += RUN_PUSH_CHUNK) {
@@ -746,7 +748,7 @@ export class QueueTransport implements Transport, ControlPlane {
         queue,
         async (job) => {
           const payload = fromJson<unknown>(job.payload);
-          const startedAt = Date.now();
+          const startedAt = performance.now();
           controller.onStart();
           // Only step durations feed the latency gradient; a workflow turn still counts as in-flight
           // work and as forward progress for stall detection (as on bullmq).
@@ -754,7 +756,7 @@ export class QueueTransport implements Transport, ControlPlane {
             try {
               await this.#runWorkflowTask(payload);
             } finally {
-              controller.onSettle(Date.now() - startedAt, true, 'workflow');
+              controller.onSettle(performance.now() - startedAt, true, 'workflow');
             }
             return;
           }
@@ -767,7 +769,7 @@ export class QueueTransport implements Transport, ControlPlane {
             await this.#adapter.pushOn(this.#resultsQueue(), this.#job('result', result));
             ok = result.status === 'completed';
           } finally {
-            controller.onSettle(Date.now() - startedAt, ok, 'step');
+            controller.onSettle(performance.now() - startedAt, ok, 'step');
           }
         },
         {

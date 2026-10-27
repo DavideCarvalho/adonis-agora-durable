@@ -6,6 +6,7 @@ import type {
   StateStore,
   StepCheckpoint,
   StepResult,
+  StepSettlement,
   Transport,
 } from '../../src/interfaces.js';
 import { DURABLE_STEP_NAME, type StepRef } from '../../src/step-name-symbol.js';
@@ -15,7 +16,7 @@ import { dbBackends } from '../support/backends.js';
 
 /**
  * A run's step results that land together (a results consumer with `resultConcurrency > 1`, a wide
- * fan) are settled in batches: one `saveCheckpointsIfPending` per batch, the fan's barrier asked once,
+ * fan) are settled in batches: one `settleCheckpointsIfPending` per batch, the fan's barrier asked once,
  * and one resume — instead of a conditional UPDATE, a barrier count and a replay per result. What
  * must not change: each step settles once, a duplicate is dropped, a failure still wakes the run, and
  * a result resolves only after its own write committed.
@@ -50,7 +51,15 @@ function instrument(store: StateStore) {
   const calls = { batch: [] as number[], single: 0 };
   const batch = store.saveCheckpointsIfPending?.bind(store);
   const single = store.saveCheckpointIfPending?.bind(store);
+  const settle = store.settleCheckpointsIfPending?.bind(store);
   const wrapped = Object.create(store) as StateStore;
+  if (settle) {
+    wrapped.settleCheckpointsIfPending = async (settlements: StepSettlement[]) => {
+      if (settlements.length === 1) calls.single += 1;
+      else calls.batch.push(settlements.length);
+      return settle(settlements);
+    };
+  }
   if (batch) {
     wrapped.saveCheckpointsIfPending = async (cps: StepCheckpoint[]) => {
       calls.batch.push(cps.length);
@@ -163,9 +172,10 @@ describe.each(stores)('batched step results (%s)', (_label, makeStore) => {
 describe('batched step results — fallbacks', () => {
   it('a store without saveCheckpointsIfPending settles each result with its own write', async () => {
     const inner = new InMemoryStateStore();
-    // Shadow the method with `undefined`, as a store that never implemented it.
+    // Shadow the methods with `undefined`, as a store that never implemented them.
     const store = Object.create(inner, {
       saveCheckpointsIfPending: { value: undefined },
+      settleCheckpointsIfPending: { value: undefined },
     }) as StateStore;
     const { store: counted, calls } = instrument(store);
     const { transport } = await fanRun(counted, 8);
@@ -175,9 +185,36 @@ describe('batched step results — fallbacks', () => {
     expect((await inner.getRun('p'))?.output).toEqual(Array.from({ length: 8 }, (_, i) => i * 10));
   });
 
-  it('a rejected batch write is retried row by row, and one bad row fails only its own result', async () => {
+  it('a rejected settle of a batch is retried row by row, and one bad row fails only its own result', async () => {
     const inner = new InMemoryStateStore();
     const store = Object.create(inner) as StateStore;
+    const settle = inner.settleCheckpointsIfPending.bind(inner);
+    let poisoned = true;
+    store.settleCheckpointsIfPending = async (settlements) => {
+      if (settlements.length > 1) throw new Error('batch settle rejected');
+      if (settlements[0]?.seq === 2 && poisoned) {
+        poisoned = false;
+        throw new Error('row 2 rejected');
+      }
+      return settle(settlements);
+    };
+    const { transport } = await fanRun(store, 5);
+    const outcomes = await Promise.allSettled(
+      transport.dispatched.map((task) => transport.result?.(result(task))),
+    );
+    const rejected = outcomes.flatMap((o, i) => (o.status === 'rejected' ? [i] : []));
+    expect(rejected).toEqual([2]);
+    expect((await inner.getCheckpoint('p', 2))?.status).toBe('pending');
+    await transport.result?.(result(transport.dispatched[2] as RemoteTask));
+    await until(async () => (await inner.getRun('p'))?.status === 'completed');
+    expect((await inner.getRun('p'))?.output).toEqual([0, 10, 20, 30, 40]);
+  });
+
+  it('a rejected batch write is retried row by row, and one bad row fails only its own result', async () => {
+    const inner = new InMemoryStateStore();
+    const store = Object.create(inner, {
+      settleCheckpointsIfPending: { value: undefined },
+    }) as StateStore;
     store.saveCheckpointsIfPending = async () => {
       throw new Error('batch write rejected');
     };

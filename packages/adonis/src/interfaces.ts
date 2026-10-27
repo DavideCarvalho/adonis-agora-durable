@@ -205,6 +205,21 @@ export interface StepCheckpoint {
 }
 
 /**
+ * What a worker's result changes on its step's checkpoint (see
+ * {@link StateStore.settleCheckpointsIfPending}): every other column of the row stays as stored.
+ */
+export interface StepSettlement {
+  runId: string;
+  seq: number;
+  status: 'completed' | 'failed';
+  output?: unknown;
+  error?: StepError | undefined;
+  events?: StepEvent[] | undefined;
+  startedAt: Date;
+  finishedAt: Date;
+}
+
+/**
  * A structured event a step (or its worker) emits while running — a log line and/or a sub-step
  * outcome. The dashboard renders these under the step, so you can see what happened inside a step
  * that the workflow treats as one unit (e.g. which of N parallel sub-processes ok/failed/skipped).
@@ -430,6 +445,16 @@ export interface StateStore {
    */
   getCheckpoints?(runId: string, seqs: number[]): Promise<StepCheckpoint[]>;
   /**
+   * {@link getCheckpoints} as a step result's settle reads them: the same rows, each without its
+   * `input` (left out of the read, not dropped after it). A settle needs the row's status, name,
+   * group, queue and timings, never what the step was called with, and the step being settled is the
+   * one whose input is still fresh: an LLM step's prompt was otherwise read back on every result.
+   * The engine reads through it only when the store also has {@link settleCheckpointsIfPending},
+   * since the whole-row write it falls back to needs the input. Optional: without it,
+   * {@link getCheckpoints} (or {@link getCheckpoint} per result).
+   */
+  getCheckpointsForSettle?(runId: string, seqs: number[]): Promise<StepCheckpoint[]>;
+  /**
    * Persist a checkpoint and advance the run atomically. Durable semantics depend on this
    * being a single transaction; stores without transactions cannot give the strong guarantee.
    */
@@ -462,6 +487,19 @@ export interface StateStore {
    * Optional: a store that omits it gets one {@link saveCheckpointIfPending} per entry.
    */
   saveCheckpointsIfPending?(checkpoints: StepCheckpoint[]): Promise<boolean[]>;
+  /**
+   * Settle step results onto their checkpoints: per entry and in input order, while the row at
+   * `(runId, seq)` is still `pending`, write the entry's `status`, `output`, `error`, `events`,
+   * `startedAt` and `finishedAt` (an absent value is written as absent) and leave every other column
+   * as stored; resolves whether each entry wrote. Same claim as {@link saveCheckpointsIfPending}: a
+   * later entry for a row an earlier one settled loses, and a rejection writes nothing. The engine
+   * settles worker results through it, so a step's `input` (an LLM step carries its whole prompt)
+   * is written once, when the step is dispatched, not again when its result lands.
+   *
+   * Optional: a store that omits it gets the whole row rewritten through
+   * {@link saveCheckpointsIfPending} / {@link saveCheckpointIfPending}.
+   */
+  settleCheckpointsIfPending?(settlements: StepSettlement[]): Promise<boolean[]>;
 
   /**
    * Used by recovery on boot to find runs to resume (crashed, left `running`). When `namespace` is
@@ -728,6 +766,16 @@ export interface StateStore {
   /** Schedules matching `query`, ordered by `nextFireAt` ascending (never-firing last), then `id`. */
   listSchedules?(query: ScheduleQuery): Promise<ScheduleRecord[]>;
   listCheckpoints(runId: string): Promise<StepCheckpoint[]>;
+  /**
+   * {@link listCheckpoints}, except that a `completed` row comes back without its `input`. The
+   * engine reads a run's checkpoints through it at the start of every turn, and replaying a
+   * completed step needs only its output; a `pending`, `running` or `failed` row keeps its `input`,
+   * which a re-dispatch or a retry sends again. The input is left out of the query itself, so it is
+   * never read from the database.
+   *
+   * Optional: a store that omits it gets {@link listCheckpoints}.
+   */
+  listCheckpointsForReplay?(runId: string): Promise<StepCheckpoint[]>;
 
   /**
    * The distinct values of ONE filter axis over the runs matching `query`, with counts — what a

@@ -849,12 +849,20 @@ export function runRunDispatchContract(name: string, factory: RunDispatchTranspo
         // The first batch of results waits until the transport has handed the engine every one, so
         // the rest of the fan is in hand when it lands.
         const writes: number[] = [];
-        const settleBatch = store.saveCheckpointsIfPending?.bind(store);
         let allInHand!: () => void;
         const inHand = new Promise<void>((resolve) => {
           allInHand = resolve;
         });
-        if (settleBatch) {
+        const settle = store.settleCheckpointsIfPending?.bind(store);
+        if (settle) {
+          store.settleCheckpointsIfPending = async (settlements) => {
+            if (writes.length === 0) await inHand;
+            writes.push(settlements.length);
+            return settle(settlements);
+          };
+        }
+        const settleBatch = store.saveCheckpointsIfPending?.bind(store);
+        if (settleBatch && !settle) {
           store.saveCheckpointsIfPending = async (cps) => {
             if (writes.length === 0) await inHand;
             writes.push(cps.length);
@@ -862,7 +870,7 @@ export function runRunDispatchContract(name: string, factory: RunDispatchTranspo
           };
         }
         const settleOne = store.saveCheckpointIfPending?.bind(store);
-        if (settleOne) {
+        if (settleOne && !settle) {
           store.saveCheckpointIfPending = async (cp) => {
             if (cp.runId === 'bulkfan' && cp.status !== 'pending') {
               if (writes.length === 0) await inHand;

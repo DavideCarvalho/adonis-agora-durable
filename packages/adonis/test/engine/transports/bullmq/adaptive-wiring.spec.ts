@@ -152,15 +152,15 @@ describe('BullMQTransport adaptive concurrency', () => {
     const pending = [0, 1, 2, 3].map((seq) => slow.process(stepJob('slow', seq)));
 
     vi.advanceTimersByTime(100);
-    expect([fast.concurrency, slow.concurrency]).toEqual([5, 5]);
+    expect([fast.concurrency, slow.concurrency]).toEqual([8, 8]);
 
     // A token registered after the move joins at the live limit, and its first beat carries it.
     transport.handle('late', async () => 'ok');
-    expect(broker.workers.get('durable-tasks-late')?.concurrency).toBe(5);
+    expect(broker.workers.get('durable-tasks-late')?.concurrency).toBe(8);
     const status = heartbeatStatus(broker, 'late');
-    expect(status.concurrency).toEqual({ mode: 'adaptive', limit: 5, min: 1, max: 10 });
+    expect(status.concurrency).toEqual({ mode: 'adaptive', limit: 8, min: 1, max: 10 });
     expect(status.inFlight).toBe(4);
-    expect(status.lastAdjust).toMatchObject({ from: 4, to: 5, reason: 'grow' });
+    expect(status.lastAdjust).toMatchObject({ from: 4, to: 8, reason: 'grow' });
 
     for (const r of release) r();
     await Promise.all(pending);

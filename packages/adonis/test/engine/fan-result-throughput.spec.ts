@@ -31,6 +31,7 @@ const RESULT_PATH = [
   'getRun',
   'saveCheckpointsIfPending',
   'saveCheckpointIfPending',
+  'settleCheckpointsIfPending',
   'countCheckpoints',
   'listCheckpoints',
 ];
@@ -119,6 +120,9 @@ function counted(inner: StateStore, counts: Counts): StateStore {
         counts.calls.set(name, (counts.calls.get(name) ?? 0) + 1);
         if (name === 'saveCheckpointsIfPending') counts.batches.push((args[0] as unknown[]).length);
         if (name === 'saveCheckpointIfPending') counts.batches.push(1);
+        if (name === 'settleCheckpointsIfPending') {
+          counts.batches.push((args[0] as unknown[]).length);
+        }
         // A round-trip: the call answers on a later turn of the event loop, as a database does.
         return new Promise((r) => setImmediate(r)).then(() => value.apply(target, args));
       };

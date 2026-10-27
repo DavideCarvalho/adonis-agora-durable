@@ -91,6 +91,7 @@ import type {
   StepInvocation,
   StepKind,
   StepResult,
+  StepSettlement,
   TerminalRunStatus,
   Transport,
   UpdateResult,
@@ -1034,6 +1035,14 @@ export class WorkflowEngine {
   private readonly turnSettledFans = new Map<string, Map<number, number>>();
   /** The kept wake reasons each executing turn on this instance serves (see {@link execute}). */
   private readonly turnServedWakes = new Map<string, Set<string>>();
+  /**
+   * `<runId>:<seq>` of the steps (not of a step fan) whose result this instance settled and whose
+   * run it then resumed, with when, kept for a lease. That resume runs a turn after any this instance
+   * is executing, or asks the lease holder for one, so the re-check after an in-process turn
+   * ({@link recheckWaitSeqs}) has no wake to recover for such a step: resuming again would only
+   * replay the run once more.
+   */
+  private readonly settledHere = new Map<string, number>();
   /** {@link sweepBufferedSignals}: the id the pass in progress resumes after, `undefined` between passes. */
   private bufferedSweepCursor: string | undefined;
   private bufferedSweepActive = false;
@@ -1190,6 +1199,7 @@ export class WorkflowEngine {
     });
     this.pool.bind(
       async (result) => {
+        this.heartbeatWrites.delete(result.stepId);
         // In-memory path (a `timeoutMs` step awaiting on THIS instance): resolve its pending promise.
         const waiter = this.pending.get(result.stepId);
         if (waiter) {
@@ -1905,9 +1915,40 @@ export class WorkflowEngine {
       return;
     if (this.heartbeatPersists.size > 1024) this.heartbeatPersists.clear();
     this.heartbeatPersists.set(id, { at: now, hadProgress: beat.progress !== undefined });
-    void this.store
-      .recordStepHeartbeat(beat.runId, beat.seq, new Date(beat.at ?? now), beat.progress)
-      .catch(() => undefined);
+    this.heartbeatWrites.set(id, {
+      runId: beat.runId,
+      seq: beat.seq,
+      at: new Date(beat.at ?? now),
+      progress: beat.progress,
+    });
+    if (!this.heartbeatWriter) {
+      this.heartbeatWriter = this.writeHeartbeats().finally(() => {
+        this.heartbeatWriter = undefined;
+      });
+      this.trackEffect(this.heartbeatWriter);
+    }
+  }
+
+  /** Beats {@link persistHeartbeat} let through and {@link writeHeartbeats} has not written yet, by
+   *  stepId: a newer beat of the same step replaces the queued one, a step's result drops it. */
+  private readonly heartbeatWrites = new Map<
+    string,
+    { runId: string; seq: number; at: Date; progress: unknown }
+  >();
+  private heartbeatWriter: Promise<void> | undefined;
+
+  /**
+   * Write the queued beats one at a time, oldest first, until none is left. One write in flight keeps
+   * a burst of beats (every step of a wide fan sends one when a worker picks it up) from taking the
+   * store's connections away from the turns and results, and a step that finishes while its beat
+   * waits never has it written: nothing reads a settled step's liveness.
+   */
+  private async writeHeartbeats(): Promise<void> {
+    const record = this.store.recordStepHeartbeat?.bind(this.store);
+    for (const [id, beat] of this.heartbeatWrites) {
+      this.heartbeatWrites.delete(id);
+      await record?.(beat.runId, beat.seq, beat.at, beat.progress).catch(() => undefined);
+    }
   }
 
   /**
@@ -2960,14 +3001,19 @@ export class WorkflowEngine {
    * delivery's own resume no-oped against this turn's still-held lease (see the WorkflowSuspended
    * catch in runExecution). Deferred one macrotask so the caller's `finally` releases the lease
    * first; tracked so `drain()` waits for the re-driven turn's writes.
+   *
+   * With `settledHereResumes`, a step in {@link settledHere} needs no re-drive: the turn that
+   * suspended on it read its snapshot before the settle, so the settle's resume queued behind that
+   * turn or asked the lease holder for one. A remote workflow's decision is applied after the turn
+   * that computed it ended, so the settle's resume may already have run, and it passes `false`.
    */
-  private recheckWaitSeqs(runId: string, seqs: number[]): void {
+  private recheckWaitSeqs(runId: string, seqs: number[], settledHereResumes = false): void {
     this.trackEffect(
       (async () => {
         await new Promise((r) => setTimeout(r, 0));
         for (const seq of seqs) {
-          const cp = await this.store.getCheckpoint(runId, seq).catch(() => null);
-          if (cp && (cp.status === 'completed' || cp.status === 'failed')) {
+          if (await this.checkpointSettled(runId, seq).catch(() => false)) {
+            if (settledHereResumes && this.settledHere.has(`${runId}:${seq}`)) return;
             await this.resumeImplicit(runId).catch(() => undefined);
             return;
           }
@@ -2998,6 +3044,15 @@ export class WorkflowEngine {
   }
 
   /** {@link StateStore.countCheckpoints} of `pending` steps, or a JS count on a store without it. */
+  /** Whether the checkpoint at `seq` is settled: a `COUNT` when the store has one, else the row. */
+  private async checkpointSettled(runId: string, seq: number): Promise<boolean> {
+    if (this.store.countCheckpoints) {
+      return (await this.store.countCheckpoints(runId, seq, seq, ['completed', 'failed'])) > 0;
+    }
+    const cp = await this.store.getCheckpoint(runId, seq);
+    return cp?.status === 'completed' || cp?.status === 'failed';
+  }
+
   private async countPendingSteps(runId: string, from: number, to: number): Promise<number> {
     if (this.store.countCheckpoints) {
       return this.store.countCheckpoints(runId, from, to, ['pending']);
@@ -5346,7 +5401,7 @@ export class WorkflowEngine {
     );
     if (routePlan?.status === 'blocked') return this.parkBlocked(run, routePlan);
 
-    const checkpoints = await this.store.listCheckpoints(run.id);
+    const checkpoints = await this.replayCheckpoints(run.id);
     const handoff = liveHandoff(run.id, checkpoints);
     if (handoff) {
       // A run that handed its failure to an onError handler only follows the handler from here on.
@@ -5936,6 +5991,40 @@ export class WorkflowEngine {
   private readonly stepLeaseRearms = new Map<string, number>();
 
   /**
+   * {@link stepLeaseRearms} for the steps of a fan this instance sent, by run: one entry per sent
+   * block of consecutive seqs instead of one per step, since they share the lease stamped at send.
+   */
+  private readonly fanLeaseRearms = new Map<
+    string,
+    Array<{ from: number; to: number; lookAgainAt: number }>
+  >();
+
+  private noteFanLease(runId: string, seqs: number[], lease: number): void {
+    if (this.remoteRedispatchMs == null || seqs.length === 0) return;
+    let from = seqs[0] as number;
+    let to = from;
+    for (const seq of seqs) {
+      if (seq < from) from = seq;
+      if (seq > to) to = seq;
+    }
+    // A gap would cover steps sent earlier, under an older lease.
+    if (to - from + 1 !== seqs.length) return;
+    if (this.fanLeaseRearms.size > 1024) this.fanLeaseRearms.clear();
+    const blocks = this.fanLeaseRearms.get(runId) ?? [];
+    blocks.push({ from, to, lookAgainAt: lease - Math.ceil(this.remoteRedispatchMs / 2) });
+    this.fanLeaseRearms.set(runId, blocks);
+  }
+
+  private fanLeaseLookAgainAt(runId: string, seq: number, now: number): number | undefined {
+    const blocks = this.fanLeaseRearms.get(runId);
+    if (!blocks) return undefined;
+    const live = blocks.filter((b) => now < b.lookAgainAt);
+    if (live.length === 0) this.fanLeaseRearms.delete(runId);
+    else if (live.length < blocks.length) this.fanLeaseRearms.set(runId, live);
+    return live.find((b) => seq >= b.from && seq <= b.to)?.lookAgainAt;
+  }
+
+  /**
    * A step-scoped heartbeat for a durably-suspended remote step: push its LEASE forward so a worker
    * that is still working on it is never presumed dead and double-dispatched. The durable counterpart
    * of the in-memory `heartbeatResets` rearm (which only exists on the instance that dispatched a
@@ -5979,7 +6068,7 @@ export class WorkflowEngine {
     if (this.remoteRedispatchMs == null) return;
     const id = stepId(runId, seq);
     const now = this.clock();
-    const lookAgainAt = this.stepLeaseRearms.get(id);
+    const lookAgainAt = this.stepLeaseRearms.get(id) ?? this.fanLeaseLookAgainAt(runId, seq, now);
     if (lookAgainAt !== undefined && now < lookAgainAt) return;
     const cp = await this.store.getCheckpoint(runId, seq);
     if (cp?.kind !== 'remote' || cp.status !== 'pending') {
@@ -6412,7 +6501,7 @@ export class WorkflowEngine {
     // Read once at execution start: a checkpoint written AFTER this snapshot (the signal/timer/child
     // this resume wakes on, or one written later in this same execution) is absent from the map, and
     // the ctx falls back to the live store for any absent seq — so replay semantics are unchanged.
-    const snapshot = await this.store.listCheckpoints(run.id);
+    const snapshot = await this.replayCheckpoints(run.id);
     const replay = new Map<number, StepCheckpoint>();
     for (const cp of snapshot) replay.set(cp.seq, cp);
     let suspendedOnFan: FanJoin | undefined;
@@ -6507,7 +6596,7 @@ export class WorkflowEngine {
         // all with reconcileMs: 0). Re-check the seqs this suspension waits on and re-drive if one
         // already settled.
         if (settled.status === 'suspended' && err.waitSeqs?.length) {
-          this.recheckWaitSeqs(run.id, err.waitSeqs);
+          this.recheckWaitSeqs(run.id, err.waitSeqs, true);
         }
         if (settled.status === 'suspended' && err.stepFans?.length) {
           this.recheckStepFans(run.id, err.stepFans);
@@ -7453,7 +7542,20 @@ export class WorkflowEngine {
           ? unsent
           : unsent.slice(0, opts.concurrency);
     if (batch.length > 0) {
-      await this.sendStepFan(runId, positions, step, inputs, batch, group, opts, runNamespace);
+      const lease = await this.sendStepFan(
+        runId,
+        positions,
+        step,
+        inputs,
+        batch,
+        group,
+        opts,
+        runNamespace,
+      );
+      if (lease !== undefined) {
+        const at = this.stepLeaseWakeAt(lease);
+        wakeAt = Math.min(wakeAt ?? at, at);
+      }
     }
 
     if (inFlight + batch.length > 0) {
@@ -7485,7 +7587,8 @@ export class WorkflowEngine {
   /**
    * Write the `pending` checkpoints of a step fan's new steps, then dispatch them: one
    * {@link StateStore.saveCheckpoints} call and one {@link TransportPool.dispatchMany} for the batch,
-   * where the store and transport have them.
+   * where the store and transport have them. With the lost-dispatch self-heal on, each step is
+   * written with its lease already stamped, and the lease is returned for the run to park on.
    */
   private async sendStepFan<TInput, TOutput>(
     runId: string,
@@ -7499,7 +7602,7 @@ export class WorkflowEngine {
       admission?: { priority?: number | undefined; fairnessKey?: string | undefined };
     },
     runNamespace?: string | undefined,
-  ): Promise<void> {
+  ): Promise<number | undefined> {
     const token = stepGroup(step, runNamespace);
     await this.ensureRoutable(token, step.requires);
     const input = (i: number): unknown | Promise<unknown> =>
@@ -7509,6 +7612,8 @@ export class WorkflowEngine {
     const validInputs = new Map<number, unknown>();
     for (const i of batch) validInputs.set(i, await input(i));
     const enqueuedAt = new Date();
+    const lease =
+      this.remoteRedispatchMs == null ? undefined : this.clock() + this.remoteRedispatchMs;
     const checkpoints = batch.map((i): StepCheckpoint => {
       const seq = positions[i] as number;
       return {
@@ -7525,6 +7630,7 @@ export class WorkflowEngine {
         enqueuedAt,
         startedAt: enqueuedAt,
         finishedAt: enqueuedAt,
+        ...(lease !== undefined ? { wakeAt: lease } : {}),
       };
     });
     if (this.store.saveCheckpoints) {
@@ -7556,6 +7662,14 @@ export class WorkflowEngine {
     for (const cp of checkpoints) {
       this.emit({ type: 'step.started', runId, seq: cp.seq, name: step.name, kind: 'remote' });
     }
+    if (lease !== undefined) {
+      this.noteFanLease(
+        runId,
+        checkpoints.map((cp) => cp.seq),
+        lease,
+      );
+    }
+    return lease;
   }
 
   /**
@@ -7589,6 +7703,14 @@ export class WorkflowEngine {
       },
       task.transport,
     );
+  }
+
+  /** A turn's read of its run's checkpoints: {@link StateStore.listCheckpointsForReplay}, or every
+   *  column through {@link StateStore.listCheckpoints} on a store without it. */
+  private replayCheckpoints(runId: string): Promise<StepCheckpoint[]> {
+    return this.store.listCheckpointsForReplay
+      ? this.store.listCheckpointsForReplay(runId)
+      : this.store.listCheckpoints(runId);
   }
 
   /**
@@ -7677,7 +7799,26 @@ export class WorkflowEngine {
     const cp = await this.settleRemoteCheckpoint(result);
     if (cp === undefined) return;
     if (await this.stepFanStillRunning(cp, result, queuedIn)) return;
+    if (!parseStepFanGroup(cp.parallelGroup)) this.noteSettledHere(result.runId, [cp.seq]);
     this.resumeInBackground(result.runId, fanWakeOf(cp, result));
+  }
+
+  /**
+   * Record `seqs` of `runId` in {@link settledHere}, dropping the entries older than a lease. A key is
+   * re-inserted at the end, so the map stays in the order its keys were noted and pruning stops at
+   * the first fresh entry.
+   */
+  private noteSettledHere(runId: string, seqs: number[]): void {
+    const now = this.clock();
+    for (const seq of seqs) {
+      const key = `${runId}:${seq}`;
+      this.settledHere.delete(key);
+      this.settledHere.set(key, now);
+    }
+    for (const [key, at] of this.settledHere) {
+      if (now - at <= this.leaseMs) break;
+      this.settledHere.delete(key);
+    }
   }
 
   private resumeInBackground(runId: string, fan?: FanWake): void {
@@ -7752,20 +7893,13 @@ export class WorkflowEngine {
       else resumable.push({ cp: read.value, result });
     });
     const finishedAt = new Date();
-    const writes = pending.map(({ index, cp }) => {
-      const result = results[index] as StepResult;
-      return {
-        ...cp,
-        status: result.status,
-        output: result.status === 'completed' ? result.output : cp.output,
-        error: result.error,
-        events: result.events ?? cp.events,
-        startedAt: result.startedAt ? new Date(result.startedAt) : cp.startedAt,
-        finishedAt,
-      };
-    });
     // Claimed, not blindly written: a duplicate delivery may have settled a step first.
-    const claims = await this.savePendingCheckpoints(writes);
+    const claims = await this.settlePendingCheckpoints(
+      pending.map(({ index, cp }) => ({
+        cp,
+        settlement: settlementOf(cp, results[index] as StepResult, finishedAt),
+      })),
+    );
     for (const [k, claim] of claims.entries()) {
       const { index, cp } = pending[k] as { index: number; cp: StepCheckpoint };
       const result = results[index] as StepResult;
@@ -7809,9 +7943,14 @@ export class WorkflowEngine {
       const fan = parseStepFanGroup(cp.parallelGroup);
       if (fan) highest.set(fan.firstSeq, Math.max(highest.get(fan.firstSeq) ?? cp.seq, cp.seq));
     }
+    // The one resume below replays every step of the batch.
+    const singles = resumable
+      .filter(({ cp }) => !parseStepFanGroup(cp.parallelGroup))
+      .map(({ cp }) => cp.seq);
     for (const { cp, result } of resumable) {
       const fan = parseStepFanGroup(cp.parallelGroup);
       if (!fan || result.status === 'failed') {
+        this.noteSettledHere(runId, singles);
         this.resumeInBackground(runId);
         return outcomes;
       }
@@ -7827,6 +7966,7 @@ export class WorkflowEngine {
         barriers.set(fan.firstSeq, closed);
       }
       if (!(await closed)) {
+        this.noteSettledHere(runId, singles);
         this.resumeInBackground(runId, {
           first: fan.firstSeq,
           seq: highest.get(fan.firstSeq) ?? cp.seq,
@@ -7835,6 +7975,34 @@ export class WorkflowEngine {
       }
     }
     return outcomes;
+  }
+
+  /**
+   * Settle pending steps, each only while its row is still `pending`; per entry, whether it wrote
+   * or the error that kept it from writing. Through {@link StateStore.settleCheckpointsIfPending}
+   * when the store has it: one call, or one per entry when that call rejects (it then wrote
+   * nothing). Else each step's whole row is written through {@link savePendingCheckpoints}.
+   */
+  private async settlePendingCheckpoints(
+    entries: Array<{ cp: StepCheckpoint; settlement: StepSettlement }>,
+  ): Promise<Array<boolean | { error: unknown }>> {
+    const settle = this.store.settleCheckpointsIfPending?.bind(this.store);
+    if (!settle) {
+      return this.savePendingCheckpoints(
+        entries.map(({ cp, settlement }) => ({ ...cp, ...settlement })),
+      );
+    }
+    const settlements = entries.map((e) => e.settlement);
+    try {
+      const wrote = await settle(settlements);
+      return settlements.map((_, i) => wrote[i] === true);
+    } catch (error) {
+      if (settlements.length === 1) return [{ error }];
+    }
+    const settled = await Promise.allSettled(settlements.map((s) => settle([s])));
+    return settled.map((r) =>
+      r.status === 'fulfilled' ? r.value[0] === true : { error: r.reason },
+    );
   }
 
   /**
@@ -7881,6 +8049,19 @@ export class WorkflowEngine {
   }
 
   /**
+   * {@link StateStore.getCheckpointsForSettle}, when the store can use what it leaves out: only
+   * with {@link StateStore.settleCheckpointsIfPending}, since a settle without it (and the salvage
+   * of a late success onto a failed run) writes back the whole row it read.
+   */
+  private settleReader():
+    | ((runId: string, seqs: number[]) => Promise<StepCheckpoint[]>)
+    | undefined {
+    return this.store.settleCheckpointsIfPending
+      ? this.store.getCheckpointsForSettle?.bind(this.store)
+      : undefined;
+  }
+
+  /**
    * The checkpoints of one run at `seqs`, each as its own outcome: one
    * {@link StateStore.getCheckpoints} call when the store has it, else one read each. The batch
    * call rejecting falls back to one read each, so a failing read fails only its own entry.
@@ -7889,6 +8070,20 @@ export class WorkflowEngine {
     runId: string,
     seqs: number[],
   ): Promise<PromiseSettledResult<StepCheckpoint | null>[]> {
+    const forSettle = this.settleReader();
+    if (forSettle) {
+      if (seqs.length > 1) {
+        try {
+          const bySeq = new Map((await forSettle(runId, seqs)).map((cp) => [cp.seq, cp]));
+          return seqs.map((seq) => ({ status: 'fulfilled', value: bySeq.get(seq) ?? null }));
+        } catch {
+          // Fall through: one by one.
+        }
+      }
+      return Promise.allSettled(
+        seqs.map(async (seq) => (await forSettle(runId, [seq]))[0] ?? null),
+      );
+    }
     if (seqs.length > 1 && this.store.getCheckpoints) {
       try {
         const bySeq = new Map(
@@ -7909,7 +8104,10 @@ export class WorkflowEngine {
    * late result for a terminal run — terminal is terminal).
    */
   private async settleRemoteCheckpoint(result: StepResult): Promise<StepCheckpoint | undefined> {
-    const cp = await this.store.getCheckpoint(result.runId, result.seq);
+    const forSettle = this.settleReader();
+    const cp = forSettle
+      ? ((await forSettle(result.runId, [result.seq]))[0] ?? null)
+      : await this.store.getCheckpoint(result.runId, result.seq);
     if (!cp) return undefined;
     const run = await this.store.getRun(result.runId);
     const terminal =
@@ -7951,31 +8149,23 @@ export class WorkflowEngine {
     if (run && (run.status === 'failed' || run.status === 'dead')) {
       await this.releaseQueueSlot(cp);
       if (result.status === 'completed') {
-        await this.store.saveCheckpoint({
-          ...cp,
-          status: 'completed',
-          output: result.output,
-          events: result.events ?? cp.events,
-          startedAt: result.startedAt ? new Date(result.startedAt) : cp.startedAt,
-          finishedAt: new Date(),
-        });
+        const salvage = { ...settlementOf(cp, result, new Date()), error: cp.error };
+        if (this.store.settleCheckpointsIfPending) {
+          await this.store.settleCheckpointsIfPending([salvage]);
+        } else {
+          await this.store.saveCheckpoint({ ...cp, ...salvage });
+        }
       }
       return undefined;
     }
     const finishedAt = new Date();
-    const startedAt = result.startedAt ? new Date(result.startedAt) : cp.startedAt;
+    const settlement = settlementOf(cp, result, finishedAt);
+    const startedAt = settlement.startedAt;
     // Claimed, not blindly written: another delivery settled it first, which is the redelivery case
     // above — re-drive the resume rather than settle twice.
-    const claimed = await this.savePendingCheckpoint({
-      ...cp,
-      status: result.status,
-      output: result.status === 'completed' ? result.output : cp.output,
-      error: result.error,
-      events: result.events ?? cp.events,
-      startedAt,
-      finishedAt,
-    });
-    if (!claimed) return terminal ? undefined : cp;
+    const [claim] = await this.settlePendingCheckpoints([{ cp, settlement }]);
+    if (typeof claim === 'object') throw claim.error;
+    if (!claim) return terminal ? undefined : cp;
     await this.releaseQueueSlot(cp);
     this.emit({
       type: result.status === 'completed' ? 'step.completed' : 'step.failed',
@@ -8335,6 +8525,20 @@ export class WorkflowEngine {
  *  the run's namespace (bare for absent/`''`/`default`) — the token a tenant worker serves. */
 function conventionGroup(name: string, namespace: string | undefined): string {
   return tenantGroup(sanitizeQueueToken(name), namespace);
+}
+
+/** What `result` settles onto its step's pending checkpoint `cp`. */
+function settlementOf(cp: StepCheckpoint, result: StepResult, finishedAt: Date): StepSettlement {
+  return {
+    runId: cp.runId,
+    seq: cp.seq,
+    status: result.status,
+    output: result.status === 'completed' ? result.output : cp.output,
+    error: result.error,
+    events: result.events ?? cp.events,
+    startedAt: result.startedAt ? new Date(result.startedAt) : cp.startedAt,
+    finishedAt,
+  };
 }
 
 /** Key of an inline remote turn's liveness reset in `heartbeatResets` (step keys are `runId:seq`). */
