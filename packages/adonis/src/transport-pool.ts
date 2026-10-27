@@ -96,10 +96,12 @@ export class TransportPool {
    *  and its workers may live on any pinned transport). Undefined when no transport implements
    *  `groupHealth` (e.g. a pure in-process transport — nothing to introspect). */
   async groupHealth(group: string): Promise<GroupHealth | undefined> {
-    const reports: GroupHealth[] = [];
-    for (const { transport } of this.transports) {
-      if (transport.groupHealth) reports.push(await transport.groupHealth(group));
-    }
+    // Every transport at once (in pool order, so the merged `liveWorkers` order is unchanged).
+    const reports = await Promise.all(
+      this.transports.flatMap(({ transport }) =>
+        transport.groupHealth ? [transport.groupHealth(group)] : [],
+      ),
+    );
     if (reports.length === 0) return undefined;
     return {
       group,
@@ -110,13 +112,12 @@ export class TransportPool {
 
   /** Distinct worker groups with a live heartbeat, merged across every transport that can report it. */
   async listWorkerGroups(): Promise<string[]> {
-    const groups = new Set<string>();
-    for (const { transport } of this.transports) {
-      if (transport.listWorkerGroups) {
-        for (const g of await transport.listWorkerGroups()) groups.add(g);
-      }
-    }
-    return [...groups];
+    const lists = await Promise.all(
+      this.transports.flatMap(({ transport }) =>
+        transport.listWorkerGroups ? [transport.listWorkerGroups()] : [],
+      ),
+    );
+    return [...new Set(lists.flat())];
   }
 
   /** Whether any transport here can read the fleet's descriptor and heartbeat keyspaces. */

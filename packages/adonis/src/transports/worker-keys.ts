@@ -95,7 +95,9 @@ export const NO_WORKER_KEYS: WorkerKeyStore = {
 /**
  * The live advertisement keys of `store`, reused for `cacheMs` (the engine asks for a token's
  * descriptors before every dispatch, and the fleet changes on the advertisement cadence). `[]` when
- * the store cannot be read, so routing falls back to what it does with no advertisement.
+ * the store cannot be read, so routing falls back to what it does with no advertisement. Calls that
+ * arrive while a read is in flight join it instead of issuing their own, so a burst of concurrent
+ * dashboard polls (or `groupHealth` for every group at once) on an expired cache costs one read.
  */
 export function cachedLiveKeys(
   store: WorkerKeyStore,
@@ -103,15 +105,23 @@ export function cachedLiveKeys(
   now: () => number,
 ): () => Promise<{ key: string; value: string }[]> {
   let read: { at: number; entries: { key: string; value: string }[] } | undefined;
-  return async () => {
+  let inFlight: Promise<{ key: string; value: string }[]> | undefined;
+  return () => {
     const at = now();
-    if (read && at - read.at < cacheMs) return read.entries;
-    try {
-      const entries = await store.live(at);
-      read = { at, entries };
-      return entries;
-    } catch {
-      return [];
-    }
+    if (read && at - read.at < cacheMs) return Promise.resolve(read.entries);
+    if (inFlight) return inFlight;
+    const pending = (async () => {
+      try {
+        const entries = await store.live(at);
+        read = { at, entries };
+        return entries;
+      } catch {
+        return [];
+      } finally {
+        inFlight = undefined;
+      }
+    })();
+    inFlight = pending;
+    return pending;
   };
 }
