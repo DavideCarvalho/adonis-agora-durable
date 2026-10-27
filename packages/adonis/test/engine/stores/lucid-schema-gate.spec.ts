@@ -165,6 +165,31 @@ describe.each(dbBackends())('on $name', ({ name: backend, makeMemoryDb }) => {
       expect(warnings.join('\n')).toContain('durable_step_checkpoints_group_idx');
     });
 
+    it('on Postgres, indexes the signal tokens for prefix scans silently on create, and repairs them', async () => {
+      const db = await fresh();
+      const warnings: string[] = [];
+      const logger = { warn: (m: string) => warnings.push(m) };
+      await createDurableTables(db, undefined, { logger });
+      const names = [
+        'durable_signal_waiters_token_prefix_idx',
+        'durable_buffered_signals_token_prefix_idx',
+      ];
+      if (!isPostgres(db)) {
+        for (const name of names) expect(await hasIndex(db, name)).toBe(false);
+        return;
+      }
+      for (const name of names) expect(await hasIndex(db, name)).toBe(true);
+      expect(await durableDdl(db)).toMatch(
+        /durable_buffered_signals_token_prefix_idx.*varchar_pattern_ops/,
+      );
+      expect(warnings).toEqual([]);
+      for (const name of names) await db.rawQuery(`drop index "${name}"`);
+      await createDurableTables(db, undefined, { force: true, logger });
+      for (const name of names) expect(await hasIndex(db, name)).toBe(true);
+      expect(warnings.join('\n')).toContain('durable_signal_waiters_token_prefix_idx');
+      expect(warnings.join('\n')).toContain('durable_buffered_signals_token_prefix_idx');
+    });
+
     it('pins the DDL to DURABLE_SCHEMA_REVISION', async () => {
       const db = await fresh();
       await createDurableTables(db);
@@ -176,10 +201,10 @@ describe.each(dbBackends())('on $name', ({ name: backend, makeMemoryDb }) => {
       // Knex upgrade changed how SQLite spells the same DDL, update the digest alone.)
       // One digest per backend: the same DDL, spelled by each dialect.
       expect({ revision: DURABLE_SCHEMA_REVISION, digest }).toEqual({
-        revision: 4,
+        revision: 5,
         digest:
           backend === 'postgres'
-            ? '8c982a7021829ae0fa0ca09be6622abed6ba3229b0616ad8370d64355797e4e9'
+            ? '6a86713912e5cd80f9a42d2dab4a1f7f0262e3de50a8669d98cf868e77cd4ad4'
             : '4aae89959954329e70c1c6b03444d0c266c850fab7d7bf9f9926c66887439284',
       });
     });

@@ -17,6 +17,7 @@ import { groupSubProcesses } from '../client/group-subprocesses';
 import { childDetailIds, childFallbackLabel, childRunIdOf, detailsById } from './child-link';
 import { FAN_PROGRESS_SEGMENTS } from './fan-progress-style';
 import { ChildIcon, iconFor } from './icons';
+import { childRunPollInterval } from './run-polling';
 import { stalePendingView } from './stale-liveness';
 
 /** Stable empty list, so a run without summarized fans keeps the node memo's input identity. */
@@ -28,7 +29,11 @@ const NO_FANS: FanSummary[] = [];
 function useChildRuns(timeline: StepCheckpoint[]): Record<string, RunDetail> {
   const ids = useMemo(() => childDetailIds(timeline), [timeline]);
   return useQueries({
-    queries: ids.map((id) => ({ queryKey: ['run', id], queryFn: () => durableClient.run(id) })),
+    queries: ids.map((id) => ({
+      queryKey: ['run', id],
+      queryFn: () => durableClient.run(id),
+      refetchInterval: childRunPollInterval,
+    })),
     combine: detailsById,
   });
 }
@@ -848,6 +853,7 @@ function ChildSpans({
   const { data } = useQuery({
     queryKey: ['run', id],
     queryFn: () => durableClient.run(id),
+    refetchInterval: childRunPollInterval,
   });
   if (depth > 6) return null; // safety cap against pathological nesting
   if (!data)

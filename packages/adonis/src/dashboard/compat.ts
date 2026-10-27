@@ -64,14 +64,22 @@ export async function enumerateLiveFleet(
     return [];
   }
   const groups: FleetGroup[] = [];
+  let tokens: string[];
   try {
-    for (const token of await transport.listWorkerGroups()) {
-      const workers = await transport.listWorkerDescriptors(token);
-      if (workers.length > 0) groups.push({ token, workers });
-    }
+    tokens = await transport.listWorkerGroups();
   } catch {
-    // A backend that can't SCAN/GET the descriptor keyspace degrades to whatever was read so far — the
-    // panel still renders (diagnostics + any partial live view) rather than 500-ing.
+    return groups;
+  }
+  // Every token's descriptors read at once (each is its own SCAN round trip; the panel polls this),
+  // then taken in token order.
+  const listDescriptors = transport.listWorkerDescriptors.bind(transport);
+  const reads = await Promise.allSettled(tokens.map(async (token) => listDescriptors(token)));
+  for (const [i, token] of tokens.entries()) {
+    const read = reads[i];
+    // A backend that can't SCAN/GET the descriptor keyspace degrades to what was read before the
+    // first failure — the panel still renders (diagnostics + any partial live view) rather than 500-ing.
+    if (!read || read.status === 'rejected') break;
+    if (read.value.length > 0) groups.push({ token, workers: read.value });
   }
   return groups;
 }

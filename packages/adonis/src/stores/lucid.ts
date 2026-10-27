@@ -32,7 +32,8 @@ import {
   axisIsRunColumn,
   mergeRunValueFacetRows,
   RUN_VALUE_FACET_LIMIT,
-  scanRunValueFacets,
+  RUN_VALUE_FACET_SCAN,
+  runValueFacetsFromRuns,
 } from '../run-value-facets.js';
 import {
   attributeColumnFor,
@@ -306,12 +307,15 @@ export class LucidStateStore implements StateStore {
       if (locksRows(trx)) {
         // Lock the key's active rows in a stable order (no lock-order deadlock between two claims).
         // A competing claim blocks here until this one commits, then reads the committed holder.
-        rows = (await sharing().orderBy('id', 'asc').forUpdate()) as RunRow[];
+        rows = (await sharing()
+          .select(SINGLETON_ADMISSION_COLUMNS)
+          .orderBy('id', 'asc')
+          .forUpdate()) as RunRow[];
       } else {
         // SQLite has no row locks: take the database write lock FIRST with a no-op write, then read,
         // so no other connection or process can claim between this read and the write below.
         await sharing().update({ workflow });
-        rows = (await sharing()) as RunRow[];
+        rows = (await sharing().select(SINGLETON_ADMISSION_COLUMNS)) as RunRow[];
       }
       const runs = rows.map(rowToRun);
       const tags = singletonAdmissionTags(runs, runId, tag, workflow, limit);
@@ -1122,14 +1126,17 @@ export class LucidStateStore implements StateStore {
     const limit = Math.max(0, opts?.limit ?? RUN_VALUE_FACET_LIMIT);
     if (limit === 0) return [];
     if (!axisIsRunColumn(axis)) {
-      return scanRunValueFacets(this, axis, query, opts);
+      // `scanRunValueFacets`' window (`listRuns` page 1 of `scan`, newest first), reading only the
+      // columns the count looks at instead of every run's payloads.
+      const { limit: scan } = runPageWindow({ page: 1, size: opts?.scan ?? RUN_VALUE_FACET_SCAN });
+      const q = this.scopedRuns(query).select(RUN_VALUE_SCAN_COLUMNS).orderBy('created_at', 'desc');
+      if (scan !== undefined) q.limit(scan);
+      return runValueFacetsFromRuns(((await q) as RunRow[]).map(rowToRun), axis, opts);
     }
     const column = axis.field;
     const needle = opts?.search?.trim().toLowerCase();
-    const sub = this.scopedRuns(query).select('id');
-    const q = this.client()
-      .from(DURABLE_TABLES.runs)
-      .whereIn('id', sub)
+    // One pass over the matching runs (the shape `runFacets` uses), not a self semi-join on `id`.
+    const q = this.scopedRuns(query)
       .select(`${column} as value`)
       .count('* as count')
       .groupBy(column);
@@ -1460,6 +1467,38 @@ const CHILD_WAIT_ROWS = 100;
 
 /** Run ids per `IN (...)` in {@link LucidStateStore.deleteRuns}. */
 const DELETE_RUNS_CHUNK = 500;
+
+/**
+ * The run columns the singleton admission decision reads (id, workflow, status, tags, creation
+ * order) plus the ones `rowToRun` always maps. Read under `FOR UPDATE` for every waiter of the key,
+ * so leaving out the payload columns (`input`/`output`/`error`) saves moving and parsing them.
+ */
+const SINGLETON_ADMISSION_COLUMNS = [
+  'id',
+  'workflow',
+  'workflow_version',
+  'status',
+  'namespace',
+  'tags',
+  'created_at',
+  'updated_at',
+];
+
+/**
+ * The run columns the tag/attribute value pickers read (`tags`, `search_attributes`) plus the ones
+ * `rowToRun` always maps: a picker scans thousands of runs and never looks at their payloads.
+ */
+const RUN_VALUE_SCAN_COLUMNS = [
+  'id',
+  'workflow',
+  'workflow_version',
+  'status',
+  'namespace',
+  'tags',
+  'search_attributes',
+  'created_at',
+  'updated_at',
+];
 
 /**
  * One conditional UPDATE: the `status = 'pending'` predicate is the compare, the affected-row count

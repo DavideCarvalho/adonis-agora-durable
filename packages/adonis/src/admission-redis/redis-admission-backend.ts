@@ -296,10 +296,13 @@ export class RedisAdmissionBackend implements AdmissionBackend {
   }
 
   async release(queue: string, slotId: string): Promise<void> {
-    await this.redis.hdel(this.key(queue, 'slots'), slotId);
     // Tell the fleet a slot freed so blocked waiters can re-contend now (best-effort; the retry tick
-    // is the guarantee). One channel, queue name as payload.
-    await this.redis.publish(this.freedChannel(), queue);
+    // is the guarantee). One channel, queue name as payload. Both commands go out back to back on the
+    // same connection — Redis runs them in that order — so a release costs one round trip, not two.
+    await Promise.all([
+      this.redis.hdel(this.key(queue, 'slots'), slotId),
+      this.redis.publish(this.freedChannel(), queue),
+    ]);
   }
 
   private closing = false;

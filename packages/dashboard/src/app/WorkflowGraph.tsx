@@ -37,6 +37,7 @@ import {
 } from './child-link';
 import { FAN_PROGRESS_SEGMENTS } from './fan-progress-style';
 import { BoltIcon, CheckIcon, ChildIcon, iconFor, KIND_LABEL, XIcon } from './icons';
+import { childRunPollInterval } from './run-polling';
 
 /** Stable empty set so a graph with no `expanded` prop doesn't re-run the layout memo each render. */
 const EMPTY_EXPANDED: Set<string> = new Set();
@@ -87,7 +88,11 @@ function useReachableChildDetails(seed: Set<string>): Record<string, RunDetail> 
     return [...all].sort();
   })();
   return useQueries({
-    queries: ids.map((id) => ({ queryKey: ['run', id], queryFn: () => durableClient.run(id) })),
+    queries: ids.map((id) => ({
+      queryKey: ['run', id],
+      queryFn: () => durableClient.run(id),
+      refetchInterval: childRunPollInterval,
+    })),
     combine: detailsById,
   });
 }

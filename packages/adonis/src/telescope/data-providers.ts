@@ -70,10 +70,34 @@ export function dedupeRunEvents<E extends TelescopeEntryLike>(entries: readonly 
   return out;
 }
 
+/**
+ * Reads of {@link fetchEntries} still in flight, by store and limit. The bundled dashboard resolves
+ * half a dozen widgets at once, each asking for the same (up to 5,000-entry) list: concurrent asks
+ * share one read. Nothing is kept once a read settles, so no answer is ever older than its request.
+ */
+const entriesInFlight = new WeakMap<object, Map<number, Promise<TelescopeEntryLike[]>>>();
+
 /** Fetch captured `agora:durable:*` lifecycle entries from Telescope storage (newest-first), with
- *  cross-pod copies of one event collapsed (see {@link dedupeRunEvents}). */
-async function fetchEntries(ctx: ExtensionContext, limit = 5_000): Promise<TelescopeEntryLike[]> {
-  return dedupeRunEvents(await ctx.store.list({ type: 'diagnostic', tag: 'lib:durable', limit }));
+ *  cross-pod copies of one event collapsed (see {@link dedupeRunEvents}). Callers must not mutate the
+ *  returned array: concurrent callers share it. */
+function fetchEntries(ctx: ExtensionContext, limit = 5_000): Promise<TelescopeEntryLike[]> {
+  const store = ctx.store as object;
+  let byLimit = entriesInFlight.get(store);
+  if (!byLimit) {
+    byLimit = new Map();
+    entriesInFlight.set(store, byLimit);
+  }
+  const pending = byLimit.get(limit);
+  if (pending) return pending;
+  const read = (async () =>
+    dedupeRunEvents(await ctx.store.list({ type: 'diagnostic', tag: 'lib:durable', limit })))();
+  const inFlight = byLimit;
+  inFlight.set(limit, read);
+  const forget = () => {
+    if (inFlight.get(limit) === read) inFlight.delete(limit);
+  };
+  read.then(forget, forget);
+  return read;
 }
 
 const contentOf = (e: TelescopeEntryLike): DurableEntryContent =>

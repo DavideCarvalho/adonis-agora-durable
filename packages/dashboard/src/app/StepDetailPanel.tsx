@@ -5,6 +5,7 @@ import { durableClient } from '../client/durable-client';
 import { groupSubProcesses, type SubProcess } from '../client/group-subprocesses';
 import { childRunIdOf } from './child-link';
 import { BoltIcon, CheckIcon, CopyIcon, iconFor, KIND_LABEL, XIcon } from './icons';
+import { childRunPollInterval } from './run-polling';
 import { RunSpans } from './SpansTimeline';
 
 function fmtMs(ms: number): string {
@@ -294,7 +295,11 @@ function ChildRunInline({
   id: string;
   onOpenRun?: ((id: string) => void) | undefined;
 }) {
-  const { data } = useQuery({ queryKey: ['run', id], queryFn: () => durableClient.run(id) });
+  const { data } = useQuery({
+    queryKey: ['run', id],
+    queryFn: () => durableClient.run(id),
+    refetchInterval: childRunPollInterval,
+  });
   // Local expand state for grandchildren expanded within this nested waterfall.
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const toggle = (childId: string) =>
