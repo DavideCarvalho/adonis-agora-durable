@@ -136,14 +136,16 @@ interface Completion {
 
 // How many recent completions the controller reasons over (latency percentiles + throughput + errors).
 const WINDOW_SIZE = 100;
-// EWMA smoothing for the "no-queuing" baseline (rttLong): low weight so a single fast sample doesn't
-// reset the baseline, but it still tracks a genuine floor shift.
-const RTT_LONG_EWMA_ALPHA = 0.2;
+// The no-queuing baseline is the window's median latency, smoothed: it follows a drop at once and a
+// rise slowly. Latency that stays high because a shared Redis or database is busy becomes the
+// baseline within a few ticks, so a worker of 1 or 2 slots, which cannot be queuing on itself, is not
+// held there by it; a rise past the tolerance before the baseline has caught up still reads as
+// queuing.
+const RTT_LONG_ALPHA_DOWN = 0.5;
+const RTT_LONG_ALPHA_UP = 0.1;
 // How far p50 may rise over the no-queuing baseline before the gradient reads it as queuing: a
-// multiple of the baseline, plus a fixed amount of noise. The baseline is the fastest completion of
-// the window, which p50 always sits above, and a step of a millisecond or two that sometimes takes
-// five says nothing about load. Read as a plain ratio, both shrank a worker of fast steps to one at
-// a time while the pod sat idle.
+// multiple of the baseline, plus a fixed amount of noise, so a step of a millisecond or two that
+// sometimes takes five says nothing about load.
 const LATENCY_TOLERANCE = 2;
 const LATENCY_NOISE_MS = 5;
 // The most one queuing tick takes off the limit: a quarter. The window holds the last 100 steps, a
@@ -220,6 +222,8 @@ export class AdaptiveController {
   private lastAdjust?: WorkerAdjust;
 
   private completionsThisTick = 0;
+  // Steps settled since the last tick: the window holds new evidence only when this is above zero.
+  private stepsThisTick = 0;
   private stallTicks = 0;
   // Set the first time the limit moves down. Until then growth doubles the limit (slow start).
   private backedOff = false;
@@ -299,6 +303,7 @@ export class AdaptiveController {
     // not stalled even when no step settles this tick.
     this.completionsThisTick += 1;
     if (kind === 'step') {
+      this.stepsThisTick += 1;
       this.window.push({ durationMs, ok, at: this.now() });
       if (this.window.length > WINDOW_SIZE) this.window.shift();
       // Slow start: until it first backs off, growth is re-decided after each limit's worth of
@@ -322,7 +327,12 @@ export class AdaptiveController {
   tick(): void {
     if (this.resolved.mode !== 'adaptive' || !this.resolved.adaptive) return;
     this.sampleCpu(this.tickMs);
-    this.refreshRttLong();
+    // A tick with no settled step adds nothing to the window: the latency it holds is the last
+    // burst's, which says nothing about the load now. Read again, it would cut the limit of a worker
+    // that went idle tick after tick, and the next burst would start from what was left.
+    const fresh = this.stepsThisTick > 0;
+    this.stepsThisTick = 0;
+    if (fresh) this.refreshRttLong();
 
     // Stall = in-flight work but no completion this tick, sustained over STALL_TICKS.
     if (this.inFlightCount > 0 && this.completionsThisTick === 0) this.stallTicks += 1;
@@ -330,7 +340,7 @@ export class AdaptiveController {
     const stalled = this.stallTicks >= STALL_TICKS;
     this.completionsThisTick = 0;
 
-    this.decide(this.resolved.adaptive, stalled);
+    this.decide(this.resolved.adaptive, stalled, false, fresh);
   }
 
   private resetCpuBaseline(): void {
@@ -364,12 +374,16 @@ export class AdaptiveController {
 
   private refreshRttLong(): void {
     if (this.window.length === 0) return;
-    let minDuration = this.window[0]?.durationMs ?? 0;
-    for (const c of this.window) if (c.durationMs < minDuration) minDuration = c.durationMs;
-    this.rttLongMs =
-      this.rttLongMs === undefined
-        ? minDuration
-        : RTT_LONG_EWMA_ALPHA * minDuration + (1 - RTT_LONG_EWMA_ALPHA) * this.rttLongMs;
+    const p50 = percentile(
+      this.window.map((c) => c.durationMs).sort((a, b) => a - b),
+      50,
+    );
+    if (this.rttLongMs === undefined) {
+      this.rttLongMs = p50;
+      return;
+    }
+    const alpha = p50 < this.rttLongMs ? RTT_LONG_ALPHA_DOWN : RTT_LONG_ALPHA_UP;
+    this.rttLongMs = alpha * p50 + (1 - alpha) * this.rttLongMs;
   }
 
   private rssPct(): number {
@@ -377,7 +391,7 @@ export class AdaptiveController {
     return (100 * this.readRss()) / this.memoryLimitBytes;
   }
 
-  private decide(cfg: AdaptiveConfig, stalled: boolean, growOnly = false): void {
+  private decide(cfg: AdaptiveConfig, stalled: boolean, growOnly = false, fresh = true): void {
     this.settledSinceDecide = 0;
     const current = this.currentLimit;
     const durations = this.window.map((c) => c.durationMs).sort((a, b) => a - b);
@@ -404,10 +418,10 @@ export class AdaptiveController {
     } else if (errorRate > 0.2 || stalled) {
       next = Math.max(cfg.min, current - 1);
       reason = 'backpressure';
-    } else if (gradient < 0.7) {
+    } else if (fresh && gradient < 0.7) {
       next = Math.max(cfg.min, Math.min(current - 1, Math.round(current * SHRINK_FACTOR)));
       reason = 'shrink';
-    } else if (gradient >= 0.9 && saturated) {
+    } else if (fresh && gradient >= 0.9 && saturated) {
       // Doubles until the first time it backs off, then grows by √limit a tick.
       const step = this.backedOff ? Math.max(1, Math.floor(Math.sqrt(current))) : current;
       next = Math.min(cfg.max, current + step);

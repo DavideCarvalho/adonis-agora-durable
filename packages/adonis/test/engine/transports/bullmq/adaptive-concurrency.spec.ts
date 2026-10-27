@@ -46,6 +46,12 @@ function fill(c: AdaptiveController, n: number, durationMs: number, okRatio = 1)
   }
 }
 
+/** A tick over a window of 100 fresh steps of `durationMs` each. */
+function tickOver(c: AdaptiveController, durationMs: number): void {
+  fill(c, 100, durationMs);
+  c.tick();
+}
+
 describe('resolveConcurrency', () => {
   it('a bare number is fixed', () => {
     expect(resolveConcurrency(8)).toEqual({ mode: 'fixed', fixed: 8 });
@@ -168,7 +174,8 @@ describe('AdaptiveController.tick — AIMD decisions', () => {
     expect(controller.limit).toBe(8);
     expect(applied).toEqual([8]);
     expect(controller.snapshot().lastAdjust).toMatchObject({ from: 4, to: 8, reason: 'grow' });
-    for (let i = 0; i < 4; i++) controller.onStart(); // inFlight=8 → saturated again
+    fill(controller, 20, 100); // the next tick's steps
+    for (let i = 0; i < 8; i++) controller.onStart(); // inFlight=8 → saturated again
     controller.tick();
     expect(controller.limit).toBe(10); // capped at max
   });
@@ -253,10 +260,8 @@ describe('AdaptiveController.tick — AIMD decisions', () => {
     const { controller } = makeController({
       concurrency: { mode: 'adaptive', min: 1, max: 32, start: 16 },
     });
-    controller.onStart();
-    controller.onSettle(1, true, 'step'); // the no-queuing baseline: 1 ms
-    fill(controller, 99, 30); // p50 30 ms: (2 × 1 + 5) / 30 ≈ 0.23
-    controller.tick();
+    tickOver(controller, 1); // the no-queuing baseline: 1 ms
+    tickOver(controller, 30); // p50 30 ms against a baseline still near 1 ms
     expect(controller.limit).toBe(12);
     expect(controller.snapshot().lastAdjust?.reason).toBe('shrink');
   });
@@ -265,23 +270,71 @@ describe('AdaptiveController.tick — AIMD decisions', () => {
     const { controller, applied } = makeController({
       concurrency: { mode: 'adaptive', min: 1, max: 32, start: 32 },
     });
-    controller.onStart();
-    controller.onSettle(1, true, 'step');
-    fill(controller, 99, 500); // gradient ≈ 0.014: a window of one slow moment
-    controller.tick();
+    tickOver(controller, 1);
+    tickOver(controller, 500); // a window of one slow moment, 500 times the baseline
     expect(controller.limit).toBe(24);
     expect(applied).toEqual([24]);
   });
 
-  it('keeps shrinking a quarter a tick while the queuing persists, down to min', () => {
+  it('keeps shrinking a quarter a tick while the latency keeps rising, down to min', () => {
     const { controller, applied } = makeController({
       concurrency: { mode: 'adaptive', min: 2, max: 32, start: 32 },
     });
-    controller.onStart();
-    controller.onSettle(1, true, 'step');
-    fill(controller, 99, 500);
-    for (let tick = 0; tick < 12; tick++) controller.tick();
+    tickOver(controller, 1);
+    // Each tick's p50 doubles: always past twice the baseline, which only rises slowly.
+    for (let tick = 0, ms = 10; tick < 12; tick++, ms *= 2) tickOver(controller, ms);
     expect(applied).toEqual([24, 18, 14, 11, 8, 6, 5, 4, 3, 2]);
+  });
+
+  it('a latency that rises and then holds becomes the baseline: the cuts stop', () => {
+    const { controller, applied } = makeController({
+      concurrency: { mode: 'adaptive', min: 1, max: 32, start: 32 },
+    });
+    tickOver(controller, 2);
+    for (let tick = 0; tick < 12; tick++) tickOver(controller, 40);
+    // Two cuts did not bring the latency down, so the queue is not this worker's.
+    expect(applied).toEqual([24, 18]);
+  });
+
+  it('a worker held at one slot by a busy shared resource grows once its latency holds steady', () => {
+    const { controller } = makeController({
+      concurrency: { mode: 'adaptive', min: 1, max: 32, start: 1 },
+    });
+    tickOver(controller, 2); // a quiet moment
+    for (let tick = 0; tick < 15; tick++) {
+      // 40 ms a step whatever the limit: the time is spent in a shared Redis or database, and now
+      // and then a step lands on a quiet moment of it.
+      fill(controller, 2, 2);
+      fill(controller, 98, 40);
+      for (let i = 0; i < controller.limit; i++) controller.onStart(); // every slot busy
+      controller.tick();
+      for (let i = 0, n = controller.limit; i < n; i++) controller.onSettle(40, true, 'step');
+    }
+    expect(controller.limit).toBeGreaterThanOrEqual(16);
+  });
+
+  it('an idle worker keeps its limit: a tick with no settled step does not move it', () => {
+    const { controller, applied } = makeController({
+      concurrency: { mode: 'adaptive', min: 1, max: 32, start: 32 },
+    });
+    tickOver(controller, 1);
+    tickOver(controller, 500); // the last burst ended slow: 32 → 24
+    for (let tick = 0; tick < 10; tick++) controller.tick(); // then nothing runs
+    expect(applied).toEqual([24]);
+    expect(controller.limit).toBe(24);
+  });
+
+  it('a worker with work in flight that stops settling it still sheds on the stall', () => {
+    const { controller } = makeController({
+      concurrency: { mode: 'adaptive', min: 1, max: 32, start: 8 },
+    });
+    fill(controller, 20, 10);
+    controller.tick();
+    for (let i = 0; i < 8; i++) controller.onStart(); // in flight, never settling
+    controller.tick();
+    controller.tick();
+    expect(controller.snapshot().lastAdjust?.reason).toBe('backpressure');
+    expect(controller.limit).toBe(7);
   });
 
   it('takes at least one slot off a small limit', () => {
@@ -299,10 +352,8 @@ describe('AdaptiveController.tick — AIMD decisions', () => {
     const { controller, applied } = makeController({
       concurrency: { mode: 'adaptive', min: 1, max: 32, start: 32 },
     });
-    controller.onStart();
-    controller.onSettle(1, true, 'step');
-    fill(controller, 99, 500);
-    controller.tick(); // the spike: 32 → 24
+    tickOver(controller, 2);
+    tickOver(controller, 500); // the spike: 32 → 24
     for (let tick = 0; tick < 2; tick++) {
       fill(controller, 100, 2); // healthy again
       const busy = controller.limit;
@@ -327,9 +378,8 @@ describe('AdaptiveController.tick — AIMD decisions', () => {
     const { controller, applied } = makeController({
       concurrency: { mode: 'adaptive', min: 1, max: 10, start: 8 },
     });
-    controller.onStart();
-    controller.onSettle(10, true, 'step'); // one fast sample seeds rttLong≈10
-    fill(controller, 19, 100); // p50≈100 → gradient≈0.1 < 0.7 → shrink
+    tickOver(controller, 10); // the baseline: 10 ms
+    fill(controller, 100, 100); // p50 100 ms: (2 × ~19 + 5) / 100 < 0.7 → shrink
     controller.tick();
     expect(controller.limit).toBeLessThan(8);
     expect(controller.snapshot().lastAdjust?.reason).toBe('shrink');
