@@ -3454,8 +3454,24 @@ export class WorkflowEngine {
       // the contract instead: park it `suspended` on the step's deadline or the reconcile timer. The
       // worker's result resumes it; `resumeDueTimers` is the safety net. A LOST dispatch stays the job
       // of `remoteRedispatchMs` / `redispatchPending`.
-      const dispatched = await this.inFlightRemoteStep(run.id);
+      // The durable marker of work on the transport: a `pending` remote checkpoint is written before
+      // the dispatch and settled by the result.
+      const checkpoints = await this.store.listCheckpoints(run.id);
+      const dispatched = checkpoints.find((cp) => cp.kind === 'remote' && cp.status === 'pending');
       if (dispatched) {
+        // `running` with a lapsed lease: the turn that wrote these checkpoints died before settling
+        // the run, possibly before its dispatch reached the broker. Send what it may have lost.
+        try {
+          await this.redispatchCrashedTurnSteps(run, checkpoints, true);
+        } catch (error) {
+          // Not sent: leave the run `running` for the next pass rather than park it on a lost step.
+          await this.store.releaseRunLock(run.id, this.instanceId).catch(() => undefined);
+          console.error(
+            `[adonis-durable] could not re-dispatch the steps of crashed run ${run.id}; retrying on a later tick:`,
+            error,
+          );
+          continue;
+        }
         // A REMOTE workflow reads `running` only while a turn is being computed or applied, so a free
         // lease here means that turn was lost — the call in flight is not what the run waits on next.
         // Park it on a near wake so the timer pass re-drives the turn promptly (never later than the
@@ -3547,13 +3563,88 @@ export class WorkflowEngine {
   }
 
   /**
-   * The remote step this run dispatched and still awaits a result for, if any — the durable marker
-   * that tells {@link recoverIncomplete} "this run's work is on the transport, not in a crashed
-   * process". A `pending` remote checkpoint is written before the dispatch and settled by the result.
+   * {@link redispatchCrashedTurnSteps} for a `suspended` run a timer pass just leased, when the run as
+   * listed shows the previous lease holder died holding it: a lease is released (both columns
+   * cleared) by every path that ends normally, so one still set but lapsed is a holder that never
+   * reached its release — a turn SIGKILLed mid-way, most likely. A resumed turn keeps the run
+   * `suspended` while it executes, so this is the only trace such a crash leaves. Called with the
+   * lease held; a failure is reported and does not stop the resume.
    */
-  private async inFlightRemoteStep(runId: string): Promise<StepCheckpoint | undefined> {
-    const checkpoints = await this.store.listCheckpoints(runId);
-    return checkpoints.find((cp) => cp.kind === 'remote' && cp.status === 'pending');
+  private async redispatchIfHolderCrashed(listed: WorkflowRun, nowMs: number): Promise<void> {
+    if (listed.status !== 'suspended') return;
+    if (listed.lockedBy === undefined || listed.lockedUntil === undefined) return;
+    if (listed.lockedUntil > nowMs) return;
+    try {
+      await this.redispatchCrashedTurnSteps(listed, await this.store.listCheckpoints(listed.id));
+    } catch (error) {
+      console.error(
+        `[adonis-durable] could not re-dispatch the steps of run ${listed.id} after its lease holder died; its turn proceeds:`,
+        error,
+      );
+    }
+  }
+
+  /**
+   * Re-dispatch the remote steps a CRASHED turn of `run` wrote `pending` and may never have sent.
+   *
+   * A turn persists a step's `pending` checkpoint BEFORE handing the job to the transport (so a fast
+   * result always finds it), then settles the run. A process that dies between the two leaves a
+   * `pending` step no worker ever received — and every later turn replays straight back to "pending,
+   * keep waiting" (re-dispatching on replay is the opt-in `remoteRedispatchMs`, because a step may
+   * legitimately run longer than any window). Observed under a SIGKILLed pod: runs stuck forever.
+   *
+   * The caller holds the run's lease and has evidence the turn died; this narrows it to the steps
+   * THAT turn wrote: the ones enqueued at or after the run's last settle (`updatedAt` — a turn that
+   * ends normally settles after its dispatches, so a step it sent is always older than its settle).
+   * `sinceInclusive` is for a run still `running`: its `updatedAt` is that same turn's start.
+   *
+   * Each step goes out again under its own `stepId` and attempt: a step whose original dispatch did
+   * land runs twice (at-least-once, as documented), and the second result finds the checkpoint
+   * settled and is dropped. Only on a crash — a healthy run never gets here. Remote (polyglot)
+   * workflows are left to their own turn re-drive. Returns how many steps were sent.
+   */
+  private async redispatchCrashedTurnSteps(
+    run: WorkflowRun,
+    checkpoints: StepCheckpoint[],
+    sinceInclusive = false,
+  ): Promise<number> {
+    const registered =
+      this.workflows.get(versionKey(run.workflow, run.workflowVersion)) ??
+      this.latest.get(run.workflow);
+    // No transport: nothing could have been dispatched, nothing can be sent again.
+    if (registered?.remote || this.pool.size === 0) return 0;
+    const since = run.updatedAt.getTime();
+    const lost = checkpoints.filter((cp) => {
+      if (cp.kind !== 'remote' || cp.status !== 'pending' || !cp.stepId) return false;
+      const at = cp.enqueuedAt.getTime();
+      return sinceInclusive ? at >= since : at > since;
+    });
+    for (const cp of lost) {
+      await this.dispatchRemoteTask({
+        runId: run.id,
+        seq: cp.seq,
+        name: cp.name,
+        stepId: cp.stepId as string,
+        group: cp.workerGroup ?? sanitizeQueueToken(cp.name),
+        input: cp.input,
+        attempt: cp.attempts,
+        priority: run.priority,
+      });
+      this.emit({
+        type: 'step.started',
+        runId: run.id,
+        seq: cp.seq,
+        name: cp.name,
+        kind: 'remote',
+        redispatched: true,
+      });
+    }
+    if (lost.length > 0) {
+      console.warn(
+        `[adonis-durable] re-dispatched ${lost.length} step(s) of run ${run.id} written by a turn that died before settling (a step that did reach a worker may run twice)`,
+      );
+    }
+    return lost.length;
   }
 
   /**
@@ -3645,6 +3736,7 @@ export class WorkflowEngine {
               ...(run.wakeRequestedAt !== undefined ? { wakeRequestedAt: undefined } : {}),
             });
             if (!claimed) continue;
+            await this.redispatchIfHolderCrashed(run, nowMs);
           } finally {
             await this.store.releaseRunLock(run.id, this.instanceId);
           }
@@ -4043,6 +4135,7 @@ export class WorkflowEngine {
           return;
         }
         try {
+          await this.redispatchIfHolderCrashed(run, nowMs);
           // A per-run hook (recovery counting / dead-lettering) may settle the run terminally instead.
           const settled = onLocked ? await onLocked(run) : undefined;
           results.push(settled ?? (await this.resumeImplicit(run.id)));
@@ -7932,9 +8025,11 @@ export class WorkflowEngine {
     result: StepResult,
     queuedIn: (from: number, to: number) => boolean,
   ): Promise<void> {
-    const cp = await this.settleRemoteCheckpoint(result);
-    if (cp === undefined) return;
+    const settled = await this.settleRemoteCheckpoint(result);
+    if (settled === undefined) return;
+    const { cp, run } = settled;
     if (await this.stepFanStillRunning(cp, result, queuedIn)) return;
+    await this.markResumeOwed(run);
     if (!parseStepFanGroup(cp.parallelGroup)) this.noteSettledHere(result.runId, [cp.seq]);
     this.resumeInBackground(result.runId, fanWakeOf(cp, result));
   }
@@ -7954,6 +8049,41 @@ export class WorkflowEngine {
     for (const [key, at] of this.settledHere) {
       if (now - at <= this.leaseMs) break;
       this.settledHere.delete(key);
+    }
+  }
+
+  /**
+   * Make the turn a settled step result owes its run DURABLE before the result is acknowledged.
+   *
+   * Settling a result does two things — settle the checkpoint, then resume the run — and only the
+   * first is durable: the resume runs in the background, after the transport has acknowledged the
+   * result. A pod SIGKILLed in between (or mid-way through the resumed turn, which keeps the run
+   * `suspended` and so is invisible to the orphan sweep) left the run parked on whatever `wakeAt` its
+   * last turn wrote — for a step that is the reconcile fallback, minutes out — with nothing else to
+   * wake it: the result was already acknowledged, so no redelivery re-drives it.
+   *
+   * So pull the suspended run's timer in to one lease from now first. The resume this instance is
+   * about to run re-parks the run (or settles it) and so overwrites it; if this instance dies before
+   * that, every instance's due-timer poll resumes the run once the lease a dying turn may hold has
+   * lapsed. Leased like any due run, so a live turn is never doubled — at worst a resume landing after
+   * the timer replays and re-parks. Only pulls a timer IN (one already due sooner is kept), and only
+   * for a `suspended` run: a run still `running` has its first turn holding the lease, which re-checks
+   * the step on settling (see `recheckWaitSeqs`) and is recovered by the orphan sweep if it dies.
+   *
+   * Best-effort: a store that refuses the write leaves the run exactly where it was before.
+   */
+  private async markResumeOwed(run: WorkflowRun | null | undefined): Promise<void> {
+    if (run?.status !== 'suspended') return;
+    const owedBy = this.clock() + this.leaseMs;
+    if (run.wakeAt !== undefined && run.wakeAt <= owedBy) return;
+    try {
+      await this.store.updateRunIf(run.id, ['suspended'], { wakeAt: owedBy });
+    } catch (err) {
+      console.warn(
+        `[adonis-durable] could not mark run ${run.id} as owed a resume (it recovers on its next reconcile wake): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
     }
   }
 
@@ -8086,6 +8216,7 @@ export class WorkflowEngine {
     for (const { cp, result } of resumable) {
       const fan = parseStepFanGroup(cp.parallelGroup);
       if (!fan || result.status === 'failed') {
+        await this.markResumeOwed(run);
         this.noteSettledHere(runId, singles);
         this.resumeInBackground(runId);
         return outcomes;
@@ -8099,6 +8230,7 @@ export class WorkflowEngine {
         barriers.set(fan.firstSeq, closed);
       }
       if (!(await closed)) {
+        await this.markResumeOwed(run);
         this.noteSettledHere(runId, singles);
         this.resumeInBackground(runId, {
           first: fan.firstSeq,
@@ -8232,11 +8364,13 @@ export class WorkflowEngine {
 
   /**
    * The durable half of {@link completeRemoteResult}: settle `result` onto its checkpoint (or re-drive
-   * the resume when a redelivered result finds it already settled). Returns the step's checkpoint as
+   * the resume when a redelivered result finds it already settled). Returns the step's checkpoint (and its run) as
    * read when its run should be resumed, or `undefined` when no resume is wanted (no checkpoint, or a
    * late result for a terminal run — terminal is terminal).
    */
-  private async settleRemoteCheckpoint(result: StepResult): Promise<StepCheckpoint | undefined> {
+  private async settleRemoteCheckpoint(
+    result: StepResult,
+  ): Promise<{ cp: StepCheckpoint; run: WorkflowRun | null } | undefined> {
     const forSettle = this.settleReader();
     const cp = forSettle
       ? ((await forSettle(result.runId, [result.seq]))[0] ?? null)
@@ -8264,7 +8398,7 @@ export class WorkflowEngine {
     // compensations already ran). Terminal is terminal — recovery of a failed run belongs to an
     // explicit `requeue`/`durable:retry`, never to a stray result.
     if (cp.status !== 'pending') {
-      if (!terminal) return cp;
+      if (!terminal) return { cp, run };
       return undefined;
     }
     // A result settling this step frees its flow-control slot (no-op if it wasn't queued). Released
@@ -8298,7 +8432,7 @@ export class WorkflowEngine {
     // above — re-drive the resume rather than settle twice.
     const [claim] = await this.settlePendingCheckpoints([{ cp, settlement }]);
     if (typeof claim === 'object') throw claim.error;
-    if (!claim) return terminal ? undefined : cp;
+    if (!claim) return terminal ? undefined : { cp, run };
     await this.releaseQueueSlot(cp);
     this.emit({
       type: result.status === 'completed' ? 'step.completed' : 'step.failed',
@@ -8311,7 +8445,7 @@ export class WorkflowEngine {
       queueMs: startedAt.getTime() - cp.enqueuedAt.getTime(),
       durationMs: finishedAt.getTime() - startedAt.getTime(),
     });
-    return cp;
+    return { cp, run };
   }
 
   /**
