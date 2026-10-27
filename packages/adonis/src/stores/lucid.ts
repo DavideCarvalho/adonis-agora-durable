@@ -154,14 +154,35 @@ export class LucidStateStore implements StateStore {
   // --- runs ---------------------------------------------------------------
 
   async createRun(run: WorkflowRun): Promise<void> {
+    if (normalizeAttributeRows(run.id, run.searchAttributes).length === 0) {
+      // Nothing to index: the insert, then clear any attribute rows a deleted run of this id left,
+      // as two statements. The insert goes first, so a run that already exists keeps its rows.
+      const client = this.client();
+      await client.table(DURABLE_TABLES.runs).insert(runToRow(run));
+      await client.from(DURABLE_TABLES.attributes).where('run_id', run.id).delete();
+      return;
+    }
     await this.client().transaction(async (trx) => {
       await trx.table(DURABLE_TABLES.runs).insert(runToRow(run));
       await this.reindexAttributes(trx, run.id, run.searchAttributes);
     });
   }
 
+  /**
+   * Run `write` in a transaction only when `patch` needs one: a terminal settle reads the run's tags
+   * under a row lock to release its singleton slot, and new search attributes rewrite their rows
+   * with the run's. Any other patch is one UPDATE, which needs no transaction around it.
+   */
+  private writeRun<T>(
+    patch: Partial<WorkflowRun>,
+    write: (client: Client) => Promise<T>,
+  ): Promise<T> {
+    if (!settlesTerminally(patch) && !('searchAttributes' in patch)) return write(this.client());
+    return this.client().transaction((trx) => write(trx));
+  }
+
   async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
-    await this.client().transaction(async (trx) => {
+    await this.writeRun(patch, async (trx) => {
       const row = await this.releaseSlot(trx, runId, patch);
       // Knex throws on an empty `.update({})`; skip the UPDATE when no mapped column changed.
       if (Object.keys(row).length) {
@@ -178,7 +199,7 @@ export class LucidStateStore implements StateStore {
     expectedStatuses: RunStatus[],
     patch: Partial<WorkflowRun>,
   ): Promise<boolean> {
-    return this.client().transaction(async (trx) => {
+    return this.writeRun(patch, async (trx) => {
       const row = await this.releaseSlot(trx, runId, patch);
       let applied: boolean;
       if (Object.keys(row).length) {
@@ -210,7 +231,7 @@ export class LucidStateStore implements StateStore {
 
   /** Whether the runs table has `awaiting_decision_task_id`, probed once per store and cached. */
   private decisionMarkerColumn: Promise<boolean> | undefined;
-  private hasDecisionMarkerColumn(trx: TransactionClientContract): Promise<boolean> {
+  private hasDecisionMarkerColumn(trx: Client): Promise<boolean> {
     // Probed on the caller's transaction: a single-connection pool (SQLite) has no other to use.
     this.decisionMarkerColumn ??= trx.schema
       .hasColumn(DURABLE_TABLES.runs, 'awaiting_decision_task_id')
@@ -228,7 +249,7 @@ export class LucidStateStore implements StateStore {
    * with a stale tag list.
    */
   private async releaseSlot(
-    trx: TransactionClientContract,
+    trx: Client,
     runId: string,
     patch: Partial<WorkflowRun>,
   ): Promise<Record<string, unknown>> {
@@ -639,7 +660,7 @@ export class LucidStateStore implements StateStore {
   }
 
   /** {@link hasWakeMarkerColumn} on the caller's transaction (a single-connection pool has no other). */
-  private hasWakeMarkerColumnIn(trx: TransactionClientContract): Promise<boolean> {
+  private hasWakeMarkerColumnIn(trx: Client): Promise<boolean> {
     this.wakeMarkerColumn ??= trx.schema
       .hasColumn(DURABLE_TABLES.runs, 'wake_requested_at')
       .catch(() => {
@@ -690,17 +711,17 @@ export class LucidStateStore implements StateStore {
   }
 
   async takeSignalWaiter(token: string): Promise<SignalWaiter | null> {
-    // Atomically take-and-remove: delete by token, returning the row only if WE deleted it. Done in a
-    // transaction so a concurrent take can't hand the same waiter to two callers.
-    return this.client().transaction(async (trx) => {
-      const row = await trx.from(DURABLE_TABLES.signalWaiters).where('token', token).first();
-      if (!row) return null;
-      const deleted = await trx.from(DURABLE_TABLES.signalWaiters).where('token', token).delete();
-      if (rowsAffected(deleted) !== 1) return null;
-      return rowToSignalWaiter(
-        row as { token: string; run_id: string; seq: number | string; parallel_group?: unknown },
-      );
-    });
+    // Take-and-remove: the row is ours only if our DELETE removed it, so a concurrent take can't hand
+    // the same waiter to two callers. The DELETE arbitrates, so no transaction is needed around it,
+    // and a token with no waiter (the common case) costs one read.
+    const client = this.client();
+    const row = await client.from(DURABLE_TABLES.signalWaiters).where('token', token).first();
+    if (!row) return null;
+    const deleted = await client.from(DURABLE_TABLES.signalWaiters).where('token', token).delete();
+    if (rowsAffected(deleted) !== 1) return null;
+    return rowToSignalWaiter(
+      row as { token: string; run_id: string; seq: number | string; parallel_group?: unknown },
+    );
   }
 
   async listSignalWaiters(prefix: string): Promise<SignalWaiter[]> {
@@ -870,24 +891,25 @@ export class LucidStateStore implements StateStore {
   }
 
   async takeBufferedSignal(token: string): Promise<{ payload: unknown } | null> {
-    return this.client().transaction(async (trx) => {
-      const row = await trx
-        .from(DURABLE_TABLES.bufferedSignals)
-        .where('token', token)
-        .orderBy('id', 'asc')
-        .first();
-      if (!row) return null;
-      const r = row as { id: number | string; payload: string | null };
-      const deleted = await trx.from(DURABLE_TABLES.bufferedSignals).where('id', r.id).delete();
-      if (rowsAffected(deleted) !== 1) return null;
-      return {
-        payload: parseJsonColumn(
-          r.payload,
-          `${DURABLE_TABLES.bufferedSignals}.payload`,
-          String(r.id),
-        ),
-      };
-    });
+    // The oldest signal is ours only if our DELETE removed it, so two takers never get the same one;
+    // that needs no transaction, and a token with nothing buffered (the common case) costs one read.
+    const client = this.client();
+    const row = await client
+      .from(DURABLE_TABLES.bufferedSignals)
+      .where('token', token)
+      .orderBy('id', 'asc')
+      .first();
+    if (!row) return null;
+    const r = row as { id: number | string; payload: string | null };
+    const deleted = await client.from(DURABLE_TABLES.bufferedSignals).where('id', r.id).delete();
+    if (rowsAffected(deleted) !== 1) return null;
+    return {
+      payload: parseJsonColumn(
+        r.payload,
+        `${DURABLE_TABLES.bufferedSignals}.payload`,
+        String(r.id),
+      ),
+    };
   }
 
   // --- buffered events (name-keyed, match-based consumption) ---------------

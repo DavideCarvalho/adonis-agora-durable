@@ -154,18 +154,92 @@ describe('start() duplicate-race convergence', () => {
     }
   }
 
-  it('a losing createRun race returns the winner’s state instead of throwing', async () => {
-    const store = new RaceStore();
+  it('a start for an existing run id returns that run’s state instead of throwing', async () => {
+    const store = new InMemoryStateStore();
     await store.createRun(baseRun({ id: 'dup', workflow: 'wf', output: 42 }));
     const engine = new WorkflowEngine({ store });
     engine.register('wf', '1', async () => 'fresh');
 
+    const result = await engine.start('wf', {}, 'dup');
+    expect(result.status).toBe('completed');
+    expect(result.output).toBe(42);
+    // The existing row was not clobbered.
+    expect((await store.getRun('dup'))?.output).toBe(42);
+  });
+
+  it('a singleton start that loses the createRun race returns the winner’s state', async () => {
+    const store = new RaceStore();
+    await store.createRun(baseRun({ id: 'dup', workflow: 'wf', output: 42 }));
+    const engine = new WorkflowEngine({ store });
+    engine.register('wf', '1', async () => 'fresh', { singleton: { key: () => 'k' } });
+
+    // The singleton's read-before-create misses the run, as in a true race.
     store.missOnce.add('dup');
     const result = await engine.start('wf', {}, 'dup');
     expect(result.status).toBe('completed');
     expect(result.output).toBe(42);
-    // The winner's row was not clobbered.
     expect((await store.getRun('dup'))?.output).toBe(42);
+  });
+
+  it('starting a new run of a workflow with no quota or singleton reads no run first', async () => {
+    const store = new InMemoryStateStore();
+    const order: string[] = [];
+    const getRun = store.getRun.bind(store);
+    const createRun = store.createRun.bind(store);
+    store.getRun = async (id) => {
+      order.push('getRun');
+      return getRun(id);
+    };
+    store.createRun = async (run) => {
+      order.push('createRun');
+      return createRun(run);
+    };
+    const engine = new WorkflowEngine({ store, runDispatcher: { dispatch: () => {} } });
+    engine.register('wf', '1', async () => 'done');
+
+    await engine.start('wf', {}, 'new-run');
+    expect(order[0]).toBe('createRun');
+  });
+
+  it('a redelivered start of a still-pending run dispatches it again', async () => {
+    const store = new InMemoryStateStore();
+    await store.createRun(baseRun({ id: 'p1', workflow: 'wf', status: 'pending' }));
+    const dispatched: string[] = [];
+    const engine = new WorkflowEngine({
+      store,
+      runDispatcher: { dispatch: (runId: string) => void dispatched.push(runId) },
+    });
+    engine.register('wf', '1', async () => 'done');
+
+    const result = await engine.start('wf', {}, 'p1');
+    expect(result.status).toBe('pending');
+    expect(dispatched).toEqual(['p1']);
+  });
+});
+
+describe('a finished run with no parent', () => {
+  it('does not read its own run again once no parent waits on it', async () => {
+    const store = new InMemoryStateStore();
+    const calls: string[] = [];
+    const getRun = store.getRun.bind(store);
+    const takeSignalWaiter = store.takeSignalWaiter.bind(store);
+    store.getRun = async (id) => {
+      calls.push(`getRun:${id}`);
+      return getRun(id);
+    };
+    store.takeSignalWaiter = async (token) => {
+      calls.push(`takeSignalWaiter:${token}`);
+      return takeSignalWaiter(token);
+    };
+    const engine = new WorkflowEngine({ store });
+    engine.register('wf', '1', async () => 'done');
+
+    await engine.start('wf', {}, 'root');
+    await engine.drain(5_000);
+    expect((await getRun('root'))?.status).toBe('completed');
+    const lookedForParent = calls.indexOf('takeSignalWaiter:child:root');
+    expect(lookedForParent).toBeGreaterThanOrEqual(0);
+    expect(calls.slice(lookedForParent + 1)).not.toContain('getRun:root');
   });
 });
 

@@ -192,6 +192,12 @@ Beyond the durability primitives, the Lucid store implements the read side the [
 
 ## Wide fans
 
+A run of one step makes each of a run's lifecycle calls once or twice, so their round trips bound how many such runs a pool carries. A write that is one statement runs without a transaction around it:
+
+- **`createRun(run)`** without search attributes is the `INSERT` of the run, then a `DELETE` of any attribute rows a deleted run of the same id left: two statements. The insert goes first, so a duplicate id is rejected before anything is deleted. With search attributes, the insert and the attribute rows are one transaction.
+- **`updateRun` / `updateRunIf`** with a patch that does not settle the run terminally and carries no search attributes (a run starting, suspending, taking a lease-long wake) is one `UPDATE`. A terminal settle still runs in a transaction: it reads the run's tags under a row lock to release its singleton slot.
+- **`takeBufferedSignal(token)`** and **`takeSignalWaiter(token)`** read the oldest row for the token and delete it by id; the row is the caller's only if its `DELETE` removed it, so two racing takers never get the same one. A token with nothing waiting (a run's cancel check on every turn, a finished run with no parent) is one `SELECT`.
+
 The store implements the reads and writes a wide fan leans on:
 
 - **`hasCheckpoints(runId, fromSeq, toSeq, statuses)`** is one `SELECT seq … ORDER BY seq DESC LIMIT 1` over the `(run_id, seq)` primary key, filtered by `status`. A [step fan](/docs/durable/authoring/child-workflows#fanning-out-over-a-step)'s join barrier calls it on every batch of results to ask whether any step of the fan is still `pending`. A fan's highest seqs settle last, so the backward scan stops within the first rows while the fan runs: on MySQL, with 30,000 of a 40,000-step fan settled, it answers in about 0.4 ms where a `COUNT(*)` over the range takes about 40 ms.
