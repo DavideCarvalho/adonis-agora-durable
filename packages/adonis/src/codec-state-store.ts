@@ -93,6 +93,14 @@ export class CodecStateStore implements StateStore {
   readonly releaseRunLockUnlessWakeRequested?: (runId: string, owner: string) => Promise<boolean>;
   /** Encodes each checkpoint like {@link saveCheckpoint}. Bound only when the inner store has it. */
   readonly saveCheckpointsIfPending?: (checkpoints: StepCheckpoint[]) => Promise<boolean[]>;
+  /** Forwarded verbatim — a lease deadline carries no payload. Bound only when the inner store has
+   *  it, so the engine's {@link saveCheckpointIfPending} fallback still applies through the wrapper. */
+  readonly renewCheckpointLease?: (
+    runId: string,
+    seq: number,
+    expectedWakeAt: number | undefined,
+    wakeAt: number,
+  ) => Promise<boolean>;
   /** Encodes each settlement's `output` (and `events`/`error` under `extended` coverage) like
    *  {@link saveCheckpoint}. Bound only when the inner store has it. */
   readonly settleCheckpointsIfPending?: (settlements: StepSettlement[]) => Promise<boolean[]>;
@@ -199,6 +207,11 @@ export class CodecStateStore implements StateStore {
           inner,
           cps.map((cp) => this.encCp(cp)),
         );
+    }
+    const renewLease = inner.renewCheckpointLease;
+    if (renewLease) {
+      this.renewCheckpointLease = (runId, seq, expectedWakeAt, wakeAt) =>
+        renewLease.call(inner, runId, seq, expectedWakeAt, wakeAt);
     }
     const settleIfPending = inner.settleCheckpointsIfPending;
     if (settleIfPending) {

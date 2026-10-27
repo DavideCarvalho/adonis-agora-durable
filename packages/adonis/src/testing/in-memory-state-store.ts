@@ -313,6 +313,18 @@ export class InMemoryStateStore implements StateStore {
     return true;
   }
 
+  async renewCheckpointLease(
+    runId: string,
+    seq: number,
+    expectedWakeAt: number | undefined,
+    wakeAt: number,
+  ): Promise<boolean> {
+    const row = this.checkpoints.get(this.key(runId, seq));
+    if (row?.status !== 'pending' || row.wakeAt !== expectedWakeAt) return false;
+    row.wakeAt = wakeAt;
+    return true;
+  }
+
   async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
     return checkpoints.map((checkpoint) => {
       const key = this.key(checkpoint.runId, checkpoint.seq);

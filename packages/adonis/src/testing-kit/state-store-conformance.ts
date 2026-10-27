@@ -785,6 +785,43 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.getCheckpoint('r1', 9)).toBeNull();
     });
 
+    t('renewCheckpointLease moves a pending row deadline only from the expected one', async () => {
+      // Optional on the interface (the engine falls back to saveCheckpointIfPending), so a store
+      // without it has nothing to check here.
+      if (!store.renewCheckpointLease) return;
+      await store.createRun(run());
+      const pending = checkpoint({ status: 'pending', output: undefined, attempts: 1 });
+      await store.saveCheckpoint(pending);
+
+      // No deadline yet: renews only from "absent".
+      expect(await store.renewCheckpointLease('r1', 0, 1_000, 5_000)).toBe(false);
+      expect(await store.renewCheckpointLease('r1', 0, undefined, 5_000)).toBe(true);
+      expect(await store.getCheckpoint('r1', 0)).toMatchObject({
+        status: 'pending',
+        wakeAt: 5_000,
+      });
+      // A stale expectation (someone re-armed it meanwhile) writes nothing.
+      expect(await store.renewCheckpointLease('r1', 0, undefined, 9_000)).toBe(false);
+      expect(await store.renewCheckpointLease('r1', 0, 5_000, 9_000)).toBe(true);
+      const renewed = await store.getCheckpoint('r1', 0);
+      // Only the deadline moved.
+      expect(renewed).toMatchObject({ status: 'pending', wakeAt: 9_000, attempts: 1 });
+
+      // A settled row is never touched, even with the matching deadline.
+      await store.saveCheckpoint({
+        ...pending,
+        status: 'completed',
+        output: { ok: true },
+        wakeAt: 9_000,
+      });
+      expect(await store.renewCheckpointLease('r1', 0, 9_000, 20_000)).toBe(false);
+      const settled = await store.getCheckpoint('r1', 0);
+      expect(settled).toMatchObject({ status: 'completed', output: { ok: true }, wakeAt: 9_000 });
+      // No row: nothing written.
+      expect(await store.renewCheckpointLease('r1', 9, undefined, 1)).toBe(false);
+      expect(await store.getCheckpoint('r1', 9)).toBeNull();
+    });
+
     t('saveCheckpointsIfPending settles a batch row by row, in order', async () => {
       // Optional on the interface (the engine falls back to one saveCheckpointIfPending per entry),
       // but a conformant store MUST provide it — assert presence, then exercise it.

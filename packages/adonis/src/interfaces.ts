@@ -488,6 +488,24 @@ export interface StateStore {
    */
   saveCheckpointsIfPending?(checkpoints: StepCheckpoint[]): Promise<boolean[]>;
   /**
+   * Renew a dispatched step's lease: set the checkpoint's `wakeAt` to `wakeAt`, but only while the row
+   * at `(runId, seq)` is still `pending` AND its `wakeAt` still equals `expectedWakeAt` (`undefined`
+   * = absent); every other column stays as stored. Resolves whether it wrote. The engine renews a
+   * step's lease from a worker heartbeat with a read followed by this write, and in between another
+   * instance may settle the step (its result) or re-dispatch it (a new `attempts` and deadline). This
+   * is the compare-and-set that keeps the renewal from undoing either.
+   *
+   * Optional: a store that omits it gets the read row written back through
+   * {@link saveCheckpointIfPending}, which still never touches a settled row but can roll back a
+   * concurrent re-dispatch.
+   */
+  renewCheckpointLease?(
+    runId: string,
+    seq: number,
+    expectedWakeAt: number | undefined,
+    wakeAt: number,
+  ): Promise<boolean>;
+  /**
    * Settle step results onto their checkpoints: per entry and in input order, while the row at
    * `(runId, seq)` is still `pending`, write the entry's `status`, `output`, `error`, `events`,
    * `startedAt` and `finishedAt` (an absent value is written as absent) and leave every other column

@@ -432,6 +432,24 @@ export class LucidStateStore implements StateStore {
     return updateCheckpointIfPending(this.client(), checkpoint);
   }
 
+  async renewCheckpointLease(
+    runId: string,
+    seq: number,
+    expectedWakeAt: number | undefined,
+    wakeAt: number,
+  ): Promise<boolean> {
+    // One guarded UPDATE: the row-level compare-and-set is atomic on every dialect, so a result or a
+    // re-dispatch committed since the caller's read makes this match nothing.
+    const query = this.client()
+      .from(DURABLE_TABLES.checkpoints)
+      .where('run_id', runId)
+      .andWhere('seq', seq)
+      .andWhere('status', 'pending');
+    if (expectedWakeAt == null) query.whereNull('wake_at');
+    else query.andWhere('wake_at', expectedWakeAt);
+    return rowsAffected(await query.update({ wake_at: wakeAt })) > 0;
+  }
+
   async saveCheckpointsIfPending(checkpoints: StepCheckpoint[]): Promise<boolean[]> {
     if (checkpoints.length === 0) return [];
     // Set-based, in one transaction (a rejection writes nothing): read which of the rows are still
