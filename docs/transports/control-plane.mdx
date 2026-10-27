@@ -9,6 +9,7 @@ import { Callout } from 'fumadocs-ui/components/callout';
 The task [transport](/docs/durable/transports) is **point-to-point**: it carries one task to one worker and a result back. The **control plane** is a separate, *broadcast* channel across **every** engine instance (every pod). It carries what each instance may need regardless of who runs a given run:
 
 - **Lifecycle events** — so a dashboard-only pod can live-tail a run executing on a worker pod.
+  A run's own events go out one per message. Step events, which a wide fan emits two per step, go out in order in one `events` message per batch: the ones emitted while a publish is in flight share the next message (up to 500), so a fan of 40,000 steps publishes a few hundred messages instead of 80,000, each delivered to every pod. An instance that does not know the `events` kind ignores it and only misses other instances' step events, which no engine logic reads.
 - **Cancellation** — so the pod actually running a run learns it was cancelled elsewhere.
 - **Enqueue nudges** — so a worker picks up a freshly enqueued run now instead of on the next poll.
 - **Schedule pause/resume** — so a schedule paused or resumed at runtime (from the dashboard or the API) stops or restarts ticking on every instance. This is runtime state: a deploy resets it to the config's `paused`.
