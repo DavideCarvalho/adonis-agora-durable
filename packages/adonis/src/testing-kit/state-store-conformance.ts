@@ -715,6 +715,40 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.countCheckpoints('r1', 0, 4, [])).toBe(0);
     });
 
+    t('hasCheckpoints answers whether a seq range holds a status', async () => {
+      // Optional on the interface (the engine falls back to countCheckpoints), but a conformant store
+      // MUST provide it — assert presence, then exercise the fast path.
+      expect(store.hasCheckpoints).toBeDefined();
+      if (!store.hasCheckpoints) return;
+      await store.createRun(run());
+      for (const [seq, status] of [
+        [0, 'completed'],
+        [1, 'pending'],
+        [2, 'completed'],
+        [3, 'failed'],
+        [4, 'completed'],
+      ] as const) {
+        await store.saveCheckpoint(checkpoint({ seq, status, stepId: `r1:${seq}` }));
+      }
+      await store.createRun(run({ id: 'other' }));
+      await store.saveCheckpoint(
+        checkpoint({ runId: 'other', seq: 4, status: 'pending', stepId: 'other:4' }),
+      );
+
+      expect(await store.hasCheckpoints('r1', 0, 4, ['pending'])).toBe(true);
+      // Both bounds are inclusive.
+      expect(await store.hasCheckpoints('r1', 1, 1, ['pending'])).toBe(true);
+      expect(await store.hasCheckpoints('r1', 0, 1, ['pending'])).toBe(true);
+      expect(await store.hasCheckpoints('r1', 1, 2, ['pending'])).toBe(true);
+      expect(await store.hasCheckpoints('r1', 2, 4, ['pending'])).toBe(false);
+      expect(await store.hasCheckpoints('r1', 2, 4, ['pending', 'failed'])).toBe(true);
+      // `other` has a pending row at seq 4: the answer is scoped to its run.
+      expect(await store.hasCheckpoints('r1', 4, 4, ['pending'])).toBe(false);
+      expect(await store.hasCheckpoints('other', 0, 9, ['pending'])).toBe(true);
+      expect(await store.hasCheckpoints('r1', 5, 9, ['completed'])).toBe(false);
+      expect(await store.hasCheckpoints('r1', 0, 4, [])).toBe(false);
+    });
+
     t('saveCheckpointIfPending writes over a pending row only', async () => {
       // Optional on the interface (the engine falls back to a blind save, which can clobber a settled
       // row), but a conformant store MUST provide it — assert presence, then exercise it.

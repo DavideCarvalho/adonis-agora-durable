@@ -13,7 +13,7 @@ import { makeIsolatedMysqlDb, makeMysqlDb } from '../support/mysql.js';
  * Opt-in throughput harness: a wide `ctx.all` over a step on the Lucid store over real MySQL and the
  * BullMQ transport over real Redis, with several engine instances (each its own connection pool, as
  * pods) and several workers. Prints what a wide fan costs: the dispatching turn, the time from the
- * last step to the run finishing, the settle batches and their size, the barrier COUNTs, the parent's
+ * last step to the run finishing, the settle batches and their size, the barrier reads, the parent's
  * turns. Not part of the suite:
  *
  *   DURABLE_HARNESS=1 DURABLE_MYSQL_URL=mysql://root:root@127.0.0.1:3306 \
@@ -44,7 +44,7 @@ function counted(store: StateStore, counts: Counts): StateStore {
     get(target, prop, receiver) {
       const value = Reflect.get(target, prop, receiver);
       if (typeof value !== 'function') return value;
-      if (prop === 'countCheckpoints') {
+      if (prop === 'hasCheckpoints' || prop === 'countCheckpoints') {
         return (...args: unknown[]) => {
           counts.barrier += 1;
           return value.apply(target, args);
@@ -168,7 +168,7 @@ describe.skipIf(!ON || !MYSQL || !REDIS)('step fan throughput harness (MySQL + B
           appliedAfterLastStepMs: finishedAt - lastStepAt,
           batches: sizes.length,
           meanBatch: Math.round(sizes.reduce((a, b) => a + b, 0) / Math.max(1, sizes.length)),
-          barrierCounts: counts.barrier,
+          barrierReads: counts.barrier,
           getCheckpoint: counts.getCheckpoint,
           getCheckpoints: counts.getCheckpoints,
           saveCheckpoint: counts.saveCheckpoint,

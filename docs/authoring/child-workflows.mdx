@@ -314,9 +314,10 @@ replays the workflow, which makes a fan of N steps cost O(N²) checkpoint reads.
 once per settled wave, because a result resumes the workflow only when no step of the fan is still
 `pending` (or when one fails). The steps share a `parallelGroup` of `steps:<firstSeq>:<size>`, with a
 `:failFast` suffix in that mode (an `allSettled` fan is a `waitAll` one, so it never has the suffix), so any one step's checkpoint names the whole block the barrier waits on. The
-barrier counts the fan's pending steps through the optional `StateStore.countCheckpoints`, which the
-Lucid and in-memory stores implement; a store without it falls back to loading the run's checkpoints
-on every result.
+barrier asks whether any step of the fan is still pending through the optional
+`StateStore.hasCheckpoints`, which the Lucid and in-memory stores implement; a store without it is
+asked `countCheckpoints`, and one with neither falls back to loading the run's checkpoints on every
+result.
 
 A child fan's `parallelGroup` is `all:<firstSeq>:n<size>`, with the same `:failFast` suffix. The size is
 there so the [dashboard](/docs/durable/observability/dashboard#what-it-shows) can show how many
