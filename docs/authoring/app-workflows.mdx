@@ -194,6 +194,31 @@ Injecting a step class only gives the workflow a typed reference to its methods.
 served by whatever registers them, which is [`stepsPath`](/docs/durable/concepts/workflows-and-steps#serving-a-step-handler) discovery
 (default `app/steps`) on the process running the worker, so a `@Step` class has to live there to run.
 
+That discovery resolves each `@Step` class **through the container** too, so a step class can declare its
+own `@inject()` constructor dependencies and its step bodies get them:
+
+```ts title="app/steps/billing_steps.ts"
+import { inject } from '@adonisjs/core'
+import { Step } from '@adonis-agora/durable'
+import StripeService from '#services/stripe_service'
+
+@inject()
+export default class BillingSteps {
+  constructor(private stripe: StripeService) {}
+
+  @Step('billing:charge')
+  async charge(input: { orderId: string; amount: number }) {
+    return this.stripe.charge(input)
+  }
+}
+```
+
+The provider (embedded worker) and `node ace durable:worker` (a `tenant` pod) both serve it this way. Like an
+`@adonisjs/queue` job, the instance is resolved **on every step execution**, not once at boot: a service the
+container doesn't bind as a singleton is fresh per execution, and an `app.container.swap(StripeService, () => fake)`
+made in a test after boot is what the next execution receives. It's never the instance injected into the
+workflow.
+
 <Callout type="warn">
 Injected dependencies are for **composing** the workflow, not for doing its work. Calling `this.billing.charge(...)`
 directly from `run` performs I/O outside a step, so it re-executes on every replay and is never checkpointed.
@@ -296,13 +321,16 @@ import { registerStepsFromDir, registerWorkflowsFromDir } from '@adonis-agora/du
 await registerWorkflowsFromDir(engine, app.makePath('app/engine/flows'), (Ctor) =>
   app.container.make(Ctor),
 )
-await registerStepsFromDir(engine, app.makePath('app/engine/steps'))
+await registerStepsFromDir(engine, app.makePath('app/engine/steps'), (Ctor) =>
+  app.container.make(Ctor),
+)
 ```
 
 Both accept one directory or an array, and apply the same cross-directory duplicate check.
-`registerWorkflowsFromDir` takes an optional third argument, the factory that builds each class. Without it
-the class is built with `new Ctor()`, so pass `(Ctor) => app.container.make(Ctor)` as above when the
-workflows use [constructor injection](#dependency-injection-in-the-constructor). It returns the metadata of
+Both also take an optional third argument, the factory that builds each class (for steps, each class with
+`@Step` methods, called on every step execution; a `defineStep` handler is served as-is). Without it the
+class is built with `new Ctor()`, once, so pass `(Ctor) => app.container.make(Ctor)` as above when the
+classes use [constructor injection](#dependency-injection-in-the-constructor). It returns the metadata of
 every workflow it registered. For a single class, `registerWorkflowClass(engine, Cls, factory?)` does the same
 for one class.
 `engine.handle` throws if the engine's transport can't serve handlers. A `tenant` pod has no engine:

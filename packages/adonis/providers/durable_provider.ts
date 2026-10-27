@@ -688,13 +688,16 @@ export default class DurableProvider {
     if (stepRoots.length === 0) return;
     const server = this.#transport as (Transport & Partial<StepServer>) | null;
     if (!server || typeof server.handle !== 'function') return;
+    // Same container factory as `app/workflows`: a class whose `@Step` methods use constructor-
+    // injected services (an `app/steps` class, or a workflow class serving its own steps) gets them.
+    const stepClassFactory = (ctor: { new (): object }) => this.app.container.make(ctor);
     const barrel = await this.#loadGeneratedStepsBarrel();
     if (barrel) {
-      await registerStepsFromBarrel(server as StepServer, barrel);
+      await registerStepsFromBarrel(server as StepServer, barrel, stepClassFactory);
       return;
     }
     const dirs = stepRoots.map((root) => this.app.makePath(root));
-    await registerStepsFromDir(server as StepServer, dirs);
+    await registerStepsFromDir(server as StepServer, dirs, stepClassFactory);
   }
 
   /** Best-effort import of the build-time steps barrel; `null` when absent (fall back to the scan). */

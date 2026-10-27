@@ -509,8 +509,8 @@ What the provider runs over `workflowsPath` / `stepsPath`, for a directory it do
 | --- | --- | --- |
 | `registerWorkflowsFromDir` | `registerWorkflowsFromDir(engine, dir: string \| string[], factory?): Promise<WorkflowMeta[]>` | Import every module under `dir` and register its `BaseWorkflow` classes. The returned metadata carries each workflow's resolved `origin`. |
 | `registerWorkflowsFromBarrel` | `registerWorkflowsFromBarrel(engine, barrel, factory?, options?: { appRoot?: string \| URL }): Promise<WorkflowMeta[]>` | The same over a generated barrel (`hooks/workflows`). `appRoot` is the app the barrel was generated for: its modules derive their [origin](/docs/durable/concepts/workflows-and-steps#run-origin--package-attribution) from it. Without it they're attributed to the calling package. |
-| `registerStepsFromDir` / `registerStepsFromBarrel` | `(server: StepServer, dir \| barrel) => Promise<DurableStepMeta[]>` | Serve every `@Step` class and `defineStep` handler found. The engine is a `StepServer`. |
-| `registerWorkflowClass` / `registerSteps` | `registerWorkflowClass(engine, cls, factory?)` / `registerSteps(server, exports)` | Register one class, or the steps in a list of module exports. |
+| `registerStepsFromDir` / `registerStepsFromBarrel` | `(server: StepServer, dir \| barrel, factory?: StepClassFactory) => Promise<DurableStepMeta[]>` | Serve every `@Step` class and `defineStep` handler found. The engine is a `StepServer`. `factory` (`(Ctor) => instance`, may be async) builds the `@Step` class on every step execution, and the provider passes `(Ctor) => app.container.make(Ctor)`. Without it each class is built once with `new Ctor()`. |
+| `registerWorkflowClass` / `registerSteps` | `registerWorkflowClass(engine, cls, factory?)` / `registerSteps(server, exports)` | Register one class, or the steps in a list of module exports. `registerSteps` is synchronous and builds `@Step` classes with `new Ctor()`. |
 | `parseDuration` | `parseDuration(duration: string \| number): number` | The duration parser every `'30s'` / `'7 days'` option goes through. |
 
 ## Errors
