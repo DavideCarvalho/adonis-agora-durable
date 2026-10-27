@@ -1,5 +1,82 @@
 # @adonis-agora/durable
 
+## 0.54.2
+
+### Patch Changes
+
+- [#409](https://github.com/DavideCarvalho/adonis-agora-durable/pull/409) [`902f12e`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/902f12e9a6ca97d24e36e11e6ad819ef8137cfac) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A `bullmq` connection given as options with a `url` (`{ url: 'redis://…' }`) now reaches that Redis
+  from every client. BullMQ read the URL for the queues, but ioredis ignores `url`, so the pub/sub and
+  heartbeat clients connected to 127.0.0.1:6379 instead: step heartbeats, run replies and tenant
+  events were lost, or went to another Redis. Keys set beside the `url` (a `tls` with a CA, a `db`) are kept over the ones the URL implies.
+
+- [#409](https://github.com/DavideCarvalho/adonis-agora-durable/pull/409) [`6433ee6`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/6433ee6af00a052c46daf9fcbb93dcc059e54c25) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The adaptive step concurrency no longer collapses to one on fast steps.
+  
+  The controller read latency jitter as queuing: its baseline is the fastest completion of the
+  window, and for 1–5 ms steps p50 sits several times above it with nothing queued, so it shrank to
+  one or two at a time. p50 may now reach twice the baseline plus 5 ms before it counts as queuing.
+  Growth doubles the limit until the first back-off, then adds √limit a tick (it added one every 2 s);
+  until that first back-off, growth is re-decided after each limit's worth of settled steps instead of
+  waiting for the 2 s tick.
+  Step durations are timed with `performance.now()` instead of whole milliseconds. Same decisions as
+  the Aviary controller.
+
+- [#409](https://github.com/DavideCarvalho/adonis-agora-durable/pull/409) [`ad5f847`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/ad5f847e9d60576ed35d108ad496ea20f5eaa3f3) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The check a turn makes after suspending on a step, whether that step already settled, is a `COUNT`
+  where the store has `countCheckpoints`. It read the step's whole row, so every turn of a
+  conversation read back the input of the LLM step it had just sent.
+
+- [#409](https://github.com/DavideCarvalho/adonis-agora-durable/pull/409) [`d9ec346`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/d9ec34637d03d95f9b1f62c825bad0501ebed671) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A turn no longer reads the input of every step its run has completed.
+  
+  Each turn of a run starts by reading the run's checkpoints, and read every column of every row,
+  including the `input` of every completed step, which replaying a completed step never uses. Stores
+  can now implement the optional `listCheckpointsForReplay(runId)`: `listCheckpoints`, except that a
+  `completed` row comes back without its `input`, left out of the query. A `pending`, `running` or
+  `failed` row keeps it, for a re-dispatch or a retry. The engine reads a turn (and a remote
+  workflow's history) through it, and falls back to `listCheckpoints` on a store without it; the run
+  detail, `durable:runs` and `engine.listCheckpoints` still read every input. The Lucid store, the
+  in-memory store and `CodecStateStore` implement it: the 20th turn of a run whose steps carry
+  100 KB inputs read 2.2 MB on Postgres and MySQL, and now reads about 200 KB, the same as its first.
+
+- [#409](https://github.com/DavideCarvalho/adonis-agora-durable/pull/409) [`7490c16`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/7490c16f73ead4cab7e1b34986d2d342db5bddde) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A worker result's settle no longer reads the step's input. It reads the step's row through the new
+  optional `StateStore.getCheckpointsForSettle`, `getCheckpoints` without `input`, left out of the
+  query itself; the engine uses it only when the store also has `settleCheckpointsIfPending`. The Lucid
+  and in-memory stores implement it, `CodecStateStore` decodes what it returns, and the store contract
+  checks it when a store has it. With the re-check by count, a turn of a conversation over 100 KB-input
+  steps reads about 2 KB of checkpoints where it read about 200 KB.
+
+- [#409](https://github.com/DavideCarvalho/adonis-agora-durable/pull/409) [`9104008`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/910400813e56ade2488de368e10a24fa64e9ec2c) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A worker result settles its step without rewriting the step's `input`.
+  
+  The engine wrote a settled step's whole checkpoint row again, so a step with a large input (an
+  agent's LLM step carries its whole prompt) had that input written twice: once when it was
+  dispatched, once when its result landed. Stores can now implement the optional
+  `settleCheckpointsIfPending(settlements)`, which writes only the columns a result changes
+  (`status`, `output`, `error`, `events`, `startedAt`, `finishedAt`) while the row is still `pending`,
+  with the same claim as `saveCheckpointsIfPending`. The engine settles every result through it, and
+  writes whole rows as before on a store without it. The Lucid store, the in-memory store and
+  `CodecStateStore` implement it: settling a step with a 100 KB input wrote about 100 KB of
+  checkpoint row on Postgres, MySQL and SQLite, and now writes about 40 bytes.
+
+- [#409](https://github.com/DavideCarvalho/adonis-agora-durable/pull/409) [`2fb0651`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/2fb06516c80266a53535d312b259f87c0ff59dd5) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A result that lands right after the turn that sent its step suspended resumes the run once. The
+  instance that settles a step and resumes its run now remembers it for a lease, and the suspended
+  turn's re-check of that step, which found it settled and resumed the run again, leaves it to that
+  resume. A remote workflow's re-check, whose decision may postdate that resume, and a re-check on any
+  other instance still re-drive the run.
+
+- [#409](https://github.com/DavideCarvalho/adonis-agora-durable/pull/409) [`eaf342e`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/eaf342e979cb99faeb54d4e01d22de4c29d01a07) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A wide step fan no longer slows down on its way out and while its steps run.
+  
+  The `bullmq` and `queue` transports grouped a fan's tasks by queue by copying the group on every
+  task, so sending 150k steps took over a minute; it is linear now. The Lucid store's batched settle
+  grouped its rows the same way.
+  
+  Every step's worker beats once when it picks the step up, and each beat was written to the step's
+  checkpoint at once: a 40k fan made 40k concurrent `UPDATE`s that took the store's connections from
+  the fan's results. Beats are now written one at a time, a newer beat of a step replaces its queued
+  one, and a step whose result arrives first never has its beat written. A 40k fan over BullMQ and
+  MySQL went from 46 s to 13 s.
+  
+  With `remoteRedispatchMs` set, a fan's steps are written with their lease already stamped and the
+  run parks on it; a pickup beat on the instance that sent the fan no longer reads the step and
+  rewrites its lease. The same 40k fan went from 50 s to 14 s.
+
 ## 0.54.1
 
 ### Patch Changes
