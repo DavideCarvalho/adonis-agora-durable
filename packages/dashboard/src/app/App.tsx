@@ -272,6 +272,7 @@ function Header({
     queryKey: ['topology'],
     queryFn: () => durableClient.topology(),
     staleTime: Number.POSITIVE_INFINITY,
+    refetchInterval: false,
   });
   const isTenant = topology?.role === 'tenant';
   const roleLabel = !topology
@@ -1149,6 +1150,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
     queryKey: ['topology'],
     queryFn: () => durableClient.topology(),
     staleTime: Number.POSITIVE_INFINITY,
+    refetchInterval: false,
   });
   const tenantPod = topology?.role === 'tenant';
   // Dead-letter link: a `dead` run may have been routed to a `dlq:<id>` handler workflow. Probe for
@@ -1160,6 +1162,8 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
     queryFn: () => durableClient.run(handlerId as string),
     enabled: !!handlerId,
     retry: false,
+    // Existence is all the link needs: stop once found, and probe a missing one every 10s, not 2s.
+    refetchInterval: (q) => (q.state.data ? false : 10_000),
   });
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ['run', id] });
@@ -1921,13 +1925,18 @@ export function App() {
       : undefined;
   // Workflows with runs waiting on a handler that has NO live worker — surfaced as a banner so it's
   // obvious nothing will progress until a worker rejoins (the "control plane up, no worker" case).
-  const stalledWorkflows = [
-    ...new Set(
-      runs
-        .filter((r) => deriveRunState(r, { runs, health }).status === 'no-worker')
-        .map((r) => r.workflow),
-    ),
-  ];
+  // Memoized: deriving each run's state scans the run list for its singleton leader, and this ran on
+  // every render (every keystroke, every list poll) for every loaded run.
+  const stalledWorkflows = useMemo(
+    () => [
+      ...new Set(
+        runs
+          .filter((r) => deriveRunState(r, { runs, health }).status === 'no-worker')
+          .map((r) => r.workflow),
+      ),
+    ],
+    [runs, health],
+  );
   // Identity for the run list's `key` (see the `<RunsList key=…>` usage below) — every filter that
   // changes what `shown` contains, including the client-side-only origin facet.
   const runsListResetKey = `${filter}|${workflowFilter.join('|')}|${tagFilter.join('|')}|${attrPredicates.join(',')}|${namespaceFilter.join('|')}|${originFilterKey(originFilter)}`;

@@ -91,6 +91,9 @@ export function ValuePicker({
     getNextPageParam: (last: RunValueRow[], all: RunValueRow[][]) =>
       last.length < PAGE_SIZE ? undefined : all.reduce((n, page) => n + page.length, 0),
     staleTime: 10_000,
+    // Each poll re-runs the facet aggregation for every loaded page: refresh as often as the data
+    // is considered fresh, not at the console's 2s default.
+    refetchInterval: 10_000,
   });
 
   const options = useMemo(() => selectable(query.data?.pages.flat() ?? []), [query.data]);
