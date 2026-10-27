@@ -38,6 +38,7 @@ import {
   decisionsName,
   effectivePrefix,
   heartbeatChannel,
+  resultBatchesName,
   resultsName,
   routingToken,
   runReplyChannel,
@@ -154,6 +155,11 @@ function normalizePingInterval(value: number | false | undefined): number | fals
 /** The largest delay `setInterval` honours (a signed 32-bit int); anything above fires at ~1ms. */
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
+/** Most step results one job of the results-batch queue carries. */
+const RESULT_BATCH_MAX = 256;
+/** How long a worker trusts its last answer to "does an engine consume result batches?". */
+const RESULT_BATCH_CONSUMERS_TTL_MS = 5_000;
+
 /**
  * A queue-backed {@link Transport} over BullMQ/Redis, BYTE-COMPATIBLE with the aviary
  * (`nestjs-durable`) BullMQ transport and its Python raw-redis worker — so an Adonis engine can
@@ -197,6 +203,16 @@ export class BullMQTransport implements Transport {
   readonly #queues = new Map<string, QueueLike>();
   readonly #taskWorkers = new Map<string, WorkerLike>();
   #resultsWorker: WorkerLike | undefined;
+  #resultBatchesWorker: WorkerLike | undefined;
+  // Step results waiting for the results-batch publish in flight to finish (see `#publishResult`).
+  readonly #resultsToBatch: Array<{
+    result: StepResult;
+    resolve: () => void;
+    reject: (err: unknown) => void;
+  }> = [];
+  #publishingResultBatch = false;
+  #resultBatchConsumers: { consumed: boolean; at: number } | undefined;
+  #resultBatchConsumersRead: Promise<boolean> | undefined;
   #decisionsWorker: WorkerLike | undefined;
   readonly #decisionHandlers = new Set<(decision: WorkflowDecision) => Promise<void>>();
   #stepEventsWorker: WorkerLike | undefined;
@@ -448,6 +464,79 @@ export class BullMQTransport implements Transport {
 
   #effectivePrefix(): string {
     return effectivePrefix(this.#prefix, this.#namespace);
+  }
+
+  /**
+   * Publish a step's result, resolving once it is on a queue. While an engine consumes result
+   * batches, results that finish while one batch is being published go out together in the next, so
+   * a busy worker publishes one job per batch instead of one per step, and an idle one publishes each
+   * result as soon as it finishes. A batch that fails to publish goes out one result per job.
+   * Otherwise each result is its own job on the results queue.
+   */
+  async #publishResult(result: StepResult): Promise<void> {
+    if (!(await this.#resultBatchesConsumed())) {
+      await this.#queue(resultsName(this.#effectivePrefix())).add(
+        'result',
+        result,
+        resultJobOptions(),
+      );
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      this.#resultsToBatch.push({ result, resolve, reject });
+      if (!this.#publishingResultBatch) void this.#publishResultBatches();
+    });
+  }
+
+  async #publishResultBatches(): Promise<void> {
+    this.#publishingResultBatch = true;
+    try {
+      while (this.#resultsToBatch.length > 0) {
+        const batch = this.#resultsToBatch.splice(0, RESULT_BATCH_MAX);
+        try {
+          await this.#queue(resultBatchesName(this.#effectivePrefix())).add(
+            'results',
+            { results: batch.map((entry) => entry.result) },
+            resultJobOptions(),
+          );
+          for (const entry of batch) entry.resolve();
+        } catch {
+          // The results queue takes them one by one, so a batch's failure costs no result of it.
+          await Promise.all(
+            batch.map((entry) =>
+              this.#queue(resultsName(this.#effectivePrefix()))
+                .add('result', entry.result, resultJobOptions())
+                .then(() => entry.resolve(), entry.reject),
+            ),
+          );
+        }
+      }
+    } finally {
+      this.#publishingResultBatch = false;
+    }
+  }
+
+  /**
+   * Whether an engine consumes the results-batch queue: this instance's own consumer, else a live
+   * worker on it, re-read at most every {@link RESULT_BATCH_CONSUMERS_TTL_MS}. A queue that cannot
+   * count its workers, or a failed read, answers no, so results go out one job each.
+   */
+  async #resultBatchesConsumed(): Promise<boolean> {
+    if (this.#resultBatchesWorker) return true;
+    const known = this.#resultBatchConsumers;
+    if (known && Date.now() - known.at < RESULT_BATCH_CONSUMERS_TTL_MS) return known.consumed;
+    this.#resultBatchConsumersRead ??= Promise.resolve()
+      .then(async () => {
+        const queue = this.#queue(resultBatchesName(this.#effectivePrefix()));
+        return queue.getWorkersCount ? (await queue.getWorkersCount()) > 0 : false;
+      })
+      .catch(() => false)
+      .then((consumed) => {
+        this.#resultBatchConsumers = { consumed, at: Date.now() };
+        this.#resultBatchConsumersRead = undefined;
+        return consumed;
+      });
+    return this.#resultBatchConsumersRead;
   }
 
   #queue(name: string): QueueLike {
@@ -703,11 +792,7 @@ export class BullMQTransport implements Transport {
       };
     }
     try {
-      await this.#queue(resultsName(this.#effectivePrefix())).add(
-        'result',
-        result,
-        resultJobOptions(),
-      );
+      await this.#publishResult(result);
       return result.status === 'completed';
     } catch (err) {
       // The results-queue publish itself threw (e.g. Redis blipped). We still hold `task`, so
@@ -779,6 +864,24 @@ export class BullMQTransport implements Transport {
 
   onResult(handler: (result: StepResult) => Promise<void>): void {
     if (this.#resultsWorker) return;
+    this.#resultBatchesWorker = this.#makeWorker(
+      resultBatchesName(this.#effectivePrefix()),
+      async (job) => {
+        const { results } = job.data as { results: StepResult[] };
+        await Promise.all(results.map((result) => handler(result)));
+      },
+      { concurrency: this.#resultConcurrency },
+    );
+    this.#resultBatchesWorker.on('failed', (job, err) => {
+      if (!job || (job.attemptsMade ?? 0) < (job.opts?.attempts ?? 1)) return;
+      const results = (job.data as { results?: unknown[] } | null | undefined)?.results ?? [];
+      const giveUp = new Error(
+        `gave up on a batch of ${results.length} step results after ${job.attemptsMade} attempts: ${err.message}`,
+        { cause: err },
+      );
+      if (this.#hasOnError) this.#onError(giveUp);
+      else console.error(`[adonis-durable] ${giveUp.message}`);
+    });
     this.#resultsWorker = this.#makeWorker(
       resultsName(this.#effectivePrefix()),
       (job) => handler(job.data as StepResult),
@@ -1290,6 +1393,7 @@ export class BullMQTransport implements Transport {
     const workers: Array<Promise<unknown> | undefined> = [
       ...[...this.#taskWorkers.values()].map((w) => w.close()),
       this.#resultsWorker?.close(),
+      this.#resultBatchesWorker?.close(),
       this.#decisionsWorker?.close(),
       this.#stepEventsWorker?.close(),
       this.#startRunWorker?.close(),

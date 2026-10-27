@@ -23,6 +23,11 @@ export interface QueueLike {
   /** Several jobs in one round trip. Optional: a queue without it gets one `add` per job. */
   addBulk?(jobs: Array<{ name: string; data: unknown; opts?: unknown }>): Promise<unknown>;
   getJobCounts(...types: string[]): Promise<Record<string, number>>;
+  /**
+   * How many workers consume the queue. Optional: without it, a worker never learns that an engine
+   * reads result batches, and publishes one result per job.
+   */
+  getWorkersCount?(): Promise<number>;
   close(): Promise<unknown>;
 }
 

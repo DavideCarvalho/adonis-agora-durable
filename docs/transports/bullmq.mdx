@@ -91,7 +91,7 @@ Every `tickMs`, an adaptive worker compares the steps' median latency (p50) with
 | RSS at or above `ramCeilingPct` of the memory limit (cgroup v2, then cgroup v1, then host total) | down 20% |
 | CPU at or above `cpuCeilingPct` | down 1 |
 | more than 20% of recent steps failed, or work in flight with no completion for two ticks | down 1 |
-| gradient below 0.7 (steps are queuing) | multiplied by the gradient, rounded down |
+| gradient below 0.7 (steps are queuing) | down a quarter (at least 1): the window is a fraction of a second of a busy worker's steps, so one slow moment can read as deep queuing, and queuing that persists still halves the limit in under three ticks |
 | gradient at or above 0.9 while in-flight work fills at least 80% of the limit | up: doubles until the first move down, then `+⌊√limit⌋` |
 
 Until the limit first moves down, growth works like slow start: the worker re-decides it after each limit's worth of settled steps instead of waiting for the next tick, so a worker of fast steps reaches its working limit within milliseconds rather than after many ticks. Only growth is decided early; every move down waits for the tick. Once the limit has moved down, growth happens on the tick, by `⌊√limit⌋` (at least 1).
@@ -136,6 +136,10 @@ bullmq: transports.bullmq({
 Raising it never gives a run two concurrent turns: the run lease admits one executor, and replay is positional. The fan's join barrier resumes the parent once per settled wave rather than once per result. For the engine-side timer batch (`timerBatchSize`) that goes with wide fans, see [Wide fans: results and timers](/docs/durable/transports#wide-fans-results-and-timers).
 
 ### Result delivery
+
+A worker publishes step results in batches while an engine consumes them: the results that finish while one batch is being published go out together in the next (up to 256), as one job on the `<P>-results-batch` queue. An idle worker publishes each result as soon as it finishes; a busy one publishes one job per batch instead of one per step, which takes a 5,000-step fan from about 66 Redis commands a step to 39. A step's task job completes only once the batch carrying its result is on the queue, so a crash never loses a result, and a batch that fails to publish goes out one result per job.
+
+A worker sends batches only once a live consumer is reading `<P>-results-batch`: it rereads that every 5 seconds through BullMQ's worker list, and a queue without `getWorkersCount` (a custom `BullMQDeps`) or any error reading it answers no. Otherwise each result is its own job on `<P>-results`, which every engine consumes, so a fleet mid-upgrade, an older engine or the Python worker loses nothing. The queue name and the job (`results`, data `{ results: StepResult[] }`) are the aviary transport's, so the two interoperate either way.
 
 If the engine's result handler throws on a result job (for example, a store timeout at peak load), the job is retried up to **5 times** with exponential backoff starting at **500 ms**. Retrying is safe because the engine settles a step only while its checkpoint is still `pending`. A result that still fails is kept in the results queue for **24 hours**, and the transport reports that it gave up on it (with the step and run ids) to `onError`, or to `console.error` when no `onError` is set.
 
@@ -242,6 +246,7 @@ The same transport also carries:
 | --- | --- | --- | --- |
 | `<P>-tasks-<token>` | queue | engine → workers | step dispatch (job `task`) and remote workflow turns (job `workflow`), one queue per routing token |
 | `<P>-results` | queue | workers → engine | step results (job `result`) |
+| `<P>-results-batch` | queue | workers → engine | step results in batches (job `results`, data `{ results }`), sent only while an engine consumes it |
 | `<P>-decisions` | queue | workers → engine | remote workflow decisions |
 | `<P>-step-events` | queue | workers → engine | streamed local-step lifecycle from remote workflows |
 | `<P>-heartbeat` | pub/sub | workers → engine | liveness for `timeoutMs` steps |
