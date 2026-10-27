@@ -84,7 +84,7 @@ Unlike `stores.lucid({ connection })` or `controlPlanes.redis({ connection })`, 
 - **`'adaptive'`** lets an `AdaptiveController` move the limit at runtime, using the defaults below.
 - **`{ mode: 'adaptive', ... }`** is adaptive mode with overrides.
 
-Every `tickMs`, an adaptive worker compares the steps' median latency (p50) with their no-queuing baseline, and checks the memory and CPU it is using. The baseline tracks the fastest step of the window, and p50 always sits above it, so the latency gradient allows for that: it is `(2 × baseline + 5 ms) / p50`, capped at 1. A step of 1–2 ms that sometimes takes 5 ms reads as noise, not as queuing. The first matching signal moves the limit:
+Every `tickMs`, an adaptive worker compares the steps' median latency (p50) with their no-queuing baseline, and checks the memory and CPU it is using. The baseline is the window's median, smoothed so it follows a drop at once and a rise slowly: a latency that stays high because a shared Redis or database is busy becomes the baseline within a few ticks, so it does not hold a worker of one or two slots there, and only a rise reads as queuing. The latency gradient is `(2 × baseline + 5 ms) / p50`, capped at 1, so a step of 1–2 ms that sometimes takes 5 ms reads as noise too. A tick with no settled step leaves the limit where it is: the window still holds the last burst, so an idle worker starts its next burst at the limit it ended on. The first matching signal moves the limit:
 
 | Signal | Move |
 | --- | --- |
