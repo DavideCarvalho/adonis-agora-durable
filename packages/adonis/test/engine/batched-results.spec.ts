@@ -46,13 +46,27 @@ async function until(check: () => boolean | Promise<boolean>, max = 1000): Promi
   throw new Error('condition not met');
 }
 
-/** Wraps a store, counting the settle calls the engine makes (and optionally sabotaging one). */
+/** Wraps a store, counting the settle and barrier calls the engine makes. */
 function instrument(store: StateStore) {
-  const calls = { batch: [] as number[], single: 0 };
+  const calls = { batch: [] as number[], single: 0, has: 0, count: 0 };
   const batch = store.saveCheckpointsIfPending?.bind(store);
   const single = store.saveCheckpointIfPending?.bind(store);
   const settle = store.settleCheckpointsIfPending?.bind(store);
+  const has = store.hasCheckpoints?.bind(store);
+  const count = store.countCheckpoints?.bind(store);
   const wrapped = Object.create(store) as StateStore;
+  if (has) {
+    wrapped.hasCheckpoints = async (...args) => {
+      calls.has += 1;
+      return has(...args);
+    };
+  }
+  if (count) {
+    wrapped.countCheckpoints = async (...args) => {
+      calls.count += 1;
+      return count(...args);
+    };
+  }
   if (settle) {
     wrapped.settleCheckpointsIfPending = async (settlements: StepSettlement[]) => {
       if (settlements.length === 1) calls.single += 1;
@@ -136,6 +150,9 @@ describe.each(stores)('batched step results (%s)', (_label, makeStore) => {
     expect(Math.max(...calls.batch)).toBeGreaterThan(1);
     // One replay for the settled fan, not one per result.
     expect(turns() - before).toBeLessThanOrEqual(2);
+    // The barrier asks whether any step is still pending, never for a count over the fan.
+    expect(calls.has).toBeGreaterThanOrEqual(1);
+    expect(calls.count).toBe(0);
   });
 
   it('drops a duplicate in the same batch and settles each step once', async () => {

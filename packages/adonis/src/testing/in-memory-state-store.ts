@@ -866,6 +866,24 @@ export class InMemoryStateStore implements StateStore {
     return n;
   }
 
+  async hasCheckpoints(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    statuses: StepCheckpoint['status'][],
+  ): Promise<boolean> {
+    for (const cp of this.checkpoints.values()) {
+      if (
+        cp.runId === runId &&
+        cp.seq >= fromSeq &&
+        cp.seq <= toSeq &&
+        statuses.includes(cp.status)
+      )
+        return true;
+    }
+    return false;
+  }
+
   async listCheckpointsByNamePrefix(runId: string, prefixes: string[]): Promise<StepCheckpoint[]> {
     const rows = [...this.checkpoints.values()]
       .filter((cp) => cp.runId === runId && prefixes.some((p) => cp.name.startsWith(p)))

@@ -296,15 +296,17 @@ export default defineConfig({
 })
 ```
 
-A custom store should implement `countCheckpoints(runId, fromSeq, toSeq,
-statuses)` as a `COUNT` (the step-fan join barrier asks it once per fan per
-batch, skipped while more of the same fan's results are queued behind the batch;
-without it the engine loads the run's checkpoints to count), implement
+A custom store should implement `hasCheckpoints(runId, fromSeq, toSeq,
+statuses)` as one `SELECT seq ... ORDER BY seq DESC LIMIT 1` (the step-fan join
+barrier asks it once per fan per batch, skipped while more of the same fan's
+results are queued behind the batch; without it the engine asks
+`countCheckpoints`), `countCheckpoints` as a `COUNT` (without either the engine
+loads the run's checkpoints), implement
 `saveCheckpointIfPending` as one conditional `UPDATE ... WHERE status = 'pending'`
 (without it a blind save can put a settled step back to `pending`), and return
 `listDueTimers` most overdue first, with or without a `limit`. Run
 `runStateStoreContract` from `@adonis-agora/durable/testing/conformance`, which
-covers all three and fails a store missing either method. The contract also
+covers each of them and fails a store missing one of these methods. The contract also
 requires `saveCheckpointsIfPending` (batched result settling), `deleteRuns`
 (batched retention/purge deletes), `runFacets`, `pruneBufferedEvents`
 (`eventBufferTtl`) and the `checkpointStats` + `queryCheckpoints` pair (the run

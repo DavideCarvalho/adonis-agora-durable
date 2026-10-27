@@ -1296,6 +1296,26 @@ export class LucidStateStore implements StateStore {
     return Number((rows as Array<{ count: number | string }>)[0]?.count ?? 0);
   }
 
+  /** The highest matching seq through the `(run_id, seq)` primary key, read downward, `LIMIT 1`. */
+  async hasCheckpoints(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    statuses: StepCheckpoint['status'][],
+  ): Promise<boolean> {
+    if (statuses.length === 0) return false;
+    const row = await this.client()
+      .from(DURABLE_TABLES.checkpoints)
+      .select('seq')
+      .where('run_id', runId)
+      .andWhere('seq', '>=', fromSeq)
+      .andWhere('seq', '<=', toSeq)
+      .whereIn('status', statuses)
+      .orderBy('seq', 'desc')
+      .first();
+    return row !== undefined && row !== null;
+  }
+
   /**
    * One `GROUP BY parallel_group, status, <name kind>` over the run's checkpoints — the buckets a run
    * detail summarizes a fan from, without loading its rows. The name-kind `CASE` is the SQL of

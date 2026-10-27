@@ -833,8 +833,8 @@ export interface StateStore {
 
   /**
    * How many of the run's checkpoints with `fromSeq <= seq <= toSeq` have one of `statuses`. The join
-   * barrier of a step fan (`ctx.all` over a `@Step`) asks this on every result — "is any step of the
-   * fan still `pending`?" — so it must be a count, not a load of the fan. An empty `statuses` counts
+   * barrier of a step fan (`ctx.all` over a `@Step`) asks it on a store without
+   * {@link hasCheckpoints}, so it must be a count, not a load of the fan. An empty `statuses` counts
    * nothing.
    *
    * Optional: a store that omits it still works — the engine falls back to {@link listCheckpoints}
@@ -846,6 +846,23 @@ export interface StateStore {
     toSeq: number,
     statuses: StepCheckpoint['status'][],
   ): Promise<number>;
+
+  /**
+   * Whether any of the run's checkpoints with `fromSeq <= seq <= toSeq` has one of `statuses`: the
+   * question the join barrier of a step fan asks on each batch of results ("is any step of the fan
+   * still `pending`?"). Read it from the TOP of the range down and stop at the first match: a fan's
+   * steps are dispatched in seq order, so its highest seqs are the last to settle, and the answer
+   * comes from the first rows read instead of a count over the whole range. An empty `statuses`
+   * answers `false`.
+   *
+   * Optional: a store that omits it still works — the engine asks {@link countCheckpoints} instead.
+   */
+  hasCheckpoints?(
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    statuses: StepCheckpoint['status'][],
+  ): Promise<boolean>;
 
   /**
    * The run's checkpoints aggregated into {@link CheckpointStat} buckets — one per

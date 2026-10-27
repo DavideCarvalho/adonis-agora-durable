@@ -3033,8 +3033,8 @@ export class WorkflowEngine {
       (async () => {
         await new Promise((r) => setTimeout(r, 0));
         for (const fan of fans) {
-          const pending = await this.countPendingSteps(runId, fan.from, fan.to).catch(() => 1);
-          if (pending === 0) {
+          const pending = await this.stepFanHasPending(runId, fan.from, fan.to).catch(() => true);
+          if (!pending) {
             await this.resumeImplicit(runId).catch(() => undefined);
             return;
           }
@@ -3043,7 +3043,6 @@ export class WorkflowEngine {
     );
   }
 
-  /** {@link StateStore.countCheckpoints} of `pending` steps, or a JS count on a store without it. */
   /** Whether the checkpoint at `seq` is settled: a `COUNT` when the store has one, else the row. */
   private async checkpointSettled(runId: string, seq: number): Promise<boolean> {
     if (this.store.countCheckpoints) {
@@ -3053,13 +3052,17 @@ export class WorkflowEngine {
     return cp?.status === 'completed' || cp?.status === 'failed';
   }
 
-  private async countPendingSteps(runId: string, from: number, to: number): Promise<number> {
-    if (this.store.countCheckpoints) {
-      return this.store.countCheckpoints(runId, from, to, ['pending']);
+  /** Whether any step of a step fan's seq range is still `pending`. */
+  private async stepFanHasPending(runId: string, from: number, to: number): Promise<boolean> {
+    if (this.store.hasCheckpoints) {
+      return this.store.hasCheckpoints(runId, from, to, ['pending']);
     }
-    return (await this.store.listCheckpoints(runId)).filter(
+    if (this.store.countCheckpoints) {
+      return (await this.store.countCheckpoints(runId, from, to, ['pending'])) > 0;
+    }
+    return (await this.store.listCheckpoints(runId)).some(
       (c) => c.seq >= from && c.seq <= to && c.status === 'pending',
-    ).length;
+    );
   }
 
   /**
@@ -7959,10 +7962,7 @@ export class WorkflowEngine {
         const lastSeq = fan.firstSeq + fan.size - 1;
         closed = queuedIn(fan.firstSeq, lastSeq)
           ? Promise.resolve(true)
-          : this.countPendingSteps(runId, fan.firstSeq, lastSeq).then(
-              (n) => n > 0,
-              () => false,
-            );
+          : this.stepFanHasPending(runId, fan.firstSeq, lastSeq).catch(() => false);
         barriers.set(fan.firstSeq, closed);
       }
       if (!(await closed)) {
@@ -8045,7 +8045,7 @@ export class WorkflowEngine {
     const lastSeq = fan.firstSeq + fan.size - 1;
     // Left to the result of this fan queued behind this one (see `completeRemoteResults`).
     if (queuedIn(fan.firstSeq, lastSeq)) return true;
-    return (await this.countPendingSteps(result.runId, fan.firstSeq, lastSeq)) > 0;
+    return this.stepFanHasPending(result.runId, fan.firstSeq, lastSeq);
   }
 
   /**

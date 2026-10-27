@@ -145,6 +145,13 @@ export class CodecStateStore implements StateStore {
     toSeq: number,
     statuses: StepCheckpoint['status'][],
   ) => Promise<number>;
+  /** Forwarded verbatim — reads no payload. Bound only when the inner store has it. */
+  readonly hasCheckpoints?: (
+    runId: string,
+    fromSeq: number,
+    toSeq: number,
+    statuses: StepCheckpoint['status'][],
+  ) => Promise<boolean>;
   /** Decodes each checkpoint. Bound only when the inner store has it. */
   readonly getCheckpoints?: (runId: string, seqs: number[]) => Promise<StepCheckpoint[]>;
   /** Decodes each checkpoint. Bound only when the inner store has it. */
@@ -254,6 +261,11 @@ export class CodecStateStore implements StateStore {
     if (countCheckpoints) {
       this.countCheckpoints = (runId, fromSeq, toSeq, statuses) =>
         countCheckpoints.call(inner, runId, fromSeq, toSeq, statuses);
+    }
+    const hasCheckpoints = inner.hasCheckpoints;
+    if (hasCheckpoints) {
+      this.hasCheckpoints = (runId, fromSeq, toSeq, statuses) =>
+        hasCheckpoints.call(inner, runId, fromSeq, toSeq, statuses);
     }
     const registerChildWaits = inner.registerChildWaits;
     if (registerChildWaits) {

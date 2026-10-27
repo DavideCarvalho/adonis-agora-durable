@@ -139,9 +139,39 @@ describe('a step fan barrier', () => {
     await Promise.all([...deliveries, redelivered]);
     await until(async () => (await store.getRun('p'))?.status === 'completed');
     expect((await store.getRun('p'))?.output).toEqual(lines(20).map(({ i }) => i * 10));
-    expect(calls.get('countCheckpoints')).toBe(1);
+    // The barrier asks whether any step is still pending, never for a count over the fan.
+    expect(calls.get('hasCheckpoints')).toBe(1);
+    expect(calls.get('countCheckpoints') ?? 0).toBe(0);
     expect(turns()).toBe(2);
   });
+
+  it.each([
+    ['without hasCheckpoints, through countCheckpoints', ['hasCheckpoints'], 'countCheckpoints'],
+    [
+      'without either, through the checkpoint list',
+      ['hasCheckpoints', 'countCheckpoints'],
+      'listCheckpoints',
+    ],
+  ] as const)(
+    'a store %s still opens the barrier once the fan settles',
+    async (_label, missing, read) => {
+      const inner = new InMemoryStateStore();
+      for (const name of missing) Object.defineProperty(inner, name, { value: undefined });
+      const { store, calls } = counting(inner);
+      const { transport, engine, register, turns } = setup(store);
+      register(async (ctx) => ctx.all(processLine, lines(10)));
+      await engine.start('fan', {}, 'p');
+      await until(() => transport.dispatched.length === 10);
+      await until(async () => (await store.getRun('p'))?.status === 'suspended');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      calls.clear();
+      await Promise.all(transport.take().map((t) => transport.deliver(ok(t))));
+      await until(async () => (await store.getRun('p'))?.status === 'completed');
+      expect((await store.getRun('p'))?.output).toEqual(lines(10).map(({ i }) => i * 10));
+      expect(calls.get(read) ?? 0).toBeGreaterThanOrEqual(1);
+      expect(turns()).toBe(2);
+    },
+  );
 
   it('a result queued for a seq outside the fan does not hold back its barrier', async () => {
     const store = new GatedStore();
@@ -204,12 +234,12 @@ describe('a step fan barrier', () => {
       private counted: (() => void)[] = [];
       private looked?: () => void;
       private holdSuspend?: Promise<void>;
-      override async countCheckpoints(
+      override async hasCheckpoints(
         runId: string,
         from: number,
         to: number,
         statuses: StepCheckpoint['status'][],
-      ): Promise<number> {
+      ): Promise<boolean> {
         if (this.counting) {
           await new Promise<void>((resolve) => {
             this.counted.push(resolve);
@@ -223,7 +253,7 @@ describe('a step fan barrier', () => {
             }
           });
         }
-        return super.countCheckpoints(runId, from, to, statuses);
+        return super.hasCheckpoints(runId, from, to, statuses);
       }
       // Time for the instance that kept the wake to look at the run.
       override async bufferEvent(input: {
