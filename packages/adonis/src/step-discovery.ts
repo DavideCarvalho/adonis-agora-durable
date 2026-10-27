@@ -52,39 +52,89 @@ export function registerStep(server: StepServer, step: DiscoveredStep): void {
 }
 
 /**
+ * A factory that instantiates a class carrying `@Step` methods, called **on every handler
+ * invocation**: each step execution runs on a fresh instance, like an `@adonisjs/queue` job. The
+ * AdonisJS provider passes `(Ctor) => app.container.make(Ctor)`, so constructor dependency injection
+ * (`@inject()`) works for step classes and a `container.swap(Service, ...)` made after boot is seen by
+ * the next execution. May return the instance or a Promise (the container's `make` is async). Never
+ * called for a `defineStep(...)` function — there is nothing to build. Without a factory, discovery
+ * keeps the old behaviour: one `new Ctor()` at registration, reused for every call.
+ */
+export type StepClassFactory = (ctor: new () => object) => object | Promise<object>;
+
+function defaultStepClassFactory(ctor: new () => object): object {
+  return new ctor();
+}
+
+/** The `@Step`-stamped method keys on a class's prototype; empty for anything that is not a class
+ *  with stamped methods. */
+function stampedStepKeys(exported: unknown): string[] {
+  if (typeof exported !== 'function' || !exported.prototype) return [];
+  const proto = exported.prototype as Record<string, unknown>;
+  return Object.getOwnPropertyNames(proto).filter((key) => {
+    const value = proto[key];
+    return (
+      typeof value === 'function' &&
+      typeof (value as { [DURABLE_STEP_NAME]?: unknown })[DURABLE_STEP_NAME] === 'string'
+    );
+  });
+}
+
+/** Bind each stamped method of `exported` (a class) to `instance`. */
+function bindStepMethods(exported: unknown, instance: object, keys: string[]): DiscoveredStep[] {
+  const proto = (exported as { prototype: Record<string, unknown> }).prototype;
+  const target = instance as Record<string, unknown>;
+  const found: DiscoveredStep[] = [];
+  for (const key of keys) {
+    const meta = stepMetaOf(proto[key]);
+    if (!meta) continue;
+    found.push({ meta, handler: (target[key] as StepHandler).bind(instance) });
+  }
+  return found;
+}
+
+/**
  * Collect every `@Step`/`defineStep` handler reachable from an exported value:
  * - a `defineStep(...)` function (stamped directly) → one handler, bound as-is.
- * - a class with `@Step`-decorated methods → instantiate once and bind each stamped method.
+ * - a class with `@Step`-decorated methods → instantiate once with `new Ctor()` and bind each stamped
+ *   method.
  * Anything else is ignored. So a module can `export` either style (or both) and be discovered.
+ *
+ * Synchronous, so it can only build a class with `new Ctor()` (no constructor dependencies). The
+ * directory/barrel discovery ({@link registerStepsFromDir}, {@link registerStepsFromBarrel}) takes a
+ * {@link StepClassFactory} instead, which is how the AdonisJS provider injects dependencies.
  */
 export function collectSteps(exported: unknown): DiscoveredStep[] {
-  const found: DiscoveredStep[] = [];
-  // A `defineStep(...)` handler: the function itself carries the stamp.
   const directMeta = stepMetaOf(exported);
-  if (directMeta) {
-    found.push({ meta: directMeta, handler: exported as DiscoveredStep['handler'] });
-    return found;
-  }
-  // A class with `@Step` methods: scan its prototype for stamped methods and bind them to an instance.
-  if (typeof exported === 'function' && exported.prototype) {
-    const proto = exported.prototype as Record<string, unknown>;
-    const stamped = Object.getOwnPropertyNames(proto).filter((key) => {
-      const value = proto[key];
-      return (
-        typeof value === 'function' &&
-        typeof (value as { [DURABLE_STEP_NAME]?: unknown })[DURABLE_STEP_NAME] === 'string'
-      );
+  if (directMeta) return [{ meta: directMeta, handler: exported as DiscoveredStep['handler'] }];
+  const keys = stampedStepKeys(exported);
+  if (keys.length === 0) return [];
+  return bindStepMethods(exported, defaultStepClassFactory(exported as new () => object), keys);
+}
+
+/**
+ * {@link collectSteps}, but with `factory` each handler resolves its instance through it on every
+ * call (and calls the method on that instance). Without `factory` this IS {@link collectSteps}.
+ */
+function collectStepsWith(exported: unknown, factory?: StepClassFactory): DiscoveredStep[] {
+  if (!factory) return collectSteps(exported);
+  const directMeta = stepMetaOf(exported);
+  if (directMeta) return [{ meta: directMeta, handler: exported as DiscoveredStep['handler'] }];
+  const keys = stampedStepKeys(exported);
+  if (keys.length === 0) return [];
+  const Ctor = exported as new () => object;
+  const proto = Ctor.prototype as Record<string, unknown>;
+  const found: DiscoveredStep[] = [];
+  for (const key of keys) {
+    const meta = stepMetaOf(proto[key]);
+    if (!meta) continue;
+    found.push({
+      meta,
+      handler: async (input: unknown, log: StepLogger) => {
+        const instance = (await factory(Ctor)) as Record<string, unknown>;
+        return (instance[key] as StepHandler).call(instance, input, log);
+      },
     });
-    if (stamped.length > 0) {
-      const Ctor = exported as new () => Record<string, (...args: unknown[]) => unknown>;
-      const instance = new Ctor();
-      for (const key of stamped) {
-        const method = proto[key] as (...args: unknown[]) => unknown;
-        const meta = stepMetaOf(method);
-        if (!meta) continue;
-        found.push({ meta, handler: (instance[key] as StepHandler).bind(instance) });
-      }
-    }
   }
   return found;
 }
@@ -134,6 +184,7 @@ function stepNamesOf(exported: unknown): string[] {
 async function registerStepModules(
   server: StepServer,
   modules: readonly DiscoveryModule[],
+  factory: StepClassFactory | undefined,
 ): Promise<DurableStepMeta[]> {
   const owners = new Map<string, { root: string; file: string; source: unknown }>();
   const plan: unknown[][] = [];
@@ -158,13 +209,31 @@ async function registerStepModules(
     }
     plan.push(exports);
   }
+  // Collect every module's handlers BEFORE serving any, so a class whose `new Ctor()` throws (no
+  // factory) fails discovery without leaving a half-served transport. With a factory nothing is
+  // built here: each handler resolves its instance when it runs.
+  const collected: DiscoveredStep[][] = [];
+  for (const exports of plan) {
+    // Per module, exactly `registerSteps`: de-duplicated by routing name, first export wins.
+    const steps: DiscoveredStep[] = [];
+    const inModule = new Set<string>();
+    for (const exported of exports) {
+      for (const step of collectStepsWith(exported, factory)) {
+        if (inModule.has(step.meta.name)) continue;
+        inModule.add(step.meta.name);
+        steps.push(step);
+      }
+    }
+    collected.push(steps);
+  }
   const registered: DurableStepMeta[] = [];
   const seen = new Set<string>();
-  for (const exports of plan) {
-    for (const meta of registerSteps(server, exports)) {
-      if (seen.has(meta.name)) continue;
-      seen.add(meta.name);
-      registered.push(meta);
+  for (const steps of collected) {
+    for (const step of steps) {
+      registerStep(server, step);
+      if (seen.has(step.meta.name)) continue;
+      seen.add(step.meta.name);
+      registered.push(step.meta);
     }
   }
   return registered;
@@ -181,12 +250,22 @@ async function registerStepModules(
  * `server` is anything with `handle(name, fn)`: a transport, the store-less `WorkerRuntime`, or the
  * `WorkflowEngine` itself (it forwards to its primary transport) — the latter is how app code
  * serves an extra directory from a preload: `await registerStepsFromDir(engine, dir)`.
+ *
+ * `factory` builds each class that carries `@Step` methods, once per handler call (see
+ * {@link StepClassFactory}); omitted, each class is built once with `new Ctor()` at registration.
+ * Pass `(Ctor) => app.container.make(Ctor)` for constructor injection — the provider does.
+ * `defineStep(...)` functions are served as-is either way.
  */
 export async function registerStepsFromDir(
   server: StepServer,
   dir: string | readonly string[],
+  factory?: StepClassFactory,
 ): Promise<DurableStepMeta[]> {
-  return registerStepModules(server, await scanDirsModules(typeof dir === 'string' ? [dir] : dir));
+  return registerStepModules(
+    server,
+    await scanDirsModules(typeof dir === 'string' ? [dir] : dir),
+    factory,
+  );
 }
 
 /** The build-time barrel shape the Assembler `init` hook generates for `app/steps` (key → lazy
@@ -197,10 +276,12 @@ export type StepsBarrel = BarrelTree;
 
 /** Register every `@Step`/`defineStep` reachable from a generated {@link StepsBarrel} (or a
  *  multi-root {@link RootedBarrel} array) onto `server` — the build-time equivalent of
- *  {@link registerStepsFromDir} with no runtime `readdir`, same cross-root duplicate rule. */
+ *  {@link registerStepsFromDir} with no runtime `readdir`, same cross-root duplicate rule and the
+ *  same optional {@link StepClassFactory}. */
 export async function registerStepsFromBarrel(
   server: StepServer,
   barrel: StepsBarrel | readonly RootedBarrel[],
+  factory?: StepClassFactory,
 ): Promise<DurableStepMeta[]> {
-  return registerStepModules(server, barrelModules(barrel));
+  return registerStepModules(server, barrelModules(barrel), factory);
 }

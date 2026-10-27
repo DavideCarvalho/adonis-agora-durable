@@ -61,7 +61,7 @@ export const workflows = {
 
 ### How the provider uses them
 
-At boot the provider imports `.adonisjs/durable/workflows.js`. It awaits each thunk and registers every `BaseWorkflow` subclass it finds, through the container so constructor injection works. Each class is registered once, even when it's re-exported from several modules. It does the same with `.adonisjs/durable/steps.js`, serving every `@Step` / `defineStep` export by name on the app's transport.
+At boot the provider imports `.adonisjs/durable/workflows.js`. It awaits each thunk and registers every `BaseWorkflow` subclass it finds, through the container so constructor injection works. Each class is registered once, even when it's re-exported from several modules. It does the same with `.adonisjs/durable/steps.js`, serving every `@Step` / `defineStep` export by name on the app's transport, and resolves each `@Step` class through the container as well, on every step execution.
 
 When a barrel file doesn't exist (because the hook isn't registered), the provider **falls back** to scanning the configured directories at runtime (`workflowsPath`, default `app/workflows`; `stepsPath`, default `app/steps`). Registration is identical either way. Only a genuine "module not found" triggers the fallback: a barrel that exists but fails to import throws at boot instead of quietly degrading. Setting `workflowsPath: false` or `stepsPath: false` in `config/durable.ts` turns discovery off entirely, barrel included.
 

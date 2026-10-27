@@ -41,9 +41,11 @@ A modular app (one folder per bounded context) lists several directories:
 `workflowsPath` and `stepsPath` in `config/durable.ts` take an array, and so
 does the `source` option of the `workflowsHook` / `stepsHook` codegen hooks.
 Names must be unique across those directories. To register one more directory
-from a preload, call `registerWorkflowsFromDir(engine, dir)` and
-`registerStepsFromDir(engine, dir)`. The engine serves steps through its
-transport (`engine.handle`).
+from a preload, call `registerWorkflowsFromDir(engine, dir, factory?)` and
+`registerStepsFromDir(engine, dir, factory?)`. The engine serves steps through its
+transport (`engine.handle`). Pass `(Ctor) => app.container.make(Ctor)` as the
+factory for constructor DI (for steps it runs on every execution); without it
+classes are built once with `new Ctor()`.
 
 ## Setup
 
@@ -78,8 +80,11 @@ fire-and-forget child instead of a top-level run.
 
 ### Pattern 1 — typed steps with `@Step`, `defineStep`, and DI
 
-Steps are discovered from `app/steps` and served by name automatically. A
-`@Step` method ref passed to `ctx.step` gives full input/output typing:
+Steps are discovered from `app/steps` and served by name automatically. Each
+`@Step` class is resolved through the container on every execution (like an
+`@adonisjs/queue` job), so it can take `@inject()` constructor dependencies and
+a `container.swap(...)` after boot reaches the next execution. A `@Step` method ref passed to `ctx.step`
+gives full input/output typing:
 
 ```ts title="app/steps/payment_steps.ts"
 import { Step } from '@adonis-agora/durable'

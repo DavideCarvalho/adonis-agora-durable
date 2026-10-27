@@ -35,8 +35,15 @@ class SchemaSpyStore extends InMemoryStateStore {
 
 const SRC = fileURLToPath(new URL('../src', import.meta.url));
 
-/** Minimal Adonis container/app stand-in capturing the singleton factory. */
-function fakeApp(config: DurableConfig = {}, appRoot = '/app', environment = 'web') {
+/** Minimal Adonis container/app stand-in capturing the singleton factory. `makeClass` plays the
+ *  container's constructor injection for `make(Ctor)`; omitted, the class is built bare. */
+function fakeApp(
+  config: DurableConfig = {},
+  appRoot = '/app',
+  environment = 'web',
+  makeClass: (Ctor: new (...args: never[]) => unknown) => unknown = (Ctor) =>
+    new (Ctor as new () => unknown)(),
+) {
   let factory: (() => unknown) | undefined;
   let singletonInstance: unknown;
   const app = {
@@ -54,8 +61,7 @@ function fakeApp(config: DurableConfig = {}, appRoot = '/app', environment = 'we
           if (!singletonInstance) singletonInstance = await factory?.();
           return singletonInstance as WorkflowEngine;
         }
-        const Ctor = key as new () => unknown;
-        return new Ctor();
+        return makeClass(key as new () => unknown);
       },
     },
   } as unknown as ApplicationService;
@@ -438,6 +444,45 @@ describe('DurableProvider — app/workflows auto-discovery (boot)', () => {
     expect((await engine.waitForRun('o1', { terminal: true, timeoutMs: 5000 })).output).toBe(
       'charged:x',
     );
+  });
+
+  it('builds app/steps classes through the container per execution: injected deps, and a swap after boot is seen', async () => {
+    await mkdir(join(dir, 'app/steps'), { recursive: true });
+    await writeFile(
+      join(dir, 'app/steps/pricing_steps.ts'),
+      `import { Step } from '${SRC}/step-ref.js'
+       export default class PricingSteps {
+         constructor(pricing) { this.pricing = pricing }
+         quote(input) { return this.pricing.quote(input) }
+       }
+       Step('pricing:quote')(PricingSteps.prototype, 'quote', Object.getOwnPropertyDescriptor(PricingSteps.prototype, 'quote'))`,
+    );
+    // Plays `@inject()` + the container: resolves the constructor's dependency from the current
+    // binding, which the test swaps after boot like `app.container.swap(Pricing, () => fake)`.
+    let pricing = { quote: (n: number) => `quoted:${n}` };
+    const built: string[] = [];
+    const { app, resolve } = fakeApp({ workflowsPath: false }, dir, 'web', (Ctor) => {
+      built.push(Ctor.name);
+      return new (Ctor as new (p: { quote(n: number): string }) => unknown)(pricing);
+    });
+    const provider = new DurableProvider(app);
+    provider.register();
+    await provider.boot();
+    expect(built).toEqual([]);
+
+    const engine = await resolve();
+    engine.register('order', '1', async (ctx, input) => ctx.step('pricing:quote', input));
+    await engine.start('order', 7, 'o1');
+    expect((await engine.waitForRun('o1', { terminal: true, timeoutMs: 5000 })).output).toBe(
+      'quoted:7',
+    );
+
+    pricing = { quote: (n: number) => `fake:${n}` };
+    await engine.start('order', 8, 'o2');
+    expect((await engine.waitForRun('o2', { terminal: true, timeoutMs: 5000 })).output).toBe(
+      'fake:8',
+    );
+    expect(built).toEqual(['PricingSteps', 'PricingSteps']);
   });
 
   it('workflowsPath and stepsPath both false leave the engine unbuilt at boot', async () => {

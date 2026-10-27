@@ -33,6 +33,7 @@ export {
   registerSteps,
   registerStepsFromBarrel,
   registerStepsFromDir,
+  type StepClassFactory,
   type StepServer,
   type StepsBarrel,
 } from '../step-discovery.js';

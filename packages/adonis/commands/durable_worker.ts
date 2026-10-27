@@ -50,6 +50,8 @@ export default class DurableWorker extends BaseCommand {
       const steps = await registerStepsFromDir(
         runtime,
         stepRoots.map((root) => this.app.makePath(root)),
+        // Built through the container, like the provider's embedded worker: constructor DI works.
+        (ctor) => this.app.container.make(ctor),
       );
       this.logger.info(
         `registered ${steps.length} step handler(s) from ${describeRoots(stepRoots)}`,
