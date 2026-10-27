@@ -7783,6 +7783,7 @@ export class WorkflowEngine {
             traceparent,
             context,
             priority: opts.admission?.priority,
+            lazyPickupBeat: true,
             attempt: 1,
           })),
           opts.transport,

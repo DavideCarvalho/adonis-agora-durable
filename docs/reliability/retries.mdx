@@ -158,7 +158,7 @@ await ctx.step(harvestBatch, input, {
 })
 ```
 
-A worker emits an automatic beat the moment it claims the task, and **that first beat is what switches the window** from `pickupTimeoutMs` to `timeoutMs`. So the two read as: `pickupTimeoutMs` is *"how long may it stay queued"*, `timeoutMs` is *"maximum silence while running"*.
+A worker emits an automatic beat the moment it claims the task, and **that first beat is what switches the window** from `pickupTimeoutMs` to `timeoutMs`. A [step fan](/docs/durable/authoring/child-workflows#fanning-out-over-a-step)'s steps, which cannot carry a `timeoutMs`, are the exception: their worker sends the pickup beat once the step has run for a second, and not at all for a step that settles sooner, so a fan of thousands of short steps does not publish one beat per step to every engine. A long fan step still gets its beat, a second late, for the lease renewal and the dashboard's "executing" state. So the two read as: `pickupTimeoutMs` is *"how long may it stay queued"*, `timeoutMs` is *"maximum silence while running"*.
 
 It defaults to `timeoutMs`, so leaving it off preserves the single-window behaviour. It is only consulted when `timeoutMs` is set — on a step with no `timeoutMs` there is no in-memory window at all, and `pickupTimeoutMs` does nothing.
 

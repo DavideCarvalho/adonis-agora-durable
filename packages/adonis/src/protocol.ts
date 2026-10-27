@@ -35,6 +35,10 @@ function withRestoredContext<T>(snapshot: Record<string, unknown> | undefined, f
 /** How often a workflow worker beats for a turn it is replaying (the Python `durable-worker` uses 5s). */
 export const TURN_HEARTBEAT_INTERVAL_MS = 5_000;
 
+/** How long a step marked {@link RemoteTask.lazyPickupBeat} runs before its worker sends the pickup
+ *  heartbeat. */
+export const PICKUP_BEAT_GRACE_MS = 1_000;
+
 /**
  * Run a workflow turn while emitting RUN-scoped heartbeats (`{ runId, seq: 0, group }`, no `stepId`):
  * one right away, then every `intervalMs` until the turn settles. They keep an engine that set
@@ -124,12 +128,21 @@ export async function runStepHandler(
   // started". This is what lets `pickupTimeoutMs` (queue-wait allowance) hand over to the tighter
   // `timeoutMs` (max silence while running) — and it stamps `lastHeartbeatAt` even for handlers
   // that never beat manually, so "queued" vs "executing" is visible on the checkpoint.
-  beat?.();
-  return withRestoredContext(task.context, async () => {
+  const pickup = task.lazyPickupBeat && beat ? setTimeout(beat, PICKUP_BEAT_GRACE_MS) : undefined;
+  pickup?.unref?.();
+  if (!pickup) beat?.();
+  const handlerBeat =
+    beat && pickup
+      ? (progress?: unknown): void => {
+          clearTimeout(pickup);
+          beat(progress);
+        }
+      : beat;
+  const settled = withRestoredContext(task.context, async () => {
     try {
       // Outside any ambient workflow ctx: an in-process transport runs the handler on the parent
       // body's async path, but a handler is not the body (see `runOutsideWorkflowCtx`).
-      const logger = createStepLogger(events, Date.now, beat);
+      const logger = createStepLogger(events, Date.now, handlerBeat);
       const output = await runOutsideWorkflowCtx(() =>
         runInStepLogger(logger, () => handler(task.input, logger)),
       );
@@ -150,4 +163,9 @@ export async function runStepHandler(
       });
     }
   });
+  try {
+    return await settled;
+  } finally {
+    clearTimeout(pickup);
+  }
 }
