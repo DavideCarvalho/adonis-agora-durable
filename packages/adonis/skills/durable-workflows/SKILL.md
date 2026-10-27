@@ -128,7 +128,7 @@ export default class OrderWorkflow extends BaseWorkflow {
 }
 ```
 
-The instance is built once at registration and reused for every run — treat the
+The workflow instance is built once at registration and reused for every run — treat the
 constructor as wiring; keep per-run state in input and step outputs, never on
 `this`. Injected services are for **composing**, not doing work: reach them
 through step refs so the work is checkpointed.
