@@ -23,14 +23,61 @@ export type AccessDeniedRenderer = GenericAccessDeniedRenderer<HttpContext>;
 export type AccessDeniedOption = GenericAccessDeniedOption<HttpContext>;
 
 /**
- * Authorization guard for the dashboard. Runs before every dashboard route
- * (API + HTML). Return `true` to allow the request, `false` to deny it (the
- * provider replies `403`). May be async (e.g. an auth lookup).
+ * A structured answer from an {@link AuthorizeHook}: whether the request may proceed and, when it may
+ * not, why. The `reason` picks the status: `'unauthenticated'` (nobody is signed in) → `401`,
+ * `'forbidden'` (signed in, not allowed) → `403`. No reason → `403` (fail closed).
+ *
+ * This is the shared Agora dashboard-gate contract — the same shape every `@adonis-agora` console
+ * accepts, so one hook (e.g. `@adonis-agora/authz`'s `authorizeByRoles`) can gate them all.
+ */
+export interface AuthorizeDecision {
+  allowed: boolean;
+  reason?: 'unauthenticated' | 'forbidden';
+}
+
+/** What an {@link AuthorizeHook} may return: a bare boolean or an {@link AuthorizeDecision}. */
+export type AuthorizeResult = boolean | AuthorizeDecision;
+
+/**
+ * Authorization guard for the dashboard. Runs before every dashboard route (API + HTML). May be
+ * async (e.g. an auth lookup). Return:
+ *
+ * - `true` or `{ allowed: true }` → the request proceeds;
+ * - `{ allowed: false, reason: 'unauthenticated' }` → `401` (the access-denied page with the
+ *   "sign in" story for a page navigation, `{ error: 'unauthorized' }` for an API request);
+ * - `{ allowed: false, reason: 'forbidden' }`, `{ allowed: false }` or `false` → `403` (the
+ *   access-denied page, or `{ error: 'forbidden' }`).
+ *
+ * A hook that THROWS is a denial (`403`), never a pass. A hook that answers the request itself — a
+ * redirect to the host's login page, most commonly — keeps its answer: the provider writes nothing
+ * over it.
  *
  * It receives the AdonisJS {@link HttpContext}, so it can read the session,
  * a bearer token, an IP allow-list, etc.
  */
-export type AuthorizeHook = (ctx: HttpContext) => boolean | Promise<boolean>;
+export type AuthorizeHook = (ctx: HttpContext) => AuthorizeResult | Promise<AuthorizeResult>;
+
+/**
+ * Collapse an {@link AuthorizeResult} into a decision. Only `true` or an object with
+ * `allowed === true` allows: anything else — `false`, `{ allowed: false }`, a truthy non-boolean, a
+ * missing value — denies. (A decision OBJECT is truthy, so a `!result` check would wave
+ * `{ allowed: false }` through; this is why the guard never tests the raw value.)
+ */
+export function normalizeAuthorizeResult(result: unknown): AuthorizeDecision {
+  if (result === true) return { allowed: true };
+  if (
+    typeof result === 'object' &&
+    result !== null &&
+    (result as AuthorizeDecision).allowed === true
+  ) {
+    return { allowed: true };
+  }
+  const reason =
+    typeof result === 'object' && result !== null
+      ? (result as AuthorizeDecision).reason
+      : undefined;
+  return { allowed: false, reason: reason === 'unauthenticated' ? 'unauthenticated' : 'forbidden' };
+}
 
 /** Shape of `config/durable_dashboard.ts`. */
 export interface DurableDashboardConfig {
@@ -46,7 +93,9 @@ export interface DurableDashboardConfig {
    */
   path?: string;
   /**
-   * Per-request authorization guard. Defaults to {@link defaultAuthorize}, which FAILS CLOSED in
+   * Per-request authorization guard — see {@link AuthorizeHook} for what it may return
+   * (`boolean` or an {@link AuthorizeDecision}; `reason: 'unauthenticated'` → `401`, otherwise a
+   * denial is `403`). Defaults to {@link defaultAuthorize}, which FAILS CLOSED in
    * EVERY environment: it requires a bearer token matching `DURABLE_DASHBOARD_TOKEN` (denying
    * everything when that env var is unset) — unless {@link dashboardAuth} is configured (the
    * session guard is then the gate) or {@link allowUnauthenticated} explicitly opts out.

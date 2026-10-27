@@ -32,7 +32,7 @@ export default defineConfig({
 | --- | --- | --- |
 | `enabled` | `true` | When `false`, no routes are registered at all. |
 | `path` | `'/durable'` | Route prefix the console mounts under. `'/'` mounts at the root. |
-| `authorize` | see below | Per-request guard: `(ctx: HttpContext) => boolean \| Promise<boolean>`. |
+| `authorize` | see below | Per-request guard: `(ctx: HttpContext) => AuthorizeResult \| Promise<AuthorizeResult>`, where `AuthorizeResult = boolean \| { allowed: boolean; reason?: 'unauthenticated' \| 'forbidden' }`. |
 | `dashboardAuth` | absent | Opt-in [session layer](/docs/durable/observability/dashboard-auth) on top of `authorize`. |
 | `allowUnauthenticated` | `false` | Local development only: serve the console with no auth at all (warns at boot). See below. |
 | `audit` | app logger | `(entry) => void` sink for every mutating attempt: `{ at, actor, method, path }`. |
@@ -60,13 +60,22 @@ Two request-level guards apply on top of whatever gate you pick:
 
 Every mutating attempt is also **audited** before its handler runs — actor (session name/id, `token`, or `anonymous`), method and path without the query string — through the app logger, or your own `audit` hook on the config. Reads are not audited. Payloads an operator submits (fix-and-replay input, signal/update/task bodies, webhook callbacks) are capped at 1 MiB (`413`). A handler that throws answers a generic `500 { "error": "internal error" }`; the detail goes to the app logger, never to the client.
 
-Override `authorize` with your own session/role/IP guard — a denied request gets a `403`: JSON for an API call, the [access-denied page](#the-access-denied-page) for a browser:
+Override `authorize` with your own session/role/IP guard. It returns a bare `boolean` or a decision object `{ allowed, reason? }` (the `AuthorizeDecision` / `AuthorizeResult` types, exported from `@adonis-agora/durable/dashboard` — the same contract every `@adonis-agora` console accepts). A denial gets JSON for an API call and the [access-denied page](#the-access-denied-page) for a browser:
+
+| Hook result | Status | API body |
+| --- | --- | --- |
+| `true` / `{ allowed: true }` | request proceeds | — |
+| `{ allowed: false, reason: 'unauthenticated' }` | `401` | `{ "error": "unauthorized" }` |
+| `{ allowed: false, reason: 'forbidden' }`, `{ allowed: false }`, `false` | `403` | `{ "error": "forbidden" }` |
+| the hook throws | `403` | `{ "error": "forbidden" }` |
+
+Only `true` or `allowed: true` lets a request through — any other value denies. A hook that already answered the request (a redirect to your login page, a body) keeps its answer; the provider writes nothing over it.
 
 ```ts
 export default defineConfig({
   authorize: async (ctx) => {
-    await ctx.auth.check()
-    return ctx.auth.user?.isAdmin === true
+    if (!(await ctx.auth.check())) return { allowed: false, reason: 'unauthenticated' } // 401
+    return ctx.auth.user?.isAdmin === true // false -> 403
   },
 })
 ```
