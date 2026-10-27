@@ -1035,6 +1035,14 @@ export class WorkflowEngine {
   private readonly turnSettledFans = new Map<string, Map<number, number>>();
   /** The kept wake reasons each executing turn on this instance serves (see {@link execute}). */
   private readonly turnServedWakes = new Map<string, Set<string>>();
+  /**
+   * `<runId>:<seq>` of the steps (not of a step fan) whose result this instance settled and whose
+   * run it then resumed, with when, kept for a lease. That resume runs a turn after any this instance
+   * is executing, or asks the lease holder for one, so the re-check after an in-process turn
+   * ({@link recheckWaitSeqs}) has no wake to recover for such a step: resuming again would only
+   * replay the run once more.
+   */
+  private readonly settledHere = new Map<string, number>();
   /** {@link sweepBufferedSignals}: the id the pass in progress resumes after, `undefined` between passes. */
   private bufferedSweepCursor: string | undefined;
   private bufferedSweepActive = false;
@@ -2993,13 +3001,19 @@ export class WorkflowEngine {
    * delivery's own resume no-oped against this turn's still-held lease (see the WorkflowSuspended
    * catch in runExecution). Deferred one macrotask so the caller's `finally` releases the lease
    * first; tracked so `drain()` waits for the re-driven turn's writes.
+   *
+   * With `settledHereResumes`, a step in {@link settledHere} needs no re-drive: the turn that
+   * suspended on it read its snapshot before the settle, so the settle's resume queued behind that
+   * turn or asked the lease holder for one. A remote workflow's decision is applied after the turn
+   * that computed it ended, so the settle's resume may already have run, and it passes `false`.
    */
-  private recheckWaitSeqs(runId: string, seqs: number[]): void {
+  private recheckWaitSeqs(runId: string, seqs: number[], settledHereResumes = false): void {
     this.trackEffect(
       (async () => {
         await new Promise((r) => setTimeout(r, 0));
         for (const seq of seqs) {
           if (await this.checkpointSettled(runId, seq).catch(() => false)) {
+            if (settledHereResumes && this.settledHere.has(`${runId}:${seq}`)) return;
             await this.resumeImplicit(runId).catch(() => undefined);
             return;
           }
@@ -6582,7 +6596,7 @@ export class WorkflowEngine {
         // all with reconcileMs: 0). Re-check the seqs this suspension waits on and re-drive if one
         // already settled.
         if (settled.status === 'suspended' && err.waitSeqs?.length) {
-          this.recheckWaitSeqs(run.id, err.waitSeqs);
+          this.recheckWaitSeqs(run.id, err.waitSeqs, true);
         }
         if (settled.status === 'suspended' && err.stepFans?.length) {
           this.recheckStepFans(run.id, err.stepFans);
@@ -7785,7 +7799,26 @@ export class WorkflowEngine {
     const cp = await this.settleRemoteCheckpoint(result);
     if (cp === undefined) return;
     if (await this.stepFanStillRunning(cp, result, queuedIn)) return;
+    if (!parseStepFanGroup(cp.parallelGroup)) this.noteSettledHere(result.runId, [cp.seq]);
     this.resumeInBackground(result.runId, fanWakeOf(cp, result));
+  }
+
+  /**
+   * Record `seqs` of `runId` in {@link settledHere}, dropping the entries older than a lease. A key is
+   * re-inserted at the end, so the map stays in the order its keys were noted and pruning stops at
+   * the first fresh entry.
+   */
+  private noteSettledHere(runId: string, seqs: number[]): void {
+    const now = this.clock();
+    for (const seq of seqs) {
+      const key = `${runId}:${seq}`;
+      this.settledHere.delete(key);
+      this.settledHere.set(key, now);
+    }
+    for (const [key, at] of this.settledHere) {
+      if (now - at <= this.leaseMs) break;
+      this.settledHere.delete(key);
+    }
   }
 
   private resumeInBackground(runId: string, fan?: FanWake): void {
@@ -7910,9 +7943,14 @@ export class WorkflowEngine {
       const fan = parseStepFanGroup(cp.parallelGroup);
       if (fan) highest.set(fan.firstSeq, Math.max(highest.get(fan.firstSeq) ?? cp.seq, cp.seq));
     }
+    // The one resume below replays every step of the batch.
+    const singles = resumable
+      .filter(({ cp }) => !parseStepFanGroup(cp.parallelGroup))
+      .map(({ cp }) => cp.seq);
     for (const { cp, result } of resumable) {
       const fan = parseStepFanGroup(cp.parallelGroup);
       if (!fan || result.status === 'failed') {
+        this.noteSettledHere(runId, singles);
         this.resumeInBackground(runId);
         return outcomes;
       }
@@ -7928,6 +7966,7 @@ export class WorkflowEngine {
         barriers.set(fan.firstSeq, closed);
       }
       if (!(await closed)) {
+        this.noteSettledHere(runId, singles);
         this.resumeInBackground(runId, {
           first: fan.firstSeq,
           seq: highest.get(fan.firstSeq) ?? cp.seq,
