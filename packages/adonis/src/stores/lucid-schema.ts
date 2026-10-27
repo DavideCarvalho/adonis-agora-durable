@@ -60,7 +60,7 @@ export const DURABLE_SCHEMA_META_TABLE = 'durable_schema_meta';
  * once on its next boot and then goes back to the one-row read. A test pins the SQLite DDL to this
  * number, so a schema change without a bump fails CI.
  */
-export const DURABLE_SCHEMA_REVISION = 4;
+export const DURABLE_SCHEMA_REVISION = 5;
 
 const SCHEMA_META_ROW = 'durable';
 
@@ -523,7 +523,12 @@ async function healDurableTables(
     });
   }
 
+  // Tables CREATEd by this call: an index added right after creating one is part of the fresh
+  // install, not a repair.
+  const created = new Set<string>();
+
   if (!(await conn().hasTable(DURABLE_TABLES.signalWaiters))) {
+    created.add(DURABLE_TABLES.signalWaiters);
     await conn().createTable(DURABLE_TABLES.signalWaiters, (table) => {
       tableCollation(table);
       table.string('token').primary();
@@ -548,6 +553,7 @@ async function healDurableTables(
   }
 
   if (!(await conn().hasTable(DURABLE_TABLES.bufferedSignals))) {
+    created.add(DURABLE_TABLES.bufferedSignals);
     await conn().createTable(DURABLE_TABLES.bufferedSignals, (table) => {
       tableCollation(table);
       table.increments('id').primary();
@@ -555,6 +561,25 @@ async function healDurableTables(
       table.text('payload', 'longtext');
       table.index(['token'], 'durable_buffered_signals_token_idx');
     });
+  }
+
+  // Postgres: the token prefix scans (`token LIKE 'prefix%'` — an event publish's waiters, a fan's
+  // buffered child completions, the entity sweep) can only use a btree built with the pattern
+  // operator class unless the database collation is `C`. The plain token indexes above use the
+  // default class, so under the usual `en_US.UTF-8` every such read scanned its whole table.
+  if (client.dialect.name === 'postgres') {
+    for (const [table, indexName] of [
+      [DURABLE_TABLES.signalWaiters, 'durable_signal_waiters_token_prefix_idx'],
+      [DURABLE_TABLES.bufferedSignals, 'durable_buffered_signals_token_prefix_idx'],
+    ] as const) {
+      if (await indexExists(client, indexName)) continue;
+      await client.rawQuery('create index ?? on ?? (?? varchar_pattern_ops)', [
+        indexName,
+        table,
+        'token',
+      ]);
+      if (!created.has(table)) repairs.push(`${table}.${indexName}`);
+    }
   }
 
   // Reliable (buffered) events: a publish that matched NO live waiter keeps ONE copy here, consumed

@@ -871,6 +871,10 @@ export async function metricsText(deps: Deps): Promise<string> {
   const count = engine.countRuns?.bind(engine);
   // A count that fails (a control plane too old to answer it, from a tenant pod) leaves the backlog
   // gauges out rather than reporting a backlog of 0.
+  // The worker health read starts alongside the counts instead of after them (one scrape, one wait).
+  const healthRead = Promise.resolve().then(() => engine.workerHealth());
+  // Never left unhandled while the counts are awaited; the `await` below still throws it.
+  healthRead.catch(() => undefined);
   const counts = count
     ? await Promise.all([
         count({ status: 'pending' }),
@@ -889,7 +893,7 @@ export async function metricsText(deps: Deps): Promise<string> {
       `durable_dead_runs ${dead}`,
     );
   }
-  const health = await engine.workerHealth();
+  const health = await healthRead;
   if (health.length > 0) {
     gauges.push('# TYPE durable_group_queue_depth gauge');
     for (const h of health) {

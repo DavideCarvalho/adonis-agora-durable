@@ -252,25 +252,27 @@ export async function loadRunDetail(
   runId: string,
   options?: RunDetailOptions,
 ): Promise<RunDetail | null> {
+  const over = options?.summarizeFansOver;
+  if (over !== undefined && aggregatesCheckpoints(source)) {
+    // The run and the buckets are read together (one round trip for a poll that ends in a 304), and
+    // both before any row, so a write landing mid-read leaves the ETag older than the body: the next
+    // poll misses and re-reads, rather than pinning a stale body.
+    const [run, stats] = await Promise.all([source.getRun(runId), source.checkpointStats(runId)]);
+    if (!run) return null;
+    const etag = runDetailEtag(run, stats, over);
+    if (etagMatches(options?.ifNoneMatch, etag)) {
+      return { run, timeline: [], children: [], notModified: true, etag };
+    }
+    return { run, ...(await summarizeRunFromStore(source, runId, over, stats)), etag };
+  }
   const run = await source.getRun(runId);
   if (!run) return null;
-  const over = options?.summarizeFansOver;
   if (over === undefined) {
     const [timeline, children] = await Promise.all([
       source.listCheckpoints(runId),
       source.getRunChildren(runId),
     ]);
     return { run, timeline, children };
-  }
-  if (aggregatesCheckpoints(source)) {
-    // The buckets are read before any row, so a write landing mid-read leaves the ETag older than
-    // the body: the next poll misses and re-reads, rather than pinning a stale body.
-    const stats = await source.checkpointStats(runId);
-    const etag = runDetailEtag(run, stats, over);
-    if (etagMatches(options?.ifNoneMatch, etag)) {
-      return { run, timeline: [], children: [], notModified: true, etag };
-    }
-    return { run, ...(await summarizeRunFromStore(source, runId, over, stats)), etag };
   }
   // Summarized: the children come from the timeline already loaded, rather than a second read of
   // every child-edge checkpoint (one per child of a wide fan). A child whose waiter is written but
@@ -297,15 +299,20 @@ export async function loadFanMembers(
   group: string,
   query: FanPageQuery,
 ): Promise<FanPage | null> {
-  if (!(await source.getRun(runId))) return null;
   if (aggregatesCheckpoints(source)) {
-    const stats = await source.checkpointStats(runId, { group });
+    // The run's existence and the group's buckets in one round trip; both still precede every row.
+    const [run, stats] = await Promise.all([
+      source.getRun(runId),
+      source.checkpointStats(runId, { group }),
+    ]);
+    if (!run) return null;
     const etag = fanPageEtag(group, stats, query);
     if (etagMatches(query.ifNoneMatch, etag)) {
       return { items: [], total: 0, notModified: true, etag };
     }
     return { ...(await pageFanFromStore(source, runId, group, query, stats)), etag };
   }
+  if (!(await source.getRun(runId))) return null;
   return pageFan(await source.listCheckpoints(runId), group, query);
 }
 

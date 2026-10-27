@@ -490,6 +490,25 @@ const LEASE_RECHECK_SLACK_MS = 100;
  */
 const REMOTE_TURN_REDRIVE_MS = 1_000;
 
+/**
+ * The most entries a per-step in-memory throttle/fallback map keeps (heartbeat writes, lease
+ * re-arms, admitted queues). Each entry is a few dozen bytes; the cap is there so a long-lived pod
+ * that hears the whole fleet's beats cannot grow without bound, while staying well above the number
+ * of steps a fleet keeps in flight, so the throttles keep working at scale.
+ */
+const THROTTLE_MAP_CAP = 16_384;
+
+/** `map.set(key, value)` keeping insertion order as recency, evicting the oldest past {@link THROTTLE_MAP_CAP}. */
+function setBounded<K, V>(map: Map<K, V>, key: K, value: V): void {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > THROTTLE_MAP_CAP) {
+    const oldest = map.keys().next();
+    if (oldest.done) break;
+    map.delete(oldest.value);
+  }
+}
+
 /** A step result waiting for its run's next batched settle. */
 interface QueuedResult {
   result: StepResult;
@@ -953,7 +972,8 @@ export class WorkflowEngine {
   private readonly admission: AdmissionBackend;
   /** Runs on THIS instance blocked on admission, by queue — woken early on a freed-slot signal. */
   private readonly queueWaiters = new Map<string, Set<string>>();
-  /** Which queue a dispatched step took a slot from, by stepId — so the result can release it. */
+  /** Which queue a dispatched step took a slot from, by stepId — so the result can release it.
+   *  Bounded (see {@link setBounded}): the checkpoint's `queue` is the durable source. */
   private readonly stepQueue = new Map<string, string>();
   /** Executions currently in flight, so a graceful shutdown can wait for them to settle. */
   private readonly inflight = new Map<Promise<RunResult>, string>();
@@ -1904,8 +1924,11 @@ export class WorkflowEngine {
    * One exemption: a beat CARRYING progress punches through when the last persisted one had none —
    * the automatic pickup beat lands first (no payload) and must not shadow the handler's first real
    * progress for a whole window. Optional store capability: no `recordStepHeartbeat` → no-op.
-   * Failures are swallowed (a lost liveness update never harms the run). The throttle map is cleared
-   * wholesale past 1024 entries — a rare extra write, never a leak.
+   * Failures are swallowed (a lost liveness update never harms the run). The throttle map stays in
+   * write order: entries whose window has passed are dropped from its front (they no longer throttle
+   * anything), and past {@link THROTTLE_MAP_CAP} the oldest goes — a rare extra write, never a leak.
+   * It used to be cleared wholesale past 1024 entries, which a fleet with more steps beating than that
+   * (every engine pod hears every beat) hit every few seconds, turning the throttle off.
    */
   private persistHeartbeat(beat: Heartbeat): void {
     const id = beat.stepId;
@@ -1920,8 +1943,17 @@ export class WorkflowEngine {
       !upgradesToProgress
     )
       return;
-    if (this.heartbeatPersists.size > 1024) this.heartbeatPersists.clear();
+    // Re-insert at the back so the map stays ordered by write time, then drop the expired front.
+    this.heartbeatPersists.delete(id);
     this.heartbeatPersists.set(id, { at: now, hadProgress: beat.progress !== undefined });
+    for (const [oldId, entry] of this.heartbeatPersists) {
+      if (
+        now - entry.at < this.heartbeatPersistThrottleMs &&
+        this.heartbeatPersists.size <= THROTTLE_MAP_CAP
+      )
+        break;
+      this.heartbeatPersists.delete(oldId);
+    }
     this.heartbeatWrites.set(id, {
       runId: beat.runId,
       seq: beat.seq,
@@ -2556,7 +2588,12 @@ export class WorkflowEngine {
       //  (b) an old pending REMOTE step whose worker heartbeat is silent — dispatched and lost.
       // A long `ctx.sleep` (wakeAt in the future) and a beating long step are NOT stalled.
       let stalePending: StalledRunInfo['stalePending'] = null;
-      for (const cp of await this.store.listCheckpoints(run.id)) {
+      // Only pending checkpoints can be stale: read just those where the store can filter, not the
+      // run's whole history (a wide fan's thousands of settled rows, payloads included).
+      const pendingCheckpoints = this.store.queryCheckpoints
+        ? await this.store.queryCheckpoints(run.id, { statuses: ['pending'] })
+        : await this.store.listCheckpoints(run.id);
+      for (const cp of pendingCheckpoints) {
         if (cp.kind !== 'remote' || cp.status !== 'pending') continue;
         const ageMs = now - cp.enqueuedAt.getTime();
         const heartbeatAgeMs = cp.lastHeartbeatAt ? now - cp.lastHeartbeatAt.getTime() : null;
@@ -6060,7 +6097,8 @@ export class WorkflowEngine {
    * (with a 30-minute window: two writes an hour), independent of beat frequency. The in-memory mark
    * is a pure optimisation — cold on a fresh instance, or on the one that didn't dispatch the step —
    * and the durable half-spent check re-derives the same answer from the checkpoint, so nothing
-   * depends on it surviving. Cleared wholesale past 1024 entries: a rare extra read, never a leak.
+   * depends on it surviving. Bounded at {@link THROTTLE_MAP_CAP} entries, oldest first: a rare extra
+   * read, never a leak.
    *
    * NEVER REJECTS. This runs on the transport's SERIAL heartbeat handler, so a store hiccup thrown out
    * of here would take the whole fleet's beat loop with it — and every lease would then lapse at once,
@@ -6095,14 +6133,13 @@ export class WorkflowEngine {
     const halfWindow = Math.ceil(this.remoteRedispatchMs / 2);
     // More than half the window left: nothing to buy, and nothing to look at until it is half spent.
     if (cp.wakeAt != null && cp.wakeAt > now + halfWindow) {
-      this.stepLeaseRearms.set(id, cp.wakeAt - halfWindow);
+      setBounded(this.stepLeaseRearms, id, cp.wakeAt - halfWindow);
       return;
     }
     const renewed = now + this.remoteRedispatchMs;
     const previous = cp.wakeAt;
     await this.store.saveCheckpoint({ ...cp, wakeAt: renewed });
-    if (this.stepLeaseRearms.size > 1024) this.stepLeaseRearms.clear();
-    this.stepLeaseRearms.set(id, renewed - halfWindow);
+    setBounded(this.stepLeaseRearms, id, renewed - halfWindow);
     // If the run is parked EXACTLY on this step's old lease, carry its wake forward too — otherwise a
     // beating worker costs one wasted turn per renewal window. Only on an exact match: any other
     // `wakeAt` belongs to some other timer (a sleep, a sibling's shorter lease) and moving it would
@@ -7385,7 +7422,9 @@ export class WorkflowEngine {
         throw new WorkflowSuspended(decision.retryAt);
       }
       this.queueWaiters.get(queue)?.delete(runId);
-      this.stepQueue.set(id, queue);
+      // Bounded: the result (and so the delete) may land on another pod, which releases the slot
+      // from the checkpoint's durable `queue` — this map is only the legacy fallback.
+      setBounded(this.stepQueue, id, queue);
       admittedQueue = queue;
     }
 

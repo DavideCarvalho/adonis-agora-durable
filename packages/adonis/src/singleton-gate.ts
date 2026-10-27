@@ -16,7 +16,10 @@ const SINGLETON_RETRY_MS = 1000;
 const SINGLETON_RETRY_JITTER_MS = 250;
 
 export interface SingletonGateDeps {
-  store: Pick<StateStore, 'listRuns' | 'updateRun' | 'updateRunIf' | 'tryAdmitSingleton'>;
+  store: Pick<
+    StateStore,
+    'listRuns' | 'countRuns' | 'updateRun' | 'updateRunIf' | 'tryAdmitSingleton'
+  >;
   clock: () => number;
   /** Hand a gated run to the run dispatcher (fire-and-forget, like the engine's other dispatches). */
   dispatch: (runId: string) => void;
@@ -58,12 +61,13 @@ export class SingletonGate {
   async assertCapacity(workflow: string, cfg: SingletonConfig, input: unknown): Promise<void> {
     if (cfg.maxQueueDepth == null) return;
     const cap = (cfg.limit ?? 1) + cfg.maxQueueDepth;
-    const queued = await this.deps.store.listRuns({
-      tag: this.tag(cfg, input),
-      workflow,
-      statuses: SINGLETON_ACTIVE_STATUSES,
-    });
-    if (queued.length >= cap) {
+    const query = { tag: this.tag(cfg, input), workflow, statuses: SINGLETON_ACTIVE_STATUSES };
+    const store = this.deps.store;
+    // A COUNT where the store has one, instead of loading every queued run (payloads included).
+    const queued = store.countRuns
+      ? await store.countRuns(query)
+      : (await store.listRuns(query)).length;
+    if (queued >= cap) {
       throw new SingletonQueueFullError(workflow, cfg.key(input), cfg.maxQueueDepth);
     }
   }
