@@ -27,6 +27,7 @@ import {
   type DashboardAuditEntry,
   type DurableDashboardConfig,
   isProduction,
+  normalizeAuthorizeResult,
   type ResolvedDurableDashboardConfig,
   resolveConfig,
 } from '../src/dashboard/define_config.js';
@@ -118,6 +119,7 @@ export default class DashboardProvider {
 
   /** Warn once so a throwing `login`/`session` hook doesn't spam the logs on every failed attempt. */
   private warnedOnHookThrow = false;
+  private warnedOnAuthorizeThrow = false;
 
   /** Login-attempt timestamps per client address — a simple sliding window (10/min) so a brute
    *  force can't hammer the host's `login` hook at line rate. In-memory per instance: a cluster
@@ -634,6 +636,14 @@ export default class DashboardProvider {
     }
   }
 
+  private async warnAuthorizeThrow(error: unknown): Promise<void> {
+    if (this.warnedOnAuthorizeThrow) return;
+    this.warnedOnAuthorizeThrow = true;
+    const message = error instanceof Error ? error.message : String(error);
+    const logger = await this.app.container.make('logger');
+    logger.warn(`[durable_dashboard] authorize hook threw; treating as denial (403). ${message}`);
+  }
+
   private async warnHookThrow(hookError: unknown): Promise<void> {
     if (hookError === undefined || this.warnedOnHookThrow) return;
     this.warnedOnHookThrow = true;
@@ -646,8 +656,11 @@ export default class DashboardProvider {
    * Run the guards for a dashboard resource. Composes the existing `authorize` hook (bearer
    * token/custom) with the optional `dashboardAuth` session guard — BOTH must pass:
    *
-   * 1. `authorize` fails -> `403`: the built-in (or host-customised) access-denied PAGE for a
-   *    `page` request, `{ error: 'forbidden' }` JSON for an `api` request.
+   * 1. `authorize` denies -> the built-in (or host-customised) access-denied PAGE for a `page`
+   *    request, JSON for an `api` request. `reason: 'unauthenticated'` is a `401`
+   *    (`{ error: 'unauthorized' }`); `false`, `{ allowed: false }`, `reason: 'forbidden'` or a
+   *    throwing hook is a `403` (`{ error: 'forbidden' }`). A hook that already answered the request
+   *    (a redirect, a body) keeps its answer.
    * 2. `dashboardAuth` configured AND no valid session -> for a `page` request, redirect `302` to
    *    the login page (Mode B) carrying a sanitized `returnTo`, or the `401` "open this console
    *    from your app" page (Mode A only, no login page to redirect to); for an `api` request, a
@@ -671,12 +684,29 @@ export default class DashboardProvider {
       ctx.response.status(403).json({ error: 'cross-site request rejected' });
       return false;
     }
-    const allowed = await config.authorize(ctx);
-    if (!allowed) {
+    // Never test the raw result: a decision OBJECT is truthy, so `{ allowed: false }` would pass a
+    // `!result` check. A throwing hook is a denial (403), never a 500 and never a pass.
+    let decision: ReturnType<typeof normalizeAuthorizeResult>;
+    try {
+      decision = normalizeAuthorizeResult(await config.authorize(ctx));
+    } catch (error) {
+      void this.warnAuthorizeThrow(error).catch(() => undefined);
+      decision = { allowed: false, reason: 'forbidden' };
+    }
+    if (!decision.allowed) {
+      const unauthenticated = decision.reason === 'unauthenticated';
       if (mode === 'page') {
-        await this.denyPage(ctx, config, { status: 403, reason: 'forbidden' });
-      } else if (!ctx.response.getHeader('location')) {
-        ctx.response.status(403).json({ error: 'forbidden' });
+        await this.denyPage(
+          ctx,
+          config,
+          unauthenticated
+            ? { status: 401, reason: 'unauthenticated' }
+            : { status: 403, reason: 'forbidden' },
+        );
+      } else if (!responseAnswered(ctx)) {
+        ctx.response
+          .status(unauthenticated ? 401 : 403)
+          .json({ error: unauthenticated ? 'unauthorized' : 'forbidden' });
       }
       return false;
     }

@@ -46,11 +46,17 @@ export default defineConfig({
   // enabled: true,          // default true; false registers no routes at all
   path: '/durable',
   authorize: async (ctx) => {
-    await ctx.auth.check()
-    return ctx.auth.user?.isAdmin === true // denied requests get 403
+    // boolean | { allowed, reason?: 'unauthenticated' | 'forbidden' }
+    if (!(await ctx.auth.check())) return { allowed: false, reason: 'unauthenticated' } // 401
+    return ctx.auth.user?.isAdmin === true // false / { allowed: false } -> 403
   },
 })
 ```
+
+`authorize` returns `AuthorizeResult = boolean | AuthorizeDecision`
+(`{ allowed: boolean; reason?: 'unauthenticated' | 'forbidden' }`). Only `true`
+or `allowed: true` passes; `reason: 'unauthenticated'` → `401`, every other
+denial (incl. a throwing hook) → `403`. A hook that redirects keeps its redirect.
 
 The default `authorize` fails closed in **every** environment: it requires a
 bearer token equal to `DURABLE_DASHBOARD_TOKEN`, denying everything when that

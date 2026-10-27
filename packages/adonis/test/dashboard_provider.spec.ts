@@ -110,7 +110,7 @@ describe('DashboardProvider — authorize hook owns its denial response', () => 
   }
 
   async function runEnforce(
-    authorize: (ctx: unknown) => boolean | Promise<boolean>,
+    authorize: (ctx: unknown) => unknown,
     mode: 'page' | 'api' = 'page',
     extra: Record<string, unknown> = {},
   ) {
@@ -177,6 +177,102 @@ describe('DashboardProvider — authorize hook owns its denial response', () => 
     expect(redirected.state.status).toBe(302);
     expect(redirected.state.headers.get('location')).toBe('/entrar');
     expect(redirected.state.body).toBeUndefined();
+  });
+
+  describe('decision contract (boolean | { allowed, reason })', () => {
+    const modes = ['page', 'api'] as const;
+
+    for (const mode of modes) {
+      it(`${mode}: { allowed: false } DENIES with 403 (a truthy object is not a pass)`, async () => {
+        const { allowed, state } = await runEnforce(() => ({ allowed: false }), mode);
+        expect(allowed).toBe(false);
+        expect(state.status).toBe(403);
+        if (mode === 'api') expect(state.body).toEqual({ error: 'forbidden' });
+        else expect(state.body).toContain('<h1>Access denied</h1>');
+      });
+
+      it(`${mode}: async { allowed: false } DENIES with 403`, async () => {
+        const { allowed, state } = await runEnforce(async () => ({ allowed: false }), mode);
+        expect(allowed).toBe(false);
+        expect(state.status).toBe(403);
+      });
+
+      it(`${mode}: reason 'unauthenticated' -> 401`, async () => {
+        const { allowed, state } = await runEnforce(
+          () => ({ allowed: false, reason: 'unauthenticated' }),
+          mode,
+        );
+        expect(allowed).toBe(false);
+        expect(state.status).toBe(401);
+        if (mode === 'api') expect(state.body).toEqual({ error: 'unauthorized' });
+        else expect(state.body).toContain('<h1>Sign in required</h1>');
+      });
+
+      it(`${mode}: reason 'forbidden' -> 403`, async () => {
+        const { allowed, state } = await runEnforce(
+          () => ({ allowed: false, reason: 'forbidden' }),
+          mode,
+        );
+        expect(allowed).toBe(false);
+        expect(state.status).toBe(403);
+        if (mode === 'api') expect(state.body).toEqual({ error: 'forbidden' });
+        else expect(state.body).toContain('<h1>Access denied</h1>');
+      });
+
+      it(`${mode}: bare false -> 403`, async () => {
+        const { allowed, state } = await runEnforce(() => false, mode);
+        expect(allowed).toBe(false);
+        expect(state.status).toBe(403);
+      });
+
+      it(`${mode}: true and { allowed: true } pass`, async () => {
+        for (const result of [true, { allowed: true }, Promise.resolve({ allowed: true })]) {
+          const { allowed, state } = await runEnforce(() => result, mode);
+          expect(allowed).toBe(true);
+          expect(state.status).toBe(0);
+          expect(state.body).toBeUndefined();
+        }
+      });
+
+      it(`${mode}: a throwing hook -> 403 (never a pass, never a 500)`, async () => {
+        const sync = await runEnforce(() => {
+          throw new Error('boom');
+        }, mode);
+        expect(sync.allowed).toBe(false);
+        expect(sync.state.status).toBe(403);
+        const rejected = await runEnforce(() => Promise.reject(new Error('boom')), mode);
+        expect(rejected.allowed).toBe(false);
+        expect(rejected.state.status).toBe(403);
+      });
+
+      it(`${mode}: a hook redirect still wins over a decision object`, async () => {
+        const { allowed, state } = await runEnforce((ctx) => {
+          (ctx as { response: { redirect(p: string): void } }).response.redirect('/login');
+          return { allowed: false, reason: 'unauthenticated' };
+        }, mode);
+        expect(allowed).toBe(false);
+        expect(state.status).toBe(302);
+        expect(state.headers.get('location')).toBe('/login');
+        expect(state.body).toBeUndefined();
+      });
+    }
+
+    it('non-boolean truthy junk denies (only true / allowed === true pass)', async () => {
+      for (const result of ['yes', 1, {}, { allowed: 'true' }, null, undefined]) {
+        const { allowed, state } = await runEnforce(() => result, 'api');
+        expect(allowed).toBe(false);
+        expect(state.status).toBe(403);
+      }
+    });
+
+    it('an allowed decision still composes with the dashboardAuth session step', async () => {
+      const { allowed, state } = await runEnforce(() => ({ allowed: true }), 'api', {
+        dashboardAuth: { secret: 's'.repeat(32), session: () => null },
+      });
+      expect(allowed).toBe(false);
+      expect(state.status).toBe(401);
+      expect(state.body).toEqual({ error: 'unauthorized', auth: { modes: ['session'] } });
+    });
   });
 
   it('Mode-A-only with no session gets the "open from your app" page', async () => {

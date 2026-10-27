@@ -38,11 +38,18 @@ export { formatProtocolRange, outcomeClass, outcomeLabel } from './compat-view.j
 export type {
   AccessDeniedOption,
   AccessDeniedRenderer,
+  AuthorizeDecision,
   AuthorizeHook,
+  AuthorizeResult,
   DurableDashboardConfig,
   ResolvedDurableDashboardConfig,
 } from './define_config.js';
-export { defaultAuthorize, defineConfig, resolveConfig } from './define_config.js';
+export {
+  defaultAuthorize,
+  defineConfig,
+  normalizeAuthorizeResult,
+  resolveConfig,
+} from './define_config.js';
 export type { EngineEventSource, RecordedBlock } from './diagnostics-recorder.js';
 export { BlockedDiagnosticsRecorder } from './diagnostics-recorder.js';
 export type { DashboardContainer } from './gateway-adapter.js';
