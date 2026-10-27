@@ -44,6 +44,15 @@ export function resultsName(effPrefix: string): string {
   return `${effPrefix}-results`;
 }
 
+/**
+ * The queue of step-result batches: one job carries many results (`{ results: StepResult[] }`). A
+ * separate queue from {@link resultsName}, which only engines that read batches consume, so an engine
+ * that reads one result per job never receives a batch.
+ */
+export function resultBatchesName(effPrefix: string): string {
+  return `${effPrefix}-results-batch`;
+}
+
 /** `${P}-decisions` — the workflow-decision queue (job `decision`). */
 export function decisionsName(effPrefix: string): string {
   return `${effPrefix}-decisions`;

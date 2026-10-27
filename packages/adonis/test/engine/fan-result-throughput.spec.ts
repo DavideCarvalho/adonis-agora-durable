@@ -227,14 +227,14 @@ describe('wide step fan result throughput', () => {
     expect(r.barrierReads).toBeLessThanOrEqual(3 * 4);
   }, 120_000);
 
-  it('the dispatching turn writes and dispatches a fan in one call each', async () => {
+  it('the dispatching turn writes and dispatches a fan in rounds of 2,000, one call each', async () => {
     const r = await fan({ size: 20_000, instances: 2, inFlight: 512 });
     expect(r.run?.status).toBe('completed');
     expect(r.sends).toEqual({
       saveCheckpoint: 0,
-      saveCheckpoints: 1,
+      saveCheckpoints: 10,
       dispatch: 0,
-      dispatchMany: 1,
+      dispatchMany: 10,
     });
   }, 120_000);
 

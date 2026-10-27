@@ -255,10 +255,62 @@ describe('AdaptiveController.tick — AIMD decisions', () => {
     });
     controller.onStart();
     controller.onSettle(1, true, 'step'); // the no-queuing baseline: 1 ms
-    fill(controller, 99, 30); // p50 30 ms: (1 + 5) / 30 = 0.2
+    fill(controller, 99, 30); // p50 30 ms: (2 × 1 + 5) / 30 ≈ 0.23
     controller.tick();
-    expect(controller.limit).toBe(3); // floor(16 × 0.2)
+    expect(controller.limit).toBe(12);
     expect(controller.snapshot().lastAdjust?.reason).toBe('shrink');
+  });
+
+  it('takes at most a quarter off the limit on one queuing tick, however deep it reads', () => {
+    const { controller, applied } = makeController({
+      concurrency: { mode: 'adaptive', min: 1, max: 32, start: 32 },
+    });
+    controller.onStart();
+    controller.onSettle(1, true, 'step');
+    fill(controller, 99, 500); // gradient ≈ 0.014: a window of one slow moment
+    controller.tick();
+    expect(controller.limit).toBe(24);
+    expect(applied).toEqual([24]);
+  });
+
+  it('keeps shrinking a quarter a tick while the queuing persists, down to min', () => {
+    const { controller, applied } = makeController({
+      concurrency: { mode: 'adaptive', min: 2, max: 32, start: 32 },
+    });
+    controller.onStart();
+    controller.onSettle(1, true, 'step');
+    fill(controller, 99, 500);
+    for (let tick = 0; tick < 12; tick++) controller.tick();
+    expect(applied).toEqual([24, 18, 14, 11, 8, 6, 5, 4, 3, 2]);
+  });
+
+  it('takes at least one slot off a small limit', () => {
+    const { controller } = makeController({
+      concurrency: { mode: 'adaptive', min: 1, max: 32, start: 2 },
+    });
+    controller.onStart();
+    controller.onSettle(1, true, 'step');
+    fill(controller, 99, 500);
+    controller.tick();
+    expect(controller.limit).toBe(1);
+  });
+
+  it('is back at its level two ticks after a one-tick latency spike', () => {
+    const { controller, applied } = makeController({
+      concurrency: { mode: 'adaptive', min: 1, max: 32, start: 32 },
+    });
+    controller.onStart();
+    controller.onSettle(1, true, 'step');
+    fill(controller, 99, 500);
+    controller.tick(); // the spike: 32 → 24
+    for (let tick = 0; tick < 2; tick++) {
+      fill(controller, 100, 2); // healthy again
+      const busy = controller.limit;
+      for (let i = 0; i < busy; i++) controller.onStart(); // every slot busy: saturated
+      controller.tick();
+      for (let i = 0; i < busy; i++) controller.onSettle(2, true, 'step');
+    }
+    expect(applied).toEqual([24, 28, 32]);
   });
 
   it('does NOT grow when healthy but not saturated (raising a ceiling no one hits is meaningless)', () => {

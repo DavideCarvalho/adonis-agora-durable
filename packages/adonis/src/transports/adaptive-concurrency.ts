@@ -146,6 +146,12 @@ const RTT_LONG_EWMA_ALPHA = 0.2;
 // a time while the pod sat idle.
 const LATENCY_TOLERANCE = 2;
 const LATENCY_NOISE_MS = 5;
+// The most one queuing tick takes off the limit: a quarter. The window holds the last 100 steps, a
+// fraction of a second of a busy worker's work, so a single slow moment reads as deep queuing; cut in
+// proportion to it, a worker would drop to one or two slots and spend the next ten ticks growing back
+// by √limit while the pod sat idle. Real queuing persists, and a quarter a tick still halves the limit
+// in under three ticks.
+const SHRINK_FACTOR = 0.75;
 // Consecutive ticks with in-flight work but zero completions before we call the worker stalled.
 const STALL_TICKS = 2;
 // Throughput is a rate over the trailing minute: a window whose newest completion is older than this
@@ -399,7 +405,7 @@ export class AdaptiveController {
       next = Math.max(cfg.min, current - 1);
       reason = 'backpressure';
     } else if (gradient < 0.7) {
-      next = Math.max(cfg.min, Math.floor(current * gradient));
+      next = Math.max(cfg.min, Math.min(current - 1, Math.round(current * SHRINK_FACTOR)));
       reason = 'shrink';
     } else if (gradient >= 0.9 && saturated) {
       // Doubles until the first time it backs off, then grows by √limit a tick.
