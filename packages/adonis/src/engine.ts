@@ -6186,7 +6186,17 @@ export class WorkflowEngine {
     }
     const renewed = now + this.remoteRedispatchMs;
     const previous = cp.wakeAt;
-    await this.store.saveCheckpoint({ ...cp, wakeAt: renewed });
+    // Conditional, never a blind write of the row read above: another instance may have settled the
+    // step (its result) or re-dispatched it (new `attempts` and deadline) since, and writing `cp`
+    // back would undo either — a `completed` step back to `pending`, the step run a second time.
+    const wrote = this.store.renewCheckpointLease
+      ? await this.store.renewCheckpointLease(runId, seq, previous, renewed)
+      : await this.savePendingCheckpoint({ ...cp, wakeAt: renewed });
+    if (!wrote) {
+      // The step moved on under us: nothing of ours to defend, and the next beat re-reads it.
+      this.stepLeaseRearms.delete(id);
+      return;
+    }
     setBounded(this.stepLeaseRearms, id, renewed - halfWindow);
     // If the run is parked EXACTLY on this step's old lease, carry its wake forward too — otherwise a
     // beating worker costs one wasted turn per renewal window. Only on an exact match: any other

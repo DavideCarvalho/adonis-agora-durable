@@ -140,6 +140,16 @@ class CountingStore extends InMemoryStateStore {
     if (checkpoint.seq === LOST_SEQ) this.writes += 1;
     return super.saveCheckpoint(checkpoint);
   }
+
+  override async renewCheckpointLease(
+    runId: string,
+    seq: number,
+    expectedWakeAt: number | undefined,
+    wakeAt: number,
+  ): Promise<boolean> {
+    if (seq === LOST_SEQ) this.writes += 1;
+    return super.renewCheckpointLease(runId, seq, expectedWakeAt, wakeAt);
+  }
 }
 
 /** A store whose WRITES can be made to throw — a hiccup mid-renewal, which must not escape into the
@@ -154,6 +164,19 @@ class FlakyStore extends InMemoryStateStore {
       throw new Error('checkpoint store unavailable');
     }
     return super.saveCheckpoint(checkpoint);
+  }
+
+  override async renewCheckpointLease(
+    runId: string,
+    seq: number,
+    expectedWakeAt: number | undefined,
+    wakeAt: number,
+  ): Promise<boolean> {
+    if (seq === LOST_SEQ && this.failCheckpointWrites > 0) {
+      this.failCheckpointWrites -= 1;
+      throw new Error('checkpoint store unavailable');
+    }
+    return super.renewCheckpointLease(runId, seq, expectedWakeAt, wakeAt);
   }
 
   override async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
