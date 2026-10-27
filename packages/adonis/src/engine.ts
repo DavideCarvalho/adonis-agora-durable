@@ -58,6 +58,7 @@ import type { WorkerDescriptor } from './handshake/descriptor.js';
 import { buildWorkflowDirectory, type WorkflowDirectory } from './handshake/directory.js';
 import type {
   BufferedSignalRow,
+  ControlMessage,
   ControlPlane,
   DeadLetter,
   EngineEvent,
@@ -443,6 +444,10 @@ const STEP_FAN_CHUNK = 200;
  * waiting for every checkpoint of a wide fan to commit.
  */
 const STEP_FAN_SEND_ROUND = 2000;
+/** Most step events one control-plane message carries (see {@link WorkflowEngine.broadcastEvents}). */
+const STEP_EVENTS_PER_BROADCAST = 500;
+
+const isStepEvent = (event: EngineEvent): boolean => event.type.startsWith('step.');
 
 /** The default {@link WorkflowEngineDeps.timerBatchSize}. */
 const DEFAULT_TIMER_BATCH = 500;
@@ -1263,6 +1268,10 @@ export class WorkflowEngine {
       if (msg.kind === 'event') {
         // `at` may be a string after JSON transit (Redis) — normalize back to a Date.
         this.deliver(markRemoteEvent({ ...msg.event, at: new Date(msg.event.at) }));
+      } else if (msg.kind === 'events') {
+        for (const event of msg.events) {
+          this.deliver(markRemoteEvent({ ...event, at: new Date(event.at) }));
+        }
       } else if (msg.kind === 'cancel') {
         this.notifyCancelled(msg.runId);
       } else if (msg.kind === 'schedulePause') {
@@ -2106,12 +2115,51 @@ export class WorkflowEngine {
   private emit(event: Omit<EngineEvent, 'at'>): void {
     const full: EngineEvent = { ...event, at: new Date() };
     this.deliver(full);
-    if (this.controlPlane) {
-      void this.controlPlane
-        .publishControl({ kind: 'event', event: full, from: this.instanceId })
-        .catch(() => {
+    if (!this.controlPlane) return;
+    this.eventsToBroadcast.push(full);
+    if (!this.broadcastingEvents) void this.broadcastEvents();
+  }
+
+  /** Events waiting for the control-plane publish in flight, in emit order (see {@link broadcastEvents}). */
+  private readonly eventsToBroadcast: EngineEvent[] = [];
+  private broadcastingEvents = false;
+
+  /**
+   * Publish the queued events in the order they were emitted. A run's own events go out one per
+   * message, as every instance expects them. Step events (a wide fan emits two per step) that queued
+   * up while a publish was in flight go out together in one `events` message, so a fan of 40,000
+   * steps costs the control plane a few hundred messages to every instance instead of 80,000.
+   */
+  private async broadcastEvents(): Promise<void> {
+    this.broadcastingEvents = true;
+    try {
+      while (this.eventsToBroadcast.length > 0 && this.controlPlane) {
+        const first = this.eventsToBroadcast[0] as EngineEvent;
+        let msg: ControlMessage;
+        if (isStepEvent(first)) {
+          let n = 1;
+          while (
+            n < STEP_EVENTS_PER_BROADCAST &&
+            n < this.eventsToBroadcast.length &&
+            isStepEvent(this.eventsToBroadcast[n] as EngineEvent)
+          ) {
+            n += 1;
+          }
+          const events = this.eventsToBroadcast.splice(0, n);
+          msg =
+            events.length === 1
+              ? { kind: 'event', event: first, from: this.instanceId }
+              : { kind: 'events', events, from: this.instanceId };
+        } else {
+          this.eventsToBroadcast.shift();
+          msg = { kind: 'event', event: first, from: this.instanceId };
+        }
+        await this.controlPlane.publishControl(msg).catch(() => {
           // control-plane delivery is best-effort observability; never break execution
         });
+      }
+    } finally {
+      this.broadcastingEvents = false;
     }
   }
 
