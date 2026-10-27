@@ -81,14 +81,14 @@ describe('a wide step fan is sent in rounds', () => {
     const log: string[] = [];
     const transport = new LoggingTransport(log);
     const engine = new WorkflowEngine({ store: loggingStore(log), transport, reconcileMs: 0 });
-    engine.register('fan', '1', (ctx, input: { n: number }) =>
-      ctx.all(processLine, lines(input.n)),
+    engine.register('fan', '1', (ctx, input) =>
+      ctx.all(processLine, lines((input as { n: number }).n)),
     );
 
     await engine.start('fan', { n: 10_000 }, 'r');
     await until(() => transport.dispatched.length === 10_000);
 
-    const lastSave = log.findLastIndex((e) => e.startsWith('save:'));
+    const lastSave = log.map((e) => e.startsWith('save:')).lastIndexOf(true);
     const firstDispatch = log.findIndex((e) => e.startsWith('dispatch:'));
     expect(firstDispatch).toBeGreaterThanOrEqual(0);
     expect(firstDispatch).toBeLessThan(lastSave);
@@ -100,8 +100,8 @@ describe('a wide step fan is sent in rounds', () => {
     const log: string[] = [];
     const transport = new LoggingTransport(log);
     const engine = new WorkflowEngine({ store: loggingStore(log), transport, reconcileMs: 0 });
-    engine.register('fan', '1', (ctx, input: { n: number }) =>
-      ctx.all(processLine, lines(input.n)),
+    engine.register('fan', '1', (ctx, input) =>
+      ctx.all(processLine, lines((input as { n: number }).n)),
     );
 
     await engine.start('fan', { n: 4_500 }, 'r');
@@ -133,8 +133,8 @@ describe('a wide step fan is sent in rounds', () => {
       );
     });
     const engine = new WorkflowEngine({ store: loggingStore(log), transport, reconcileMs: 0 });
-    engine.register('fan', '1', (ctx, input: { n: number }) =>
-      ctx.all(processLine, lines(input.n)),
+    engine.register('fan', '1', (ctx, input) =>
+      ctx.all(processLine, lines((input as { n: number }).n)),
     );
 
     const runId = 'r';
