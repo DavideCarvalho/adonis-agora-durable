@@ -1,5 +1,27 @@
 # @adonis-agora/durable
 
+## 0.56.3
+
+### Patch Changes
+
+- [#421](https://github.com/DavideCarvalho/adonis-agora-durable/pull/421) [`da8dd5e`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/da8dd5e859c68dbc9eebf25af92d4fcf9f9caa1e) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Step events reach other instances in batches. The engine published every lifecycle event on the
+  control plane, one message each, and a wide fan emits two per step: a 40,000-step fan published 80,000
+  messages, each delivered to every pod, and each Redis `PUBLISH` stalled every other command behind it.
+  Step events now go out, in emit order, in one `{ kind: 'events', events }` message per batch (the
+  events emitted while a publish is in flight share the next one, up to 500). A run's own events still go
+  out one per message. An instance that does not know the `events` kind ignores it and only misses other
+  instances' step events, which no engine logic reads. Interoperable with `@dudousxd/nestjs-durable-core`
+  0.85.12, which sends and reads the same message.
+
+- [#420](https://github.com/DavideCarvalho/adonis-agora-durable/pull/420) [`5eb8655`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/5eb86558b39e636c9ea1df043618518e46b5057b) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Performance sweep, no API or behaviour change:
+  
+  - The per-step heartbeat write throttle no longer resets wholesale past 1,024 entries (which a fleet with more steps in flight than that hit every few seconds, turning the throttle off); expired entries are dropped and the map is capped at 16,384, oldest first. The lease re-arm throttle and the admitted-queue fallback map are bounded the same way (the latter previously leaked when a result landed on another pod).
+  - Postgres: `durable_signal_waiters.token` and `durable_buffered_signals.token` get a `varchar_pattern_ops` index, so the `token LIKE 'prefix%'` reads (event publish, a fan's buffered child completions, the entity sweep) stop scanning the whole table under a non-`C` collation. Schema revision 5.
+  - Singleton admission reads only the columns its decision needs under `FOR UPDATE` (not every waiter's payloads); the `maxQueueDepth` check counts instead of loading runs.
+  - The console's tag/attribute pickers scan only `tags`/`search_attributes` instead of every run's payloads; column pickers are one grouped pass instead of a self semi-join.
+  - The stalled-run sweep reads only pending checkpoints; run-detail and fan-page polls read the run and its checkpoint buckets in one round trip; `/compat` reads each group's descriptors at once; `/metrics` reads worker health alongside the counts; Telescope widgets share concurrent identical reads.
+  - Redis admission `release` sends its HDEL and PUBLISH back to back (one round trip).
+
 ## 0.56.2
 
 ### Patch Changes

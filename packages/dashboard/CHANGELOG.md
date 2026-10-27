@@ -1,5 +1,11 @@
 # @adonis-agora/durable-dashboard
 
+## 0.8.3
+
+### Patch Changes
+
+- [#420](https://github.com/DavideCarvalho/adonis-agora-durable/pull/420) [`5eb8655`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/5eb86558b39e636c9ea1df043618518e46b5057b) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Less polling: the topology query fetches once (as intended), value pickers refresh every 10s instead of 2s, child-run details of a settled child refresh every 30s instead of 2s, the dead-letter handler probe stops once found (10s while missing), and the stalled-workflows banner is memoized.
+
 ## 0.8.2
 
 ### Patch Changes
