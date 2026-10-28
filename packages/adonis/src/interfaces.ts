@@ -1359,6 +1359,14 @@ export interface RemoteTask {
    * wins; absent means default/unprioritised. Transports without priority support ignore it.
    */
   priority?: number | undefined;
+  /**
+   * Set on a step nothing awaits with a liveness `timeoutMs` (a `ctx.all` fan step). Its automatic
+   * pickup heartbeat only stamps `lastHeartbeatAt` and feeds the lease renewal, so a worker sends it
+   * once the step has run for `PICKUP_BEAT_GRACE_MS` (1 s), and not at all for a step that settles
+   * sooner: a wide fan does not publish one heartbeat per step to every engine. A worker that does
+   * not know the field sends the beat at pickup, as for every other task.
+   */
+  lazyPickupBeat?: boolean | undefined;
   attempt: number;
 }
 
