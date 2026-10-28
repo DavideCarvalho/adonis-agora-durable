@@ -975,7 +975,7 @@ export class BullMQTransport implements Transport {
    *  and that gap is itself the signal). */
   #startWorkerHeartbeat(token: string): void {
     const client = this.#workerRedisClient();
-    const beatOne = (t: string): void => {
+    const beatOne = (t: string, written?: () => void): void => {
       const key = workerHeartbeatKey(this.#effectivePrefix(), t, this.#instanceId);
       void client
         .set(
@@ -984,11 +984,17 @@ export class BullMQTransport implements Transport {
           'EX',
           WORKER_HEARTBEAT_TTL_SECONDS,
         )
+        .then(() => written?.())
         .catch((err) => this.#onError(err));
     };
     const isNew = !this.#heartbeatTokens.has(token);
     this.#heartbeatTokens.add(token);
-    if (isNew) beatOne(token);
+    if (isNew) {
+      // This instance's first key for `token`: drop the cached heartbeat read now (a walk already in
+      // flight may miss the key) — and again once the SET lands, so the next read sees it.
+      this.#invalidateHeartbeatRead();
+      beatOne(token, () => this.#invalidateHeartbeatRead());
+    }
     if (this.#workerHeartbeatTimer) return;
     this.#workerHeartbeatTimer = setInterval(() => {
       for (const t of this.#heartbeatTokens) beatOne(t);
@@ -999,23 +1005,83 @@ export class BullMQTransport implements Transport {
 
   /** Distinct routing tokens with a live worker heartbeat, discovered by SCANning the heartbeat
    *  keyspace (never KEYS — it blocks Redis). A key is `${P}-worker-heartbeat:<token>:<instance>`, and
-   *  neither segment carries a `:`, so the token is the segment between the fixed prefix and the next `:`. */
+   *  neither segment carries a `:`, so the token is the segment between the fixed prefix and the next `:`.
+   *  Reads the shared {@link #liveHeartbeats} snapshot, so it costs no extra walk next to `groupHealth`. */
   async listWorkerGroups(): Promise<string[]> {
-    const client = this.#workerRedisClient();
-    const prefix = workerHeartbeatKeyPrefix(this.#effectivePrefix());
+    const { prefix, entries } = await this.#liveHeartbeats();
     const groups = new Set<string>();
-    let cursor = '0';
-    do {
-      const [next, keys] = await client.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', 100);
-      cursor = next;
-      for (const key of keys) {
-        const rest = key.slice(prefix.length);
-        const sep = rest.indexOf(':');
-        const group = sep === -1 ? rest : rest.slice(0, sep);
-        if (group) groups.add(group);
-      }
-    } while (cursor !== '0');
+    for (const { key } of entries) {
+      const rest = key.slice(prefix.length);
+      const sep = rest.indexOf(':');
+      const group = sep === -1 ? rest : rest.slice(0, sep);
+      if (group) groups.add(group);
+    }
     return [...groups];
+  }
+
+  /**
+   * The last read of the worker-heartbeat keyspace, shared by {@link listWorkerGroups},
+   * {@link groupHealth} and {@link readAllWorkerHeartbeats}. The heartbeat keys live in the SAME Redis
+   * db as every BullMQ job hash, so a `MATCH ${P}-worker-heartbeat:*` SCAN has to walk the WHOLE
+   * keyspace to find a handful of keys: with thousands of jobs that is dozens of round trips per walk.
+   * `engine.workerHealth()` (behind the dashboard's `/workers` and `/metrics`) used to do one walk for
+   * `listWorkerGroups` and one more per group in `groupHealth` — hundreds of SCANs a request, repeated
+   * by every concurrent poller. Now one walk serves them all: `read` is the in-flight walk (concurrent
+   * callers join it instead of starting their own) and `done` keeps its result for
+   * {@link WORKER_HEARTBEAT_READ_TTL_MS}, a small fraction of the 35s key TTL, so a worker that starts
+   * or dies still shows up within a second. `generation` drops a walk that started before this
+   * instance wrote a new heartbeat key, so its own freshly registered handler is never hidden.
+   */
+  #heartbeatRead:
+    | {
+        prefix: string;
+        generation: number;
+        read?: Promise<HeartbeatSnapshot> | undefined;
+        done?: { at: number; snapshot: HeartbeatSnapshot };
+      }
+    | undefined;
+  #heartbeatGeneration = 0;
+
+  /** Forget the cached heartbeat read (this instance just wrote or removed a key it must see). */
+  #invalidateHeartbeatRead(): void {
+    this.#heartbeatGeneration += 1;
+    this.#heartbeatRead = undefined;
+  }
+
+  /** Every live `${P}-worker-heartbeat:*` key with its raw value: one SCAN walk (MGET per page), shared
+   *  and briefly reused — see {@link #heartbeatRead}. A failed walk is not cached; it rejects for every
+   *  caller that joined it, which then fails (or degrades) exactly as its own walk used to. */
+  #liveHeartbeats(): Promise<HeartbeatSnapshot> {
+    const prefix = workerHeartbeatKeyPrefix(this.#effectivePrefix());
+    const generation = this.#heartbeatGeneration;
+    let slot = this.#heartbeatRead;
+    if (!slot || slot.prefix !== prefix || slot.generation !== generation) {
+      slot = { prefix, generation };
+      this.#heartbeatRead = slot;
+    }
+    if (slot.done && Date.now() - slot.done.at < WORKER_HEARTBEAT_READ_TTL_MS) {
+      return Promise.resolve(slot.done.snapshot);
+    }
+    if (slot.read) return slot.read;
+    const current = slot;
+    const read = (async (): Promise<HeartbeatSnapshot> => {
+      const entries: Array<{ key: string; raw: string | null }> = [];
+      await this.#scanValues(this.#workerRedisClient(), prefix, (key, raw) => {
+        entries.push({ key, raw });
+      });
+      return { prefix, entries };
+    })();
+    current.read = read;
+    read.then(
+      (snapshot) => {
+        current.read = undefined;
+        current.done = { at: Date.now(), snapshot };
+      },
+      () => {
+        current.read = undefined;
+      },
+    );
+    return read;
   }
 
   /** The LIVE worker descriptors advertised on `token` — SCAN the `${P}-worker-descriptor:<token>:*`
@@ -1039,7 +1105,7 @@ export class BullMQTransport implements Transport {
     try {
       let cursor = '0';
       do {
-        const [next, keys] = await client.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', 100);
+        const [next, keys] = await client.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', SCAN_COUNT);
         cursor = next;
         if (keys.length === 0) continue;
         // One MGET per SCAN page instead of one GET per key (per-key fallback for a client without it).
@@ -1093,14 +1159,13 @@ export class BullMQTransport implements Transport {
   /** Every live worker heartbeat on every token: SCAN `${P}-worker-heartbeat:*`. A key is
    *  `<prefix><token>:<instance>` and neither segment carries a `:`. Degrades to `[]`. */
   async readAllWorkerHeartbeats(): Promise<WorkerHeartbeat[]> {
-    const client = this.#workerRedisClient();
-    const prefix = workerHeartbeatKeyPrefix(this.#effectivePrefix());
     const beats: WorkerHeartbeat[] = [];
     try {
-      await this.#scanValues(client, prefix, (key, raw) => {
+      const { prefix, entries } = await this.#liveHeartbeats();
+      for (const { key, raw } of entries) {
         const rest = key.slice(prefix.length);
         const sep = rest.indexOf(':');
-        if (sep <= 0) return;
+        if (sep <= 0) continue;
         const parsed = parseHeartbeatValue(raw);
         beats.push({
           group: rest.slice(0, sep),
@@ -1110,7 +1175,7 @@ export class BullMQTransport implements Transport {
             ? { status: parsed.status as unknown as WorkerStatus }
             : {}),
         });
-      });
+      }
     } catch (err) {
       this.#onError(err);
       return [];
@@ -1126,7 +1191,7 @@ export class BullMQTransport implements Transport {
   ): Promise<void> {
     let cursor = '0';
     do {
-      const [next, keys] = await client.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', 100);
+      const [next, keys] = await client.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', SCAN_COUNT);
       cursor = next;
       if (keys.length === 0) continue;
       const raws = client.mget
@@ -1140,48 +1205,41 @@ export class BullMQTransport implements Transport {
   }
 
   /** Per-group worker-health: queue depth (waiting+active+delayed+prioritized) + live workers (their
-   *  non-expired heartbeat keys). `group` is a routing token — the same value a dispatch targets. */
+   *  non-expired heartbeat keys). `group` is a routing token — the same value a dispatch targets. The
+   *  job counts and the (shared, see {@link #heartbeatRead}) heartbeat read run concurrently. */
   async groupHealth(group: string): Promise<GroupHealth> {
-    const counts = await this.#queue(tasksName(this.#effectivePrefix(), group)).getJobCounts(
-      'waiting',
-      'active',
-      'delayed',
-      'prioritized',
-    );
+    const [counts, liveWorkers] = await Promise.all([
+      this.#queue(tasksName(this.#effectivePrefix(), group)).getJobCounts(
+        'waiting',
+        'active',
+        'delayed',
+        'prioritized',
+      ),
+      this.#listLiveWorkers(group),
+    ]);
     const depth = Object.values(counts).reduce((sum, n) => sum + (n ?? 0), 0);
-    return { group, depth, liveWorkers: await this.#listLiveWorkers(group) };
+    return { group, depth, liveWorkers };
   }
 
   async #listLiveWorkers(group: string): Promise<WorkerHeartbeat[]> {
-    const client = this.#workerRedisClient();
     const keyPrefix = workerHeartbeatKey(this.#effectivePrefix(), group, '');
-    const match = `${keyPrefix}*`;
+    const { entries } = await this.#liveHeartbeats();
     const workers: WorkerHeartbeat[] = [];
-    let cursor = '0';
-    do {
-      const [next, keys] = await client.scan(cursor, 'MATCH', match, 'COUNT', 100);
-      cursor = next;
-      if (keys.length === 0) continue;
-      // One MGET per SCAN page instead of one serial GET per key (per-key fallback without mget).
-      const raws = client.mget
-        ? await client.mget(...keys)
-        : await Promise.all(keys.map((k) => client.get(k)));
-      for (let i = 0; i < keys.length; i += 1) {
-        const key = keys[i];
-        if (key === undefined) continue;
-        const parsed = parseHeartbeatValue(raws[i] ?? null);
-        workers.push({
-          group,
-          instanceId: key.slice(keyPrefix.length),
-          lastBeatAt: parsed.lastBeatAt,
-          // Passed through as-is: the payload is worker-authored (this SDK's #workerStatus, or the
-          // NestJS/Python fleet's own shape) and the console renders what it recognizes.
-          ...(parsed.status !== undefined
-            ? { status: parsed.status as unknown as WorkerStatus }
-            : {}),
-        });
-      }
-    } while (cursor !== '0');
+    for (const { key, raw } of entries) {
+      // The same set the old `MATCH ${keyPrefix}*` SCAN returned, in the same SCAN order.
+      if (!key.startsWith(keyPrefix)) continue;
+      const parsed = parseHeartbeatValue(raw);
+      workers.push({
+        group,
+        instanceId: key.slice(keyPrefix.length),
+        lastBeatAt: parsed.lastBeatAt,
+        // Passed through as-is: the payload is worker-authored (this SDK's #workerStatus, or the
+        // NestJS/Python fleet's own shape) and the console renders what it recognizes.
+        ...(parsed.status !== undefined
+          ? { status: parsed.status as unknown as WorkerStatus }
+          : {}),
+      });
+    }
     return workers;
   }
 
@@ -1430,6 +1488,23 @@ async function withTimeout(work: Promise<unknown>, ms: number): Promise<void> {
   }
 }
 const DEFAULT_CLOSE_TIMEOUT_MS = 5_000;
+/**
+ * The `COUNT` hint of every worker-key SCAN. The heartbeat and descriptor keys share the Redis db with
+ * every BullMQ job hash, so a `MATCH` walk visits the whole keyspace however few keys match; at 100 a
+ * keyspace of 6k job keys took ~60 round trips per walk. 1000 cuts that tenfold while each SCAN call
+ * still returns in well under a millisecond on the server (it is a hint, never a blocking KEYS).
+ */
+const SCAN_COUNT = 1_000;
+/** How long one read of the worker-heartbeat keyspace is reused (see `#heartbeatRead`): a small
+ *  fraction of the 35s heartbeat-key TTL and the 10s beat interval, so liveness stays current. */
+const WORKER_HEARTBEAT_READ_TTL_MS = 1_000;
+
+/** One read of the `${P}-worker-heartbeat:*` keyspace: the prefix it was taken under and every key
+ *  with its raw value (`null` when the key expired between the SCAN and the MGET). */
+interface HeartbeatSnapshot {
+  prefix: string;
+  entries: Array<{ key: string; raw: string | null }>;
+}
 /** The fewest step results a results consumer holds at once (see `resultConcurrency`). */
 const RESULT_CONSUMER_MIN = 512;
 /** The most task jobs one `addBulk` carries, and how many such calls run at once (`dispatchMany`). */
