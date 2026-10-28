@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 0.56.7
+
+### Patch Changes
+
+- [#428](https://github.com/DavideCarvalho/adonis-agora-durable/pull/428) [`95b8233`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/95b823315557473af0ae33e7a307d5351b85970b) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - perf(otel): `attachDurableMetrics` no longer leaks memory. Runs that start on this instance but never report a terminal event here (suspended and resumed elsewhere, cancelled) are no longer tracked forever — the oldest of more than 10,000 pending starts is dropped. Duration samples are kept as an exact value histogram, so memory scales with distinct millisecond values instead of sample count and `snapshot()` no longer sorts every sample; reported counts and percentiles are unchanged.
+
 ## 0.56.6
 
 ### Patch Changes
