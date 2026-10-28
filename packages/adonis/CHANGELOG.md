@@ -1,5 +1,33 @@
 # @adonis-agora/durable
 
+## 0.56.5
+
+### Patch Changes
+
+- [#423](https://github.com/DavideCarvalho/adonis-agora-durable/pull/423) [`5e11049`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/5e110491835743bf4a4081ad37add3f19cb1fdf8) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - fix(engine): a pod killed mid-flight no longer strands its runs.
+  
+  - A step result is now acknowledged only after its run is durably marked as owed a turn (its
+    `suspended` timer is pulled in to one lease from now). Before, a pod that settled a result and died
+    before — or during — the background resume left the run `suspended` until the 5-minute reconcile
+    wake; now any instance's due-timer poll resumes it once the dead pod's lease lapses.
+  - A turn that died between writing a step's `pending` checkpoint and handing the job to the broker
+    no longer leaves that step undispatched forever. Recovery (an orphaned `running` run, or a
+    `suspended` run whose lease holder died holding it) re-sends the steps that turn wrote, under the
+    run's lease, with their original `stepId` — a step whose first dispatch did land may run twice,
+    within the documented at-least-once contract.
+
+- [#424](https://github.com/DavideCarvalho/adonis-agora-durable/pull/424) [`28ec25e`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/28ec25e6a708d55cae4df0421fd042558242ae65) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A fan step's worker no longer publishes a pickup heartbeat for a step that finishes within a second.
+  Every remote step's worker beat the moment it picked the task up, so a 40,000-step `ctx.all` fan
+  published 40,000 heartbeats, each delivered to every engine instance. For a fan step that beat only
+  stamps `lastHeartbeatAt` and feeds the lease renewal (a fan step cannot carry a `timeoutMs`), so the
+  engine now marks fan tasks `lazyPickupBeat` and the worker sends the beat once the step has run for
+  `PICKUP_BEAT_GRACE_MS` (1 s), or not at all when it settles first; a beat the handler sends itself
+  replaces it. Every other step still beats at pickup, and a worker that does not know the field beats
+  at pickup as before. A 40k fan with 12 subscribers locally: ~40,000 → ~300 publishes, Redis CPU −18%,
+  wall 4.7 s → 4.0 s.
+
+- [#425](https://github.com/DavideCarvalho/adonis-agora-durable/pull/425) [`8b8d192`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/8b8d1924cbbd4217df9c3192f334a2e255f44d83) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Make `engine.workerHealth()` (the dashboard's `/workers`, `/health` and `/metrics`) cheap on the BullMQ transport: one shared, single-flight walk of the worker-heartbeat keyspace (reused for 1s) now serves `listWorkerGroups`, every `groupHealth` and `readAllWorkerHeartbeats`, instead of one full-keyspace SCAN walk per call per group; worker-key SCANs use `COUNT 1000`; job counts run alongside the heartbeat read; the transport pool queries its transports in parallel; and the queue/db transports' cached worker-key read coalesces concurrent misses. Response shapes, Redis keys and config are unchanged.
+
 ## 0.56.4
 
 ### Patch Changes
