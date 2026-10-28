@@ -1,3 +1,4 @@
+import { dispatchKeyOf } from '../../dispatch-key.js';
 import type { WorkerDescriptor } from '../../handshake/descriptor.js';
 import type {
   GroupHealth,
@@ -575,7 +576,7 @@ export class BullMQTransport implements Transport {
     await this.#queue(tasksName(this.#effectivePrefix(), task.group)).add(
       'task',
       task,
-      taskJobOptions(task.priority),
+      taskDispatchOptions(task),
     );
   }
 
@@ -599,7 +600,7 @@ export class BullMQTransport implements Transport {
         const chunk = queued.slice(at, at + TASK_ADD_BULK_CHUNK).map((task) => ({
           name: 'task',
           data: task,
-          opts: taskJobOptions(task.priority),
+          opts: taskDispatchOptions(task),
         }));
         calls.push(() =>
           queue.addBulk
@@ -1507,6 +1508,37 @@ interface HeartbeatSnapshot {
 }
 /** The fewest step results a results consumer holds at once (see `resultConcurrency`). */
 const RESULT_CONSUMER_MIN = 512;
+/**
+ * How long BullMQ keeps refusing a keyed dispatch's re-send after its job finished (see
+ * {@link taskDispatchOptions}). Covers the window in which a crashed turn's step is re-sent although
+ * its job already completed and only the result is still on its way back (a results batch held by
+ * the dead pod is redelivered once BullMQ finds it stalled). One small Redis key per keyed dispatch,
+ * expiring after this.
+ */
+const TASK_DEDUPE_TTL_MS = 120_000;
+
+/**
+ * The BullMQ options of a step task job: {@link taskJobOptions}, plus — when the task carries a
+ * dispatch key (see `dispatch-key.ts`) — a job id and a deduplication id derived from it. BullMQ adds
+ * nothing for an id it still holds, and nothing for a deduplication id seen within
+ * {@link TASK_DEDUPE_TTL_MS}, so a re-send of the same dispatch (a crashed turn's step re-dispatched on
+ * recovery) is a no-op while the original job waits or runs, or has just finished, instead of a second
+ * execution. A new attempt, or a new checkpoint of the step, has another key. A task without a key gets
+ * a broker-generated id, as before. The id escapes `%` and `:` (BullMQ refuses a custom id with `:`).
+ * A BullMQ without deduplication ignores that option, and still dedupes by job id.
+ */
+function taskDispatchOptions(task: RemoteTask): ReturnType<typeof taskJobOptions> & {
+  jobId?: string;
+  deduplication?: { id: string; ttl: number };
+} {
+  const options = taskJobOptions(task.priority);
+  const key = dispatchKeyOf(task);
+  if (key === undefined) return options;
+  const esc = (v: string) => v.replaceAll('%', '%25').replaceAll(':', '%3A');
+  const jobId = `task-${esc(key)}`;
+  return { ...options, jobId, deduplication: { id: jobId, ttl: TASK_DEDUPE_TTL_MS } };
+}
+
 /** The most task jobs one `addBulk` carries, and how many such calls run at once (`dispatchMany`). */
 const TASK_ADD_BULK_CHUNK = 500;
 const TASK_ADD_BULK_IN_FLIGHT = 4;

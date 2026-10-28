@@ -104,6 +104,9 @@ export class CodecStateStore implements StateStore {
   /** Encodes each settlement's `output` (and `events`/`error` under `extended` coverage) like
    *  {@link saveCheckpoint}. Bound only when the inner store has it. */
   readonly settleCheckpointsIfPending?: (settlements: StepSettlement[]) => Promise<boolean[]>;
+  /** Forwarded verbatim — a timer carries no payload. Bound only when the inner store has it, so the
+   *  engine's {@link updateRunIf} fallback still applies through the wrapper. */
+  readonly pullRunWakesIn?: (runIds: string[], wakeAt: number) => Promise<void>;
   /** Decodes each checkpoint read like {@link listCheckpoints}. Bound only when the inner store has
    *  it. */
   readonly listCheckpointsForReplay?: (runId: string) => Promise<StepCheckpoint[]>;
@@ -220,6 +223,10 @@ export class CodecStateStore implements StateStore {
           inner,
           settlements.map((s) => this.encSettlement(s)),
         );
+    }
+    const pullWakesIn = inner.pullRunWakesIn;
+    if (pullWakesIn) {
+      this.pullRunWakesIn = (runIds, wakeAt) => pullWakesIn.call(inner, runIds, wakeAt);
     }
     const listForReplay = inner.listCheckpointsForReplay;
     if (listForReplay) {

@@ -23,6 +23,7 @@ import {
   countRuns,
   resolveConcurrency,
 } from './concurrency.js';
+import { DISPATCH_KEY, dispatchKey, type KeyedTask } from './dispatch-key.js';
 import {
   type BlockedDispatch,
   controlPlaneDescriptor,
@@ -466,6 +467,25 @@ const BUFFERED_SWEEP_REST_MS = 10 * 60_000;
 
 /** The most results of one run settled by one batched write (see `completeRemoteResult`). */
 const RESULT_BATCH_MAX = 256;
+
+/** The most runs one owed-resume write marks (see `WorkflowEngine.markResumeOwed`). */
+const OWED_RESUME_BATCH_MAX = 500;
+
+/**
+ * How long a settled step result's acknowledgement waits for the run's resume before it marks the
+ * run as owed one instead (see `WorkflowEngine.resumeOwed`). A turn that ends within it needs no mark.
+ */
+const OWED_RESUME_GRACE_MS = 3_000;
+
+/** How a refused wake's durable request went (see `WorkflowEngine.stampWakeRequest`). */
+type WakeStamp = 'stamped' | 'gone' | 'failed';
+
+/**
+ * The results `execute` returns when another instance holds the run's lease — no turn ran here, so the
+ * wake that asked for it is not served yet — each with the durable request that wake made instead
+ * (see `WorkflowEngine.resumeOwed`). By identity, so the result keeps the shape every caller sees.
+ */
+const leaseRefused = new WeakMap<RunResult, Promise<WakeStamp>>();
 
 /**
  * How many runs this instance executes in-process at once when it runs them itself (the default
@@ -949,6 +969,11 @@ export class WorkflowEngine {
   private readonly pending = new Map<string, PendingRemote>();
   /** Each run's step results waiting to be settled on this instance — see {@link completeRemoteResult}. */
   private readonly resultQueues = new Map<string, QueuedResult[]>();
+  /** Runs waiting to be marked as owed a resume by the next batched write — see {@link markResumeOwed}. */
+  private readonly owedResumes: Array<{ runId: string; served: () => boolean; done: () => void }> =
+    [];
+  /** Whether an owed-resume write is in flight (the runs marked meanwhile go out in the next). */
+  private markingOwedResumes = false;
   /** Per-step "reset the liveness timer" callbacks, called with the beat's worker timestamp when a
    *  heartbeat arrives. */
   private readonly heartbeatResets = new Map<string, (at: number | undefined) => void>();
@@ -3031,7 +3056,13 @@ export class WorkflowEngine {
     }
     // A resume issued from INSIDE this run's own execution (its ambient ctx is this run) can only be
     // satisfied once that execution ends — awaiting it there would deadlock. Queue it, answer now.
-    if (workflowAls.getStore()?.runId === runId) return this.echoCurrentStatus(runId);
+    if (workflowAls.getStore()?.runId === runId) {
+      // Queued, not run: the wake is not served yet (see `resumeOwed`).
+      return this.echoCurrentStatus(runId).then((echoed) => {
+        leaseRefused.set(echoed, Promise.resolve('failed'));
+        return echoed;
+      });
+    }
     return queued.result;
   }
 
@@ -3598,10 +3629,12 @@ export class WorkflowEngine {
    * ends normally settles after its dispatches, so a step it sent is always older than its settle).
    * `sinceInclusive` is for a run still `running`: its `updatedAt` is that same turn's start.
    *
-   * Each step goes out again under its own `stepId` and attempt: a step whose original dispatch did
-   * land runs twice (at-least-once, as documented), and the second result finds the checkpoint
-   * settled and is dropped. Only on a crash — a healthy run never gets here. Remote (polyglot)
-   * workflows are left to their own turn re-drive. Returns how many steps were sent.
+   * Each step goes out again under its own `stepId` and attempt, keyed like its original dispatch
+   * (see `dispatch-key.ts`): a broker that deduplicates by key (BullMQ) adds nothing while the original
+   * job still waits or runs, or has just finished. Elsewhere a step whose original dispatch did land
+   * runs twice (at-least-once, as documented), and the second result finds the checkpoint settled and
+   * is dropped. Only on a crash — a healthy run never gets here. Remote (polyglot) workflows are left to
+   * their own turn re-drive. Returns how many steps were sent.
    */
   private async redispatchCrashedTurnSteps(
     run: WorkflowRun,
@@ -3629,6 +3662,8 @@ export class WorkflowEngine {
         input: cp.input,
         attempt: cp.attempts,
         priority: run.priority,
+        // The original dispatch's key: a broker that still holds that job adds nothing.
+        enqueuedAt: cp.enqueuedAt,
       });
       this.emit({
         type: 'step.started',
@@ -4941,6 +4976,32 @@ export class WorkflowEngine {
   }
 
   /**
+   * The durable half of {@link requestWake}: keep the wake's reason, then stamp
+   * {@link WorkflowRun.wakeRequestedAt} on the run. `stamped`; `gone` when the run is no longer live
+   * (nothing to wake); `failed` when the stamp could not be kept (a schema without the column, a store
+   * error). Never rejects.
+   */
+  private async stampWakeRequest(runId: string, reason: WakeReason): Promise<WakeStamp> {
+    try {
+      // The reason first, the stamp second: a holder that finds the stamp finds the reason too.
+      await this.store
+        .bufferEvent({
+          name: wakeRequestName(runId),
+          payload: reason.generic ? null : { fans: [...reason.fans] },
+          id: globalThis.crypto.randomUUID(),
+          publishedAt: this.clock(),
+        })
+        .catch(() => undefined);
+      const marked = await this.store.updateRunIf(runId, ['running', 'suspended', 'blocked'], {
+        wakeRequestedAt: this.clock(),
+      });
+      return marked ? 'stamped' : 'gone';
+    } catch {
+      return 'failed';
+    }
+  }
+
+  /**
    * A wake that found the run leased by another instance (its turn is executing) asks for another
    * turn, durably: it stamps {@link WorkflowRun.wakeRequestedAt} on the run. The holder does not let
    * go of the lease while the stamp is there ({@link releaseSuspendedLease}) and runs another turn,
@@ -4956,28 +5017,16 @@ export class WorkflowEngine {
     runId: string,
     lockedUntil: number | undefined,
     reason: WakeReason = { generic: true, fans: new Map() },
+    stamping?: Promise<WakeStamp>,
   ): Promise<void> {
-    if (this.draining) return;
-    let marked: boolean;
-    try {
-      // The reason first, the stamp second: a holder that finds the stamp finds the reason too.
-      await this.store
-        .bufferEvent({
-          name: wakeRequestName(runId),
-          payload: reason.generic ? null : { fans: [...reason.fans] },
-          id: globalThis.crypto.randomUUID(),
-          publishedAt: this.clock(),
-        })
-        .catch(() => undefined);
-      marked = await this.store.updateRunIf(runId, ['running', 'suspended', 'blocked'], {
-        wakeRequestedAt: this.clock(),
-      });
-    } catch {
+    if (!stamping && this.draining) return;
+    const stamp = await (stamping ?? this.stampWakeRequest(runId, reason));
+    if (stamp === 'failed') {
       // Not kept (a schema without the column, a store error): the in-memory re-check is all there is.
       this.recheckAfterLease(runId, lockedUntil);
       return;
     }
-    if (!marked) return;
+    if (stamp === 'gone') return;
     // The fast path for a holder that went down mid-turn: look again in memory too (it stops once a
     // turn served the request).
     this.recheckAfterLease(runId, lockedUntil, 1, true);
@@ -5121,8 +5170,11 @@ export class WorkflowEngine {
       if (
         !(await this.store.tryLockRun(run.id, this.instanceId, lockNow + this.leaseMs, lockNow))
       ) {
-        this.trackEffect(this.requestWake(run.id, run.lockedUntil, reason));
-        return { runId: run.id, status: run.status };
+        const stamping = this.draining ? undefined : this.stampWakeRequest(run.id, reason);
+        this.trackEffect(this.requestWake(run.id, run.lockedUntil, reason, stamping));
+        const refused: RunResult = { runId: run.id, status: run.status };
+        leaseRefused.set(refused, stamping ?? Promise.resolve('failed'));
+        return refused;
       }
     }
     // This turn reads the run's checkpoints after this point, so it sees whatever the wakes that
@@ -7624,6 +7676,7 @@ export class WorkflowEngine {
       priority: admission?.priority,
       attempt,
       transport,
+      enqueuedAt,
     });
     this.emit({ type: 'step.started', runId, seq, name: step.name, kind: 'remote' });
     throw new WorkflowSuspended(undefined, [seq]);
@@ -7866,19 +7919,22 @@ export class WorkflowEngine {
         const round = checkpoints.slice(from, from + STEP_FAN_SEND_ROUND);
         await this.saveFanCheckpoints(round);
         const dispatch = this.pool.dispatchMany(
-          round.map((cp) => ({
-            runId,
-            seq: cp.seq,
-            name: step.name,
-            stepId: cp.stepId as string,
-            group: token,
-            input: cp.input,
-            traceparent,
-            context,
-            priority: opts.admission?.priority,
-            lazyPickupBeat: true,
-            attempt: 1,
-          })),
+          round.map(
+            (cp): Omit<KeyedTask, 'transport'> => ({
+              runId,
+              seq: cp.seq,
+              name: step.name,
+              stepId: cp.stepId as string,
+              group: token,
+              input: cp.input,
+              traceparent,
+              context,
+              priority: opts.admission?.priority,
+              lazyPickupBeat: true,
+              attempt: 1,
+              [DISPATCH_KEY]: dispatchKey(cp.stepId as string, 1, enqueuedAt),
+            }),
+          ),
           opts.transport,
         );
         // Awaited below; a rejection is not left unhandled while the next round is written.
@@ -7917,22 +7973,24 @@ export class WorkflowEngine {
     attempt: number;
     priority?: number | undefined;
     transport?: string | undefined;
+    /** When the step's `pending` checkpoint was enqueued: keys the dispatch (see `dispatch-key.ts`). */
+    enqueuedAt?: Date | undefined;
   }): Promise<void> {
-    return this.pool.dispatch(
-      {
-        runId: task.runId,
-        seq: task.seq,
-        name: task.name,
-        stepId: task.stepId,
-        group: task.group,
-        input: task.input,
-        traceparent: this.traceparent?.(),
-        context: this.context?.(),
-        priority: task.priority,
-        attempt: task.attempt,
-      },
-      task.transport,
-    );
+    const remote: Omit<KeyedTask, 'transport'> = {
+      runId: task.runId,
+      seq: task.seq,
+      name: task.name,
+      stepId: task.stepId,
+      group: task.group,
+      input: task.input,
+      traceparent: this.traceparent?.(),
+      context: this.context?.(),
+      priority: task.priority,
+      attempt: task.attempt,
+    };
+    if (task.enqueuedAt)
+      remote[DISPATCH_KEY] = dispatchKey(task.stepId, task.attempt, task.enqueuedAt);
+    return this.pool.dispatch(remote, task.transport);
   }
 
   /** A turn's read of its run's checkpoints: {@link StateStore.listCheckpointsForReplay}, or every
@@ -8030,9 +8088,8 @@ export class WorkflowEngine {
     if (settled === undefined) return;
     const { cp, run } = settled;
     if (await this.stepFanStillRunning(cp, result, queuedIn)) return;
-    await this.markResumeOwed(run);
     if (!parseStepFanGroup(cp.parallelGroup)) this.noteSettledHere(result.runId, [cp.seq]);
-    this.resumeInBackground(result.runId, fanWakeOf(cp, result));
+    await this.resumeOwed(run, result.runId, fanWakeOf(cp, result));
   }
 
   /**
@@ -8054,50 +8111,166 @@ export class WorkflowEngine {
   }
 
   /**
-   * Make the turn a settled step result owes its run DURABLE before the result is acknowledged.
+   * Resume the run a settled step result owes a turn, and make that turn DURABLE before the result
+   * is acknowledged (the caller's return is the acknowledgement).
    *
    * Settling a result does two things — settle the checkpoint, then resume the run — and only the
-   * first is durable: the resume runs in the background, after the transport has acknowledged the
-   * result. A pod SIGKILLed in between (or mid-way through the resumed turn, which keeps the run
-   * `suspended` and so is invisible to the orphan sweep) left the run parked on whatever `wakeAt` its
-   * last turn wrote — for a step that is the reconcile fallback, minutes out — with nothing else to
-   * wake it: the result was already acknowledged, so no redelivery re-drives it.
+   * first is durable on its own: the resume runs in the background, so the transport is never held
+   * by a turn that awaits another result (the self-deadlock the background resume exists for). A pod
+   * SIGKILLed after the acknowledgement and before (or mid-way through) the resumed turn, which keeps
+   * the run `suspended` and so is invisible to the orphan sweep, left the run parked on whatever
+   * `wakeAt` its last turn wrote — for a step that is the reconcile fallback, minutes out — with
+   * nothing else to wake it: the result was already acknowledged, so no redelivery re-drives it.
    *
-   * So pull the suspended run's timer in to one lease from now first. The resume this instance is
-   * about to run re-parks the run (or settles it) and so overwrites it; if this instance dies before
-   * that, every instance's due-timer poll resumes the run once the lease a dying turn may hold has
-   * lapsed. Leased like any due run, so a live turn is never doubled — at worst a resume landing after
-   * the timer replays and re-parks. Only pulls a timer IN (one already due sooner is kept), and only
-   * for a `suspended` run: a run still `running` has its first turn holding the lease, which re-checks
-   * the step on settling (see `recheckWaitSeqs`) and is recovered by the orphan sweep if it dies.
+   * So the acknowledgement waits for one of two things, at most {@link OWED_RESUME_GRACE_MS}:
+   *  - the resumed turn ending here: it settled or re-parked the run itself, so nothing is owed any
+   *    more — the common case, and it costs no write;
+   *  - else ({@link OWED_RESUME_GRACE_MS} passed, or the resume failed) a durable mark: for a
+   *    `suspended` run {@link markResumeOwed} pulls its timer in to one lease from now, so every
+   *    instance's due-timer poll resumes it once the lease a dying turn may hold has lapsed; for a run
+   *    whose turn is still in flight, a {@link requestWake} stamp (see {@link owedDurably}). A resume
+   *    refused by another instance's lease already made that stamp, which is then enough.
+   * A pod dying while the acknowledgement waits never acknowledged: the transport redelivers the
+   * result, whose settled checkpoint re-drives the resume on a live instance.
    *
-   * Best-effort: a store that refuses the write leaves the run exactly where it was before.
+   * The wait is bounded, so a turn that awaits another result in memory holds this one for at most
+   * the grace before it is marked and acknowledged — never a deadlock.
    */
-  private async markResumeOwed(run: WorkflowRun | null | undefined): Promise<void> {
-    if (run?.status !== 'suspended') return;
-    const owedBy = this.clock() + this.leaseMs;
-    if (run.wakeAt !== undefined && run.wakeAt <= owedBy) return;
-    try {
-      await this.store.updateRunIf(run.id, ['suspended'], { wakeAt: owedBy });
-    } catch (err) {
-      console.warn(
-        `[adonis-durable] could not mark run ${run.id} as owed a resume (it recovers on its next reconcile wake): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    }
-  }
-
-  private resumeInBackground(runId: string, fan?: FanWake): void {
-    this.trackEffect(
-      this.resumeImplicit(runId, fan).catch((err) => {
+  private async resumeOwed(
+    run: WorkflowRun | null | undefined,
+    runId: string,
+    fan?: FanWake,
+  ): Promise<void> {
+    let served = false;
+    let refusal: Promise<WakeStamp> | undefined;
+    const resumed = this.resumeImplicit(runId, fan).then(
+      (result) => {
+        refusal = leaseRefused.get(result);
+        served = refusal === undefined;
+      },
+      (err) => {
         console.warn(
           `[adonis-durable] background resume of run ${runId} failed (the run recovers on its next reconcile wake): ${
             err instanceof Error ? err.message : String(err)
           }`,
         );
-      }),
+      },
     );
+    this.trackEffect(resumed);
+    const owed = this.owedDurably(run);
+    if (owed === undefined) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      resumed,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, OWED_RESUME_GRACE_MS);
+      }),
+    ]);
+    clearTimeout(timer);
+    if (served) return;
+    // Refused: the wake already asked the lease holder for a turn, durably, unless that failed.
+    if (refusal !== undefined && (await refusal) !== 'failed') return;
+    if (owed === 'mark') {
+      await this.markResumeOwed(run as WorkflowRun, () => served);
+      return;
+    }
+    if ((await this.stampWakeRequest(runId, { generic: true, fans: new Map() })) === 'failed') {
+      console.warn(
+        `[adonis-durable] could not mark run ${runId} as owed a turn (it recovers on its next reconcile wake)`,
+      );
+    }
+  }
+
+  /**
+   * What makes the turn a result settled for `run` (as read when it settled) owes durable, if the
+   * resume does not end in time: `mark` ({@link markResumeOwed}) for a `suspended` run whose timer is
+   * not already due within a lease; `stamp` (a {@link requestWake} stamp) for a run whose turn is in
+   * flight (`running`, or `blocked`) — its turn may park it after this, overwriting any timer, and a
+   * holder that dies after parking leaves a `suspended` run the orphan sweep never sees, so only the
+   * stamp (kept across the park, and due for the timer poll at once) survives both. Else nothing.
+   */
+  private owedDurably(run: WorkflowRun | null | undefined): 'mark' | 'stamp' | undefined {
+    if (run?.status === 'suspended') return this.owesMark(run) ? 'mark' : undefined;
+    if (run?.status === 'running' || run?.status === 'blocked') return 'stamp';
+    return undefined;
+  }
+
+  /**
+   * Whether a result settled for `run` (as read when it settled) would need {@link markResumeOwed}: only
+   * a `suspended` run whose timer is not already due within a lease (a run whose turn is in flight
+   * gets a wake request instead, see {@link owedDurably}).
+   */
+  private owesMark(run: WorkflowRun | null | undefined): run is WorkflowRun {
+    if (run?.status !== 'suspended') return false;
+    return run.wakeAt === undefined || run.wakeAt > this.clock() + this.leaseMs;
+  }
+
+  /**
+   * Mark `run` as owed a resume: pull its timer in to one lease from now (only IN — a timer already
+   * due sooner is kept, and only while the run is still `suspended`). Leased like any due run, so a
+   * live turn is never doubled — at worst a resume that lands after the mark replays and re-parks.
+   * `served` reports a resume that ended meanwhile, whose mark is then dropped if not yet written.
+   *
+   * Batched across runs when the store has {@link StateStore.pullRunWakesIn}. Best-effort: a store that
+   * refuses the write leaves the run exactly where it was before.
+   */
+  private async markResumeOwed(
+    run: WorkflowRun,
+    served: () => boolean = () => false,
+  ): Promise<void> {
+    if (!this.owesMark(run)) return;
+    if (!this.store.pullRunWakesIn) {
+      await this.markRunResumeOwed(run.id, this.clock() + this.leaseMs);
+      return;
+    }
+    // Batched across runs: the results of a busy instance arrive many runs at a time (a results batch
+    // settles each of its runs concurrently), and each would otherwise cost its own UPDATE. The first
+    // mark goes out at once; the ones arriving while it is in flight go out together in the next.
+    await new Promise<void>((done) => {
+      this.owedResumes.push({ runId: run.id, served, done });
+      if (!this.markingOwedResumes) void this.markOwedResumes();
+    });
+  }
+
+  /** Write the queued owed-resume marks, a batch at a time, until none is left (see {@link markResumeOwed}). */
+  private async markOwedResumes(): Promise<void> {
+    this.markingOwedResumes = true;
+    try {
+      while (this.owedResumes.length > 0) {
+        const batch = this.owedResumes.splice(0, OWED_RESUME_BATCH_MAX);
+        // One lease from the write, not from each mark's arrival: never later than a single write.
+        const owedBy = this.clock() + this.leaseMs;
+        // A resume that ended while its mark queued owes nothing any more.
+        const runIds = batch.filter((entry) => !entry.served()).map((entry) => entry.runId);
+        if (runIds.length === 0) {
+          for (const entry of batch) entry.done();
+          continue;
+        }
+        try {
+          await this.store.pullRunWakesIn?.(runIds, owedBy);
+        } catch {
+          // A batch the store refused (a deadlock victim, a dropped connection) is retried one run at
+          // a time, so one bad row costs no other run its mark.
+          for (const runId of new Set(runIds)) await this.markRunResumeOwed(runId, owedBy);
+        }
+        for (const entry of batch) entry.done();
+      }
+    } finally {
+      this.markingOwedResumes = false;
+    }
+  }
+
+  /** {@link markResumeOwed} for one run, through {@link StateStore.updateRunIf}. Best-effort. */
+  private async markRunResumeOwed(runId: string, owedBy: number): Promise<void> {
+    try {
+      await this.store.updateRunIf(runId, ['suspended'], { wakeAt: owedBy });
+    } catch (err) {
+      console.warn(
+        `[adonis-durable] could not mark run ${runId} as owed a resume (it recovers on its next reconcile wake): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
   }
 
   /**
@@ -8217,9 +8390,8 @@ export class WorkflowEngine {
     for (const { cp, result } of resumable) {
       const fan = parseStepFanGroup(cp.parallelGroup);
       if (!fan || result.status === 'failed') {
-        await this.markResumeOwed(run);
         this.noteSettledHere(runId, singles);
-        this.resumeInBackground(runId);
+        await this.resumeOwed(run, runId);
         return outcomes;
       }
       let closed = barriers.get(fan.firstSeq);
@@ -8231,9 +8403,8 @@ export class WorkflowEngine {
         barriers.set(fan.firstSeq, closed);
       }
       if (!(await closed)) {
-        await this.markResumeOwed(run);
         this.noteSettledHere(runId, singles);
-        this.resumeInBackground(runId, {
+        await this.resumeOwed(run, runId, {
           first: fan.firstSeq,
           seq: highest.get(fan.firstSeq) ?? cp.seq,
         });
