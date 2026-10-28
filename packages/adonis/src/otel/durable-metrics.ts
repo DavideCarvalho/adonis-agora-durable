@@ -38,12 +38,44 @@ export interface DurableMetrics {
   unsubscribe(): void;
 }
 
-function stats(xs: number[]): DurationStats {
-  if (xs.length === 0) return { count: 0, p50: 0, p95: 0, max: 0 };
-  const sorted = [...xs].sort((a, b) => a - b);
-  const at = (p: number) =>
-    sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))] ?? 0;
-  return { count: sorted.length, p50: at(50), p95: at(95), max: sorted[sorted.length - 1] ?? 0 };
+/**
+ * Most `run.started` entries kept waiting for their terminal event. A run that starts here but never
+ * ends here (suspended and resumed on another pod, cancelled, reclaimed elsewhere) would otherwise
+ * stay in the map forever. Past the cap the OLDEST start is dropped — only a run still in flight
+ * after this many newer starts loses its (single) duration sample.
+ */
+export const MAX_TRACKED_RUN_STARTS = 10_000;
+
+/**
+ * Exact duration samples as a value → occurrences histogram. Durations are whole milliseconds, so
+ * memory grows with the number of DISTINCT values (bounded by the duration range) instead of with
+ * the number of samples, and percentiles stay identical to sorting every sample.
+ */
+class DurationSamples {
+  private readonly counts = new Map<number, number>();
+  private total = 0;
+
+  add(value: number): void {
+    this.counts.set(value, (this.counts.get(value) ?? 0) + 1);
+    this.total += 1;
+  }
+
+  stats(): DurationStats {
+    if (this.total === 0) return { count: 0, p50: 0, p95: 0, max: 0 };
+    const values = [...this.counts.keys()].sort((a, b) => a - b);
+    const n = this.total;
+    // The value at sorted-sample index `i`, walking cumulative counts.
+    const atIndex = (i: number): number => {
+      let seen = 0;
+      for (const v of values) {
+        seen += this.counts.get(v) ?? 0;
+        if (i < seen) return v;
+      }
+      return values[values.length - 1] ?? 0;
+    };
+    const at = (p: number) => atIndex(Math.min(n - 1, Math.floor((p / 100) * n)));
+    return { count: n, p50: at(50), p95: at(95), max: values[values.length - 1] ?? 0 };
+  }
 }
 
 /**
@@ -66,14 +98,14 @@ export function attachDurableMetrics(engine: WorkflowEngine): DurableMetrics {
   let runs = zeroRuns();
   let routedByCode: Record<string, number> = {};
   let steps = { completed: 0, failed: 0 };
-  let stepDur: number[] = [];
-  let runDur: number[] = [];
+  let stepDur = new DurationSamples();
+  let runDur = new DurationSamples();
   const runStart = new Map<string, number>();
 
   const finishRun = (runId: string, at: Date): void => {
     const t0 = runStart.get(runId);
     if (t0 != null) {
-      runDur.push(at.getTime() - t0);
+      runDur.add(at.getTime() - t0);
       runStart.delete(runId);
     }
   };
@@ -85,7 +117,13 @@ export function attachDurableMetrics(engine: WorkflowEngine): DurableMetrics {
     switch (e.type) {
       case 'run.started':
         runs.started += 1;
+        // Re-insert so the map's insertion order stays oldest-start-first for eviction.
+        runStart.delete(e.runId);
         runStart.set(e.runId, e.at.getTime());
+        if (runStart.size > MAX_TRACKED_RUN_STARTS) {
+          const oldest = runStart.keys().next().value;
+          if (oldest !== undefined) runStart.delete(oldest);
+        }
         break;
       case 'run.completed':
         runs.completed += 1;
@@ -109,11 +147,11 @@ export function attachDurableMetrics(engine: WorkflowEngine): DurableMetrics {
         break;
       case 'step.completed':
         steps.completed += 1;
-        if (e.durationMs != null) stepDur.push(e.durationMs);
+        if (e.durationMs != null) stepDur.add(e.durationMs);
         break;
       case 'step.failed':
         steps.failed += 1;
-        if (e.durationMs != null) stepDur.push(e.durationMs);
+        if (e.durationMs != null) stepDur.add(e.durationMs);
         break;
     }
   });
@@ -123,15 +161,15 @@ export function attachDurableMetrics(engine: WorkflowEngine): DurableMetrics {
       runs: { ...runs },
       routedByCode: { ...routedByCode },
       steps: { ...steps },
-      stepDurationMs: stats(stepDur),
-      runDurationMs: stats(runDur),
+      stepDurationMs: stepDur.stats(),
+      runDurationMs: runDur.stats(),
     }),
     reset: () => {
       runs = zeroRuns();
       routedByCode = {};
       steps = { completed: 0, failed: 0 };
-      stepDur = [];
-      runDur = [];
+      stepDur = new DurationSamples();
+      runDur = new DurationSamples();
       runStart.clear();
     },
     unsubscribe,
