@@ -230,6 +230,18 @@ export class LucidStateStore implements StateStore {
     });
   }
 
+  async pullRunWakesIn(runIds: string[], wakeAt: number): Promise<void> {
+    if (runIds.length === 0) return;
+    // Sorted, so two batches sharing runs take their row locks in the same order.
+    const ids = [...new Set(runIds)].sort();
+    await this.client()
+      .from(DURABLE_TABLES.runs)
+      .whereIn('id', ids)
+      .where('status', 'suspended')
+      .andWhere((w) => w.whereNull('wake_at').orWhere('wake_at', '>', wakeAt))
+      .update({ wake_at: wakeAt });
+  }
+
   /** Whether the runs table has `awaiting_decision_task_id`, probed once per store and cached. */
   private decisionMarkerColumn: Promise<boolean> | undefined;
   private hasDecisionMarkerColumn(trx: Client): Promise<boolean> {

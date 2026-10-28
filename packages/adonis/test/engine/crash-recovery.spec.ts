@@ -1,9 +1,11 @@
 import type { Database } from '@adonisjs/lucid/database';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { DISPATCH_KEY, dispatchKeyOf } from '../../src/dispatch-key.js';
 import { WorkflowEngine } from '../../src/engine.js';
 import type { RemoteTask, StateStore, StepResult, Transport } from '../../src/interfaces.js';
 import { LucidStateStore } from '../../src/stores/lucid.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
+import { runOutsideWorkflowCtx } from '../../src/workflow-als.js';
 import { dbBackends } from '../support/backends.js';
 
 /**
@@ -68,14 +70,20 @@ function killable(store: StateStore): {
  *  inside the dispatch, before the job reaches the broker. */
 class CrashableTransport implements Transport {
   readonly dispatched: RemoteTask[] = [];
+  /** Every task handed to `dispatch`, the ones a crash swallowed included. */
+  readonly attempted: RemoteTask[] = [];
   result: ((r: StepResult) => Promise<void>) | undefined;
   crashOnDispatch: (() => void) | undefined;
+  /** Awaited inside `dispatch`, after the job reached the broker: the turn that dispatched waits on it. */
+  onDispatch: ((task: RemoteTask) => Promise<void>) | undefined;
   async dispatch(task: RemoteTask): Promise<void> {
+    this.attempted.push(task);
     if (this.crashOnDispatch) {
       this.crashOnDispatch();
       return new Promise(() => {});
     }
     this.dispatched.push(task);
+    await this.onDispatch?.(task);
   }
   onResult(handler: (r: StepResult) => Promise<void>): void {
     this.result = handler;
@@ -102,6 +110,24 @@ async function parked(store: StateStore, runId: string): Promise<void> {
 }
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+/**
+ * Deliver `result` to `dying`, a pod about to die mid-resume, the way a broker does: the handler
+ * resolving is the acknowledgement. A pod that died before acknowledging never did, so the broker
+ * redelivers the result to a live consumer (`survivor`).
+ */
+async function deliverToDying(
+  dying: { transport: CrashableTransport; dead: () => boolean },
+  survivor: { transport: CrashableTransport },
+  result: StepResult,
+): Promise<'acked' | 'redelivered'> {
+  const delivered = dying.transport.result?.(result).then(() => 'acked' as const);
+  await until(() => dying.dead());
+  const outcome = await Promise.race([delivered, settle().then(() => 'unacked' as const)]);
+  if (outcome === 'acked') return 'acked';
+  await survivor.transport.result?.(result);
+  return 'redelivered';
+}
 
 const completed = (task: RemoteTask, output: unknown = { ok: true }): StepResult => ({
   runId: task.runId,
@@ -227,8 +253,7 @@ describe.each(backends)('crash recovery on $name', (backend) => {
     if (!task) throw new Error('expected a dispatched task');
 
     freezeB = true;
-    await b.transport.result?.(completed(task));
-    await until(() => b.dead());
+    await deliverToDying(b, a, completed(task));
     expect((await store.getRun('r1'))?.lockedBy).toBe('pod-b');
 
     await tickAt(a.engine, LEASE_MS + 1_000);
@@ -256,6 +281,14 @@ describe.each(backends)('crash recovery on $name', (backend) => {
       await tickAt(b.engine, RECONCILE_MS + 1_000);
     }
     expect(b.transport.dispatched.map((t) => t.stepId)).toEqual(['r1:0']);
+    // Re-sent as the SAME dispatch: a broker that still holds the original job adds nothing (BullMQ
+    // derives the job id from this key). The key never reaches the wire.
+    const original = a.transport.attempted[0] as RemoteTask;
+    const resent = b.transport.dispatched[0] as RemoteTask;
+    expect(dispatchKeyOf(resent)).toBeDefined();
+    expect(dispatchKeyOf(resent)).toBe(dispatchKeyOf(original));
+    expect(JSON.parse(JSON.stringify(resent))).toEqual(JSON.parse(JSON.stringify(original)));
+    expect(Object.keys(resent)).not.toContain(String(DISPATCH_KEY));
 
     const task = b.transport.dispatched[0] as RemoteTask;
     await b.transport.result?.(completed(task));
@@ -279,8 +312,7 @@ describe.each(backends)('crash recovery on $name', (backend) => {
 
     // B consumes step 1's result and resumes the run; its turn dies dispatching step 2.
     b.transport.crashOnDispatch = () => b.kill();
-    await b.transport.result?.(completed(first));
-    await until(() => b.dead());
+    await deliverToDying(b, a, completed(first));
     await until(async () => (await store.listCheckpoints('r1')).length === 2);
 
     await tickAt(a.engine, LEASE_MS + 1_000);
@@ -292,6 +324,109 @@ describe.each(backends)('crash recovery on $name', (backend) => {
     await a.transport.result?.(completed(a.transport.dispatched[1] as RemoteTask, 2));
     await until(async () => (await store.getRun('r1'))?.status === 'completed');
     expect((await store.getRun('r1'))?.output).toBe(2);
+  });
+
+  it('acknowledges a result whose resume ends first without an owed-resume write', async () => {
+    const { store, a, b } = await setup();
+    live = [a.engine, b.engine];
+    for (const { engine } of [a, b]) {
+      engine.register('Test', '1', async (ctx) => ctx.step(STEP, {}));
+    }
+    await a.engine.start('Test', {}, 'r1');
+    await parked(store, 'r1');
+    const task = a.transport.dispatched[0] as RemoteTask;
+
+    const updateRunIf = vi.spyOn(store, 'updateRunIf');
+    const pulls = store.pullRunWakesIn ? vi.spyOn(store, 'pullRunWakesIn') : undefined;
+    await b.transport.result?.(completed(task));
+    // Acknowledged once the turn it owed ended: the run is done, and nothing marked it.
+    expect((await store.getRun('r1'))?.status).toBe('completed');
+    const marks = updateRunIf.mock.calls.filter(
+      ([, statuses, patch]) =>
+        statuses.length === 1 &&
+        statuses[0] === 'suspended' &&
+        Object.keys(patch).join() === 'wakeAt',
+    );
+    expect(marks).toHaveLength(0);
+    expect(pulls?.mock.calls ?? []).toHaveLength(0);
+  });
+
+  it('marks the run owed before acknowledging a result whose resume outlasts the grace', async () => {
+    const { store, a, b } = await setup();
+    live = [a.engine, b.engine];
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let hold = false;
+    for (const { engine } of [a, b]) {
+      engine.register('Test', '1', async (ctx) => {
+        const out = await ctx.step(STEP, {});
+        // A slow resumed turn on a LIVE pod (it awaits something else in memory).
+        if (hold) await held;
+        return out;
+      });
+    }
+    await a.engine.start('Test', {}, 'r1');
+    await parked(store, 'r1');
+    const task = a.transport.dispatched[0] as RemoteTask;
+
+    hold = true;
+    const acked = b.transport.result?.(completed(task));
+    // Not held hostage by the turn: acknowledged after the grace, with the run due within a lease.
+    await acked;
+    const run = await store.getRun('r1');
+    expect(run?.status).toBe('suspended');
+    expect(run?.wakeAt).toBeLessThanOrEqual(now + LEASE_MS);
+
+    release();
+    await until(async () => (await store.getRun('r1'))?.status === 'completed');
+  });
+
+  it('pulls only the timers of suspended runs in, and only in (pullRunWakesIn)', async () => {
+    const { store, a } = await setup();
+    live = [a.engine];
+    a.engine.register('Test', '1', async (ctx) => ctx.step(STEP, {}));
+    for (const id of ['far', 'soon', 'done']) {
+      await a.engine.start('Test', {}, id);
+      await parked(store, id);
+    }
+    await store.updateRun('soon', { wakeAt: now + 1_000 });
+    await store.updateRun('done', { status: 'completed', wakeAt: now + RECONCILE_MS });
+    const by = now + LEASE_MS;
+    await store.pullRunWakesIn?.(['far', 'soon', 'done', 'missing', 'far'], by);
+    if (!store.pullRunWakesIn) return;
+    expect((await store.getRun('far'))?.wakeAt).toBe(by);
+    expect((await store.getRun('soon'))?.wakeAt).toBe(now + 1_000);
+    expect((await store.getRun('done'))?.wakeAt).toBe(now + RECONCILE_MS);
+    expect((await store.getRun('done'))?.status).toBe('completed');
+  });
+
+  it('resumes a run whose result settled mid-turn on a pod that died after parking it', async () => {
+    const { store, a, b } = await setup();
+    live = [b.engine];
+    for (const { engine } of [a, b]) {
+      engine.register('Test', '1', async (ctx) => ctx.step(STEP, {}));
+    }
+    // The step's result reaches pod A while A's first turn is still in flight (the run `running`,
+    // A's own resume queued behind that turn). A acknowledges it, then dies once the turn parked the
+    // run — before letting go of the lease or running the queued resume. Nothing about a `running`
+    // run's timer survives the park, so only a durable wake request gets the run back before its
+    // reconcile wake.
+    a.transport.onDispatch = async (task) => {
+      a.transport.onDispatch = undefined;
+      // Delivered by the transport's consumer, not from inside the turn.
+      await runOutsideWorkflowCtx(() => a.transport.result?.(completed(task)));
+      a.onCall('releaseRunLockUnlessWakeRequested', () => a.kill());
+    };
+    void a.engine.start('Test', {}, 'r1');
+    await until(() => a.dead(), 2_000);
+    const run = await store.getRun('r1');
+    expect(run?.status).toBe('suspended');
+    expect(run?.lockedBy).toBe('pod-a');
+
+    await tickAt(b.engine, LEASE_MS + 1_000);
+    await until(async () => (await store.getRun('r1'))?.status === 'completed');
   });
 
   it('does not re-dispatch a step a healthy turn already sent', async () => {

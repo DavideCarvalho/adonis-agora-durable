@@ -520,6 +520,20 @@ export interface StateStore {
   settleCheckpointsIfPending?(settlements: StepSettlement[]): Promise<boolean[]>;
 
   /**
+   * Pull the timer of every run in `runIds` that is still `suspended` IN to `wakeAt`: write `wakeAt`
+   * where the run's `wakeAt` is absent or later, and leave every other run (another status, or a
+   * timer already due by then) untouched. One statement for the whole list in a SQL store — the
+   * predicate lives in its WHERE clause, so no prior read is involved.
+   *
+   * The engine marks the runs a batch of settled step results owes a turn through it, before the
+   * results are acknowledged, so a pod dying between the acknowledgement and the resume leaves every
+   * such run due one lease later instead of on its reconcile timer.
+   *
+   * Optional: without it the engine writes each run with {@link updateRunIf}.
+   */
+  pullRunWakesIn?(runIds: string[], wakeAt: number): Promise<void>;
+
+  /**
    * Used by recovery on boot to find runs to resume (crashed, left `running`). When `namespace` is
    * given, restrict to runs in that worker-pool partition (ANDed); omit it to return all (back-compat).
    */

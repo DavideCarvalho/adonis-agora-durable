@@ -221,6 +221,15 @@ export class InMemoryStateStore implements StateStore {
     return true;
   }
 
+  async pullRunWakesIn(runIds: string[], wakeAt: number): Promise<void> {
+    for (const runId of runIds) {
+      const existing = this.runs.get(runId);
+      if (existing?.status !== 'suspended') continue;
+      if (existing.wakeAt !== undefined && existing.wakeAt <= wakeAt) continue;
+      this.runs.set(runId, { ...existing, wakeAt });
+    }
+  }
+
   async tryAdmitSingleton(
     runId: string,
     tag: string,

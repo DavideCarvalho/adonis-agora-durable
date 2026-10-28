@@ -60,10 +60,12 @@ describe('step results of one run on one instance', () => {
         output: task.seq,
       });
     const [a, b] = transport.dispatched as [RemoteTask, RemoteTask];
-    // The second result lands while the first one's turn holds the lease, mid-body.
-    await deliver(a);
+    // The second result lands while the first one's turn holds the lease, mid-body. (A result is
+    // acknowledged once the turn it resumed ended, so the first delivery is not awaited before it.)
+    const first = deliver(a);
     await until(() => active === 1);
     await deliver(b);
+    await first;
     await until(async () => (await store.getRun('r1'))?.status === 'completed');
 
     expect((await store.getRun('r1'))?.output).toEqual([0, 1]);
