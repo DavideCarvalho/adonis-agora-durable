@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 0.57.1
+
+### Patch Changes
+
+- [#431](https://github.com/DavideCarvalho/adonis-agora-durable/pull/431) [`ebfb499`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/ebfb4996f30b33d4f2e799903ebb6c964a984990) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - perf(engine): a run whose workflow is registered here no longer pays an `await` for the unregistered-workflow check added in 0.57.0. Recovery (`recoverIncomplete`) and the run-queue hand-off (`handOffDue`) check the local registry synchronously first, and only fall back to the async convention-routing lookup when the workflow is not registered locally.
+
 ## 0.57.0
 
 ### Minor Changes
