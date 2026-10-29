@@ -368,6 +368,8 @@ export class DbTransport implements Transport, ControlPlane {
   #workerKeyStore: WorkerKeyStore | undefined;
   #readWorkerKeys: (() => Promise<{ key: string; value: string }[]>) | undefined;
   readonly #handlers = new Map<string, StepHandler>();
+  /** Aborted when `close()` starts: the `log.signal` of every step this worker runs. */
+  readonly #shutdown = new AbortController();
   readonly #pollers: Pollers;
   /** When set (see {@link deferConsumers}), {@link #startLoop} parks its loop until
    *  {@link startConsumers}. Dispatching is never deferred; only consumption is. */
@@ -792,8 +794,11 @@ export class DbTransport implements Transport, ControlPlane {
       this.#controller.onStart();
       let ok = false;
       try {
-        const result = await runStepHandler(task, this.#handlers.get(task.name), (beat) =>
-          this.heartbeat(beat),
+        const result = await runStepHandler(
+          task,
+          this.#handlers.get(task.name),
+          (beat) => this.heartbeat(beat),
+          this.#shutdown.signal,
         );
         ok = result.status === 'completed';
         // Stop renewing before settling: the settle deletes the row, and a renewal racing it would
@@ -2130,6 +2135,8 @@ export class DbTransport implements Transport, ControlPlane {
    * dropped. Does not close the shared `Database`.
    */
   async stop(): Promise<void> {
+    // Steps still running get the word first, so a long one can stop before the drain budget ends.
+    this.#shutdown.abort(new Error('transport closing'));
     this.#pollers.stopAll();
     this.#taskLoop = undefined;
     this.#controller.stop();

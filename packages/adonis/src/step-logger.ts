@@ -19,10 +19,14 @@ function withDuration(start: number, now: () => number, data?: unknown): Record<
  *  loop must not flood the transport; the freshest progress payload still wins on each emission. */
 const HEARTBEAT_MIN_INTERVAL_MS = 5_000;
 
+/** The signal of a step that runs where nothing can shut it down early: never aborted. */
+const NEVER_ABORTED = new AbortController().signal;
+
 export function createStepLogger(
   events: StepEvent[],
   now: () => number,
   emitBeat?: (progress?: unknown) => void,
+  signal: AbortSignal = NEVER_ABORTED,
 ): StepLogger {
   // The sub-process a `subProcess(...)` body is currently inside; debug/info/warn/error emitted while
   // inside get tagged with its id, so the dashboard groups that log trail under the sub-process.
@@ -90,6 +94,7 @@ export function createStepLogger(
   };
 
   return {
+    signal,
     debug: (m, d) => push('debug', m, d),
     info: (m, d) => push('info', m, d),
     warn: (m, d) => push('warn', m, d),

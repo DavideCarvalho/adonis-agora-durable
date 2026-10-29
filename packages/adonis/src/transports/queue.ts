@@ -410,6 +410,8 @@ export class QueueTransport implements Transport, ControlPlane {
   readonly #instanceId: string;
   readonly #onError: (err: unknown) => void;
   readonly #handlers = new Map<string, StepHandler>();
+  /** Aborted when `close()` starts: the `log.signal` of every step this worker runs. */
+  readonly #shutdown = new AbortController();
   readonly #pollers: Pollers;
   /** One task poll loop per subscribed routing token (`tenantGroup(sanitizeQueueToken(name), partition)`)
    *  — a dedicated queue per handler name, never a single shared group queue. */
@@ -763,8 +765,11 @@ export class QueueTransport implements Transport, ControlPlane {
           const task = payload as TaskPayload;
           let ok = false;
           try {
-            const result = await runStepHandler(task, this.#handlers.get(task.name), (beat) =>
-              this.heartbeat(beat),
+            const result = await runStepHandler(
+              task,
+              this.#handlers.get(task.name),
+              (beat) => this.heartbeat(beat),
+              this.#shutdown.signal,
             );
             await this.#adapter.pushOn(this.#resultsQueue(), this.#job('result', result));
             ok = result.status === 'completed';
@@ -1579,6 +1584,8 @@ export class QueueTransport implements Transport, ControlPlane {
    * `recoverStalledJobs`.
    */
   async close(): Promise<void> {
+    // Steps still running get the word first, so a long one can stop before the drain budget ends.
+    this.#shutdown.abort(new Error('transport closing'));
     this.#pollers.stopAll();
     this.#reclaimPollers?.stopAll();
     this.#taskLoops.clear();

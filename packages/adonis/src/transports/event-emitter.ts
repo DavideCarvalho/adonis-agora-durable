@@ -86,6 +86,8 @@ export class EventEmitterTransport implements Transport, ControlPlane {
   readonly #onError: (err: unknown) => void;
   #closed = false;
   readonly #handlers = new Map<string, StepHandler>();
+  /** Aborted when `close()` starts: the `log.signal` of every step this worker runs. */
+  readonly #shutdown = new AbortController();
   // Logical deployment namespace folded into every channel name via `#suffix()`. Mutable so an engine
   // can push its namespace via `useNamespace()` — but only when one wasn't passed explicitly to the
   // constructor (`#explicitNamespace`), which always wins.
@@ -165,7 +167,12 @@ export class EventEmitterTransport implements Transport, ControlPlane {
     const handler = this.#handlers.get(task.name);
     // Another subscriber may own this step name — stay silent, don't synthesize a "no handler" failure.
     if (!handler) return;
-    const result = await runStepHandler(task, handler, (beat) => this.heartbeat(beat));
+    const result = await runStepHandler(
+      task,
+      handler,
+      (beat) => this.heartbeat(beat),
+      this.#shutdown.signal,
+    );
     // Emit the result on a LATER tick: a durable `ctx.step` suspends the run right after dispatch, so
     // the result must land AFTER that unwinds (else the resume re-enters mid-suspend). Real brokers
     // deliver asynchronously; this mirrors them.
@@ -179,6 +186,7 @@ export class EventEmitterTransport implements Transport, ControlPlane {
   /** Stop redelivering failed results (the provider calls it on shutdown). Idempotent. */
   async close(): Promise<void> {
     this.#closed = true;
+    this.#shutdown.abort(new Error('transport closing'));
   }
 
   onResult(handler: (result: StepResult) => Promise<void>): void {

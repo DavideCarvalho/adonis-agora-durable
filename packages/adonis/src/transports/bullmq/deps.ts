@@ -8,14 +8,23 @@
 
 /** A BullMQ job as this transport reads it — only the fields it uses. `data` is the raw DTO. */
 export interface JobLike {
+  /** Present on real BullMQ jobs; fakes may omit it. */
+  id?: string | undefined;
   data: unknown;
   failedReason?: string | undefined;
   attemptsMade?: number | undefined;
   opts?: { attempts?: number | undefined } | undefined;
+  /**
+   * Move this ACTIVE job back to the broker (BullMQ `Job.moveToDelayed`, which does not count an
+   * attempt) while `token` still holds its lock. Used by `close()` to hand back a step that outlived
+   * the shutdown budget. Optional: a fake without it leaves the job to the broker's stalled check.
+   */
+  moveToDelayed?(timestamp: number, token?: string): Promise<unknown>;
 }
 
-/** The processor a task/result/decision/step-event worker runs per job. */
-export type ProcessFn = (job: JobLike) => Promise<unknown>;
+/** The processor a task/result/decision/step-event worker runs per job. `token` is the job's lock
+ *  token (BullMQ passes it to every processor). */
+export type ProcessFn = (job: JobLike, token?: string) => Promise<unknown>;
 
 /** The subset of a BullMQ `Queue` this transport uses. */
 export interface QueueLike {
@@ -172,7 +181,11 @@ export async function createBullMQDeps(
   const ioredisSpecifier = 'ioredis';
   const { Queue, Worker } = (await import(bullmqSpecifier)) as {
     Queue: new (name: string, opts: unknown) => QueueLike;
-    Worker: new (name: string, processor: (job: JobLike) => unknown, opts: unknown) => WorkerLike;
+    Worker: new (
+      name: string,
+      processor: (job: JobLike, token?: string) => unknown,
+      opts: unknown,
+    ) => WorkerLike;
   };
   const { Redis } = (await import(ioredisSpecifier)) as {
     Redis: new (opts?: unknown) => RedisLike;
@@ -211,7 +224,7 @@ export async function createBullMQDeps(
   return {
     makeQueue: (name) => new Queue(name, { connection }),
     makeWorker: (name, process, opts) =>
-      new Worker(name, (job) => process(job), {
+      new Worker(name, (job, token) => process(job, token), {
         connection: workerConnection(),
         concurrency: workerConcurrency(opts?.concurrency, defaultConcurrency),
       }),

@@ -1133,6 +1133,8 @@ export class WorkflowEngine {
   private bufferedSweepActive = false;
   private lastBufferedSweepEndedAt = Number.NEGATIVE_INFINITY;
   private draining = false;
+  /** Aborted by {@link beginDrain}: the {@link StepLogger.signal} of every local step this engine runs. */
+  private readonly drainAbort = new AbortController();
   /** Shutdown wait already spent before/alongside {@link drain} (see {@link beginDrain}). */
   private drainSpentMs = 0;
   /** Re-arms the deadline of every {@link drain} currently waiting, when more wait is reported. */
@@ -3254,8 +3256,9 @@ export class WorkflowEngine {
   /**
    * Stop picking up new work without waiting: recovery, timer, pending, schedule and timeout sweeps
    * (and their per-run lock loops) start nothing once this is called, and {@link runOne} refuses
-   * broker-delivered runs. Runs already started finish. {@link drain} calls it first; the worker loop
-   * calls it the moment a stop is requested, so a tick still in flight stops leasing a backlog.
+   * broker-delivered runs. Runs already started finish; their local steps see `log.signal` aborted.
+   * {@link drain} calls it first; the worker loop calls it the moment a stop is requested, so a tick
+   * still in flight stops leasing a backlog.
    *
    * `spentMs` is wait time ALREADY spent on this shutdown (the worker loop waiting for its in-flight
    * tick). It is deducted from the budget of a later {@link drain}, so that wait plus the drain stay
@@ -3265,6 +3268,10 @@ export class WorkflowEngine {
    */
   beginDrain(spentMs = 0): void {
     this.draining = true;
+    // Tell the local steps still running: a long one can stop between units of work instead of
+    // being cut off when the drain budget runs out.
+    if (!this.drainAbort.signal.aborted)
+      this.drainAbort.abort(new Error('durable engine draining'));
     // Take no more runs from the run queue; the ones in flight here finish (and are waited for).
     const stopRunConsumer = this.stopRunConsumer;
     this.stopRunConsumer = undefined;
@@ -7322,6 +7329,7 @@ export class WorkflowEngine {
       store: this.store,
       replay,
       clock: this.clock,
+      stepSignal: this.drainAbort.signal,
       eventBufferTtlMs: this.eventBufferTtlMs,
       webhookUrl: this.webhookUrl,
       startStep: (s) => this.startStep(s),
