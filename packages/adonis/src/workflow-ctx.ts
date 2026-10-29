@@ -150,6 +150,8 @@ export interface CtxHost {
    */
   readonly replay?: Map<number, StepCheckpoint> | undefined;
   clock(): number;
+  /** Aborted when this process starts shutting down; becomes each local step's `log.signal`. */
+  readonly stepSignal?: AbortSignal | undefined;
   /** A buffered event older than this (ms) is expired: skipped and removed instead of consumed. */
   eventBufferTtlMs?: number | undefined;
   webhookUrl?: ((token: string) => string) | undefined;
@@ -321,7 +323,7 @@ export function createWorkflowCtx(
         };
         const body = () =>
           runInStepScope(scopeOwner, name, () => {
-            const logger = createStepLogger(events, host.clock);
+            const logger = createStepLogger(events, host.clock, undefined, host.stepSignal);
             return runInStepLogger(logger, () => fn(logger));
           });
         const output = host.interceptStep

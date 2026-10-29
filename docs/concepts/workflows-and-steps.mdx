@@ -409,6 +409,34 @@ Each beat does three things:
 Beat from a **dispatched** step, where there is a worker whose silence is meaningful. Inside `ctx.localStep`
 the body runs in the engine itself, so there is nothing to report liveness to and `log.heartbeat` is a no-op.
 
+### Stopping a long step on shutdown
+
+A deploy stops the worker with the step mid-flight, and shutdown waits for it only for a bounded time
+(`closeTimeoutMs` on the transport, `drainTimeoutMs` on the engine). `log.signal` is an `AbortSignal` that
+aborts the moment shutdown starts, so a long step can stop between units of work instead of being cut off:
+
+```ts
+@Step()
+async harvest(input: { source: string }, log: StepLogger) {
+  let done = 0
+  for (const item of await queue.pending(input.source)) {
+    if (log.signal.aborted) break // the rest waits for the next run
+    await fetchItem(item, { signal: log.signal })
+    done += 1
+  }
+  return { done }
+}
+```
+
+Returning early completes the step with what it returns; throwing fails it like any other error (and
+retries per its policy). Pass `log.signal` to `fetch` and other APIs that accept one to cut an in-flight
+request short. Code deeper in the call stack reads the same signal as `currentStep()?.signal`.
+
+Every transport aborts it when its `close()` starts; the engine aborts it for `ctx.localStep` bodies when it
+begins draining. A step that ignores it is not lost: the queue, db and bullmq transports hand a step still
+running at the end of the budget back to the broker, and another worker runs it again. Checking the signal
+just saves that rework.
+
 ## Step interceptors
 
 For cross-cutting concerns around step execution — timing, structured logging, tracing, error enrichment — register an onion-style interceptor instead of repeating the same wrapper in every step body. `engine.use(interceptor)` takes `(invocation, next) => Promise<unknown>`: call `next()` to run the step body (or the next interceptor) and return — or transform — its result; throw to fail the step. First registered runs outermost, and `use` returns a function that removes the interceptor.

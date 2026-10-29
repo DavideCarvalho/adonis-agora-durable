@@ -198,6 +198,16 @@ export class BullMQTransport implements Transport {
   readonly #deferredWorkers: Array<() => void> = [];
 
   readonly #handlers = new Map<string, StepHandler>();
+  /** Aborted when `close()` starts: the `log.signal` of every step this worker runs. */
+  readonly #shutdown = new AbortController();
+  /**
+   * Task jobs whose handler is still running, with the lock token BullMQ handed the processor and the
+   * hook that makes the processor let go. `close()` hands back whatever is still here when its budget
+   * runs out.
+   */
+  readonly #openTasks = new Map<JobLike, { token: string | undefined; release: () => void }>();
+  /** Payloads of jobs handed back by `close()`: their abandoned handler must publish nothing. */
+  readonly #handedBack = new WeakSet<object>();
   // Worker-side workflow turn consumers, keyed by workflow name — a `workflow`-shaped job routes here.
   readonly #workflowTurns = new Map<string, WorkflowTurnHandler>();
   // One task queue/worker per registered handler name (its routing token) — never a shared queue.
@@ -667,7 +677,7 @@ export class BullMQTransport implements Transport {
     // move joins at the current limit rather than at `start`.
     const worker = this.#makeWorker(
       tasksName(this.#effectivePrefix(), token),
-      (job) => this.#runJob(job.data),
+      (job, token) => this.#runTaskJob(job, token),
       this.#concurrency !== undefined ? { concurrency: controller.limit } : undefined,
     );
     // Terminal-failure bridge: a task job reaching a TERMINAL `failed` state is an INFRASTRUCTURE
@@ -695,6 +705,52 @@ export class BullMQTransport implements Transport {
     } else {
       this.#startWorkerHeartbeat(token);
     }
+  }
+
+  /**
+   * The task-queue processor: {@link #runJob}, tracked in {@link #openTasks} so `close()` can hand the
+   * job back to the broker if it outlives the shutdown budget. Handed back, the processor rejects with
+   * a `DelayedError` (BullMQ matches it by name), which tells the worker the job was already moved and
+   * must not be completed or failed; the handler itself keeps running until the process exits, and
+   * {@link #handedBack} keeps it from publishing.
+   */
+  async #runTaskJob(job: JobLike, token: string | undefined): Promise<void> {
+    let release!: () => void;
+    const released = new Promise<never>((_, reject) => {
+      release = () => reject(handedBackError());
+    });
+    released.catch(() => undefined);
+    this.#openTasks.set(job, { token, release });
+    try {
+      await Promise.race([this.#runJob(job.data), released]);
+    } finally {
+      this.#openTasks.delete(job);
+    }
+  }
+
+  /**
+   * Hand every task job still running back to the broker: `moveToDelayed(now)` under the job's lock,
+   * which skips the attempt count, so another worker picks it up at once instead of BullMQ finding it
+   * stalled once this process is gone (and, past `maxStalledCount`, failing it for good). The same
+   * hand-back the queue and db transports do on close.
+   */
+  async #handBackOpenTasks(): Promise<void> {
+    const open = [...this.#openTasks];
+    this.#openTasks.clear();
+    await Promise.allSettled(
+      open.map(async ([job, { token, release }]) => {
+        if (!job.moveToDelayed) return;
+        try {
+          await job.moveToDelayed(Date.now(), token);
+        } catch (err) {
+          // Lock already lost (or Redis gone): the stalled check redelivers it, as before.
+          this.#onError(err);
+          return;
+        }
+        if (job.data && typeof job.data === 'object') this.#handedBack.add(job.data);
+        release();
+      }),
+    );
   }
 
   /** Route one task job by SHAPE (spec §6.3): a workflow turn runs the replay → decision path, a step
@@ -755,6 +811,8 @@ export class BullMQTransport implements Transport {
         error: { message: err instanceof Error ? err.message : String(err) },
       };
     }
+    // Handed back on shutdown: the broker already redelivers this turn elsewhere.
+    if (this.#handedBack.has(task)) return;
     try {
       await this.#queue(decisionsName(this.#effectivePrefix())).add(
         'decision',
@@ -775,7 +833,12 @@ export class BullMQTransport implements Transport {
     try {
       result = await this.#withStepTimeout(
         task,
-        runStepHandler(task, this.#handlers.get(task.name), (beat) => this.heartbeat(beat)),
+        runStepHandler(
+          task,
+          this.#handlers.get(task.name),
+          (beat) => this.heartbeat(beat),
+          this.#shutdown.signal,
+        ),
       );
     } catch (err) {
       // runStepHandler is pure (a handler throw becomes a failed StepResult), so reaching here is a
@@ -792,6 +855,8 @@ export class BullMQTransport implements Transport {
         },
       };
     }
+    // Handed back on shutdown: the broker already redelivers this step elsewhere.
+    if (this.#handedBack.has(task)) return false;
     try {
       await this.#publishResult(result);
       return result.status === 'completed';
@@ -1438,6 +1503,8 @@ export class BullMQTransport implements Transport {
   /** Close all workers/queues and disconnect pub/sub + heartbeat connections so the process can exit. */
   async close(): Promise<void> {
     this.#closing = true;
+    // Steps still running get the word first, so a long one can stop before the budget below ends.
+    this.#shutdown.abort(new Error('transport closing'));
     this.#controller?.stop();
     if (this.#workerHeartbeatTimer) clearInterval(this.#workerHeartbeatTimer);
     this.#workerHeartbeatTimer = undefined;
@@ -1459,7 +1526,16 @@ export class BullMQTransport implements Transport {
       this.#runRequestWorker?.close(),
       ...[...this.#runsWorkers.values()].map((r) => r.worker.close()),
     ];
-    await withTimeout(Promise.allSettled(workers.filter((p) => p !== undefined)), remaining());
+    // The tail of the budget is kept for handing back a step that outlives the wait, so the hand-back
+    // and the workers settling after it stay inside `closeTimeoutMs` too.
+    const reserve = Math.min(HAND_BACK_RESERVE_MS, this.#closeTimeoutMs / 5);
+    const settled = Promise.allSettled(workers.filter((p) => p !== undefined));
+    await withTimeout(settled, remaining() - reserve);
+    // A step that outlived the wait goes back to the broker now; its worker then settles at once.
+    if (this.#openTasks.size > 0) {
+      await withTimeout(this.#handBackOpenTasks(), remaining());
+      await withTimeout(settled, remaining());
+    }
     await withTimeout(
       Promise.allSettled([...this.#queues.values()].map((q) => q.close())),
       remaining(),
@@ -1489,6 +1565,22 @@ async function withTimeout(work: Promise<unknown>, ms: number): Promise<void> {
   }
 }
 const DEFAULT_CLOSE_TIMEOUT_MS = 5_000;
+
+/**
+ * The tail of `closeTimeoutMs` that `close()` keeps for handing back the jobs still running and letting
+ * their workers settle: at most this, and never more than a fifth of the budget.
+ */
+const HAND_BACK_RESERVE_MS = 1_000;
+
+/**
+ * The error a handed-back processor rejects with. BullMQ's worker matches `DelayedError` by NAME as
+ * well as by class, so this needs no import of `bullmq` (an optional peer, loaded lazily).
+ */
+function handedBackError(): Error {
+  const err = new Error('job handed back to the broker on shutdown');
+  err.name = 'DelayedError';
+  return err;
+}
 /**
  * The `COUNT` hint of every worker-key SCAN. The heartbeat and descriptor keys share the Redis db with
  * every BullMQ job hash, so a `MATCH` walk visits the whole keyspace however few keys match; at 100 a

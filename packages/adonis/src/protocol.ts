@@ -84,11 +84,15 @@ export type StepHandler = (input: unknown, log: StepLogger) => Promise<unknown> 
  * Run `handler` for `task` and produce the wire-format {@link StepResult}. Pure (no transport,
  * no I/O beyond the handler), so every transport — and any language port — can share the exact
  * same completed / failed / no-handler contract instead of re-deriving it.
+ *
+ * `signal` becomes the handler's {@link StepLogger.signal}: a transport passes one it aborts when its
+ * `close()` starts, so a long step can stop between units of work instead of being cut off.
  */
 export async function runStepHandler(
   task: RemoteTask,
   handler: StepHandler | undefined,
   emitBeat?: (beat: Heartbeat) => void | Promise<void>,
+  signal?: AbortSignal,
 ): Promise<StepResult> {
   // Stamp the worker's pickup time so the engine can report queue-wait (startedAt − enqueuedAt).
   // This is the one place every transport funnels through, so timing comes for free everywhere.
@@ -142,7 +146,7 @@ export async function runStepHandler(
     try {
       // Outside any ambient workflow ctx: an in-process transport runs the handler on the parent
       // body's async path, but a handler is not the body (see `runOutsideWorkflowCtx`).
-      const logger = createStepLogger(events, Date.now, handlerBeat);
+      const logger = createStepLogger(events, Date.now, handlerBeat, signal);
       const output = await runOutsideWorkflowCtx(() =>
         runInStepLogger(logger, () => handler(task.input, logger)),
       );

@@ -278,6 +278,26 @@ export interface StepLogger {
    * (local steps run in-process; the run itself is live).
    */
   heartbeat(progress?: unknown): void;
+  /**
+   * Aborted when the process running this step starts shutting down: a transport's `close()` on a
+   * worker, the engine's `beginDrain()`/`drain()` for a local step. Shutdown waits for in-flight
+   * steps only for a bounded time (`closeTimeoutMs` / `drainTimeoutMs`), so a long step — a batch,
+   * a crawl — should check it between units of work and return (or throw) early instead of being cut
+   * off mid-item when the process exits. Pass it to `fetch` and other APIs that take an `AbortSignal`.
+   *
+   * ```ts
+   * for (const item of batch) {
+   *   if (log.signal.aborted) break // the rest goes to the next run
+   *   await process(item)
+   * }
+   * ```
+   *
+   * Returning early completes the step with whatever it returns. A step still running when the
+   * shutdown budget runs out is handed back to the broker for another worker (queue, db and bullmq
+   * transports), so stopping early is about not wasting that work, not about losing the step.
+   * Never aborted outside a shutdown; also reachable ambiently as `currentStep()?.signal`.
+   */
+  readonly signal: AbortSignal;
   /** Record a sub-step / sub-process outcome (e.g. one of N parallel p-processes). */
   sub(name: string, status: 'ok' | 'failed' | 'skipped', message?: string, data?: unknown): void;
   /** Record a sub-process event. Typically pass `phase` for an intermediate transition (carrying no

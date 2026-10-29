@@ -10,6 +10,7 @@ import {
 import { Pricing, PricingSteps } from './fixtures/steps-inject/pricing_steps.js';
 
 const noopLog: StepLogger = {
+  signal: new AbortController().signal,
   debug: () => {},
   info: () => {},
   warn: () => {},
