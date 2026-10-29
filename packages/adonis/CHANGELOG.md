@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 0.57.0
+
+### Minor Changes
+
+- [#430](https://github.com/DavideCarvalho/adonis-agora-durable/pull/430) [`61021de`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/61021de638dde8ca4f4ef4828afc4b1226bcfe0b) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A run whose `workflow@version` is registered on no instance (the workflow was renamed or deleted with runs in flight) no longer loops forever. Once it has been due for `unregisteredWorkflowGraceMs` (default 24h, counted from its `wakeAt` for a parked run), it moves to `dead` with a `workflow_not_registered` error, fires `onDead` and reaches the dead-letter workflow. Before, every poll tick skipped it and logged `is not registered — keep the prior version deployed` again. A rolling deploy's skew, where the pod on the prior version picks the run up within seconds, is unaffected. Set `unregisteredWorkflowGraceMs: 0` to keep the old skip-forever behavior.
+
 ## 0.56.7
 
 ### Patch Changes
