@@ -139,7 +139,8 @@ describe('BullMQTransport close() with a step still running', () => {
 
     const t0 = Date.now();
     await transport.close();
-    expect(Date.now() - t0).toBeLessThan(1_000);
+    // The hand-back happens inside the budget, not after it.
+    expect(Date.now() - t0).toBeLessThan(250);
     expect(moved).toHaveLength(1);
     expect(moved[0]?.token).toBe('lock-2');
     expect(moved[0]?.timestamp).toBeLessThanOrEqual(Date.now());

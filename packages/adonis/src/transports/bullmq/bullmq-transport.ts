@@ -1526,12 +1526,15 @@ export class BullMQTransport implements Transport {
       this.#runRequestWorker?.close(),
       ...[...this.#runsWorkers.values()].map((r) => r.worker.close()),
     ];
+    // The tail of the budget is kept for handing back a step that outlives the wait, so the hand-back
+    // and the workers settling after it stay inside `closeTimeoutMs` too.
+    const reserve = Math.min(HAND_BACK_RESERVE_MS, this.#closeTimeoutMs / 5);
     const settled = Promise.allSettled(workers.filter((p) => p !== undefined));
-    await withTimeout(settled, remaining());
-    // A step that outlived the budget goes back to the broker now; its worker then settles at once.
+    await withTimeout(settled, remaining() - reserve);
+    // A step that outlived the wait goes back to the broker now; its worker then settles at once.
     if (this.#openTasks.size > 0) {
-      await this.#handBackOpenTasks();
-      await withTimeout(settled, HAND_BACK_SETTLE_MS);
+      await withTimeout(this.#handBackOpenTasks(), remaining());
+      await withTimeout(settled, remaining());
     }
     await withTimeout(
       Promise.allSettled([...this.#queues.values()].map((q) => q.close())),
@@ -1563,8 +1566,11 @@ async function withTimeout(work: Promise<unknown>, ms: number): Promise<void> {
 }
 const DEFAULT_CLOSE_TIMEOUT_MS = 5_000;
 
-/** How long `close()` waits for the workers to settle after handing their open jobs back. */
-const HAND_BACK_SETTLE_MS = 1_000;
+/**
+ * The tail of `closeTimeoutMs` that `close()` keeps for handing back the jobs still running and letting
+ * their workers settle: at most this, and never more than a fifth of the budget.
+ */
+const HAND_BACK_RESERVE_MS = 1_000;
 
 /**
  * The error a handed-back processor rejects with. BullMQ's worker matches `DelayedError` by NAME as

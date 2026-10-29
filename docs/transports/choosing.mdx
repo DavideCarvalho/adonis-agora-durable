@@ -46,7 +46,7 @@ This page compares the five drivers side by side. Every cell reflects what the t
 | Result redelivered when the engine's handler throws | ✅ 5 attempts, exponential backoff from 500 ms, then kept 24 h and reported | ✅ redelivered one poll interval later, with no cap | ⚠️ redelivered after `leaseMs`, with no cap | ✅ in-memory, backoff 100 ms → 5 s, until `close()`⁷ | ❌ |
 | Step heartbeats (`timeoutMs` liveness) across engine instances | ✅ `<P>-heartbeat` pub/sub reaches every instance | ⚠️ one instance takes each beat; the others read the persisted beat⁸ | ⚠️ one instance takes each beat; the others read the persisted beat⁸ | ✅ in-process | ❌ no beats |
 | Per-step wall-clock ceiling on the worker | ✅ `stepTimeoutMs` (opt-in): a wedged handler is failed retryable | ❌ | ❌ | ❌ | ❌ |
-| Clean shutdown hands unfinished work back | ❌ left to BullMQ's stalled check after `closeTimeoutMs`; liveness keys expire after 35 s | ✅ unfinished jobs re-queued at once after the `closeTimeoutMs` drain; liveness keys withdrawn at once | ✅ claims cleared at once after `closeTimeoutMs`, uncounted; liveness keys withdrawn at once | n/a | n/a |
+| Clean shutdown hands unfinished work back | ✅ jobs still running at the end of `closeTimeoutMs` moved back at once (`moveToDelayed`, uncounted); liveness keys expire after 35 s | ✅ unfinished jobs re-queued at once after the `closeTimeoutMs` drain; liveness keys withdrawn at once | ✅ claims cleared at once after `closeTimeoutMs`, uncounted; liveness keys withdrawn at once | n/a | n/a |
 
 ### Cluster features
 
@@ -91,7 +91,7 @@ This page compares the five drivers side by side. Every cell reflects what the t
 
 ## Limitations per transport
 
-**`bullmq`.** It needs Redis and two extra packages. Crash recovery depends on a live worker of the same queue, and a clean shutdown doesn't hand unfinished jobs back: after `closeTimeoutMs` they wait for BullMQ's stalled check, and the process's liveness keys stay up to 35 s. The failure bridge exists only in consumers that implement it (this transport, the NestJS one and the Python `durable-worker`). There is no control plane in the transport, so add `controlPlanes.redis`.
+**`bullmq`.** It needs Redis and two extra packages. Crash recovery depends on a live worker of the same queue, and the process's liveness keys stay up to 35 s after a clean shutdown (jobs still running at the end of `closeTimeoutMs` are handed back at once, but a worker that dies without closing leaves them to BullMQ's stalled check). The failure bridge exists only in consumers that implement it (this transport, the NestJS one and the Python `durable-worker`). There is no control plane in the transport, so add `controlPlanes.redis`.
 
 **`queue`.** It's polling-based, so a first task after a quiet spell can wait up to `idleBackoffMax × pollIntervalMs`, and every served step name costs one poll loop. Crash detection is the slowest of the three (about 2 minutes by default). The poison bound needs `@adonisjs/queue` 0.7. Priority is squeezed onto a 1–10 scale. Health depth counts pending jobs only, and health and descriptors need a worker-key store. Heartbeats and decisions are single-consumer (notes 8 and 9), there's no control plane, and there's no cross-language wire.
 
