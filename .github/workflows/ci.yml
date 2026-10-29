@@ -52,7 +52,7 @@ jobs:
           --health-timeout 3s
           --health-retries 15
       postgres:
-        image: postgres:16-alpine
+        image: postgres:18-alpine
         env:
           POSTGRES_PASSWORD: postgres
         ports:
@@ -118,7 +118,7 @@ jobs:
           --health-timeout 3s
           --health-retries 15
       postgres:
-        image: postgres:16-alpine
+        image: postgres:18-alpine
         env:
           POSTGRES_PASSWORD: postgres
         ports:
