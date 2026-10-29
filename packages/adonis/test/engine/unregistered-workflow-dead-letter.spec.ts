@@ -95,4 +95,60 @@ describe('a run whose workflow is registered nowhere', () => {
 
     expect((await store.getRun('sched:index-writing:1'))?.status).toBe('pending');
   });
+
+  it('releases the lease at once within the grace, so the pod with the version can take it now', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const store = new InMemoryStateStore();
+    const engine = engineWith(store);
+    await store.createRun(orphan({ updatedAt: new Date(NOW - 60 * 1000) }));
+
+    await engine.runPending(NOW);
+
+    expect(await store.tryLockRun('sched:index-writing:1', 'old-pod', NOW + 30_000, NOW)).toBe(
+      true,
+    );
+  });
+
+  it('dead-letters a `running` orphan without counting a recovery or re-pending it', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new InMemoryStateStore();
+    const engine = engineWith(store);
+    await store.createRun(orphan({ status: 'running' }));
+
+    await engine.recoverIncomplete(NOW);
+
+    const run = await store.getRun('sched:index-writing:1');
+    expect(run?.status).toBe('dead');
+    expect(run?.error?.code).toBe('workflow_not_registered');
+    expect(run?.recoveryAttempts ?? 0).toBe(0);
+  });
+
+  it('leaves a young `running` orphan untouched, so it keeps aging', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const store = new InMemoryStateStore();
+    const engine = engineWith(store);
+    const updatedAt = new Date(NOW - 60 * 1000);
+    await store.createRun(orphan({ status: 'running', updatedAt }));
+
+    await engine.recoverIncomplete(NOW);
+
+    const run = await store.getRun('sched:index-writing:1');
+    expect(run?.status).toBe('running');
+    expect(run?.updatedAt.getTime()).toBe(updatedAt.getTime());
+    expect(run?.recoveryAttempts ?? 0).toBe(0);
+  });
+
+  it('dead-letters a run taken from the run queue', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const store = new InMemoryStateStore();
+    const engine = engineWith(store);
+    await store.createRun(orphan());
+
+    await engine.runEnqueued('sched:index-writing:1');
+
+    expect((await store.getRun('sched:index-writing:1'))?.error?.code).toBe(
+      'workflow_not_registered',
+    );
+  });
 });

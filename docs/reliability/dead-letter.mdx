@@ -108,7 +108,7 @@ The handler is an ordinary workflow, so write it like any other (`run(ctx, dl: D
 ### What the handler run gets
 
 - **Run id `dlq:<deadRunId>`.** `start` is idempotent by run id, so a run that is dead-lettered (and re-detected) more than once still triggers exactly one handler run. The dashboard links the pair by that id (see below).
-- **Input `DeadLetter`**, exported from `@adonis-agora/durable`: `{ deadRunId, workflow, input, error? }` — which run died, of which workflow, with what input, and why (`max_recovery_attempts`). `DeadLetter<TInput>` types `input`.
+- **Input `DeadLetter`**, exported from `@adonis-agora/durable`: `{ deadRunId, workflow, input, error? }` — which run died, of which workflow, with what input, and why (`max_recovery_attempts` or `workflow_not_registered`). `DeadLetter<TInput>` types `input`.
 - **The dead run's namespace.** Tags are not copied.
 - **Only `dead` runs are routed** — runs past `maxRecoveryAttempts` (so set it to route crash loops) or past `unregisteredWorkflowGraceMs`. An ordinary `failed` run is [`onError`](/docs/durable/reliability/on-error)'s job.
 - **No chains.** A handler run (a `dlq:` id) that itself goes dead is not routed again.
@@ -145,7 +145,7 @@ engine.onDead((run) => {
 })
 ```
 
-Dead-lettering also goes through the engine's event stream: the transition emits a `run.failed` event whose `error.code` is `max_recovery_attempts`, so [events and interceptors](/docs/durable/observability/events-and-interceptors), OpenTelemetry and Telescope see a dead-lettered run as a failure without any extra wiring. The `dead` status and that error code are what tell it apart from an ordinary step failure.
+Dead-lettering also goes through the engine's event stream: the transition emits a `run.failed` event whose `error.code` is `max_recovery_attempts` (or `workflow_not_registered`), so [events and interceptors](/docs/durable/observability/events-and-interceptors), OpenTelemetry and Telescope see a dead-lettered run as a failure without any extra wiring. The `dead` status and that error code are what tell it apart from an ordinary step failure.
 
 The handler run is a normal durable run. It shows up in the dashboard with its own history, so you can confirm it did its job (alerted, opened a ticket, compensated), then retry the original once it's fixed.
 
