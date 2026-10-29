@@ -656,6 +656,17 @@ export interface WorkflowEngineDeps {
    */
   maxRecoveryAttempts?: number | undefined;
   /**
+   * How long (ms) a run may stay due while NO instance can resume it because its workflow version is
+   * not registered anywhere, before it is moved to `dead` (code `workflow_not_registered`). A rolling
+   * deploy skips such a run on purpose (skew protection): the pod still on the prior version picks it
+   * up within seconds. A run that stays unresumable far past that — its workflow was renamed or
+   * deleted — would otherwise be retried and logged on every tick forever. The clock starts when the
+   * run became due (its `wakeAt` for a parked run, its last update otherwise), so a long sleep is not
+   * counted. Default 24h; `0` disables (skip forever). A non-finite or negative value falls back to
+   * the default.
+   */
+  unregisteredWorkflowGraceMs?: number | undefined;
+  /**
    * Fallback re-drive window (ms) for a run that SUSPENDS with no natural timer — i.e. it's waiting on
    * an EVENT to wake it (a child's completion, a signal, a remote step with no `timeoutMs`) rather than
    * a `ctx.sleep`. Those events re-drive the run directly; but if the wake is LOST (the delivering pod
@@ -851,11 +862,27 @@ export interface WorkflowEngineDeps {
   persistedSchedules?: boolean | undefined;
 }
 
+/** The statuses a run can be skipped in for an unregistered workflow — every non-terminal one. */
+const UNREGISTERED_DEAD_LETTER_FROM: RunStatus[] = ['pending', 'running', 'suspended', 'blocked'];
+
 /** Thrown by {@link WorkflowEngine.resume} when the run belongs to a different namespace. */
 export class NamespaceMismatch extends Error {
   constructor() {
     super('namespace-mismatch');
     this.name = 'NamespaceMismatch';
+  }
+}
+
+/**
+ * Thrown by {@link WorkflowEngine.resume} when no workflow registered here (nor a live worker group)
+ * can run the run's pinned `workflow@version`.
+ */
+export class WorkflowNotRegistered extends Error {
+  constructor(workflow: string, version: string) {
+    super(
+      `workflow ${workflow}@${version} is not registered — keep the prior version deployed so in-flight runs can drain (skew protection)`,
+    );
+    this.name = 'WorkflowNotRegistered';
   }
 }
 
@@ -903,6 +930,7 @@ export class WorkflowEngine {
    */
   private readonly bootedAt: number;
   private readonly maxRecoveryAttempts?: number | undefined;
+  private readonly unregisteredWorkflowGraceMs: number;
   private readonly reconcileMs: number | undefined;
   private readonly heartbeatPersistThrottleMs: number;
   private readonly timerBatchSize: number;
@@ -1155,6 +1183,9 @@ export class WorkflowEngine {
     this.leaseMs = deps.leaseMs ?? 30_000;
     this.bootedAt = this.clock();
     this.maxRecoveryAttempts = deps.maxRecoveryAttempts;
+    const grace = deps.unregisteredWorkflowGraceMs;
+    this.unregisteredWorkflowGraceMs =
+      grace !== undefined && Number.isFinite(grace) && grace >= 0 ? grace : 24 * 60 * 60 * 1000;
     // Default 5min; an explicit 0 disables the fallback (opt back into wake-forever-on-lost-event). A
     // non-finite or negative value falls back to the default rather than silently disabling the net
     // (NaN) or stamping a wake in the past that re-drives the run every tick (negative).
@@ -2112,7 +2143,8 @@ export class WorkflowEngine {
 
   /**
    * Be notified when a run is **dead-lettered** — moved to `dead` after exceeding
-   * `maxRecoveryAttempts`. The listener receives the dead run (status `dead`, with its error), so a
+   * `maxRecoveryAttempts`, or because its workflow version is registered nowhere (see
+   * `unregisteredWorkflowGraceMs`). The listener receives the dead run (status `dead`, with its error), so a
    * DLQ handler can do something other than just leaving it parked: alert, push to a real queue, or
    * start a dead-letter workflow (e.g. `engine.onDead((run) => engine.start('pipeline-dlq', run, ...))`).
    * Returns an unsubscribe function.
@@ -3115,11 +3147,7 @@ export class WorkflowEngine {
         this.workflows.get(versionKey(run.workflow, run.workflowVersion)) ??
         this.latest.get(run.workflow);
     }
-    if (!registered) {
-      throw new Error(
-        `workflow ${run.workflow}@${run.workflowVersion} is not registered — keep the prior version deployed so in-flight runs can drain (skew protection)`,
-      );
-    }
+    if (!registered) throw new WorkflowNotRegistered(run.workflow, run.workflowVersion);
     return this.track(runId, this.execute(run, registered.fn));
   }
 
@@ -3691,36 +3719,72 @@ export class WorkflowEngine {
   private async countRecovery(run: WorkflowRun): Promise<RunResult | null | undefined> {
     const attempts = (run.recoveryAttempts ?? 0) + 1;
     if (this.maxRecoveryAttempts != null && attempts > this.maxRecoveryAttempts) {
-      const error = {
-        message: `run exceeded maxRecoveryAttempts (${this.maxRecoveryAttempts}) — moved to dead-letter`,
-        code: 'max_recovery_attempts',
-      };
       // Conditional on still-`running`, like the `pending` flip in recoverIncomplete: the lease does
       // not fence `cancel()`, which writes `cancelled` without it, so a cancel landing after the
       // caller's re-read must not be overwritten with `dead`.
-      const applied = await this.store.updateRunIf(run.id, ['running'], {
-        status: 'dead',
-        error,
-        updatedAt: new Date(),
+      return this.deadLetterLeased({ ...run, recoveryAttempts: attempts }, ['running'], {
+        message: `run exceeded maxRecoveryAttempts (${this.maxRecoveryAttempts}) — moved to dead-letter`,
+        code: 'max_recovery_attempts',
       });
-      await this.store.releaseRunLock(run.id, this.instanceId);
-      if (!applied) return null;
-      this.emit({
-        type: 'run.failed',
-        runId: run.id,
-        workflow: run.workflow,
-        namespace: run.namespace,
-        error,
-      });
-      this.notifyDead({ ...run, status: 'dead', error, recoveryAttempts: attempts });
-      // `dead` is terminal like `failed`: a parent awaiting this run as a child (ctx.child, a ctx.all /
-      // allSettled fan) must learn it now, as a failed child, not on its next reconcile wake.
-      this.notifyParent(run.id, failedCompletion(error));
-      return { runId: run.id, status: 'dead', error };
     }
     // Count BEFORE resuming, so a crash mid-resume still advances the counter.
     await this.store.updateRun(run.id, { recoveryAttempts: attempts, updatedAt: new Date() });
     return undefined;
+  }
+
+  /**
+   * Move a run whose lease this instance holds to `dead`, if it is still in one of `from`, and
+   * release the lease. Returns the terminal result, or `null` when the run left `from` meanwhile
+   * (e.g. a lease-free `cancel()`), so it is not ours to touch.
+   */
+  private async deadLetterLeased(
+    run: WorkflowRun,
+    from: RunStatus[],
+    error: { message: string; code: string },
+  ): Promise<RunResult | null> {
+    const applied = await this.store.updateRunIf(run.id, from, {
+      status: 'dead',
+      error,
+      updatedAt: new Date(),
+    });
+    await this.store.releaseRunLock(run.id, this.instanceId);
+    if (!applied) return null;
+    this.emit({
+      type: 'run.failed',
+      runId: run.id,
+      workflow: run.workflow,
+      namespace: run.namespace,
+      error,
+    });
+    this.notifyDead({ ...run, status: 'dead', error });
+    // `dead` is terminal like `failed`: a parent awaiting this run as a child (ctx.child, a ctx.all /
+    // allSettled fan) must learn it now, as a failed child, not on its next reconcile wake.
+    this.notifyParent(run.id, failedCompletion(error));
+    return { runId: run.id, status: 'dead', error };
+  }
+
+  /**
+   * A leased run nobody can resume because its `workflow@version` is not registered (see
+   * {@link WorkflowNotRegistered}). Within {@link unregisteredWorkflowGraceMs} of becoming due it is a
+   * rolling deploy's skew — leave it for the pod that still has the version. Past it, the workflow is
+   * gone from the whole fleet (a capable pod would have taken the run long ago): dead-letter it.
+   * Returns the terminal result, or `undefined` when it is left for later.
+   */
+  private async deadLetterUnregistered(
+    listed: WorkflowRun,
+    nowMs: number,
+  ): Promise<RunResult | undefined> {
+    if (this.unregisteredWorkflowGraceMs === 0) return undefined;
+    // Re-read under the lease: the listing is a snapshot (see recoverIncomplete).
+    const run = await this.store.getRun(listed.id);
+    if (!run || !UNREGISTERED_DEAD_LETTER_FROM.includes(run.status)) return undefined;
+    const dueSince = Math.max(run.updatedAt.getTime(), run.wakeAt ?? 0);
+    if (nowMs - dueSince < this.unregisteredWorkflowGraceMs) return undefined;
+    const settled = await this.deadLetterLeased(run, [run.status], {
+      message: `workflow ${run.workflow}@${run.workflowVersion} is not registered on any live instance (unresumable for over ${this.unregisteredWorkflowGraceMs}ms) — moved to dead-letter`,
+      code: 'workflow_not_registered',
+    });
+    return settled ?? undefined;
   }
 
   /**
@@ -4177,6 +4241,14 @@ export class WorkflowEngine {
         } catch (error) {
           // A foreign-namespace run is simply not ours (resume released its lease) — skip quietly.
           if (error instanceof NamespaceMismatch) continue;
+          if (error instanceof WorkflowNotRegistered) {
+            const dead = await this.deadLetterUnregistered(run, nowMs).catch(() => undefined);
+            if (dead) {
+              console.warn(`[adonis-durable] run ${run.id}: ${dead.error?.message}`);
+              results.push(dead);
+              continue;
+            }
+          }
           // Loud: a skip is not nothing — the run is still there and not progressing, and the reason
           // (a version skew, a store outage) is what tells an operator which.
           console.error(

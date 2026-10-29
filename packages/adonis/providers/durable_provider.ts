@@ -264,6 +264,9 @@ export default class DurableProvider {
         ...(config.maxRecoveryAttempts !== undefined
           ? { maxRecoveryAttempts: config.maxRecoveryAttempts }
           : {}),
+        ...(config.unregisteredWorkflowGraceMs !== undefined
+          ? { unregisteredWorkflowGraceMs: config.unregisteredWorkflowGraceMs }
+          : {}),
         ...(config.compensationRetries !== undefined
           ? { compensationRetries: config.compensationRetries }
           : {}),

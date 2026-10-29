@@ -32,7 +32,8 @@ export type RunStatus =
   | 'completed'
   | 'failed'
   | 'cancelled'
-  /** Dead-letter: recovery gave up after `maxRecoveryAttempts` (a poison pill). Terminal; inspect it. */
+  /** Dead-letter: recovery gave up after `maxRecoveryAttempts` (a poison pill), or no instance has
+   *  the run's workflow version registered past `unregisteredWorkflowGraceMs`. Terminal; inspect it. */
   | 'dead';
 
 /** One execution of a workflow. The unit of durability and the unit shown in the dashboard. */

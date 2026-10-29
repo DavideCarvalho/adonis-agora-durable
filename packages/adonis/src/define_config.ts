@@ -192,6 +192,11 @@ export interface BaseDurableConfig {
   namespace?: string;
   /** Cap crash-recovery pickups before dead-lettering a poison run. Omit for unlimited. */
   maxRecoveryAttempts?: number;
+  /**
+   * How long (ms) a run may stay unresumable because its workflow version is registered nowhere (a
+   * renamed or deleted workflow) before it is dead-lettered. Default 24h; `0` skips it forever.
+   */
+  unregisteredWorkflowGraceMs?: number;
   /** Attempts per saga compensation on run failure. Default 1. */
   compensationRetries?: number;
   /**

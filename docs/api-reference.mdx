@@ -301,7 +301,7 @@ import engine from '@adonis-agora/durable/services/main'
 | --- | --- | --- |
 | `subscribe` | `subscribe(listener: EngineListener): () => void` | Every `EngineEvent` the engine emits. See [Events & interceptors](/docs/durable/observability/events-and-interceptors). |
 | `use` | `use(interceptor: StepInterceptor): () => void` | Onion middleware around real local-step execution; never fires on replay. |
-| `onDead` | `onDead(listener: (run: WorkflowRun) => void): () => void` | Runs moved to `dead` past `maxRecoveryAttempts`. See [Dead-letter queue](/docs/durable/reliability/dead-letter). |
+| `onDead` | `onDead(listener: (run: WorkflowRun) => void): () => void` | Runs moved to `dead` past `maxRecoveryAttempts` or `unregisteredWorkflowGraceMs`. See [Dead-letter queue](/docs/durable/reliability/dead-letter). |
 | `onEnqueued` | `onEnqueued(listener: (runId: string) => void): () => void` | Runs enqueued on another instance (control-plane broadcast). |
 | `onCancel` | `onCancel(listener: (runId: string) => void): () => void` | Cancellations on any instance, for cooperative abort. |
 | `onStalled` | `onStalled(listener: (info: StalledRunInfo) => void): () => void` | Stranded in-flight runs, paged by `sweepStalled` after [`stalledAfter`](#durableconfig). See [The stalled-run pager](/docs/durable/reliability/failure-modes). |
@@ -424,6 +424,7 @@ export default defineConfig({
 | `instanceId` | `string` | random | Unique per process; run leases are held by it. |
 | `namespace` | `string` | `'default'` on `standalone`; unset (operator) on `control-plane` | Worker-pool partition; poll and recovery paths act only on this namespace. A `control-plane` with no `namespace` is the operator and drives every pool (before 0.51 an unset namespace meant operator on every role). See [Tenancy](/docs/durable/concepts/tenancy). |
 | `maxRecoveryAttempts` | `number` | unlimited | Crash-recovery pickups before a run moves to `dead`. See [Dead-letter queue](/docs/durable/reliability/dead-letter). |
+| `unregisteredWorkflowGraceMs` | `number` | 24h | How long a run may stay due with its `workflow@version` registered nowhere before it moves to `dead` (`workflow_not_registered`). `0` disables. See [Dead-letter queue](/docs/durable/reliability/dead-letter#an-unregistered-workflow). |
 | `compensationRetries` | `number` | `1` | Attempts per saga compensation on run failure. See [Retrying a transient undo](/docs/durable/reliability/sagas#retrying-a-transient-undo). |
 | `compensationTimeoutMs` | `number` | `300000` | Upper bound on awaiting one dispatched compensation without its own `timeoutMs`. |
 | `retention` | `{ completed?, failed?, cancelled?, dead?: string \| number; policies?: Array<{ statuses: TerminalRunStatus[]; maxAge?: string \| number; maxCount?: number; scope: RunScope }> }` | keep everything | Hard-delete terminal runs past an age, per status or per scope. A policy needs `maxAge` and/or `maxCount` (keep the N newest by start time within the scope). See [Run retention](/docs/durable/reliability/retention). |
@@ -568,7 +569,7 @@ try {
 | `completed` | Finished successfully. Terminal. |
 | `failed` | Finished with an unrecovered error. Terminal. |
 | `cancelled` | Cancelled, with or without compensation, or past its `executionTimeout`. Terminal. |
-| `dead` | Dead-lettered: crash recovery gave up after `maxRecoveryAttempts`. Terminal. |
+| `dead` | Dead-lettered: crash recovery gave up after `maxRecoveryAttempts`, or the run's workflow version stayed registered nowhere past `unregisteredWorkflowGraceMs`. Terminal. |
 
 Only `completed`, `failed`, `cancelled` and `dead` are terminal (`TerminalRunStatus`, listed in `TERMINAL_RUN_STATUSES`). Only those are eligible for [retention pruning](/docs/durable/reliability/retention), and they never transition on their own again.
 
