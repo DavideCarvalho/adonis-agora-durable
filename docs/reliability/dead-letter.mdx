@@ -25,6 +25,18 @@ export default defineConfig({
 
 Omit `maxRecoveryAttempts` for unlimited recovery (the default). A `dead` run is terminal but **not lost**: it stays fully inspectable in the [dashboard](/docs/durable/observability/dashboard) — its history, its checkpoints, its error — and it can be retried from there (or via [`durable:retry`](/docs/durable/cli)) once you've shipped a fix. A retry (`engine.requeue`) of a `dead` or `failed` run resets its `recoveryAttempts` to 0, so the retried run gets the full budget again. Requeueing a run that is still live keeps its count. The point is that one poison pill no longer keeps the process crashing for every other run.
 
+## An unregistered workflow
+
+A run also goes `dead` when its `workflow@version` is registered on no instance. During a rolling deploy, a pod that lacks the version skips the run on purpose (skew protection), and the pod still on the prior version picks it up within seconds. When a run is still unresumable well after that, its workflow was renamed or deleted, and nothing will ever run it. Once it has been due for `unregisteredWorkflowGraceMs` (counted from its `wakeAt` for a parked run, from its last update otherwise), the engine moves it to `dead` with a `workflow_not_registered` error instead of retrying and logging it every tick:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  unregisteredWorkflowGraceMs: 6 * 60 * 60 * 1000, // default 24h; 0 skips such runs forever
+})
+```
+
+Raise it if a pool can legitimately stay down longer than that while another app sharing the store, with no `namespace` of its own, polls its runs.
+
 ## Routing to a DLQ workflow
 
 The most useful thing to do with a dead run is hand it to a *workflow of its own*: a durable handler that gets all the reliability machinery (retries, steps, its own observability) to triage the failure. Declare it and the engine starts it for you.
@@ -96,9 +108,9 @@ The handler is an ordinary workflow, so write it like any other (`run(ctx, dl: D
 ### What the handler run gets
 
 - **Run id `dlq:<deadRunId>`.** `start` is idempotent by run id, so a run that is dead-lettered (and re-detected) more than once still triggers exactly one handler run. The dashboard links the pair by that id (see below).
-- **Input `DeadLetter`**, exported from `@adonis-agora/durable`: `{ deadRunId, workflow, input, error? }` — which run died, of which workflow, with what input, and why (`max_recovery_attempts`). `DeadLetter<TInput>` types `input`.
+- **Input `DeadLetter`**, exported from `@adonis-agora/durable`: `{ deadRunId, workflow, input, error? }` — which run died, of which workflow, with what input, and why (`max_recovery_attempts` or `workflow_not_registered`). `DeadLetter<TInput>` types `input`.
 - **The dead run's namespace.** Tags are not copied.
-- **Only `dead` runs are routed** — runs past `maxRecoveryAttempts`, so it must be set. An ordinary `failed` run is [`onError`](/docs/durable/reliability/on-error)'s job.
+- **Only `dead` runs are routed** — runs past `maxRecoveryAttempts` (so set it to route crash loops) or past `unregisteredWorkflowGraceMs`. An ordinary `failed` run is [`onError`](/docs/durable/reliability/on-error)'s job.
 - **No chains.** A handler run (a `dlq:` id) that itself goes dead is not routed again.
 - **A failed start is warned, not thrown.** If the handler is not registered on the instance that dead-letters the run, the engine logs a `console.warn` and recovery carries on.
 
@@ -133,7 +145,7 @@ engine.onDead((run) => {
 })
 ```
 
-Dead-lettering also goes through the engine's event stream: the transition emits a `run.failed` event whose `error.code` is `max_recovery_attempts`, so [events and interceptors](/docs/durable/observability/events-and-interceptors), OpenTelemetry and Telescope see a dead-lettered run as a failure without any extra wiring. The `dead` status and that error code are what tell it apart from an ordinary step failure.
+Dead-lettering also goes through the engine's event stream: the transition emits a `run.failed` event whose `error.code` is `max_recovery_attempts` (or `workflow_not_registered`), so [events and interceptors](/docs/durable/observability/events-and-interceptors), OpenTelemetry and Telescope see a dead-lettered run as a failure without any extra wiring. The `dead` status and that error code are what tell it apart from an ordinary step failure.
 
 The handler run is a normal durable run. It shows up in the dashboard with its own history, so you can confirm it did its job (alerted, opened a ticket, compensated), then retry the original once it's fixed.
 

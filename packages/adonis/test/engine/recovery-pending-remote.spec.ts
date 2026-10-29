@@ -96,6 +96,8 @@ describe('recoverIncomplete with an in-flight pending remote step', () => {
   it('still dead-letters a genuine poison pill — no dispatched step in flight', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store, runDispatcher: noDispatch, maxRecoveryAttempts: 2 });
+    // Registered: recovery leaves a run of a workflow it does not have to the pod that has it.
+    engine.register('ingest', '1', async () => undefined);
     await store.createRun(runningRun('r2'));
     // A remote step that already SETTLED is no excuse.
     await store.saveCheckpoint(remoteStep('r2', { status: 'completed', output: {} }));
