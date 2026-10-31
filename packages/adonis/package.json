@@ -135,7 +135,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.tests.json"
   },
   "dependencies": {
-    "@adonis-agora/filter": "0.11.1"
+    "@adonis-agora/filter": "0.11.2"
   },
   "peerDependencies": {
     "@adonisjs/assembler": "^8.4.0",
