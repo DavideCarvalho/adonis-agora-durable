@@ -58,7 +58,7 @@ jobs:
           --health-timeout 3s
           --health-retries 15
       mysql:
-        image: mysql:8.4
+        image: mysql:26.10
         env:
           MYSQL_ROOT_PASSWORD: root
         ports:
