@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 0.58.3
+
+### Patch Changes
+
+- [#445](https://github.com/DavideCarvalho/adonis-agora-durable/pull/445) [`ed8b7d0`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/ed8b7d0e697f5a3059bd5c5c1530284fe1192937) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Stop a woken run executing on two instances. A queued wake read the run while the same instance's timer hand-off held its short claim, the hand-off released it, and `execute` trusted the read and started a turn holding no lease, so another instance locked the run and ran beside it. `execute` now proves a re-entry with an owner-scoped renewal. A claim in flight, or one begun while the renewal was out, leaves it unproved, and a turn that just locked runs without the proof.
+
 ## 0.58.2
 
 ### Patch Changes
