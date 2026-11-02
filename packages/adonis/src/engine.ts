@@ -1050,6 +1050,12 @@ export class WorkflowEngine {
    * own release as a takeover: a late `false` renew would otherwise fence whoever applies the decision.
    */
   private readonly executionLeases = new Map<string, { handedOff: boolean }>();
+  /** Runs a caller just locked to execute now, so their turn has nothing to prove and no await to add. */
+  private readonly lockedForTurn = new Set<string>();
+  /** Runs this instance holds for a moment and will release, not to execute (see {@link handOffDue}). */
+  private readonly claimsInFlight = new Map<string, number>();
+  /** How many such claims each run has had, so a proof can tell one came and went (see {@link proveOwnLease}). */
+  private readonly claimsMade = new Map<string, number>();
   /** Stable decision handler subscribed on every remote executor's transport (see registerRemote). */
   private readonly decisionHandler = (decision: WorkflowDecision): Promise<void> => {
     // A transport that delivers the decision from INSIDE its own `dispatchWorkflowTask` (an in-process
@@ -3866,6 +3872,31 @@ export class WorkflowEngine {
    * lease, held while the run's `wakeAt` moves {@link leaseMs} ahead) keeps every other instance's
    * poll from handing it off again meanwhile; a wake lost on the way comes due again then.
    */
+  private markClaim(runId: string): void {
+    this.claimsInFlight.set(runId, (this.claimsInFlight.get(runId) ?? 0) + 1);
+    // Bounded by forgetting: a proof under way then reads a changed count, and locks the ordinary way.
+    if (this.claimsMade.size >= 4096) this.claimsMade.clear();
+    this.claimsMade.set(runId, (this.claimsMade.get(runId) ?? 0) + 1);
+  }
+
+  private unmarkClaim(runId: string): void {
+    const left = (this.claimsInFlight.get(runId) ?? 1) - 1;
+    if (left > 0) this.claimsInFlight.set(runId, left);
+    else this.claimsInFlight.delete(runId);
+  }
+
+  /**
+   * Whether this instance holds the run's lease for a turn, from the store and by owner. A renewal can land
+   * on a claim marked after it was sent, and that claim is about to be released, so any claim begun while
+   * the renewal was out, even one already over, leaves it unproved.
+   */
+  private async proveOwnLease(runId: string, nowMs: number): Promise<boolean> {
+    if (this.claimsInFlight.has(runId)) return false;
+    const before = this.claimsMade.get(runId);
+    const renewed = await this.store.renewRunLock(runId, this.instanceId, nowMs + this.leaseMs);
+    return renewed && !this.claimsInFlight.has(runId) && this.claimsMade.get(runId) === before;
+  }
+
   private async handOffDue(runs: WorkflowRun[], nowMs: number): Promise<RunResult[]> {
     if (this.draining) return [];
     const results: RunResult[] = [];
@@ -3875,6 +3906,8 @@ export class WorkflowEngine {
         const run = runs[next];
         next += 1;
         if (!run || this.draining) return;
+        // Marked before the lock, so no turn of this instance can take this claim for its own lease.
+        this.markClaim(run.id);
         try {
           if (
             !(await this.store.tryLockRun(run.id, this.instanceId, nowMs + this.leaseMs, nowMs))
@@ -3914,6 +3947,8 @@ export class WorkflowEngine {
             `[adonis-durable] could not hand off due run ${run.id}; leaving it for another instance or a later tick:`,
             error,
           );
+        } finally {
+          this.unmarkClaim(run.id);
         }
       }
     };
@@ -3954,15 +3989,18 @@ export class WorkflowEngine {
     }
     // resume() checks the namespace and throws NamespaceMismatch when it doesn't match (releasing the
     // lease) — a foreign run leased here is simply skipped rather than run.
-    return this.resumeImplicit(runId).catch(async (err) => {
-      if (err instanceof NamespaceMismatch) return null;
-      if (err instanceof WorkflowNotRegistered) {
-        const run = await this.store.getRun(runId);
-        const settled = run ? await this.settleUnregistered(run, nowMs) : null;
-        if (settled !== undefined) return settled;
-      }
-      throw err;
-    });
+    this.lockedForTurn.add(runId);
+    return this.resumeImplicit(runId)
+      .finally(() => this.lockedForTurn.delete(runId))
+      .catch(async (err) => {
+        if (err instanceof NamespaceMismatch) return null;
+        if (err instanceof WorkflowNotRegistered) {
+          const run = await this.store.getRun(runId);
+          const settled = run ? await this.settleUnregistered(run, nowMs) : null;
+          if (settled !== undefined) return settled;
+        }
+        throw err;
+      });
   }
 
   /**
@@ -4303,6 +4341,7 @@ export class WorkflowEngine {
           await this.redispatchIfHolderCrashed(run, nowMs);
           // A per-run hook (recovery counting / dead-lettering) may settle the run terminally instead.
           const settled = onLocked ? await onLocked(run) : undefined;
+          if (!settled) this.lockedForTurn.add(run.id);
           results.push(settled ?? (await this.resumeImplicit(run.id)));
         } catch (error) {
           // A foreign-namespace run is simply not ours (resume released its lease) — skip quietly.
@@ -4318,6 +4357,8 @@ export class WorkflowEngine {
             `[adonis-durable] could not resume run ${run.id} (${run.workflow}@${run.workflowVersion}); leaving it for another instance or a later tick:`,
             error,
           );
+        } finally {
+          this.lockedForTurn.delete(run.id);
         }
       }
     };
@@ -5301,7 +5342,15 @@ export class WorkflowEngine {
     // The wakes this turn answers: it reads the store after they were recorded.
     const reason = this.wakeReasons.get(run.id) ?? { generic: true, fans: new Map() };
     this.wakeReasons.delete(run.id);
-    if (run.lockedBy !== this.instanceId || (run.lockedUntil ?? 0) <= lockNow) {
+    // `run` may have been read while this instance held only a short claim that is now released, or is
+    // about to be. So a re-entry is proved against the store, by owner, never read off the snapshot: a
+    // turn holding nothing runs beside whoever locks next.
+    const lockedForTurn = this.lockedForTurn.delete(run.id);
+    const reentered =
+      run.lockedBy === this.instanceId &&
+      (run.lockedUntil ?? 0) > lockNow &&
+      (lockedForTurn || (await this.proveOwnLease(run.id, lockNow)));
+    if (!reentered) {
       if (
         !(await this.store.tryLockRun(run.id, this.instanceId, lockNow + this.leaseMs, lockNow))
       ) {
