@@ -103,7 +103,9 @@ describe('concurrent lifecycle publishers', () => {
     await a.start('ingest', {}, 'i1');
     await poll(async () => (await store.getRun(accumulatorRunId('digest'))) !== null);
     await poll(async () => !(await store.getRun('i1'))?.tags?.includes(LIFECYCLE_PENDING_TAG));
-    // A batched subscriber leaves no triggered tag, so B's heal routes the same event again.
+    // Without its coalesced tag (a run tagged before deliveries into an accumulator were recorded),
+    // B's heal routes the same event again.
+    await store.updateRun('i1', { tags: [] });
     await b.sweepLifecycleEvents(Date.now() + 1_000);
     await a.start('ingest', {}, 'i2');
     await poll(async () => fired.length > 0);

@@ -94,12 +94,33 @@ export function owedSubscribersOf(run: Pick<WorkflowRun, 'tags'>): string[] {
 }
 
 /**
+ * Prefix of the tags naming each debounce/batch subscriber a settled run's event was routed to
+ * (`durable:coalesced:<workflow>`). Such a subscriber starts no run of the source's id, so it gets no
+ * {@link LIFECYCLE_TRIGGERED_TAG_PREFIX} tag; this one records the delivery instead, written by the
+ * same tag write that drops its owed tag.
+ */
+export const LIFECYCLE_COALESCED_TAG_PREFIX = 'durable:coalesced:';
+
+/** The coalesced tag of `subscriber` (see {@link LIFECYCLE_COALESCED_TAG_PREFIX}). */
+export function lifecycleCoalescedTag(subscriber: string): string {
+  return `${LIFECYCLE_COALESCED_TAG_PREFIX}${subscriber}`;
+}
+
+/** The subscribers whose {@link LIFECYCLE_COALESCED_TAG_PREFIX} tag is in `tags`. */
+export function coalescedSubscribersOf(tags: readonly string[] | undefined): string[] {
+  return (tags ?? [])
+    .filter((tag) => tag.startsWith(LIFECYCLE_COALESCED_TAG_PREFIX))
+    .map((tag) => tag.slice(LIFECYCLE_COALESCED_TAG_PREFIX.length));
+}
+
+/**
  * The subscribers a settled run's tags record as done with its event: started (a
- * {@link LIFECYCLE_TRIGGERED_TAG_PREFIX} tag) or failed (a {@link LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX}
+ * {@link LIFECYCLE_TRIGGERED_TAG_PREFIX} tag), routed into an accumulator (a
+ * {@link LIFECYCLE_COALESCED_TAG_PREFIX} tag) or failed (a {@link LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX}
  * tag).
  */
 export function deliveredSubscribersOf(run: Pick<WorkflowRun, 'tags'>): Set<string> {
-  const out = new Set<string>();
+  const out = new Set<string>(coalescedSubscribersOf(run.tags));
   for (const tag of run.tags ?? []) {
     if (tag.startsWith(LIFECYCLE_TRIGGERED_TAG_PREFIX)) {
       out.add(tag.slice(LIFECYCLE_TRIGGERED_TAG_PREFIX.length));
@@ -131,6 +152,7 @@ export function isLifecycleTag(tag: string): boolean {
     tag === LIFECYCLE_PENDING_TAG ||
     tag.startsWith(LIFECYCLE_OWED_TAG_PREFIX) ||
     tag.startsWith(LIFECYCLE_TRIGGERED_TAG_PREFIX) ||
+    tag.startsWith(LIFECYCLE_COALESCED_TAG_PREFIX) ||
     tag.startsWith(LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX) ||
     tag.startsWith(LIFECYCLE_TRACE_TAG_PREFIX)
   );
@@ -362,10 +384,10 @@ export interface RunWaitLink {
  * - `failed`: its last delivery failed (a `durable:trigger_failed:<subscriber>` tag): its `where`
  *   threw, its input was rejected, its start failed, or the sweep dropped it as an orphan. A
  *   republish retries it;
- * - `coalesced`: routed into a debounce/batch accumulator (`runId` is the accumulator's, when it
- *   can be derived);
- * - `not-started`: no run and nothing owed: its `where` declined the event, it coalesces on another
- *   instance, or it subscribed after the run settled.
+ * - `coalesced`: routed into a debounce/batch accumulator (a `durable:coalesced:<subscriber>` tag;
+ *   `runId` is the accumulator's, when it can be derived);
+ * - `not-started`: no run and nothing owed: its `where` declined the event, or it subscribed after
+ *   the run settled.
  */
 export type LifecycleDeliveryState = 'started' | 'owed' | 'failed' | 'coalesced' | 'not-started';
 
@@ -396,11 +418,13 @@ export interface LifecycleDelivery {
 
 /**
  * The {@link LifecycleDelivery} of each subscriber of a settled run, sorted by subscriber: the
- * union of `subscribers` (the ones the run's event goes to now), the owed, triggered and
- * trigger-failed tags. A started subscriber wins over the others, then an owed one over a failed
- * one. `live` names the subscribers a live instance registers or announces; an owed subscriber
- * outside it gets `orphanAt`. `coalesced` maps each subscriber that coalesces its events to its
- * accumulator run id (undefined when it cannot be derived). Empty for a run that has not settled.
+ * union of `subscribers` (the ones the run's event goes to now), the owed, triggered, coalesced and
+ * trigger-failed tags. A started or coalesced subscriber wins over the others, then an owed one over
+ * a failed one. `live` names the subscribers a live instance registers or announces; an owed
+ * subscriber outside it gets `orphanAt`. `coalesced` maps each subscriber that coalesces its events
+ * to its accumulator run id (undefined when it cannot be derived), the link of a coalesced one; a
+ * subscriber in it with no tag at all (a run settled before coalesced deliveries were tagged) is
+ * `coalesced` too. Empty for a run that has not settled.
  */
 export function lifecycleDeliveriesOf(
   run: Pick<WorkflowRun, 'id' | 'status' | 'tags' | 'updatedAt'>,
@@ -424,14 +448,22 @@ export function lifecycleDeliveriesOf(
       .filter((t) => t.startsWith(LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX))
       .map((t) => t.slice(LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX.length)),
   );
+  const coalescedTagged = new Set(coalescedSubscribersOf(tags));
   // A run marked pending without owed tags is owed to every subscriber it has not started.
   const owedToAll = owed.size === 0 && tags.includes(LIFECYCLE_PENDING_TAG);
   const settledAt = run.updatedAt.getTime();
-  const names = [...new Set([...opts.subscribers, ...owed, ...triggered, ...failed])].sort();
+  const names = [
+    ...new Set([...opts.subscribers, ...owed, ...triggered, ...coalescedTagged, ...failed]),
+  ].sort();
+  const coalescedState = (subscriber: string): LifecycleDelivery => {
+    const runId = opts.coalesced?.get(subscriber);
+    return { subscriber, state: 'coalesced', ...(runId !== undefined ? { runId } : {}) };
+  };
   return names.map((subscriber): LifecycleDelivery => {
     if (triggered.has(subscriber)) {
       return { subscriber, state: 'started', runId: lifecycleRunId(run.id, kind, subscriber) };
     }
+    if (coalescedTagged.has(subscriber)) return coalescedState(subscriber);
     if (owed.has(subscriber) || owedToAll) {
       return {
         subscriber,
@@ -441,10 +473,7 @@ export function lifecycleDeliveriesOf(
       };
     }
     if (failed.has(subscriber)) return { subscriber, state: 'failed' };
-    if (opts.coalesced?.has(subscriber)) {
-      const runId = opts.coalesced.get(subscriber);
-      return { subscriber, state: 'coalesced', ...(runId !== undefined ? { runId } : {}) };
-    }
+    if (opts.coalesced?.has(subscriber)) return coalescedState(subscriber);
     return { subscriber, state: 'not-started' };
   });
 }

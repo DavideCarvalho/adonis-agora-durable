@@ -125,6 +125,7 @@ import type {
 import { isNonEmptyRunScope, TERMINAL_RUN_STATUSES } from './interfaces.js';
 import {
   chainPredecessorsOf,
+  coalescedSubscribersOf,
   deliveredSubscribersOf,
   LIFECYCLE_HEAL_WINDOW_MS,
   LIFECYCLE_ORPHAN_MS,
@@ -143,6 +144,7 @@ import {
   type LifecycleRegistryEntry,
   type LifecycleSubscriptionLink,
   lastRunOfChain,
+  lifecycleCoalescedTag,
   lifecycleDeliveriesOf,
   lifecycleEventName,
   lifecycleEventOf,
@@ -3005,8 +3007,8 @@ export class WorkflowEngine {
    * to the subscribers it owes it to that this instance can deliver to (registered here, or announced
    * and started by name; see {@link deliverableSubscribers}), and settle their part of the marker:
    * drop each one's {@link LIFECYCLE_OWED_TAG_PREFIX} tag, record each started one as a
-   * `durable:triggered:<workflow>` tag, and drop {@link LIFECYCLE_PENDING_TAG} once no owed tag is
-   * left.
+   * `durable:triggered:<workflow>` tag (a coalescing one as `durable:coalesced:<workflow>`), and drop
+   * {@link LIFECYCLE_PENDING_TAG} once no owed tag is left.
    *
    * A run marked pending with no owed tag has an unresolved owed set (see
    * {@link LIFECYCLE_PENDING_TAG}). With a successful read of the fleet's subscriptions it is resolved
@@ -3030,10 +3032,12 @@ export class WorkflowEngine {
    * rejected or whose start fails, and an orphan the sweep drops, gets a
    * {@link LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX} tag in the same tag write, and is not retried until a
    * republish; the write that records a subscriber reached removes its trigger-failed tag.
-   * `run.triggered` and `run.trigger_failed` are emitted only for the subscribers whose triggered or
-   * trigger-failed tag this write added (a debounced/batched subscriber, which gets no triggered tag:
-   * when this write dropped its owed tag, or it was routed for an unresolved or healed run). A failure
-   * to write the marker leaves it, and the sweep publishes the run again.
+   * A debounce/batch subscriber routed into its accumulator gets a
+   * {@link LIFECYCLE_COALESCED_TAG_PREFIX} tag in the same write instead of a triggered one; a
+   * republish routes it again only when the run also carries its trigger-failed tag.
+   * `run.triggered` and `run.trigger_failed` are emitted only for the subscribers whose triggered,
+   * coalesced or trigger-failed tag this write added. A failure to write the marker leaves it, and
+   * the sweep publishes the run again.
    */
   private async publishSettled(
     source: WorkflowRun,
@@ -3115,13 +3119,15 @@ export class WorkflowEngine {
           });
         }
       }
-      // A debounced/batched subscriber's accumulator drops an event it already holds, but one that
-      // already fired would start the target again, so it is only routed while the run owes it.
-      targets = all.filter(
-        (s) =>
-          here.has(s) &&
-          (!this.latest.get(s)?.eventBatch || owed.includes(s) || (pending && !owed.length)),
+      // An accumulator that already fired would start its target again, so a subscriber the run's
+      // tags record as coalesced is routed again (or owed again) only after a failed delivery.
+      const settledCoalesced = new Set(
+        coalescedSubscribersOf(before).filter(
+          (s) => !before.includes(lifecycleTriggerFailedTag(s)),
+        ),
       );
+      all = all.filter((s) => !settledCoalesced.has(s));
+      targets = all.filter((s) => here.has(s));
       newlyOwed = all.filter((s) => !here.has(s));
     } else if (unresolved) {
       targets = [...local].filter((s) => !delivered.has(s));
@@ -3143,9 +3149,13 @@ export class WorkflowEngine {
     const orphaned =
       opts?.nowMs !== undefined ? await this.orphanedSubscribers(run, owed, here, opts.nowMs) : [];
     const done = new Set([...targets, ...orphaned]);
-    const triggered = reached
-      .filter((r) => r.runId !== undefined)
-      .map((r) => `${LIFECYCLE_TRIGGERED_TAG_PREFIX}${r.workflow}`);
+    // A started subscriber is recorded by its triggered tag, one routed into its accumulator by its
+    // coalesced tag.
+    const deliveryTag = (r: { workflow: string; runId?: string }): string =>
+      r.runId !== undefined
+        ? `${LIFECYCLE_TRIGGERED_TAG_PREFIX}${r.workflow}`
+        : lifecycleCoalescedTag(r.workflow);
+    const deliveryTags = reached.map(deliveryTag);
     const reachedNow = new Set(reached.map((r) => r.workflow));
     const failedNow = [...failed.map((f) => f.workflow), ...orphaned];
     const kept = [
@@ -3165,7 +3175,7 @@ export class WorkflowEngine {
       ...new Set([
         ...kept.filter((t) => t !== LIFECYCLE_PENDING_TAG),
         ...(owedLeft || unresolved ? [LIFECYCLE_PENDING_TAG] : []),
-        ...triggered,
+        ...deliveryTags,
         ...failedNow.map(lifecycleTriggerFailedTag),
       ]),
     ];
@@ -3174,11 +3184,9 @@ export class WorkflowEngine {
     }
     // Only the tag changes this write made are announced, so a publisher that repeats another's
     // delivery emits nothing.
-    // A debounced/batched subscriber (no run id) is routed only while owed, unresolved or healed.
-    for (const { workflow, runId } of reached) {
-      if (runId !== undefined && before.includes(`${LIFECYCLE_TRIGGERED_TAG_PREFIX}${workflow}`)) {
-        continue;
-      }
+    for (const r of reached) {
+      if (before.includes(deliveryTag(r))) continue;
+      const { workflow, runId } = r;
       this.emit({
         type: 'run.triggered',
         runId: run.id,
@@ -3297,7 +3305,7 @@ export class WorkflowEngine {
   /**
    * The (run, subscriber) pairs this engine already healed, with when each entry lapses (epoch ms):
    * a subscriber whose `where` declines the event leaves no tag, so without it every sweep would
-   * route it again for the whole heal window.
+   * offer it the event again for the whole heal window.
    */
   private readonly lifecycleHealed = new Map<string, number>();
 
@@ -3306,7 +3314,7 @@ export class WorkflowEngine {
    * subscriber in the current snapshot of the fleet's subscriptions (or registered here) listens to,
    * read its runs settled in the last {@link LIFECYCLE_HEAL_WINDOW_MS} (at most
    * {@link LIFECYCLE_HEAL_SCAN_CAP}, one listing per workflow) and publish each one to the
-   * subscribers of its ending its tags record as neither owed, started nor failed (see
+   * subscribers of its ending its tags record as neither owed, started, coalesced nor failed (see
    * {@link publishSettled}'s `heal`). That covers a subscriber announced just after the run
    * settled, while the settling instance's snapshot was stale. Each pair is healed at most once per
    * engine. A run whose owed set is unresolved is left to {@link sweepLifecycleEvents}. Needs a
@@ -3443,8 +3451,9 @@ export class WorkflowEngine {
    * registered on this instance are started; any other (announced by a live worker) is marked owed
    * again, so the sweep of an instance that registers it starts it, and is not counted in
    * `started`. The same path as the live publish, so a subscriber whose run already exists is not
-   * started again; a subscriber that debounces or batches is routed only while the run still owes it
-   * the event, since an accumulator that already fired would start the target again. A run another
+   * started again; a subscriber that debounces or batches is not routed again once the run carries
+   * its coalesced tag, unless it also carries its trigger-failed tag, since an accumulator that
+   * already fired would start the target again. A run another
    * publisher holds past the lease retries is reported in `failed` with subscriber `*`. A
    * subscriber registered after the runs settled (more than {@link LIFECYCLE_HEAL_WINDOW_MS} after,
    * past what the sweep heals) is backfilled this way. A workflow target's `namespace` narrows it to

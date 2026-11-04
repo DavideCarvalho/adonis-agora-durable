@@ -463,9 +463,9 @@ A settled run whose lifecycle event goes to some workflow lists each subscriber 
 | --- | --- | --- |
 | `started` | Its run exists (a `durable:triggered:<subscriber>` tag). | the subscriber's run, with its status |
 | `owed` | Still pending (a `durable:lifecycle:owed:<subscriber>` tag), shown as `owed for 2h`. When no live instance registers or announces the subscriber for the run's namespace, also `orphan in 22h`: when the [sweep](/docs/durable/authoring/lifecycle-events#which-subscribers-a-run-owes) drops it. | — |
-| `coalesced` | Routed into the subscriber's debounce/batch accumulator. | the accumulator run, when the instance registers the subscriber and can compute its `key` |
+| `coalesced` | Routed into the subscriber's debounce/batch accumulator (a `durable:coalesced:<subscriber>` tag). | the accumulator run, when the instance registers the subscriber and can compute its `key` |
 | `failed` | Its last delivery failed (a `durable:trigger_failed:<subscriber>` tag): its `where` threw, its input was rejected, its start failed, or the sweep dropped it as an orphan. The reason is not stored with the run: the row says so and points at the `run.trigger_failed` event, which the run's **Events** panel shows when it arrives while the page is open. **Republish lifecycle event** retries it, and a start clears the state. | — |
-| `not started` | No run and nothing owed: its `where` declined the event, it coalesces on another instance, or it subscribed after the run settled. | — |
+| `not started` | No run and nothing owed: its `where` declined the event, or it subscribed after the run settled. | — |
 
 The rows come from the run's tags and the subscribers of its namespace, plus one batched read of the started runs' statuses. The **Republish lifecycle event** action stays next to them.
 
