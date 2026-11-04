@@ -31,8 +31,22 @@ export function runFailedEvent(workflow: WorkflowRef): string {
 /**
  * Tag written with a run's terminal status when some workflow subscribes to its lifecycle event,
  * and removed once the event is published. A settled run still carrying it was never published.
+ *
+ * Without any {@link LIFECYCLE_OWED_TAG_PREFIX} tag beside it, the run's owed set is unresolved: the
+ * terminal write happened before this instance could read the subscriptions the fleet announces
+ * (no read yet, or the last one failed). The publish that next reads them successfully resolves it
+ * into owed tags; until then, the subscribers registered on an instance are started by it.
  */
 export const LIFECYCLE_PENDING_TAG = 'durable:lifecycle:pending';
+
+/**
+ * How long after a run settled the lifecycle sweep still looks for subscribers the run owes its
+ * event to but was never marked for: one announced by an instance that came up just after the
+ * run settled, before the settling instance's snapshot of the fleet's subscriptions saw it. A
+ * subscriber that appears later than this is a backfill, done with
+ * `WorkflowEngine.republishLifecycle`.
+ */
+export const LIFECYCLE_HEAL_WINDOW_MS = 2 * 60 * 1000;
 
 /** Prefix of the tags naming the subscribers a settled run started (`durable:triggered:<workflow>`). */
 export const LIFECYCLE_TRIGGERED_TAG_PREFIX = 'durable:triggered:';
@@ -77,6 +91,23 @@ export function owedSubscribersOf(run: Pick<WorkflowRun, 'tags'>): string[] {
   return (run.tags ?? [])
     .filter((tag) => tag.startsWith(LIFECYCLE_OWED_TAG_PREFIX))
     .map((tag) => tag.slice(LIFECYCLE_OWED_TAG_PREFIX.length));
+}
+
+/**
+ * The subscribers a settled run's tags record as done with its event: started (a
+ * {@link LIFECYCLE_TRIGGERED_TAG_PREFIX} tag) or failed (a {@link LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX}
+ * tag).
+ */
+export function deliveredSubscribersOf(run: Pick<WorkflowRun, 'tags'>): Set<string> {
+  const out = new Set<string>();
+  for (const tag of run.tags ?? []) {
+    if (tag.startsWith(LIFECYCLE_TRIGGERED_TAG_PREFIX)) {
+      out.add(tag.slice(LIFECYCLE_TRIGGERED_TAG_PREFIX.length));
+    } else if (tag.startsWith(LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX)) {
+      out.add(tag.slice(LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX.length));
+    }
+  }
+  return out;
 }
 
 /**

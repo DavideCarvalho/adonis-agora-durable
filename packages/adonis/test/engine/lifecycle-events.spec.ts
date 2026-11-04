@@ -3,6 +3,7 @@ import { WorkflowEngine } from '../../src/engine.js';
 import { FatalError } from '../../src/errors.js';
 import type { EngineEvent, WorkflowRun } from '../../src/interfaces.js';
 import {
+  LIFECYCLE_HEAL_WINDOW_MS,
   LIFECYCLE_PENDING_TAG,
   LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX,
   lifecycleEventOf,
@@ -362,6 +363,8 @@ describe('lifecycle delivery guarantees', () => {
     engine.register('refresh', '1', async () => void runs++, {
       onEvent: [runCompletedEvent('ingest')],
     });
+    // Read the fleet's subscriptions first, so the terminal write resolves the owed set.
+    await engine.sweepLifecycleEvents();
 
     await engine.start('ingest', {}, 'i1');
     await poll(
@@ -498,7 +501,8 @@ describe('lifecycle trigger-failed state', () => {
       updatedAt: new Date(0),
     } as WorkflowRun);
 
-    expect(await engine.sweepLifecycleEvents(60_000)).toBe(1);
+    // Past the heal window, so the other subscribers the fixture never marked stay out of it.
+    expect(await engine.sweepLifecycleEvents(LIFECYCLE_HEAL_WINDOW_MS + 60_000)).toBe(1);
     expect((await store.getRun('i1'))?.tags).toEqual([failedTag('strict')]);
   });
 

@@ -93,6 +93,15 @@ function makeEngine(namespace: string): WorkflowEngine {
  * this single process — in a real cluster a store-less acme WORKER pod would; here the coordinator
  * doubles as it, letting a run actually run to completion so the read/control verbs have real state.
  */
+async function poll(fn: () => Promise<boolean>, timeoutMs = 1000): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (await fn()) return;
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  throw new Error('poll timed out');
+}
+
 function wireControlPlane(
   transport: FakeP4Transport,
   options: { verify?: ReturnType<typeof hmacTenantVerifier>; namespace?: string } = {},
@@ -313,17 +322,59 @@ describe('republishLifecycle over the round-trip', () => {
   it('republishes a tenant’s own settled run to a subscriber registered after it settled', async () => {
     const started = await acme.start('echo', { n: 1 });
     await engine.waitForRun(started.runId);
+    // The run's live publish has finished before the subscriber is deployed.
+    await poll(
+      async () =>
+        !(await engine.getRun(started.runId))?.tags?.includes('durable:lifecycle:pending'),
+    );
     engine.register('audit', '1', async () => 'audited', {
       onEvent: [runCompletedEvent('echo')],
     });
 
-    const result = await acme.republishLifecycle({ runId: started.runId });
+    const result = await acme.republishLifecycle({ runId: started.runId, subscriber: 'audit' });
     expect(result).toEqual({ runs: 1, started: 1, failed: [] });
     expect(await acme.republishLifecycle({ runId: started.runId })).toEqual({
       runs: 1,
       started: 0,
       failed: [],
     });
+  });
+
+  it('refuses a subscriber that does not subscribe in the tenant’s namespace', async () => {
+    const started = await acme.start('echo', { n: 1 });
+    await engine.waitForRun(started.runId);
+    await expect(
+      acme.republishLifecycle({ runId: started.runId, subscriber: 'nobody' }),
+    ).rejects.toMatchObject({
+      code: 'bad-request',
+      message: 'subscriber nobody does not subscribe to run.completed:echo',
+    });
+    await expect(
+      acme.republishLifecycle({ workflow: 'echo', kind: 'failed', subscriber: 'nobody' }),
+    ).rejects.toMatchObject({
+      code: 'bad-request',
+      message: 'subscriber nobody does not subscribe to run.failed:echo',
+    });
+    expect((await engine.getRun(started.runId))?.tags ?? []).not.toContain(
+      'durable:lifecycle:owed:nobody',
+    );
+  });
+
+  it('requires a positive integer limit and clamps it to 1000', async () => {
+    for (const limit of [0, -1, 1.5, Number.POSITIVE_INFINITY, Number.NaN]) {
+      await expect(acme.republishLifecycle({ workflow: 'echo', limit })).rejects.toMatchObject({
+        code: 'bad-request',
+        message: 'republishLifecycle limit must be a positive integer',
+      });
+    }
+    const seen: unknown[] = [];
+    const republish = engine.republishLifecycle.bind(engine);
+    engine.republishLifecycle = async (target) => {
+      seen.push(target);
+      return republish(target);
+    };
+    await acme.republishLifecycle({ workflow: 'echo', limit: 1_000_000_000 });
+    expect(seen).toEqual([expect.objectContaining({ workflow: 'echo', limit: 1000 })]);
   });
 
   it('rejects another tenant’s run like retry', async () => {
@@ -349,7 +400,12 @@ describe('republishLifecycle over the round-trip', () => {
       (await tenantA.start('echo', { n: 2 })).runId,
       (await tenantB.start('echo', { n: 3 })).runId,
     ];
-    for (const id of ids) await operator.waitForRun(id);
+    for (const id of ids) {
+      await operator.waitForRun(id);
+      await poll(
+        async () => !(await store.getRun(id))?.tags?.includes('durable:lifecycle:pending'),
+      );
+    }
     let audited = 0;
     operator.register('audit', '1', async () => void audited++, {
       onEvent: [runCompletedEvent('echo')],
@@ -364,9 +420,12 @@ describe('republishLifecycle over the round-trip', () => {
         workflow: 'echo',
         since: new Date(0),
         until: new Date(Date.now() + 60_000),
-        subscriber: 'audit',
       }),
     ).toEqual({ runs: 2, started: 2, failed: [] });
+    // The operator's own subscriber is not one of the tenant's subscriptions to name.
+    await expect(
+      tenantA.republishLifecycle({ workflow: 'echo', subscriber: 'audit' }),
+    ).rejects.toMatchObject({ code: 'bad-request' });
     expect(await tenantA.republishLifecycle({ workflow: 'echo', until: new Date(0) })).toEqual({
       runs: 0,
       started: 0,

@@ -1133,6 +1133,11 @@ export interface RunQuery {
    */
   updatedBefore?: number | undefined;
   /**
+   * Only runs last touched at or after this epoch-ms instant (`updated_at >= updatedAfter`): what the
+   * lifecycle sweep means by "settled in the last two minutes".
+   */
+  updatedAfter?: number | undefined;
+  /**
    * Only runs whose durable wake timer is due at this instant (`wake_at IS NOT NULL AND wake_at <=
    * wakeBefore`). Lets the blocked-run recovery poll ask the store for due rows instead of listing
    * every blocked run and comparing in process.

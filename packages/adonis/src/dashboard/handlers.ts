@@ -589,7 +589,8 @@ function triggerCountsOf(
  * `POST /runs/:id/republish-lifecycle` — publish a settled run's lifecycle event again, to the
  * subscribers it has not started yet (or only `subscriber`, from the body). Answers with how many
  * subscriber runs it started and which subscribers failed; `404` for an unknown run or a topology
- * without the verb, `409` for a run that has not settled, `501` when a tenant pod's control plane
+ * without the verb, `409` for a run that has not settled, `400` when a tenant pod's control plane
+ * refuses the request (a `subscriber` that does not subscribe to the run's ending), `501` when it
  * is too old to answer it.
  */
 export async function republishLifecycleRun(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
@@ -606,14 +607,21 @@ export async function republishLifecycleRun(deps: Deps, req: ApiRequest): Promis
     return { status: 409, body: { error: `run ${id} has not settled` } };
   }
   const republish = deps.engine.republishLifecycle;
-  return unlessUnsupported(async () =>
-    ok({
-      result: await republish.call(deps.engine, {
-        runId: id,
-        ...(typeof body.subscriber === 'string' ? { subscriber: body.subscriber } : {}),
-      }),
-    }),
-  );
+  return unlessUnsupported(async () => {
+    try {
+      return ok({
+        result: await republish.call(deps.engine, {
+          runId: id,
+          ...(typeof body.subscriber === 'string' ? { subscriber: body.subscriber } : {}),
+        }),
+      });
+    } catch (err) {
+      if ((err as { code?: unknown } | null)?.code === 'bad-request') {
+        return badRequest(err instanceof Error ? err.message : String(err));
+      }
+      throw err;
+    }
+  });
 }
 
 /**

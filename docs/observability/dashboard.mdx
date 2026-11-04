@@ -263,7 +263,7 @@ The tail is **cross-pod** when the engine has a [control plane](/docs/durable/tr
 | `POST` | `/durable/api/runs/:id/continue` | resume a run parked at a `ctx.breakpoint()` |
 | `POST` | `/durable/api/runs/:id/cancel` | cancel the run — ask for the saga undo with `?compensate=true` or a `{ compensate: true }` body |
 | `POST` | `/durable/api/runs/:id/redispatch` | re-enqueue every remote step still `pending` on this run |
-| `POST` | `/durable/api/runs/:id/republish-lifecycle` | publish a settled run's [lifecycle event](/docs/durable/authoring/lifecycle-events#republishing-and-backfilling) again, to the subscribers it has not started (or `{ subscriber }` only); answers `{ result: { runs, started, failed } }`, `409` for a run that has not settled, `501` on a tenant pod whose control plane is older than the verb |
+| `POST` | `/durable/api/runs/:id/republish-lifecycle` | publish a settled run's [lifecycle event](/docs/durable/authoring/lifecycle-events#republishing-and-backfilling) again, to the subscribers it has not started (or `{ subscriber }` only); answers `{ result: { runs, started, failed } }`, `409` for a run that has not settled, `400` on a tenant pod whose control plane refuses the request (a `subscriber` that does not subscribe to the run's ending in the tenant's namespace), `501` on a tenant pod whose control plane is older than the verb |
 | `POST` | `/durable/api/runs/:id/signal` | deliver a signal payload on a token the run is waiting on |
 | `POST` | `/durable/api/runs/:id/update/:name` | deliver a validated update to a `ctx.onUpdate` point |
 | `POST` | `/durable/api/runs/:id/tasks/:name/complete` | complete an external `ctx.task` |

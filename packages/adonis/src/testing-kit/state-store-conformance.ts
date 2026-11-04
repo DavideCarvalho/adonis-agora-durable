@@ -1730,6 +1730,19 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       ).toEqual(['due']);
     });
 
+    t('listRuns pushes updatedBefore/updatedAfter down as predicates', async () => {
+      await store.createRun(run({ id: 'early', updatedAt: new Date(1_000) }));
+      await store.createRun(run({ id: 'mid', updatedAt: new Date(5_000) }));
+      await store.createRun(run({ id: 'late', updatedAt: new Date(9_000) }));
+      expect((await store.listRuns({ updatedAfter: 5_000 })).map((r) => r.id).sort()).toEqual([
+        'late',
+        'mid',
+      ]);
+      expect(
+        (await store.listRuns({ updatedAfter: 2_000, updatedBefore: 8_000 })).map((r) => r.id),
+      ).toEqual(['mid']);
+    });
+
     t(
       'releaseRunLock with an owner only releases that owner’s lease (zombie fencing)',
       async () => {

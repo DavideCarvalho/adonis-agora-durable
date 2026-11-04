@@ -333,6 +333,8 @@ describe('attachDurableOtel', () => {
     const engine = new WorkflowEngine({ store });
     attachDurableOtel(engine, { tracer });
     engine.register('ingest', '1', async () => 'ok');
+    // Read the fleet's subscriptions first: before that read, a terminal write marks the run unresolved.
+    await engine.sweepLifecycleEvents();
     let tagWrites = 0;
     const updateRun = store.updateRun.bind(store);
     store.updateRun = async (runId, patch) => {

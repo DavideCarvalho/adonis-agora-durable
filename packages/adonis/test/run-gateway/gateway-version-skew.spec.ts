@@ -368,7 +368,10 @@ describe('lifecycle verbs against an older control plane', () => {
       requestId: 'q1',
       result: {
         ok: false,
-        error: { message: 'republishLifecycle needs a { runId } or { workflow } target' },
+        error: {
+          message: 'republishLifecycle needs a { runId } or { workflow } target',
+          code: 'bad-request',
+        },
       },
     });
   });

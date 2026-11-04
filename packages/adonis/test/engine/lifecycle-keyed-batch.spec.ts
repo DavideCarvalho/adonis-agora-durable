@@ -181,4 +181,84 @@ describe('@OnWorkflowCompleted / @OnWorkflowFailed debounce and batch', () => {
       return Same;
     }).not.toThrow();
   });
+
+  it('accepts separately written identical key functions, and rejects keys that differ', () => {
+    expect(() => {
+      @OnWorkflowFailed(IngestWorkflow, {
+        debounce: { windowMs: '5s', key: (input) => input.input.baseId },
+      })
+      @OnWorkflowCompleted(IngestWorkflow, {
+        debounce: { windowMs: 5000, key: (input) => input.input.baseId },
+      })
+      class SameKey extends BaseWorkflow {
+        static override workflow = { name: 'same-key' };
+        async run() {}
+      }
+      return SameKey;
+    }).not.toThrow();
+
+    // Keys that compute the same thing but are written differently still differ.
+    expect(() => {
+      @OnWorkflowFailed(IngestWorkflow, {
+        batch: { maxSize: 5, windowMs: 1000, key: (e) => e.input.baseId },
+      })
+      @OnWorkflowCompleted(IngestWorkflow, {
+        batch: { maxSize: 5, windowMs: 1000, key: (input) => input.input.baseId },
+      })
+      class OtherKey extends BaseWorkflow {
+        static override workflow = { name: 'other-key' };
+        async run() {}
+      }
+      return OtherKey;
+    }).toThrow(/differs from the workflow's eventBatch/);
+  });
+});
+
+describe('accumulator dedupe', () => {
+  it('counts an event routed twice into a batch once', async () => {
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore(), clock: () => 1000 });
+    const fired: unknown[] = [];
+    engine.register('agg', '1', async (_ctx, input) => void fired.push(input), {
+      onEvent: ['hit'],
+      eventBatch: { mode: 'batch', maxSize: 2, windowMs: 60_000 },
+    });
+
+    await engine.publishEvent('hit', { n: 1 }, { id: 'e1' });
+    await engine.waitForRun(accumulatorRunId('agg'));
+    await engine.publishEvent('hit', { n: 1 }, { id: 'e1' });
+    await engine.publishEvent('hit', { n: 2 }, { id: 'e2' });
+    await until(() => fired.length > 0);
+    expect(fired).toEqual([{ events: [{ n: 1 }, { n: 2 }] }]);
+
+    // The next burst still knows the first one's events.
+    await engine.publishEvent('hit', { n: 2 }, { id: 'e2' });
+    await engine.publishEvent('hit', { n: 3 }, { id: 'e3' });
+    await engine.publishEvent('hit', { n: 4 }, { id: 'e4' });
+    await until(() => fired.length > 1);
+    expect(fired[1]).toEqual({ events: [{ n: 3 }, { n: 4 }] });
+  });
+
+  it('does not let a duplicate debounced event fire the target again', async () => {
+    let now = 1000;
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore(), clock: () => now });
+    const fired: unknown[] = [];
+    engine.register('refresh', '1', async (_ctx, input) => void fired.push(input), {
+      onEvent: ['ingested'],
+      eventBatch: { mode: 'debounce', windowMs: 5000 },
+    });
+
+    await engine.publishEvent('ingested', { n: 1 }, { id: 'e1' });
+    await engine.waitForRun(accumulatorRunId('refresh'));
+    now += 6000;
+    await engine.resumeDueTimers(now);
+    await until(() => fired.length > 0);
+    await until(() => false, 50);
+
+    await engine.publishEvent('ingested', { n: 1 }, { id: 'e1' });
+    await until(() => false, 50);
+    now += 6000;
+    await engine.resumeDueTimers(now);
+    await until(() => false, 100);
+    expect(fired).toEqual([{ n: 1 }]);
+  });
 });

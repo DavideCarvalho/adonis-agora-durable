@@ -103,7 +103,7 @@ An unknown run id exits `1` with `Run <id> not found.`. Run `durable:work` (or a
 
 ## `durable:lifecycle:republish` — republish lifecycle events
 
-Publishes settled runs' [lifecycle events](/docs/durable/authoring/lifecycle-events#republishing-and-backfilling) again through `engine.republishLifecycle`: a backfill for a subscriber registered after the runs settled, or a retry of one that failed. A subscriber run that already exists is not started again. The subscribers this app can deliver to are started (the ones registered in it, and [Python subscribers](/docs/durable/python#starting-on-another-workflows-lifecycle) whose worker it reaches); any other one is marked owed, and the lifecycle sweep of an instance that has it starts it.
+Publishes settled runs' [lifecycle events](/docs/durable/authoring/lifecycle-events#republishing-and-backfilling) again through `engine.republishLifecycle`: a backfill for a subscriber registered after the runs settled, or a retry of one that failed. A subscriber run that already exists is not started again. The subscribers this app can deliver to are started (the ones registered in it, and [Python subscribers](/docs/durable/python#starting-on-another-workflows-lifecycle) whose worker it reaches); any other one is marked owed, and the lifecycle sweep of an instance that has it starts it. A `--subscriber` that does not subscribe to the runs' ending is reported as failed and nothing is marked. The lifecycle sweep heals only runs settled in the last two minutes, so this is how a subscriber deployed later reaches older runs.
 
 ```bash
 # One run, to every subscriber it has not started yet.

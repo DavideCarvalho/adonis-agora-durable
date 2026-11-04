@@ -52,7 +52,8 @@ describe('lifecycle sweep paging', () => {
       await store.createRun(settledRun(`other-${i}`, 'elsewhere', 2_000 + i));
     }
 
-    expect(await engine.sweepLifecycleEvents(120_000)).toBe(1);
+    // Past the heal window, so only the marked runs are looked at.
+    expect(await engine.sweepLifecycleEvents(300_000)).toBe(1);
     await poll(
       async () =>
         (await store.getRun(lifecycleRunId('mine', 'completed', 'refresh')))?.status ===

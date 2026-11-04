@@ -262,10 +262,11 @@ describe('lifecycle subscription registry', () => {
     const store = new InMemoryStateStore();
     let now = 70_000_000;
     const engine = new WorkflowEngine({ store, instanceId: 'me', clock: () => now });
-    // Two settled runs, then the registry run, the newest of all.
+    // Two settled runs (before the heal window, so the sweep starts no subscriber for them), then
+    // the registry run, the newest of all.
     for (const [id, at] of [
-      ['older', now - 2_000],
-      ['newer', now - 1_000],
+      ['older', now - 300_000],
+      ['newer', now - 200_000],
     ] as const) {
       await store.createRun({
         ...registryRow('ignored', [], at),

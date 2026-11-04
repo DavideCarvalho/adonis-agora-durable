@@ -302,13 +302,17 @@ function subscriberEventBatch(
   return undefined;
 }
 
-/** Whether two `eventBatch` configs coalesce the same way (the same `key` function included). */
+/**
+ * Whether two `eventBatch` configs coalesce the same way: same mode, window and batch size, and
+ * `key` functions with the same source text (two separately written but identical arrows match;
+ * keys whose source differs do not, even when they compute the same key).
+ */
 function sameEventBatch(a: EventBatchConfig, b: EventBatchConfig): boolean {
   return (
     a.mode === b.mode &&
     a.windowMs === b.windowMs &&
-    (a.mode !== 'batch' || b.mode !== 'batch' || a.maxSize === b.maxSize) &&
-    a.key === b.key
+    (a.mode === 'batch' ? a.maxSize : undefined) === (b.mode === 'batch' ? b.maxSize : undefined) &&
+    a.key?.toString() === b.key?.toString()
   );
 }
 

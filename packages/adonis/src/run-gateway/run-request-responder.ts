@@ -10,7 +10,12 @@ import type {
   TenantEvent,
   WorkflowRun,
 } from '../interfaces.js';
-import { lifecycleKindOf, type RepublishLifecycleTarget } from '../lifecycle-events.js';
+import {
+  type LifecycleKind,
+  lifecycleEventName,
+  lifecycleKindOf,
+  type RepublishLifecycleTarget,
+} from '../lifecycle-events.js';
 import {
   loadFanMembers,
   loadRunDetail,
@@ -77,6 +82,12 @@ function wireDate(value: unknown): Date | undefined {
   return date;
 }
 
+/** The most runs one tenant `republishLifecycle` of a workflow walks (a larger `limit` is clamped). */
+export const REPUBLISH_LIMIT_CAP = 1000;
+
+/** The code of a reply refusing a malformed or disallowed request. */
+export const BAD_REQUEST = 'bad-request';
+
 /**
  * The {@link RepublishLifecycleTarget} a wire target stands for: exactly one of `runId` and
  * `workflow`, `since`/`until` back to dates. Throws on a malformed one.
@@ -85,19 +96,23 @@ function republishTargetOf(value: unknown): RepublishLifecycleTarget {
   const t = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>;
   const subscriber = t.subscriber;
   if (subscriber !== undefined && typeof subscriber !== 'string') {
-    throw new Error('republishLifecycle subscriber must be a string');
+    throw new BadRequestError('republishLifecycle subscriber must be a string');
   }
   const sub = subscriber !== undefined ? { subscriber } : {};
   if (typeof t.runId === 'string' && t.workflow === undefined) return { runId: t.runId, ...sub };
   if (typeof t.workflow !== 'string' || t.runId !== undefined) {
-    throw new Error('republishLifecycle needs a { runId } or { workflow } target');
+    throw new BadRequestError('republishLifecycle needs a { runId } or { workflow } target');
   }
   if (t.kind !== undefined && t.kind !== 'completed' && t.kind !== 'failed') {
-    throw new Error('republishLifecycle kind must be completed or failed');
+    throw new BadRequestError('republishLifecycle kind must be completed or failed');
   }
-  if (t.limit !== undefined && typeof t.limit !== 'number') {
-    throw new Error('republishLifecycle limit must be a number');
+  if (
+    t.limit !== undefined &&
+    (typeof t.limit !== 'number' || !Number.isInteger(t.limit) || t.limit <= 0)
+  ) {
+    throw new BadRequestError('republishLifecycle limit must be a positive integer');
   }
+  const limit = t.limit === undefined ? undefined : Math.min(t.limit, REPUBLISH_LIMIT_CAP);
   const since = wireDate(t.since);
   const until = wireDate(t.until);
   return {
@@ -105,7 +120,7 @@ function republishTargetOf(value: unknown): RepublishLifecycleTarget {
     ...(t.kind !== undefined ? { kind: t.kind } : {}),
     ...(since !== undefined ? { since } : {}),
     ...(until !== undefined ? { until } : {}),
-    ...(t.limit !== undefined ? { limit: t.limit } : {}),
+    ...(limit !== undefined ? { limit } : {}),
     ...sub,
   };
 }
@@ -333,6 +348,12 @@ export class RunRequestResponder {
           error: { message: 'run belongs to another tenant', code: 'cross-tenant' },
         });
       }
+      if (err instanceof BadRequestError) {
+        return reply(msg.requestId, {
+          ok: false,
+          error: { message: err.message, code: BAD_REQUEST },
+        });
+      }
       if (err instanceof GatewayLacksVerbError) {
         return reply(msg.requestId, {
           ok: false,
@@ -414,7 +435,14 @@ export class RunRequestResponder {
         // Ownership first, like every runId-bearing verb: another tenant's run is never republished.
         const run = await this.#gateway.getRun(target.runId);
         if (run && run.namespace !== tenant) throw new CrossTenantError();
+        if (run && target.subscriber !== undefined) {
+          const kind = lifecycleKindOf(run.status);
+          await this.#assertSubscribes(run.workflow, kind, target.subscriber, tenant);
+        }
         return this.#gateway.republishLifecycle(target);
+      }
+      if (target.subscriber !== undefined) {
+        await this.#assertSubscribes(target.workflow, target.kind, target.subscriber, tenant);
       }
       // A workflow's runs: forced to the tenant's namespace, never a body claim.
       return this.#gateway.republishLifecycle({ ...target, namespace: tenant });
@@ -597,6 +625,30 @@ export class RunRequestResponder {
    * the signed token: it is verified and the real tenant DERIVED from it (`null` on reject). Without a
    * verifier, the wire value is trusted verbatim (prefix/network isolation only, aviary-compatible).
    */
+  /**
+   * Refuse ({@link BadRequestError}) a republish naming a `subscriber` that does not subscribe to
+   * `workflow`'s lifecycle event (`kind`, or either when undefined) in `tenant`'s namespace, so a
+   * tenant can only owe a run's event to one of its own subscribers.
+   */
+  async #assertSubscribes(
+    workflow: string,
+    kind: LifecycleKind | undefined,
+    subscriber: string,
+    tenant: string,
+  ): Promise<void> {
+    if (!this.#gateway.workflowLifecycle) throw new GatewayLacksVerbError('workflowLifecycle');
+    const links = await this.#gateway.workflowLifecycle(workflow, { namespace: tenant });
+    const subscribes = links.startsOnSettle.some(
+      (link) => link.workflow === subscriber && (kind === undefined || link.kind === kind),
+    );
+    if (!subscribes) {
+      const event = kind
+        ? lifecycleEventName(workflow, kind)
+        : `the lifecycle events of ${workflow}`;
+      throw new BadRequestError(`subscriber ${subscriber} does not subscribe to ${event}`);
+    }
+  }
+
   async #resolveTenant(wireTenant: string): Promise<string | null> {
     if (!this.#verifyTenant) return wireTenant;
     const verified = await this.#verifyTenant({ token: wireTenant, tenant: wireTenant });
@@ -606,6 +658,9 @@ export class RunRequestResponder {
 
 /** A runId-bearing request addressed a run of another tenant. */
 class CrossTenantError extends Error {}
+
+/** A request that is malformed or asks for something the tenant may not do; replied as `bad-request`. */
+class BadRequestError extends Error {}
 
 /** The control plane's gateway does not implement an optional verb (a hand-written gateway). */
 class GatewayLacksVerbError extends Error {

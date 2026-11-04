@@ -125,6 +125,8 @@ import type {
 import { isNonEmptyRunScope, TERMINAL_RUN_STATUSES } from './interfaces.js';
 import {
   chainPredecessorsOf,
+  deliveredSubscribersOf,
+  LIFECYCLE_HEAL_WINDOW_MS,
   LIFECYCLE_ORPHAN_MS,
   LIFECYCLE_OWED_TAG_PREFIX,
   LIFECYCLE_PENDING_TAG,
@@ -564,6 +566,9 @@ const RUN_DISPATCH_BATCH = 500;
 /** Tries, and the first backoff, for telling a parent that its child finished (see `deliverToParent`). */
 const PARENT_NOTIFY_ATTEMPTS = 4;
 const PARENT_NOTIFY_BACKOFF_MS = 250;
+
+/** What a lifecycle publish's run lease owner carries: `<instanceId>#lifecycle#<uuid>`. */
+const LIFECYCLE_LEASE_MARK = '#lifecycle#';
 
 /** How often, at most, and how many times a wake dropped on a held lease looks again (see `recheckAfterLease`). */
 const LEASE_RECHECK_MAX_MS = 2_000;
@@ -2320,8 +2325,9 @@ export class WorkflowEngine {
         const batch = this.latest.get(workflow)?.eventBatch;
         if (batch) {
           // Coalesce: route the event into the workflow's accumulator (one long-lived run per
-          // target and key that debounces/batches and then starts the target).
-          await this.accumulators.route(workflow, batch, input);
+          // target and key that debounces/batches and then starts the target), named by the run
+          // id it would start, so a second route of the same event is dropped there.
+          await this.accumulators.route(workflow, batch, input, runIdOf(workflow));
           reached.push({ workflow });
         } else {
           const runId = runIdOf(workflow);
@@ -2542,19 +2548,25 @@ export class WorkflowEngine {
    * {@link LIFECYCLE_TRACE_TAG_PREFIX} tag when a run trace provider knows it. Written in the same
    * update as the status, so a run can never be settled without a record of whom its lifecycle event
    * is owed to.
+   *
+   * While this instance has no successful read of the fleet's announced subscriptions (none yet, or
+   * the last one failed), it cannot know who else subscribes, so the marker is the pending tag alone:
+   * the run's owed set is unresolved, and the publish that next reads the fleet resolves it (see
+   * {@link publishSettled}). Never waits on that read.
    */
   private withLifecycleMarker<P extends Partial<WorkflowRun>>(
     run: Pick<WorkflowRun, 'id' | 'workflow' | 'tags' | 'namespace'>,
     patch: P,
   ): P {
     const kind = lifecycleKindOf(patch.status);
-    if (!kind) return patch;
+    if (!kind || run.workflow.startsWith('__')) return patch;
     const subscribers = this.lifecycleSubscribers(
       run.workflow,
       kind,
       normalizeNamespace(run.namespace),
     );
-    if (subscribers.length === 0) return patch;
+    const unresolved = !this.announcedSubscriptionsSnapshot?.ok;
+    if (subscribers.length === 0 && !unresolved) return patch;
     const tags = patch.tags ?? run.tags ?? [];
     let traceparent: string | undefined;
     try {
@@ -2563,10 +2575,12 @@ export class WorkflowEngine {
       traceparent = undefined;
     }
     const recordsTrace =
-      traceparent !== undefined && !tags.some((t) => t.startsWith(LIFECYCLE_TRACE_TAG_PREFIX));
+      traceparent !== undefined &&
+      subscribers.length > 0 &&
+      !tags.some((t) => t.startsWith(LIFECYCLE_TRACE_TAG_PREFIX));
     const marker = [
       LIFECYCLE_PENDING_TAG,
-      ...subscribers.map(lifecycleOwedTag),
+      ...(unresolved ? [] : subscribers.map(lifecycleOwedTag)),
       ...(recordsTrace ? [`${LIFECYCLE_TRACE_TAG_PREFIX}${traceparent}`] : []),
     ];
     if (marker.every((tag) => tags.includes(tag))) return patch;
@@ -2643,8 +2657,8 @@ export class WorkflowEngine {
     }
   }
 
-  /** How many registry rows one read of the lifecycle subscription registry lists at most. */
-  private static readonly LIFECYCLE_REGISTRY_READ_CAP = 1000;
+  /** How many registry rows one page of a read of the lifecycle subscription registry lists. */
+  private static readonly LIFECYCLE_REGISTRY_PAGE_SIZE = 1000;
 
   /** How long a read of the subscriptions the fleet announces is reused. */
   private static readonly ANNOUNCED_SUBSCRIPTIONS_TTL_MS = 5_000;
@@ -2702,7 +2716,8 @@ export class WorkflowEngine {
 
   /**
    * Read the fleet's announced subscriptions into the snapshot: the registry rows whose heartbeat
-   * is at most {@link LIFECYCLE_REGISTRY_TTL_MS} old (a range of the store's `created_at` index), and
+   * is at most {@link LIFECYCLE_REGISTRY_TTL_MS} old (a range of the store's `created_at` index, read
+   * page by page until a short page, so a large fleet is never cut off), and
    * the worker descriptors on a transport that can read them fleet-wide. Never throws: a failed read
    * of either leaves an empty snapshot marked not `ok`, which counts as the local registry only and
    * never orphans a subscriber. Concurrent callers share one read.
@@ -2723,10 +2738,11 @@ export class WorkflowEngine {
         subscribers.add(workflow);
         byEvent.set(event, subscribers);
       };
-      try {
-        const [descriptors, rows] = await Promise.all([
-          this.pool.introspectsFleet ? this.pool.readAllWorkerDescriptors() : [],
-          asHeartbeat(() =>
+      const readRegistry = async (): Promise<WorkflowRun[]> => {
+        const size = WorkflowEngine.LIFECYCLE_REGISTRY_PAGE_SIZE;
+        const out: WorkflowRun[] = [];
+        for (let page = 1; ; page += 1) {
+          const rows = await asHeartbeat(() =>
             this.store.listRuns({
               workflow: LIFECYCLE_REGISTRY_WORKFLOW,
               createdAfter: at - LIFECYCLE_REGISTRY_TTL_MS,
@@ -2735,9 +2751,18 @@ export class WorkflowEngine {
               ...(this.namespace !== undefined
                 ? { namespaces: [...new Set([this.namespace, 'default'])] }
                 : {}),
-              size: WorkflowEngine.LIFECYCLE_REGISTRY_READ_CAP,
+              page,
+              size,
             }),
-          ),
+          );
+          out.push(...rows);
+          if (rows.length < size) return out;
+        }
+      };
+      try {
+        const [descriptors, rows] = await Promise.all([
+          this.pool.introspectsFleet ? this.pool.readAllWorkerDescriptors() : [],
+          readRegistry(),
         ]);
         for (const row of rows) {
           if (row.workflow !== LIFECYCLE_REGISTRY_WORKFLOW) continue;
@@ -2902,16 +2927,77 @@ export class WorkflowEngine {
     const kind = event.type === 'run.completed' ? 'completed' : 'failed';
     if (!event.workflow || event.workflow.startsWith('__')) return;
     const name = lifecycleEventName(event.workflow, kind);
+    const snapshot = this.announcedSubscriptionsSnapshot;
+    // Without a successful read of the fleet the terminal write left the owed set unresolved, and
+    // this publish resolves it.
     if (
+      snapshot?.ok &&
       this.localSubscribers(name).length === 0 &&
-      !this.announcedSubscriptionsSnapshot?.byEvent.get(name)?.size
+      !snapshot.byEvent.get(name)?.size
     ) {
       return;
     }
+    // The turn that settled the run still holds its lease: publish once it let go.
+    const turns = [...this.inflight].filter(([, runId]) => runId === event.runId).map(([p]) => p);
     void (async () => {
+      await Promise.allSettled(turns);
       const run = await this.store.getRun(event.runId);
       if (run) await this.publishSettled(run);
     })().catch(() => undefined);
+  }
+
+  /**
+   * Take the run lease for this instance's turn, as `tryLockRun` at `nowMs`; when the lease is held
+   * by a lifecycle publish (see {@link withLifecycleLease}), which only ever holds a settled run for
+   * the length of its publish (an explicit retry can land in it), wait for that publish to let go,
+   * at most `leaseMs`.
+   */
+  private async lockRunPastLifecyclePublish(runId: string, nowMs: number): Promise<boolean> {
+    if (await this.store.tryLockRun(runId, this.instanceId, nowMs + this.leaseMs, nowMs)) {
+      return true;
+    }
+    // Real time, not `this.clock`: a test clock may stand still.
+    const giveUpAt = Date.now() + this.leaseMs;
+    let delayMs = 10;
+    for (;;) {
+      const held = await this.store.getRun(runId);
+      if (!held?.lockedBy?.includes(LIFECYCLE_LEASE_MARK) || Date.now() >= giveUpAt) return false;
+      await new Promise((r) => setTimeout(r, delayMs));
+      delayMs = Math.min(delayMs * 2, 250);
+      const now = this.clock();
+      if (await this.store.tryLockRun(runId, this.instanceId, now + this.leaseMs, now)) return true;
+    }
+  }
+
+  /** The waits between attempts to take a settled run's lifecycle lease (see {@link withLifecycleLease}). */
+  private static readonly LIFECYCLE_LEASE_RETRY_MS = [50, 100, 200, 400, 800];
+
+  /**
+   * Run `fn` holding the run lease of the settled run `runId` under an owner unique to this call, so
+   * every read-start-write of a run's lifecycle tags (live publish, sweeps, heal, republish, on any
+   * instance or twice in this one) runs one at a time. A refused lease is asked for again after each
+   * of {@link LIFECYCLE_LEASE_RETRY_MS}; still refused, resolves `{ acquired: false }` without
+   * running `fn`. The lease is released when `fn` settles, and expires after `leaseMs` if this
+   * process dies first.
+   */
+  private async withLifecycleLease<T>(
+    runId: string,
+    fn: () => Promise<T>,
+  ): Promise<{ acquired: true; value: T } | { acquired: false }> {
+    const owner = `${this.instanceId}${LIFECYCLE_LEASE_MARK}${globalThis.crypto.randomUUID()}`;
+    const delays = WorkflowEngine.LIFECYCLE_LEASE_RETRY_MS;
+    for (let attempt = 0; ; attempt += 1) {
+      const nowMs = this.clock();
+      if (await this.store.tryLockRun(runId, owner, nowMs + this.leaseMs, nowMs)) break;
+      const delay = delays[attempt];
+      if (delay === undefined) return { acquired: false };
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+    try {
+      return { acquired: true, value: await fn() };
+    } finally {
+      await this.store.releaseRunLock(runId, owner).catch(() => undefined);
+    }
   }
 
   /**
@@ -2920,26 +3006,66 @@ export class WorkflowEngine {
    * and started by name; see {@link deliverableSubscribers}), and settle their part of the marker:
    * drop each one's {@link LIFECYCLE_OWED_TAG_PREFIX} tag, record each started one as a
    * `durable:triggered:<workflow>` tag, and drop {@link LIFECYCLE_PENDING_TAG} once no owed tag is
-   * left. A run marked pending with no owed tag is owed to every subscriber registered here.
+   * left.
    *
-   * `republish` publishes to every subscriber of the ending (or only `subscriber`), owed or not:
-   * the ones this instance can deliver to are started, and the others are marked owed again (with
-   * the pending tag) for the sweep of an instance that can.
+   * A run marked pending with no owed tag has an unresolved owed set (see
+   * {@link LIFECYCLE_PENDING_TAG}). With a successful read of the fleet's subscriptions it is resolved
+   * here: every subscriber of the ending (see {@link lifecycleSubscribers}) the run's tags do not
+   * record as started or failed becomes owed, and the ones nobody here delivers to keep an owed tag.
+   * Without one, the subscribers registered here are started and the run stays unresolved.
+   *
+   * `republish` publishes to every subscriber of the ending (or only `subscriber`, which must be one),
+   * owed or not: the ones this instance can deliver to are started, and the others are marked owed
+   * again (with the pending tag) for the sweep of an instance that can. `heal` names subscribers of
+   * the ending the run was never marked for (see {@link healLifecycleEvents}): they are owed now, and
+   * the ones this instance delivers to are started.
    * `nowMs` (the sweep's clock) also drops the owed tag of a subscriber that is neither registered
    * here nor announced by a live worker once the run settled {@link LIFECYCLE_ORPHAN_MS} ago,
    * reporting it as `run.trigger_failed`.
    *
-   * Idempotent, since every subscriber run id is deterministic, so the live path, every instance's
-   * sweep and a republish may all reach the same run. A subscriber whose `where` throws, whose input
-   * is rejected or whose start fails, and an orphan the sweep drops, is reported as
-   * `run.trigger_failed`, gets a {@link LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX} tag in the same tag
-   * write, and is not retried until a republish; the write that records a subscriber reached removes
-   * its trigger-failed tag. A failure to write the marker
-   * leaves it, and the sweep publishes the run again.
+   * Runs under the run's lifecycle lease (see {@link withLifecycleLease}) and reads the run again
+   * under it, so concurrent publishers never overwrite each other's tags; `busy` when the lease
+   * stayed taken. Idempotent, since every subscriber run id is deterministic and a debounce/batch
+   * accumulator drops an event it already holds. A subscriber whose `where` throws, whose input is
+   * rejected or whose start fails, and an orphan the sweep drops, gets a
+   * {@link LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX} tag in the same tag write, and is not retried until a
+   * republish; the write that records a subscriber reached removes its trigger-failed tag.
+   * `run.triggered` and `run.trigger_failed` are emitted only for the subscribers whose triggered or
+   * trigger-failed tag this write added (a debounced/batched subscriber, which gets no triggered tag:
+   * when this write dropped its owed tag, or it was routed for an unresolved or healed run). A failure
+   * to write the marker leaves it, and the sweep publishes the run again.
    */
   private async publishSettled(
+    source: WorkflowRun,
+    opts?: {
+      republish?: boolean;
+      subscriber?: string | undefined;
+      heal?: readonly string[] | undefined;
+      nowMs?: number;
+    },
+  ): Promise<{
+    started: number;
+    failed: { workflow: string; error: unknown }[];
+    busy?: true;
+  }> {
+    const leased = await this.withLifecycleLease(source.id, async () => {
+      const run = await this.store.getRun(source.id);
+      return run
+        ? this.publishSettledLeased(run, opts)
+        : { started: 0, failed: [] as { workflow: string; error: unknown }[] };
+    });
+    return leased.acquired ? leased.value : { started: 0, failed: [], busy: true };
+  }
+
+  /** {@link publishSettled} once it holds the run's lifecycle lease and has read `run` under it. */
+  private async publishSettledLeased(
     run: WorkflowRun,
-    opts?: { republish?: boolean; subscriber?: string | undefined; nowMs?: number },
+    opts?: {
+      republish?: boolean;
+      subscriber?: string | undefined;
+      heal?: readonly string[] | undefined;
+      nowMs?: number;
+    },
   ): Promise<{
     started: number;
     failed: { workflow: string; error: unknown }[];
@@ -2948,28 +3074,60 @@ export class WorkflowEngine {
     if (!kind) return { started: 0, failed: [] };
     const name = lifecycleEventName(run.workflow, kind);
     const namespace = normalizeNamespace(run.namespace);
+    const before = run.tags ?? [];
+    const delivered = deliveredSubscribersOf(run);
+    let owed = owedSubscribersOf(run);
+    const pending = before.includes(LIFECYCLE_PENDING_TAG);
+    // Subscribers this write marks owed: a resolved or healed owed set, or a republish's re-mark.
+    let newlyOwed: string[] = [];
+    let unresolved = false;
+    if (pending && owed.length === 0 && !opts?.republish) {
+      await this.freshAnnouncedSubscriptions();
+      if (this.announcedSubscriptionsSnapshot?.ok) {
+        owed = this.lifecycleSubscribers(run.workflow, kind, namespace).filter(
+          (s) => !delivered.has(s),
+        );
+        newlyOwed = owed;
+      } else {
+        unresolved = true;
+      }
+    }
+    if (opts?.heal?.length) {
+      const healed = opts.heal.filter((s) => !owed.includes(s) && !delivered.has(s));
+      owed = [...owed, ...healed];
+      newlyOwed = [...newlyOwed, ...healed];
+    }
     const { local, remote, all: here } = await this.deliverableSubscribers(name, namespace);
-    const owed = owedSubscribersOf(run);
-    const pending = run.tags?.includes(LIFECYCLE_PENDING_TAG) ?? false;
     let targets: string[];
-    // Subscribers registered elsewhere that a republish marks owed again, for their instance's sweep.
-    let remark: string[] = [];
+    const refused: { workflow: string; error: unknown }[] = [];
     if (opts?.republish) {
-      const all =
-        opts.subscriber !== undefined
-          ? [opts.subscriber]
-          : this.lifecycleSubscribers(run.workflow, kind, namespace);
-      // A debounced/batched subscriber's accumulator would count the event twice, so it is only
-      // routed while the run still owes it the event.
+      await this.freshAnnouncedSubscriptions();
+      // Without a read of the fleet, an unresolved run stays unresolved for the next publish.
+      unresolved = pending && owed.length === 0 && !this.announcedSubscriptionsSnapshot?.ok;
+      const subscribers = this.lifecycleSubscribers(run.workflow, kind, namespace);
+      let all = subscribers;
+      if (opts.subscriber !== undefined) {
+        all = subscribers.includes(opts.subscriber) ? [opts.subscriber] : [];
+        if (all.length === 0) {
+          refused.push({
+            workflow: opts.subscriber,
+            error: new Error(`subscriber ${opts.subscriber} does not subscribe to ${name}`),
+          });
+        }
+      }
+      // A debounced/batched subscriber's accumulator drops an event it already holds, but one that
+      // already fired would start the target again, so it is only routed while the run owes it.
       targets = all.filter(
         (s) =>
           here.has(s) &&
           (!this.latest.get(s)?.eventBatch || owed.includes(s) || (pending && !owed.length)),
       );
-      remark = all.filter((s) => !here.has(s));
-    } else if (owed.length > 0) targets = owed.filter((s) => here.has(s));
-    else targets = pending ? [...local] : [];
-    if (opts?.subscriber !== undefined) targets = targets.filter((s) => s === opts.subscriber);
+      newlyOwed = all.filter((s) => !here.has(s));
+    } else if (unresolved) {
+      targets = [...local].filter((s) => !delivered.has(s));
+    } else {
+      targets = owed.filter((s) => here.has(s));
+    }
 
     const { reached, failed } =
       targets.length > 0
@@ -2990,9 +3148,8 @@ export class WorkflowEngine {
       .map((r) => `${LIFECYCLE_TRIGGERED_TAG_PREFIX}${r.workflow}`);
     const reachedNow = new Set(reached.map((r) => r.workflow));
     const failedNow = [...failed.map((f) => f.workflow), ...orphaned];
-    const current = (await this.store.getRun(run.id)) ?? run;
     const kept = [
-      ...(current.tags ?? []).filter(
+      ...before.filter(
         (t) =>
           !(
             (t.startsWith(LIFECYCLE_OWED_TAG_PREFIX) &&
@@ -3001,22 +3158,27 @@ export class WorkflowEngine {
               reachedNow.has(t.slice(LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX.length)))
           ),
       ),
-      ...remark.map(lifecycleOwedTag),
+      ...newlyOwed.filter((s) => !done.has(s)).map(lifecycleOwedTag),
     ];
     const owedLeft = kept.some((t) => t.startsWith(LIFECYCLE_OWED_TAG_PREFIX));
     const tags = [
       ...new Set([
         ...kept.filter((t) => t !== LIFECYCLE_PENDING_TAG),
-        ...(owedLeft ? [LIFECYCLE_PENDING_TAG] : []),
+        ...(owedLeft || unresolved ? [LIFECYCLE_PENDING_TAG] : []),
         ...triggered,
         ...failedNow.map(lifecycleTriggerFailedTag),
       ]),
     ];
-    const before = current.tags ?? [];
     if (tags.length !== before.length || tags.some((t) => !before.includes(t))) {
       await this.store.updateRun(run.id, { tags });
     }
+    // Only the tag changes this write made are announced, so a publisher that repeats another's
+    // delivery emits nothing.
+    // A debounced/batched subscriber (no run id) is routed only while owed, unresolved or healed.
     for (const { workflow, runId } of reached) {
+      if (runId !== undefined && before.includes(`${LIFECYCLE_TRIGGERED_TAG_PREFIX}${workflow}`)) {
+        continue;
+      }
       this.emit({
         type: 'run.triggered',
         runId: run.id,
@@ -3034,6 +3196,7 @@ export class WorkflowEngine {
       })),
     ];
     for (const { workflow, error } of unreached) {
+      if (before.includes(lifecycleTriggerFailedTag(workflow))) continue;
       this.emit({
         type: 'run.trigger_failed',
         runId: run.id,
@@ -3043,7 +3206,10 @@ export class WorkflowEngine {
         error: { message: error instanceof Error ? error.message : String(error) },
       });
     }
-    return { started: reached.filter((r) => r.created).length, failed: unreached };
+    return {
+      started: reached.filter((r) => r.created).length,
+      failed: [...refused, ...unreached],
+    };
   }
 
   /**
@@ -3093,18 +3259,23 @@ export class WorkflowEngine {
    * act on (every owed subscriber is delivered elsewhere and none is orphaned yet), so runs owed only
    * to other instances never hide the ones it can publish. Stops once it has published `limit` runs
    * or read {@link LIFECYCLE_SWEEP_SCAN_CAP} marked runs. A run settled in the last
-   * {@link LIFECYCLE_SWEEP_GRACE_MS} is left to the live publish. Returns how many runs it published
-   * plus how many waiters it woke.
+   * {@link LIFECYCLE_SWEEP_GRACE_MS} is left to the live publish; a run another publisher holds
+   * (see {@link withLifecycleLease}) is left to the next tick. Then heals the runs settled in the
+   * last {@link LIFECYCLE_HEAL_WINDOW_MS} (see {@link healLifecycleEvents}). Returns how many marked
+   * runs it published plus how many waiters it woke; healed runs are not counted.
    */
   async sweepLifecycleEvents(nowMs: number = this.clock(), limit = 100): Promise<number> {
     await this.heartbeatLifecycleRegistry();
-    await this.freshAnnouncedSubscriptions();
+    // A failed read is tried again on every tick, so unresolved runs resolve once the fleet is back.
+    if (this.announcedSubscriptionsSnapshot?.ok === false)
+      await this.refreshAnnouncedSubscriptions();
+    else await this.freshAnnouncedSubscriptions();
     const actionable = await this.lifecycleActionableRuns(nowMs, limit);
     let published = 0;
     for (const run of actionable) {
       try {
-        await this.publishSettled(run, { nowMs });
-        published += 1;
+        const { busy } = await this.publishSettled(run, { nowMs });
+        if (!busy) published += 1;
       } catch (error) {
         console.error(
           `[adonis-durable] lifecycle sweep: run ${run.id} failed; retrying next tick:`,
@@ -3112,7 +3283,91 @@ export class WorkflowEngine {
         );
       }
     }
+    try {
+      await this.healLifecycleEvents(nowMs);
+    } catch (error) {
+      console.error('[adonis-durable] lifecycle sweep: heal failed; retrying next tick:', error);
+    }
     return published + (await this.sweepRunWaits(limit));
+  }
+
+  /** How many settled runs of one source workflow a heal pass reads at most. */
+  private static readonly LIFECYCLE_HEAL_SCAN_CAP = 100;
+
+  /**
+   * The (run, subscriber) pairs this engine already healed, with when each entry lapses (epoch ms):
+   * a subscriber whose `where` declines the event leaves no tag, so without it every sweep would
+   * route it again for the whole heal window.
+   */
+  private readonly lifecycleHealed = new Map<string, number>();
+
+  /**
+   * Deliver lifecycle events the terminal write never marked: for every source workflow some
+   * subscriber in the current snapshot of the fleet's subscriptions (or registered here) listens to,
+   * read its runs settled in the last {@link LIFECYCLE_HEAL_WINDOW_MS} (at most
+   * {@link LIFECYCLE_HEAL_SCAN_CAP}, one listing per workflow) and publish each one to the
+   * subscribers of its ending its tags record as neither owed, started nor failed (see
+   * {@link publishSettled}'s `heal`). That covers a subscriber announced just after the run
+   * settled, while the settling instance's snapshot was stale. Each pair is healed at most once per
+   * engine. A run whose owed set is unresolved is left to {@link sweepLifecycleEvents}. Needs a
+   * successful read of the fleet's subscriptions; returns how many runs it published.
+   */
+  private async healLifecycleEvents(nowMs: number): Promise<number> {
+    const snapshot = this.announcedSubscriptionsSnapshot;
+    if (!snapshot?.ok) return 0;
+    for (const [key, lapsesAt] of this.lifecycleHealed) {
+      if (lapsesAt <= nowMs) this.lifecycleHealed.delete(key);
+    }
+    const sources = new Map<string, Set<LifecycleKind>>();
+    for (const event of new Set([...snapshot.byEvent.keys(), ...this.eventTriggers.keys()])) {
+      const source = parseLifecycleEvent(event);
+      if (!source || source.workflow.startsWith('__')) continue;
+      const kinds = sources.get(source.workflow) ?? new Set<LifecycleKind>();
+      kinds.add(source.kind);
+      sources.set(source.workflow, kinds);
+    }
+    let healed = 0;
+    for (const [workflow, kinds] of sources) {
+      const statuses: RunStatus[] = [
+        ...(kinds.has('completed') ? (['completed'] as const) : []),
+        ...(kinds.has('failed') ? (['failed', 'cancelled', 'dead'] as const) : []),
+      ];
+      const runs = await asHeartbeat(() =>
+        this.store.listRuns({
+          workflow,
+          statuses,
+          ...(this.namespace !== undefined ? { namespace: this.namespace } : {}),
+          updatedAfter: nowMs - LIFECYCLE_HEAL_WINDOW_MS,
+          size: WorkflowEngine.LIFECYCLE_HEAL_SCAN_CAP,
+        }),
+      );
+      for (const run of runs) {
+        const kind = lifecycleKindOf(run.status);
+        if (run.workflow !== workflow || !kind || !kinds.has(kind)) continue;
+        if (nowMs - run.updatedAt.getTime() > LIFECYCLE_HEAL_WINDOW_MS) continue;
+        const owed = owedSubscribersOf(run);
+        if (owed.length === 0 && run.tags?.includes(LIFECYCLE_PENDING_TAG)) continue;
+        const delivered = deliveredSubscribersOf(run);
+        const missing = this.lifecycleSubscribers(
+          workflow,
+          kind,
+          normalizeNamespace(run.namespace),
+        ).filter(
+          (s) =>
+            !owed.includes(s) &&
+            !delivered.has(s) &&
+            !this.lifecycleHealed.has(`${run.id}\u0000${s}`),
+        );
+        if (missing.length === 0) continue;
+        const { busy } = await this.publishSettled(run, { heal: missing, nowMs });
+        if (busy) continue;
+        for (const s of missing) {
+          this.lifecycleHealed.set(`${run.id}\u0000${s}`, nowMs + LIFECYCLE_HEAL_WINDOW_MS);
+        }
+        healed += 1;
+      }
+    }
+    return healed;
   }
 
   /**
@@ -3182,24 +3437,38 @@ export class WorkflowEngine {
    * Publish settled runs' lifecycle events again, whether or not they are still marked: one run
    * (`{ runId }`), or a workflow's settled runs (`{ workflow, kind, since, until, limit }`, read in
    * pages of the store's listing, filtered by when the run settled). `subscriber` restricts it to
-   * one subscribing workflow. The subscribers registered on this instance are started; any other
-   * (announced by a live worker, or named by `subscriber`) is marked owed again, so the sweep of an
-   * instance that registers it starts it, and is not counted in `started`. The same path as the
-   * live publish, so a subscriber whose run already exists is not started again; a subscriber that
-   * debounces or batches is routed only while the run still owes it the event, since its
-   * accumulator does not deduplicate. A subscriber registered after the runs settled is backfilled
-   * this way. A workflow target's `namespace` narrows it to that namespace; on an engine bound to
-   * another namespace it publishes nothing.
+   * one subscribing workflow, which must subscribe to the run's ending (registered here or announced
+   * by a live worker for the run's namespace): otherwise the run is reported in `failed` with
+   * `subscriber <name> does not subscribe to <event>` and nothing is marked. The subscribers
+   * registered on this instance are started; any other (announced by a live worker) is marked owed
+   * again, so the sweep of an instance that registers it starts it, and is not counted in
+   * `started`. The same path as the live publish, so a subscriber whose run already exists is not
+   * started again; a subscriber that debounces or batches is routed only while the run still owes it
+   * the event, since an accumulator that already fired would start the target again. A run another
+   * publisher holds past the lease retries is reported in `failed` with subscriber `*`. A
+   * subscriber registered after the runs settled (more than {@link LIFECYCLE_HEAL_WINDOW_MS} after,
+   * past what the sweep heals) is backfilled this way. A workflow target's `namespace` narrows it to
+   * that namespace; on an engine bound to another namespace it publishes nothing.
    */
   async republishLifecycle(target: RepublishLifecycleTarget): Promise<RepublishLifecycleResult> {
     const result: RepublishLifecycleResult = { runs: 0, started: 0, failed: [] };
+    // A backfill usually follows a deploy: read the fleet's subscriptions now, not from the cache.
+    await this.refreshAnnouncedSubscriptions();
     const publish = async (run: WorkflowRun): Promise<void> => {
       if (!lifecycleKindOf(run.status)) return;
       result.runs += 1;
-      const { started, failed } = await this.publishSettled(run, {
+      const { started, failed, busy } = await this.publishSettled(run, {
         republish: true,
         subscriber: target.subscriber,
       });
+      if (busy) {
+        result.failed.push({
+          runId: run.id,
+          subscriber: '*',
+          error: `run ${run.id} is being published elsewhere; try again`,
+        });
+        return;
+      }
       result.started += started;
       for (const { workflow, error } of failed) {
         result.failed.push({
@@ -6623,9 +6892,7 @@ export class WorkflowEngine {
       (run.lockedUntil ?? 0) > lockNow &&
       (lockedForTurn || (await this.proveOwnLease(run.id, lockNow)));
     if (!reentered) {
-      if (
-        !(await this.store.tryLockRun(run.id, this.instanceId, lockNow + this.leaseMs, lockNow))
-      ) {
+      if (!(await this.lockRunPastLifecyclePublish(run.id, lockNow))) {
         const stamping = this.draining ? undefined : this.stampWakeRequest(run.id, reason);
         this.trackEffect(this.requestWake(run.id, run.lockedUntil, reason, stamping));
         const refused: RunResult = { runId: run.id, status: run.status };

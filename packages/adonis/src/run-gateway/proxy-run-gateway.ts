@@ -45,12 +45,14 @@ import { UNSUPPORTED_RUN_REQUEST } from './run-request-responder.js';
 export type RunGatewayErrorCode =
   | 'unauthorized'
   | 'cross-tenant'
+  | 'bad-request'
   | typeof UNSUPPORTED_RUN_REQUEST
   | (string & {});
 
 /**
  * A tenant's run-gateway call the control plane refused, with the responder's `code` when it sent
  * one. `unsupported-request`: the control plane runs an older release that does not know the verb.
+ * `bad-request`: the request was malformed or asked for something the tenant may not do.
  */
 export class RunGatewayError extends Error {
   readonly code: RunGatewayErrorCode | undefined;

@@ -3,6 +3,7 @@ import { WorkflowEngine } from '../../src/engine.js';
 import type { WorkerDescriptor } from '../../src/handshake/descriptor.js';
 import type { EngineEvent, WorkflowRun } from '../../src/interfaces.js';
 import {
+  LIFECYCLE_HEAL_WINDOW_MS,
   LIFECYCLE_ORPHAN_MS,
   LIFECYCLE_OWED_TAG_PREFIX,
   LIFECYCLE_PENDING_TAG,
@@ -215,8 +216,9 @@ describe('lifecycle subscriptions announced by the fleet', () => {
     for (const engine of [a, b]) engine.register('ingest', '1', async () => 'ok');
     await a.start('ingest', {}, 'i1');
     await poll(async () => (await store.getRun('i1'))?.status === 'completed');
-    // The subscriber is deployed on B after the run settled.
+    // The subscriber is deployed on B after the run settled, past the heal window, and B announces it.
     b.register('late', '1', async () => void ran++, { onEvent: [runCompletedEvent('ingest')] });
+    await b.sweepLifecycleEvents(Date.now() + LIFECYCLE_HEAL_WINDOW_MS + 60_000);
 
     expect(await a.republishLifecycle({ runId: 'i1', subscriber: 'late' })).toEqual({
       runs: 1,

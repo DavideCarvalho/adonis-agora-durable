@@ -6,6 +6,7 @@ import { WorkflowEngine } from '../../src/engine.js';
 import { FatalError } from '../../src/errors.js';
 import type { WorkflowRun } from '../../src/interfaces.js';
 import {
+  LIFECYCLE_HEAL_WINDOW_MS,
   lifecycleRunId,
   runCompletedEvent,
   runFailedEvent,
@@ -135,6 +136,11 @@ describe('engine.republishLifecycle', () => {
       started: 0,
       failed: [{ runId: 'i1', subscriber: 'strict', error: 'bad input' }],
     });
+    // `elsewhere` is registered on another instance, which announces it in the registry.
+    const other = new WorkflowEngine({ store });
+    other.register('elsewhere', '1', async () => 'ran', { onEvent: [runCompletedEvent('ingest')] });
+    await other.sweepLifecycleEvents(Date.now() + LIFECYCLE_HEAL_WINDOW_MS + 60_000);
+    await engine.sweepLifecycleEvents(Date.now() + LIFECYCLE_HEAL_WINDOW_MS + 60_000);
     expect(await engine.republishLifecycle({ runId: 'i1', subscriber: 'elsewhere' })).toEqual({
       runs: 1,
       started: 0,
@@ -145,6 +151,31 @@ describe('engine.republishLifecycle', () => {
       'durable:lifecycle:owed:elsewhere',
       'durable:lifecycle:pending',
     ]);
+  });
+
+  it('refuses a subscriber that does not subscribe, and marks nothing', async () => {
+    const { store, engine } = await setup();
+    const before = (await store.getRun('i1'))?.tags;
+    expect(await engine.republishLifecycle({ runId: 'i1', subscriber: 'nobody' })).toEqual({
+      runs: 1,
+      started: 0,
+      failed: [
+        {
+          runId: 'i1',
+          subscriber: 'nobody',
+          error: 'subscriber nobody does not subscribe to run.completed:ingest',
+        },
+      ],
+    });
+    expect(
+      await engine.republishLifecycle({
+        workflow: 'ingest',
+        kind: 'completed',
+        subscriber: 'nobody',
+      }),
+    ).toMatchObject({ runs: 2, started: 0 });
+    expect((await store.getRun('i1'))?.tags).toEqual(before);
+    expect((await store.getRun('i2'))?.tags ?? []).not.toContain('durable:lifecycle:owed:nobody');
   });
 
   it('publishes nothing for an unknown or unsettled run', async () => {

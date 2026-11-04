@@ -8,6 +8,7 @@ import type {
   WorkflowTask,
 } from '../../src/interfaces.js';
 import {
+  LIFECYCLE_HEAL_WINDOW_MS,
   LIFECYCLE_OWED_TAG_PREFIX,
   LIFECYCLE_PENDING_TAG,
   lifecycleRunId,
@@ -205,7 +206,8 @@ describe('lifecycle subscribers known only from announcements', () => {
     // The Python subscriber is deployed after the run settled; a later instance sees it announced.
     board.set('py', announcing('notify', [runCompletedEvent('ingest')]));
     const later = new WorkflowEngine({ store, transport });
-    await later.sweepLifecycleEvents();
+    // Past the heal window: only a republish reaches a run settled that long before.
+    await later.sweepLifecycleEvents(Date.now() + LIFECYCLE_HEAL_WINDOW_MS + 60_000);
     expect(await later.republishLifecycle({ workflow: 'ingest' })).toEqual({
       runs: 1,
       started: 1,
