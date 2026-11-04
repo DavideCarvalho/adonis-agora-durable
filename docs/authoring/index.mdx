@@ -20,6 +20,7 @@ icon: PenLine
 - **[Queries & updates](/docs/durable/authoring/queries-and-updates)**: read a live run's state without affecting it (`ctx.setEvent` + `engine.getEvent`), steer it with validated updates that can be rejected before they reach the run, and index runs with search attributes.
 - **[Events](/docs/durable/authoring/events)**: `engine.publishEvent` resumes every run parked on a matching `ctx.waitForEvent` and starts every `onEvent` subscriber, with idempotent publishing, debounce/batch coalescing and buffered delivery.
 - **[Event-triggered workflows](/docs/durable/authoring/event-triggers)**: start a workflow from an AdonisJS emitter event (`@OnEvent`) or an `@adonis-agora/diagnostics` channel (`@OnDiagnostic`), with the payload as input.
+- **[Chaining workflows](/docs/durable/authoring/lifecycle-events)**: start a workflow when another one completes or fails (`@OnWorkflowCompleted`, `@OnWorkflowFailed`), exactly once per settled run, with a typed `where` and `input`.
 - **[Durable webhooks](/docs/durable/authoring/webhooks)**: `ctx.webhook()` creates a callback URL to hand to a third party inside a step. The run then suspends, using no compute, until the callback arrives.
 - **[External tasks & control primitives](/docs/durable/authoring/external-tasks)**: `ctx.task` with `engine.completeTask` / `failTask` for work a foreign system completes, `ctx.transaction` for a step that checkpoints in the same transaction as its write, and `ctx.breakpoint` to pause a run for a human.
 

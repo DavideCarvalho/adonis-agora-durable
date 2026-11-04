@@ -24,7 +24,7 @@ export interface TestEngine {
   store: InMemoryStateStore;
   transport: InMemoryTransport;
   clock: MutableClock;
-  /** Advance the clock by `ms` and resume any durable sleeps now due. */
+  /** Advance the clock by `ms`, resume any durable sleeps now due, and publish owed lifecycle events. */
   tick(ms: number): Promise<RunResult[]>;
   /**
    * Enqueue a run and wait for it to settle (terminal or suspended). `engine.start` only enqueues
@@ -54,7 +54,9 @@ export function createTestEngine(): TestEngine {
     clock,
     async tick(ms: number): Promise<RunResult[]> {
       clock.advance(ms);
-      return engine.resumeDueTimers(clock.now());
+      const resumed = await engine.resumeDueTimers(clock.now());
+      await engine.sweepLifecycleEvents(clock.now());
+      return resumed;
     },
     async run(workflow, input, runId, opts): Promise<RunResult> {
       // `start` is overloaded per ref kind; a `WorkflowRef` union fits neither overload directly, so

@@ -1196,6 +1196,7 @@ export class LucidStateStore implements StateStore {
       if (query.workflows.length) q.whereIn('workflow', query.workflows);
       else q.whereRaw('1 = 0');
     }
+    if (query.excludeWorkflows?.length) q.whereNotIn('workflow', query.excludeWorkflows);
     if (query.namespace !== undefined) {
       q.whereIn('namespace', namespaceFilterValues(query.namespace));
     }

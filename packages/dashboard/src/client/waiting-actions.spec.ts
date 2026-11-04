@@ -40,6 +40,7 @@ describe('classifyWaitToken: the token prefix carries which console verb answers
     expect(classifyWaitToken('bp:run-1:4')).toBeUndefined();
     expect(classifyWaitToken('breakpoint:review')).toBeUndefined();
     expect(classifyWaitToken('child:run-2')).toBeUndefined();
+    expect(classifyWaitToken('runwait:ingest-1#run-3#2')).toBeUndefined();
   });
 });
 

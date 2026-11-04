@@ -88,7 +88,8 @@ export interface StepCheckpoint {
  *  `tenant` pod that can't do the scan), in which case `deriveRunState` falls back to its other
  *  signals (timeline, worker health) instead of the "awaiting" detail line. */
 export interface RunWaiting {
-  on: 'signal' | 'webhook' | 'child' | 'breakpoint';
+  /** `run` is a `ctx.waitForRun`, whose `name` is the run waited for. */
+  on: 'signal' | 'webhook' | 'child' | 'breakpoint' | 'run';
   name: string;
 }
 
@@ -120,6 +121,107 @@ export interface RunDetail {
   fans?: FanSummary[] | undefined;
   /** How many children the run has, when `children` lists only the first of them. */
   childCount?: number | undefined;
+  /** Runs this run's settling started (`@OnWorkflowCompleted` / `@OnWorkflowFailed` subscribers). */
+  triggered?: string[] | undefined;
+  /** The run whose settling started this one, with its status and the trace id of its span when
+   *  the server read them. */
+  triggeredBy?: LifecycleSource | undefined;
+  /** The workflows a settled run's lifecycle event goes to; absent when there are none. */
+  lifecycleSubscribers?: string[] | undefined;
+  /** Who starts whom through lifecycle events, for this run's workflow, when anyone does. */
+  workflowLifecycle?: WorkflowLifecycleLinks | undefined;
+  /** Where a settled run's lifecycle event stands for each subscriber. */
+  lifecycleDeliveries?: LifecycleDelivery[] | undefined;
+  /** The runs this suspended run waits for through `ctx.waitForRun`. */
+  waitsFor?: RunWaitLink[] | undefined;
+  /** The runs waiting for this one through `ctx.waitForRun`. */
+  awaitedBy?: RunWaitLink[] | undefined;
+}
+
+/** The run whose settling started a run. */
+export interface LifecycleSource {
+  runId: string;
+  kind: 'completed' | 'failed';
+  status?: RunStatus | undefined;
+  namespace?: string | undefined;
+  /** The W3C trace id of the source run's span, when it recorded one. */
+  traceId?: string | undefined;
+}
+
+/** One end of a `ctx.waitForRun` wait: the other run, the waiting run's `seq`, and the other run's
+ *  status when the server could read it. */
+export interface RunWaitLink {
+  runId: string;
+  seq: number;
+  status?: RunStatus | undefined;
+  namespace?: string | undefined;
+}
+
+/**
+ * Where a settled run's lifecycle event stands for one subscriber: `started` (its run exists),
+ * `owed` (still pending), `failed` (its last delivery failed; a republish retries it), `coalesced`
+ * (routed into a debounce/batch accumulator) or `not-started`.
+ */
+export interface LifecycleDelivery {
+  subscriber: string;
+  state: 'started' | 'owed' | 'failed' | 'coalesced' | 'not-started';
+  /** The subscriber's run when `started`; the accumulator run when `coalesced` and derivable. */
+  runId?: string | undefined;
+  status?: RunStatus | undefined;
+  namespace?: string | undefined;
+  /** Epoch ms the subscriber became owed. */
+  owedSince?: number | undefined;
+  /** Epoch ms the sweep drops an owed subscriber no live instance has. */
+  orphanAt?: number | undefined;
+  /** Why a `failed` subscriber could not be started, when the server knows it. */
+  error?: string | undefined;
+}
+
+/**
+ * One workflow that starts when another settles (`GET /workflows/:name/lifecycle`). `local` is what
+ * the answering instance registers, with what its subscription does to the payload; an entry only
+ * live workers announce (a Python subscriber) states none of that.
+ */
+export interface LifecycleSubscriptionLink {
+  /** The other end: the subscriber on `startsOnSettle`, the settling workflow on `startedBy`. */
+  workflow: string;
+  kind: 'completed' | 'failed';
+  /** Registered on the answering instance. */
+  local: boolean;
+  /** Announced by at least one live worker. */
+  announced: boolean;
+  /** The subscription filters payloads with `where`. */
+  where: boolean;
+  /** The subscription maps the payload to the run's input with `input`. */
+  input: boolean;
+  /** The subscriber coalesces events: debounced or batched, and whether per `key`. */
+  coalesce?: { mode: 'debounce' | 'batch'; keyed: boolean } | undefined;
+}
+
+/** Who starts whom through lifecycle events, for one workflow. */
+export interface WorkflowLifecycleLinks {
+  workflow: string;
+  /** Workflows that start when this one settles. */
+  startsOnSettle: LifecycleSubscriptionLink[];
+  /** Workflows whose settling starts this one. */
+  startedBy: LifecycleSubscriptionLink[];
+}
+
+/**
+ * `GET /workflows/:name/lifecycle`: the workflow's lifecycle links plus, when the dashboard reads its
+ * process's metrics, how many runs each subscriber in `startsOnSettle` was started for and how many
+ * starts failed, since that process started.
+ */
+export interface WorkflowLifecyclePage extends WorkflowLifecycleLinks {
+  triggerCounts?: Record<string, { triggered: number; failed: number }> | undefined;
+}
+
+/** What republishing a run's lifecycle event did (`POST /runs/:id/republish-lifecycle`). */
+export interface RepublishLifecycleResult {
+  runs: number;
+  /** Subscriber runs it started; one that already existed is not counted. */
+  started: number;
+  failed: { runId: string; subscriber: string; error: string }[];
 }
 
 /**
@@ -336,14 +438,27 @@ export interface EngineEvent {
     | 'step.started'
     | 'step.completed'
     | 'step.failed'
-    | 'step.progress';
+    | 'step.progress'
+    | 'capability.unavailable'
+    | 'protocol.incompatible'
+    | 'run.routed'
+    | 'run.unrouted'
+    | 'run.triggered'
+    | 'run.trigger_failed';
   runId: string;
   workflow?: string;
+  namespace?: string;
   seq?: number;
+  /** The step name; the handler on `run.routed`; the subscriber on `run.triggered` / `run.trigger_failed`. */
   name?: string;
   kind?: StepKind;
   durationMs?: number;
   event?: StepEvent;
+  error?: StepError;
+  /** Why a `run.unrouted` run's onError routes were not applied. */
+  reason?: string;
+  /** The run a `run.triggered` event started. */
+  triggeredRunId?: string;
   at: string;
 }
 
@@ -819,6 +934,23 @@ export const durableClient = {
     });
     return res.result;
   },
+  /** Who starts whom through lifecycle events, for one workflow. */
+  workflowLifecycle(workflow: string): Promise<WorkflowLifecyclePage> {
+    return http<WorkflowLifecyclePage>(`/workflows/${encodeURIComponent(workflow)}/lifecycle`);
+  },
+  /** Publish a settled run's lifecycle event again, to the subscribers it has not started yet (or
+   *  only `subscriber`). */
+  async republishLifecycle(id: string, subscriber?: string): Promise<RepublishLifecycleResult> {
+    const res = await http<{ result: RepublishLifecycleResult }>(
+      `/runs/${encodeURIComponent(id)}/republish-lifecycle`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(subscriber !== undefined ? { subscriber } : {}),
+      },
+    );
+    return res.result;
+  },
   /** Re-dispatch a run's stuck `pending` remote steps. Returns the run's status plus how many steps
    *  were re-dispatched. */
   async redispatch(
@@ -895,6 +1027,8 @@ export const durableClient = {
   },
   /** Live-tail a run's lifecycle events over SSE. Calls `onEvent` per event; returns a closer. */
   streamRun(id: string, onEvent: (event: EngineEvent) => void): () => void {
+    // A runtime without EventSource (a server render, a DOM shim) gets no live tail; the poll stays.
+    if (typeof EventSource === 'undefined') return () => {};
     const source = new EventSource(`${apiBase()}/runs/${encodeURIComponent(id)}/stream`);
     source.onmessage = (msg) => {
       try {

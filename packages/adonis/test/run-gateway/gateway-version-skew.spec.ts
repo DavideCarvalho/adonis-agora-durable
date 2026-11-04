@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { gatewayDashboardEngine } from '../../src/dashboard/gateway-adapter.js';
+import { republishLifecycleRun, workflowLifecycle } from '../../src/dashboard/handlers.js';
 import { WorkflowEngine } from '../../src/engine.js';
 import type {
   RunReply,
@@ -8,7 +10,11 @@ import type {
   TenantEvent,
 } from '../../src/interfaces.js';
 import type { RunGateway } from '../../src/run-gateway/interface.js';
-import { ProxyRunGateway, type ProxyTransport } from '../../src/run-gateway/proxy-run-gateway.js';
+import {
+  ProxyRunGateway,
+  type ProxyTransport,
+  RunGatewayError,
+} from '../../src/run-gateway/proxy-run-gateway.js';
 import {
   type ResponderTransport,
   RunRequestResponder,
@@ -283,5 +289,125 @@ describe('ProxyRunGateway against an older control plane', () => {
     const proxy = new ProxyRunGateway(wire, { partition: 'acme', requestTimeoutMs: 2_000 });
     await expect(proxy.getRunDetail('p')).rejects.toThrow('store unavailable (getRunDetail)');
     expect(wire.requests).toEqual(['getRunDetail']);
+  });
+});
+
+describe('lifecycle verbs against an older control plane', () => {
+  for (const legacyStyle of ['message', 'code'] as const) {
+    it(`fails fast with "not supported by this server" (${legacyStyle} style), and remembers it`, async () => {
+      const wire = new Wire();
+      await controlPlane(wire);
+      wire.legacy = new Set(['republishLifecycle', 'workflowLifecycle']);
+      wire.legacyStyle = legacyStyle;
+      const proxy = new ProxyRunGateway(wire, { partition: 'acme', requestTimeoutMs: 5_000 });
+
+      const started = Date.now();
+      const runError = await proxy.republishLifecycle({ runId: 'p' }).catch((e: unknown) => e);
+      expect(runError).toBeInstanceOf(RunGatewayError);
+      expect((runError as Error).message).toBe(
+        'republishLifecycle is not supported by this server: the control plane is older than this tenant',
+      );
+      expect((runError as { code?: string }).code).toBe('unsupported-request');
+      await expect(proxy.republishLifecycle({ workflow: 'parent' })).rejects.toThrow(
+        /not supported by this server/,
+      );
+      await expect(proxy.workflowLifecycle('parent')).rejects.toThrow(
+        /^workflowLifecycle is not supported by this server/,
+      );
+      expect(Date.now() - started).toBeLessThan(1_000);
+      // The second republish was not sent: the missing verb is remembered.
+      expect(wire.requests.filter((k) => k === 'republishLifecycle')).toHaveLength(1);
+    });
+  }
+
+  it('a control plane whose gateway lacks the verbs answers unsupported, not a timeout', async () => {
+    const wire = new Wire();
+    await controlPlane(
+      wire,
+      (g) =>
+        new Proxy(g, {
+          get(target, prop, receiver) {
+            if (prop === 'republishLifecycle' || prop === 'workflowLifecycle') return undefined;
+            const value = Reflect.get(target, prop, receiver);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        }),
+    );
+    const proxy = new ProxyRunGateway(wire, { partition: 'acme', requestTimeoutMs: 5_000 });
+    await expect(proxy.republishLifecycle({ runId: 'p' })).rejects.toBeInstanceOf(RunGatewayError);
+    await expect(proxy.workflowLifecycle('parent')).rejects.toBeInstanceOf(RunGatewayError);
+  });
+
+  it('treats an empty ok reply from an older responder as unsupported', async () => {
+    const wire = new Wire();
+    await controlPlane(wire);
+    const send = wire.dispatchRunRequest.bind(wire);
+    wire.dispatchRunRequest = async (msg) => {
+      if (msg.body.kind !== 'workflowLifecycle') return send(msg);
+      wire.requests.push(msg.body.kind);
+      await wire.publishRunReply({
+        requestId: msg.requestId,
+        result: { ok: true, data: undefined },
+      });
+    };
+    const proxy = new ProxyRunGateway(wire, { partition: 'acme', requestTimeoutMs: 5_000 });
+    const error = await proxy.workflowLifecycle('parent').catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(RunGatewayError);
+    expect((error as RunGatewayError).code).toBe('unsupported-request');
+  });
+
+  it('rejects a malformed republish target with an error reply', async () => {
+    const wire = new Wire();
+    await controlPlane(wire);
+    await wire.dispatchRunRequest({
+      requestId: 'q1',
+      tenant: 'acme',
+      body: { kind: 'republishLifecycle', target: { runId: 'p', workflow: 'parent' } },
+    } as unknown as RunRequest);
+    expect(wire.replies.at(-1)).toEqual({
+      requestId: 'q1',
+      result: {
+        ok: false,
+        error: { message: 'republishLifecycle needs a { runId } or { workflow } target' },
+      },
+    });
+  });
+});
+
+describe("a tenant pod's dashboard over the lifecycle verbs", () => {
+  it('answers the workflow page and republish against a current control plane', async () => {
+    const wire = new Wire();
+    await controlPlane(wire);
+    const deps = {
+      engine: gatewayDashboardEngine(
+        new ProxyRunGateway(wire, { partition: 'acme', requestTimeoutMs: 2_000 }),
+      ),
+    };
+    const page = await workflowLifecycle(deps, { params: { name: 'parent' }, query: {} });
+    expect(page).toEqual({
+      status: 200,
+      body: { workflow: 'parent', startsOnSettle: [], startedBy: [] },
+    });
+    const republished = await republishLifecycleRun(deps, { params: { id: 'p' }, query: {} });
+    expect(republished).toEqual({
+      status: 200,
+      body: { result: { runs: 1, started: 0, failed: [] } },
+    });
+  });
+
+  it('answers 501 when the control plane is older than the verbs', async () => {
+    const wire = new Wire();
+    await controlPlane(wire);
+    wire.legacy = new Set(['republishLifecycle', 'workflowLifecycle']);
+    const deps = {
+      engine: gatewayDashboardEngine(
+        new ProxyRunGateway(wire, { partition: 'acme', requestTimeoutMs: 2_000 }),
+      ),
+    };
+    const page = await workflowLifecycle(deps, { params: { name: 'parent' }, query: {} });
+    expect(page.status).toBe(501);
+    expect((page.body as { error: string }).error).toMatch(/not supported by this server/);
+    const republished = await republishLifecycleRun(deps, { params: { id: 'p' }, query: {} });
+    expect(republished.status).toBe(501);
   });
 });

@@ -95,6 +95,7 @@ export * from './handshake/directory.js';
 export * from './handshake/negotiate.js';
 export * from './handshake/routing.js';
 export * from './interfaces.js';
+export * from './lifecycle-events.js';
 export * from './metrics.js';
 export { asHeartbeat, withScheduleOrigin } from './observability-scope.js';
 export * from './on-error.js';
@@ -111,6 +112,8 @@ export {
   ProxyRunGateway,
   type ProxyRunGatewayOptions,
   type ProxyTransport,
+  RunGatewayError,
+  type RunGatewayErrorCode,
 } from './run-gateway/proxy-run-gateway.js';
 export {
   type ResponderTransport,

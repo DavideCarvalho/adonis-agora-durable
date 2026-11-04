@@ -69,11 +69,13 @@ export {
   metricsText,
   ok,
   redispatchPendingRun,
+  republishLifecycleRun,
   retryRun,
   retryWithInputRun,
   runValues,
   topology,
   workers,
+  workflowLifecycle,
 } from './handlers.js';
 export { renderLoginPage } from './login_page.js';
 export { RUN_STATUSES, RunFilter } from './run-filter.js';

@@ -96,6 +96,29 @@ export function durableDashboard(opts: DurableDashboardOptions = {}): DashboardS
           },
           {
             kind: 'table',
+            title: 'Failed triggers',
+            data: { provider: 'durable.failedTriggers' },
+            columns: [
+              { key: 'at', label: 'Time' },
+              { key: 'workflow', label: 'Source workflow' },
+              { key: 'runId', label: 'Source run', link: { href: runHref } },
+              { key: 'subscriber', label: 'Subscriber' },
+              { key: 'error', label: 'Error' },
+            ],
+          },
+          {
+            kind: 'table',
+            title: 'Owed lifecycle events',
+            data: { provider: 'durable.owedLifecycle' },
+            columns: [
+              { key: 'settledAt', label: 'Settled' },
+              { key: 'workflow', label: 'Workflow' },
+              { key: 'runId', label: 'Run', link: { href: runHref } },
+              { key: 'owed', label: 'Owed to' },
+            ],
+          },
+          {
+            kind: 'table',
             // Lists EVERY worker group (starved ones first); the Status column flags STARVED (queued
             // work, zero live workers). "Starved worker groups" read as if every row were starved.
             title: 'Worker health',
@@ -106,6 +129,13 @@ export function durableDashboard(opts: DurableDashboardOptions = {}): DashboardS
               { key: 'liveWorkers', label: 'Workers' },
               { key: 'status', label: 'Status' },
             ],
+          },
+          {
+            kind: 'stat',
+            title: 'Owed runs',
+            data: { provider: 'durable.owedLifecycle', query: { metric: 'count' } },
+            spark: false,
+            thresholds: { warn: 1, bad: 50, direction: 'up-bad' },
           },
         ],
       },
@@ -133,6 +163,26 @@ export function durableDashboard(opts: DurableDashboardOptions = {}): DashboardS
               { key: 'lastAdjust', label: 'Last adjust' },
               { key: 'lastBeat', label: 'Last beat' },
             ],
+          },
+        ],
+      },
+      {
+        // Workflows started when another one settles (`run.completed:<wf>` / `run.failed:<wf>`).
+        title: 'Lifecycle',
+        cols: 2,
+        panels: [
+          {
+            kind: 'timeseries',
+            title: 'Lifecycle triggers over time',
+            data: { provider: 'durable.lifecycleTriggers' },
+            series: ['triggered', 'failed'],
+            style: 'stacked',
+          },
+          {
+            kind: 'topN',
+            title: 'Triggered by subscriber',
+            data: { provider: 'durable.lifecycleTriggers', query: { metric: 'bySubscriber' } },
+            limit: 10,
           },
         ],
       },

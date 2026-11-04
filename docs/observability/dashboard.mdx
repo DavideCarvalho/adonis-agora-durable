@@ -164,7 +164,7 @@ All routes are relative to `path` (default `/durable`), and every one of them ru
 | `GET` | `/durable` | the React console (`index.html`, with the base path and API base injected) |
 | `GET` | `/durable/assets/:file` | the console's hashed JS/CSS bundle, served immutable |
 
-The console routes client-side on the URL hash (`#/run/<id>`), so a deep link needs no server-side rewrite.
+The console routes client-side on the URL hash (`#/run/<id>` for a run, `#/workflow/<name>` for a [workflow's page](#workflow-pages)), so a deep link needs no server-side rewrite.
 
 ### Reading runs
 
@@ -172,7 +172,7 @@ The console routes client-side on the URL hash (`#/run/<id>`), so a deep link ne
 | --- | --- | --- |
 | `GET` | `/durable/api/runs` | list runs — see the filters below |
 | `GET` | `/durable/api/runs/values` | distinct values of one filter axis, with counts — what the pickers list |
-| `GET` | `/durable/api/runs/:id` | run detail: the run, its step `timeline`, and its `children`; a fan of more than 50 members comes back summarized in `fans` unless `?full=true` |
+| `GET` | `/durable/api/runs/:id` | run detail: the run, its step `timeline`, its `children`, its lifecycle links (`triggered`, `triggeredBy` with the source's `status` and `traceId`), `lifecycleSubscribers`, `lifecycleDeliveries`, its `ctx.waitForRun` links (`waitsFor`, `awaitedBy`) and its workflow's `workflowLifecycle` (absent when no workflow starts it or starts on it); a fan of more than 50 members comes back summarized in `fans` unless `?full=true` |
 | `GET` | `/durable/api/runs/:id/fans/:group` | one page of a summarized fan's members (`offset`, `limit` up to 500, `failed=true`), with the `total` |
 | `GET` | `/durable/api/runs/:id/stream` | Server-Sent Events: this run's lifecycle events, live |
 
@@ -240,7 +240,7 @@ const source = new EventSource(`/durable/api/runs/${runId}/stream`)
 source.onmessage = (msg) => {
   const event = JSON.parse(msg.data)
   // event.type is one of run.started / run.completed / run.failed / run.suspended /
-  // run.routed / run.unrouted / step.started / step.completed / step.failed /
+  // run.routed / run.unrouted / run.triggered / run.trigger_failed / step.started / step.completed / step.failed /
   // step.progress (a live step event, never persisted) / capability.unavailable / protocol.incompatible
   console.log(event.type, event.name, event.durationMs)
 }
@@ -263,6 +263,7 @@ The tail is **cross-pod** when the engine has a [control plane](/docs/durable/tr
 | `POST` | `/durable/api/runs/:id/continue` | resume a run parked at a `ctx.breakpoint()` |
 | `POST` | `/durable/api/runs/:id/cancel` | cancel the run — ask for the saga undo with `?compensate=true` or a `{ compensate: true }` body |
 | `POST` | `/durable/api/runs/:id/redispatch` | re-enqueue every remote step still `pending` on this run |
+| `POST` | `/durable/api/runs/:id/republish-lifecycle` | publish a settled run's [lifecycle event](/docs/durable/authoring/lifecycle-events#republishing-and-backfilling) again, to the subscribers it has not started (or `{ subscriber }` only); answers `{ result: { runs, started, failed } }`, `409` for a run that has not settled, `501` on a tenant pod whose control plane is older than the verb |
 | `POST` | `/durable/api/runs/:id/signal` | deliver a signal payload on a token the run is waiting on |
 | `POST` | `/durable/api/runs/:id/update/:name` | deliver a validated update to a `ctx.onUpdate` point |
 | `POST` | `/durable/api/runs/:id/tasks/:name/complete` | complete an external `ctx.task` |
@@ -392,6 +393,7 @@ These are the console's Schedules tab, riding [`engine.listSchedules` / `setSche
 | `GET` | `/durable/api/health` | the compact shape: queue depth and a `stalled` flag per group |
 | `GET` | `/durable/api/topology` | this pod's `role`, plus its `tenant` when it is a store-less pod |
 | `GET` | `/durable/api/compat` | protocol/capability negotiation across the fleet, plus blocked runs |
+| `GET` | `/durable/api/workflows/:name/lifecycle` | who starts whom through [lifecycle events](/docs/durable/authoring/lifecycle-events): `{ workflow, startsOnSettle, startedBy, triggerCounts? }` (see [Workflow pages](#workflow-pages)); on a tenant pod only its namespace's subscriptions, `501` when its control plane is older than the verb |
 | `GET` | `/durable/api/openapi.json` | the machine-readable API contract (OpenAPI 3.1) |
 
 `GET /api/workers` returns the raw `GroupHealth[]` — for each routing token, its queue `depth` and the **individual live workers** with their `instanceId` and `lastBeatAt`. That is what tells "one worker is wedged" apart from "the whole group is down".
@@ -411,10 +413,69 @@ The routes are all named (`durable_dashboard.index`, `durable_dashboard.runs.sho
 - **Step timeline** — the selected run's steps in order, tagged by kind (local / remote / sleep / signal), with worker group, queue wait and duration. In-flight steps appear while they run, not only on completion — a remote step in flight reads as `pending`, and a local step's executing body as `running` (the [`trackStepStart`](/docs/durable/concepts/workflows-and-steps#in-flight-visibility) option).
 - **Live tail** — the open run streams its events over SSE, so a long run updates without a reload.
 - **Children and lineage** — a run's [child workflows](/docs/durable/authoring/child-workflows) are linked from its detail, as is the original of a fix-and-replay run.
+- **Lifecycle triggers** — a run started by another run's [lifecycle event](/docs/durable/authoring/lifecycle-events) links back to it ("started by `<run>` on completed / failed"), with the source run's status and, when the source recorded its span ([OpenTelemetry](/docs/durable/observability/otel)), its trace id with a copy button. A settled run with lifecycle subscribers lists them under **Lifecycle subscribers**, one row each (see [Lifecycle subscribers of a run](#lifecycle-subscribers-of-a-run)). Neither end is a child: they are not cancelled or awaited together.
+- **Waits on other runs** — a run suspended in [`ctx.waitForRun`](/docs/durable/concepts/sleep-and-signals) shows "Waiting for run `<id>`", linked, with that run's current status, and the run it waits for shows **Awaited by** with each waiting run.
+- **Workflow pages** — who starts whom through lifecycle events, per workflow, with each subscriber's started and failed counts. See [Workflow pages](#workflow-pages).
+- **Lifecycle pending** — a chip under the tag filter selects the settled runs still tagged `durable:lifecycle:pending`, whose lifecycle event is owed to some subscriber. The registry's `__lifecycle_registry` runs never show.
 - **Wide fans** — a fan of more than 50 members draws as one node in the graph and one row in the timeline, labelled `label ×total`, with a segmented progress bar against its declared size, a legend (`done`, `failed`, `running`, `pending`, `not started`), `600 of 40000 started`, and its sampled failures. Once the run has finished (`completed`, `failed`, `cancelled` or `dead`), members still running or pending read as `interrupted` and the ones never sent as `never ran`, marked `(failFast)` when a failFast fan stopped early. A `blocked` or `suspended` run is not finished, so its fans stay in flight. Expanding it lists the members in a virtualized list that pages them in as you scroll, with a failed-only toggle. The run header lists the first 12 children and counts the rest, and only the first 50 children's details are fetched to label their rows.
-- **Actions** — retry, cancel, cancel + undo ([saga compensation](/docs/durable/reliability/sagas)), fix-and-replay, redispatch, continue, the [human-in-the-loop verbs](#human-in-the-loop-signals-updates-and-tasks) (deliver a signal, a validated update, or a task completion), and the bulk equivalents of retry and cancel.
+- **Actions** — retry, cancel, cancel + undo ([saga compensation](/docs/durable/reliability/sagas)), fix-and-replay, redispatch, continue, republish lifecycle event (on a settled run whose workflow has [lifecycle subscribers](/docs/durable/authoring/lifecycle-events#republishing-and-backfilling); a confirm dialog, then how many subscriber runs it started and which failed), the [human-in-the-loop verbs](#human-in-the-loop-signals-updates-and-tasks) (deliver a signal, a validated update, or a task completion), and the bulk equivalents of retry and cancel.
 - **Schedules** — the ticked [scheduled workflows](/docs/durable/authoring/scheduling) with their fire windows and effective pause state, plus pause / resume / run-now controls that apply fleet-wide at runtime.
 - **Worker cards** — on the BullMQ, queue and db transports, each worker's live telemetry: concurrency, in-flight, RSS/CPU, throughput and p95.
+
+### Workflow pages
+
+The workflow name in a run's header links to that workflow's page (`#/workflow/<name>`), which lists two things:
+
+- **Starts when it settles**: the subscribers of `run.completed:<workflow>` and `run.failed:<workflow>`.
+- **Started by**: the workflows whose settling starts this one.
+
+Each entry links to the other workflow's page and is chipped with its `kind` (`on completed` / `on failed`) and what its subscription does: `where`, `input`, `debounce` / `batch` (`by key` when it has a `key`), or `announced` when this instance does not register it and only a live worker announces it (a [Python subscriber](/docs/durable/authoring/lifecycle-events#subscribers-in-python), or a TypeScript one served elsewhere). An announcement names only the event, so an announced entry states no `where`, `input` or coalescing. The same two lists appear on the run detail, under the lifecycle links, when either is non-empty.
+
+When the dashboard serves an engine (not a store-less tenant pod), each "Starts when it settles" entry also shows how many runs that subscriber was started for and how many starts failed (`12 started · 1 failed`), counted by the dashboard's own process since it started, from the same counters as `GET /metrics` (`durable_runs_triggered_total`, `durable_runs_trigger_failed_total`). They count what that process published, not the fleet's total; for the fleet, see the [Telescope Lifecycle section](/docs/durable/observability/telescope) or your metrics backend.
+
+The data comes from `engine.workflowLifecycle(workflow)`, built from the answering instance's registry plus the subscriptions the fleet announces (read at most every 5 seconds). It is a run gateway verb (`workflowLifecycle`) that a tenant proxy carries: on a store-less tenant pod the control plane answers with the subscriptions of the tenant's namespace only (as it does for the run detail's `workflowLifecycle` and `lifecycleSubscribers`), and the page answers `501` while the control plane is older than the verb. Announced entries come from the lifecycle subscription registry and live worker descriptors; the registry's own `__lifecycle_registry` runs never show in the run list.
+
+```json
+{
+  "workflow": "ingestion",
+  "startsOnSettle": [
+    { "workflow": "refresh-summaries", "kind": "completed", "local": true, "announced": false,
+      "where": true, "input": true, "coalesce": { "mode": "debounce", "keyed": true } },
+    { "workflow": "notify", "kind": "failed", "local": false, "announced": true,
+      "where": false, "input": false }
+  ],
+  "startedBy": [
+    { "workflow": "upload", "kind": "completed", "local": true, "announced": false,
+      "where": false, "input": false }
+  ],
+  "triggerCounts": {
+    "refresh-summaries": { "triggered": 12, "failed": 0 },
+    "notify": { "triggered": 0, "failed": 1 }
+  }
+}
+```
+
+### Lifecycle subscribers of a run
+
+A settled run whose lifecycle event goes to some workflow lists each subscriber with where the event stands for it (`lifecycleDeliveries` on `GET /api/runs/:id`):
+
+| State | Means | Links to |
+| --- | --- | --- |
+| `started` | Its run exists (a `durable:triggered:<subscriber>` tag). | the subscriber's run, with its status |
+| `owed` | Still pending (a `durable:lifecycle:owed:<subscriber>` tag), shown as `owed for 2h`. When no live instance registers or announces the subscriber for the run's namespace, also `orphan in 22h`: when the [sweep](/docs/durable/authoring/lifecycle-events#which-subscribers-a-run-owes) drops it. | — |
+| `coalesced` | Routed into the subscriber's debounce/batch accumulator. | the accumulator run, when the instance registers the subscriber and can compute its `key` |
+| `failed` | Its last delivery failed (a `durable:trigger_failed:<subscriber>` tag): its `where` threw, its input was rejected, its start failed, or the sweep dropped it as an orphan. The reason is not stored with the run: the row says so and points at the `run.trigger_failed` event, which the run's **Events** panel shows when it arrives while the page is open. **Republish lifecycle event** retries it, and a start clears the state. | — |
+| `not started` | No run and nothing owed: its `where` declined the event, it coalesces on another instance, or it subscribed after the run settled. | — |
+
+The rows come from the run's tags and the subscribers of its namespace, plus one batched read of the started runs' statuses. The **Republish lifecycle event** action stays next to them.
+
+### Live events of a run
+
+The run detail has an **Events** panel listing the run's engine events as the live stream (`GET /api/runs/:id/stream`) delivers them, newest first: the time, the type, the step, subscriber or handler it names, and its error. A `run.triggered` links to the run it started and a `run.trigger_failed` names the subscriber and the reason; the `run.started` of a lifecycle-started run links back to its source run, and of a child run to its parent; a child step's events link to the child run. A `run.trigger_failed` that arrives also fills in that subscriber's reason in **Lifecycle subscribers**.
+
+Nothing is stored or fetched for it: it shows what arrives while the page is open, the last 200 events, and starts empty on every load (the empty panel says so). The stream stays open on a settled run too, since a republish or the lifecycle sweep still reports to it, and it carries only what the stream route already sends, so a tenant pod sees its own runs' events as before.
+
+The run detail's `ETag` also covers what it reads from other runs (their statuses, the waits on the run, the fleet's subscriptions), so a subscriber run that finishes changes the source run's detail even though the source run itself did not change.
 
 ### The `waiting` state
 
@@ -426,8 +487,9 @@ The routes are all named (`durable_dashboard.index`, `durable_dashboard.runs.sho
 | `webhook` | a [`ctx.webhook().wait()`](/docs/durable/authoring/webhooks) callback |
 | `child` | a [child run](/docs/durable/authoring/child-workflows); `name` is the child's run id |
 | `breakpoint` | a `ctx.breakpoint()` — a human has to release it |
+| `run` | a [`ctx.waitForRun`](/docs/durable/concepts/sleep-and-signals); `name` is the run waited for |
 
-The kind comes from the waiter token's prefix, so no extra store read is needed: `wh:` is a webhook, `child:` a child run, `bp:` a breakpoint (named `breakpoint` rather than its raw `bp:<runId>:<seq>` token), an `event:` token a `ctx.waitForEvent` (named by its decoded event name), and anything else a signal named by the token itself. `engine.continue` resumes a breakpoint through the same signal machinery.
+The kind comes from the waiter token's prefix, so no extra store read is needed: `wh:` is a webhook, `child:` a child run, `bp:` a breakpoint (named `breakpoint` rather than its raw `bp:<runId>:<seq>` token), `runwait:` a `ctx.waitForRun` (named by the run it waits for), an `event:` token a `ctx.waitForEvent` (named by its decoded event name), and anything else a signal named by the token itself. `engine.continue` resumes a breakpoint through the same signal machinery.
 
 A `suspended` run with no waiter gets no `waiting` value, and that absence is itself informative: a bare `ctx.sleep`, an in-flight remote step and a run whose wake was lost all fall into that bucket. Use [`durable:runs --stale`](/docs/durable/cli) to separate the last one from the first two.
 

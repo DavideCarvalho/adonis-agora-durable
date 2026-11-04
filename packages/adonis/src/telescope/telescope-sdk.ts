@@ -137,3 +137,21 @@ export interface TelescopeExtension {
   /** Contribute known scheduled tasks to telescope's Live Schedules screen. */
   schedules?(ctx: ExtensionContext): ScheduleContribution[] | Promise<ScheduleContribution[]>;
 }
+
+/**
+ * What a watcher hands to Telescope's `safeRecord` / `TelescopeStore.record` (mirror of
+ * `@adonis-agora/telescope`'s `RecordInput`): the store fills in `id`, `sequence` and `createdAt`.
+ */
+export interface TelescopeRecordInput {
+  type: string;
+  content: unknown;
+  familyHash?: string | null;
+  tags?: string[];
+  durationMs?: number | null;
+  traceId?: string | null;
+}
+
+/** Where a standalone watcher records: a host wires it to Telescope's `safeRecord`. */
+export interface WatcherContext {
+  record(entry: TelescopeRecordInput): void;
+}

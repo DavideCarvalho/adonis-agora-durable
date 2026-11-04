@@ -2,6 +2,9 @@ export { type DurableDashboardOptions, durableDashboard } from './dashboard.js';
 export {
   dedupeRunEvents,
   durableDurationProvider,
+  durableFailedTriggersProvider,
+  durableLifecycleTriggersProvider,
+  durableOwedLifecycleProvider,
   durableRecentFailuresProvider,
   durableRunsOverTimeProvider,
   durableStateBreakdownProvider,
@@ -19,5 +22,14 @@ export type {
   DataProvider,
   ExtensionContext,
   TelescopeExtension,
+  TelescopeRecordInput,
   TelescopeStoreLike,
+  WatcherContext,
 } from './telescope-sdk.js';
+export {
+  buildDurableEntry,
+  DURABLE_DIAGNOSTIC_EVENTS,
+  DurableTelescopeWatcher,
+  durableEntryTags,
+  traceIdOfTraceparent,
+} from './watcher.js';

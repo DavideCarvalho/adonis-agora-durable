@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { attachDurableDiagnostics } from '../../src/diagnostics-bridge.js';
 import { WorkflowEngine } from '../../src/engine.js';
 import type { ControlMessage, ControlPlane } from '../../src/interfaces.js';
+import { lifecycleRunId, runCompletedEvent } from '../../src/lifecycle-events.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
 
 /** A broadcast bus shared by several engines, like a Redis control plane (echoes to the sender). */
@@ -86,6 +87,34 @@ describe('attachDurableDiagnostics', () => {
     expect(seen.filter((e) => e.runId === 'p').every((e) => e.parentRunId === undefined)).toBe(
       true,
     );
+  });
+
+  it('stamps the source run on the events of a run a lifecycle event started', async () => {
+    const seen: Array<{
+      type: string;
+      runId: string;
+      lifecycleSourceRunId?: string;
+      lifecycleKind?: string;
+    }> = [];
+    slot[EMIT_SLOT] = (_lib: string, _event: string, payload: unknown) =>
+      seen.push(payload as (typeof seen)[number]);
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    const off = attachDurableDiagnostics(engine);
+    engine.register('ingest', '1', async () => 'ok');
+    engine.register('notify', '1', async () => 'sent', {
+      onEvent: [runCompletedEvent('ingest')],
+    });
+    await engine.start('ingest', {}, 'i1');
+    const notifyRun = lifecycleRunId('i1', 'completed', 'notify');
+    for (let i = 0; i < 200 && (await store.getRun(notifyRun))?.status !== 'completed'; i += 1) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    off();
+
+    const started = seen.find((e) => e.type === 'run.started' && e.runId === notifyRun);
+    expect(started).toMatchObject({ lifecycleSourceRunId: 'i1', lifecycleKind: 'completed' });
+    expect(seen.filter((e) => e.runId === 'i1').every((e) => !e.lifecycleSourceRunId)).toBe(true);
   });
 
   it('forwards only the events this instance produced, so a fleet records each event once', async () => {

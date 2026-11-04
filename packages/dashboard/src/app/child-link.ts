@@ -63,6 +63,46 @@ export function childChips(
 }
 
 /**
+ * The lifecycle-trigger links a run header lists: the run whose settling started this one, and the
+ * runs this one's settling started. Neither is a child: they are not cancelled or awaited together.
+ */
+export function triggerChips<S extends { runId: string; kind: 'completed' | 'failed' }>(detail: {
+  triggered?: readonly string[] | undefined;
+  triggeredBy?: S | undefined;
+}): { startedBy?: S; triggered: string[] } {
+  return {
+    ...(detail.triggeredBy ? { startedBy: { ...detail.triggeredBy } } : {}),
+    triggered: [...(detail.triggered ?? [])],
+  };
+}
+
+/** The run statuses after which a run has published its lifecycle event. */
+const SETTLED = new Set(['completed', 'failed', 'cancelled', 'dead']);
+
+/**
+ * The subscribers a "Republish lifecycle event" action would reach: the run's lifecycle subscribers
+ * once it has settled, else none (and the action is hidden).
+ */
+export function republishTargets(detail: {
+  run: { status: string };
+  lifecycleSubscribers?: readonly string[] | undefined;
+}): string[] {
+  return SETTLED.has(detail.run.status) ? [...(detail.lifecycleSubscribers ?? [])] : [];
+}
+
+/** A one-line account of a republish result, for the action's dialog. */
+export function republishSummary(result: {
+  started: number;
+  failed: readonly { subscriber: string; error: string }[];
+}): string {
+  const started = `${result.started} subscriber run${result.started === 1 ? '' : 's'} started`;
+  if (result.failed.length === 0) return `${started}.`;
+  return `${started}, ${result.failed.length} failed: ${result.failed
+    .map((f) => `${f.subscriber} (${f.error})`)
+    .join('; ')}.`;
+}
+
+/**
  * The settled child-run details of a `useQueries` over `['run', id]` keys, by run id. Passed as the
  * queries' `combine`: a module-level function, so the map keeps its identity until a detail changes
  * and a memo keyed on it holds.

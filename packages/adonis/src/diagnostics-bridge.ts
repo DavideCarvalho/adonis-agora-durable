@@ -1,5 +1,6 @@
 import { parentRunIdOf } from './fan-join.js';
 import type { EngineEvent } from './interfaces.js';
+import { lifecycleSourceOf } from './lifecycle-events.js';
 import { isRemoteEvent } from './remote-event.js';
 
 /** The minimal engine surface the bridge needs: a lifecycle-event subscription. */
@@ -39,7 +40,11 @@ export interface DurableDiagnosticsOptions {
  * types are forwarded — filtering is the subscriber's job. An event of a child run
  * the engine started (`ctx.all`, `ctx.child`, `ctx.startChild` without a caller-chosen id) also
  * carries `parentRunId`: each child is its own run, so that field is how a subscriber (a Telescope
- * search, say) finds every child of one parent, a whole `ctx.all` fan included.
+ * search, say) finds every child of one parent, a whole `ctx.all` fan included. An event of a run a
+ * lifecycle event started (an `@OnWorkflowCompleted` / `@OnWorkflowFailed` subscriber) carries
+ * `lifecycleSourceRunId` and `lifecycleKind`, the settled run that started it and how that run
+ * ended, so its entries link back to the source run; its `run.started` also carries the source's
+ * `sourceTraceparent` when the engine knows it.
  *
  * @returns an unsubscribe function that detaches the bridge from the engine.
  */
@@ -53,6 +58,19 @@ export function attachDurableDiagnostics(
     const emit = (globalThis as Record<symbol, unknown>)[EMIT_SLOT] as EmitFn | undefined;
     if (typeof emit !== 'function') return;
     const parentRunId = parentRunIdOf(event.runId);
-    emit('durable', event.type, parentRunId ? { ...event, parentRunId } : event);
+    const source = event.workflow
+      ? lifecycleSourceOf({ id: event.runId, workflow: event.workflow })
+      : undefined;
+    emit(
+      'durable',
+      event.type,
+      parentRunId || source
+        ? {
+            ...event,
+            ...(parentRunId ? { parentRunId } : {}),
+            ...(source ? { lifecycleSourceRunId: source.runId, lifecycleKind: source.kind } : {}),
+          }
+        : event,
+    );
   });
 }

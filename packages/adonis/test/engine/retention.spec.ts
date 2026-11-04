@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from '../../src/engine.js';
 import type { StepCheckpoint, WorkflowRun } from '../../src/interfaces.js';
+import { LIFECYCLE_PENDING_TAG } from '../../src/lifecycle-events.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
 
 const run = (over: Partial<WorkflowRun> & { id: string }): WorkflowRun => ({
@@ -42,6 +43,39 @@ describe('retention sweep', () => {
     expect((await store.getRun('young-failed'))?.id).toBe('young-failed');
     expect((await store.getRun('old-cancelled'))?.id).toBe('old-cancelled');
     expect((await store.getRun('live'))?.id).toBe('live');
+  });
+
+  it('keeps a settled run whose lifecycle event is still owed, by age and by count', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({
+      store,
+      retention: { completed: 1_000 },
+      retentionPolicies: [{ statuses: ['completed'], maxCount: 1, scope: { workflow: 'wf' } }],
+      clock: () => 10_000,
+    });
+    await store.createRun(
+      run({ id: 'owed', tags: ['etl', LIFECYCLE_PENDING_TAG], updatedAt: new Date(2_000) }),
+    );
+    await store.createRun(
+      run({ id: 'published', tags: ['durable:triggered:refresh'], updatedAt: new Date(2_000) }),
+    );
+    await store.createRun(
+      run({
+        id: 'owed-over-cap',
+        tags: [LIFECYCLE_PENDING_TAG],
+        createdAt: new Date(9_000),
+        updatedAt: new Date(9_000),
+      }),
+    );
+    await store.createRun(
+      run({ id: 'newest', createdAt: new Date(9_500), updatedAt: new Date(9_500) }),
+    );
+
+    expect(await engine.sweepRetention()).toBe(1);
+    expect(await store.getRun('published')).toBeNull();
+    expect((await store.getRun('owed'))?.id).toBe('owed');
+    expect((await store.getRun('owed-over-cap'))?.id).toBe('owed-over-cap');
+    expect((await store.getRun('newest'))?.id).toBe('newest');
   });
 
   it('is self-throttled: a second sweep inside the minute is a no-op', async () => {

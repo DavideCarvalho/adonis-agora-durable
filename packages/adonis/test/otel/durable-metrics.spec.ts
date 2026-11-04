@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { FatalError, InMemoryStateStore, WorkflowEngine } from '../../src/index.js';
+import {
+  FatalError,
+  InMemoryStateStore,
+  lifecycleRunId,
+  runCompletedEvent,
+  WorkflowEngine,
+} from '../../src/index.js';
 import type { EngineEvent } from '../../src/interfaces.js';
 import { attachDurableMetrics, MAX_TRACKED_RUN_STARTS } from '../../src/otel/durable-metrics.js';
 
@@ -85,6 +91,41 @@ describe('attachDurableMetrics', () => {
     expect(snap.runs.routed).toBe(1);
     expect(snap.runs.failed).toBe(0);
     expect(snap.routedByCode).toEqual({ invalid_line: 1 });
+  });
+
+  it('counts the subscriber runs a settled run started', async () => {
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
+    const metrics = attachDurableMetrics(engine);
+    engine.register('ingest', '1', async () => 'ok');
+    engine.register('refresh', '1', async () => 'refreshed', {
+      onEvent: [runCompletedEvent('ingest')],
+    });
+    await engine.start('ingest', {}, 'i1');
+    await engine.waitForRun(lifecycleRunId('i1', 'completed', 'refresh'));
+
+    expect(metrics.snapshot().runs.triggered).toBe(1);
+    expect(metrics.snapshot().triggeredBySubscriber).toEqual({ ingest: { refresh: 1 } });
+    metrics.reset();
+    expect(metrics.snapshot().triggeredBySubscriber).toEqual({});
+  });
+
+  it('counts the subscribers a settled run could not start', async () => {
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
+    const metrics = attachDurableMetrics(engine);
+    engine.register('ingest', '1', async () => 'ok');
+    engine.register('strict', '1', async () => 'ran', {
+      onEvent: [runCompletedEvent('ingest')],
+      validateInput: () => {
+        throw new Error('bad input');
+      },
+    });
+    await engine.start('ingest', {}, 'i1');
+    await engine.waitForRun('i1');
+    for (let i = 0; i < 50 && metrics.snapshot().runs.triggerFailed === 0; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+
+    expect(metrics.snapshot().runs.triggerFailed).toBe(1);
   });
 
   it('counts only the events this instance produced, not another pod’s re-delivered ones', async () => {

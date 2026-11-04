@@ -11,8 +11,9 @@ import type { RunWaiting, StepCheckpoint } from './durable-client.js';
  *  - `task:<runId>:<name>`   — an external `ctx.task`      → `POST /runs/:id/tasks/:name/complete|fail`
  *  - anything else            — a plain `ctx.waitForSignal` token (incl. `wh:` webhooks)
  *                               → `POST /runs/:id/signal`
- *  - `bp:`/`breakpoint` and `child:` tokens are NOT actions here: a breakpoint already has the
- *    Continue button (`POST /runs/:id/continue`), and an awaited child resolves by itself — offering
+ *  - `bp:`/`breakpoint`, `child:` and `runwait:` tokens are NOT actions here: a breakpoint already
+ *    has the Continue button (`POST /runs/:id/continue`), and an awaited child or run (`ctx.waitForRun`)
+ *    resolves by itself — offering
  *    "deliver a signal" on either would fabricate a completion the engine did not ask a human for.
  */
 export type WaitTarget =
@@ -23,6 +24,7 @@ export type WaitTarget =
 const UPDATE_PREFIX = 'update:';
 const TASK_PREFIX = 'task:';
 const CHILD_PREFIX = 'child:';
+const RUN_WAIT_PREFIX = 'runwait:';
 const BREAKPOINT_PREFIXES = ['bp:', 'breakpoint'];
 
 /** Split a run-scoped `<prefix><runId>:<name>` token into its `name`, or `undefined` when the token
@@ -39,7 +41,7 @@ function runScopedName(token: string, prefix: string): string | undefined {
  *  human verb should touch (breakpoints have Continue; children complete themselves). */
 export function classifyWaitToken(token: string): WaitTarget | undefined {
   if (BREAKPOINT_PREFIXES.some((p) => token.startsWith(p))) return undefined;
-  if (token.startsWith(CHILD_PREFIX)) return undefined;
+  if (token.startsWith(CHILD_PREFIX) || token.startsWith(RUN_WAIT_PREFIX)) return undefined;
   if (token.startsWith(UPDATE_PREFIX)) {
     const name = runScopedName(token, UPDATE_PREFIX);
     if (name !== undefined) return { kind: 'update', token, name };

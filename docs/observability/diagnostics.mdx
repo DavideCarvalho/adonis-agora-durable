@@ -74,6 +74,8 @@ A channel is named `agora:durable:<type>`, one per `EngineEvent` type:
 | `run.suspended` | A run parks (sleep, signal, child, remote step, singleton back-pressure). |
 | `run.routed` | A failed run handed its failure to an [onError handler](/docs/durable/reliability/on-error). |
 | `run.unrouted` | A failed run had onError routes the engine could not apply (`reason` says why). |
+| `run.triggered` | A settled run's [lifecycle event](/docs/durable/authoring/lifecycle-events) started a subscriber (`name`, `triggeredRunId`). |
+| `run.trigger_failed` | A settled run's lifecycle event could not start a subscriber (`name`, `error`). |
 | `step.started` | A step's body begins (`redispatched: true` on a lost-dispatch re-drive). |
 | `step.completed` | A step settles successfully (`durationMs`, plus `queueMs` for remote). |
 | `step.failed` | A step attempt fails (each retry emits its own). |
@@ -85,6 +87,10 @@ See [the event types](/docs/durable/observability/events-and-interceptors#the-ev
 ### Child runs carry `parentRunId`
 
 An event of a child run the engine started (`ctx.all`, `ctx.child`, `ctx.startChild` without a caller-chosen id) also carries `parentRunId` in its payload. Each child is its own run, so that field is how a subscriber finds every child of one parent, including a whole `ctx.all` fan. `parentRunIdOf(runId)` is exported from `@adonis-agora/durable` if you need the same mapping yourself.
+
+### Lifecycle subscribers carry their source run
+
+An event of a run a [lifecycle event](/docs/durable/authoring/lifecycle-events) started carries `lifecycleSourceRunId` (the settled run that started it) and `lifecycleKind` (`completed` or `failed`), read from the run's id with `lifecycleSourceOf`, so a subscriber of the bus can go from a subscriber run's events to its source run.
 
 <Callout title="Filtering is the subscriber's job">
 The bridge forwards **every** engine event, including the high-frequency `step.started` and `step.completed`. That's cheap: diagnostics' `emit` short-circuits when a channel has no subscribers, so a channel nobody listens to costs nothing. A subscriber, though, runs **inline** on the engine's emit, so keep handlers cheap and hand expensive work (network, disk) to a queue. Subscribe only to the events you act on.

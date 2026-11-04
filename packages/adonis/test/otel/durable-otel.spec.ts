@@ -12,8 +12,16 @@ import type {
   RemoteTask,
   StepResult,
   Transport,
+  WorkflowRun,
   WorkflowStepEvent,
 } from '../../src/interfaces.js';
+import {
+  LIFECYCLE_OWED_TAG_PREFIX,
+  LIFECYCLE_PENDING_TAG,
+  LIFECYCLE_TRACE_TAG_PREFIX,
+  lifecycleRunId,
+  runCompletedEvent,
+} from '../../src/lifecycle-events.js';
 import { attachDurableOtel } from '../../src/otel/durable-otel.js';
 
 /** Build a full worker {@link WorkerDescriptor} for a token — the shape the transport advertises. */
@@ -208,5 +216,149 @@ describe('attachDurableOtel', () => {
       'durable.on_error.handler': 'dlq',
       'durable.error.code': 'invalid_line',
     });
+  });
+
+  it("links a lifecycle subscriber's run span to its source run's span", async () => {
+    const { tracer, exporter } = tracerWithExporter();
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    attachDurableOtel(engine, { tracer });
+    engine.register('ingest', '1', async () => 'ok');
+    engine.register('refresh', '1', async () => 'refreshed', {
+      onEvent: [runCompletedEvent('ingest')],
+    });
+    await engine.start('ingest', {}, 'i1');
+    const subscriberId = lifecycleRunId('i1', 'completed', 'refresh');
+    await engine.waitForRun(subscriberId);
+
+    const spans = exporter.getFinishedSpans();
+    const source = spans.find((s) => s.name === 'workflow ingest');
+    const subscriber = spans.find((s) => s.name === 'workflow refresh');
+    expect(subscriber?.attributes).toMatchObject({
+      'durable.run_id': subscriberId,
+      'durable.lifecycle.source_run_id': 'i1',
+      'durable.lifecycle.kind': 'completed',
+    });
+    expect(subscriber?.links.map((l) => l.context.spanId)).toEqual([source?.spanContext().spanId]);
+    expect(subscriber?.links[0]?.context.traceId).toBe(source?.spanContext().traceId);
+    expect(source?.attributes['durable.lifecycle.source_run_id']).toBeUndefined();
+    expect(source?.links).toEqual([]);
+    // The source's span is recorded on the run, for a subscriber running in another process.
+    const tags = (await store.getRun('i1'))?.tags ?? [];
+    expect(tags).toContain(
+      `${LIFECYCLE_TRACE_TAG_PREFIX}00-${source?.spanContext().traceId}-${source?.spanContext().spanId}-01`,
+    );
+  });
+
+  it('links to the traceparent the source run recorded when it settled in another process', async () => {
+    const { tracer, exporter } = tracerWithExporter();
+    const store = new InMemoryStateStore();
+    const traceId = 'a'.repeat(32);
+    const spanId = 'b'.repeat(16);
+    // Settled by another process, whose bridge recorded its span on the run.
+    await store.createRun({
+      id: 'i1',
+      workflow: 'ingest',
+      workflowVersion: '1',
+      status: 'completed',
+      input: {},
+      output: 'ok',
+      tags: [
+        LIFECYCLE_PENDING_TAG,
+        `${LIFECYCLE_OWED_TAG_PREFIX}refresh`,
+        `${LIFECYCLE_TRACE_TAG_PREFIX}00-${traceId}-${spanId}-01`,
+      ],
+      createdAt: new Date(0),
+      updatedAt: new Date(0),
+    } as WorkflowRun);
+    const engine = new WorkflowEngine({ store });
+    attachDurableOtel(engine, { tracer });
+    engine.register('refresh', '1', async () => 'refreshed', {
+      onEvent: [runCompletedEvent('ingest')],
+    });
+
+    await engine.sweepLifecycleEvents(60_000);
+    await engine.waitForRun(lifecycleRunId('i1', 'completed', 'refresh'));
+
+    const subscriber = exporter.getFinishedSpans().find((s) => s.name === 'workflow refresh');
+    expect(subscriber?.links.map((l) => l.context)).toEqual([
+      expect.objectContaining({ traceId, spanId, traceFlags: 1, isRemote: true }),
+    ]);
+    expect(subscriber?.attributes['durable.lifecycle.source_run_id']).toBe('i1');
+  });
+
+  it('links to the span of the first turn when the run settles in a process that never saw it', async () => {
+    const first = tracerWithExporter();
+    const second = tracerWithExporter();
+    const store = new InMemoryStateStore();
+    const a = new WorkflowEngine({ store, instanceId: 'a' });
+    const b = new WorkflowEngine({ store, instanceId: 'b' });
+    attachDurableOtel(a, { tracer: first.tracer });
+    attachDurableOtel(b, { tracer: second.tracer });
+    for (const engine of [a, b]) {
+      engine.register('ingest', '1', async (ctx) => ctx.waitForSignal('go'));
+    }
+    // The subscriber lives on B only; A learns of it from the registry.
+    b.register('refresh', '1', async () => 'refreshed', {
+      onEvent: [runCompletedEvent('ingest')],
+    });
+    await b.sweepLifecycleEvents();
+    await a.sweepLifecycleEvents();
+
+    await a.start('ingest', {}, 'i1');
+    for (let i = 0; i < 200 && (await store.getRun('i1'))?.status !== 'suspended'; i += 1) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect((await store.getRun('i1'))?.status).toBe('suspended');
+    await b.signal('go', 'payload');
+    const subscriberId = lifecycleRunId('i1', 'completed', 'refresh');
+    await b.waitForRun(subscriberId);
+
+    const source = first.exporter.getFinishedSpans().find((s) => s.name === 'workflow ingest');
+    expect(second.exporter.getFinishedSpans().some((s) => s.name === 'workflow ingest')).toBe(
+      false,
+    );
+    const subscriber = second.exporter
+      .getFinishedSpans()
+      .find((s) => s.name === 'workflow refresh');
+    expect(source).toBeDefined();
+    expect(subscriber?.links.map((l) => l.context.spanId)).toEqual([source?.spanContext().spanId]);
+    expect(subscriber?.links[0]?.context.traceId).toBe(source?.spanContext().traceId);
+    expect(subscriber?.attributes['durable.lifecycle.source_run_id']).toBe('i1');
+  });
+
+  it('writes no trace tag for a run nobody subscribes to', async () => {
+    const { tracer } = tracerWithExporter();
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    attachDurableOtel(engine, { tracer });
+    engine.register('ingest', '1', async () => 'ok');
+    let tagWrites = 0;
+    const updateRun = store.updateRun.bind(store);
+    store.updateRun = async (runId, patch) => {
+      if (patch.tags) tagWrites += 1;
+      return updateRun(runId, patch);
+    };
+    await engine.start('ingest', {}, 'i1');
+    await engine.waitForRun('i1');
+    expect(tagWrites).toBe(0);
+    expect((await store.getRun('i1'))?.tags ?? []).toEqual([]);
+  });
+
+  it('stops answering run traceparents once detached', async () => {
+    const { tracer } = tracerWithExporter();
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    const detach = attachDurableOtel(engine, { tracer });
+    detach();
+    engine.register('ingest', '1', async () => 'ok');
+    engine.register('refresh', '1', async () => 'refreshed', {
+      onEvent: [runCompletedEvent('ingest')],
+    });
+    await engine.start('ingest', {}, 'i1');
+    await engine.waitForRun(lifecycleRunId('i1', 'completed', 'refresh'));
+    expect(
+      (await store.getRun('i1'))?.tags?.some((t) => t.startsWith(LIFECYCLE_TRACE_TAG_PREFIX)),
+    ).toBe(false);
   });
 });

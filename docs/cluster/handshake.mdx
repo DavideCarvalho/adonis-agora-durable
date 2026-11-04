@@ -87,12 +87,15 @@ interface WorkflowRegistration {
   requires?: string[]
   origin?: string    // the package that declared the workflow
   onError?: { code?: string; workflow: string }[]  // failure routes — see below
+  subscribes?: string[]  // the onEvent events it subscribes to, lifecycle events included
 }
 ```
 
 The rule is **announce only what you can run**. A worker publishes a registration for a body it holds and a queue it consumes; it never publishes one for a workflow it merely knows how to *route to* (an engine's `registerRemote`). So an entry means a live process said "I can run this", not "somebody, somewhere, might". The control plane's own descriptor announces nothing — it is a router, not an executor.
 
 On a store-less Adonis worker, `WorkerRuntime.registerWorkflow(name, body, meta)` announces a registration for every body it holds, with `group` set to the routing token it consumes; `workflowAnnouncement(MyWorkflow)` builds `meta` (`version`, `origin`, `onError`) from a class's `static workflow`. A name advertised with `registerWorkflowName` (routed elsewhere, not run here) gets no registration. A Python worker fills the same axes with `@worker.workflow("pipeline", version="2", origin="…")`.
+
+`subscribes` is how a worker runtime (the Aviary Python client, say) announces the [lifecycle subscribers](/docs/durable/authoring/lifecycle-events#which-subscribers-a-run-owes) it serves; a settling engine reads it beside the lifecycle subscription registry (`announcedSubscriptions(descriptors)` folds descriptors into event → subscribers). A store-backed engine runs its workflows in-process and publishes no descriptor for them: it announces its own subscriptions in that registry, in the state store, which every transport can reach.
 
 ### Liveness
 

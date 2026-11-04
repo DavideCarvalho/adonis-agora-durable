@@ -6,6 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from '../../src/engine.js';
 import type { RunQuery, WorkflowRun } from '../../src/interfaces.js';
+import { LIFECYCLE_REGISTRY_WORKFLOW } from '../../src/lifecycle-events.js';
 import { startRun } from '../../src/test-helpers.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
 
@@ -13,7 +14,8 @@ class CountingStore extends InMemoryStateStore {
   listRunsCalls = 0;
   admissionCalls = 0;
   override async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
-    this.listRunsCalls++;
+    // The lifecycle subscription registry read is the engine's, not the singleton gate's.
+    if (query.workflow !== LIFECYCLE_REGISTRY_WORKFLOW) this.listRunsCalls++;
     return super.listRuns(query);
   }
   override async tryAdmitSingleton(

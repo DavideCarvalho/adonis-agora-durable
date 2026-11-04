@@ -1,12 +1,12 @@
 ---
 title: CLI
-description: Ace commands for durable — durable:work runs the store-backed worker loop, durable:worker runs a store-less thin worker, durable:runs lists runs (including the --stale view), durable:retry re-enqueues a run, durable:export captures a replay fixture for CI, and make:workflow scaffolds a workflow.
+description: Ace commands for durable — durable:work runs the store-backed worker loop, durable:worker runs a store-less thin worker, durable:runs lists runs (including the --stale view), durable:retry re-enqueues a run, durable:lifecycle:republish publishes settled runs' lifecycle events again, durable:export captures a replay fixture for CI, and make:workflow scaffolds a workflow.
 icon: SquareTerminal
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
-`@adonis-agora/durable` ships six ace commands: two long-running workers (`durable:work` for a store-backed pod, `durable:worker` for a [store-less thin pod](/docs/durable/cluster/roles-and-config)), a run **lister**, a **retry**, a replay-fixture **exporter**, and a **workflow generator**. Except for `durable:worker`, they all resolve the [`WorkflowEngine`](/docs/durable/concepts/workflows-and-steps) bound by the provider, so they operate on the same engine (and store) your app is configured with.
+`@adonis-agora/durable` ships seven ace commands: two long-running workers (`durable:work` for a store-backed pod, `durable:worker` for a [store-less thin pod](/docs/durable/cluster/roles-and-config)), a run **lister**, a **retry**, a lifecycle **republish**, a replay-fixture **exporter**, and a **workflow generator**. Except for `durable:worker`, they all resolve the [`WorkflowEngine`](/docs/durable/concepts/workflows-and-steps) bound by the provider, so they operate on the same engine (and store) your app is configured with.
 
 ```bash
 node ace configure @adonis-agora/durable
@@ -28,7 +28,7 @@ node ace durable:work --interval=500 --drain-timeout=15000
 | `--interval` | `1000` | poll interval in ms between ticks |
 | `--drain-timeout` | `10000` | shutdown budget in ms, from the stop signal: the wait for the tick in flight plus the drain |
 
-Each tick runs `engine.runPending()` → `engine.recoverIncomplete()` → `engine.resumeDueTimers()` → `engine.sweepTimeouts()` → fire due [schedules](/docs/durable/authoring/scheduling) (the `schedules` from `config/durable.ts` merged with any colocated `static schedule`, config winning on a key collision, then the [persisted schedules](/docs/durable/authoring/persisted-schedules) when `persistedSchedules` is on) → `engine.sweepRetention()` ([retention eviction](/docs/durable/reliability/retention), self-throttled to once a minute) → `engine.sweepStalled()` (the [stalled-run pager](/docs/durable/reliability/failure-modes#the-stalled-run-pager--onstalled--stalledafter), same throttle, a no-op without listeners). Each phase is isolated: one that throws (a transient store hiccup) is logged as `tick phase <name> failed: …` and the rest of the tick still runs.
+Each tick runs `engine.runPending()` → `engine.recoverIncomplete()` → `engine.resumeDueTimers()` → `engine.sweepTimeouts()` → `engine.sweepLifecycleEvents()` (owed [lifecycle events](/docs/durable/authoring/lifecycle-events#delivery-exactly-once-per-subscriber) and `ctx.waitForRun` waiters) → fire due [schedules](/docs/durable/authoring/scheduling) (the `schedules` from `config/durable.ts` merged with any colocated `static schedule`, config winning on a key collision, then the [persisted schedules](/docs/durable/authoring/persisted-schedules) when `persistedSchedules` is on) → `engine.sweepRetention()` ([retention eviction](/docs/durable/reliability/retention), self-throttled to once a minute) → `engine.sweepStalled()` (the [stalled-run pager](/docs/durable/reliability/failure-modes#the-stalled-run-pager--onstalled--stalledafter), same throttle, a no-op without listeners). Each phase is isolated: one that throws (a transient store hiccup) is logged as `tick phase <name> failed: …` and the rest of the tick still runs.
 
 On start the loop also calls `engine.startConsumers()`. Broker transports (BullMQ, DB, queue) defer their consumer subscriptions when the app boots in the `console` or `repl` environment (the default `consumers: 'auto'` in `config/durable.ts`), so a one-shot `node ace` command (a migration, `durable:runs`, `node ace repl`) stays a pure producer and never claims jobs. `durable:work` is the process that declares itself a worker and flushes them. `consumers: 'always'` keeps consumers eager everywhere; `consumers: 'never'` defers them in every environment, web included. A custom loop built on `runWorkerLoop` gets the same behaviour; one built on `runTick` alone must call `engine.startConsumers()` itself.
 
@@ -100,6 +100,30 @@ node ace durable:retry checkout:1234
 ```
 
 An unknown run id exits `1` with `Run <id> not found.`. Run `durable:work` (or any worker) to pick it up afterward. This is the terminal equivalent of the dashboard's retry button — handy for replaying a [dead](/docs/durable/reliability/dead-letter) run once you've shipped a fix.
+
+## `durable:lifecycle:republish` — republish lifecycle events
+
+Publishes settled runs' [lifecycle events](/docs/durable/authoring/lifecycle-events#republishing-and-backfilling) again through `engine.republishLifecycle`: a backfill for a subscriber registered after the runs settled, or a retry of one that failed. A subscriber run that already exists is not started again. The subscribers this app can deliver to are started (the ones registered in it, and [Python subscribers](/docs/durable/python#starting-on-another-workflows-lifecycle) whose worker it reaches); any other one is marked owed, and the lifecycle sweep of an instance that has it starts it.
+
+```bash
+# One run, to every subscriber it has not started yet.
+node ace durable:lifecycle:republish --run ingest-42
+
+# Every ingestion that failed in January, to the pager only.
+node ace durable:lifecycle:republish --workflow ingestion --kind failed \
+  --since 2026-01-01 --until 2026-02-01 --subscriber ingestion-pager
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `--run` | One settled run id. |
+| `--workflow` | Every settled run of this workflow, paged through the store. |
+| `--since` / `--until` | With `--workflow`: runs settled at or after / at or before this ISO date or date-time. |
+| `--kind` | With `--workflow`: `completed` or `failed` (failed, cancelled and dead). Both when absent. |
+| `--limit` | With `--workflow`: at most this many runs. Default 1000. |
+| `--subscriber` | Only this subscribing workflow. |
+
+It prints how many runs it published and subscriber runs it started, then one line per subscriber it could not start, and exits `1` when any failed or the flags name no target.
 
 ## `durable:export` — capture a replay fixture
 

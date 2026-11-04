@@ -17,6 +17,7 @@ import {
   type WorkflowRun,
   waitTargetsOf,
 } from '../client/durable-client';
+import { EventTail } from '../client/event-tail';
 import { groupByPartition, type PartitionView } from '../client/group-by-partition';
 import { appendLiveEvent, mergeLiveEvents } from '../client/merge-live-events';
 import { pivotByWorker, type WorkerView } from '../client/pivot-by-worker';
@@ -42,10 +43,12 @@ import { type HealthSummary, summarizeHealth } from '../client/summarize-health'
 import { throttle } from '../client/throttle';
 import { AttributeFilters } from './AttributeFilters';
 import { CompatHealth } from './CompatPanel';
-import { childChips } from './child-link';
+import { childChips, republishSummary, republishTargets, triggerChips } from './child-link';
 import { BoltIcon, PlayIcon, RetryIcon, SearchIcon, UserIcon, XIcon } from './icons';
 import { OriginFacets } from './OriginFacets';
+import { LiveLifecycleDeliveries, RunEvents } from './RunEvents';
 import { RunInfoPanel } from './RunInfoPanel';
+import { LifecyclePendingFilter, LifecycleSourceLine, RunWaits } from './RunLifecycle';
 import { parentRunIdOf, retryOriginOf } from './run-lineage';
 import { SchedulesPanel } from './SchedulesPanel';
 import { SpansTimeline } from './SpansTimeline';
@@ -61,6 +64,12 @@ import { Tooltip, TooltipProvider } from './ui/tooltip';
 import { ValuePicker } from './ValuePicker';
 import { WaitingActions } from './WaitingActions';
 import { WorkflowGraph } from './WorkflowGraph';
+import {
+  WorkflowLifecycleLists,
+  WorkflowPage,
+  workflowFromHash,
+  workflowHash,
+} from './WorkflowLifecycle';
 
 /** The console's top-level views: the runs board (list + detail) and the schedules table. */
 type ConsoleView = 'runs' | 'schedules';
@@ -1169,17 +1178,20 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
     qc.invalidateQueries({ queryKey: ['run', id] });
     qc.invalidateQueries({ queryKey: ['runs'] });
   };
-  // Live-tail over SSE: refresh the moment an event lands instead of waiting for the poll. Only
-  // while the run is in flight; the 1.5s poll above stays as a fallback (e.g. transport with no
-  // control plane, or a dropped stream).
-  const liveStatus = (data as RunDetailData | undefined)?.run.status;
-  const isLive = liveStatus === 'running' || liveStatus === 'suspended';
+  // The Events panel's tail: what the stream delivers while this run's page is open, reset per run.
+  const tailRef = useRef<{ runId: string; tail: EventTail } | null>(null);
+  if (tailRef.current?.runId !== id) tailRef.current = { runId: id, tail: new EventTail() };
+  const eventTail = tailRef.current.tail;
+  // Live-tail over SSE: refresh the moment an event lands instead of waiting for the poll, and feed
+  // the Events panel. Open for a settled run too, since a republish or the lifecycle sweep still
+  // reports to it (run.triggered, run.trigger_failed). The 1.5s poll above stays as a fallback (e.g.
+  // transport with no control plane, or a dropped stream).
   useEffect(() => {
-    if (!isLive) return;
     // A busy fan emits a lifecycle event per member; refetching the detail on each would fetch it
     // back-to-back. At most one refetch per poll interval, the last event always followed by one.
     const refetch = throttle(() => qc.invalidateQueries({ queryKey: ['run', id] }), 1500);
     const stop = durableClient.streamRun(id, (event) => {
+      eventTail.push(event);
       // `step.progress` carries a single live event from a still-running step — merge it straight
       // into the cached step's `events` so a long step's trail streams in line-by-line. Invalidating
       // per event would mean a store refetch per log line (hundreds for a fan-out step) AND would
@@ -1199,7 +1211,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
       refetch.cancel();
       stop();
     };
-  }, [id, isLive, qc]);
+  }, [id, qc, eventTail]);
   const retry = useMutation({ mutationFn: () => durableClient.retry(id), onSuccess: invalidate });
   const cancel = useMutation({
     mutationFn: (compensate?: boolean) =>
@@ -1211,6 +1223,12 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   // remote step stuck `pending`. Reconcile-wake can't recover this on its own.
   const redispatch = useMutation({
     mutationFn: () => durableClient.redispatch(id),
+    onSuccess: invalidate,
+  });
+  // Publish a settled run's lifecycle event again: confirm first, then show what it started.
+  const [republishOpen, setRepublishOpen] = useState(false);
+  const republish = useMutation({
+    mutationFn: () => durableClient.republishLifecycle(id),
     onSuccess: invalidate,
   });
   // Fix-and-replay: edit the input as JSON, then re-run as a fresh linked run.
@@ -1288,6 +1306,9 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   const stepCount = fans.reduce((n, fan) => n + fan.size, body.length);
   const hasFlow = body.length > 0 || fans.length > 0;
   const chips = childChips(data.children ?? [], data.childCount);
+  const triggers = triggerChips(data);
+  const startedBy = triggers.startedBy;
+  const subscribers = republishTargets(data);
   const compSummary = compensationSummary(compensations);
   // A dead-letter run is a recovery path, not the normal flow — surface it as a banner. The two ends
   // of the relationship, linked both ways:
@@ -1368,7 +1389,15 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
       <div className="flex items-start justify-between gap-4 border-b border-line px-7 py-5">
         <div className="min-w-0">
           <div className="flex items-center gap-3">
-            <h2 className="text-lg font-semibold tracking-tight">{run.workflow}</h2>
+            <h2 className="text-lg font-semibold tracking-tight">
+              <a
+                href={workflowHash(run.workflow)}
+                className="underline-offset-4 hover:underline"
+                title="Open this workflow's page: who starts when it settles, and who starts it"
+              >
+                {run.workflow}
+              </a>
+            </h2>
             {parentRunIdOf(run.id) !== undefined && (
               <Button
                 variant="alt"
@@ -1482,6 +1511,37 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
               )}
             </div>
           ) : null}
+          {startedBy ? <LifecycleSourceLine source={startedBy} onOpenRun={onOpenRun} /> : null}
+          <RunWaits waitsFor={data.waitsFor} awaitedBy={data.awaitedBy} onOpenRun={onOpenRun} />
+          {triggers.triggered.length > 0 && !data.lifecycleDeliveries ? (
+            <div className="mt-1.5 flex flex-wrap items-center gap-1">
+              <span className="text-[10px] text-zinc-600">triggered:</span>
+              {triggers.triggered.map((tid) => (
+                <Button
+                  key={tid}
+                  variant="chip"
+                  size="xs"
+                  onClick={() => onOpenRun(tid)}
+                  className="mono px-1.5 py-0"
+                >
+                  {tid}
+                </Button>
+              ))}
+            </div>
+          ) : null}
+          {data.lifecycleDeliveries ? (
+            <LiveLifecycleDeliveries
+              deliveries={data.lifecycleDeliveries}
+              tail={eventTail}
+              onOpenRun={onOpenRun}
+            />
+          ) : null}
+          {data.workflowLifecycle ? (
+            <div className="mt-3">
+              <WorkflowLifecycleLists links={data.workflowLifecycle} />
+            </div>
+          ) : null}
+          <RunEvents tail={eventTail} onOpenRun={onOpenRun} />
         </div>
         <div className="flex shrink-0 gap-2">
           <Button
@@ -1523,6 +1583,20 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
             >
               <BoltIcon width={12} height={12} />
               Re-dispatch
+            </Button>
+          )}
+          {subscribers.length > 0 && (
+            <Button
+              variant="info"
+              disabled={republish.isPending}
+              onClick={() => {
+                republish.reset();
+                setRepublishOpen(true);
+              }}
+              title="Publish this run's lifecycle event again, to the subscribers it has not started yet"
+            >
+              <BoltIcon width={12} height={12} />
+              Republish lifecycle event
             </Button>
           )}
           {(run.status === 'dead' || run.status === 'failed') && (
@@ -1675,6 +1749,45 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
         />
       )}
       <Dialog
+        open={republishOpen}
+        onOpenChange={setRepublishOpen}
+        title="Republish lifecycle event"
+        subtitle={`publishes ${run.id}'s ${run.status === 'completed' ? 'completed' : 'failed'} event again`}
+        footer={
+          republish.isSuccess ? (
+            <Button onClick={() => setRepublishOpen(false)}>Close</Button>
+          ) : (
+            <>
+              <Button onClick={() => setRepublishOpen(false)}>Cancel</Button>
+              <Button
+                variant="info"
+                disabled={republish.isPending}
+                onClick={() => republish.mutate()}
+              >
+                Republish
+              </Button>
+            </>
+          )
+        }
+      >
+        {republish.isSuccess ? (
+          <p className="text-[12.5px] leading-relaxed text-zinc-300">
+            {republishSummary(republish.data)}
+          </p>
+        ) : (
+          <p className="text-[12.5px] leading-relaxed text-zinc-400">
+            Starts the subscribers of this run's lifecycle event that it has not started yet:{' '}
+            <span className="mono text-zinc-300">{subscribers.join(', ')}</span>. A subscriber run
+            that already exists is not started again.
+          </p>
+        )}
+        {republish.isError && (
+          <p className="mono mt-2 rounded border border-bad/25 bg-bad/10 px-2 py-1 text-[11px] text-bad">
+            {republish.error instanceof Error ? republish.error.message : 'Republish failed'}
+          </p>
+        )}
+      </Dialog>
+      <Dialog
         open={fixOpen}
         onOpenChange={setFixOpen}
         title="Fix & replay"
@@ -1714,6 +1827,12 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   );
 }
 
+/** The workflow whose page the URL hash opens (`#/workflow/<name>`). */
+function workflowPageFromHash(): string | undefined {
+  if (typeof window === 'undefined') return undefined;
+  return workflowFromHash(window.location.hash);
+}
+
 /** The open run id encoded in the URL hash (`#/run/<id>`) — so a run is deep-linkable / shareable. */
 function runIdFromHash(): string | undefined {
   if (typeof window === 'undefined') return undefined;
@@ -1741,8 +1860,13 @@ export function App() {
   // Which top-level view fills the main area. Plain state (not the hash): the hash stays the run
   // deep-link it has always been, and every run navigation below switches back to `runs` anyway.
   const [view, setView] = useState<ConsoleView>('runs');
+  // A workflow's page (`#/workflow/<name>`), opened from a workflow link, replaces the main area.
+  const [workflowPage, setWorkflowPage] = useState<string | undefined>(() =>
+    workflowPageFromHash(),
+  );
   const setSelected = useCallback((id?: string) => {
     setSelectedState(id);
+    setWorkflowPage(undefined);
     if (typeof window === 'undefined') return;
     const hash = id ? `#/run/${encodeURIComponent(id)}` : '';
     const url = hash || window.location.pathname + window.location.search;
@@ -1757,9 +1881,20 @@ export function App() {
     },
     [setSelected],
   );
+  // The view toggle leaves a workflow's page for the chosen view.
+  const showView = useCallback(
+    (next: ConsoleView) => {
+      if (workflowPage !== undefined) setSelected(undefined);
+      setView(next);
+    },
+    [workflowPage, setSelected],
+  );
   // Follow back/forward and external hash edits.
   useEffect(() => {
-    const sync = () => setSelectedState(runIdFromHash());
+    const sync = () => {
+      setSelectedState(runIdFromHash());
+      setWorkflowPage(workflowPageFromHash());
+    };
     window.addEventListener('hashchange', sync);
     window.addEventListener('popstate', sync);
     return () => {
@@ -1964,7 +2099,7 @@ export function App() {
           onFilter={setFilter}
           onOpenRun={openRun}
           view={view}
-          onView={setView}
+          onView={showView}
         />
         {stalledWorkflows.length > 0 && (
           <div className="flex items-center gap-2 border-b border-amber-500/30 bg-amber-500/10 px-4 py-1.5 text-[11px] text-amber-200">
@@ -1978,7 +2113,11 @@ export function App() {
             </span>
           </div>
         )}
-        {view === 'schedules' ? (
+        {workflowPage !== undefined ? (
+          <main className="min-h-0 flex-1 overflow-y-auto">
+            <WorkflowPage workflow={workflowPage} />
+          </main>
+        ) : view === 'schedules' ? (
           <main className="min-h-0 flex-1">
             <SchedulesPanel onOpenRun={openRun} />
           </main>
@@ -2007,6 +2146,9 @@ export function App() {
                     onChange={setTagFilter}
                     title="Tags carried by a run (WorkflowRun.tags). Several match ANY of them."
                   />
+                </div>
+                <div className="mt-1.5 flex">
+                  <LifecyclePendingFilter tags={tagFilter} onChange={setTagFilter} />
                 </div>
                 <div className="mt-1.5">
                   <ValuePicker

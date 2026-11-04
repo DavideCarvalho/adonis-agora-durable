@@ -137,6 +137,8 @@ const settled = await ctx.waitForEvent<{ orderId: string; amount: number }>(
 await engine.publishEvent('payment.settled', { orderId, amount })
 ```
 
+To wait for one specific run you did not start (an ingestion a controller kicked off, say), use [`ctx.waitForRun(runId)`](/docs/durable/authoring/lifecycle-events#waiting-for-any-run-ctxwaitforrun): it resolves with the run's status and output or error once it settles, at once if it already has.
+
 `waitForEvent` suspends with no compute, exactly like `waitForSignal`, and a `timeoutMs` that passes first throws `SignalTimeoutError`. Idempotent publishing (`opts.id`), `debounce`/`batch` coalescing of bursty subscribers (`eventBatch`), the match semantics, and how events compare with signals and updates are covered in the [Events guide](/docs/durable/authoring/events).
 
 ### Reliable (buffered) events

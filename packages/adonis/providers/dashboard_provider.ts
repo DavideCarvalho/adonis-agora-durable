@@ -52,6 +52,7 @@ import {
   listSchedules,
   metricsText,
   redispatchPendingRun,
+  republishLifecycleRun,
   retryRun,
   retryWithInputRun,
   runValues,
@@ -60,6 +61,7 @@ import {
   topology,
   updateRun,
   workers,
+  workflowLifecycle,
 } from '../src/dashboard/handlers.js';
 import { renderLoginPage } from '../src/dashboard/login_page.js';
 import { openApiDocument } from '../src/dashboard/openapi.js';
@@ -99,12 +101,14 @@ function spaDirectory(): string {
  * - `POST /api/runs/:id/retry`        -> re-enqueue the run
  * - `POST /api/runs/:id/retry-with-input` -> fix-and-replay: start a corrected linked run
  * - `POST /api/runs/:id/redispatch`   -> re-dispatch a run's lost pending remote steps
+ * - `POST /api/runs/:id/republish-lifecycle` -> publish a settled run's lifecycle event again
  * - `POST /api/runs/:id/cancel`       -> cancel the run
  * - `POST /api/runs/:id/continue`     -> resume a run paused at a breakpoint
  * - `POST /api/runs/:id/signal`       -> deliver a signal payload to a waited token
  * - `POST /api/runs/:id/update/:name` -> deliver a validated update (ctx.onUpdate)
  * - `POST /api/runs/:id/tasks/:name/complete` -> complete an external ctx.task
  * - `POST /api/runs/:id/tasks/:name/fail`     -> fail an external ctx.task
+ * - `GET  /api/workflows/:name/lifecycle` -> who starts whom through lifecycle events, for a workflow
  * - `GET  /api/schedules`             -> ticked schedules with control state + fire windows
  * - `POST /api/schedules/:key/:action`-> pause / resume / trigger a schedule at runtime
  * - `POST /api/bulk/:action`          -> bulk retry/cancel every run matching a filter
@@ -263,7 +267,13 @@ export default class DashboardProvider {
     router
       .post(`${apiBase}/runs/:id/redispatch`, json(redispatchPendingRun))
       .as('durable_dashboard.runs.redispatch');
+    router
+      .post(`${apiBase}/runs/:id/republish-lifecycle`, json(republishLifecycleRun))
+      .as('durable_dashboard.runs.republish_lifecycle');
     router.post(`${apiBase}/runs/:id/cancel`, json(cancelRun)).as('durable_dashboard.runs.cancel');
+    router
+      .get(`${apiBase}/workflows/:name/lifecycle`, json(workflowLifecycle))
+      .as('durable_dashboard.workflows.lifecycle');
     router
       .post(`${apiBase}/runs/:id/continue`, json(continueRun))
       .as('durable_dashboard.runs.continue');

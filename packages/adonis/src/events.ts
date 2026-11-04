@@ -67,3 +67,45 @@ export function eventMatches(payload: unknown, match: Record<string, unknown>): 
   const p = payload as Record<string, unknown>;
   return keys.every((k) => JSON.stringify(p[k]) === JSON.stringify(match[k]));
 }
+
+/**
+ * One `onEvent` subscription: the event name, plus an optional `where` that decides, per payload,
+ * whether this workflow starts, and an optional `input` that turns the payload into the started
+ * run's input. A bare string is shorthand for `{ event }`. Both functions run in the publishing
+ * process, so they only exist for subscriptions registered in TypeScript.
+ */
+export interface EventSubscription {
+  event: string;
+  where?: ((payload: unknown) => boolean) | undefined;
+  /** The started run's input, built from the payload. Defaults to the payload itself. */
+  input?: ((payload: unknown) => unknown) | undefined;
+}
+
+/** An `onEvent` entry: an event name, or a {@link EventSubscription}. */
+export type OnEventEntry = string | EventSubscription;
+
+/** Normalize an `onEvent` entry to its {@link EventSubscription} form. */
+export function toEventSubscription(entry: OnEventEntry): EventSubscription {
+  return typeof entry === 'string' ? { event: entry } : entry;
+}
+
+/**
+ * Which of one workflow's subscriptions to an event takes `payload`: the first whose `where`
+ * accepts it (a subscription without `where` accepts everything). A `where` that throws counts as
+ * a rejection, and its error is returned so the caller can report it instead of losing it.
+ */
+export function acceptingSubscription(
+  subscriptions: readonly EventSubscription[],
+  payload: unknown,
+): { accepted?: EventSubscription; errors: unknown[] } {
+  const errors: unknown[] = [];
+  for (const subscription of subscriptions) {
+    if (!subscription.where) return { accepted: subscription, errors };
+    try {
+      if (subscription.where(payload)) return { accepted: subscription, errors };
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  return { errors };
+}

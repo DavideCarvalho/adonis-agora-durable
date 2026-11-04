@@ -161,6 +161,7 @@ async function registerClass(
       ...(meta.onEvent || exactNames.length > 0
         ? { onEvent: [...(meta.onEvent ?? []), ...exactNames] }
         : {}),
+      ...(meta.eventBatch ? { eventBatch: meta.eventBatch } : {}),
       ...(meta.singleton ? { singleton: meta.singleton } : {}),
       ...(meta.concurrency ? { concurrency: meta.concurrency } : {}),
       ...originOpts,

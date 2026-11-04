@@ -33,7 +33,7 @@ export default class PaymentsController {
 `publishEvent` does three things, in order, and returns how many runs it reached:
 
 1. **Resumes waiters.** It lists every run parked on `ctx.waitForEvent(name, ...)` and signals each one whose `match` the payload satisfies.
-2. **Starts subscribers.** It starts a run of every workflow registered with `onEvent: [name]`, passing `payload` as the input. A subscriber with [`eventBatch`](#coalescing-bursts--eventbatch) instead routes the event into its accumulator.
+2. **Starts subscribers.** It starts a run of every workflow registered with `onEvent: [name]` whose [`where`](#filtering-and-mapping--where-and-input) accepts the payload, passing `payload` (or what its `input` builds from it) as the input. A subscriber with [`eventBatch`](#coalescing-bursts--eventbatch) instead routes the event into its accumulator.
 3. **Buffers, if nobody heard it.** If steps 1 and 2 reached nobody, one copy is [buffered](#reliable-buffered-delivery) for a future waiter.
 
 | Option | Default | Meaning |
@@ -41,7 +41,7 @@ export default class PaymentsController {
 | `id` | a fresh uuid per publish | Dedupes the subscriber *start* half across redeliveries. See [Idempotent publishing](#idempotent-publishing--optsid). |
 | `buffer` | `true` | Set `false` to drop a publish that reached nobody instead of buffering it. |
 
-A subscriber whose `inputSchema` or `validateInput` rejects the payload, or whose start throws for any other reason (a [`concurrency`](/docs/durable/reliability/concurrency-quotas) quota, for example), is skipped. It does not block the other subscribers, and it is not counted in the returned total.
+A subscriber whose `inputSchema` or `validateInput` rejects the payload, whose `where` throws, or whose start throws for any other reason (a [`concurrency`](/docs/durable/reliability/concurrency-quotas) quota, for example), is skipped and logged with `console.warn`. It does not block the other subscribers, and it is not counted in the returned total.
 
 ## Starting a workflow from an event
 
@@ -73,6 +73,29 @@ From then on, `publishEvent('user.registered', { email })` starts `send-welcome`
 
 <Callout type="info" title="Events from the app emitter and the diagnostics bus">
 You can also have publishes made for you. `@OnEvent` bridges an **AdonisJS emitter** event, and `@OnDiagnostic` bridges an `@adonis-agora/diagnostics` channel into the engine. An exact trigger is published under its canonical name, so it starts the same `onEvent` subscribers. See [Event-triggered workflows](/docs/durable/authoring/event-triggers).
+</Callout>
+
+### Filtering and mapping — `where` and `input`
+
+An `onEvent` entry can be an object instead of a name. `where(payload)` decides, per publish, whether this workflow starts, and `input(payload)` builds the run's input from the payload:
+
+```ts
+static workflow = {
+  name: 'large-order-review',
+  onEvent: [
+    {
+      event: 'order.placed',
+      where: (p) => (p as { total: number }).total > 1000,
+      input: (p) => ({ orderId: (p as { id: string }).id }),
+    },
+  ],
+}
+```
+
+A workflow subscribed to the same name twice starts once, through the first entry whose `where` accepts the payload. Both functions run in the process that publishes, so they exist only for subscriptions registered in TypeScript.
+
+<Callout type="info" title="Reacting to another workflow finishing">
+Every settled run publishes `run.completed:<workflow>` or `run.failed:<workflow>`. `@OnWorkflowCompleted` and `@OnWorkflowFailed` subscribe to them with a typed `where` and `input`, delivered exactly once per settled run. See [Chaining workflows](/docs/durable/authoring/lifecycle-events).
 </Callout>
 
 ### Idempotent publishing — `opts.id`
@@ -122,17 +145,29 @@ engine.register('flush-metrics', '1', async (ctx, input) => {
 
 Use `debounce` when only the latest state matters, such as reindexing a document that was edited eleven times. Use `batch` when every event is a fact you must not lose, such as metrics or an audit trail. `windowMs` is in milliseconds.
 
-<Callout type="warn">
-`eventBatch` is an `engine.register` option. A class's `static workflow` config has no `eventBatch` field, so to coalesce a subscription, register that workflow with the function form.
-</Callout>
+`eventBatch` is also a `static workflow` field, and [`@OnWorkflowCompleted` / `@OnWorkflowFailed`](/docs/durable/authoring/lifecycle-events#coalescing-per-key) set it from their `debounce` and `batch` options.
+
+### Coalescing per key
+
+Both modes take a `key`, computed from the run's input (after the subscription's `input` mapping). Each distinct key gets its own accumulator, so events coalesce per key instead of per workflow:
+
+```ts
+// One reindex per document, however many documents are edited at once.
+engine.register('reindex', '1', reindex, {
+  onEvent: ['document.edited'],
+  eventBatch: { mode: 'debounce', windowMs: 5_000, key: (e) => (e as { docId: string }).docId },
+})
+```
+
+The key must be a string; a `key` that throws counts as a subscriber that could not be started.
 
 ### How the accumulator works
 
-The engine does not start the target directly. It routes each event into a per-workflow **accumulator**: a long-lived built-in workflow (`__evt_debounce` or `__evt_batch`, registered when the engine is constructed) with the run id `__evtacc__:<workflow>`. Events reach it through `signalWithStart`. The accumulator collects payloads, starts the real target once as a child (`ctx.startChild`), then calls `continueAsNew` to get ready for the next burst. Signal buffering means an event that arrives while it is re-arming is not lost.
+The engine does not start the target directly. It routes each event into a per-workflow **accumulator**: a long-lived built-in workflow (`__evt_debounce` or `__evt_batch`, registered when the engine is constructed) with the run id `__evtacc__:<workflow>`, or `__evtacc__:<workflow>#<key>` with a `key`, percent-encoded (`accumulatorRunId(target, key)`). Events reach it through `signalWithStart`. The accumulator collects payloads, starts the real target once as a child (`ctx.startChild`), then calls `continueAsNew` to get ready for the next burst. Signal buffering means an event that arrives while it is re-arming is not lost.
 
 Because the accumulator is a durable workflow, a window that is still open survives a restart instead of losing the events buffered in it. It also means:
 
-- The accumulator is per **target workflow**, not per event name. A workflow subscribed to several names collects all of them into one burst.
+- The accumulator is per **target workflow** (and key), not per event name. A workflow subscribed to several names collects all of them into one burst.
 - An event routed into an accumulator counts as delivered, so it is never also [buffered](#reliable-buffered-delivery).
 - Accumulator runs appear in the dashboard under their built-in names, next to the target runs they start.
 

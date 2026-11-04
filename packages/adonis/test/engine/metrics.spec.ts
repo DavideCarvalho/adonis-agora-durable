@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { WorkflowEngine } from '../../src/engine.js';
 import { FatalError } from '../../src/errors.js';
+import { lifecycleRunId, runCompletedEvent } from '../../src/lifecycle-events.js';
 import { collectMetrics } from '../../src/metrics.js';
 import { startRun } from '../../src/test-helpers.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
@@ -54,6 +55,23 @@ describe('collectMetrics', () => {
     expect(metrics.snapshot().runs.routed).toBe(1);
     expect(metrics.snapshot().routedByCode).toEqual({ invalid_line: 1 });
     expect(metrics.prometheus()).toContain('durable_runs_routed_total{code="invalid_line"} 1');
+    metrics.stop();
+  });
+
+  it('counts subscriber runs by settled workflow and subscriber', async () => {
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
+    const metrics = collectMetrics(engine);
+    engine.register('ingest', '1', async () => 'ok');
+    engine.register('refresh', '1', async () => 'refreshed', {
+      onEvent: [runCompletedEvent('ingest')],
+    });
+    await engine.start('ingest', {}, 'i1');
+    await engine.waitForRun(lifecycleRunId('i1', 'completed', 'refresh'));
+
+    expect(metrics.snapshot().triggeredBySubscriber).toEqual({ ingest: { refresh: 1 } });
+    expect(metrics.prometheus()).toContain(
+      'durable_runs_triggered_total{workflow="ingest",subscriber="refresh"} 1',
+    );
     metrics.stop();
   });
 });

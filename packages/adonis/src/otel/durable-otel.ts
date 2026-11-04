@@ -1,13 +1,40 @@
 import {
   context,
+  isSpanContextValid,
+  type Link,
   type Span,
+  type SpanContext,
   SpanStatusCode,
   type Tracer,
   type TracerProvider,
   trace,
 } from '@opentelemetry/api';
 import type { EngineEvent, WorkflowEngine } from '../index.js';
+import { lifecycleSourceOf } from '../lifecycle-events.js';
 import { isRemoteEvent } from '../remote-event.js';
+
+/** How many runs' span contexts are kept after their span ended, for subscribers to link to. */
+const ENDED_RUN_CONTEXTS = 10_000;
+
+/** A span context as a W3C `traceparent`. */
+function toTraceparent(ctx: SpanContext): string {
+  return `00-${ctx.traceId}-${ctx.spanId}-${(ctx.traceFlags & 0xff).toString(16).padStart(2, '0')}`;
+}
+
+/** The span context a W3C `traceparent` names, or undefined when it is not a valid one. */
+function fromTraceparent(traceparent: string | undefined): SpanContext | undefined {
+  const match = /^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/.exec(
+    traceparent?.trim().toLowerCase() ?? '',
+  );
+  if (!match || match[1] === 'ff') return undefined;
+  const ctx: SpanContext = {
+    traceId: match[2] as string,
+    spanId: match[3] as string,
+    traceFlags: Number.parseInt(match[4] as string, 16),
+    isRemote: true,
+  };
+  return isSpanContextValid(ctx) ? ctx : undefined;
+}
 
 export interface DurableOtelOptions {
   /** Tracer to use. Defaults to one from the global provider (or `provider` if given). */
@@ -25,6 +52,13 @@ export interface DurableOtelOptions {
  * Zero-overhead when no OTel SDK is registered: `@opentelemetry/api` resolves to no-op spans/tracer,
  * so the bridge still subscribes but produces nothing. Pair with {@link otelTraceparent} (wired into
  * the engine's `traceparent` option) for cross-process step continuation.
+ *
+ * A run a lifecycle event started (`@OnWorkflowCompleted`, `onEvent: [runCompletedEvent(...)]`) has
+ * its root span linked to the source run's span, with `durable.lifecycle.source_run_id` and
+ * `durable.lifecycle.kind` attributes. The bridge installs the engine's run trace provider
+ * (`engine.setRunTraceparent`), so a run with subscribers records the traceparent of the span its
+ * first turn opened (with its first suspend, or its terminal write), and the link holds when the
+ * run settles, or the subscriber runs, in another process.
  */
 export function attachDurableOtel(
   engine: WorkflowEngine,
@@ -33,6 +67,21 @@ export function attachDurableOtel(
   const tracer =
     options.tracer ?? (options.provider ?? trace).getTracer('@adonis-agora/durable', '0.1.0');
   const roots = new Map<string, Span>();
+  const ended = new Map<string, SpanContext>();
+
+  const remember = (runId: string, ctx: SpanContext): void => {
+    ended.delete(runId);
+    ended.set(runId, ctx);
+    if (ended.size > ENDED_RUN_CONTEXTS) {
+      const oldest = ended.keys().next().value;
+      if (oldest !== undefined) ended.delete(oldest);
+    }
+  };
+  const runTraceparent = (runId: string): string | undefined => {
+    const ctx = roots.get(runId)?.spanContext() ?? ended.get(runId);
+    return ctx && isSpanContextValid(ctx) ? toTraceparent(ctx) : undefined;
+  };
+  engine.setRunTraceparent(runTraceparent);
 
   const endRoot = (
     event: EngineEvent,
@@ -49,17 +98,38 @@ export function attachDurableOtel(
     }
     span.end(event.at);
     roots.delete(event.runId);
+    remember(event.runId, span.spanContext());
   };
 
-  return engine.subscribe((event) => {
+  const unsubscribe = engine.subscribe((event) => {
     // Spans come from the instance that ran the work; another instance's events, re-delivered here
     // over the control plane, would open a duplicate trace of the same run on every pod.
     if (isRemoteEvent(event)) return;
     switch (event.type) {
       case 'run.started': {
+        const source =
+          event.workflow !== undefined
+            ? lifecycleSourceOf({ id: event.runId, workflow: event.workflow })
+            : undefined;
+        const sourceContext = source
+          ? (fromTraceparent(event.sourceTraceparent) ??
+            roots.get(source.runId)?.spanContext() ??
+            ended.get(source.runId))
+          : undefined;
+        const links: Link[] = sourceContext ? [{ context: sourceContext }] : [];
         const span = tracer.startSpan(`workflow ${event.workflow ?? '?'}`, {
           startTime: event.at,
-          attributes: { 'durable.run_id': event.runId, 'durable.workflow': event.workflow },
+          attributes: {
+            'durable.run_id': event.runId,
+            'durable.workflow': event.workflow,
+            ...(source
+              ? {
+                  'durable.lifecycle.source_run_id': source.runId,
+                  'durable.lifecycle.kind': source.kind,
+                }
+              : {}),
+          },
+          links,
         });
         roots.set(event.runId, span);
         break;
@@ -143,4 +213,8 @@ export function attachDurableOtel(
         break;
     }
   });
+  return () => {
+    unsubscribe();
+    engine.setRunTraceparent(undefined);
+  };
 }

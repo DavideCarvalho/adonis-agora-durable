@@ -1,5 +1,6 @@
 import { EVENT_TOKEN_PREFIX, eventNameOf } from './events.js';
 import type { RunWaiting, SignalWaiter, StateStore, WorkflowRun } from './interfaces.js';
+import { runWaitTargetOf } from './lifecycle-events.js';
 
 /**
  * Port of `@dudousxd/nestjs-durable-core`'s `run-waiting.ts`, byte-for-byte (this package's
@@ -37,6 +38,7 @@ export function classifyWaiterToken(token: string): RunWaiting {
 
 /**
  * Resolve a suspended run's {@link RunWaiting} from the pending signal waiters (indexed by `runId`).
+ * A `ctx.waitForRun` waiter is named `{ on: 'run', name: <the run waited for> }`.
  * Event-only by design (see {@link RunWaiting}): a `waitForSignal`/`waitForEvent`/webhook/awaited-child
  * suspend registers a waiter and gets named here; every other suspend (a bare `ctx.sleep`, an in-flight
  * remote step, a reconcile-parked orphan) returns `undefined`, so the client layers its own display
@@ -48,7 +50,9 @@ export function resolveRunWaiting(
 ): RunWaiting | undefined {
   if (run.status !== 'suspended') return undefined;
   const waiter = waiterByRun.get(run.id);
-  return waiter ? classifyWaiterToken(waiter.token) : undefined;
+  if (!waiter) return undefined;
+  const target = runWaitTargetOf(waiter);
+  return target !== undefined ? { on: 'run', name: target } : classifyWaiterToken(waiter.token);
 }
 
 const RUN_ID_BATCH = 500;

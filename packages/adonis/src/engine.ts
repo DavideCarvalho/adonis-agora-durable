@@ -44,8 +44,20 @@ import {
   type StepFanRange,
   WorkflowSuspended,
 } from './errors.js';
-import { EventAccumulators, type EventBatchConfig } from './event-accumulators.js';
-import { eventMatches, eventMatchOf, eventPrefix } from './events.js';
+import {
+  accumulatorRunId,
+  EventAccumulators,
+  type EventBatchConfig,
+} from './event-accumulators.js';
+import {
+  acceptingSubscription,
+  type EventSubscription,
+  eventMatches,
+  eventMatchOf,
+  eventPrefix,
+  type OnEventEntry,
+  toEventSubscription,
+} from './events.js';
 import {
   childIdsOf,
   FOLDED_PREFIX,
@@ -54,7 +66,11 @@ import {
   parseStepFanGroup,
   stepFanGroup,
 } from './fan-join.js';
-import { type AnnouncedWorkflow, aggregateAnnouncements } from './handshake/announced.js';
+import {
+  type AnnouncedWorkflow,
+  aggregateAnnouncements,
+  announcementsOf,
+} from './handshake/announced.js';
 import type { WorkerDescriptor } from './handshake/descriptor.js';
 import { buildWorkflowDirectory, type WorkflowDirectory } from './handshake/directory.js';
 import type {
@@ -107,7 +123,51 @@ import type {
   WorkflowStepEvent,
 } from './interfaces.js';
 import { isNonEmptyRunScope, TERMINAL_RUN_STATUSES } from './interfaces.js';
-import { DEFAULT_NAMESPACE } from './namespaces.js';
+import {
+  chainPredecessorsOf,
+  LIFECYCLE_ORPHAN_MS,
+  LIFECYCLE_OWED_TAG_PREFIX,
+  LIFECYCLE_PENDING_TAG,
+  LIFECYCLE_REGISTRY_HEARTBEAT_MS,
+  LIFECYCLE_REGISTRY_STALE_MS,
+  LIFECYCLE_REGISTRY_TAG,
+  LIFECYCLE_REGISTRY_TTL_MS,
+  LIFECYCLE_REGISTRY_WORKFLOW,
+  LIFECYCLE_TRACE_TAG_PREFIX,
+  LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX,
+  LIFECYCLE_TRIGGERED_TAG_PREFIX,
+  type LifecycleDelivery,
+  type LifecycleKind,
+  type LifecycleRegistryEntry,
+  type LifecycleSubscriptionLink,
+  lastRunOfChain,
+  lifecycleDeliveriesOf,
+  lifecycleEventName,
+  lifecycleEventOf,
+  lifecycleKindOf,
+  lifecycleOwedTag,
+  lifecycleRegistryNamespace,
+  lifecycleRegistryRunId,
+  lifecycleRegistrySubscriptions,
+  lifecycleRunId,
+  lifecycleSourceOf,
+  lifecycleTraceparentOf,
+  lifecycleTriggerFailedTag,
+  nextContinuationId,
+  owedSubscribersOf,
+  parseLifecycleEvent,
+  type RepublishLifecycleResult,
+  type RepublishLifecycleTarget,
+  RUN_WAIT_TOKEN_PREFIX,
+  type RunWaitLink,
+  retentionKeeps,
+  runWaitPrefix,
+  runWaitTargetOf,
+  triggeredRunsOf,
+  type WorkflowLifecycleEvent,
+  type WorkflowLifecycleLinks,
+} from './lifecycle-events.js';
+import { DEFAULT_NAMESPACE, normalizeNamespace } from './namespaces.js';
 import { asHeartbeat } from './observability-scope.js';
 import {
   assertRoutes,
@@ -127,6 +187,8 @@ import type { QueueConfig } from './queue.js';
 import { markRemoteEvent } from './remote-event.js';
 import { RemoteWorkflowExecutor } from './remote-workflow-executor.js';
 import {
+  etagMatches,
+  extendEtag,
   type FanPage,
   type FanPageQuery,
   loadFanMembers,
@@ -137,7 +199,7 @@ import {
 } from './run-detail-summary.js';
 import { runFacetsOf } from './run-facets.js';
 import { scanRunValueFacets } from './run-value-facets.js';
-import { listSignalWaitersOfRuns } from './run-waiting.js';
+import { getRunsByIds, listSignalWaitersOfRuns } from './run-waiting.js';
 import { resolveSchedule, type ScheduledWorkflow, scheduleWindow } from './scheduler.js';
 import { ScheduleClient } from './schedules.js';
 import {
@@ -361,8 +423,8 @@ interface RegisteredWorkflow {
   /** Typed search-attributes shape: `ctx.upsertSearchAttributes` validates the MERGED attributes
    *  against it and rejects a non-conforming write. See {@link SearchAttributesSchema}. */
   searchAttributesSchema?: SearchAttributesSchema | undefined;
-  /** Event names that start a fresh run of this workflow when published. See `publishEvent`. */
-  onEvent?: string[] | undefined;
+  /** Events that start a fresh run of this workflow when published. See `publishEvent`. */
+  onEvent?: OnEventEntry[] | undefined;
   /** Coalesce `onEvent` triggers: debounce (fire once it's quiet) or batch (fire on size/window). */
   eventBatch?: EventBatchConfig | undefined;
   /** Set for a workflow authored in another SDK (e.g. Python): the engine advances it by dispatching
@@ -565,12 +627,6 @@ function stepGroup(
   runNamespace?: string | undefined,
 ): string {
   return tenantGroup(sanitizeQueueToken(step.name), step.partition ?? runNamespace);
-}
-
-/** The id for the next continuation of a run: `r` → `r~1` → `r~2` … (stable, traceable lineage). */
-function nextContinuationId(runId: string): string {
-  const m = runId.match(/^(.*)~(\d+)$/);
-  return m ? `${m[1]}~${Number(m[2]) + 1}` : `${runId}~1`;
 }
 
 /** True when version `a` is newer than `b` (numeric when both parse as numbers, else natural sort). */
@@ -985,8 +1041,8 @@ export class WorkflowEngine {
   private readonly workflows = new Map<string, RegisteredWorkflow>();
   /** The newest registered version per workflow name — used to `start` new runs. */
   private readonly latest = new Map<string, RegisteredWorkflow>();
-  /** Event name → workflow names started when that event is published (see `onEvent`). */
-  private readonly eventTriggers = new Map<string, Set<string>>();
+  /** Event name → subscribing workflow name → that workflow's subscriptions to it. See `onEvent`. */
+  private readonly eventTriggers = new Map<string, Map<string, EventSubscription[]>>();
   /** Durable-entity subsystem (registers the `__entity` runner; see `registerEntity`). */
   private readonly entities: Entities;
   /** Colocated schedules (from `static schedule`) collected during auto-discovery; see `registerSchedules`. */
@@ -1807,7 +1863,7 @@ export class WorkflowEngine {
       inputSchema?: StandardSchemaV1 | undefined;
       /** Typed/validated `searchAttributes` shape — see `RegisteredWorkflow.searchAttributesSchema`. */
       searchAttributesSchema?: SearchAttributesSchema | undefined;
-      onEvent?: string[] | undefined;
+      onEvent?: OnEventEntry[] | undefined;
       eventBatch?: EventBatchConfig | undefined;
       requires?: string[] | undefined;
       /**
@@ -1852,10 +1908,11 @@ export class WorkflowEngine {
     this.workflows.set(versionKey(name, version), registered);
     const current = this.latest.get(name);
     if (!current || isNewerVersion(version, current.version)) this.latest.set(name, registered);
-    for (const event of opts?.onEvent ?? []) {
-      const subscribers = this.eventTriggers.get(event) ?? new Set<string>();
-      subscribers.add(name);
-      this.eventTriggers.set(event, subscribers);
+    for (const entry of opts?.onEvent ?? []) {
+      const subscription = toEventSubscription(entry);
+      const subscribers = this.eventTriggers.get(subscription.event) ?? new Map();
+      subscribers.set(name, [...(subscribers.get(name) ?? []), subscription]);
+      this.eventTriggers.set(subscription.event, subscribers);
     }
   }
 
@@ -2207,14 +2264,1060 @@ export class WorkflowEngine {
     );
   }
 
-  /** Emit a locally-produced lifecycle event: deliver to subscribers AND broadcast it on the
-   *  control plane so other instances (e.g. a dashboard pod) can live-tail this run. */
-  private emit(event: Omit<EngineEvent, 'at'>): void {
+  /**
+   * Emit a locally-produced lifecycle event: deliver to subscribers AND broadcast it on the control
+   * plane so other instances (e.g. a dashboard pod) can live-tail this run. A `run.completed` or
+   * `run.failed` also wakes the `ctx.waitForRun` waiters on the run and publishes its lifecycle
+   * event (see {@link publishLifecycle}); `lifecycle: false` marks a `run.completed` that is not a
+   * real completion (a continue-as-new handoff), which publishes no lifecycle event.
+   */
+  private emit(event: Omit<EngineEvent, 'at'>, opts?: { lifecycle?: boolean }): void {
     const full: EngineEvent = { ...event, at: new Date() };
     this.deliver(full);
+    if (full.type === 'run.completed' || full.type === 'run.failed') {
+      this.notifyRunWaiters(full.runId, full.workflow);
+    }
+    if (opts?.lifecycle !== false) this.publishLifecycle(full);
     if (!this.controlPlane) return;
     this.eventsToBroadcast.push(full);
     if (!this.broadcastingEvents) void this.broadcastEvents();
+  }
+
+  /**
+   * Start every workflow subscribed to `name` that takes `payload` (see {@link acceptingSubscription}),
+   * each under `runIdOf(workflow)` and with its subscription's `input` applied; only the ones in
+   * `only` when given. Returns the subscribers reached, with the run each started (none when the
+   * payload went into its debounce/batch accumulator) and whether that run is new, and the ones that
+   * could not be started, with why.
+   *
+   * `remote` names subscribers known only from the fleet's announcements (see
+   * {@link announcedRemoteSubscribers}): each is started by name with the payload as its input, with
+   * no `where` or `input` mapping, unless it is also registered here.
+   */
+  private async startSubscribers(
+    name: string,
+    payload: unknown,
+    runIdOf: (workflow: string) => string,
+    only?: ReadonlySet<string>,
+    remote: readonly string[] = [],
+  ): Promise<{
+    reached: { workflow: string; runId?: string; created?: boolean }[];
+    failed: { workflow: string; error: unknown }[];
+  }> {
+    const reached: { workflow: string; runId?: string; created?: boolean }[] = [];
+    const failed: { workflow: string; error: unknown }[] = [];
+    for (const [workflow, subscriptions] of this.eventTriggers.get(name) ?? []) {
+      if (only && !only.has(workflow)) continue;
+      const { accepted, errors } = acceptingSubscription(subscriptions, payload);
+      if (!accepted) {
+        if (errors.length > 0) failed.push({ workflow, error: errors[0] });
+        continue;
+      }
+      // A subscriber that rejects the payload (validateInput / inputSchema) must not block the
+      // others or the waiters: its run never starts, and the caller decides how to report it.
+      try {
+        const input = accepted.input ? accepted.input(payload) : payload;
+        const batch = this.latest.get(workflow)?.eventBatch;
+        if (batch) {
+          // Coalesce: route the event into the workflow's accumulator (one long-lived run per
+          // target and key that debounces/batches and then starts the target).
+          await this.accumulators.route(workflow, batch, input);
+          reached.push({ workflow });
+        } else {
+          const runId = runIdOf(workflow);
+          const existed = (await this.store.getRun(runId)) !== null;
+          await this.start(workflow, input, runId);
+          reached.push({ workflow, runId, created: !existed });
+        }
+      } catch (error) {
+        failed.push({ workflow, error });
+      }
+    }
+    const local = this.eventTriggers.get(name);
+    for (const workflow of remote) {
+      if (local?.has(workflow) || (only && !only.has(workflow))) continue;
+      try {
+        const runId = runIdOf(workflow);
+        const existed = (await this.store.getRun(runId)) !== null;
+        await this.start(workflow, payload, runId);
+        reached.push({ workflow, runId, created: !existed });
+      } catch (error) {
+        failed.push({ workflow, error });
+      }
+    }
+    return { reached, failed };
+  }
+
+  /** The workflows registered on this instance that subscribe to `event`. */
+  private localSubscribers(event: string): string[] {
+    return [...(this.eventTriggers.get(event)?.keys() ?? [])];
+  }
+
+  /**
+   * Whether this engine's own subscribers are owed the lifecycle events of `namespace`'s runs: always
+   * for an engine with no namespace (its sweep reads every namespace's runs), else only its own
+   * namespace's. `undefined` asks without a namespace and is always true.
+   */
+  private servesNamespace(namespace: string | undefined): boolean {
+    return (
+      namespace === undefined ||
+      this.namespace === undefined ||
+      normalizeNamespace(this.namespace) === normalizeNamespace(namespace)
+    );
+  }
+
+  /** The workflows registered here that subscribe to `event` and serve `namespace`'s runs. */
+  private localSubscribersFor(event: string, namespace: string | undefined): string[] {
+    return this.servesNamespace(namespace) ? this.localSubscribers(event) : [];
+  }
+
+  /**
+   * The subscribers of `event` this engine starts by name although it has no `onEvent` for them:
+   * announced only by non-Node workers (a Python `@worker.workflow(..., on_workflow_completed=...)`),
+   * and reachable from here, either registered (`registerRemote`) or served by convention on a live
+   * worker group of the same name. A subscriber some Node engine announces is left to that engine,
+   * which applies its own `where` and `input`; one this engine cannot reach stays owed, for an
+   * instance that can. Read from the snapshot {@link announcedSubscribers} keeps. With `namespace`,
+   * only the subscriptions announced for that namespace's runs (see {@link announcedFor}).
+   */
+  private async announcedRemoteSubscribers(
+    event: string,
+    namespace?: string | undefined,
+  ): Promise<string[]> {
+    const announced = this.announcedFor(event, namespace);
+    if (announced.size === 0) return [];
+    const local = new Set(this.localSubscribers(event));
+    const byEngine = this.announcedFor(event, namespace, { node: true });
+    const startable: string[] = [];
+    for (const workflow of [...announced].sort()) {
+      if (local.has(workflow) || byEngine?.has(workflow) || workflow.startsWith('__')) continue;
+      const registered = this.latest.get(workflow);
+      if (registered && !registered.convention) {
+        startable.push(workflow);
+        continue;
+      }
+      try {
+        if (await this.pool.transportWithLiveGroup(conventionGroup(workflow, this.namespace))) {
+          startable.push(workflow);
+        }
+      } catch {
+        // An unreadable fleet leaves the subscriber owed, for the next sweep.
+      }
+    }
+    return startable;
+  }
+
+  /**
+   * The subscribers of `event` this engine can deliver to for a run of `namespace`: the ones
+   * registered here that serve it, and the announced ones it starts by name (see
+   * {@link announcedRemoteSubscribers}).
+   */
+  private async deliverableSubscribers(
+    event: string,
+    namespace?: string | undefined,
+  ): Promise<{ local: Set<string>; remote: string[]; all: Set<string> }> {
+    const local = new Set(this.localSubscribersFor(event, namespace));
+    const remote = await this.announcedRemoteSubscribers(event, namespace);
+    return { local, remote, all: new Set([...local, ...remote]) };
+  }
+
+  /**
+   * Every workflow a run of `workflow` settling as `kind` owes its lifecycle event to: the ones
+   * registered here plus the ones the fleet announces (from a snapshot of the lifecycle subscription
+   * registry and the worker descriptors at most 5s old), sorted.
+   *
+   * With `namespace` (the settled run's), only the subscribers that serve that namespace's runs: the
+   * ones registered here when this engine has no namespace or has that one, the registry rows of
+   * engines in that namespace or with none, and the worker descriptors serving it. What the
+   * terminal status write marks the run owed to.
+   */
+  lifecycleSubscribers(
+    workflow: string,
+    kind: LifecycleKind,
+    namespace?: string | undefined,
+  ): string[] {
+    if (workflow.startsWith('__')) return [];
+    const event = lifecycleEventName(workflow, kind);
+    return [
+      ...new Set([
+        ...this.localSubscribersFor(event, namespace),
+        ...this.announcedSubscribers(event, namespace),
+      ]),
+    ].sort();
+  }
+
+  /**
+   * Who starts whom through lifecycle events, for `workflow`: the workflows that start when it
+   * settles, and the workflows whose settling starts it. Built from this engine's registry and the
+   * subscriptions live workers announce (read again when the snapshot is older than 5s); a failed
+   * fleet read leaves the local registry alone. What the dashboard's workflow page shows.
+   *
+   * With `namespace`, only the subscriptions of that namespace: the ones announced by registry runs
+   * and worker descriptors serving it, and this engine's own when it is that namespace's engine (an
+   * engine with no namespace is `default`'s). What a tenant is shown.
+   */
+  async workflowLifecycle(
+    workflow: string,
+    opts?: { namespace?: string | undefined },
+  ): Promise<WorkflowLifecycleLinks> {
+    await this.freshAnnouncedSubscriptions();
+    const snapshot = this.announcedSubscriptionsSnapshot;
+    const scope = opts?.namespace;
+    let fleet = snapshot?.byEvent ?? new Map<string, Set<string>>();
+    if (scope !== undefined) {
+      fleet = new Map();
+      for (const entry of snapshot?.entries ?? []) {
+        if ((entry.namespace ?? DEFAULT_NAMESPACE) !== scope) continue;
+        const subscribers = fleet.get(entry.event) ?? new Set<string>();
+        subscribers.add(entry.workflow);
+        fleet.set(entry.event, subscribers);
+      }
+    }
+    const triggers =
+      scope === undefined || (this.namespace || 'default') === scope
+        ? this.eventTriggers
+        : new Map<string, Map<string, EventSubscription[]>>();
+    const startsOnSettle = new Map<string, LifecycleSubscriptionLink>();
+    const startedBy = new Map<string, LifecycleSubscriptionLink>();
+    const link = (
+      into: Map<string, LifecycleSubscriptionLink>,
+      other: string,
+      kind: LifecycleKind,
+      local: { subscriber: string; subscriptions: readonly EventSubscription[] } | undefined,
+    ): void => {
+      const key = `${other}\u0000${kind}`;
+      const entry = into.get(key) ?? {
+        workflow: other,
+        kind,
+        local: false,
+        announced: false,
+        where: false,
+        input: false,
+      };
+      if (local) {
+        entry.local = true;
+        entry.where ||= local.subscriptions.some((sub) => sub.where !== undefined);
+        entry.input ||= local.subscriptions.some((sub) => sub.input !== undefined);
+        const batch = this.latest.get(local.subscriber)?.eventBatch;
+        if (batch) entry.coalesce = { mode: batch.mode, keyed: batch.key !== undefined };
+      } else {
+        entry.announced = true;
+      }
+      into.set(key, entry);
+    };
+    if (!workflow.startsWith('__')) {
+      for (const kind of ['completed', 'failed'] as const) {
+        const event = lifecycleEventName(workflow, kind);
+        for (const [subscriber, subscriptions] of triggers.get(event) ?? []) {
+          link(startsOnSettle, subscriber, kind, { subscriber, subscriptions });
+        }
+        for (const subscriber of fleet.get(event) ?? []) {
+          link(startsOnSettle, subscriber, kind, undefined);
+        }
+      }
+    }
+    for (const [event, subscribers] of triggers) {
+      const source = parseLifecycleEvent(event);
+      const subscriptions = subscribers.get(workflow);
+      if (source && subscriptions) {
+        link(startedBy, source.workflow, source.kind, { subscriber: workflow, subscriptions });
+      }
+    }
+    for (const [event, subscribers] of fleet) {
+      const source = parseLifecycleEvent(event);
+      if (source && subscribers.has(workflow)) {
+        link(startedBy, source.workflow, source.kind, undefined);
+      }
+    }
+    const sorted = (links: Map<string, LifecycleSubscriptionLink>) =>
+      [...links.values()].sort(
+        (a, b) => a.workflow.localeCompare(b.workflow) || a.kind.localeCompare(b.kind),
+      );
+    return { workflow, startsOnSettle: sorted(startsOnSettle), startedBy: sorted(startedBy) };
+  }
+
+  /**
+   * `patch` (a terminal status write of `run`) plus the {@link LIFECYCLE_PENDING_TAG} marker and one
+   * {@link LIFECYCLE_OWED_TAG_PREFIX} tag per subscriber of that ending, and the run's span as a
+   * {@link LIFECYCLE_TRACE_TAG_PREFIX} tag when a run trace provider knows it. Written in the same
+   * update as the status, so a run can never be settled without a record of whom its lifecycle event
+   * is owed to.
+   */
+  private withLifecycleMarker<P extends Partial<WorkflowRun>>(
+    run: Pick<WorkflowRun, 'id' | 'workflow' | 'tags' | 'namespace'>,
+    patch: P,
+  ): P {
+    const kind = lifecycleKindOf(patch.status);
+    if (!kind) return patch;
+    const subscribers = this.lifecycleSubscribers(
+      run.workflow,
+      kind,
+      normalizeNamespace(run.namespace),
+    );
+    if (subscribers.length === 0) return patch;
+    const tags = patch.tags ?? run.tags ?? [];
+    let traceparent: string | undefined;
+    try {
+      traceparent = this.runTraceparent?.(run.id);
+    } catch {
+      traceparent = undefined;
+    }
+    const recordsTrace =
+      traceparent !== undefined && !tags.some((t) => t.startsWith(LIFECYCLE_TRACE_TAG_PREFIX));
+    const marker = [
+      LIFECYCLE_PENDING_TAG,
+      ...subscribers.map(lifecycleOwedTag),
+      ...(recordsTrace ? [`${LIFECYCLE_TRACE_TAG_PREFIX}${traceparent}`] : []),
+    ];
+    if (marker.every((tag) => tags.includes(tag))) return patch;
+    return { ...patch, tags: [...new Set([...tags, ...marker])] };
+  }
+
+  /** Answers the traceparent of a run's span in this process; see {@link setRunTraceparent}. */
+  private runTraceparent: ((runId: string) => string | undefined) | undefined;
+
+  /**
+   * Install the function that answers the W3C `traceparent` of a run's span in this process, or
+   * `undefined` to remove it. `attachDurableOtel` installs one. With it, a run some workflow
+   * subscribes to records its traceparent (a {@link LIFECYCLE_TRACE_TAG_PREFIX} tag) with its first
+   * suspend (see {@link withRunTrace}), or else with its terminal write, and the `run.started` of a
+   * run a lifecycle event started carries its source run's as `sourceTraceparent`, so the
+   * subscriber's trace links to the source's whichever process ran either.
+   */
+  setRunTraceparent(provider: ((runId: string) => string | undefined) | undefined): void {
+    this.runTraceparent = provider;
+  }
+
+  /**
+   * `patch` (a suspend write of `run`) plus the run's {@link LIFECYCLE_TRACE_TAG_PREFIX} tag, when a
+   * run trace provider is installed (see {@link setRunTraceparent}), some workflow subscribes to the
+   * run's ending, the provider answers for the run and the run does not carry the tag yet. The first
+   * turn's suspend records the run's root span this way, so a run that settles in a process that
+   * never saw its first turn still links its subscribers' traces; a workflow nobody subscribes to
+   * gets no tag and no extra read or write. The tags are read again before they are written, so a
+   * tag the turn added is kept.
+   */
+  private async withRunTrace<P extends Partial<WorkflowRun>>(
+    run: Pick<WorkflowRun, 'id' | 'workflow' | 'tags' | 'namespace'>,
+    patch: P,
+  ): Promise<P> {
+    const provider = this.runTraceparent;
+    if (!provider || run.workflow.startsWith('__')) return patch;
+    if ((run.tags ?? []).some((t) => t.startsWith(LIFECYCLE_TRACE_TAG_PREFIX))) return patch;
+    const namespace = normalizeNamespace(run.namespace);
+    if (
+      this.lifecycleSubscribers(run.workflow, 'completed', namespace).length === 0 &&
+      this.lifecycleSubscribers(run.workflow, 'failed', namespace).length === 0
+    ) {
+      return patch;
+    }
+    let traceparent: string | undefined;
+    try {
+      traceparent = provider(run.id);
+    } catch {
+      return patch;
+    }
+    if (!traceparent) return patch;
+    const tags = (await this.store.getRun(run.id))?.tags ?? run.tags ?? [];
+    if (tags.some((t) => t.startsWith(LIFECYCLE_TRACE_TAG_PREFIX))) return patch;
+    return { ...patch, tags: [...tags, `${LIFECYCLE_TRACE_TAG_PREFIX}${traceparent}`] };
+  }
+
+  /**
+   * `{ sourceTraceparent }` for the `run.started` of `run`, when a lifecycle event started it and a
+   * run trace provider is installed: the source run's recorded traceparent, else this process's.
+   */
+  private async sourceTraceOf(
+    run: Pick<WorkflowRun, 'id' | 'workflow'>,
+  ): Promise<{ sourceTraceparent?: string }> {
+    const provider = this.runTraceparent;
+    if (!provider) return {};
+    const source = lifecycleSourceOf(run);
+    if (!source) return {};
+    try {
+      const recorded = lifecycleTraceparentOf((await this.store.getRun(source.runId))?.tags);
+      const traceparent = recorded ?? provider(source.runId);
+      return traceparent ? { sourceTraceparent: traceparent } : {};
+    } catch {
+      return {};
+    }
+  }
+
+  /** How many registry rows one read of the lifecycle subscription registry lists at most. */
+  private static readonly LIFECYCLE_REGISTRY_READ_CAP = 1000;
+
+  /** How long a read of the subscriptions the fleet announces is reused. */
+  private static readonly ANNOUNCED_SUBSCRIPTIONS_TTL_MS = 5_000;
+
+  /** The last read of the fleet's announced subscriptions; see {@link announcedSubscribers}. */
+  private announcedSubscriptionsSnapshot:
+    | {
+        at: number;
+        ok: boolean;
+        /** Every subscriber announced for each event, whatever namespace it serves. */
+        byEvent: Map<string, Set<string>>;
+        /** Every announced subscription, with the namespace it serves. */
+        entries: AnnouncedSubscription[];
+      }
+    | undefined;
+  private announcedSubscriptionsRead: Promise<void> | undefined;
+
+  /**
+   * The workflows the fleet announces as subscribers of `event`: the live rows of the lifecycle
+   * subscription registry (see {@link LIFECYCLE_REGISTRY_WORKFLOW}) and the live worker descriptors'
+   * `registrations[].subscribes`, from a snapshot refreshed in the background once it is older than
+   * {@link ANNOUNCED_SUBSCRIPTIONS_TTL_MS}. Synchronous, so a terminal status write never waits on
+   * the fleet; before the first read completes it answers with nothing.
+   */
+  private announcedSubscribers(event: string, namespace?: string | undefined): ReadonlySet<string> {
+    const snapshot = this.announcedSubscriptionsSnapshot;
+    if (!snapshot || this.clock() - snapshot.at > WorkflowEngine.ANNOUNCED_SUBSCRIPTIONS_TTL_MS) {
+      void this.refreshAnnouncedSubscriptions();
+    }
+    return this.announcedFor(event, namespace);
+  }
+
+  /**
+   * The subscribers of `event` in the current snapshot that serve `namespace`'s runs: announced for
+   * that namespace, or by an engine with no namespace (see {@link LifecycleRegistryEntry}). Every
+   * announced subscriber when `namespace` is undefined. `node` keeps only the ones Node engines
+   * announce (registry rows and Node worker descriptors), which start their own subscribers.
+   */
+  private announcedFor(
+    event: string,
+    namespace: string | undefined,
+    opts?: { node?: boolean },
+  ): Set<string> {
+    const snapshot = this.announcedSubscriptionsSnapshot;
+    if (!snapshot?.byEvent.has(event)) return new Set();
+    const scope = namespace === undefined ? undefined : normalizeNamespace(namespace);
+    const out = new Set<string>();
+    for (const entry of snapshot.entries) {
+      if (entry.event !== event || (opts?.node && !entry.node)) continue;
+      if (scope !== undefined && entry.namespace !== null && entry.namespace !== scope) continue;
+      out.add(entry.workflow);
+    }
+    return out;
+  }
+
+  /**
+   * Read the fleet's announced subscriptions into the snapshot: the registry rows whose heartbeat
+   * is at most {@link LIFECYCLE_REGISTRY_TTL_MS} old (a range of the store's `created_at` index), and
+   * the worker descriptors on a transport that can read them fleet-wide. Never throws: a failed read
+   * of either leaves an empty snapshot marked not `ok`, which counts as the local registry only and
+   * never orphans a subscriber. Concurrent callers share one read.
+   */
+  private refreshAnnouncedSubscriptions(): Promise<void> {
+    this.announcedSubscriptionsRead ??= (async () => {
+      const at = this.clock();
+      const byEvent = new Map<string, Set<string>>();
+      const entries: AnnouncedSubscription[] = [];
+      const add = (
+        event: string,
+        workflow: string,
+        node: boolean,
+        namespace: string | null,
+      ): void => {
+        entries.push({ event, workflow, namespace, node });
+        const subscribers = byEvent.get(event) ?? new Set<string>();
+        subscribers.add(workflow);
+        byEvent.set(event, subscribers);
+      };
+      try {
+        const [descriptors, rows] = await Promise.all([
+          this.pool.introspectsFleet ? this.pool.readAllWorkerDescriptors() : [],
+          asHeartbeat(() =>
+            this.store.listRuns({
+              workflow: LIFECYCLE_REGISTRY_WORKFLOW,
+              createdAfter: at - LIFECYCLE_REGISTRY_TTL_MS,
+              // A namespaced engine also reads `default`, where an engine with no namespace writes
+              // its row: those subscribers are owed this namespace's runs too.
+              ...(this.namespace !== undefined
+                ? { namespaces: [...new Set([this.namespace, 'default'])] }
+                : {}),
+              size: WorkflowEngine.LIFECYCLE_REGISTRY_READ_CAP,
+            }),
+          ),
+        ]);
+        for (const row of rows) {
+          if (row.workflow !== LIFECYCLE_REGISTRY_WORKFLOW) continue;
+          if (at - row.updatedAt.getTime() > LIFECYCLE_REGISTRY_TTL_MS) continue;
+          const namespace = lifecycleRegistryNamespace(row.input, row.namespace);
+          for (const { workflow, events } of lifecycleRegistrySubscriptions(row.input)) {
+            for (const event of events) add(event, workflow, true, namespace);
+          }
+        }
+        for (const descriptor of descriptors) {
+          for (const announced of announcementsOf(descriptor)) {
+            const namespace = servedNamespace(descriptor.namespace, announced.group);
+            for (const event of announced.subscribes ?? []) {
+              add(event, announced.name, descriptor.runtime === 'node', namespace);
+            }
+          }
+        }
+        this.announcedSubscriptionsSnapshot = { at, ok: true, byEvent, entries };
+      } catch {
+        this.announcedSubscriptionsSnapshot = { at, ok: false, byEvent: new Map(), entries: [] };
+      }
+    })().finally(() => {
+      this.announcedSubscriptionsRead = undefined;
+    });
+    return this.announcedSubscriptionsRead;
+  }
+
+  /** Read the fleet's announced subscriptions again when the snapshot is older than the TTL. */
+  private async freshAnnouncedSubscriptions(): Promise<void> {
+    const snapshot = this.announcedSubscriptionsSnapshot;
+    if (!snapshot || this.clock() - snapshot.at > WorkflowEngine.ANNOUNCED_SUBSCRIPTIONS_TTL_MS) {
+      await this.refreshAnnouncedSubscriptions();
+    }
+  }
+
+  /** When this engine last wrote its registry row; see {@link heartbeatLifecycleRegistry}. */
+  private lifecycleRegistryBeatAt: number | undefined;
+  /** When this engine last deleted stale registry rows; undefined before its first pass. */
+  private lifecycleRegistryCleanedAt: number | undefined;
+
+  /** How often an engine with a registry row looks for stale rows to delete. */
+  private static readonly LIFECYCLE_REGISTRY_CLEANUP_MS = 60_000;
+
+  /**
+   * This engine's lifecycle registry entry: each workflow registered here that subscribes to an
+   * event, with the events it subscribes to. Undefined when none does.
+   */
+  private lifecycleRegistryEntry(): LifecycleRegistryEntry | undefined {
+    const subscribes = new Map<string, Set<string>>();
+    for (const [event, subscribers] of this.eventTriggers) {
+      for (const workflow of subscribers.keys()) {
+        if (workflow.startsWith('__')) continue;
+        const events = subscribes.get(workflow) ?? new Set<string>();
+        events.add(event);
+        subscribes.set(workflow, events);
+      }
+    }
+    if (subscribes.size === 0) return undefined;
+    return {
+      instanceId: this.instanceId,
+      runtime: 'node',
+      engineNamespace: this.namespace ?? null,
+      subscriptions: [...subscribes.keys()].sort().map((workflow) => ({
+        workflow,
+        events: [...(subscribes.get(workflow) ?? [])].sort(),
+      })),
+    };
+  }
+
+  /**
+   * Write this engine's row of the lifecycle subscription registry (see
+   * {@link LIFECYCLE_REGISTRY_WORKFLOW}), at most once per {@link LIFECYCLE_REGISTRY_HEARTBEAT_MS}:
+   * an update of the existing row, or a create when it is missing (first beat, or deleted as stale
+   * after a long pause). Once a minute it also deletes rows whose heartbeat stopped
+   * {@link LIFECYCLE_REGISTRY_STALE_MS} ago: the ones that went stale in the last
+   * {@link LIFECYCLE_REGISTRY_STALE_MS}, a bounded range of the `created_at` index, and on its first
+   * pass every stale row, for the ones left while no engine ran. The row is created tagged
+   * {@link LIFECYCLE_REGISTRY_TAG}, which retention keeps. A no-op for an engine without
+   * subscriptions. Its store calls are marked as heartbeats for observability tools. Never throws.
+   */
+  async heartbeatLifecycleRegistry(): Promise<void> {
+    const nowMs = this.clock();
+    if (
+      this.lifecycleRegistryBeatAt !== undefined &&
+      nowMs - this.lifecycleRegistryBeatAt < LIFECYCLE_REGISTRY_HEARTBEAT_MS
+    ) {
+      return;
+    }
+    const entry = this.lifecycleRegistryEntry();
+    if (!entry) return;
+    this.lifecycleRegistryBeatAt = nowMs;
+    const id = lifecycleRegistryRunId(this.instanceId);
+    const at = new Date(nowMs);
+    try {
+      await asHeartbeat(async () => {
+        const beat: Partial<WorkflowRun> = { input: entry, createdAt: at, updatedAt: at };
+        if (await this.store.updateRunIf(id, ['completed'], beat)) return;
+        try {
+          await this.store.createRun({
+            id,
+            workflow: LIFECYCLE_REGISTRY_WORKFLOW,
+            workflowVersion: '1',
+            status: 'completed',
+            input: entry,
+            tags: [LIFECYCLE_REGISTRY_TAG],
+            ...(this.namespace !== undefined ? { namespace: this.namespace } : {}),
+            createdAt: at,
+            updatedAt: at,
+          });
+        } catch {
+          // Created by a concurrent beat under the same instance id.
+          await this.store.updateRun(id, beat);
+        }
+      });
+    } catch (error) {
+      console.error('[adonis-durable] could not write the lifecycle subscription registry:', error);
+    }
+    const cleanedAt = this.lifecycleRegistryCleanedAt;
+    if (
+      cleanedAt !== undefined &&
+      nowMs - cleanedAt < WorkflowEngine.LIFECYCLE_REGISTRY_CLEANUP_MS
+    ) {
+      return;
+    }
+    this.lifecycleRegistryCleanedAt = nowMs;
+    const staleBefore = nowMs - LIFECYCLE_REGISTRY_STALE_MS;
+    try {
+      await asHeartbeat(async () => {
+        const stale = await this.store.listRuns({
+          workflow: LIFECYCLE_REGISTRY_WORKFLOW,
+          ...(this.namespace !== undefined ? { namespace: this.namespace } : {}),
+          createdBefore: staleBefore,
+          ...(cleanedAt !== undefined
+            ? { createdAfter: staleBefore - LIFECYCLE_REGISTRY_STALE_MS }
+            : {}),
+          size: 100,
+        });
+        for (const row of stale) {
+          if (row.workflow === LIFECYCLE_REGISTRY_WORKFLOW && row.id !== id) {
+            await this.store.deleteRun(row.id);
+          }
+        }
+      });
+    } catch (error) {
+      console.error('[adonis-durable] could not prune the lifecycle subscription registry:', error);
+    }
+  }
+
+  /**
+   * The runs started by `runId` settling (see {@link publishLifecycle}), read from the run's own
+   * tags, so it needs no subscriber registry. Empty for a run that has not settled or started
+   * nobody. Pass the run itself when it is already loaded, to skip reading it again.
+   */
+  async triggeredRuns(source: string | WorkflowRun): Promise<string[]> {
+    const run = typeof source === 'string' ? await this.store.getRun(source) : source;
+    return run ? triggeredRunsOf(run) : [];
+  }
+
+  /** The live path of {@link publishSettled}: right after this instance settled the run. */
+  private publishLifecycle(event: EngineEvent): void {
+    if (event.type !== 'run.completed' && event.type !== 'run.failed') return;
+    const kind = event.type === 'run.completed' ? 'completed' : 'failed';
+    if (!event.workflow || event.workflow.startsWith('__')) return;
+    const name = lifecycleEventName(event.workflow, kind);
+    if (
+      this.localSubscribers(name).length === 0 &&
+      !this.announcedSubscriptionsSnapshot?.byEvent.get(name)?.size
+    ) {
+      return;
+    }
+    void (async () => {
+      const run = await this.store.getRun(event.runId);
+      if (run) await this.publishSettled(run);
+    })().catch(() => undefined);
+  }
+
+  /**
+   * Publish a settled run's lifecycle event (`run.completed:<workflow>` / `run.failed:<workflow>`)
+   * to the subscribers it owes it to that this instance can deliver to (registered here, or announced
+   * and started by name; see {@link deliverableSubscribers}), and settle their part of the marker:
+   * drop each one's {@link LIFECYCLE_OWED_TAG_PREFIX} tag, record each started one as a
+   * `durable:triggered:<workflow>` tag, and drop {@link LIFECYCLE_PENDING_TAG} once no owed tag is
+   * left. A run marked pending with no owed tag is owed to every subscriber registered here.
+   *
+   * `republish` publishes to every subscriber of the ending (or only `subscriber`), owed or not:
+   * the ones this instance can deliver to are started, and the others are marked owed again (with
+   * the pending tag) for the sweep of an instance that can.
+   * `nowMs` (the sweep's clock) also drops the owed tag of a subscriber that is neither registered
+   * here nor announced by a live worker once the run settled {@link LIFECYCLE_ORPHAN_MS} ago,
+   * reporting it as `run.trigger_failed`.
+   *
+   * Idempotent, since every subscriber run id is deterministic, so the live path, every instance's
+   * sweep and a republish may all reach the same run. A subscriber whose `where` throws, whose input
+   * is rejected or whose start fails, and an orphan the sweep drops, is reported as
+   * `run.trigger_failed`, gets a {@link LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX} tag in the same tag
+   * write, and is not retried until a republish; the write that records a subscriber reached removes
+   * its trigger-failed tag. A failure to write the marker
+   * leaves it, and the sweep publishes the run again.
+   */
+  private async publishSettled(
+    run: WorkflowRun,
+    opts?: { republish?: boolean; subscriber?: string | undefined; nowMs?: number },
+  ): Promise<{
+    started: number;
+    failed: { workflow: string; error: unknown }[];
+  }> {
+    const kind = lifecycleKindOf(run.status);
+    if (!kind) return { started: 0, failed: [] };
+    const name = lifecycleEventName(run.workflow, kind);
+    const namespace = normalizeNamespace(run.namespace);
+    const { local, remote, all: here } = await this.deliverableSubscribers(name, namespace);
+    const owed = owedSubscribersOf(run);
+    const pending = run.tags?.includes(LIFECYCLE_PENDING_TAG) ?? false;
+    let targets: string[];
+    // Subscribers registered elsewhere that a republish marks owed again, for their instance's sweep.
+    let remark: string[] = [];
+    if (opts?.republish) {
+      const all =
+        opts.subscriber !== undefined
+          ? [opts.subscriber]
+          : this.lifecycleSubscribers(run.workflow, kind, namespace);
+      // A debounced/batched subscriber's accumulator would count the event twice, so it is only
+      // routed while the run still owes it the event.
+      targets = all.filter(
+        (s) =>
+          here.has(s) &&
+          (!this.latest.get(s)?.eventBatch || owed.includes(s) || (pending && !owed.length)),
+      );
+      remark = all.filter((s) => !here.has(s));
+    } else if (owed.length > 0) targets = owed.filter((s) => here.has(s));
+    else targets = pending ? [...local] : [];
+    if (opts?.subscriber !== undefined) targets = targets.filter((s) => s === opts.subscriber);
+
+    const { reached, failed } =
+      targets.length > 0
+        ? await this.startSubscribers(
+            name,
+            lifecycleEventOf(run),
+            (sub) => lifecycleRunId(run.id, kind, sub),
+            new Set(targets),
+            remote,
+          )
+        : { reached: [], failed: [] };
+
+    const orphaned =
+      opts?.nowMs !== undefined ? await this.orphanedSubscribers(run, owed, here, opts.nowMs) : [];
+    const done = new Set([...targets, ...orphaned]);
+    const triggered = reached
+      .filter((r) => r.runId !== undefined)
+      .map((r) => `${LIFECYCLE_TRIGGERED_TAG_PREFIX}${r.workflow}`);
+    const reachedNow = new Set(reached.map((r) => r.workflow));
+    const failedNow = [...failed.map((f) => f.workflow), ...orphaned];
+    const current = (await this.store.getRun(run.id)) ?? run;
+    const kept = [
+      ...(current.tags ?? []).filter(
+        (t) =>
+          !(
+            (t.startsWith(LIFECYCLE_OWED_TAG_PREFIX) &&
+              done.has(t.slice(LIFECYCLE_OWED_TAG_PREFIX.length))) ||
+            (t.startsWith(LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX) &&
+              reachedNow.has(t.slice(LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX.length)))
+          ),
+      ),
+      ...remark.map(lifecycleOwedTag),
+    ];
+    const owedLeft = kept.some((t) => t.startsWith(LIFECYCLE_OWED_TAG_PREFIX));
+    const tags = [
+      ...new Set([
+        ...kept.filter((t) => t !== LIFECYCLE_PENDING_TAG),
+        ...(owedLeft ? [LIFECYCLE_PENDING_TAG] : []),
+        ...triggered,
+        ...failedNow.map(lifecycleTriggerFailedTag),
+      ]),
+    ];
+    const before = current.tags ?? [];
+    if (tags.length !== before.length || tags.some((t) => !before.includes(t))) {
+      await this.store.updateRun(run.id, { tags });
+    }
+    for (const { workflow, runId } of reached) {
+      this.emit({
+        type: 'run.triggered',
+        runId: run.id,
+        workflow: run.workflow,
+        namespace: run.namespace,
+        name: workflow,
+        triggeredRunId: runId,
+      });
+    }
+    const unreached = [
+      ...failed,
+      ...orphaned.map((workflow) => ({
+        workflow,
+        error: new Error(`subscriber ${workflow} is not registered on any live worker`),
+      })),
+    ];
+    for (const { workflow, error } of unreached) {
+      this.emit({
+        type: 'run.trigger_failed',
+        runId: run.id,
+        workflow: run.workflow,
+        namespace: run.namespace,
+        name: workflow,
+        error: { message: error instanceof Error ? error.message : String(error) },
+      });
+    }
+    return { started: reached.filter((r) => r.created).length, failed: unreached };
+  }
+
+  /**
+   * The subscribers `run` owes its event to that nothing can deliver it to: not in `here` (what
+   * this instance delivers to), announced by no live worker, and owed since
+   * {@link LIFECYCLE_ORPHAN_MS} or longer. Empty while the fleet's announcements cannot be read,
+   * since then nobody is known to be gone.
+   */
+  private async orphanedSubscribers(
+    run: WorkflowRun,
+    owed: readonly string[],
+    here: ReadonlySet<string>,
+    nowMs: number,
+  ): Promise<string[]> {
+    if (nowMs - run.updatedAt.getTime() < LIFECYCLE_ORPHAN_MS) return [];
+    const candidates = owed.filter((s) => !here.has(s));
+    if (candidates.length === 0) return [];
+    await this.freshAnnouncedSubscriptions();
+    const fresh = this.announcedSubscriptionsSnapshot;
+    if (!fresh?.ok) return [];
+    const kind = lifecycleKindOf(run.status);
+    if (!kind) return [];
+    const announced = this.announcedFor(
+      lifecycleEventName(run.workflow, kind),
+      normalizeNamespace(run.namespace),
+    );
+    return candidates.filter((s) => !announced.has(s));
+  }
+
+  /** How long a settled run's marker is left to the live publish before the sweep takes it over. */
+  private static readonly LIFECYCLE_SWEEP_GRACE_MS = 30_000;
+
+  /** How many marked runs one lifecycle sweep reads at most, looking for ones it can act on. */
+  private static readonly LIFECYCLE_SWEEP_SCAN_CAP = 1000;
+
+  /**
+   * Publish the lifecycle event of settled runs still marked {@link LIFECYCLE_PENDING_TAG} to the
+   * subscribers this instance can deliver to that they still owe it to: a run whose settling process
+   * died, or whose marker write failed, before publishing, or whose subscriber is registered only on
+   * other instances. Also writes this instance's row of the lifecycle subscription registry (see
+   * {@link heartbeatLifecycleRegistry}), refreshes the snapshot of the subscriptions the fleet
+   * announces (registry rows and worker descriptors), drops
+   * owed subscribers nothing can deliver to (see {@link orphanedSubscribers}) and wakes the
+   * `ctx.waitForRun` waiters whose run already settled (see {@link sweepRunWaits}).
+   *
+   * Called by the worker poll loop. Reads the marked runs page by page and skips the ones it cannot
+   * act on (every owed subscriber is delivered elsewhere and none is orphaned yet), so runs owed only
+   * to other instances never hide the ones it can publish. Stops once it has published `limit` runs
+   * or read {@link LIFECYCLE_SWEEP_SCAN_CAP} marked runs. A run settled in the last
+   * {@link LIFECYCLE_SWEEP_GRACE_MS} is left to the live publish. Returns how many runs it published
+   * plus how many waiters it woke.
+   */
+  async sweepLifecycleEvents(nowMs: number = this.clock(), limit = 100): Promise<number> {
+    await this.heartbeatLifecycleRegistry();
+    await this.freshAnnouncedSubscriptions();
+    const actionable = await this.lifecycleActionableRuns(nowMs, limit);
+    let published = 0;
+    for (const run of actionable) {
+      try {
+        await this.publishSettled(run, { nowMs });
+        published += 1;
+      } catch (error) {
+        console.error(
+          `[adonis-durable] lifecycle sweep: run ${run.id} failed; retrying next tick:`,
+          error,
+        );
+      }
+    }
+    return published + (await this.sweepRunWaits(limit));
+  }
+
+  /**
+   * Up to `limit` settled runs marked {@link LIFECYCLE_PENDING_TAG}, past the sweep grace, that this
+   * instance can act on: a run owing its event to a subscriber it delivers to, a run marked without
+   * owed tags, or a run owing it to a subscriber nothing delivers to past
+   * {@link LIFECYCLE_ORPHAN_MS}. Reads at most {@link LIFECYCLE_SWEEP_SCAN_CAP} marked runs, in
+   * pages, all read before any is acted on, since publishing a run takes it out of the listing.
+   */
+  private async lifecycleActionableRuns(nowMs: number, limit: number): Promise<WorkflowRun[]> {
+    const size = Math.max(1, Math.min(limit, 100));
+    const deliverable = new Map<string, Promise<Set<string>>>();
+    const deliverableTo = (event: string, namespace: string): Promise<Set<string>> => {
+      const key = `${namespace}\u0000${event}`;
+      let entry = deliverable.get(key);
+      if (!entry) {
+        entry = this.deliverableSubscribers(event, namespace).then((d) => d.all);
+        deliverable.set(key, entry);
+      }
+      return entry;
+    };
+    const out: WorkflowRun[] = [];
+    const seen = new Set<string>();
+    let scanned = 0;
+    for (let page = 1; out.length < limit && scanned < WorkflowEngine.LIFECYCLE_SWEEP_SCAN_CAP; ) {
+      const runs = await asHeartbeat(() =>
+        this.store.listRuns({
+          tag: LIFECYCLE_PENDING_TAG,
+          statuses: ['completed', 'failed', 'cancelled', 'dead'],
+          ...(this.namespace !== undefined ? { namespace: this.namespace } : {}),
+          updatedBefore: nowMs - WorkflowEngine.LIFECYCLE_SWEEP_GRACE_MS,
+          page,
+          size,
+        }),
+      );
+      for (const run of runs) {
+        if (out.length >= limit || scanned >= WorkflowEngine.LIFECYCLE_SWEEP_SCAN_CAP) break;
+        scanned += 1;
+        if (seen.has(run.id)) continue;
+        seen.add(run.id);
+        if (nowMs - run.updatedAt.getTime() < WorkflowEngine.LIFECYCLE_SWEEP_GRACE_MS) continue;
+        const kind = lifecycleKindOf(run.status);
+        if (!kind) continue;
+        const owed = owedSubscribersOf(run);
+        if (owed.length === 0) {
+          out.push(run);
+          continue;
+        }
+        const here = await deliverableTo(
+          lifecycleEventName(run.workflow, kind),
+          normalizeNamespace(run.namespace),
+        );
+        if (
+          owed.some((s) => here.has(s)) ||
+          (await this.orphanedSubscribers(run, owed, here, nowMs)).length > 0
+        ) {
+          out.push(run);
+        }
+      }
+      if (runs.length < size) break;
+      page += 1;
+    }
+    return out;
+  }
+
+  /**
+   * Publish settled runs' lifecycle events again, whether or not they are still marked: one run
+   * (`{ runId }`), or a workflow's settled runs (`{ workflow, kind, since, until, limit }`, read in
+   * pages of the store's listing, filtered by when the run settled). `subscriber` restricts it to
+   * one subscribing workflow. The subscribers registered on this instance are started; any other
+   * (announced by a live worker, or named by `subscriber`) is marked owed again, so the sweep of an
+   * instance that registers it starts it, and is not counted in `started`. The same path as the
+   * live publish, so a subscriber whose run already exists is not started again; a subscriber that
+   * debounces or batches is routed only while the run still owes it the event, since its
+   * accumulator does not deduplicate. A subscriber registered after the runs settled is backfilled
+   * this way. A workflow target's `namespace` narrows it to that namespace; on an engine bound to
+   * another namespace it publishes nothing.
+   */
+  async republishLifecycle(target: RepublishLifecycleTarget): Promise<RepublishLifecycleResult> {
+    const result: RepublishLifecycleResult = { runs: 0, started: 0, failed: [] };
+    const publish = async (run: WorkflowRun): Promise<void> => {
+      if (!lifecycleKindOf(run.status)) return;
+      result.runs += 1;
+      const { started, failed } = await this.publishSettled(run, {
+        republish: true,
+        subscriber: target.subscriber,
+      });
+      result.started += started;
+      for (const { workflow, error } of failed) {
+        result.failed.push({
+          runId: run.id,
+          subscriber: workflow,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    };
+    if ('runId' in target) {
+      const run = await this.store.getRun(target.runId);
+      if (run) await publish(run);
+      return result;
+    }
+    if (
+      target.namespace !== undefined &&
+      this.namespace !== undefined &&
+      target.namespace !== this.namespace
+    ) {
+      return result;
+    }
+    const namespace = target.namespace ?? this.namespace;
+    const limit = target.limit ?? 1000;
+    const statuses: RunStatus[] =
+      target.kind === 'completed'
+        ? ['completed']
+        : target.kind === 'failed'
+          ? ['failed', 'cancelled', 'dead']
+          : ['completed', 'failed', 'cancelled', 'dead'];
+    const size = Math.min(limit, 100);
+    let seen = 0;
+    for (let page = 1; seen < limit; page += 1) {
+      const runs = await this.store.listRuns({
+        workflow: target.workflow,
+        statuses,
+        ...(namespace !== undefined ? { namespace } : {}),
+        page,
+        size,
+      });
+      for (const run of runs) {
+        if (seen >= limit) break;
+        const settledAt = run.updatedAt.getTime();
+        if (target.since && settledAt < target.since.getTime()) continue;
+        if (target.until && settledAt > target.until.getTime()) continue;
+        seen += 1;
+        await publish(run);
+      }
+      if (runs.length < size) break;
+    }
+    return result;
+  }
+
+  /**
+   * Wake the `ctx.waitForRun` waiters on `runId`, which just settled, and on the earlier runs of its
+   * continue-as-new chain, with the event of the run that ends the chain (none yet when `runId`
+   * handed off). One waiter listing per settle. Best effort: a waiter missed here (this process dies
+   * first) is woken by {@link sweepRunWaits}. Internal `__` runs have no waiters, so they are
+   * skipped without a read.
+   */
+  private notifyRunWaiters(runId: string, workflow: string | undefined): void {
+    if (workflow?.startsWith('__')) return;
+    void (async () => {
+      const predecessors = chainPredecessorsOf(runId);
+      const targets = new Set([runId, ...predecessors]);
+      // Every run of a chain shares the first one's id as a prefix.
+      const prefix =
+        predecessors[0] !== undefined
+          ? `${RUN_WAIT_TOKEN_PREFIX}${predecessors[0]}`
+          : runWaitPrefix(runId);
+      const waiters = (await this.store.listSignalWaiters(prefix)).filter((w) =>
+        targets.has(runWaitTargetOf(w) ?? ''),
+      );
+      if (waiters.length === 0) return;
+      const run = await lastRunOfChain((id) => this.store.getRun(id), runId);
+      if (!run || !lifecycleKindOf(run.status)) return;
+      const event = lifecycleEventOf(run);
+      for (const waiter of waiters) await this.wakeSignalWaiter(waiter.token, event);
+    })().catch(() => undefined);
+  }
+
+  /** How many waited-on runs one {@link sweepRunWaits} reads at most. */
+  private static readonly RUN_WAIT_SWEEP_SCAN_CAP = 1000;
+  /** Where the next {@link sweepRunWaits} starts in the list of waited-on runs. */
+  private runWaitSweepCursor = 0;
+
+  /**
+   * Wake the `ctx.waitForRun` waiters (up to `limit`) whose run, or the run ending its
+   * continue-as-new chain, has already settled: the recovery for a process that died between
+   * settling a run and waking its waiters. Waiters on runs still in flight are skipped, reading at
+   * most {@link RUN_WAIT_SWEEP_SCAN_CAP} waited-on runs per call; the next call starts where this one
+   * stopped, so waiters on long-running runs never hide the ones that can be woken. Returns how many
+   * it woke.
+   */
+  async sweepRunWaits(limit = 100): Promise<number> {
+    const waiters = await asHeartbeat(() => this.store.listSignalWaiters(RUN_WAIT_TOKEN_PREFIX));
+    const byTarget = new Map<string, SignalWaiter[]>();
+    for (const waiter of waiters) {
+      const target = runWaitTargetOf(waiter);
+      if (target === undefined) continue;
+      byTarget.set(target, [...(byTarget.get(target) ?? []), waiter]);
+    }
+    const targets = [...byTarget.keys()].sort();
+    if (targets.length === 0) return 0;
+    const from = this.runWaitSweepCursor % targets.length;
+    const scan = Math.min(targets.length, WorkflowEngine.RUN_WAIT_SWEEP_SCAN_CAP);
+    let woken = 0;
+    let read = 0;
+    for (; read < scan && woken < limit; read += 1) {
+      const target = targets[(from + read) % targets.length] as string;
+      const run = await lastRunOfChain((id) => this.store.getRun(id), target);
+      if (!run || !lifecycleKindOf(run.status)) continue;
+      const event = lifecycleEventOf(run);
+      for (const waiter of byTarget.get(target) ?? []) {
+        if (await this.wakeSignalWaiter(waiter.token, event)) woken += 1;
+      }
+    }
+    this.runWaitSweepCursor = read >= targets.length ? 0 : (from + read) % targets.length;
+    return woken;
   }
 
   /** Events waiting for the control-plane publish in flight, in emit order (see {@link broadcastEvents}). */
@@ -2525,8 +3628,11 @@ export class WorkflowEngine {
    * engine's read API for inspection surfaces (the dashboard, the `durable:runs` CLI) so they query
    * through the engine rather than reaching for its private store.
    */
-  listRuns(query: RunQuery): Promise<WorkflowRun[]> {
-    return this.store.listRuns(query);
+  async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
+    const scoped = withoutBookkeepingRuns(query);
+    const runs = await this.store.listRuns(scoped);
+    const hidden = scoped.excludeWorkflows;
+    return hidden?.length ? runs.filter((run) => !hidden.includes(run.workflow)) : runs;
   }
 
   /**
@@ -2540,10 +3646,11 @@ export class WorkflowEngine {
     query: RunFacetQuery,
     opts?: RunValueFacetOptions,
   ): Promise<RunValueFacetRow[]> {
+    const scoped = withoutBookkeepingRuns(query);
     if (this.store.runValueFacets) {
-      return this.store.runValueFacets(axis, query, opts);
+      return this.store.runValueFacets(axis, scoped, opts);
     }
-    return scanRunValueFacets(this.store, axis, query, opts);
+    return scanRunValueFacets(this.store, axis, scoped, opts);
   }
 
   /** List a run's step checkpoints (its timeline). Part of the engine's read API; see {@link listRuns}. */
@@ -2556,7 +3663,7 @@ export class WorkflowEngine {
    * has {@link StateStore.runFacets} (else counted over a listing). Part of the engine's read API.
    */
   runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
-    return runFacetsOf(this.store, query);
+    return runFacetsOf(this.store, withoutBookkeepingRuns(query));
   }
 
   /**
@@ -2564,8 +3671,160 @@ export class WorkflowEngine {
    * `checkpointStats` + `queryCheckpoints` — a summarized detail then reads a few rows per wide fan
    * instead of the whole history, and carries an `etag` that `options.ifNoneMatch` can match.
    */
-  getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail | null> {
-    return loadRunDetail(this.detailSource(), runId, options);
+  async getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail | null> {
+    const source = this.detailSource();
+    const withExtras = async (detail: RunDetail): Promise<RunDetail> => {
+      const extras = await this.lifecycleDetail(detail.run);
+      return {
+        ...detail,
+        ...extras,
+        ...(detail.etag ? { etag: extendEtag(detail.etag, nonEmptyObject(extras)) } : {}),
+      };
+    };
+    const ifNoneMatch = options?.ifNoneMatch;
+    if (ifNoneMatch === undefined) {
+      const detail = await loadRunDetail(source, runId, options);
+      return detail ? withExtras(detail) : null;
+    }
+    // A revalidation: read the run and its validator only ('*' always matches), add what the
+    // detail reads from outside the run, and answer 304 when both are unchanged. A source that
+    // cannot version the detail answers it in full instead.
+    const head = await loadRunDetail(source, runId, { ...options, ifNoneMatch: '*' });
+    if (!head) return null;
+    if (!head.notModified || !head.etag) return withExtras(head);
+    const extras = await this.lifecycleDetail(head.run);
+    const etag = extendEtag(head.etag, nonEmptyObject(extras));
+    if (etagMatches(ifNoneMatch, etag)) {
+      return { run: head.run, timeline: [], children: [], notModified: true, etag };
+    }
+    const { ifNoneMatch: _matched, ...fresh } = options as RunDetailOptions;
+    const detail = await loadRunDetail(source, runId, fresh);
+    return detail ? withExtras(detail) : null;
+  }
+
+  /**
+   * What a run detail reads beyond the run row and its checkpoints: the subscribers its lifecycle
+   * event goes to (of its namespace) and where it stands for each, its workflow's lifecycle links,
+   * and the `ctx.waitForRun` waits on either side of it with the other run's status. A few reads per
+   * detail: the run's own waiters while it is suspended, the waiters on it (one prefix read), and
+   * one batched read of every linked run.
+   */
+  private async lifecycleDetail(
+    run: WorkflowRun,
+  ): Promise<
+    Pick<
+      RunDetail,
+      | 'lifecycleSubscribers'
+      | 'workflowLifecycle'
+      | 'lifecycleDeliveries'
+      | 'waitsFor'
+      | 'awaitedBy'
+      | 'triggeredBy'
+    >
+  > {
+    const namespace = normalizeNamespace(run.namespace);
+    const kind = lifecycleKindOf(run.status);
+    const subscribers = kind ? this.lifecycleSubscribers(run.workflow, kind, namespace) : [];
+    const links = await this.workflowLifecycle(run.workflow);
+    const deliveries = kind
+      ? lifecycleDeliveriesOf(run, {
+          subscribers,
+          live: new Set(subscribers),
+          coalesced: this.coalescedSubscribers(run, kind),
+        })
+      : [];
+    const [own, onIt] = await Promise.all([
+      run.status === 'suspended' ? listSignalWaitersOfRuns(this.store, [run.id]) : [],
+      this.store.listSignalWaiters(runWaitPrefix(run.id)),
+    ]);
+    const waitsFor: RunWaitLink[] = own.flatMap((w) => {
+      const target = runWaitTargetOf(w);
+      return target !== undefined ? [{ runId: target, seq: w.seq }] : [];
+    });
+    const awaitedBy: RunWaitLink[] = onIt
+      .filter((w) => runWaitTargetOf(w) === run.id)
+      .map((w) => ({ runId: w.runId, seq: w.seq }));
+    const started = deliveries.flatMap((d) =>
+      d.state === 'started' && d.runId !== undefined ? [d.runId] : [],
+    );
+    const source = lifecycleSourceOf(run);
+    const linked = await getRunsByIds(this.store, [
+      ...(source ? [source.runId] : []),
+      ...started,
+      ...waitsFor.map((l) => l.runId),
+      ...awaitedBy.map((l) => l.runId),
+    ]);
+    const withRun = <T extends { runId?: string | undefined }>(link: T): T => {
+      const other = link.runId !== undefined ? linked.get(link.runId) : undefined;
+      return other ? { ...link, status: other.status, namespace: other.namespace } : link;
+    };
+    const sourceRun = source ? linked.get(source.runId) : undefined;
+    const sourceTrace = lifecycleTraceparentOf(sourceRun?.tags)?.split('-')[1];
+    return {
+      ...(source
+        ? {
+            triggeredBy: {
+              ...source,
+              ...(sourceRun ? { status: sourceRun.status, namespace: sourceRun.namespace } : {}),
+              ...(sourceTrace ? { traceId: sourceTrace } : {}),
+            },
+          }
+        : {}),
+      ...(subscribers.length > 0 ? { lifecycleSubscribers: subscribers } : {}),
+      ...(links.startsOnSettle.length > 0 || links.startedBy.length > 0
+        ? { workflowLifecycle: links }
+        : {}),
+      ...(deliveries.length > 0
+        ? {
+            lifecycleDeliveries: deliveries.map(
+              (d): LifecycleDelivery => (d.state === 'started' ? withRun(d) : d),
+            ),
+          }
+        : {}),
+      ...(waitsFor.length > 0 ? { waitsFor: waitsFor.map(withRun) } : {}),
+      ...(awaitedBy.length > 0 ? { awaitedBy: awaitedBy.map(withRun) } : {}),
+    };
+  }
+
+  /**
+   * The subscribers registered here that coalesce `run`'s lifecycle event (debounce/batch) and
+   * accept it, each with the accumulator run the event went to: the subscription's `where`, `input`
+   * and `key` applied to the event as `startSubscribers` does. Undefined when the key cannot be
+   * computed. A subscriber whose `where` declines the event is left out.
+   */
+  private coalescedSubscribers(
+    run: WorkflowRun,
+    kind: LifecycleKind,
+  ): Map<string, string | undefined> {
+    const out = new Map<string, string | undefined>();
+    const event = lifecycleEventName(run.workflow, kind);
+    const triggers = this.eventTriggers.get(event);
+    if (!triggers) return out;
+    let payload: WorkflowLifecycleEvent | undefined;
+    for (const [workflow, subscriptions] of triggers) {
+      const batch = this.latest.get(workflow)?.eventBatch;
+      if (!batch) continue;
+      if (!batch.key && subscriptions.every((sub) => !sub.where)) {
+        out.set(workflow, accumulatorRunId(workflow));
+        continue;
+      }
+      try {
+        payload ??= lifecycleEventOf(run);
+        const { accepted } = acceptingSubscription(subscriptions, payload);
+        if (!accepted) continue;
+        const input = accepted.input ? accepted.input(payload) : payload;
+        const key = batch.key ? batch.key(input) : undefined;
+        out.set(
+          workflow,
+          key === undefined || typeof key === 'string'
+            ? accumulatorRunId(workflow, key)
+            : undefined,
+        );
+      } catch {
+        out.set(workflow, undefined);
+      }
+    }
+    return out;
   }
 
   /** One page of a summarized fan's members (see `loadFanMembers`), versioned like {@link getRunDetail}. */
@@ -2815,7 +4074,9 @@ export class WorkflowEngine {
         if (maxCount === 0) {
           passes.push(scoped);
         } else {
-          const [lastKept] = await this.store.listRuns({ ...scoped, page: maxCount, size: 1 });
+          const [lastKept] = await this.store.listRuns(
+            withoutBookkeepingRuns({ ...scoped, page: maxCount, size: 1 }),
+          );
           if (lastKept) {
             passes.push({ ...scoped, createdBefore: lastKept.createdAt.getTime() - 1 });
           }
@@ -2823,9 +4084,12 @@ export class WorkflowEngine {
       }
     }
     for (const pass of passes) {
-      const candidates = await this.store.listRuns({ ...pass, size: 100 });
+      const candidates = await this.store.listRuns(withoutBookkeepingRuns({ ...pass, size: 100 }));
       const archived: string[] = [];
       for (const run of candidates) {
+        // A run whose lifecycle event is still owed is kept until it is published, and a registry
+        // run is replaced by its engine's heartbeat instead.
+        if (retentionKeeps(run.tags) || run.workflow === LIFECYCLE_REGISTRY_WORKFLOW) continue;
         try {
           if (this.evictListeners.size > 0) {
             const checkpoints = await this.store.listCheckpoints(run.id);
@@ -2971,7 +4235,7 @@ export class WorkflowEngine {
     let deleted = 0;
     let previous = '';
     for (;;) {
-      const batch = await this.store.listRuns({ ...scope, statuses, size });
+      const batch = await this.store.listRuns(withoutBookkeepingRuns({ ...scope, statuses, size }));
       if (batch.length === 0) break;
       const fingerprint = batch.map((r) => r.id).join('\u0000');
       // Every listed run is deleted below, so the next page is new rows — the same page twice means
@@ -3420,11 +4684,15 @@ export class WorkflowEngine {
         // (and the listRuns calls above it), so this run could have settled on its own — via its own
         // in-flight turn, an operator cancel, or another sweep — in the gap. Only clobber it into
         // `cancelled` if it's still genuinely `running`/`suspended`.
-        const applied = await this.store.updateRunIf(run.id, ['running', 'suspended'], {
-          status: 'cancelled',
-          error,
-          updatedAt: new Date(),
-        });
+        const applied = await this.store.updateRunIf(
+          run.id,
+          ['running', 'suspended'],
+          this.withLifecycleMarker(run, {
+            status: 'cancelled',
+            error,
+            updatedAt: new Date(),
+          }),
+        );
         if (!applied) continue;
         this.emit({
           type: 'run.failed',
@@ -3763,11 +5031,15 @@ export class WorkflowEngine {
     from: RunStatus[],
     error: { message: string; code: string },
   ): Promise<RunResult | null> {
-    const applied = await this.store.updateRunIf(run.id, from, {
-      status: 'dead',
-      error,
-      updatedAt: new Date(),
-    });
+    const applied = await this.store.updateRunIf(
+      run.id,
+      from,
+      this.withLifecycleMarker(run, {
+        status: 'dead',
+        error,
+        updatedAt: new Date(),
+      }),
+    );
     await this.store.releaseRunLock(run.id, this.instanceId);
     if (!applied) return null;
     this.emit({
@@ -4376,7 +5648,9 @@ export class WorkflowEngine {
    *     match the payload satisfies (fan-out, vs `signal`'s point-to-point token).
    *  2. **Starts** a fresh run of every workflow registered with `onEvent: [name]`, passing the
    *     payload as input. Idempotent by `evt:<id>:<workflow>` — pass `opts.id` to dedupe redeliveries
-   *     of the same logical event (default: a fresh uuid, so each publish triggers once).
+   *     of the same logical event (default: a fresh uuid, so each publish triggers once). A workflow
+   *     a non-Node worker announces as subscribing to `name` (a Python `on_event=[...]`) is started
+   *     the same way, by name, when this engine can reach it (see {@link announcedRemoteSubscribers}).
    *
    * Reliable (buffered) delivery — mirrors `signalWithStart`'s reliability contract, so document it
    * exactly: a publish that resumes ≥1 live waiter, OR routes into an `eventBatch` accumulator /
@@ -4402,25 +5676,20 @@ export class WorkflowEngine {
         touched += 1;
       }
     }
-    const subscribers = this.eventTriggers.get(name);
-    if (subscribers?.size) {
+    await this.freshAnnouncedSubscriptions();
+    const remote = await this.announcedRemoteSubscribers(name);
+    if (this.eventTriggers.get(name)?.size || remote.length > 0) {
       const eventId = opts?.id ?? globalThis.crypto.randomUUID();
-      for (const workflow of subscribers) {
-        // A subscriber that rejects the payload (validateInput) must not block the others or the
-        // waiters — its run simply never starts, mirroring fire-and-forget dead-letter routing.
-        try {
-          const batch = this.latest.get(workflow)?.eventBatch;
-          if (batch) {
-            // Coalesce: route the event into a per-workflow accumulator (one long-lived run that
-            // debounces/batches and then starts the target with the collected payload(s)).
-            await this.accumulators.route(workflow, batch, payload);
-          } else {
-            await this.start(workflow, payload, `evt:${eventId}:${workflow}`);
-          }
-          touched += 1;
-        } catch {
-          // skip this subscriber
-        }
+      const { reached, failed } = await this.startSubscribers(
+        name,
+        payload,
+        (workflow) => `evt:${eventId}:${workflow}`,
+        undefined,
+        remote,
+      );
+      touched += reached.length;
+      for (const { workflow, error } of failed) {
+        console.warn(`[adonis-durable] event ${name}: subscriber ${workflow} not started:`, error);
       }
     }
     // Nobody received it live (no waiter matched, no subscriber exists/started) — buffer ONE copy
@@ -4806,12 +6075,15 @@ export class WorkflowEngine {
     }
     const error = { message: 'cancelled' };
     // Clears a remote turn's decision marker too: a cancelled run awaits no decision.
-    await this.store.updateRun(runId, {
-      status: 'cancelled',
-      error,
-      awaitingDecisionTaskId: undefined,
-      updatedAt: new Date(),
-    });
+    await this.store.updateRun(
+      runId,
+      this.withLifecycleMarker(run, {
+        status: 'cancelled',
+        error,
+        awaitingDecisionTaskId: undefined,
+        updatedAt: new Date(),
+      }),
+    );
     this.emit({
       type: 'run.failed',
       runId,
@@ -4929,7 +6201,7 @@ export class WorkflowEngine {
    * the full listing for a store without one.
    */
   countRuns(query: Omit<RunQuery, 'page' | 'size'>): Promise<number> {
-    return countRuns(this.store, query);
+    return countRuns(this.store, withoutBookkeepingRuns(query));
   }
 
   /**
@@ -5639,12 +6911,16 @@ export class WorkflowEngine {
       // resurrect/clobber it — the conditional write (status still one of SETTLE_ELIGIBLE_STATUSES) is
       // the guard; the database, not a prior JS read, arbitrates. Also clears any error from an
       // earlier failed-then-retried attempt — a completed run is a success.
-      const applied = await this.store.updateRunIf(run.id, SETTLE_ELIGIBLE_STATUSES, {
-        status: 'completed',
-        output: outcome.output,
-        error: undefined,
-        updatedAt,
-      });
+      const applied = await this.store.updateRunIf(
+        run.id,
+        SETTLE_ELIGIBLE_STATUSES,
+        this.withLifecycleMarker(run, {
+          status: 'completed',
+          output: outcome.output,
+          error: undefined,
+          updatedAt,
+        }),
+      );
       if (!applied) return this.echoCurrentStatus(run.id);
       this.emit({
         type: 'run.completed',
@@ -5671,11 +6947,11 @@ export class WorkflowEngine {
       const applied = await this.store.updateRunIf(
         run.id,
         SETTLE_ELIGIBLE_STATUSES.filter((s) => s !== 'failed'),
-        {
+        this.withLifecycleMarker(run, {
           status: 'failed',
           error,
           updatedAt,
-        },
+        }),
       );
       if (!applied) return this.echoCurrentStatus(run.id);
       this.emit({
@@ -5695,11 +6971,15 @@ export class WorkflowEngine {
     // conditional write IS the guard — it subsumes the read-then-write this branch used to do (that
     // was itself a narrower, TOCTOU-prone version of the same check, and only looked for `cancelled`;
     // this now also catches `completed`/`dead` reached via any other path mid-turn).
-    const applied = await this.store.updateRunIf(run.id, SETTLE_ELIGIBLE_STATUSES, {
-      status: 'suspended',
-      wakeAt: this.reconcileWakeAt(outcome.wakeAt),
-      updatedAt,
-    });
+    const applied = await this.store.updateRunIf(
+      run.id,
+      SETTLE_ELIGIBLE_STATUSES,
+      await this.withRunTrace(run, {
+        status: 'suspended',
+        wakeAt: this.reconcileWakeAt(outcome.wakeAt),
+        updatedAt,
+      }),
+    );
     if (!applied) return this.echoCurrentStatus(run.id);
     this.emit({
       type: 'run.suspended',
@@ -5816,6 +7096,7 @@ export class WorkflowEngine {
         runId: run.id,
         workflow: run.workflow,
         namespace: run.namespace,
+        ...(await this.sourceTraceOf(run)),
       });
     }
     if (registered.singleton && !(await this.singletons.admit(run, registered.singleton))) {
@@ -5893,7 +7174,10 @@ export class WorkflowEngine {
         message: err instanceof Error ? err.message : String(err),
         stack: err instanceof Error ? err.stack : undefined,
       };
-      await this.store.updateRun(run.id, { status: 'failed', error, updatedAt: new Date() });
+      await this.store.updateRun(
+        run.id,
+        this.withLifecycleMarker(run, { status: 'failed', error, updatedAt: new Date() }),
+      );
       this.emit({
         type: 'run.failed',
         runId: run.id,
@@ -5984,12 +7268,16 @@ export class WorkflowEngine {
     // id (the `db` transport dedupes a turn by it, and the marker gates the decision on it).
     const taskId = `${run.id}:wf:${globalThis.crypto.randomUUID()}`;
     const windowMs = this.decisionWindowMs(registered);
-    const marked = await this.store.updateRunIf(run.id, SETTLE_ELIGIBLE_STATUSES, {
-      status: 'suspended',
-      awaitingDecisionTaskId: taskId,
-      wakeAt: windowMs != null ? this.clock() + Math.min(windowMs, MAX_BACKOFF_MS) : undefined,
-      updatedAt: new Date(),
-    });
+    const marked = await this.store.updateRunIf(
+      run.id,
+      SETTLE_ELIGIBLE_STATUSES,
+      await this.withRunTrace(run, {
+        status: 'suspended',
+        awaitingDecisionTaskId: taskId,
+        wakeAt: windowMs != null ? this.clock() + Math.min(windowMs, MAX_BACKOFF_MS) : undefined,
+        updatedAt: new Date(),
+      }),
+    );
     if (!marked) {
       // Cancelled / completed / dead while this turn was being prepared: nothing to dispatch.
       await this.releaseTurnLease(run.id);
@@ -6026,13 +7314,17 @@ export class WorkflowEngine {
     };
     const current = await this.store.getRun(run.id);
     if (current?.awaitingDecisionTaskId !== taskId) return this.echoCurrentStatus(run.id);
-    const failed = await this.store.updateRunIf(run.id, ['suspended'], {
-      status: 'failed',
-      error,
-      awaitingDecisionTaskId: undefined,
-      wakeAt: undefined,
-      updatedAt: new Date(),
-    });
+    const failed = await this.store.updateRunIf(
+      run.id,
+      ['suspended'],
+      this.withLifecycleMarker(run, {
+        status: 'failed',
+        error,
+        awaitingDecisionTaskId: undefined,
+        wakeAt: undefined,
+        updatedAt: new Date(),
+      }),
+    );
     if (!failed) return this.echoCurrentStatus(run.id);
     this.emit({
       type: 'run.failed',
@@ -6867,12 +8159,15 @@ export class WorkflowEngine {
       if (comp) await this.runCompensation(run, comp, i);
     }
     const error = { message: 'cancelled' };
-    await this.store.updateRun(run.id, {
-      status: 'cancelled',
-      error,
-      awaitingDecisionTaskId: undefined,
-      updatedAt: new Date(),
-    });
+    await this.store.updateRun(
+      run.id,
+      this.withLifecycleMarker(run, {
+        status: 'cancelled',
+        error,
+        awaitingDecisionTaskId: undefined,
+        updatedAt: new Date(),
+      }),
+    );
     // The cancellation is durably recorded — consume the marker(s) so a later retry of this run id
     // doesn't get spuriously re-cancelled.
     for (;;) {
@@ -6927,6 +8222,7 @@ export class WorkflowEngine {
         runId: run.id,
         workflow: run.workflow,
         namespace: run.namespace,
+        ...(await this.sourceTraceOf(run)),
       });
     }
     // Singleton admission gate: if this run shares its key with `limit` older in-flight runs, wait
@@ -7003,12 +8299,15 @@ export class WorkflowEngine {
           error: undefined,
           updatedAt: new Date(),
         });
-        this.emit({
-          type: 'run.completed',
-          runId: run.id,
-          workflow: run.workflow,
-          namespace: run.namespace,
-        });
+        this.emit(
+          {
+            type: 'run.completed',
+            runId: run.id,
+            workflow: run.workflow,
+            namespace: run.namespace,
+          },
+          { lifecycle: false },
+        );
         this.notifyParent(run.id, { ok: true, value: undefined });
         // Tracked handoff (see {@link handoffRun}): held in `postSettle` from this settle until the
         // continuation has entered `inflight` and settled, so `drain()` can't return before the next
@@ -9147,6 +10446,51 @@ export class WorkflowEngine {
 
 /** The worker group a convention-routed workflow's run dispatches to: its sanitized name, suffixed by
  *  the run's namespace (bare for absent/`''`/`default`) — the token a tenant worker serves. */
+/**
+ * `query` with the lifecycle subscription registry's rows left out (see
+ * {@link LIFECYCLE_REGISTRY_WORKFLOW}), unless it asks for that workflow by name.
+ */
+/**
+ * One subscription the fleet announces: `workflow` starts on `event` for the runs of `namespace`
+ * (every namespace when `null`: a registry row of an engine with no namespace).
+ */
+interface AnnouncedSubscription {
+  event: string;
+  workflow: string;
+  namespace: string | null;
+  /** Announced by a Node engine (registry row or Node worker descriptor). */
+  node: boolean;
+}
+
+/**
+ * The namespace an announcement serves: the descriptor's own, else the `@<namespace>` suffix of its
+ * routing group, else `default`.
+ */
+function servedNamespace(namespace: string | undefined, group: string | undefined): string {
+  if (namespace) return namespace;
+  const at = group?.lastIndexOf('@') ?? -1;
+  return group && at >= 0 && at < group.length - 1 ? group.slice(at + 1) : 'default';
+}
+
+function withoutBookkeepingRuns<
+  Q extends Pick<RunQuery, 'workflow' | 'workflows' | 'excludeWorkflows'>,
+>(query: Q): Q {
+  if (
+    query.workflow === LIFECYCLE_REGISTRY_WORKFLOW ||
+    query.workflows?.includes(LIFECYCLE_REGISTRY_WORKFLOW)
+  ) {
+    return query;
+  }
+  const excluded = query.excludeWorkflows ?? [];
+  if (excluded.includes(LIFECYCLE_REGISTRY_WORKFLOW)) return query;
+  return { ...query, excludeWorkflows: [...excluded, LIFECYCLE_REGISTRY_WORKFLOW] };
+}
+
+/** `value` when it has at least one own key, else undefined. */
+function nonEmptyObject<T extends object>(value: T): T | undefined {
+  return Object.keys(value).length > 0 ? value : undefined;
+}
+
 function conventionGroup(name: string, namespace: string | undefined): string {
   return tenantGroup(sanitizeQueueToken(name), namespace);
 }

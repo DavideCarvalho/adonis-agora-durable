@@ -2085,6 +2085,75 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.listRuns({ namespaces: [] })).toHaveLength(0);
     });
 
+    t(
+      'leaves out the workflows in excludeWorkflows from listRuns, countRuns and facets',
+      async () => {
+        await store.createRun(run({ id: 'a', workflow: 'checkout', status: 'completed' }));
+        await store.createRun(
+          run({ id: 'b', workflow: '__lifecycle_registry', status: 'completed' }),
+        );
+        await store.createRun(run({ id: 'c', workflow: 'refund', status: 'completed' }));
+        const query = { excludeWorkflows: ['__lifecycle_registry'] };
+
+        expect((await store.listRuns(query)).map((r) => r.id).sort()).toEqual(['a', 'c']);
+        expect(
+          (await store.listRuns({ excludeWorkflows: ['__lifecycle_registry', 'refund'] })).map(
+            (r) => r.id,
+          ),
+        ).toEqual(['a']);
+        expect(await store.listRuns({ excludeWorkflows: [] })).toHaveLength(3);
+        if (store.countRuns) expect(await store.countRuns(query)).toBe(2);
+        if (store.runValueFacets) {
+          const rows = await store.runValueFacets({ field: 'workflow' }, query);
+          expect(rows.map((row) => row.value).sort()).toEqual(['checkout', 'refund']);
+        }
+        if (store.runFacets) {
+          const rows = await store.runFacets(query);
+          expect(rows.reduce((sum, row) => sum + row.count, 0)).toBe(2);
+        }
+      },
+    );
+
+    t('keeps a lifecycle registry row: listed by workflow, beat by updateRunIf', async () => {
+      const id = '__lifecycle_registry:engine-1';
+      const entry = {
+        instanceId: 'engine-1',
+        runtime: 'node',
+        subscriptions: [{ workflow: 'notify', events: ['run.completed:ingest'] }],
+      };
+      // Missing: the conditional beat reports it, so the engine creates the row.
+      expect(await store.updateRunIf(id, ['completed'], { input: entry, updatedAt: at })).toBe(
+        false,
+      );
+      await store.createRun(
+        run({ id, workflow: '__lifecycle_registry', status: 'completed', input: entry }),
+      );
+      await store.createRun(run({ id: 'other', workflow: 'ingest', status: 'completed' }));
+      const beat = new Date(at.getTime() + 10_000);
+      expect(
+        await store.updateRunIf(id, ['completed'], {
+          input: entry,
+          createdAt: beat,
+          updatedAt: beat,
+        }),
+      ).toBe(true);
+
+      const rows = await store.listRuns({
+        workflow: '__lifecycle_registry',
+        createdAfter: at.getTime(),
+      });
+      expect(rows.map((r) => r.id)).toEqual([id]);
+      expect(rows[0]?.input).toEqual(entry);
+      expect(rows[0]?.createdAt.getTime()).toBe(beat.getTime());
+      expect(rows[0]?.updatedAt.getTime()).toBe(beat.getTime());
+      expect(
+        await store.listRuns({
+          workflow: '__lifecycle_registry',
+          createdAfter: beat.getTime() + 1,
+        }),
+      ).toHaveLength(0);
+    });
+
     t('enumerates value facets for the column axes (workflow / status / namespace)', async () => {
       if (!store.runValueFacets) return; // optional store method — callers fall back to a scan
       await store.createRun(run({ id: 'a', workflow: 'checkout', status: 'completed' }));
