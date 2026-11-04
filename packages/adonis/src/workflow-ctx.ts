@@ -47,16 +47,24 @@ import {
   type StepOptions,
   type StepUndo,
   TERMINAL_RUN_STATUSES,
+  type WaitForRunOptions,
   type WorkflowCtx,
   type WorkflowRun,
 } from './interfaces.js';
+import {
+  lastRunOfChain,
+  lifecycleEventOf,
+  lifecycleKindOf,
+  runWaitToken,
+  type WorkflowLifecycleEvent,
+} from './lifecycle-events.js';
 import { codeAndDetails } from './on-error.js';
 import { breakpointToken } from './protocol.js';
 import { getRunsByIds } from './run-waiting.js';
 import { createStepLogger } from './step-logger.js';
 import { type StepConfig, type StepRef, stepConfigOf, stepNameOf } from './step-name-symbol.js';
 import { currentStepScope, runInStepScope } from './workflow-als.js';
-import { type WorkflowRef, workflowName } from './workflow-ref.js';
+import { type WorkflowClass, type WorkflowRef, workflowName } from './workflow-ref.js';
 
 /**
  * Merge a `@Step`-declared {@link StepConfig} with a per-call {@link StepDispatchOpts} override into
@@ -616,6 +624,74 @@ export function createWorkflowCtx(
     await store.putSignalWaiter({ token, runId, seq: waitSeq });
     const bufferedHit = await consumeBufferedEvent<T>(name, opts.match, token, waitSeq);
     if (bufferedHit) return bufferedHit.value;
+    throw new WorkflowSuspended(deadline, [waitSeq]);
+  };
+
+  // Wait for any run to settle (`ctx.waitForRun`). A signal waiter whose token embeds the target and
+  // this call's own `runId#seq` (see runWaitToken), woken with the lifecycle event of the run that
+  // ends the target's continue-as-new chain when it settles (the engine's notifyRunWaiters, or its
+  // sweepRunWaits after a crash). Registered FIRST, then the target is read: one that settled
+  // before the registration resolves here, one that settles after it finds the waiter.
+  const settledTarget = async (
+    target: string,
+    token: string,
+    seq: number,
+  ): Promise<{ value: WorkflowLifecycleEvent } | null> => {
+    const run = await lastRunOfChain((id) => store.getRun(id), target);
+    if (!run) {
+      await store.removeSignalWaiter({ token, runId, seq }).catch(() => undefined);
+      throw new FatalError(`run ${target} not found`, 'run_not_found');
+    }
+    if (!lifecycleKindOf(run.status)) return null;
+    // Claim our own waiter (the token is unique to this call). When the engine's settle delivery
+    // took it first, that delivery writes the checkpoint and wakes the run: resolve from the
+    // checkpoint if it is already there, else suspend and let the wake replay this call.
+    if (!(await store.takeSignalWaiter(token))) {
+      const delivered = await store.getCheckpoint(runId, seq);
+      return delivered?.status === 'completed'
+        ? { value: delivered.output as WorkflowLifecycleEvent }
+        : null;
+    }
+    const event = lifecycleEventOf(run);
+    await writeCheckpoint(
+      instantCheckpoint({ runId, seq, name: `signal:${token}`, kind: 'signal', output: event }),
+    );
+    return { value: event };
+  };
+
+  const waitForRun = async (
+    first: WorkflowClass | string,
+    second?: string | WaitForRunOptions,
+    third?: WaitForRunOptions,
+  ): Promise<WorkflowLifecycleEvent> => {
+    const target = typeof first === 'string' ? first : (second as string);
+    const opts = typeof first === 'string' ? (second as WaitForRunOptions | undefined) : third;
+    if (opts?.timeoutMs == null) {
+      const current = pos.next();
+      const existing = await readCheckpoint(current);
+      if (existing && existing.status === 'completed') {
+        return existing.output as WorkflowLifecycleEvent;
+      }
+      const token = runWaitToken(target, runId, current);
+      await store.putSignalWaiter({ token, runId, seq: current });
+      const settled = await settledTarget(target, token, current);
+      if (settled) return settled.value;
+      throw new WorkflowSuspended(undefined, [current]);
+    }
+    const timeoutMs = parseDuration(opts.timeoutMs);
+    const deadlineSeq = pos.next();
+    const waitSeq = pos.next();
+    const token = runWaitToken(target, runId, waitSeq);
+    const deadline = await stampDeadline(deadlineSeq, `run:${target}`, timeoutMs);
+    const waited = await readCheckpoint(waitSeq);
+    if (waited && waited.status === 'completed') return waited.output as WorkflowLifecycleEvent;
+    if (host.clock() >= deadline) {
+      await store.removeSignalWaiter({ token, runId, seq: waitSeq }).catch(() => undefined);
+      throw new SignalTimeoutError(`run:${target}`, timeoutMs);
+    }
+    await store.putSignalWaiter({ token, runId, seq: waitSeq });
+    const settled = await settledTarget(target, token, waitSeq);
+    if (settled) return settled.value;
     throw new WorkflowSuspended(deadline, [waitSeq]);
   };
 
@@ -1456,6 +1532,7 @@ export function createWorkflowCtx(
     continueAsNew,
     waitForSignal: guard('waitForSignal', waitForSignal),
     waitForEvent: guard('waitForEvent', waitForEvent),
+    waitForRun: guard('waitForRun', waitForRun) as WorkflowCtx['waitForRun'],
     task: guard('task', task),
     child: guard('child', child),
     all: guard('all', all),

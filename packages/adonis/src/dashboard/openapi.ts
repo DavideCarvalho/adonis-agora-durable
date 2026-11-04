@@ -211,6 +211,13 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
                 children: { type: 'array', items: { type: 'string' } },
                 fans: { type: 'array', items: { type: 'object' } },
                 childCount: { type: 'integer' },
+                triggered: { type: 'array', items: { type: 'string' } },
+                triggeredBy: { type: 'object' },
+                lifecycleSubscribers: { type: 'array', items: { type: 'string' } },
+                lifecycleDeliveries: { type: 'array', items: { type: 'object' } },
+                waitsFor: { type: 'array', items: { type: 'object' } },
+                awaitedBy: { type: 'array', items: { type: 'object' } },
+                workflowLifecycle: { type: 'object' },
               },
             }),
             '304': notModifiedResponse,
@@ -271,6 +278,27 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
           responses: {
             '200': jsonResponse('The new linked run id.', { type: 'object' }),
             '404': err('Unknown run, or unavailable on this topology.'),
+          },
+        },
+      },
+      '/runs/{id}/republish-lifecycle': {
+        post: {
+          summary: "Publish a settled run's lifecycle event again (subscribers not started yet)",
+          parameters: [idParam],
+          requestBody: {
+            content: {
+              'application/json': {
+                schema: { type: 'object', properties: { subscriber: { type: 'string' } } },
+              },
+            },
+          },
+          responses: {
+            '200': jsonResponse('Runs published, subscribers started, failures.', {
+              type: 'object',
+            }),
+            '404': err('Unknown run, or unavailable on this topology.'),
+            '409': err('The run has not settled.'),
+            '501': err("The tenant pod's control plane is too old to answer it."),
           },
         },
       },
@@ -398,6 +426,21 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
             { name: 'compensate', in: 'query', schema: { type: 'boolean' } },
           ],
           responses: { '200': jsonResponse('`{ matched, applied }` counts.', { type: 'object' }) },
+        },
+      },
+      '/workflows/{name}/lifecycle': {
+        get: {
+          summary:
+            'Who starts whom through lifecycle events: the workflows that start when it settles, and the ones that start it',
+          parameters: [{ name: 'name', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: {
+            '200': jsonResponse(
+              '`{ workflow, startsOnSettle, startedBy }`, plus `triggerCounts` (per subscriber, started and failed, counted by this process) when the dashboard reads its metrics.',
+              { type: 'object' },
+            ),
+            '404': err('Unavailable on this topology.'),
+            '501': err("The tenant pod's control plane is too old to answer it."),
+          },
         },
       },
       '/schedules': {

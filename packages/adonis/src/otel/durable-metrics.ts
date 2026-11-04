@@ -19,9 +19,18 @@ export interface DurableMetricsSnapshot {
     routed: number;
     /** Failures that had onError routes the engine could not apply (workers disagree). */
     unrouted: number;
+    /** Subscriber runs started by a settled run's lifecycle event. */
+    triggered: number;
+    /** Subscribers a settled run's lifecycle event could not start (`where` threw, start failed). */
+    triggerFailed: number;
   };
   /** Routed failures by error code (`*` for a failure without one). */
   routedByCode: Record<string, number>;
+  /**
+   * The `durable.runs.triggered` counter by its attributes: `workflow` (the settled run's) and
+   * `subscriber` (the workflow its lifecycle event started), keyed by workflow, then subscriber.
+   */
+  triggeredBySubscriber: Record<string, Record<string, number>>;
   steps: { completed: number; failed: number };
   /** Per-step wall-clock (from the `durationMs` on step events). */
   stepDurationMs: DurationStats;
@@ -94,9 +103,12 @@ export function attachDurableMetrics(engine: WorkflowEngine): DurableMetrics {
     suspended: 0,
     routed: 0,
     unrouted: 0,
+    triggered: 0,
+    triggerFailed: 0,
   });
   let runs = zeroRuns();
   let routedByCode: Record<string, number> = {};
+  let triggeredBy: Record<string, Record<string, number>> = {};
   let steps = { completed: 0, failed: 0 };
   let stepDur = new DurationSamples();
   let runDur = new DurationSamples();
@@ -145,6 +157,18 @@ export function attachDurableMetrics(engine: WorkflowEngine): DurableMetrics {
       case 'run.unrouted':
         runs.unrouted += 1;
         break;
+      case 'run.triggered': {
+        runs.triggered += 1;
+        const workflow = e.workflow ?? 'unknown';
+        const subscriber = e.name ?? 'unknown';
+        const bySubscriber = triggeredBy[workflow] ?? {};
+        bySubscriber[subscriber] = (bySubscriber[subscriber] ?? 0) + 1;
+        triggeredBy[workflow] = bySubscriber;
+        break;
+      }
+      case 'run.trigger_failed':
+        runs.triggerFailed += 1;
+        break;
       case 'step.completed':
         steps.completed += 1;
         if (e.durationMs != null) stepDur.add(e.durationMs);
@@ -160,6 +184,7 @@ export function attachDurableMetrics(engine: WorkflowEngine): DurableMetrics {
     snapshot: () => ({
       runs: { ...runs },
       routedByCode: { ...routedByCode },
+      triggeredBySubscriber: structuredClone(triggeredBy),
       steps: { ...steps },
       stepDurationMs: stepDur.stats(),
       runDurationMs: runDur.stats(),
@@ -167,6 +192,7 @@ export function attachDurableMetrics(engine: WorkflowEngine): DurableMetrics {
     reset: () => {
       runs = zeroRuns();
       routedByCode = {};
+      triggeredBy = {};
       steps = { completed: 0, failed: 0 };
       stepDur = new DurationSamples();
       runDur = new DurationSamples();

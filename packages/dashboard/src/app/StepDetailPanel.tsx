@@ -213,7 +213,7 @@ function StepEvents({ events }: { events: StepEvent[] }) {
   );
 }
 
-function CopyButton({ value }: { value: string }) {
+export function CopyButton({ value }: { value: string }) {
   const [done, setDone] = useState(false);
   return (
     <button

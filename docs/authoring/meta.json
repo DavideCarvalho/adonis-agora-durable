@@ -13,6 +13,7 @@
     "scheduling",
     "persisted-schedules",
     "event-triggers",
-    "events"
+    "events",
+    "lifecycle-events"
   ]
 }

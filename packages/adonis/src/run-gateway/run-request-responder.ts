@@ -10,7 +10,18 @@ import type {
   TenantEvent,
   WorkflowRun,
 } from '../interfaces.js';
-import { loadFanMembers, loadRunDetail, type RunDetailSource } from '../run-detail-summary.js';
+import {
+  type LifecycleKind,
+  lifecycleEventName,
+  lifecycleKindOf,
+  type RepublishLifecycleTarget,
+} from '../lifecycle-events.js';
+import {
+  loadFanMembers,
+  loadRunDetail,
+  type RunDetail,
+  type RunDetailSource,
+} from '../run-detail-summary.js';
 import { runFacetsOf } from '../run-facets.js';
 import type { RunGateway } from './interface.js';
 
@@ -54,12 +65,79 @@ const KNOWN_KINDS: ReadonlySet<string> = new Set<RunRequestKind['kind']>([
   'continue',
   'retryWithInput',
   'waitingFor',
+  'republishLifecycle',
+  'workflowLifecycle',
 ]);
+
+/** A wire `since`/`until` (an ISO string after JSON) back to a `Date`. */
+function wireDate(value: unknown): Date | undefined {
+  if (value === undefined || value === null) return undefined;
+  const date =
+    value instanceof Date
+      ? value
+      : typeof value === 'string' || typeof value === 'number'
+        ? new Date(value)
+        : undefined;
+  if (!date || Number.isNaN(date.getTime())) throw new Error(`invalid date ${String(value)}`);
+  return date;
+}
+
+/** The most runs one tenant `republishLifecycle` of a workflow walks (a larger `limit` is clamped). */
+export const REPUBLISH_LIMIT_CAP = 1000;
+
+/** The code of a reply refusing a malformed or disallowed request. */
+export const BAD_REQUEST = 'bad-request';
+
+/**
+ * The {@link RepublishLifecycleTarget} a wire target stands for: exactly one of `runId` and
+ * `workflow`, `since`/`until` back to dates. Throws on a malformed one.
+ */
+function republishTargetOf(value: unknown): RepublishLifecycleTarget {
+  const t = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>;
+  const subscriber = t.subscriber;
+  if (subscriber !== undefined && typeof subscriber !== 'string') {
+    throw new BadRequestError('republishLifecycle subscriber must be a string');
+  }
+  const sub = subscriber !== undefined ? { subscriber } : {};
+  if (typeof t.runId === 'string' && t.workflow === undefined) return { runId: t.runId, ...sub };
+  if (typeof t.workflow !== 'string' || t.runId !== undefined) {
+    throw new BadRequestError('republishLifecycle needs a { runId } or { workflow } target');
+  }
+  if (t.kind !== undefined && t.kind !== 'completed' && t.kind !== 'failed') {
+    throw new BadRequestError('republishLifecycle kind must be completed or failed');
+  }
+  if (
+    t.limit !== undefined &&
+    (typeof t.limit !== 'number' || !Number.isInteger(t.limit) || t.limit <= 0)
+  ) {
+    throw new BadRequestError('republishLifecycle limit must be a positive integer');
+  }
+  const limit = t.limit === undefined ? undefined : Math.min(t.limit, REPUBLISH_LIMIT_CAP);
+  const since = wireDate(t.since);
+  const until = wireDate(t.until);
+  return {
+    workflow: t.workflow,
+    ...(t.kind !== undefined ? { kind: t.kind } : {}),
+    ...(since !== undefined ? { since } : {}),
+    ...(until !== undefined ? { until } : {}),
+    ...(limit !== undefined ? { limit } : {}),
+    ...sub,
+  };
+}
 
 /** The verbs that carry no `runId` and are scoped some other way. */
 type UnscopedKind = Extract<
   RunRequestKind,
-  { kind: 'listRuns' | 'workerHealth' | 'runFacets' | 'runValueFacets' | 'waitingFor' }
+  {
+    kind:
+      | 'listRuns'
+      | 'workerHealth'
+      | 'runFacets'
+      | 'runValueFacets'
+      | 'waitingFor'
+      | 'republishLifecycle'
+      | 'workflowLifecycle';
+  }
 >;
 
 /** Options for {@link RunRequestResponder}. */
@@ -110,9 +188,13 @@ function isTerminalRunEvent(event: EngineEvent): boolean {
  *    tenant owns.
  * 3. **`workerHealth` is group-scoped** to the tenant's own `@<tenant>` queues.
  * 4. **Every runId-bearing verb** (`getRun`/`getCheckpoints`/`getRunDetail`/`getFanMembers`/
- *    `getSearchAttributes`/`signal`/`cancel`/`redispatch`/`retry`/`continue`/`retryWithInput`)
- *    loads the run alone FIRST — never its timeline — and rejects with `cross-tenant` when `run.namespace` isn't the derived tenant —
- *    anti-IDOR, so a tenant can never read OR act on another tenant's run.
+ *    `getSearchAttributes`/`signal`/`cancel`/`redispatch`/`retry`/`continue`/`retryWithInput`, and
+ *    `republishLifecycle` of one run) loads the run alone FIRST — never its timeline — and rejects
+ *    with `cross-tenant` when `run.namespace` isn't the derived tenant —
+ *    anti-IDOR, so a tenant can never read OR act on another tenant's run. A `republishLifecycle`
+ *    of a workflow's runs is forced to the tenant's namespace, like `listRuns`.
+ *    `workflowLifecycle`, and the lifecycle links of `getRunDetail`, list only the subscriptions of
+ *    the tenant's namespace.
  * 5. **`start` forces the run's namespace** to the derived tenant, so a started run is owned by, and
  *    later only reachable by, that tenant.
  * 6. **Unknown verbs are rejected** rather than silently ignored, with the
@@ -123,6 +205,34 @@ function isTerminalRunEvent(event: EngineEvent): boolean {
  *
  * Do not weaken any of these — they are the isolation guarantee of the store-less cluster.
  */
+/**
+ * `detail` with its links to other runs kept to `tenant`'s namespace: `awaitedBy` without the
+ * waiting runs of other namespaces, and what was read of a `triggeredBy`, `waitsFor` or started
+ * `lifecycleDeliveries` run (its status, namespace and trace id) only when that run is the tenant's.
+ */
+function scopeRunLinks(detail: RunDetail, tenant: string): RunDetail {
+  const own = (link: { namespace?: string | undefined }) => link.namespace === tenant;
+  const bare = <T extends { status?: unknown; namespace?: string | undefined }>(link: T): T => {
+    if (own(link)) return link;
+    const { status: _status, namespace: _namespace, ...rest } = link;
+    return rest as T;
+  };
+  const awaitedBy = detail.awaitedBy?.filter(own);
+  const { awaitedBy: _awaitedBy, ...rest } = detail;
+  const source = detail.triggeredBy;
+  return {
+    ...rest,
+    ...(source
+      ? { triggeredBy: own(source) ? source : { runId: source.runId, kind: source.kind } }
+      : {}),
+    ...(awaitedBy && awaitedBy.length > 0 ? { awaitedBy } : {}),
+    ...(detail.waitsFor ? { waitsFor: detail.waitsFor.map(bare) } : {}),
+    ...(detail.lifecycleDeliveries
+      ? { lifecycleDeliveries: detail.lifecycleDeliveries.map(bare) }
+      : {}),
+  };
+}
+
 export class RunRequestResponder {
   readonly #transport: ResponderTransport;
   readonly #gateway: RunGateway;
@@ -238,6 +348,12 @@ export class RunRequestResponder {
           error: { message: 'run belongs to another tenant', code: 'cross-tenant' },
         });
       }
+      if (err instanceof BadRequestError) {
+        return reply(msg.requestId, {
+          ok: false,
+          error: { message: err.message, code: BAD_REQUEST },
+        });
+      }
       if (err instanceof GatewayLacksVerbError) {
         return reply(msg.requestId, {
           ok: false,
@@ -303,12 +419,75 @@ export class RunRequestResponder {
       return owned;
     }
 
+    if (body.kind === 'workflowLifecycle') {
+      if (!this.#gateway.workflowLifecycle) throw new GatewayLacksVerbError(body.kind);
+      if (typeof body.workflow !== 'string' || body.workflow.length === 0) {
+        throw new Error('workflowLifecycle needs a workflow name');
+      }
+      // Only the subscriptions of the tenant's namespace: another tenant's are not its to see.
+      return this.#gateway.workflowLifecycle(body.workflow, { namespace: tenant });
+    }
+
+    if (body.kind === 'republishLifecycle') {
+      if (!this.#gateway.republishLifecycle) throw new GatewayLacksVerbError(body.kind);
+      const target = republishTargetOf(body.target);
+      if ('runId' in target) {
+        // Ownership first, like every runId-bearing verb: another tenant's run is never republished.
+        const run = await this.#gateway.getRun(target.runId);
+        if (run && run.namespace !== tenant) throw new CrossTenantError();
+        if (run && target.subscriber !== undefined) {
+          const kind = lifecycleKindOf(run.status);
+          await this.#assertSubscribes(run.workflow, kind, target.subscriber, tenant);
+        }
+        return this.#gateway.republishLifecycle(target);
+      }
+      if (target.subscriber !== undefined) {
+        await this.#assertSubscribes(target.workflow, target.kind, target.subscriber, tenant);
+      }
+      // A workflow's runs: forced to the tenant's namespace, never a body claim.
+      return this.#gateway.republishLifecycle({ ...target, namespace: tenant });
+    }
+
     // Every remaining verb is runId-bearing. Load the run FIRST — before calling the verb — so a
     // cross-tenant request never reaches the gateway's mutating methods (signal/cancel/redispatch/
-    // retry/continue/retryWithInput) or leaks another tenant's run via a read (getRun/getCheckpoints/getSearchAttributes).
+    // retry/continue/retryWithInput) or leaks another tenant's run via a read
+    // (getRun/getCheckpoints/getSearchAttributes).
     const run = await this.#gateway.getRun(body.runId);
     if (run && run.namespace !== tenant) throw new CrossTenantError();
-    return this.#callVerb(body, run);
+    const answer = await this.#callVerb(body, run);
+    if (body.kind === 'getRunDetail' && answer) {
+      return this.#scopeLifecycle(answer as RunDetail, tenant);
+    }
+    return answer;
+  }
+
+  /**
+   * `detail` with its lifecycle links (`workflowLifecycle`, `lifecycleSubscribers`) narrowed to the
+   * subscriptions of `tenant`'s namespace, as the `workflowLifecycle` verb answers them, and its
+   * links to other runs kept to `tenant`'s: a run of another namespace waiting on this one is left
+   * out, and a linked run of another namespace keeps its id (derived from this run) but not its
+   * status.
+   */
+  async #scopeLifecycle(input: RunDetail, tenant: string): Promise<RunDetail> {
+    const detail = scopeRunLinks(input, tenant);
+    if (detail.workflowLifecycle === undefined && detail.lifecycleSubscribers === undefined) {
+      return detail;
+    }
+    const { workflowLifecycle: _links, lifecycleSubscribers: _subscribers, ...rest } = detail;
+    const links = await this.#gateway.workflowLifecycle?.(detail.run.workflow, {
+      namespace: tenant,
+    });
+    if (!links) return rest;
+    const kind = lifecycleKindOf(detail.run.status);
+    const subscribers = kind
+      ? [...new Set(links.startsOnSettle.filter((l) => l.kind === kind).map((l) => l.workflow))]
+      : [];
+    const linked = links.startsOnSettle.length > 0 || links.startedBy.length > 0;
+    return {
+      ...rest,
+      ...(subscribers.length > 0 ? { lifecycleSubscribers: subscribers } : {}),
+      ...(linked ? { workflowLifecycle: links } : {}),
+    };
   }
 
   /** Dispatch a runId-bearing verb. `run` is the already-loaded run (ownership-checked by the caller) —
@@ -446,6 +625,30 @@ export class RunRequestResponder {
    * the signed token: it is verified and the real tenant DERIVED from it (`null` on reject). Without a
    * verifier, the wire value is trusted verbatim (prefix/network isolation only, aviary-compatible).
    */
+  /**
+   * Refuse ({@link BadRequestError}) a republish naming a `subscriber` that does not subscribe to
+   * `workflow`'s lifecycle event (`kind`, or either when undefined) in `tenant`'s namespace, so a
+   * tenant can only owe a run's event to one of its own subscribers.
+   */
+  async #assertSubscribes(
+    workflow: string,
+    kind: LifecycleKind | undefined,
+    subscriber: string,
+    tenant: string,
+  ): Promise<void> {
+    if (!this.#gateway.workflowLifecycle) throw new GatewayLacksVerbError('workflowLifecycle');
+    const links = await this.#gateway.workflowLifecycle(workflow, { namespace: tenant });
+    const subscribes = links.startsOnSettle.some(
+      (link) => link.workflow === subscriber && (kind === undefined || link.kind === kind),
+    );
+    if (!subscribes) {
+      const event = kind
+        ? lifecycleEventName(workflow, kind)
+        : `the lifecycle events of ${workflow}`;
+      throw new BadRequestError(`subscriber ${subscriber} does not subscribe to ${event}`);
+    }
+  }
+
   async #resolveTenant(wireTenant: string): Promise<string | null> {
     if (!this.#verifyTenant) return wireTenant;
     const verified = await this.#verifyTenant({ token: wireTenant, tenant: wireTenant });
@@ -455,6 +658,9 @@ export class RunRequestResponder {
 
 /** A runId-bearing request addressed a run of another tenant. */
 class CrossTenantError extends Error {}
+
+/** A request that is malformed or asks for something the tenant may not do; replied as `bad-request`. */
+class BadRequestError extends Error {}
 
 /** The control plane's gateway does not implement an optional verb (a hand-written gateway). */
 class GatewayLacksVerbError extends Error {

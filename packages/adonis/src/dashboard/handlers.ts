@@ -20,6 +20,13 @@ import type {
   WorkflowRun,
 } from '../index.js';
 import {
+  lifecycleKindOf,
+  type RepublishLifecycleResult,
+  type RepublishLifecycleTarget,
+  type WorkflowLifecycleLinks,
+} from '../lifecycle-events.js';
+import type { MetricsSnapshot } from '../metrics.js';
+import {
   type FanPage,
   type FanPageQuery,
   type FanSummary,
@@ -108,6 +115,12 @@ export interface DashboardEngine {
   listSchedules?(): Promise<ScheduleInfo[]>;
   setSchedulePaused?(key: string, paused: boolean): boolean | Promise<boolean>;
   triggerSchedule?(key: string): Promise<RunResult | null>;
+  /** Publish one settled run's lifecycle event again (`engine.republishLifecycle({ runId })`).
+   *  Optional: absent where the topology cannot, and the handler answers 404. */
+  republishLifecycle?(target: RepublishLifecycleTarget): Promise<RepublishLifecycleResult>;
+  /** Who starts whom through lifecycle events, for one workflow (`engine.workflowLifecycle`).
+   *  Optional: absent where the topology cannot answer, and the handler answers 404. */
+  workflowLifecycle?(workflow: string): Promise<WorkflowLifecycleLinks>;
   /** Live lifecycle events for ONE run; returns an unsubscribe fn. */
   subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void;
   /**
@@ -154,8 +167,14 @@ export interface DashboardEngine {
 /** The read/control port the handlers operate over (a store engine or a tenant gateway adapter). */
 export interface Deps {
   engine: DashboardEngine;
-  /** This process's event counters (`collectMetrics`), prepended to `GET /metrics`. */
-  metrics?: { prometheus(): string } | undefined;
+  /** This process's event counters (`collectMetrics`), prepended to `GET /metrics`, and read by
+   *  `GET /workflows/:name/lifecycle` for its per-subscriber trigger counts. */
+  metrics?:
+    | {
+        prometheus(): string;
+        snapshot?(): Pick<MetricsSnapshot, 'triggeredBySubscriber' | 'triggerFailedBySubscriber'>;
+      }
+    | undefined;
   /** Host redaction hooks over the SERIALIZED run/checkpoint shapes (see the config's `redact`). */
   redact?: {
     run?: (run: Record<string, unknown>) => Record<string, unknown>;
@@ -217,6 +236,21 @@ const badRequest = (message: string): ApiResponse => ({
   status: 400,
   body: { error: message },
 });
+
+/**
+ * `work`'s answer, or `501` when the topology's control plane answered that it does not support the
+ * verb (an older release behind a tenant pod; the error carries the `unsupported-request` code).
+ */
+async function unlessUnsupported(work: () => Promise<ApiResponse>): Promise<ApiResponse> {
+  try {
+    return await work();
+  } catch (err) {
+    if ((err as { code?: unknown } | null)?.code === 'unsupported-request') {
+      return { status: 501, body: { error: (err as Error).message } };
+    }
+    throw err;
+  }
+}
 
 /** Library-level ceiling for operator-supplied payloads (fix-and-replay input, signal/update/task
  *  bodies): 1 MiB of JSON. The host's bodyparser limit still applies first; this guards deployments
@@ -437,6 +471,13 @@ export async function getRun(deps: Deps, req: ApiRequest): Promise<ApiResponse> 
       children: detail.children,
       ...(detail.fans ? { fans: detail.fans.map((fan) => serializeFan(fan, checkpoint)) } : {}),
       ...(detail.childCount !== undefined ? { childCount: detail.childCount } : {}),
+      ...(detail.triggered ? { triggered: detail.triggered } : {}),
+      ...(detail.triggeredBy ? { triggeredBy: detail.triggeredBy } : {}),
+      ...(detail.lifecycleSubscribers ? { lifecycleSubscribers: detail.lifecycleSubscribers } : {}),
+      ...(detail.workflowLifecycle ? { workflowLifecycle: detail.workflowLifecycle } : {}),
+      ...(detail.lifecycleDeliveries ? { lifecycleDeliveries: detail.lifecycleDeliveries } : {}),
+      ...(detail.waitsFor ? { waitsFor: detail.waitsFor } : {}),
+      ...(detail.awaitedBy ? { awaitedBy: detail.awaitedBy } : {}),
     }),
     ...(detail.etag ? { headers: etagHeaders(detail.etag) } : {}),
   };
@@ -502,6 +543,85 @@ export async function retryRun(deps: Deps, req: ApiRequest): Promise<ApiResponse
   const result = await deps.engine.requeue(id);
   if (!result) return notFound(`run ${id} not found`);
   return ok({ result });
+}
+
+/**
+ * `GET /workflows/:name/lifecycle` — who starts whom through lifecycle events, for one workflow: the
+ * workflows that start when it settles and the ones whose settling starts it, from the answering
+ * engine's registry and the subscriptions live workers announce, plus `triggerCounts` (per
+ * subscriber, started and failed, counted by this process since it started) when the dashboard has
+ * the process's metrics. `404` on a topology without it, `501` when a tenant pod's control plane is
+ * too old to answer it.
+ */
+export async function workflowLifecycle(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
+  const name = req.params.name;
+  if (!name) return notFound('workflow name is required');
+  const read = deps.engine.workflowLifecycle;
+  if (!read) return notFound('workflow lifecycle links are unavailable on this topology');
+  return unlessUnsupported(async () => {
+    const links = await read.call(deps.engine, name);
+    const counts = triggerCountsOf(deps, links);
+    return ok(counts ? { ...links, triggerCounts: counts } : links);
+  });
+}
+
+/**
+ * How many runs each subscriber of `links.workflow` was started for (`triggered`) and how many
+ * times starting it failed (`failed`), counted by this process's metrics since it started. Undefined
+ * without metrics (a tenant pod) or without subscribers.
+ */
+function triggerCountsOf(
+  deps: Deps,
+  links: WorkflowLifecycleLinks,
+): Record<string, { triggered: number; failed: number }> | undefined {
+  const snapshot = deps.metrics?.snapshot?.();
+  if (!snapshot || links.startsOnSettle.length === 0) return undefined;
+  const triggered = snapshot.triggeredBySubscriber[links.workflow] ?? {};
+  const failed = snapshot.triggerFailedBySubscriber[links.workflow] ?? {};
+  const counts: Record<string, { triggered: number; failed: number }> = {};
+  for (const { workflow } of links.startsOnSettle) {
+    counts[workflow] = { triggered: triggered[workflow] ?? 0, failed: failed[workflow] ?? 0 };
+  }
+  return counts;
+}
+
+/**
+ * `POST /runs/:id/republish-lifecycle` — publish a settled run's lifecycle event again, to the
+ * subscribers it has not started yet (or only `subscriber`, from the body). Answers with how many
+ * subscriber runs it started and which subscribers failed; `404` for an unknown run or a topology
+ * without the verb, `409` for a run that has not settled, `400` when a tenant pod's control plane
+ * refuses the request (a `subscriber` that does not subscribe to the run's ending), `501` when it
+ * is too old to answer it.
+ */
+export async function republishLifecycleRun(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
+  const id = req.params.id;
+  if (!id) return notFound('run id is required');
+  if (!deps.engine.republishLifecycle) return notFound('republish is unavailable on this topology');
+  const body = (req.body ?? {}) as { subscriber?: unknown };
+  if (body.subscriber !== undefined && typeof body.subscriber !== 'string') {
+    return badRequest('subscriber must be a string');
+  }
+  const run = await deps.engine.getRun(id);
+  if (!run) return notFound(`run ${id} not found`);
+  if (!lifecycleKindOf(run.status)) {
+    return { status: 409, body: { error: `run ${id} has not settled` } };
+  }
+  const republish = deps.engine.republishLifecycle;
+  return unlessUnsupported(async () => {
+    try {
+      return ok({
+        result: await republish.call(deps.engine, {
+          runId: id,
+          ...(typeof body.subscriber === 'string' ? { subscriber: body.subscriber } : {}),
+        }),
+      });
+    } catch (err) {
+      if ((err as { code?: unknown } | null)?.code === 'bad-request') {
+        return badRequest(err instanceof Error ? err.message : String(err));
+      }
+      throw err;
+    }
+  });
 }
 
 /**

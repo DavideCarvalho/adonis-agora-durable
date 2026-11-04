@@ -233,6 +233,9 @@ describe('a finished run with no parent', () => {
     };
     const engine = new WorkflowEngine({ store });
     engine.register('wf', '1', async () => 'done');
+    // Read the fleet's subscriptions first: before that read, the run's lifecycle publish reads it.
+    await engine.sweepLifecycleEvents();
+    calls.length = 0;
 
     await engine.start('wf', {}, 'root');
     await engine.drain(5_000);

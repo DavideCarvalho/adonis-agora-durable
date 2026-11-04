@@ -50,12 +50,14 @@ engine.subscribe((event) => {
 
 | Type | Also carries | Emitted when |
 | --- | --- | --- |
-| `run.started` | `workflow`, `namespace` | a run begins executing (not when it is created — a `pending` run has not started) |
+| `run.started` | `workflow`, `namespace`, `sourceTraceparent?` | a run begins executing (not when it is created — a `pending` run has not started); on a run a lifecycle event started, `sourceTraceparent` is the source run's span when a run trace provider recorded it (see [OpenTelemetry](/docs/durable/observability/otel#lifecycle-links)) |
 | `run.completed` | `workflow`, `namespace`, `output` | a run finishes successfully |
 | `run.failed` | `workflow`, `namespace`, `error` | a run reaches a terminal failure, including a dead-letter |
 | `run.suspended` | `workflow`, `namespace` | a run parks — on a sleep, a signal, a child, a remote step, or singleton back-pressure |
 | `run.routed` | `workflow`, `namespace`, `name`, `error` | a failed run handed its failure to an [onError handler](/docs/durable/reliability/on-error) (`name` is the handler workflow); the run now waits on the handler |
 | `run.unrouted` | `workflow`, `namespace`, `error`, `reason` | a failed run had onError routes the engine could not apply (its live workers announce different route sets), so it failed instead |
+| `run.triggered` | `workflow`, `namespace`, `name`, `triggeredRunId?` | a settled run's [lifecycle event](/docs/durable/authoring/lifecycle-events) started subscriber `name` as run `triggeredRunId` (absent when the subscriber batches its events) |
+| `run.trigger_failed` | `workflow`, `namespace`, `name`, `error` | a settled run's lifecycle event could not start subscriber `name`: its `where` threw or its start failed. Not retried |
 | `step.started` | `seq`, `name`, `kind`, `redispatched?` | a step's body begins; `redispatched: true` marks a lost-dispatch re-drive of a remote step, not a first attempt or a failure retry |
 | `step.completed` | `seq`, `name`, `kind`, `output`, `durationMs`, `queueMs` (remote) | a step settles successfully |
 | `step.failed` | `seq`, `name`, `kind`, `error`, `durationMs`, `queueMs` (remote) | a step attempt fails (each retry emits its own) |

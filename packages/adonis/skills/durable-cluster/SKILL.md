@@ -155,10 +155,12 @@ const detail = await runGateway.getRunDetail?.(params.id, { summarizeFansOver: 5
 
 Tenants and the control plane upgrade in either order. A verb the control plane
 does not know comes back as `unsupported-request` (or, before 0.50, an
-`unknown run-request verb` error) and the proxy falls back at once: run detail
+`unknown run-request verb` error). Verbs with a fallback fall back at once: run detail
 is built from `getRun` + `getCheckpoints` and summarized on the tenant, and the
 tenant console degrades `retry` to a re-dispatch; it remembers the old control
-plane for a minute. Every request gets a reply, even when the gateway throws.
+plane for a minute. `republishLifecycle` and `workflowLifecycle` have no fallback —
+the proxy rejects with `RunGatewayError` (`unsupported-request`), which the dashboard
+answers as `501`. Every request gets a reply, even when the gateway throws.
 Source: `docs/cluster/roles-and-config.mdx`.
 
 ### Pattern 2 — capability-aware routing and blocked runs

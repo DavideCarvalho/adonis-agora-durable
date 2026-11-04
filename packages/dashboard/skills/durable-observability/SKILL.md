@@ -208,7 +208,8 @@ listing on stores without it). The **Worker health** table lists every group
 (STARVED first); the **Workers** table has one row per live instance (mode,
 limit, saturation, RAM/CPU, steps/min, p95, last adjustment; `n/a` = no status
 reported, `—` = nothing measured yet). Copies of one event recorded by several
-pods are collapsed by event + runId + emission instant (`dedupeRunEvents`).
+pods are collapsed by event + runId + emission instant + subscriber name
+(`dedupeRunEvents`, so two subscribers of one run sharing an instant stay apart).
 Per-run actions stay in the durable dashboard. Source:
 `docs/observability/telescope.mdx`.
 

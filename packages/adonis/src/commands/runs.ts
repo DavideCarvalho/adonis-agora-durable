@@ -1,4 +1,6 @@
 import type {
+  RepublishLifecycleResult,
+  RepublishLifecycleTarget,
   RunQuery,
   RunResult,
   RunStatus,
@@ -49,6 +51,68 @@ export async function listRuns(source: RunLister, opts: ListRunsOptions): Promis
  */
 export async function retryRun(engine: WorkflowEngine, runId: string): Promise<RunResult | null> {
   return engine.requeue(runId);
+}
+
+/** The `durable:lifecycle:republish` flags: `--run`, or `--workflow` with the optional window. */
+export interface RepublishLifecycleOptions {
+  run?: string | undefined;
+  workflow?: string | undefined;
+  /** Only runs settled at or after this ISO date/time. */
+  since?: string | undefined;
+  /** Only runs settled at or before this ISO date/time. */
+  until?: string | undefined;
+  subscriber?: string | undefined;
+  /** `completed` or `failed`; both when absent. */
+  kind?: string | undefined;
+  limit?: number | undefined;
+}
+
+/**
+ * The {@link RepublishLifecycleTarget} the `durable:lifecycle:republish` flags describe, or an error message
+ * for flags that describe none (neither or both of `--run` / `--workflow`, an unparseable date, an
+ * unknown kind).
+ */
+export function republishLifecycleTarget(
+  opts: RepublishLifecycleOptions,
+): RepublishLifecycleTarget | { error: string } {
+  const subscriber = opts.subscriber ? { subscriber: opts.subscriber } : {};
+  if (opts.run && opts.workflow) return { error: 'pass --run or --workflow, not both' };
+  if (opts.run) {
+    if (opts.since || opts.until || opts.kind || opts.limit !== undefined) {
+      return { error: '--since, --until, --kind and --limit go with --workflow, not --run' };
+    }
+    return { runId: opts.run, ...subscriber };
+  }
+  if (!opts.workflow) return { error: 'pass --run <id> or --workflow <name>' };
+  const date = (flag: string, value: string | undefined): Date | string | undefined => {
+    if (value === undefined) return undefined;
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? `--${flag} is not a date: ${value}` : parsed;
+  };
+  const since = date('since', opts.since);
+  const until = date('until', opts.until);
+  if (typeof since === 'string') return { error: since };
+  if (typeof until === 'string') return { error: until };
+  if (opts.kind !== undefined && opts.kind !== 'completed' && opts.kind !== 'failed') {
+    return { error: `--kind must be completed or failed, not ${opts.kind}` };
+  }
+  return {
+    workflow: opts.workflow,
+    ...(opts.kind ? { kind: opts.kind } : {}),
+    ...(since ? { since } : {}),
+    ...(until ? { until } : {}),
+    ...(opts.limit !== undefined ? { limit: opts.limit } : {}),
+    ...subscriber,
+  };
+}
+
+/** A one-line summary of a republish, then one line per subscriber it could not start. */
+export function renderRepublishResult(result: RepublishLifecycleResult): string {
+  const lines = [
+    `Republished ${result.runs} run(s): started ${result.started} subscriber run(s), ${result.failed.length} failed.`,
+  ];
+  for (const f of result.failed) lines.push(`  ${f.runId} -> ${f.subscriber}: ${f.error}`);
+  return lines.join('\n');
 }
 
 // ---------------------------------------------------------------------------

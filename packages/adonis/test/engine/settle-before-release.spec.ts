@@ -261,6 +261,8 @@ describe('recoverIncomplete acts on the run it LOCKED, not the one it listed', (
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store, maxRecoveryAttempts: 0 });
     engine.register('wf', '1', async () => 'done');
+    // Read the fleet's subscriptions first, so no lifecycle publish leases the dead run.
+    await engine.sweepLifecycleEvents();
     await store.createRun({
       id: 'r1',
       workflow: 'wf',

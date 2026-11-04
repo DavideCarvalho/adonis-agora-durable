@@ -1196,6 +1196,7 @@ export class LucidStateStore implements StateStore {
       if (query.workflows.length) q.whereIn('workflow', query.workflows);
       else q.whereRaw('1 = 0');
     }
+    if (query.excludeWorkflows?.length) q.whereNotIn('workflow', query.excludeWorkflows);
     if (query.namespace !== undefined) {
       q.whereIn('namespace', namespaceFilterValues(query.namespace));
     }
@@ -1229,6 +1230,7 @@ export class LucidStateStore implements StateStore {
     if (query.createdBefore !== undefined) q.where('created_at', '<=', query.createdBefore);
     if (query.createdAfter !== undefined) q.where('created_at', '>=', query.createdAfter);
     if (query.updatedBefore !== undefined) q.where('updated_at', '<=', query.updatedBefore);
+    if (query.updatedAfter !== undefined) q.where('updated_at', '>=', query.updatedAfter);
     if (query.wakeBefore !== undefined) {
       q.whereNotNull('wake_at').where('wake_at', '<=', query.wakeBefore);
     }

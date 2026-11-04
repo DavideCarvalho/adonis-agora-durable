@@ -1,5 +1,10 @@
 import type { DispatchDiagnostics } from './dispatch-routing.js';
 import type { WorkerDescriptor } from './handshake/descriptor.js';
+import type {
+  LifecycleEventOf,
+  RepublishLifecycleTarget,
+  WorkflowLifecycleEvent,
+} from './lifecycle-events.js';
 import type { FanPageQuery, RunDetailOptions } from './run-detail-summary.js';
 import type { StandardSchemaV1 } from './standard-schema.js';
 import type { StepRef } from './step-name-symbol.js';
@@ -132,7 +137,8 @@ export interface WorkflowRun {
  * `@dudousxd/nestjs-durable-core`'s `RunWaiting` byte-for-byte.
  */
 export interface RunWaiting {
-  on: 'signal' | 'webhook' | 'child' | 'breakpoint';
+  /** `run` is a `ctx.waitForRun`, whose `name` is the run waited for. */
+  on: 'signal' | 'webhook' | 'child' | 'breakpoint' | 'run';
   name: string;
 }
 
@@ -1069,6 +1075,11 @@ export interface RunQuery {
    * else, and further narrowed by a concurrent single `workflow`. Empty array = matches nothing.
    */
   workflows?: string[] | undefined;
+  /**
+   * Leave out the runs of these workflows (`workflow NOT IN (...)`). The engine's read API sets it
+   * to hide its internal bookkeeping rows (the lifecycle subscription registry) from run lists.
+   */
+  excludeWorkflows?: string[] | undefined;
   status?: RunStatus | undefined;
   /**
    * Restrict to runs in this worker-pool partition (exact match against {@link WorkflowRun.namespace}),
@@ -1121,6 +1132,11 @@ export interface RunQuery {
    * `updatedAt`; its `createdAt` may be much older on a long workflow).
    */
   updatedBefore?: number | undefined;
+  /**
+   * Only runs last touched at or after this epoch-ms instant (`updated_at >= updatedAfter`): what the
+   * lifecycle sweep means by "settled in the last two minutes".
+   */
+  updatedAfter?: number | undefined;
   /**
    * Only runs whose durable wake timer is due at this instant (`wake_at IS NOT NULL AND wake_at <=
    * wakeBefore`). Lets the blocked-run recovery poll ask the store for due rows instead of listing
@@ -1731,7 +1747,13 @@ export type RunRequestKind =
   | { kind: 'retry'; runId: string }
   | { kind: 'continue'; runId: string }
   | { kind: 'retryWithInput'; runId: string; input: unknown }
-  | { kind: 'waitingFor'; runIds: string[] };
+  | { kind: 'waitingFor'; runIds: string[] }
+  // Publish settled runs' lifecycle events again (`engine.republishLifecycle`): one run (ownership
+  // checked on the run first) or a workflow's runs (forced to the tenant's namespace). Nested under
+  // `target`, whose own `kind` would collide with the verb's; `since`/`until` travel as ISO strings.
+  | { kind: 'republishLifecycle'; target: RepublishLifecycleTarget }
+  // Who starts whom through lifecycle events, for one workflow (`engine.workflowLifecycle`).
+  | { kind: 'workflowLifecycle'; workflow: string };
 
 /** The control plane's answer to a {@link RunRequest} (or to a start-run, correlated by the minted
  *  runId), keyed by `requestId`. Byte-compatible with aviary's `RunReply`. */
@@ -2050,6 +2072,12 @@ export interface ChildCallOptions {
   priority?: number | undefined;
 }
 
+/** Options for `ctx.waitForRun`. */
+export interface WaitForRunOptions {
+  /** Give up after this long (ms, or a duration like `'2h'`), throwing `SignalTimeoutError`. */
+  timeoutMs?: number | string | undefined;
+}
+
 export interface StepOptions {
   /** Max attempts before the step (and run) fails. */
   retries?: number;
@@ -2317,6 +2345,25 @@ export interface WorkflowCtx<A extends SearchAttributesShape = SearchAttributes>
     name: string,
     opts?: { match?: Record<string, unknown>; timeoutMs?: number },
   ): Promise<TPayload>;
+  /**
+   * Wait for ANY run (not only a child of this one) to settle, then resume with its
+   * {@link WorkflowLifecycleEvent}: `status`, and `output` when it completed or `error` when it did
+   * not. A run that has already settled resolves at once. `timeoutMs` (ms or a duration like `'2h'`)
+   * bounds the wait and throws `SignalTimeoutError`; an unknown `runId` throws a non-retryable
+   * `FatalError` (`run <id> not found`). No compute consumed while waiting.
+   *
+   * Pass the run's workflow class first (`ctx.waitForRun(IngestWorkflow, runId)`) to type the event
+   * as `LifecycleEventOf<typeof IngestWorkflow>`.
+   */
+  waitForRun<C extends WorkflowClass>(
+    workflow: C,
+    runId: string,
+    opts?: WaitForRunOptions,
+  ): Promise<LifecycleEventOf<C>>;
+  waitForRun<TOutput = unknown>(
+    runId: string,
+    opts?: WaitForRunOptions,
+  ): Promise<WorkflowLifecycleEvent<unknown, TOutput>>;
   /**
    * An external task with **async completion**: run `dispatch` once (checkpointed — e.g. send to a
    * queue, kick off a non-durable worker or a foreign service like a Python process), then suspend
@@ -2593,7 +2640,15 @@ export type EngineEventType =
   | 'run.routed'
   // A failed run had onError routes that could not be applied — its live workers announce different
   // ones (`reason` says so) — so it failed instead of being handed off.
-  | 'run.unrouted';
+  | 'run.unrouted'
+  // A settled run started a subscriber of its lifecycle event (`run.completed:<workflow>` /
+  // `run.failed:<workflow>`). `runId` is the settled run, `name` the subscriber workflow and
+  // `triggeredRunId` the run it started (absent when the subscriber debounces/batches its events).
+  | 'run.triggered'
+  // A settled run's lifecycle event could not start a subscriber: its `where` threw, or starting it
+  // failed (e.g. its input was rejected). `runId` is the settled run, `name` the subscriber workflow
+  // and `error` the cause. The event is not retried.
+  | 'run.trigger_failed';
 
 /**
  * A lifecycle event emitted by the engine. The observability surfaces (dashboard, OTel, the
@@ -2634,6 +2689,14 @@ export interface EngineEvent {
   redispatched?: boolean | undefined;
   /** Why a `run.unrouted` run's onError routes were not applied. */
   reason?: string | undefined;
+  /** The run a `run.triggered` event started. */
+  triggeredRunId?: string | undefined;
+  /**
+   * On the `run.started` of a run a lifecycle event started: the W3C traceparent of the source run's
+   * span, when it is known (see `WorkflowEngine.setRunTraceparent`). A tracer links the run's span
+   * to it.
+   */
+  sourceTraceparent?: string | undefined;
   at: Date;
 }
 

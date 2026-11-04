@@ -1,6 +1,9 @@
 import { type DurableDashboardOptions, durableDashboard } from './dashboard.js';
 import {
   durableDurationProvider,
+  durableFailedTriggersProvider,
+  durableLifecycleTriggersProvider,
+  durableOwedLifecycleProvider,
   durableRecentFailuresProvider,
   durableRunsOverTimeProvider,
   durableStateBreakdownProvider,
@@ -48,6 +51,9 @@ export function durableTelescopeExtension(opts: DurableDashboardOptions = {}): T
       durableSuccessRateProvider(),
       durableThroughputProvider(),
       durableStateBreakdownProvider(),
+      durableFailedTriggersProvider(),
+      durableOwedLifecycleProvider(),
+      durableLifecycleTriggersProvider(),
     ],
     schedules: (ctx) => durableSchedules(ctx),
   };

@@ -10,6 +10,11 @@ import type {
   SignalWaiter,
   UpdateResult,
 } from '../interfaces.js';
+import type {
+  RepublishLifecycleResult,
+  RepublishLifecycleTarget,
+  WorkflowLifecycleLinks,
+} from '../lifecycle-events.js';
 import { DURABLE_RUN_GATEWAY } from '../role_bindings.js';
 import type { FanPageQuery, RunDetailOptions } from '../run-detail-summary.js';
 import type { RunGateway } from '../run-gateway/interface.js';
@@ -64,6 +69,10 @@ export interface StoreEngineLike {
   /** Backlog gauges for `GET /metrics` and the `ctx.setEvent` live query — forwarded 1:1. */
   countRuns?(query: Omit<RunQuery, 'page' | 'size'>): Promise<number>;
   getEvent?(runId: string, key: string): Promise<unknown>;
+  /** Lifecycle republish — forwarded 1:1 when the engine has it. */
+  republishLifecycle?(target: RepublishLifecycleTarget): Promise<RepublishLifecycleResult>;
+  /** Who starts whom through lifecycle events — forwarded 1:1 when the engine has it. */
+  workflowLifecycle?(workflow: string): Promise<WorkflowLifecycleLinks>;
   /** Value enumeration for the console's pickers — forwarded 1:1 when the engine has it. */
   runValueFacets?(
     axis: RunValueAxis,
@@ -127,6 +136,22 @@ export function storeDashboardEngine(engine: StoreEngineLike): DashboardEngine {
       ? {
           countRuns: (query: Omit<RunQuery, 'page' | 'size'>) =>
             (engine.countRuns as NonNullable<StoreEngineLike['countRuns']>)(query),
+        }
+      : {}),
+    ...(engine.republishLifecycle
+      ? {
+          republishLifecycle: (target: RepublishLifecycleTarget) =>
+            (engine.republishLifecycle as NonNullable<StoreEngineLike['republishLifecycle']>)(
+              target,
+            ),
+        }
+      : {}),
+    ...(engine.workflowLifecycle
+      ? {
+          workflowLifecycle: (workflow: string) =>
+            (engine.workflowLifecycle as NonNullable<StoreEngineLike['workflowLifecycle']>)(
+              workflow,
+            ),
         }
       : {}),
     ...(engine.getEvent
@@ -218,6 +243,18 @@ export function gatewayDashboardEngine(gateway: RunGateway): DashboardEngine {
     redispatchPending: (runId): Promise<RunResult | null> => gateway.redispatchPending(runId),
     cancel: (runId, opts) => gateway.cancel(runId, opts),
     workerHealth: () => gateway.workerHealth(),
+    ...(gateway.republishLifecycle
+      ? {
+          republishLifecycle: (target: RepublishLifecycleTarget) =>
+            (gateway.republishLifecycle as NonNullable<RunGateway['republishLifecycle']>)(target),
+        }
+      : {}),
+    ...(gateway.workflowLifecycle
+      ? {
+          workflowLifecycle: (workflow: string) =>
+            (gateway.workflowLifecycle as NonNullable<RunGateway['workflowLifecycle']>)(workflow),
+        }
+      : {}),
     retryWithInput: (runId, input) =>
       gateway.retryWithInput
         ? orOlder(gateway.retryWithInput(runId, input), () => Promise.resolve(null))

@@ -186,6 +186,27 @@ export function aggregateAnnouncements(
   return out.sort((a, b) => a.key.localeCompare(b.key));
 }
 
+/**
+ * Which workflows the live fleet announces as subscribers of each event: event name → subscriber
+ * workflow names, folded from every descriptor's {@link WorkflowRegistration.subscribes}. Pure, like
+ * {@link aggregateAnnouncements}.
+ */
+export function announcedSubscriptions(
+  descriptors: readonly (RawWorkerDescriptor | WorkerDescriptor)[],
+): Map<string, Set<string>> {
+  const byEvent = new Map<string, Set<string>>();
+  for (const descriptor of descriptors) {
+    for (const announcement of announcementsOf(descriptor)) {
+      for (const event of announcement.subscribes ?? []) {
+        const subscribers = byEvent.get(event);
+        if (subscribers) subscribers.add(announcement.name);
+        else byEvent.set(event, new Set([announcement.name]));
+      }
+    }
+  }
+  return byEvent;
+}
+
 /** One live worker heartbeat as {@link observedAnnouncements} reads it: the token and who beats. */
 export interface HeartbeatSighting {
   /** The routing token the beat was published under (already partition-suffixed when partitioned). */

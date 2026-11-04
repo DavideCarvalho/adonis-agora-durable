@@ -110,6 +110,9 @@ async function runTickInScope(engine: WorkflowEngine, options: TickOptions): Pro
     await engine.sweepTimeouts(now);
     return 0;
   });
+  // Lifecycle events a settled run still owes (its process died before publishing). A no-op
+  // without lifecycle subscribers.
+  await phase('sweepLifecycleEvents', async () => engine.sweepLifecycleEvents(now));
   // Buffered child completions nothing will consume: a bounded slice per tick, self-throttled
   // between full passes. Housekeeping, so it runs beside the tick instead of inside it.
   startBufferedSweep(engine, now, result);

@@ -19,6 +19,11 @@ import type {
   TenantEvent,
   WorkflowRun,
 } from '../interfaces.js';
+import type {
+  RepublishLifecycleResult,
+  RepublishLifecycleTarget,
+  WorkflowLifecycleLinks,
+} from '../lifecycle-events.js';
 import {
   type FanPage,
   type FanPageQuery,
@@ -33,9 +38,36 @@ import type { WorkflowRef } from '../workflow-ref.js';
 import type { DurableTopology, RunGateway, StartRunOptions } from './interface.js';
 import { UNSUPPORTED_RUN_REQUEST } from './run-request-responder.js';
 
+/**
+ * The codes the run-request responder replies with. `string & {}` keeps a code from a newer control
+ * plane assignable without losing autocomplete on the known ones.
+ */
+export type RunGatewayErrorCode =
+  | 'unauthorized'
+  | 'cross-tenant'
+  | 'bad-request'
+  | typeof UNSUPPORTED_RUN_REQUEST
+  | (string & {});
+
+/**
+ * A tenant's run-gateway call the control plane refused, with the responder's `code` when it sent
+ * one. `unsupported-request`: the control plane runs an older release that does not know the verb.
+ * `bad-request`: the request was malformed or asked for something the tenant may not do.
+ */
+export class RunGatewayError extends Error {
+  readonly code: RunGatewayErrorCode | undefined;
+  constructor(message: string, code?: RunGatewayErrorCode) {
+    super(message);
+    this.name = 'RunGatewayError';
+    this.code = code;
+  }
+}
+
 /** The control plane answered a verb it does not know: it runs an older release than this tenant. */
-class UnsupportedRunRequestError extends Error {
-  readonly code = UNSUPPORTED_RUN_REQUEST;
+class UnsupportedRunRequestError extends RunGatewayError {
+  constructor(message: string) {
+    super(message, UNSUPPORTED_RUN_REQUEST);
+  }
 }
 
 /** The message a responder before 0.50 rejected an unknown verb with (it sent no `code`). */
@@ -101,7 +133,8 @@ interface PendingReply {
  *
  * - read/control (`getRun`/`listRuns`/`getCheckpoints`/`getRunChildren`/`getRunDetail`/
  *   `getFanMembers`/`getSearchAttributes`/`runFacets`/`runValueFacets`/`waitingFor`/`workerHealth`/
- *   `signal`/`cancel`/`retry`/`continue`/`retryWithInput`/`redispatchPending`) → publish a {@link RunRequest} correlated by a minted `requestId`,
+ *   `signal`/`cancel`/`retry`/`continue`/`retryWithInput`/`redispatchPending`/`republishLifecycle`/
+ *   `workflowLifecycle`) → publish a {@link RunRequest} correlated by a minted `requestId`,
  *   await the {@link RunReply} within `requestTimeoutMs`;
  * - `start` → publish a {@link StartRunMessage} (its own channel, byte-compatible with aviary), then
  *   await the reply the responder correlates by the minted `runId`;
@@ -154,9 +187,7 @@ export class ProxyRunGateway implements RunGateway {
     ) {
       pending.reject(new UnsupportedRunRequestError(reply.result.error.message));
     } else {
-      const err = new Error(reply.result.error.message) as Error & { code?: string };
-      if (reply.result.error.code !== undefined) err.code = reply.result.error.code;
-      pending.reject(err);
+      pending.reject(new RunGatewayError(reply.result.error.message, reply.result.error.code));
     }
   }
 
@@ -345,6 +376,48 @@ export class ProxyRunGateway implements RunGateway {
 
   retryWithInput(runId: string, input: unknown): Promise<{ runId: string } | null> {
     return this.#request<{ runId: string } | null>({ kind: 'retryWithInput', runId, input });
+  }
+
+  /**
+   * Both forms cross the wire (`since`/`until` as ISO strings). The control plane checks that a
+   * `{ runId }` target is this tenant's run, and confines a `{ workflow }` target to this tenant's
+   * namespace (a `namespace` given here is replaced). Against a control plane older than the verb it
+   * rejects with a {@link RunGatewayError} coded `unsupported-request`.
+   */
+  republishLifecycle(target: RepublishLifecycleTarget): Promise<RepublishLifecycleResult> {
+    return this.#newerVerb<RepublishLifecycleResult>({ kind: 'republishLifecycle', target });
+  }
+
+  /**
+   * Who starts whom through lifecycle events, for one workflow: only the subscriptions of this
+   * tenant's namespace, which the control plane forces. Same version-skew error as
+   * {@link republishLifecycle}.
+   */
+  workflowLifecycle(workflow: string): Promise<WorkflowLifecycleLinks> {
+    return this.#newerVerb<WorkflowLifecycleLinks>({ kind: 'workflowLifecycle', workflow });
+  }
+
+  /**
+   * A verb with no fallback on an older control plane: its unsupported-request error, or an empty
+   * `ok` reply, becomes a {@link RunGatewayError} coded `unsupported-request`. Remembered for
+   * `capabilityTtlMs`, so later calls fail at once instead of asking again.
+   */
+  async #newerVerb<T>(body: RunRequestKind): Promise<T> {
+    const notSupported = () =>
+      new RunGatewayError(
+        `${body.kind} is not supported by this server: the control plane is older than this tenant`,
+        UNSUPPORTED_RUN_REQUEST,
+      );
+    if (this.#knownUnsupported(body.kind)) throw notSupported();
+    let data: T | undefined;
+    try {
+      data = await this.#request<T | undefined>(body);
+    } catch (err) {
+      if (!(err instanceof UnsupportedRunRequestError)) throw err;
+    }
+    if (data !== undefined && data !== null) return data;
+    this.#unsupportedUntil.set(body.kind, Date.now() + this.#capabilityTtlMs);
+    throw notSupported();
   }
 
   /**

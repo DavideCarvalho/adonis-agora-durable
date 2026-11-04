@@ -59,6 +59,7 @@ ref (`OrderWorkflow.dispatch(input)`, `ctx.child(OrderWorkflow)`) carries its in
 | `tags` | Labels merged onto every run of this workflow. |
 | `executionTimeout` | Wall-clock budget for the whole run (`'5m'`, or ms). |
 | `onEvent` | Event names that start a run when published. See [Events](/docs/durable/authoring/events). |
+| `eventBatch` | Debounce or batch the runs `onEvent` starts, optionally per `key`. See [Coalescing bursts](/docs/durable/authoring/events#coalescing-bursts--eventbatch). |
 | `singleton` | Per-key serialization: excess runs sharing a key wait (suspended) for a slot. See [Singleton](/docs/durable/reliability/singleton). |
 | `concurrency` | A start-time quota: a start over `limit` runs sharing a key throws `ConcurrencyLimitError` and creates nothing. See [Concurrency quotas](/docs/durable/reliability/concurrency-quotas). |
 | `onError` | Route a failed run to a handler workflow by error `code`. See [onError routing](/docs/durable/reliability/on-error). |
@@ -67,10 +68,9 @@ ref (`OrderWorkflow.dispatch(input)`, `ctx.child(OrderWorkflow)`) carries its in
 | `origin` | Package attribution stamped on every run (the console's origin facet). Usually omitted: it is derived from the nearest `package.json` `name` (your app's, for a workflow in `app/workflows`). Set it to override. See [Run origin](/docs/durable/concepts/workflows-and-steps#run-origin--package-attribution). |
 
 Discovery forwards each of these to `engine.register`. Two names differ between the two forms:
-`searchAttributes` here is `searchAttributesSchema` on `engine.register`. And three `engine.register`
-options have no `static workflow` equivalent: `validateInput` (a function-form validator), `eventBatch`
-(debounce/batch coalescing for `onEvent`) and `requires` (worker capabilities). A workflow that needs one of
-those is registered by hand with `engine.register`.
+`searchAttributes` here is `searchAttributesSchema` on `engine.register`. And two `engine.register`
+options have no `static workflow` equivalent: `validateInput` (a function-form validator) and `requires`
+(worker capabilities). A workflow that needs one of those is registered by hand with `engine.register`.
 
 ## Validating the input
 

@@ -14,6 +14,11 @@ import type {
   StepCheckpoint,
   WorkflowRun,
 } from '../interfaces.js';
+import type {
+  RepublishLifecycleResult,
+  RepublishLifecycleTarget,
+  WorkflowLifecycleLinks,
+} from '../lifecycle-events.js';
 import type { FanPage, FanPageQuery, RunDetail, RunDetailOptions } from '../run-detail-summary.js';
 import type { WorkflowRef } from '../workflow-ref.js';
 
@@ -153,6 +158,24 @@ export interface RunGateway {
   /** What each of `runIds` is parked on (signal, webhook, awaited child, breakpoint), for the ones
    *  currently waiting; every other id is absent. A proxy only learns about the tenant's own runs. */
   waitingFor?(runIds: string[]): Promise<Record<string, RunWaiting>>;
+
+  /**
+   * Publish settled runs' lifecycle events again (`engine.republishLifecycle`): a backfill for a
+   * subscriber registered after the runs settled, or a retry of one that failed. Idempotent. Over a
+   * tenant proxy a `{ runId }` target is ownership-checked like `retry`, and a `{ workflow }` target
+   * is confined to the tenant's namespace. Optional, like `retry`.
+   */
+  republishLifecycle?(target: RepublishLifecycleTarget): Promise<RepublishLifecycleResult>;
+
+  /**
+   * Who starts whom through lifecycle events, for one workflow (`engine.workflowLifecycle`), only
+   * the subscriptions of `opts.namespace` when given. Over a tenant proxy, always the tenant's.
+   * Optional, like `retry`.
+   */
+  workflowLifecycle?(
+    workflow: string,
+    opts?: { namespace?: string | undefined },
+  ): Promise<WorkflowLifecycleLinks>;
 
   /** Live lifecycle events for ONE run; returns an unsubscribe fn. Framework-agnostic (no rxjs). */
   subscribe(runId: string, onEvent: (event: EngineEvent) => void): () => void;

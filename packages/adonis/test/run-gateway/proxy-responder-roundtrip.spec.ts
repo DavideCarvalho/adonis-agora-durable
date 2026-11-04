@@ -7,6 +7,12 @@ import type {
   StartRunMessage,
   TenantEvent,
 } from '../../src/interfaces.js';
+import {
+  LIFECYCLE_REGISTRY_TAG,
+  LIFECYCLE_REGISTRY_WORKFLOW,
+  lifecycleRegistryRunId,
+  runCompletedEvent,
+} from '../../src/lifecycle-events.js';
 import type { ProxyTransport } from '../../src/run-gateway/proxy-run-gateway.js';
 import { ProxyRunGateway } from '../../src/run-gateway/proxy-run-gateway.js';
 import type { ResponderTransport } from '../../src/run-gateway/run-request-responder.js';
@@ -87,6 +93,15 @@ function makeEngine(namespace: string): WorkflowEngine {
  * this single process — in a real cluster a store-less acme WORKER pod would; here the coordinator
  * doubles as it, letting a run actually run to completion so the read/control verbs have real state.
  */
+async function poll(fn: () => Promise<boolean>, timeoutMs = 1000): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (await fn()) return;
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  throw new Error('poll timed out');
+}
+
 function wireControlPlane(
   transport: FakeP4Transport,
   options: { verify?: ReturnType<typeof hmacTenantVerifier>; namespace?: string } = {},
@@ -288,5 +303,294 @@ describe('proxy fail-fast (spec §8)', () => {
     transport.failDispatch = true;
     const proxy = new ProxyRunGateway(transport, { partition: 'acme', requestTimeoutMs: 5_000 });
     await expect(proxy.listRuns({})).rejects.toThrow(/transport unavailable/);
+  });
+});
+
+describe('republishLifecycle over the round-trip', () => {
+  let transport: FakeP4Transport;
+  let engine: WorkflowEngine;
+  let acme: ProxyRunGateway;
+  let evil: ProxyRunGateway;
+
+  beforeEach(() => {
+    transport = new FakeP4Transport();
+    engine = wireControlPlane(transport);
+    acme = new ProxyRunGateway(transport, { partition: 'acme', requestTimeoutMs: 500 });
+    evil = new ProxyRunGateway(transport, { partition: 'evil', requestTimeoutMs: 500 });
+  });
+
+  it('republishes a tenant’s own settled run to a subscriber registered after it settled', async () => {
+    const started = await acme.start('echo', { n: 1 });
+    await engine.waitForRun(started.runId);
+    // The run's live publish has finished before the subscriber is deployed.
+    await poll(
+      async () =>
+        !(await engine.getRun(started.runId))?.tags?.includes('durable:lifecycle:pending'),
+    );
+    engine.register('audit', '1', async () => 'audited', {
+      onEvent: [runCompletedEvent('echo')],
+    });
+
+    const result = await acme.republishLifecycle({ runId: started.runId, subscriber: 'audit' });
+    expect(result).toEqual({ runs: 1, started: 1, failed: [] });
+    expect(await acme.republishLifecycle({ runId: started.runId })).toEqual({
+      runs: 1,
+      started: 0,
+      failed: [],
+    });
+  });
+
+  it('refuses a subscriber that does not subscribe in the tenant’s namespace', async () => {
+    const started = await acme.start('echo', { n: 1 });
+    await engine.waitForRun(started.runId);
+    await expect(
+      acme.republishLifecycle({ runId: started.runId, subscriber: 'nobody' }),
+    ).rejects.toMatchObject({
+      code: 'bad-request',
+      message: 'subscriber nobody does not subscribe to run.completed:echo',
+    });
+    await expect(
+      acme.republishLifecycle({ workflow: 'echo', kind: 'failed', subscriber: 'nobody' }),
+    ).rejects.toMatchObject({
+      code: 'bad-request',
+      message: 'subscriber nobody does not subscribe to run.failed:echo',
+    });
+    expect((await engine.getRun(started.runId))?.tags ?? []).not.toContain(
+      'durable:lifecycle:owed:nobody',
+    );
+  });
+
+  it('requires a positive integer limit and clamps it to 1000', async () => {
+    for (const limit of [0, -1, 1.5, Number.POSITIVE_INFINITY, Number.NaN]) {
+      await expect(acme.republishLifecycle({ workflow: 'echo', limit })).rejects.toMatchObject({
+        code: 'bad-request',
+        message: 'republishLifecycle limit must be a positive integer',
+      });
+    }
+    const seen: unknown[] = [];
+    const republish = engine.republishLifecycle.bind(engine);
+    engine.republishLifecycle = async (target) => {
+      seen.push(target);
+      return republish(target);
+    };
+    await acme.republishLifecycle({ workflow: 'echo', limit: 1_000_000_000 });
+    expect(seen).toEqual([expect.objectContaining({ workflow: 'echo', limit: 1000 })]);
+  });
+
+  it('rejects another tenant’s run like retry', async () => {
+    const started = await acme.start('echo', {});
+    await engine.waitForRun(started.runId);
+    await expect(evil.republishLifecycle({ runId: started.runId })).rejects.toThrow(
+      /another tenant/,
+    );
+    await expect(evil.retry(started.runId)).rejects.toThrow(/another tenant/);
+  });
+
+  it('republishes a workflow’s runs, confined to the tenant’s namespace', async () => {
+    const store = new InMemoryStateStore();
+    // An operator control plane: no namespace of its own, so it serves every tenant's runs.
+    const operator = new WorkflowEngine({ store });
+    operator.register('echo', '1', async (_ctx, input) => input);
+    const wire = new FakeP4Transport();
+    new RunRequestResponder(wire, new StoreRunGateway(operator, { role: 'control-plane' })).start();
+    const tenantA = new ProxyRunGateway(wire, { partition: 'acme', requestTimeoutMs: 500 });
+    const tenantB = new ProxyRunGateway(wire, { partition: 'evil', requestTimeoutMs: 500 });
+    const ids = [
+      (await tenantA.start('echo', { n: 1 })).runId,
+      (await tenantA.start('echo', { n: 2 })).runId,
+      (await tenantB.start('echo', { n: 3 })).runId,
+    ];
+    for (const id of ids) {
+      await operator.waitForRun(id);
+      await poll(
+        async () => !(await store.getRun(id))?.tags?.includes('durable:lifecycle:pending'),
+      );
+    }
+    let audited = 0;
+    operator.register('audit', '1', async () => void audited++, {
+      onEvent: [runCompletedEvent('echo')],
+    });
+
+    // A namespace the tenant names is replaced by its own.
+    expect(
+      await tenantB.republishLifecycle({ workflow: 'echo', kind: 'completed', namespace: 'acme' }),
+    ).toEqual({ runs: 1, started: 1, failed: [] });
+    expect(
+      await tenantA.republishLifecycle({
+        workflow: 'echo',
+        since: new Date(0),
+        until: new Date(Date.now() + 60_000),
+      }),
+    ).toEqual({ runs: 2, started: 2, failed: [] });
+    // The operator's own subscriber is not one of the tenant's subscriptions to name.
+    await expect(
+      tenantA.republishLifecycle({ workflow: 'echo', subscriber: 'audit' }),
+    ).rejects.toMatchObject({ code: 'bad-request' });
+    expect(await tenantA.republishLifecycle({ workflow: 'echo', until: new Date(0) })).toEqual({
+      runs: 0,
+      started: 0,
+      failed: [],
+    });
+    for (const id of ids) await operator.waitForRun(`evt:${id}:completed:audit`);
+    expect(audited).toBe(3);
+  });
+
+  it('sends since/until as ISO strings over JSON and gets them back as dates', async () => {
+    const json = new FakeP4Transport();
+    const send = json.dispatchRunRequest.bind(json);
+    json.dispatchRunRequest = (msg) => send(JSON.parse(JSON.stringify(msg)));
+    const control = wireControlPlane(json);
+    const tenant = new ProxyRunGateway(json, { partition: 'acme', requestTimeoutMs: 500 });
+    const started = await tenant.start('echo', {});
+    await control.waitForRun(started.runId);
+    expect(
+      await tenant.republishLifecycle({
+        workflow: 'echo',
+        since: new Date(Date.now() - 60_000),
+        until: new Date(Date.now() + 60_000),
+      }),
+    ).toEqual({ runs: 1, started: 0, failed: [] });
+    expect(
+      await tenant.republishLifecycle({ workflow: 'echo', since: new Date(Date.now() + 60_000) }),
+    ).toEqual({ runs: 0, started: 0, failed: [] });
+  });
+
+  it('answers who starts whom for a workflow', async () => {
+    engine.register('audit', '1', async () => 'audited', {
+      onEvent: [runCompletedEvent('echo')],
+    });
+    expect(await acme.workflowLifecycle('echo')).toEqual({
+      workflow: 'echo',
+      startsOnSettle: [
+        {
+          workflow: 'audit',
+          kind: 'completed',
+          local: true,
+          announced: false,
+          where: false,
+          input: false,
+        },
+      ],
+      startedBy: [],
+    });
+    expect((await acme.workflowLifecycle('audit')).startedBy.map((l) => l.workflow)).toEqual([
+      'echo',
+    ]);
+  });
+
+  it('shows a tenant only the subscriptions of its own namespace', async () => {
+    const store = new InMemoryStateStore();
+    const operator = new WorkflowEngine({ store });
+    operator.register('echo', '1', async (_ctx, input) => input);
+    // Registered on the operator itself, which serves the default namespace.
+    operator.register('audit', '1', async () => 'audited', {
+      onEvent: [runCompletedEvent('echo')],
+    });
+    for (const [instance, namespace, workflow] of [
+      ['a', 'acme', 'notify-acme'],
+      ['e', 'evil', 'notify-evil'],
+    ] as const) {
+      await store.createRun({
+        id: lifecycleRegistryRunId(instance),
+        workflow: LIFECYCLE_REGISTRY_WORKFLOW,
+        workflowVersion: '1',
+        status: 'completed',
+        namespace,
+        input: {
+          instanceId: instance,
+          runtime: 'node',
+          subscriptions: [{ workflow, events: [runCompletedEvent('echo')] }],
+        },
+        tags: [LIFECYCLE_REGISTRY_TAG],
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+    }
+    const wire = new FakeP4Transport();
+    new RunRequestResponder(wire, new StoreRunGateway(operator, { role: 'control-plane' })).start();
+    const tenantA = new ProxyRunGateway(wire, { partition: 'acme', requestTimeoutMs: 500 });
+    const tenantB = new ProxyRunGateway(wire, { partition: 'evil', requestTimeoutMs: 500 });
+
+    const names = (links: { startsOnSettle: { workflow: string }[] }) =>
+      links.startsOnSettle.map((l) => l.workflow);
+    expect(names(await operator.workflowLifecycle('echo'))).toEqual([
+      'audit',
+      'notify-acme',
+      'notify-evil',
+    ]);
+    expect(names(await tenantA.workflowLifecycle('echo'))).toEqual(['notify-acme']);
+    expect(names(await tenantB.workflowLifecycle('echo'))).toEqual(['notify-evil']);
+
+    // The run detail's links are narrowed the same way.
+    const started = await tenantA.start('echo', {});
+    await operator.waitForRun(started.runId);
+    const detail = await tenantA.getRunDetail(started.runId);
+    expect(detail?.lifecycleSubscribers).toEqual(['notify-acme']);
+    expect(detail && names(detail.workflowLifecycle ?? { startsOnSettle: [] })).toEqual([
+      'notify-acme',
+    ]);
+  });
+
+  it('keeps a tenant’s run detail links to its own namespace’s runs', async () => {
+    const store = new InMemoryStateStore();
+    const operator = new WorkflowEngine({ store });
+    operator.register('target', '1', async (ctx) => ctx.waitForSignal(`go:${ctx.runId}`));
+    operator.register('watcher', '1', async (ctx, input) =>
+      ctx.waitForRun((input as { target: string }).target),
+    );
+    await operator.start('target', {}, 'acme-target', { namespace: 'acme' });
+    await operator.start('target', {}, 'evil-target', { namespace: 'evil' });
+    await operator.start('watcher', { target: 'acme-target' }, 'acme-watch', { namespace: 'acme' });
+    await operator.start('watcher', { target: 'acme-target' }, 'evil-watch', { namespace: 'evil' });
+    await operator.start('watcher', { target: 'evil-target' }, 'acme-peek', { namespace: 'acme' });
+    const suspended = async (id: string) => (await store.getRun(id))?.status === 'suspended';
+    for (let i = 0; i < 100; i++) {
+      const all = await Promise.all(['acme-watch', 'evil-watch', 'acme-peek'].map(suspended));
+      if (all.every(Boolean)) break;
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    const wire = new FakeP4Transport();
+    new RunRequestResponder(wire, new StoreRunGateway(operator, { role: 'control-plane' })).start();
+    const tenantA = new ProxyRunGateway(wire, { partition: 'acme', requestTimeoutMs: 500 });
+
+    expect(
+      (await operator.getRunDetail('acme-target'))?.awaitedBy?.map((l) => l.runId).sort(),
+    ).toEqual(['acme-watch', 'evil-watch']);
+    expect((await tenantA.getRunDetail('acme-target'))?.awaitedBy).toEqual([
+      expect.objectContaining({ runId: 'acme-watch', status: 'suspended' }),
+    ]);
+    // A wait on another tenant's run keeps the id the tenant gave, not that run's status.
+    expect((await tenantA.getRunDetail('acme-peek'))?.waitsFor).toEqual([
+      { runId: 'evil-target', seq: expect.any(Number) },
+    ]);
+  });
+
+  it('applies the tenant verifier to both verbs', async () => {
+    const SECRET = 'lifecycle-secret';
+    const wire = new FakeP4Transport();
+    const control = wireControlPlane(wire, { verify: hmacTenantVerifier(SECRET) });
+    const forged = new ProxyRunGateway(wire, {
+      partition: 'acme',
+      token: signTenantToken('acme', 'the-wrong-secret'),
+      requestTimeoutMs: 500,
+    });
+    const genuine = new ProxyRunGateway(wire, {
+      partition: 'acme',
+      token: signTenantToken('acme', SECRET),
+      requestTimeoutMs: 500,
+    });
+    const started = await genuine.start('echo', {});
+    await control.waitForRun(started.runId);
+
+    await expect(forged.republishLifecycle({ runId: started.runId })).rejects.toThrow(
+      /unauthorized/,
+    );
+    await expect(forged.republishLifecycle({ workflow: 'echo' })).rejects.toThrow(/unauthorized/);
+    await expect(forged.workflowLifecycle('echo')).rejects.toThrow(/unauthorized/);
+    expect(await genuine.republishLifecycle({ runId: started.runId })).toEqual({
+      runs: 1,
+      started: 0,
+      failed: [],
+    });
   });
 });

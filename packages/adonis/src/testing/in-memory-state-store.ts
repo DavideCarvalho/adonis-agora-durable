@@ -742,6 +742,10 @@ export class InMemoryStateStore implements StateStore {
           ? []
           : runs.filter((r) => query.workflows?.includes(r.workflow));
     }
+    if (query.excludeWorkflows?.length) {
+      const excluded = new Set(query.excludeWorkflows);
+      runs = runs.filter((r) => !excluded.has(r.workflow));
+    }
     if (query.namespace !== undefined) {
       const namespace = query.namespace;
       runs = runs.filter((r) => namespaceMatches(r.namespace, namespace));
@@ -775,6 +779,10 @@ export class InMemoryStateStore implements StateStore {
     if (query.updatedBefore !== undefined) {
       const before = query.updatedBefore;
       runs = runs.filter((r) => r.updatedAt.getTime() <= before);
+    }
+    if (query.updatedAfter !== undefined) {
+      const after = query.updatedAfter;
+      runs = runs.filter((r) => r.updatedAt.getTime() >= after);
     }
     if (query.wakeBefore !== undefined) {
       const wake = query.wakeBefore;

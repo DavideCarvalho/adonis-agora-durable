@@ -3,10 +3,28 @@ import {
   type CheckpointQuery,
   type CheckpointStat,
   checkpointNameKind,
+  type RunStatus,
   type StateStore,
   type StepCheckpoint,
   type WorkflowRun,
 } from './interfaces.js';
+import {
+  type LifecycleDelivery,
+  lifecycleSourceOf,
+  type RunWaitLink,
+  triggeredRunsOf,
+  type WorkflowLifecycleLinks,
+} from './lifecycle-events.js';
+
+/** The run whose settling started a run, as its detail names it. */
+export interface LifecycleSource {
+  runId: string;
+  kind: 'completed' | 'failed';
+  status?: RunStatus | undefined;
+  namespace?: string | undefined;
+  /** The W3C trace id of the source run's span, when it recorded one. */
+  traceId?: string | undefined;
+}
 
 /**
  * A parallel fan (a `ctx.all`, a step fan, a polyglot `gather`) reduced to what a detail view needs
@@ -205,6 +223,37 @@ export interface RunDetail {
   /** How many children the run has, when `children` lists only the first of them. */
   childCount?: number | undefined;
   /**
+   * Runs started by this run settling: subscribers of its `run.completed:<workflow>` or
+   * `run.failed:<workflow>` event. Not children: they are not cancelled with it or awaited by it.
+   */
+  triggered?: string[] | undefined;
+  /**
+   * The run whose settling started this one, when a lifecycle event started it. The engine adds the
+   * source run's `status` and `namespace`, and the trace id of its span (`traceId`) when the source
+   * recorded one (see `LIFECYCLE_TRACE_TAG_PREFIX`).
+   */
+  triggeredBy?: LifecycleSource | undefined;
+  /**
+   * The workflows a settled run's lifecycle event goes to (see `engine.lifecycleSubscribers`). Set
+   * by the engine, which knows the subscribers; absent when there are none.
+   */
+  lifecycleSubscribers?: string[] | undefined;
+  /**
+   * Who starts whom through lifecycle events, for this run's workflow (see
+   * `engine.workflowLifecycle`). Set by the engine; absent when the workflow neither starts nor is
+   * started by another one.
+   */
+  workflowLifecycle?: WorkflowLifecycleLinks | undefined;
+  /**
+   * Where a settled run's lifecycle event stands for each subscriber: started, owed, coalesced or
+   * not started. Set by the engine; absent when the run has not settled or has no subscribers.
+   */
+  lifecycleDeliveries?: LifecycleDelivery[] | undefined;
+  /** The runs a suspended run waits for through `ctx.waitForRun`. Set by the engine. */
+  waitsFor?: RunWaitLink[] | undefined;
+  /** The runs waiting for this one through `ctx.waitForRun`. Set by the engine. */
+  awaitedBy?: RunWaitLink[] | undefined;
+  /**
    * A validator for this detail, when the source can compute one without reading the timeline (a
    * store with `checkpointStats`): it changes whenever the run or any of its checkpoints does.
    */
@@ -263,7 +312,12 @@ export async function loadRunDetail(
     if (etagMatches(options?.ifNoneMatch, etag)) {
       return { run, timeline: [], children: [], notModified: true, etag };
     }
-    return { run, ...(await summarizeRunFromStore(source, runId, over, stats)), etag };
+    return {
+      run,
+      ...(await summarizeRunFromStore(source, runId, over, stats)),
+      etag,
+      ...lifecycleLinks(run),
+    };
   }
   const run = await source.getRun(runId);
   if (!run) return null;
@@ -272,7 +326,7 @@ export async function loadRunDetail(
       source.listCheckpoints(runId),
       source.getRunChildren(runId),
     ]);
-    return { run, timeline, children };
+    return { run, timeline, children, ...lifecycleLinks(run) };
   }
   // Summarized: the children come from the timeline already loaded, rather than a second read of
   // every child-edge checkpoint (one per child of a wide fan). A child whose waiter is written but
@@ -286,6 +340,17 @@ export async function loadRunDetail(
     children: ids.slice(0, SUMMARY_CHILD_LIMIT),
     fans,
     childCount: ids.length,
+    ...lifecycleLinks(run),
+  };
+}
+
+/** Both ends of a lifecycle trigger, read from the run row: what its settling started, and what started it. */
+function lifecycleLinks(run: WorkflowRun): Pick<RunDetail, 'triggered' | 'triggeredBy'> {
+  const triggered = triggeredRunsOf(run);
+  const triggeredBy = lifecycleSourceOf(run);
+  return {
+    ...(triggered.length > 0 ? { triggered } : {}),
+    ...(triggeredBy ? { triggeredBy } : {}),
   };
 }
 
@@ -701,6 +766,18 @@ export function fanPageEtag(group: string, stats: CheckpointStat[], query: FanPa
   const { offset, limit } = fanPageBounds(query);
   const key = [group, offset, limit, query.failedOnly === true].join('\u0001');
   return `"fp-${hash(`${key}\u0003${statsFingerprint(stats)}`)}"`;
+}
+
+/**
+ * `etag` extended with a fingerprint of `extras`, the parts of a detail read from outside the run
+ * row and its checkpoints (another run's status, the fleet's subscriptions), so a change to them
+ * also changes the validator. `etag` itself when `extras` is undefined.
+ */
+export function extendEtag(etag: string, extras: unknown): string {
+  if (extras === undefined) return etag;
+  const weak = etag.startsWith('W/') ? 'W/' : '';
+  const bare = etag.slice(weak.length).replace(/^"|"$/g, '');
+  return `${weak}"${bare}.${hash(JSON.stringify(extras))}"`;
 }
 
 /** Whether an `If-None-Match` header value names `etag` (weak comparison, as RFC 9110 asks for). */

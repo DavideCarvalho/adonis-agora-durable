@@ -10,9 +10,24 @@ export interface MetricsSnapshot {
     suspended: number;
     routed: number;
     unrouted: number;
+    /** Subscriber runs started by a settled run's lifecycle event. */
+    triggered: number;
+    /** Subscribers a settled run's lifecycle event could not start (`where` threw, start failed). */
+    triggerFailed: number;
   };
   /** Routed failures by error code (`*` for a failure without one). */
   routedByCode: Record<string, number>;
+  /**
+   * Subscriber runs a settled run's lifecycle event started (`run.triggered`), keyed by the settled
+   * run's workflow, then by the subscriber. Exposed as `durable_runs_triggered_total{workflow,subscriber}`.
+   */
+  triggeredBySubscriber: Record<string, Record<string, number>>;
+  /**
+   * Subscribers a settled run's lifecycle event could not start (`run.trigger_failed`), keyed by the
+   * settled run's workflow, then by the subscriber. Exposed as
+   * `durable_runs_trigger_failed_total{workflow,subscriber}`.
+   */
+  triggerFailedBySubscriber: Record<string, Record<string, number>>;
   steps: { started: number; completed: number; failed: number };
   /** Per-workflow run counters, keyed by workflow name. */
   byWorkflow: Record<string, { started: number; completed: number; failed: number }>;
@@ -38,8 +53,19 @@ type Subscribable = { subscribe(listener: (event: EngineEvent) => void): () => v
  */
 export function collectMetrics(engine: Subscribable): MetricsCollector {
   const m: MetricsSnapshot = {
-    runs: { started: 0, completed: 0, failed: 0, suspended: 0, routed: 0, unrouted: 0 },
+    runs: {
+      started: 0,
+      completed: 0,
+      failed: 0,
+      suspended: 0,
+      routed: 0,
+      unrouted: 0,
+      triggered: 0,
+      triggerFailed: 0,
+    },
     routedByCode: {},
+    triggeredBySubscriber: {},
+    triggerFailedBySubscriber: {},
     steps: { started: 0, completed: 0, failed: 0 },
     byWorkflow: {},
     stepDuration: { sumMs: 0, count: 0 },
@@ -83,6 +109,14 @@ export function collectMetrics(engine: Subscribable): MetricsCollector {
       case 'run.unrouted':
         m.runs.unrouted += 1;
         break;
+      case 'run.triggered':
+        m.runs.triggered += 1;
+        countBySubscriber(m.triggeredBySubscriber, e);
+        break;
+      case 'run.trigger_failed':
+        m.runs.triggerFailed += 1;
+        countBySubscriber(m.triggerFailedBySubscriber, e);
+        break;
       case 'step.started':
         m.steps.started += 1;
         break;
@@ -117,6 +151,18 @@ export function collectMetrics(engine: Subscribable): MetricsCollector {
       lines.push('# TYPE durable_runs_routed_total counter');
       for (const [code, n] of Object.entries(m.routedByCode))
         lines.push(`durable_runs_routed_total{code="${code}"} ${n}`);
+      lines.push('# TYPE durable_runs_triggered_total counter');
+      for (const [workflow, bySubscriber] of Object.entries(m.triggeredBySubscriber))
+        for (const [subscriber, n] of Object.entries(bySubscriber))
+          lines.push(
+            `durable_runs_triggered_total{workflow="${workflow}",subscriber="${subscriber}"} ${n}`,
+          );
+      lines.push('# TYPE durable_runs_trigger_failed_total counter');
+      for (const [workflow, bySubscriber] of Object.entries(m.triggerFailedBySubscriber))
+        for (const [subscriber, n] of Object.entries(bySubscriber))
+          lines.push(
+            `durable_runs_trigger_failed_total{workflow="${workflow}",subscriber="${subscriber}"} ${n}`,
+          );
       lines.push('# TYPE durable_step_duration_ms_sum counter');
       lines.push(`durable_step_duration_ms_sum ${m.stepDuration.sumMs}`);
       lines.push('# TYPE durable_step_duration_count counter');
@@ -124,4 +170,13 @@ export function collectMetrics(engine: Subscribable): MetricsCollector {
       return `${lines.join('\n')}\n`;
     },
   };
+}
+
+/** Count a `run.triggered` / `run.trigger_failed` event under its settled workflow and subscriber. */
+function countBySubscriber(into: Record<string, Record<string, number>>, e: EngineEvent): void {
+  const workflow = e.workflow ?? 'unknown';
+  const subscriber = e.name ?? 'unknown';
+  const bySubscriber = into[workflow] ?? {};
+  bySubscriber[subscriber] = (bySubscriber[subscriber] ?? 0) + 1;
+  into[workflow] = bySubscriber;
 }

@@ -1,0 +1,261 @@
+---
+title: Chaining workflows
+description: Start a workflow when another one completes or fails, without the first one knowing. @OnWorkflowCompleted and @OnWorkflowFailed subscribe to a workflow's lifecycle events, delivered exactly once per settled run across the fleet, with a typed filter, an input mapping, per-key debounce and batch, a republish for backfills, linked runs in the dashboard, and ctx.waitForRun to wait for any run.
+icon: Link
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+When a run settles, the engine publishes a **lifecycle event** for it on the same bus as [`publishEvent`](/docs/durable/authoring/events):
+
+- `run.completed:<workflow>` when the run completes, and
+- `run.failed:<workflow>` when it ends `failed`, `cancelled` or `dead`.
+
+Any workflow can subscribe to these, so one workflow can start another when it finishes. The workflow that settles doesn't import its subscribers, doesn't call them, and doesn't wait for them. Adding a reaction to "ingestion finished" means adding a subscriber, not editing ingestion.
+
+Use [`ctx.child`](/docs/durable/authoring/child-workflows) when the parent needs the child's result or has to wait for it. Use a lifecycle subscriber when the work only has to happen *after* the run, and the run shouldn't care.
+
+## Subscribing with a decorator
+
+```ts title="app/workflows/refresh_summaries_workflow.ts"
+import {
+  BaseWorkflow,
+  OnWorkflowCompleted,
+  type WorkflowCtx,
+} from '@adonis-agora/durable'
+import IngestionWorkflow from '#workflows/ingestion_workflow'
+
+@OnWorkflowCompleted(IngestionWorkflow, {
+  where: (e) => e.input.type === 'mvr',
+  input: (e) => ({ baseId: e.input.baseId }),
+})
+export default class RefreshSummariesWorkflow extends BaseWorkflow {
+  static workflow = { name: 'refresh-summaries' }
+
+  async run(ctx: WorkflowCtx, input: { baseId: string }) {
+    await ctx.step('summaries.refresh', input)
+  }
+}
+```
+
+`@OnWorkflowCompleted(workflow, options?)` and `@OnWorkflowFailed(workflow, options?)` take the source workflow as a class or as a registered name. Like `@Scheduled` and `@OnEvent`, they only add an entry to the class's `static workflow.onEvent`, so the class must declare `static workflow = { name }`, and [discovery](/docs/durable/authoring/app-workflows) registers the subscription with the workflow.
+
+| Option | Type | Meaning |
+| --- | --- | --- |
+| `where` | `(event) => boolean` | Start only for the settled runs this accepts, e.g. by `input` or `searchAttributes`. A `where` that throws counts as a rejection and is reported as `run.trigger_failed`. |
+| `input` | `(event) => TInput` | The started run's input, built from the event. Without it, the run receives the whole [event](#the-event). |
+| `statuses` | `('failed' \| 'cancelled' \| 'dead')[]` | `@OnWorkflowFailed` only. The endings that start the subscriber. Defaults to all three. |
+| `debounce` | `{ windowMs: number \| string; key?: (input) => string }` | Start one run with the last input once events stop arriving for `windowMs`; with `key`, one per key. See [Coalescing per key](#coalescing-per-key). |
+| `batch` | `{ maxSize: number; windowMs: number \| string; key?: (input) => string }` | Start one run with `{ events }` once `maxSize` arrived or `windowMs` passed since the first; with `key`, one per key. Cannot be combined with `debounce`. |
+
+```ts
+// Page someone when an ingestion fails or goes dead, but not when an operator cancels it.
+@OnWorkflowFailed(IngestionWorkflow, { statuses: ['failed', 'dead'] })
+export default class IngestionPagerWorkflow extends BaseWorkflow {
+  static workflow = { name: 'ingestion-pager' }
+
+  async run(ctx: WorkflowCtx, event: LifecycleEventOf<typeof IngestionWorkflow>) {
+    await ctx.step('pager.notify', { runId: event.runId, error: event.error })
+  }
+}
+```
+
+### The input is type-checked
+
+With a class ref, the decorator checks the subscriber's `run(ctx, input)` against what it will receive: the event, or the return type of `input`. A subscriber that expects another shape fails to compile instead of failing at runtime:
+
+```ts
+@OnWorkflowCompleted(IngestionWorkflow) // ✗ compile error: run expects { baseId }, gets the event
+export default class Wrong extends BaseWorkflow {
+  static workflow = { name: 'wrong' }
+  async run(ctx: WorkflowCtx, input: { baseId: string }) {}
+}
+```
+
+`where` and `input` see the source's typed input and output (`LifecycleEventOf<typeof IngestionWorkflow>`). A `debounce` or `batch` `key` sees the subscriber's input (what `input` builds), and with `batch` the subscriber's `run` must take `{ events: TInput[] }`. A source given by name carries no types, so the subscriber is not checked.
+
+### Coalescing per key
+
+Several ingestion runs of the same base often finish within seconds of each other, and refreshing the base's summaries once per run is wasted work. `debounce` with a `key` starts one downstream run per base, once that base's ingestions have stopped finishing for the window:
+
+```ts title="app/workflows/refresh_summaries_workflow.ts"
+@OnWorkflowCompleted(IngestionWorkflow, {
+  input: (e) => ({ baseId: e.input.baseId }),
+  debounce: { windowMs: '30s', key: (input) => input.baseId },
+})
+export default class RefreshSummariesWorkflow extends BaseWorkflow {
+  static workflow = { name: 'refresh-summaries' }
+
+  async run(ctx: WorkflowCtx, input: { baseId: string }) {
+    await ctx.step('summaries.refresh', input)
+  }
+}
+```
+
+Three ingestions of base `b1` and one of `b2` finishing together start two `refresh-summaries` runs: one for `b1`, with the last of its inputs, and one for `b2`. Use `batch` instead when every settled run matters: `batch: { maxSize: 50, windowMs: '1m', key: (input) => input.baseId }` starts the subscriber with `{ events: [...] }` per base.
+
+`debounce` and `batch` set the workflow's [`eventBatch`](/docs/durable/authoring/events#coalescing-bursts--eventbatch), so they apply to every event the workflow subscribes to. Declaring a different `eventBatch` on the same workflow, or a second decorator with a different `debounce`/`batch`, throws when the class is decorated. Two configs are the same when their mode, window and batch size match and their `key` functions have the same source text, so `@OnWorkflowCompleted` and `@OnWorkflowFailed` can each write `key: (input) => input.baseId`. Keys whose source differs throw, even when they compute the same key: write the key once and pass it to both.
+
+### Without a decorator
+
+The decorators are shorthand for an `onEvent` entry, which also works in `static workflow` or with `engine.register`:
+
+```ts
+import { runCompletedEvent } from '@adonis-agora/durable'
+
+engine.register('refresh-summaries', '1', refreshSummaries, {
+  onEvent: [
+    {
+      event: runCompletedEvent('ingestion'),
+      where: (e) => (e as WorkflowLifecycleEvent<{ type: string }>).input.type === 'mvr',
+      input: (e) => ({ baseId: (e as WorkflowLifecycleEvent<{ baseId: string }>).input.baseId }),
+    },
+  ],
+})
+```
+
+`runCompletedEvent(workflow)` and `runFailedEvent(workflow)` return the event names. `where` and `input` work on any `onEvent` entry, not only lifecycle events.
+
+## The event
+
+Without `input`, the subscriber's input is a `WorkflowLifecycleEvent`, read from the store after the run settled:
+
+| Field | Meaning |
+| --- | --- |
+| `runId`, `workflow`, `workflowVersion`, `namespace` | The run that settled. |
+| `status` | `completed`, or `failed`, `cancelled` or `dead`. |
+| `input` | The run's input. |
+| `output` | The run's output, on a completed run. |
+| `error` | The run's error, on a run that did not complete. |
+| `tags`, `searchAttributes` | The run's tags and search attributes. |
+
+`input` keeps the new run's row small: without it, the settled run's whole input and output are copied into every subscriber's input.
+
+## Delivery: exactly once per subscriber
+
+Each settled run starts each subscriber at most once, and a crash cannot make it skip one, even when subscribers are registered on different instances:
+
+1. **The marker.** When some workflow subscribes to how a run ended, the write that settles the run also tags it `durable:lifecycle:pending`, plus one `durable:lifecycle:owed:<subscriber>` tag per subscriber it owes the event to. The status and the marker land in one update, so a run can't be settled without a record of whom its event is owed to. Before the instance has read the fleet's subscriptions once (right after boot), or while its last read failed, it can't know who else subscribes, so it writes `durable:lifecycle:pending` alone: the run's owed set is [unresolved](#settled-before-the-fleet-was-visible).
+2. **The live publish.** Right after settling, the instance that ran it reads the run back, starts every owed subscriber it has registered whose `where` accepts it, drops their owed tags and adds one `durable:triggered:<subscriber>` tag per run it started. A subscriber that [debounces or batches](#coalescing-per-key) starts no run of that id: its event goes into its accumulator, and the run gets a `durable:coalesced:<subscriber>` tag instead. `durable:lifecycle:pending` goes with the last owed tag.
+3. **The sweep.** Each `durable:work` tick looks for settled runs still marked (leaving runs settled in the last 30 seconds to the live publish) and publishes them to the owed subscribers *that instance* can deliver to. That covers a process that died before step 2, a marker write that failed, and a subscriber registered only on another instance. The sweep pages through the marked runs and skips the ones it can't act on (every owed subscriber is delivered by another instance, and none is [orphaned](#which-subscribers-a-run-owes) yet), until it has published 100 runs or read 1,000, so runs owed only to other instances never hold up the ones it can publish. Then it [heals](#settled-before-the-fleet-was-visible) the runs settled in the last two minutes.
+
+Every subscriber run is started under a deterministic id, `evt:<runId>:<completed|failed>:<subscriber>`, and starting an existing run id is a no-op. So the live publish, every instance's sweep and a [republish](#republishing-and-backfilling) can all reach the same run and still start each subscriber once.
+
+Publishers of one run take turns. Each one (live, sweep, heal, republish, on any instance) holds the run's lease while it reads the run, starts subscribers and writes the tags, under an owner of its own (`<instanceId>#lifecycle#<uuid>`), so two publishers never overwrite each other's tags. A publisher that finds the lease taken asks again five times (after 50, 100, 200, 400 and 800 ms) and then leaves the run: the live publish to the sweep, the sweep to its next tick, and a republish reports it in `failed` with subscriber `*`. An explicit retry of a failed run that lands while a publish holds it waits for the publish. `run.triggered` and `run.trigger_failed` are emitted only by the publisher whose tag write added the subscriber's `durable:triggered:`, `durable:coalesced:` or `durable:trigger_failed:` tag, so a repeated delivery emits nothing. A subscriber that [debounces or batches](#coalescing-per-key) drops an event its accumulator already took (named by the subscriber run id it would start, `evt:<runId>:<kind>:<subscriber>`, remembered across the accumulator's last 200 events), so a routed event never counts twice.
+
+### Settled before the fleet was visible
+
+A run settled with `durable:lifecycle:pending` and no owed tag has an unresolved owed set. The first publish of it that has a successful read of the fleet's subscriptions (the live publish reads them; the sweep reads them again on every tick while the last read failed) resolves it: every subscriber of the run's ending that its tags don't record as started, coalesced or failed becomes owed, and the publish proceeds as usual. Until then, an instance starts the subscribers registered on it and leaves the run unresolved. A run marked by a release that predates owed tags is resolved the same way, so it reaches at least every subscriber registered on the instance that publishes it.
+
+A snapshot can also be stale: a subscriber announced by an instance that came up a few seconds before the run settled isn't in it yet. So each sweep also heals: for every workflow some subscriber listens to (announced by the fleet or registered on the instance), it reads that workflow's runs settled in the last two minutes (`LIFECYCLE_HEAL_WINDOW_MS`, at most 100 per workflow, through the store's `updatedAfter` filter) and publishes each one to the subscribers its tags record as neither owed, started, coalesced nor failed: it starts the ones it delivers to and marks the others owed for the instance that has them. Each instance heals a run and subscriber once, so a subscriber whose `where` declined the event (which leaves no tag) is not looked at again. A subscriber that appears more than two minutes after a run settled is a backfill: use a [republish](#republishing-and-backfilling).
+
+### Which subscribers a run owes
+
+The owed tags name every subscriber registered on the settling instance **plus** every subscriber the fleet announces. The announcements come from two places, read together every 5 seconds:
+
+- **The subscription registry, in the state store.** Each instance with `onEvent` subscriptions keeps one completed run of the internal `__lifecycle_registry` workflow (`LIFECYCLE_REGISTRY_WORKFLOW`), id `__lifecycle_registry:<instanceId>` (`lifecycleRegistryRunId`), tagged `durable:lifecycle:registry` (`LIFECYCLE_REGISTRY_TAG`), holding its subscriptions as input (`{ instanceId, runtime: 'node', engineNamespace, subscriptions: [{ workflow, events }] }`, `LifecycleRegistryEntry`; `engineNamespace` is the instance's namespace, or `null` for an instance with none). Its `durable:work` tick rewrites it every 10 seconds (`LIFECYCLE_REGISTRY_HEARTBEAT_MS`), and other instances count it while it is at most 35 seconds old (`LIFECYCLE_REGISTRY_TTL_MS`). The tick of an instance with a registry run deletes the ones that stopped beating 10 minutes ago (`LIFECYCLE_REGISTRY_STALE_MS`). It lives in the store, so it works with every transport (BullMQ, `db`, `queue`, SQS, the event emitter, or none). The registry is read page by page (1,000 rows each), so a fleet of any size is read whole.
+- **Worker descriptors**, on a transport that reads them fleet-wide (the [BullMQ transport](/docs/durable/transports/bullmq)): each [descriptor](/docs/durable/cluster/handshake)'s `registrations[].subscribes`. That is how a [Python subscriber](#subscribers-in-python) is announced.
+
+A terminal write never waits on that read: it uses the last snapshot, or marks the run unresolved when there is no successful one, and nothing is [orphaned](#which-subscribers-a-run-owes) while the fleet can't be read. A namespaced instance reads the registry runs of its own namespace and of `default`, where an instance with no namespace writes its own.
+
+A run owes its event only to the subscribers that serve its namespace (`engine.lifecycleSubscribers(workflow, kind, namespace)`):
+
+- the ones registered on the settling instance, when that instance has no namespace (it sweeps and starts its subscribers for every namespace's runs) or has the run's namespace;
+- the ones in the registry runs of instances in the run's namespace, or of instances with no namespace (`engineNamespace: null`). The stores write both an instance with no namespace and one in `default` under the `default` namespace, so the row's `engineNamespace` tells them apart; a row without it (written by an older release) under `default` counts for every namespace;
+- the ones in the worker descriptors serving the run's namespace.
+
+So a tenant's run settled by an instance with no namespace (a control plane, say) is not marked owed to another tenant's subscribers, which would never start it and, still announced, would never become orphans either. An owed tag already written for a subscriber that does not serve the run's namespace is dropped by the orphan rule below.
+
+So in a rolling deploy, or when a subscriber is registered on some workers only, the instance that settles the run still marks it for subscribers it doesn't have, and an instance that has them delivers through its sweep. An instance that knows only subscriber X never clears the marker for subscriber Y.
+
+Registry runs are bookkeeping, not history: [retention](/docs/durable/reliability/retention#how-the-sweep-runs) never deletes them and a policy's `maxCount` doesn't count them, `engine.listRuns`, `countRuns`, `runFacets` and `runValueFacets` (and so the dashboard, the `durable:runs` command and the run gateway) leave them out unless the query names `__lifecycle_registry`, and recovery never resumes them, since they are completed.
+
+A subscriber can be owed and gone: removed from the code, or registered only on a worker that was scaled away. Once a run has carried an owed tag for 24 hours (`LIFECYCLE_ORPHAN_MS`) and no live worker announces the subscriber nor registers it locally, the sweep drops the tag and emits `run.trigger_failed` with `subscriber <name> is not registered on any live worker`, so a removed subscriber doesn't keep the run from retention forever. A run marked `durable:lifecycle:pending` with no owed tag at all is [unresolved](#settled-before-the-fleet-was-visible).
+
+Retention skips a run while it still carries `durable:lifecycle:pending`, so a short retention window cannot delete a run before its event is published. See [Retention](/docs/durable/reliability/retention#how-the-sweep-runs).
+
+### Subscribers in Python
+
+A Python workflow served by the [Aviary Python client](/docs/durable/python#starting-on-another-workflows-lifecycle) can subscribe too: `@worker.workflow("notify", on_workflow_completed="ingestion")` makes its worker announce `run.completed:ingestion` in `subscribes`. The engine has no `onEvent` for it, so it starts it **by name**: under the same deterministic id, with the whole [event](#the-event) as input, routed to the live worker group of that name like any [convention-routed](/docs/durable/python#dispatching-a-python-workflow-from-adonis) workflow. There is no `where` or `input` for an announced subscriber; filter in the Python body.
+
+An instance starts an announced subscriber only when the subscriber is announced by a non-Node worker and the instance can reach it (registered with `registerRemote`, or a live worker group of the same name). A subscriber registered on the instance itself goes through its own `onEvent`, with its `where` and `input`, and is started once. A subscriber another Node instance announces is left to that instance, which applies its own `where` and `input`.
+
+A subscriber that can't be started is not retried. That happens when its `where` throws, or its start fails (an `inputSchema` or `validateInput` that rejects the event, a [concurrency quota](/docs/durable/reliability/concurrency-quotas)). The engine emits `run.trigger_failed` with the settled run as `runId`, the subscriber as `name` and the cause as `error`, so you can alert on it, and in the same tag write that drops that subscriber's owed tag adds `durable:trigger_failed:<subscriber>` (`LIFECYCLE_TRIGGER_FAILED_TAG_PREFIX`), which the run detail shows as `failed`. The sweep's orphan drop adds it too. The message stays in the event: tags are short and indexed, and search attributes would show up in your attribute filters. Use a [republish](#republishing-and-backfilling) to try it again; the write that records its start removes the tag.
+
+### What publishes
+
+- **Child runs publish too.** A run started with `ctx.child`, `ctx.startChild` or `ctx.all` is a run of its own workflow, so a subscriber to that workflow starts whether the run was started directly or by a parent.
+- **A continue-as-new handoff doesn't.** Only the last run of a chain publishes `run.completed`, with the final output.
+- **A subscriber with `eventBatch`** gets the event routed into its accumulator instead of a run of its own, so no `durable:triggered:` tag is written for it.
+
+## Republishing and backfilling
+
+`engine.republishLifecycle(target)` runs the same publish again for settled runs, whether or not they are still marked. Use it to backfill a subscriber you registered after the runs settled, or to retry one that failed:
+
+```ts
+// One run, to every subscriber registered here (or only `subscriber`).
+await engine.republishLifecycle({ runId: 'ingest-42' })
+
+// Every ingestion that failed in the last week, to the new pager only.
+const result = await engine.republishLifecycle({
+  workflow: 'ingestion',
+  kind: 'failed',
+  since: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),
+  subscriber: 'ingestion-pager',
+})
+// → { runs: 12, started: 12, failed: [] }
+```
+
+The workflow form pages through the store's listing (`limit`, default 1000 runs) and filters by when the run settled (`since`, `until`). It returns how many runs it published, how many subscriber runs it started, and each subscriber it could not start with why. It's idempotent: a subscriber whose run already exists is not started again, so a second call starts nothing. It reads the fleet's subscriptions afresh first, so a subscriber deployed a moment ago counts. The subscribers the calling instance can deliver to are started: the ones registered on it, and the [Python subscribers](#subscribers-in-python) it reaches. Any other one announced by another instance is marked owed again, with `durable:lifecycle:pending`, so the [sweep](#delivery-exactly-once-per-subscriber) of an instance that has it starts it; those are not counted in `started`. A `subscriber` must subscribe to the run's ending (registered here, or announced for the run's namespace): otherwise nothing is marked and the run is reported in `failed` with `subscriber <name> does not subscribe to run.completed:<workflow>`. A subscriber that debounces or batches is not routed again once the run carries its `durable:coalesced:` tag, unless the run also carries its `durable:trigger_failed:` tag, since an accumulator that already fired would start it again.
+
+This is how to reach runs settled before a subscriber existed. The sweep [heals](#settled-before-the-fleet-was-visible) only runs settled in the last two minutes, so a subscriber deployed later than that, or a new subscriber for older history, needs a republish.
+
+The same operation is available as:
+
+- the [`durable:lifecycle:republish`](/docs/durable/cli#durablelifecyclerepublish--republish-lifecycle-events) ace command (`--run`, or `--workflow` with `--since`, `--until`, `--kind`, `--limit`, plus `--subscriber`),
+- the run gateway's `republishLifecycle` verb, which a [tenant pod](/docs/durable/cluster/roles-and-config) carries in both forms: a run is ownership-checked like `retry`, and a workflow's runs are confined to the tenant's namespace (the workflow form takes a `namespace` on the engine; over the proxy it is always the tenant's). The control plane refuses, with a `RunGatewayError` coded `bad-request` (a `400` in the dashboard), a `limit` that is not a positive integer and a `subscriber` that does not subscribe to the workflow's lifecycle events in the tenant's namespace (as `workflowLifecycle` lists them), so a tenant can't mark runs owed to an arbitrary name; a larger `limit` is clamped to 1,000. A control plane older than the verb answers with a `RunGatewayError` coded `unsupported-request` (`… is not supported by this server`), which the dashboard shows as a `501`,
+- `POST /durable/api/runs/:id/republish-lifecycle` and the [dashboard](/docs/durable/observability/dashboard)'s **Republish lifecycle event** action, shown on a settled run whose workflow has subscribers.
+
+## Waiting for any run: `ctx.waitForRun`
+
+A lifecycle subscriber reacts to *every* run of a workflow. When one workflow has to wait for one specific run it did not start (so `ctx.child` doesn't apply), use `ctx.waitForRun(runId)`. It suspends with no compute until that run settles, then resumes with its [event](#the-event): `status`, and `output` or `error`.
+
+```ts title="app/workflows/monthly_report_workflow.ts"
+export default class MonthlyReportWorkflow extends BaseWorkflow {
+  static workflow = { name: 'monthly-report' }
+
+  async run(ctx: WorkflowCtx, input: { baseId: string; ingestionRunId: string }) {
+    // The ingestion was started by an upload controller, not by this workflow.
+    const ingestion = await ctx.waitForRun(IngestionWorkflow, input.ingestionRunId, {
+      timeoutMs: '6h',
+    })
+    if (ingestion.status !== 'completed') {
+      return { skipped: true, reason: ingestion.error?.message }
+    }
+    // `ingestion.output` is typed as IngestionWorkflow's output.
+    return ctx.step('report.build', { baseId: input.baseId, rows: ingestion.output?.rows })
+  }
+}
+```
+
+- A run that has already settled resolves at once. The waiter is registered before the target is read, so a run settling at the same moment is not missed.
+- A run that continued as new is followed to the run that ends its chain (`r` → `r~1` → `r~2`, at most 100 hops), and the event is that run's.
+- With a class first (`ctx.waitForRun(IngestionWorkflow, runId)`), the event is typed as `LifecycleEventOf<typeof IngestionWorkflow>`; by id alone, `ctx.waitForRun<TOutput>(runId)` types only the output.
+- `timeoutMs` (ms, or a duration like `'6h'`) bounds the wait and throws `SignalTimeoutError`, like `waitForEvent`.
+- An unknown run id throws a non-retryable `FatalError` (`run <id> not found`).
+- The event is recorded in the waiting run's history, so a replay reads it back instead of reading the target again.
+- The instance that settles the target wakes its waiters. If it dies first, the `durable:work` tick's lifecycle sweep (`engine.sweepRunWaits`) wakes the waiters whose run has settled: up to 100 a pass, skipping waiters on runs still in flight and reading at most 1,000 waited-on runs, with the next pass starting where this one stopped.
+
+## Following the links
+
+Both ends of the link come from the run rows, so any process holding them can answer, including a dashboard that registers no subscriber:
+
+- `engine.triggeredRuns(runId)` (and `triggeredRunsOf(run)`) list the runs a settled run started, from its `durable:triggered:` tags.
+- `lifecycleSourceOf(run)` returns `{ runId, kind }` for a run a lifecycle event started, read from its id.
+- `getRunDetail` returns them as `triggered` and `triggeredBy` (and the run's `lifecycleSubscribers`), and the [dashboard](/docs/durable/observability/dashboard) run header shows them as links: "started when this run completed" on the subscriber, "triggered" on the source.
+
+- `engine.workflowLifecycle(workflow)` answers who starts whom for a whole workflow: `startsOnSettle` (the subscribers of its two events) and `startedBy` (the workflows whose settling starts it), each entry with its `kind`, whether it is registered here (`local`) or announced by the fleet (`announced`), and whether its subscription sets `where`, `input` or a debounce/batch (`coalesce`). The dashboard's workflow page shows it; see [Dashboard](/docs/durable/observability/dashboard#workflow-pages). `engine.workflowLifecycle(workflow, { namespace })` keeps only the subscriptions of that namespace: the ones registry runs and worker descriptors announce for it, and the instance's own when the instance serves that namespace (one without a namespace serves `default`). A [tenant pod](/docs/durable/cluster/roles-and-config) reaches it through the run gateway's `workflowLifecycle` verb, always scoped to its own namespace, as are the lifecycle links of its run details.
+
+Each start also emits `run.triggered` (`runId` the settled run, `name` the subscriber, `triggeredRunId` the run it started). It's counted in [metrics](/docs/durable/observability/metrics) as `runs.triggered` (and by settled workflow and subscriber, `durable_runs_triggered_total{workflow,subscriber}`), failures as `runs.triggerFailed`, and forwarded to [diagnostics](/docs/durable/observability/diagnostics) and Telescope as `agora:durable:run.triggered` and `agora:durable:run.trigger_failed`.
+
+With [OpenTelemetry](/docs/durable/observability/otel#lifecycle-links), the subscriber's run span links to the source run's span and carries `durable.lifecycle.source_run_id` and `durable.lifecycle.kind`.

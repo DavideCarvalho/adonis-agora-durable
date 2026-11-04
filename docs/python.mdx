@@ -476,3 +476,35 @@ forever.
 
 The workflow-task/decision wire is language-neutral, so the same Python workflow runs unchanged
 against an Adonis, a [NestJS](/docs/durable/cluster/interop), or any other conformant control plane.
+
+## Starting on another workflow's lifecycle
+
+A Python workflow can start when a run of another workflow settles, the way a TypeScript
+`@OnWorkflowCompleted` subscriber does (see [Chaining workflows](/docs/durable/authoring/lifecycle-events)).
+This works with the Aviary Python client (`durable-worker`, from `clients/python` in the
+[nestjs-durable](https://davidecarvalho.github.io/aviary/docs/durable) repo), whose
+`@worker.workflow(...)` takes `on_workflow_completed=`, `on_workflow_failed=` (a workflow name, or a
+list of them) and `on_event=[...]` (any event published with `engine.publishEvent`):
+
+```python
+@worker.workflow("notify", on_workflow_completed="ingestion", on_workflow_failed=["ingestion"])
+def notify(ctx, event):
+    # The whole lifecycle event: {"runId", "workflow", "status", "input", "output" | "error", ...}
+    if event["status"] == "completed" and event["output"]["rows"] == 0:
+        return None
+    ctx.step("email.send", {"runId": event["runId"], "status": event["status"]})
+```
+
+The worker announces the event names in its descriptor (`registrations[].subscribes`). The Adonis
+engine reads the fleet's descriptors, so a settled `ingestion` run [owes](/docs/durable/authoring/lifecycle-events#which-subscribers-a-run-owes)
+its event to `notify`, and an engine instance that reaches the `notify` worker group starts it **by
+name**: under the deterministic id `evt:<runId>:<completed|failed>:notify`, with the event as its
+input, exactly once per settled run. If no `notify` worker is live when the run settles, the run
+stays marked and the `durable:work` sweep starts it once one is; a subscriber no live worker has
+announced for 24 hours is dropped with `run.trigger_failed`.
+
+There is no `where` or `input` mapping for a Python subscriber, since the announcement carries only
+the event name: filter in the workflow body, as above. A workflow both registered in the Adonis app
+with an `onEvent` and announced by a Python worker is started once, through the app's subscription.
+The dashboard's [workflow page](/docs/durable/observability/dashboard#workflow-pages) lists a Python
+subscriber as `announced`.

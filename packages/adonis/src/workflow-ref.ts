@@ -8,6 +8,8 @@
 
 import type { ConcurrencyConfig } from './concurrency.js';
 import type { SingletonConfig } from './engine.js';
+import type { EventBatchConfig } from './event-accumulators.js';
+import type { OnEventEntry } from './events.js';
 import type { SearchAttributesSchema } from './interfaces.js';
 import { callerFile, declaredOriginOf, originOfCaller, rememberDeclaringFile } from './origin.js';
 import type { ScheduledWorkflow, WorkflowScheduleConfig } from './scheduler.js';
@@ -23,8 +25,21 @@ export interface WorkflowOptions {
   tags?: string[];
   /** Wall-clock budget for the whole run (a duration string like `'5m'`, or ms). */
   executionTimeout?: string | number;
-  /** Event names that start a run of this workflow when published (see `onEvent`). */
-  onEvent?: string[];
+  /**
+   * Events that start a run of this workflow when published (see `publishEvent`). An entry is an
+   * event name, or `{ event, where, input }`: `where(payload)` decides per event whether this
+   * workflow starts, and `input(payload)` builds the started run's input. `@OnWorkflowCompleted` /
+   * `@OnWorkflowFailed` add entries here for another workflow's lifecycle events.
+   */
+  onEvent?: OnEventEntry[];
+  /**
+   * Coalesce the runs `onEvent` starts: `{ mode: 'debounce', windowMs }` starts one run with the
+   * last payload once events have been quiet for `windowMs`; `{ mode: 'batch', maxSize, windowMs }`
+   * starts one run with `{ events }` once `maxSize` arrived or `windowMs` passed since the first.
+   * `key(input)` coalesces per key instead of per workflow. `@OnWorkflowCompleted` /
+   * `@OnWorkflowFailed` set it from their `debounce` / `batch` options.
+   */
+  eventBatch?: EventBatchConfig;
   /**
    * Per-key serialization for runs of this workflow (see {@link SingletonConfig}): `key` derives the
    * serialization key from the run input, `limit` (default 1) caps concurrent runs sharing it, and

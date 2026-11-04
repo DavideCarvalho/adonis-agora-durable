@@ -47,9 +47,24 @@ export interface MetricsSnapshot {
     suspended: number
     routed: number
     unrouted: number
+    /** Subscriber runs started by a settled run's lifecycle event. */
+    triggered: number
+    /** Subscribers a settled run's lifecycle event could not start (`where` threw, start failed). */
+    triggerFailed: number
   }
   /** Routed failures by error code (`*` for a failure without one). */
   routedByCode: Record<string, number>
+  /**
+   * Subscriber runs a settled run's lifecycle event started (`run.triggered`), keyed by the settled
+   * run's workflow, then by the subscriber. Exposed as `durable_runs_triggered_total{workflow,subscriber}`.
+   */
+  triggeredBySubscriber: Record<string, Record<string, number>>
+  /**
+   * Subscribers a settled run's lifecycle event could not start (`run.trigger_failed`), keyed by the
+   * settled run's workflow, then by the subscriber. Exposed as
+   * `durable_runs_trigger_failed_total{workflow,subscriber}`.
+   */
+  triggerFailedBySubscriber: Record<string, Record<string, number>>
   steps: { started: number; completed: number; failed: number }
   /** Per-workflow run counters, keyed by workflow name. */
   byWorkflow: Record<string, { started: number; completed: number; failed: number }>
@@ -107,6 +122,8 @@ durable_runs_total{event="failed"} 2
 durable_runs_total{event="suspended"} 6
 durable_runs_total{event="routed"} 1
 durable_runs_total{event="unrouted"} 0
+durable_runs_total{event="triggered"} 3
+durable_runs_total{event="triggerFailed"} 0
 # TYPE durable_steps_total counter
 durable_steps_total{event="started"} 120
 durable_steps_total{event="completed"} 115
@@ -117,6 +134,10 @@ durable_runs_by_workflow_total{workflow="charge-order",event="completed"} 38
 durable_runs_by_workflow_total{workflow="charge-order",event="failed"} 2
 # TYPE durable_runs_routed_total counter
 durable_runs_routed_total{code="E_CARD_DECLINED"} 1
+# TYPE durable_runs_triggered_total counter
+durable_runs_triggered_total{workflow="ingestion",subscriber="refresh-summaries"} 3
+# TYPE durable_runs_trigger_failed_total counter
+durable_runs_trigger_failed_total{workflow="ingestion",subscriber="notify"} 1
 # TYPE durable_step_duration_ms_sum counter
 durable_step_duration_ms_sum 184230
 # TYPE durable_step_duration_count counter
@@ -161,9 +182,18 @@ export interface DurableMetricsSnapshot {
     routed: number
     /** Failures that had onError routes the engine could not apply (workers disagree). */
     unrouted: number
+    /** Subscriber runs started by a settled run's lifecycle event. */
+    triggered: number
+    /** Subscribers a settled run's lifecycle event could not start (`where` threw, start failed). */
+    triggerFailed: number
   }
   /** Routed failures by error code (`*` for a failure without one). */
   routedByCode: Record<string, number>
+  /**
+   * The `durable.runs.triggered` counter by its attributes: `workflow` (the settled run's) and
+   * `subscriber` (the workflow its lifecycle event started), keyed by workflow, then subscriber.
+   */
+  triggeredBySubscriber: Record<string, Record<string, number>>
   steps: { completed: number; failed: number }
   /** Per-step wall-clock (from the `durationMs` on step events). */
   stepDurationMs: DurationStats
@@ -206,7 +236,7 @@ Call `reset()` after reading if you want each window's counters (and percentiles
 
 Both subscribe to the same event stream through `engine.subscribe` and are safe to run side by side. Each just adds its own listener. Use `collectMetrics` for Prometheus text and per-workflow counters. Use `attachDurableMetrics` for duration percentiles, a JSON snapshot, or a resettable window.
 
-A failure handed to an [onError handler](/docs/durable/reliability/on-error) is counted as `routed`, not `failed`, and is broken down by error code in `routedByCode` (Prometheus: `durable_runs_routed_total{code}`). An `unrouted` count above zero means a deploy left workers announcing different routes.
+A failure handed to an [onError handler](/docs/durable/reliability/on-error) is counted as `routed`, not `failed`, and is broken down by error code in `routedByCode` (Prometheus: `durable_runs_routed_total{code}`). An `unrouted` count above zero means a deploy left workers announcing different routes. `triggered` counts the subscriber runs [lifecycle events](/docs/durable/authoring/lifecycle-events) started, `triggeredBySubscriber` splits it by settled workflow and subscriber (Prometheus: `durable_runs_triggered_total{workflow,subscriber}`), and a `triggerFailed` above zero means a subscriber's `where` threw or its start was rejected; `triggerFailedBySubscriber` (Prometheus: `durable_runs_trigger_failed_total{workflow,subscriber}`) says which. The dashboard's [workflow page](/docs/durable/observability/dashboard#workflow-pages) shows both per subscriber.
 
 <Callout type="warn" title="Counters are per process">
 Both collectors count the events **this process's engine** emits, and both reset when the process restarts. A multi-pod deployment needs one scrape target per instance (or an aggregating layer), the same as any Prometheus client library. In a [split cluster](/docs/durable/cluster) the run lifecycle is emitted where the engine runs (the `standalone` / `control-plane` pods), not on store-less `tenant` pods, which have no engine to subscribe to.

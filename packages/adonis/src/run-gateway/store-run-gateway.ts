@@ -14,6 +14,11 @@ import type {
   StepCheckpoint,
   WorkflowRun,
 } from '../interfaces.js';
+import type {
+  RepublishLifecycleResult,
+  RepublishLifecycleTarget,
+  WorkflowLifecycleLinks,
+} from '../lifecycle-events.js';
 import {
   type FanPage,
   type FanPageQuery,
@@ -72,6 +77,11 @@ export interface RunGatewayEngine {
     opts?: RunValueFacetOptions,
   ): Promise<RunValueFacetRow[]>;
   listSignalWaitersByRunIds?(runIds: string[]): Promise<SignalWaiter[]>;
+  republishLifecycle?(target: RepublishLifecycleTarget): Promise<RepublishLifecycleResult>;
+  workflowLifecycle?(
+    workflow: string,
+    opts?: { namespace?: string | undefined },
+  ): Promise<WorkflowLifecycleLinks>;
 }
 
 /** Options for {@link StoreRunGateway}. */
@@ -190,6 +200,23 @@ export class StoreRunGateway implements RunGateway {
 
   retryWithInput(runId: string, input: unknown): Promise<{ runId: string } | null> {
     return this.#engine.retryWithInput?.(runId, input) ?? Promise.resolve(null);
+  }
+
+  republishLifecycle(target: RepublishLifecycleTarget): Promise<RepublishLifecycleResult> {
+    return (
+      this.#engine.republishLifecycle?.(target) ??
+      Promise.resolve({ runs: 0, started: 0, failed: [] })
+    );
+  }
+
+  workflowLifecycle(
+    workflow: string,
+    opts?: { namespace?: string | undefined },
+  ): Promise<WorkflowLifecycleLinks> {
+    return (
+      this.#engine.workflowLifecycle?.(workflow, opts) ??
+      Promise.resolve({ workflow, startsOnSettle: [], startedBy: [] })
+    );
   }
 
   runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {

@@ -1,4 +1,5 @@
 import { type RunStatus, type WorkerStatus, WorkflowEngine } from '../index.js';
+import { LIFECYCLE_PENDING_TAG, owedSubscribersOf } from '../lifecycle-events.js';
 import type { DataProvider, ExtensionContext, TelescopeEntryLike } from './telescope-sdk.js';
 
 /**
@@ -29,7 +30,15 @@ function countByStatus(engine: WorkflowEngine, status: RunStatus): Promise<numbe
 /** The Telescope diagnostic-entry content the durable bridge produces (`payload` is the EngineEvent). */
 interface DurableEntryContent {
   event?: string;
-  payload?: { workflow?: string; runId?: string; durationMs?: number; at?: string | number };
+  payload?: {
+    workflow?: string;
+    runId?: string;
+    durationMs?: number;
+    at?: string | number;
+    /** The subscriber of a `run.triggered` / `run.trigger_failed`. */
+    name?: string;
+    error?: { message?: string };
+  };
 }
 
 /** Resolve the live durable engine from the host container. */
@@ -58,8 +67,10 @@ export function dedupeRunEvents<E extends TelescopeEntryLike>(entries: readonly 
     const runId = c.payload?.runId;
     let key: string | undefined;
     if (c.event?.startsWith('run.') && runId) {
-      if (c.payload?.at !== undefined) key = `${c.event}:${runId}:${String(c.payload.at)}`;
-      else if (ONCE_PER_ATTEMPT.has(c.event)) key = `${c.event}:${runId}`;
+      // `name` keeps apart two subscribers of one settled run whose events share an instant.
+      if (c.payload?.at !== undefined) {
+        key = `${c.event}:${runId}:${String(c.payload.at)}:${c.payload.name ?? ''}`;
+      } else if (ONCE_PER_ATTEMPT.has(c.event)) key = `${c.event}:${runId}`;
     }
     if (key !== undefined) {
       if (seen.has(key)) continue;
@@ -313,7 +324,130 @@ export function durableStateBreakdownProvider(): DataProvider {
   };
 }
 
+/** The UTC minute of an instant, as the tables print it: `2026-11-04 17:30Z`. */
+function minuteStamp(at: Date | number | string): string {
+  return `${new Date(at).toISOString().replace('T', ' ').slice(0, 16)}Z`;
+}
+
+/** How long after settling a run still marked `durable:lifecycle:pending` is left to the live publish. */
+const LIFECYCLE_GRACE_MS = 30_000;
+
+/**
+ * Settled runs still tagged `durable:lifecycle:pending` past the 30s grace the lifecycle sweep
+ * gives the live publish (newest first), with the subscribers each still owes its event to. One
+ * listing by tag, like "Stuck runs"; `query.limit` (10-200, default 50). `query.metric: 'count'`
+ * answers how many there are instead, as a stat (one count over the same predicates).
+ */
+export function durableOwedLifecycleProvider(): DataProvider {
+  return {
+    name: 'durable.owedLifecycle',
+    async resolve(query, ctx) {
+      const engine = await engineOf(ctx);
+      const owedQuery = {
+        tag: LIFECYCLE_PENDING_TAG,
+        statuses: ['completed', 'failed', 'cancelled', 'dead'] as RunStatus[],
+        updatedBefore: Date.now() - LIFECYCLE_GRACE_MS,
+      };
+      if ((query?.metric as string) === 'count') {
+        return { value: await engine.countRuns(owedQuery) };
+      }
+      const limit = Math.min(200, Math.max(10, Number(query?.limit ?? 50)));
+      const runs = await engine.listRuns({ ...owedQuery, size: limit });
+      const rows = runs
+        .slice()
+        .sort((a, b) => +new Date(b.updatedAt) - +new Date(a.updatedAt))
+        .map((r) => ({
+          settledAt: minuteStamp(r.updatedAt),
+          workflow: r.workflow,
+          runId: r.id,
+          owed: owedSubscribersOf(r).join(', ') || 'every subscriber',
+        }));
+      return { rows };
+    },
+  };
+}
+
 // ─── entry-backed (captured diagnostics history) ──────────────────────────────
+
+/**
+ * Recent `run.trigger_failed` events (newest first): when, the settled run's workflow and id, the
+ * subscriber that could not be started and why. `query.limit` (10-200, default 50).
+ */
+export function durableFailedTriggersProvider(): DataProvider {
+  return {
+    name: 'durable.failedTriggers',
+    async resolve(query, ctx) {
+      const limit = Math.min(200, Math.max(10, Number(query?.limit ?? 50)));
+      const entries = await fetchEntries(ctx);
+      const rows = entries
+        .filter((e) => contentOf(e).event === 'run.trigger_failed')
+        .sort((a, b) => +new Date(b.createdAt ?? 0) - +new Date(a.createdAt ?? 0))
+        .slice(0, limit)
+        .map((e) => {
+          const p = contentOf(e).payload ?? {};
+          return {
+            at: minuteStamp(e.createdAt ?? 0),
+            workflow: p.workflow ?? '',
+            runId: p.runId ?? '',
+            subscriber: p.name ?? '',
+            error: p.error?.message ?? '',
+          };
+        });
+      return { rows };
+    },
+  };
+}
+
+/**
+ * Lifecycle triggers from the captured `run.triggered` / `run.trigger_failed` events. By default
+ * `triggered`/`failed` counts in `query.buckets ?? 24` equal time buckets; with
+ * `query.metric: 'bySubscriber'`, the subscriber runs started per `<workflow> → <subscriber>`, most
+ * first.
+ */
+export function durableLifecycleTriggersProvider(): DataProvider {
+  return {
+    name: 'durable.lifecycleTriggers',
+    async resolve(query, ctx) {
+      const entries = (await fetchEntries(ctx)).filter((e) => {
+        const event = contentOf(e).event;
+        return event === 'run.triggered' || event === 'run.trigger_failed';
+      });
+      if ((query?.metric as string) === 'bySubscriber') {
+        const counts = new Map<string, number>();
+        for (const e of entries) {
+          const c = contentOf(e);
+          if (c.event !== 'run.triggered') continue;
+          const label = `${c.payload?.workflow ?? 'unknown'} → ${c.payload?.name ?? 'unknown'}`;
+          counts.set(label, (counts.get(label) ?? 0) + 1);
+        }
+        const items = [...counts.entries()]
+          .map(([label, value]) => ({ label, value }))
+          .sort((a, b) => b.value - a.value || a.label.localeCompare(b.label));
+        return { items };
+      }
+      const n = Math.max(1, Number(query?.buckets ?? 24));
+      const now = Date.now();
+      let minT = now;
+      for (const e of entries) {
+        if (e.createdAt) minT = Math.min(minT, +new Date(e.createdAt));
+      }
+      const bucketSize = Math.max(now - minT, 1) / n;
+      const rows = Array.from({ length: n }, (_, i) => ({
+        label: new Date(minT + i * bucketSize).toISOString().slice(11, 16),
+        triggered: 0,
+        failed: 0,
+      }));
+      for (const e of entries) {
+        const t = e.createdAt ? +new Date(e.createdAt) : 0;
+        const row = rows[Math.min(n - 1, Math.max(0, Math.floor((t - minT) / bucketSize)))];
+        if (!row) continue;
+        if (contentOf(e).event === 'run.triggered') row.triggered += 1;
+        else row.failed += 1;
+      }
+      return { rows };
+    },
+  };
+}
 
 /** Rollups from captured run.* entries. `query.metric`: successRate | failed | total | topFailures. */
 export function durableTimeseriesProvider(): DataProvider {
