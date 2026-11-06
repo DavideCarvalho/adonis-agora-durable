@@ -66,7 +66,7 @@ jobs:
       # and the db transport's run queue. Data on tmpfs, so the per-test DDL
       # stays fast; every test gets a database of its own.
       mysql:
-        image: mysql:8.4
+        image: mysql:26.10
         env:
           MYSQL_ROOT_PASSWORD: root
         ports:
@@ -132,7 +132,7 @@ jobs:
       # and the db transport's run queue. Data on tmpfs, so the per-test DDL
       # stays fast; every test gets a database of its own.
       mysql:
-        image: mysql:8.4
+        image: mysql:26.10
         env:
           MYSQL_ROOT_PASSWORD: root
         ports:
