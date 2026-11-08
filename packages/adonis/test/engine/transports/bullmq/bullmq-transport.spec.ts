@@ -452,6 +452,33 @@ describe('BullMQTransport', () => {
       ]);
     });
 
+    it('listWorkerDescriptors reuses a read, shares one in flight, and re-reads when asked fresh', async () => {
+      broker.redis.store.set(
+        'durable-worker-descriptor:proc:w1',
+        JSON.stringify({ instanceId: 'w1' }),
+      );
+      let scans = 0;
+      const scan = broker.redis.scan.bind(broker.redis);
+      broker.redis.scan = async (...args: Parameters<typeof scan>) => {
+        scans += 1;
+        return scan(...args);
+      };
+      // Concurrent reads of one token: one SCAN between them.
+      await Promise.all([1, 2, 3].map(() => transport.listWorkerDescriptors('proc')));
+      expect(scans).toBe(1);
+      // Inside the reuse window: none.
+      await transport.listWorkerDescriptors('proc');
+      expect(scans).toBe(1);
+      // Fresh: read again, and the new descriptor is there.
+      broker.redis.store.set(
+        'durable-worker-descriptor:proc:w2',
+        JSON.stringify({ instanceId: 'w2' }),
+      );
+      const fresh = await transport.listWorkerDescriptors('proc', { fresh: true });
+      expect(scans).toBe(2);
+      expect(fresh.map((d) => d.instanceId).sort()).toEqual(['w1', 'w2']);
+    });
+
     it('listWorkerDescriptors degrades to [] and never throws on a malformed value', async () => {
       broker.redis.store.set('durable-worker-descriptor:proc:bad', '{not json');
       expect(await transport.listWorkerDescriptors('proc')).toEqual([]);

@@ -76,7 +76,10 @@ class CapabilityTransport implements Transport {
 
   onStepEvent(_handler: (event: WorkflowStepEvent) => Promise<void>): void {}
 
-  async listWorkerDescriptors(_token: string): Promise<WorkerDescriptor[]> {
+  async listWorkerDescriptors(
+    _token: string,
+    _opts?: { fresh?: boolean | undefined },
+  ): Promise<WorkerDescriptor[]> {
     return this.descriptors;
   }
 }
@@ -128,6 +131,35 @@ describe('WorkflowEngine — capability/protocol-aware dispatch', () => {
     expect(diag?.diagnostics?.liveWorkers).toBe(1);
     expect(diag?.diagnostics?.workers).toHaveLength(1);
     expect(diag?.diagnostics?.controlPlane.instanceId).toBeDefined();
+  });
+
+  it('re-reads the descriptors before parking: a capable worker missing from a reused read still gets the step', async () => {
+    const store = new InMemoryStateStore();
+    const transport = new CapabilityTransport();
+    transport.handle('billing.charge', () => ({ charged: true }));
+    // A reused (cached) read still shows the old fleet; a fresh one sees the capable worker.
+    const fresh: boolean[] = [];
+    transport.listWorkerDescriptors = async (_token, opts) => {
+      fresh.push(opts?.fresh === true);
+      return opts?.fresh
+        ? [worker({ instanceId: 'w2', capabilities: ['saga'] })]
+        : [worker({ instanceId: 'w1', capabilities: ['signals'] })];
+    };
+    const engine = new WorkflowEngine({ store, transport });
+    engine.register('checkout', '1', async (ctx) => {
+      const r = await ctx.step<{ charged: boolean }>(
+        'billing.charge',
+        { amount: 1 },
+        { requires: ['saga'] },
+      );
+      return r.charged;
+    });
+    await engine.start('checkout', {}, 'run1');
+    const run = await settle(store, 'run1');
+    expect(run.status).toBe('completed');
+    expect(transport.dispatched).toHaveLength(1);
+    // The reused read first, then one fresh read before deciding to park.
+    expect(fresh.slice(0, 2)).toEqual([false, true]);
   });
 
   it('dispatches normally when a live worker advertises the required capability', async () => {

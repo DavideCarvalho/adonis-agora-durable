@@ -440,7 +440,7 @@ export class QueueTransport implements Transport, ControlPlane {
   readonly #workerKeys: WorkerKeyStore;
   /** Whether a real key store was configured — without one there is no liveness to report. */
   readonly #hasWorkerKeys: boolean;
-  readonly #liveWorkerKeys: () => Promise<{ key: string; value: string }[]>;
+  readonly #liveWorkerKeys: (fresh?: boolean) => Promise<{ key: string; value: string }[]>;
   /** Workflow turn consumers by workflow name — a `workflow`-shaped task job routes here. */
   readonly #workflowTurns = new Map<string, WorkflowTurnHandler>();
   /** Every `onDecision` handler (an engine subscribes one; it applies a decision by run id). */
@@ -565,8 +565,11 @@ export class QueueTransport implements Transport, ControlPlane {
   }
 
   /** The live worker descriptors advertised on `token`. */
-  async listWorkerDescriptors(token: string): Promise<WorkerDescriptor[]> {
-    return descriptorsOn(await this.#liveWorkerKeys(), token);
+  async listWorkerDescriptors(
+    token: string,
+    opts?: { fresh?: boolean | undefined },
+  ): Promise<WorkerDescriptor[]> {
+    return descriptorsOn(await this.#liveWorkerKeys(opts?.fresh === true), token);
   }
 
   /** The routing tokens a live worker beats on. */

@@ -98,17 +98,18 @@ export const NO_WORKER_KEYS: WorkerKeyStore = {
  * the store cannot be read, so routing falls back to what it does with no advertisement. Calls that
  * arrive while a read is in flight join it instead of issuing their own, so a burst of concurrent
  * dashboard polls (or `groupHealth` for every group at once) on an expired cache costs one read.
+ * `fresh` skips the reuse (a read already in flight is still joined: it started no earlier).
  */
 export function cachedLiveKeys(
   store: WorkerKeyStore,
   cacheMs: number,
   now: () => number,
-): () => Promise<{ key: string; value: string }[]> {
+): (fresh?: boolean) => Promise<{ key: string; value: string }[]> {
   let read: { at: number; entries: { key: string; value: string }[] } | undefined;
   let inFlight: Promise<{ key: string; value: string }[]> | undefined;
-  return () => {
+  return (fresh = false) => {
     const at = now();
-    if (read && at - read.at < cacheMs) return Promise.resolve(read.entries);
+    if (!fresh && read && at - read.at < cacheMs) return Promise.resolve(read.entries);
     if (inFlight) return inFlight;
     const pending = (async () => {
       try {

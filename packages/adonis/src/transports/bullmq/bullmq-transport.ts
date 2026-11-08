@@ -1446,12 +1446,32 @@ export class BullMQTransport implements Transport {
    *  cadence (tens of seconds), but `ensureRoutable` asks before EVERY dispatch — without this memo
    *  a 500-step/s engine ran 500 SCAN cycles/s against Redis for an answer that was identical. */
   readonly #descriptorCache = new Map<string, { at: number; descriptors: WorkerDescriptor[] }>();
+  /** The descriptor read in flight per token: concurrent callers share it instead of each scanning. */
+  readonly #descriptorReads = new Map<string, Promise<WorkerDescriptor[]>>();
 
-  async listWorkerDescriptors(token: string): Promise<WorkerDescriptor[]> {
+  /**
+   * `fresh` skips the reuse: the engine re-reads before it parks a run `blocked`, so a capable
+   * worker that joined inside the cache window is never missed. A read already in flight is joined
+   * either way (it started no earlier).
+   */
+  async listWorkerDescriptors(
+    token: string,
+    opts?: { fresh?: boolean | undefined },
+  ): Promise<WorkerDescriptor[]> {
     const cached = this.#descriptorCache.get(token);
     // A short TTL (5s): a fraction of the descriptor heartbeat TTL, so a scaled-down fleet is
     // noticed within one cache window while the per-dispatch SCAN storm disappears.
-    if (cached && Date.now() - cached.at < 5_000) return cached.descriptors;
+    if (!opts?.fresh && cached && Date.now() - cached.at < 5_000) return cached.descriptors;
+    const inFlight = this.#descriptorReads.get(token);
+    if (inFlight) return inFlight;
+    const read = this.#readWorkerDescriptors(token).finally(() => {
+      if (this.#descriptorReads.get(token) === read) this.#descriptorReads.delete(token);
+    });
+    this.#descriptorReads.set(token, read);
+    return read;
+  }
+
+  async #readWorkerDescriptors(token: string): Promise<WorkerDescriptor[]> {
     const client = this.#workerRedisClient();
     const prefix = workerDescriptorTokenPrefix(this.#effectivePrefix(), token);
     const descriptors: WorkerDescriptor[] = [];

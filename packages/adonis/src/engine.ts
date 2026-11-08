@@ -7533,10 +7533,14 @@ export class WorkflowEngine {
     // Capability/protocol guard (design §7.5): a remote workflow's turn dispatches a WorkflowTask to
     // its group — if no live worker on that group can run it, park `blocked` before advancing rather
     // than handing the task to the executor to enqueue into a void. Re-checked each turn (recovery).
-    const routePlan = await this.planRoute(
-      registered.convention ? conventionGroup(run.workflow, run.namespace) : remote.group,
-      registered.requires,
-    );
+    const routeToken = registered.convention
+      ? conventionGroup(run.workflow, run.namespace)
+      : remote.group;
+    let routePlan = await this.planRoute(routeToken, registered.requires);
+    // As in ensureRoutable: re-read before parking, never park on reused descriptors.
+    if (routePlan?.status === 'blocked') {
+      routePlan = await this.planRoute(routeToken, registered.requires, true);
+    }
     if (routePlan?.status === 'blocked') return this.parkBlocked(run, routePlan);
 
     const checkpoints = await this.replayCheckpoints(run.id);
@@ -9348,11 +9352,11 @@ export class WorkflowEngine {
    *  descriptor keyspace. Empty when no transport can introspect it (in-process / pre-handshake broker)
    *  OR nobody is publishing — either way the guard is skipped and dispatch proceeds legacy
    *  assume-compatible (design §7.7). Never throws (the transport degrades to `[]`). */
-  private async liveDescriptorsFor(token: string): Promise<WorkerDescriptor[]> {
+  private async liveDescriptorsFor(token: string, fresh = false): Promise<WorkerDescriptor[]> {
     const read = this.primaryTransport?.listWorkerDescriptors;
     if (!read) return [];
     try {
-      return await read.call(this.primaryTransport, token);
+      return await read.call(this.primaryTransport, token, fresh ? { fresh } : undefined);
     } catch {
       return [];
     }
@@ -9368,8 +9372,9 @@ export class WorkflowEngine {
   private async planRoute(
     token: string,
     requires: string[] | undefined,
+    fresh = false,
   ): Promise<DispatchPlan | undefined> {
-    const descriptors = await this.liveDescriptorsFor(token);
+    const descriptors = await this.liveDescriptorsFor(token, fresh);
     if (descriptors.length === 0) return undefined; // legacy/no-runtime path — skip the guard
     return planDispatch(requires ?? [], descriptors, this.cpDescriptor, token);
   }
@@ -9379,7 +9384,9 @@ export class WorkflowEngine {
    *  checkpoint + dispatching into a queue nobody consumes (design §7.5). A no-op when the guard does
    *  not engage (no descriptors) or a capable+compatible worker exists. */
   private async ensureRoutable(token: string, requires: string[] | undefined): Promise<void> {
-    const plan = await this.planRoute(token, requires);
+    let plan = await this.planRoute(token, requires);
+    // Never park a run on reused descriptors: a capable worker may have joined since they were read.
+    if (plan?.status === 'blocked') plan = await this.planRoute(token, requires, true);
     if (plan?.status === 'blocked') throw new WorkflowBlocked(plan);
   }
 

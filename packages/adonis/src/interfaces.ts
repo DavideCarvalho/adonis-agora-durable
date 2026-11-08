@@ -1963,7 +1963,10 @@ export interface Transport {
    * skips the guard and dispatches as before (legacy assume-compatible, design §7.7). MUST degrade to
    * `[]` (never throw) when the keyspace is empty or unreadable. Pairs with {@link listWorkerGroups}.
    */
-  listWorkerDescriptors?(token: string): Promise<WorkerDescriptor[]>;
+  listWorkerDescriptors?(
+    token: string,
+    opts?: { fresh?: boolean | undefined },
+  ): Promise<WorkerDescriptor[]>;
   /**
    * EVERY live worker descriptor, across all routing tokens — the fleet-wide read behind
    * {@link WorkflowEngine.workflowDirectory}. Optional, and MUST degrade to `[]` when unreadable.
