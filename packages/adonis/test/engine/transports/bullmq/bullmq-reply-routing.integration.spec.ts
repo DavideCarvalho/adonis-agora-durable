@@ -110,6 +110,7 @@ const completed = async (store: InMemoryStateStore, ids: string[]) =>
 
 describe.skipIf(!REDIS_URL)('routed step results (BullMQ)', () => {
   it('go back to the engine that dispatched them, so no body replays', async () => {
+    // (Either engine may take a run off the run queue; whichever runs its turns gets its results.)
     const env = setup(uniqueRedisPrefix('rr'));
     const a = await env.engine('engine-a');
     const b = await env.engine('engine-b');
@@ -148,10 +149,12 @@ describe.skipIf(!REDIS_URL)('routed step results (BullMQ)', () => {
     });
     const deadDeps = await killableDeps();
     const a = await env.engine('engine-a', {}, deadDeps);
-    await env.engine('engine-b');
     await env.worker('worker-1', {}, () => gate);
+    // A alone takes the run off the run queue, so the body is parked on A.
     await a.engine.start('seq', { n: 2 }, 'd1');
     await until(async () => (await env.store.getRun('d1'))?.status === 'suspended');
+    expect(env.entries()).toBe(1);
+    await env.engine('engine-b');
     // Engine A crashes: it stops consuming and beating, without the goodbye a shutdown sends.
     await deadDeps.kill();
     // The step finishes while A's alive key may still stand: its result goes to A's own queue, or
