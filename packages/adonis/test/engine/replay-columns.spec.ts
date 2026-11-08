@@ -161,7 +161,12 @@ describe('the engine reads a turn through listCheckpointsForReplay', () => {
           : undefined,
       });
       const transport = new HeldTransport();
-      const engine = new WorkflowEngine({ store, transports: [{ id: 't', transport }] });
+      // Every turn replays (no sticky continuation), so each one takes the snapshot this pins.
+      const engine = new WorkflowEngine({
+        store,
+        transports: [{ id: 't', transport }],
+        stickyRuns: 0,
+      });
       engine.register('chat', '1', async (ctx) => ctx.step(STEP, { prompt: 'p' }));
       await startRun(engine, 'chat', {}, 'r1');
       await transport.result?.(ok(transport.dispatched[0] as RemoteTask));

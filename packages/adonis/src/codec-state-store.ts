@@ -12,9 +12,11 @@ import type {
   RunValueFacetRow,
   ScheduleQuery,
   ScheduleRecord,
+  SettledStepResult,
   SignalWaiter,
   StateStore,
   StepCheckpoint,
+  StepResultSettlement,
   StepSettlement,
   WorkflowRun,
 } from './interfaces.js';
@@ -104,6 +106,20 @@ export class CodecStateStore implements StateStore {
   /** Encodes each settlement's `output` (and `events`/`error` under `extended` coverage) like
    *  {@link saveCheckpoint}. Bound only when the inner store has it. */
   readonly settleCheckpointsIfPending?: (settlements: StepSettlement[]) => Promise<boolean[]>;
+  /** Encodes each result's payloads like {@link settleCheckpointsIfPending}, decodes each row read
+   *  back. Bound only when the inner store has it. */
+  readonly settleResultsIfPending?: (
+    results: StepResultSettlement[],
+  ) => Promise<(SettledStepResult | null)[]>;
+  /** Encodes like {@link saveCheckpoint}. Bound only when the inner store has it. */
+  readonly insertCheckpointIfAbsent?: (checkpoint: StepCheckpoint) => Promise<boolean>;
+  /** Decodes the run read. Bound only when the inner store has it. */
+  readonly tryLockRunAndGet?: (
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ) => Promise<WorkflowRun | null>;
   /** Forwarded verbatim — a timer carries no payload. Bound only when the inner store has it, so the
    *  engine's {@link updateRunIf} fallback still applies through the wrapper. */
   readonly pullRunWakesIn?: (runIds: string[], wakeAt: number) => Promise<void>;
@@ -223,6 +239,27 @@ export class CodecStateStore implements StateStore {
           inner,
           settlements.map((s) => this.encSettlement(s)),
         );
+    }
+    const settleResults = inner.settleResultsIfPending;
+    if (settleResults) {
+      this.settleResultsIfPending = async (results) =>
+        (
+          await settleResults.call(
+            inner,
+            results.map((r) => this.encSettlement(r)),
+          )
+        ).map((settled) =>
+          settled ? { ...settled, checkpoint: this.decCp(settled.checkpoint) } : null,
+        );
+    }
+    const insertIfAbsent = inner.insertCheckpointIfAbsent;
+    if (insertIfAbsent) {
+      this.insertCheckpointIfAbsent = (cp) => insertIfAbsent.call(inner, this.encCp(cp));
+    }
+    const lockAndGet = inner.tryLockRunAndGet;
+    if (lockAndGet) {
+      this.tryLockRunAndGet = async (runId, owner, leaseUntilMs, nowMs) =>
+        this.decRun(await lockAndGet.call(inner, runId, owner, leaseUntilMs, nowMs));
     }
     const pullWakesIn = inner.pullRunWakesIn;
     if (pullWakesIn) {
@@ -365,14 +402,14 @@ export class CodecStateStore implements StateStore {
     }
     return next;
   }
-  private encSettlement(settlement: StepSettlement): StepSettlement {
-    const next: StepSettlement = { ...settlement, output: this.enc(settlement.output) };
+  private encSettlement<S extends StepSettlement | StepResultSettlement>(settlement: S): S {
+    const next: S = { ...settlement, output: this.enc(settlement.output) };
     if (this.extended) {
       if (settlement.events !== undefined) {
-        next.events = this.enc(settlement.events) as StepSettlement['events'];
+        next.events = this.enc(settlement.events) as S['events'];
       }
       if (settlement.error !== undefined) {
-        next.error = this.enc(settlement.error) as StepSettlement['error'];
+        next.error = this.enc(settlement.error) as S['error'];
       }
     }
     return next;

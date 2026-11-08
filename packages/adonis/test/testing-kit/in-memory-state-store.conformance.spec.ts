@@ -10,9 +10,15 @@ runStateStoreContract('InMemoryStateStore', async () => ({
   cleanup: async () => undefined,
 }));
 
+// With the optional round-trip methods on, as an engine test can ask for them.
+runStateStoreContract('InMemoryStateStore (round-trip methods)', async () => ({
+  store: new InMemoryStateStore({ roundTripMethods: true }),
+  cleanup: async () => undefined,
+}));
+
 // The wrapper must stay contract-conformant too, including the optional fan methods it forwards.
 runStateStoreContract('CodecStateStore(InMemoryStateStore)', async () => ({
-  store: new CodecStateStore(new InMemoryStateStore(), {
+  store: new CodecStateStore(new InMemoryStateStore({ roundTripMethods: true }), {
     encode: (v) => ({ wrapped: v }),
     decode: (v) => (v as { wrapped: unknown }).wrapped,
   }),

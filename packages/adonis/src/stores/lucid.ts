@@ -19,12 +19,15 @@ import type {
   RunValueFacetRow,
   ScheduleQuery,
   ScheduleRecord,
+  SettledStepResult,
   SignalWaiter,
   StateStore,
   StepCheckpoint,
+  StepResultSettlement,
   StepSettlement,
   WorkflowRun,
 } from '../interfaces.js';
+import { SETTLEABLE_RUN_STATUSES } from '../interfaces.js';
 import { namespaceFilterValues, normalizeNamespace } from '../namespaces.js';
 import { mergeRunFacetRows } from '../run-facets.js';
 import { runPageWindow } from '../run-pagination.js';
@@ -545,6 +548,130 @@ export class LucidStateStore implements StateStore {
     });
   }
 
+  async settleResultsIfPending(
+    results: StepResultSettlement[],
+  ): Promise<(SettledStepResult | null)[]> {
+    if (results.length === 0) return [];
+    // A later entry for a row an earlier one claims loses, before anything is written.
+    const seen = new Set<string>();
+    const first = results.map((r) => {
+      const k = checkpointKey(r.runId, r.seq);
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+    const live = results.filter((_, i) => first[i]);
+    const client = this.client();
+    const settled =
+      client.dialect.name === 'postgres'
+        ? await settleResultsReturningPg(client, live)
+        : await this.settleResultsPlain(live);
+    const out: (SettledStepResult | null)[] = [];
+    let k = 0;
+    for (let i = 0; i < results.length; i += 1) {
+      if (!first[i]) {
+        out.push(null);
+        continue;
+      }
+      const r = live[k] as StepResultSettlement;
+      k += 1;
+      out.push(settled.get(checkpointKey(r.runId, r.seq)) ?? null);
+    }
+    return out;
+  }
+
+  /**
+   * {@link settleResultsIfPending} on a dialect without `UPDATE … RETURNING` in one statement
+   * (MySQL, SQLite): the runs' statuses, the rows, then the settle (one conditional UPDATE for a
+   * single result, the batched transaction for several). The same three statements the engine's
+   * read-first path costs.
+   */
+  private async settleResultsPlain(
+    results: StepResultSettlement[],
+  ): Promise<Map<string, SettledStepResult>> {
+    const out = new Map<string, SettledStepResult>();
+    const client = this.client();
+    const runRows = (await client
+      .from(DURABLE_TABLES.runs)
+      .whereIn('id', [...new Set(results.map((r) => r.runId))])
+      .select('id', 'status', 'wake_at')) as Array<Pick<RunRow, 'id' | 'status' | 'wake_at'>>;
+    const runs = new Map(runRows.map((row) => [row.id, row]));
+    const settleable = results.filter((r) =>
+      SETTLEABLE_RUN_STATUSES.includes(runs.get(r.runId)?.status as RunStatus),
+    );
+    if (settleable.length === 0) return out;
+    // What the result does not carry keeps its stored value, so the rows are read first.
+    const stored = new Map<string, StepCheckpoint>();
+    const byRun = new Map<string, number[]>();
+    for (const r of settleable) byRun.set(r.runId, [...(byRun.get(r.runId) ?? []), r.seq]);
+    for (const [runId, seqs] of byRun) {
+      for (const cp of await this.getCheckpointsForSettle(runId, seqs)) {
+        stored.set(checkpointKey(cp.runId, cp.seq), cp);
+      }
+    }
+    const settlements = settleable.flatMap((r): StepSettlement[] => {
+      const cp = stored.get(checkpointKey(r.runId, r.seq));
+      if (!cp) return [];
+      return [
+        {
+          runId: r.runId,
+          seq: r.seq,
+          status: r.status,
+          output: r.status === 'completed' ? r.output : cp.output,
+          error: r.error,
+          events: r.events ?? cp.events,
+          startedAt: r.startedAt ?? cp.startedAt,
+          finishedAt: r.finishedAt,
+        },
+      ];
+    });
+    const wrote = await this.settleCheckpointsIfPending(settlements);
+    // The rows as they now read: the stored row with the settlement written over it (the settle is a
+    // compare-and-set on `pending`, so nothing else wrote it in between).
+    settlements.forEach((settlement, i) => {
+      if (!wrote[i]) return;
+      const k = checkpointKey(settlement.runId, settlement.seq);
+      const { runId: _runId, seq: _seq, ...written } = settlement;
+      const checkpoint: StepCheckpoint = { ...(stored.get(k) as StepCheckpoint), ...written };
+      for (const key of ['output', 'error', 'events'] as const) {
+        if (checkpoint[key] === undefined) delete checkpoint[key];
+      }
+      const run = runs.get(settlement.runId) as Pick<RunRow, 'status' | 'wake_at'>;
+      out.set(k, {
+        checkpoint,
+        run: {
+          status: run.status as RunStatus,
+          wakeAt: run.wake_at == null ? undefined : Number(run.wake_at),
+        },
+      });
+    });
+    return out;
+  }
+
+  async insertCheckpointIfAbsent(checkpoint: StepCheckpoint): Promise<boolean> {
+    const client = this.client();
+    const row = checkpointToRow(checkpoint);
+    if (client.dialect.name === 'postgres') {
+      const inserted = (await client
+        .insertQuery()
+        .table(DURABLE_TABLES.checkpoints)
+        .knexQuery.insert(row)
+        .onConflict(['run_id', 'seq'])
+        .ignore()
+        .returning('seq')) as unknown[];
+      return inserted.length > 0;
+    }
+    // MySQL and SQLite: a plain INSERT, whose duplicate-key error is the "already there" answer (an
+    // `INSERT IGNORE` would also swallow every other error, and reports no row count through Knex).
+    try {
+      await client.table(DURABLE_TABLES.checkpoints).insert(row);
+      return true;
+    } catch (err) {
+      if (isDuplicateKey(err)) return false;
+      throw err;
+    }
+  }
+
   /** Persist the latest worker heartbeat on the step's checkpoint row (see the interface doc).
    *  A targeted two-column UPDATE — never an upsert: a beat racing the checkpoint's own insert (or
    *  outliving a deleted run) matches zero rows and is a silent no-op, by design. */
@@ -662,6 +789,35 @@ export class LucidStateStore implements StateStore {
       })
       .update({ locked_by: owner, locked_until: leaseUntilMs });
     return rowsAffected(affected) === 1;
+  }
+
+  async tryLockRunAndGet(
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ): Promise<WorkflowRun | null> {
+    const client = this.client();
+    if (client.dialect.name === 'postgres') {
+      // One statement: the lease's compare-and-set and the read of the row it locked. The scope
+      // fence sits in the WHERE clause, so a run outside it is neither locked nor read.
+      const rows = (await this.fenced(
+        client
+          .from(DURABLE_TABLES.runs)
+          .where('id', runId)
+          .andWhere((q) => {
+            q.whereNull('locked_until').orWhere('locked_until', '<=', nowMs);
+          }),
+      )
+        .update({ locked_by: owner, locked_until: leaseUntilMs })
+        .returning('*')) as RunRow[];
+      return rows[0] ? rowToRun(rows[0]) : null;
+    }
+    if (!(await this.tryLockRun(runId, owner, leaseUntilMs, nowMs))) return null;
+    const run = await this.getRun(runId);
+    // Outside the store's read scope: give the lease back.
+    if (!run) await this.releaseRunLock(runId, owner);
+    return run;
   }
 
   async releaseRunLock(runId: string, owner?: string): Promise<void> {
@@ -1591,6 +1747,83 @@ function nameKindSql(dialect: string): string {
 
 function escapeLike(value: string): string {
   return value.replace(/[!%_]/g, (c) => `!${c}`);
+}
+
+/**
+ * {@link LucidStateStore.settleResultsIfPending} on Postgres: one `UPDATE … FROM (VALUES …) …
+ * RETURNING` for the whole batch (entries already deduplicated by row). The run's status is checked
+ * in the same statement, and read back with its `wake_at`. What a result does not carry keeps its
+ * stored value: `output` unless it completed, `events` and `started_at` unless present.
+ */
+async function settleResultsReturningPg(
+  client: Client,
+  results: StepResultSettlement[],
+): Promise<Map<string, SettledStepResult>> {
+  const values: string[] = [];
+  const bindings: unknown[] = [];
+  for (const r of results) {
+    const row = settlementToRow({
+      ...r,
+      startedAt: r.startedAt ?? new Date(0),
+    });
+    values.push(
+      '(?::text, ?::int, ?::text, ?::text, ?::text, ?::boolean, ?::text, ?::bigint, ?::bigint)',
+    );
+    bindings.push(
+      r.runId,
+      r.seq,
+      r.status,
+      r.status === 'completed' ? row.output : null,
+      row.error,
+      r.events !== undefined,
+      row.events,
+      r.startedAt ? row.started_at : null,
+      row.finished_at,
+    );
+  }
+  const cols = CHECKPOINT_COLUMNS_BUT_INPUT.map((c) => `c.${c}`).join(', ');
+  const statuses = SETTLEABLE_RUN_STATUSES.map(() => '?').join(', ');
+  bindings.push(...SETTLEABLE_RUN_STATUSES);
+  const sql = `update ${DURABLE_TABLES.checkpoints} as c set
+      status = v.status,
+      output = case when v.status = 'completed' then v.output else c.output end,
+      error = v.error,
+      events = case when v.has_events then v.events else c.events end,
+      started_at = coalesce(v.started_at, c.started_at),
+      finished_at = v.finished_at
+    from (values ${values.join(', ')})
+      as v(run_id, seq, status, output, error, has_events, events, started_at, finished_at),
+      ${DURABLE_TABLES.runs} as r
+    where c.run_id = v.run_id and c.seq = v.seq and c.status = 'pending'
+      and r.id = c.run_id and r.status in (${statuses})
+    returning ${cols}, r.status as run_status, r.wake_at as run_wake_at`;
+  const { rows } = (await client.rawQuery(sql, bindings as never)) as {
+    rows: Array<CheckpointRow & { run_status: string; run_wake_at: string | number | null }>;
+  };
+  const out = new Map<string, SettledStepResult>();
+  for (const row of rows) {
+    const checkpoint = rowToCheckpoint(row);
+    out.set(checkpointKey(checkpoint.runId, checkpoint.seq), {
+      checkpoint,
+      run: {
+        status: row.run_status as RunStatus,
+        wakeAt: row.run_wake_at == null ? undefined : Number(row.run_wake_at),
+      },
+    });
+  }
+  return out;
+}
+
+/** A duplicate-key violation, as MySQL and SQLite report it through Knex. */
+function isDuplicateKey(err: unknown): boolean {
+  const e = err as { code?: unknown; errno?: unknown } | null;
+  return (
+    e?.code === 'ER_DUP_ENTRY' ||
+    e?.errno === 1062 ||
+    e?.code === 'SQLITE_CONSTRAINT_PRIMARYKEY' ||
+    e?.code === 'SQLITE_CONSTRAINT_UNIQUE' ||
+    e?.code === '23505'
+  );
 }
 
 function checkpointKey(runId: string, seq: number): string {

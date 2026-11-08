@@ -109,6 +109,8 @@ describe('REGRESSION: a step result settled by another instance during the dispa
       store,
       transports: [{ id: 't', transport }],
       reconcileMs: 0,
+      // Counts body replays: every turn replays (no sticky continuation keeps the body).
+      stickyRuns: 0,
     });
     let bodyRuns = 0;
     engine.register('line', '1', async (ctx) => {

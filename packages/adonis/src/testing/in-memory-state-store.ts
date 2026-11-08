@@ -13,12 +13,15 @@ import type {
   RunValueFacetRow,
   ScheduleQuery,
   ScheduleRecord,
+  SettledStepResult,
   SignalWaiter,
   StateStore,
   StepCheckpoint,
+  StepResultSettlement,
   StepSettlement,
   WorkflowRun,
 } from '../interfaces.js';
+import { SETTLEABLE_RUN_STATUSES } from '../interfaces.js';
 import { namespaceMatches, normalizeNamespace } from '../namespaces.js';
 import { checkpointStatsOf, queryCheckpointsOf } from '../run-detail-summary.js';
 import { mergeRunFacetRows } from '../run-facets.js';
@@ -134,6 +137,104 @@ export class InMemoryStateStore implements StateStore {
   /** The namespace run reads are fenced to (see {@link withScope}); undefined sees every run. */
   private scopeNamespace: string | undefined;
 
+  // The three round-trip-saving methods below are built on the plain ones, so a test store that
+  // overrides `tryLockRun`, `getRun`, `getCheckpoint` or a settle to stage a race keeps staging it.
+  // They are OFF unless asked for (`roundTripMethods`, or `DURABLE_TEST_ROUND_TRIP_METHODS=1` for a
+  // whole suite): many specs pin the store calls the engine makes without them.
+  readonly settleResultsIfPending?: (
+    results: StepResultSettlement[],
+  ) => Promise<(SettledStepResult | null)[]>;
+  readonly insertCheckpointIfAbsent?: (checkpoint: StepCheckpoint) => Promise<boolean>;
+  readonly tryLockRunAndGet?: (
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ) => Promise<WorkflowRun | null>;
+  private readonly roundTripMethods: boolean;
+
+  constructor(opts: { roundTripMethods?: boolean } = {}) {
+    this.roundTripMethods =
+      opts.roundTripMethods ??
+      (typeof process !== 'undefined' && process.env.DURABLE_TEST_ROUND_TRIP_METHODS === '1');
+    if (this.roundTripMethods) {
+      this.settleResultsIfPending = (results) => this.settleResultsFallback(results);
+      this.insertCheckpointIfAbsent = (cp) => this.insertIfAbsentFallback(cp);
+      this.tryLockRunAndGet = (runId, owner, until, now) =>
+        this.lockAndGetFallback(runId, owner, until, now);
+    }
+  }
+
+  private async settleResultsFallback(
+    results: StepResultSettlement[],
+  ): Promise<(SettledStepResult | null)[]> {
+    const out: (SettledStepResult | null)[] = results.map(() => null);
+    // One read per run, then one settle for the batch: the calls the engine makes without this.
+    const before = new Map<string, StepCheckpoint>();
+    const seqsByRun = new Map<string, number[]>();
+    for (const r of results) seqsByRun.set(r.runId, [...(seqsByRun.get(r.runId) ?? []), r.seq]);
+    for (const [runId, seqs] of seqsByRun) {
+      for (const cp of await this.getCheckpointsForSettle(runId, seqs)) {
+        before.set(this.key(runId, cp.seq), cp);
+      }
+    }
+    const claimed = new Set<string>();
+    const settlements: StepSettlement[] = [];
+    const runs: WorkflowRun[] = [];
+    const at: number[] = [];
+    for (const [i, r] of results.entries()) {
+      const key = this.key(r.runId, r.seq);
+      const cp = before.get(key);
+      if (cp?.status !== 'pending' || claimed.has(key)) continue;
+      const run = this.runs.get(r.runId);
+      if (!run || !SETTLEABLE_RUN_STATUSES.includes(run.status)) continue;
+      claimed.add(key);
+      settlements.push({
+        runId: r.runId,
+        seq: r.seq,
+        status: r.status,
+        output: r.status === 'completed' ? r.output : cp.output,
+        error: r.error,
+        events: r.events ?? cp.events,
+        startedAt: r.startedAt ?? cp.startedAt,
+        finishedAt: r.finishedAt,
+      });
+      runs.push(run);
+      at.push(i);
+    }
+    if (settlements.length === 0) return out;
+    const wrote = await this.settleCheckpointsIfPending(settlements);
+    settlements.forEach((settlement, k) => {
+      if (!wrote[k]) return;
+      const cp = before.get(this.key(settlement.runId, settlement.seq)) as StepCheckpoint;
+      const run = runs[k] as WorkflowRun;
+      const checkpoint: StepCheckpoint = { ...cp, ...settlement };
+      for (const field of ['output', 'error', 'events'] as const) {
+        if (checkpoint[field] === undefined) delete checkpoint[field];
+      }
+      out[at[k] as number] = { checkpoint, run: { status: run.status, wakeAt: run.wakeAt } };
+    });
+    return out;
+  }
+
+  private async insertIfAbsentFallback(checkpoint: StepCheckpoint): Promise<boolean> {
+    if (await this.getCheckpoint(checkpoint.runId, checkpoint.seq)) return false;
+    await this.saveCheckpoint(checkpoint);
+    return true;
+  }
+
+  private async lockAndGetFallback(
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ): Promise<WorkflowRun | null> {
+    const run = await this.getRun(runId);
+    if (!run) return null;
+    if (!(await this.tryLockRun(runId, owner, leaseUntilMs, nowMs))) return null;
+    return { ...run, lockedBy: owner, lockedUntil: leaseUntilMs };
+  }
+
   /**
    * A view of THIS store (same data) whose run reads — `getRun`, `listRuns`, the counts and the
    * recovery/dispatch/timer scans — only see `scope.namespace`. Writes stay unscoped. Mirrors
@@ -143,7 +244,7 @@ export class InMemoryStateStore implements StateStore {
     // A plain store holding the SAME state object by reference (not an `Object.create(this)` child,
     // whose own-property writes — a counter bump — would shadow the base's, and which would break on
     // any `#private` field). Overrides of a subclass are not carried over to the view.
-    const view = new InMemoryStateStore();
+    const view = new InMemoryStateStore({ roundTripMethods: this.roundTripMethods });
     view.state = this.state;
     view.scopeNamespace = scope.namespace;
     return view;
