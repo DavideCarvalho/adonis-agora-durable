@@ -1,5 +1,29 @@
 # @adonis-agora/durable
 
+## 0.60.0
+
+### Minor Changes
+
+- [#469](https://github.com/DavideCarvalho/adonis-agora-durable/pull/469) [`7253d59`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/7253d593d1f0ef8c37c6e7d64526e2021cfa17a2) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `runPending` claims a batch of pending runs in one statement and runs it concurrently. New optional `StateStore.claimPendingRuns` leases the oldest free pending runs, skipping rows another instance is claiming right now (`FOR UPDATE SKIP LOCKED`), so instances polling one backlog split it instead of racing for the same rows. The Lucid store implements it (one statement on Postgres, one transaction on MySQL, the lease's compare-and-set per run on SQLite); the in-memory store has it with `roundTripMethods`. A store without it keeps the list-then-lock loop.
+
+- [#469](https://github.com/DavideCarvalho/adonis-agora-durable/pull/469) [`7253d59`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/7253d593d1f0ef8c37c6e7d64526e2021cfa17a2) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Lucid store on Postgres: the statements every workflow step runs go to the `pg` connection as constant SQL instead of being rebuilt by Knex's query builder on every call (about a fifth of a busy engine's CPU). They run on the same Knex pool (a global transaction's connection inside one) and are still announced as Knex's `query` event; a connection with Lucid's `debug` on keeps the builder. New option `stores.lucid({ preparedStatements: true })` sends them as named prepared statements (off by default: PgBouncer in transaction mode before 1.21 cannot hold them).
+  
+  `WorkflowSuspended`, thrown at every suspension point as control flow, no longer captures a stack trace.
+
+- [#469](https://github.com/DavideCarvalho/adonis-agora-durable/pull/469) [`7253d59`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/7253d593d1f0ef8c37c6e7d64526e2021cfa17a2) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - BullMQ: a dispatched `ctx.step`'s result goes back to the engine instance that dispatched it, which holds the workflow body parked on the step, so with several engines the body continues instead of replaying on whichever engine took the result. The engine consumes `<P>-results-to-<instanceId>` while it keeps `<P>:reply-alive:<instanceId>` alive; a worker sends there while the key exists, else to the shared `<P>-results`. A dead engine's routed results are moved to the shared queue by the other transports' sweep, so none is lost. Step fans keep the shared results. The queue, keys and job names are the NestJS transport's and the Python worker's, so a mixed fleet routes too; engines and workers that predate it ignore the field.
+  
+  New `RemoteTask.replyTo` and optional `Transport.consumeRepliesFor`. Transport options `replyRouting` (default `true`), `replyAliveTtlMs` (15 s), `replySweepMs` (5 s), `replyDrainIdleMs` (90 s). Engine option `routeReplies` (default `true` while the sticky cache is on), and `stickyRuns`, `stickyIdleMs`, `routeReplies` in `config/durable.ts`.
+
+- [#469](https://github.com/DavideCarvalho/adonis-agora-durable/pull/469) [`7253d59`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/7253d593d1f0ef8c37c6e7d64526e2021cfa17a2) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Sticky continuations: a workflow body parked on dispatched `ctx.step` calls stays in memory and continues when the step's result lands on the same instance, instead of replaying from the top over the run's history. Bounded by `stickyRuns` (default 2000, `0` turns it off) and `stickyIdleMs` (default 5 min); a run moved on by another instance, a cancel, an eviction, a classic suspension (sleep, signal, child) or a primitive called while the body is detached falls back to a replay.
+  
+  Fewer round trips per dispatched step, through new optional `StateStore` methods, implemented by the Lucid store (one statement each on Postgres): `settleResultsIfPending` (settle results and read the rows and the run back), `tryLockRunAndGet` (take the lease and read the run) and `insertCheckpointIfAbsent` (a first dispatch's `pending` row without reading the position first). The in-memory store has them opt-in (`new InMemoryStateStore({ roundTripMethods: true })`).
+  
+  Also fixes a resurrection race: a run's first turn moves it `pending` → `running` with a compare-and-set, so a cancel landing between the run's read and its start is no longer overwritten.
+
+### Patch Changes
+
+- [#469](https://github.com/DavideCarvalho/adonis-agora-durable/pull/469) [`7253d59`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/7253d593d1f0ef8c37c6e7d64526e2021cfa17a2) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The dispatch routing guard never parks a run `blocked` on reused worker descriptors: before parking, it reads them again, so a capable worker that joined inside the descriptor cache window gets the step. On BullMQ, concurrent descriptor reads of one token now share a single `SCAN` (the queue and db transports already did). `Transport.listWorkerDescriptors` takes an optional `{ fresh }`.
+
 ## 0.59.0
 
 ### Minor Changes
