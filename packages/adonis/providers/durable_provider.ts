@@ -325,6 +325,9 @@ export default class DurableProvider {
           ? { remoteAdvanceSilenceMs: config.remoteAdvanceSilenceMs }
           : {}),
         ...(config.timerBatchSize !== undefined ? { timerBatchSize: config.timerBatchSize } : {}),
+        ...(config.stickyRuns !== undefined ? { stickyRuns: config.stickyRuns } : {}),
+        ...(config.stickyIdleMs !== undefined ? { stickyIdleMs: config.stickyIdleMs } : {}),
+        ...(config.routeReplies !== undefined ? { routeReplies: config.routeReplies } : {}),
         ...(config.eventBufferTtl !== undefined
           ? { eventBufferTtlMs: parseDuration(config.eventBufferTtl) }
           : {}),

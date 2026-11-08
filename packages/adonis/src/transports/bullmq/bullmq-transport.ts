@@ -39,6 +39,9 @@ import {
   decisionsName,
   effectivePrefix,
   heartbeatChannel,
+  replyAliveKey,
+  replyInstancesKey,
+  replyQueueName,
   resultBatchesName,
   resultsName,
   routingToken,
@@ -134,6 +137,23 @@ export interface BullMQTransportOptions {
    * your slowest legitimate step. Unset (the default) = no ceiling.
    */
   stepTimeoutMs?: number | undefined;
+  /**
+   * Route a dispatched `ctx.step`'s result back to the engine instance that dispatched it (the task's
+   * `replyTo`), on a queue of its own, while that instance is alive: it holds the workflow body parked
+   * on the step, so with several engines the result continues the body instead of replaying it on
+   * whichever engine takes it off the shared results. An instance announces it is alive with a Redis
+   * key it refreshes; once the key lapses (a crash, a scale-down, a shutdown), workers send its
+   * results to the shared queue again and every transport moves what is left on its queue there, so
+   * no result is lost. Default `true`. `false` neither consumes nor sends routed replies. The keys
+   * and queue are the NestJS transport's and the Python worker's, so a mixed fleet routes too.
+   */
+  replyRouting?: boolean | undefined;
+  /** How long an engine's alive key outlives its last refresh (refreshed every third of it). Default 15 s. */
+  replyAliveTtlMs?: number | undefined;
+  /** How often a transport looks for dead engines' reply queues to move to the shared results. Default 5 s. */
+  replySweepMs?: number | undefined;
+  /** How long a dead engine's emptied reply queue is still watched before it is forgotten. Default 90 s. */
+  replyDrainIdleMs?: number | undefined;
 }
 
 /** Default {@link BullMQTransportOptions.pingIntervalMs}. */
@@ -215,6 +235,8 @@ export class BullMQTransport implements Transport {
   readonly #taskWorkers = new Map<string, WorkerLike>();
   #resultsWorker: WorkerLike | undefined;
   #resultBatchesWorker: WorkerLike | undefined;
+  /** The engine's result handlers (one per engine), also fed by the routed-reply queue. */
+  readonly #resultHandlers = new Set<(result: StepResult) => Promise<void>>();
   // Step results waiting for the results-batch publish in flight to finish (see `#publishResult`).
   readonly #resultsToBatch: Array<{
     result: StepResult;
@@ -258,6 +280,30 @@ export class BullMQTransport implements Transport {
   readonly #stepTimeoutMs: number | undefined;
   #pingWatchdogTimer: ReturnType<typeof setInterval> | undefined;
 
+  // --- Reply routing (see `replyRouting`) ---
+  readonly #replyRouting: boolean;
+  readonly #replyAliveTtlMs: number;
+  readonly #replySweepMs: number;
+  readonly #replyDrainIdleMs: number;
+  /** The engine instance this transport consumes routed replies for. */
+  #replyId: string | undefined;
+  #replyWorker: WorkerLike | undefined;
+  #replyRedisClient: RedisLike | undefined;
+  #replyBeatTimer: ReturnType<typeof setInterval> | undefined;
+  #replySweepTimer: ReturnType<typeof setInterval> | undefined;
+  #replySweeping = false;
+  readonly #replyAliveCache = new Map<string, { alive: boolean; at: number }>();
+  /** Routed results waiting for the batch in flight to their instance's queue, by queue. */
+  readonly #replyOutboxes = new Map<
+    string,
+    {
+      entries: Array<{ result: StepResult; resolve: (sent: boolean) => void }>;
+      publishing: boolean;
+    }
+  >();
+  /** Dead engines' reply queues this transport is moving to the shared results. */
+  readonly #replyDrains = new Map<string, { worker: WorkerLike; idleSince?: number | undefined }>();
+
   constructor(options: BullMQTransportOptions) {
     this.#deps = options.deps;
     this.#partition = options.partition;
@@ -276,6 +322,10 @@ export class BullMQTransport implements Transport {
       workerConcurrency(options.resultConcurrency),
     );
     this.#concurrency = options.concurrency;
+    this.#replyRouting = options.replyRouting !== false;
+    this.#replyAliveTtlMs = positiveMs(options.replyAliveTtlMs, 15_000);
+    this.#replySweepMs = positiveMs(options.replySweepMs, 5_000);
+    this.#replyDrainIdleMs = positiveMs(options.replyDrainIdleMs, 90_000);
     this.#pingIntervalMs = normalizePingInterval(options.pingIntervalMs);
     this.#stepTimeoutMs =
       options.stepTimeoutMs !== undefined &&
@@ -484,7 +534,8 @@ export class BullMQTransport implements Transport {
    * result as soon as it finishes. A batch that fails to publish goes out one result per job.
    * Otherwise each result is its own job on the results queue.
    */
-  async #publishResult(result: StepResult): Promise<void> {
+  async #publishResult(result: StepResult, replyTo?: string): Promise<void> {
+    if (replyTo !== undefined && (await this.#publishReply(result, replyTo))) return;
     if (!(await this.#resultBatchesConsumed())) {
       await this.#queue(resultsName(this.#effectivePrefix())).add(
         'result',
@@ -858,7 +909,7 @@ export class BullMQTransport implements Transport {
     // Handed back on shutdown: the broker already redelivers this step elsewhere.
     if (this.#handedBack.has(task)) return false;
     try {
-      await this.#publishResult(result);
+      await this.#publishResult(result, task.replyTo);
       return result.status === 'completed';
     } catch (err) {
       // The results-queue publish itself threw (e.g. Redis blipped). We still hold `task`, so
@@ -930,6 +981,7 @@ export class BullMQTransport implements Transport {
 
   onResult(handler: (result: StepResult) => Promise<void>): void {
     if (this.#resultsWorker) return;
+    this.#resultHandlers.add(handler);
     this.#resultBatchesWorker = this.#makeWorker(
       resultBatchesName(this.#effectivePrefix()),
       async (job) => {
@@ -963,6 +1015,241 @@ export class BullMQTransport implements Transport {
       if (this.#hasOnError) this.#onError(giveUp);
       else console.error(`[adonis-durable] ${giveUp.message}`);
     });
+  }
+
+  // --- Reply routing ------------------------------------------------------------------------------
+  // A task carrying `replyTo` asks for its result back on `<P>-results-to-<replyTo>`, a queue only
+  // that engine instance consumes, while its alive key (`<P>:reply-alive:<id>`, refreshed every third
+  // of `replyAliveTtlMs`) exists. Every instance that consumed or was sent a routed reply is
+  // remembered in `<P>:reply-instances`; any transport that routes replies sweeps that set and moves
+  // the queue of an instance whose key lapsed onto the shared results, stalled jobs included (BullMQ's
+  // stalled check hands a dead consumer's job to the next worker on that queue).
+
+  /** The connection reply routing uses, or `undefined` when routing is off or the client lacks it. */
+  #replyRedis():
+    | (RedisLike & Required<Pick<RedisLike, 'exists' | 'del' | 'sadd' | 'srem' | 'smembers'>>)
+    | undefined {
+    if (!this.#replyRouting) return undefined;
+    this.#replyRedisClient ??= this.#deps.makeRedis();
+    const r = this.#replyRedisClient;
+    if (!r.exists || !r.del || !r.sadd || !r.srem || !r.smembers) return undefined;
+    return r as RedisLike &
+      Required<Pick<RedisLike, 'exists' | 'del' | 'sadd' | 'srem' | 'smembers'>>;
+  }
+
+  /** Run `start` now, or once consumers start (see {@link deferConsumers}). */
+  #whenConsuming(start: () => void): void {
+    if (this.#consumersDeferred) this.#deferredWorkers.push(start);
+    else start();
+  }
+
+  /** A results-queue job's results: one `result`, or a `results` batch. */
+  #resultsOf(job: JobLike): StepResult[] {
+    // A batch is recognized by its shape too: a fake job may carry no name.
+    const data = job.data as { results?: StepResult[] } | StepResult;
+    return job.name === 'results' || (job.name === undefined && 'results' in data)
+      ? ((data as { results: StepResult[] }).results ?? [])
+      : [data as StepResult];
+  }
+
+  /**
+   * Engine side: consume the results routed to engine instance `replyTo`, keep its alive key fresh,
+   * and sweep dead instances' reply queues. Once per transport. Resolves whether replies are routed
+   * here (`false` with `replyRouting: false`, or a Redis client without the keys it needs). A process
+   * whose consumers are deferred announces nothing until they start: until then its tasks' results
+   * ride the shared queue.
+   */
+  consumeRepliesFor(replyTo: string): boolean {
+    if (this.#replyId !== undefined) return this.#replyId === replyTo;
+    const redis = this.#replyRedis();
+    if (!redis || this.#resultHandlers.size === 0) return false;
+    this.#replyId = replyTo;
+    const prefix = this.#effectivePrefix();
+    this.#replyWorker = this.#makeWorker(
+      replyQueueName(prefix, replyTo),
+      (job) => this.#handleResultJob(job),
+      { concurrency: this.#resultConcurrency },
+    );
+    this.#replyWorker.on('failed', (job, err) => {
+      if (!job || (job.attemptsMade ?? 0) < (job.opts?.attempts ?? 1)) return;
+      const giveUp = new Error(
+        `gave up on a routed step result after ${job.attemptsMade} attempts: ${err.message}`,
+        { cause: err },
+      );
+      if (this.#hasOnError) this.#onError(giveUp);
+      else console.error(`[adonis-durable] ${giveUp.message}`);
+    });
+    this.#whenConsuming(() => {
+      if (this.#closing) return;
+      const beat = async (): Promise<void> => {
+        try {
+          await redis.set(replyAliveKey(prefix, replyTo), '1', 'PX', this.#replyAliveTtlMs);
+          await redis.sadd(replyInstancesKey(prefix), replyTo);
+        } catch {
+          // The next beat retries; a lapsed key only sends this instance's results to the shared queue.
+        }
+      };
+      void beat();
+      this.#replyBeatTimer = setInterval(
+        () => void beat(),
+        Math.max(50, Math.floor(this.#replyAliveTtlMs / 3)),
+      );
+      this.#replyBeatTimer.unref?.();
+      this.#startReplySweeper();
+    });
+    return true;
+  }
+
+  /** Hand a results job to every result handler. */
+  async #handleResultJob(job: JobLike): Promise<void> {
+    const results = this.#resultsOf(job);
+    await Promise.all(
+      results.flatMap((result) => [...this.#resultHandlers].map((handler) => handler(result))),
+    );
+  }
+
+  /** Whether engine instance `id` is alive to take its routed replies (read at most every second). */
+  async #replyAlive(id: string): Promise<boolean> {
+    if (id === this.#replyId && this.#replyBeatTimer) return true;
+    const known = this.#replyAliveCache.get(id);
+    if (known && Date.now() - known.at < 1_000) return known.alive;
+    const redis = this.#replyRedis();
+    if (!redis) return false;
+    const alive = (await redis.exists(replyAliveKey(this.#effectivePrefix(), id))) === 1;
+    this.#replyAliveCache.set(id, { alive, at: Date.now() });
+    return alive;
+  }
+
+  /**
+   * Worker side: send `result` to engine instance `replyTo` while it is alive. Resolves `false` to
+   * send it to the shared results instead (routing off, the instance gone, or Redis refusing).
+   */
+  async #publishReply(result: StepResult, replyTo: string): Promise<boolean> {
+    if (!this.#replyRouting) return false;
+    try {
+      if (!(await this.#replyAlive(replyTo))) return false;
+    } catch {
+      return false;
+    }
+    // Batched like the shared results: the results that finish while one batch to this instance is
+    // being published go out together in the next. A batch that cannot be published goes to the
+    // shared results, one result per job.
+    const queue = replyQueueName(this.#effectivePrefix(), replyTo);
+    let outbox = this.#replyOutboxes.get(queue);
+    if (!outbox) {
+      outbox = { entries: [], publishing: false };
+      this.#replyOutboxes.set(queue, outbox);
+    }
+    const box = outbox;
+    const sent = await new Promise<boolean>((resolve) => {
+      box.entries.push({ result, resolve });
+      if (!box.publishing) void this.#publishReplyBatches(queue, box);
+    });
+    if (!sent) return false;
+    // A sender also watches for dead engines, so routed results never wait on an engine coming back.
+    this.#startReplySweeper();
+    return true;
+  }
+
+  async #publishReplyBatches(
+    queue: string,
+    outbox: {
+      entries: Array<{ result: StepResult; resolve: (sent: boolean) => void }>;
+      publishing: boolean;
+    },
+  ): Promise<void> {
+    outbox.publishing = true;
+    try {
+      while (outbox.entries.length > 0) {
+        const batch = outbox.entries.splice(0, RESULT_BATCH_MAX);
+        try {
+          await (batch.length === 1
+            ? this.#queue(queue).add('result', batch[0]?.result, resultJobOptions())
+            : this.#queue(queue).add(
+                'results',
+                { results: batch.map((entry) => entry.result) },
+                resultJobOptions(),
+              ));
+          for (const entry of batch) entry.resolve(true);
+        } catch {
+          for (const entry of batch) entry.resolve(false);
+        }
+      }
+    } finally {
+      outbox.publishing = false;
+    }
+  }
+
+  #startReplySweeper(): void {
+    if (this.#replySweepTimer || this.#closing || this.#consumersDeferred || !this.#replyRedis()) {
+      return;
+    }
+    this.#replySweepTimer = setInterval(() => {
+      if (this.#replySweeping) return;
+      this.#replySweeping = true;
+      void this.sweepReplyQueues()
+        .catch(() => undefined)
+        .finally(() => {
+          this.#replySweeping = false;
+        });
+    }, this.#replySweepMs);
+    this.#replySweepTimer.unref?.();
+  }
+
+  /**
+   * Move the reply queue of every engine instance whose alive key lapsed onto the shared results: a
+   * drain worker forwards each job (waiting, delayed, or stalled under the dead consumer) there. Once
+   * a dead instance's queue has stayed empty for `replyDrainIdleMs` (past BullMQ's stalled check, and
+   * past any sender's cached view of the instance), it is forgotten. Runs on its own every
+   * `replySweepMs` on a transport that routes replies; exposed for tests.
+   */
+  async sweepReplyQueues(): Promise<void> {
+    const redis = this.#replyRedis();
+    if (!redis || this.#closing) return;
+    const prefix = this.#effectivePrefix();
+    for (const id of await redis.smembers(replyInstancesKey(prefix))) {
+      if (id === this.#replyId || this.#closing) continue;
+      const alive = (await redis.exists(replyAliveKey(prefix, id))) === 1;
+      const drain = this.#replyDrains.get(id);
+      if (alive) {
+        if (drain) {
+          this.#replyDrains.delete(id);
+          await drain.worker.close().catch(() => undefined);
+        }
+        continue;
+      }
+      if (!drain) {
+        const worker = this.#deps.makeWorker(replyQueueName(prefix, id), async (job) => {
+          await Promise.all(
+            this.#resultsOf(job).map((result) =>
+              this.#queue(resultsName(prefix)).add('result', result, resultJobOptions()),
+            ),
+          );
+        });
+        this.#replyDrains.set(id, { worker });
+        continue;
+      }
+      const counts = await this.#queue(replyQueueName(prefix, id)).getJobCounts(
+        'waiting',
+        'wait',
+        'active',
+        'delayed',
+        'prioritized',
+      );
+      const left = Object.values(counts).reduce((sum, n) => sum + n, 0);
+      if (left > 0) {
+        drain.idleSince = undefined;
+        continue;
+      }
+      drain.idleSince ??= Date.now();
+      if (Date.now() - drain.idleSince < this.#replyDrainIdleMs) continue;
+      this.#replyDrains.delete(id);
+      await drain.worker.close().catch(() => undefined);
+      // Forgotten only while still dead: an instance that came back re-adds itself on its next beat.
+      if ((await redis.exists(replyAliveKey(prefix, id))) === 0) {
+        await redis.srem(replyInstancesKey(prefix), id);
+      }
+    }
   }
 
   onDecision(handler: (decision: WorkflowDecision) => Promise<void>): void {
@@ -1510,6 +1797,18 @@ export class BullMQTransport implements Transport {
     this.#workerHeartbeatTimer = undefined;
     if (this.#pingWatchdogTimer) clearInterval(this.#pingWatchdogTimer);
     this.#pingWatchdogTimer = undefined;
+    if (this.#replyBeatTimer) clearInterval(this.#replyBeatTimer);
+    if (this.#replySweepTimer) clearInterval(this.#replySweepTimer);
+    // Stop taking routed replies first: with the alive key gone, workers send to the shared results
+    // and other instances move what is left on this instance's queue there.
+    if (this.#replyId !== undefined && this.#replyBeatTimer && this.#replyRedisClient?.del) {
+      await withTimeout(
+        this.#replyRedisClient
+          .del(replyAliveKey(this.#effectivePrefix(), this.#replyId))
+          .catch(() => undefined),
+        this.#closeTimeoutMs,
+      );
+    }
     // Workers first (concurrently with each other), THEN queues: a worker's close() waits for its
     // in-flight job, which publishes its result/decision through a queue, so that queue must still be
     // open until every worker has settled. One shared deadline bounds both phases: a graceful
@@ -1520,6 +1819,8 @@ export class BullMQTransport implements Transport {
       ...[...this.#taskWorkers.values()].map((w) => w.close()),
       this.#resultsWorker?.close(),
       this.#resultBatchesWorker?.close(),
+      this.#replyWorker?.close(),
+      ...[...this.#replyDrains.values()].map((d) => d.worker.close()),
       this.#decisionsWorker?.close(),
       this.#stepEventsWorker?.close(),
       this.#startRunWorker?.close(),
@@ -1547,7 +1848,13 @@ export class BullMQTransport implements Transport {
     this.#runReplySub?.disconnect();
     this.#tenantEventPub?.disconnect();
     this.#tenantEventSub?.disconnect();
+    this.#replyRedisClient?.disconnect();
   }
+}
+
+/** A positive finite duration, else `fallback`. */
+function positiveMs(value: number | undefined, fallback: number): number {
+  return value !== undefined && Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
 /** Resolve when `work` settles or `ms` elapses (the loser is abandoned). `ms <= 0` skips the wait. */

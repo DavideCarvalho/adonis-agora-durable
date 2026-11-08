@@ -143,6 +143,14 @@ A worker sends batches only once a live consumer is reading `<P>-results-batch`:
 
 If the engine's result handler throws on a result job (for example, a store timeout at peak load), the job is retried up to **5 times** with exponential backoff starting at **500 ms**. Retrying is safe because the engine settles a step only while its checkpoint is still `pending`. A result that still fails is kept in the results queue for **24 hours**, and the transport reports that it gave up on it (with the step and run ids) to `onError`, or to `console.error` when no `onError` is set.
 
+### Routed results
+
+With several engine instances, a dispatched `ctx.step`'s result goes back to the instance that dispatched it, which holds the workflow body [parked on the step](/docs/durable/reliability/multi-instance#sticky-continuations): the body continues there instead of replaying its history on whichever engine takes the result off the shared queue. The engine stamps the task with `replyTo: <instanceId>`, and consumes its own queue, `<P>-results-to-<instanceId>`, while it keeps a key alive, `<P>:reply-alive:<instanceId>` (refreshed every third of `replyAliveTtlMs`, 15 s by default). A worker sends the result to that queue, batched like the shared results, while the key exists (it checks at most once a second), and to the shared queue otherwise. A step of a `ctx.all` fan carries no `replyTo`: its fan's barrier joins it, wherever the results land.
+
+No result is lost when an engine goes away. A clean shutdown deletes its key first. After a crash the key lapses, and every transport that routes replies (it sweeps `<P>:reply-instances` every `replySweepMs`, 5 s by default) moves what is left on the dead instance's queue, stalled jobs included, to `<P>-results`, where another engine settles it and replays the run. A process whose consumers are [deferred](#beyond-steps) (an ace command) announces nothing until they start, so its tasks' results stay on the shared queue.
+
+`replyRouting: false` on an engine stops it asking, and on a worker stops it sending: the results ride `<P>-results` as before. An engine or worker that predates routing ignores the field, so a rolling deploy mixes both. The queue, keys and job names are the NestJS transport's and the Python worker's, so a mixed fleet routes too. Turning the engine's sticky cache off (`stickyRuns: 0`), or `routeReplies: false` on the engine, also stops it asking.
+
 ## Priority
 
 A per-call `priority` on `ctx.step` follows the engine's convention: **higher wins**. BullMQ's job priority works the other way, with lower numbers running first. The transport converts between them (`clamp(round(1_048_576 - priority), 1, 2_097_151)`), so "higher means more urgent" holds end to end. The NestJS and Python sides use the same mapping. Leave `priority` unset to keep the default FIFO ordering.
@@ -236,6 +244,10 @@ The same transport also carries:
 | `closeTimeoutMs` | `5000` | Graceful-shutdown deadline for `close()`. `0` skips the wait. |
 | `pingIntervalMs` | `30_000` | How often the subscriber watchdog pings each pub/sub connection. `0` or `false` disables it. See [Subscriber health](#subscriber-health-pingintervalms). |
 | `stepTimeoutMs` | — (off) | Wall-clock ceiling per step handler; a step past it fails retryable. See [Wedged steps](#wedged-steps-steptimeoutms). |
+| `replyRouting` | `true` | Route a dispatched step's result back to the engine instance that dispatched it. See [Routed results](#routed-results). |
+| `replyAliveTtlMs` | `15_000` | How long an engine's reply alive key outlives its last refresh. |
+| `replySweepMs` | `5_000` | How often a transport moves dead engines' routed results to the shared queue. |
+| `replyDrainIdleMs` | `90_000` | How long a dead engine's emptied reply queue is still watched before it is forgotten. |
 | `onError` | swallowed / `console.warn` | Receives background failures: heartbeat refresh errors, result-publish errors, pub/sub subscribe failures and subscriber connection errors, unreadable fleet keyspaces, and a result the transport gave up on. |
 
 `transports.bullmq(config)` returns the lazy driver thunk used in `config/durable.ts`. The underlying `BullMQTransport` class (with `createBullMQDeps`) is also exported from `@adonis-agora/durable` if you want to build one by hand.
@@ -247,6 +259,8 @@ The same transport also carries:
 | `<P>-tasks-<token>` | queue | engine → workers | step dispatch (job `task`) and remote workflow turns (job `workflow`), one queue per routing token |
 | `<P>-results` | queue | workers → engine | step results (job `result`) |
 | `<P>-results-batch` | queue | workers → engine | step results in batches (job `results`, data `{ results }`), sent only while an engine consumes it |
+| `<P>-results-to-<instance>` | queue | workers → engine | step results routed to the engine instance that dispatched them (jobs `result` / `results`), see [Routed results](#routed-results) |
+| `<P>:reply-alive:<instance>`, `<P>:reply-instances` | key, set | engine → workers | an engine instance consuming its routed results; every instance that routed any |
 | `<P>-decisions` | queue | workers → engine | remote workflow decisions |
 | `<P>-step-events` | queue | workers → engine | streamed local-step lifecycle from remote workflows |
 | `<P>-heartbeat` | pub/sub | workers → engine | liveness for `timeoutMs` steps |

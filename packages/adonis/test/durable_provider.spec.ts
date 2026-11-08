@@ -205,6 +205,16 @@ describe('DurableProvider', () => {
     ).toBeUndefined();
   });
 
+  it('forwards the sticky-continuation options to the engine', async () => {
+    const { app, resolve } = fakeApp({ stickyRuns: 7, stickyIdleMs: 1_234, routeReplies: false });
+    await new DurableProvider(app).register();
+    const engine = await resolve();
+    const sticky = (engine as unknown as { sticky: { maxEntries: number; maxIdleMs: number } })
+      .sticky;
+    expect(sticky.maxEntries).toBe(7);
+    expect(sticky.maxIdleMs).toBe(1_234);
+  });
+
   it('forwards timerBatchSize to the engine', async () => {
     const { app, resolve } = fakeApp({ timerBatchSize: 50 });
     new DurableProvider(app).register();

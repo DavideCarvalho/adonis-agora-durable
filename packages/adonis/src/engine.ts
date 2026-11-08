@@ -918,6 +918,14 @@ export interface WorkflowEngineDeps {
   /** How long a parked body may sit idle in the sticky cache before it is dropped. Default 5 min. */
   stickyIdleMs?: number | undefined;
   /**
+   * Ask the transports that can ({@link Transport.consumeRepliesFor}, e.g. BullMQ) to send the result
+   * of a dispatched `ctx.step` back to this instance, which holds the body parked on it, rather than
+   * to whichever engine instance takes it off the shared results. With several engine instances,
+   * that is what keeps the sticky continuation hitting. A result whose instance is gone goes to the
+   * shared results and replays elsewhere. Default `true` while the sticky cache is on.
+   */
+  routeReplies?: boolean | undefined;
+  /**
    * Capabilities the control-plane itself advertises in its handshake descriptor (design §7.3). The
    * CP is a router, not an executor, so this is rarely needed — leave empty. Never gates which workers
    * are dispatchable (that's the worker descriptors); it only shapes the `missingOnLocal` delta.
@@ -1021,6 +1029,8 @@ export class WorkflowEngine {
   private readonly claimedRuns = new Map<string, WorkflowRun>();
   /** The continuation each turn executing here runs in, by run id, while the turn runs. */
   private readonly turnContinuations = new Map<string, StickyContinuation>();
+  /** Whether a transport routes this instance's step results back to it (see `routeReplies`). */
+  private repliesRouted = false;
   /** The run row stamp (`updatedAt`, epoch ms) a turn here wrote when it settled `suspended`. */
   private readonly suspendStamps = new Map<string, number>();
   private readonly heartbeatPersistThrottleMs: number;
@@ -1441,6 +1451,11 @@ export class WorkflowEngine {
         await this.persistStepEvent(event);
       },
     );
+    // Step results come back to the instance holding the body parked on the step, where a transport
+    // can route them (see WorkflowEngineDeps.routeReplies).
+    if ((deps.routeReplies ?? true) && this.sticky.enabled) {
+      this.repliesRouted = this.pool.routeReplies(this.instanceId);
+    }
     // Control plane: re-broadcast lifecycle events from OTHER instances to this instance's
     // subscribers (cross-pod live-tail), and act on cancellations issued elsewhere. A broker may
     // echo our own publish back — ignore those (we already handled them locally) to avoid duplicates.
@@ -9579,6 +9594,8 @@ export class WorkflowEngine {
         priority: admission?.priority,
         attempt: reAttempt,
         transport,
+        // A fan's steps are joined by its barrier, not a parked body: their results stay shared.
+        replyHere: parallelGroup === undefined,
       });
       this.emit({
         type: 'step.started',
@@ -9684,6 +9701,7 @@ export class WorkflowEngine {
       attempt,
       transport,
       enqueuedAt,
+      replyHere: parallelGroup === undefined,
     });
     this.emit({ type: 'step.started', runId, seq, name: step.name, kind: 'remote' });
     throw new WorkflowSuspended(undefined, [seq]);
@@ -9747,6 +9765,7 @@ export class WorkflowEngine {
       attempt: 1,
       transport,
       enqueuedAt,
+      replyHere: parallelGroup === undefined,
     });
     this.emit({ type: 'step.started', runId, seq, name: step.name, kind: 'remote' });
     return true;
@@ -10034,6 +10053,8 @@ export class WorkflowEngine {
    * {@link redispatchPending}. Carries the current trace/context so a re-dispatch is traceable.
    */
   private dispatchRemoteTask(task: {
+    /** Ask for the result back here (a single `ctx.step` the body may be parked on). */
+    replyHere?: boolean | undefined;
     runId: string;
     seq: number;
     name: string;
@@ -10057,6 +10078,9 @@ export class WorkflowEngine {
       context: this.context?.(),
       priority: task.priority,
       attempt: task.attempt,
+      ...(task.replyHere && this.repliesRouted && !this.draining
+        ? { replyTo: this.instanceId }
+        : {}),
     };
     if (task.enqueuedAt)
       remote[DISPATCH_KEY] = dispatchKey(task.stepId, task.attempt, task.enqueuedAt);
