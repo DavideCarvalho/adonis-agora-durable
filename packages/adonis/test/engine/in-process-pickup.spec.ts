@@ -31,13 +31,14 @@ describe('the in-process pickup', () => {
       const store = new InMemoryStateStore();
       const engine = new WorkflowEngine({ store });
       engine.register('wf', '1', async () => 'ok');
-      // The table is gone: the turn's first write — flipping the run to `running` — throws.
-      const updateRun = store.updateRun.bind(store);
-      vi.spyOn(store, 'updateRun').mockImplementation(async (runId, patch) => {
+      // The table is gone: the turn's first write — flipping the run to `running` (a compare-and-set
+      // on `pending`) — throws.
+      const updateRunIf = store.updateRunIf.bind(store);
+      vi.spyOn(store, 'updateRunIf').mockImplementation(async (runId, expected, patch) => {
         if (patch.status === 'running') {
           throw new Error('relation "durable_workflow_runs" does not exist');
         }
-        return updateRun(runId, patch);
+        return updateRunIf(runId, expected, patch);
       });
 
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});

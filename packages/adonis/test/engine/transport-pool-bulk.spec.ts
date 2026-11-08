@@ -101,4 +101,21 @@ describe('TransportPool.dispatchMany', () => {
     ]);
     await expect(pool.dispatchMany(tasks(2))).rejects.toThrow();
   });
+
+  it('drops replyTo on a transport that does not route replies, keeps it on one that does', async () => {
+    const plain = new Recording();
+    const routing = Object.assign(new Recording(), { consumeRepliesFor: () => true });
+    const pool = new TransportPool([
+      { id: 'plain', transport: plain },
+      { id: 'routing', transport: routing },
+    ]);
+    expect(pool.routeReplies('engine-1')).toBe(true);
+    const withReply = tasks(2).map((t) => ({ ...t, replyTo: 'engine-1' }));
+    await pool.dispatchMany(withReply, 'plain');
+    await pool.dispatchMany(withReply, 'routing');
+    await pool.dispatch(withReply[0] as Omit<RemoteTask, 'transport'>, 'plain');
+    expect(plain.many[0]?.every((t) => !('replyTo' in t))).toBe(true);
+    expect(plain.one.every((t) => !('replyTo' in t))).toBe(true);
+    expect(routing.many[0]?.map((t) => t.replyTo)).toEqual(['engine-1', 'engine-1']);
+  });
 });

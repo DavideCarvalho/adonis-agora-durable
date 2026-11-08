@@ -40,6 +40,20 @@ The queue is at-least-once and every delivery is checked against the store: a st
 - **Shutdown.** `drain()` stops the instance's run-queue consumer first, then waits for the turns it is executing. A run taken from the queue during the drain is handed back to the queue.
 - **Each instance bounds what it executes.** An instance takes at most 64 runs from the run queue at once, and executes at most 256 in-process runs it dispatched to itself (no run queue) or child starts at once; the rest wait as run ids. A run id still waiting when the instance drains is dropped, not lost: the run is persisted, so the pending-run poll or the parent's next turn picks it up.
 
+## Sticky continuations
+
+A dispatched `ctx.step` used to end the turn: the body unwound, and the step's result started a new turn that read the run's history and replayed the body from the top. Now the call parks instead. Once nothing else the body started is in flight, the turn settles the run `suspended` exactly as before (same writes, same lease release), and the body itself stays in memory, waiting on that call. When the step's result resumes the run on the same instance, the turn re-reads only the parked step and the body continues from there: no history read, no replay.
+
+It is an optimization, never a different outcome. A turn continues a parked body only when the run row still carries the exact `updatedAt` this instance's suspend wrote, on the same registered body and version. Anything else replays as before: a turn another instance ran in between, a cancel, a retry, a restart, an eviction from the cache. A body that suspends the classic way (`ctx.sleep`, a signal, a child, a step fan) is not kept, and a body that calls a `ctx` primitive between turns (from a raw timer it awaited outside the ctx) is refused that call and replayed on its next turn.
+
+| Engine option | Default | |
+| --- | --- | --- |
+| `stickyRuns` | `2000` | Parked bodies an instance keeps; least recently used out first. `0` turns it off. |
+| `stickyIdleMs` | `300_000` | How long a parked body may wait before it is dropped (the run then replays). |
+| `routeReplies` | `true` | Ask a transport that can (BullMQ) to send a step's result back to this instance. |
+
+With several engine instances, a step's result has to reach the instance holding the body. On `bullmq` it does: the result is [routed back](/docs/durable/transports/bullmq#routed-results) to the dispatching instance while it is alive, and to the shared queue otherwise. On `queue` and `db` a result lands on whichever instance takes it, and a body parked elsewhere is replayed there.
+
 ## Wide fans and lost completions
 
 A child persists its terminal state first and tells its parent after. A crash, a scale-down or a store error between the two leaves the parent waiting on a child that already finished. Three things make sure it is not stranded:

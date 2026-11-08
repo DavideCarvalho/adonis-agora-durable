@@ -32,7 +32,8 @@ describe('step results of one run on one instance', () => {
   it('resume the run one at a time, so it never has two concurrent turns', async () => {
     const store = new InMemoryStateStore();
     const transport = new CapturingTransport();
-    const engine = new WorkflowEngine({ store, transport, reconcileMs: 0 });
+    // Every turn replays the body, so a body running twice at once would be two concurrent turns.
+    const engine = new WorkflowEngine({ store, transport, reconcileMs: 0, stickyRuns: 0 });
     let active = 0;
     let maxActive = 0;
     engine.register('pair', '1', async (ctx) => {

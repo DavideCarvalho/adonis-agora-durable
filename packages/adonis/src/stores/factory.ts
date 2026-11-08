@@ -27,6 +27,12 @@ export interface LucidStoreConfig {
    * `'utf8mb4_unicode_ci'`) so a JOIN against them doesn't fail with `Illegal mix of collations`.
    */
   collation?: string;
+  /**
+   * Postgres only: send the statements every workflow step runs as named prepared statements,
+   * parsed once per connection. Needs a direct connection or a pooler that supports protocol-level
+   * prepared statements (PgBouncer in transaction mode before 1.21 does not). Default off.
+   */
+  preparedStatements?: boolean;
 }
 
 /**
@@ -56,6 +62,9 @@ export const stores = {
       return new LucidStateStore(db, {
         ...(config.connection !== undefined ? { connectionName: config.connection } : {}),
         ...(config.collation !== undefined ? { collation: config.collation } : {}),
+        ...(config.preparedStatements !== undefined
+          ? { preparedStatements: config.preparedStatements }
+          : {}),
       });
     };
   },

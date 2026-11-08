@@ -985,6 +985,228 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
     );
 
     t(
+      'settleResultsIfPending settles pending rows of live runs and reads them back without their input (when implemented)',
+      async () => {
+        // Optional (the engine falls back to reads and settleCheckpointsIfPending).
+        if (!store.settleResultsIfPending) return;
+        expect(await store.settleResultsIfPending([])).toEqual([]);
+        await store.createRun(run({ status: 'suspended', wakeAt: 9_000 }));
+        await store.createRun(run({ id: 'r2' }));
+        await store.createRun(run({ id: 'gone', status: 'cancelled' }));
+        await store.createRun(run({ id: 'dead', status: 'failed' }));
+        const pending = (runId: string, seq: number) =>
+          checkpoint({
+            runId,
+            seq,
+            name: 'ask',
+            kind: 'remote',
+            stepId: `${runId}:${seq}`,
+            status: 'pending',
+            input: { prompt: `p${seq}` },
+            output: { partial: seq },
+            events: [{ at: 1, level: 'info', message: 'queued' }],
+            attempts: 2,
+            workerGroup: 'llm',
+            parallelGroup: 'all:0:2',
+            wakeAt: 5_000,
+          });
+        for (const seq of [0, 1, 2, 3]) await store.saveCheckpoint(pending('r1', seq));
+        await store.saveCheckpoint(pending('r2', 0));
+        await store.saveCheckpoint(pending('gone', 0));
+        await store.saveCheckpoint(pending('dead', 0));
+        await store.saveCheckpoint({
+          ...pending('r1', 1),
+          status: 'completed',
+          output: { first: 1 },
+        });
+        const later = new Date(at.getTime() + 60_000);
+        const settled = await store.settleResultsIfPending([
+          {
+            runId: 'r1',
+            seq: 0,
+            status: 'completed',
+            output: { n: 0 },
+            startedAt: new Date(at.getTime() + 1_000),
+            finishedAt: later,
+          },
+          // Already settled: nothing written.
+          { runId: 'r1', seq: 1, status: 'completed', output: { n: 1 }, finishedAt: later },
+          // A second result for the row the first one settles: loses.
+          { runId: 'r1', seq: 0, status: 'completed', output: { n: 'dup' }, finishedAt: later },
+          // A failure keeps the stored output, events and start; records the error.
+          { runId: 'r1', seq: 2, status: 'failed', error: { message: 'boom' }, finishedAt: later },
+          // No such row.
+          { runId: 'r1', seq: 9, status: 'completed', output: { n: 9 }, finishedAt: later },
+          // Another run's row at the same seq.
+          {
+            runId: 'r2',
+            seq: 0,
+            status: 'completed',
+            output: { n: 'r2' },
+            events: [{ at: 2, level: 'info', message: 'ran' }],
+            finishedAt: later,
+          },
+          // A cancelled run's step settles nothing, nor a failed run's.
+          { runId: 'gone', seq: 0, status: 'completed', output: { n: 'late' }, finishedAt: later },
+          { runId: 'dead', seq: 0, status: 'completed', output: { n: 'late' }, finishedAt: later },
+        ]);
+        expect(
+          settled.map((s) =>
+            s ? [s.checkpoint.runId, s.checkpoint.seq, s.checkpoint.status] : null,
+          ),
+        ).toEqual([
+          ['r1', 0, 'completed'],
+          null,
+          null,
+          ['r1', 2, 'failed'],
+          null,
+          ['r2', 0, 'completed'],
+          null,
+          null,
+        ]);
+        const [first, , , failed, , other] = settled;
+        expect(first?.run).toEqual({ status: 'suspended', wakeAt: 9_000 });
+        expect(other?.run.status).toBe('running');
+        expect(other?.run.wakeAt).toBeUndefined();
+        const cp = first?.checkpoint;
+        expect(cp?.output).toEqual({ n: 0 });
+        expect(cp?.input).toBeUndefined();
+        expect(cp?.name).toBe('ask');
+        expect(cp?.stepId).toBe('r1:0');
+        expect(cp?.attempts).toBe(2);
+        expect(cp?.parallelGroup).toBe('all:0:2');
+        expect(cp?.workerGroup).toBe('llm');
+        expect(cp?.events).toEqual([{ at: 1, level: 'info', message: 'queued' }]);
+        expect(cp?.startedAt.getTime()).toBe(at.getTime() + 1_000);
+        expect(cp?.finishedAt.getTime()).toBe(later.getTime());
+        expect(cp?.enqueuedAt.getTime()).toBe(at.getTime());
+        expect(failed?.checkpoint.output).toEqual({ partial: 2 });
+        expect(failed?.checkpoint.error).toEqual({ message: 'boom' });
+        expect(failed?.checkpoint.startedAt.getTime()).toBe(at.getTime());
+        expect(other?.checkpoint.events).toEqual([{ at: 2, level: 'info', message: 'ran' }]);
+        // What was read back is what is stored, input included.
+        const stored = await store.getCheckpoint('r1', 0);
+        expect(stored?.output).toEqual({ n: 0 });
+        expect(stored?.input).toEqual({ prompt: 'p0' });
+        expect((await store.getCheckpoint('r1', 2))?.output).toEqual({ partial: 2 });
+        expect((await store.getCheckpoint('r1', 1))?.output).toEqual({ first: 1 });
+        expect((await store.getCheckpoint('r1', 3))?.status).toBe('pending');
+        expect((await store.getCheckpoint('gone', 0))?.status).toBe('pending');
+        expect((await store.getCheckpoint('dead', 0))?.status).toBe('pending');
+        expect(await store.getCheckpoint('r1', 9)).toBeNull();
+        // One entry alone is the same compare-and-set.
+        const one = {
+          runId: 'r1',
+          seq: 3,
+          status: 'completed' as const,
+          output: { n: 3 },
+          finishedAt: later,
+        };
+        expect((await store.settleResultsIfPending([one]))[0]?.checkpoint.output).toEqual({ n: 3 });
+        expect(await store.settleResultsIfPending([{ ...one, output: { n: 'again' } }])).toEqual([
+          null,
+        ]);
+      },
+    );
+
+    t('insertCheckpointIfAbsent writes a position only once (when implemented)', async () => {
+      if (!store.insertCheckpointIfAbsent) return;
+      await store.createRun(run());
+      const first = checkpoint({ seq: 4, status: 'pending', input: { a: 1 }, output: undefined });
+      expect(await store.insertCheckpointIfAbsent(first)).toBe(true);
+      expect(
+        await store.insertCheckpointIfAbsent({ ...first, status: 'completed', output: { b: 2 } }),
+      ).toBe(false);
+      const stored = await store.getCheckpoint('r1', 4);
+      expect(stored?.status).toBe('pending');
+      expect(stored?.input).toEqual({ a: 1 });
+      expect(stored?.output).toBeUndefined();
+    });
+
+    t(
+      'tryLockRunAndGet takes a free or expired lease and reads the run (when implemented)',
+      async () => {
+        if (!store.tryLockRunAndGet) return;
+        await store.createRun(run({ status: 'suspended' }));
+        const locked = await store.tryLockRunAndGet('r1', 'a', 2_000, 1_000);
+        expect(locked?.id).toBe('r1');
+        expect(locked?.status).toBe('suspended');
+        expect(locked?.input).toEqual({ orderId: 'o1' });
+        expect(locked?.lockedBy).toBe('a');
+        expect(locked?.lockedUntil).toBe(2_000);
+        // Held: another owner gets nothing, and the lease is unchanged.
+        expect(await store.tryLockRunAndGet('r1', 'b', 3_000, 1_500)).toBeNull();
+        expect((await store.getRun('r1'))?.lockedBy).toBe('a');
+        // Expired: taken over.
+        expect((await store.tryLockRunAndGet('r1', 'b', 4_000, 2_000))?.lockedBy).toBe('b');
+        expect(await store.tryLockRunAndGet('missing', 'a', 2_000, 1_000)).toBeNull();
+      },
+    );
+
+    t(
+      'claimPendingRuns leases the oldest free pending runs, and concurrent claims never overlap (when implemented)',
+      async () => {
+        if (!store.claimPendingRuns) return;
+        const created = (i: number) => new Date(at.getTime() + i * 1_000);
+        for (let i = 0; i < 6; i += 1) {
+          await store.createRun(run({ id: `p${i}`, status: 'pending', createdAt: created(i) }));
+        }
+        await store.createRun(run({ id: 'busy', status: 'pending', createdAt: created(-2) }));
+        await store.updateRun('busy', { lockedBy: 'other', lockedUntil: 5_000 });
+        await store.createRun(run({ id: 'stale', status: 'pending', createdAt: created(-1) }));
+        await store.updateRun('stale', { lockedBy: 'gone', lockedUntil: 500 });
+        await store.createRun(run({ id: 'done', status: 'completed', createdAt: created(-3) }));
+        await store.createRun(
+          run({ id: 'elsewhere', status: 'pending', namespace: 'other', createdAt: created(-4) }),
+        );
+
+        const first = await store.claimPendingRuns(3, 'a', 9_000, 1_000, 'default');
+        // Oldest first; a held lease is skipped, an expired one taken over; another namespace's
+        // run is not this claim's.
+        expect(first.map((r) => r.id)).toEqual(['stale', 'p0', 'p1']);
+        for (const r of first) {
+          expect(r.status).toBe('pending');
+          expect(r.input).toEqual({ orderId: 'o1' });
+          expect(r.lockedBy).toBe('a');
+          expect(r.lockedUntil).toBe(9_000);
+        }
+        expect((await store.getRun('p0'))?.lockedBy).toBe('a');
+        expect((await store.getRun('busy'))?.lockedBy).toBe('other');
+        expect((await store.getRun('elsewhere'))?.lockedBy).toBeUndefined();
+        expect(await store.claimPendingRuns(0, 'a', 9_000, 1_000)).toEqual([]);
+
+        // Two claimers at once never take the same run. One may come back short of what is left
+        // (a row the other's scan locked is skipped, not waited on); a later claim takes the rest.
+        const [x, y] = await Promise.all([
+          store.claimPendingRuns(3, 'x', 9_000, 1_000, 'default'),
+          store.claimPendingRuns(3, 'y', 9_000, 1_000, 'default'),
+        ]);
+        const ids = [...x, ...y].map((r) => r.id);
+        expect(new Set(ids).size).toBe(ids.length);
+        expect(ids.length).toBeGreaterThan(0);
+        const rest = await store.claimPendingRuns(10, 'z', 9_000, 1_000, 'default');
+        expect([...ids, ...rest.map((r) => r.id)].sort()).toEqual(['p2', 'p3', 'p4', 'p5']);
+      },
+    );
+
+    t(
+      'keeps updatedAt to the millisecond, through createRun, updateRun and updateRunIf',
+      async () => {
+        // The engine recognizes its own suspend by the exact `updatedAt` it wrote (the sticky
+        // continuation's stamp): a store that rounds it never matches, and every turn replays.
+        const created = new Date(at.getTime() + 123);
+        await store.createRun(run({ updatedAt: created }));
+        expect((await store.getRun('r1'))?.updatedAt.getTime()).toBe(created.getTime());
+        const patched = new Date(at.getTime() + 60_456);
+        await store.updateRun('r1', { status: 'suspended', updatedAt: patched });
+        expect((await store.getRun('r1'))?.updatedAt.getTime()).toBe(patched.getTime());
+        const stamped = new Date(at.getTime() + 120_789);
+        expect(await store.updateRunIf('r1', ['suspended'], { updatedAt: stamped })).toBe(true);
+        expect((await store.getRun('r1'))?.updatedAt.getTime()).toBe(stamped.getTime());
+      },
+    );
+
+    t(
       'settleCheckpointsIfPending settles a batch wider than one statement (when implemented)',
       async () => {
         if (!store.settleCheckpointsIfPending) return;

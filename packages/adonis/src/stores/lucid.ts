@@ -19,12 +19,15 @@ import type {
   RunValueFacetRow,
   ScheduleQuery,
   ScheduleRecord,
+  SettledStepResult,
   SignalWaiter,
   StateStore,
   StepCheckpoint,
+  StepResultSettlement,
   StepSettlement,
   WorkflowRun,
 } from '../interfaces.js';
+import { SETTLEABLE_RUN_STATUSES } from '../interfaces.js';
 import { namespaceFilterValues, normalizeNamespace } from '../namespaces.js';
 import { mergeRunFacetRows } from '../run-facets.js';
 import { runPageWindow } from '../run-pagination.js';
@@ -64,6 +67,7 @@ import {
   SETTLED_CHECKPOINT_COLUMNS,
   settlementToRow,
 } from './lucid-mappers.js';
+import { LucidPgHotPath, quote } from './lucid-pg-hot-path.js';
 import { createDurableTables, DURABLE_TABLES } from './lucid-schema.js';
 
 /** A Lucid query client — either the connection client or a transaction client. */
@@ -95,6 +99,13 @@ export interface LucidStateStoreOptions {
    * `CreateDurableTablesOptions.collation`). Ignored on other dialects.
    */
   collation?: string | undefined;
+  /**
+   * Postgres: send the statements of a workflow's hot path (the ones every step runs) as NAMED
+   * prepared statements, parsed once per connection. Needs a direct connection or a pooler that
+   * supports protocol-level prepared statements (PgBouncer in transaction mode before 1.21 does not).
+   * Default off. Ignored on other dialects.
+   */
+  preparedStatements?: boolean | undefined;
 }
 
 /**
@@ -143,6 +154,17 @@ export class LucidStateStore implements StateStore {
     return this.connectionName ? this.db.connection(this.connectionName) : this.db.connection();
   }
 
+  /**
+   * The Postgres hot path (see `lucid-pg-hot-path.ts`): the statements a turn and a step result run
+   * on every step, as constant SQL. `undefined` on any other dialect, or with Lucid's `debug` on.
+   * Resolved per call, like {@link client}: under a global transaction it is the transaction's.
+   */
+  private hot(): LucidPgHotPath | undefined {
+    return LucidPgHotPath.for(this.client(), {
+      preparedStatements: this.options.preparedStatements,
+    });
+  }
+
   /** Idempotently provision the durable tables (called on boot when `autoSchema` is on). */
   async ensureSchema(): Promise<void> {
     await createDurableTables(
@@ -158,6 +180,17 @@ export class LucidStateStore implements StateStore {
     if (normalizeAttributeRows(run.id, run.searchAttributes).length === 0) {
       // Nothing to index: the insert, then clear any attribute rows a deleted run of this id left,
       // as two statements. The insert goes first, so a run that already exists keeps its rows.
+      const hot = this.hot();
+      if (hot) {
+        const row = runToRow(run) as unknown as Record<string, unknown>;
+        const keys = Object.keys(row);
+        await hot.run(
+          insertSql(DURABLE_TABLES.runs, keys),
+          keys.map((k) => row[k]),
+        );
+        await hot.run(DELETE_ATTRIBUTES_SQL, [run.id]);
+        return;
+      }
       const client = this.client();
       await client.table(DURABLE_TABLES.runs).insert(runToRow(run));
       await client.from(DURABLE_TABLES.attributes).where('run_id', run.id).delete();
@@ -183,6 +216,15 @@ export class LucidStateStore implements StateStore {
   }
 
   async updateRun(runId: string, patch: Partial<WorkflowRun>): Promise<void> {
+    const hot = this.hotFor(patch);
+    if (hot) {
+      const row = await this.releaseSlot(this.client(), runId, patch);
+      const keys = Object.keys(row);
+      if (keys.length) {
+        await hot.run(updateRunSql(keys, false), [...keys.map((k) => row[k]), runId]);
+      }
+      return;
+    }
     await this.writeRun(patch, async (trx) => {
       const row = await this.releaseSlot(trx, runId, patch);
       // Knex throws on an empty `.update({})`; skip the UPDATE when no mapped column changed.
@@ -200,6 +242,21 @@ export class LucidStateStore implements StateStore {
     expectedStatuses: RunStatus[],
     patch: Partial<WorkflowRun>,
   ): Promise<boolean> {
+    const hot = this.hotFor(patch);
+    if (hot) {
+      const row = await this.releaseSlot(this.client(), runId, patch);
+      const keys = Object.keys(row);
+      if (keys.length === 0) {
+        const found = await hot.rows(RUN_IN_STATUSES_SQL, [runId, expectedStatuses]);
+        return found.length > 0;
+      }
+      const { count } = await hot.run(updateRunSql(keys, true), [
+        ...keys.map((k) => row[k]),
+        runId,
+        expectedStatuses,
+      ]);
+      return count === 1;
+    }
     return this.writeRun(patch, async (trx) => {
       const row = await this.releaseSlot(trx, runId, patch);
       let applied: boolean;
@@ -228,6 +285,15 @@ export class LucidStateStore implements StateStore {
       }
       return applied;
     });
+  }
+
+  /**
+   * The hot path for a run write of `patch`: one that needs no transaction (see {@link writeRun}),
+   * on a connection that takes it.
+   */
+  private hotFor(patch: Partial<WorkflowRun>): LucidPgHotPath | undefined {
+    if (settlesTerminally(patch) || 'searchAttributes' in patch) return undefined;
+    return this.hot();
   }
 
   async pullRunWakesIn(runIds: string[], wakeAt: number): Promise<void> {
@@ -347,6 +413,14 @@ export class LucidStateStore implements StateStore {
   }
 
   async getRun(runId: string): Promise<WorkflowRun | null> {
+    const hot = this.hot();
+    if (hot) {
+      const rows =
+        this.scopeNamespace === undefined
+          ? await hot.rows(GET_RUN_SQL, [runId])
+          : await hot.rows(GET_RUN_SCOPED_SQL, [runId, namespaceFilterValues(this.scopeNamespace)]);
+      return rows[0] ? rowToRun(rows[0] as unknown as RunRow) : null;
+    }
     const row = await this.fenced(
       this.client().from(DURABLE_TABLES.runs).where('id', runId),
     ).first();
@@ -391,6 +465,11 @@ export class LucidStateStore implements StateStore {
   // --- checkpoints --------------------------------------------------------
 
   async getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null> {
+    const hot = this.hot();
+    if (hot) {
+      const rows = await hot.rows(GET_CHECKPOINT_SQL, [runId, seq]);
+      return rows[0] ? rowToCheckpoint(rows[0] as unknown as CheckpointRow) : null;
+    }
     const row = await this.client()
       .from(DURABLE_TABLES.checkpoints)
       .where('run_id', runId)
@@ -414,6 +493,13 @@ export class LucidStateStore implements StateStore {
 
   async getCheckpointsForSettle(runId: string, seqs: number[]): Promise<StepCheckpoint[]> {
     const unique = [...new Set(seqs)];
+    const hot = this.hot();
+    if (hot && unique.length <= CHECKPOINT_BATCH) {
+      const rows = await hot.rows(CHECKPOINTS_FOR_SETTLE_SQL, [runId, unique]);
+      return (rows as unknown as CheckpointRow[])
+        .map(rowToCheckpoint)
+        .sort((a, b) => a.seq - b.seq);
+    }
     const out: StepCheckpoint[] = [];
     for (let at = 0; at < unique.length; at += CHECKPOINT_BATCH) {
       const rows = (await this.client()
@@ -545,6 +631,136 @@ export class LucidStateStore implements StateStore {
     });
   }
 
+  async settleResultsIfPending(
+    results: StepResultSettlement[],
+  ): Promise<(SettledStepResult | null)[]> {
+    if (results.length === 0) return [];
+    // A later entry for a row an earlier one claims loses, before anything is written.
+    const seen = new Set<string>();
+    const first = results.map((r) => {
+      const k = checkpointKey(r.runId, r.seq);
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+    const live = results.filter((_, i) => first[i]);
+    const client = this.client();
+    const settled =
+      client.dialect.name === 'postgres'
+        ? await settleResultsReturningPg(client, this.hot(), live)
+        : await this.settleResultsPlain(live);
+    const out: (SettledStepResult | null)[] = [];
+    let k = 0;
+    for (let i = 0; i < results.length; i += 1) {
+      if (!first[i]) {
+        out.push(null);
+        continue;
+      }
+      const r = live[k] as StepResultSettlement;
+      k += 1;
+      out.push(settled.get(checkpointKey(r.runId, r.seq)) ?? null);
+    }
+    return out;
+  }
+
+  /**
+   * {@link settleResultsIfPending} on a dialect without `UPDATE … RETURNING` in one statement
+   * (MySQL, SQLite): the runs' statuses, the rows, then the settle (one conditional UPDATE for a
+   * single result, the batched transaction for several). The same three statements the engine's
+   * read-first path costs.
+   */
+  private async settleResultsPlain(
+    results: StepResultSettlement[],
+  ): Promise<Map<string, SettledStepResult>> {
+    const out = new Map<string, SettledStepResult>();
+    const client = this.client();
+    const runRows = (await client
+      .from(DURABLE_TABLES.runs)
+      .whereIn('id', [...new Set(results.map((r) => r.runId))])
+      .select('id', 'status', 'wake_at')) as Array<Pick<RunRow, 'id' | 'status' | 'wake_at'>>;
+    const runs = new Map(runRows.map((row) => [row.id, row]));
+    const settleable = results.filter((r) =>
+      SETTLEABLE_RUN_STATUSES.includes(runs.get(r.runId)?.status as RunStatus),
+    );
+    if (settleable.length === 0) return out;
+    // What the result does not carry keeps its stored value, so the rows are read first.
+    const stored = new Map<string, StepCheckpoint>();
+    const byRun = new Map<string, number[]>();
+    for (const r of settleable) byRun.set(r.runId, [...(byRun.get(r.runId) ?? []), r.seq]);
+    for (const [runId, seqs] of byRun) {
+      for (const cp of await this.getCheckpointsForSettle(runId, seqs)) {
+        stored.set(checkpointKey(cp.runId, cp.seq), cp);
+      }
+    }
+    const settlements = settleable.flatMap((r): StepSettlement[] => {
+      const cp = stored.get(checkpointKey(r.runId, r.seq));
+      if (!cp) return [];
+      return [
+        {
+          runId: r.runId,
+          seq: r.seq,
+          status: r.status,
+          output: r.status === 'completed' ? r.output : cp.output,
+          error: r.error,
+          events: r.events ?? cp.events,
+          startedAt: r.startedAt ?? cp.startedAt,
+          finishedAt: r.finishedAt,
+        },
+      ];
+    });
+    const wrote = await this.settleCheckpointsIfPending(settlements);
+    // The rows as they now read: the stored row with the settlement written over it (the settle is a
+    // compare-and-set on `pending`, so nothing else wrote it in between).
+    settlements.forEach((settlement, i) => {
+      if (!wrote[i]) return;
+      const k = checkpointKey(settlement.runId, settlement.seq);
+      const { runId: _runId, seq: _seq, ...written } = settlement;
+      const checkpoint: StepCheckpoint = { ...(stored.get(k) as StepCheckpoint), ...written };
+      for (const key of ['output', 'error', 'events'] as const) {
+        if (checkpoint[key] === undefined) delete checkpoint[key];
+      }
+      const run = runs.get(settlement.runId) as Pick<RunRow, 'status' | 'wake_at'>;
+      out.set(k, {
+        checkpoint,
+        run: {
+          status: run.status as RunStatus,
+          wakeAt: run.wake_at == null ? undefined : Number(run.wake_at),
+        },
+      });
+    });
+    return out;
+  }
+
+  async insertCheckpointIfAbsent(checkpoint: StepCheckpoint): Promise<boolean> {
+    const client = this.client();
+    const row = checkpointToRow(checkpoint);
+    const hot = this.hot();
+    if (hot) {
+      const keys = Object.keys(row);
+      const values = keys.map((k) => (row as unknown as Record<string, unknown>)[k] ?? null);
+      return (await hot.rows(insertCheckpointIfAbsentSql(keys), values)).length > 0;
+    }
+    if (client.dialect.name === 'postgres') {
+      const inserted = (await client
+        .insertQuery()
+        .table(DURABLE_TABLES.checkpoints)
+        .knexQuery.insert(row)
+        .onConflict(['run_id', 'seq'])
+        .ignore()
+        .returning('seq')) as unknown[];
+      return inserted.length > 0;
+    }
+    // MySQL and SQLite: a plain INSERT, whose duplicate-key error is the "already there" answer (an
+    // `INSERT IGNORE` would also swallow every other error, and reports no row count through Knex).
+    try {
+      await client.table(DURABLE_TABLES.checkpoints).insert(row);
+      return true;
+    } catch (err) {
+      if (isDuplicateKey(err)) return false;
+      throw err;
+    }
+  }
+
   /** Persist the latest worker heartbeat on the step's checkpoint row (see the interface doc).
    *  A targeted two-column UPDATE — never an upsert: a beat racing the checkpoint's own insert (or
    *  outliving a deleted run) matches zero rows and is a silent no-op, by design. */
@@ -623,6 +839,70 @@ export class LucidStateStore implements StateStore {
     return (rows as RunRow[]).map(rowToRun);
   }
 
+  async claimPendingRuns(
+    limit: number,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+    namespace?: string,
+  ): Promise<WorkflowRun[]> {
+    if (limit <= 0) return [];
+    const client = this.client();
+    const dialect = client.dialect.name;
+    const free = (q: AnyQuery): AnyQuery => {
+      q.where('status', 'pending').andWhere((w: AnyQuery) => {
+        w.whereNull('locked_until').orWhere('locked_until', '<=', nowMs);
+      });
+      if (namespace !== undefined) q.whereIn('namespace', namespaceFilterValues(namespace));
+      return this.fenced(q);
+    };
+    const oldest = (q: AnyQuery): AnyQuery =>
+      free(q).select('id').orderBy('created_at', 'asc').orderBy('id', 'asc').limit(limit);
+    let rows: RunRow[];
+    if (dialect === 'postgres') {
+      // One statement: pick the oldest free pending rows, skipping any another claimer holds locked
+      // right now, and lease them. Several pollers at once each get a different slice.
+      const pick = oldest(client.from(DURABLE_TABLES.runs)).forUpdate().skipLocked();
+      rows = (await client
+        .from(DURABLE_TABLES.runs)
+        .whereIn('id', pick)
+        .update({ locked_by: owner, locked_until: leaseUntilMs })
+        .returning('*')) as RunRow[];
+    } else if (dialect === 'mysql') {
+      // No UPDATE … RETURNING: lock the batch (skipping rows another claimer holds), lease it and read
+      // it back, in one transaction.
+      rows = await client.transaction(async (trx) => {
+        const ids = (
+          (await oldest(trx.from(DURABLE_TABLES.runs)).forUpdate().skipLocked()) as Array<{
+            id: string;
+          }>
+        ).map((r) => r.id);
+        if (ids.length === 0) return [];
+        await trx
+          .from(DURABLE_TABLES.runs)
+          .whereIn('id', ids)
+          .update({ locked_by: owner, locked_until: leaseUntilMs });
+        return (await trx.from(DURABLE_TABLES.runs).whereIn('id', ids)) as RunRow[];
+      });
+    } else {
+      // SQLite has no row locks to skip: each run is taken with the lease's own compare-and-set.
+      const claimed: WorkflowRun[] = [];
+      const candidates = (await free(client.from(DURABLE_TABLES.runs))
+        .orderBy('created_at', 'asc')
+        .orderBy('id', 'asc')
+        .limit(limit)) as RunRow[];
+      for (const run of candidates.map(rowToRun)) {
+        if (await this.tryLockRun(run.id, owner, leaseUntilMs, nowMs)) {
+          claimed.push({ ...run, lockedBy: owner, lockedUntil: leaseUntilMs });
+        }
+      }
+      return claimed;
+    }
+    return rows
+      .map(rowToRun)
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
+  }
+
   async listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]> {
     const marker = await this.hasWakeMarkerColumn();
     const q = this.fenced(
@@ -664,7 +944,56 @@ export class LucidStateStore implements StateStore {
     return rowsAffected(affected) === 1;
   }
 
+  async tryLockRunAndGet(
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ): Promise<WorkflowRun | null> {
+    const hot = this.hot();
+    if (hot) {
+      const rows =
+        this.scopeNamespace === undefined
+          ? await hot.rows(LOCK_AND_GET_SQL, [owner, leaseUntilMs, runId, nowMs])
+          : await hot.rows(LOCK_AND_GET_SCOPED_SQL, [
+              owner,
+              leaseUntilMs,
+              runId,
+              nowMs,
+              namespaceFilterValues(this.scopeNamespace),
+            ]);
+      return rows[0] ? rowToRun(rows[0] as unknown as RunRow) : null;
+    }
+    const client = this.client();
+    if (client.dialect.name === 'postgres') {
+      // One statement: the lease's compare-and-set and the read of the row it locked. The scope
+      // fence sits in the WHERE clause, so a run outside it is neither locked nor read.
+      const rows = (await this.fenced(
+        client
+          .from(DURABLE_TABLES.runs)
+          .where('id', runId)
+          .andWhere((q) => {
+            q.whereNull('locked_until').orWhere('locked_until', '<=', nowMs);
+          }),
+      )
+        .update({ locked_by: owner, locked_until: leaseUntilMs })
+        .returning('*')) as RunRow[];
+      return rows[0] ? rowToRun(rows[0]) : null;
+    }
+    if (!(await this.tryLockRun(runId, owner, leaseUntilMs, nowMs))) return null;
+    const run = await this.getRun(runId);
+    // Outside the store's read scope: give the lease back.
+    if (!run) await this.releaseRunLock(runId, owner);
+    return run;
+  }
+
   async releaseRunLock(runId: string, owner?: string): Promise<void> {
+    const hot = this.hot();
+    if (hot) {
+      if (owner === undefined) await hot.run(RELEASE_LOCK_SQL, [runId]);
+      else await hot.run(RELEASE_OWN_LOCK_SQL, [runId, owner]);
+      return;
+    }
     // Owner-scoped release (when `owner` is given): the `locked_by` predicate lives in the UPDATE's
     // WHERE clause, so a stale executor whose lease was taken over matches zero rows and cannot
     // wipe the new owner's lease — same conditional-write shape as renewRunLock.
@@ -677,6 +1006,16 @@ export class LucidStateStore implements StateStore {
     // One conditional UPDATE: a marker a refused wake set after the holder's last look keeps the
     // lease where it is, and the holder runs another turn.
     const marker = await this.hasWakeMarkerColumn();
+    const hot = this.hot();
+    if (hot) {
+      const released = await hot.run(marker ? RELEASE_UNLESS_WAKE_SQL : RELEASE_OWN_LOCK_SQL, [
+        runId,
+        owner,
+      ]);
+      if (released.count === 1) return true;
+      const rows = await hot.rows(LOCKED_BY_SQL, [runId]);
+      return rows[0]?.locked_by !== owner;
+    }
     const q = this.client()
       .from(DURABLE_TABLES.runs)
       .where('id', runId)
@@ -717,6 +1056,8 @@ export class LucidStateStore implements StateStore {
   }
 
   async renewRunLock(runId: string, owner: string, leaseUntilMs: number): Promise<boolean> {
+    const hot = this.hot();
+    if (hot) return (await hot.run(RENEW_LOCK_SQL, [leaseUntilMs, runId, owner])).count === 1;
     // Extend ONLY if `owner` still holds the lease — a dead worker's lease still expires & is reclaimed.
     const affected = await this.client()
       .from(DURABLE_TABLES.runs)
@@ -928,15 +1269,20 @@ export class LucidStateStore implements StateStore {
     // The oldest signal is ours only if our DELETE removed it, so two takers never get the same one;
     // that needs no transaction, and a token with nothing buffered (the common case) costs one read.
     const client = this.client();
-    const row = await client
-      .from(DURABLE_TABLES.bufferedSignals)
-      .where('token', token)
-      .orderBy('id', 'asc')
-      .first();
+    const hot = this.hot();
+    const row = hot
+      ? (await hot.rows(OLDEST_BUFFERED_SIGNAL_SQL, [token]))[0]
+      : await client
+          .from(DURABLE_TABLES.bufferedSignals)
+          .where('token', token)
+          .orderBy('id', 'asc')
+          .first();
     if (!row) return null;
     const r = row as { id: number | string; payload: string | null };
-    const deleted = await client.from(DURABLE_TABLES.bufferedSignals).where('id', r.id).delete();
-    if (rowsAffected(deleted) !== 1) return null;
+    const deleted = hot
+      ? (await hot.run(DELETE_BUFFERED_SIGNAL_SQL, [r.id])).count
+      : rowsAffected(await client.from(DURABLE_TABLES.bufferedSignals).where('id', r.id).delete());
+    if (deleted !== 1) return null;
     return {
       payload: parseJsonColumn(
         r.payload,
@@ -968,11 +1314,14 @@ export class LucidStateStore implements StateStore {
     name: string,
     limit: number,
   ): Promise<Array<{ id: string; payload: unknown; publishedAt: number }>> {
-    const rows = await this.client()
-      .from(DURABLE_TABLES.bufferedEvents)
-      .where('name', name)
-      .orderBy('published_at', 'asc') // oldest first
-      .limit(limit);
+    const hot = this.hot();
+    const rows = hot
+      ? await hot.rows(BUFFERED_EVENTS_SQL, [name, limit])
+      : await this.client()
+          .from(DURABLE_TABLES.bufferedEvents)
+          .where('name', name)
+          .orderBy('published_at', 'asc') // oldest first
+          .limit(limit);
     return (
       rows as Array<{ id: string; payload: string | null; published_at: number | string }>
     ).map((r) => ({
@@ -1288,11 +1637,16 @@ export class LucidStateStore implements StateStore {
   }
 
   async listCheckpointsForReplay(runId: string): Promise<StepCheckpoint[]> {
-    const rows = (await this.client()
-      .from(DURABLE_TABLES.checkpoints)
-      .where('run_id', runId)
-      .orderBy('seq', 'asc')
-      .select(...CHECKPOINT_COLUMNS_BUT_INPUT)) as CheckpointRow[];
+    const hot = this.hot();
+    const rows = (
+      hot
+        ? await hot.rows(REPLAY_CHECKPOINTS_SQL, [runId])
+        : await this.client()
+            .from(DURABLE_TABLES.checkpoints)
+            .where('run_id', runId)
+            .orderBy('seq', 'asc')
+            .select(...CHECKPOINT_COLUMNS_BUT_INPUT)
+    ) as CheckpointRow[];
     // The input of every row but a completed one, read by seq: a row that completed since the read
     // above still gets its input, as that read reported it unsettled.
     const unsettled = rows
@@ -1347,6 +1701,11 @@ export class LucidStateStore implements StateStore {
     statuses: StepCheckpoint['status'][],
   ): Promise<number> {
     if (statuses.length === 0) return 0;
+    const hot = this.hot();
+    if (hot) {
+      const rows = await hot.rows(COUNT_CHECKPOINTS_SQL, [runId, fromSeq, toSeq, statuses]);
+      return Number(rows[0]?.count ?? 0);
+    }
     const rows = await this.client()
       .from(DURABLE_TABLES.checkpoints)
       .where('run_id', runId)
@@ -1591,6 +1950,147 @@ function nameKindSql(dialect: string): string {
 
 function escapeLike(value: string): string {
   return value.replace(/[!%_]/g, (c) => `!${c}`);
+}
+
+// --- the Postgres hot path's statements (see `lucid-pg-hot-path.ts`) --------------------------------
+
+const RUNS_T = quote(DURABLE_TABLES.runs);
+const CHECKPOINTS_T = quote(DURABLE_TABLES.checkpoints);
+const CHECKPOINT_LIST = CHECKPOINT_COLUMNS_BUT_INPUT.map(quote).join(', ');
+const GET_RUN_SQL = `select * from ${RUNS_T} where "id" = ? limit 1`;
+const GET_RUN_SCOPED_SQL = `select * from ${RUNS_T} where "id" = ? and "namespace" = any(?) limit 1`;
+const RUN_IN_STATUSES_SQL = `select 1 from ${RUNS_T} where "id" = ? and "status" = any(?) limit 1`;
+const LOCK_AND_GET_SQL = `update ${RUNS_T} set "locked_by" = ?, "locked_until" = ? where "id" = ? and ("locked_until" is null or "locked_until" <= ?) returning *`;
+const LOCK_AND_GET_SCOPED_SQL = `update ${RUNS_T} set "locked_by" = ?, "locked_until" = ? where "id" = ? and ("locked_until" is null or "locked_until" <= ?) and "namespace" = any(?) returning *`;
+const RELEASE_LOCK_SQL = `update ${RUNS_T} set "locked_by" = null, "locked_until" = null where "id" = ?`;
+const RELEASE_OWN_LOCK_SQL = `update ${RUNS_T} set "locked_by" = null, "locked_until" = null where "id" = ? and "locked_by" = ?`;
+const RELEASE_UNLESS_WAKE_SQL = `update ${RUNS_T} set "locked_by" = null, "locked_until" = null where "id" = ? and "locked_by" = ? and "wake_requested_at" is null`;
+const LOCKED_BY_SQL = `select "locked_by" from ${RUNS_T} where "id" = ? limit 1`;
+const RENEW_LOCK_SQL = `update ${RUNS_T} set "locked_until" = ? where "id" = ? and "locked_by" = ?`;
+const DELETE_ATTRIBUTES_SQL = `delete from ${quote(DURABLE_TABLES.attributes)} where "run_id" = ?`;
+const GET_CHECKPOINT_SQL = `select * from ${CHECKPOINTS_T} where "run_id" = ? and "seq" = ? limit 1`;
+const CHECKPOINTS_FOR_SETTLE_SQL = `select ${CHECKPOINT_LIST} from ${CHECKPOINTS_T} where "run_id" = ? and "seq" = any(?)`;
+const REPLAY_CHECKPOINTS_SQL = `select ${CHECKPOINT_LIST} from ${CHECKPOINTS_T} where "run_id" = ? order by "seq" asc`;
+const COUNT_CHECKPOINTS_SQL = `select count(*) as "count" from ${CHECKPOINTS_T} where "run_id" = ? and "seq" >= ? and "seq" <= ? and "status" = any(?)`;
+const OLDEST_BUFFERED_SIGNAL_SQL = `select * from ${quote(DURABLE_TABLES.bufferedSignals)} where "token" = ? order by "id" asc limit 1`;
+const DELETE_BUFFERED_SIGNAL_SQL = `delete from ${quote(DURABLE_TABLES.bufferedSignals)} where "id" = ?`;
+const BUFFERED_EVENTS_SQL = `select * from ${quote(DURABLE_TABLES.bufferedEvents)} where "name" = ? order by "published_at" asc limit ?`;
+
+/** Statements whose column list is the row's own keys, built once per key set. */
+const shaped = new Map<string, string>();
+function shapedSql(key: string, build: () => string): string {
+  let text = shaped.get(key);
+  if (text === undefined) {
+    text = build();
+    shaped.set(key, text);
+  }
+  return text;
+}
+
+/** `INSERT` of one row of `table` with the columns `keys`. */
+function insertSql(table: string, keys: string[]): string {
+  return shapedSql(`insert:${table}:${keys.join(',')}`, () => {
+    const cols = keys.map(quote).join(', ');
+    return `insert into ${quote(table)} (${cols}) values (${keys.map(() => '?').join(', ')})`;
+  });
+}
+
+/** {@link insertSql} of a checkpoint that writes nothing when its position is taken. */
+function insertCheckpointIfAbsentSql(keys: string[]): string {
+  return shapedSql(
+    `insert-if-absent:${keys.join(',')}`,
+    () =>
+      `${insertSql(DURABLE_TABLES.checkpoints, keys)} on conflict ("run_id", "seq") do nothing returning "seq"`,
+  );
+}
+
+/** `UPDATE` of one run's columns `keys`, with a status predicate when `conditional`. */
+function updateRunSql(keys: string[], conditional: boolean): string {
+  return shapedSql(`update-run:${conditional}:${keys.join(',')}`, () => {
+    const set = keys.map((k) => `${quote(k)} = ?`).join(', ');
+    const where = conditional ? `"id" = ? and "status" = any(?)` : `"id" = ?`;
+    return `update ${RUNS_T} set ${set} where ${where}`;
+  });
+}
+
+/**
+ * {@link LucidStateStore.settleResultsIfPending} on Postgres: one `UPDATE … FROM (VALUES …) …
+ * RETURNING` for the whole batch (entries already deduplicated by row). The run's status is checked
+ * in the same statement, and read back with its `wake_at`. What a result does not carry keeps its
+ * stored value: `output` unless it completed, `events` and `started_at` unless present.
+ */
+async function settleResultsReturningPg(
+  client: Client,
+  hot: LucidPgHotPath | undefined,
+  results: StepResultSettlement[],
+): Promise<Map<string, SettledStepResult>> {
+  const values: string[] = [];
+  const bindings: unknown[] = [];
+  for (const r of results) {
+    const row = settlementToRow({
+      ...r,
+      startedAt: r.startedAt ?? new Date(0),
+    });
+    values.push(
+      '(?::text, ?::int, ?::text, ?::text, ?::text, ?::boolean, ?::text, ?::bigint, ?::bigint)',
+    );
+    bindings.push(
+      r.runId,
+      r.seq,
+      r.status,
+      r.status === 'completed' ? row.output : null,
+      row.error,
+      r.events !== undefined,
+      row.events,
+      r.startedAt ? row.started_at : null,
+      row.finished_at,
+    );
+  }
+  const cols = CHECKPOINT_COLUMNS_BUT_INPUT.map((c) => `c.${c}`).join(', ');
+  const statuses = SETTLEABLE_RUN_STATUSES.map(() => '?').join(', ');
+  bindings.push(...SETTLEABLE_RUN_STATUSES);
+  const sql = `update ${DURABLE_TABLES.checkpoints} as c set
+      status = v.status,
+      output = case when v.status = 'completed' then v.output else c.output end,
+      error = v.error,
+      events = case when v.has_events then v.events else c.events end,
+      started_at = coalesce(v.started_at, c.started_at),
+      finished_at = v.finished_at
+    from (values ${values.join(', ')})
+      as v(run_id, seq, status, output, error, has_events, events, started_at, finished_at),
+      ${DURABLE_TABLES.runs} as r
+    where c.run_id = v.run_id and c.seq = v.seq and c.status = 'pending'
+      and r.id = c.run_id and r.status in (${statuses})
+    returning ${cols}, r.status as run_status, r.wake_at as run_wake_at`;
+  const { rows } = (
+    hot ? { rows: await hot.rows(sql, bindings) } : await client.rawQuery(sql, bindings as never)
+  ) as {
+    rows: Array<CheckpointRow & { run_status: string; run_wake_at: string | number | null }>;
+  };
+  const out = new Map<string, SettledStepResult>();
+  for (const row of rows) {
+    const checkpoint = rowToCheckpoint(row);
+    out.set(checkpointKey(checkpoint.runId, checkpoint.seq), {
+      checkpoint,
+      run: {
+        status: row.run_status as RunStatus,
+        wakeAt: row.run_wake_at == null ? undefined : Number(row.run_wake_at),
+      },
+    });
+  }
+  return out;
+}
+
+/** A duplicate-key violation, as MySQL and SQLite report it through Knex. */
+function isDuplicateKey(err: unknown): boolean {
+  const e = err as { code?: unknown; errno?: unknown } | null;
+  return (
+    e?.code === 'ER_DUP_ENTRY' ||
+    e?.errno === 1062 ||
+    e?.code === 'SQLITE_CONSTRAINT_PRIMARYKEY' ||
+    e?.code === 'SQLITE_CONSTRAINT_UNIQUE' ||
+    e?.code === '23505'
+  );
 }
 
 function checkpointKey(runId: string, seq: number): string {

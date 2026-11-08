@@ -10,6 +10,8 @@
 export interface JobLike {
   /** Present on real BullMQ jobs; fakes may omit it. */
   id?: string | undefined;
+  /** The job's name (`result` / `results` on a results queue). Present on real BullMQ jobs. */
+  name?: string | undefined;
   data: unknown;
   failedReason?: string | undefined;
   attemptsMade?: number | undefined;
@@ -53,7 +55,16 @@ export interface RedisLike {
   publish(channel: string, message: string): Promise<unknown> | unknown;
   subscribe(channel: string): Promise<unknown> | unknown;
   on(event: string, listener: (...args: never[]) => void): unknown;
-  set(key: string, value: string, mode: 'EX', ttl: number): Promise<unknown>;
+  set(key: string, value: string, mode: 'EX' | 'PX', ttl: number): Promise<unknown>;
+  /**
+   * The keys reply routing uses (an engine's alive key, the set of instances that route replies).
+   * Optional: a client without them routes no replies, and every result rides the shared queue.
+   */
+  exists?(...keys: string[]): Promise<number>;
+  del?(...keys: string[]): Promise<number>;
+  sadd?(key: string, ...members: string[]): Promise<number>;
+  srem?(key: string, ...members: string[]): Promise<number>;
+  smembers?(key: string): Promise<string[]>;
   scan(cursor: string | number, ...args: (string | number)[]): Promise<[string, string[]]>;
   get(key: string): Promise<string | null>;
   /** Batched read — optional: a client without it falls back to per-key `get`. */

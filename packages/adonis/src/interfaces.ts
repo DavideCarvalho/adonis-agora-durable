@@ -227,6 +227,41 @@ export interface StepSettlement {
 }
 
 /**
+ * A step's worker result as {@link StateStore.settleResultsIfPending} writes it onto the step's
+ * `pending` checkpoint. Unlike a {@link StepSettlement}, what the result does not carry keeps the
+ * stored value: `output` is written only for a `completed` result, `events` and `startedAt` only when
+ * present.
+ */
+export interface StepResultSettlement {
+  runId: string;
+  seq: number;
+  status: 'completed' | 'failed';
+  output?: unknown;
+  error?: StepError | undefined;
+  events?: StepEvent[] | undefined;
+  startedAt?: Date | undefined;
+  finishedAt: Date;
+}
+
+/** One entry {@link StateStore.settleResultsIfPending} settled: the row read back, and its run. */
+export interface SettledStepResult {
+  checkpoint: StepCheckpoint;
+  run: Pick<WorkflowRun, 'status' | 'wakeAt'>;
+}
+
+/**
+ * The run statuses a step result settles in through {@link StateStore.settleResultsIfPending}: the
+ * run is alive. A result for a run in any other status (finished, cancelled, dead) takes the engine's
+ * read-first path, which drops it or salvages it.
+ */
+export const SETTLEABLE_RUN_STATUSES: readonly RunStatus[] = [
+  'pending',
+  'running',
+  'suspended',
+  'blocked',
+];
+
+/**
  * A structured event a step (or its worker) emits while running — a log line and/or a sub-step
  * outcome. The dashboard renders these under the step, so you can see what happened inside a step
  * that the workflow treats as one unit (e.g. which of N parallel sub-processes ok/failed/skipped).
@@ -545,6 +580,32 @@ export interface StateStore {
    * {@link saveCheckpointsIfPending} / {@link saveCheckpointIfPending}.
    */
   settleCheckpointsIfPending?(settlements: StepSettlement[]): Promise<boolean[]>;
+  /**
+   * Settle steps from their worker results and read them back, in one round trip where the store
+   * can: per entry and in input order, while the row at `(runId, seq)` is still `pending` and its run
+   * is in one of {@link SETTLEABLE_RUN_STATUSES} (a result for a finished run settles nothing here),
+   * write the result (see {@link StepResultSettlement} for what keeps its stored value) and resolve
+   * the row as it now reads, without its `input` (as {@link getCheckpointsForSettle} reads it),
+   * together with the run's `status` and `wakeAt` as they read when it settled. `null` for an entry
+   * that wrote nothing: the row is absent or already settled, or its run is not settleable. Claims
+   * like {@link settleCheckpointsIfPending}: a later entry for a row an earlier one settled loses,
+   * and a rejection writes nothing.
+   *
+   * The engine settles a batch of one run's results through it without reading the rows or the run
+   * first; an entry that comes back `null` goes through the read-first path (a redelivery, a step
+   * gone, a late result for a finished run).
+   *
+   * Optional: a store that omits it gets the reads followed by {@link settleCheckpointsIfPending}.
+   */
+  settleResultsIfPending?(results: StepResultSettlement[]): Promise<(SettledStepResult | null)[]>;
+  /**
+   * Write `checkpoint` only if the run has no checkpoint at its `seq` yet; resolves whether it wrote.
+   * The engine writes a step it dispatches for the first time through it, instead of reading the
+   * position first: a row already there (written by a turn it did not see) is then read and acted on.
+   *
+   * Optional: a store that omits it gets a {@link getCheckpoint} before the {@link saveCheckpoint}.
+   */
+  insertCheckpointIfAbsent?(checkpoint: StepCheckpoint): Promise<boolean>;
 
   /**
    * Pull the timer of every run in `runIds` that is still `suspended` IN to `wakeAt`: write `wakeAt`
@@ -594,6 +655,25 @@ export interface StateStore {
   listPendingRuns(limit: number, namespace?: string): Promise<WorkflowRun[]>;
 
   /**
+   * Claim up to `limit` of the oldest `pending` runs that no instance holds (no lease, or one that
+   * expired by `nowMs`): lease each to `owner` until `leaseUntilMs` and resolve them as locked, in
+   * one statement where the store can. Rows another claimer is locking right now are skipped, not
+   * waited on (`FOR UPDATE SKIP LOCKED`), so instances polling at once split the backlog instead of
+   * racing for the same rows. `namespace` and the read scope filter like {@link listPendingRuns}.
+   * Concurrent claimers never get the same run; a row one of them skipped may be left for a later
+   * claim.
+   *
+   * Optional: a store that omits it gets {@link listPendingRuns} and a {@link tryLockRun} per run.
+   */
+  claimPendingRuns?(
+    limit: number,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+    namespace?: string,
+  ): Promise<WorkflowRun[]>;
+
+  /**
    * Suspended runs whose durable timer is due (`wakeAt <= nowMs`), or that carry a
    * {@link WorkflowRun.wakeRequestedAt}, ready to resume. When `namespace`
    * is given, restrict to runs in that worker-pool partition (ANDed); omit it to return all. `limit`
@@ -608,6 +688,20 @@ export interface StateStore {
    * acquired — so concurrent engine instances never recover the same run twice.
    */
   tryLockRun(runId: string, owner: string, leaseUntilMs: number, nowMs: number): Promise<boolean>;
+  /**
+   * {@link tryLockRun}, resolving the run as it reads once locked (`null` when the lease was not
+   * acquired, or the run does not exist): the engine takes a run's lease and reads it in one round
+   * trip where the store can. The read honors the store's read scope like {@link getRun}; a run
+   * outside it is not locked.
+   *
+   * Optional: a store that omits it gets a {@link getRun} and a {@link tryLockRun}.
+   */
+  tryLockRunAndGet?(
+    runId: string,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+  ): Promise<WorkflowRun | null>;
 
   /**
    * Release a run's recovery lease so another instance can pick it up (e.g. once it suspends).
@@ -1419,6 +1513,14 @@ export interface RemoteTask {
    */
   lazyPickupBeat?: boolean | undefined;
   attempt: number;
+  /**
+   * The engine instance that dispatched the task and wants its result back, when the transport
+   * routes replies ({@link Transport.consumeRepliesFor}): that instance keeps the workflow body
+   * parked on the step, so its result continues the body there instead of replaying it elsewhere.
+   * A worker sends the result to that instance while it is alive, else to the shared results, like
+   * a task without it. Absent when replies are not routed (a step fan's tasks never carry it).
+   */
+  replyTo?: string | undefined;
 }
 
 export interface StepResult {
@@ -1791,6 +1893,15 @@ export interface Transport {
   dispatchMany?(tasks: RemoteTask[]): Promise<void>;
   /** worker → engine: a step finished (ok or error). */
   onResult(handler: (result: StepResult) => Promise<void>): void;
+  /**
+   * Also consume the results workers address to engine instance `replyTo` (tasks dispatched with
+   * {@link RemoteTask.replyTo}), handing them to the {@link onResult} handlers; resolves whether this
+   * transport routes them. A transport that does must never lose such a result: while `replyTo` is
+   * gone (crashed, scaled down, drained), its results go, or are moved, to the shared results.
+   * Optional: a transport without it gets tasks without `replyTo`, and every result comes back on
+   * the shared results.
+   */
+  consumeRepliesFor?(replyTo: string): boolean;
   /** worker → engine: liveness signal for an in-flight long step. */
   onHeartbeat(handler: (beat: Heartbeat) => Promise<void>): void;
   /**
@@ -1852,7 +1963,10 @@ export interface Transport {
    * skips the guard and dispatches as before (legacy assume-compatible, design §7.7). MUST degrade to
    * `[]` (never throw) when the keyspace is empty or unreadable. Pairs with {@link listWorkerGroups}.
    */
-  listWorkerDescriptors?(token: string): Promise<WorkerDescriptor[]>;
+  listWorkerDescriptors?(
+    token: string,
+    opts?: { fresh?: boolean | undefined },
+  ): Promise<WorkerDescriptor[]>;
   /**
    * EVERY live worker descriptor, across all routing tokens — the fleet-wide read behind
    * {@link WorkflowEngine.workflowDirectory}. Optional, and MUST degrade to `[]` when unreadable.

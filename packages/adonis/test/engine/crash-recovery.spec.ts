@@ -216,6 +216,8 @@ describe.each(backends)('crash recovery on $name', (backend) => {
     // Pod B consumes the result (the handler resolving IS the broker ack) and dies the moment its
     // resume reaches for the run's lease — after the ack, before any turn ran.
     b.onCall('tryLockRun', () => b.kill());
+    // (Where the store takes the lease and reads the run in one call, that call is the reach.)
+    b.onCall('tryLockRunAndGet', () => b.kill());
     const delivered = b.transport.result?.(completed(task)).then(() => 'acked' as const);
     await until(() => b.dead());
     const outcome = await Promise.race([delivered, settle().then(() => 'unacked' as const)]);

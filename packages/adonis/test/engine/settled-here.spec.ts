@@ -48,6 +48,8 @@ describe('a result settled here right after its turn suspended', () => {
       store,
       transports: [{ id: 't', transport }],
       reconcileMs: 0,
+      // Counts body replays: every turn replays (no sticky continuation keeps the body).
+      stickyRuns: 0,
     });
     let turns = 0;
     const STEPS = 8;
@@ -65,6 +67,35 @@ describe('a result settled here right after its turn suspended', () => {
     expect(transport.sent).toBe(STEPS);
     // The first turn, then one per settled step.
     expect(turns).toBe(STEPS + 1);
+  });
+
+  it('resumes the run once: one turn per step, a parked body continued (sticky)', async () => {
+    const store = new InMemoryStateStore();
+    const transport = new InstantTransport();
+    const engine = new WorkflowEngine({
+      store,
+      transports: [{ id: 't', transport }],
+      reconcileMs: 0,
+    });
+    let turns = 0;
+    const STEPS = 8;
+    engine.register('chat', '1', async (ctx) => {
+      turns += 1;
+      const out: unknown[] = [];
+      for (let i = 0; i < STEPS; i += 1) out.push(await ctx.step('llm.ask', { turn: i }));
+      return out;
+    });
+    await startRun(engine, 'chat', {}, 'r1');
+    await until(async () => (await store.getRun('r1'))?.status === 'completed');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect((await store.getRun('r1'))?.output).toEqual(Array.from({ length: STEPS }, (_, i) => i));
+    expect(transport.sent).toBe(STEPS);
+    expect(turns).toBe(1);
+    // One warm turn per settled step: an extra turn would take the parked body again (a hit).
+    expect(
+      (engine as unknown as { sticky: { hits: number; misses: number } }).sticky,
+    ).toMatchObject({ hits: STEPS, misses: 0 });
   });
 
   it('keeps the steps it settled for a lease only', () => {

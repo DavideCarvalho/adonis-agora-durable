@@ -159,6 +159,12 @@ async up() {
 
 The logger only needs a `warn(message: string)` method, which both `console` (the default) and AdonisJS's `Logger` satisfy.
 
+## Postgres: the per-step statements
+
+On Postgres, the statements every workflow step runs (the run's lease, read and suspend, the step's `pending` row and its settled result, the turn's checkpoint reads) go to the `pg` connection as constant SQL text instead of being rebuilt by Knex's query builder on every call, which on a busy engine was about a fifth of its CPU. They run on the same Knex pool (inside a global transaction, on the transaction's connection), and each is still announced as Knex's `query` event. A connection with Lucid's `debug` on keeps the query builder, so its `db:query` events show every statement as before.
+
+`stores.lucid({ preparedStatements: true })` sends them as named prepared statements, parsed once per connection. Leave it off behind PgBouncer in transaction mode older than 1.21, which cannot hold them.
+
 ## MySQL: longtext and collation
 
 MySQL's `text` holds 64KB. A larger step output, input or event log — a fan step's `events`, a big report — is rejected in strict mode and cut off in non-strict mode, where the row then fails to parse on read. So the JSON columns (`DURABLE_JSON_COLUMNS`: run and checkpoint `input`/`output`/`error`, `events`, `tags`, `search_attributes`, `heartbeat_progress`, the buffered payloads and the schedule documents) are `longtext` on MySQL. Postgres and SQLite `text` has no limit, and their DDL is unchanged.

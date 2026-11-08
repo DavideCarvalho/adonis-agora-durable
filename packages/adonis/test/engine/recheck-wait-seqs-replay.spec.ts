@@ -50,6 +50,8 @@ describe('recheckWaitSeqs and a result settled on the same instance', () => {
       store,
       transports: [{ id: 't', transport }],
       reconcileMs: 0,
+      // Counts body replays: every turn replays (no sticky continuation keeps the body).
+      stickyRuns: 0,
     });
     let bodyRuns = 0;
     engine.register('wf', '1', async (ctx) => {
@@ -91,6 +93,8 @@ describe('recheckWaitSeqs and a result settled on the same instance', () => {
       store,
       transports: [{ id: 't', transport }],
       reconcileMs: 0,
+      // Counts body replays: every turn replays (no sticky continuation keeps the body).
+      stickyRuns: 0,
     });
     let bodyRuns = 0;
     engine.register('wf', '1', async (ctx) => {

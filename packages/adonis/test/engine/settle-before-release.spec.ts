@@ -342,6 +342,9 @@ describe("a replay's stale view of a remote step never overwrites its landed res
       clock: () => now,
       reconcileMs: 0,
       remoteRedispatchMs: 60 * 60_000,
+      // The race is a REPLAY's stale snapshot: a warm (sticky) turn takes none, it re-reads the
+      // parked step and stamps its lease with a compare-and-set on `pending`.
+      stickyRuns: 0,
     });
     engine.register('wf', '1', async (ctx) => {
       const r = await ctx.step<{ pong: boolean }>(PING, {});
@@ -373,5 +376,52 @@ describe("a replay's stale view of a remote step never overwrites its landed res
     expect(run?.status).toBe('completed');
     expect(run?.output).toBe(true);
     expect(transport.dispatched).toHaveLength(1);
+  });
+
+  it('a warm (sticky) turn: the result landing after the parked step is re-read is not overwritten', async () => {
+    let now = 1_000_000;
+    let armed = false;
+    let seq = -1;
+    class ReadRaceStore extends InMemoryStateStore {
+      override async getCheckpoint(runId: string, at: number): Promise<StepCheckpoint | null> {
+        const row = await super.getCheckpoint(runId, at);
+        if (armed && at === seq && row?.status === 'pending') {
+          armed = false;
+          await super.saveCheckpoint({ ...row, status: 'completed', output: { pong: true } });
+        }
+        return row;
+      }
+    }
+    const store = new ReadRaceStore();
+    const transport = new ManualTransport();
+    const engine = new WorkflowEngine({
+      store,
+      transports: [{ id: 't', transport }],
+      clock: () => now,
+      reconcileMs: 0,
+      remoteRedispatchMs: 60 * 60_000,
+    });
+    let entries = 0;
+    engine.register('wf', '1', async (ctx) => {
+      entries += 1;
+      const r = await ctx.step<{ pong: boolean }>(PING, {});
+      return r.pong;
+    });
+
+    await startRun(engine, 'wf', {}, 'r1');
+    const task = transport.dispatched[0];
+    if (!task) throw new Error('expected a dispatched task');
+    seq = task.seq;
+    armed = true;
+    now += 1_000;
+    await engine.runOne('r1');
+    // The stale `pending` read stamped nothing over the result; a later turn completes the run.
+    const cp = await store.getCheckpoint('r1', seq);
+    expect(cp?.status).toBe('completed');
+    expect(cp?.output).toEqual({ pong: true });
+    await engine.runOne('r1');
+    expect((await store.getRun('r1'))?.status).toBe('completed');
+    expect(transport.dispatched).toHaveLength(1);
+    expect(entries).toBe(1);
   });
 });

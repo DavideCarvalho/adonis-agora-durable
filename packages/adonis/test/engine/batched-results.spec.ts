@@ -67,6 +67,15 @@ function instrument(store: StateStore) {
       return count(...args);
     };
   }
+  // A store that settles results and reads them back in one call (Postgres) goes through it instead.
+  const settleResults = store.settleResultsIfPending?.bind(store);
+  if (settleResults) {
+    wrapped.settleResultsIfPending = async (results) => {
+      if (results.length === 1) calls.single += 1;
+      else calls.batch.push(results.length);
+      return settleResults(results);
+    };
+  }
   if (settle) {
     wrapped.settleCheckpointsIfPending = async (settlements: StepSettlement[]) => {
       if (settlements.length === 1) calls.single += 1;
@@ -221,6 +230,36 @@ describe('batched step results — fallbacks', () => {
     );
     const rejected = outcomes.flatMap((o, i) => (o.status === 'rejected' ? [i] : []));
     expect(rejected).toEqual([2]);
+    expect((await inner.getCheckpoint('p', 2))?.status).toBe('pending');
+    await transport.result?.(result(transport.dispatched[2] as RemoteTask));
+    await until(async () => (await inner.getRun('p'))?.status === 'completed');
+    expect((await inner.getRun('p'))?.output).toEqual([0, 10, 20, 30, 40]);
+  });
+
+  it('settleResultsIfPending: a rejected batch is retried result by result, and one bad row fails only its own result', async () => {
+    const inner = new InMemoryStateStore({ roundTripMethods: true });
+    const store = Object.create(inner) as StateStore;
+    const settle = inner.settleResultsIfPending?.bind(inner);
+    if (!settle) throw new Error('expected the round-trip methods');
+    let poisoned = true;
+    const sizes: number[] = [];
+    store.settleResultsIfPending = async (results) => {
+      sizes.push(results.length);
+      if (results.length > 1) throw new Error('batch settle rejected');
+      if (results[0]?.seq === 2 && poisoned) {
+        poisoned = false;
+        throw new Error('row 2 rejected');
+      }
+      return settle(results);
+    };
+    const { transport } = await fanRun(store, 5);
+    const outcomes = await Promise.allSettled(
+      transport.dispatched.map((task) => transport.result?.(result(task))),
+    );
+    const rejected = outcomes.flatMap((o, i) => (o.status === 'rejected' ? [i] : []));
+    expect(rejected).toEqual([2]);
+    // The results that landed together were tried as a batch first.
+    expect(Math.max(...sizes)).toBeGreaterThan(1);
     expect((await inner.getCheckpoint('p', 2))?.status).toBe('pending');
     await transport.result?.(result(transport.dispatched[2] as RemoteTask));
     await until(async () => (await inner.getRun('p'))?.status === 'completed');

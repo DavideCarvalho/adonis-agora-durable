@@ -366,7 +366,7 @@ export class DbTransport implements Transport, ControlPlane {
   readonly #instanceId: string;
   readonly #workerKeysCacheMs: number;
   #workerKeyStore: WorkerKeyStore | undefined;
-  #readWorkerKeys: (() => Promise<{ key: string; value: string }[]>) | undefined;
+  #readWorkerKeys: ((fresh?: boolean) => Promise<{ key: string; value: string }[]>) | undefined;
   readonly #handlers = new Map<string, StepHandler>();
   /** Aborted when `close()` starts: the `log.signal` of every step this worker runs. */
   readonly #shutdown = new AbortController();
@@ -2093,16 +2093,19 @@ export class DbTransport implements Transport, ControlPlane {
   }
 
   /** The live advertisement keys, reused for {@link DbTransportOptions.workerKeysCacheMs}. */
-  #liveWorkerKeys(): Promise<{ key: string; value: string }[]> {
+  #liveWorkerKeys(fresh = false): Promise<{ key: string; value: string }[]> {
     this.#readWorkerKeys ??= cachedLiveKeys(this.#workerKeys(), this.#workerKeysCacheMs, () =>
       this.#now(),
     );
-    return this.#readWorkerKeys();
+    return this.#readWorkerKeys(fresh);
   }
 
   /** The live worker descriptors advertised on `token`. */
-  async listWorkerDescriptors(token: string): Promise<WorkerDescriptor[]> {
-    return descriptorsOn(await this.#liveWorkerKeys(), token);
+  async listWorkerDescriptors(
+    token: string,
+    opts?: { fresh?: boolean | undefined },
+  ): Promise<WorkerDescriptor[]> {
+    return descriptorsOn(await this.#liveWorkerKeys(opts?.fresh === true), token);
   }
 
   /** The routing tokens a live worker beats on. */

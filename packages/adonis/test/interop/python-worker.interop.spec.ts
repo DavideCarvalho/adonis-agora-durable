@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn } from 'node:child_process';
+import { type ChildProcess, spawn, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -190,4 +190,81 @@ describe.skipIf(!REDIS_URL)('Adonis control-plane -> Python worker interop (real
       ].join('\n'),
     );
   }, 60_000);
+
+  // A Python worker that routes results (durable-worker with `ResultPublisher`) sends each step's
+  // result back to the Adonis engine that dispatched it, which holds the body parked on the step: with
+  // two engines, every body runs once. An older worker sends them to the shared queue, and the runs
+  // still complete (replaying where the result landed), so only the completion is asserted then.
+  it.skipIf(!PYTHON)(
+    'routes each result back to the engine that dispatched the step, with two engines',
+    async () => {
+      const prefix = `durable-interop-rr-${Date.now()}`;
+      const parsed = new URL(REDIS_URL as string);
+      const connection = { host: parsed.hostname, port: Number(parsed.port || 6379) } as unknown;
+      const store = new InMemoryStateStore({ roundTripMethods: true });
+      let entries = 0;
+      const engines = await Promise.all(
+        ['adonis-a', 'adonis-b'].map(async (id) => {
+          const transport = new BullMQTransport({
+            deps: await createBullMQDeps(connection),
+            prefix,
+            instanceId: id,
+          });
+          closers.push(() => transport.close());
+          const engine = new WorkflowEngine({ store, transport, instanceId: id, reconcileMs: 0 });
+          engine.register('py-seq', '1', async (ctx) => {
+            entries += 1;
+            let n = 0;
+            for (let i = 0; i < 4; i += 1) {
+              n = (await ctx.step<{ nPlusOne: number }>('py-echo', { n })).nPlusOne;
+            }
+            return n;
+          });
+          return { engine, transport };
+        }),
+      );
+      const worker = spawn(PYTHON as string, [WORKER_SCRIPT, prefix], {
+        env: { ...process.env, DURABLE_INTEROP_REDIS_URL: REDIS_URL },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const workerLog: string[] = [];
+      worker.stderr?.on('data', (b: Buffer) => workerLog.push(`[py-err] ${b.toString().trim()}`));
+      closers.push(
+        () =>
+          new Promise<void>((res) => {
+            worker.once('exit', () => res());
+            worker.kill('SIGTERM');
+            setTimeout(() => {
+              worker.kill('SIGKILL');
+              res();
+            }, 3000);
+          }),
+      );
+      const first = engines[0] as (typeof engines)[number];
+      await waitFor(
+        `python worker to register the 'py-echo' group\n${workerLog.join('\n')}`,
+        async () => (await first.transport.listWorkerGroups()).includes('py-echo'),
+        20_000,
+      );
+      const ids = Array.from({ length: 6 }, (_, i) => `rr-${i}`);
+      for (const [i, id] of ids.entries()) {
+        await (engines[i % 2] as (typeof engines)[number]).engine.start('py-seq', {}, id);
+      }
+      await waitFor(
+        `runs to complete\n${workerLog.join('\n')}`,
+        async () =>
+          (await Promise.all(ids.map((id) => store.getRun(id)))).every(
+            (r) => r?.status === 'completed',
+          ),
+        30_000,
+      );
+      for (const id of ids) expect((await store.getRun(id))?.output).toBe(4);
+      const routes =
+        spawnSync(PYTHON as string, ['-c', 'import durable_worker.result_publisher']).status === 0;
+      // Routed by the Python worker: no body replayed on the other engine.
+      if (routes) expect(entries, workerLog.join('\n')).toBe(ids.length);
+      else expect(entries).toBeGreaterThanOrEqual(ids.length);
+    },
+    60_000,
+  );
 });

@@ -53,6 +53,25 @@ export function resultBatchesName(effPrefix: string): string {
   return `${effPrefix}-results-batch`;
 }
 
+/**
+ * `${P}-results-to-${instance}` — the step results routed back to the engine instance that dispatched
+ * them (jobs `result` / `results`, see `RemoteTask.replyTo`). The instance id is sanitized like the
+ * NestJS transport and the Python worker sanitize it, so all three address the same queue.
+ */
+export function replyQueueName(effPrefix: string, instanceId: string): string {
+  return `${effPrefix}-results-to-${instanceId.replace(/[^A-Za-z0-9_.@-]/g, '-')}`;
+}
+
+/** `${P}:reply-alive:${instance}` — set while that engine instance consumes its routed results. */
+export function replyAliveKey(effPrefix: string, instanceId: string): string {
+  return `${effPrefix}:reply-alive:${instanceId}`;
+}
+
+/** `${P}:reply-instances` — every engine instance that consumed or was sent routed results. */
+export function replyInstancesKey(effPrefix: string): string {
+  return `${effPrefix}:reply-instances`;
+}
+
 /** `${P}-decisions` — the workflow-decision queue (job `decision`). */
 export function decisionsName(effPrefix: string): string {
   return `${effPrefix}-decisions`;

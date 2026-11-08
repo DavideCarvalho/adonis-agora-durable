@@ -335,6 +335,19 @@ export interface BaseDurableConfig {
    */
   timerBatchSize?: number;
   /**
+   * How many workflow bodies parked on dispatched `ctx.step` calls this instance keeps in memory, so
+   * a step's result continues the body instead of replaying it (sticky continuations). Least recently
+   * used out first. Default 2000; `0` turns it off.
+   */
+  stickyRuns?: number;
+  /** How long a parked body may wait in memory before it is dropped (the run then replays). Default 5 min. */
+  stickyIdleMs?: number;
+  /**
+   * Ask a transport that can (BullMQ) to send a dispatched step's result back to the instance holding
+   * the body parked on it. Default `true` while sticky continuations are on.
+   */
+  routeReplies?: boolean;
+  /**
    * How long a buffered event (a `publishEvent` that matched no waiter) is kept for a later
    * `waitForEvent` — a duration string (`'7d'`) or ms. Omit to keep it until consumed. When set, an
    * expired event is never delivered, and the worker tick's retention phase deletes expired rows
