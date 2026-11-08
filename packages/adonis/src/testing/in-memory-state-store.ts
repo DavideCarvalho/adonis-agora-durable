@@ -151,6 +151,13 @@ export class InMemoryStateStore implements StateStore {
     leaseUntilMs: number,
     nowMs: number,
   ) => Promise<WorkflowRun | null>;
+  readonly claimPendingRuns?: (
+    limit: number,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+    namespace?: string,
+  ) => Promise<WorkflowRun[]>;
   private readonly roundTripMethods: boolean;
 
   constructor(opts: { roundTripMethods?: boolean } = {}) {
@@ -162,6 +169,15 @@ export class InMemoryStateStore implements StateStore {
       this.insertCheckpointIfAbsent = (cp) => this.insertIfAbsentFallback(cp);
       this.tryLockRunAndGet = (runId, owner, until, now) =>
         this.lockAndGetFallback(runId, owner, until, now);
+      this.claimPendingRuns = async (limit, owner, until, now, namespace) => {
+        const claimed: WorkflowRun[] = [];
+        for (const run of await this.listPendingRuns(Number.MAX_SAFE_INTEGER, namespace)) {
+          if (claimed.length >= limit) break;
+          const locked = await this.lockAndGetFallback(run.id, owner, until, now);
+          if (locked) claimed.push(locked);
+        }
+        return claimed;
+      };
     }
   }
 

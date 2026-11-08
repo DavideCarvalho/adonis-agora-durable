@@ -1144,6 +1144,69 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
     );
 
     t(
+      'claimPendingRuns leases the oldest free pending runs, and concurrent claims never overlap (when implemented)',
+      async () => {
+        if (!store.claimPendingRuns) return;
+        const created = (i: number) => new Date(at.getTime() + i * 1_000);
+        for (let i = 0; i < 6; i += 1) {
+          await store.createRun(run({ id: `p${i}`, status: 'pending', createdAt: created(i) }));
+        }
+        await store.createRun(run({ id: 'busy', status: 'pending', createdAt: created(-2) }));
+        await store.updateRun('busy', { lockedBy: 'other', lockedUntil: 5_000 });
+        await store.createRun(run({ id: 'stale', status: 'pending', createdAt: created(-1) }));
+        await store.updateRun('stale', { lockedBy: 'gone', lockedUntil: 500 });
+        await store.createRun(run({ id: 'done', status: 'completed', createdAt: created(-3) }));
+        await store.createRun(
+          run({ id: 'elsewhere', status: 'pending', namespace: 'other', createdAt: created(-4) }),
+        );
+
+        const first = await store.claimPendingRuns(3, 'a', 9_000, 1_000, 'default');
+        // Oldest first; a held lease is skipped, an expired one taken over; another namespace's
+        // run is not this claim's.
+        expect(first.map((r) => r.id)).toEqual(['stale', 'p0', 'p1']);
+        for (const r of first) {
+          expect(r.status).toBe('pending');
+          expect(r.input).toEqual({ orderId: 'o1' });
+          expect(r.lockedBy).toBe('a');
+          expect(r.lockedUntil).toBe(9_000);
+        }
+        expect((await store.getRun('p0'))?.lockedBy).toBe('a');
+        expect((await store.getRun('busy'))?.lockedBy).toBe('other');
+        expect((await store.getRun('elsewhere'))?.lockedBy).toBeUndefined();
+        expect(await store.claimPendingRuns(0, 'a', 9_000, 1_000)).toEqual([]);
+
+        // Two claimers at once never take the same run. One may come back short of what is left
+        // (a row the other's scan locked is skipped, not waited on); a later claim takes the rest.
+        const [x, y] = await Promise.all([
+          store.claimPendingRuns(3, 'x', 9_000, 1_000, 'default'),
+          store.claimPendingRuns(3, 'y', 9_000, 1_000, 'default'),
+        ]);
+        const ids = [...x, ...y].map((r) => r.id);
+        expect(new Set(ids).size).toBe(ids.length);
+        expect(ids.length).toBeGreaterThan(0);
+        const rest = await store.claimPendingRuns(10, 'z', 9_000, 1_000, 'default');
+        expect([...ids, ...rest.map((r) => r.id)].sort()).toEqual(['p2', 'p3', 'p4', 'p5']);
+      },
+    );
+
+    t(
+      'keeps updatedAt to the millisecond, through createRun, updateRun and updateRunIf',
+      async () => {
+        // The engine recognizes its own suspend by the exact `updatedAt` it wrote (the sticky
+        // continuation's stamp): a store that rounds it never matches, and every turn replays.
+        const created = new Date(at.getTime() + 123);
+        await store.createRun(run({ updatedAt: created }));
+        expect((await store.getRun('r1'))?.updatedAt.getTime()).toBe(created.getTime());
+        const patched = new Date(at.getTime() + 60_456);
+        await store.updateRun('r1', { status: 'suspended', updatedAt: patched });
+        expect((await store.getRun('r1'))?.updatedAt.getTime()).toBe(patched.getTime());
+        const stamped = new Date(at.getTime() + 120_789);
+        expect(await store.updateRunIf('r1', ['suspended'], { updatedAt: stamped })).toBe(true);
+        expect((await store.getRun('r1'))?.updatedAt.getTime()).toBe(stamped.getTime());
+      },
+    );
+
+    t(
       'settleCheckpointsIfPending settles a batch wider than one statement (when implemented)',
       async () => {
         if (!store.settleCheckpointsIfPending) return;

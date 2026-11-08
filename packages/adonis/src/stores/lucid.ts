@@ -839,6 +839,70 @@ export class LucidStateStore implements StateStore {
     return (rows as RunRow[]).map(rowToRun);
   }
 
+  async claimPendingRuns(
+    limit: number,
+    owner: string,
+    leaseUntilMs: number,
+    nowMs: number,
+    namespace?: string,
+  ): Promise<WorkflowRun[]> {
+    if (limit <= 0) return [];
+    const client = this.client();
+    const dialect = client.dialect.name;
+    const free = (q: AnyQuery): AnyQuery => {
+      q.where('status', 'pending').andWhere((w: AnyQuery) => {
+        w.whereNull('locked_until').orWhere('locked_until', '<=', nowMs);
+      });
+      if (namespace !== undefined) q.whereIn('namespace', namespaceFilterValues(namespace));
+      return this.fenced(q);
+    };
+    const oldest = (q: AnyQuery): AnyQuery =>
+      free(q).select('id').orderBy('created_at', 'asc').orderBy('id', 'asc').limit(limit);
+    let rows: RunRow[];
+    if (dialect === 'postgres') {
+      // One statement: pick the oldest free pending rows, skipping any another claimer holds locked
+      // right now, and lease them. Several pollers at once each get a different slice.
+      const pick = oldest(client.from(DURABLE_TABLES.runs)).forUpdate().skipLocked();
+      rows = (await client
+        .from(DURABLE_TABLES.runs)
+        .whereIn('id', pick)
+        .update({ locked_by: owner, locked_until: leaseUntilMs })
+        .returning('*')) as RunRow[];
+    } else if (dialect === 'mysql') {
+      // No UPDATE … RETURNING: lock the batch (skipping rows another claimer holds), lease it and read
+      // it back, in one transaction.
+      rows = await client.transaction(async (trx) => {
+        const ids = (
+          (await oldest(trx.from(DURABLE_TABLES.runs)).forUpdate().skipLocked()) as Array<{
+            id: string;
+          }>
+        ).map((r) => r.id);
+        if (ids.length === 0) return [];
+        await trx
+          .from(DURABLE_TABLES.runs)
+          .whereIn('id', ids)
+          .update({ locked_by: owner, locked_until: leaseUntilMs });
+        return (await trx.from(DURABLE_TABLES.runs).whereIn('id', ids)) as RunRow[];
+      });
+    } else {
+      // SQLite has no row locks to skip: each run is taken with the lease's own compare-and-set.
+      const claimed: WorkflowRun[] = [];
+      const candidates = (await free(client.from(DURABLE_TABLES.runs))
+        .orderBy('created_at', 'asc')
+        .orderBy('id', 'asc')
+        .limit(limit)) as RunRow[];
+      for (const run of candidates.map(rowToRun)) {
+        if (await this.tryLockRun(run.id, owner, leaseUntilMs, nowMs)) {
+          claimed.push({ ...run, lockedBy: owner, lockedUntil: leaseUntilMs });
+        }
+      }
+      return claimed;
+    }
+    return rows
+      .map(rowToRun)
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
+  }
+
   async listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]> {
     const marker = await this.hasWakeMarkerColumn();
     const q = this.fenced(

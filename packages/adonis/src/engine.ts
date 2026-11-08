@@ -567,6 +567,8 @@ const leaseRefused = new WeakMap<RunResult, Promise<WakeStamp>>();
  * parent's next turn.
  */
 const LOCAL_RUN_CONCURRENCY = 256;
+/** Pending runs one {@link WorkflowEngine.runPending} poll takes at most. */
+const PENDING_POLL_BATCH = 100;
 /** How many dispatched runs this instance takes from the transport's run queue at once. */
 const RUN_CONSUMER_CONCURRENCY = 64;
 /** The most runs handed to {@link Transport.dispatchRuns} in one call. */
@@ -1015,6 +1017,8 @@ export class WorkflowEngine {
   private readonly reconcileMs: number | undefined;
   /** Parked workflow bodies kept between turns (see {@link WorkflowEngineDeps.stickyRuns}). */
   private readonly sticky: StickyCache;
+  /** Pending runs claimed by {@link runPending} for the turn about to run them, as read by the claim. */
+  private readonly claimedRuns = new Map<string, WorkflowRun>();
   /** The continuation each turn executing here runs in, by run id, while the turn runs. */
   private readonly turnContinuations = new Map<string, StickyContinuation>();
   /** The run row stamp (`updatedAt`, epoch ms) a turn here wrote when it settled `suspended`. */
@@ -4691,6 +4695,12 @@ export class WorkflowEngine {
   }
 
   private async resumeRunNow(runId: string, allowFailed: boolean): Promise<RunResult> {
+    // A run just claimed for this turn (runPending) is held, and was read by the claim.
+    const claimed = this.claimedRuns.get(runId);
+    if (claimed) {
+      this.claimedRuns.delete(runId);
+      return this.resumeLoadedRun(claimed, runId, allowFailed);
+    }
     // Take the lease and read the run in one round trip when the store can: `execute` then finds
     // the lease held for this turn. Not when a caller already holds it for this turn (a leased
     // sweep) or a turn of the run is in flight here; a failed take reads the run as before.
@@ -5829,8 +5839,58 @@ export class WorkflowEngine {
   async runPending(nowMs: number = this.clock()): Promise<RunResult[]> {
     // Oldest-first (FIFO), capped per call so a backlog drains over several polls without one sweep
     // fetching unboundedly. A run not picked up this tick is picked up the next.
-    const pending = await asHeartbeat(() => this.store.listPendingRuns(100, this.namespace));
+    // A store that can claims a batch in one statement (rows another instance is claiming are
+    // skipped, not raced for), and the batch runs concurrently, within this engine's run budget.
+    const claim = this.store.claimPendingRuns;
+    if (claim) {
+      if (this.draining) return [];
+      const room = Math.min(PENDING_POLL_BATCH, LOCAL_RUN_CONCURRENCY - this.inflight.size);
+      if (room <= 0) return [];
+      const claimed = await asHeartbeat(() =>
+        claim.call(this.store, room, this.instanceId, nowMs + this.leaseMs, nowMs, this.namespace),
+      );
+      return this.runClaimed(claimed, nowMs);
+    }
+    const pending = await asHeartbeat(() =>
+      this.store.listPendingRuns(PENDING_POLL_BATCH, this.namespace),
+    );
     return this.resumeLeased(pending, nowMs);
+  }
+
+  /**
+   * Run `claimed` (pending runs this instance just leased, read as locked): every turn starts at
+   * once, and each re-enters the lease taken for it without reading the run again. A run this
+   * instance cannot resume is skipped and logged, as {@link resumeLeased} does; its lease lapses.
+   */
+  private async runClaimed(claimed: WorkflowRun[], nowMs: number): Promise<RunResult[]> {
+    const turns = claimed.map(async (run): Promise<RunResult | undefined> => {
+      if (this.draining) {
+        // Drain began after the claim: give the lease back; the run stays for another instance.
+        await this.store.releaseRunLock(run.id, this.instanceId).catch(() => undefined);
+        return undefined;
+      }
+      this.lockedForTurn.add(run.id);
+      this.claimedRuns.set(run.id, run);
+      try {
+        return await this.resumeImplicit(run.id);
+      } catch (error) {
+        if (error instanceof NamespaceMismatch) return undefined;
+        if (error instanceof WorkflowNotRegistered) {
+          const settled = await this.settleUnregistered(run, nowMs).catch(() => undefined);
+          if (settled) return settled;
+          if (settled !== undefined) return undefined;
+        }
+        console.error(
+          `[adonis-durable] could not resume run ${run.id} (${run.workflow}@${run.workflowVersion}); leaving it for another instance or a later tick:`,
+          error,
+        );
+        return undefined;
+      } finally {
+        this.lockedForTurn.delete(run.id);
+        this.claimedRuns.delete(run.id);
+      }
+    });
+    return (await Promise.all(turns)).filter((r): r is RunResult => r !== undefined);
   }
 
   /**
