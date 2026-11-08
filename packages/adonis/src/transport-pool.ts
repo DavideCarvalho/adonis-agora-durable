@@ -36,6 +36,14 @@ export class TransportPool {
     return this.replying.size > 0;
   }
 
+  /** `task` as sent on transport `id`: a reply goes back only on a transport that routes it, so
+   *  elsewhere `replyTo` is dropped (its result rides the shared results). */
+  private withReply<T extends { replyTo?: string | undefined }>(task: T, id: string): T {
+    if (task.replyTo === undefined || this.replying.has(id)) return task;
+    const { replyTo: _replyTo, ...rest } = task;
+    return rest as T;
+  }
+
   get size(): number {
     return this.transports.length;
   }
@@ -66,10 +74,7 @@ export class TransportPool {
     let lastErr: unknown;
     for (const { id, transport } of this.ordered(preferId)) {
       try {
-        // A reply goes back only on a transport that routes it; elsewhere it is dropped from the task.
-        const { replyTo, ...rest } = task;
-        const reply = replyTo !== undefined && this.replying.has(id) ? { replyTo } : {};
-        await transport.dispatch({ ...rest, ...reply, transport: id });
+        await transport.dispatch({ ...this.withReply(task, id), transport: id });
         return;
       } catch (err) {
         lastErr = err;
@@ -88,7 +93,9 @@ export class TransportPool {
     const first = this.ordered(preferId)[0];
     if (first?.transport.dispatchMany) {
       try {
-        await first.transport.dispatchMany(tasks.map((task) => ({ ...task, transport: first.id })));
+        await first.transport.dispatchMany(
+          tasks.map((task) => ({ ...this.withReply(task, first.id), transport: first.id })),
+        );
         return;
       } catch (err) {
         if (!this.warnedBulkRefusal) {
