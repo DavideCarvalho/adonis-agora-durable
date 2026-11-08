@@ -274,7 +274,11 @@ export class WorkflowSuspended extends Error {
   /** Marks this as a control-flow signal — see {@link isWorkflowControlFlowSignal}. */
   readonly [CONTROL_FLOW_SIGNAL] = true;
   constructor(wakeAt?: number, waitSeqs?: number[], fan?: FanJoin, stepFans?: StepFanRange[]) {
+    // Control flow, thrown at every suspension point: skip capturing a stack trace nobody reads.
+    const limit = Error.stackTraceLimit;
+    Error.stackTraceLimit = 0;
     super('workflow suspended');
+    Error.stackTraceLimit = limit;
     this.name = 'WorkflowSuspended';
     this.wakeAt = wakeAt;
     this.waitSeqs = waitSeqs;
