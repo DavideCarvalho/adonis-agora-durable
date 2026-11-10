@@ -118,11 +118,17 @@ export interface RedisControlPlaneOptions {
   /**
    * Deployment namespace folded into the channel name this control plane LISTENS on. Unset adopts the
    * engine's namespace (see {@link RedisControlPlane.useNamespace}); an explicit value wins. `default`
-   * keeps the bare `` `${prefix}-control` `` channel. With no namespace at all (an engine over every
-   * namespace), it also listens on every namespace's channel ({@link namespacesPattern}). It does not pin publishing: a message about a
+   * keeps the bare `` `${prefix}-control` `` channel. It does not pin publishing: a message about a
    * run still goes to the channel of that run's namespace (see {@link RedisControlPlane.publishControl}).
    */
   namespace?: string;
+  /**
+   * Which namespaces this instance observes. `'own'`: its own channel only. `'all'`: also every
+   * namespace's channel (a `<prefix>-*-control` pattern subscription), for a console's live tail.
+   * Unset: `'all'` for an engine with no namespace, or once the process mounts the durable dashboard
+   * (see {@link RedisControlPlane.observeAll}); `'own'` otherwise. An explicit value wins.
+   */
+  observe?: 'all' | 'own';
   /**
    * How often (ms) to PING the duplicated pub/sub subscriber connection to detect — and recover
    * from — a silent connection loss. A subscriber connection never WRITEs on its own (it only
@@ -200,6 +206,13 @@ export class RedisControlPlane implements ControlPlane {
   /** Only ever set on the raw-ioredis path — it is the `duplicate()`d subscriber connection. */
   private subscriber: IoredisSubscriber | undefined;
   private subscribed = false;
+  private readonly observe: 'all' | 'own' | undefined;
+  /** {@link observeAll} was called (the dashboard is mounted in this process). */
+  private observeAllRequested = false;
+  /** The pattern subscription is in place (it is added once, possibly after {@link onControl}). */
+  private patternSubscribed = false;
+  /** Subscribes the namespaces pattern on the connection {@link onControl} set up. */
+  private subscribePattern: ((pattern: string) => void) | undefined;
   private readonly pingIntervalMs: number | false;
   private pingWatchdogTimer: ReturnType<typeof setInterval> | undefined;
   private closed = false;
@@ -208,6 +221,7 @@ export class RedisControlPlane implements ControlPlane {
     this.connection = options.connection;
     this.prefix = options.prefix ?? 'durable';
     this.namespace = options.namespace;
+    this.observe = options.observe;
     this.explicitNamespace = options.namespace !== undefined;
     this.pingIntervalMs = normalizePingInterval(options.pingIntervalMs);
   }
@@ -222,11 +236,32 @@ export class RedisControlPlane implements ControlPlane {
    * The pattern an engine with no namespace (the operator view over every namespace) also listens on:
    * every namespace's channel, `<prefix>-<namespace>-control`. It never matches the bare
    * `<prefix>-control` (the `*` sits between two dashes), so no message arrives twice. `undefined`
-   * once a namespace is set: a namespaced engine hears its own channel only.
+   * when this instance observes its own namespace only (see {@link RedisControlPlaneOptions.observe}).
    */
   get namespacesPattern(): string | undefined {
-    if (this.namespace !== undefined) return undefined;
-    return `${escapeGlob(this.prefix)}-*-control`;
+    const all =
+      this.observe === 'all' ||
+      (this.observe === undefined && (this.namespace === undefined || this.observeAllRequested));
+    return all ? `${escapeGlob(this.prefix)}-*-control` : undefined;
+  }
+
+  /**
+   * Observe every namespace from now on: the process mounts a console (the durable dashboard), whose
+   * live tail follows runs of every namespace whatever the engine's own namespace is. Adds the
+   * pattern subscription even after {@link onControl} subscribed. A no-op with `observe: 'own'`.
+   */
+  observeAll(): void {
+    if (this.observe === 'own') return;
+    this.observeAllRequested = true;
+    this.armPattern();
+  }
+
+  /** Subscribe the namespaces pattern once, when this instance observes all and has subscribed. */
+  private armPattern(): void {
+    const pattern = this.namespacesPattern;
+    if (pattern === undefined || this.patternSubscribed || !this.subscribePattern) return;
+    this.patternSubscribed = true;
+    this.subscribePattern(pattern);
   }
 
   /** The channel of `namespace` (`''`, `default` and unset are all the bare `<prefix>-control`). */
@@ -273,19 +308,19 @@ export class RedisControlPlane implements ControlPlane {
       }
       handler(msg);
     };
-    const pattern = this.namespacesPattern;
-
     if (isIoredisClient(this.connection)) {
       // raw ioredis: a subscriber connection can't run normal commands → use a dedicated dup.
       const sub = this.connection.duplicate();
       this.subscriber = sub;
       swallowSubscribe(sub.subscribe(this.channel), () => this.closed, 'control-plane');
       sub.on?.('message', (_channel, payload) => deliver(payload));
-      if (pattern !== undefined && typeof sub.psubscribe === 'function') {
+      this.subscribePattern = (pattern) => {
+        if (typeof sub.psubscribe !== 'function') return;
         // ioredis's `autoResubscribe` restores pattern subscriptions on reconnect too.
         swallowSubscribe(sub.psubscribe(pattern), () => this.closed, 'control-plane');
         sub.on?.('pmessage', (_pattern, _channel, payload) => deliver(payload, true));
-      }
+      };
+      this.armPattern();
       this.trackSubscriber(sub);
     } else {
       // `@adonisjs/redis` connection: manages its own subscriber connection; handler gets the message.
@@ -294,13 +329,16 @@ export class RedisControlPlane implements ControlPlane {
         () => this.closed,
         'control-plane',
       );
-      if (pattern !== undefined && typeof this.connection.psubscribe === 'function') {
+      const connection = this.connection;
+      this.subscribePattern = (pattern) => {
+        if (typeof connection.psubscribe !== 'function') return;
         swallowSubscribe(
-          this.connection.psubscribe(pattern, (_channel, payload) => deliver(payload, true)),
+          connection.psubscribe(pattern, (_channel, payload) => deliver(payload, true)),
           () => this.closed,
           'control-plane',
         );
-      }
+      };
+      this.armPattern();
       // The connection keeps its ioredis subscriber on the public `ioSubscriberConnection` field
       // (created by the subscribe above, replaced if it ends). Watch THAT one: it has the same
       // silent-death failure mode as the duplicated subscriber on the ioredis path. Read on every

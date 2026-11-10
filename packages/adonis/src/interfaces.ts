@@ -2165,6 +2165,11 @@ export interface ControlPlane {
    * {@link onControl}, and only when the engine has a namespace.
    */
   useNamespace?(namespace: string): void;
+  /**
+   * Optional: observe every namespace, not only the engine's own — the process mounts a console whose
+   * live tail follows runs of every namespace. May be called after {@link onControl}.
+   */
+  observeAll?(): void;
 }
 
 /** A message on the {@link ControlPlane}. `from` is the originating engine's `instanceId`, so a

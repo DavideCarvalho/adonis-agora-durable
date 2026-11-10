@@ -232,6 +232,64 @@ describe.skipIf(!REDIS_URL)('RedisControlPlane (real Redis)', () => {
     expect(seenByOther).toEqual([]);
   });
 
+  /** A worker in `bulas` and an observer in `default`, as in a web pod that also mounts the console. */
+  async function defaultObserver(prefix: string, observe?: 'all' | 'own', mountsConsole = true) {
+    const store = new InMemoryStateStore();
+    const bulas = new WorkflowEngine({
+      store,
+      controlPlane: plane(prefix),
+      instanceId: 'bulas-worker',
+      namespace: 'bulas',
+    });
+    const web = new WorkflowEngine({
+      store,
+      controlPlane: new RedisControlPlane({
+        connection: client(),
+        prefix,
+        ...(observe ? { observe } : {}),
+      }),
+      instanceId: 'web',
+      namespace: 'default',
+    });
+    // What the dashboard provider does once the app booted: after the subscription is in place.
+    if (mountsConsole) web.observeAllNamespaces();
+    const seen: string[] = [];
+    web.subscribe((e) => {
+      if (e.runId === 'bulas-run') seen.push(e.type);
+    });
+    await subscribedOn(`${prefix}-bulas-control`, 1);
+    await subscribedOn(`${prefix}-control`, 1);
+    bulas.register('wf', '1', async (ctx) => {
+      await ctx.localStep('a', async () => 1);
+      return 'ok';
+    });
+    return { bulas, seen };
+  }
+
+  it('a `default` web pod that mounts the console observes a `bulas` worker live', async () => {
+    const prefix = `${PREFIX}-${++ns}`;
+    const { bulas, seen } = await defaultObserver(prefix);
+    await patternSubscribed(`${prefix}-*-control`);
+    await startRun(bulas, 'wf', {}, 'bulas-run');
+    const expected = ['run.started', 'step.started', 'step.completed', 'run.completed'];
+    await until(() => seen.length >= expected.length);
+    await delay(100);
+    expect(seen).toEqual(expected);
+  });
+
+  it('a `default` worker without the console, or with observe: own, observes its own namespace only', async () => {
+    for (const [observe, mounts] of [
+      [undefined, false],
+      ['own', true],
+    ] as const) {
+      const prefix = `${PREFIX}-${++ns}`;
+      const { bulas, seen } = await defaultObserver(prefix, observe, mounts);
+      await startRun(bulas, 'wf', {}, 'bulas-run');
+      await delay(300);
+      expect(seen).toEqual([]);
+    }
+  });
+
   it('a pattern subscription survives the watchdog reconnecting the subscriber', async () => {
     const prefix = `${PREFIX}-${++ns}`;
     const cp = new RedisControlPlane({ connection: client(), prefix, pingIntervalMs: 50 });

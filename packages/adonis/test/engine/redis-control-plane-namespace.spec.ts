@@ -36,7 +36,7 @@ function fakeConnection() {
   };
 }
 
-function plane(options: { prefix?: string; namespace?: string } = {}) {
+function plane(options: { prefix?: string; namespace?: string; observe?: 'all' | 'own' } = {}) {
   const fake = fakeConnection();
   const cp = new RedisControlPlane({
     connection: fake.connection,
@@ -167,5 +167,29 @@ describe('RedisControlPlane publishes a message about a run on that run’s name
     expect(messages.filter((m) => m.kind === 'cancel').map((m) => m.channel)).toEqual([
       'durable-control',
     ]);
+  });
+});
+
+describe('RedisControlPlane observe option', () => {
+  it('observeAll adds the pattern after the subscription, once; observe: own refuses it', () => {
+    const a = plane({ namespace: 'default' });
+    new WorkflowEngine({
+      store: new InMemoryStateStore(),
+      controlPlane: a.cp,
+      namespace: 'default',
+    });
+    expect(a.subscribed).toEqual(['durable-control']);
+    a.cp.observeAll();
+    a.cp.observeAll();
+    expect(a.subscribed).toEqual(['durable-control', 'pattern:durable-*-control']);
+
+    const own = plane({ observe: 'own' });
+    new WorkflowEngine({ store: new InMemoryStateStore(), controlPlane: own.cp });
+    own.cp.observeAll();
+    expect(own.subscribed).toEqual(['durable-control']);
+
+    const all = plane({ namespace: 'bulas', observe: 'all' });
+    new WorkflowEngine({ store: new InMemoryStateStore(), controlPlane: all.cp });
+    expect(all.subscribed).toEqual(['durable-bulas-control', 'pattern:durable-*-control']);
   });
 });

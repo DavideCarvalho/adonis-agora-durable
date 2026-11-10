@@ -76,9 +76,11 @@ channel of that run's namespace. A console with no namespace that cancels a run 
 worker therefore reaches it at once, with no extra setting: don't pin `namespace: 'default'` on the
 control plane for that. Messages with no run stay on the publisher's own channel.
 
-An engine with no namespace observes every namespace: it listens on `<prefix>-control` and on every
-`<prefix>-<namespace>-control`, so a console's live tail still shows the runs of namespaced workers.
-An engine with a namespace observes only its own. Delivery is
+A process that mounts the durable dashboard, or an engine with no namespace, observes every
+namespace: it also listens on every `<prefix>-<namespace>-control`, so the console's live tail still
+shows the runs of namespaced workers, even on a web pod with `namespace: 'default'`. Any other
+namespaced engine (a worker) observes only its own. `controlPlanes.redis({ observe: 'own' | 'all' })`
+overrides it. Delivery is
 best-effort: the cancel is recorded in the store first, and the message only makes it immediate.
 
 This is a wire change for namespaced deployments:

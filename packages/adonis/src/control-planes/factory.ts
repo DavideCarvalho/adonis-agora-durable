@@ -42,6 +42,12 @@ export interface RedisControlPlaneConfig {
    */
   namespace?: string;
   /**
+   * Which namespaces this instance observes: `'own'` (its channel only) or `'all'` (every
+   * namespace's channel too). Default: `'all'` for an engine with no namespace or a process that
+   * mounts the durable dashboard, `'own'` otherwise.
+   */
+  observe?: 'all' | 'own';
+  /**
    * How often (ms) to PING the connection's pub/sub subscriber, so one a VPN/NAT/idle timeout dropped
    * silently is reconnected (and resubscribed) instead of sitting deaf until a restart. `0` or `false`
    * disables it. Default `30_000`.
@@ -82,6 +88,7 @@ export const controlPlanes = {
         connection,
         ...(config.prefix !== undefined ? { prefix: config.prefix } : {}),
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
+        ...(config.observe !== undefined ? { observe: config.observe } : {}),
         ...(config.pingIntervalMs !== undefined ? { pingIntervalMs: config.pingIntervalMs } : {}),
       });
     };

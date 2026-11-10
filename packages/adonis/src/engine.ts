@@ -2266,6 +2266,15 @@ export class WorkflowEngine {
    * worker bridge can use this for cooperative cancellation: abort the in-flight work for `runId`
    * instead of finishing it just to have the result discarded. Returns an unsubscribe function.
    */
+  /**
+   * Observe the control-plane traffic of every namespace, not only this engine's own: the process
+   * mounts a console (the durable dashboard) whose live tail follows runs of every namespace. The
+   * dashboard provider calls it; a control plane without namespaced channels ignores it.
+   */
+  observeAllNamespaces(): void {
+    this.controlPlane?.observeAll?.();
+  }
+
   onCancel(listener: (runId: string) => void): () => void {
     this.cancelListeners.add(listener);
     return () => this.cancelListeners.delete(listener);

@@ -195,6 +195,8 @@ export default class DashboardProvider {
     if ((this.app as { getMode?: () => string }).getMode?.() === 'warmup') return;
     try {
       const engine = await this.app.container.make(WorkflowEngine);
+      // The console's live tail follows runs of every namespace, whatever this engine's own is.
+      engine.observeAllNamespaces();
       this.detachDiagnostics = this.diagnostics.attach(engine);
       this.metricsCollector = collectMetrics(engine);
     } catch {
