@@ -119,6 +119,41 @@ describe('compensating cancel is honored on every exit of the turn', () => {
     },
   );
 
+  it('a cancel that lands while continue-as-new forks still wins over the completion', async () => {
+    const store = new InMemoryStateStore();
+    const owner = new WorkflowEngine({ store, instanceId: 'owner' });
+    const operator = new WorkflowEngine({
+      store,
+      instanceId: 'operator',
+      runDispatcher: { dispatch: () => {} },
+    });
+    const undone: string[] = [];
+    for (const engine of [owner, operator]) {
+      engine.register('saga', '1', async (ctx: WorkflowCtx, input) => {
+        await ctx.localStep('reserve', async () => 'r', {
+          compensate: async () => {
+            undone.push('reserve');
+          },
+        });
+        if (input === 'first') throw new ContinueAsNew('next');
+        return 'done';
+      });
+    }
+    // The cancel lands after the turn's re-read, right as the continuation is persisted.
+    const create = store.createRun.bind(store);
+    store.createRun = async (run) => {
+      await create(run);
+      if (run.id === 'r1~1') await operator.cancel('r1', { compensate: true });
+    };
+    await owner.start('saga', 'first', 'r1');
+
+    expect(await statusOf(store, 'r1', 'cancelled')).toBe('cancelled');
+    expect(undone).toEqual(['reserve']);
+    expect(await statusOf(store, 'r1~1', 'cancelled')).toBe('cancelled');
+    await owner.drain();
+    await operator.drain();
+  });
+
   it('a run without a pending cancel completes normally', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });

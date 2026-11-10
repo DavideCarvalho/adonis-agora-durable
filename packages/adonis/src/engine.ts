@@ -8915,8 +8915,9 @@ export class WorkflowEngine {
         // complete this one. Zombie fence first — a fenced turn must not fork a continuation either.
         if (this.leaseLostRuns.has(run.id)) return await this.echoCurrentStatus(run.id);
         // A cancel in flight wins over continue-as-new: undo + cancel instead of forking the next run.
-        // The run is re-read here (continue-as-new is rare) because the forked run would be created
-        // before any settle could find a cancel another pod persisted during this turn.
+        // The run is re-read here (continue-as-new is rare) so a cancel another pod persisted during
+        // this turn usually stops the fork; one that lands after the read loses the conditional
+        // completion below instead.
         if (
           this.takeCancelIntent(run.id) ||
           (await this.store.getRun(run.id))?.status === 'cancelling'
@@ -8935,12 +8936,23 @@ export class WorkflowEngine {
         // `dispatch: false`: the tracked handoff below owns the pickup. The continuation inherits
         // the parent RUN's namespace so a tenant's chain stays in its worker-pool partition.
         await this.startCore(run.workflow, err.input, nextId, { namespace: run.namespace }, false);
-        await this.store.updateRun(run.id, {
+        // Conditional, like every settle: a cancel persisted after the re-read above (`cancelling`, or a
+        // plain `cancelled`) must win over this completion. The continuation already exists then, and
+        // nothing has handed it off: cancel it, and unwind this run if the cancel compensates.
+        const completed = await this.store.updateRunIf(run.id, SETTLE_ELIGIBLE_STATUSES, {
           status: 'completed',
           output: undefined,
           error: undefined,
           updatedAt: new Date(),
         });
+        if (!completed) {
+          await this.cancel(nextId);
+          const current = await this.store.getRun(run.id);
+          if (current?.status === 'cancelling' && !this.leaseLostRuns.has(run.id)) {
+            return await this.compensateAndCancel(run, compensations);
+          }
+          return await this.echoCurrentStatus(run.id);
+        }
         this.emit(
           {
             type: 'run.completed',
