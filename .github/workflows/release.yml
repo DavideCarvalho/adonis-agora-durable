@@ -269,8 +269,16 @@ jobs:
 
       # Stamp every pending-changeset package (and any out-of-range dependent) to
       # `0.0.0-beta-<datetime>` in the runner only — never committed.
+      #
+      # Changesets refuses a snapshot while pre mode is on (`.changeset/pre.json`): every push to
+      # master already publishes a prerelease then, so say that instead of failing on its error.
       - name: Version as beta snapshot
-        run: pnpm changeset version --snapshot beta
+        run: |
+          if [ -f .changeset/pre.json ]; then
+            echo "::error::Pre mode is on (.changeset/pre.json): every push to master publishes a prerelease, so snapshots are disabled until \`changeset pre exit\`."
+            exit 1
+          fi
+          pnpm changeset version --snapshot beta
 
       - name: Build all packages
         run: pnpm --filter './packages/*' build
