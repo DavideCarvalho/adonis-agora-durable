@@ -160,7 +160,7 @@ describe('durableClient: human-in-the-loop verbs (signal / update / task) and sc
     await expect(durableClient.update('r1', 'set-limit', { limit: -1 })).rejects.toThrow(
       'limit must be positive',
     );
-    expect(calls[0]?.url).toBe('/durable/api/runs/r1/update/set-limit');
+    expect(calls[0]?.url).toBe('/durable/api/runs/r1/updates/set-limit');
   });
 
   it('completeTask/failTask keep the { result, delivered } envelope — buffered is a success, not a miss', async () => {

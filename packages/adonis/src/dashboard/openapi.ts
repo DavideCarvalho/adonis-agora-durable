@@ -367,7 +367,7 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
           },
         },
       },
-      '/runs/{id}/update/{name}': {
+      '/runs/{id}/updates/{name}': {
         post: {
           summary: "Deliver a validated update to the run's ctx.onUpdate(name) point",
           parameters: [idParam, nameParam('The update name.')],

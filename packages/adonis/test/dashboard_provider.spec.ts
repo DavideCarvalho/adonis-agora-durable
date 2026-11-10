@@ -70,6 +70,12 @@ describe('DashboardProvider — boots inside a real AdonisJS app', () => {
         'durable_dashboard.webhooks.deliver',
       ]),
     );
+
+    // The update route is plural, matching the Aviary dashboard API, and has no singular alias.
+    const routes = router.toJSON().root!;
+    const update = routes.find((route) => route.name === 'durable_dashboard.runs.update');
+    expect(update?.pattern).toMatch(/\/api\/runs\/:id\/updates\/:name$/);
+    expect(routes.some((route) => /\/runs\/:id\/update\/:name$/.test(route.pattern))).toBe(false);
   });
 });
 

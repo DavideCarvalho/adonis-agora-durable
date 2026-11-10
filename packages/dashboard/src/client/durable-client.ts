@@ -298,7 +298,7 @@ export interface ScheduleInfo {
   lastRunStatus?: RunStatus;
 }
 
-/** Outcome of `POST /runs/:id/update/:name` — the workflow's registered validator arbitrated
+/** Outcome of `POST /runs/:id/updates/:name` — the workflow's registered validator arbitrated
  *  server-side. The rejected arm never reaches a caller of {@link durableClient.update}: the server
  *  spells a rejection as a 422 whose body carries it, thrown as a {@link DurableActionError}. */
 export interface UpdateResult {
@@ -698,7 +698,7 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
 /**
  * A refusal the console must READ, not just report: the human-in-the-loop verbs answer with
  * structured bodies — `POST /runs/:id/signal`'s 409 carries `waitingOn` (the tokens the run IS
- * parked on, offered as choices), `POST /runs/:id/update/:name`'s 422 carries the validator's
+ * parked on, offered as choices), `POST /runs/:id/updates/:name`'s 422 carries the validator's
  * `reason`. The plain {@link http} throws a bare status-line `Error` and drops the body; the verbs
  * below throw this instead, body attached. `message` prefers the body's own `error` copy.
  */
@@ -988,7 +988,7 @@ export const durableClient = {
    *  message is the validator's reason, and nothing is delivered. */
   async update(id: string, name: string, arg?: unknown): Promise<UpdateResult> {
     const res = await postAction<{ result: UpdateResult }>(
-      `/runs/${encodeURIComponent(id)}/update/${encodeURIComponent(name)}`,
+      `/runs/${encodeURIComponent(id)}/updates/${encodeURIComponent(name)}`,
       { arg },
     );
     return res.result;
