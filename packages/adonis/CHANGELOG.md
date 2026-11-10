@@ -1,5 +1,17 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.4
+
+### Major Changes
+
+- [#490](https://github.com/DavideCarvalho/adonis-agora-durable/pull/490) [`89e0305`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/89e030531c92be31657ba10519ff033b330bcbbe) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A compensating cancel no longer writes or reads a buffered `cancel:<runId>` marker. The persisted `cancelling` status is the durable intent: a turn picks it up at start, and a turn already running on another pod when the cancel lands finds it at its settle (the status check no longer matches) and runs the saga undo there, on every exit (return, throw, continue-as-new, suspend). Every turn exit saves a buffered-signal read and re-write.
+  
+  Upgrade note: stop pre-1.0 engines before or while deploying 1.0. They rely on the marker 1.0 no longer writes, so while one of them still executes a run, a compensating cancel issued from a 1.0 pod can wait for crash recovery before its undo runs.
+
+### Patch Changes
+
+- [#493](https://github.com/DavideCarvalho/adonis-agora-durable/pull/493) [`267b719`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/267b7199d2e07a5e720d4d2de91b235f736056dc) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The db transport's run queue no longer takes runs after its consumer's `stop()` resolved. A poll that was already in flight when `stop()` was called (waiting on the claim's read) could claim runs dispatched afterwards and hand them to the handler. `stop()` now waits for that poll, and a poll that finds the consumer stopping gives back what it claimed.
+
 ## 1.0.0-rc.3
 
 ### Major Changes
