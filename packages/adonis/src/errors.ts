@@ -21,6 +21,20 @@ export class FatalError extends Error {
 }
 
 /**
+ * Thrown by a store's `createRun` when a run with that id already exists. The store detects it
+ * without a failing statement (an insert that writes nothing on conflict), so a surrounding database
+ * transaction stays usable; the engine then reads the existing run and reports it.
+ */
+export class RunAlreadyExistsError extends Error {
+  readonly runId: string;
+  constructor(runId: string) {
+    super(`run "${runId}" already exists`);
+    this.name = 'RunAlreadyExistsError';
+    this.runId = runId;
+  }
+}
+
+/**
  * Thrown by `start` when a run would exceed its concurrency quota: `active` runs sharing the quota
  * `key` are already in flight (in the quota's counted statuses) and the limit is `limit`. Nothing was
  * created — the start is rejected up front, so the caller can shed load or answer "try again in a

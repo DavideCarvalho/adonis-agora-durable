@@ -1,8 +1,10 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Database } from '@adonisjs/lucid/database';
 import type {
   QueryClientContract,
   TransactionClientContract,
 } from '@adonisjs/lucid/types/database';
+import { RunAlreadyExistsError } from '../errors.js';
 import type {
   AttributeFilter,
   BufferedSignalRow,
@@ -156,10 +158,11 @@ export class LucidStateStore implements StateStore {
 
   /**
    * The Postgres hot path (see `lucid-pg-hot-path.ts`): the statements a turn and a step result run
-   * on every step, as constant SQL. `undefined` on any other dialect, or with Lucid's `debug` on.
-   * Resolved per call, like {@link client}: under a global transaction it is the transaction's.
+   * on every step, as constant SQL. `undefined` on any other dialect, with Lucid's `debug` on, or
+   * under a (global) transaction. Resolved per call, like {@link client}.
    */
   private hot(): LucidPgHotPath | undefined {
+    // Not on a transaction (an app's global one): see `LucidPgHotPath.for`.
     return LucidPgHotPath.for(this.client(), {
       preparedStatements: this.options.preparedStatements,
     });
@@ -176,6 +179,11 @@ export class LucidStateStore implements StateStore {
 
   // --- runs ---------------------------------------------------------------
 
+  /**
+   * Insert the run, or reject with {@link RunAlreadyExistsError} when its id is taken. The insert
+   * writes nothing on a conflict instead of failing, so a run that already exists never aborts a
+   * surrounding transaction (an app's test `wrapInGlobalTransaction`, on Postgres).
+   */
   async createRun(run: WorkflowRun): Promise<void> {
     if (normalizeAttributeRows(run.id, run.searchAttributes).length === 0) {
       // Nothing to index: the insert, then clear any attribute rows a deleted run of this id left,
@@ -184,20 +192,25 @@ export class LucidStateStore implements StateStore {
       if (hot) {
         const row = runToRow(run) as unknown as Record<string, unknown>;
         const keys = Object.keys(row);
-        await hot.run(
-          insertSql(DURABLE_TABLES.runs, keys),
+        const inserted = await hot.rows(
+          insertRunIfAbsentSql(keys),
           keys.map((k) => row[k]),
         );
+        if (inserted.length === 0) throw new RunAlreadyExistsError(run.id);
         await hot.run(DELETE_ATTRIBUTES_SQL, [run.id]);
         return;
       }
       const client = this.client();
-      await client.table(DURABLE_TABLES.runs).insert(runToRow(run));
+      if (!(await insertIfAbsent(client, DURABLE_TABLES.runs, runToRow(run), ['id']))) {
+        throw new RunAlreadyExistsError(run.id);
+      }
       await client.from(DURABLE_TABLES.attributes).where('run_id', run.id).delete();
       return;
     }
     await this.client().transaction(async (trx) => {
-      await trx.table(DURABLE_TABLES.runs).insert(runToRow(run));
+      if (!(await insertIfAbsent(trx, DURABLE_TABLES.runs, runToRow(run), ['id']))) {
+        throw new RunAlreadyExistsError(run.id);
+      }
       await this.reindexAttributes(trx, run.id, run.searchAttributes);
     });
   }
@@ -740,25 +753,7 @@ export class LucidStateStore implements StateStore {
       const values = keys.map((k) => (row as unknown as Record<string, unknown>)[k] ?? null);
       return (await hot.rows(insertCheckpointIfAbsentSql(keys), values)).length > 0;
     }
-    if (client.dialect.name === 'postgres') {
-      const inserted = (await client
-        .insertQuery()
-        .table(DURABLE_TABLES.checkpoints)
-        .knexQuery.insert(row)
-        .onConflict(['run_id', 'seq'])
-        .ignore()
-        .returning('seq')) as unknown[];
-      return inserted.length > 0;
-    }
-    // MySQL and SQLite: a plain INSERT, whose duplicate-key error is the "already there" answer (an
-    // `INSERT IGNORE` would also swallow every other error, and reports no row count through Knex).
-    try {
-      await client.table(DURABLE_TABLES.checkpoints).insert(row);
-      return true;
-    } catch (err) {
-      if (isDuplicateKey(err)) return false;
-      throw err;
-    }
+    return insertIfAbsent(client, DURABLE_TABLES.checkpoints, row, ['run_id', 'seq']);
   }
 
   /** Persist the latest worker heartbeat on the step's checkpoint row (see the interface doc).
@@ -1851,6 +1846,50 @@ export class LucidStateStore implements StateStore {
 }
 
 /**
+ * Serialize the store's work on a transaction client. A transaction is ONE connection: two store
+ * calls in flight at once (a background run pickup next to a request's own write, under an app's test
+ * `wrapInGlobalTransaction`) would send overlapping queries down it, which `pg` deprecates (and 9.0
+ * removes), and a statement could land inside a savepoint the other call is rolling back. So while
+ * the store's client is a transaction, each call waits for the previous one on that transaction to
+ * finish. Re-entrant: a store method calling another one in the same call does not wait for itself.
+ * A store on a plain connection is untouched (its pool hands each query its own connection).
+ */
+const transactionTails = new WeakMap<object, Promise<unknown>>();
+const holdingTransaction = new AsyncLocalStorage<object>();
+
+function serializeOnTransactions(proto: object): void {
+  const AsyncFunction = (async () => {}).constructor;
+  for (const name of Object.getOwnPropertyNames(proto)) {
+    if (name === 'constructor') continue;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, name);
+    const original = descriptor?.value as unknown;
+    if (typeof original !== 'function' || !(original instanceof AsyncFunction)) continue;
+    const method = original as (this: LucidStateStore, ...args: unknown[]) => Promise<unknown>;
+    Object.defineProperty(proto, name, {
+      ...descriptor,
+      value: function (this: LucidStateStore, ...args: unknown[]): Promise<unknown> {
+        const client = (this as unknown as { client(): QueryClientContract }).client();
+        if (!client.isTransaction || holdingTransaction.getStore() === client) {
+          return method.apply(this, args);
+        }
+        const previous = transactionTails.get(client) ?? Promise.resolve();
+        const run = previous.then(
+          () => holdingTransaction.run(client, () => method.apply(this, args)),
+          () => holdingTransaction.run(client, () => method.apply(this, args)),
+        );
+        transactionTails.set(
+          client,
+          run.catch(() => undefined),
+        );
+        return run;
+      },
+    });
+  }
+}
+
+serializeOnTransactions(LucidStateStore.prototype);
+
+/**
  * Escape LIKE metacharacters (`%`, `_`) — and the escape character itself — using `!` as the ESCAPE
  * char. `!` because a backslash inside a SQL string literal is dialect-divergent (MySQL treats it as
  * its own string escape; SQLite has no default LIKE escape at all), while `'!'` is byte-identical
@@ -1999,6 +2038,14 @@ function insertSql(table: string, keys: string[]): string {
   });
 }
 
+/** {@link insertSql} of a run that writes nothing when its id is taken, returning the id it wrote. */
+function insertRunIfAbsentSql(keys: string[]): string {
+  return shapedSql(
+    `insert-run-if-absent:${keys.join(',')}`,
+    () => `${insertSql(DURABLE_TABLES.runs, keys)} on conflict ("id") do nothing returning "id"`,
+  );
+}
+
 /** {@link insertSql} of a checkpoint that writes nothing when its position is taken. */
 function insertCheckpointIfAbsentSql(keys: string[]): string {
   return shapedSql(
@@ -2086,15 +2133,41 @@ async function settleResultsReturningPg(
 }
 
 /** A duplicate-key violation, as MySQL and SQLite report it through Knex. */
-function isDuplicateKey(err: unknown): boolean {
-  const e = err as { code?: unknown; errno?: unknown } | null;
-  return (
-    e?.code === 'ER_DUP_ENTRY' ||
-    e?.errno === 1062 ||
-    e?.code === 'SQLITE_CONSTRAINT_PRIMARYKEY' ||
-    e?.code === 'SQLITE_CONSTRAINT_UNIQUE' ||
-    e?.code === '23505'
-  );
+/**
+ * Insert `row` into `table` unless a row with the same `key` exists, as a statement that never
+ * fails on the conflict, and say whether it wrote. A failing statement would abort a surrounding
+ * Postgres transaction, so the conflict is never detected by catching a duplicate-key error.
+ *
+ * - Postgres and SQLite: `INSERT … ON CONFLICT (key) DO NOTHING RETURNING key`, a row back when it wrote.
+ * - MySQL: `INSERT … ON DUPLICATE KEY UPDATE key = IF(LAST_INSERT_ID(1), key, key)`, which leaves an
+ *   existing row as it is and reports `insertId` 1 for it, 0 for a row it wrote (`table` has no
+ *   AUTO_INCREMENT). The affected-row count cannot tell them apart (mysql2 counts found rows), and
+ *   `INSERT IGNORE` would turn a value the column cannot hold into a silent truncation.
+ */
+async function insertIfAbsent(
+  client: Client,
+  table: string,
+  row: object,
+  key: string[],
+): Promise<boolean> {
+  if (client.dialect.name === 'mysql') {
+    const first = key[0] as string;
+    const knex = client.getWriteClient();
+    const { sql, bindings } = client
+      .insertQuery()
+      .table(table)
+      .knexQuery.insert(row)
+      .onConflict(key)
+      .merge({ [first]: knex.raw('if(last_insert_id(1), ??, ??)', [first, first]) })
+      .toSQL()
+      .toNative();
+    const result = (await client.rawQuery(sql, bindings as never[])) as unknown;
+    const header = (Array.isArray(result) ? result[0] : result) as { insertId?: number };
+    return Number(header?.insertId ?? 0) === 0;
+  }
+  const insert = client.insertQuery().table(table).knexQuery.insert(row).onConflict(key);
+  const inserted = (await insert.ignore().returning(key[0] as string)) as unknown[];
+  return inserted.length > 0;
 }
 
 function checkpointKey(runId: string, seq: number): string {
