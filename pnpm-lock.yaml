@@ -200,7 +200,7 @@ importers:
   packages/adonis:
     dependencies:
       '@adonis-agora/filter':
-        specifier: 0.11.2
+        specifier: '>=0.11.2 <2.0.0 || >=1.0.0-rc.0 <2.0.0'
         version: 0.11.2(@adonisjs/core@7.6.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(@adonisjs/lucid@22.4.2(@adonisjs/assembler@8.6.0(typescript@7.0.2))(@adonisjs/core@7.6.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.0.3)(luxon@3.7.2)(mysql2@3.24.6(@types/node@26.6.5))(pg@8.23.1)(supports-color@10.2.2))
     devDependencies:
       '@adonis-agora/durable-dashboard':

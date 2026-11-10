@@ -67,6 +67,12 @@
       "matchDatasources": ["node-version"],
       "matchUpdateTypes": ["major"],
       "enabled": false
+    },
+    {
+      "description": "`@adonis-agora/durable` depends on `@adonis-agora/filter` through a RANGE on purpose, so an app on filter 1.x shares one copy with durable instead of getting a second one nested inside it. Keep the range: the global `rangeStrategy: pin` would turn it back into an exact version.",
+      "matchFileNames": ["packages/adonis/package.json"],
+      "matchPackageNames": ["@adonis-agora/filter"],
+      "rangeStrategy": "widen"
     }
   ],
   "lockFileMaintenance": {

@@ -13,6 +13,7 @@
 - **The dashboard update route is `POST <path>/api/runs/:id/updates/:name`** (was `update/:name`), matching the Aviary dashboard API. No alias.
 - **The transports' `group` option is removed** from `transports.queue`, `transports.db`, `transports.eventEmitter` and the `QueueTransport`, `DbTransport` and `EventEmitterTransport` constructors. It had no effect; use `partition` for separate worker pools.
 - **`RunSchedulesOptions.sleep` is removed.** It was no longer called.
+- **`@adonis-agora/filter` is now a range dependency** (`>=0.11.2 <2.0.0 || >=1.0.0-rc.0 <2.0.0`, was pinned to `0.11.2`), so an app that installs filter 1.x shares its copy with durable instead of getting a second one nested inside it.
 - **`ProxyRunGateway` no longer reads the pre-0.50 unknown-verb reply** (an `unknown run-request verb` message with no `code`), nor an empty `ok` reply, as "the control plane does not know this verb". It relies on the `unsupported-request` code every 0.50+ control plane sends, so upgrade a control plane older than 0.50 before its tenant pods.
 
 `@adonis-agora/durable-dashboard`: the console's `update` call targets `POST <path>/api/runs/:id/updates/:name`, which only a 1.0 server answers.
