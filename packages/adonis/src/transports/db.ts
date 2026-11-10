@@ -1082,6 +1082,11 @@ export class DbTransport implements Transport, ControlPlane {
         'step_id',
       );
       if (rows.length === 0) return false;
+      if (this.#pollers.closed) {
+        // stop() began while this round was claiming: give the results back for the next consumer.
+        await this.#handBack(table, [token]);
+        return false;
+      }
       this.#hold(
         table,
         token,
@@ -1133,6 +1138,11 @@ export class DbTransport implements Transport, ControlPlane {
       scope,
     });
     if (rows.length === 0) return 0;
+    if (this.#pollers.closed) {
+      // stop() began while this round was claiming: hand the rows back instead of handling them.
+      await this.#handBack(table, [token]);
+      return 0;
+    }
     const idOf = (row: T): string | number =>
       (row as Record<string, string | number>)[idCol] as string | number;
     this.#hold(table, token, rows.map(idOf));
@@ -1517,18 +1527,18 @@ export class DbTransport implements Transport, ControlPlane {
     let stopping = false;
     let polling: Promise<boolean> | undefined;
     const poll = async (): Promise<boolean> => {
-      if (stopping || !(await this.#messagesReady(false))) return false;
+      if (stopping || this.#pollers.closed || !(await this.#messagesReady(false))) return false;
       const free = concurrency - inFlight.size;
       if (free <= 0) {
         await Promise.race(inFlight);
         return true;
       }
-      if (stopping) return false;
+      if (stopping || this.#pollers.closed) return false;
       const { rows, token } = await this.#claim<MessageRow>(table, free, undefined, 'id', {
         scope: { kind: MESSAGE_KINDS.run, recipients: [''], namespace },
       });
       if (rows.length === 0) return false;
-      if (stopping) {
+      if (stopping || this.#pollers.closed) {
         await this.#handBack(table, [token]);
         return false;
       }

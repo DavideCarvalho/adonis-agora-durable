@@ -135,6 +135,11 @@ interface JobLeaseLike {
 
 /** Per-loop knobs: how many jobs it keeps in flight, and its idle backoff (instance default if unset).
  *  A function `concurrency` is a LIVE limit (the adaptive controller's), read on every tick. */
+/** A poll loop of this transport: stop it, then wait for the poll it may have in flight. */
+interface QueueLoop extends PollLoop {
+  settled(): Promise<void>;
+}
+
 interface LoopOptions {
   concurrency?: number | (() => number);
   idleBackoffMax?: number;
@@ -1058,6 +1063,7 @@ export class QueueTransport implements Transport, ControlPlane {
     const stop = () => {
       stopped ??= (async () => {
         loop.stop();
+        await loop.settled();
         await Promise.allSettled([...running]);
       })();
       return stopped;
@@ -1307,12 +1313,12 @@ export class QueueTransport implements Transport, ControlPlane {
     queue: string,
     onJob: (job: JobData) => Promise<void>,
     opts: LoopOptions = {},
-  ): PollLoop {
+  ): QueueLoop {
     // Deferred consumption (see deferConsumers): park the start; startConsumers() flushes it. The
     // handle returned now still stops the loop whether it is flushed later or never.
     if (this.#consumersDeferred) {
       let cancelled = false;
-      let live: PollLoop | undefined;
+      let live: QueueLoop | undefined;
       this.#deferredStarts.push(() => {
         if (!cancelled) live = this.#reallyStartLoop(queue, onJob, opts);
       });
@@ -1320,6 +1326,9 @@ export class QueueTransport implements Transport, ControlPlane {
         stop: () => {
           cancelled = true;
           live?.stop();
+        },
+        settled: async () => {
+          await live?.settled();
         },
       };
     }
@@ -1330,7 +1339,7 @@ export class QueueTransport implements Transport, ControlPlane {
     queue: string,
     onJob: (job: JobData) => Promise<void>,
     { concurrency = 1, idleBackoffMax }: LoopOptions,
-  ): PollLoop {
+  ): QueueLoop {
     // Record every queue we consume from so the reclaim sweep can walk exactly this set.
     this.#poppedQueues.add(queue);
     // This loop's jobs still in a handler. With one fixed slot the tick awaits its job (the historical
@@ -1338,33 +1347,58 @@ export class QueueTransport implements Transport, ControlPlane {
     // slots cost ONE poll loop, not N. A live (adaptive) limit is re-read on every tick.
     const limit = typeof concurrency === 'function' ? concurrency : () => concurrency;
     const inFlight = new Set<Promise<void>>();
-    return this.#pollers.start(
-      async () => {
-        if (inFlight.size >= limit()) {
-          // Every slot busy: wait for one to free (or the limit to move), then report work so the
-          // loop re-ticks at once.
-          await this.#slotFreed(inFlight);
-          return true;
-        }
-        let job: AcquiredJob | null;
-        try {
-          job = await this.#adapter.popFrom(queue);
-        } catch {
-          // A transient adapter error: treat as "no work", retry on the next tick.
-          return false;
-        }
-        if (!job) return false;
-        const run = this.#runJob(queue, job, onJob);
-        if (concurrency === 1) {
-          await run;
-          return true;
-        }
-        inFlight.add(run);
-        void run.finally(() => inFlight.delete(run));
+    // A pop already past the loop's stop check when this loop (or the whole transport) stops must not
+    // run what it popped after the stop: it re-delivers the job at once instead, and `settled()` (what
+    // a loop's own stop waits for) resolves once that pop is done.
+    let stopping = false;
+    let polling: Promise<boolean> | undefined;
+    const poll = async (): Promise<boolean> => {
+      if (stopping || this.#pollers.closed) return false;
+      if (inFlight.size >= limit()) {
+        // Every slot busy: wait for one to free (or the limit to move), then report work so the
+        // loop re-ticks at once.
+        await this.#slotFreed(inFlight);
         return true;
+      }
+      let job: AcquiredJob | null;
+      try {
+        job = await this.#adapter.popFrom(queue);
+      } catch {
+        // A transient adapter error: treat as "no work", retry on the next tick.
+        return false;
+      }
+      if (!job) return false;
+      if (stopping || this.#pollers.closed) {
+        await this.#adapter
+          .retryJob(jobHandle(job), queue, new Date())
+          .catch((err) => this.#onError(err));
+        return false;
+      }
+      const run = this.#runJob(queue, job, onJob);
+      if (concurrency === 1) {
+        await run;
+        return true;
+      }
+      inFlight.add(run);
+      void run.finally(() => inFlight.delete(run));
+      return true;
+    };
+    const inner = this.#pollers.start(
+      () => {
+        polling = poll();
+        return polling;
       },
       idleBackoffMax === undefined ? undefined : { idleBackoffMax },
     );
+    return {
+      stop: () => {
+        stopping = true;
+        inner.stop();
+      },
+      settled: async () => {
+        await polling?.catch(() => false);
+      },
+    };
   }
 
   /** Resolve when one of `inFlight` settles or the adaptive controller moves the limit. */
