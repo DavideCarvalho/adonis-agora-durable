@@ -102,13 +102,14 @@ describe.skipIf(postgres.length === 0).each(postgres)('the Lucid store hot path 
 });
 
 describe('the Lucid store hot path', () => {
-  it('is taken only by a Postgres connection that is not being debugged', () => {
+  it('is taken only by a Postgres connection that is not being debugged or a transaction', () => {
     const knex = {
       client: { acquireConnection: async () => ({}), releaseConnection: async () => {} },
     };
-    const client = (name: string, debug: boolean) =>
-      ({ dialect: { name }, debug, getWriteClient: () => knex }) as never;
+    const client = (name: string, debug: boolean, isTransaction = false) =>
+      ({ dialect: { name }, debug, isTransaction, getWriteClient: () => knex }) as never;
     expect(LucidPgHotPath.for(client('postgres', false))).toBeInstanceOf(LucidPgHotPath);
+    expect(LucidPgHotPath.for(client('postgres', false, true))).toBeUndefined();
     expect(LucidPgHotPath.for(client('postgres', true))).toBeUndefined();
     expect(LucidPgHotPath.for(client('mysql', false))).toBeUndefined();
     expect(LucidPgHotPath.for(client('better-sqlite3', false))).toBeUndefined();

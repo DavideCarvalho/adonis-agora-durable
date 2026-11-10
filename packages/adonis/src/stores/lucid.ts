@@ -2132,7 +2132,6 @@ async function settleResultsReturningPg(
   return out;
 }
 
-/** A duplicate-key violation, as MySQL and SQLite report it through Knex. */
 /**
  * Insert `row` into `table` unless a row with the same `key` exists, as a statement that never
  * fails on the conflict, and say whether it wrote. A failing statement would abort a surrounding
