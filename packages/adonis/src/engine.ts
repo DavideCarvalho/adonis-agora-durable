@@ -5997,20 +5997,20 @@ export class WorkflowEngine {
       let off: () => void = () => {};
       let poller: ReturnType<typeof setInterval> | undefined;
       let reading = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const stop = (): void => {
         done = true;
         if (timer) clearTimeout(timer);
         if (poller) clearInterval(poller);
         off();
       };
-      const timer =
-        opts?.timeoutMs != null
-          ? setTimeout(() => {
-              if (done) return;
-              stop();
-              reject(new Error(`waitForRun(${runId}) timed out after ${opts.timeoutMs}ms`));
-            }, opts.timeoutMs)
-          : undefined;
+      if (opts?.timeoutMs != null) {
+        timer = setTimeout(() => {
+          if (done) return;
+          stop();
+          reject(new Error(`waitForRun(${runId}) timed out after ${opts.timeoutMs}ms`));
+        }, opts.timeoutMs);
+      }
       const finish = (run: WorkflowRun): void => {
         if (done) return;
         stop();
