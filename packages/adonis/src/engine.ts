@@ -384,6 +384,15 @@ const isBreakpoint = (cp: { status: string; name: string }): boolean =>
  * through some other path (an operator's cancel, a timeout sweep, a dead-letter) while this turn's
  * outcome was being computed from a possibly-stale snapshot.
  */
+/** Statuses a wake refused by a held lease may stamp a request for another turn on. */
+const WAKEABLE_RUN_STATUSES: RunStatus[] = ['running', 'suspended', 'blocked', 'cancelling'];
+
+/**
+ * Statuses a wake that finds the lease free re-drives: parked runs, and a `cancelling` run whose
+ * undo is not executing (its turn unwinds the saga).
+ */
+const PARKED_RUN_STATUSES: readonly RunStatus[] = ['suspended', 'blocked', 'cancelling'];
+
 const SETTLE_ELIGIBLE_STATUSES: RunStatus[] = [
   'pending',
   'running',
@@ -6916,7 +6925,7 @@ export class WorkflowEngine {
           publishedAt: this.clock(),
         })
         .catch(() => undefined);
-      const marked = await this.store.updateRunIf(runId, ['running', 'suspended', 'blocked'], {
+      const marked = await this.store.updateRunIf(runId, WAKEABLE_RUN_STATUSES, {
         wakeRequestedAt: this.clock(),
       });
       return marked ? 'stamped' : 'gone';
@@ -6957,7 +6966,7 @@ export class WorkflowEngine {
     const nowMs = this.clock();
     if (!(await this.store.tryLockRun(runId, this.instanceId, nowMs + this.leaseMs, nowMs))) return;
     const fresh = await this.store.getRun(runId);
-    if (fresh?.status !== 'suspended' && fresh?.status !== 'blocked') {
+    if (!fresh || !PARKED_RUN_STATUSES.includes(fresh.status)) {
       await this.store.releaseRunLock(runId, this.instanceId);
       return;
     }
@@ -7056,7 +7065,7 @@ export class WorkflowEngine {
     }
     // Free, and `pending` (its dispatch or the pending-run poll runs it) or `running` with no lease
     // (a holder that died mid-turn: crash recovery takes it): nothing for a wake to do.
-    if (run.status !== 'suspended' && run.status !== 'blocked') return;
+    if (!PARKED_RUN_STATUSES.includes(run.status)) return;
     if (this.runQueue) {
       this.enqueueRun(
         {
@@ -7070,7 +7079,7 @@ export class WorkflowEngine {
     }
     if (!(await this.store.tryLockRun(runId, this.instanceId, nowMs + this.leaseMs, nowMs))) return;
     const fresh = await this.store.getRun(runId);
-    if (fresh?.status !== 'suspended' && fresh?.status !== 'blocked') {
+    if (!fresh || !PARKED_RUN_STATUSES.includes(fresh.status)) {
       await this.store.releaseRunLock(runId, this.instanceId);
       return;
     }
@@ -7658,13 +7667,16 @@ export class WorkflowEngine {
       // with its lease released, so crash recovery re-drives it (replaying completed steps; bounded by
       // `maxRecoveryAttempts`).
       if (err instanceof RemoteWorkflowTimeout) {
-        await this.store
+        const reset = await this.store
           .updateRunIf(run.id, ['running', 'suspended'], {
             status: 'running',
             updatedAt: new Date(),
           })
           .catch(() => false);
         await this.releaseTurnLease(run.id);
+        // Not reset: the run moved on meanwhile (a compensating cancel made it `cancelling`, or it
+        // settled). Report what it is now, not a `running` it no longer reads.
+        if (!reset) return this.echoCurrentStatus(run.id);
         return { runId: run.id, status: 'running' };
       }
       const error = {

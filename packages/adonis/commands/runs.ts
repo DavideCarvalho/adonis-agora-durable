@@ -50,10 +50,12 @@ export default class DurableRuns extends BaseCommand {
     const wantsStale = this.stale !== undefined;
     const runs = await listRuns(engine, {
       ...(this.status ? { status: this.status as RunStatus } : {}),
-      // No explicit --status: scope the query to running/suspended, the only statuses a stranded
+      // No explicit --status: scope the query to running/suspended/cancelling, the only statuses a stranded
       // dispatch can show up in, so a stale candidate isn't pushed out of the window by newer
       // terminal runs.
-      ...(!this.status && wantsStale ? { statuses: ['running', 'suspended'] as RunStatus[] } : {}),
+      ...(!this.status && wantsStale
+        ? { statuses: ['running', 'suspended', 'cancelling'] as RunStatus[] }
+        : {}),
       ...(this.workflow ? { workflow: this.workflow } : {}),
       limit: this.limit,
     });

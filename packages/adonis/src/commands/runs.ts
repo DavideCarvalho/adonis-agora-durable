@@ -193,7 +193,7 @@ export async function attachLiveness(
   return Promise.all(
     runs.map(async (run) => {
       const stalePending =
-        run.status === 'running' || run.status === 'suspended'
+        run.status === 'running' || run.status === 'suspended' || run.status === 'cancelling'
           ? await oldestPendingRemoteStep(source, run.id, now)
           : null;
       return {
