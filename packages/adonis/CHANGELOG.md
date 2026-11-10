@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.6
+
+### Patch Changes
+
+- [#489](https://github.com/DavideCarvalho/adonis-agora-durable/pull/489) [`001663d`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/001663da24ea2c92f503816c173bdc69e139c2cb) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The Lucid store's Postgres hot path names its columns instead of `select *` / `returning *` (run reads and lease, checkpoint read, buffered signals and events). With `preparedStatements: true`, a `*` statement prepared before the schema added a column (another pod's boot during a rolling upgrade) failed with "cached plan must not change result type". The run and checkpoint reads list the later-wave columns the tables actually have, probed once per store and again after its own `ensureSchema`. `preparedStatements` stays off by default; the Lucid store docs now say when it is safe to turn on (direct Postgres, or PgBouncer 1.21+ with `max_prepared_statements > 0`) and how to check.
+
 ## 1.0.0-rc.5
 
 ### Patch Changes
