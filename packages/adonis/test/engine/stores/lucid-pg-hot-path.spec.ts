@@ -48,7 +48,9 @@ describe.skipIf(postgres.length === 0).each(postgres)('the Lucid store hot path 
         lockedBy: 'a',
       });
       knex.off('query', listen);
-      expect(seen.some((sql) => sql.includes('returning *'))).toBe(true);
+      expect(seen.some((sql) => sql.includes('returning "id", "workflow"'))).toBe(true);
+      // The hot statements name their columns: a prepared `*` breaks when a column is added.
+      expect(seen.some((sql) => /select \*|returning \*/.test(sql))).toBe(false);
       expect(seen.some((sql) => sql.startsWith('insert into "durable_workflow_runs"'))).toBe(true);
     } finally {
       await db.manager.closeAll();
@@ -78,6 +80,7 @@ describe.skipIf(postgres.length === 0).each(postgres)('the Lucid store hot path 
       const store = new LucidStateStore(db, { preparedStatements: true });
       await store.ensureSchema();
       await store.createRun(run());
+      await store.getRun('r1'); // the one-off column probe, before counting
       const names: Array<string | undefined> = [];
       const query = pg.Client.prototype.query;
       pg.Client.prototype.query = function (this: unknown, ...args: unknown[]) {

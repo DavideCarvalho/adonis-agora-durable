@@ -54,3 +54,28 @@ describe.each(dbBackends({ mysql: true }))('on $name', ({ makeStoreDb }) => {
     });
   });
 });
+
+/** The same contract with the Postgres hot path's statements sent as named prepared statements. */
+const postgres = dbBackends().filter((b) => b.name === 'postgres');
+describe.skipIf(postgres.length === 0).each(postgres)(
+  'on $name with prepared statements',
+  ({ makeStoreDb }) => {
+    runStateStoreContract('LucidStateStore (preparedStatements)', async () => {
+      const db = await makeStoreDb();
+      let sent = 0;
+      const count = () => {
+        sent += 1;
+      };
+      const clients = new Set([db.connection().getWriteClient(), db.connection().getReadClient()]);
+      for (const client of clients) client.on('query', count);
+      return {
+        store: new LucidStateStore(db, { preparedStatements: true }),
+        statements: () => sent,
+        cleanup: async () => {
+          for (const client of clients) client.off('query', count);
+          await db.manager.closeAll();
+        },
+      };
+    });
+  },
+);
