@@ -18,8 +18,15 @@ import { controlChannel, effectivePrefix } from '../transports/bullmq/naming.js'
 export interface IoredisSubscriber {
   /** Subscribe to a channel. Payloads arrive on `on('message')`, never through an argument here. */
   subscribe(channel: string): unknown;
+  /** Subscribe to a channel pattern. Payloads arrive on `on('pmessage')`. */
+  psubscribe?(pattern: string): unknown;
   /** A payload on a channel this connection is subscribed to. */
   on?(event: 'message', listener: (channel: string, message: string) => void): unknown;
+  /** A payload on a channel matching a pattern this connection is subscribed to. */
+  on?(
+    event: 'pmessage',
+    listener: (pattern: string, channel: string, message: string) => void,
+  ): unknown;
   /** A connection-level failure — the driver logs one line per reconnect burst. */
   on?(event: 'error', listener: (err: Error) => void): unknown;
   /** The connection (re)established — the driver re-arms its error logging. */
@@ -68,6 +75,8 @@ export interface AdonisRedisPubSub {
   publish(channel: string, message: string): unknown;
   /** Subscribe to a channel; the handler receives each payload directly. */
   subscribe(channel: string, handler: (message: string) => void): unknown;
+  /** Subscribe to a channel pattern; the handler receives the channel and each payload. */
+  psubscribe?(pattern: string, handler: (channel: string, message: string) => void): unknown;
 }
 
 /**
@@ -109,7 +118,8 @@ export interface RedisControlPlaneOptions {
   /**
    * Deployment namespace folded into the channel name this control plane LISTENS on. Unset adopts the
    * engine's namespace (see {@link RedisControlPlane.useNamespace}); an explicit value wins. `default`
-   * keeps the bare `` `${prefix}-control` `` channel. It does not pin publishing: a message about a
+   * keeps the bare `` `${prefix}-control` `` channel. With no namespace at all (an engine over every
+   * namespace), it also listens on every namespace's channel ({@link namespacesPattern}). It does not pin publishing: a message about a
    * run still goes to the channel of that run's namespace (see {@link RedisControlPlane.publishControl}).
    */
   namespace?: string;
@@ -129,6 +139,20 @@ export interface RedisControlPlaneOptions {
    * manages its own subscriber connection and its own health.
    */
   pingIntervalMs?: number | false;
+}
+
+/** The `kind`s of a {@link ControlMessage}. */
+const CONTROL_KINDS: ReadonlySet<string> = new Set<ControlMessage['kind']>([
+  'event',
+  'events',
+  'cancel',
+  'enqueued',
+  'schedulePause',
+]);
+
+/** `value` with Redis glob metacharacters escaped, so a prefix matches only itself. */
+function escapeGlob(value: string): string {
+  return value.replace(/[*?[\]\\]/g, '\\$&');
 }
 
 /** Default {@link RedisControlPlaneOptions.pingIntervalMs}. */
@@ -194,6 +218,17 @@ export class RedisControlPlane implements ControlPlane {
     return this.channelFor(this.namespace);
   }
 
+  /**
+   * The pattern an engine with no namespace (the operator view over every namespace) also listens on:
+   * every namespace's channel, `<prefix>-<namespace>-control`. It never matches the bare
+   * `<prefix>-control` (the `*` sits between two dashes), so no message arrives twice. `undefined`
+   * once a namespace is set: a namespaced engine hears its own channel only.
+   */
+  get namespacesPattern(): string | undefined {
+    if (this.namespace !== undefined) return undefined;
+    return `${escapeGlob(this.prefix)}-*-control`;
+  }
+
   /** The channel of `namespace` (`''`, `default` and unset are all the bare `<prefix>-control`). */
   channelFor(namespace: string | undefined): string {
     return controlChannel(effectivePrefix(this.prefix, namespace || undefined));
@@ -224,15 +259,21 @@ export class RedisControlPlane implements ControlPlane {
     if (this.subscribed) return; // one subscription per control plane
     this.subscribed = true;
 
-    const deliver = (payload: string) => {
+    const deliver = (payload: string, fromPattern = false) => {
       let msg: ControlMessage;
       try {
         msg = JSON.parse(payload) as ControlMessage;
       } catch {
         return; // swallow malformed payloads — a control message must never crash the engine
       }
+      // A pattern can match a channel some other publisher named `…-control`: take control messages
+      // only, so a stray payload on such a channel never reaches the engine.
+      if (fromPattern && !CONTROL_KINDS.has((msg as { kind?: unknown } | null)?.kind as string)) {
+        return;
+      }
       handler(msg);
     };
+    const pattern = this.namespacesPattern;
 
     if (isIoredisClient(this.connection)) {
       // raw ioredis: a subscriber connection can't run normal commands → use a dedicated dup.
@@ -240,6 +281,11 @@ export class RedisControlPlane implements ControlPlane {
       this.subscriber = sub;
       swallowSubscribe(sub.subscribe(this.channel), () => this.closed, 'control-plane');
       sub.on?.('message', (_channel, payload) => deliver(payload));
+      if (pattern !== undefined && typeof sub.psubscribe === 'function') {
+        // ioredis's `autoResubscribe` restores pattern subscriptions on reconnect too.
+        swallowSubscribe(sub.psubscribe(pattern), () => this.closed, 'control-plane');
+        sub.on?.('pmessage', (_pattern, _channel, payload) => deliver(payload, true));
+      }
       this.trackSubscriber(sub);
     } else {
       // `@adonisjs/redis` connection: manages its own subscriber connection; handler gets the message.
@@ -248,6 +294,13 @@ export class RedisControlPlane implements ControlPlane {
         () => this.closed,
         'control-plane',
       );
+      if (pattern !== undefined && typeof this.connection.psubscribe === 'function') {
+        swallowSubscribe(
+          this.connection.psubscribe(pattern, (_channel, payload) => deliver(payload, true)),
+          () => this.closed,
+          'control-plane',
+        );
+      }
       // The connection keeps its ioredis subscriber on the public `ioSubscriberConnection` field
       // (created by the subscribe above, replaced if it ends). Watch THAT one: it has the same
       // silent-death failure mode as the duplicated subscriber on the ioredis path. Read on every

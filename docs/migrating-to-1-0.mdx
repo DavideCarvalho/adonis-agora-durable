@@ -74,7 +74,11 @@ on `<prefix>-control`.
 A message about a run (a cancel, an enqueue nudge, the run's lifecycle events) is published on the
 channel of that run's namespace. A console with no namespace that cancels a run on a namespaced
 worker therefore reaches it at once, with no extra setting: don't pin `namespace: 'default'` on the
-control plane for that. Messages with no run stay on the publisher's own channel. Delivery is
+control plane for that. Messages with no run stay on the publisher's own channel.
+
+An engine with no namespace observes every namespace: it listens on `<prefix>-control` and on every
+`<prefix>-<namespace>-control`, so a console's live tail still shows the runs of namespaced workers.
+An engine with a namespace observes only its own. Delivery is
 best-effort: the cancel is recorded in the store first, and the message only makes it immediate.
 
 This is a wire change for namespaced deployments:

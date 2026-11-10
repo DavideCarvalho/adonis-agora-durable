@@ -72,7 +72,13 @@ export default class RunsController {
 }
 ```
 
-An explicit `namespace` on `controlPlanes.redis(...)` only picks the channel the instance **listens** on; it does not redirect what it publishes about runs.
+### What each engine observes
+
+- **An engine with no namespace** (the operator view, such as a console over every namespace) listens on `durable-control` **and** on every namespace channel (a pattern subscription to `durable-*-control`). Its live tail and run events cover every namespace, as they would on one shared channel.
+- **An engine with a namespace** listens on its own channel only, so it sees its namespace's events and nothing else.
+- **An explicit `namespace` on `controlPlanes.redis(...)`** pins that one channel (`'default'` pins the bare one), with no pattern. It only picks what the instance listens on; it does not redirect what it publishes about runs.
+
+An engine with no namespace therefore also hears cancels for runs of other namespaces. They reach `engine.onCancel` listeners like any other cancel, so a listener should act only on the runs it is executing.
 
 Delivery is best-effort, as with any pub/sub. The cancel itself is recorded in the store first, so a worker that misses the message still finds the run cancelled at its next turn; the message only makes it immediate.
 

@@ -118,6 +118,20 @@ describe.skipIf(!REDIS_URL)('RedisControlPlane (real Redis)', () => {
     }
   }
 
+  /** Wait until a pattern subscription for `pattern` exists, as the server sees it (global count). */
+  async function patternSubscribed(pattern: string): Promise<void> {
+    const c = client();
+    const deadline = Date.now() + 20_000;
+    for (;;) {
+      // PUBSUB NUMPAT is global; check the pattern really routes by publishing to a probe channel.
+      const probe = pattern.replace('*', `probe${Math.random().toString(36).slice(2, 8)}`);
+      const receivers = Number(await c.publish(probe, 'not json'));
+      if (receivers >= 1) return;
+      if (Date.now() > deadline) throw new Error(`${pattern} never got a subscriber`);
+      await delay(20);
+    }
+  }
+
   it('a console with no namespace cancels a run on a namespaced worker in real time', async () => {
     const prefix = `${PREFIX}-${++ns}`;
     const store = new InMemoryStateStore();
@@ -172,6 +186,103 @@ describe.skipIf(!REDIS_URL)('RedisControlPlane (real Redis)', () => {
     expect(heard.filter((m) => m.kind === 'cancel')).toEqual([
       { channel: `${prefix}-control`, kind: 'cancel' },
     ]);
+  });
+
+  it('a console with no namespace observes a namespaced worker’s run and step events live', async () => {
+    const prefix = `${PREFIX}-${++ns}`;
+    const store = new InMemoryStateStore();
+    const worker = new WorkflowEngine({
+      store,
+      controlPlane: plane(prefix),
+      instanceId: 'bulas-worker',
+      namespace: 'bulas',
+    });
+    const consoleEngine = new WorkflowEngine({
+      store,
+      controlPlane: plane(prefix),
+      instanceId: 'console',
+    });
+    const other = new WorkflowEngine({
+      store,
+      controlPlane: plane(prefix),
+      instanceId: 'other-worker',
+      namespace: 'other',
+    });
+    const seen: Array<{ type: string; runId: string }> = [];
+    consoleEngine.subscribe((e) => seen.push({ type: e.type, runId: e.runId }));
+    const seenByOther: string[] = [];
+    other.subscribe((e) => seenByOther.push(e.type));
+    await subscribedOn(`${prefix}-bulas-control`, 1);
+    await subscribedOn(`${prefix}-other-control`, 1);
+    await subscribedOn(`${prefix}-control`, 1);
+    await patternSubscribed(`${prefix}-*-control`);
+
+    worker.register('wf', '1', async (ctx) => {
+      await ctx.localStep('a', async () => 1);
+      return 'ok';
+    });
+    await startRun(worker, 'wf', {}, 'bulas-live');
+
+    const expected = ['run.started', 'step.started', 'step.completed', 'run.completed'];
+    await until(() => seen.length >= expected.length);
+    await delay(100); // a duplicate delivery would land by now
+    expect(seen.map((e) => e.type)).toEqual(expected);
+    expect(new Set(seen.map((e) => e.runId))).toEqual(new Set(['bulas-live']));
+    // A namespaced engine observes its own namespace only.
+    expect(seenByOther).toEqual([]);
+  });
+
+  it('a pattern subscription survives the watchdog reconnecting the subscriber', async () => {
+    const prefix = `${PREFIX}-${++ns}`;
+    const cp = new RedisControlPlane({ connection: client(), prefix, pingIntervalMs: 50 });
+    planes.push(cp);
+    const kinds: string[] = [];
+    cp.onControl((msg) => kinds.push(msg.kind));
+    await patternSubscribed(`${prefix}-*-control`);
+
+    // One failed PING: the watchdog disconnects the subscriber and ioredis reconnects it.
+    const sub = (cp as unknown as { subscriber: { ping: () => Promise<unknown> } }).subscriber;
+    const ping = sub.ping.bind(sub);
+    let failed = false;
+    sub.ping = () => {
+      if (failed) return ping();
+      failed = true;
+      return Promise.reject(new Error('simulated dead connection'));
+    };
+    await until(() => failed);
+    await delay(300);
+    await patternSubscribed(`${prefix}-*-control`);
+
+    const publisher = client();
+    for (let i = 0; i < 50 && kinds.length === 0; i += 1) {
+      await publisher.publish(
+        `${prefix}-bulas-control`,
+        JSON.stringify({ kind: 'cancel', runId: 'x' }),
+      );
+      await delay(50);
+    }
+    expect(kinds).toContain('cancel');
+  });
+
+  it('ignores a payload that is not a control message on a channel the pattern matches', async () => {
+    const prefix = `${PREFIX}-${++ns}`;
+    const cp = plane(prefix);
+    const kinds: string[] = [];
+    cp.onControl((msg) => kinds.push(msg.kind));
+    await patternSubscribed(`${prefix}-*-control`);
+    const publisher = client();
+    // A tenant-events channel for a tenant named `acme-control` matches the pattern.
+    await publisher.publish(
+      `${prefix}-tenant-events-acme-control`,
+      JSON.stringify({ tenant: 'acme-control', event: { type: 'run.started', runId: 'r' } }),
+    );
+    await publisher.publish(
+      `${prefix}-acme-control`,
+      JSON.stringify({ kind: 'cancel', runId: 'r' }),
+    );
+    await until(() => kinds.length > 0);
+    await delay(50);
+    expect(kinds).toEqual(['cancel']);
   });
 
   it('fans out lifecycle events to another pod, each exactly once (from dedupe)', async () => {

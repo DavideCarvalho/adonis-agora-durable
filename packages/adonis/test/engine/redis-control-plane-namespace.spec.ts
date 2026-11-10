@@ -28,6 +28,10 @@ function fakeConnection() {
         subscribed.push(channel);
         return Promise.resolve();
       },
+      psubscribe(pattern: string) {
+        subscribed.push(`pattern:${pattern}`);
+        return Promise.resolve();
+      },
     },
   };
 }
@@ -73,7 +77,7 @@ describe('RedisControlPlane channel namespace folding', () => {
       controlPlane: cp,
       namespace: 'tenant-a',
     });
-    expect(subscribed).toEqual(['durable-tenant-a-control']);
+    expect(subscribed).toEqual(['durable-tenant-a-control']); // namespaced: its own channel only
     await cp.publishControl({ kind: 'cancel', runId: 'r1' });
     expect(published).toEqual(['durable-tenant-a-control']);
   });
@@ -88,10 +92,24 @@ describe('RedisControlPlane channel namespace folding', () => {
     expect(subscribed).toEqual(['durable-other-control']);
   });
 
-  it('an operator engine (no namespace) stays on the bare channel', () => {
+  it('an operator engine (no namespace) listens on the bare channel and every namespace channel', () => {
     const { cp, subscribed } = plane();
     new WorkflowEngine({ store: new InMemoryStateStore(), controlPlane: cp });
-    expect(subscribed).toEqual(['durable-control']);
+    expect(subscribed).toEqual(['durable-control', 'pattern:durable-*-control']);
+  });
+
+  it('an explicit namespace pins the one channel, `default` included', () => {
+    for (const namespace of ['default', 'bulas']) {
+      const { cp, subscribed } = plane({ namespace });
+      new WorkflowEngine({ store: new InMemoryStateStore(), controlPlane: cp });
+      expect(subscribed).toHaveLength(1);
+      expect(subscribed[0]).not.toMatch(/^pattern:/);
+    }
+  });
+
+  it('escapes glob characters of the prefix in the pattern', () => {
+    const { cp } = plane({ prefix: 'app[1]*' });
+    expect(cp.namespacesPattern).toBe('app\\[1\\]\\*-*-control');
   });
 });
 
