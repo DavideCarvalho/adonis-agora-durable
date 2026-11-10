@@ -60,14 +60,66 @@ describe('compensating cancel is honored on every exit of the turn', () => {
 
       expect(await statusOf(store, 'r1', 'cancelled')).toBe('cancelled');
       expect(undone).toEqual(['reserve']);
-      // The durable intent is consumed once honored, and no continuation was forked.
-      expect(await store.takeBufferedSignal('cancel:r1')).toBeNull();
+      // No continuation was forked.
       expect(await store.getRun('r1~1')).toBeNull();
       await engine.drain();
     },
   );
 
-  it('the cancel is honored by ANOTHER instance whose turn is the one running (durable marker)', async () => {
+  it.each(['returns', 'throws', 'continues-as-new', 'suspends'] as const)(
+    'a cancel from ANOTHER pod while the turn runs is honored when the body %s',
+    async (exit) => {
+      const store = new InMemoryStateStore();
+      // No marker: the persisted `cancelling` status is the only thing that reaches the owner's turn.
+      const buffered: string[] = [];
+      const buffer = store.bufferSignal.bind(store);
+      store.bufferSignal = async (token, payload) => {
+        buffered.push(token);
+        return buffer(token, payload);
+      };
+      const owner = new WorkflowEngine({ store, instanceId: 'owner' });
+      const operator = new WorkflowEngine({
+        store,
+        instanceId: 'operator',
+        runDispatcher: { dispatch: () => {} },
+      });
+      const undone: string[] = [];
+      const inBody = gate();
+      const release = gate();
+      for (const engine of [owner, operator]) {
+        engine.register('saga', '1', async (ctx: WorkflowCtx, input) => {
+          await ctx.localStep('reserve', async () => 'r', {
+            compensate: async () => {
+              undone.push('reserve');
+            },
+          });
+          await ctx.localStep('work', async () => {
+            inBody.open();
+            await release.wait;
+          });
+          if (exit === 'throws') throw new Error('boom');
+          if (exit === 'continues-as-new' && input === 'first') throw new ContinueAsNew('next');
+          if (exit === 'suspends') await ctx.waitForSignal('never-sent');
+          return 'done';
+        });
+      }
+      await owner.start('saga', 'first', 'r1');
+      await inBody.wait;
+      // The operator pod holds no lease, and no in-memory flag or control message reaches the owner.
+      await operator.cancel('r1', { compensate: true });
+      expect((await store.getRun('r1'))?.status).toBe('cancelling');
+      release.open();
+
+      expect(await statusOf(store, 'r1', 'cancelled')).toBe('cancelled');
+      expect(undone).toEqual(['reserve']);
+      expect(await store.getRun('r1~1')).toBeNull();
+      expect(buffered.filter((t) => t.startsWith('cancel:'))).toEqual([]);
+      await owner.drain();
+      await operator.drain();
+    },
+  );
+
+  it('a cancel that lands while continue-as-new forks still wins over the completion', async () => {
     const store = new InMemoryStateStore();
     const owner = new WorkflowEngine({ store, instanceId: 'owner' });
     const operator = new WorkflowEngine({
@@ -76,30 +128,28 @@ describe('compensating cancel is honored on every exit of the turn', () => {
       runDispatcher: { dispatch: () => {} },
     });
     const undone: string[] = [];
-    const inBody = gate();
-    const release = gate();
     for (const engine of [owner, operator]) {
-      engine.register('saga', '1', async (ctx: WorkflowCtx) => {
+      engine.register('saga', '1', async (ctx: WorkflowCtx, input) => {
         await ctx.localStep('reserve', async () => 'r', {
           compensate: async () => {
             undone.push('reserve');
           },
         });
-        await ctx.localStep('work', async () => {
-          inBody.open();
-          await release.wait;
-        });
+        if (input === 'first') throw new ContinueAsNew('next');
         return 'done';
       });
     }
-    await owner.start('saga', {}, 'r1');
-    await inBody.wait;
-    // The operator pod holds no lease and no in-memory flag reaches the owner: only the marker does.
-    await operator.cancel('r1', { compensate: true });
-    release.open();
+    // The cancel lands after the turn's re-read, right as the continuation is persisted.
+    const create = store.createRun.bind(store);
+    store.createRun = async (run) => {
+      await create(run);
+      if (run.id === 'r1~1') await operator.cancel('r1', { compensate: true });
+    };
+    await owner.start('saga', 'first', 'r1');
 
     expect(await statusOf(store, 'r1', 'cancelled')).toBe('cancelled');
     expect(undone).toEqual(['reserve']);
+    expect(await statusOf(store, 'r1~1', 'cancelled')).toBe('cancelled');
     await owner.drain();
     await operator.drain();
   });
