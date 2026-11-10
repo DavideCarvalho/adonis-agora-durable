@@ -59,6 +59,14 @@
       "description": "Lockfile maintenance refreshes the whole tree at once, so Renovate has no single release to age: its `renovate/stability-days` check stays pending forever and the automerge below never fires. pnpm already enforces the minimum release age itself when it resolves the refreshed lockfile, so the check adds nothing here.",
       "matchUpdateTypes": ["lockFileMaintenance"],
       "minimumReleaseAge": null
+    },
+    {
+      "description": "Build and release stay pinned to Node 24, and CI tests 24 and 26 (1.0 policy). A Node major for the pinned toolchain (`.nvmrc`, `actions/setup-node`'s `node-version`) is a policy decision, not a dependency bump, so Renovate does not propose it.",
+      "matchManagers": ["nvm", "nodenv", "github-actions"],
+      "matchDepNames": ["node"],
+      "matchDatasources": ["node-version"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
     }
   ],
   "lockFileMaintenance": {
