@@ -1,6 +1,7 @@
 /**
  * Cross-package, cross-runtime marker for engine CONTROL-FLOW signals — {@link WorkflowSuspended}
- * and {@link ContinueAsNew} (see `./errors.ts`). These are thrown by `WorkflowCtx` ops to unwind the
+ * and {@link ContinueAsNew} (see `./errors.ts`), and the thin-worker turn suspend (`TurnSuspend` in
+ * `./workflow-turn.ts`). These are thrown by `WorkflowCtx` ops to unwind the
  * current turn — never real failures — so a workflow's `catch` block MUST rethrow them untouched.
  * Running a failure/cleanup path on a control-flow signal corrupts the run: it emits extra
  * `recordStep` commands into history that a subsequent replay didn't produce the first time,
@@ -23,9 +24,9 @@
 export const CONTROL_FLOW_SIGNAL: unique symbol = Symbol.for('@agora/durable:control-flow');
 
 /**
- * True for any engine control-flow signal (currently: {@link WorkflowSuspended} and
- * {@link ContinueAsNew}) — regardless of which module instance threw it. Workflow `catch` blocks
- * MUST rethrow these untouched; running a failure/cleanup path on one corrupts the run's history
+ * True for any engine control-flow signal (currently: {@link WorkflowSuspended},
+ * {@link ContinueAsNew} and the thin-worker `TurnSuspend`) — regardless of which module instance
+ * threw it. Workflow `catch` blocks MUST rethrow these untouched; running a failure/cleanup path on one corrupts the run's history
  * (extra commands recorded during what replay will later see as a suspend, not a failure) and the
  * resumed replay dies with a non-determinism error.
  *
