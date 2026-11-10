@@ -169,24 +169,38 @@ export class LucidStateStore implements StateStore {
   }
 
   /**
-   * The hot run reads with an explicit column list: the base columns plus the later-wave ones this
-   * table has, probed once per store (an older schema without them keeps working). A column added
-   * after the probe is not read until the next boot, and a statement already prepared keeps its shape.
+   * The hot reads with explicit column lists: each table's base columns plus the later-wave ones it
+   * has, probed once (an older schema without them keeps working) and again after this store's own
+   * {@link ensureSchema}. A column another process adds later is not read until the next probe, and a
+   * statement already prepared keeps its shape.
    */
-  private hotRunStatements: Promise<ReturnType<typeof runReadSql>> | undefined;
-  private hotRunSql(hot: LucidPgHotPath): Promise<ReturnType<typeof runReadSql>> {
-    this.hotRunStatements ??= hot
-      .rows(RUN_COLUMNS_PRESENT_SQL, [DURABLE_TABLES.runs, [...RUN_OPTIONAL_COLUMNS]])
+  private hotReadStatements: Promise<HotReads> | undefined;
+  private hotReads(hot: LucidPgHotPath): Promise<HotReads> {
+    this.hotReadStatements ??= hot
+      .rows(COLUMNS_PRESENT_SQL, [
+        [DURABLE_TABLES.runs, DURABLE_TABLES.checkpoints],
+        [...RUN_OPTIONAL_COLUMNS, ...CHECKPOINT_OPTIONAL_COLUMNS],
+      ])
       .then((rows) => {
-        const present = new Set(rows.map((r) => String(r.column_name)));
-        const cols = [...RUN_BASE_COLUMNS, ...RUN_OPTIONAL_COLUMNS.filter((c) => present.has(c))];
-        return runReadSql(cols.map(quote).join(', '));
+        const present = new Set(
+          rows.map((r) => `${String(r.table_name)}.${String(r.column_name)}`),
+        );
+        const has = (table: string) => (c: string) => present.has(`${table}.${c}`);
+        const runCols = [
+          ...RUN_BASE_COLUMNS,
+          ...RUN_OPTIONAL_COLUMNS.filter(has(DURABLE_TABLES.runs)),
+        ];
+        const checkpointCols = [
+          ...CHECKPOINT_BASE_COLUMNS,
+          ...CHECKPOINT_OPTIONAL_COLUMNS.filter(has(DURABLE_TABLES.checkpoints)),
+        ];
+        return hotReadSql(runCols.map(quote).join(', '), checkpointCols.map(quote).join(', '));
       })
       .catch((error: unknown) => {
-        this.hotRunStatements = undefined; // a failed probe is retried, never cached
+        this.hotReadStatements = undefined; // a failed probe is retried, never cached
         throw error;
       });
-    return this.hotRunStatements;
+    return this.hotReadStatements;
   }
 
   /** Idempotently provision the durable tables (called on boot when `autoSchema` is on). */
@@ -196,6 +210,8 @@ export class LucidStateStore implements StateStore {
       this.connectionName,
       this.options.collation !== undefined ? { collation: this.options.collation } : {},
     );
+    // The tables may have gained columns: the next hot read probes them again.
+    this.hotReadStatements = undefined;
   }
 
   // --- runs ---------------------------------------------------------------
@@ -449,7 +465,7 @@ export class LucidStateStore implements StateStore {
   async getRun(runId: string): Promise<WorkflowRun | null> {
     const hot = this.hot();
     if (hot) {
-      const sql = await this.hotRunSql(hot);
+      const sql = await this.hotReads(hot);
       const rows =
         this.scopeNamespace === undefined
           ? await hot.rows(sql.get, [runId])
@@ -502,7 +518,7 @@ export class LucidStateStore implements StateStore {
   async getCheckpoint(runId: string, seq: number): Promise<StepCheckpoint | null> {
     const hot = this.hot();
     if (hot) {
-      const rows = await hot.rows(GET_CHECKPOINT_SQL, [runId, seq]);
+      const rows = await hot.rows((await this.hotReads(hot)).getCheckpoint, [runId, seq]);
       return rows[0] ? rowToCheckpoint(rows[0] as unknown as CheckpointRow) : null;
     }
     const row = await this.client()
@@ -973,7 +989,7 @@ export class LucidStateStore implements StateStore {
   ): Promise<WorkflowRun | null> {
     const hot = this.hot();
     if (hot) {
-      const sql = await this.hotRunSql(hot);
+      const sql = await this.hotReads(hot);
       const rows =
         this.scopeNamespace === undefined
           ? await hot.rows(sql.lockAndGet, [owner, leaseUntilMs, runId, nowMs])
@@ -2050,20 +2066,41 @@ const RUN_BASE_COLUMNS = [
 ] as const;
 /** Runs columns that arrived in later schema waves: read only when the table has them. */
 const RUN_OPTIONAL_COLUMNS = ['origin', 'awaiting_decision_task_id', 'wake_requested_at'] as const;
-const RUN_COLUMNS_PRESENT_SQL = `select "column_name" from information_schema.columns where "table_schema" = current_schema() and "table_name" = ? and "column_name" = any(?)`;
-/** Every checkpoint column. */
-const CHECKPOINT_ALL_LIST = [...CHECKPOINT_COLUMNS_BUT_INPUT, 'input'].map(quote).join(', ');
+/** Checkpoint columns that arrived in later schema waves: read only when the table has them. */
+const CHECKPOINT_OPTIONAL_COLUMNS = [
+  'queue',
+  'parallel_group',
+  'last_heartbeat_at',
+  'heartbeat_progress',
+] as const;
+const CHECKPOINT_BASE_COLUMNS = [
+  ...CHECKPOINT_COLUMNS_BUT_INPUT.filter(
+    (c) => !(CHECKPOINT_OPTIONAL_COLUMNS as readonly string[]).includes(c),
+  ),
+  'input',
+];
+const COLUMNS_PRESENT_SQL = `select "table_name", "column_name" from information_schema.columns where "table_schema" = current_schema() and "table_name" = any(?) and "column_name" = any(?)`;
 const BUFFERED_SIGNAL_LIST = ['id', 'token', 'payload'].map(quote).join(', ');
 const BUFFERED_EVENT_LIST = ['id', 'name', 'payload', 'published_at'].map(quote).join(', ');
 
-/** The hot run reads, for the runs column list `cols` (quoted, comma-joined). */
-function runReadSql(cols: string): {
+/** The hot reads whose column list depends on the schema: the run reads and the checkpoint read. */
+interface HotReads {
   get: string;
   getScoped: string;
   lockAndGet: string;
   lockAndGetScoped: string;
-} {
+  getCheckpoint: string;
+}
+
+/** {@link HotReads} for the runs column list `cols` and checkpoints column list `checkpointCols`
+ *  (each quoted, comma-joined). */
+function hotReadSql(cols: string, checkpointCols: string): HotReads {
   return {
+    getCheckpoint: shapedSql(
+      `checkpoint-get:${checkpointCols}`,
+      () =>
+        `select ${checkpointCols} from ${CHECKPOINTS_T} where "run_id" = ? and "seq" = ? limit 1`,
+    ),
     get: shapedSql(`run-get:${cols}`, () => `select ${cols} from ${RUNS_T} where "id" = ? limit 1`),
     getScoped: shapedSql(
       `run-get-scoped:${cols}`,
@@ -2088,7 +2125,6 @@ const RELEASE_UNLESS_WAKE_SQL = `update ${RUNS_T} set "locked_by" = null, "locke
 const LOCKED_BY_SQL = `select "locked_by" from ${RUNS_T} where "id" = ? limit 1`;
 const RENEW_LOCK_SQL = `update ${RUNS_T} set "locked_until" = ? where "id" = ? and "locked_by" = ?`;
 const DELETE_ATTRIBUTES_SQL = `delete from ${quote(DURABLE_TABLES.attributes)} where "run_id" = ?`;
-const GET_CHECKPOINT_SQL = `select ${CHECKPOINT_ALL_LIST} from ${CHECKPOINTS_T} where "run_id" = ? and "seq" = ? limit 1`;
 const CHECKPOINTS_FOR_SETTLE_SQL = `select ${CHECKPOINT_LIST} from ${CHECKPOINTS_T} where "run_id" = ? and "seq" = any(?)`;
 const REPLAY_CHECKPOINTS_SQL = `select ${CHECKPOINT_LIST} from ${CHECKPOINTS_T} where "run_id" = ? order by "seq" asc`;
 const COUNT_CHECKPOINTS_SQL = `select count(*) as "count" from ${CHECKPOINTS_T} where "run_id" = ? and "seq" >= ? and "seq" <= ? and "status" = any(?)`;
