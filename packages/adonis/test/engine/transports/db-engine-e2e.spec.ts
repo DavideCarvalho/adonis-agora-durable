@@ -37,7 +37,7 @@ describe.each(dbBackends())('on $name', ({ makeTransportDb }) => {
       const db = await makeTransportDb();
       const store = new InMemoryStateStore();
       const engineTransport = new DbTransport({ db, pollIntervalMs: 5 });
-      const workerTransport = new DbTransport({ db, group: 'math', pollIntervalMs: 5 });
+      const workerTransport = new DbTransport({ db, pollIntervalMs: 5 });
       cleanups.push(
         () => engineTransport.close(),
         () => workerTransport.close(),
@@ -68,7 +68,7 @@ describe.each(dbBackends())('on $name', ({ makeTransportDb }) => {
       const db = await makeTransportDb();
       const store = new InMemoryStateStore();
       const engineTransport = new DbTransport({ db, pollIntervalMs: 5 });
-      const workerTransport = new DbTransport({ db, group: 'math', pollIntervalMs: 5 });
+      const workerTransport = new DbTransport({ db, pollIntervalMs: 5 });
       cleanups.push(
         () => engineTransport.close(),
         () => workerTransport.close(),

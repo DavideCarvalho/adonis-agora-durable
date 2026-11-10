@@ -51,7 +51,7 @@ export interface RedisControlPlaneConfig {
  *
  * export default defineConfig({
  *   transport: 'queue',
- *   transports: { queue: transports.queue({ connection: 'redis', group: 'workers' }) },
+ *   transports: { queue: transports.queue({ connection: 'redis' }) },
  *   // Fan out lifecycle events + cancellation across every replica over Redis pub/sub.
  *   controlPlane: controlPlanes.redis({ connection: 'main' }),
  * })

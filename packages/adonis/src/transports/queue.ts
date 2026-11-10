@@ -225,13 +225,6 @@ export interface QueueTransportOptions {
    */
   adapter: AdapterFactory;
   /**
-   * @deprecated Steps are now routed BY HANDLER NAME, so this instance serves whatever names it
-   * `handle()`s — no group to declare. Accepted for back-compat / parity with the pre-redesign API
-   * and otherwise ignored (a worker subscribes to one task queue PER registered handler name). Use
-   * {@link partition} for isolation.
-   */
-  group?: string;
-  /**
    * Optional isolation partition suffixing every per-handler tasks queue this worker subscribes to
    * (`<name>@<partition>`), matching the `partition` a dispatch carries — so the same backend can
    * host several worker pools serving the same handler name without their tasks crossing. Unset (or

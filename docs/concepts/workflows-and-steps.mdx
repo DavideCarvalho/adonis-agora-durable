@@ -185,7 +185,7 @@ transport.handle('payments:charge-card', async (input: { orderId: number; amount
 })
 ```
 
-Routing is by name: a step's queue/wire token is derived from its (sanitized) name, suffixed `<name>@<partition>` when the run belongs to a non-default namespace or the transport sets a `partition` (see [Tenancy](/docs/durable/concepts/tenancy#partition--the-queue-suffix)). The transports' old `group` option is **deprecated**: it is accepted and ignored, so use `partition` for isolation.
+Routing is by name: a step's queue/wire token is derived from its (sanitized) name, suffixed `<name>@<partition>` when the run belongs to a non-default namespace or the transport sets a `partition` (see [Tenancy](/docs/durable/concepts/tenancy#partition--the-queue-suffix)).
 
 ## Local (in-process) steps
 

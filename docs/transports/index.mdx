@@ -65,7 +65,6 @@ export default defineConfig({
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `group` | — | Accepted for parity with the broker drivers. Handlers match by step name in-process, so it does not affect routing. |
 | `instanceId` | random | Stable id for this process, stamped on control messages. |
 | (namespace) | the engine's | Not a factory option: the engine pushes its `namespace` onto the transport, which folds it into its internal channel names. |
 | `onError` | `console.error` | Where a failing result or heartbeat handler is reported. A failed result is redelivered from memory with backoff (100ms doubling to 5s) until `close()`; a failed heartbeat is dropped. |

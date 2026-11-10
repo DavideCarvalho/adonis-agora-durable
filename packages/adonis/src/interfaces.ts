@@ -287,8 +287,8 @@ export interface StepEvent {
   phase?: string;
   /** For a log line emitted *inside* a sub-process: that owning sub-process's name, so the dashboard
    *  can group a step's log trail under each sub-process instead of one flat list. Set on logs (no
-   *  `status`); a worker stamps it from the sub-process it's running.
-   *  @deprecated Superseded by `subId` for run-distinct grouping; kept so existing workers/runs render. */
+   *  `status`); a worker stamps it from the sub-process it's running. The Python worker still sends
+   *  it, and stored checkpoints carry it, so it stays; the TS step logger groups by `subId` instead. */
   process?: string;
   /** Optional structured payload. `data.durationMs` (number) overrides the derived duration. */
   data?: unknown;

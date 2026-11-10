@@ -75,8 +75,8 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb, makeTransportDb }) => {
 
       const seenA: string[] = [];
       const seenB: string[] = [];
-      const workerA = transport({ group: 'math', instanceId: 'A' });
-      const workerB = transport({ group: 'math', instanceId: 'B' });
+      const workerA = transport({ instanceId: 'A' });
+      const workerB = transport({ instanceId: 'B' });
       workerA.handle('math.double', (input) => {
         seenA.push(JSON.stringify(input));
         return { ok: true };
@@ -126,7 +126,7 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb, makeTransportDb }) => {
     it('delivers a worker result row to the engine onResult handler', async () => {
       db = await makeTransportDb();
       const engine = transport();
-      const worker = transport({ group: 'math' });
+      const worker = transport();
 
       const results: StepResult[] = [];
       engine.onResult(async (r) => {
@@ -153,7 +153,7 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb, makeTransportDb }) => {
     it('a thrown handler produces a failed result carrying retryable', async () => {
       db = await makeTransportDb();
       const engine = transport();
-      const worker = transport({ group: 'math' });
+      const worker = transport();
       const results: StepResult[] = [];
       engine.onResult(async (r) => {
         results.push(r);
@@ -172,7 +172,7 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb, makeTransportDb }) => {
     it('polls heartbeat rows and delivers them to the engine', async () => {
       db = await makeTransportDb();
       const engine = transport();
-      const worker = transport({ group: 'math' });
+      const worker = transport();
 
       const beats: Heartbeat[] = [];
       engine.onHeartbeat(async (b) => {
@@ -205,7 +205,7 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb, makeTransportDb }) => {
         .update({ claimed_by: 'dead', claimed_at: Date.now() - 60_000 });
 
       const seen: string[] = [];
-      const worker = transport({ group: 'math', leaseMs: 1000 });
+      const worker = transport({ leaseMs: 1000 });
       worker.handle('math.double', (input) => {
         seen.push(JSON.stringify(input));
         return { ok: true };
@@ -248,9 +248,9 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb, makeTransportDb }) => {
       it('two namespaces over ONE table set never cross-claim tasks or cross-deliver results', async () => {
         db = await makeTransportDb();
         const alphaEngine = transport({ namespace: 'alpha' });
-        const alphaWorker = transport({ namespace: 'alpha', group: 'math' });
+        const alphaWorker = transport({ namespace: 'alpha' });
         const betaEngine = transport({ namespace: 'beta' });
-        const betaWorker = transport({ namespace: 'beta', group: 'math' });
+        const betaWorker = transport({ namespace: 'beta' });
 
         const alphaResults: unknown[] = [];
         const betaResults: unknown[] = [];
@@ -339,7 +339,7 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb, makeTransportDb }) => {
 
         // A default worker claims and runs the back-filled legacy row.
         const seen: string[] = [];
-        const worker = transport({ group: 'math' });
+        const worker = transport();
         worker.handle('math.double', (input: any) => {
           seen.push(JSON.stringify(input));
           return { n: input.n * 2 };

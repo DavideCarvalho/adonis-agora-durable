@@ -20,7 +20,7 @@ import { defineConfig, transports, stores } from '@adonis-agora/durable'
 export default defineConfig({
   // role: 'standalone' is the default — you can omit it
   transport: 'queue',
-  transports: { queue: transports.queue({ connection: 'redis', group: 'durable' }) },
+  transports: { queue: transports.queue({ connection: 'redis' }) },
   store: 'lucid',
   stores: { lucid: stores.lucid({ connection: 'pg' }) },
 })

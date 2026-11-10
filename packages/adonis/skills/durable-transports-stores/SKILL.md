@@ -417,27 +417,6 @@ schema in place" warning meaning exactly this — the database was behind and th
 fix was never recorded in migration history. Source: `docs/stores/lucid.mdx`
 ("The repair warning").
 
-### MEDIUM using the deprecated `group` option to isolate worker pools
-
-Wrong:
-
-```ts
-transports.db({ group: 'tenant-a' }) // silently accepted and ignored
-```
-
-Correct:
-
-```ts
-transports.db({ partition: 'tenant-a' })
-```
-
-Mechanism: routing is by handler name — an instance serves whatever names it
-registers, so there is no group to declare. Isolation comes from `partition`
-(suffixes routing tokens `<name>@<partition>`) plus `namespace` (scopes which
-runs this engine polls; absent = `'default'` on standalone, every pool on a
-control plane). Source: `docs/transports/db.mdx` options table,
-`docs/concepts/tenancy.mdx`.
-
 ### MEDIUM wrapping a store in CodecStateStore and expecting heartbeats
 
 Wrong:

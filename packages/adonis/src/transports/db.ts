@@ -205,13 +205,6 @@ export interface DbTransportOptions {
    */
   db: Database;
   /**
-   * @deprecated Steps are now routed BY HANDLER NAME, so this instance serves whatever names it
-   * `handle()`s — no group to declare. Accepted for back-compat / parity and otherwise ignored (the
-   * task poll loop claims rows for every registered handler name's routing token). Use
-   * {@link partition} for isolation.
-   */
-  group?: string;
-  /**
    * Optional isolation partition suffixing every per-handler routing token this worker claims
    * (`<name>@<partition>`), matching the `partition` a dispatch carries. Unset (or `'default'`)
    * claims the bare (sanitized) handler-name tokens.

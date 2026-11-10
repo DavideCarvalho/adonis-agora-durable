@@ -509,20 +509,6 @@ skills:
         status: active
         version_context: '0.25.0'
         skills: ['durable-transports-stores']
-      - mistake: expecting the deprecated group option to isolate workers
-        mechanism: >-
-          `group` is accepted but ignored on queue/db transports — routing is
-          by handler name; isolation comes from `partition` (queues) and
-          `namespace` (store poll scope).
-        wrong_pattern: |
-          transports.db({ group: 'tenant-a' }) // silently ignored
-        correct_pattern: |
-          transports.db({ partition: 'tenant-a' })
-        source: 'DavideCarvalho/adonis-durable:docs/transports/db.mdx'
-        priority: MEDIUM
-        status: active
-        version_context: '0.25.0'
-        skills: ['durable-transports-stores', 'durable-cluster']
       - mistake: wrapping a store in CodecStateStore and losing heartbeats
         mechanism: >-
           CodecStateStore does not implement recordStepHeartbeat, so encrypted
