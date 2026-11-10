@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.2
+
+### Patch Changes
+
+- [#485](https://github.com/DavideCarvalho/adonis-agora-durable/pull/485) [`62466b7`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/62466b763adaab309d83cc4d35ed4278854ab4e9) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The suspend a thin-worker workflow op (`WorkflowTurnCtx.step`, `sleep`, `waitSignal`, `gatherCalls`, …) throws is now a control-flow signal: `isWorkflowControlFlowSignal(error)` returns `true` for it, so a `catch` in the body can rethrow it instead of running cleanup that emits extra commands into the turn.
+
 ## 1.0.0-rc.1
 
 ### Patch Changes
