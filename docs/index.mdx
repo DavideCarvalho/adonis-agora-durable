@@ -40,7 +40,7 @@ This registers the durable and dashboard providers, the Ace commands and the cod
 </Step>
 <Step>
 
-Define a workflow as a class under `app/workflows/` — it is auto-registered at boot. Every `ctx.step` is checkpointed; `ctx.waitForSignal` suspends the run until a signal arrives:
+Define a workflow as a class under `app/workflows/` — it is auto-registered at boot. Every step is checkpointed (here `ctx.localStep`, which runs in-process; `ctx.step` dispatches to a worker); `ctx.waitForSignal` suspends the run until a signal arrives:
 
 ```ts title="app/workflows/checkout_workflow.ts"
 import { BaseWorkflow } from '@adonis-agora/durable'

@@ -1,0 +1,108 @@
+---
+title: Read-only pods
+description: "A recipe for a pod that reads durable state (the dashboard, an admin API, reports) and never executes a workflow: drive: false, consumers: 'never' and stepsPath: false on the shared config, with durable:work pods doing the work."
+icon: Eye
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+Sometimes a pod should see every run but never run one: an operations console, an internal admin API, a reporting service. It shares the store with the rest of the fleet, but it shouldn't execute workflow bodies, claim broker jobs or serve `app/steps`. Three settings in `config/durable.ts` turn a `standalone` pod into one:
+
+| Setting | What it stops |
+| --- | --- |
+| `drive: false` | Executing runs. A run it starts, retries or recovers is left `pending` for a `durable:work` pod. |
+| `consumers: 'never'` | Claiming broker jobs: step tasks, step results, the run queue. |
+| `stepsPath: false` | Serving the step handlers under `app/steps`. |
+
+Keep one config file for the whole fleet and switch the pod with an environment variable, because `stepsPath: false` would also stop a `durable:work` pod from serving steps.
+
+```ts title="start/env.ts"
+export default await Env.create(new URL('../', import.meta.url), {
+  // …
+  DURABLE_READ_ONLY: Env.schema.boolean.optional(),
+})
+```
+
+```ts title="config/durable.ts"
+import env from '#start/env'
+import { defineConfig, stores, transports } from '@adonis-agora/durable'
+
+const readOnly = env.get('DURABLE_READ_ONLY', false)
+
+export default defineConfig({
+  transport: 'bullmq',
+  transports: {
+    bullmq: transports.bullmq({
+      connection: { host: env.get('REDIS_HOST'), port: env.get('REDIS_PORT') },
+    }),
+  },
+  store: 'lucid',
+  stores: { lucid: stores.lucid({ connection: 'pg' }) },
+
+  drive: !readOnly,
+  consumers: readOnly ? 'never' : 'auto',
+  stepsPath: readOnly ? false : 'app/steps',
+})
+```
+
+Deploy the pod with `DURABLE_READ_ONLY=true` and start it as a normal web server (`node bin/server.js`). Don't enable `worker: { embedded: true }` on it: `drive: false` together with the embedded worker throws at boot. At least one `node ace durable:work` pod, without the variable, has to run elsewhere, or the runs this pod starts stay `pending`.
+
+## Reading from it
+
+Everything that reads the store works as on any pod: the [dashboard](/docs/durable/observability/dashboard), `engine.getRun`, `engine.listRuns`, `engine.getEvent`, run detail and search attributes.
+
+```ts title="app/controllers/admin/runs_controller.ts"
+import type { HttpContext } from '@adonisjs/core/http'
+import engine from '@adonis-agora/durable/services/main'
+
+export default class RunsController {
+  async index({ request, response }: HttpContext) {
+    const runs = await engine.listRuns({
+      workflow: 'checkout',
+      status: 'failed',
+      page: request.input('page', 1),
+      size: 50,
+    })
+    return response.ok(runs.map((run) => ({ id: run.id, status: run.status, updatedAt: run.updatedAt })))
+  }
+
+  async show({ params, response }: HttpContext) {
+    const run = await engine.getRun(params.id)
+    if (!run) return response.notFound()
+    return response.ok({ run, progress: await engine.getEvent(run.id, 'progress') })
+  }
+}
+```
+
+## What still runs on it
+
+`drive: false` stops the pod from *picking up* runs, not from acting on a run it is asked to act on directly:
+
+- **Starting** writes a `pending` run and returns. A `durable:work` pod executes it.
+- **A signal, an update or a webhook** that this pod receives resumes the waiting run here, under the run's lease.
+- **A compensating cancel** runs its undo steps here.
+- **A retry from the console** requeues the run as `pending` for a worker.
+
+All of these write to the store, so the pod needs the primary database connection, not a read-only replica connection. The Lucid store also provisions its tables at boot unless `autoSchema` is `false`.
+
+<Callout type="info" title="Keep the console read-only too">
+If the pod must never resume a run, route signals and webhooks to the worker pods and give the console's users the `viewer` role, so every mutating dashboard route answers `403`. See [Dashboard authentication](/docs/durable/observability/dashboard-auth).
+</Callout>
+
+## A hand-built engine
+
+A `WorkflowEngine` you construct yourself gets the same behaviour from a run dispatcher that does nothing. Don't register step handlers on its transport:
+
+```ts
+const engine = new WorkflowEngine({
+  store,
+  transport,
+  runDispatcher: { dispatch: () => {} }, // started runs stay pending
+})
+```
+
+## Related
+
+- [Roles & config](/docs/durable/cluster/roles-and-config): `drive`, `consumers` and the other roles.
+- [Running in production](/docs/durable/production): web and worker pods sharing one config.
+- [Where a run actually executes](/docs/durable/reliability/failure-modes#where-a-run-actually-executes): the run dispatchers side by side.

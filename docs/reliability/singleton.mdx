@@ -6,7 +6,7 @@ icon: Diamond
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
-Some work must never overlap for a given key, even though many *different* keys should run freely in parallel — one inventory sync per store, one statement generation per account, one deploy per environment. `singleton` is a durable, FIFO mutex over a workflow's runs: declare a key function once, and the engine admits at most `limit` runs sharing that key at a time, across every instance that shares the store.
+Some work must never overlap for a given key, even though many *different* keys should run freely in parallel — one inventory sync per store, one statement generation per account, one deploy per environment. `singleton` is a durable, FIFO mutex over a workflow's runs: declare a key function once, and the engine admits at most `limit` runs sharing that key at a time, across every instance that shares the store (on the bundled stores; see [Limits](#limits) for the edges).
 
 As a live system: three keys, one mutex slot each. Burst `store:A` and only its lane backs up, while the waiters sit suspended with zero compute:
 
@@ -142,6 +142,17 @@ try {
 The capacity check counts the `pending`/`running`/`suspended`/`blocked` runs of the workflow sharing the key in one scan and compares against `(limit ?? 1) + maxQueueDepth`. Unlike the slot claim, that scan is an ordinary run read, so with `scopeReads` on it only counts the engine's own namespace. It runs *before* the run row is written, so a rejected start leaves no trace in the store. Once a slot frees (notify-on-release promotes the oldest waiter, which later settles), the backlog count drops below the cap and the next `start` is accepted again.
 
 The check applies wherever the workflow is started — `engine.start`, `Wf.dispatch` / `Wf.start`, child workflows (a rejected child start is delivered to the parent as a failed child), event triggers and schedules. An idempotent re-`start` of an existing `runId` returns that run before the check and is never rejected.
+
+## Limits
+
+The guarantee above has edges. Plan around these:
+
+- **"At most `limit`" holds only on a store with `tryAdmitSingleton`.** The Lucid and in-memory stores have it. A custom store without it falls back to the scan described under [Store support](#store-support), and replicas can then briefly run more than `limit` runs of a key.
+- **`maxQueueDepth` is a soft cap.** The capacity check is a count taken before the run is written, not part of the slot claim. Starts for the same key that arrive at the same moment on different instances can each pass it, so the backlog can end up a few runs past `limit + maxQueueDepth`. Treat it as back-pressure, not as an exact bound.
+- **A crashed holder blocks its key until recovery.** Its slot is held through the crash, so waiters keep waiting until a worker loop's recovery pass re-drives it (after its lease expires, `leaseMs`, 30 s by default) and it settles. With no worker loop running, that never happens.
+- **Waiters poll.** A waiter that misses the release notification (the releasing instance died first) claims the slot on its next retry, about a second later, and each retry is a store round-trip. A long same-key backlog costs one claim per waiter per second.
+- **Waiters look `suspended`.** A run waiting for a slot shows as `suspended` in the dashboard and in `listRuns`, the same as a run that is sleeping or waiting on a signal. Its `singleton:<key>` tag and the absence of the `durable:singleton:admitted` tag tell them apart.
+- **A delayed start holds its place in line.** A run started with `startAt` is a `suspended` waiter for its key from the moment it is created. It counts toward `maxQueueDepth`, and while it is the oldest waiter, younger runs of the key wait behind it until its start time comes and it takes the slot.
 
 ## Singleton schedules
 

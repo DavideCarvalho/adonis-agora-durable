@@ -239,6 +239,8 @@ const result = await OrderWorkflow.start(input)
 ```
 
 Both are **context-aware**: called inside a running workflow body they route to a child instead of the engine.
+A dispatched step handler is not the body, so `Wf.dispatch` called from one starts a separate top-level run, not a
+child of the run that dispatched the step.
 See [Child workflows](/docs/durable/authoring/child-workflows) for the full semantics table.
 
 The second argument (`WorkflowDispatchOptions`) is an optional `runId` plus the engine's `StartOptions`:
