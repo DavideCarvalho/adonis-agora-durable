@@ -211,6 +211,32 @@ describe('BaseWorkflow.start — OUTSIDE, a run that does not complete', () => {
     expect((err as FatalError).message).toMatch(/^run "parked-1" failed: /);
   });
 
+  it('throws when the run goes dead', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store, maxRecoveryAttempts: 0 });
+    setWorkflowEngineResolver(() => engine);
+
+    class Doomed extends BaseWorkflow {
+      static override workflow = { name: 'outside-doomed', version: '1' };
+      async run(ctx: WorkflowCtx) {
+        return ctx.waitForSignal<string>('never-sent');
+      }
+    }
+    await registerWorkflowClass(engine, Doomed);
+
+    const started = Doomed.start({}, { runId: 'doomed-1' }).catch((e: unknown) => e);
+    await poll(async () => (await store.getRun('doomed-1'))?.status === 'suspended');
+    // An executor that crashed mid-turn leaves the run `running` with a free lease; with no
+    // recovery attempts left, recovery marks it dead.
+    await store.updateRun('doomed-1', { status: 'running' });
+    await engine.recoverIncomplete();
+    expect((await store.getRun('doomed-1'))?.status).toBe('dead');
+
+    const err = await started;
+    expect(err).toBeInstanceOf(FatalError);
+    expect((err as FatalError).message).toMatch(/^run "doomed-1" failed: /);
+  });
+
   it('honours timeoutMs, rejecting while the run keeps going', async () => {
     const store = new InMemoryStateStore();
     const engine = new WorkflowEngine({ store });
