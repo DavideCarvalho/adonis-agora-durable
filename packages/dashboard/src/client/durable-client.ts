@@ -10,8 +10,9 @@
  *
  * 1. `WorkflowRun.origin` — the engine stores the origin it attributes at start (the `origin` column),
  *    so a run carries one when its registration declared or derived one; older and unattributed runs
- *    have none and bucket under the console's `app` facet. The server does not filter runs by origin:
- *    the origin facet (`OriginFacets.tsx`) counts and narrows the page already loaded, client-side.
+ *    have none and bucket under the console's `app` facet. An exact `origin` filter narrows the store
+ *    query server-side; the `app` bucket (no origin) filters the loaded page client-side, since an
+ *    exact match cannot express absence.
  *    A suspended run's list row carries `waiting` too (the engine's `listSignalWaiters` scan is wired
  *    into `GET /runs`, see `packages/adonis/src/dashboard/handlers.ts`'s `listRuns`).
  * 2. `WorkerHeartbeat.status` (rss/cpu/concurrency telemetry) — present when the worker's heartbeat
@@ -763,8 +764,8 @@ export interface RunFilterOptions {
   namespace?: string | string[] | undefined;
   /** One workflow narrows; several match ANY of them (the workflow picker's multi-select). */
   workflow?: string | string[] | undefined;
-  /** See module doc note #1 — the server ignores it (the origin facet narrows client-side), and it
-   *  cannot select unattributed runs. */
+  /** See module doc note #1 — an exact match, narrowed server-side; it cannot select unattributed
+   *  runs (the `app` bucket filters client-side). */
   origin?: string | undefined;
 }
 
