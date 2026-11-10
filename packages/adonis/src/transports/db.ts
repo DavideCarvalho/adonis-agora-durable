@@ -1511,17 +1511,27 @@ export class DbTransport implements Transport, ControlPlane {
           this.#release(table, token, row.id);
         }
       })();
-    const tick = async (): Promise<boolean> => {
-      if (!(await this.#messagesReady(false))) return false;
+    // Set by `stop()`. A poll already past the loop's own stop check when `stop()` lands (waiting on
+    // the schema probe or the claim's read) must not hand rows to the handler after `stop()` resolved:
+    // it gives back whatever it claimed, and `stop()` waits for it.
+    let stopping = false;
+    let polling: Promise<boolean> | undefined;
+    const poll = async (): Promise<boolean> => {
+      if (stopping || !(await this.#messagesReady(false))) return false;
       const free = concurrency - inFlight.size;
       if (free <= 0) {
         await Promise.race(inFlight);
         return true;
       }
+      if (stopping) return false;
       const { rows, token } = await this.#claim<MessageRow>(table, free, undefined, 'id', {
         scope: { kind: MESSAGE_KINDS.run, recipients: [''], namespace },
       });
       if (rows.length === 0) return false;
+      if (stopping) {
+        await this.#handBack(table, [token]);
+        return false;
+      }
       this.#hold(
         table,
         token,
@@ -1534,11 +1544,18 @@ export class DbTransport implements Transport, ControlPlane {
       }
       return true;
     };
+    const tick = (): Promise<boolean> => {
+      const current = poll();
+      polling = current;
+      return current;
+    };
     const loop = this.#startLoop(tick, this.#idleBackoffMax);
     let stopped: Promise<void> | undefined;
     const stop = () => {
       stopped ??= (async () => {
+        stopping = true;
         loop.stop();
+        await polling?.catch(() => false);
         await Promise.allSettled([...inFlight]);
       })();
       return stopped;

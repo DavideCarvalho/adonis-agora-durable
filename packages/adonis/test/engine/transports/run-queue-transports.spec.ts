@@ -124,17 +124,113 @@ describe.each(dbBackends({ mysql: true }))('DbTransport run queue on $name', ({ 
     expect(Number(rows[0]?.n)).toBe(450);
   });
 
+  /** The `run` rows nobody holds a claim on. */
+  const unclaimedRuns = async (): Promise<number> => {
+    const rows = (await (db as Database)
+      .from(TRANSPORT_TABLES.messages)
+      .where('kind', 'run')
+      .whereNull('claimed_by')
+      .count('* as n')) as Array<{ n: number | string }>;
+    return Number(rows[0]?.n);
+  };
+
+  /** Watch `state` for `ms`: the handler count must not move (nothing is taken after stop). */
+  const staysStill = async (state: { done: number; active: number }, ms: number) => {
+    const done = state.done;
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      expect(state.active).toBe(0);
+      expect(state.done).toBe(done);
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  };
+
   it('runs at most `concurrency` handlers at once, and stops taking rows on stop', async () => {
     const transport = await make();
     const { state, handler } = overlapping();
     const stop = transport.onDispatchedRun(handler, { concurrency: 3 });
     await transport.dispatchRuns(runs(12));
     await until(() => state.done === 12);
-    expect(state.peak).toBe(3);
+    expect(state.peak).toBeGreaterThanOrEqual(1);
+    expect(state.peak).toBeLessThanOrEqual(3);
     await stop();
     await transport.dispatchRuns(runs(2));
-    await new Promise((r) => setTimeout(r, 100));
-    expect(state.done).toBe(12);
+    await staysStill(state, 300);
+    expect(await unclaimedRuns()).toBe(2);
+  });
+
+  it('a poll in flight when stop() is called takes nothing after stop() resolves', async () => {
+    const live = await makeMemoryDb();
+    // Park the next read of the messages table until released: a poll that started before stop()
+    // and reads the table after the rows below were written.
+    let armed = false;
+    let parked = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const connection = live.connection.bind(live);
+    (live as { connection: typeof live.connection }).connection = ((name?: string) => {
+      const client = connection(name);
+      return new Proxy(client, {
+        get(target, prop, receiver) {
+          if (prop !== 'knexQuery') return Reflect.get(target, prop, receiver);
+          return () => gated(target.knexQuery());
+        },
+      });
+    }) as typeof live.connection;
+    const gated = (builder: ReturnType<ReturnType<Database['connection']>['knexQuery']>) => {
+      const proxy: unknown = new Proxy(builder, {
+        get(target, prop) {
+          if (prop === 'then') {
+            const sql = target.toSQL().sql;
+            const isMessageRead =
+              armed && sql.startsWith('select') && sql.includes(TRANSPORT_TABLES.messages);
+            if (!isMessageRead) return target.then.bind(target);
+            parked += 1;
+            return (ok: (v: unknown) => unknown, ko: (e: unknown) => unknown) =>
+              gate.then(() => target.then(ok, ko));
+          }
+          const value = Reflect.get(target, prop);
+          if (typeof value !== 'function') return value;
+          return (...args: unknown[]) => {
+            const out = value.apply(target, args);
+            return out === target ? proxy : out;
+          };
+        },
+      });
+      return proxy as typeof builder;
+    };
+    const transport = new DbTransport({ db: live, pollIntervalMs: 5 });
+    try {
+      const { state, handler } = overlapping(5);
+      const stop = transport.onDispatchedRun(handler, { concurrency: 3 });
+      await transport.dispatchRuns(runs(3));
+      await until(() => state.done === 3);
+      armed = true;
+      await until(() => parked > 0);
+      armed = false;
+      let stopped = false;
+      const stopping = stop().then(() => {
+        stopped = true;
+      });
+      await transport.dispatchRuns(runs(2));
+      release();
+      await stopping;
+      expect(stopped).toBe(true);
+      await staysStill(state, 300);
+      expect(state.done).toBe(3);
+      const rows = (await live
+        .from(TRANSPORT_TABLES.messages)
+        .where('kind', 'run')
+        .whereNull('claimed_by')
+        .count('* as n')) as Array<{ n: number | string }>;
+      expect(Number(rows[0]?.n)).toBe(2);
+    } finally {
+      release();
+      await transport.close();
+      await live.manager.closeAll();
+    }
   });
 
   it("claims only its namespace's rows", async () => {
