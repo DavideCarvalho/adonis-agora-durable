@@ -7,7 +7,7 @@ import type { RunWaiting, StepCheckpoint } from './durable-client.js';
  * The engine parks every external rendezvous on one signal-waiter table, and the TOKEN carries the
  * shape (see `packages/adonis/src/run-waiting.ts` and `workflow-ctx.ts`):
  *
- *  - `update:<runId>:<name>` — a `ctx.onUpdate(name)` point → `POST /runs/:id/update/:name`
+ *  - `update:<runId>:<name>` — a `ctx.onUpdate(name)` point → `POST /runs/:id/updates/:name`
  *  - `task:<runId>:<name>`   — an external `ctx.task`      → `POST /runs/:id/tasks/:name/complete|fail`
  *  - anything else            — a plain `ctx.waitForSignal` token (incl. `wh:` webhooks)
  *                               → `POST /runs/:id/signal`

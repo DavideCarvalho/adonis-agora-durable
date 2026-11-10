@@ -1,5 +1,5 @@
 /** Keep in sync with this package's `version` in package.json. */
-export const VERSION = '0.60.0';
+export const VERSION = '1.0.0-rc.2';
 
 // Re-export the configure hook from the package root so `node ace configure` finds it.
 // AdonisJS imports the package MAIN and reads `configure` off the module namespace —
@@ -20,6 +20,7 @@ export {
   setWorkflowEngineResolver,
   type WorkflowDispatchOptions,
   type WorkflowEngineResolver,
+  type WorkflowStartOptions,
 } from './base-workflow.js';
 export * from './codec-state-store.js';
 // --- ace command building blocks --------------------------------------------

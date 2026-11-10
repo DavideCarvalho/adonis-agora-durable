@@ -1,3 +1,4 @@
+import { CONTROL_FLOW_SIGNAL } from './control-flow-signal.js';
 import type {
   HistoryEvent,
   StepError,
@@ -86,8 +87,25 @@ export class WorkflowTurnCancelled extends Error {
   }
 }
 
-/** Internal: stop the replay at the first unresolved blocking op (Python `_Suspend`). Never escapes. */
-class TurnSuspend extends Error {}
+/**
+ * Internal: stop the replay at the first unresolved blocking op (Python `_Suspend`). {@link runWorkflowTurn}
+ * turns it into a `continue` decision, but a body's own `catch` around a still-pending op sees it first.
+ * Stamped with {@link CONTROL_FLOW_SIGNAL}, so `isWorkflowControlFlowSignal(err)` in such a `catch`
+ * recognizes it and rethrows it, instead of running cleanup that would emit extra commands into the
+ * turn and corrupt the replayed history.
+ */
+class TurnSuspend extends Error {
+  /** Marks this as a control-flow signal — see `isWorkflowControlFlowSignal`. */
+  readonly [CONTROL_FLOW_SIGNAL] = true;
+  constructor() {
+    // Control flow, thrown at every unresolved op: skip capturing a stack trace nobody reads.
+    const limit = Error.stackTraceLimit;
+    Error.stackTraceLimit = 0;
+    super('workflow turn suspended');
+    Error.stackTraceLimit = limit;
+    this.name = 'TurnSuspend';
+  }
+}
 
 /** Convert an arbitrary thrown value into the wire {@link StepError} (message + optional code + stack). */
 function toStepError(err: unknown): StepError {

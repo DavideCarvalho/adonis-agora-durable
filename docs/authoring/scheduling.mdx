@@ -345,6 +345,39 @@ The guarantee that makes scheduling safe in a multi-instance deployment is the *
 
 The result for scheduling: **each window starts exactly once**, no matter how many worker instances are racing the tick.
 
+The first tick after the loop starts fires the **current** window when it has no run yet. It doesn't wait for the next boundary. A worker that boots at 10:20 starts the 10:00 window of an hourly `everyMs` schedule right away, and a newly added `cron: '0 2 * * *'` schedule starts the window of 02:00 that same day. If that window already has a run (another instance fired it, or the previous deploy did), nothing new starts.
+
+To find a window's run, for a link from your own page or an assertion in a test, build its id with the same helpers the scheduler uses. They are exported from `@adonis-agora/durable`:
+
+```ts title="app/controllers/reports_controller.ts"
+import type { HttpContext } from '@adonisjs/core/http'
+import { nextCronFireMs, prevCronFireMs, scheduledRunId } from '@adonis-agora/durable'
+import engine from '@adonis-agora/durable/services/main'
+
+export default class ReportsController {
+  async show({ response }: HttpContext) {
+    const now = Date.now()
+    // cron window: `sched:<key>:<fire time in ms>`
+    const lastFire = prevCronFireMs('0 2 * * *', now, 'America/Sao_Paulo')
+    const nightly = await engine.getRun(`sched:nightly-report:${lastFire}`)
+    // everyMs window: `sched:<key>:<bucket>`
+    const sync = await engine.getRun(scheduledRunId('cache-sync', 5 * 60 * 1000, now))
+
+    return response.ok({
+      nightly: nightly?.status ?? 'not fired',
+      nextNightlyAt: new Date(nextCronFireMs('0 2 * * *', now, 'America/Sao_Paulo')),
+      sync: sync?.status ?? 'not fired',
+    })
+  }
+}
+```
+
+- `scheduledRunId(key, everyMs, nowMs)`: the run id of the `everyMs` window containing `nowMs`.
+- `prevCronFireMs(cron, nowMs, timezone?)`: the latest fire at or before `nowMs` (the cron window's bucket).
+- `nextCronFireMs(cron, nowMs, timezone?)`: the next fire strictly after `nowMs`.
+
+`timezone` defaults to `UTC` in both cron helpers. Both need `cron-parser` installed, like any cron schedule. For the schedules the worker loop runs, `engine.listSchedules()` already returns each one's current window and next fire time (see [Runtime control](#runtime-control--pause-resume-run-now)).
+
 ## Lower-level — `runSchedules`
 
 The worker loop fires schedules for you, so registering them in `config/durable.ts` is all you normally need. If you drive ticks yourself (a custom loop, an external scheduler, a serverless trigger), call `runSchedules(engine, schedules, nowMs, opts?)` directly — it evaluates each schedule against `nowMs` (applying `paused` and the runtime pause override, `overlap`, `jitter` and `backfill`), starts any due window that does not exist yet, and returns the run ids it started:
@@ -362,4 +395,4 @@ await runSchedules(engine, schedules, Date.now())
 
 A schedule that names its workflow with a lazy import must go through `await resolveSchedules(schedules)` first, which calls the imports and returns the list with registered names; `runSchedules` refuses an unresolved one.
 
-`opts.random` overrides the `Math.random` used to draw each window's `jitter` delay, so tests can make it deterministic (`opts.sleep` is deprecated and no longer called). Pass the same `engine` on every call: fired windows and deferred jittered windows are remembered per engine object. Schedules you pass here directly are not seen by `listSchedules` / `setSchedulePaused` / `triggerSchedule`; those read the set the worker loop adopts (config plus colocated).
+`opts.random` overrides the `Math.random` used to draw each window's `jitter` delay, so tests can make it deterministic. Pass the same `engine` on every call: fired windows and deferred jittered windows are remembered per engine object. Schedules you pass here directly are not seen by `listSchedules` / `setSchedulePaused` / `triggerSchedule`; those read the set the worker loop adopts (config plus colocated).

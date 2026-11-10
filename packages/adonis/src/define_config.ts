@@ -51,7 +51,7 @@ import type { WorkflowRef } from './workflow-ref.js';
  *   transports: {
  *     // production single-process, no external infra:
  *     'event-emitter': transports.eventEmitter(),
- *     queue: transports.queue({ adapter: redis({ host: '127.0.0.1' }), group: 'durable' }),
+ *     queue: transports.queue({ adapter: redis({ host: '127.0.0.1' }) }),
  *     db: transports.db({ connection: 'pg' }),
  *   },
  *   store: 'lucid',
@@ -328,6 +328,12 @@ export interface BaseDurableConfig {
    * waits for the decision with no deadline.
    */
   remoteAdvanceSilenceMs?: number;
+  /**
+   * How often (ms) `engine.waitForRun` and the blocking `Workflow.start()` re-read the run while they
+   * wait, so they see a run that settles on another pod without a control plane. Default 250; `0`
+   * leaves the wait on lifecycle events alone.
+   */
+  waitForRunPollMs?: number;
   /**
    * The most due timers one timer pass loads and resumes, most overdue first; a larger backlog
    * drains over the next ticks. Every worker runs the pass each tick, and each walks its batch in a

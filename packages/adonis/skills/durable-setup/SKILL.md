@@ -176,16 +176,21 @@ the tick in flight is deducted from the drain. The recovery fallbacks are
 
 ### Pattern 3 — dispatch vs start vs waitForRun
 
-One rule: `.dispatch(input)` = fire-and-forget (`{ runId }`); `.start(input)` =
+One rule: `.dispatch(input)` = fire-and-forget (`{ runId }`); `.start(input, { timeoutMs? })` =
 block until the run is **terminal** (it waits through sleeps/signals) and get its
-output; `engine.waitForRun(runId)` resolves a previously started run once it
+output on `completed` — on `failed`/`cancelled`/`dead` it throws the same `FatalError`
+`ctx.child` throws (`run "<runId>" failed: <reason>`, carrying the run error's
+`code`/`details`); `timeoutMs` bounds the wait (the run itself keeps going).
+`engine.waitForRun(runId)` resolves a previously started run once it
 **settles** (terminal or suspended — except a `suspended` run still awaiting a
-remote workflow turn's decision, which keeps waiting until the decision lands) —
+remote workflow turn's decision, which keeps waiting until the decision lands,
+and a `blocked` run with no capable worker, which keeps waiting until it is
+re-driven) —
 pass `{ terminal: true }` to wait for the end.
 
 ```ts
 const { runId } = await OrderWorkflow.dispatch(order) // hot path — respond now
-const output = await OrderWorkflow.start(order) // scripts / short runs only
+const output = await OrderWorkflow.start(order, { timeoutMs: 30_000 }) // scripts / short runs only; throws on failed/cancelled/dead
 await engine.start('order', order, runId)
 const settled = await engine.waitForRun(runId) // RunResult, resolves on settle
 const done = await engine.waitForRun(runId, { terminal: true, timeoutMs: 60_000 })

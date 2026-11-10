@@ -38,7 +38,6 @@ describe('QueueTransport + WorkflowEngine (end to end)', () => {
     const engineTransport = new QueueTransport({ adapter: () => adapter, pollIntervalMs: 5 });
     const workerTransport = new QueueTransport({
       adapter: () => adapter,
-      group: 'math',
       pollIntervalMs: 5,
     });
     cleanups.push(
@@ -70,7 +69,6 @@ describe('QueueTransport + WorkflowEngine (end to end)', () => {
     const engineTransport = new QueueTransport({ adapter: () => adapter, pollIntervalMs: 5 });
     const workerTransport = new QueueTransport({
       adapter: () => adapter,
-      group: 'math',
       pollIntervalMs: 5,
     });
     cleanups.push(

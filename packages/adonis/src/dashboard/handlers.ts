@@ -721,7 +721,7 @@ export async function signalRun(deps: Deps, req: ApiRequest): Promise<ApiRespons
 }
 
 /**
- * `POST /runs/:id/update/:name` — deliver `{ arg? }` to a run's `ctx.onUpdate(name)` point. The
+ * `POST /runs/:id/updates/:name` — deliver `{ arg? }` to a run's `ctx.onUpdate(name)` point. The
  * workflow's registered validator arbitrates server-side: a rejection comes back 422 with the
  * reason, and nothing is delivered.
  */

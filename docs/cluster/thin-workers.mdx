@@ -103,7 +103,22 @@ runtime.registerWorkflow('checkout', (ctx, input) => {
 
 To announce what the worker runs beyond the name (a version, the declaring package, the `onError` routes the engine applies to it), pass a third `meta` argument: `runtime.registerWorkflow('checkout', body, { version: '2', origin: 'billing' })`, or `workflowAnnouncement(CheckoutWorkflow)` (from `@adonis-agora/durable`) to build it from a class's `static workflow`. When the class declares no `origin`, `workflowAnnouncement` [derives](/docs/durable/concepts/workflows-and-steps#run-origin--package-attribution) it the same way a registration does. See [announced registrations](/docs/durable/cluster/handshake#announced-registrations). `registerWorkflowName(name)` / `registerWorkflowNames(names)` advertise a name without a body: it appears in the descriptor's `workflows` list, but this worker executes no turns for it and announces no registration.
 
-The body is synchronous, and that is deliberate rather than a limitation. `ctx.step` either returns the value already recorded in the history or ends the turn by throwing — so a turn is a pure replay that produces a decision, never a long-lived process holding state in memory. `WorkflowTurnCtx` offers `step`, `sleep`, `waitSignal`, `startChild`, `gatherCalls`, `gatherChildren`, `now` and `sideEffect`.
+The body is synchronous, and that is deliberate rather than a limitation. `ctx.step` either returns the value already recorded in the history or ends the turn by throwing — so a turn is a pure replay that produces a decision, never a long-lived process holding state in memory. `WorkflowTurnCtx` offers `step`, `sleep`, `waitSignal`, `startChild`, `gatherCalls`, `gatherChildren`, `now` and `sideEffect`. A `try/catch` around one of them sees that throw when the op is still pending: rethrow it with `if (isWorkflowControlFlowSignal(error)) throw error`, as in a store-backed workflow.
+
+A `ctx.step` in a turn body has no retry policy, no backoff and no `timeoutMs`. The engine dispatches it once, and a failure the worker reports is thrown into the body as a `WorkflowStepFailedError` (exported from `@adonis-agora/durable/worker`) on the next turn, with the recorded error on `.error`. Retry inside the step handler itself when the call is flaky. A step whose worker dies is re-dispatched only through `remoteRedispatchMs` (see [Lost remote dispatch](/docs/durable/reliability/failure-modes#lost-remote-dispatch-the-run-suspends-and-nothing-auto-redrives-it)).
+
+```ts
+import { WorkflowStepFailedError } from '@adonis-agora/durable/worker'
+
+runtime.registerWorkflow('checkout', (ctx, input) => {
+  try {
+    return { paid: ctx.step('billing.charge', input) }
+  } catch (error) {
+    if (error instanceof WorkflowStepFailedError) return { paid: null, reason: error.error.message }
+    throw error // anything else, including the turn's own suspend, must propagate
+  }
+})
+```
 
 <Callout type="warn">
 `node ace durable:worker` registers workflow **names** from `app/workflows` (so routing works) but not their bodies. A pod that must execute turns registers them with `runtime.registerWorkflow(name, body)` explicitly.

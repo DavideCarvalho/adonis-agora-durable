@@ -20,13 +20,13 @@ import { defineConfig, transports, stores } from '@adonis-agora/durable'
 export default defineConfig({
   // role: 'standalone' is the default — you can omit it
   transport: 'queue',
-  transports: { queue: transports.queue({ connection: 'redis', group: 'durable' }) },
+  transports: { queue: transports.queue({ connection: 'redis' }) },
   store: 'lucid',
   stores: { lucid: stores.lucid({ connection: 'pg' }) },
 })
 ```
 
-A standalone engine with no `namespace` is in the `'default'` pool: it drives only `'default'` runs (and legacy rows stored without a namespace), never another pool's on a shared store. Set `drive: false` on a web pod that should only start runs (pair it with `consumers: 'never'`): started runs stay `pending` for a `node ace durable:work` pod, which drives through its poll whatever `drive` says, so the web and worker pods can share one config file. `drive: false` with `worker: { embedded: true }` throws at boot.
+A standalone engine with no `namespace` is in the `'default'` pool: it drives only `'default'` runs (and legacy rows stored without a namespace), never another pool's on a shared store. Set `drive: false` on a web pod that should only start runs (pair it with `consumers: 'never'`): started runs stay `pending` for a `node ace durable:work` pod, which drives through its poll whatever `drive` says, so the web and worker pods can share one config file. `drive: false` with `worker: { embedded: true }` throws at boot. For a pod that only reads (a console or an admin API), see [Read-only pods](/docs/durable/cluster/read-replica).
 
 ## Control plane
 
@@ -126,7 +126,7 @@ A `tenant` pod's *shape* is not another config field — it's **which process yo
 
 <Tab value="Worker pod">
 
-A store-less **task consumer**. It registers `app/steps` (served by the transport) and advertises `app/workflows` names in its descriptor, subscribes their `<name>@<tenant>` queues, executes bodies, and publishes results. It owns no store.
+A store-less **task consumer**. It registers the `app/steps` handlers, subscribes their `<name>@<tenant>` queues, runs the step bodies and publishes the results. It also advertises the `app/workflows` names in its descriptor, so routing works, but it doesn't run those workflow bodies (see [Executing workflow turns](/docs/durable/cluster/thin-workers#executing-workflow-turns)). It owns no store.
 
 ```bash
 node ace durable:worker
@@ -213,24 +213,22 @@ const detail = await runGateway.getRunDetail?.(params.id, { summarizeFansOver: 5
 // detail.fans: [{ group: 'steps:3:40000', label: 'processLine', size: 600, total: 40000, counts: { completed: 580, pending: 20 }, … }]
 ```
 
-On a store-less `tenant` pod the [dashboard](/docs/durable/observability/dashboard) reads run detail through the `getRunDetail` run-request verb, and pages a fan through `getFanMembers`, so the control plane summarizes a wide fan before it crosses the wire. Before answering either verb, the responder checks tenant ownership on the run alone, without loading its timeline. A control plane older than the tenant still serves both; see [Rolling upgrades](#rolling-upgrades).
+On a store-less `tenant` pod the [dashboard](/docs/durable/observability/dashboard) reads run detail through the `getRunDetail` run-request verb, and pages a fan through `getFanMembers`, so the control plane summarizes a wide fan before it crosses the wire. Before answering either verb, the responder checks tenant ownership on the run alone, without loading its timeline. A control plane on 0.50 or later that is older than the tenant still serves both; see [Rolling upgrades](#rolling-upgrades).
 
 ### Rolling upgrades
 
-Tenant pods and the control plane can be upgraded in either order.
+Tenant pods and a control plane on 0.50 or later can be upgraded in either order; upgrade an older control plane first (see [Migrating to 1.0](/docs/durable/migrating-to-1-0#upgrade-a-control-plane-older-than-050-before-its-tenant-pods)). A control plane that does not know a verb a newer tenant sends answers it with an error whose `code` is `unsupported-request`, before it touches the store, and the tenant degrades:
 
-| Tenant | Control plane | What happens |
-| --- | --- | --- |
-| 0.50+ | 0.49.x | The old responder knows `getRunDetail` and `getFanMembers` but not the six newer verbs. It rejects those with an `unknown run-request verb` error, which `ProxyRunGateway` reads as `unsupported-request`; the tenant console degrades as described in [the dashboard docs](/docs/durable/observability/dashboard#fleet-health). |
-| 0.51+ | 0.50.x | The old responder does not know `runFacets`. `ProxyRunGateway` counts the same `(status, origin)` cells from `runValueFacets` (the status axis once overall and once per origin), so the console's chips and backlog gauges keep working. |
-| 0.51+ | 0.49.x | No `runFacets` and no `runValueFacets`: the proxy counts the cells from a `listRuns` of the tenant's matching runs, which reads every one of them, so finish upgrading the control plane soon. |
-| 0.50+ | before 0.49 | Also no `getRunDetail` / `getFanMembers`. `ProxyRunGateway` builds the run detail itself from `getRun`, `getCheckpoints` and `getRunChildren` (each still ownership-checked by the responder), summarizes wide fans on the tenant, and pages fans out of the full timeline. |
-| 0.49.x | 0.50+ | An older proxy never sends the newer verbs; the new responder answers everything it sends exactly as before. |
-| with lifecycle verbs | without them | `republishLifecycle` and `workflowLifecycle` have no fallback: the proxy rejects at once with a `RunGatewayError` coded `unsupported-request` (`<verb> is not supported by this server: the control plane is older than this tenant`), also when an older responder answers with an empty `ok` reply, and the dashboard's republish action and workflow page answer `501`. |
+| Verb the control plane does not answer | What the tenant does |
+| --- | --- |
+| `runFacets` | Counts the same `(status, origin)` cells from `runValueFacets`, or, without that either, from a `listRuns` of the tenant's matching runs, which reads every one of them. |
+| `getRunDetail` / `getFanMembers` | Builds the run detail itself from `getRun`, `getCheckpoints` and `getRunChildren` (each still ownership-checked by the responder), summarizes wide fans on the tenant, and pages fans out of the full timeline. |
+| `retry`, `continue`, `retryWithInput`, `runValueFacets`, `waitingFor` | The tenant console degrades as described in [the dashboard docs](/docs/durable/observability/dashboard#fleet-health). |
+| `republishLifecycle`, `workflowLifecycle` | No fallback: the proxy rejects at once with a `RunGatewayError` coded `unsupported-request` (`<verb> is not supported by this server: the control plane is older than this tenant`), and the dashboard's republish action and workflow page answer `501`. |
 
 Every fallback happens on the reply, with no timeout wait. After the control plane answers that it does not know a verb, the proxy uses the fallback for the next minute before it asks again (`capabilityTtlMs` on a `ProxyRunGateway` you build yourself, default `60_000`): the control plane can be several pods of mixed versions behind one queue, and a reply does not say which pod sent it. The fallback for run detail moves every checkpoint of the run over the wire, so on a run with a very wide fan, finish upgrading the control plane soon.
 
-From 0.50 on, a responder answers a verb it does not know with an error whose `code` is `unsupported-request`, before it touches the store, so the next new verb can fall back the same way. And every request gets a reply: a gateway that throws (in `listRuns`, `workerHealth`, the ownership read, or a tenant verifier) becomes an error reply, so a tenant no longer waits out `requestTimeoutMs` for an answer that will never come.
+Every request gets a reply: a gateway that throws (in `listRuns`, `workerHealth`, the ownership read, or a tenant verifier) becomes an error reply, so a tenant never waits out `requestTimeoutMs` for an answer that will never come.
 
 On a store role, `engine` (the default export of `services/main`) is still there for everything the gateway does not cover — registering workflows, driving poll loops, `getEvent`, `update`, the task verbs. On a `tenant` pod there is no engine to resolve, which is exactly the point: reach for `runGateway` in anything that must run on more than one role.
 

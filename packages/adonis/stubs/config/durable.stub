@@ -24,7 +24,7 @@ import { defineConfig, transports } from '@adonis-agora/durable'
  *     // single-process production, no external infra:
  *     'event-emitter': transports.eventEmitter(),
  *     // \`connection\` names an adapter from config/queue.ts (configure @adonisjs/queue first):
- *     queue: transports.queue({ connection: 'redis', group: 'durable' }),
+ *     queue: transports.queue({ connection: 'redis' }),
  *     db: transports.db(),
  *   },
  *   store: 'lucid',

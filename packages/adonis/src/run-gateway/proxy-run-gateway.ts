@@ -70,9 +70,6 @@ class UnsupportedRunRequestError extends RunGatewayError {
   }
 }
 
-/** The message a responder before 0.50 rejected an unknown verb with (it sent no `code`). */
-const LEGACY_UNKNOWN_VERB = /^unknown run-request verb: /;
-
 /**
  * The narrow slice of {@link import('../interfaces.js').Transport} the {@link ProxyRunGateway} needs —
  * the P4 store-less protocol methods, here declared NON-optional. They are all optional on the full
@@ -180,11 +177,7 @@ export class ProxyRunGateway implements RunGateway {
     this.#pending.delete(reply.requestId);
     if (reply.result.ok) {
       pending.resolve(reply.result.data);
-    } else if (
-      reply.result.error.code === UNSUPPORTED_RUN_REQUEST ||
-      (reply.result.error.code === undefined &&
-        LEGACY_UNKNOWN_VERB.test(reply.result.error.message))
-    ) {
+    } else if (reply.result.error.code === UNSUPPORTED_RUN_REQUEST) {
       pending.reject(new UnsupportedRunRequestError(reply.result.error.message));
     } else {
       pending.reject(new RunGatewayError(reply.result.error.message, reply.result.error.code));
@@ -398,9 +391,9 @@ export class ProxyRunGateway implements RunGateway {
   }
 
   /**
-   * A verb with no fallback on an older control plane: its unsupported-request error, or an empty
-   * `ok` reply, becomes a {@link RunGatewayError} coded `unsupported-request`. Remembered for
-   * `capabilityTtlMs`, so later calls fail at once instead of asking again.
+   * A verb with no fallback when the control plane does not answer it: its unsupported-request error
+   * becomes a {@link RunGatewayError} with a clear message. Remembered for `capabilityTtlMs`, so later
+   * calls fail at once instead of asking again.
    */
   async #newerVerb<T>(body: RunRequestKind): Promise<T> {
     const notSupported = () =>
@@ -409,15 +402,13 @@ export class ProxyRunGateway implements RunGateway {
         UNSUPPORTED_RUN_REQUEST,
       );
     if (this.#knownUnsupported(body.kind)) throw notSupported();
-    let data: T | undefined;
     try {
-      data = await this.#request<T | undefined>(body);
+      return await this.#request<T>(body);
     } catch (err) {
       if (!(err instanceof UnsupportedRunRequestError)) throw err;
+      this.#unsupportedUntil.set(body.kind, Date.now() + this.#capabilityTtlMs);
+      throw notSupported();
     }
-    if (data !== undefined && data !== null) return data;
-    this.#unsupportedUntil.set(body.kind, Date.now() + this.#capabilityTtlMs);
-    throw notSupported();
   }
 
   /**

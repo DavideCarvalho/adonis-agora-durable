@@ -596,7 +596,7 @@ function postBody(route: string, payload: Record<string, unknown>): MockAnswer {
     }
     return settleRun(id, 'completed');
   }
-  const update = route.match(/^\/runs\/([^/]+)\/update\/([^/]+)$/);
+  const update = route.match(/^\/runs\/([^/]+)\/updates\/([^/]+)$/);
   if (update) {
     const id = decodeURIComponent(update[1] as string);
     return settleRun(id, 'completed');

@@ -69,7 +69,6 @@ describe('QueueTransport stalled-job reclaim', () => {
     let runs = 0;
     const worker = new QueueTransport({
       adapter: () => adapter,
-      group: 'ext',
       pollIntervalMs: POLL,
       stalledCheckIntervalMs: CHECK,
       stalledThresholdMs: THRESHOLD,
@@ -106,7 +105,6 @@ describe('QueueTransport stalled-job reclaim', () => {
     let runs = 0;
     const worker = new QueueTransport({
       adapter: () => adapter,
-      group: 'ext',
       pollIntervalMs: POLL,
       stalledCheckIntervalMs: CHECK,
       stalledThresholdMs: 10_000,
@@ -141,7 +139,6 @@ describe('QueueTransport stalled-job reclaim', () => {
     });
     const worker = new QueueTransport({
       adapter: () => adapter,
-      group: 'ext',
       pollIntervalMs: POLL,
       stalledCheckIntervalMs: CHECK,
       stalledThresholdMs: THRESHOLD,
@@ -195,7 +192,6 @@ describe('QueueTransport stalled-job reclaim', () => {
     // ignores results for an already-completed checkpoint. Assert current behavior, no corruption/crash.
     const worker = new QueueTransport({
       adapter: () => adapter,
-      group: 'ext',
       pollIntervalMs: POLL,
       stalledCheckIntervalMs: CHECK,
       stalledThresholdMs: THRESHOLD,

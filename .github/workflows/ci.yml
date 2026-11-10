@@ -31,6 +31,9 @@ jobs:
 
       - run: pnpm build
 
+      # publint + arethetypeswrong over every published package, against the build above.
+      - run: pnpm check:package
+
   # The suite runs on every Node line we support (the range `engines.node` promises): the lines Node
   # itself still maintains that AdonisJS 7 also accepts (it requires >=24).
   # Lint, typecheck and build stay on the single pinned version above: only the test run is multiplied.

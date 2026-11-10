@@ -77,6 +77,7 @@ import type {
   BufferedSignalRow,
   ControlMessage,
   ControlPlane,
+  ControlPublishTarget,
   DeadLetter,
   EngineEvent,
   EngineListener,
@@ -507,6 +508,13 @@ function wakeReasonSeen(payload: unknown, settledFans: ReadonlyMap<number, numbe
   );
 }
 
+/**
+ * The control-plane target of a message about a run in `namespace`: the run's namespace, so the
+ * instances serving it hear it wherever the publisher is. Unknown → the publisher's own channel.
+ */
+const runTarget = (namespace: string | undefined): ControlPublishTarget | undefined =>
+  namespace === undefined ? undefined : { namespace };
+
 /** Whether `status` is one a run never leaves on its own. */
 const isTerminalRun = (status: RunStatus): boolean =>
   TERMINAL_RUN_STATUSES.includes(status as TerminalRunStatus);
@@ -534,6 +542,14 @@ const isStepEvent = (event: EngineEvent): boolean => event.type.startsWith('step
 
 /** The default {@link WorkflowEngineDeps.timerBatchSize}. */
 const DEFAULT_TIMER_BATCH = 500;
+
+/** The default {@link WorkflowEngineDeps.waitForRunPollMs}. */
+const DEFAULT_WAIT_FOR_RUN_POLL_MS = 250;
+
+/** A `waitForRun` read interval: a finite value `>= 0` (`0` = no reads), else `undefined`. */
+function validPollMs(ms: number | undefined): number | undefined {
+  return ms !== undefined && Number.isFinite(ms) && ms >= 0 ? ms : undefined;
+}
 
 /** {@link WorkflowEngine.sweepBufferedSignals}: rows read per page. */
 const BUFFERED_SWEEP_PAGE = 500;
@@ -820,6 +836,13 @@ export interface WorkflowEngineDeps {
    */
   remoteAdvanceSilenceMs?: number | undefined;
   /**
+   * How often (ms) `waitForRun` re-reads the run while it waits. Lifecycle events wake a wait at once,
+   * but they only reach this instance for runs it executes (or through a control plane, best-effort),
+   * so a run that settles on another pod is seen on the next read. Default 250. `0` turns the read
+   * off and leaves the wait on events alone. Per-call `waitForRun(id, { pollMs })` overrides it.
+   */
+  waitForRunPollMs?: number | undefined;
+  /**
    * Build the public callback URL for a `ctx.webhook()` token (e.g.
    * ``(t) => `https://api.example.com/durable/webhooks/${t}` ``). Populates
    * {@link DurableWebhook.url}. Omit if you build URLs yourself from the token.
@@ -1054,6 +1077,7 @@ export class WorkflowEngine {
   private readonly remoteRedispatchMs: number | undefined;
   private readonly remoteRedispatchMax: number;
   private readonly remoteAdvanceSilenceMs: number | undefined;
+  private readonly waitForRunPollMs: number;
   private readonly webhookUrl?: ((token: string) => string) | undefined;
   private readonly traceparent?: (() => string | undefined) | undefined;
   private readonly context?: (() => Record<string, unknown> | undefined) | undefined;
@@ -1304,6 +1328,7 @@ export class WorkflowEngine {
     // An operator (no namespace) skips this entirely: not calling `useNamespace` IS the bare prefix,
     // which is what it must stay on to reach every tenant's queues.
     if (this.namespace !== undefined) this.pool.useNamespace(this.namespace);
+    if (this.namespace !== undefined) this.controlPlane?.useNamespace?.(this.namespace);
     this.leaseMs = deps.leaseMs ?? 30_000;
     this.bootedAt = this.clock();
     this.maxRecoveryAttempts = deps.maxRecoveryAttempts;
@@ -1342,6 +1367,7 @@ export class WorkflowEngine {
     this.remoteRedispatchMax = Math.max(1, deps.remoteRedispatchMax ?? 10);
     // Opt-in: unset (or 0) keeps the unbounded wait for a remote workflow turn's decision.
     this.remoteAdvanceSilenceMs = deps.remoteAdvanceSilenceMs || undefined;
+    this.waitForRunPollMs = validPollMs(deps.waitForRunPollMs) ?? DEFAULT_WAIT_FOR_RUN_POLL_MS;
     this.webhookUrl = deps.webhookUrl;
     this.traceparent = deps.traceparent;
     this.context = deps.context;
@@ -2272,6 +2298,15 @@ export class WorkflowEngine {
    * worker bridge can use this for cooperative cancellation: abort the in-flight work for `runId`
    * instead of finishing it just to have the result discarded. Returns an unsubscribe function.
    */
+  /**
+   * Observe the control-plane traffic of every namespace, not only this engine's own: the process
+   * mounts a console (the durable dashboard) whose live tail follows runs of every namespace. The
+   * dashboard provider calls it; a control plane without namespaced channels ignores it.
+   */
+  observeAllNamespaces(): void {
+    this.controlPlane?.observeAll?.();
+  }
+
   onCancel(listener: (runId: string) => void): () => void {
     this.cancelListeners.add(listener);
     return () => this.cancelListeners.delete(listener);
@@ -3696,7 +3731,9 @@ export class WorkflowEngine {
           this.eventsToBroadcast.shift();
           msg = { kind: 'event', event: first, from: this.instanceId };
         }
-        await this.controlPlane.publishControl(msg).catch(() => {
+        // A run's own event goes to its namespace's channel; step events carry none and stay here.
+        const target = msg.kind === 'event' ? runTarget(msg.event.namespace) : undefined;
+        await this.controlPlane.publishControl(msg, target).catch(() => {
           // control-plane delivery is best-effort observability; never break execution
         });
       }
@@ -3884,7 +3921,10 @@ export class WorkflowEngine {
       // queue already delivers it to a consuming instance.
       if (this.controlPlane && !this.runQueue) {
         void this.controlPlane
-          .publishControl({ kind: 'enqueued', runId, from: this.instanceId })
+          .publishControl(
+            { kind: 'enqueued', runId, from: this.instanceId },
+            runTarget(run.namespace),
+          )
           .catch(() => undefined);
       }
     }
@@ -5089,7 +5129,10 @@ export class WorkflowEngine {
         this.notifyCancelled(run.id);
         if (this.controlPlane) {
           void this.controlPlane
-            .publishControl({ kind: 'cancel', runId: run.id, from: this.instanceId })
+            .publishControl(
+              { kind: 'cancel', runId: run.id, from: this.instanceId },
+              runTarget(run.namespace),
+            )
             .catch(() => undefined);
         }
         this.notifyParent(run.id, { ok: false, error: error.message });
@@ -5960,19 +6003,30 @@ export class WorkflowEngine {
    * the wait continues until the run reaches an end state. This is what `BaseWorkflow.start` needs so
    * "I want the result" blocks through a suspension instead of returning early with no output. The
    * default (`terminal` unset/false) resolves on any settled state, suspended included.
+   *
+   * A `blocked` run (no live worker can take its next dispatch) is NOT settled in either mode: the
+   * engine re-drives it as soon as a capable worker appears, so the wait continues. Bound it with
+   * `timeoutMs`.
+   *
+   * The wait wakes on this run's lifecycle events, and also re-reads the run every `pollMs` (default
+   * the engine's `waitForRunPollMs`, 250 ms), so it sees a run that settles on another instance even
+   * without a control plane. `pollMs: 0` turns the re-read off.
    */
-  waitForRun(runId: string, opts?: { timeoutMs?: number; terminal?: boolean }): Promise<RunResult> {
+  waitForRun(
+    runId: string,
+    opts?: { timeoutMs?: number; terminal?: boolean; pollMs?: number },
+  ): Promise<RunResult> {
     const isTerminal = (s: RunStatus): boolean =>
       s === 'completed' || s === 'failed' || s === 'cancelled' || s === 'dead';
     // A run `suspended` while it awaits a dispatched remote workflow turn's decision
     // (`awaitingDecisionTaskId` set) is mid-turn, not settled: that suspend is the engine's re-drive
-    // marker, not a sleep/signal the body asked for. Keep waiting until the decision lands.
+    // marker, not a sleep/signal the body asked for. Keep waiting until the decision lands. A `blocked`
+    // run is parked on the fleet, not on anything the body asked for, and is re-driven on its own.
     // A `cancelling` run is still undoing its saga: it settles once it is `cancelled`.
     const isSettled = (run: WorkflowRun): boolean =>
-      run.status !== 'pending' &&
-      run.status !== 'running' &&
       run.status !== 'cancelling' &&
-      !(run.status === 'suspended' && run.awaitingDecisionTaskId !== undefined);
+      (isTerminal(run.status) ||
+        (run.status === 'suspended' && run.awaitingDecisionTaskId === undefined));
     const shouldResolve = (run: WorkflowRun): boolean =>
       opts?.terminal ? isTerminal(run.status) : isSettled(run);
     const toResult = (run: WorkflowRun): RunResult => ({
@@ -5981,34 +6035,50 @@ export class WorkflowEngine {
       output: run.output,
       error: run.error,
     });
+    const pollMs = validPollMs(opts?.pollMs) ?? this.waitForRunPollMs;
     return new Promise<RunResult>((resolve, reject) => {
       let done = false;
       let off: () => void = () => {};
-      const timer =
-        opts?.timeoutMs != null
-          ? setTimeout(() => {
-              if (done) return;
-              done = true;
-              off();
-              reject(new Error(`waitForRun(${runId}) timed out after ${opts.timeoutMs}ms`));
-            }, opts.timeoutMs)
-          : undefined;
-      const finish = (run: WorkflowRun): void => {
-        if (done) return;
+      let poller: ReturnType<typeof setInterval> | undefined;
+      let reading = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const stop = (): void => {
         done = true;
         if (timer) clearTimeout(timer);
+        if (poller) clearInterval(poller);
         off();
+      };
+      if (opts?.timeoutMs != null) {
+        timer = setTimeout(() => {
+          if (done) return;
+          stop();
+          reject(new Error(`waitForRun(${runId}) timed out after ${opts.timeoutMs}ms`));
+        }, opts.timeoutMs);
+      }
+      const finish = (run: WorkflowRun): void => {
+        if (done) return;
+        stop();
         resolve(toResult(run));
       };
-      const check = (): void => {
-        // Swallow a transient store error: the next settling event re-checks, and the timeout still
-        // bounds the wait. Unhandled, one hiccup here was a process-fatal unhandled rejection.
-        void this.store
+      // Swallow a transient store error: the next event or poll re-checks, and the timeout still
+      // bounds the wait. Unhandled, one hiccup here was a process-fatal unhandled rejection.
+      const read = (): Promise<void> =>
+        this.store
           .getRun(runId)
           .then((run) => {
             if (run && shouldResolve(run)) finish(run);
           })
           .catch(() => undefined);
+      const check = (): void => {
+        if (!done) void read();
+      };
+      // The poll skips a tick while its previous read is still out, so a slow store never stacks reads.
+      const poll = (): void => {
+        if (done || reading) return;
+        reading = true;
+        void read().finally(() => {
+          reading = false;
+        });
       };
       // React only to this run's settling events (not its every step event), and subscribe BEFORE the
       // initial read so a run that settles in between isn't missed.
@@ -6020,6 +6090,12 @@ export class WorkflowEngine {
           check();
         }
       });
+      // Events only reach this instance for runs it executes (or over a control plane, best-effort):
+      // the poll is what sees a run that settles on another pod.
+      if (pollMs > 0) {
+        poller = setInterval(poll, pollMs);
+        (poller as { unref?: () => void }).unref?.();
+      }
       check();
     });
   }
@@ -6537,7 +6613,10 @@ export class WorkflowEngine {
       this.cancelRequested.add(runId);
       if (this.controlPlane) {
         void this.controlPlane
-          .publishControl({ kind: 'cancel', runId, from: this.instanceId })
+          .publishControl(
+            { kind: 'cancel', runId, from: this.instanceId },
+            runTarget(run.namespace),
+          )
           .catch(() => undefined);
       }
       // Tracked (see {@link trackEffect}): the background resume replays the run and drives its saga
@@ -6585,7 +6664,7 @@ export class WorkflowEngine {
     this.notifyCancelled(runId);
     if (this.controlPlane) {
       void this.controlPlane
-        .publishControl({ kind: 'cancel', runId, from: this.instanceId })
+        .publishControl({ kind: 'cancel', runId, from: this.instanceId }, runTarget(run.namespace))
         .catch(() => undefined);
     }
     // A cancelled singleton run frees its slot — wake the next gated waiter now (notify-on-release).

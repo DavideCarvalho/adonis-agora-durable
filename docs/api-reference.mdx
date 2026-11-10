@@ -139,10 +139,10 @@ The base class for a workflow under `app/workflows/`, auto-registered at boot. S
 | `schedule` | `static schedule?: WorkflowScheduleConfig \| WorkflowScheduleConfig[]` | Colocated recurring schedule(s), merged with `config.schedules` (config wins on a `key` collision). See [Scheduling](/docs/durable/authoring/scheduling#colocate-the-schedule-with-the-workflow). |
 | `run` | `abstract run(ctx: WorkflowCtx, input: unknown): unknown` | The workflow body. Annotate `input` with the type you want `WorkflowInputOf` to infer. |
 | `deadLetter` | `deadLetter?(ctx: WorkflowCtx, dead: DeadLetter): unknown` | Optional inline dead-letter handler, registered as `<name>.dlq` (same version and origin) and started as `dlq:<deadRunId>` when a run of this workflow goes `dead`. `DeadLetter<TInput>` is `{ deadRunId: string; workflow: string; input: TInput; error?: StepError }`. Declaring it with `static workflow.deadLetterWorkflow` throws. See [Dead-letter queue](/docs/durable/reliability/dead-letter#routing-to-a-dlq-workflow). |
-| `start` | `static start<C extends WorkflowClass>(this: C, input: WorkflowInputOf<C>, opts?: WorkflowDispatchOptions): Promise<WorkflowOutputOf<C>>` | Run and wait for the result. Outside a workflow: `engine.start` plus `waitForRun(runId, { terminal: true })`. Inside one: `ctx.child`. |
+| `start` | `static start<C extends WorkflowClass>(this: C, input: WorkflowInputOf<C>, opts?: WorkflowStartOptions): Promise<WorkflowOutputOf<C>>` | Run and wait for the result. Outside a workflow: `engine.start` plus `waitForRun(runId, { terminal: true, timeoutMs })`. Inside one: `ctx.child`. Throws `FatalError` for a run that ends `failed`, `cancelled` or `dead`. |
 | `dispatch` | `static dispatch<C extends WorkflowClass>(this: C, input: WorkflowInputOf<C>, opts?: WorkflowDispatchOptions): Promise<{ runId: string }>` | Fire-and-forget. Outside a workflow: `engine.start`. Inside one: `ctx.startChild`. |
 
-`WorkflowDispatchOptions` is `{ runId?: string } & StartOptions`. Outside a workflow `runId` sets the new run's id (default `randomUUID()`); inside one it is the deterministic child id, and omitting it lets the ctx derive a replay-stable one. See [Child workflows](/docs/durable/authoring/child-workflows).
+`WorkflowDispatchOptions` is `{ runId?: string } & StartOptions`; `WorkflowStartOptions` adds `timeoutMs` (outside a workflow only). Outside a workflow `runId` sets the new run's id (default `randomUUID()`); inside one it is the deterministic child id, and omitting it lets the ctx derive a replay-stable one. See [Child workflows](/docs/durable/authoring/child-workflows).
 
 Related helpers:
 
@@ -269,7 +269,7 @@ import engine from '@adonis-agora/durable/services/main'
 | Member | Signature | Notes |
 | --- | --- | --- |
 | `start` | `start<C extends WorkflowClass>(workflow: C, input: WorkflowInputOf<C>, runId: string, opts?: StartOptions): Promise<RunResult>` | Create and enqueue a run. Idempotent by `runId`. Also takes a workflow name (`start<TInput>(workflow: string, input: TInput, runId: string, opts?)`). |
-| `waitForRun` | `waitForRun(runId: string, opts?: { timeoutMs?: number; terminal?: boolean }): Promise<RunResult>` | Resolve once the run settles (terminal or suspended; a run suspended while it awaits a remote workflow turn's decision is not settled yet). `terminal: true` waits past suspensions for a terminal status. |
+| `waitForRun` | `waitForRun(runId: string, opts?: { timeoutMs?: number; terminal?: boolean; pollMs?: number }): Promise<RunResult>` | Resolve once the run settles (terminal or suspended; a run suspended while it awaits a remote workflow turn's decision, or a `blocked` run, is not settled yet). `terminal: true` waits past suspensions for a terminal status. Re-reads the run every `pollMs` (default `waitForRunPollMs`, 250 ms; `0` = off), so it sees a run that settles on another instance. |
 | `signal` | `signal(token: string, payload: unknown): Promise<RunResult \| null>` | Deliver a signal; buffered if no run is waiting yet (`null`). On a transport with a [run queue](/docs/durable/reliability/multi-instance#where-a-run-executes) the result is the run's status once the wake is handed over, not after the resumed turn; `waitForRun` gives the outcome. See [Signals](/docs/durable/concepts/sleep-and-signals#signals-human-in-the-loop). |
 | `signalWithStart` | `signalWithStart(workflow: WorkflowRef, input: unknown, runId: string, signal: { token: string; payload?: unknown }, opts?: StartOptions): Promise<{ runId: string }>` | Ensure the run exists, then signal it, race-free. |
 | `publishEvent` | `publishEvent(name: string, payload: unknown, opts?: { id?: string; buffer?: boolean }): Promise<number>` | Resume every run parked on `ctx.waitForEvent(name, …)` and start every `onEvent` subscriber; returns the count touched. A publish that reaches nobody is buffered once unless `buffer: false`. See [Named events](/docs/durable/concepts/sleep-and-signals#named-events). |
@@ -330,6 +330,8 @@ import engine from '@adonis-agora/durable/services/main'
 | `schedules` | `readonly schedules: ScheduleClient` — `create` / `upsert` / `get` / `list` / `pause` / `resume` / `trigger` / `delete` / `tick` | Persisted, runtime-managed schedules stored in `durable_schedules`, fired when [`persistedSchedules`](#durableconfig) is on. `create` throws `ScheduleAlreadyExistsError`; the others throw `ScheduleNotFoundError` on an unknown id. See [Persisted schedules](/docs/durable/authoring/persisted-schedules). |
 
 `runSchedules(engine, schedules, nowMs, opts?)` is a standalone function, not an engine method: it starts each `ScheduledWorkflow`'s current time-bucket run (idempotent through `engine.start`). The `durable:work` loop calls it for you. `resolveSchedules(schedules)` resolves the lazy imports and classes to registered names first (async); `runSchedules` refuses a schedule whose lazy import was not resolved. See [Lower-level — `runSchedules`](/docs/durable/authoring/scheduling#lower-level--runschedules).
+
+The window helpers are standalone functions too: `scheduledRunId(key, everyMs, nowMs)` is an `everyMs` window's run id, and `prevCronFireMs(cron, nowMs, timezone?)` / `nextCronFireMs(cron, nowMs, timezone?)` are the cron fires at or before and strictly after `nowMs` (epoch ms, `timezone` defaulting to `UTC`). See [Exactly-once across instances](/docs/durable/authoring/scheduling#exactly-once-across-instances).
 
 ### Listening and middleware
 
@@ -479,6 +481,7 @@ export default defineConfig({
 | `remoteRedispatchMs` | `number` | off | Opt-in self-heal: re-dispatch a no-`timeoutMs` remote step still `pending` past this window. The step must be idempotent. See [Failure modes](/docs/durable/reliability/failure-modes). |
 | `remoteRedispatchMax` | `number` | `10` | Re-dispatches per lost step before failing it (`remote_step_lost`). |
 | `remoteAdvanceSilenceMs` | `number` | off | Liveness window of a remote workflow turn: with no decision and no run-scoped heartbeat for this long, the turn is re-dispatched (fresh `taskId`, same history) instead of waiting forever; heartbeats rearm it. A `RemoteWorkflowExecutor`'s `timeoutMs` is the per-workflow version (the shorter wins). See [Remote workflow turns](/docs/durable/reliability/multi-instance#remote-workflow-turns). |
+| `waitForRunPollMs` | `number` | `250` | How often `engine.waitForRun` and the blocking `Workflow.start()` re-read the run while they wait, so they see a run that settles on another pod without a control plane. `0` leaves the wait on lifecycle events alone. |
 | `timerBatchSize` | `number` | `500` | Most due timers one timer pass loads, most overdue first. |
 | `eventBufferTtl` | `string \| number` | keep until consumed | Age after which a [buffered event](/docs/durable/concepts/sleep-and-signals#reliable-buffered-events) is expired: never delivered, and deleted by the worker tick's retention phase (`StateStore.pruneBufferedEvents`). |
 | `scopeReads` | `boolean` | `false` | Fence the store's run reads to `namespace` (a tenant-boundary view) through the store's `withScope`. Writes are unaffected. See [Lucid store](/docs/durable/stores/lucid#scoped-reads-scopereads). |
@@ -587,7 +590,7 @@ The thin-worker turn runtime ([`@adonis-agora/durable/worker`](#subpath-exports)
 | Export | Signature | Notes |
 | --- | --- | --- |
 | `CONTROL_FLOW_SIGNAL` | `const CONTROL_FLOW_SIGNAL: unique symbol` | `Symbol.for('@agora/durable:control-flow')`, the global-registry marker stamped on every control-flow signal class. Rarely used directly. |
-| `isWorkflowControlFlowSignal` | `isWorkflowControlFlowSignal(error: unknown): boolean` | `true` for `WorkflowSuspended` and `ContinueAsNew`, whichever module copy threw them. Not true for a cancellation or a `FatalError` / step rejection, which are real outcomes a `catch` may handle. |
+| `isWorkflowControlFlowSignal` | `isWorkflowControlFlowSignal(error: unknown): boolean` | `true` for `WorkflowSuspended`, `ContinueAsNew` and the suspend a thin-worker `WorkflowTurnCtx` op throws, whichever module copy threw them. Not true for a cancellation or a `FatalError` / step rejection, which are real outcomes a `catch` may handle. |
 
 ```ts
 try {

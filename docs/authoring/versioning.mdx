@@ -12,6 +12,8 @@ A durable run is replayed: when the engine resumes a suspended run, it re-execut
 
 The engine pairs each replayed step with the checkpoint recorded at that logical position. If the *name* at a position no longer matches what was recorded — you inserted a step, removed one, or reordered them — the engine throws a `NonDeterminismError` rather than silently corrupting the run.
 
+Steps are not the only calls that take a position. `ctx.sleep`, `ctx.waitForSignal`, `ctx.sideEffect`, `ctx.now`, child starts and `ctx.setEvent` each take one too, so adding or removing a `ctx.setEvent('status', …)` shifts every position after it exactly as a new step would.
+
 ```text
 // On replay, a checkpoint recorded as `charge` at this position but now named `refund` is caught:
 // NonDeterminismError(runId, seq, expected: 'refund', recorded: 'charge')

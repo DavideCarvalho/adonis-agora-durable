@@ -37,8 +37,8 @@ async function until(check: () => Promise<boolean>): Promise<void> {
 }
 
 /**
- * In-memory P4 wire. `legacy` lists verbs to answer the way a responder before 0.49 answered a
- * verb it did not know (an error message, no code) without reaching the real responder.
+ * In-memory P4 wire. `legacy` lists verbs to answer the way a control plane that does not know a
+ * verb answers (`unsupported-request`), without reaching the real responder.
  */
 class Wire implements ProxyTransport, ResponderTransport {
   #onRunRequest: ((msg: RunRequest) => Promise<void>) | undefined;
@@ -47,8 +47,6 @@ class Wire implements ProxyTransport, ResponderTransport {
   readonly requests: RunRequestKind['kind'][] = [];
   readonly replies: RunReply[] = [];
   legacy = new Set<RunRequestKind['kind']>();
-  /** `message`: a responder before 0.50 (no code); `code`: one that sends `unsupported-request`. */
-  legacyStyle: 'message' | 'code' = 'message';
 
   // Like a broker queue, a dispatch never sees the consumer's failure: a consumer that throws
   // without replying leaves the tenant waiting.
@@ -62,10 +60,7 @@ class Wire implements ProxyTransport, ResponderTransport {
         requestId: msg.requestId,
         result: {
           ok: false,
-          error:
-            this.legacyStyle === 'message'
-              ? { message: `unknown run-request verb: ${msg.body.kind}` }
-              : { message: 'not supported', code: 'unsupported-request' },
+          error: { message: 'not supported', code: 'unsupported-request' },
         },
       });
       return;
@@ -237,17 +232,6 @@ describe('ProxyRunGateway against an older control plane', () => {
     expect(detail?.fans).toHaveLength(1);
   });
 
-  it('falls back on the unsupported-request code too', async () => {
-    const wire = new Wire();
-    await controlPlane(wire);
-    wire.legacy = new Set(['getRunDetail']);
-    wire.legacyStyle = 'code';
-    const proxy = new ProxyRunGateway(wire, { partition: 'acme', requestTimeoutMs: 2_000 });
-    const detail = await proxy.getRunDetail('p', { summarizeFansOver: 50 });
-    expect(detail?.fans).toHaveLength(1);
-    expect(wire.requests).toContain('getCheckpoints');
-  });
-
   it('counts runFacets from runValueFacets, then from listRuns, as the control plane gets older', async () => {
     const sort = (cells: { status: string; origin: string | null; count: number }[]) =>
       [...cells].sort((a, b) => a.status.localeCompare(b.status));
@@ -274,7 +258,6 @@ describe('ProxyRunGateway against an older control plane', () => {
     const oldest = new Wire();
     await controlPlane(oldest);
     oldest.legacy = new Set(['runFacets', 'runValueFacets']);
-    oldest.legacyStyle = 'code';
     const viaList = new ProxyRunGateway(oldest, { partition: 'acme', requestTimeoutMs: 2_000 });
     expect(sort(await viaList.runFacets({}))).toEqual(current);
     expect(sort(await viaList.runFacets({ workflow: 'parent' }))).toEqual([
@@ -293,32 +276,29 @@ describe('ProxyRunGateway against an older control plane', () => {
 });
 
 describe('lifecycle verbs against an older control plane', () => {
-  for (const legacyStyle of ['message', 'code'] as const) {
-    it(`fails fast with "not supported by this server" (${legacyStyle} style), and remembers it`, async () => {
-      const wire = new Wire();
-      await controlPlane(wire);
-      wire.legacy = new Set(['republishLifecycle', 'workflowLifecycle']);
-      wire.legacyStyle = legacyStyle;
-      const proxy = new ProxyRunGateway(wire, { partition: 'acme', requestTimeoutMs: 5_000 });
+  it('fails fast with "not supported by this server", and remembers it', async () => {
+    const wire = new Wire();
+    await controlPlane(wire);
+    wire.legacy = new Set(['republishLifecycle', 'workflowLifecycle']);
+    const proxy = new ProxyRunGateway(wire, { partition: 'acme', requestTimeoutMs: 5_000 });
 
-      const started = Date.now();
-      const runError = await proxy.republishLifecycle({ runId: 'p' }).catch((e: unknown) => e);
-      expect(runError).toBeInstanceOf(RunGatewayError);
-      expect((runError as Error).message).toBe(
-        'republishLifecycle is not supported by this server: the control plane is older than this tenant',
-      );
-      expect((runError as { code?: string }).code).toBe('unsupported-request');
-      await expect(proxy.republishLifecycle({ workflow: 'parent' })).rejects.toThrow(
-        /not supported by this server/,
-      );
-      await expect(proxy.workflowLifecycle('parent')).rejects.toThrow(
-        /^workflowLifecycle is not supported by this server/,
-      );
-      expect(Date.now() - started).toBeLessThan(1_000);
-      // The second republish was not sent: the missing verb is remembered.
-      expect(wire.requests.filter((k) => k === 'republishLifecycle')).toHaveLength(1);
-    });
-  }
+    const started = Date.now();
+    const runError = await proxy.republishLifecycle({ runId: 'p' }).catch((e: unknown) => e);
+    expect(runError).toBeInstanceOf(RunGatewayError);
+    expect((runError as Error).message).toBe(
+      'republishLifecycle is not supported by this server: the control plane is older than this tenant',
+    );
+    expect((runError as { code?: string }).code).toBe('unsupported-request');
+    await expect(proxy.republishLifecycle({ workflow: 'parent' })).rejects.toThrow(
+      /not supported by this server/,
+    );
+    await expect(proxy.workflowLifecycle('parent')).rejects.toThrow(
+      /^workflowLifecycle is not supported by this server/,
+    );
+    expect(Date.now() - started).toBeLessThan(1_000);
+    // The second republish was not sent: the missing verb is remembered.
+    expect(wire.requests.filter((k) => k === 'republishLifecycle')).toHaveLength(1);
+  });
 
   it('a control plane whose gateway lacks the verbs answers unsupported, not a timeout', async () => {
     const wire = new Wire();
@@ -336,24 +316,6 @@ describe('lifecycle verbs against an older control plane', () => {
     const proxy = new ProxyRunGateway(wire, { partition: 'acme', requestTimeoutMs: 5_000 });
     await expect(proxy.republishLifecycle({ runId: 'p' })).rejects.toBeInstanceOf(RunGatewayError);
     await expect(proxy.workflowLifecycle('parent')).rejects.toBeInstanceOf(RunGatewayError);
-  });
-
-  it('treats an empty ok reply from an older responder as unsupported', async () => {
-    const wire = new Wire();
-    await controlPlane(wire);
-    const send = wire.dispatchRunRequest.bind(wire);
-    wire.dispatchRunRequest = async (msg) => {
-      if (msg.body.kind !== 'workflowLifecycle') return send(msg);
-      wire.requests.push(msg.body.kind);
-      await wire.publishRunReply({
-        requestId: msg.requestId,
-        result: { ok: true, data: undefined },
-      });
-    };
-    const proxy = new ProxyRunGateway(wire, { partition: 'acme', requestTimeoutMs: 5_000 });
-    const error = await proxy.workflowLifecycle('parent').catch((e: unknown) => e);
-    expect(error).toBeInstanceOf(RunGatewayError);
-    expect((error as RunGatewayError).code).toBe('unsupported-request');
   });
 
   it('rejects a malformed republish target with an error reply', async () => {

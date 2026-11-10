@@ -65,7 +65,6 @@ export default defineConfig({
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `group` | — | Accepted for parity with the broker drivers. Handlers match by step name in-process, so it does not affect routing. |
 | `instanceId` | random | Stable id for this process, stamped on control messages. |
 | (namespace) | the engine's | Not a factory option: the engine pushes its `namespace` onto the transport, which folds it into its internal channel names. |
 | `onError` | `console.error` | Where a failing result or heartbeat handler is reported. A failed result is redelivered from memory with backoff (100ms doubling to 5s) until `close()`; a failed heartbeat is dropped. |
@@ -74,7 +73,7 @@ Pair it with the [Lucid store](/docs/durable/stores/lucid) and the durability gu
 
 What you do **not** get is a second process serving your steps: a `ctx.step` dispatched over `eventEmitter` is handled only by the process that dispatched it. A dispatched step with no registered handler is ignored silently (another subscriber on the same emitter might own it), so the run waits on it. Lifecycle events and cancellation reach subscribers in this process with no control plane at all; they do not fan out across pods.
 
-Several replicas can still share `eventEmitter` + a shared Lucid store **when every step is a `ctx.localStep`**: leases, checkpoints, signals and cancellation all go through the store, so two replicas never execute the same run. What you lose without a [control plane](/docs/durable/transports/control-plane) is cross-pod fan-out — live-tail, `onCancel` listeners, schedule pause and a `waitForRun` (or a blocking `start()`) that waits on a run resumed by another pod. Add `controlPlanes.redis` for those, and move to `queue`, `db` or `bullmq` once steps must run in another process. See [Pick a topology](/docs/durable/production#2-pick-a-topology).
+Several replicas can still share `eventEmitter` + a shared Lucid store **when every step is a `ctx.localStep`**: leases, checkpoints, signals and cancellation all go through the store, so two replicas never execute the same run. What you lose without a [control plane](/docs/durable/transports/control-plane) is cross-pod fan-out — live-tail, `onCancel` listeners and schedule pause. A `waitForRun` (or a blocking `start()`) on a run resumed by another pod still resolves, on its next read of the run (`waitForRunPollMs`, 250 ms by default). Add `controlPlanes.redis` for those, and move to `queue`, `db` or `bullmq` once steps must run in another process. See [Pick a topology](/docs/durable/production#2-pick-a-topology).
 
 ## In-process for tests — `memory`
 

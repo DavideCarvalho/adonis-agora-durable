@@ -239,6 +239,8 @@ const result = await OrderWorkflow.start(input)
 ```
 
 Both are **context-aware**: called inside a running workflow body they route to a child instead of the engine.
+A dispatched step handler is not the body, so `Wf.dispatch` called from one starts a separate top-level run, not a
+child of the run that dispatched the step.
 See [Child workflows](/docs/durable/authoring/child-workflows) for the full semantics table.
 
 The second argument (`WorkflowDispatchOptions`) is an optional `runId` plus the engine's `StartOptions`:
@@ -258,12 +260,24 @@ await OrderWorkflow.dispatch(input, {
 `origin` and a per-start `concurrency` quota are accepted too. A `version` that is not registered throws
 before any run is created; it never falls back to the newest.
 
-<Callout type="warn" title="Wf.start outside a workflow does not throw on failure">
+<Callout type="info" title="Wf.start throws when the run does not complete">
 Outside a workflow, `Wf.start` waits for a **terminal** status (`completed`, `failed`, `cancelled` or
-`dead`), blocking through any sleep or signal wait with no timeout, and returns the run's `output`. A run
-that failed or was cancelled has no output, so the call resolves with `undefined` rather than throwing. When
-the outcome matters, use `Wf.dispatch` and then `engine.waitForRun(runId, { terminal: true })`, which
-returns `{ status, output, error }`. Inside a workflow, `Wf.start` is `ctx.child`, which does throw.
+`dead`), blocking through any sleep or signal wait, and returns the run's `output`. A run that ends any other
+way throws a `FatalError` (`run "<runId>" failed: <reason>`, with the run error's `code` and `details`),
+the same error `ctx.child` throws inside a workflow. Pass `timeoutMs` to bound the wait: the call rejects
+when it runs out, and the run keeps going.
+
+```ts
+import { FatalError } from '@adonis-agora/durable'
+
+try {
+  const receipt = await OrderWorkflow.start(input, { timeoutMs: 30_000 })
+  return response.ok(receipt)
+} catch (error) {
+  if (error instanceof FatalError) return response.unprocessableEntity({ reason: error.message })
+  throw error
+}
+```
 </Callout>
 
 <Callout type="info">

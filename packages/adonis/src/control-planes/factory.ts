@@ -31,10 +31,22 @@ export interface RedisControlPlaneConfig {
    */
   connection?: string;
   /**
-   * Channel prefix. Defaults to `durable`; the channel is `` `${prefix}-control` ``, matched exactly
-   * to the NestJS BullMQ transport so an AdonisJS fleet interoperates with a NestJS fleet on one Redis.
+   * Channel prefix. Defaults to `durable`; the channel is `` `${prefix}-control` ``, or
+   * `` `${prefix}-${namespace}-control` `` under a non-`default` namespace, matched exactly to the
+   * NestJS BullMQ transport so an AdonisJS fleet interoperates with a NestJS fleet on one Redis.
    */
   prefix?: string;
+  /**
+   * Namespace folded into the channel name. Defaults to the engine's `namespace`; set it only to
+   * listen on another namespace's channel.
+   */
+  namespace?: string;
+  /**
+   * Which namespaces this instance observes: `'own'` (its channel only) or `'all'` (every
+   * namespace's channel too). Default: `'all'` for an engine with no namespace or a process that
+   * mounts the durable dashboard, `'own'` otherwise.
+   */
+  observe?: 'all' | 'own';
   /**
    * How often (ms) to PING the connection's pub/sub subscriber, so one a VPN/NAT/idle timeout dropped
    * silently is reconnected (and resubscribed) instead of sitting deaf until a restart. `0` or `false`
@@ -51,7 +63,7 @@ export interface RedisControlPlaneConfig {
  *
  * export default defineConfig({
  *   transport: 'queue',
- *   transports: { queue: transports.queue({ connection: 'redis', group: 'workers' }) },
+ *   transports: { queue: transports.queue({ connection: 'redis' }) },
  *   // Fan out lifecycle events + cancellation across every replica over Redis pub/sub.
  *   controlPlane: controlPlanes.redis({ connection: 'main' }),
  * })
@@ -75,6 +87,8 @@ export const controlPlanes = {
       return new RedisControlPlane({
         connection,
         ...(config.prefix !== undefined ? { prefix: config.prefix } : {}),
+        ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
+        ...(config.observe !== undefined ? { observe: config.observe } : {}),
         ...(config.pingIntervalMs !== undefined ? { pingIntervalMs: config.pingIntervalMs } : {}),
       });
     };

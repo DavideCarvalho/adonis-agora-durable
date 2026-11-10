@@ -10,6 +10,6 @@ import { EventEmitterTransport } from '../../../src/transports/event-emitter.js'
  */
 describe('EventEmitterTransport conformance', () => {
   it('satisfies the shared Transport contract', async () => {
-    await assertTransportConformance(new EventEmitterTransport({ group: 'conformance' }));
+    await assertTransportConformance(new EventEmitterTransport());
   });
 });

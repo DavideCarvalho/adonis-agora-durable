@@ -6,18 +6,19 @@
  * This is a from-scratch port of `@dudousxd/nestjs-durable-dashboard`'s `durable-client.ts`, kept
  * behaviourally identical wherever the AdonisJS engine exposes the same data (deliberate: every UI
  * component under `src/app/` was ported unedited and imports these exact names/shapes). Divergences
- * from the NestJS client are called out inline — the remaining known gaps are:
+ * from the NestJS client are called out inline. Two notes on fields that are optional on the wire:
  *
- * 1. `WorkflowRun.origin` — the AdonisJS engine has no `origin` column, so `origin` is always
- *    `undefined` here. The origin facet UI (`OriginFacets.tsx`) still renders — every run just buckets
- *    under "unknown" until a future engine change adds the column. (`RunWaiting`/`waiting` is NO LONGER
- *    in this gap: the engine's `listSignalWaiters` bulk scan is wired into `GET /runs` — see
- *    `packages/adonis/src/dashboard/handlers.ts`'s `listRuns` — so a suspended run's list row DOES
- *    carry `waiting` the same as the NestJS console's, once the server is new enough.)
- * 2. `WorkerHeartbeat.status` (rss/cpu/concurrency telemetry) — the AdonisJS engine's heartbeat carries
- *    no `WorkerStatus` payload (only `group`/`instanceId`/`lastBeatAt`), so worker cards never show the
- *    resource-usage details the NestJS console can. The types are kept so a future engine addition
- *    lights the UI up with no client change.
+ * 1. `WorkflowRun.origin` — the engine stores the origin it attributes at start (the `origin` column),
+ *    so a run carries one when its registration declared or derived one; older and unattributed runs
+ *    have none and bucket under the console's `app` facet. An exact `origin` filter narrows the store
+ *    query server-side; the `app` bucket (no origin) filters the loaded page client-side, since an
+ *    exact match cannot express absence.
+ *    A suspended run's list row carries `waiting` too (the engine's `listSignalWaiters` scan is wired
+ *    into `GET /runs`, see `packages/adonis/src/dashboard/handlers.ts`'s `listRuns`).
+ * 2. `WorkerHeartbeat.status` (rss/cpu/concurrency telemetry) — present when the worker's heartbeat
+ *    carries a `WorkerStatus` payload (the BullMQ, queue and db transports pass it through as the
+ *    worker wrote it). A beat without one (a worker runtime's compact `{ ts }` beat) reads as liveness
+ *    only, and the worker card shows no resource-usage details.
  */
 
 // ── Wire types (independent of `@adonis-agora/durable`'s own `Date`-typed engine interfaces — the
@@ -294,7 +295,7 @@ export interface ScheduleInfo {
   lastRunStatus?: RunStatus;
 }
 
-/** Outcome of `POST /runs/:id/update/:name` — the workflow's registered validator arbitrated
+/** Outcome of `POST /runs/:id/updates/:name` — the workflow's registered validator arbitrated
  *  server-side. The rejected arm never reaches a caller of {@link durableClient.update}: the server
  *  spells a rejection as a 422 whose body carries it, thrown as a {@link DurableActionError}. */
 export interface UpdateResult {
@@ -699,7 +700,7 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
 /**
  * A refusal the console must READ, not just report: the human-in-the-loop verbs answer with
  * structured bodies — `POST /runs/:id/signal`'s 409 carries `waitingOn` (the tokens the run IS
- * parked on, offered as choices), `POST /runs/:id/update/:name`'s 422 carries the validator's
+ * parked on, offered as choices), `POST /runs/:id/updates/:name`'s 422 carries the validator's
  * `reason`. The plain {@link http} throws a bare status-line `Error` and drops the body; the verbs
  * below throw this instead, body attached. `message` prefers the body's own `error` copy.
  */
@@ -765,7 +766,8 @@ export interface RunFilterOptions {
   namespace?: string | string[] | undefined;
   /** One workflow narrows; several match ANY of them (the workflow picker's multi-select). */
   workflow?: string | string[] | undefined;
-  /** See module doc gap #1 — cannot select unattributed runs, and no run carries an origin today. */
+  /** See module doc note #1 — an exact match, narrowed server-side; it cannot select unattributed
+   *  runs (the `app` bucket filters client-side). */
   origin?: string | undefined;
 }
 
@@ -988,7 +990,7 @@ export const durableClient = {
    *  message is the validator's reason, and nothing is delivered. */
   async update(id: string, name: string, arg?: unknown): Promise<UpdateResult> {
     const res = await postAction<{ result: UpdateResult }>(
-      `/runs/${encodeURIComponent(id)}/update/${encodeURIComponent(name)}`,
+      `/runs/${encodeURIComponent(id)}/updates/${encodeURIComponent(name)}`,
       { arg },
     );
     return res.result;

@@ -128,11 +128,11 @@ engine.onDead((run) => {
 })
 ```
 
-`onDead` returns an unsubscribe function. It fires on the instance that dead-letters the run, which is whichever worker's recovery pass picked the run up — so register the listener in a preload that every worker process loads (`start/durable.ts`), not only in the web process. It fires **before** the declared dead-letter workflow is started.
+`onDead` returns an unsubscribe function, and you can register several listeners; each one is called. It fires on the instance that dead-letters the run, which is whichever worker's recovery pass picked the run up — so register the listener in a preload that every worker process loads (`start/durable.ts`), not only in the web process. It fires **before** the declared dead-letter workflow is started.
 
 The listener is called synchronously and its return value is not awaited. A throw is swallowed so that a broken handler can't break recovery, and a rejected promise goes unobserved, so catch inside it (`void pager.alert(...).catch(...)`). The hook is in-memory, and so is the declarative routing above: if the process dies between the `dead` write and the call, nothing replays it. For a handler that must not be missed, alert on the `run.failed` event or on `dead` runs in the dashboard as well.
 
-`onDead` stays the escape hatch for routing the declarative form can't express. To start a handler from it yourself, keep the `dlq:<runId>` id (and don't also declare a `deadLetterWorkflow`, since both would claim the same id):
+`onDead` stays the escape hatch for routing the declarative form can't express. To start a handler from it yourself, keep the `dlq:<runId>` id and start it in the dead run's namespace, as the declarative form does (and don't also declare a `deadLetterWorkflow`, since both would claim the same id):
 
 ```ts title="start/durable.ts"
 import type { DeadLetter } from '@adonis-agora/durable'
@@ -141,7 +141,9 @@ const handlers: Record<string, string> = { pipeline: 'pipeline-dlq', checkout: '
 
 engine.onDead((run) => {
   const input: DeadLetter = { deadRunId: run.id, workflow: run.workflow, input: run.input, error: run.error }
-  void engine.start(handlers[run.workflow] ?? 'global-dlq', input, `dlq:${run.id}`)
+  void engine.start(handlers[run.workflow] ?? 'global-dlq', input, `dlq:${run.id}`, {
+    namespace: run.namespace,
+  })
 })
 ```
 

@@ -30,7 +30,7 @@ describe('the dashboard OpenAPI document', () => {
       '/runs/{id}/cancel',
       '/runs/{id}/continue',
       '/runs/{id}/signal',
-      '/runs/{id}/update/{name}',
+      '/runs/{id}/updates/{name}',
       '/runs/{id}/tasks/{name}/complete',
       '/runs/{id}/tasks/{name}/fail',
       '/runs/{id}/events/{key}',

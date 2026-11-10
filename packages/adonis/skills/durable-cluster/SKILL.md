@@ -153,9 +153,10 @@ gateways implement them, tenant-scoped by the responder). Never branch on `role`
 const detail = await runGateway.getRunDetail?.(params.id, { summarizeFansOver: 50 })
 ```
 
-Tenants and the control plane upgrade in either order. A verb the control plane
-does not know comes back as `unsupported-request` (or, before 0.50, an
-`unknown run-request verb` error). Verbs with a fallback fall back at once: run detail
+Upgrade a control plane older than 0.50 before its tenant pods. A verb the control plane
+does not know comes back as `unsupported-request`, which is the only unknown-verb
+signal the proxy reads (a pre-0.50 `unknown run-request verb` reply or an empty
+`ok` reply no longer counts). Verbs with a fallback fall back at once: run detail
 is built from `getRun` + `getCheckpoints` and summarized on the tenant, and the
 tenant console degrades `retry` to a re-dispatch; it remembers the old control
 plane for a minute. `republishLifecycle` and `workflowLifecycle` have no fallback —
