@@ -243,8 +243,8 @@ importers:
         specifier: 13.0.3
         version: 13.0.3
       bullmq:
-        specifier: 6.7.1
-        version: 6.7.1(ioredis@6.0.0(supports-color@10.2.2))(pg@8.23.1)
+        specifier: 6.7.2
+        version: 6.7.2(ioredis@6.0.0(supports-color@10.2.2))(pg@8.23.1)
       cron-parser:
         specifier: 5.10.4
         version: 5.10.4
@@ -1905,8 +1905,8 @@ packages:
     resolution: {integrity: sha512-nEh+kZOPY1w+gcCMobZ6ETUp9WfibndnosbpwB1iJk/8Gt5ZF2bhS6+B6bPYz424KtwsR6Rflc3tCz1/ghX2dQ==}
     engines: {node: '>=4.0'}
 
-  bullmq@6.7.1:
-    resolution: {integrity: sha512-WIm9+O2ULs4tcEeKBwlH2so7Vzs6/K2Ru+FFb0V/v3FAlBjj5yNk7kC2KOm0/yMpdE93SvgPR+FC0jznX6ce1g==}
+  bullmq@6.7.2:
+    resolution: {integrity: sha512-JCoMvkTD9FAX8TY3qQXIkB+ybZYDpTqV09EshxwYjzn2oTdqagKUIF/GWjtYl9bahPO2DHm3sWjijFGHeIf6XQ==}
     engines: {node: '>=14.18.0'}
     peerDependencies:
       bullmq-otel: '>=2.0.0'
@@ -4933,7 +4933,7 @@ snapshots:
     dependencies:
       '@types/node': 26.6.5
 
-  bullmq@6.7.1(ioredis@6.0.0(supports-color@10.2.2))(pg@8.23.1):
+  bullmq@6.7.2(ioredis@6.0.0(supports-color@10.2.2))(pg@8.23.1):
     dependencies:
       cron-parser: 5.10.3
       msgpackr: 2.1.4
