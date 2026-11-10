@@ -118,11 +118,6 @@ export interface WorkflowScheduleConfig extends Omit<ScheduledWorkflow, 'workflo
  *  `Math.random`; overridden in tests so jitter is deterministic. */
 export interface RunSchedulesOptions {
   random?: () => number;
-  /**
-   * @deprecated No longer called: jitter defers a window to a later tick instead of sleeping inside
-   * this one. Kept so existing callers still type-check.
-   */
-  sleep?: (ms: number) => Promise<void>;
 }
 
 /** Per engine, per schedule key: the jittered fire time of each window this process has seen due. */

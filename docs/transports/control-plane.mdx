@@ -47,13 +47,52 @@ export default defineConfig({
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `connection` | `'main'` | `config/redis.ts` connection used for pub/sub. |
-| `prefix` | `'durable'` | Channel is `` `${prefix}-control` ``. The engine's `namespace` is **not** folded in. |
+| `prefix` | `'durable'` | Channel is `` `${prefix}-control` ``, or `` `${prefix}-<namespace>-control` `` under a namespace. |
+| `namespace` | the engine's `namespace` | Namespace folded into the channel this instance listens on. `'default'` keeps the bare channel. Messages about a run are still published on the run's namespace channel. |
 
 Every instance that should hear each other must use the same channel, so give every engine (and every NestJS or Python process on the same Redis) the same `prefix`. The engine drops a message whose `from` is its own `instanceId`, so its own publishes echoed back by Redis are ignored.
 
-<Callout type="info" title="Namespaces share the channel">
-The `bullmq` transport puts an engine's `namespace` into every queue name (`durable-<namespace>-…`), but the control channel stays `` `${prefix}-control` `` whatever the namespace. Engines of different namespaces on one Redis therefore share it unless you give each its own `prefix`. A Python or NestJS process pointed at the namespaced prefix (`durable-<namespace>`) listens on `durable-<namespace>-control`, so for cancellation to reach it, set `prefix: 'durable-<namespace>'` here too. See [Python interop](/docs/durable/python).
+<Callout type="info" title="Each namespace has its own channel">
+The channel folds the engine's `namespace` in the same way the `bullmq` transport names its queues: an engine with `namespace: 'tenant-a'` listens on `durable-tenant-a-control`, and one with no namespace (or `'default'` or `''`) on `durable-control`. A Python or NestJS process pointed at the same prefix and namespace listens on the same channel. See [Python interop](/docs/durable/python).
 </Callout>
+
+### Which channel a message goes to
+
+A message about a run (a cancel, an enqueue nudge, the run's own lifecycle events) is published on the channel of **that run's namespace**, whatever the publisher's namespace is. So a console with no namespace that cancels a run in `bulas` publishes on `durable-bulas-control`, where the `bulas` workers (Adonis, NestJS or Python) hear it at once. A message with no run (a schedule pause) or about a run of unknown namespace, and step events (which carry no namespace), go to the publisher's own channel.
+
+```ts title="app/controllers/runs_controller.ts"
+import engine from '@adonis-agora/durable/services/main'
+
+export default class RunsController {
+  // A console process with no namespace: the cancel still reaches the run's namespaced workers.
+  async cancel({ params, response }: HttpContext) {
+    await engine.cancel(params.id)
+    return response.noContent()
+  }
+}
+```
+
+### What each engine observes
+
+Observing every namespace is a console concern, so it follows from what the process runs, not only from its namespace:
+
+- **A process that mounts the durable dashboard** listens on its own channel **and** on every namespace channel (a pattern subscription to `durable-*-control`), whatever its engine's `namespace` is, `'default'` included. Its console's live tail shows runs of every namespace.
+- **An engine with no namespace** (the operator view) does the same.
+- **Any other engine with a namespace**, such as a worker, listens on its own channel only, so it sees its namespace's events and nothing else.
+- **`observe` on `controlPlanes.redis(...)`** overrides both: `'own'` keeps one channel even with the dashboard mounted, `'all'` adds the pattern anywhere.
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  namespace: 'default',
+  controlPlane: controlPlanes.redis({ connection: 'main', observe: 'own' }), // this pod's console stays on its own namespace
+})
+```
+
+`namespace` on `controlPlanes.redis(...)` picks the instance's own channel (`'default'` is the bare one); it does not redirect what it publishes about runs.
+
+An engine with no namespace therefore also hears cancels for runs of other namespaces. They reach `engine.onCancel` listeners like any other cancel, so a listener should act only on the runs it is executing.
+
+Delivery is best-effort, as with any pub/sub. The cancel itself is recorded in the store first, so a worker that misses the message still finds the run cancelled at its next turn; the message only makes it immediate.
 
 <Callout type="info">
 **Interoperates with a NestJS fleet.** The channel (`` `${prefix}-control` ``) and the JSON payload match the NestJS BullMQ transport's control plane, so an AdonisJS fleet and a NestJS fleet sharing one Redis fan out across both runtimes on the same channel.
@@ -76,7 +115,8 @@ export default defineConfig({ controlPlane })
 | Constructor option | Default | Meaning |
 | --- | --- | --- |
 | `connection` | — (required) | A raw `ioredis` client or an `@adonisjs/redis` connection. |
-| `prefix` | `'durable'` | Channel is `` `${prefix}-control` ``. |
+| `prefix` | `'durable'` | Channel is `` `${prefix}-control` ``, or `` `${prefix}-<namespace>-control` `` under a namespace. |
+| `namespace` | the engine's `namespace` | Namespace folded into the channel name. |
 | `pingIntervalMs` | `30_000` | How often the watchdog pings the subscriber connection (both forms; `controlPlanes.redis({ pingIntervalMs })` too). `0` or `false` disables it. |
 
 ## Subscriber health

@@ -151,7 +151,7 @@ describe('QueueTransport', () => {
 
   it('close() stops loops and destroys the adapter', async () => {
     const adapter = new MockAdapter();
-    const t = new QueueTransport({ adapter: () => adapter, group: 'ext', pollIntervalMs: POLL });
+    const t = new QueueTransport({ adapter: () => adapter, pollIntervalMs: POLL });
     t.handle('ext.echo', async () => 1);
     t.onResult(async () => {});
     await t.close();
@@ -255,13 +255,11 @@ describe('QueueTransport', () => {
       const alphaWorker = new QueueTransport({
         adapter: () => adapter,
         namespace: 'alpha',
-        group: 'ext',
         pollIntervalMs: POLL,
       });
       const betaWorker = new QueueTransport({
         adapter: () => adapter,
         namespace: 'beta',
-        group: 'ext',
         pollIntervalMs: POLL,
       });
       transports.push(alphaEngine, alphaWorker, betaWorker);

@@ -20,6 +20,7 @@ export {
   setWorkflowEngineResolver,
   type WorkflowDispatchOptions,
   type WorkflowEngineResolver,
+  type WorkflowStartOptions,
 } from './base-workflow.js';
 export * from './codec-state-store.js';
 // --- ace command building blocks --------------------------------------------

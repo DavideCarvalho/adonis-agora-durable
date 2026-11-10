@@ -287,8 +287,8 @@ export interface StepEvent {
   phase?: string;
   /** For a log line emitted *inside* a sub-process: that owning sub-process's name, so the dashboard
    *  can group a step's log trail under each sub-process instead of one flat list. Set on logs (no
-   *  `status`); a worker stamps it from the sub-process it's running.
-   *  @deprecated Superseded by `subId` for run-distinct grouping; kept so existing workers/runs render. */
+   *  `status`); a worker stamps it from the sub-process it's running. The Python worker still sends
+   *  it, and stored checkpoints carry it, so it stays; the TS step logger groups by `subId` instead. */
   process?: string;
   /** Optional structured payload. `data.durationMs` (number) overrides the derived duration. */
   data?: unknown;
@@ -1547,7 +1547,7 @@ export interface Heartbeat {
    */
   stepId?: string | undefined;
   group: string;
-  /** Worker-side emission time (epoch ms). Optional on the wire for back-compat with 0.17-era workers. */
+  /** Worker-side emission time (epoch ms). Optional on the wire: NestJS workers do not send it. */
   at?: number | undefined;
   /**
    * Opaque JSON-safe progress payload the step handler attached (`log.heartbeat({done: 12, total: 50})`).
@@ -1837,8 +1837,8 @@ export type RunRequestKind =
   | { kind: 'redispatch'; runId: string }
   // Aviary's verbs, in aviary's shapes. `runFacets`/`runValueFacets` are namespace-forced like
   // `listRuns`; `waitingFor` is bulk and filtered to the requester's own runs; the rest are
-  // runId-bearing and ownership-checked first. Additive: an older control plane answers them with an
-  // unknown-verb error, which `ProxyRunGateway` reports as such.
+  // runId-bearing and ownership-checked first. A control plane that does not answer one replies
+  // `unsupported-request`, which `ProxyRunGateway` reports as such.
   | { kind: 'runFacets'; query: RunFacetQuery }
   | {
       kind: 'runValueFacets';
@@ -2142,9 +2142,34 @@ export interface GroupHealth {
  * `controlPlane` to enable cross-instance events/cancellation; omit it and the engine is local-only.
  * A transport that can broadcast may implement this too and be passed as both.
  */
+/** Where a {@link ControlPlane.publishControl} message is about. */
+export interface ControlPublishTarget {
+  /**
+   * The namespace of the run the message is about. A control plane that partitions its channel by
+   * namespace (the Redis one) publishes there, so the instances serving that run's namespace hear it
+   * whichever namespace the publisher is in. `''`, `'default'` and `undefined` are the default pool.
+   */
+  namespace?: string | undefined;
+}
+
 export interface ControlPlane {
-  publishControl(msg: ControlMessage): Promise<void>;
+  /**
+   * Broadcast `msg`. `target` names the namespace of the run it is about, when there is one; without
+   * it, the message goes where the publisher's own instances listen.
+   */
+  publishControl(msg: ControlMessage, target?: ControlPublishTarget): Promise<void>;
   onControl(handler: (msg: ControlMessage) => void): void;
+  /**
+   * Optional: adopt the engine's namespace, so a namespaced engine broadcasts on its own channel (the
+   * Redis control plane folds it in like the BullMQ transport's names). Called once, before
+   * {@link onControl}, and only when the engine has a namespace.
+   */
+  useNamespace?(namespace: string): void;
+  /**
+   * Optional: observe every namespace, not only the engine's own — the process mounts a console whose
+   * live tail follows runs of every namespace. May be called after {@link onControl}.
+   */
+  observeAll?(): void;
 }
 
 /** A message on the {@link ControlPlane}. `from` is the originating engine's `instanceId`, so a

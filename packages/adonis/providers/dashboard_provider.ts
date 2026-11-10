@@ -105,7 +105,7 @@ function spaDirectory(): string {
  * - `POST /api/runs/:id/cancel`       -> cancel the run
  * - `POST /api/runs/:id/continue`     -> resume a run paused at a breakpoint
  * - `POST /api/runs/:id/signal`       -> deliver a signal payload to a waited token
- * - `POST /api/runs/:id/update/:name` -> deliver a validated update (ctx.onUpdate)
+ * - `POST /api/runs/:id/updates/:name` -> deliver a validated update (ctx.onUpdate)
  * - `POST /api/runs/:id/tasks/:name/complete` -> complete an external ctx.task
  * - `POST /api/runs/:id/tasks/:name/fail`     -> fail an external ctx.task
  * - `GET  /api/workflows/:name/lifecycle` -> who starts whom through lifecycle events, for a workflow
@@ -195,6 +195,8 @@ export default class DashboardProvider {
     if ((this.app as { getMode?: () => string }).getMode?.() === 'warmup') return;
     try {
       const engine = await this.app.container.make(WorkflowEngine);
+      // The console's live tail follows runs of every namespace, whatever this engine's own is.
+      engine.observeAllNamespaces();
       this.detachDiagnostics = this.diagnostics.attach(engine);
       this.metricsCollector = collectMetrics(engine);
     } catch {
@@ -282,7 +284,7 @@ export default class DashboardProvider {
     // operator act on it.
     router.post(`${apiBase}/runs/:id/signal`, json(signalRun)).as('durable_dashboard.runs.signal');
     router
-      .post(`${apiBase}/runs/:id/update/:name`, json(updateRun))
+      .post(`${apiBase}/runs/:id/updates/:name`, json(updateRun))
       .as('durable_dashboard.runs.update');
     router
       .post(`${apiBase}/runs/:id/tasks/:name/complete`, json(completeTaskRun))

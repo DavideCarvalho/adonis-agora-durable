@@ -4,6 +4,8 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { IgnitorFactory } from '@adonisjs/core/factories';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { WorkflowEngine } from '../src/engine.js';
+import { InMemoryStateStore } from '../src/testing/in-memory-state-store.js';
 
 /**
  * Regression test for a real crash: `@adonisjs/core/services/router` is a plain module-level
@@ -70,6 +72,49 @@ describe('DashboardProvider — boots inside a real AdonisJS app', () => {
         'durable_dashboard.webhooks.deliver',
       ]),
     );
+
+    // The update route is plural, matching the Aviary dashboard API, and has no singular alias.
+    const routes = router.toJSON().root!;
+    const update = routes.find((route) => route.name === 'durable_dashboard.runs.update');
+    expect(update?.pattern).toMatch(/\/api\/runs\/:id\/updates\/:name$/);
+    expect(routes.some((route) => /\/runs\/:id\/update\/:name$/.test(route.pattern))).toBe(false);
+  });
+});
+
+describe('DashboardProvider — a mounted console observes every namespace', () => {
+  let appRoot: string;
+  beforeEach(async () => {
+    appRoot = await mkdtemp(join(tmpdir(), 'durable-dashboard-observe-'));
+  });
+  afterEach(async () => {
+    await rm(appRoot, { recursive: true, force: true });
+  });
+
+  it('asks the engine’s control plane to observe all namespaces once booted', async () => {
+    const ignitor = new IgnitorFactory()
+      .withCoreProviders()
+      .withCoreConfig()
+      .merge({
+        rcFileContents: { providers: [() => import('../providers/dashboard_provider.js')] },
+      })
+      .create(pathToFileURL(`${appRoot}/`));
+    const app = ignitor.createApp('web');
+    await app.init();
+    let observed = 0;
+    const engine = new WorkflowEngine({
+      store: new InMemoryStateStore(),
+      namespace: 'default',
+      controlPlane: {
+        publishControl: async () => {},
+        onControl: () => {},
+        observeAll: () => {
+          observed += 1;
+        },
+      },
+    });
+    app.container.singleton(WorkflowEngine, () => engine);
+    await app.boot();
+    expect(observed).toBe(1);
   });
 });
 

@@ -13,7 +13,6 @@ describe('QueueTransport conformance', () => {
     const adapter = new MockAdapter();
     const transport = new QueueTransport({
       adapter: () => adapter,
-      group: 'conformance',
       pollIntervalMs: 5,
     });
     await expect(assertTransportConformance(transport)).resolves.toBeUndefined();

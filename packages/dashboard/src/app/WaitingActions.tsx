@@ -19,7 +19,7 @@ import { InputField } from './ui/input';
  *  - a plain signal wait → **Deliver signal** (`POST /runs/:id/signal`), token pre-filled and
  *    editable, JSON payload optional. A 409 ("run is not waiting on that token") surfaces the
  *    server's `waitingOn` list as clickable token chips instead of a dead-end error.
- *  - an update wait (`update:<runId>:<name>`) → **Send update** (`POST /runs/:id/update/:name`);
+ *  - an update wait (`update:<runId>:<name>`) → **Send update** (`POST /runs/:id/updates/:name`);
  *    a 422 shows the workflow validator's reason inline, nothing delivered.
  *  - a task wait (`task:<runId>:<name>`) → **Complete task** / **Fail task**
  *    (`POST /runs/:id/tasks/:name/complete|fail`).

@@ -51,7 +51,7 @@ import type { WorkflowRef } from './workflow-ref.js';
  *   transports: {
  *     // production single-process, no external infra:
  *     'event-emitter': transports.eventEmitter(),
- *     queue: transports.queue({ adapter: redis({ host: '127.0.0.1' }), group: 'durable' }),
+ *     queue: transports.queue({ adapter: redis({ host: '127.0.0.1' }) }),
  *     db: transports.db({ connection: 'pg' }),
  *   },
  *   store: 'lucid',

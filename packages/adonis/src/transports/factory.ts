@@ -55,11 +55,6 @@ export interface MemoryTransportConfig {
 
 /** Options for the production in-process EventEmitter transport (no peer dependency). */
 export interface EventEmitterTransportConfig {
-  /**
-   * The worker group this instance serves. Accepted for parity with the broker transports; handlers
-   * are matched by step name in-process, so it does not affect routing.
-   */
-  group?: string;
   /** Stable id for this process (stamped on control `from` when a publisher leaves it unset). Default random. */
   instanceId?: string;
   /** Where a failing result/heartbeat handler is reported (a failed result is redelivered). Default `console.error`. */
@@ -81,11 +76,6 @@ export interface QueueTransportConfig {
    * precedence over `connection`.
    */
   adapter?: AdapterFactory;
-  /**
-   * @deprecated Steps route BY HANDLER NAME, so this instance serves whatever names it registers.
-   * Accepted for back-compat and otherwise ignored. Use {@link partition} for isolation.
-   */
-  group?: string;
   /**
    * Isolation partition suffixing every per-handler task queue this worker subscribes to
    * (`<name>@<partition>`), matched against the `partition` a dispatch carries — so one backend can
@@ -263,11 +253,6 @@ export interface BullMQTransportConfig {
 /** Options for the DB-table-backed (`@adonisjs/lucid`) transport. */
 export interface DbTransportConfig {
   /**
-   * @deprecated Steps route BY HANDLER NAME, so this instance serves whatever names it registers.
-   * Accepted for back-compat and otherwise ignored. Use {@link partition} for isolation.
-   */
-  group?: string;
-  /**
    * Isolation partition suffixing every per-handler routing token this worker claims
    * (`<name>@<partition>`), matched against the `partition` a dispatch carries. Unset (or `'default'`)
    * claims the bare handler-name tokens.
@@ -350,7 +335,7 @@ export interface DbTransportConfig {
  *   transport: 'queue',
  *   transports: {
  *     memory: transports.memory(),
- *     queue: transports.queue({ connection: 'redis', group: 'durable' }),
+ *     queue: transports.queue({ connection: 'redis' }),
  *     db: transports.db({ connection: 'pg' }),
  *   },
  * })
@@ -415,7 +400,6 @@ export const transports = {
     return async (ctx) => {
       const { EventEmitterTransport } = await import('./event-emitter.js');
       return new EventEmitterTransport({
-        ...(config.group !== undefined ? { group: config.group } : {}),
         ...inherited('instanceId', config.instanceId, ctx),
         ...(config.onError !== undefined ? { onError: config.onError } : {}),
       });
@@ -434,7 +418,6 @@ export const transports = {
         ...(config.workerKeysCacheMs !== undefined
           ? { workerKeysCacheMs: config.workerKeysCacheMs }
           : {}),
-        ...(config.group !== undefined ? { group: config.group } : {}),
         ...inherited('partition', config.partition, ctx),
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
         ...(config.prefix !== undefined ? { prefix: config.prefix } : {}),
@@ -510,7 +493,6 @@ export const transports = {
       const { DbTransport } = await import('./db.js');
       return new DbTransport({
         db,
-        ...(config.group !== undefined ? { group: config.group } : {}),
         ...inherited('partition', config.partition, ctx),
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
         ...(config.connection !== undefined ? { connectionName: config.connection } : {}),

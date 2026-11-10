@@ -77,6 +77,7 @@ import type {
   BufferedSignalRow,
   ControlMessage,
   ControlPlane,
+  ControlPublishTarget,
   DeadLetter,
   EngineEvent,
   EngineListener,
@@ -497,6 +498,13 @@ function wakeReasonSeen(payload: unknown, settledFans: ReadonlyMap<number, numbe
       (settledFans.get(pair[0]) ?? -1) >= pair[1],
   );
 }
+
+/**
+ * The control-plane target of a message about a run in `namespace`: the run's namespace, so the
+ * instances serving it hear it wherever the publisher is. Unknown → the publisher's own channel.
+ */
+const runTarget = (namespace: string | undefined): ControlPublishTarget | undefined =>
+  namespace === undefined ? undefined : { namespace };
 
 /** Whether `status` is one a run never leaves on its own. */
 const isTerminalRun = (status: RunStatus): boolean =>
@@ -1289,6 +1297,7 @@ export class WorkflowEngine {
     // An operator (no namespace) skips this entirely: not calling `useNamespace` IS the bare prefix,
     // which is what it must stay on to reach every tenant's queues.
     if (this.namespace !== undefined) this.pool.useNamespace(this.namespace);
+    if (this.namespace !== undefined) this.controlPlane?.useNamespace?.(this.namespace);
     this.leaseMs = deps.leaseMs ?? 30_000;
     this.bootedAt = this.clock();
     this.maxRecoveryAttempts = deps.maxRecoveryAttempts;
@@ -2257,6 +2266,15 @@ export class WorkflowEngine {
    * worker bridge can use this for cooperative cancellation: abort the in-flight work for `runId`
    * instead of finishing it just to have the result discarded. Returns an unsubscribe function.
    */
+  /**
+   * Observe the control-plane traffic of every namespace, not only this engine's own: the process
+   * mounts a console (the durable dashboard) whose live tail follows runs of every namespace. The
+   * dashboard provider calls it; a control plane without namespaced channels ignores it.
+   */
+  observeAllNamespaces(): void {
+    this.controlPlane?.observeAll?.();
+  }
+
   onCancel(listener: (runId: string) => void): () => void {
     this.cancelListeners.add(listener);
     return () => this.cancelListeners.delete(listener);
@@ -3681,7 +3699,9 @@ export class WorkflowEngine {
           this.eventsToBroadcast.shift();
           msg = { kind: 'event', event: first, from: this.instanceId };
         }
-        await this.controlPlane.publishControl(msg).catch(() => {
+        // A run's own event goes to its namespace's channel; step events carry none and stay here.
+        const target = msg.kind === 'event' ? runTarget(msg.event.namespace) : undefined;
+        await this.controlPlane.publishControl(msg, target).catch(() => {
           // control-plane delivery is best-effort observability; never break execution
         });
       }
@@ -3869,7 +3889,10 @@ export class WorkflowEngine {
       // queue already delivers it to a consuming instance.
       if (this.controlPlane && !this.runQueue) {
         void this.controlPlane
-          .publishControl({ kind: 'enqueued', runId, from: this.instanceId })
+          .publishControl(
+            { kind: 'enqueued', runId, from: this.instanceId },
+            runTarget(run.namespace),
+          )
           .catch(() => undefined);
       }
     }
@@ -5074,7 +5097,10 @@ export class WorkflowEngine {
         this.notifyCancelled(run.id);
         if (this.controlPlane) {
           void this.controlPlane
-            .publishControl({ kind: 'cancel', runId: run.id, from: this.instanceId })
+            .publishControl(
+              { kind: 'cancel', runId: run.id, from: this.instanceId },
+              runTarget(run.namespace),
+            )
             .catch(() => undefined);
         }
         this.notifyParent(run.id, { ok: false, error: error.message });
@@ -6466,7 +6492,10 @@ export class WorkflowEngine {
       await this.store.bufferSignal(`cancel:${runId}`, true).catch(() => undefined);
       if (this.controlPlane) {
         void this.controlPlane
-          .publishControl({ kind: 'cancel', runId, from: this.instanceId })
+          .publishControl(
+            { kind: 'cancel', runId, from: this.instanceId },
+            runTarget(run.namespace),
+          )
           .catch(() => undefined);
       }
       // Tracked (see {@link trackEffect}): the background resume replays the run and drives its saga
@@ -6514,7 +6543,7 @@ export class WorkflowEngine {
     this.notifyCancelled(runId);
     if (this.controlPlane) {
       void this.controlPlane
-        .publishControl({ kind: 'cancel', runId, from: this.instanceId })
+        .publishControl({ kind: 'cancel', runId, from: this.instanceId }, runTarget(run.namespace))
         .catch(() => undefined);
     }
     // A cancelled singleton run frees its slot — wake the next gated waiter now (notify-on-release).

@@ -23,6 +23,7 @@
     "cli",
     "production",
     "troubleshooting",
+    "migrating-to-1-0",
     "api-reference"
   ],
   "root": true,

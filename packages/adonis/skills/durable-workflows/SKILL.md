@@ -71,8 +71,10 @@ export default class CheckoutWorkflow extends BaseWorkflow {
 ```
 
 Run it from anywhere: `CheckoutWorkflow.dispatch(input, { runId })` enqueues;
-`CheckoutWorkflow.start(input)` blocks until the run is terminal and returns its
-output. Both statics are
+`CheckoutWorkflow.start(input, { timeoutMs })` blocks until the run is terminal and returns its
+output on `completed` — on `failed`/`cancelled`/`dead` it throws the same `FatalError`
+`ctx.child` throws (`run "<runId>" failed: <reason>`); `timeoutMs` (new `WorkflowStartOptions`
+field) bounds the wait while the run keeps going. Both statics are
 context-aware — inside a running body they become a linked child /
 fire-and-forget child instead of a top-level run.
 
@@ -408,9 +410,10 @@ const { runId } = await CheckoutWorkflow.dispatch(order, { runId: `checkout:${or
 return response.accepted({ runId })
 ```
 
-Mechanism: `.start` resolves only when the run reaches a terminal state — it
+Mechanism: `.start` settles only when the run reaches a terminal state — it
 keeps waiting through every sleep/signal suspension, hours later for a long
-workflow. Source: `docs/getting-started.mdx`
+workflow — and returns its output only on `completed`, throwing `FatalError`
+(`run "<runId>" failed: <reason>`) on `failed`/`cancelled`/`dead`. Source: `docs/getting-started.mdx`
 (warning callout).
 
 ### MEDIUM awaiting a webhook with no timeout

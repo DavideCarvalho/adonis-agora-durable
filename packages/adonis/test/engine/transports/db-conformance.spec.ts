@@ -14,7 +14,7 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb }) => {
   describe('DbTransport conformance', () => {
     it('satisfies the shared Transport contract', async () => {
       const db = await makeMemoryDb();
-      const transport = new DbTransport({ db, group: 'conformance', pollIntervalMs: 5 });
+      const transport = new DbTransport({ db, pollIntervalMs: 5 });
       await assertTransportConformance(transport);
       await db.manager.closeAll();
     });

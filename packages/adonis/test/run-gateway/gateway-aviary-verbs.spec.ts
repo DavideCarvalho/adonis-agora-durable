@@ -27,7 +27,7 @@ class Wire implements ProxyTransport, ResponderTransport {
   #onRunRequest: ((msg: RunRequest) => Promise<void>) | undefined;
   #onStartRun: ((msg: StartRunMessage) => Promise<void>) | undefined;
   readonly #replyHandlers = new Set<(r: RunReply) => void>();
-  /** Verbs to answer the way a control plane before 0.50 did (unknown verb, no code). */
+  /** Verbs to answer the way a control plane that does not know them does (`unsupported-request`). */
   legacy = new Set<RunRequestKind['kind']>();
   async dispatchStartRun(msg: StartRunMessage): Promise<void> {
     await this.#onStartRun?.(msg).catch(() => {});
@@ -36,7 +36,13 @@ class Wire implements ProxyTransport, ResponderTransport {
     if (this.legacy.has(msg.body.kind)) {
       await this.publishRunReply({
         requestId: msg.requestId,
-        result: { ok: false, error: { message: `unknown run-request verb: ${msg.body.kind}` } },
+        result: {
+          ok: false,
+          error: {
+            message: `unknown run-request verb: ${msg.body.kind}`,
+            code: 'unsupported-request',
+          },
+        },
       });
       return;
     }

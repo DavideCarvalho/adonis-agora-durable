@@ -41,8 +41,7 @@ export interface ResponderTransport {
 /**
  * The error `code` a responder answers a verb it does not know with, so a newer tenant can tell
  * "this control plane is older than me" from a real failure and fall back at once instead of
- * waiting out its timeout. Responders before 0.50 answered with an error message
- * (`unknown run-request verb: <kind>`) and no code; `ProxyRunGateway` recognizes both.
+ * waiting out its timeout.
  */
 export const UNSUPPORTED_RUN_REQUEST = 'unsupported-request';
 

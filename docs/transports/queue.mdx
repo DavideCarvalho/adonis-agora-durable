@@ -80,7 +80,6 @@ Upgrading an app from 0.6 to 0.7:
 | --- | --- | --- |
 | `connection` | `config/queue.ts` `default` | Name of the `@adonisjs/queue` connection (a key of that file's `adapters`) whose adapter this transport uses. |
 | `adapter` | — | Escape hatch: a raw `@adonisjs/queue` adapter factory, used instead of resolving from `config/queue.ts`. Takes precedence over `connection`. |
-| `group` | — | **Deprecated.** Steps route by handler name, so an instance serves whatever names it registers — no group to declare. Accepted for back-compat and otherwise ignored; use `partition` for isolation. |
 | `partition` | — | Optional isolation partition suffixing every per-handler task queue this worker subscribes to (`<name>@<partition>`), matching a dispatch's `partition` — so one backend can host several pools serving the same handler name without their tasks crossing. `'default'` and `''` mean no partition. |
 | `namespace` | from the engine | Worker-pool namespace folded into every queue name. Setting it here is explicit and wins over the engine's propagation of `config.namespace` — see [Namespaces](#namespaces--sharing-one-broker-across-pools). |
 | `prefix` | `'durable'` | Namespaces the queues (`<prefix>:tasks:<token>`, `<prefix>:results`, …). |

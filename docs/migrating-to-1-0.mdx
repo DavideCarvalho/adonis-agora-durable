@@ -1,0 +1,210 @@
+---
+title: Migrating to 1.0
+description: The breaking changes in @adonis-agora/durable 1.0, @adonis-agora/durable-dashboard 1.0 and @adonis-agora/durable-eslint-plugin 1.0, and what to change in your app.
+icon: CircleArrowUp
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+## Requirements
+
+- Node.js 24 or newer.
+- Stop the pre-1.0 engines before or while you deploy 1.0, rather than running both on one store for
+  long: 1.0 records a compensating cancel (`cancel(id, { compensate: true })`) differently, so while a
+  0.x engine still executes a run, its undo can wait for crash recovery.
+
+```sh
+pnpm add @adonis-agora/durable@^1
+pnpm add -D @adonis-agora/durable-eslint-plugin@^1   # if you lint workflows
+```
+
+The console served by `@adonis-agora/durable` is upgraded with it. If you embed
+`@adonis-agora/durable-dashboard` yourself, move it to 1.0 at the same time: it calls a route only the
+1.0 server answers (see [the update route](#the-dashboard-update-route-is-updatesname)).
+`@adonis-agora/durable-eslint-plugin` 1.0 has no breaking changes.
+
+## `Wf.start` throws when the run does not complete
+
+Called outside a workflow (a controller, a command, a script), `Wf.start` used to resolve with
+`undefined` when the run ended `failed`, `cancelled` or `dead`. It now throws a `FatalError`, the
+same error `ctx.child` throws inside a workflow. Its message is `run "<runId>" failed: <reason>`,
+and it carries the run error's `code` and `details`.
+
+Before:
+
+```ts title="app/controllers/orders_controller.ts"
+export default class OrdersController {
+  async store({ request, response }: HttpContext) {
+    const receipt = await CheckoutWorkflow.start(request.body())
+    if (receipt === undefined) return response.unprocessableEntity({ reason: 'checkout failed' })
+    return response.ok(receipt)
+  }
+}
+```
+
+After:
+
+```ts title="app/controllers/orders_controller.ts"
+import { FatalError } from '@adonis-agora/durable'
+
+export default class OrdersController {
+  async store({ request, response }: HttpContext) {
+    try {
+      const receipt = await CheckoutWorkflow.start(request.body(), { timeoutMs: 30_000 })
+      return response.ok(receipt)
+    } catch (error) {
+      if (error instanceof FatalError) return response.unprocessableEntity({ reason: error.message })
+      throw error
+    }
+  }
+}
+```
+
+`Wf.start` also takes `timeoutMs` now. When the wait runs out, the call rejects and the run keeps
+going. To read the outcome without a `try`/`catch`, use `Wf.dispatch` and then
+`engine.waitForRun(runId, { terminal: true })`, which returns `{ status, output, error }`.
+
+## The Redis control plane channel includes the namespace
+
+`controlPlanes.redis` (and `RedisControlPlane`) listen on `<prefix>-<namespace>-control` when the
+engine has a `namespace`, the same way the `bullmq` transport names its queues and the NestJS and
+Python workers name the channel. An engine without a namespace, or with `namespace: 'default'`, stays
+on `<prefix>-control`.
+
+A message about a run (a cancel, an enqueue nudge, the run's lifecycle events) is published on the
+channel of that run's namespace. A console with no namespace that cancels a run on a namespaced
+worker therefore reaches it at once, with no extra setting: don't pin `namespace: 'default'` on the
+control plane for that. Messages with no run stay on the publisher's own channel.
+
+A process that mounts the durable dashboard, or an engine with no namespace, observes every
+namespace: it also listens on every `<prefix>-<namespace>-control`, so the console's live tail still
+shows the runs of namespaced workers, even on a web pod with `namespace: 'default'`. Any other
+namespaced engine (a worker) observes only its own. `controlPlanes.redis({ observe: 'own' | 'all' })`
+overrides it. Delivery is
+best-effort: the cancel is recorded in the store first, and the message only makes it immediate.
+
+This is a wire change for namespaced deployments:
+
+- Deploy every pod of a namespace to 1.0 together. While some run 0.x (on `durable-control`) and some
+  run 1.0 (on `durable-<namespace>-control`), a cancel or a live event does not reach the pods on the
+  other version. Runs themselves are not affected.
+- If you set `prefix: 'durable-<namespace>'` on the control plane so NestJS or Python workers would
+  hear it, remove it. The namespace is added for you, and keeping it would give
+  `durable-<namespace>-<namespace>-control`.
+
+Before:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  namespace: 'tenant-a',
+  transport: 'bullmq',
+  transports: { bullmq: transports.bullmq({ connection: { host: '127.0.0.1' } }) },
+  controlPlane: controlPlanes.redis({ connection: 'main', prefix: 'durable-tenant-a' }),
+})
+```
+
+After:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  namespace: 'tenant-a',
+  transport: 'bullmq',
+  transports: { bullmq: transports.bullmq({ connection: { host: '127.0.0.1' } }) },
+  controlPlane: controlPlanes.redis({ connection: 'main' }), // durable-tenant-a-control
+})
+```
+
+To listen on another namespace's channel, pass `namespace` to `controlPlanes.redis` or to the
+`RedisControlPlane` constructor.
+
+## The dashboard update route is `updates/:name`
+
+The route that delivers an update to a `ctx.onUpdate(name)` point moved from
+`POST <path>/api/runs/:id/update/:name` to `POST <path>/api/runs/:id/updates/:name`. The old path is
+gone. The 1.0 console already calls the new one; change any script or client of your own.
+
+Before:
+
+```sh
+curl -X POST https://app.example.com/durable/api/runs/order-42/update/set-limit \
+  -H 'content-type: application/json' -d '{ "arg": 500 }'
+```
+
+After:
+
+```sh
+curl -X POST https://app.example.com/durable/api/runs/order-42/updates/set-limit \
+  -H 'content-type: application/json' -d '{ "arg": 500 }'
+```
+
+## Upgrade a control plane older than 0.50 before its tenant pods
+
+A store-less `tenant` pod on 1.0 relies on the control plane answering a verb it does not know with
+the `unsupported-request` code, which every control plane from 0.50 on does. Against an older control
+plane, the newer verbs (`retry`, `continue`, `retryWithInput`, `runFacets`, `runValueFacets`,
+`waitingFor`, the lifecycle verbs) fail with a `RunGatewayError` instead of falling back.
+
+Before, either deploy order worked:
+
+```sh
+# tenant pods first, control plane (0.49) later
+kubectl rollout restart deployment/tenant-acme
+kubectl rollout restart deployment/durable-control-plane
+```
+
+After, move a control plane that is still on 0.49 or older first:
+
+```sh
+kubectl rollout restart deployment/durable-control-plane   # now on 1.0
+kubectl rollout restart deployment/tenant-acme
+```
+
+A control plane already on 0.50 or later can still be upgraded in either order.
+
+## Transports no longer accept `group`
+
+`transports.queue`, `transports.db` and `transports.eventEmitter`, and the `QueueTransport`,
+`DbTransport` and `EventEmitterTransport` constructors, no longer take a `group` option. Steps are
+routed by handler name, so it had no effect. Remove it, and use `partition` where you need separate
+worker pools.
+
+Before:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  transport: 'queue',
+  transports: { queue: transports.queue({ connection: 'redis', group: 'tenant-a' }) },
+})
+```
+
+After:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  transport: 'queue',
+  transports: { queue: transports.queue({ connection: 'redis', partition: 'tenant-a' }) },
+})
+```
+
+<Callout type="warn">
+`partition` does change routing: a worker with `partition: 'tenant-a'` serves only steps dispatched to
+that partition. If `group` was only a label, delete it instead of renaming it.
+</Callout>
+
+## `runSchedules` no longer takes `sleep`
+
+The `sleep` option of `runSchedules(engine, schedules, now, opts)` is gone. Jitter defers a window to a
+later tick, so nothing called it. Remove it from the options; `random` still makes jitter
+deterministic in tests.
+
+Before:
+
+```ts title="tests/functional/schedules.spec.ts"
+await runSchedules(engine, schedules, now, { random: () => 0, sleep: async () => {} })
+```
+
+After:
+
+```ts title="tests/functional/schedules.spec.ts"
+await runSchedules(engine, schedules, now, { random: () => 0 })
+```

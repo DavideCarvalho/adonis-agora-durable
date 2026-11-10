@@ -27,11 +27,6 @@ export interface EventEmitterTransportOptions {
    */
   emitter?: EventEmitter;
   /**
-   * The worker group this instance serves. Unused for routing (handlers are matched by step name in
-   * this same process) — accepted for parity with the broker transports, and stamped nowhere.
-   */
-  group?: string;
-  /**
    * Logical deployment namespace, folded into the internal event-channel names so two namespaces over
    * ONE shared in-process emitter don't cross-process each other's tasks/results. `"default"` (and
    * absent) keeps the channel names BYTE-IDENTICAL to the un-namespaced scheme; any other value
