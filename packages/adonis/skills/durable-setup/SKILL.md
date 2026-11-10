@@ -183,7 +183,9 @@ output on `completed` — on `failed`/`cancelled`/`dead` it throws the same `Fat
 `code`/`details`); `timeoutMs` bounds the wait (the run itself keeps going).
 `engine.waitForRun(runId)` resolves a previously started run once it
 **settles** (terminal or suspended — except a `suspended` run still awaiting a
-remote workflow turn's decision, which keeps waiting until the decision lands) —
+remote workflow turn's decision, which keeps waiting until the decision lands,
+and a `blocked` run with no capable worker, which keeps waiting until it is
+re-driven) —
 pass `{ terminal: true }` to wait for the end.
 
 ```ts

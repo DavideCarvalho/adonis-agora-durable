@@ -534,6 +534,14 @@ const isStepEvent = (event: EngineEvent): boolean => event.type.startsWith('step
 /** The default {@link WorkflowEngineDeps.timerBatchSize}. */
 const DEFAULT_TIMER_BATCH = 500;
 
+/** The default {@link WorkflowEngineDeps.waitForRunPollMs}. */
+const DEFAULT_WAIT_FOR_RUN_POLL_MS = 250;
+
+/** A `waitForRun` read interval: a finite value `>= 0` (`0` = no reads), else `undefined`. */
+function validPollMs(ms: number | undefined): number | undefined {
+  return ms !== undefined && Number.isFinite(ms) && ms >= 0 ? ms : undefined;
+}
+
 /** {@link WorkflowEngine.sweepBufferedSignals}: rows read per page. */
 const BUFFERED_SWEEP_PAGE = 500;
 /** {@link WorkflowEngine.sweepBufferedSignals}: pages per call, so one tick stays short. */
@@ -819,6 +827,13 @@ export interface WorkflowEngineDeps {
    */
   remoteAdvanceSilenceMs?: number | undefined;
   /**
+   * How often (ms) `waitForRun` re-reads the run while it waits. Lifecycle events wake a wait at once,
+   * but they only reach this instance for runs it executes (or through a control plane, best-effort),
+   * so a run that settles on another pod is seen on the next read. Default 250. `0` turns the read
+   * off and leaves the wait on events alone. Per-call `waitForRun(id, { pollMs })` overrides it.
+   */
+  waitForRunPollMs?: number | undefined;
+  /**
    * Build the public callback URL for a `ctx.webhook()` token (e.g.
    * ``(t) => `https://api.example.com/durable/webhooks/${t}` ``). Populates
    * {@link DurableWebhook.url}. Omit if you build URLs yourself from the token.
@@ -1047,6 +1062,7 @@ export class WorkflowEngine {
   private readonly remoteRedispatchMs: number | undefined;
   private readonly remoteRedispatchMax: number;
   private readonly remoteAdvanceSilenceMs: number | undefined;
+  private readonly waitForRunPollMs: number;
   private readonly webhookUrl?: ((token: string) => string) | undefined;
   private readonly traceparent?: (() => string | undefined) | undefined;
   private readonly context?: (() => Record<string, unknown> | undefined) | undefined;
@@ -1336,6 +1352,7 @@ export class WorkflowEngine {
     this.remoteRedispatchMax = Math.max(1, deps.remoteRedispatchMax ?? 10);
     // Opt-in: unset (or 0) keeps the unbounded wait for a remote workflow turn's decision.
     this.remoteAdvanceSilenceMs = deps.remoteAdvanceSilenceMs || undefined;
+    this.waitForRunPollMs = validPollMs(deps.waitForRunPollMs) ?? DEFAULT_WAIT_FOR_RUN_POLL_MS;
     this.webhookUrl = deps.webhookUrl;
     this.traceparent = deps.traceparent;
     this.context = deps.context;
@@ -5944,17 +5961,28 @@ export class WorkflowEngine {
    * the wait continues until the run reaches an end state. This is what `BaseWorkflow.start` needs so
    * "I want the result" blocks through a suspension instead of returning early with no output. The
    * default (`terminal` unset/false) resolves on any settled state, suspended included.
+   *
+   * A `blocked` run (no live worker can take its next dispatch) is NOT settled in either mode: the
+   * engine re-drives it as soon as a capable worker appears, so the wait continues. Bound it with
+   * `timeoutMs`.
+   *
+   * The wait wakes on this run's lifecycle events, and also re-reads the run every `pollMs` (default
+   * the engine's `waitForRunPollMs`, 250 ms), so it sees a run that settles on another instance even
+   * without a control plane. `pollMs: 0` turns the re-read off.
    */
-  waitForRun(runId: string, opts?: { timeoutMs?: number; terminal?: boolean }): Promise<RunResult> {
+  waitForRun(
+    runId: string,
+    opts?: { timeoutMs?: number; terminal?: boolean; pollMs?: number },
+  ): Promise<RunResult> {
     const isTerminal = (s: RunStatus): boolean =>
       s === 'completed' || s === 'failed' || s === 'cancelled' || s === 'dead';
     // A run `suspended` while it awaits a dispatched remote workflow turn's decision
     // (`awaitingDecisionTaskId` set) is mid-turn, not settled: that suspend is the engine's re-drive
-    // marker, not a sleep/signal the body asked for. Keep waiting until the decision lands.
+    // marker, not a sleep/signal the body asked for. Keep waiting until the decision lands. A `blocked`
+    // run is parked on the fleet, not on anything the body asked for, and is re-driven on its own.
     const isSettled = (run: WorkflowRun): boolean =>
-      run.status !== 'pending' &&
-      run.status !== 'running' &&
-      !(run.status === 'suspended' && run.awaitingDecisionTaskId !== undefined);
+      isTerminal(run.status) ||
+      (run.status === 'suspended' && run.awaitingDecisionTaskId === undefined);
     const shouldResolve = (run: WorkflowRun): boolean =>
       opts?.terminal ? isTerminal(run.status) : isSettled(run);
     const toResult = (run: WorkflowRun): RunResult => ({
@@ -5963,34 +5991,50 @@ export class WorkflowEngine {
       output: run.output,
       error: run.error,
     });
+    const pollMs = validPollMs(opts?.pollMs) ?? this.waitForRunPollMs;
     return new Promise<RunResult>((resolve, reject) => {
       let done = false;
       let off: () => void = () => {};
-      const timer =
-        opts?.timeoutMs != null
-          ? setTimeout(() => {
-              if (done) return;
-              done = true;
-              off();
-              reject(new Error(`waitForRun(${runId}) timed out after ${opts.timeoutMs}ms`));
-            }, opts.timeoutMs)
-          : undefined;
-      const finish = (run: WorkflowRun): void => {
-        if (done) return;
+      let poller: ReturnType<typeof setInterval> | undefined;
+      let reading = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const stop = (): void => {
         done = true;
         if (timer) clearTimeout(timer);
+        if (poller) clearInterval(poller);
         off();
+      };
+      if (opts?.timeoutMs != null) {
+        timer = setTimeout(() => {
+          if (done) return;
+          stop();
+          reject(new Error(`waitForRun(${runId}) timed out after ${opts.timeoutMs}ms`));
+        }, opts.timeoutMs);
+      }
+      const finish = (run: WorkflowRun): void => {
+        if (done) return;
+        stop();
         resolve(toResult(run));
       };
-      const check = (): void => {
-        // Swallow a transient store error: the next settling event re-checks, and the timeout still
-        // bounds the wait. Unhandled, one hiccup here was a process-fatal unhandled rejection.
-        void this.store
+      // Swallow a transient store error: the next event or poll re-checks, and the timeout still
+      // bounds the wait. Unhandled, one hiccup here was a process-fatal unhandled rejection.
+      const read = (): Promise<void> =>
+        this.store
           .getRun(runId)
           .then((run) => {
             if (run && shouldResolve(run)) finish(run);
           })
           .catch(() => undefined);
+      const check = (): void => {
+        if (!done) void read();
+      };
+      // The poll skips a tick while its previous read is still out, so a slow store never stacks reads.
+      const poll = (): void => {
+        if (done || reading) return;
+        reading = true;
+        void read().finally(() => {
+          reading = false;
+        });
       };
       // React only to this run's settling events (not its every step event), and subscribe BEFORE the
       // initial read so a run that settles in between isn't missed.
@@ -6002,6 +6046,12 @@ export class WorkflowEngine {
           check();
         }
       });
+      // Events only reach this instance for runs it executes (or over a control plane, best-effort):
+      // the poll is what sees a run that settles on another pod.
+      if (pollMs > 0) {
+        poller = setInterval(poll, pollMs);
+        (poller as { unref?: () => void }).unref?.();
+      }
       check();
     });
   }

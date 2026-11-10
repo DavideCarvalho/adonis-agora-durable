@@ -329,6 +329,12 @@ export interface BaseDurableConfig {
    */
   remoteAdvanceSilenceMs?: number;
   /**
+   * How often (ms) `engine.waitForRun` and the blocking `Workflow.start()` re-read the run while they
+   * wait, so they see a run that settles on another pod without a control plane. Default 250; `0`
+   * leaves the wait on lifecycle events alone.
+   */
+  waitForRunPollMs?: number;
+  /**
    * The most due timers one timer pass loads and resumes, most overdue first; a larger backlog
    * drains over the next ticks. Every worker runs the pass each tick, and each walks its batch in a
    * shuffled order so instances don't contend for the same leases row by row. Default 500.
