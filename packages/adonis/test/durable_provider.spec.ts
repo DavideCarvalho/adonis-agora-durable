@@ -205,6 +205,17 @@ describe('DurableProvider', () => {
     ).toBeUndefined();
   });
 
+  it('forwards waitForRunPollMs to the engine (250 by default)', async () => {
+    const configured = fakeApp({ waitForRunPollMs: 1_000 });
+    new DurableProvider(configured.app).register();
+    const engine = await configured.resolve();
+    expect((engine as unknown as { waitForRunPollMs: number }).waitForRunPollMs).toBe(1_000);
+    const plain = fakeApp();
+    new DurableProvider(plain.app).register();
+    const defaults = await plain.resolve();
+    expect((defaults as unknown as { waitForRunPollMs: number }).waitForRunPollMs).toBe(250);
+  });
+
   it('forwards the sticky-continuation options to the engine', async () => {
     const { app, resolve } = fakeApp({ stickyRuns: 7, stickyIdleMs: 1_234, routeReplies: false });
     await new DurableProvider(app).register();

@@ -129,9 +129,9 @@ Better still, use the built-in `compensate` option ([Sagas](/docs/durable/reliab
 
 **Symptom:** `await engine.waitForRun(runId)` — or the blocking `BaseWorkflow.start(input)`, which is built on it — never returns (or hits its timeout), although the dashboard shows the run `completed`.
 
-**Cause:** `waitForRun` reads the run once, then waits for its lifecycle events on **this** engine instance. Without a control plane, events stay on the process that produced them. If the run suspended and was resumed elsewhere — by `durable:work` after a `ctx.sleep`, by a signal handled on another pod, by a worker that consumed the step result — the waiting process never hears it settle.
+**Cause:** `waitForRun` wakes on the run's lifecycle events, which reach only the process that runs it (or every pod, over a control plane), and re-reads the run every `waitForRunPollMs` (250 ms by default) to see a run that settles on another pod. With `waitForRunPollMs: 0` (or `{ pollMs: 0 }` on the call) and no control plane, a run resumed elsewhere — by `durable:work` after a `ctx.sleep`, by a signal handled on another pod — is never seen settling.
 
-**Fix:** add [`controlPlanes.redis`](/docs/durable/transports/control-plane) so events fan out to every pod, or don't block a request on a long-lived run: `dispatch` it, return the run id, and poll `getRun`.
+**Fix:** keep the re-read on (remove `waitForRunPollMs: 0`), or add [`controlPlanes.redis`](/docs/durable/transports/control-plane) so events fan out to every pod. A wait also keeps going while the run is `blocked` (no live worker can take its next step); bound it with `timeoutMs`.
 
 ## Cancelling a run does not stop the work in progress
 
