@@ -52,7 +52,7 @@ The key is scoped to the workflow: admission only looks at runs of the **same wo
 
 A singleton run is tagged `singleton:<key>` at start time. Start never blocks and, without `maxQueueDepth`, never fails: the run is created as usual. The gate runs when the run is executed — first marked `running`, then checked **before its body executes**. The check is one atomic call to the store, `tryAdmitSingleton`:
 
-1. Inside a single transaction that serializes competing claims, the store reads this workflow's runs carrying the same `singleton:<key>` tag in `pending`, `running`, `suspended` or `blocked`.
+1. Inside a single transaction that serializes competing claims, the store reads this workflow's runs carrying the same `singleton:<key>` tag in `pending`, `running`, `suspended`, `blocked` or `cancelling`.
 2. Runs that already **hold a slot** keep it. A holder is marked durably on the run itself, with the reserved tag `durable:singleton:admitted`.
 3. The free slots (`limit` minus the holders) go to the oldest waiters by `(createdAt, id)`. If this run is one of them, the store adds the admission tag in the same transaction and the body runs.
 4. Otherwise the store parks the run `suspended` with a retry `wakeAt` (~1s, jittered ±250ms so a queue of waiters doesn't wake in lockstep), still inside that transaction, and the engine releases the lease. The timer poller wakes it and the claim runs again.
@@ -139,7 +139,7 @@ try {
 }
 ```
 
-The capacity check counts the `pending`/`running`/`suspended`/`blocked` runs of the workflow sharing the key in one scan and compares against `(limit ?? 1) + maxQueueDepth`. Unlike the slot claim, that scan is an ordinary run read, so with `scopeReads` on it only counts the engine's own namespace. It runs *before* the run row is written, so a rejected start leaves no trace in the store. Once a slot frees (notify-on-release promotes the oldest waiter, which later settles), the backlog count drops below the cap and the next `start` is accepted again.
+The capacity check counts the `pending`/`running`/`suspended`/`blocked`/`cancelling` runs of the workflow sharing the key in one scan and compares against `(limit ?? 1) + maxQueueDepth`. Unlike the slot claim, that scan is an ordinary run read, so with `scopeReads` on it only counts the engine's own namespace. It runs *before* the run row is written, so a rejected start leaves no trace in the store. Once a slot frees (notify-on-release promotes the oldest waiter, which later settles), the backlog count drops below the cap and the next `start` is accepted again.
 
 The check applies wherever the workflow is started — `engine.start`, `Wf.dispatch` / `Wf.start`, child workflows (a rejected child start is delivered to the parent as a failed child), event triggers and schedules. An idempotent re-`start` of an existing `runId` returns that run before the check and is never rejected.
 

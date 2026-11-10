@@ -21,7 +21,7 @@ import type {
   StepSettlement,
   WorkflowRun,
 } from '../interfaces.js';
-import { SETTLEABLE_RUN_STATUSES } from '../interfaces.js';
+import { RECOVERABLE_RUN_STATUSES, SETTLEABLE_RUN_STATUSES } from '../interfaces.js';
 import { namespaceMatches, normalizeNamespace } from '../namespaces.js';
 import { checkpointStatsOf, queryCheckpointsOf } from '../run-detail-summary.js';
 import { mergeRunFacetRows } from '../run-facets.js';
@@ -487,7 +487,7 @@ export class InMemoryStateStore implements StateStore {
     return this.visibleRuns()
       .filter(
         (r) =>
-          r.status === 'running' &&
+          RECOVERABLE_RUN_STATUSES.includes(r.status) &&
           (namespace === undefined || namespaceMatches(r.namespace, namespace)),
       )
       .map(copyRun);
@@ -526,7 +526,7 @@ export class InMemoryStateStore implements StateStore {
     return this.visibleRuns()
       .filter(
         (r) =>
-          r.status === 'running' &&
+          RECOVERABLE_RUN_STATUSES.includes(r.status) &&
           (r.lockedUntil === undefined ||
             r.lockedUntil <= nowMs ||
             (owner !== undefined && r.lockedBy === owner)) &&

@@ -1742,6 +1742,23 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
     );
 
     t(
+      'recovery listings include `cancelling` runs (a compensating cancel whose undo died)',
+      async () => {
+        await store.createRun(run({ id: 'unwinding', status: 'cancelling' }));
+        await store.createRun(run({ id: 'leased-unwind', status: 'cancelling' }));
+        await store.createRun(run({ id: 'done', status: 'cancelled' }));
+        await store.tryLockRun('leased-unwind', 'A', 9_000, 1_000);
+        expect((await store.listIncompleteRuns()).map((r) => r.id).sort()).toEqual([
+          'leased-unwind',
+          'unwinding',
+        ]);
+        if (store.listOrphanedRuns) {
+          expect((await store.listOrphanedRuns(5_000, 10)).map((r) => r.id)).toEqual(['unwinding']);
+        }
+      },
+    );
+
+    t(
       'listOrphanedRuns with an owner also returns the runs still leased to that owner',
       async () => {
         if (!store.listOrphanedRuns) return;

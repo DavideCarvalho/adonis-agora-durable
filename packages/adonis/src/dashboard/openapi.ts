@@ -11,7 +11,17 @@
 
 const runStatus = {
   type: 'string',
-  enum: ['pending', 'running', 'suspended', 'blocked', 'completed', 'failed', 'cancelled', 'dead'],
+  enum: [
+    'pending',
+    'running',
+    'suspended',
+    'blocked',
+    'cancelling',
+    'completed',
+    'failed',
+    'cancelled',
+    'dead',
+  ],
 } as const;
 
 const runSummary = {

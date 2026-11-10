@@ -24,17 +24,14 @@
 // ── Wire types (independent of `@adonis-agora/durable`'s own `Date`-typed engine interfaces — the
 // dashboard's `handlers.ts` serializes every `Date` to an ISO string before it reaches this client). ──
 
-// NOTE: no `cancelling` here, deliberately. The NestJS console's union carried it (saga
-// compensation in progress), but the AdonisJS engine's `RunStatus` union (`interfaces.ts`) never
-// produces it — `cancel()` settles straight to `cancelled` — and the server's own `RUN_STATUSES`
-// list (`run-filter.ts`) omits it too, so a status the server can never send stayed a dead filter
-// chip in the header. Trimmed rather than kept: re-add it here (and to `App.tsx`'s `STATUSES`)
-// only if a future engine version actually emits a visible compensating status.
+// `cancelling`: a compensating cancel is undoing the saga; the run ends `cancelled` (same as the
+// NestJS console's union).
 export type RunStatus =
   | 'pending'
   | 'running'
   | 'suspended'
   | 'blocked'
+  | 'cancelling'
   | 'completed'
   | 'failed'
   | 'cancelled'
@@ -484,7 +481,12 @@ export interface RunDisplayState {
   detail?: string;
 }
 
-const SINGLETON_INFLIGHT = new Set<RunStatus>(['running', 'suspended', 'blocked']);
+/** A run still in flight on its own: executing, parked mid-run, or undoing its saga. */
+export function isLiveStatus(status: RunStatus): boolean {
+  return status === 'running' || status === 'suspended' || status === 'cancelling';
+}
+
+const SINGLETON_INFLIGHT = new Set<RunStatus>(['running', 'suspended', 'blocked', 'cancelling']);
 /** Mirrors `SINGLETON_ADMITTED_TAG` in `@adonis-agora/durable`: the run holds a singleton slot. */
 const SINGLETON_ADMITTED_TAG = 'durable:singleton:admitted';
 

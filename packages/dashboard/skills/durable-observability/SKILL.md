@@ -121,8 +121,8 @@ curl -X POST '/durable/api/bulk/cancel?status=suspended&tag=stuck&compensate=tru
 ```
 
 Bulk acts on at most **500 runs per call**, no paging — compare `matched` to 500
-and narrow + repeat. A compensating cancel answers with the PRE-cancel status;
-watch the SSE stream until it reaches `cancelled`.
+and narrow + repeat. A compensating cancel answers with `cancelling` and keeps
+that status while the saga undo runs; watch the SSE stream until it reaches `cancelled`.
 Source: `docs/observability/dashboard.mdx`.
 
 ### Pattern 3 — lifecycle events → logs, metrics, traces
@@ -297,8 +297,8 @@ await cancelRun(runId, { compensate: true })
 // poll getRun / subscribe to the stream until status === 'cancelled'
 ```
 
-Mechanism: cancel-with-compensate answers immediately with the pre-cancel status
-while the saga undo replays in the background; only a plain cancel is terminal in
+Mechanism: cancel-with-compensate answers immediately with `cancelling`
+while the saga undo runs in the background — poll until `cancelled`. Only a plain cancel is terminal in
 the response itself. Source: `docs/observability/dashboard.mdx` (info callout).
 
 ### MEDIUM scraping one pod's collectMetrics counters as fleet totals

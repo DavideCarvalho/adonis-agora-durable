@@ -43,6 +43,7 @@ export const DEFAULT_CONCURRENCY_STATUSES: readonly RunStatus[] = [
   'running',
   'suspended',
   'blocked',
+  'cancelling',
 ];
 
 /** The tag a quota-bearing run carries, so its siblings can be counted by one tag+status query. */

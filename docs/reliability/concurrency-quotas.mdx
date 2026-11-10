@@ -67,7 +67,7 @@ try {
 
 - `key` — the quota bucket. On the workflow it's a function of the input; return `undefined` to leave that start unlimited. Per start it's a plain string. The key is **global, not per workflow**: every workflow started with `tenant:acme` draws on the same quota, so one limit can cover all the kinds of work a tenant runs.
 - `limit` — max runs of the key in flight. On the workflow it may be a (sync or async) function of the key, for per-plan limits: `limit: (key) => plans.maxActive(key)`. Per start it's a number. `limit <= 0` rejects every start.
-- `countStatuses` — which statuses occupy a slot. Default: every non-terminal status (`pending`, `running`, `suspended`, `blocked`), exported as `DEFAULT_CONCURRENCY_STATUSES`. Narrow it to `['pending', 'running']` when runs parked on a human (suspended on a signal) shouldn't hold a slot.
+- `countStatuses` — which statuses occupy a slot. Default: every non-terminal status (`pending`, `running`, `suspended`, `blocked`, `cancelling`), exported as `DEFAULT_CONCURRENCY_STATUSES`. Narrow it to `['pending', 'running']` when runs parked on a human (suspended on a signal) shouldn't hold a slot.
 
 ## How it's enforced
 

@@ -102,7 +102,7 @@ export class SingletonGate {
   /**
    * The pre-atomic admission, kept for a custom store without {@link StateStore.tryAdmitSingleton}
    * so an upgrade doesn't break it: `run` is admitted while it is among the `limit` oldest
-   * `running`/`suspended` runs sharing its key by `(createdAt, id)`. It is a read followed by a
+   * `running`/`suspended`/`cancelling` runs sharing its key by `(createdAt, id)`. It is a read followed by a
    * decision, not a claim, so replicas can briefly over-admit and a same-millisecond start can
    * displace a holder — hence the one-time warning. A denied run is parked on the retry timer here,
    * conditionally, so a concurrent cancel is not overwritten.
@@ -113,7 +113,8 @@ export class SingletonGate {
       await this.deps.store.listRuns({
         tag: this.tag(cfg, run.input),
         workflow: run.workflow,
-        statuses: ['running', 'suspended'],
+        // A `cancelling` holder keeps its slot until its undo has run.
+        statuses: ['running', 'suspended', 'cancelling'],
       })
     ).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
     const idx = inflight.findIndex((r) => r.id === run.id);
@@ -131,7 +132,7 @@ export class SingletonGate {
     this.warnedNonAtomic = true;
     console.warn(
       '[adonis-durable] singleton admission is NOT atomic on this state store: it does not implement ' +
-        'StateStore.tryAdmitSingleton, so the engine falls back to a scan of running/suspended runs. ' +
+        'StateStore.tryAdmitSingleton, so the engine falls back to a scan of running/suspended/cancelling runs. ' +
         'Replicas can briefly admit more than `limit` runs per key, and a same-millisecond start can ' +
         'displace a holder. Implement tryAdmitSingleton (see the exported singletonAdmissionTags / ' +
         'singletonAdmissionDenialPatch helpers and the "Store support" section of the singleton docs) ' +

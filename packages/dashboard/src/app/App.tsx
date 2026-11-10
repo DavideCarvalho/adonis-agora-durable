@@ -99,14 +99,13 @@ function LogoMark({ className }: { className?: string }) {
   );
 }
 
-// The server's own `RUN_STATUSES` order (`run-filter.ts`), every state a chip. `blocked` earned its
-// chip (a run parked with no compatible worker — see the compat panel); `cancelling` lost its (the
-// engine never emits it — see the `RunStatus` union's note in `durable-client.ts`).
+// The server's own `RUN_STATUSES` order (`run-filter.ts`), every state a chip.
 const STATUSES: RunStatus[] = [
   'pending',
   'running',
   'suspended',
   'blocked',
+  'cancelling',
   'completed',
   'failed',
   'cancelled',
@@ -1134,7 +1133,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
     // Live-follow an in-flight run; stop polling once it reaches a terminal state.
     refetchInterval: (q) => {
       const s = (q.state.data as RunDetailData | undefined)?.run.status;
-      return s === 'running' || s === 'suspended' ? 1500 : false;
+      return s === 'running' || s === 'suspended' || s === 'cancelling' ? 1500 : false;
     },
   });
   // Worker health + the sibling run list feed the SAME `deriveRunState` the list uses, so the detail
