@@ -88,9 +88,9 @@ export function heartbeatChannel(effPrefix: string): string {
 }
 
 /**
- * `${P}-control` — the control-plane broadcast channel. Provided ONLY so tests can assert the name;
- * the transport does NOT publish/subscribe it (the shipped `RedisControlPlane` owns the control
- * plane). Kept here so the one place that knows the naming contract stays authoritative.
+ * `${P}-control` — the control-plane broadcast channel. The transport does NOT publish/subscribe it:
+ * the shipped `RedisControlPlane` owns the control plane and builds its channel from this, so the one
+ * place that knows the naming contract stays authoritative.
  */
 export function controlChannel(effPrefix: string): string {
   return `${effPrefix}-control`;

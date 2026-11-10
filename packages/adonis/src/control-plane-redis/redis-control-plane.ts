@@ -1,5 +1,6 @@
 import type { ControlMessage, ControlPlane } from '../index.js';
 import { swallowSubscribe } from '../safe-subscribe.js';
+import { controlChannel, effectivePrefix } from '../transports/bullmq/naming.js';
 
 /**
  * The raw-`ioredis` half of {@link RedisPubSub}. A real `Redis` instance is assignable to this.
@@ -99,10 +100,18 @@ export interface RedisControlPlaneOptions {
   connection: RedisPubSub;
   /**
    * Key prefix namespacing the control channel. Defaults to `durable`. The channel is
-   * `` `${prefix}-control` `` — matched EXACTLY to the NestJS BullMQ transport so an AdonisJS fleet
-   * and a NestJS fleet sharing one Redis interoperate on the same control plane.
+   * `` `${prefix}-control` ``, or `` `${prefix}-${namespace}-control` `` for a set, non-`default`
+   * {@link namespace} — the same folding as the BullMQ transport's names, matched EXACTLY to the
+   * NestJS BullMQ transport so an AdonisJS fleet and a NestJS fleet sharing one Redis interoperate on
+   * the same control plane.
    */
   prefix?: string;
+  /**
+   * Deployment namespace folded into the channel name. Unset adopts the engine's namespace (see
+   * {@link RedisControlPlane.useNamespace}); an explicit value wins. `default` keeps the bare
+   * `` `${prefix}-control` `` channel.
+   */
+  namespace?: string;
   /**
    * How often (ms) to PING the duplicated pub/sub subscriber connection to detect — and recover
    * from — a silent connection loss. A subscriber connection never WRITEs on its own (it only
@@ -154,12 +163,15 @@ const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
  * already dedupes self-broadcasts by `msg.from`, so a publish Redis echoes back to its own subscriber
  * is ignored. Omit a control plane entirely and the engine is local-only (single instance).
  *
- * The channel name (`` `${prefix}-control` ``) and the JSON payload match the NestJS BullMQ
- * transport, so a mixed AdonisJS + NestJS fleet on one Redis fans out across both runtimes.
+ * The channel name (`` `${effectivePrefix}-control` ``, the namespace folded in as in the BullMQ
+ * transport's names) and the JSON payload match the NestJS BullMQ transport, so a mixed AdonisJS +
+ * NestJS fleet on one Redis fans out across both runtimes.
  */
 export class RedisControlPlane implements ControlPlane {
   private readonly connection: RedisPubSub;
-  private readonly channel: string;
+  private readonly prefix: string;
+  private namespace: string | undefined;
+  private readonly explicitNamespace: boolean;
   /** Only ever set on the raw-ioredis path — it is the `duplicate()`d subscriber connection. */
   private subscriber: IoredisSubscriber | undefined;
   private subscribed = false;
@@ -169,8 +181,24 @@ export class RedisControlPlane implements ControlPlane {
 
   constructor(options: RedisControlPlaneOptions) {
     this.connection = options.connection;
-    this.channel = `${options.prefix ?? 'durable'}-control`;
+    this.prefix = options.prefix ?? 'durable';
+    this.namespace = options.namespace;
+    this.explicitNamespace = options.namespace !== undefined;
     this.pingIntervalMs = normalizePingInterval(options.pingIntervalMs);
+  }
+
+  /** The broadcast channel: `` `${effectivePrefix}-control` ``, as the BullMQ transports name it. */
+  get channel(): string {
+    return controlChannel(effectivePrefix(this.prefix, this.namespace));
+  }
+
+  /**
+   * Adopt the engine's namespace — unless one was passed to the constructor (an explicit one always
+   * wins), or the channel is already subscribed. The engine calls it before it subscribes.
+   */
+  useNamespace(namespace: string): void {
+    if (this.explicitNamespace || this.subscribed) return;
+    this.namespace = namespace;
   }
 
   async publishControl(msg: ControlMessage): Promise<void> {

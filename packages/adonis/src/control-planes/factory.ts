@@ -31,10 +31,16 @@ export interface RedisControlPlaneConfig {
    */
   connection?: string;
   /**
-   * Channel prefix. Defaults to `durable`; the channel is `` `${prefix}-control` ``, matched exactly
-   * to the NestJS BullMQ transport so an AdonisJS fleet interoperates with a NestJS fleet on one Redis.
+   * Channel prefix. Defaults to `durable`; the channel is `` `${prefix}-control` ``, or
+   * `` `${prefix}-${namespace}-control` `` under a non-`default` namespace, matched exactly to the
+   * NestJS BullMQ transport so an AdonisJS fleet interoperates with a NestJS fleet on one Redis.
    */
   prefix?: string;
+  /**
+   * Namespace folded into the channel name. Defaults to the engine's `namespace`; set it only to
+   * listen on another namespace's channel.
+   */
+  namespace?: string;
   /**
    * How often (ms) to PING the connection's pub/sub subscriber, so one a VPN/NAT/idle timeout dropped
    * silently is reconnected (and resubscribed) instead of sitting deaf until a restart. `0` or `false`
@@ -75,6 +81,7 @@ export const controlPlanes = {
       return new RedisControlPlane({
         connection,
         ...(config.prefix !== undefined ? { prefix: config.prefix } : {}),
+        ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
         ...(config.pingIntervalMs !== undefined ? { pingIntervalMs: config.pingIntervalMs } : {}),
       });
     };

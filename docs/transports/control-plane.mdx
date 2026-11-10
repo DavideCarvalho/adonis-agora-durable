@@ -47,12 +47,13 @@ export default defineConfig({
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `connection` | `'main'` | `config/redis.ts` connection used for pub/sub. |
-| `prefix` | `'durable'` | Channel is `` `${prefix}-control` ``. The engine's `namespace` is **not** folded in. |
+| `prefix` | `'durable'` | Channel is `` `${prefix}-control` ``, or `` `${prefix}-<namespace>-control` `` under a namespace. |
+| `namespace` | the engine's `namespace` | Namespace folded into the channel name. `'default'` keeps the bare channel. |
 
 Every instance that should hear each other must use the same channel, so give every engine (and every NestJS or Python process on the same Redis) the same `prefix`. The engine drops a message whose `from` is its own `instanceId`, so its own publishes echoed back by Redis are ignored.
 
-<Callout type="info" title="Namespaces share the channel">
-The `bullmq` transport puts an engine's `namespace` into every queue name (`durable-<namespace>-…`), but the control channel stays `` `${prefix}-control` `` whatever the namespace. Engines of different namespaces on one Redis therefore share it unless you give each its own `prefix`. A Python or NestJS process pointed at the namespaced prefix (`durable-<namespace>`) listens on `durable-<namespace>-control`, so for cancellation to reach it, set `prefix: 'durable-<namespace>'` here too. See [Python interop](/docs/durable/python).
+<Callout type="info" title="Each namespace has its own channel">
+The channel folds the engine's `namespace` in the same way the `bullmq` transport names its queues: an engine with `namespace: 'tenant-a'` broadcasts on `durable-tenant-a-control`, and one with no namespace (or `'default'`) on `durable-control`. A Python or NestJS process pointed at the same prefix and namespace listens on the same channel, so cancellation reaches it with no extra setting. See [Python interop](/docs/durable/python).
 </Callout>
 
 <Callout type="info">
@@ -76,7 +77,8 @@ export default defineConfig({ controlPlane })
 | Constructor option | Default | Meaning |
 | --- | --- | --- |
 | `connection` | — (required) | A raw `ioredis` client or an `@adonisjs/redis` connection. |
-| `prefix` | `'durable'` | Channel is `` `${prefix}-control` ``. |
+| `prefix` | `'durable'` | Channel is `` `${prefix}-control` ``, or `` `${prefix}-<namespace>-control` `` under a namespace. |
+| `namespace` | the engine's `namespace` | Namespace folded into the channel name. |
 | `pingIntervalMs` | `30_000` | How often the watchdog pings the subscriber connection (both forms; `controlPlanes.redis({ pingIntervalMs })` too). `0` or `false` disables it. |
 
 ## Subscriber health

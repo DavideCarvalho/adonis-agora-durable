@@ -1289,6 +1289,7 @@ export class WorkflowEngine {
     // An operator (no namespace) skips this entirely: not calling `useNamespace` IS the bare prefix,
     // which is what it must stay on to reach every tenant's queues.
     if (this.namespace !== undefined) this.pool.useNamespace(this.namespace);
+    if (this.namespace !== undefined) this.controlPlane?.useNamespace?.(this.namespace);
     this.leaseMs = deps.leaseMs ?? 30_000;
     this.bootedAt = this.clock();
     this.maxRecoveryAttempts = deps.maxRecoveryAttempts;

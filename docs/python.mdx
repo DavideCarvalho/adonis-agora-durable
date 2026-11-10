@@ -250,11 +250,11 @@ control message and the handler bails out on its own at a safe point.
 
 - The engine publishes `{"kind": "cancel", "runId": ...}` on its control plane. With
   [`controlPlanes.redis`](/docs/durable/transports/control-plane#multi-replica-controlplanesredis)
-  that is the Redis channel `<prefix>-control` — the same channel and payload the NestJS transport
-  uses, which is the one `durable-worker` subscribes to. The `bullmq` transport does not publish this
-  channel itself, so **configure `controlPlanes.redis` on the same Redis, with the `prefix` the Python
-  worker uses** (`durable-<namespace>` when the engine sets a namespace), or Python handlers never see
-  the cancel.
+  that is the Redis channel `<prefix>-control` (`<prefix>-<namespace>-control` when the engine sets a
+  namespace) — the same channel and payload the NestJS transport uses, which is the one
+  `durable-worker` subscribes to. The `bullmq` transport does not publish this channel itself, so
+  **configure `controlPlanes.redis` on the same Redis, with the same `prefix` as the transport**, or
+  Python handlers never see the cancel.
 - `run_redis_worker` **subscribes** to that channel and feeds a `CancellationRegistry` — a thread-safe
   set of cancelled run ids. One is created for you if you don't pass your own.
 - The registry is surfaced to your handler through the step context as **`ctx.cancelled`** (a bool) and

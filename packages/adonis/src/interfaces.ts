@@ -2145,6 +2145,12 @@ export interface GroupHealth {
 export interface ControlPlane {
   publishControl(msg: ControlMessage): Promise<void>;
   onControl(handler: (msg: ControlMessage) => void): void;
+  /**
+   * Optional: adopt the engine's namespace, so a namespaced engine broadcasts on its own channel (the
+   * Redis control plane folds it in like the BullMQ transport's names). Called once, before
+   * {@link onControl}, and only when the engine has a namespace.
+   */
+  useNamespace?(namespace: string): void;
 }
 
 /** A message on the {@link ControlPlane}. `from` is the originating engine's `instanceId`, so a
