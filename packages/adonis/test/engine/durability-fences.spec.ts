@@ -412,8 +412,6 @@ describe('durable compensating cancel', () => {
     const run = await store.getRun('o1');
     expect(run?.status).toBe('cancelled');
     expect(undone).toBe(1);
-    // The marker was consumed once the cancellation was recorded.
-    expect(await store.takeBufferedSignal('cancel:o1')).toBeNull();
   });
 });
 

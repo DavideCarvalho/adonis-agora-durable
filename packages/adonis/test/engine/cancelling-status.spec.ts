@@ -85,16 +85,16 @@ describe('cancel({ compensate: true }) persists `cancelling`', () => {
     expect((await waiting).status).toBe('cancelled');
   });
 
-  it('a failed cancel-marker write fails the cancel and leaves the run as it was', async () => {
+  it('a failed `cancelling` write fails the cancel and leaves the run as it was', async () => {
     const store = new InMemoryStateStore();
     const { engine } = sagaEngine(store);
     await engine.start('saga', {}, 's4');
     await engine.waitForRun('s4');
 
-    const buffer = store.bufferSignal.bind(store);
-    store.bufferSignal = async (token, payload) => {
-      if (token.startsWith('cancel:')) throw new Error('store down');
-      return buffer(token, payload);
+    const updateIf = store.updateRunIf.bind(store);
+    store.updateRunIf = async (id, expected, patch) => {
+      if (patch.status === 'cancelling') throw new Error('store down');
+      return updateIf(id, expected, patch);
     };
 
     await expect(engine.cancel('s4', { compensate: true })).rejects.toThrow('store down');
@@ -109,7 +109,7 @@ describe('crash recovery re-drives a `cancelling` run', () => {
     await first.engine.start('saga', {}, 's5');
     await first.engine.waitForRun('s5');
     // The pod that took the cancel dies before its undo ran: the row reads `cancelling` and nothing
-    // in memory survives. No marker either, so only the persisted status carries the intent.
+    // in memory survives: only the persisted status carries the intent.
     await store.updateRun('s5', { status: 'cancelling', updatedAt: new Date() });
 
     const second = sagaEngine(store, 'b');

@@ -94,8 +94,8 @@ envelope (`{ input, output }`). Engine-level `compensationRetries` (default 1)
 bounds transient undo failures; failing compensations are skipped so they can't
 mask the original error. Trigger deliberately with
 `await engine.cancel(runId, { compensate: true })` or
-`engine.cancelWhere(filter, { compensate: true })`. The cancel is durable (a
-`cancel:<runId>` marker) and honored on every exit of the turn running when it
+`engine.cancelWhere(filter, { compensate: true })`. The cancel is durable (the
+persisted `cancelling` status) and honored on every exit of the turn running when it
 lands: return, throw, continue-as-new or suspend all compensate and settle
 `cancelled`. Every undo surfaces as a visible `compensate:<step>` event.
 Source: `docs/reliability/sagas.mdx`.

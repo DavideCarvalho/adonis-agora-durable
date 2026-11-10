@@ -4572,11 +4572,10 @@ export class WorkflowEngine {
   /**
    * Sweep a deleted run's token-keyed buffered signals — they are not run-scoped rows, so the store's
    * deleteRun can't cascade them. Without this every fire-and-forget child that was never joined leaks
-   * its buffered `child:<id>` completion FOREVER (one row per spawn), and a raced compensate-cancel
-   * can leave a `cancel:<id>` marker behind.
+   * its buffered `child:<id>` completion FOREVER (one row per spawn).
    */
   private async sweepRunBufferedSignals(runId: string): Promise<void> {
-    for (const token of [`child:${runId}`, `cancel:${runId}`]) {
+    for (const token of [`child:${runId}`]) {
       for (;;) {
         const buffered = await this.store.takeBufferedSignal(token).catch(() => null);
         if (!buffered) break;
@@ -6590,20 +6589,16 @@ export class WorkflowEngine {
     // compensations. `execute` holds the run's lease, so this can't double-run one a live worker owns
     // (its lease acquire fails and it no-ops); the broadcast tells that worker to abort cooperatively.
     if (opts?.compensate && (run.status === 'suspended' || run.status === 'running')) {
-      // The buffered `cancel:<id>` marker tells a turn already executing on ANOTHER pod (its exits
-      // re-read it) and pods of an older version to unwind. Written first and NOT swallowed: a failed
-      // write fails the cancel before anything changed, so the caller can retry.
-      await this.store.bufferSignal(`cancel:${runId}`, true);
       // DURABLE cancel intent: the persisted `cancelling` status. It survives a crash or a pod
-      // handoff (any turn of a `cancelling` run unwinds it, and crash recovery re-drives one whose
-      // undo died), and shows the dashboard/API that an undo is in progress. Conditional: a run that
+      // handoff (any turn of a `cancelling` run unwinds it, a turn already executing on another pod
+      // finds it when its settle loses the status race, and crash recovery re-drives one whose undo
+      // died), and shows the dashboard/API that an undo is in progress. Conditional: a run that
       // moved meanwhile (settled, parked) is re-read and cancelled for what it is now.
       const marked = await this.store.updateRunIf(runId, ['suspended', 'running'], {
         status: 'cancelling',
         updatedAt: new Date(),
       });
       if (!marked) {
-        await this.store.takeBufferedSignal(`cancel:${runId}`).catch(() => null);
         if (mayRetry) return this.cancelOnce(runId, opts, false);
         const current = await this.store.getRun(runId);
         return current
@@ -7651,7 +7646,7 @@ export class WorkflowEngine {
     // settle — and it must happen even while a dispatched turn is still out (the hold below would
     // otherwise swallow the cancel's resume, and the in-flight turn's decision would carry the run on
     // as if it was never cancelled). The late decision then finds the run cancelled and is dropped.
-    if (await this.takeCancelIntent(run.id)) return this.compensateAndCancel(run, []);
+    if (this.takeCancelIntent(run.id)) return this.compensateAndCancel(run, []);
     // A dispatched turn is still out and within its liveness window: whatever woke the run (a step
     // result, a signal, a wait recheck) must not dispatch a second turn over it — that would supersede
     // the first and drop its decision, re-running whatever local steps that turn ran. Everything such a
@@ -8713,19 +8708,29 @@ export class WorkflowEngine {
   }
 
   /**
-   * Whether a compensating cancel is pending for this run, consuming the in-memory flag. The intent
-   * lives in TWO places: the in-memory `cancelRequested` fast path (same pod, same boot), and the
-   * DURABLE buffered `cancel:<id>` marker `cancel()` persisted — so a crash or a cross-pod handoff
-   * mid-cancellation can't silently forget the cancel. The marker is peeked (take + re-buffer), not
-   * consumed: it must survive a crash mid-unwind; {@link compensateAndCancel} drains it once
-   * `cancelled` is durably recorded.
+   * Whether a compensating cancel is pending for this run, consuming the in-memory flag. The flag is
+   * set by `cancel()` on this pod, and at turn start for a run that reads `cancelling` (the durable
+   * intent: a cancel from another pod, or one re-driven by recovery). A cancel another pod persists
+   * while this turn runs is found at the settle instead: the run no longer reads a settle-eligible
+   * status, and {@link settleOrUnwind} unwinds it.
    */
-  private async takeCancelIntent(runId: string): Promise<boolean> {
-    if (this.cancelRequested.delete(runId)) return true;
-    const marker = await this.store.takeBufferedSignal(`cancel:${runId}`);
-    if (!marker) return false;
-    await this.store.bufferSignal(`cancel:${runId}`, marker.payload).catch(() => undefined);
-    return true;
+  private takeCancelIntent(runId: string): boolean {
+    return this.cancelRequested.delete(runId);
+  }
+
+  /**
+   * Settle this turn's `outcome` — unless a compensating cancel was persisted on another pod while the
+   * turn ran: the settle's status check then reads `cancelling`, and this turn (which still holds the
+   * lease and the saga it registered) undoes it and settles `cancelled` itself.
+   */
+  private async settleOrUnwind(
+    run: WorkflowRun,
+    outcome: RunOutcome,
+    compensations: Compensation[],
+  ): Promise<RunResult> {
+    const settled = await this.settleRun(run, outcome);
+    if (settled.status !== 'cancelling' || this.leaseLostRuns.has(run.id)) return settled;
+    return this.compensateAndCancel(run, compensations);
   }
 
   /**
@@ -8739,8 +8744,8 @@ export class WorkflowEngine {
     compensations: Compensation[],
   ): Promise<RunResult> {
     this.cancelRequested.delete(run.id);
-    // Zombie fence (as in settleRun): another instance owns the run now; the durable marker is still
-    // there for it, so this stale turn must neither undo nor write.
+    // Zombie fence (as in settleRun): another instance owns the run now; the persisted `cancelling`
+    // status is still there for it, so this stale turn must neither undo nor write.
     if (this.leaseLostRuns.has(run.id)) return this.echoCurrentStatus(run.id);
     for (let i = compensations.length - 1; i >= 0; i -= 1) {
       const comp = compensations[i];
@@ -8756,12 +8761,6 @@ export class WorkflowEngine {
         updatedAt: new Date(),
       }),
     );
-    // The cancellation is durably recorded — consume the marker(s) so a later retry of this run id
-    // doesn't get spuriously re-cancelled.
-    for (;;) {
-      const m = await this.store.takeBufferedSignal(`cancel:${run.id}`).catch(() => null);
-      if (!m) break;
-    }
     this.emit({
       type: 'run.failed',
       runId: run.id,
@@ -8906,17 +8905,22 @@ export class WorkflowEngine {
       }
       // A compensating cancel requested while this turn ran (or one whose resume replays straight to
       // `return`, with no suspension point left) still wins: undo + settle cancelled, never completed.
-      if (await this.takeCancelIntent(run.id)) {
+      if (this.takeCancelIntent(run.id)) {
         return await this.compensateAndCancel(run, compensations);
       }
-      return await this.settleRun(run, { kind: 'completed', output });
+      return await this.settleOrUnwind(run, { kind: 'completed', output }, compensations);
     } catch (err) {
       if (err instanceof ContinueAsNew) {
         // Hand off to a fresh execution with a clean history: persist the next run (`<id>~N`), then
         // complete this one. Zombie fence first — a fenced turn must not fork a continuation either.
         if (this.leaseLostRuns.has(run.id)) return await this.echoCurrentStatus(run.id);
         // A cancel in flight wins over continue-as-new: undo + cancel instead of forking the next run.
-        if (await this.takeCancelIntent(run.id)) {
+        // The run is re-read here (continue-as-new is rare) because the forked run would be created
+        // before any settle could find a cancel another pod persisted during this turn.
+        if (
+          this.takeCancelIntent(run.id) ||
+          (await this.store.getRun(run.id))?.status === 'cancelling'
+        ) {
           return await this.compensateAndCancel(run, compensations);
         }
         const nextId = nextContinuationId(run.id);
@@ -8963,10 +8967,14 @@ export class WorkflowEngine {
       if (err instanceof WorkflowSuspended) {
         // A compensating cancel resumed this run to reach here: the replay re-registered the saga,
         // so undo the completed steps in reverse and mark it cancelled instead of re-suspending.
-        if (await this.takeCancelIntent(run.id)) {
+        if (this.takeCancelIntent(run.id)) {
           return await this.compensateAndCancel(run, compensations);
         }
-        const settled = await this.settleRun(run, { kind: 'suspended', wakeAt: err.wakeAt });
+        const settled = await this.settleOrUnwind(
+          run,
+          { kind: 'suspended', wakeAt: err.wakeAt },
+          compensations,
+        );
         const stamp = this.suspendStamps.get(run.id);
         this.suspendStamps.delete(run.id);
         if (parkedTurn && cont && settled.status === 'suspended' && stamp !== undefined) {
@@ -8991,7 +8999,7 @@ export class WorkflowEngine {
       }
       // A cancel in flight that surfaced as a thrown error settles `cancelled`, not `failed`: the saga
       // undo runs either way; this keeps the terminal status faithful to the cancel request.
-      if (await this.takeCancelIntent(run.id)) {
+      if (this.takeCancelIntent(run.id)) {
         return await this.compensateAndCancel(run, compensations);
       }
       const error = {
@@ -9008,7 +9016,8 @@ export class WorkflowEngine {
         if (!comp) continue;
         await this.runCompensation(run, comp, i);
       }
-      return await this.settleRun(run, { kind: 'failed', error });
+      // The saga is undone already: a cancel persisted meanwhile only needs the `cancelled` settle.
+      return await this.settleOrUnwind(run, { kind: 'failed', error }, []);
     } finally {
       // Release the recovery lease once the run reaches a terminal/suspended state, so the
       // next instance (or the timer poller) can pick it up promptly. Owner-scoped: if this turn's
