@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { BaseWorkflow, setWorkflowEngineResolver } from '../../src/base-workflow.js';
 import { WorkflowEngine } from '../../src/engine.js';
+import { FatalError } from '../../src/errors.js';
 import type { WorkflowCtx } from '../../src/interfaces.js';
 import { startRun } from '../../src/test-helpers.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
@@ -166,6 +167,67 @@ describe('BaseWorkflow — OUTSIDE a workflow (engine path)', () => {
     const result = await startPromise; // resolves now, with the REAL output
     expect(result).toBe('decided:yes');
     expect((await store.getRun('appr-1'))?.status).toBe('completed');
+  });
+});
+
+describe('BaseWorkflow.start — OUTSIDE, a run that does not complete', () => {
+  it('throws the FatalError ctx.child throws when the run fails', async () => {
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
+    setWorkflowEngineResolver(() => engine);
+
+    class Boom extends BaseWorkflow {
+      static override workflow = { name: 'outside-boom', version: '1' };
+      async run(): Promise<string> {
+        throw new FatalError('card declined', 'declined');
+      }
+    }
+    await registerWorkflowClass(engine, Boom);
+
+    const err = await Boom.start({}, { runId: 'boom-1' }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(FatalError);
+    expect((err as FatalError).message).toBe('run "boom-1" failed: card declined');
+    expect((err as FatalError).code).toBe('declined');
+  });
+
+  it('throws when the run is cancelled', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    setWorkflowEngineResolver(() => engine);
+
+    class Parked extends BaseWorkflow {
+      static override workflow = { name: 'outside-parked', version: '1' };
+      async run(ctx: WorkflowCtx) {
+        return ctx.waitForSignal<string>('never-sent');
+      }
+    }
+    await registerWorkflowClass(engine, Parked);
+
+    const started = Parked.start({}, { runId: 'parked-1' }).catch((e: unknown) => e);
+    await poll(async () => (await store.getRun('parked-1'))?.status === 'suspended');
+    await engine.cancel('parked-1');
+
+    const err = await started;
+    expect(err).toBeInstanceOf(FatalError);
+    expect((err as FatalError).message).toMatch(/^run "parked-1" failed: /);
+  });
+
+  it('honours timeoutMs, rejecting while the run keeps going', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({ store });
+    setWorkflowEngineResolver(() => engine);
+
+    class Slow extends BaseWorkflow {
+      static override workflow = { name: 'outside-slow', version: '1' };
+      async run(ctx: WorkflowCtx) {
+        return ctx.waitForSignal<string>('slow-go');
+      }
+    }
+    await registerWorkflowClass(engine, Slow);
+
+    await expect(Slow.start({}, { runId: 'slow-1', timeoutMs: 50 })).rejects.toThrow(
+      /timed out after 50ms/,
+    );
+    expect((await store.getRun('slow-1'))?.status).toBe('suspended');
   });
 });
 

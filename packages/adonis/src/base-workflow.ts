@@ -1,3 +1,4 @@
+import { failedCompletion, unwrapCompletion } from './completion.js';
 import type { StartOptions } from './engine.js';
 import { WorkflowEngine } from './engine.js';
 import type { DeadLetter, WorkflowCtx } from './interfaces.js';
@@ -18,6 +19,13 @@ import type {
  *   replay-stable id from the call position (DO NOT pass a random one — it breaks determinism).
  */
 export type WorkflowDispatchOptions = { runId?: string | undefined } & StartOptions;
+
+/**
+ * Options for `BaseWorkflow.start`: {@link WorkflowDispatchOptions} plus `timeoutMs`, how long the
+ * OUTSIDE path waits for the run to finish before rejecting (the run itself keeps going). Inside a
+ * running workflow it has no effect: the parent waits for its child as long as the child runs.
+ */
+export type WorkflowStartOptions = WorkflowDispatchOptions & { timeoutMs?: number | undefined };
 
 /**
  * How `BaseWorkflow`'s OUTSIDE static path locates the {@link WorkflowEngine}. Defaults to resolving
@@ -109,11 +117,14 @@ export abstract class BaseWorkflow {
    * Start a run and **wait for its result**. Outside a workflow, enqueues via the engine and blocks
    * until the run settles, returning its output. Inside a running workflow, starts a **linked child**
    * (`ctx.child`) — the parent suspends until the child settles — and returns the child's output.
+   *
+   * Both paths throw the same `FatalError` when the run ends `failed`, `cancelled` or `dead`.
+   * Outside a workflow, `opts.timeoutMs` bounds the wait.
    */
   static start<C extends WorkflowClass>(
     this: C,
     input: WorkflowInputOf<C>,
-    opts?: WorkflowDispatchOptions,
+    opts?: WorkflowStartOptions,
   ): Promise<WorkflowOutputOf<C>> {
     const ctx = getCurrentWorkflowCtx();
     if (ctx) {
@@ -126,14 +137,24 @@ export abstract class BaseWorkflow {
     // BaseWorkflow-only option (not part of StartOptions) — strip it before forwarding to engine.start.
     return (async () => {
       const engine = await resolveEngine();
-      const { runId: _runId, ...startOpts } = opts ?? {};
+      const { runId: _runId, timeoutMs, ...startOpts } = opts ?? {};
       const runId = opts?.runId ?? globalThis.crypto.randomUUID();
       // biome-ignore lint/complexity/noThisInStatic: see .start's child branch — `this` is the polymorphic subclass (`this: C`), not BaseWorkflow.
       await engine.start(this, input, runId, startOpts);
       // `terminal: true` so a workflow that suspends (sleep/waitForSignal/waitForEvent/async step)
       // keeps blocking through the suspension and returns the real output — the ".start = I want the
       // result" contract, matching the INSIDE ctx.child path (which also waits for terminal).
-      const result = await engine.waitForRun(runId, { terminal: true });
+      const result = await engine.waitForRun(runId, {
+        terminal: true,
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      });
+      if (result.status !== 'completed') {
+        // The same error `ctx.child` throws for a child that did not complete.
+        unwrapCompletion(
+          failedCompletion(result.error ?? { message: result.status }),
+          `run "${runId}"`,
+        );
+      }
       return result.output as WorkflowOutputOf<C>;
     })();
   }
