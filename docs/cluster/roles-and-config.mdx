@@ -213,11 +213,11 @@ const detail = await runGateway.getRunDetail?.(params.id, { summarizeFansOver: 5
 // detail.fans: [{ group: 'steps:3:40000', label: 'processLine', size: 600, total: 40000, counts: { completed: 580, pending: 20 }, … }]
 ```
 
-On a store-less `tenant` pod the [dashboard](/docs/durable/observability/dashboard) reads run detail through the `getRunDetail` run-request verb, and pages a fan through `getFanMembers`, so the control plane summarizes a wide fan before it crosses the wire. Before answering either verb, the responder checks tenant ownership on the run alone, without loading its timeline. A control plane older than the tenant still serves both; see [Rolling upgrades](#rolling-upgrades).
+On a store-less `tenant` pod the [dashboard](/docs/durable/observability/dashboard) reads run detail through the `getRunDetail` run-request verb, and pages a fan through `getFanMembers`, so the control plane summarizes a wide fan before it crosses the wire. Before answering either verb, the responder checks tenant ownership on the run alone, without loading its timeline. A control plane on 0.50 or later that is older than the tenant still serves both; see [Rolling upgrades](#rolling-upgrades).
 
 ### Rolling upgrades
 
-Tenant pods and the control plane can be upgraded in either order. A control plane that does not know a verb a newer tenant sends answers it with an error whose `code` is `unsupported-request`, before it touches the store, and the tenant degrades:
+Tenant pods and a control plane on 0.50 or later can be upgraded in either order; upgrade an older control plane first (see [Migrating to 1.0](/docs/durable/migrating-to-1-0#upgrade-a-control-plane-older-than-050-before-its-tenant-pods)). A control plane that does not know a verb a newer tenant sends answers it with an error whose `code` is `unsupported-request`, before it touches the store, and the tenant degrades:
 
 | Verb the control plane does not answer | What the tenant does |
 | --- | --- |
