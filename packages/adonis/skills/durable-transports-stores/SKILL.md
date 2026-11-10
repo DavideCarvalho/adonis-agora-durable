@@ -237,7 +237,9 @@ export default defineConfig({
 })
 ```
 
-Channel is `${prefix}-control` (default prefix `durable`) — wire-compatible with
+Channel is `${prefix}-control` (default prefix `durable`) — or
+`${prefix}-${namespace}-control` under a non-`default` namespace, matching the
+`bullmq` transport's names — wire-compatible with
 the NestJS fleet's channel, so an AdonisJS and NestJS deployment sharing one
 Redis fan out across both runtimes. Source: `docs/transports/control-plane.mdx`.
 
