@@ -3,7 +3,7 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import type React from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { FanSummary, RunDetail, StepCheckpoint, WorkflowRun } from '../client/durable-client';
-import { durableClient, isStalePending } from '../client/durable-client';
+import { durableClient, isLiveStatus, isStalePending } from '../client/durable-client';
 import { FAN_PAGE_SIZE, fanPagesInView } from '../client/fan-pages';
 import { stepDisplayName } from '../client/folded-children';
 import {
@@ -51,7 +51,7 @@ function barWindow(
 ): [number, number] {
   if (childRun) {
     const created = new Date(childRun.run.createdAt).getTime();
-    const open = childRun.run.status === 'running' || childRun.run.status === 'suspended';
+    const open = isLiveStatus(childRun.run.status);
     const end = open ? liveNow : new Date(childRun.run.updatedAt).getTime();
     return [created, Math.max(end, created)];
   }
@@ -79,7 +79,7 @@ function timelineFrame(
   windows: readonly [number, number][],
   fans: readonly FanSummary[],
 ): Frame {
-  const live = run.status === 'running' || run.status === 'suspended';
+  const live = isLiveStatus(run.status);
   const liveNow = Date.now();
   let t0 = new Date(run.createdAt).getTime();
   let tEnd = Number.NEGATIVE_INFINITY;
@@ -447,7 +447,7 @@ function SummarizedFan({
   const progress = fanProgress(fan, done);
   const status = fanStatus(fan, done);
   const inFlight = status === 'running' || status === 'pending';
-  const runLive = rowProps.run.status === 'running' || rowProps.run.status === 'suspended';
+  const runLive = isLiveStatus(rowProps.run.status);
   const start = fan.startedAt ? new Date(fan.startedAt).getTime() : undefined;
   const end = fan.finishedAt
     ? new Date(fan.finishedAt).getTime()

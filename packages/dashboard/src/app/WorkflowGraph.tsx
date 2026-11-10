@@ -14,6 +14,7 @@ import { useCallback, useMemo } from 'react';
 import {
   durableClient,
   type FanSummary,
+  isLiveStatus,
   type RunDetail,
   type RunDisplayStatus,
   runDisplayStatus,
@@ -408,7 +409,7 @@ export function WorkflowGraph({
     const FAN_ROW = 96;
     const nodes: Node[] = [];
     const edges: Edge[] = [];
-    const live = run.status === 'running' || run.status === 'suspended';
+    const live = isLiveStatus(run.status);
     const mainEdge = (source: string, target: string, failed: boolean): Edge => ({
       id: `${source}->${target}`,
       source,

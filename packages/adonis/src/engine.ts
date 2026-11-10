@@ -954,7 +954,13 @@ export interface WorkflowEngineDeps {
 }
 
 /** The statuses a run can be skipped in for an unregistered workflow — every non-terminal one. */
-const UNREGISTERED_DEAD_LETTER_FROM: RunStatus[] = ['pending', 'running', 'suspended', 'blocked'];
+const UNREGISTERED_DEAD_LETTER_FROM: RunStatus[] = [
+  'pending',
+  'running',
+  'suspended',
+  'blocked',
+  'cancelling',
+];
 
 /** Thrown by {@link WorkflowEngine.resume} when the run belongs to a different namespace. */
 export class NamespaceMismatch extends Error {
@@ -4273,7 +4279,7 @@ export class WorkflowEngine {
     if (now - this.#lastStalledSweepAt < 60_000) return [];
     this.#lastStalledSweepAt = now;
     const candidates = await this.store.listRuns({
-      statuses: ['suspended', 'running'],
+      statuses: ['suspended', 'running', 'cancelling'],
       namespace: this.namespace,
       updatedBefore: now - this.stalledAfterMs,
       size: 100,
@@ -5145,6 +5151,30 @@ export class WorkflowEngine {
       // finished run) and re-enqueues it for a second execution. Only a run that still reads
       // `running` under the lease is an orphan; release the lease taken just to look at anything else.
       const run = await this.store.getRun(listed.id);
+      // A compensating cancel whose undo died with its pod (or never started: the pod that took the
+      // cancel crashed before its resume ran). Re-drive it rather than re-pend it, which would drop
+      // the cancel: any turn of a `cancelling` run unwinds the saga and settles it `cancelled`.
+      if (run?.status === 'cancelling') {
+        // Only a pod that has the workflow can run its compensations; past the grace, one that is
+        // registered nowhere is dead-lettered like any orphan.
+        if (!this.isRegisteredHere(run) && !(await this.canResolveWorkflow(run))) {
+          const settled = await this.settleUnregistered(run, nowMs);
+          if (settled) results.push(settled);
+          else if (settled === undefined) this.logUnregisteredSkip(run);
+          continue;
+        }
+        await this.store.releaseRunLock(listed.id, this.instanceId);
+        this.trackEffect(
+          Promise.resolve(this.wake(run.id)).catch((error: unknown) => {
+            console.error(
+              `[adonis-durable] could not re-drive cancelling run ${run.id}; retrying on a later tick:`,
+              error,
+            );
+          }),
+        );
+        results.push({ runId: run.id, status: 'cancelling' });
+        continue;
+      }
       if (run?.status !== 'running') {
         await this.store.releaseRunLock(listed.id, this.instanceId);
         continue;
@@ -5652,6 +5682,9 @@ export class WorkflowEngine {
     seen.add(runId);
     const run = await this.store.getRun(runId);
     if (!run) return null;
+    // A run undoing its saga for a compensating cancel is not retried over: re-pending it would drop
+    // the cancel. It ends `cancelled`, and can be requeued from there.
+    if (run.status === 'cancelling') return { runId, status: 'cancelling' };
     // A FAILED/DEAD run's replay deterministically re-throws its recorded failures — an exhausted
     // failed checkpoint rethrows, and an awaited child's failure completion rethrows through
     // unwrapCompletion — so "retry" without resetting that state is a no-op that re-fails in
@@ -5925,9 +5958,11 @@ export class WorkflowEngine {
     // A run `suspended` while it awaits a dispatched remote workflow turn's decision
     // (`awaitingDecisionTaskId` set) is mid-turn, not settled: that suspend is the engine's re-drive
     // marker, not a sleep/signal the body asked for. Keep waiting until the decision lands.
+    // A `cancelling` run is still undoing its saga: it settles once it is `cancelled`.
     const isSettled = (run: WorkflowRun): boolean =>
       run.status !== 'pending' &&
       run.status !== 'running' &&
+      run.status !== 'cancelling' &&
       !(run.status === 'suspended' && run.awaitingDecisionTaskId !== undefined);
     const shouldResolve = (run: WorkflowRun): boolean =>
       opts?.terminal ? isTerminal(run.status) : isSettled(run);
@@ -6441,6 +6476,14 @@ export class WorkflowEngine {
    * cancelled. Without it, cancellation is immediate (no undo).
    */
   async cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null> {
+    return this.cancelOnce(runId, opts, true);
+  }
+
+  private async cancelOnce(
+    runId: string,
+    opts: { compensate?: boolean } | undefined,
+    mayRetry: boolean,
+  ): Promise<RunResult | null> {
     const run = await this.store.getRun(runId);
     if (!run) return null;
     // Terminal runs are IMMUTABLE: cancelling one is a no-op that echoes its current state. That
@@ -6452,18 +6495,37 @@ export class WorkflowEngine {
     if ((TERMINAL_RUN_STATUSES as readonly string[]).includes(run.status)) {
       return { runId, status: run.status, output: run.output, error: run.error };
     }
+    // A compensating cancel is already undoing the saga: a repeat cancel, with or without
+    // `compensate`, echoes it. Taking the instant path below would mark it `cancelled` and skip the
+    // undo still in flight. Recovery re-drives a `cancelling` run whose undo died.
+    if (run.status === 'cancelling') return { runId, status: 'cancelling' };
     // Compensating cancel: resume the run with a cancellation pending — replay re-registers the saga,
     // and at the suspension point execute() runs the undo and marks it cancelled. Run that resume in
     // the BACKGROUND so the caller (e.g. an HTTP request) never blocks on replaying the workflow +
     // compensations. `execute` holds the run's lease, so this can't double-run one a live worker owns
     // (its lease acquire fails and it no-ops); the broadcast tells that worker to abort cooperatively.
     if (opts?.compensate && (run.status === 'suspended' || run.status === 'running')) {
+      // The buffered `cancel:<id>` marker tells a turn already executing on ANOTHER pod (its exits
+      // re-read it) and pods of an older version to unwind. Written first and NOT swallowed: a failed
+      // write fails the cancel before anything changed, so the caller can retry.
+      await this.store.bufferSignal(`cancel:${runId}`, true);
+      // DURABLE cancel intent: the persisted `cancelling` status. It survives a crash or a pod
+      // handoff (any turn of a `cancelling` run unwinds it, and crash recovery re-drives one whose
+      // undo died), and shows the dashboard/API that an undo is in progress. Conditional: a run that
+      // moved meanwhile (settled, parked) is re-read and cancelled for what it is now.
+      const marked = await this.store.updateRunIf(runId, ['suspended', 'running'], {
+        status: 'cancelling',
+        updatedAt: new Date(),
+      });
+      if (!marked) {
+        await this.store.takeBufferedSignal(`cancel:${runId}`).catch(() => null);
+        if (mayRetry) return this.cancelOnce(runId, opts, false);
+        const current = await this.store.getRun(runId);
+        return current
+          ? { runId, status: current.status, output: current.output, error: current.error }
+          : null;
+      }
       this.cancelRequested.add(runId);
-      // DURABLE cancel intent: the in-memory flag above only survives on this pod, this boot. The
-      // buffered `cancel:<id>` marker is what lets the compensating unwind survive a crash or be
-      // picked up by ANOTHER pod (its resume replays into the WorkflowSuspended catch, which checks
-      // the marker when the flag is absent). Consumed there once `cancelled` is durably recorded.
-      await this.store.bufferSignal(`cancel:${runId}`, true).catch(() => undefined);
       if (this.controlPlane) {
         void this.controlPlane
           .publishControl({ kind: 'cancel', runId, from: this.instanceId })
@@ -6485,7 +6547,7 @@ export class WorkflowEngine {
         ),
       );
       await this.cancelChildren(runId, opts);
-      return { runId, status: run.status };
+      return { runId, status: 'cancelling' };
     }
     const error = { message: 'cancelled' };
     // Clears a remote turn's decision marker too: a cancelled run awaits no decision.
@@ -7085,6 +7147,10 @@ export class WorkflowEngine {
       // A remote (e.g. Python) workflow is advanced by dispatching workflow tasks, not by running an
       // in-process body — but everything around it (lease, recovery, timers, the resume that lands us
       // here on a step result) is identical, so it branches here under the same lease.
+      // A `cancelling` run is a compensating cancel in flight, maybe re-driven by crash recovery or
+      // by another pod that never saw the in-memory flag: re-derive the intent from the status, so
+      // this turn unwinds the saga and settles `cancelled` at whichever exit it reaches.
+      if (run.status === 'cancelling') this.cancelRequested.add(run.id);
       const result = registered?.remote
         ? await this.runRemoteExecution(run, registered)
         : await this.runExecution(run, fn, registered);
@@ -8662,7 +8728,13 @@ export class WorkflowEngine {
     }
     // Singleton admission gate: if this run shares its key with `limit` older in-flight runs, wait
     // (suspend on a short timer) until a slot frees instead of running now. Re-checked on each resume.
-    if (registered?.singleton && !(await this.singletons.admit(run, registered.singleton))) {
+    // A `cancelling` run skips it: it is tearing down, not competing for a slot, and parking it here
+    // would overwrite `cancelling` with `suspended`.
+    if (
+      run.status !== 'cancelling' &&
+      registered?.singleton &&
+      !(await this.singletons.admit(run, registered.singleton))
+    ) {
       return this.singletonWaitResult(run);
     }
     // A body this instance parked on dispatched steps in an earlier turn continues from there (see

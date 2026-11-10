@@ -29,6 +29,8 @@ export const SINGLETON_ACTIVE_STATUSES: RunStatus[] = [
   'running',
   'suspended',
   'blocked',
+  // Still undoing its saga: it keeps its slot until it is `cancelled`.
+  'cancelling',
 ];
 
 /** The same `(createdAt, id)` total order every instance uses for the FIFO waiter queue. */

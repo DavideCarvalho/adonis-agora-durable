@@ -10,6 +10,7 @@ export const RUN_STATUSES: readonly RunStatus[] = [
   'running',
   'suspended',
   'blocked',
+  'cancelling',
   'completed',
   'failed',
   'cancelled',

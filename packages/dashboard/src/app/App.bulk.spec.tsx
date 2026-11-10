@@ -114,11 +114,11 @@ describe('App: status chips are a SERVER-side filter (the list and the bulk filt
     });
   });
 
-  it('offers a `blocked` chip (first-class engine status) and no `cancelling` one (never emitted)', async () => {
+  it('offers `blocked` and `cancelling` chips (first-class engine statuses)', async () => {
     runsPage.mockResolvedValue({ runs: [], meta: { page: 1, size: 100, count: 0 } });
     render(<App />, { wrapper });
     expect(screen.getByRole('button', { name: 'blocked 0' })).toBeTruthy();
-    expect(screen.queryByRole('button', { name: 'cancelling 0' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'cancelling 0' })).toBeTruthy();
   });
 });
 

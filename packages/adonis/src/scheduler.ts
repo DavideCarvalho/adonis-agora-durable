@@ -416,7 +416,11 @@ export async function runSchedules(
       const prevBucket = Math.floor(nowMs / s.everyMs) - 1;
       if (prevBucket >= 0) {
         const prev = await engine.getRun(`sched:${s.key}:${prevBucket}`);
-        if (prev && (prev.status === 'running' || prev.status === 'suspended')) continue;
+        if (
+          prev &&
+          (prev.status === 'running' || prev.status === 'suspended' || prev.status === 'cancelling')
+        )
+          continue;
       }
     }
     // Dispatch-path jitter (not workflow code): spread same-boundary ticks across instances. Each

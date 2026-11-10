@@ -34,6 +34,12 @@ export type RunStatus =
    * `wakeAt`) so it proceeds the moment a capable+compatible worker appears.
    */
   | 'blocked'
+  /**
+   * A compensating cancel (`cancel(id, { compensate: true })`) is undoing the saga. NOT terminal: the
+   * run still holds its singleton/concurrency slot, recovery re-drives it after a crash, and it ends
+   * `cancelled` once its compensations have run. A repeat `cancel()` echoes it.
+   */
+  | 'cancelling'
   | 'completed'
   | 'failed'
   | 'cancelled'
@@ -259,7 +265,16 @@ export const SETTLEABLE_RUN_STATUSES: readonly RunStatus[] = [
   'running',
   'suspended',
   'blocked',
+  // A dispatched saga undo's result lands while the run unwinds.
+  'cancelling',
 ];
+
+/**
+ * The run statuses crash recovery looks at ({@link StateStore.listIncompleteRuns} /
+ * `listOrphanedRuns`): a `running` run whose turn died, and a `cancelling` run whose saga undo died
+ * (or never started). A store must return both, or a crashed compensating cancel is never finished.
+ */
+export const RECOVERABLE_RUN_STATUSES: readonly RunStatus[] = ['running', 'cancelling'];
 
 /**
  * A structured event a step (or its worker) emits while running — a log line and/or a sub-step
@@ -622,13 +637,15 @@ export interface StateStore {
   pullRunWakesIn?(runIds: string[], wakeAt: number): Promise<void>;
 
   /**
-   * Used by recovery on boot to find runs to resume (crashed, left `running`). When `namespace` is
+   * Used by recovery on boot to find runs to resume: the {@link RECOVERABLE_RUN_STATUSES} (crashed,
+   * left `running`, or a compensating cancel left `cancelling`). When `namespace` is
    * given, restrict to runs in that worker-pool partition (ANDed); omit it to return all (back-compat).
    */
   listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]>;
 
   /**
-   * `running` runs whose recovery lease is free (`locked_until` NULL or `<= nowMs`) — the ORPHANS a
+   * {@link RECOVERABLE_RUN_STATUSES} runs (`running` or `cancelling`) whose recovery lease is free
+   * (`locked_until` NULL or `<= nowMs`) — the ORPHANS a
    * periodic recovery pass should reclaim, capped at `limit`. Optional but strongly recommended:
    * without it the engine falls back to {@link listIncompleteRuns} and filters in process, which on
    * a busy fleet fetches (and lock-probes) every healthy running run once per tick per worker. When

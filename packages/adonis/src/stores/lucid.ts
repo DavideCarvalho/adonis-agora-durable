@@ -27,7 +27,7 @@ import type {
   StepSettlement,
   WorkflowRun,
 } from '../interfaces.js';
-import { SETTLEABLE_RUN_STATUSES } from '../interfaces.js';
+import { RECOVERABLE_RUN_STATUSES, SETTLEABLE_RUN_STATUSES } from '../interfaces.js';
 import { namespaceFilterValues, normalizeNamespace } from '../namespaces.js';
 import { mergeRunFacetRows } from '../run-facets.js';
 import { runPageWindow } from '../run-pagination.js';
@@ -799,7 +799,11 @@ export class LucidStateStore implements StateStore {
   // --- recovery / dispatch queries ----------------------------------------
 
   async listIncompleteRuns(namespace?: string): Promise<WorkflowRun[]> {
-    const q = this.fenced(this.client().from(DURABLE_TABLES.runs).where('status', 'running'));
+    const q = this.fenced(
+      this.client()
+        .from(DURABLE_TABLES.runs)
+        .whereIn('status', [...RECOVERABLE_RUN_STATUSES]),
+    );
     if (namespace !== undefined) q.whereIn('namespace', namespaceFilterValues(namespace));
     const rows = await q;
     return (rows as RunRow[]).map(rowToRun);
@@ -818,7 +822,7 @@ export class LucidStateStore implements StateStore {
     const q = this.fenced(
       this.client()
         .from(DURABLE_TABLES.runs)
-        .where('status', 'running')
+        .whereIn('status', [...RECOVERABLE_RUN_STATUSES])
         .andWhere((sub) => {
           sub.whereNull('locked_until').orWhere('locked_until', '<=', nowMs);
           if (owner !== undefined) sub.orWhere('locked_by', owner);

@@ -609,6 +609,7 @@ try {
 | `running` | A worker is executing (or replaying) the body. |
 | `suspended` | Parked with zero compute on a sleep, a signal, event or update, an awaited step or a child. |
 | `blocked` | Parked because no live worker can run the next dispatch (a required capability is unadvertised, or every live worker is protocol-incompatible). Not terminal: the blocked-recovery poll re-drives it once a capable worker appears. See [Handshake](/docs/durable/cluster/handshake). |
+| `cancelling` | A compensating cancel (`cancel(id, { compensate: true })`) is running the saga's compensations. Not terminal: it keeps its singleton and concurrency slot, a repeat `cancel()` returns it unchanged, and crash recovery re-drives it. It becomes `cancelled` once the compensations have run. |
 | `completed` | Finished successfully. Terminal. |
 | `failed` | Finished with an unrecovered error. Terminal. |
 | `cancelled` | Cancelled, with or without compensation, or past its `executionTimeout`. Terminal. |

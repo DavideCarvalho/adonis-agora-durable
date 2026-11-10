@@ -62,7 +62,7 @@ node ace durable:runs --workflow=checkout --limit=100
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--status` | — | filter: `pending` / `running` / `suspended` / `blocked` / `completed` / `failed` / `cancelled` / `dead` |
+| `--status` | — | filter: `pending` / `running` / `suspended` / `blocked` / `cancelling` / `completed` / `failed` / `cancelled` / `dead` |
 | `--workflow` | — | filter by workflow name |
 | `--limit` | `50` | max runs to list |
 | `--stale` | — | show only runs that look stranded. Bare `--stale` uses the 15-minute default; `--stale=1h` or `--stale=90s` sets your own threshold. |

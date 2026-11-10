@@ -186,7 +186,7 @@ The console routes client-side on the URL hash (`#/run/<id>` for a run, `#/workf
 
 | Param | Meaning |
 | --- | --- |
-| `status` | one of `pending`, `running`, `suspended`, `blocked`, `completed`, `failed`, `cancelled`, `dead`. An unrecognised value is ignored, not rejected. Repeat for a set. |
+| `status` | one of `pending`, `running`, `suspended`, `blocked`, `cancelling`, `completed`, `failed`, `cancelled`, `dead`. An unrecognised value is ignored, not rejected. Repeat for a set. |
 | `workflow` | exact workflow-name match. Repeatable — repeats match ANY of them. |
 | `tag` | exact match against the run's tags. Repeatable — repeats match runs carrying ANY of them. |
 | `namespace` | exact match against the run's [worker-pool namespace](/docs/durable/cluster/roles-and-config) — omit it and the listing spans every namespace. Repeatable — repeats match ANY of them. |
@@ -506,6 +506,7 @@ The `waiting` value is one input to a richer **display state** that the runs lis
 | `no-worker` | The run's next work is queued on a worker group that has a real backlog (`depth > 0`) and zero live workers. |
 | `queued` | A [singleton](/docs/durable/reliability/singleton) run gated behind another in-flight run holding its key, shown as `behind leader <id>`. |
 | `blocked` | Shown as its own state, with the reason from `run.error.message`. No *compatible* worker exists, which starting another worker of the same build cannot fix. See [Fleet health](#fleet-health). |
+| `cancelling` | A compensating cancel is undoing the saga; the run turns `cancelled` when it is done. |
 | `running` | Everything else open or in flight, including a settled step waiting to be replayed with nothing currently blocking it. |
 
 `no-worker` is gated on a **real backlog**, not on zero live workers alone. A worker only heartbeats for a group while it serves it, so an idle group (a run parked on its reconcile timer with nothing enqueued, a schedule between fires) legitimately reports no live workers without anything being stuck. Worker health comes from `GET /api/workers`, so on transports without `groupHealth` (anything but BullMQ, queue and db) nothing ever reads `no-worker`.

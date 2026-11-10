@@ -400,11 +400,11 @@ describe('durable compensating cancel', () => {
     expect((await store.getRun('o1'))?.status).toBe('suspended');
 
     // An "API pod" — same store, workflow NOT registered — cancels with compensation. Its own
-    // resume attempt fails (no registration), so only the DURABLE marker carries the intent.
+    // resume attempt fails (no registration), so only the DURABLE `cancelling` status carries the intent.
     const apiEngine = new WorkflowEngine({ store, instanceId: 'api' });
     await apiEngine.cancel('o1', { compensate: true });
     await flush();
-    expect((await store.getRun('o1'))?.status).toBe('suspended'); // api pod couldn't unwind
+    expect((await store.getRun('o1'))?.status).toBe('cancelling'); // api pod couldn't unwind
 
     // The worker pod re-drives the run (reconcile/timer stand-in) and must find the durable intent.
     await workerEngine.resume('o1');
