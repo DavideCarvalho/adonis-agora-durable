@@ -430,8 +430,10 @@ export interface StateStore {
   ensureSchema?(): Promise<void>;
 
   /**
-   * Persist a NEW run. MUST reject a duplicate id (throw — a SQL store's primary-key violation is
-   * exactly right) rather than overwrite: the engine treats the throw as "someone else already
+   * Persist a NEW run. MUST reject a duplicate id (throw `RunAlreadyExistsError`) rather than
+   * overwrite. A SQL store should detect the duplicate without a failing statement (an insert that
+   * writes nothing on conflict): a primary-key violation aborts a surrounding Postgres transaction,
+   * such as an app's test `wrapInGlobalTransaction`. The engine treats the throw as "someone else already
    * started this id", re-reads the existing run and returns its state, which is what makes
    * `start`/`signalWithStart`/scheduler double-fires converge on one run instead of forking or
    * clobbering the winner's state.

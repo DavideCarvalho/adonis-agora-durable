@@ -61,12 +61,17 @@ export class LucidPgHotPath {
     private readonly prepared: boolean,
   ) {}
 
-  /** The hot path for `client`, or `undefined` when it is not Postgres or is being debugged. */
+  /**
+   * The hot path for `client`, or `undefined` when it is not Postgres, is being debugged, or is a
+   * transaction: a transaction's one connection is knex's to order (its savepoints included), and a
+   * statement sent to it directly would overlap knex's.
+   */
   static for(
     client: QueryClientContract,
     options: PgHotPathOptions = {},
   ): LucidPgHotPath | undefined {
-    if (client.dialect.name !== 'postgres' || client.debug) return undefined;
+    if (client.dialect.name !== 'postgres' || client.debug || client.isTransaction)
+      return undefined;
     const knex = client.getWriteClient() as unknown as KnexLike;
     if (typeof knex?.client?.acquireConnection !== 'function') return undefined;
     return new LucidPgHotPath(knex, options.preparedStatements === true);
@@ -75,7 +80,7 @@ export class LucidPgHotPath {
   /**
    * Run one statement, written with `?` placeholders (the store's texts carry no other `?`);
    * resolves its rows as the driver decoded them, and the affected-row count. The connection comes
-   * from the Knex client's own pool: inside a (global) transaction, that is the transaction's.
+   * from the Knex client's own pool.
    */
   async run(
     sql: string,
