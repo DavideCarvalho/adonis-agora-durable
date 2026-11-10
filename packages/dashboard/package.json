@@ -45,7 +45,7 @@
   "devDependencies": {
     "@adonis-agora/filter-client": "0.4.0",
     "@base-ui/react": "1.9.0",
-    "@tailwindcss/postcss": "4.3.4",
+    "@tailwindcss/postcss": "4.3.5",
     "@tanstack/intent": "0.5.6",
     "@tanstack/react-query": "5.106.1",
     "@tanstack/react-virtual": "3.14.26",
@@ -63,7 +63,7 @@
     "react": "19.3.1",
     "react-dom": "19.3.1",
     "tailwind-merge": "3.7.0",
-    "tailwindcss": "4.3.4",
+    "tailwindcss": "4.3.5",
     "typescript": "7.0.2",
     "vite": "8.3.6",
     "vitest": "5.1.0"
