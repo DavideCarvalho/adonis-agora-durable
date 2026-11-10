@@ -9,6 +9,10 @@ import { Callout } from 'fumadocs-ui/components/callout';
 ## Requirements
 
 - Node.js 24 or newer.
+- Stop the pre-1.0 engines before or while you deploy 1.0, rather than running both on one store for
+  long. A compensating cancel (`cancel(id, { compensate: true })`) is carried by the run's persisted
+  `cancelling` status in 1.0: while a 0.x engine still executes a run, its undo can wait for crash
+  recovery.
 
 ```sh
 pnpm add @adonis-agora/durable@^1
