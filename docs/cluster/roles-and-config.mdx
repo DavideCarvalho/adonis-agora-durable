@@ -217,20 +217,18 @@ On a store-less `tenant` pod the [dashboard](/docs/durable/observability/dashboa
 
 ### Rolling upgrades
 
-Tenant pods and the control plane can be upgraded in either order.
+Tenant pods and the control plane can be upgraded in either order. A control plane that does not know a verb a newer tenant sends answers it with an error whose `code` is `unsupported-request`, before it touches the store, and the tenant degrades:
 
-| Tenant | Control plane | What happens |
-| --- | --- | --- |
-| 0.50+ | 0.49.x | The old responder knows `getRunDetail` and `getFanMembers` but not the six newer verbs. It rejects those with an `unknown run-request verb` error, which `ProxyRunGateway` reads as `unsupported-request`; the tenant console degrades as described in [the dashboard docs](/docs/durable/observability/dashboard#fleet-health). |
-| 0.51+ | 0.50.x | The old responder does not know `runFacets`. `ProxyRunGateway` counts the same `(status, origin)` cells from `runValueFacets` (the status axis once overall and once per origin), so the console's chips and backlog gauges keep working. |
-| 0.51+ | 0.49.x | No `runFacets` and no `runValueFacets`: the proxy counts the cells from a `listRuns` of the tenant's matching runs, which reads every one of them, so finish upgrading the control plane soon. |
-| 0.50+ | before 0.49 | Also no `getRunDetail` / `getFanMembers`. `ProxyRunGateway` builds the run detail itself from `getRun`, `getCheckpoints` and `getRunChildren` (each still ownership-checked by the responder), summarizes wide fans on the tenant, and pages fans out of the full timeline. |
-| 0.49.x | 0.50+ | An older proxy never sends the newer verbs; the new responder answers everything it sends exactly as before. |
-| with lifecycle verbs | without them | `republishLifecycle` and `workflowLifecycle` have no fallback: the proxy rejects at once with a `RunGatewayError` coded `unsupported-request` (`<verb> is not supported by this server: the control plane is older than this tenant`), also when an older responder answers with an empty `ok` reply, and the dashboard's republish action and workflow page answer `501`. |
+| Verb the control plane does not answer | What the tenant does |
+| --- | --- |
+| `runFacets` | Counts the same `(status, origin)` cells from `runValueFacets`, or, without that either, from a `listRuns` of the tenant's matching runs, which reads every one of them. |
+| `getRunDetail` / `getFanMembers` | Builds the run detail itself from `getRun`, `getCheckpoints` and `getRunChildren` (each still ownership-checked by the responder), summarizes wide fans on the tenant, and pages fans out of the full timeline. |
+| `retry`, `continue`, `retryWithInput`, `runValueFacets`, `waitingFor` | The tenant console degrades as described in [the dashboard docs](/docs/durable/observability/dashboard#fleet-health). |
+| `republishLifecycle`, `workflowLifecycle` | No fallback: the proxy rejects at once with a `RunGatewayError` coded `unsupported-request` (`<verb> is not supported by this server: the control plane is older than this tenant`), and the dashboard's republish action and workflow page answer `501`. |
 
 Every fallback happens on the reply, with no timeout wait. After the control plane answers that it does not know a verb, the proxy uses the fallback for the next minute before it asks again (`capabilityTtlMs` on a `ProxyRunGateway` you build yourself, default `60_000`): the control plane can be several pods of mixed versions behind one queue, and a reply does not say which pod sent it. The fallback for run detail moves every checkpoint of the run over the wire, so on a run with a very wide fan, finish upgrading the control plane soon.
 
-From 0.50 on, a responder answers a verb it does not know with an error whose `code` is `unsupported-request`, before it touches the store, so the next new verb can fall back the same way. And every request gets a reply: a gateway that throws (in `listRuns`, `workerHealth`, the ownership read, or a tenant verifier) becomes an error reply, so a tenant no longer waits out `requestTimeoutMs` for an answer that will never come.
+Every request gets a reply: a gateway that throws (in `listRuns`, `workerHealth`, the ownership read, or a tenant verifier) becomes an error reply, so a tenant never waits out `requestTimeoutMs` for an answer that will never come.
 
 On a store role, `engine` (the default export of `services/main`) is still there for everything the gateway does not cover — registering workflows, driving poll loops, `getEvent`, `update`, the task verbs. On a `tenant` pod there is no engine to resolve, which is exactly the point: reach for `runGateway` in anything that must run on more than one role.
 

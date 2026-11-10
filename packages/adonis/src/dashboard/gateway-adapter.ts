@@ -209,7 +209,7 @@ export function storeDashboardEngine(engine: StoreEngineLike): DashboardEngine {
  * `retry`, `continue`, `retryWithInput`, `runValueFacets` and `waitingFor` ride the wire too (aviary's
  * verbs), so a tenant pod's console retries in place, continues a breakpoint, fixes and replays,
  * fills its value pickers and names what a suspended run waits on. Against a control plane that
- * predates them (it answers `unsupported-request` or an unknown-verb error) each degrades the way it
+ * predates them (it answers `unsupported-request`) each degrades the way it
  * did before those verbs existed: `requeue` re-dispatches the run's pending steps, `continue` and
  * `retryWithInput` answer `null` (the handlers 404), the pickers count a bounded `listRuns` scan,
  * and the list rows carry no `waiting` stamp.

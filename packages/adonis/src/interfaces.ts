@@ -1547,7 +1547,7 @@ export interface Heartbeat {
    */
   stepId?: string | undefined;
   group: string;
-  /** Worker-side emission time (epoch ms). Optional on the wire for back-compat with 0.17-era workers. */
+  /** Worker-side emission time (epoch ms). Optional on the wire: NestJS workers do not send it. */
   at?: number | undefined;
   /**
    * Opaque JSON-safe progress payload the step handler attached (`log.heartbeat({done: 12, total: 50})`).
@@ -1837,8 +1837,8 @@ export type RunRequestKind =
   | { kind: 'redispatch'; runId: string }
   // Aviary's verbs, in aviary's shapes. `runFacets`/`runValueFacets` are namespace-forced like
   // `listRuns`; `waitingFor` is bulk and filtered to the requester's own runs; the rest are
-  // runId-bearing and ownership-checked first. Additive: an older control plane answers them with an
-  // unknown-verb error, which `ProxyRunGateway` reports as such.
+  // runId-bearing and ownership-checked first. A control plane that does not answer one replies
+  // `unsupported-request`, which `ProxyRunGateway` reports as such.
   | { kind: 'runFacets'; query: RunFacetQuery }
   | {
       kind: 'runValueFacets';

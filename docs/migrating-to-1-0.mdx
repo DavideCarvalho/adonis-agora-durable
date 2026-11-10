@@ -122,6 +122,30 @@ curl -X POST https://app.example.com/durable/api/runs/order-42/updates/set-limit
   -H 'content-type: application/json' -d '{ "arg": 500 }'
 ```
 
+## Upgrade a control plane older than 0.50 before its tenant pods
+
+A store-less `tenant` pod on 1.0 relies on the control plane answering a verb it does not know with
+the `unsupported-request` code, which every control plane from 0.50 on does. Against an older control
+plane, the newer verbs (`retry`, `continue`, `retryWithInput`, `runFacets`, `runValueFacets`,
+`waitingFor`, the lifecycle verbs) fail with a `RunGatewayError` instead of falling back.
+
+Before, either deploy order worked:
+
+```sh
+# tenant pods first, control plane (0.49) later
+kubectl rollout restart deployment/tenant-acme
+kubectl rollout restart deployment/durable-control-plane
+```
+
+After, move a control plane that is still on 0.49 or older first:
+
+```sh
+kubectl rollout restart deployment/durable-control-plane   # now on 1.0
+kubectl rollout restart deployment/tenant-acme
+```
+
+A control plane already on 0.50 or later can still be upgraded in either order.
+
 ## Transports no longer accept `group`
 
 `transports.queue`, `transports.db` and `transports.eventEmitter`, and the `QueueTransport`,
