@@ -26,7 +26,7 @@ export default defineConfig({
 })
 ```
 
-A standalone engine with no `namespace` is in the `'default'` pool: it drives only `'default'` runs (and legacy rows stored without a namespace), never another pool's on a shared store. Set `drive: false` on a web pod that should only start runs (pair it with `consumers: 'never'`): started runs stay `pending` for a `node ace durable:work` pod, which drives through its poll whatever `drive` says, so the web and worker pods can share one config file. `drive: false` with `worker: { embedded: true }` throws at boot.
+A standalone engine with no `namespace` is in the `'default'` pool: it drives only `'default'` runs (and legacy rows stored without a namespace), never another pool's on a shared store. Set `drive: false` on a web pod that should only start runs (pair it with `consumers: 'never'`): started runs stay `pending` for a `node ace durable:work` pod, which drives through its poll whatever `drive` says, so the web and worker pods can share one config file. `drive: false` with `worker: { embedded: true }` throws at boot. For a pod that only reads (a console or an admin API), see [Read-only pods](/docs/durable/cluster/read-replica).
 
 ## Control plane
 
@@ -126,7 +126,7 @@ A `tenant` pod's *shape* is not another config field — it's **which process yo
 
 <Tab value="Worker pod">
 
-A store-less **task consumer**. It registers `app/steps` (served by the transport) and advertises `app/workflows` names in its descriptor, subscribes their `<name>@<tenant>` queues, executes bodies, and publishes results. It owns no store.
+A store-less **task consumer**. It registers the `app/steps` handlers, subscribes their `<name>@<tenant>` queues, runs the step bodies and publishes the results. It also advertises the `app/workflows` names in its descriptor, so routing works, but it doesn't run those workflow bodies (see [Executing workflow turns](/docs/durable/cluster/thin-workers#executing-workflow-turns)). It owns no store.
 
 ```bash
 node ace durable:worker

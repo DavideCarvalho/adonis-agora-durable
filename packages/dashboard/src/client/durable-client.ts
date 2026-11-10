@@ -6,18 +6,18 @@
  * This is a from-scratch port of `@dudousxd/nestjs-durable-dashboard`'s `durable-client.ts`, kept
  * behaviourally identical wherever the AdonisJS engine exposes the same data (deliberate: every UI
  * component under `src/app/` was ported unedited and imports these exact names/shapes). Divergences
- * from the NestJS client are called out inline — the remaining known gaps are:
+ * from the NestJS client are called out inline. Two notes on fields that are optional on the wire:
  *
- * 1. `WorkflowRun.origin` — the AdonisJS engine has no `origin` column, so `origin` is always
- *    `undefined` here. The origin facet UI (`OriginFacets.tsx`) still renders — every run just buckets
- *    under "unknown" until a future engine change adds the column. (`RunWaiting`/`waiting` is NO LONGER
- *    in this gap: the engine's `listSignalWaiters` bulk scan is wired into `GET /runs` — see
- *    `packages/adonis/src/dashboard/handlers.ts`'s `listRuns` — so a suspended run's list row DOES
- *    carry `waiting` the same as the NestJS console's, once the server is new enough.)
- * 2. `WorkerHeartbeat.status` (rss/cpu/concurrency telemetry) — the AdonisJS engine's heartbeat carries
- *    no `WorkerStatus` payload (only `group`/`instanceId`/`lastBeatAt`), so worker cards never show the
- *    resource-usage details the NestJS console can. The types are kept so a future engine addition
- *    lights the UI up with no client change.
+ * 1. `WorkflowRun.origin` — the engine stores the origin it attributes at start (the `origin` column),
+ *    so a run carries one when its registration declared or derived one; older and unattributed runs
+ *    have none and bucket under the console's `app` facet. The server does not filter runs by origin:
+ *    the origin facet (`OriginFacets.tsx`) counts and narrows the page already loaded, client-side.
+ *    A suspended run's list row carries `waiting` too (the engine's `listSignalWaiters` scan is wired
+ *    into `GET /runs`, see `packages/adonis/src/dashboard/handlers.ts`'s `listRuns`).
+ * 2. `WorkerHeartbeat.status` (rss/cpu/concurrency telemetry) — present when the worker's heartbeat
+ *    carries a `WorkerStatus` payload (the BullMQ, queue and db transports pass it through as the
+ *    worker wrote it). A beat without one (a worker runtime's compact `{ ts }` beat) reads as liveness
+ *    only, and the worker card shows no resource-usage details.
  */
 
 // ── Wire types (independent of `@adonis-agora/durable`'s own `Date`-typed engine interfaces — the
@@ -763,7 +763,8 @@ export interface RunFilterOptions {
   namespace?: string | string[] | undefined;
   /** One workflow narrows; several match ANY of them (the workflow picker's multi-select). */
   workflow?: string | string[] | undefined;
-  /** See module doc gap #1 — cannot select unattributed runs, and no run carries an origin today. */
+  /** See module doc note #1 — the server ignores it (the origin facet narrows client-side), and it
+   *  cannot select unattributed runs. */
   origin?: string | undefined;
 }
 

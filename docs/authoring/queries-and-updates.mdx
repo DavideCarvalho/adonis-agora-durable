@@ -19,7 +19,7 @@ A query is a side-effect-free read of a run's state. The run publishes values; r
 
 ### Publishing a value — `ctx.setEvent(key, value)`
 
-Inside the workflow body, call `ctx.setEvent(key, value)` to publish a named, queryable value. The latest value for a given `key` is what a reader sees; calling `setEvent` again with the same key overwrites it. It is checkpointed and replay-safe — on replay the publish is idempotent, so it never double-fires.
+Inside the workflow body, call `ctx.setEvent(key, value)` to publish a named, queryable value. The latest value for a given `key` is what a reader sees; calling `setEvent` again with the same key overwrites it. It is checkpointed and replay-safe — on replay the publish is idempotent, so it never double-fires. Each call takes a position in the run's history, like a step, so adding, removing or moving a `setEvent` call is a shape change for runs in flight: [version the workflow](/docs/durable/authoring/versioning) or guard the change with `ctx.patched`.
 
 ```ts
 engine.register('video-encode', '1', async (ctx, job: EncodeJob) => {

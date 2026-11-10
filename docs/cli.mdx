@@ -34,10 +34,10 @@ On start the loop also calls `engine.startConsumers()`. Broker transports (BullM
 
 On `SIGINT`/`SIGTERM` the loop stops picking up new runs, waits for the tick in flight, then calls `engine.drain()` with whatever is left of `--drain-timeout`. A tick that outlives the whole budget is abandoned with a warning instead of holding the pod past its termination grace period, so keep `--drain-timeout` below your orchestrator's grace period.
 
-Run this as a dedicated process (or several) when you split web from worker; in a single-process app the in-process dispatcher already runs workflows, so this is optional but recommended for [recovery and timers](/docs/durable/concepts/durability#consequences).
+Run this as a dedicated process (or several) when you split web from worker. A single-process app can run the same loop in the web process with `worker: { embedded: true }` instead. One of the two is required: without a worker loop, started runs still execute in-process, but sleeps and retry timers never wake, crashed runs are never recovered and schedules never fire (see [Workers](/docs/durable/concepts/durability#workers-a-process-that-drains-pending-runs)).
 
 <Callout type="info">
-Any [scheduled workflows](/docs/durable/authoring/scheduling) registered under `schedules` in `config/durable.ts` are fired by this loop (the tick's 5th phase) — so you need at least one `durable:work` process running for them to start. This is also where a [queue](/docs/durable/transports/queue) or [DB](/docs/durable/transports/db) transport worker registers its handlers for a group.
+Any [scheduled workflows](/docs/durable/authoring/scheduling) registered under `schedules` in `config/durable.ts` are fired by this loop (the tick's 5th phase), so you need at least one `durable:work` process, or a web process with the [embedded worker](/docs/durable/authoring/scheduling#running-the-loop-in-the-web-process), running for them to start. This is also where a [queue](/docs/durable/transports/queue) or [DB](/docs/durable/transports/db) transport worker registers its handlers for a group.
 </Callout>
 
 ## `durable:worker` — the store-less worker

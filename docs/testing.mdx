@@ -129,7 +129,7 @@ await assertRunStatus(t.store, 'run1', 'failed')       // result.error.message =
 await assertStepAttempts(t.store, 'run1', 'flaky', 3)  // all attempts thrown → run failed
 ```
 
-Inject failures with `ctx.localStep`, as above: a dispatched `ctx.step` retries on a different policy (a worker that *reported* an error is surfaced to the workflow rather than re-dispatched; re-dispatch is reserved for liveness timeouts), so it is not the path to drive with `failOnce`.
+Inject failures with `ctx.localStep`, as above: a dispatched `ctx.step` retries durably instead: a failure the worker reports is re-dispatched on a persisted timer per the step's `retries` and backoff (see [Dispatched-step retries](/docs/durable/reliability/retries#dispatched-step-retries)), so each attempt waits for the timer poller and is not the path to drive with `failOnce`.
 
 ## Assertions
 

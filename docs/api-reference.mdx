@@ -331,6 +331,8 @@ import engine from '@adonis-agora/durable/services/main'
 
 `runSchedules(engine, schedules, nowMs, opts?)` is a standalone function, not an engine method: it starts each `ScheduledWorkflow`'s current time-bucket run (idempotent through `engine.start`). The `durable:work` loop calls it for you. `resolveSchedules(schedules)` resolves the lazy imports and classes to registered names first (async); `runSchedules` refuses a schedule whose lazy import was not resolved. See [Lower-level — `runSchedules`](/docs/durable/authoring/scheduling#lower-level--runschedules).
 
+The window helpers are standalone functions too: `scheduledRunId(key, everyMs, nowMs)` is an `everyMs` window's run id, and `prevCronFireMs(cron, nowMs, timezone?)` / `nextCronFireMs(cron, nowMs, timezone?)` are the cron fires at or before and strictly after `nowMs` (epoch ms, `timezone` defaulting to `UTC`). See [Exactly-once across instances](/docs/durable/authoring/scheduling#exactly-once-across-instances).
+
 ### Listening and middleware
 
 | Member | Signature | Notes |

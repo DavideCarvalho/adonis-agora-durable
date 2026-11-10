@@ -78,7 +78,7 @@ node ace durable:work --interval=500 --drain-timeout=30000
 
 An instance configured with `role: 'control-plane'` in `config/durable.ts` gets a **no-op run dispatcher**: its `start` only **enqueues**, leaving the run `pending` for a `durable:work` process to pick up over the database. An explicit `runDispatcher` overrides the role default. See [Roles & config](/docs/durable/cluster/roles-and-config).
 
-The default (no explicit worker) is the in-process dispatcher — so single-process apps need none of this. Runs simply execute on the same instance, just asynchronously. Run a dedicated `durable:work` process once you outgrow that.
+Without a worker, a started run still executes: the default in-process dispatcher runs it on the same instance, asynchronously. What nothing does without a worker loop is the rest of the list above. A run that sleeps, retries a dispatched step on a timer or waits with a timeout never wakes, a crashed run is never recovered, and schedules never fire. So every app needs one worker loop: a `durable:work` process, or the embedded one below.
 
 If your background work does not justify a second container, the provider can run the same loop inside the web process instead — `worker: { embedded: true }` in `config/durable.ts` (with optional `intervalMs` and `drainTimeoutMs`, same defaults as the command). It starts in the web environment only (so a `node ace` command, including `durable:work` itself, never runs a second loop), and its shutdown is wired to `app.terminate()`, so a deploy drains exactly like a dedicated worker.
 
