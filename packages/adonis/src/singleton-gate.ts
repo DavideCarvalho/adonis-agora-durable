@@ -132,7 +132,7 @@ export class SingletonGate {
     this.warnedNonAtomic = true;
     console.warn(
       '[adonis-durable] singleton admission is NOT atomic on this state store: it does not implement ' +
-        'StateStore.tryAdmitSingleton, so the engine falls back to a scan of running/suspended runs. ' +
+        'StateStore.tryAdmitSingleton, so the engine falls back to a scan of running/suspended/cancelling runs. ' +
         'Replicas can briefly admit more than `limit` runs per key, and a same-millisecond start can ' +
         'displace a holder. Implement tryAdmitSingleton (see the exported singletonAdmissionTags / ' +
         'singletonAdmissionDenialPatch helpers and the "Store support" section of the singleton docs) ' +
