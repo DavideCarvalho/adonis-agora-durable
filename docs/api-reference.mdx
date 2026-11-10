@@ -590,7 +590,7 @@ The thin-worker turn runtime ([`@adonis-agora/durable/worker`](#subpath-exports)
 | Export | Signature | Notes |
 | --- | --- | --- |
 | `CONTROL_FLOW_SIGNAL` | `const CONTROL_FLOW_SIGNAL: unique symbol` | `Symbol.for('@agora/durable:control-flow')`, the global-registry marker stamped on every control-flow signal class. Rarely used directly. |
-| `isWorkflowControlFlowSignal` | `isWorkflowControlFlowSignal(error: unknown): boolean` | `true` for `WorkflowSuspended` and `ContinueAsNew`, whichever module copy threw them. Not true for a cancellation or a `FatalError` / step rejection, which are real outcomes a `catch` may handle. |
+| `isWorkflowControlFlowSignal` | `isWorkflowControlFlowSignal(error: unknown): boolean` | `true` for `WorkflowSuspended`, `ContinueAsNew` and the suspend a thin-worker `WorkflowTurnCtx` op throws, whichever module copy threw them. Not true for a cancellation or a `FatalError` / step rejection, which are real outcomes a `catch` may handle. |
 
 ```ts
 try {

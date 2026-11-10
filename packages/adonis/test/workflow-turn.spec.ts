@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
+import { isWorkflowControlFlowSignal } from '../src/control-flow-signal.js';
 import type { WorkflowStepEvent, WorkflowTask } from '../src/interfaces.js';
-import { isWorkflowTask, runWorkflowTurn, type WorkflowBody } from '../src/workflow-turn.js';
+import {
+  isWorkflowTask,
+  runWorkflowTurn,
+  type WorkflowBody,
+  type WorkflowTurnCtx,
+} from '../src/workflow-turn.js';
 
 /** Build a workflow task with sensible defaults; override `history`/`input`/etc per turn. */
 function task(overrides: Partial<WorkflowTask> = {}): WorkflowTask {
@@ -440,5 +446,55 @@ describe('isWorkflowTask — shape discrimination (spec §6.3)', () => {
     expect(isWorkflowTask({ workflow: 'checkout' })).toBe(false); // no history array
     expect(isWorkflowTask(null)).toBe(false);
     expect(isWorkflowTask('nope')).toBe(false);
+  });
+});
+
+describe('runWorkflowTurn — the turn suspend is a control-flow signal', () => {
+  it("a body's catch recognizes it with isWorkflowControlFlowSignal and rethrows: no cleanup command leaks into the turn", async () => {
+    const caught: unknown[] = [];
+    const checkout: WorkflowBody = (ctx) => {
+      try {
+        return ctx.step('charge', { amount: 1 });
+      } catch (err) {
+        caught.push(err);
+        if (isWorkflowControlFlowSignal(err)) throw err;
+        // A REAL failure: compensate. Must not run for a suspend.
+        ctx.step('refund', { amount: 1 });
+        throw err;
+      }
+    };
+
+    const decision = await runWorkflowTurn(bodies({ checkout }), task(), { partition: 'acme' });
+
+    expect(caught).toHaveLength(1);
+    expect(isWorkflowControlFlowSignal(caught[0])).toBe(true);
+    expect(decision.status).toBe('continue');
+    expect(decision.commands).toEqual([
+      { kind: 'call', seq: 0, name: 'charge', group: 'acme', input: { amount: 1 } },
+    ]);
+  });
+
+  it('sleep, signal and gather suspends carry the stamp too', async () => {
+    const seen: boolean[] = [];
+    const probe =
+      (op: (ctx: WorkflowTurnCtx) => unknown): WorkflowBody =>
+      (ctx) => {
+        try {
+          return op(ctx);
+        } catch (err) {
+          seen.push(isWorkflowControlFlowSignal(err));
+          throw err;
+        }
+      };
+    const flows = {
+      sleeps: probe((ctx) => ctx.sleep(1000)),
+      waits: probe((ctx) => ctx.waitSignal('approve')),
+      fans: probe((ctx) => ctx.gatherCalls([{ name: 'a' }, { name: 'b' }])),
+    };
+    for (const workflow of Object.keys(flows)) {
+      const d = await runWorkflowTurn(bodies(flows), task({ workflow }));
+      expect(d.status).toBe('continue');
+    }
+    expect(seen).toEqual([true, true, true]);
   });
 });
