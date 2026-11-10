@@ -79,7 +79,7 @@ describe.each(dbBackends({ mysql: true }))(
             runId: 'cp-1',
             seq: 0,
             name: 'charge',
-            kind: 'step' as const,
+            kind: 'remote' as const,
             stepId: 'cp-1:0',
             status: 'pending' as const,
             attempts: 0,
