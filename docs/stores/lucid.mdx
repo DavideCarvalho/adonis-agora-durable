@@ -161,9 +161,45 @@ The logger only needs a `warn(message: string)` method, which both `console` (th
 
 ## Postgres: the per-step statements
 
-On Postgres, the statements every workflow step runs (the run's lease, read and suspend, the step's `pending` row and its settled result, the turn's checkpoint reads) go to the `pg` connection as constant SQL text instead of being rebuilt by Knex's query builder on every call, which on a busy engine was about a fifth of its CPU. They run on the same Knex pool (inside a global transaction, on the transaction's connection), and each is still announced as Knex's `query` event. A connection with Lucid's `debug` on keeps the query builder, so its `db:query` events show every statement as before.
+On Postgres, the statements every workflow step runs (the run's lease, read and suspend, the step's `pending` row and its settled result, the turn's checkpoint reads) go to the `pg` connection as constant SQL text instead of being rebuilt by Knex's query builder on every call, which on a busy engine was about a fifth of its CPU. They run on the same Knex pool, and each is still announced as Knex's `query` event. A connection with Lucid's `debug` on keeps the query builder, so its `db:query` events show every statement as before, and so does a store inside a transaction (an app's `wrapInGlobalTransaction()` in tests).
 
-`stores.lucid({ preparedStatements: true })` sends them as named prepared statements, parsed once per connection. Leave it off behind PgBouncer in transaction mode older than 1.21, which cannot hold them.
+### Prepared statements
+
+`stores.lucid({ preparedStatements: true })` sends those statements as named prepared statements: Postgres parses and plans each one once per connection instead of on every call. It is off by default.
+
+```ts title="config/durable.ts"
+import { defineConfig, stores } from '@adonis-agora/durable'
+
+export default defineConfig({
+  store: 'lucid',
+  stores: { lucid: stores.lucid({ preparedStatements: true }) },
+})
+```
+
+What it buys, measured with the package's benches on one machine against a local Postgres 18 (two runs each, so read the ranges, not the digits):
+
+| Bench | Off | On |
+| --- | --- | --- |
+| Pending-run pickup, 1 process (`claim-pending.mjs 1`) | 158–167 wf/s | 178–198 wf/s |
+| Pending-run pickup, 2 processes (`claim-pending.mjs 2`) | 221–255 wf/s | 247–256 wf/s |
+| Dispatched steps over BullMQ, 1 engine, 4 workers (`dispatched-steps.mjs 1 4`) | 28–45 wf/s | 37–38 wf/s |
+
+The statement count is the same either way (26 per workflow for the pickup, about 10 per dispatched step); what changes is the parse work on the database. Where the engine waits on the broker more than on Postgres, as in the dispatched-steps bench, the difference is inside the noise.
+
+Turn it on only when every connection the store opens reaches Postgres in a way that keeps a prepared statement for the next query on the same client:
+
+- **Direct connections to Postgres**: safe.
+- **PgBouncer 1.21 or later with `max_prepared_statements` above 0**: safe, in every pool mode.
+- **PgBouncer older than 1.21 in transaction (or statement) mode**: leave it off. The next query can land on another server connection, which never saw the statement, and fails with `prepared statement "durable_…" does not exist`.
+
+To check a PgBouncer, connect to its admin console (the `pgbouncer` database) and run:
+
+```sql
+SHOW VERSION;  -- 1.21.0 or later
+SHOW CONFIG;   -- max_prepared_statements must be above 0; pool_mode says which mode it runs
+```
+
+The statements name their columns rather than `*`, so a column the schema adds while a statement is prepared (another pod's boot during a rolling upgrade) does not break it.
 
 ## MySQL: longtext and collation
 

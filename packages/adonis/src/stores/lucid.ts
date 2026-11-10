@@ -168,6 +168,27 @@ export class LucidStateStore implements StateStore {
     });
   }
 
+  /**
+   * The hot run reads with an explicit column list: the base columns plus the later-wave ones this
+   * table has, probed once per store (an older schema without them keeps working). A column added
+   * after the probe is not read until the next boot, and a statement already prepared keeps its shape.
+   */
+  private hotRunStatements: Promise<ReturnType<typeof runReadSql>> | undefined;
+  private hotRunSql(hot: LucidPgHotPath): Promise<ReturnType<typeof runReadSql>> {
+    this.hotRunStatements ??= hot
+      .rows(RUN_COLUMNS_PRESENT_SQL, [DURABLE_TABLES.runs, [...RUN_OPTIONAL_COLUMNS]])
+      .then((rows) => {
+        const present = new Set(rows.map((r) => String(r.column_name)));
+        const cols = [...RUN_BASE_COLUMNS, ...RUN_OPTIONAL_COLUMNS.filter((c) => present.has(c))];
+        return runReadSql(cols.map(quote).join(', '));
+      })
+      .catch((error: unknown) => {
+        this.hotRunStatements = undefined; // a failed probe is retried, never cached
+        throw error;
+      });
+    return this.hotRunStatements;
+  }
+
   /** Idempotently provision the durable tables (called on boot when `autoSchema` is on). */
   async ensureSchema(): Promise<void> {
     await createDurableTables(
@@ -428,10 +449,11 @@ export class LucidStateStore implements StateStore {
   async getRun(runId: string): Promise<WorkflowRun | null> {
     const hot = this.hot();
     if (hot) {
+      const sql = await this.hotRunSql(hot);
       const rows =
         this.scopeNamespace === undefined
-          ? await hot.rows(GET_RUN_SQL, [runId])
-          : await hot.rows(GET_RUN_SCOPED_SQL, [runId, namespaceFilterValues(this.scopeNamespace)]);
+          ? await hot.rows(sql.get, [runId])
+          : await hot.rows(sql.getScoped, [runId, namespaceFilterValues(this.scopeNamespace)]);
       return rows[0] ? rowToRun(rows[0] as unknown as RunRow) : null;
     }
     const row = await this.fenced(
@@ -951,10 +973,11 @@ export class LucidStateStore implements StateStore {
   ): Promise<WorkflowRun | null> {
     const hot = this.hot();
     if (hot) {
+      const sql = await this.hotRunSql(hot);
       const rows =
         this.scopeNamespace === undefined
-          ? await hot.rows(LOCK_AND_GET_SQL, [owner, leaseUntilMs, runId, nowMs])
-          : await hot.rows(LOCK_AND_GET_SCOPED_SQL, [
+          ? await hot.rows(sql.lockAndGet, [owner, leaseUntilMs, runId, nowMs])
+          : await hot.rows(sql.lockAndGetScoped, [
               owner,
               leaseUntilMs,
               runId,
@@ -2000,24 +2023,78 @@ function escapeLike(value: string): string {
 const RUNS_T = quote(DURABLE_TABLES.runs);
 const CHECKPOINTS_T = quote(DURABLE_TABLES.checkpoints);
 const CHECKPOINT_LIST = CHECKPOINT_COLUMNS_BUT_INPUT.map(quote).join(', ');
-const GET_RUN_SQL = `select * from ${RUNS_T} where "id" = ? limit 1`;
-const GET_RUN_SCOPED_SQL = `select * from ${RUNS_T} where "id" = ? and "namespace" = any(?) limit 1`;
+/**
+ * The runs columns every schema has. The hot path names its columns instead of `*`: a named prepared
+ * statement's result type is fixed when it is parsed, so a `*` statement fails ("cached plan must
+ * not change result type") once a column is added under it — another pod's `ensureSchema` during a
+ * rolling upgrade.
+ */
+const RUN_BASE_COLUMNS = [
+  'id',
+  'workflow',
+  'workflow_version',
+  'status',
+  'namespace',
+  'input',
+  'output',
+  'error',
+  'wake_at',
+  'locked_by',
+  'locked_until',
+  'recovery_attempts',
+  'tags',
+  'search_attributes',
+  'priority',
+  'created_at',
+  'updated_at',
+] as const;
+/** Runs columns that arrived in later schema waves: read only when the table has them. */
+const RUN_OPTIONAL_COLUMNS = ['origin', 'awaiting_decision_task_id', 'wake_requested_at'] as const;
+const RUN_COLUMNS_PRESENT_SQL = `select "column_name" from information_schema.columns where "table_schema" = current_schema() and "table_name" = ? and "column_name" = any(?)`;
+/** Every checkpoint column. */
+const CHECKPOINT_ALL_LIST = [...CHECKPOINT_COLUMNS_BUT_INPUT, 'input'].map(quote).join(', ');
+const BUFFERED_SIGNAL_LIST = ['id', 'token', 'payload'].map(quote).join(', ');
+const BUFFERED_EVENT_LIST = ['id', 'name', 'payload', 'published_at'].map(quote).join(', ');
+
+/** The hot run reads, for the runs column list `cols` (quoted, comma-joined). */
+function runReadSql(cols: string): {
+  get: string;
+  getScoped: string;
+  lockAndGet: string;
+  lockAndGetScoped: string;
+} {
+  return {
+    get: shapedSql(`run-get:${cols}`, () => `select ${cols} from ${RUNS_T} where "id" = ? limit 1`),
+    getScoped: shapedSql(
+      `run-get-scoped:${cols}`,
+      () => `select ${cols} from ${RUNS_T} where "id" = ? and "namespace" = any(?) limit 1`,
+    ),
+    lockAndGet: shapedSql(
+      `run-lock:${cols}`,
+      () =>
+        `update ${RUNS_T} set "locked_by" = ?, "locked_until" = ? where "id" = ? and ("locked_until" is null or "locked_until" <= ?) returning ${cols}`,
+    ),
+    lockAndGetScoped: shapedSql(
+      `run-lock-scoped:${cols}`,
+      () =>
+        `update ${RUNS_T} set "locked_by" = ?, "locked_until" = ? where "id" = ? and ("locked_until" is null or "locked_until" <= ?) and "namespace" = any(?) returning ${cols}`,
+    ),
+  };
+}
 const RUN_IN_STATUSES_SQL = `select 1 from ${RUNS_T} where "id" = ? and "status" = any(?) limit 1`;
-const LOCK_AND_GET_SQL = `update ${RUNS_T} set "locked_by" = ?, "locked_until" = ? where "id" = ? and ("locked_until" is null or "locked_until" <= ?) returning *`;
-const LOCK_AND_GET_SCOPED_SQL = `update ${RUNS_T} set "locked_by" = ?, "locked_until" = ? where "id" = ? and ("locked_until" is null or "locked_until" <= ?) and "namespace" = any(?) returning *`;
 const RELEASE_LOCK_SQL = `update ${RUNS_T} set "locked_by" = null, "locked_until" = null where "id" = ?`;
 const RELEASE_OWN_LOCK_SQL = `update ${RUNS_T} set "locked_by" = null, "locked_until" = null where "id" = ? and "locked_by" = ?`;
 const RELEASE_UNLESS_WAKE_SQL = `update ${RUNS_T} set "locked_by" = null, "locked_until" = null where "id" = ? and "locked_by" = ? and "wake_requested_at" is null`;
 const LOCKED_BY_SQL = `select "locked_by" from ${RUNS_T} where "id" = ? limit 1`;
 const RENEW_LOCK_SQL = `update ${RUNS_T} set "locked_until" = ? where "id" = ? and "locked_by" = ?`;
 const DELETE_ATTRIBUTES_SQL = `delete from ${quote(DURABLE_TABLES.attributes)} where "run_id" = ?`;
-const GET_CHECKPOINT_SQL = `select * from ${CHECKPOINTS_T} where "run_id" = ? and "seq" = ? limit 1`;
+const GET_CHECKPOINT_SQL = `select ${CHECKPOINT_ALL_LIST} from ${CHECKPOINTS_T} where "run_id" = ? and "seq" = ? limit 1`;
 const CHECKPOINTS_FOR_SETTLE_SQL = `select ${CHECKPOINT_LIST} from ${CHECKPOINTS_T} where "run_id" = ? and "seq" = any(?)`;
 const REPLAY_CHECKPOINTS_SQL = `select ${CHECKPOINT_LIST} from ${CHECKPOINTS_T} where "run_id" = ? order by "seq" asc`;
 const COUNT_CHECKPOINTS_SQL = `select count(*) as "count" from ${CHECKPOINTS_T} where "run_id" = ? and "seq" >= ? and "seq" <= ? and "status" = any(?)`;
-const OLDEST_BUFFERED_SIGNAL_SQL = `select * from ${quote(DURABLE_TABLES.bufferedSignals)} where "token" = ? order by "id" asc limit 1`;
+const OLDEST_BUFFERED_SIGNAL_SQL = `select ${BUFFERED_SIGNAL_LIST} from ${quote(DURABLE_TABLES.bufferedSignals)} where "token" = ? order by "id" asc limit 1`;
 const DELETE_BUFFERED_SIGNAL_SQL = `delete from ${quote(DURABLE_TABLES.bufferedSignals)} where "id" = ?`;
-const BUFFERED_EVENTS_SQL = `select * from ${quote(DURABLE_TABLES.bufferedEvents)} where "name" = ? order by "published_at" asc limit ?`;
+const BUFFERED_EVENTS_SQL = `select ${BUFFERED_EVENT_LIST} from ${quote(DURABLE_TABLES.bufferedEvents)} where "name" = ? order by "published_at" asc limit ?`;
 
 /** Statements whose column list is the row's own keys, built once per key set. */
 const shaped = new Map<string, string>();

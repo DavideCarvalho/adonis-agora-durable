@@ -7,7 +7,8 @@
  *   pnpm exec tsc -p tsconfig.build.json   # the bench runs the built dist/, not the sources
  *   node bench/dispatched-steps.mjs <engines=1> [workers=4] [scenario=throughput|long]
  *
- * Env: DURABLE_PG_URL, DURABLE_REDIS_URL, BENCH_WF (1000), BENCH_POOL (per engine, 10),
+ * Env: DURABLE_PG_URL, DURABLE_REDIS_URL, BENCH_WF (1000), BENCH_POOL (per engine, 10), BENCH_PREPARED=1
+ * (named prepared statements for the store's hot path),
  * BENCH_STEP_CONCURRENCY (per worker, 16), BENCH_LONG_STEPS (1000), BENCH_ROOT (another checkout's
  * `packages/adonis`, built, to bench it with this script: an A/B against a baseline), BENCH_SQL_LOG=1
  * (each engine prints its statements by text), BENCH_PROF=<dir> (engines write a V8 CPU profile).
@@ -80,7 +81,7 @@ if (role === '--worker') {
   const id = `e-${process.pid}`;
   const t = await makeTransport(id);
   const engine = new WorkflowEngine({
-    store: new LucidStateStore(db),
+    store: new LucidStateStore(db, { preparedStatements: process.env.BENCH_PREPARED === '1' }),
     transport: t,
     instanceId: id,
     reconcileMs: 60_000,

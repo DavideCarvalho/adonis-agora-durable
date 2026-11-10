@@ -5,7 +5,8 @@
  *   pnpm exec tsc -p tsconfig.build.json
  *   node bench/claim-pending.mjs <processes=1>
  *
- * Env: DURABLE_PG_URL, BENCH_WF (1000), BENCH_POOL (per process, 10), BENCH_ROOT (another checkout's
+ * Env: DURABLE_PG_URL, BENCH_WF (1000), BENCH_POOL (per process, 10), BENCH_PREPARED=1 (the store
+ * sends its hot statements as named prepared statements), BENCH_ROOT (another checkout's
  * `packages/adonis`, built, for an A/B). Not part of the suite.
  */
 import { fork } from 'node:child_process';
@@ -38,7 +39,7 @@ pg.Client.prototype.query = function (...args) {
 const idle = { dispatch: () => undefined };
 function engineOn(db) {
   const engine = new WorkflowEngine({
-    store: new LucidStateStore(db),
+    store: new LucidStateStore(db, { preparedStatements: process.env.BENCH_PREPARED === '1' }),
     runDispatcher: idle,
     reconcileMs: 60_000,
   });
