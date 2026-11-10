@@ -1,4 +1,4 @@
-import type { ControlMessage, ControlPlane } from '../index.js';
+import type { ControlMessage, ControlPlane, ControlPublishTarget } from '../index.js';
 import { swallowSubscribe } from '../safe-subscribe.js';
 import { controlChannel, effectivePrefix } from '../transports/bullmq/naming.js';
 
@@ -107,9 +107,10 @@ export interface RedisControlPlaneOptions {
    */
   prefix?: string;
   /**
-   * Deployment namespace folded into the channel name. Unset adopts the engine's namespace (see
-   * {@link RedisControlPlane.useNamespace}); an explicit value wins. `default` keeps the bare
-   * `` `${prefix}-control` `` channel.
+   * Deployment namespace folded into the channel name this control plane LISTENS on. Unset adopts the
+   * engine's namespace (see {@link RedisControlPlane.useNamespace}); an explicit value wins. `default`
+   * keeps the bare `` `${prefix}-control` `` channel. It does not pin publishing: a message about a
+   * run still goes to the channel of that run's namespace (see {@link RedisControlPlane.publishControl}).
    */
   namespace?: string;
   /**
@@ -187,9 +188,15 @@ export class RedisControlPlane implements ControlPlane {
     this.pingIntervalMs = normalizePingInterval(options.pingIntervalMs);
   }
 
-  /** The broadcast channel: `` `${effectivePrefix}-control` ``, as the BullMQ transports name it. */
+  /** The channel this control plane listens on: `` `${effectivePrefix}-control` ``, as the BullMQ
+   *  transports name it. */
   get channel(): string {
-    return controlChannel(effectivePrefix(this.prefix, this.namespace));
+    return this.channelFor(this.namespace);
+  }
+
+  /** The channel of `namespace` (`''`, `default` and unset are all the bare `<prefix>-control`). */
+  channelFor(namespace: string | undefined): string {
+    return controlChannel(effectivePrefix(this.prefix, namespace || undefined));
   }
 
   /**
@@ -201,8 +208,16 @@ export class RedisControlPlane implements ControlPlane {
     this.namespace = namespace;
   }
 
-  async publishControl(msg: ControlMessage): Promise<void> {
-    await this.connection.publish(this.channel, JSON.stringify(msg));
+  /**
+   * Publish `msg`. A message about a run (`target.namespace` known) goes to the channel of that run's
+   * namespace, so the instances serving the run hear it whichever namespace the publisher is in: a
+   * console with no namespace cancels a run on a namespaced worker in real time. Anything else goes to
+   * this control plane's own channel. The payload is the same either way.
+   */
+  async publishControl(msg: ControlMessage, target?: ControlPublishTarget): Promise<void> {
+    const channel =
+      target?.namespace !== undefined ? this.channelFor(target.namespace) : this.channel;
+    await this.connection.publish(channel, JSON.stringify(msg));
   }
 
   onControl(handler: (msg: ControlMessage) => void): void {

@@ -106,6 +106,74 @@ describe.skipIf(!REDIS_URL)('RedisControlPlane (real Redis)', () => {
     expect(aborted).toEqual(['run1']);
   });
 
+  /** Wait until `count` subscribers listen on `channel`, as the server sees it. */
+  async function subscribedOn(channel: string, count: number): Promise<void> {
+    const c = client();
+    const deadline = Date.now() + 20_000;
+    for (;;) {
+      const [, n] = (await c.pubsub('NUMSUB', channel)) as [string, number];
+      if (Number(n) >= count) return;
+      if (Date.now() > deadline) throw new Error(`${channel} never reached ${count} subscribers`);
+      await delay(10);
+    }
+  }
+
+  it('a console with no namespace cancels a run on a namespaced worker in real time', async () => {
+    const prefix = `${PREFIX}-${++ns}`;
+    const store = new InMemoryStateStore();
+    const worker = new WorkflowEngine({
+      store,
+      controlPlane: plane(prefix),
+      instanceId: 'bulas-worker',
+      namespace: 'bulas',
+    });
+    const consoleEngine = new WorkflowEngine({
+      store,
+      controlPlane: plane(prefix),
+      instanceId: 'console',
+    });
+    const aborted: string[] = [];
+    worker.onCancel((runId) => aborted.push(runId));
+    await subscribedOn(`${prefix}-bulas-control`, 1);
+    await subscribedOn(`${prefix}-control`, 1);
+
+    worker.register('wf', '1', async (ctx) => ctx.waitForSignal('go'));
+    await startRun(worker, 'wf', {}, 'bulas-run');
+    expect((await store.getRun('bulas-run'))?.namespace).toBe('bulas');
+
+    await consoleEngine.cancel('bulas-run');
+    await until(() => aborted.length > 0);
+    expect(aborted).toEqual(['bulas-run']);
+  });
+
+  it('a namespaced engine publishes about a default run on the bare channel', async () => {
+    const prefix = `${PREFIX}-${++ns}`;
+    const store = new InMemoryStateStore();
+    const operator = new WorkflowEngine({ store });
+    operator.register('wf', '1', async (ctx) => ctx.waitForSignal('go'));
+    await startRun(operator, 'wf', {}, 'default-run');
+
+    const listener = client().duplicate();
+    clients.push(listener);
+    const heard: Array<{ channel: string; kind: string }> = [];
+    listener.on('message', (channel, payload) =>
+      heard.push({ channel, kind: (JSON.parse(payload) as { kind: string }).kind }),
+    );
+    await listener.subscribe(`${prefix}-control`, `${prefix}-bulas-control`);
+
+    const bulas = new WorkflowEngine({
+      store,
+      controlPlane: plane(prefix),
+      instanceId: 'bulas',
+      namespace: 'bulas',
+    });
+    await bulas.cancel('default-run');
+    await until(() => heard.some((m) => m.kind === 'cancel'));
+    expect(heard.filter((m) => m.kind === 'cancel')).toEqual([
+      { channel: `${prefix}-control`, kind: 'cancel' },
+    ]);
+  });
+
   it('fans out lifecycle events to another pod, each exactly once (from dedupe)', async () => {
     const prefix = `${PREFIX}-${++ns}`;
     const { worker, dashboard } = twoPods(prefix);

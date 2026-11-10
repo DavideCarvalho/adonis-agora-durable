@@ -2142,8 +2142,22 @@ export interface GroupHealth {
  * `controlPlane` to enable cross-instance events/cancellation; omit it and the engine is local-only.
  * A transport that can broadcast may implement this too and be passed as both.
  */
+/** Where a {@link ControlPlane.publishControl} message is about. */
+export interface ControlPublishTarget {
+  /**
+   * The namespace of the run the message is about. A control plane that partitions its channel by
+   * namespace (the Redis one) publishes there, so the instances serving that run's namespace hear it
+   * whichever namespace the publisher is in. `''`, `'default'` and `undefined` are the default pool.
+   */
+  namespace?: string | undefined;
+}
+
 export interface ControlPlane {
-  publishControl(msg: ControlMessage): Promise<void>;
+  /**
+   * Broadcast `msg`. `target` names the namespace of the run it is about, when there is one; without
+   * it, the message goes where the publisher's own instances listen.
+   */
+  publishControl(msg: ControlMessage, target?: ControlPublishTarget): Promise<void>;
   onControl(handler: (msg: ControlMessage) => void): void;
   /**
    * Optional: adopt the engine's namespace, so a namespaced engine broadcasts on its own channel (the

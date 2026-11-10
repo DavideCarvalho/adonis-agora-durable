@@ -63,10 +63,16 @@ going. To read the outcome without a `try`/`catch`, use `Wf.dispatch` and then
 
 ## The Redis control plane channel includes the namespace
 
-`controlPlanes.redis` (and `RedisControlPlane`) broadcast cancellation and lifecycle events on
-`<prefix>-<namespace>-control` when the engine has a `namespace`, the same way the `bullmq`
-transport names its queues and the NestJS and Python workers name the channel. An engine without a
-namespace, or with `namespace: 'default'`, stays on `<prefix>-control`.
+`controlPlanes.redis` (and `RedisControlPlane`) listen on `<prefix>-<namespace>-control` when the
+engine has a `namespace`, the same way the `bullmq` transport names its queues and the NestJS and
+Python workers name the channel. An engine without a namespace, or with `namespace: 'default'`, stays
+on `<prefix>-control`.
+
+A message about a run (a cancel, an enqueue nudge, the run's lifecycle events) is published on the
+channel of that run's namespace. A console with no namespace that cancels a run on a namespaced
+worker therefore reaches it at once, with no extra setting: don't pin `namespace: 'default'` on the
+control plane for that. Messages with no run stay on the publisher's own channel. Delivery is
+best-effort: the cancel is recorded in the store first, and the message only makes it immediate.
 
 This is a wire change for namespaced deployments:
 

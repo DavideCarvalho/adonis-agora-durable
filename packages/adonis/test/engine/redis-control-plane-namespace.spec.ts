@@ -11,13 +11,17 @@ import { controlChannel, effectivePrefix } from '../../src/transports/bullmq/nam
  */
 function fakeConnection() {
   const published: string[] = [];
+  const messages: Array<{ channel: string; kind: string; type?: string }> = [];
   const subscribed: string[] = [];
   return {
     published,
+    messages,
     subscribed,
     connection: {
-      publish(channel: string) {
+      publish(channel: string, payload: string) {
         published.push(channel);
+        const msg = JSON.parse(payload) as { kind: string; event?: { type: string } };
+        messages.push({ channel, kind: msg.kind, ...(msg.event ? { type: msg.event.type } : {}) });
         return Promise.resolve(1);
       },
       subscribe(channel: string) {
@@ -88,5 +92,62 @@ describe('RedisControlPlane channel namespace folding', () => {
     const { cp, subscribed } = plane();
     new WorkflowEngine({ store: new InMemoryStateStore(), controlPlane: cp });
     expect(subscribed).toEqual(['durable-control']);
+  });
+});
+
+describe('RedisControlPlane publishes a message about a run on that run’s namespace channel', () => {
+  it('routes by target namespace, and keeps the own channel without one', async () => {
+    const { cp, published } = plane({ namespace: 'console' });
+    await cp.publishControl({ kind: 'cancel', runId: 'r1' }, { namespace: 'bulas' });
+    await cp.publishControl({ kind: 'cancel', runId: 'r2' }, { namespace: 'default' });
+    await cp.publishControl({ kind: 'cancel', runId: 'r3' }, { namespace: '' });
+    await cp.publishControl({ kind: 'schedulePause', key: 'k', paused: true });
+    await cp.publishControl({ kind: 'cancel', runId: 'r4' }, { namespace: undefined });
+    expect(published).toEqual([
+      'durable-bulas-control',
+      'durable-control',
+      'durable-control',
+      'durable-console-control', // no run: the publisher's own (explicitly pinned) channel
+      'durable-console-control', // a run of unknown namespace: the publisher's own channel
+    ]);
+  });
+
+  it('an operator engine sends a namespaced run’s cancel and lifecycle to that namespace', async () => {
+    const { cp, messages } = plane();
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore(), controlPlane: cp });
+    engine.register('parked', '1', async (ctx) => {
+      await ctx.localStep('prep', async () => 1);
+      return ctx.waitForSignal('never-sent');
+    });
+    await engine.start('parked', {}, 'b1', { namespace: 'bulas' });
+    await new Promise((r) => setTimeout(r, 50));
+    await engine.cancel('b1');
+    await new Promise((r) => setTimeout(r, 20));
+
+    const byKind = (kind: string) => messages.filter((m) => m.kind === kind);
+    expect(byKind('cancel').map((m) => m.channel)).toEqual(['durable-bulas-control']);
+    expect(byKind('enqueued').map((m) => m.channel)).toEqual(['durable-bulas-control']);
+    const runEvents = messages.filter((m) => m.type?.startsWith('run.'));
+    expect(runEvents.length).toBeGreaterThan(0);
+    expect(new Set(runEvents.map((m) => m.channel))).toEqual(new Set(['durable-bulas-control']));
+    // Step events carry no namespace: they stay on the publisher's own channel.
+    const stepEvents = messages.filter((m) => m.type?.startsWith('step.') || m.kind === 'events');
+    expect(stepEvents.length).toBeGreaterThan(0);
+    expect(new Set(stepEvents.map((m) => m.channel))).toEqual(new Set(['durable-control']));
+  });
+
+  it('a namespaced engine sends a default run’s cancel to the bare channel', async () => {
+    const store = new InMemoryStateStore();
+    const operator = new WorkflowEngine({ store });
+    operator.register('parked', '1', async (ctx) => ctx.waitForSignal('never-sent'));
+    await operator.start('parked', {}, 'd1');
+    await new Promise((r) => setTimeout(r, 20));
+
+    const { cp, messages } = plane();
+    const bulas = new WorkflowEngine({ store, controlPlane: cp, namespace: 'bulas' });
+    await bulas.cancel('d1');
+    expect(messages.filter((m) => m.kind === 'cancel').map((m) => m.channel)).toEqual([
+      'durable-control',
+    ]);
   });
 });
