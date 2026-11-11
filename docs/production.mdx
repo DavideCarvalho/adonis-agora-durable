@@ -331,7 +331,7 @@ Both depend on the worker loop running somewhere, like timers and retention.
 
 ## 14. Observe it
 
-- **The [dashboard](/docs/durable/observability/dashboard)** is the operating surface — run list, step graph, retry/cancel/fix-and-replay. It fails closed by default: set `DURABLE_DASHBOARD_TOKEN`, or supply your own `authorize` guard or the [session layer](/docs/durable/observability/dashboard-auth).
+- **The [dashboard](/docs/durable/observability/dashboard)** is the operating surface — run list, step graph, retry/cancel/fix-and-replay. Without `authorize` it answers `403` to everything in production: set `authorize` (and `authorizeByToken` for scripts).
 - **Page on stranded runs.** `suspended` is not an error, so a lost dispatch alerts nobody. Register `engine.onStalled` (and tune `stalledAfter`, default `'15m'`) so the worker loop pages you once per stranded episode; `node ace durable:runs --stale` is the same query by hand. See [the stalled-run pager](/docs/durable/reliability/failure-modes#the-stalled-run-pager--onstalled--stalledafter).
 - **Dead runs.** `engine.onDead` fires for every run that crosses `maxRecoveryAttempts`, and for every run whose workflow version stayed registered nowhere past `unregisteredWorkflowGraceMs` (a workflow renamed or deleted with runs in flight; error code `workflow_not_registered`).
 - **Traces.** [OpenTelemetry](/docs/durable/observability/otel) turns runs into traces — a root span per run, a child span per step — and continues them on remote workers through `traceparent`. One caveat before you build a latency dashboard on it: the root span ends when the run first suspends and is not reopened on resume, so steps that settle after a sleep, a signal wait or a remote dispatch show up as spans without that parent.

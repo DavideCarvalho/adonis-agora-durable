@@ -255,11 +255,11 @@ A bounded wait takes **two** logical positions (the deadline and the wait), so a
 
 **Cause:**
 
-- **Access denied.** The default `authorize` fails closed in every environment: it requires a bearer token equal to `DURABLE_DASHBOARD_TOKEN` and denies everything when that variable is unset.
+- **Access denied.** Without `authorize`, the console answers `403` to every request when the app runs in production (the boot log says so).
 - **No runs.** With `scopeReads: true` (and a `namespace`), the engine reads through a store view that only sees its own namespace, so runs stamped with another namespace are invisible to this dashboard by design. With no `store` configured, the engine uses the in-memory store, so each process only sees its own runs — and loses them on restart. Two pools on different namespaces, or a dashboard pointed at a different Lucid connection, also see different sets.
 - **Empty worker health.** `engine.workerHealth()` and the `/api/health` panel read group health off the transport, and only `bullmq`, `queue` (with a worker-key store) and `db` report it; on `eventEmitter` it is empty, not "healthy".
 
-**Fix:** set the token or your own `authorize` ([Dashboard → Authorization](/docs/durable/observability/dashboard#authorization)); select the [Lucid store](/docs/durable/stores/lucid) and check `namespace` / `scopeReads` on the process serving the dashboard; for stranded-run detection off BullMQ, use `durable:runs --stale` or `engine.onStalled`.
+**Fix:** set `authorize` ([Dashboard → Authorization](/docs/durable/observability/dashboard#authorization)); select the [Lucid store](/docs/durable/stores/lucid) and check `namespace` / `scopeReads` on the process serving the dashboard; for stranded-run detection off BullMQ, use `durable:runs --stale` or `engine.onStalled`.
 
 ## Two pools execute each other's runs
 

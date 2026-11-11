@@ -135,11 +135,11 @@ Durable doesn't ship a generated or prebuilt client for the dashboard's REST API
 The document is served at `GET <path>/api/openapi.json`, which is `/durable/api/openapi.json` with the default `path`:
 
 ```bash
-curl -H "Authorization: Bearer $DURABLE_DASHBOARD_TOKEN" \
+curl -H "Authorization: Bearer $CONSOLE_TOKEN" \
   http://localhost:3333/durable/api/openapi.json > durable-openapi.json
 ```
 
-The route sits behind the same [`authorize` gate](/docs/durable/observability/dashboard#authorization) as the rest of the API, so send the dashboard token (or a session) like any other API call. Its `servers` entry is the mounted API base (`/durable/api`, or `<path>/api`), so paths in the document are relative to it (`/runs`, `/runs/{id}/retry`, …).
+The route sits behind the same [`authorize` gate](/docs/durable/observability/dashboard#authorization) as the rest of the API, so send whatever your `authorize` accepts, for example the token of [`authorizeByToken`](/docs/durable/observability/dashboard#scripts-and-scrapers-authorizebytoken). Its `servers` entry is the mounted API base (`/durable/api`, or `<path>/api`), so paths in the document are relative to it (`/runs`, `/runs/{id}/retry`, …).
 
 The document isn't exported as a library function. The served route is the way to get it, and committing the downloaded `durable-openapi.json` keeps client generation reproducible offline and in CI. Diffing a freshly fetched copy against the committed one after an upgrade shows exactly what changed in the wire contract.
 
@@ -185,7 +185,7 @@ What the generated types cover:
 `GET /runs/{id}/stream` is a Server-Sent Events endpoint, so read it with `EventSource` (see [Live-tailing one run](/docs/durable/observability/dashboard#live-tailing-one-run)) rather than through the generated client.
 
 <Callout type="warn" title="It's still a control surface">
-A generated client talks to the same routes the console does, including retry, cancel, bulk and the human-in-the-loop verbs. A browser client in your own frontend needs the dashboard to accept its requests: configure [`dashboardAuth`](/docs/durable/observability/dashboard-auth) or a custom `authorize` that recognises your app's session rather than shipping the bearer token to the browser. Mutating requests are also subject to the dashboard's cross-site rejection and session-role checks.
+A generated client talks to the same routes the console does, including retry, cancel, bulk and the human-in-the-loop verbs. A browser client in your own frontend needs the dashboard to accept its requests: use an `authorize` that recognises your app's session rather than shipping a bearer token to the browser. Mutating requests are also subject to the dashboard's cross-site rejection.
 </Callout>
 
 For server-side code in the same app, you don't need HTTP at all. The handlers behind the routes (`listRuns`, `getRun`, `getRunEvent`, `retryRun`, `cancelRun`, `deliverWebhook`, `metricsText`, …) are exported from `@adonis-agora/durable/dashboard`, and `runGateway` from `@adonis-agora/durable/services/main` is the role-agnostic read/control surface. See [Calling the API directly](/docs/durable/observability/dashboard#calling-the-api-directly).

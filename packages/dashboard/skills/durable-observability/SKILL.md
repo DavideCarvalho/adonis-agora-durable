@@ -2,8 +2,8 @@
 name: durable-observability
 description: >-
   Operate and observe @adonis-agora/durable runs: the embedded dashboard
-  (config/durable_dashboard.ts, enabled/path/authorize, dashboardAuth session
-  layer with session/login hooks, JSON API for listRuns/retry/retry-with-input/
+  (config/durable_dashboard.ts, enabled/path/authorize, authorizeByToken for
+  scripts, JSON API for listRuns/retry/retry-with-input/
   cancel/redispatch/bulk, SSE live tail via EventSource), engine.subscribe
   lifecycle events (run.started/completed/failed/suspended, step.*,
   capability.unavailable), engine.use local-step interceptors, collectMetrics
@@ -19,7 +19,6 @@ metadata:
   framework: adonisjs
 sources:
   - 'DavideCarvalho/adonis-durable:docs/observability/dashboard.mdx'
-  - 'DavideCarvalho/adonis-durable:docs/observability/dashboard-auth.mdx'
   - 'DavideCarvalho/adonis-durable:docs/observability/events-and-interceptors.mdx'
   - 'DavideCarvalho/adonis-durable:docs/observability/otel.mdx'
   - 'DavideCarvalho/adonis-durable:docs/observability/telescope.mdx'
@@ -65,43 +64,27 @@ denial (incl. a throwing hook) → `403`; `{ redirectTo }` → `302` for a page
 navigation, `401` for an API call. A hook that already answered the request (a
 redirect, a body) keeps its answer.
 
-The default `authorize` fails closed in **every** environment: it requires a
-bearer token equal to `DURABLE_DASHBOARD_TOKEN`, denying everything when that
-env var is unset. Open it up explicitly with `dashboardAuth`, your own
-`authorize`, or (local dev only) `allowUnauthenticated: true`.
-The console mutates runs — always front it with a real guard beyond local dev.
+Without `authorize`, the console is open when the app is not in production
+(`app.inProduction === false`) and answers `403` to every request in
+production, with one warning logged at boot. The console mutates runs — set
+`authorize` before you deploy.
 
 ## Core patterns
 
-### Pattern 1 — operator sign-in with `dashboardAuth`
-
-Opt-in session layer, additive to `authorize` (both must pass). `secret` plus at
-least one of `session` / `login`; a mis-wired gate throws at boot:
+### Pattern 1 — script access with `authorizeByToken`
 
 ```ts title="config/durable_dashboard.ts"
-import { defineConfig } from '@adonis-agora/durable/dashboard'
 import env from '#start/env'
-import User from '#models/user'
+import { authorizeByToken, defineConfig } from '@adonis-agora/durable/dashboard'
 
 export default defineConfig({
-  path: '/durable',
-  dashboardAuth: {
-    secret: env.get('DURABLE_DASHBOARD_SECRET'), // HMAC-SHA256 key, 32+ bytes
-    ttl: '8h',
-    login: async (username, password) => {
-      const user = await User.verifyCredentials(username, password).catch(() => null)
-      if (!user || !user.isAdmin) return null // null denies
-      return { id: String(user.id), name: user.fullName, roles: ['admin'] }
-    },
-    // or Mode A — mint a session from your app's own cookie via
-    // POST <path>/session with credentials: 'include' and redirect: 'manual'.
-  },
+  authorize: authorizeByToken({ token: env.get('CONSOLE_TOKEN') }),
 })
 ```
 
-Adds `GET/POST <path>/login`, `POST <path>/session`, `GET <path>/logout`. Pages
-redirect 302 to login without a valid cookie; API requests get
-`401 { error, auth: { modes } }`. Source: `docs/observability/dashboard-auth.mdx`.
+Allows a matching `Authorization: Bearer <token>` header (timing-safe), else
+`401`. Header only — no query string, no custom header. An empty or undefined
+token throws when the config loads. Source: `docs/observability/dashboard.mdx`.
 
 ### Pattern 2 — fix-and-replay and bulk actions
 
@@ -227,7 +210,7 @@ Per-run actions stay in the durable dashboard. Source:
 Wrong:
 
 ```ts
-export default defineConfig({}) // DURABLE_DASHBOARD_TOKEN unset — every route 403s
+export default defineConfig({}) // open in dev, every route 403s in production
 ```
 
 Correct:
@@ -241,11 +224,9 @@ export default defineConfig({
 })
 ```
 
-Mechanism: the default authorize fails CLOSED in every environment when the
-token env var is unset, so every console route 403s and the console looks
-broken rather than leaking — either set the token deliberately, configure
-`dashboardAuth`, or override authorize (`allowUnauthenticated: true` is the
-explicit local-dev-only opt-out).
+Mechanism: without `authorize` the console is open outside production and
+denies every request in production, so it works locally and 403s once
+deployed. Set `authorize` (and `authorizeByToken` for scripts).
 Source: `docs/observability/dashboard.mdx` ("Authorization").
 
 ### HIGH making interceptor outputs depend on time, randomness or external state

@@ -627,51 +627,29 @@ function uiBase(): string {
   return '/durable';
 }
 
-/**
- * The provider's session-logout URL (`GET <base>/logout` — `dashboard_provider.ts`'s
- * `registerAuthRoutes`): a plain idempotent GET that clears the console's session cookie and
- * redirects to the login page (Mode B) or the dashboard root, so a simple `<a href>` works. The
- * route only exists when the host configured `dashboardAuth`; on an unauthenticated deployment
- * following it just 404s harmlessly (the injected config carries no auth flag to gate on).
- */
-export function logoutUrl(): string {
-  return `${uiBase()}/logout`;
-}
-
 function apiBase(): string {
   const injected = readConfig().api;
   if (typeof injected === 'string') return injected;
   return `${uiBase()}/api`;
 }
 
-/** Best-effort read of an `{ error: 'unauthorized' }`/`{ auth: { modes } }` 401 body. The AdonisJS
- *  dashboard's session guard sends a plain `{ error: 'unauthorized' }` (no `modes` — it only has one
- *  auth surface, the built-in login page), so this always falls back to a bare navigation to `uiBase()`,
- *  which itself redirects to the login page server-side when `dashboardAuth` is configured. */
-async function readAuthModes(res: Response): Promise<string[] | undefined> {
+/** The `redirectTo` a `401` body carries when the console's `authorize` asked for a redirect. */
+async function readRedirectTo(res: Response): Promise<string | undefined> {
   try {
     const body: unknown = await res.json();
-    if (typeof body !== 'object' || body === null || !('auth' in body)) return undefined;
-    const auth = (body as { auth?: unknown }).auth;
-    if (typeof auth !== 'object' || auth === null || !('modes' in auth)) return undefined;
-    const modes = (auth as { modes?: unknown }).modes;
-    return Array.isArray(modes)
-      ? modes.filter((m): m is string => typeof m === 'string')
-      : undefined;
+    if (typeof body !== 'object' || body === null) return undefined;
+    const target = (body as { redirectTo?: unknown }).redirectTo;
+    return typeof target === 'string' && target !== '' ? target : undefined;
   } catch {
     return undefined;
   }
 }
 
-function redirectToAuthSurface(modes: readonly string[] | undefined): void {
+/** On a `401`, go where `authorize` asked (`redirectTo`), else reload the console page so the
+ *  server answers the navigation itself (its access-denied page, or its own redirect). */
+function redirectToAuthSurface(redirectTo: string | undefined): void {
   if (typeof window === 'undefined') return;
-  const base = uiBase();
-  if (modes?.includes('login')) {
-    const returnTo = encodeURIComponent(window.location.pathname + window.location.search);
-    window.location.href = `${base}/login?returnTo=${returnTo}`;
-    return;
-  }
-  window.location.href = base;
+  window.location.href = redirectTo ?? (uiBase() || '/');
 }
 
 /**
@@ -709,8 +687,8 @@ async function send(path: string, init?: RequestInit): Promise<Response> {
       : {}),
   });
   if (res.status === 401) {
-    redirectToAuthSurface(await readAuthModes(res));
-    throw new Error('Session expired; redirecting to sign-in.');
+    redirectToAuthSurface(await readRedirectTo(res));
+    throw new Error('Not signed in; redirecting.');
   }
   if (res.type === 'opaqueredirect' || res.redirected || (res.status >= 300 && res.status < 400)) {
     throw new DurableActionError(res.status, REDIRECTED, undefined);
@@ -1070,15 +1048,6 @@ export const durableClient = {
     return () => source.close();
   },
 };
-
-export {
-  ConsoleSessionError,
-  durableConsoleSessionUrl,
-  durableConsoleUrl,
-  mintDurableConsoleSession,
-  type OpenConsoleOptions,
-  openDurableConsole,
-} from './console-session.js';
 
 export { groupSubProcesses, type SubProcess } from './group-subprocesses.js';
 export {

@@ -470,7 +470,7 @@ describe('durableClient.values: the picker enumeration', () => {
   });
 });
 
-describe('durableClient: 401 handling (session gone mid-console)', () => {
+describe('durableClient: 401 handling', () => {
   beforeEach(() => {
     (globalThis as { window?: FakeWindow }).window = {
       location: { href: '', pathname: '/durable/runs/abc', search: '?tab=timeline' },
@@ -482,42 +482,27 @@ describe('durableClient: 401 handling (session gone mid-console)', () => {
     vi.unstubAllGlobals();
   });
 
-  it('sends the operator to the login page (with returnTo) when the server offers Mode B', async () => {
+  it('goes where authorize asked when the 401 carries a redirectTo', async () => {
     vi.stubGlobal(
       'fetch',
       vi
         .fn()
         .mockResolvedValue(
-          jsonResponse({ error: 'unauthorized', auth: { modes: ['login'] } }, 401),
+          jsonResponse({ error: 'unauthenticated', redirectTo: '/auth/login' }, 401),
         ),
     );
 
     await expect(durableClient.runs()).rejects.toThrow();
 
     const win = (globalThis as unknown as { window: FakeWindow }).window;
-    expect(win.location.href).toBe(
-      '/durable/login?returnTo=%2Fdurable%2Fruns%2Fabc%3Ftab%3Dtimeline',
-    );
+    expect(win.location.href).toBe('/auth/login');
   });
 
-  it('sends the operator to the UI mount when only session mode (Mode A) is offered', async () => {
+  it('falls back to the UI mount on a bare 401', async () => {
     vi.stubGlobal(
       'fetch',
-      vi
-        .fn()
-        .mockResolvedValue(
-          jsonResponse({ error: 'unauthorized', auth: { modes: ['session'] } }, 401),
-        ),
+      vi.fn().mockResolvedValue(jsonResponse({ error: 'unauthenticated' }, 401)),
     );
-
-    await expect(durableClient.runs()).rejects.toThrow();
-
-    const win = (globalThis as unknown as { window: FakeWindow }).window;
-    expect(win.location.href).toBe('/durable');
-  });
-
-  it("falls back to the UI mount on a bare 401 with no auth info (today's unauthenticated-by-default dashboard)", async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ error: 'unauthorized' }, 401)));
 
     await expect(durableClient.runs()).rejects.toThrow();
 
@@ -544,17 +529,13 @@ describe('durableClient: root-mounted base (path: "")', () => {
     };
     vi.stubGlobal(
       'fetch',
-      vi
-        .fn()
-        .mockResolvedValue(
-          jsonResponse({ error: 'unauthorized', auth: { modes: ['login'] } }, 401),
-        ),
+      vi.fn().mockResolvedValue(jsonResponse({ error: 'unauthenticated' }, 401)),
     );
 
     await expect(durableClient.runs()).rejects.toThrow();
 
     const win = (globalThis as unknown as { window: FakeWindow }).window;
-    expect(win.location.href).toBe('/login?returnTo=%2Fruns%2Fabc');
+    expect(win.location.href).toBe('/');
   });
 });
 

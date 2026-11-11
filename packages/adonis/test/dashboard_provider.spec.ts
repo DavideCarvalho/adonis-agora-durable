@@ -82,6 +82,61 @@ describe('DashboardProvider — boots inside a real AdonisJS app', () => {
   });
 });
 
+describe('DashboardProvider — boot warning when authorize is omitted', () => {
+  let appRoot: string;
+  beforeEach(async () => {
+    appRoot = await mkdtemp(join(tmpdir(), 'durable-dashboard-warn-'));
+  });
+  afterEach(async () => {
+    await rm(appRoot, { recursive: true, force: true });
+  });
+
+  async function bootWith(config: Record<string, unknown> | undefined): Promise<string[]> {
+    const warnings: string[] = [];
+    // Runs before the dashboard provider boots: capture every logger.warn line.
+    class SpyProvider {
+      constructor(protected app: { container: { make(key: string): Promise<unknown> } }) {}
+      async boot() {
+        const logger = (await this.app.container.make('logger')) as {
+          warn: (message: string) => void;
+        };
+        logger.warn = (message: string) => {
+          warnings.push(message);
+        };
+      }
+    }
+    const ignitor = new IgnitorFactory()
+      .withCoreProviders()
+      .withCoreConfig()
+      .merge({
+        ...(config ? { config: { durable_dashboard: config } } : {}),
+        rcFileContents: {
+          providers: [
+            async () => ({ default: SpyProvider }),
+            () => import('../providers/dashboard_provider.js'),
+          ],
+        },
+      })
+      .create(pathToFileURL(`${appRoot}/`));
+    const app = ignitor.createApp('web');
+    await app.init();
+    await app.boot();
+    return warnings;
+  }
+
+  it('logs the shared warning exactly once at boot', async () => {
+    const { NO_AUTHORIZE_WARNING } = await import('../src/dashboard/define_config.js');
+    const warnings = await bootWith(undefined);
+    expect(warnings.filter((w) => w === NO_AUTHORIZE_WARNING)).toHaveLength(1);
+  });
+
+  it('stays quiet when authorize is set', async () => {
+    const { NO_AUTHORIZE_WARNING } = await import('../src/dashboard/define_config.js');
+    const warnings = await bootWith({ authorize: () => true });
+    expect(warnings).not.toContain(NO_AUTHORIZE_WARNING);
+  });
+});
+
 describe('DashboardProvider — a mounted console observes every namespace', () => {
   let appRoot: string;
   beforeEach(async () => {
@@ -256,7 +311,7 @@ describe('DashboardProvider — authorize hook owns its denial response', () => 
         );
         expect(allowed).toBe(false);
         expect(state.status).toBe(401);
-        if (mode === 'api') expect(state.body).toEqual({ error: 'unauthorized' });
+        if (mode === 'api') expect(state.body).toEqual({ error: 'unauthenticated' });
         else expect(state.body).toContain('<h1>Sign in required</h1>');
       });
 
@@ -316,15 +371,6 @@ describe('DashboardProvider — authorize hook owns its denial response', () => 
         expect(state.status).toBe(403);
       }
     });
-
-    it('an allowed decision still composes with the dashboardAuth session step', async () => {
-      const { allowed, state } = await runEnforce(() => ({ allowed: true }), 'api', {
-        dashboardAuth: { secret: 's'.repeat(32), session: () => null },
-      });
-      expect(allowed).toBe(false);
-      expect(state.status).toBe(401);
-      expect(state.body).toEqual({ error: 'unauthorized', auth: { modes: ['session'] } });
-    });
   });
 
   describe('console authorize contract (function | class | lazy import, redirectTo)', () => {
@@ -351,7 +397,7 @@ describe('DashboardProvider — authorize hook owns its denial response', () => 
       const { allowed, state } = await runEnforce(() => ({ redirectTo: '/login' }), 'api');
       expect(allowed).toBe(false);
       expect(state.status).toBe(401);
-      expect(state.body).toEqual({ error: 'unauthorized' });
+      expect(state.body).toEqual({ error: 'unauthenticated', redirectTo: '/login' });
     });
 
     it('a class authorizer gates the request', async () => {
@@ -372,58 +418,82 @@ describe('DashboardProvider — authorize hook owns its denial response', () => 
     });
   });
 
-  describe('default (authorize omitted) stays fail-closed', () => {
-    async function runDefault(
-      extra: Record<string, unknown>,
-      headers: Record<string, string> = {},
-    ) {
+  describe('default (authorize omitted): open outside production, 403 in production', () => {
+    async function runDefault(inProduction: boolean | undefined, mode: 'page' | 'api' = 'api') {
       const { default: DashboardProvider } = await import('../providers/dashboard_provider.js');
       const { resolveConfig } = await import('../src/dashboard/define_config.js');
       const provider = new DashboardProvider({} as never);
-      const config = resolveConfig(extra);
+      const config = resolveConfig({}, inProduction === undefined ? {} : { inProduction });
+      const { ctx, state } = fakeCtx();
+      const allowed = await (
+        provider as unknown as {
+          enforce(c: unknown, x: unknown, m: 'page' | 'api'): Promise<boolean>;
+        }
+      ).enforce(config, ctx, mode);
+      return { allowed, state };
+    }
+
+    it('outside production every request passes', async () => {
+      expect((await runDefault(false, 'api')).allowed).toBe(true);
+      expect((await runDefault(false, 'page')).allowed).toBe(true);
+    });
+
+    it('in production every request is a 403 (shell and API)', async () => {
+      const api = await runDefault(true, 'api');
+      expect(api.allowed).toBe(false);
+      expect(api.state.status).toBe(403);
+      expect(api.state.body).toEqual({ error: 'forbidden' });
+      const page = await runDefault(true, 'page');
+      expect(page.allowed).toBe(false);
+      expect(page.state.status).toBe(403);
+      expect(page.state.body).toContain('<h1>Access denied</h1>');
+    });
+
+    it('an unknown environment is treated as production', async () => {
+      expect((await runDefault(undefined)).allowed).toBe(false);
+    });
+
+    it('a bearer token alone opens nothing (no token default anymore)', async () => {
+      const { default: DashboardProvider } = await import('../providers/dashboard_provider.js');
+      const { resolveConfig } = await import('../src/dashboard/define_config.js');
+      const provider = new DashboardProvider({} as never);
+      const config = resolveConfig({}, { inProduction: true });
       const { ctx, state } = fakeCtx();
       (ctx as { request: { header: (n: string) => string | undefined } }).request.header = (n) =>
-        headers[n.toLowerCase()];
+        n.toLowerCase() === 'authorization' ? 'Bearer sekret' : undefined;
+      const allowed = await (
+        provider as unknown as {
+          enforce(c: unknown, x: unknown, m: 'page' | 'api'): Promise<boolean>;
+        }
+      ).enforce(config, ctx, 'api');
+      expect(allowed).toBe(false);
+      expect(state.status).toBe(403);
+    });
+  });
+
+  it('authorizeByToken: a matching bearer passes, anything else is a 401', async () => {
+    const { authorizeByToken } = await import('../src/dashboard/console_authorize.js');
+    const gate = authorizeByToken({ token: 'sekret' });
+    const withHeader = async (value: string | undefined) => {
+      const { default: DashboardProvider } = await import('../providers/dashboard_provider.js');
+      const { resolveConfig } = await import('../src/dashboard/define_config.js');
+      const provider = new DashboardProvider({} as never);
+      const config = resolveConfig({ authorize: gate }, { inProduction: true });
+      const { ctx, state } = fakeCtx();
+      (ctx as { request: { header: (n: string) => string | undefined } }).request.header = (n) =>
+        n.toLowerCase() === 'authorization' ? value : undefined;
       const allowed = await (
         provider as unknown as {
           enforce(c: unknown, x: unknown, m: 'page' | 'api'): Promise<boolean>;
         }
       ).enforce(config, ctx, 'api');
       return { allowed, state };
-    }
-
-    it('no token configured -> 403 in every environment', async () => {
-      const previous = process.env.DURABLE_DASHBOARD_TOKEN;
-      delete process.env.DURABLE_DASHBOARD_TOKEN;
-      try {
-        const { allowed, state } = await runDefault({});
-        expect(allowed).toBe(false);
-        expect(state.status).toBe(403);
-      } finally {
-        if (previous !== undefined) process.env.DURABLE_DASHBOARD_TOKEN = previous;
-      }
-    });
-
-    it('the matching bearer token passes; allowUnauthenticated opens it', async () => {
-      const previous = process.env.DURABLE_DASHBOARD_TOKEN;
-      process.env.DURABLE_DASHBOARD_TOKEN = 'sekret';
-      try {
-        expect((await runDefault({}, { authorization: 'Bearer sekret' })).allowed).toBe(true);
-        expect((await runDefault({}, { authorization: 'Bearer nope' })).allowed).toBe(false);
-      } finally {
-        if (previous === undefined) delete process.env.DURABLE_DASHBOARD_TOKEN;
-        else process.env.DURABLE_DASHBOARD_TOKEN = previous;
-      }
-      expect((await runDefault({ allowUnauthenticated: true })).allowed).toBe(true);
-    });
-  });
-
-  it('Mode-A-only with no session gets the "open from your app" page', async () => {
-    const { allowed, state } = await runEnforce(() => true, 'page', {
-      dashboardAuth: { secret: 's'.repeat(32), session: () => null },
-    });
-    expect(allowed).toBe(false);
-    expect(state.status).toBe(401);
-    expect(state.body).toContain('<h1>Open this console from your app</h1>');
+    };
+    expect((await withHeader('Bearer sekret')).allowed).toBe(true);
+    const wrong = await withHeader('Bearer nope');
+    expect(wrong.allowed).toBe(false);
+    expect(wrong.state.status).toBe(401);
+    expect(wrong.state.body).toEqual({ error: 'unauthenticated' });
+    expect((await withHeader(undefined)).state.status).toBe(401);
   });
 });

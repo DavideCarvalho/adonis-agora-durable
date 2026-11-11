@@ -1,11 +1,11 @@
 /**
  * The built-in "access denied" page a BROWSER sees when the dashboard guard refuses a page
- * navigation — the SPA shell, its assets, or (Mode A only) a session-less visit. Before this page
+ * navigation — the SPA shell or its assets. Before this page
  * existed the guard answered every denial with the JSON it answers the API with
  * (`{ "error": "forbidden" }`), which is the right thing for the SPA's `fetch` calls and the wrong
  * thing for a human staring at a browser tab.
  *
- * Deliberately a small, dependency-free, hand-authored HTML page (like `login_page.ts`) — NOT part
+ * Deliberately a small, dependency-free, hand-authored HTML page — NOT part
  * of the bundled SPA, so a denial never needs the SPA to load first. It carries NO `<script>` at all,
  * so a host running a nonce'd `script-src` CSP (the `@adonisjs/shield` default) cannot break it; the
  * one inline `<style>` takes the request's CSP nonce when the provider hands one over.
@@ -28,7 +28,7 @@ export type AccessDeniedReason =
   | 'unauthenticated'
   /** Somebody is signed in but `authorize` said no (a `403`). */
   | 'forbidden'
-  /** `dashboardAuth` runs in Mode A only and there is no session — the host app must mint one. */
+  /** There is no session the console accepts — the host app must sign the user in first. */
   | 'session-required';
 
 /** What the provider knows about the refusal — handed to a custom renderer and to the default page. */
@@ -38,7 +38,7 @@ export interface AccessDeniedInfo {
   reason: AccessDeniedReason;
   /** The console's mount path (`/durable`; `''` when mounted at the root). */
   basePath: string;
-  /** The built-in login page, present only when `dashboardAuth.login` is configured. */
+  /** Where "Sign in" points, when the provider knows one. */
   loginHref?: string;
   /** A developer-facing detail (e.g. a thrown hook's message). Providers set it OUTSIDE production only. */
   detail?: string;

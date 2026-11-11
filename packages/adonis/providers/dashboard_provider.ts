@@ -9,14 +9,6 @@ import {
   resolveAccessDeniedPage,
 } from '../src/dashboard/access_denied_page.js';
 import {
-  performLogin,
-  performSession,
-  type ResolvedDashboardAuth,
-  readSession,
-  SESSION_COOKIE_NAME,
-  sanitizeReturnTo,
-} from '../src/dashboard/auth.js';
-import {
   type CompatSource,
   compat,
   enumerateLiveFleet,
@@ -26,7 +18,7 @@ import {
 import {
   type DashboardAuditEntry,
   type DurableDashboardConfig,
-  isProduction,
+  NO_AUTHORIZE_WARNING,
   type ResolvedDurableDashboardConfig,
   resolveConfig,
 } from '../src/dashboard/define_config.js';
@@ -62,7 +54,6 @@ import {
   workers,
   workflowLifecycle,
 } from '../src/dashboard/handlers.js';
-import { renderLoginPage } from '../src/dashboard/login_page.js';
 import { openApiDocument } from '../src/dashboard/openapi.js';
 import { contentTypeFor, renderIndexHtml } from '../src/dashboard/spa.js';
 import type { DurableConfig } from '../src/define_config.js';
@@ -120,33 +111,7 @@ function spaDirectory(): string {
 export default class DashboardProvider {
   constructor(protected app: ApplicationService) {}
 
-  /** Warn once so a throwing `login`/`session` hook doesn't spam the logs on every failed attempt. */
-  private warnedOnHookThrow = false;
   private warnedOnAuthorizeThrow = false;
-
-  /** Login-attempt timestamps per client address — a simple sliding window (10/min) so a brute
-   *  force can't hammer the host's `login` hook at line rate. In-memory per instance: a cluster
-   *  multiplies the budget by pod count, which still reduces the attack by orders of magnitude. */
-  private readonly loginAttempts = new Map<string, number[]>();
-
-  /** True (and reply 429) when this address exhausted its login window. */
-  private loginRateLimited(ctx: HttpContext): boolean {
-    const WINDOW_MS = 60_000;
-    const MAX_ATTEMPTS = 10;
-    const key = ctx.request.ip() || 'unknown';
-    const now = Date.now();
-    const recent = (this.loginAttempts.get(key) ?? []).filter((t) => now - t < WINDOW_MS);
-    if (recent.length >= MAX_ATTEMPTS) {
-      this.loginAttempts.set(key, recent);
-      ctx.response.status(429).json({ error: 'too many login attempts — retry in a minute' });
-      return true;
-    }
-    recent.push(now);
-    this.loginAttempts.set(key, recent);
-    // Bounded: prune other addresses opportunistically so the map can't grow without limit.
-    if (this.loginAttempts.size > 10_000) this.loginAttempts.clear();
-    return false;
-  }
 
   /** SSE connections currently open, per client address (and in total) — see streamRun. */
   private readonly sseByAddress = new Map<string, number>();
@@ -171,8 +136,10 @@ export default class DashboardProvider {
   async boot() {
     const config = resolveConfig(
       this.app.config.get<DurableDashboardConfig>('durable_dashboard', {}),
+      { inProduction: this.app.inProduction },
     );
     if (!config.enabled) return;
+    if (!config.authorizeConfigured) await this.warnNoAuthorize();
 
     const role = this.durableRole();
 
@@ -220,13 +187,6 @@ export default class DashboardProvider {
       ...(config.redact ? { redact: config.redact } : {}),
       ...(this.metricsCollector ? { metrics: this.metricsCollector } : {}),
     });
-
-    // Built-in `dashboardAuth` (Mode A `session` and/or Mode B `login`, opt-in). Registered ONLY when
-    // configured, so omitting `dashboardAuth` leaves route registration byte-for-byte as it was. These
-    // endpoints are public (behind NEITHER guard): they MINT the session the guard checks for.
-    if (config.dashboardAuth) {
-      this.registerAuthRoutes(router, config, config.dashboardAuth);
-    }
 
     this.registerSpaRoutes(router, config, apiBase);
 
@@ -498,121 +458,12 @@ export default class DashboardProvider {
     }
   }
 
-  /**
-   * Mount the built-in `dashboardAuth` endpoints under `basePath`. All are public (no guard): they
-   * create/destroy the session the {@link enforce} guard checks for.
-   *
-   * - `GET  <base>/login`  -> the server-rendered login page (Mode B only).
-   * - `POST <base>/login`  -> verifies credentials via the host `login` hook and mints the cookie.
-   * - `POST <base>/session` -> Mode A: verifies the HOST APP's own auth (off the raw request) via the
-   *    `session` hook and mints the cookie. No body — the hook reads whatever it needs off `request`.
-   *    `204` on success, uniform `401` on denial. Mirrors `@dudousxd/nestjs-durable-dashboard`'s
-   *    `DurableAuthController.session` and `client/console-session.ts`'s `mintDurableConsoleSession`.
-   * - `GET  <base>/logout` -> clears the cookie and redirects to the login page (Mode B) or the
-   *    dashboard root (Mode A only). A plain `GET` (idempotent, only ever destroys the caller's own
-   *    session) so a simple `<a href>` works.
-   */
-  private registerAuthRoutes(
-    router: HttpRouterService,
-    config: ResolvedDurableDashboardConfig,
-    auth: ResolvedDashboardAuth,
-  ): void {
-    const loginPath = `${config.path}/login`;
-    const sessionPath = `${config.path}/session`;
-    const logoutPath = `${config.path}/logout`;
-
-    if (auth.login) {
-      router
-        .get(loginPath, async (ctx) => {
-          ctx.response.header('content-type', 'text/html; charset=utf-8');
-          ctx.response.header('cache-control', 'no-store, must-revalidate');
-          const qs = ctx.request.qs();
-          const nonce = cspNonce(ctx);
-          return ctx.response.send(
-            renderLoginPage(config.path, {
-              ...(nonce !== undefined ? { nonce } : {}),
-              error: qs.error !== undefined,
-              returnTo: qs.returnTo,
-            }),
-          );
-        })
-        .as('durable_dashboard.login.page');
-
-      // Two callers: the page's own `fetch` (JSON in, JSON out — `{ redirectTo }` / `{ error }`)
-      // and, with JavaScript off or its inline script dropped by a CSP, the same page as a classic
-      // form post (form-encoded in, a redirect out: to `returnTo` on success, back to the login
-      // page with `?error` on failure). Same hook, same cookie, same uniform failure either way.
-      router
-        .post(loginPath, async (ctx) => {
-          if (this.loginRateLimited(ctx)) return;
-          const body = ctx.request.body();
-          const outcome = await performLogin(auth, body, config.path);
-          const form = isFormPost(ctx);
-          const backToLogin = () =>
-            ctx.response
-              .redirect()
-              .withQs({
-                error: '1',
-                returnTo: sanitizeReturnTo(
-                  (body as { returnTo?: unknown } | null)?.returnTo,
-                  config.path || '/',
-                ),
-              })
-              .toPath(loginPath);
-          if (outcome.kind === 'bad-request') {
-            if (form) return backToLogin();
-            return ctx.response.status(400).json({ error: outcome.message });
-          }
-          if (outcome.kind === 'unauthorized') {
-            void this.warnHookThrow(outcome.hookError).catch(() => undefined);
-            if (form) return backToLogin();
-            return ctx.response.status(401).json({ error: outcome.message });
-          }
-          this.writeSessionCookie(ctx, auth, outcome.cookieValue);
-          if (form) return ctx.response.redirect().toPath(outcome.redirectTo);
-          return ctx.response.status(200).json({ redirectTo: outcome.redirectTo });
-        })
-        .as('durable_dashboard.login.submit');
-    }
-
-    if (auth.session) {
-      router
-        .post(sessionPath, async (ctx) => {
-          if (this.loginRateLimited(ctx)) return;
-          const outcome = await performSession(auth, ctx.request.request);
-          if (outcome.kind === 'unauthorized') {
-            void this.warnHookThrow(outcome.hookError).catch(() => undefined);
-            return ctx.response.status(401).json({ error: 'unauthorized' });
-          }
-          this.writeSessionCookie(ctx, auth, outcome.cookieValue);
-          return ctx.response.status(204).send('');
-        })
-        .as('durable_dashboard.session.mint');
-    }
-
-    const logout = async (ctx: HttpContext) => {
-      ctx.response.clearCookie(SESSION_COOKIE_NAME, { path: '/' });
-      return ctx.response.redirect().toPath(auth.login ? loginPath : config.path || '/');
-    };
-    router.get(logoutPath, logout).as('durable_dashboard.logout');
-    // POST too: the CSRF-proof spelling for clients that prefer it (the GET stays for plain <a>
-    // links — it only ever destroys the caller's own session, so a forced logout is an annoyance,
-    // not a compromise).
-    router.post(logoutPath, logout).as('durable_dashboard.logout.post');
-  }
-
   /** Record one mutating console action (see DashboardAuditEntry). Never throws into the request. */
   private audit(config: ResolvedDurableDashboardConfig, ctx: HttpContext): void {
     try {
-      const auth = config.dashboardAuth;
-      const session = auth ? readSession(auth, this.readSessionCookie(ctx)) : null;
-      const fromToken =
-        ctx.request.header('authorization') !== undefined ||
-        ctx.request.header('x-durable-token') !== undefined;
-      const actor = session?.name ?? session?.sub ?? (fromToken ? 'token' : 'anonymous');
       const entry: DashboardAuditEntry = {
         at: new Date(),
-        actor,
+        actor: auditActor(ctx),
         method: ctx.request.method().toUpperCase(),
         path: ctx.request.url(false),
       };
@@ -655,31 +506,26 @@ export default class DashboardProvider {
     logger.warn(`[durable_dashboard] authorize hook threw; treating as denial (403). ${message}`);
   }
 
-  private async warnHookThrow(hookError: unknown): Promise<void> {
-    if (hookError === undefined || this.warnedOnHookThrow) return;
-    this.warnedOnHookThrow = true;
-    const message = hookError instanceof Error ? hookError.message : String(hookError);
-    const logger = await this.app.container.make('logger');
-    logger.warn(`dashboardAuth login/session hook threw; treating as denial. ${message}`);
+  /** The once-per-boot warning for a console with no `authorize` (open in dev, 403 in production). */
+  private async warnNoAuthorize(): Promise<void> {
+    try {
+      const logger = await this.app.container.make('logger');
+      logger.warn(NO_AUTHORIZE_WARNING);
+    } catch {
+      console.warn(NO_AUTHORIZE_WARNING);
+    }
   }
 
   /**
-   * Run the guards for a dashboard resource. Composes the existing `authorize` hook (bearer
-   * token/custom) with the optional `dashboardAuth` session guard — BOTH must pass:
+   * Run `authorize` for a dashboard resource. On a denial:
    *
-   * 1. `authorize` denies -> the built-in (or host-customised) access-denied PAGE for a `page`
-   *    request, JSON for an `api` request; `{ redirectTo }` is a `302` there for a `page` request and
-   *    a `401` for an `api` request. `reason: 'unauthenticated'` is a `401`
-   *    (`{ error: 'unauthorized' }`); `false`, `{ allowed: false }`, `reason: 'forbidden'` or a
-   *    throwing hook is a `403` (`{ error: 'forbidden' }`). A hook that already answered the request
-   *    (a redirect, a body) keeps its answer.
-   * 2. `dashboardAuth` configured AND no valid session -> for a `page` request, redirect `302` to
-   *    the login page (Mode B) carrying a sanitized `returnTo`, or the `401` "open this console
-   *    from your app" page (Mode A only, no login page to redirect to); for an `api` request, a
-   *    plain `401 { error: 'unauthorized', auth: { modes } }` — the `modes` list lets the SPA's
-   *    client (`durable-client.ts`) decide whether to offer the login page.
+   * - `{ redirectTo }`: a `page` request is redirected there (`302`); an `api` request gets
+   *   `401 { error: 'unauthenticated', redirectTo }`;
+   * - `reason: 'unauthenticated'`: `401` (the access-denied page, or `{ error: 'unauthenticated' }`);
+   * - anything else (`false`, `{ allowed: false }`, a throw): `403` (the access-denied page, or
+   *   `{ error: 'forbidden' }`).
    *
-   * When `dashboardAuth` is unconfigured only step 1 runs.
+   * A hook that already answered the request (a redirect, a body) keeps its answer.
    * Returns `false` (and has already written the response) when the request must short-circuit.
    */
   private async enforce(
@@ -687,69 +533,43 @@ export default class DashboardProvider {
     ctx: HttpContext,
     mode: 'page' | 'api',
   ): Promise<boolean> {
-    // CSRF defense-in-depth over the Lax session cookie: a browser-originated CROSS-SITE mutating
-    // request is rejected outright, whatever guard would have passed it. The mutating endpoints
-    // need no body and read flags from the query string, so without this a malicious page could
-    // fire them as SIMPLE cross-origin POSTs (no preflight) against a console the operator's
-    // browser is authenticated to. Non-browser clients send neither header and pass.
+    // CSRF defense-in-depth: a browser-originated CROSS-SITE mutating request is rejected outright,
+    // whatever `authorize` would say. The mutating endpoints need no body and read flags from the
+    // query string, so without this a malicious page could fire them as SIMPLE cross-origin POSTs
+    // (no preflight) against a console the operator's browser is signed in to. Non-browser clients
+    // send neither header and pass.
     if (mode === 'api' && isMutatingMethod(ctx) && crossSiteRequest(ctx)) {
       ctx.response.status(403).json({ error: 'cross-site request rejected' });
       return false;
     }
     // The resolved gate never throws: a throwing `authorize` comes back as a 403 carrying the error.
     const decision = await config.authorize(ctx);
-    if (!decision.allowed) {
-      if (decision.error !== undefined)
-        void this.warnAuthorizeThrow(decision.error).catch(() => undefined);
-      const unauthenticated = decision.reason === 'unauthenticated';
-      if (mode === 'page' && decision.redirectTo !== undefined && !responseAnswered(ctx)) {
-        ctx.response.redirect().toPath(decision.redirectTo);
-      } else if (mode === 'page') {
-        await this.denyPage(
-          ctx,
-          config,
-          unauthenticated
-            ? { status: 401, reason: 'unauthenticated' }
-            : { status: 403, reason: 'forbidden' },
-        );
-      } else if (!responseAnswered(ctx)) {
-        ctx.response
-          .status(unauthenticated ? 401 : 403)
-          .json({ error: unauthenticated ? 'unauthorized' : 'forbidden' });
-      }
-      return false;
-    }
-
-    const auth = config.dashboardAuth;
-    if (!auth) return true;
-
-    const session = readSession(auth, this.readSessionCookie(ctx));
-    if (session) {
-      // Role convention: a session WITHOUT roles keeps full access (back-compat — most host hooks
-      // never set them); a session WITH roles must carry `operator` (or `admin`) to mutate.
-      // Previously every authenticated principal — including a read-only support login — could
-      // bulk-cancel with compensation or fix-and-replay.
-      if (mode === 'api' && isMutatingMethod(ctx) && !sessionCanMutate(session)) {
-        ctx.response
-          .status(403)
-          .json({ error: "this session's roles do not include 'operator' (or 'admin')" });
-        return false;
-      }
-      return true;
-    }
-
+    if (decision.allowed) return true;
+    if (decision.error !== undefined)
+      void this.warnAuthorizeThrow(decision.error).catch(() => undefined);
+    const unauthenticated = decision.reason === 'unauthenticated';
     if (mode === 'page') {
-      if (auth.login) {
-        const returnTo = ctx.request.url(true);
-        ctx.response.redirect().withQs('returnTo', returnTo).toPath(`${config.path}/login`);
+      if (decision.redirectTo !== undefined && !responseAnswered(ctx)) {
+        ctx.response.redirect().toPath(decision.redirectTo);
         return false;
       }
-      // Mode A only: there's no login page to send the browser to — this deployment expects the
-      // host app to mint a session via `POST <path>/session` before ever navigating here.
-      await this.denyPage(ctx, config, { status: 401, reason: 'session-required' });
+      await this.denyPage(
+        ctx,
+        config,
+        unauthenticated
+          ? { status: 401, reason: 'unauthenticated' }
+          : { status: 403, reason: 'forbidden' },
+      );
       return false;
     }
-    ctx.response.status(401).json({ error: 'unauthorized', auth: { modes: auth.modes } });
+    if (responseAnswered(ctx)) return false;
+    if (!unauthenticated) {
+      ctx.response.status(403).json({ error: 'forbidden' });
+    } else if (decision.redirectTo !== undefined) {
+      ctx.response.status(401).json({ error: 'unauthenticated', redirectTo: decision.redirectTo });
+    } else {
+      ctx.response.status(401).json({ error: 'unauthenticated' });
+    }
     return false;
   }
 
@@ -770,7 +590,6 @@ export default class DashboardProvider {
     const info: AccessDeniedInfo = {
       ...denial,
       basePath: config.path,
-      ...(config.dashboardAuth?.login ? { loginHref: `${config.path}/login` } : {}),
       ...(nonce !== undefined ? { nonce } : {}),
     };
     const html = await resolveAccessDeniedPage(info, config.accessDenied, ctx, answered);
@@ -782,24 +601,6 @@ export default class DashboardProvider {
       .send(html);
   }
 
-  private readSessionCookie(ctx: HttpContext): string | undefined {
-    const value = ctx.request.plainCookie(SESSION_COOKIE_NAME, undefined, false);
-    return typeof value === 'string' && value !== '' ? value : undefined;
-  }
-
-  private writeSessionCookie(ctx: HttpContext, auth: ResolvedDashboardAuth, value: string): void {
-    ctx.response.plainCookie(SESSION_COOKIE_NAME, value, {
-      httpOnly: true,
-      sameSite: 'lax',
-      // Forced on in production even when `request.secure()` reads false (a TLS-terminating proxy
-      // without AdonisJS trustProxy) — exactly the deployments that most need the Secure flag.
-      secure: isProduction() || ctx.request.secure(),
-      path: '/',
-      maxAge: Math.floor(auth.ttlMs / 1000),
-      encode: false,
-    });
-  }
-
   async shutdown(): Promise<void> {
     this.detachDiagnostics?.();
     this.detachDiagnostics = null;
@@ -808,12 +609,6 @@ export default class DashboardProvider {
   }
 }
 
-/**
- * Whether something already answered this request: a redirect (`location` header — the signal the
- * `authorize` contract has always honoured) or a body queued on the response. The body check reads
- * AdonisJS's `response.hasLazyBody` structurally so a plain-object `ctx` double in a unit test
- * (which has neither) still works.
- */
 /** Whether this request can change state (everything but GET/HEAD/OPTIONS). Exported for tests. */
 export function isMutatingMethod(ctx: HttpContext): boolean {
   const method = ctx.request.method().toUpperCase();
@@ -839,15 +634,12 @@ export function crossSiteRequest(ctx: HttpContext): boolean {
   }
 }
 
-/** Role convention (see enforce): no roles = full access; with roles, mutating needs operator/admin. */
-export function sessionCanMutate(session: { roles: string[] }): boolean {
-  if (session.roles.length === 0) return true;
-  return session.roles.some((r) => {
-    const role = r.toLowerCase();
-    return role === 'operator' || role === 'admin';
-  });
-}
-
+/**
+ * Whether something already answered this request: a redirect (`location` header — the signal the
+ * `authorize` contract has always honoured) or a body queued on the response. The body check reads
+ * AdonisJS's `response.hasLazyBody` structurally so a plain-object `ctx` double in a unit test
+ * (which has neither) still works.
+ */
 function responseAnswered(ctx: HttpContext): boolean {
   if (ctx.response.getHeader('location')) return true;
   const response = ctx.response as unknown as { hasLazyBody?: unknown; headersSent?: unknown };
@@ -865,13 +657,20 @@ function cspNonce(ctx: HttpContext): string | undefined {
 }
 
 /**
- * Whether a login `POST` came from a classic HTML form submit (form-encoded — JavaScript off, or
- * the page's inline script dropped by a CSP) rather than the page's own JSON `fetch`. Decides
- * whether the reply is a redirect (a browser navigating) or JSON (a script awaiting it).
+ * Who a mutating console action is attributed to: the signed-in user (`ctx.auth.user`'s `email`,
+ * `name` or `id`, read structurally — this package does not depend on `@adonisjs/auth`), `'bearer'`
+ * for a caller with an `Authorization` header and no user, else `'anonymous'`.
  */
-function isFormPost(ctx: HttpContext): boolean {
-  const type = ctx.request.header('content-type') ?? '';
-  return type.includes('application/x-www-form-urlencoded') || type.includes('multipart/form-data');
+export function auditActor(ctx: HttpContext): string {
+  const user = (ctx as unknown as { auth?: { user?: Record<string, unknown> | null } }).auth?.user;
+  if (user) {
+    for (const key of ['email', 'name', 'id'] as const) {
+      const value = user[key];
+      if (typeof value === 'string' && value !== '') return value;
+      if (typeof value === 'number') return String(value);
+    }
+  }
+  return ctx.request.header('authorization') !== undefined ? 'bearer' : 'anonymous';
 }
 
 /** Adapt an AdonisJS `HttpContext` to the framework-light {@link ApiRequest}. */
