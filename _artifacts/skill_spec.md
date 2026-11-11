@@ -41,7 +41,7 @@ Six skills therefore target `packages/adonis`; one targets `packages/dashboard`
    `timeoutMs` liveness vs durable suspend, sagas, flow-control queues +
    Redis admission, DLQ, the stuck-run playbook, CLI ops commands, testing
    harness + conformance kits.
-6. **durable-cluster** — roles (`standalone`/`control-plane`/`tenant`), thin
+6. **durable-cluster** — topologies (`standalone`/`control-plane`/`tenant`), thin
    workers (`WorkerRuntime`, `RedisWorkerRegistry`), descriptor handshake,
    capability routing (`requires` → blocked), signed tenant auth, Python /
    NestJS interop over BullMQ.
@@ -67,7 +67,7 @@ Six skills therefore target `packages/adonis`; one targets `packages/dashboard`
   step refs or their bodies re-run on every replay.
 - **Control-flow signals throw** — rethrow via `isWorkflowControlFlowSignal`
   before treating an error as failure.
-- **Roles change the command**: store-backed loop = `durable:work`, store-less
+- **Topologies change the command**: store-backed loop = `durable:work`, store-less
   tenant worker = `durable:worker` (which serves step names, not workflow
   bodies unless explicitly registered).
 - **The production authorize gate fails closed** when

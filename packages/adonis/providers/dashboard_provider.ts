@@ -23,7 +23,7 @@ import {
   resolveConfig,
 } from '../src/dashboard/define_config.js';
 import { BlockedDiagnosticsRecorder } from '../src/dashboard/diagnostics-recorder.js';
-import { dashboardEngineForRole } from '../src/dashboard/gateway-adapter.js';
+import { dashboardEngineForTopology } from '../src/dashboard/gateway-adapter.js';
 import {
   type ApiRequest,
   type ApiResponse,
@@ -104,7 +104,7 @@ function spaDirectory(): string {
  * - `POST /api/bulk/:action`          -> bulk retry/cancel every run matching a filter
  * - `GET  /api/health`                -> worker-group health (compact shape)
  * - `GET  /api/workers`               -> worker-group health (full heartbeats; SPA)
- * - `GET  /api/topology`              -> this deployment's durable role
+ * - `GET  /api/topology`              -> this deployment's durable topology
  * - `GET  /api/compat`                -> fleet health / protocol-compatibility panel
  * - `GET  /api/openapi.json`          -> the machine-readable API contract (OpenAPI 3.1)
  */
@@ -120,17 +120,17 @@ export default class DashboardProvider {
   /**
    * Captures the engine's `capability.unavailable` / `protocol.incompatible` diagnostics events so the
    * `/compat` health panel can render each blocked run's structured delta + the live-fleet compat view
-   * (design §7.6, §10). Store-role only — attached in {@link boot}; a `tenant` pod owns no engine.
+   * (design §7.6, §10). Store-topology only — attached in {@link boot}; a `tenant` pod owns no engine.
    */
   private readonly diagnostics = new BlockedDiagnosticsRecorder();
   /** Detach handle for the diagnostics subscription, released on {@link shutdown}. */
   private detachDiagnostics: (() => void) | null = null;
-  /** This process's event counters for `GET /metrics` (store roles; a tenant pod has no engine). */
+  /** This process's event counters for `GET /metrics` (store topologies; a tenant pod has no engine). */
   private metricsCollector: MetricsCollector | null = null;
 
-  /** The active durable role (`standalone` when no `durable` config is present — today's default). */
-  private durableRole(): 'standalone' | 'control-plane' | 'tenant' {
-    return this.app.config.get<DurableConfig>('durable', {}).role ?? 'standalone';
+  /** The active durable topology (`standalone` when no `durable` config is present — today's default). */
+  private durableTopology(): 'standalone' | 'control-plane' | 'tenant' {
+    return this.app.config.get<DurableConfig>('durable', {}).topology ?? 'standalone';
   }
 
   async boot() {
@@ -141,20 +141,22 @@ export default class DashboardProvider {
     if (!config.enabled) return;
     if (!config.authorizeConfigured) await this.warnNoAuthorize();
 
-    const role = this.durableRole();
+    const durableTopology = this.durableTopology();
 
     // Route registration can't happen synchronously in `boot()` — see the long-standing note this
     // provider always carried: the router singleton isn't committed until the app's "booted" hooks
     // run, which fire strictly AFTER every provider's own `boot()`.
     await this.app.booted(async () => {
       const router = await this.app.container.make('router');
-      this.registerRoutes(router, config, role);
-      await this.attachDiagnostics(role);
+      this.registerRoutes(router, config, durableTopology);
+      await this.attachDiagnostics(durableTopology);
     });
   }
 
-  private async attachDiagnostics(role: 'standalone' | 'control-plane' | 'tenant'): Promise<void> {
-    if (role === 'tenant') return;
+  private async attachDiagnostics(
+    durableTopology: 'standalone' | 'control-plane' | 'tenant',
+  ): Promise<void> {
+    if (durableTopology === 'tenant') return;
     // A warmed-up app (`node ace codegen`) never starts nor shuts down: resolving the engine would open
     // the transport/store connections nothing closes, and the command would never exit. The routes are
     // still registered above (codegen reads them); the engine is resolved per request.
@@ -173,15 +175,15 @@ export default class DashboardProvider {
   private registerRoutes(
     router: HttpRouterService,
     config: ResolvedDurableDashboardConfig,
-    role: 'standalone' | 'control-plane' | 'tenant',
+    durableTopology: 'standalone' | 'control-plane' | 'tenant',
   ): void {
     const apiBase = `${config.path}/api`;
 
-    // Resolve the dashboard's read/control port lazily per request, branched by role (design §5/§8):
-    // a store role adapts the engine (built by @adonis-agora/durable's provider); a store-less `tenant`
+    // Resolve the dashboard's read/control port lazily per request, branched by topology (design §5/§8):
+    // a store topology adapts the engine (built by @adonis-agora/durable's provider); a store-less `tenant`
     // pod resolves the DURABLE_RUN_GATEWAY token (a ProxyRunGateway) and adapts it — NO engine, NO store.
     const resolveEngine = (): Promise<DashboardEngine> =>
-      dashboardEngineForRole(role, this.app.container, WorkflowEngine);
+      dashboardEngineForTopology(durableTopology, this.app.container, WorkflowEngine);
     const deps = async (): Promise<Deps> => ({
       engine: await resolveEngine(),
       ...(config.redact ? { redact: config.redact } : {}),
@@ -305,8 +307,8 @@ export default class DashboardProvider {
         // Only a `TenantConfig` carries a `partition` (its `<name>@<tenant>` routing suffix, spec
         // §6.1) — the field this dashboard's `DurableTopology.tenant` badge actually names.
         const durableConfig = this.app.config.get<DurableConfig>('durable', {});
-        const tenant = durableConfig.role === 'tenant' ? durableConfig.partition : undefined;
-        const result = topology(role, tenant);
+        const tenant = durableConfig.topology === 'tenant' ? durableConfig.partition : undefined;
+        const result = topology(durableTopology, tenant);
         return ctx.response.status(result.status).json(result.body);
       })
       .as('durable_dashboard.topology');

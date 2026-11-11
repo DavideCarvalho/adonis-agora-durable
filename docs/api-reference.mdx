@@ -245,7 +245,7 @@ Related helpers:
 
 ## WorkflowEngine (selected public surface)
 
-The engine singleton is the default export of `@adonis-agora/durable/services/main` (bound on the `standalone` and `control-plane` roles only; a `tenant` pod uses `runGateway` from the same module, see [Roles & config](/docs/durable/cluster/roles-and-config#reading-and-steering-runs-rungateway)). It is also resolvable from the container as `WorkflowEngine`. This is a curated subset, not the full class.
+The engine singleton is the default export of `@adonis-agora/durable/services/main` (bound on the `standalone` and `control-plane` topologies only; a `tenant` pod uses `runGateway` from the same module, see [Topology & config](/docs/durable/cluster/topology-and-config#reading-and-steering-runs-rungateway)). It is also resolvable from the container as `WorkflowEngine`. This is a curated subset, not the full class.
 
 ```ts
 import engine from '@adonis-agora/durable/services/main'
@@ -380,7 +380,7 @@ These are the phases `node ace durable:work` (or the [embedded worker](#durablec
 
 ## RunGateway
 
-The read, control and start surface every role exposes, as `runGateway` from `@adonis-agora/durable/services/main`. On `standalone` and `control-plane` it is a `StoreRunGateway` over the engine; on a `tenant` pod it is a `ProxyRunGateway` that round-trips each call over the transport to the control plane's `RunRequestResponder`. The dashboard and the CLI read through it, so code written against it runs unchanged on every role. See [Reading and steering runs](/docs/durable/cluster/roles-and-config#reading-and-steering-runs-rungateway).
+The read, control and start surface every topology exposes, as `runGateway` from `@adonis-agora/durable/services/main`. On `standalone` and `control-plane` it is a `StoreRunGateway` over the engine; on a `tenant` pod it is a `ProxyRunGateway` that round-trips each call over the transport to the control plane's `RunRequestResponder`. The dashboard and the CLI read through it, so code written against it runs unchanged on every topology. See [Reading and steering runs](/docs/durable/cluster/topology-and-config#reading-and-steering-runs-rungateway).
 
 ```ts
 import { runGateway } from '@adonis-agora/durable/services/main'
@@ -409,12 +409,12 @@ const detail = await runGateway.getRunDetail?.(runId, { summarizeFansOver: 50 })
 
 | Export | Signature | Notes |
 | --- | --- | --- |
-| `StoreRunGateway` | `new StoreRunGateway(engine: RunGatewayEngine, options?: { role?: 'standalone' \| 'control-plane' })` | The store-backed gateway the provider binds on the store roles. |
+| `StoreRunGateway` | `new StoreRunGateway(engine: RunGatewayEngine, options?: { topology?: 'standalone' \| 'control-plane' })` | The store-backed gateway the provider binds on the store topologies. |
 | `ProxyRunGateway` | `new ProxyRunGateway(transport: ProxyTransport, options: { partition: string; token?: string; requestTimeoutMs?: number })` | The tenant pod's gateway. `requestTimeoutMs` is the config's `requestTimeoutMs`. |
 | `RunGatewayError` / `RunGatewayErrorCode` | `class extends Error { code: RunGatewayErrorCode \| undefined }` / `'unauthorized' \| 'cross-tenant' \| 'bad-request' \| 'unsupported-request' \| string` | What a `ProxyRunGateway` call the control plane refused rejects with. `bad-request`: the request was malformed or asked for something the tenant may not do (the dashboard answers `400`). `unsupported-request`: the control plane is older than the verb (for `republishLifecycle` and `workflowLifecycle`, also an empty `ok` reply). |
 | `RunRequestResponder` | `new RunRequestResponder(transport: ResponderTransport, gateway: RunGateway, options?: { verifyTenant?; subscribeEngineEvents? })` | Answers proxied run requests on the control plane; a request it cannot serve is answered `UNSUPPORTED_RUN_REQUEST`. |
 | `signTenantToken` | `signTenantToken(tenant: string, secret: string, opts?: { ttlMs?: number; now?: number }): string` | Mint a pod's HMAC tenant claim (`config.tenant.token`); `ttlMs` makes it expire. |
-| `hmacTenantVerifier` | `hmacTenantVerifier(secret: string \| string[], capabilities?: string[]): TenantVerifier` | The matching `verifyTenant`. A list of secrets allows rotation. See [Layered tenant authentication](/docs/durable/cluster/roles-and-config#layered-tenant-authentication). |
+| `hmacTenantVerifier` | `hmacTenantVerifier(secret: string \| string[], capabilities?: string[]): TenantVerifier` | The matching `verifyTenant`. A list of secrets allows rotation. See [Layered tenant authentication](/docs/durable/cluster/topology-and-config#layered-tenant-authentication). |
 
 ## Run detail and fan types
 
@@ -436,7 +436,7 @@ What `getRunDetail` and `getFanMembers` return, on the engine and the `RunGatewa
 
 ## DurableConfig
 
-`defineConfig(config)` in `config/durable.ts` returns a `DurableConfig`, a union discriminated on `role`: `StandaloneConfig` (the default when `role` is omitted), `ControlPlaneConfig` or `TenantConfig`. All roles share the fields below. See [Roles & config](/docs/durable/cluster/roles-and-config).
+`defineConfig(config)` in `config/durable.ts` returns a `DurableConfig`, a union discriminated on `topology`: `StandaloneConfig` (the default when `topology` is omitted), `ControlPlaneConfig` or `TenantConfig`. All topologies share the fields below. See [Topology & config](/docs/durable/cluster/topology-and-config).
 
 ```ts title="config/durable.ts"
 import { defineConfig, stores, transports } from '@adonis-agora/durable'
@@ -451,7 +451,7 @@ export default defineConfig({
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `role` | `'standalone' \| 'control-plane' \| 'tenant'` | `'standalone'` | Explicit topology, never inferred. See [Cluster](/docs/durable/cluster). |
+| `topology` | `'standalone' \| 'control-plane' \| 'tenant'` | `'standalone'` | Explicit topology, never inferred. See [Cluster](/docs/durable/cluster). |
 | `transport` | `string` | in-process | Key of `transports` to dispatch over. See [Transports](/docs/durable/transports). |
 | `transports` | `Record<string, TransportFactory>` | — | Named transports, built with the [`transports`](#driver-factories) factory. |
 | `store` | `string` | in-memory | Key of `stores` for runs, checkpoints and timers. See [State stores](/docs/durable/stores). |
@@ -466,7 +466,7 @@ export default defineConfig({
 | `trackStepStart` | `boolean` | `true` | Persist a `running` checkpoint when a local step starts; `false` halves checkpoint writes on hot paths. |
 | `leaseMs` | `number` | `30000` | Recovery lease duration. See [Delivery under multiple instances](/docs/durable/reliability/multi-instance). |
 | `instanceId` | `string` | random | Unique per process; run leases are held by it. |
-| `namespace` | `string` | `'default'` on `standalone`; unset (operator) on `control-plane` | Worker-pool partition; poll and recovery paths act only on this namespace. A `control-plane` with no `namespace` is the operator and drives every pool (before 0.51 an unset namespace meant operator on every role). See [Tenancy](/docs/durable/concepts/tenancy). |
+| `namespace` | `string` | `'default'` on `standalone`; unset (operator) on `control-plane` | Worker-pool partition; poll and recovery paths act only on this namespace. A `control-plane` with no `namespace` is the operator and drives every pool (before 0.51 an unset namespace meant operator on every topology). See [Tenancy](/docs/durable/concepts/tenancy). |
 | `maxRecoveryAttempts` | `number` | unlimited | Crash-recovery pickups before a run moves to `dead`. See [Dead-letter queue](/docs/durable/reliability/dead-letter). |
 | `unregisteredWorkflowGraceMs` | `number` | 24h | How long a run may stay due with its `workflow@version` registered nowhere before it moves to `dead` (`workflow_not_registered`). `0` disables. See [Dead-letter queue](/docs/durable/reliability/dead-letter#an-unregistered-workflow). |
 | `compensationRetries` | `number` | `1` | Attempts per saga compensation on run failure. See [Retrying a transient undo](/docs/durable/reliability/sagas#retrying-a-transient-undo). |
@@ -492,12 +492,12 @@ export default defineConfig({
 | `workflowsPath` | `string \| string[] \| false` | `'app/workflows'` | Directory (or directories) scanned for `BaseWorkflow` classes; `false` or `[]` disables discovery. A workflow name + version defined in two directories fails boot. See [app/workflows](/docs/durable/authoring/app-workflows#several-directories-modular-apps). |
 | `stepsPath` | `string \| string[] \| false` | `'app/steps'` | Directory (or directories) scanned for `@Step` classes and `defineStep` handlers; `false` or `[]` disables. A step name defined in two directories fails boot. |
 
-Role-specific fields:
+Topology-specific fields:
 
-| Role | Field | Type | Notes |
+| Topology | Field | Type | Notes |
 | --- | --- | --- | --- |
 | `control-plane` | `store`, `transport` | `string` | Both required. |
-| `control-plane`, `standalone` | `verifyTenant` | `TenantVerifier` | Verifies tenant tokens on incoming requests (a standalone engine answers tenant pods too when its transport carries the store-less protocol). See [Layered tenant authentication](/docs/durable/cluster/roles-and-config#layered-tenant-authentication). |
+| `control-plane`, `standalone` | `verifyTenant` | `TenantVerifier` | Verifies tenant tokens on incoming requests (a standalone engine answers tenant pods too when its transport carries the store-less protocol). See [Layered tenant authentication](/docs/durable/cluster/topology-and-config#layered-tenant-authentication). |
 | `tenant` | `store`, `stores` | `never` | A store-less pod may not name a store; any value is a compile error. |
 | `tenant` | `transport`, `partition` | `string` | Both required. `partition` suffixes the pod's `<name>@<tenant>` routing tokens. |
 | `tenant` | `tenant` | `{ token?: string }` | The pod's signed claim. |
@@ -633,7 +633,7 @@ Only `completed`, `failed`, `cancelled` and `dead` are terminal (`TerminalRunSta
 | Import path | What it provides |
 | --- | --- |
 | `@adonis-agora/durable` | Everything on this page: ctx types, `BaseWorkflow`, decorators, `WorkflowEngine`, `defineConfig`, factories, errors, statuses. |
-| `@adonis-agora/durable/services/main` | The `WorkflowEngine` singleton (default export, `undefined` on a `tenant` pod) and [`runGateway`](#rungateway). See [Roles & config](/docs/durable/cluster/roles-and-config#reading-and-steering-runs-rungateway). |
+| `@adonis-agora/durable/services/main` | The `WorkflowEngine` singleton (default export, `undefined` on a `tenant` pod) and [`runGateway`](#rungateway). See [Topology & config](/docs/durable/cluster/topology-and-config#reading-and-steering-runs-rungateway). |
 | `@adonis-agora/durable/durable_provider` | The AdonisJS provider registered by `node ace configure`. See [Getting started](/docs/durable/getting-started). |
 | `@adonis-agora/durable/dashboard_provider` | The dashboard provider. See [Dashboard](/docs/durable/observability/dashboard). |
 | `@adonis-agora/durable/dashboard` | Dashboard building blocks: its own `defineConfig` / `resolveConfig`, the console access contract (`ConsoleAuthorize`, `authorizeByToken`), the framework-agnostic handlers (`listRuns`, `getRun`, `getRunEvent`, `cancelRun`, `retryRun`, `retryWithInputRun`, `continueRun`, `redispatchPendingRun`, `bulkAction`, `runValues`, `workers`, `topology`, `health`, `metricsText`, `deliverWebhook`), `dashboardEngineForRole` / `gatewayDashboardEngine` and the access-denied page renderer. See [Dashboard](/docs/durable/observability/dashboard). |

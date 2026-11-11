@@ -23,28 +23,28 @@ declare module '@adonisjs/core/types' {
 }
 
 /**
- * Container binding tokens for the role-branched, store-less cluster wiring (design §5). Each active
- * role publishes exactly the objects its topology needs under these keys, so app/dashboard/command code
+ * Container binding tokens for the topology-branched, store-less cluster wiring (design §5). Each active
+ * topology publishes exactly the objects its topology needs under these keys, so app/dashboard/command code
  * resolves the SAME abstract token regardless of whether a store is present:
  *
- * - {@link DURABLE_RUN_GATEWAY} — the active role's {@link import('./run-gateway/interface.js').RunGateway}:
+ * - {@link DURABLE_RUN_GATEWAY} — the active topology's {@link import('./run-gateway/interface.js').RunGateway}:
  *   a `StoreRunGateway` on `standalone`/`control-plane`, a `ProxyRunGateway` on `tenant`.
  * - {@link DURABLE_WORKER_RUNTIME} — bound ONLY on `tenant`: the store-less
  *   {@link import('./worker-runtime/index.js').WorkerRuntime} the `durable:worker` command drives.
- * - {@link DURABLE_RUN_REQUEST_RESPONDER} — bound on store roles whose transport carries the P4 methods:
+ * - {@link DURABLE_RUN_REQUEST_RESPONDER} — bound on store topologies whose transport carries the P4 methods:
  *   the operator-side {@link import('./run-gateway/run-request-responder.js').RunRequestResponder} tenant
  *   pods round-trip to.
  *
  * They are plain string tokens (like `'router'`/`'logger'`) rather than class constructors because the
- * RunGateway is an INTERFACE with two concrete impls chosen by role — there is no single class to key on.
+ * RunGateway is an INTERFACE with two concrete impls chosen by topology — there is no single class to key on.
  */
 export const DURABLE_RUN_GATEWAY = '@adonis-agora/durable:run-gateway';
 export const DURABLE_WORKER_RUNTIME = '@adonis-agora/durable:worker-runtime';
 export const DURABLE_RUN_REQUEST_RESPONDER = '@adonis-agora/durable:run-request-responder';
 /**
- * The store role's active task {@link import('./interfaces.js').Transport}, published so store-agnostic
+ * The store topology's active task {@link import('./interfaces.js').Transport}, published so store-agnostic
  * consumers (the dashboard's fleet-health panel) can enumerate the LIVE worker fleet off it
- * (`listWorkerGroups`/`listWorkerDescriptors`) without reaching into the engine. Bound ONLY on store roles
+ * (`listWorkerGroups`/`listWorkerDescriptors`) without reaching into the engine. Bound ONLY on store topologies
  * (`standalone`/`control-plane`); a `tenant` pod never binds it, so its panel degrades to diagnostics-only.
  */
 export const DURABLE_TRANSPORT = '@adonis-agora/durable:transport';
@@ -52,7 +52,7 @@ export const DURABLE_TRANSPORT = '@adonis-agora/durable:transport';
 /**
  * A no-op {@link RunDispatcher}: a freshly-`start`ed run stays `pending` in the store for a worker's
  * `runPending` poll to pick up, instead of running inline on this instance (design §3 pure coordinator).
- * The `control-plane` role uses this so `start()` never executes a body on the coordinator — only the
+ * The `control-plane` topology uses this so `start()` never executes a body on the coordinator — only the
  * store-backed dispatch/recover/timers loop drives runs forward. `standalone` keeps the engine's default
  * in-process (microtask) dispatcher (today's embedded-worker behavior).
  */

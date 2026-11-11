@@ -22,7 +22,7 @@ import { InMemoryStateStore, InMemoryTransport, WorkflowEngine } from '../../src
  * (`raw.start`/`raw.waitForRun`/`raw.getRun` — engine-only, not part of the {@link Deps} port), plus
  * that same engine adapted through {@link storeDashboardEngine} into the bounded {@link Deps} port the
  * handlers under test actually receive — the same wiring `gateway-adapter.ts`'s
- * `dashboardEngineForRole` does for a store role in production.
+ * `dashboardEngineForTopology` does for a store topology in production.
  */
 function makeEngine(): { raw: WorkflowEngine; undone: string[]; deps: Deps } {
   const store = new InMemoryStateStore();

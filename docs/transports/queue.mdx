@@ -224,11 +224,11 @@ Reach for `'always'` only for a script that genuinely must round-trip a remote s
 
 ## Tenant pods over the queue transport
 
-A [`tenant` pod](/docs/durable/cluster/roles-and-config#tenant-store-less-thin-pod) owns no store: every read, control action and run start goes to the control plane as a request, and the answer comes back. The queue transport carries that protocol, so a `control-plane` and its `tenant` pods can share one `@adonisjs/queue` backend instead of Redis plus `bullmq`. Point both at the same connection and prefix:
+A [`tenant` pod](/docs/durable/cluster/topology-and-config#tenant-store-less-thin-pod) owns no store: every read, control action and run start goes to the control plane as a request, and the answer comes back. The queue transport carries that protocol, so a `control-plane` and its `tenant` pods can share one `@adonisjs/queue` backend instead of Redis plus `bullmq`. Point both at the same connection and prefix:
 
 ```ts title="config/durable.ts (control plane)"
 export default defineConfig({
-  role: 'control-plane',
+  topology: 'control-plane',
   transport: 'queue',
   transports: { queue: transports.queue({ connection: 'redis' }) },
   store: 'lucid',
@@ -239,7 +239,7 @@ export default defineConfig({
 
 ```ts title="config/durable.ts (tenant pod)"
 export default defineConfig({
-  role: 'tenant',
+  topology: 'tenant',
   transport: 'queue',
   // No database on the pod: its advertisement and subscriptions go to the control plane.
   // The transport's `partition` decides which `<name>@acme-corp` task queues the pod consumes.
@@ -249,7 +249,7 @@ export default defineConfig({
 })
 ```
 
-Set `partition` on the transport as well as at the top level: the provider passes the top-level one to the run gateway and the worker runtime, not to the transport that subscribes the task queues (see [Roles and config](/docs/durable/cluster/roles-and-config#tenant-store-less-thin-pod)).
+Set `partition` on the transport as well as at the top level: the provider passes the top-level one to the run gateway and the worker runtime, not to the transport that subscribes the task queues (see [Topology & config](/docs/durable/cluster/topology-and-config#tenant-store-less-thin-pod)).
 
 Starting a run and sending a read or control request are plain jobs on `<prefix>:start-run` and `<prefix>:run-request`, which one control-plane instance consumes. The two parts BullMQ broadcasts on Redis pub/sub are different here, because a queue job has exactly one consumer:
 

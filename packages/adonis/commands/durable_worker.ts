@@ -14,17 +14,17 @@ import {
 import { discoverWorkflows } from '../src/workflow-discovery.js';
 
 /**
- * `node ace durable:worker` — the **store-less** task-consumer loop for a `role: 'tenant'` worker pod
+ * `node ace durable:worker` — the **store-less** task-consumer loop for a `topology: 'tenant'` worker pod
  * (design §3). Distinct from `durable:work` (the store-backed dispatch/recovery/timers loop, which
  * this command deliberately does NOT clobber): a store-less worker owns no durable state — it consumes
  * `${P}-tasks-<token>` tasks (executed through the shared `runStepHandler`, results published) and
  * advertises its {@link import('../src/handshake/descriptor.js').WorkerDescriptor} + heartbeat. Stays
  * alive until SIGINT/SIGTERM, then drains.
  *
- * On a `role: 'tenant'` pod it resolves the **container-bound {@link WorkerRuntime}** the provider wired
+ * On a `topology: 'tenant'` pod it resolves the **container-bound {@link WorkerRuntime}** the provider wired
  * (design §5): that runtime shares the tenant transport with the `ProxyRunGateway` and carries a
  * `RedisWorkerRegistry` built from the transport's Redis connection, so descriptor + heartbeat are
- * actually published on the shared Redis. Only when no bound runtime exists (a non-tenant role, or a
+ * actually published on the shared Redis. Only when no bound runtime exists (a non-tenant topology, or a
  * misconfigured pod) does it fall back to building a self-contained runtime from `config/durable.ts`
  * with a {@link NoopWorkerRegistry} (advertising is then a no-op).
  */
@@ -36,9 +36,9 @@ export default class DurableWorker extends BaseCommand {
 
   override async run(): Promise<void> {
     const config = this.app.config.get<DurableConfig>('durable', {});
-    if (config.role !== 'tenant') {
+    if (config.topology !== 'tenant') {
       this.logger.warning(
-        `durable:worker is the store-less worker for role 'tenant'; config.role is '${config.role ?? 'standalone'}'. Continuing, but a store-backed role should use durable:work.`,
+        `durable:worker is the store-less worker for topology 'tenant'; config.topology is '${config.topology ?? 'standalone'}'. Continuing, but a store-backed topology should use durable:work.`,
       );
     }
 
@@ -90,10 +90,10 @@ export default class DurableWorker extends BaseCommand {
   }
 
   /**
-   * Prefer the provider-bound {@link WorkerRuntime} (the `role: 'tenant'` branch of `durable_provider`):
+   * Prefer the provider-bound {@link WorkerRuntime} (the `topology: 'tenant'` branch of `durable_provider`):
    * it shares the tenant transport with the `ProxyRunGateway` and advertises through a real
    * `RedisWorkerRegistry`. Fall back to a self-built runtime (a {@link NoopWorkerRegistry}) only when the
-   * container has no bound runtime — a non-tenant role, or a pod running this command by mistake.
+   * container has no bound runtime — a non-tenant topology, or a pod running this command by mistake.
    */
   async #resolveRuntime(
     config: DurableConfig,

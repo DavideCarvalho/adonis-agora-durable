@@ -68,7 +68,7 @@ The `memory` transport drives a dispatch straight into its handler and exists fo
 </Callout>
 
 <Callout type="info">
-The provider binds a singleton [`WorkflowEngine`](/docs/durable/concepts/workflows-and-steps) built from this config. Import it anywhere — a controller, a service, a start file — with `import engine from '@adonis-agora/durable/services/main'`. On a store-less [`tenant`](/docs/durable/cluster/roles-and-config) pod there is no engine; the same module exports `runGateway`, the role-agnostic read/control/start surface.
+The provider binds a singleton [`WorkflowEngine`](/docs/durable/concepts/workflows-and-steps) built from this config. Import it anywhere — a controller, a service, a start file — with `import engine from '@adonis-agora/durable/services/main'`. On a store-less [`tenant`](/docs/durable/cluster/topology-and-config) pod there is no engine; the same module exports `runGateway`, the topology-agnostic read/control/start surface.
 </Callout>
 
 ## 2. Define a step (optional)

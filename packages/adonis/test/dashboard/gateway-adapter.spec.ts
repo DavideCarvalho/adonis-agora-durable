@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  dashboardEngineForRole,
+  dashboardEngineForTopology,
   gatewayDashboardEngine,
   type StoreEngineLike,
   storeDashboardEngine,
@@ -183,13 +183,13 @@ function containerWith(bindings: Map<unknown, unknown>) {
   };
 }
 
-describe('dashboardEngineForRole — role-branched resolution', () => {
+describe('dashboardEngineForTopology — topology-branched resolution', () => {
   it('tenant: resolves the DURABLE_RUN_GATEWAY token and NEVER touches WorkflowEngine (store-less)', async () => {
     const gw = gatewaySpy();
     // Only the gateway is bound — the engine token is deliberately ABSENT (tenant structural isolation).
     const container = containerWith(new Map<unknown, unknown>([[DURABLE_RUN_GATEWAY, gw]]));
 
-    const engine = await dashboardEngineForRole('tenant', container, WorkflowEngine);
+    const engine = await dashboardEngineForTopology('tenant', container, WorkflowEngine);
     // The returned port delegates to the gateway (proving it IS the proxy, not an engine).
     await engine.listRuns({ page: 1, size: 5 });
     expect(gw.calls).toContain('listRuns');
@@ -199,11 +199,11 @@ describe('dashboardEngineForRole — role-branched resolution', () => {
     expect(container.touched).not.toContain(WorkflowEngine);
   });
 
-  it('store role: resolves WorkflowEngine and adapts it via storeDashboardEngine (verbs still forward 1:1)', async () => {
+  it('store topology: resolves WorkflowEngine and adapts it via storeDashboardEngine (verbs still forward 1:1)', async () => {
     const fakeEngine = storeEngineSpy();
     const container = containerWith(new Map<unknown, unknown>([[WorkflowEngine, fakeEngine]]));
 
-    const resolved = await dashboardEngineForRole('standalone', container, WorkflowEngine);
+    const resolved = await dashboardEngineForTopology('standalone', container, WorkflowEngine);
     // Not the same reference (an explicit adapter, not a raw cast — see storeDashboardEngine's doc),
     // but delegation is still 1:1: calling through the port reaches the real engine's methods.
     expect(resolved).not.toBe(fakeEngine);

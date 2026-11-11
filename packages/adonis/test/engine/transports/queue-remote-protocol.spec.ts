@@ -629,7 +629,7 @@ describe('QueueTransport — store-less protocol and remote workflows', () => {
       const errors: unknown[] = [];
       controlPlane(adapter, undefined, { onError: (e) => errors.push(e) });
       const pod = make(adapter, { instanceId: 'pod' });
-      pod.useTenantRole();
+      pod.useTenantTopology();
       const writer = pod.createDescriptorRedis();
       await writer.set('durable-worker-heartbeat:charge:pod', '{}', 'EX', 30);
       await until(() => errors.length > 0);
@@ -672,7 +672,7 @@ describe('QueueTransport — store-less protocol and remote workflows', () => {
       const cp = make(adapter, { workerKeys: keys, workerKeysCacheMs: 0 });
       cp.onRunRequest(async () => {});
       const pod = make(adapter, { instanceId: 'pod', partition: 'acme' });
-      pod.useTenantRole();
+      pod.useTenantTopology();
       const runtime = new WorkerRuntime({
         transport: pod,
         partition: 'acme',
@@ -696,7 +696,7 @@ describe('QueueTransport — store-less protocol and remote workflows', () => {
       const cp = make(adapter, { workerKeys: keys });
       cp.onRunRequest(async () => {});
       const pod = make(adapter);
-      pod.useTenantRole();
+      pod.useTenantTopology();
       const writer = pod.createDescriptorRedis();
       await writer.set(
         tenantSubscriberKey('durable', 'acme', 'evil'),

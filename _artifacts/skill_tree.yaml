@@ -11,7 +11,7 @@ library:
   description: >-
     Durable cross-app workflows for AdonisJS — deterministic replay engine with
     checkpointed steps, durable sleeps/signals/events, sagas, DLQ, cluster
-    roles, dashboard, OTel and Telescope views.
+    topologies, dashboard, OTel and Telescope views.
 
 generated_from:
   domain_map: '_artifacts/domain_map.yaml'
@@ -118,13 +118,13 @@ skills:
     package: '@adonis-agora/durable'
     path: 'packages/adonis/skills/durable-cluster/SKILL.md'
     description: >-
-      Scale out: role-discriminated config (standalone/control-plane/tenant),
+      Scale out: topology-discriminated config (standalone/control-plane/tenant),
       thin WorkerRuntime pods, worker descriptors and handshake negotiation,
       requires-capability routing and blocked runs, signed tenant auth,
       Python/NestJS interop over the bullmq wire.
     sources:
       - 'DavideCarvalho/adonis-durable:docs/cluster/index.mdx'
-      - 'DavideCarvalho/adonis-durable:docs/cluster/roles-and-config.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/cluster/topology-and-config.mdx'
       - 'DavideCarvalho/adonis-durable:docs/cluster/thin-workers.mdx'
       - 'DavideCarvalho/adonis-durable:docs/cluster/handshake.mdx'
       - 'DavideCarvalho/adonis-durable:docs/cluster/interop.mdx'

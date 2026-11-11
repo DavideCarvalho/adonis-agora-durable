@@ -142,7 +142,7 @@ interface PendingReply {
  * a dropped reply) rejects with a clear, verb-named error instead of hanging forever.
  *
  * Idiomatic AdonisJS: a plain class constructed with its transport dependency, wired by the package's
- * provider for the `tenant` role. The counterpart to the operator-side `StoreRunGateway`.
+ * provider for the `tenant` topology. The counterpart to the operator-side `StoreRunGateway`.
  */
 export class ProxyRunGateway implements RunGateway {
   readonly #transport: ProxyTransport;

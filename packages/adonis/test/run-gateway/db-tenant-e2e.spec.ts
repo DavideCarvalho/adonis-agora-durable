@@ -73,7 +73,7 @@ describe.each(dbBackends())('on $name', ({ makeTransportDb }) => {
       expect(hasResponderCapability(cpTransport)).toBe(true);
       const responder = new RunRequestResponder(
         cpTransport,
-        new StoreRunGateway(engine, { role: 'control-plane' }),
+        new StoreRunGateway(engine, { topology: 'control-plane' }),
         {
           verifyTenant: hmacTenantVerifier(SECRET),
           subscribeEngineEvents: (listener) => engine.subscribe(listener),

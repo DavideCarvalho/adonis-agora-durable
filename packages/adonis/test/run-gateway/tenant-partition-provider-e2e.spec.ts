@@ -91,7 +91,7 @@ describe('tenant pod with a top-level partition only (provider-built transport)'
     }));
     const responder = new RunRequestResponder(
       cpTransport,
-      new StoreRunGateway(engine, { role: 'control-plane' }),
+      new StoreRunGateway(engine, { topology: 'control-plane' }),
       {
         verifyTenant: hmacTenantVerifier(SECRET),
         subscribeEngineEvents: (listener) => engine.subscribe(listener),
@@ -107,7 +107,7 @@ describe('tenant pod with a top-level partition only (provider-built transport)'
 
   async function tenantPod(adapter: MockAdapter, transportPartition?: string) {
     const { app, container } = makeApp({
-      role: 'tenant',
+      topology: 'tenant',
       transport: 'queue',
       transports: {
         queue: transports.queue({

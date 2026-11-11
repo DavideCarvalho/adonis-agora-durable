@@ -87,19 +87,19 @@ export interface RunGatewayEngine {
 /** Options for {@link StoreRunGateway}. */
 export interface StoreRunGatewayOptions {
   /**
-   * The role reported by {@link StoreRunGateway.topology}. `standalone` for a single-process
+   * The topology reported by {@link StoreRunGateway.topology}. `standalone` for a single-process
    * deployment (the default — this package's first target); `control-plane` when this engine is the
    * store-owning operator that tenant proxies round-trip to. A store-backed gateway is never a
-   * `tenant` (that's the proxy's role), so only these two are accepted.
+   * `tenant` (that's the proxy's topology), so only these two are accepted.
    */
-  role?: 'standalone' | 'control-plane' | undefined;
+  topology?: 'standalone' | 'control-plane' | undefined;
 }
 
 /**
  * Store-backed {@link RunGateway} — the operator-side implementation. Wraps the local
  * {@link WorkflowEngine} and forwards each read/control/stream verb to the engine's existing method,
  * exactly the surface a `standalone` or `control-plane` deployment exposes. It holds NO state of its
- * own beyond the injected engine and its declared role; all durability lives in the engine/store.
+ * own beyond the injected engine and its declared topology; all durability lives in the engine/store.
  *
  * Idiomatic AdonisJS: a plain class constructed with its dependency, wired by the package's provider /
  * `defineConfig` (no framework DI decorators). A later `ProxyRunGateway` (Wave 2) will implement the
@@ -108,15 +108,15 @@ export interface StoreRunGatewayOptions {
  */
 export class StoreRunGateway implements RunGateway {
   readonly #engine: RunGatewayEngine;
-  readonly #role: 'standalone' | 'control-plane';
+  readonly #topology: 'standalone' | 'control-plane';
 
   constructor(engine: RunGatewayEngine, options: StoreRunGatewayOptions = {}) {
     this.#engine = engine;
-    this.#role = options.role ?? 'standalone';
+    this.#topology = options.topology ?? 'standalone';
   }
 
   topology(): DurableTopology {
-    return { role: this.#role };
+    return { role: this.#topology };
   }
 
   getRun(runId: string): Promise<WorkflowRun | null> {

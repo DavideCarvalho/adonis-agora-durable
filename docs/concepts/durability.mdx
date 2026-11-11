@@ -76,7 +76,7 @@ Each phase is isolated: one failing phase is logged and the tick continues with 
 node ace durable:work --interval=500 --drain-timeout=30000
 ```
 
-An instance configured with `role: 'control-plane'` in `config/durable.ts` gets a **no-op run dispatcher**: its `start` only **enqueues**, leaving the run `pending` for a `durable:work` process to pick up over the database. An explicit `runDispatcher` overrides the role default. See [Roles & config](/docs/durable/cluster/roles-and-config).
+An instance configured with `topology: 'control-plane'` in `config/durable.ts` gets a **no-op run dispatcher**: its `start` only **enqueues**, leaving the run `pending` for a `durable:work` process to pick up over the database. An explicit `runDispatcher` overrides the topology default. See [Topology & config](/docs/durable/cluster/topology-and-config).
 
 Without a worker, a started run still executes: the default in-process dispatcher runs it on the same instance, asynchronously. What nothing does without a worker loop is the rest of the list above. A run that sleeps, retries a dispatched step on a timer or waits with a timeout never wakes, a crashed run is never recovered, and schedules never fire. So every app needs one worker loop: a `durable:work` process, or the embedded one below.
 

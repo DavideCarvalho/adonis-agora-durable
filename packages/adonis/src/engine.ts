@@ -734,7 +734,7 @@ export interface WorkflowEngineDeps {
    *
    * The AdonisJS provider maps `config/durable.ts` onto this: an absent `namespace` is `'default'` on
    * a `standalone` engine (it drives only the default pool, legacy rows included), and stays
-   * `undefined` — the operator — only on a `role: 'control-plane'` engine. Constructing the engine by
+   * `undefined` — the operator — only on a `topology: 'control-plane'` engine. Constructing the engine by
    * hand keeps the raw meaning above.
    */
   namespace?: string | undefined;
@@ -4816,7 +4816,7 @@ export class WorkflowEngine {
     // Piggybacked on the existing store.getRun above — no extra async step on the happy path. An
     // undefined namespace (a store row created before the field existed) is treated as "belongs to
     // everyone" for back-compat: don't skip it. An operator (this.namespace undefined) belongs to
-    // every namespace too, so the guard never applies to it — that is the whole point of the role.
+    // every namespace too, so the guard never applies to it — that is the whole point of the topology.
     if (
       this.namespace !== undefined &&
       run.namespace !== undefined &&
