@@ -86,7 +86,15 @@ export default class RunsController {
 All of these write to the store, so the pod needs the primary database connection, not a read-only replica connection. The Lucid store also provisions its tables at boot unless `autoSchema` is `false`.
 
 <Callout type="info" title="Keep the console read-only too">
-If the pod must never resume a run, route signals and webhooks to the worker pods and give the console's users the `viewer` role, so every mutating dashboard route answers `403`. See [Dashboard authentication](/docs/durable/observability/dashboard-auth).
+If the pod must never resume a run, route signals and webhooks to the worker pods and deny mutating requests in the console's `authorize`, so every mutating dashboard route answers `403`:
+
+```ts title="config/durable_dashboard.ts"
+export default defineConfig({
+  authorize: (ctx) => ctx.request.method() === 'GET' && ctx.auth.user?.isAdmin === true,
+})
+```
+
+See [Authorization](/docs/durable/observability/dashboard#authorization).
 </Callout>
 
 ## A hand-built engine

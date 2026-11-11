@@ -32,44 +32,69 @@ export default defineConfig({
 | --- | --- | --- |
 | `enabled` | `true` | When `false`, no routes are registered at all. |
 | `path` | `'/durable'` | Route prefix the console mounts under. `'/'` mounts at the root. |
-| `authorize` | see below | Per-request guard: `(ctx: HttpContext) => AuthorizeResult \| Promise<AuthorizeResult>`, where `AuthorizeResult = boolean \| { allowed: boolean; reason?: 'unauthenticated' \| 'forbidden' }`. |
-| `dashboardAuth` | absent | Opt-in [session layer](/docs/durable/observability/dashboard-auth) on top of `authorize`. |
-| `allowUnauthenticated` | `false` | Local development only: serve the console with no auth at all (warns at boot). See below. |
+| `authorize` | open outside production, `403` in production | Who may reach the console: a function `(ctx) => result`, an authorizer class, or a lazy import of one. See [Authorization](#authorization). |
 | `audit` | app logger | `(entry) => void` sink for every mutating attempt: `{ at, actor, method, path }`. |
 | `redact` | absent | `{ run?, checkpoint? }` hooks applied to every serialized run and checkpoint right before it leaves the API. See [Redacting payloads](#redacting-payloads). |
 | `accessDenied` | built-in page | Tweak or replace the [access-denied page](#the-access-denied-page). |
 
 ### Authorization
 
-The default `authorize` **fails closed in every environment**: it requires a bearer token equal to the `DURABLE_DASHBOARD_TOKEN` env var, and denies everything when that var is unset. (Before 0.37 it was open outside `NODE_ENV=production` — which left dev boxes, staging, and any deployment with a misspelled/unset `NODE_ENV` serving an unauthenticated console.) The token is accepted from an `Authorization: Bearer <token>` header or an `x-durable-token` header, compared in constant time; the `?token=` query param works on **GET and HEAD only** (it exists for the SSE live-tail, whose `EventSource` cannot set headers) — never on a mutating route, so a leaked/logged URL can't act as a destructive magic link.
+Without `authorize`, the console is open when the app is not in production. In production every request, the console page and its API alike, gets `403`, and the app logs this once at boot:
 
-<Callout type="info" title="The token gate is for scripts and proxies, not browsers">
-The bundled console never attaches a token: its page navigation, its `fetch` calls and its `EventSource` carry only the browser's cookies. The default token gate therefore suits machine clients (a script, a Prometheus scrape of [`/api/metrics`](#live-queries-webhooks-and-metrics)) or a reverse proxy that injects the header. For operators in a browser, use [`dashboardAuth`](/docs/durable/observability/dashboard-auth) or an `authorize` hook that reads your app's own session cookie.
-</Callout>
+```
+[@adonis-agora/durable] console has no `authorize` configured: it is open outside production and denies every request in production. Set `authorize` in config/durable_dashboard.ts.
+```
 
-Three ways to open the console up, in order of preference:
+Set `authorize` to choose who may open it. It takes the same contract as every `@adonis-agora` console (`ConsoleAuthorize`, exported from `@adonis-agora/durable/dashboard`), in three forms:
 
-1. configure [`dashboardAuth`](/docs/durable/observability/dashboard-auth) — the session guard becomes the gate (the default token guard steps aside);
-2. set `DURABLE_DASHBOARD_TOKEN` (or supply your own `authorize`);
-3. for local development only, `allowUnauthenticated: true` serves the console with **no auth at all** — it exists so the old open-by-default behavior has to be spelled out in config (and greppable at review time). It logs a warning at boot.
+```ts title="config/durable_dashboard.ts"
+import { defineConfig } from '@adonis-agora/durable/dashboard'
+import ConsoleAccess from '#policies/console_access'
 
-Two request-level guards apply on top of whatever gate you pick:
+export default defineConfig({
+  // 1. an inline function
+  authorize: (ctx) => ctx.auth.user?.isAdmin === true,
 
-- **Cross-site rejection** — a browser-originated cross-site mutating request (by `Sec-Fetch-Site`, else `Origin` vs `Host`) gets `403 { "error": "cross-site request rejected" }` before any handler runs, closing the drive-by CSRF shape (the mutating endpoints need no body, so they used to be firable as simple cross-origin POSTs). `Sec-Fetch-Site: same-site` counts as cross-site on purpose, so a sibling subdomain cannot drive the console's actions either; an `Origin: null` is rejected too. Non-browser clients send neither header and pass.
-- **Session roles** — a `dashboardAuth` session whose `roles` list is **non-empty** must include `operator` or `admin` (compared case-insensitively) to hit a mutating route; everything else is a viewer (`403`). An empty/absent roles list keeps full access, so existing hooks that never set roles are unchanged.
+  // 2. an authorizer class (built by the container, so `@inject()` works)
+  // authorize: ConsoleAccess,
 
-Every mutating attempt is also **audited** before its handler runs — actor (session name/id, `token`, or `anonymous`), method and path without the query string — through the app logger, or your own `audit` hook on the config. Reads are not audited. Payloads an operator submits (fix-and-replay input, signal/update/task bodies, webhook callbacks) are capped at 1 MiB (`413`). A handler that throws answers a generic `500 { "error": "internal error" }`; the detail goes to the app logger, never to the client.
+  // 3. a lazy import of that class
+  // authorize: () => import('#policies/console_access'),
+})
+```
 
-Override `authorize` with your own session/role/IP guard. It returns a bare `boolean` or a decision object `{ allowed, reason? }` (the `AuthorizeDecision` / `AuthorizeResult` types, exported from `@adonis-agora/durable/dashboard` — the same contract every `@adonis-agora` console accepts). A denial gets JSON for an API call and the [access-denied page](#the-access-denied-page) for a browser:
+```ts title="app/policies/console_access.ts"
+import { inject } from '@adonisjs/core'
+import type { HttpContext } from '@adonisjs/core/http'
+import type { ConsoleAuthorizer } from '@adonis-agora/durable/dashboard'
+import AuditService from '#services/audit_service'
 
-| Hook result | Status | API body |
+@inject()
+export default class ConsoleAccess implements ConsoleAuthorizer {
+  constructor(private audit: AuditService) {}
+
+  async authorize(ctx: HttpContext) {
+    if (!(await ctx.auth.check())) return { redirectTo: '/login' }
+    const allowed = ctx.auth.user!.isAdmin
+    await this.audit.record('durable-console', ctx.auth.user!.id, allowed)
+    return allowed
+  }
+}
+```
+
+The class is the same for every console, so one `ConsoleAccess` can gate durable, telescope, media, payments and agent.
+
+What `authorize` returns decides the answer. A denial gets JSON for an API call and the [access-denied page](#the-access-denied-page) for a browser:
+
+| Result | Status | API body |
 | --- | --- | --- |
 | `true` / `{ allowed: true }` | request proceeds | — |
-| `{ allowed: false, reason: 'unauthenticated' }` | `401` | `{ "error": "unauthorized" }` |
+| `{ allowed: false, reason: 'unauthenticated' }` | `401` | `{ "error": "unauthenticated" }` |
 | `{ allowed: false, reason: 'forbidden' }`, `{ allowed: false }`, `false` | `403` | `{ "error": "forbidden" }` |
-| the hook throws | `403` | `{ "error": "forbidden" }` |
+| `{ redirectTo: '/login' }` | `302` to that path for a page, `401` for an API call | `{ "error": "unauthenticated", "redirectTo": "/login" }` |
+| it throws | `403` | `{ "error": "forbidden" }` |
 
-Only `true` or `allowed: true` lets a request through — any other value denies. A hook that already answered the request (a redirect to your login page, a body) keeps its answer; the provider writes nothing over it.
+Only `true` or `allowed: true` lets a request through — any other value denies. A guard that already answered the request itself (`ctx.response.redirect(...)`, a body) keeps its answer; the console writes nothing over it. When an API call gets a `401` carrying `redirectTo`, the bundled console sends the browser there.
 
 ```ts
 export default defineConfig({
@@ -97,15 +122,48 @@ The user is resolved from `ctx.auth.getUser()` (authkit) or `ctx.auth.user` (any
 denied (`false`). The same helper works across every `@adonis-agora` dashboard — durable,
 telescope, media and agent — so one RBAC gate config reads the same everywhere.
 
-<Callout type="warn">
-The console exposes retry, cancel, replay and bulk actions that mutate runs. Always front it with a real guard in production — the default token gate is a floor, not a substitute for your app's auth.
-</Callout>
+#### Scripts and scrapers: `authorizeByToken`
 
-Prefer a real sign-in page, or to open the console from an app where the operator is already signed in? Opt into the built-in [dashboard auth](/docs/durable/observability/dashboard-auth) (`dashboardAuth`), which layers a signed session cookie on top of `authorize`.
+For machine access (a script, a Prometheus scrape of [`/api/metrics`](#live-queries-webhooks-and-metrics)), `authorizeByToken` lets a request through when its `Authorization: Bearer <token>` header matches, and answers `401` otherwise. Only that header is read. An empty or missing token throws when the config loads.
+
+```ts title="config/durable_dashboard.ts"
+import env from '#start/env'
+import { authorizeByToken, defineConfig } from '@adonis-agora/durable/dashboard'
+
+export default defineConfig({
+  authorize: authorizeByToken({ token: env.get('CONSOLE_TOKEN') }),
+})
+```
+
+```sh
+curl -H "Authorization: Bearer $CONSOLE_TOKEN" https://app.example.com/durable/api/runs
+```
+
+To let both operators and scripts in, combine them in a function:
+
+```ts title="config/durable_dashboard.ts"
+const byToken = authorizeByToken({ token: env.get('CONSOLE_TOKEN') })
+const byRole = authorizeByRoles({ roles: ['ADMIN'] })
+
+export default defineConfig({
+  authorize: async (ctx) =>
+    ctx.request.header('authorization') ? byToken(ctx) : byRole(ctx),
+})
+```
+
+#### Request guards and audit
+
+A browser-originated cross-site mutating request (by `Sec-Fetch-Site`, else `Origin` vs `Host`) gets `403 { "error": "cross-site request rejected" }` whatever `authorize` says. `Sec-Fetch-Site: same-site` counts as cross-site, so a sibling subdomain cannot drive the console's actions either; an `Origin: null` is rejected too. Non-browser clients send neither header and pass.
+
+Every mutating attempt is **audited** before its handler runs: actor (`ctx.auth.user`'s `email`, `name` or `id`, `bearer` for a token caller, else `anonymous`), method and path without the query string. It goes to the app logger, or to your own `audit` hook. Reads are not audited. Payloads an operator submits (fix-and-replay input, signal/update/task bodies, webhook callbacks) are capped at 1 MiB (`413`). A handler that throws answers a generic `500 { "error": "internal error" }`; the detail goes to the app logger, never to the client.
+
+<Callout type="warn">
+The console exposes retry, cancel, replay and bulk actions that mutate runs. Set `authorize` before you deploy; a staging app that does not run in production mode is open without it.
+</Callout>
 
 ### The access-denied page
 
-A refused **API** request gets JSON (`403 { "error": "forbidden" }`, or `401 { "error": "unauthorized", "auth": { "modes": [...] } }` without a session) — that is what the console's own `fetch` calls expect. A refused **page** navigation — the console shell, its assets, or the Mode-A-only "open this from your app" case — gets a real page instead: a dark card in the console's visual language showing the status, a sentence explaining the refusal, a "Back to app" link and, when `dashboardAuth.login` is configured, a "Sign in" button. It carries no inline script, so a nonce'd `script-src` CSP cannot break it (its one inline `<style>` picks up `@adonisjs/shield`'s request nonce).
+A refused **API** request gets JSON (`403 { "error": "forbidden" }` or `401 { "error": "unauthenticated" }`) — that is what the console's own `fetch` calls expect. A refused **page** navigation — the console shell or its assets — gets a real page instead: a dark card in the console's visual language showing the status, a sentence explaining the refusal, a "Back to app" link and, when you set `loginHref`, a "Sign in" button. It carries no inline script, so a nonce'd `script-src` CSP cannot break it (its one inline `<style>` picks up `@adonisjs/shield`'s request nonce).
 
 Tweak it with `accessDenied` — every field optional:
 
@@ -117,14 +175,14 @@ export default defineConfig({
     message: 'Peça ao admin para liberar o console de workflows.',
     homeHref: '/admin',              // "Back to app"; default "/", `false` hides it
     homeLabel: 'Voltar',
-    loginHref: '/entrar',            // default: the built-in login page when one exists
+    loginHref: '/entrar',            // "Sign in" on a 401; absent by default
     loginLabel: 'Entrar',
     accent: '#f59e0b',               // any CSS colour; default: the console's lime
   },
 })
 ```
 
-Or replace it. Pass a function and it receives the refusal (`status`, `reason` — `'forbidden'`, `'unauthenticated'` or `'session-required'` — `basePath`, `loginHref`, and the CSP `nonce` when there is one) plus the `HttpContext`. Return an HTML string to have it served with the right status; answer the request yourself and return nothing to make the provider stand down:
+Or replace it. Pass a function and it receives the refusal (`status`, `reason` — `'forbidden'` or `'unauthenticated'` — `basePath`, and the CSP `nonce` when there is one) plus the `HttpContext`. Return an HTML string to have it served with the right status; answer the request yourself and return nothing to make the provider stand down:
 
 ```ts title="config/durable_dashboard.ts"
 export default defineConfig({
@@ -347,7 +405,7 @@ The filter is evaluated with a hard cap of 500 and no paging. A filter matching 
 **`POST /api/webhooks/:token`** resumes a run parked on [`ctx.webhook().wait()`](/docs/durable/authoring/webhooks). It only takes webhook tokens (`wh:<runId>:<seq>`), so it is not a second signal endpoint. A callback for a run waiting on that token resumes it and answers `{ result }`. One that lands before the run reaches `wait()` — the url was handed out, then the run kept going — is buffered and answers `202 { buffered: true }`, as long as the run exists, is not terminal and has not consumed that webhook yet; the later `wait()` consumes it. A callback for an unknown or terminal run, or a duplicate of one already delivered, answers `404` and buffers nothing. Past the 1 MiB payload limit it answers `413`.
 
 <Callout type="warn" title="The webhook route is behind the console's guard">
-Like every route here, `webhooks/:token` runs behind `authorize` (and, with built-in auth, needs a session that may act). A webhook token embeds the run id, which a caller may know, so it is not a secret to rely on. Let the sender through in `authorize`, for example by checking a shared header or a signature for that path, or expose your own public route that verifies the sender and calls `engine.signal(token, body)`. Point `webhookUrl` in `config/durable.ts` at whichever route you choose.
+Like every route here, `webhooks/:token` runs behind `authorize`. A webhook token embeds the run id, which a caller may know, so it is not a secret to rely on. Let the sender through in `authorize`, for example by checking a shared header or a signature for that path, or expose your own public route that verifies the sender and calls `engine.signal(token, body)`. Point `webhookUrl` in `config/durable.ts` at whichever route you choose.
 </Callout>
 
 **`GET /api/metrics`** serves `text/plain; version=0.0.4` for a Prometheus scrape:

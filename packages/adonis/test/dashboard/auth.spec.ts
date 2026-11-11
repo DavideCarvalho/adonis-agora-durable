@@ -1,6 +1,7 @@
 import type { HttpContext } from '@adonisjs/core/http';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { defaultAuthorize, resolveConfig } from '../../src/dashboard/define_config.js';
+import { describe, expect, it } from 'vitest';
+import { authorizeByToken } from '../../src/dashboard/console_authorize.js';
+import { NO_AUTHORIZE_WARNING, resolveConfig } from '../../src/dashboard/define_config.js';
 
 /** Minimal HttpContext stand-in exposing the bits the guard reads. */
 function fakeCtx(
@@ -16,122 +17,122 @@ function fakeCtx(
   } as unknown as HttpContext;
 }
 
-const NODE_ENV = process.env.NODE_ENV;
-const TOKEN = process.env.DURABLE_DASHBOARD_TOKEN;
-
-/** Set an env var to a string value, or remove it entirely when `undefined`. */
-function setEnv(key: string, value: string | undefined): void {
-  if (value === undefined) Reflect.deleteProperty(process.env, key);
-  else process.env[key] = value;
-}
-
-describe('defaultAuthorize — fails closed in EVERY environment', () => {
-  beforeEach(() => {
-    setEnv('DURABLE_DASHBOARD_TOKEN', undefined);
-  });
-  afterEach(() => {
-    setEnv('NODE_ENV', NODE_ENV);
-    setEnv('DURABLE_DASHBOARD_TOKEN', TOKEN);
-  });
-
-  it('denies OUTSIDE production too when no token is configured (the old open default)', () => {
-    process.env.NODE_ENV = 'development';
-    expect(defaultAuthorize(fakeCtx())).toBe(false);
-  });
-
-  it('denies with NODE_ENV unset / misspelled — the deployments the old branch left open', () => {
-    setEnv('NODE_ENV', undefined);
-    expect(defaultAuthorize(fakeCtx())).toBe(false);
-    process.env.NODE_ENV = 'prod';
-    expect(defaultAuthorize(fakeCtx())).toBe(false);
-  });
-
-  it('denies when no token env is configured (fail-closed)', () => {
-    process.env.NODE_ENV = 'production';
-    process.env.DURABLE_DASHBOARD_TOKEN = '';
-    expect(defaultAuthorize(fakeCtx())).toBe(false);
-  });
-
-  it('denies with a wrong token', () => {
-    process.env.DURABLE_DASHBOARD_TOKEN = 'secret';
-    expect(defaultAuthorize(fakeCtx({ headers: { authorization: 'Bearer nope' } }))).toBe(false);
-  });
-
-  it('allows with a matching bearer token, in any environment', () => {
-    process.env.NODE_ENV = 'development';
-    process.env.DURABLE_DASHBOARD_TOKEN = 'secret';
-    expect(defaultAuthorize(fakeCtx({ headers: { authorization: 'Bearer secret' } }))).toBe(true);
-  });
-
-  it('accepts the token via the x-durable-token header', () => {
-    process.env.DURABLE_DASHBOARD_TOKEN = 'secret';
-    expect(defaultAuthorize(fakeCtx({ headers: { 'x-durable-token': 'secret' } }))).toBe(true);
-  });
-
-  it('accepts the ?token query param on GET only (EventSource), never on a mutating method', () => {
-    process.env.DURABLE_DASHBOARD_TOKEN = 'secret';
-    expect(defaultAuthorize(fakeCtx({ qs: { token: 'secret' } }))).toBe(true);
-    expect(defaultAuthorize(fakeCtx({ qs: { token: 'secret' }, method: 'POST' }))).toBe(false);
-    // The header channels still work for mutating methods.
-    expect(
-      defaultAuthorize(fakeCtx({ headers: { 'x-durable-token': 'secret' }, method: 'POST' })),
-    ).toBe(true);
-  });
-});
-
-describe('resolveConfig', () => {
-  afterEach(() => {
-    setEnv('DURABLE_DASHBOARD_TOKEN', TOKEN);
-  });
-
+describe('resolveConfig — authorize omitted', () => {
   it('applies defaults', () => {
     const c = resolveConfig();
     expect(c.enabled).toBe(true);
     expect(c.path).toBe('/durable');
     expect(typeof c.authorize).toBe('function');
+    expect(c.authorizeConfigured).toBe(false);
   });
 
-  it('the default guard is the fail-closed token guard (denies with no token env)', async () => {
-    setEnv('DURABLE_DASHBOARD_TOKEN', undefined);
+  it('is open outside production', async () => {
+    const c = resolveConfig({}, { inProduction: false });
+    expect(await c.authorize(fakeCtx())).toEqual({ allowed: true });
+  });
+
+  it('denies every request in production (403)', async () => {
+    const c = resolveConfig({}, { inProduction: true });
+    expect(await c.authorize(fakeCtx())).toEqual({ allowed: false, reason: 'forbidden' });
+  });
+
+  it('denies when the environment is unknown', async () => {
     const c = resolveConfig();
-    expect(await c.authorize(fakeCtx())).toBe(false);
+    expect(await c.authorize(fakeCtx())).toEqual({ allowed: false, reason: 'forbidden' });
   });
 
-  it('allowUnauthenticated: true consciously opens the guard', async () => {
-    setEnv('DURABLE_DASHBOARD_TOKEN', undefined);
-    const c = resolveConfig({ allowUnauthenticated: true });
-    expect(await c.authorize(fakeCtx())).toBe(true);
+  it('ignores the removed token channels and options', async () => {
+    const c = resolveConfig(
+      { allowUnauthenticated: true, dashboardAuth: { secret: 'x' } } as never,
+      { inProduction: true },
+    );
+    for (const ctx of [
+      fakeCtx({ headers: { authorization: 'Bearer secret' } }),
+      fakeCtx({ headers: { 'x-durable-token': 'secret' } }),
+      fakeCtx({ qs: { token: 'secret' } }),
+    ]) {
+      expect(await c.authorize(ctx)).toEqual({ allowed: false, reason: 'forbidden' });
+    }
   });
 
-  it('a configured dashboardAuth makes the session guard the gate (authorize passes)', async () => {
-    setEnv('DURABLE_DASHBOARD_TOKEN', undefined);
-    const c = resolveConfig({
-      dashboardAuth: { secret: 's3cret-key', login: () => ({ id: 'u1' }) },
-    });
-    // authorize alone passes — enforce() still requires the session cookie on every route.
-    expect(await c.authorize(fakeCtx())).toBe(true);
-    expect(c.dashboardAuth).not.toBeNull();
+  it('the boot warning has the shared wording', () => {
+    expect(NO_AUTHORIZE_WARNING).toBe(
+      '[@adonis-agora/durable] console has no `authorize` configured: it is open outside production and denies every request in production. Set `authorize` in config/durable_dashboard.ts.',
+    );
   });
+});
 
+describe('resolveConfig', () => {
   it('normalizes the path (single leading slash, no trailing)', () => {
     expect(resolveConfig({ path: 'admin/durable/' }).path).toBe('/admin/durable');
     expect(resolveConfig({ path: '///ops' }).path).toBe('/ops');
   });
 
-  it('honors a custom authorize hook (it wins over allowUnauthenticated)', async () => {
-    let seen = false;
-    const c = resolveConfig({
-      allowUnauthenticated: true,
-      authorize: () => {
-        seen = true;
-        return false;
-      },
-    });
-    expect(await c.authorize({} as HttpContext)).toBe(false);
-    expect(seen).toBe(true);
+  it('a configured authorize wins in every environment', async () => {
+    for (const inProduction of [true, false]) {
+      let seen = false;
+      const c = resolveConfig(
+        {
+          authorize: () => {
+            seen = true;
+            return false;
+          },
+        },
+        { inProduction },
+      );
+      expect(c.authorizeConfigured).toBe(true);
+      expect(await c.authorize({} as HttpContext)).toEqual({
+        allowed: false,
+        reason: 'forbidden',
+      });
+      expect(seen).toBe(true);
+    }
   });
 
   it('respects enabled: false', () => {
     expect(resolveConfig({ enabled: false }).enabled).toBe(false);
+  });
+});
+
+describe('authorizeByToken', () => {
+  const gate = authorizeByToken({ token: 'secret' });
+
+  it('allows a matching Authorization: Bearer header', () => {
+    expect(gate(fakeCtx({ headers: { authorization: 'Bearer secret' } }))).toEqual({
+      allowed: true,
+    });
+    expect(gate(fakeCtx({ headers: { authorization: 'bearer   secret' } }))).toEqual({
+      allowed: true,
+    });
+  });
+
+  it('answers unauthenticated for a wrong, missing or differently-sized token', () => {
+    const denied = { allowed: false, reason: 'unauthenticated' };
+    expect(gate(fakeCtx({ headers: { authorization: 'Bearer nope' } }))).toEqual(denied);
+    expect(gate(fakeCtx({ headers: { authorization: 'Bearer secret-and-more' } }))).toEqual(denied);
+    expect(gate(fakeCtx({ headers: { authorization: 'Basic secret' } }))).toEqual(denied);
+    expect(gate(fakeCtx())).toEqual(denied);
+  });
+
+  it('reads the header only (no query string, no custom header)', () => {
+    const denied = { allowed: false, reason: 'unauthenticated' };
+    expect(gate(fakeCtx({ qs: { token: 'secret' } }))).toEqual(denied);
+    expect(gate(fakeCtx({ headers: { 'x-durable-token': 'secret' } }))).toEqual(denied);
+  });
+
+  it('throws at config time for an empty or undefined token', () => {
+    expect(() => authorizeByToken({ token: undefined })).toThrow(/non-empty/);
+    expect(() => authorizeByToken({ token: '' })).toThrow(/non-empty/);
+  });
+
+  it('plugs into resolveConfig as the authorize gate', async () => {
+    const c = resolveConfig(
+      { authorize: authorizeByToken({ token: 'secret' }) },
+      { inProduction: true },
+    );
+    expect(await c.authorize(fakeCtx({ headers: { authorization: 'Bearer secret' } }))).toEqual({
+      allowed: true,
+    });
+    expect(await c.authorize(fakeCtx())).toEqual({ allowed: false, reason: 'unauthenticated' });
   });
 });

@@ -1,11 +1,11 @@
 /**
  * The built-in "access denied" page a BROWSER sees when the dashboard guard refuses a page
- * navigation — the SPA shell, its assets, or (Mode A only) a session-less visit. Before this page
+ * navigation — the SPA shell or its assets. Before this page
  * existed the guard answered every denial with the JSON it answers the API with
  * (`{ "error": "forbidden" }`), which is the right thing for the SPA's `fetch` calls and the wrong
  * thing for a human staring at a browser tab.
  *
- * Deliberately a small, dependency-free, hand-authored HTML page (like `login_page.ts`) — NOT part
+ * Deliberately a small, dependency-free, hand-authored HTML page — NOT part
  * of the bundled SPA, so a denial never needs the SPA to load first. It carries NO `<script>` at all,
  * so a host running a nonce'd `script-src` CSP (the `@adonisjs/shield` default) cannot break it; the
  * one inline `<style>` takes the request's CSP nonce when the provider hands one over.
@@ -27,9 +27,7 @@ export type AccessDeniedReason =
   /** Nobody is signed in (a `401`): offer the login page when one exists. */
   | 'unauthenticated'
   /** Somebody is signed in but `authorize` said no (a `403`). */
-  | 'forbidden'
-  /** `dashboardAuth` runs in Mode A only and there is no session — the host app must mint one. */
-  | 'session-required';
+  | 'forbidden';
 
 /** What the provider knows about the refusal — handed to a custom renderer and to the default page. */
 export interface AccessDeniedInfo {
@@ -38,7 +36,7 @@ export interface AccessDeniedInfo {
   reason: AccessDeniedReason;
   /** The console's mount path (`/durable`; `''` when mounted at the root). */
   basePath: string;
-  /** The built-in login page, present only when `dashboardAuth.login` is configured. */
+  /** The app's login page, when the console knows one (`accessDenied.loginHref`). */
   loginHref?: string;
   /** A developer-facing detail (e.g. a thrown hook's message). Providers set it OUTSIDE production only. */
   detail?: string;
@@ -61,7 +59,7 @@ export interface AccessDeniedPageOptions {
   homeHref?: string | false;
   /** Label of the "Back to app" button. */
   homeLabel?: string;
-  /** Where "Sign in" points. Default: the built-in login page when one exists; `false` hides it. */
+  /** Where "Sign in" points (your app's login page). Default: none; `false` hides it. */
   loginHref?: string | false;
   /** Label of the "Sign in" button. */
   loginLabel?: string;
@@ -104,11 +102,6 @@ const DEFAULT_COPY: Record<AccessDeniedReason, { title: string; message: string 
     title: 'Access denied',
     message:
       'Your account is not allowed to open this console. If that looks wrong, ask an administrator to grant you access.',
-  },
-  'session-required': {
-    title: 'Open this console from your app',
-    message:
-      'This console only accepts a session minted by your application. Go back to the app and open the console from there.',
   },
 };
 

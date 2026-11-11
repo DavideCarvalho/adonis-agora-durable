@@ -13,28 +13,25 @@ export {
   renderAccessDeniedPage,
   resolveAccessDeniedPage,
 } from './access_denied_page.js';
-export type {
-  AuthMode,
-  DashboardAuthOptions,
-  LoginHook,
-  LoginOutcome,
-  ResolvedDashboardAuth,
-  SessionHook,
-  SessionOutcome,
-} from './auth.js';
-// Built-in `dashboardAuth` login screen (optional; opt-in via `config/durable_dashboard.ts`).
-export {
-  performLogin,
-  performSession,
-  readSession,
-  resolveDashboardAuth,
-  SESSION_COOKIE_NAME,
-  sanitizeReturnTo,
-} from './auth.js';
 export type { CompatSource, FleetGroup, FleetTransport } from './compat.js';
 // Fleet health / protocol-compatibility panel (design §7.6, §10).
 export { compat, enumerateLiveFleet, mergeFleets } from './compat.js';
 export { formatProtocolRange, outcomeClass, outcomeLabel } from './compat-view.js';
+export type {
+  AuthorizeByTokenOptions,
+  ConsoleAuthorize,
+  ConsoleAuthorizeGate,
+  ConsoleAuthorizeResult,
+  ConsoleAuthorizer,
+  ConsoleAuthorizerClass,
+  ConsoleDecision,
+} from './console_authorize.js';
+// The shared console `authorize` contract (function, class, lazy import).
+export {
+  authorizeByToken,
+  normalizeConsoleDecision,
+  resolveConsoleAuthorize,
+} from './console_authorize.js';
 export type {
   AccessDeniedOption,
   AccessDeniedRenderer,
@@ -42,11 +39,12 @@ export type {
   AuthorizeHook,
   AuthorizeResult,
   DurableDashboardConfig,
+  ResolveConfigOptions,
   ResolvedDurableDashboardConfig,
 } from './define_config.js';
 export {
-  defaultAuthorize,
   defineConfig,
+  NO_AUTHORIZE_WARNING,
   normalizeAuthorizeResult,
   resolveConfig,
 } from './define_config.js';
@@ -77,17 +75,6 @@ export {
   workers,
   workflowLifecycle,
 } from './handlers.js';
-export { renderLoginPage } from './login_page.js';
 export { RUN_STATUSES, RunFilter } from './run-filter.js';
 export { RunQueryDraft } from './run-query-draft.js';
 export { runValueAdapter, valueAxisFor } from './run-values.js';
-export type {
-  DashboardSession,
-  DashboardSessionUser,
-  SignOptions,
-  VerifyOptions,
-} from './session_cookie.js';
-export {
-  signSessionCookie,
-  verifySessionCookie,
-} from './session_cookie.js';

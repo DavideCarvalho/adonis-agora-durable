@@ -2,41 +2,21 @@
   exports({ to: app.configPath('durable_dashboard.ts') })
 }}}
 import { defineConfig } from '@adonis-agora/durable/dashboard'
-// Used by the commented-out dashboardAuth example below.
-// import env from '#start/env'
 
 /**
- * Configuration for the @adonis-agora/durable dashboard.
+ * Configuration for the @adonis-agora/durable console.
  *
- * By default the dashboard FAILS CLOSED in every environment: it requires a
- * bearer token equal to \`DURABLE_DASHBOARD_TOKEN\`, and denies everything when
- * that env var is unset. Replace \`authorize\` with your own guard (session,
- * role, IP allow-list, …), or set \`allowUnauthenticated: true\` for a trusted
- * local network only. \`authorize\` returns a boolean or a decision
- * \`{ allowed, reason?: 'unauthenticated' | 'forbidden' }\` — \`'unauthenticated'\`
- * answers 401, any other denial 403.
- *
- * \`dashboardAuth\` is an ADDITIVE, optional session gate on top of \`authorize\` —
- * a signed cookie minted via a built-in login page (Mode B: \`login\`) and/or a
- * "open the console from your app" endpoint (Mode A: \`session\`). At least one
- * of the two is required when \`dashboardAuth\` is set; either or both may be
- * configured. See \`docs/observability/dashboard-auth.mdx\`.
+ * Without \`authorize\` the console is open outside production and answers 403
+ * to every request in production. Set \`authorize\` to choose who may open it:
+ * a function, an authorizer class, or a lazy import of one
+ * (\`() => import('#policies/console_access')\`). It returns a boolean,
+ * \`{ allowed, reason?: 'unauthenticated' | 'forbidden' }\` (\`'unauthenticated'\`
+ * answers 401, any other denial 403) or \`{ redirectTo }\`. For scripts, use
+ * \`authorizeByToken({ token: env.get('CONSOLE_TOKEN') })\`.
  */
 export default defineConfig({
   // enabled: true,
   // path: '/durable',
   // authorize: (ctx) => ctx.auth.user?.isAdmin === true,
-  // dashboardAuth: {
-  //   secret: env.get('DURABLE_DASHBOARD_SECRET'),
-  //   ttl: '8h',
-  //   // Mode B — standalone login page.
-  //   login: async (username, password) => {
-  //     if (username === 'admin' && password === env.get('DURABLE_DASHBOARD_PASSWORD')) {
-  //       return { id: 'admin', name: 'Admin' }
-  //     }
-  //     return null
-  //   },
-  //   // Mode A — mint a session for an already-authenticated host request.
-  //   // session: async (request) => (request.user?.isAdmin ? { id: request.user.id } : null),
-  // },
+  // authorize: () => import('#policies/console_access'),
 })

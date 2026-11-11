@@ -1,10 +1,6 @@
 import type { HttpContext } from '@adonisjs/core/http';
 import { describe, expect, it } from 'vitest';
-import {
-  crossSiteRequest,
-  isMutatingMethod,
-  sessionCanMutate,
-} from '../../providers/dashboard_provider.js';
+import { crossSiteRequest, isMutatingMethod } from '../../providers/dashboard_provider.js';
 import { CodecStateStore, type PayloadCodec } from '../../src/codec-state-store.js';
 import type { TenantVerifier, VerifiedTenant } from '../../src/config_types.js';
 import { storeDashboardEngine } from '../../src/dashboard/gateway-adapter.js';
@@ -69,16 +65,6 @@ describe('cross-site rejection on mutating console routes (CSRF defense-in-depth
       true, // a sandboxed/opaque origin is exactly the drive-by shape
     );
     expect(crossSiteRequest(fakeCtx())).toBe(false); // curl/SDKs send neither header
-  });
-});
-
-describe('session role convention on mutating routes', () => {
-  it('no roles = full access (back-compat); with roles, operator/admin is required', () => {
-    expect(sessionCanMutate({ roles: [] })).toBe(true);
-    expect(sessionCanMutate({ roles: ['viewer'] })).toBe(false);
-    expect(sessionCanMutate({ roles: ['support', 'viewer'] })).toBe(false);
-    expect(sessionCanMutate({ roles: ['viewer', 'operator'] })).toBe(true);
-    expect(sessionCanMutate({ roles: ['Admin'] })).toBe(true);
   });
 });
 

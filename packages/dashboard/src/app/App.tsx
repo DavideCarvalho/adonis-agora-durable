@@ -7,7 +7,6 @@ import {
   durableClient,
   type FanSummary,
   type GroupHealth,
-  logoutUrl,
   type RunDetail as RunDetailData,
   type RunDisplayStatus,
   type RunPredicates,
@@ -44,7 +43,7 @@ import { throttle } from '../client/throttle';
 import { AttributeFilters } from './AttributeFilters';
 import { CompatHealth } from './CompatPanel';
 import { childChips, republishSummary, republishTargets, triggerChips } from './child-link';
-import { BoltIcon, PlayIcon, RetryIcon, SearchIcon, UserIcon, XIcon } from './icons';
+import { BoltIcon, PlayIcon, RetryIcon, SearchIcon, XIcon } from './icons';
 import { OriginFacets } from './OriginFacets';
 import { LiveLifecycleDeliveries, RunEvents } from './RunEvents';
 import { RunInfoPanel } from './RunInfoPanel';
@@ -203,31 +202,6 @@ function RunIdSearch({ onOpenRun }: { onOpenRun: (id: string) => void }) {
   );
 }
 
-/** The session control: a user icon opening a small menu with the provider's Logout link
- *  (`GET <base>/logout` — see {@link logoutUrl}). A plain `<a>`: logout is a navigation, and the
- *  server answers it with a redirect to the login page / dashboard root. */
-function SessionMenu() {
-  return (
-    <Popover>
-      <PopoverTrigger
-        render={
-          <Button variant="quiet" size="icon" aria-label="session menu" title="Session">
-            <UserIcon width={13} height={13} />
-          </Button>
-        }
-      />
-      <PopoverContent className="w-36">
-        <a
-          href={logoutUrl()}
-          className="mono block px-2.5 py-2 text-[11px] text-zinc-300 hover:bg-zinc-800/50 hover:text-zinc-100"
-        >
-          Logout
-        </a>
-      </PopoverContent>
-    </Popover>
-  );
-}
-
 function Header({
   scope,
   filter,
@@ -347,7 +321,6 @@ function Header({
         <span className="dot s-completed pulse" aria-hidden />
         live
       </div>
-      <SessionMenu />
     </header>
   );
 }

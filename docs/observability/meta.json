@@ -4,7 +4,6 @@
   "pages": [
     "index",
     "dashboard",
-    "dashboard-auth",
     "events-and-interceptors",
     "otel",
     "metrics",

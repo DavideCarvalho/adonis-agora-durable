@@ -137,6 +137,99 @@ curl -X POST https://app.example.com/durable/api/runs/order-42/updates/set-limit
   -H 'content-type: application/json' -d '{ "arg": 500 }'
 ```
 
+## The console without `authorize`: open in development, `403` in production
+
+Without `authorize`, the console used to require a bearer token equal to `DURABLE_DASHBOARD_TOKEN`
+in every environment. Now it is open when the app is not in production, and in production every
+request gets `403`. The app logs this once at boot:
+
+```
+[@adonis-agora/durable] console has no `authorize` configured: it is open outside production and denies every request in production. Set `authorize` in config/durable_dashboard.ts.
+```
+
+If you relied on the default, set `authorize` before you deploy. A staging app that does not run in
+production mode is open without it.
+
+## The console token, `dashboardAuth` and `allowUnauthenticated` are removed
+
+These options and the env var are gone, with no alias:
+
+- `DURABLE_DASHBOARD_TOKEN`, and the token read from `Authorization: Bearer`, `x-durable-token` and
+  `?token=`;
+- `dashboardAuth` (the built-in login page and `POST <path>/session`, `<path>/login`,
+  `<path>/logout`) and its session roles;
+- `allowUnauthenticated`;
+- `defaultAuthorize`, `resolveDashboardAuth`, `performLogin`, `performSession`, `readSession`,
+  `signSessionCookie`, `verifySessionCookie`, `SESSION_COOKIE_NAME` and `renderLoginPage` from
+  `@adonis-agora/durable/dashboard`.
+
+For scripts, use `authorizeByToken`. It reads only the `Authorization: Bearer` header.
+
+Before:
+
+```ts title="config/durable_dashboard.ts"
+import { defineConfig } from '@adonis-agora/durable/dashboard'
+
+// DURABLE_DASHBOARD_TOKEN=... in .env
+export default defineConfig({})
+```
+
+After:
+
+```ts title="config/durable_dashboard.ts"
+import env from '#start/env'
+import { authorizeByToken, defineConfig } from '@adonis-agora/durable/dashboard'
+
+export default defineConfig({
+  authorize: authorizeByToken({ token: env.get('CONSOLE_TOKEN') }),
+})
+```
+
+```sh
+curl -H "Authorization: Bearer $CONSOLE_TOKEN" https://app.example.com/durable/api/runs
+```
+
+For operators, gate the console with your app's own sign-in instead of `dashboardAuth`.
+
+Before:
+
+```ts title="config/durable_dashboard.ts"
+export default defineConfig({
+  dashboardAuth: {
+    secret: env.get('DURABLE_DASHBOARD_SECRET'),
+    login: async (username, password) => verifyOperator(username, password),
+  },
+})
+```
+
+After:
+
+```ts title="config/durable_dashboard.ts"
+export default defineConfig({
+  authorize: async (ctx) => {
+    if (!(await ctx.auth.check())) return { redirectTo: '/login' }
+    return ctx.auth.user!.isAdmin === true
+  },
+})
+```
+
+An `authorize` that called `defaultAuthorize(ctx)` first to let a token through calls the
+`authorizeByToken` gate instead:
+
+```ts title="config/durable_dashboard.ts"
+const byToken = authorizeByToken({ token: env.get('CONSOLE_TOKEN') })
+
+export default defineConfig({
+  authorize: async (ctx) => {
+    if (ctx.request.header('authorization')) return byToken(ctx)
+    return ctx.auth.user?.isAdmin === true
+  },
+})
+```
+
+An unauthenticated API call now answers `401 { "error": "unauthenticated" }` (it was
+`{ "error": "unauthorized" }`), with `redirectTo` when `authorize` returned one.
+
 ## Upgrade a control plane older than 0.50 before its tenant pods
 
 A store-less `tenant` pod on 1.0 relies on the control plane answering a verb it does not know with
