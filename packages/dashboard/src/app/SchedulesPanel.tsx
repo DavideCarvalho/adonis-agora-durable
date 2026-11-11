@@ -164,6 +164,14 @@ function ScheduleRow({ s, onOpenRun }: { s: ScheduleInfo; onOpenRun: (id: string
           Run now
         </Button>
       </span>
+      {(setPaused.error || trigger.error) && (
+        <div role="alert" className="mono col-span-full text-[11px] text-rose-300">
+          {(() => {
+            const failure = setPaused.error ?? trigger.error;
+            return `Action failed: ${failure instanceof Error ? failure.message : String(failure)}`;
+          })()}
+        </div>
+      )}
     </li>
   );
 }

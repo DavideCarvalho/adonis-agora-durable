@@ -697,7 +697,8 @@ const REDIRECTED =
  * follow to an HTML 200 the console then mistakes for success. A 401 goes to the auth surface.
  */
 async function send(path: string, init?: RequestInit): Promise<Response> {
-  const write = (init?.method ?? 'GET').toUpperCase() !== 'GET';
+  const method = (init?.method ?? 'GET').toUpperCase();
+  const write = method !== 'GET' && method !== 'HEAD';
   const res = await fetch(apiBase() + path, {
     ...init,
     ...(write

@@ -1394,7 +1394,8 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   const waitTargets = run.status === 'suspended' ? waitTargetsOf(body, waiting) : [];
   // An action the server refused (or answered with a redirect, e.g. an expired CSRF token): said on
   // the page, never swallowed.
-  const actionFailure = [retry, cancel, cont, redispatch].find((m) => m.error)?.error;
+  // (Republish shows its own failure in its dialog.)
+  const actionFailure = [retry, cancel, cont, redispatch, fixReplay].find((m) => m.error)?.error;
 
   return (
     <div className="flex h-full flex-col">

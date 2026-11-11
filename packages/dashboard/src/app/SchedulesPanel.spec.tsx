@@ -140,6 +140,14 @@ describe('SchedulesPanel: the schedules table', () => {
     await waitFor(() => expect(onOpenRun).toHaveBeenCalledWith('rep-window-1'));
   });
 
+  it('shows a refused Run now on the row instead of doing nothing', async () => {
+    triggerSchedule.mockRejectedValue(new Error('The server redirected this request'));
+    await renderPanel([schedule()]);
+    fireEvent.click(await screen.findByRole('button', { name: 'Run now' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('redirected');
+  });
+
   it('degrades to an unavailable note when the endpoint 404s (tenant topology / older server)', async () => {
     schedules.mockRejectedValue(new Error('404 Not Found'));
     render(<SchedulesPanel onOpenRun={vi.fn()} />, { wrapper });

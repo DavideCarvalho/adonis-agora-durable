@@ -30,6 +30,7 @@ function stubElementSize() {
 
 const getRun = vi.fn<(id: string) => Promise<RunDetail>>();
 const cancel = vi.fn();
+const retryWithInput = vi.fn();
 
 vi.mock('../client/durable-client', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../client/durable-client')>();
@@ -39,6 +40,7 @@ vi.mock('../client/durable-client', async (importOriginal) => {
       ...actual.durableClient,
       run: (id: string) => getRun(id),
       cancel: (...args: unknown[]) => cancel(...args),
+      retryWithInput: (...args: unknown[]) => retryWithInput(...args),
       streamRun: () => () => {},
       runs: vi.fn().mockResolvedValue([]),
       runsPage: vi.fn().mockResolvedValue({ runs: [], meta: { page: 1, size: 100, count: 0 } }),
@@ -93,6 +95,7 @@ describe('App: the run detail of a waiting or cancelling run', () => {
     stubElementSize();
     getRun.mockReset();
     cancel.mockReset();
+    retryWithInput.mockReset();
     window.location.hash = '';
   });
   afterEach(() => {
@@ -151,5 +154,24 @@ describe('App: the run detail of a waiting or cancelling run', () => {
     act(() => button?.click());
     const alert = await screen.findByRole('alert');
     expect(alert.textContent).toContain('redirected');
+  });
+
+  it('says so on the page when fix-and-replay is refused', async () => {
+    getRun.mockImplementation((id) => Promise.resolve(detail(id, { status: 'failed' })));
+    retryWithInput.mockRejectedValue(new Error('input rejected by the server'));
+    window.location.hash = '#/run/f1';
+    render(<App />, { wrapper });
+    await screen.findByRole('heading', { name: 'approve' });
+    const open = (await screen.findAllByRole('button')).find((b) =>
+      /fix/i.test(b.textContent ?? ''),
+    );
+    expect(open).toBeDefined();
+    act(() => open?.click());
+    const submit = (await screen.findAllByRole('button')).find(
+      (b) => /replay/i.test(b.textContent ?? '') && b !== open,
+    );
+    act(() => submit?.click());
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('input rejected');
   });
 });
