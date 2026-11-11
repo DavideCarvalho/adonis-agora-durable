@@ -1,0 +1,8 @@
+---
+"@adonis-agora/durable": major
+---
+
+Durable is now the transport behind `@adonis-agora/diagnostics`' `transports.durable()`, and its own `@OnDiagnostic` workflow trigger is removed.
+
+- **New `@adonis-agora/durable/diagnostics` subpath.** With `default: 'durable'` in `config/diagnostics.ts`, every diagnostics listener call runs as a run of the internal `durable.diagnostics.listener` workflow, with the id `diag:<event id>:<listener id>`. The same event never runs a listener twice, even when it is handed over twice or from two processes. The listener runs in the `handle` step with the transport's `retries` / `backoff` / `backoffMs` / `backoffMaxMs` / `jitter` (default: 3 attempts, exponential from 1s, at most 30s). A listener the running process does not know fails the run at once with `E_UNKNOWN_DIAGNOSTICS_LISTENER`. In the console the runs carry the origin `@adonis-agora/diagnostics` and the tags `diagnostics`, `lib:<lib>`, `event:<event>` and `listener:<id>`. They are not echoed back onto the bus as `agora:durable:*` events, so a listener on durable events cannot trigger itself. `@adonis-agora/diagnostics` (1.0.0-rc.1 or later) is a new optional peer, used for types only.
+- **Breaking: `@OnDiagnostic`, `DiagnosticsTriggerConfig` and `static on` entries with `source: 'diagnostics'` are removed**, with no alias. A `static on` entry with that source now fails the app's boot. To start a workflow from a diagnostics event, dispatch it from a diagnostics listener (`MyWorkflow.dispatch(event.payload, { runId: \`evt:${event.id}\` })`), or select `transports.durable()` and put the work in the listener. `@OnEvent`, `@OnWorkflowCompleted` and `@OnWorkflowFailed` are unchanged. See the migration guide.

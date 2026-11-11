@@ -81,7 +81,7 @@ function defaultWorkflowFactory(
  * (the Adonis container's `make` resolves async), so this function is async.
  *
  * Origin: the class's explicit `static workflow.origin` wins; else the package that DECLARED it, when
- * a class decorator (`@Scheduled`, `@OnEvent`, `@OnDiagnostic`) captured its file; else the package
+ * a class decorator (`@Scheduled`, `@OnEvent`) captured its file; else the package
  * whose code is CALLING this function (a lib registering its own workflows → the lib). `undefined`
  * when none resolves. See `./origin.ts`.
  */
@@ -124,14 +124,11 @@ async function registerClass(
   const originOpts = { ...(origin ? { origin } : {}), [ORIGIN_RESOLVED]: true as const };
   const Ctor = cls as DiscoveredWorkflowClass;
   const instance = await factory(Ctor);
-  // Colocated `static on` event triggers: exact-string ones register under the engine's
-  // `onEvent` (the bridge publishes the canonical name); regex/any ones are started
-  // directly by the bridge. Both are recorded so the provider can attach the bridge.
+  // Colocated `static on` event triggers register under the engine's `onEvent` (the bridge
+  // publishes the canonical name), and are recorded so the provider can attach the bridge.
   const events = workflowEvents(cls);
   if (events.length > 0) engine.registerEventTriggers(events);
-  const exactNames = events
-    .map(eventTriggerCanonicalName)
-    .filter((name): name is string => name !== null);
+  const exactNames = events.map(eventTriggerCanonicalName);
   // Inline dead-letter handler: a `deadLetter(ctx, dead)` method becomes the workflow `<name>.dlq`.
   const inlineDeadLetter = (instance as { deadLetter?: unknown }).deadLetter;
   let deadLetterWorkflow = meta.deadLetterWorkflow;

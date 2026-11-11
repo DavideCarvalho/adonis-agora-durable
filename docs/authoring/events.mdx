@@ -72,7 +72,7 @@ engine.register('fraud-check', '1', async (ctx, payment) => { /* … */ }, {
 From then on, `publishEvent('user.registered', { email })` starts `send-welcome` with `{ email }`. One publish can resume waiters and start subscribers **in the same call**, and the returned count includes both.
 
 <Callout type="info" title="Events from the app emitter and the diagnostics bus">
-You can also have publishes made for you. `@OnEvent` bridges an **AdonisJS emitter** event, and `@OnDiagnostic` bridges an `@adonis-agora/diagnostics` channel into the engine. An exact trigger is published under its canonical name, so it starts the same `onEvent` subscribers. See [Event-triggered workflows](/docs/durable/authoring/event-triggers).
+You can also have publishes made for you. `@OnEvent` bridges an **AdonisJS emitter** event into the engine, published under the event name, so it starts the same `onEvent` subscribers. See [Event-triggered workflows](/docs/durable/authoring/event-triggers).
 </Callout>
 
 ### Filtering and mapping — `where` and `input`

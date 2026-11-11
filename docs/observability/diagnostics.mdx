@@ -127,7 +127,7 @@ This is exactly what the provider does in `ready()` (attach) and `shutdown()` (d
 
 ## The other direction: starting workflows from the bus
 
-The bridge publishes durable events *onto* the bus. To *consume* the bus and start a workflow when a channel fires (any library's `agora:<lib>:<event>`, durable's own included), use `@OnDiagnostic({ lib, event? })` on a workflow. See [Event triggers](/docs/durable/authoring/event-triggers).
+The bridge publishes durable events *onto* the bus. To *consume* the bus, write a diagnostics listener; with `transports.durable()` each listener call runs as a durable run, and a listener can dispatch one of your workflows. See [Diagnostics listeners](/docs/durable/authoring/diagnostics-listeners). The runs of those listener calls are the one thing this bridge does not publish, so a listener on `durable` events never triggers itself.
 
 ## See also
 

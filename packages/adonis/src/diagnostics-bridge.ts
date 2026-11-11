@@ -1,3 +1,4 @@
+import { isDiagnosticsDeliveryEvent } from './diagnostics/transport.js';
 import { parentRunIdOf } from './fan-join.js';
 import type { EngineEvent } from './interfaces.js';
 import { lifecycleSourceOf } from './lifecycle-events.js';
@@ -37,7 +38,8 @@ export interface DurableDiagnosticsOptions {
  * `hasSubscribers`, so an unsubscribed channel costs nothing, and it never throws back into the
  * engine. Only the events THIS instance produced are forwarded by default (see
  * {@link DurableDiagnosticsOptions.includeRemote}), so a fleet records each event once; all event
- * types are forwarded — filtering is the subscriber's job. An event of a child run
+ * types are forwarded — filtering is the subscriber's job — except those of the runs that deliver
+ * diagnostics listener calls (`transports.durable()`), which would otherwise feed themselves. An event of a child run
  * the engine started (`ctx.all`, `ctx.child`, `ctx.startChild` without a caller-chosen id) also
  * carries `parentRunId`: each child is its own run, so that field is how a subscriber (a Telescope
  * search, say) finds every child of one parent, a whole `ctx.all` fan included. An event of a run a
@@ -55,6 +57,9 @@ export function attachDurableDiagnostics(
   const includeRemote = options.includeRemote === true;
   return engine.subscribe((event: EngineEvent) => {
     if (!includeRemote && isRemoteEvent(event)) return;
+    // A run delivering a diagnostics listener call (`transports.durable()`) is not echoed back onto
+    // the bus: a listener on `durable` events would start a delivery run for each one, forever.
+    if (isDiagnosticsDeliveryEvent(event)) return;
     const emit = (globalThis as Record<symbol, unknown>)[EMIT_SLOT] as EmitFn | undefined;
     if (typeof emit !== 'function') return;
     const parentRunId = parentRunIdOf(event.runId);

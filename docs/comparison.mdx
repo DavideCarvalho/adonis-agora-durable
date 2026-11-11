@@ -25,7 +25,7 @@ being that *you* own scaling and operations, the way you already do for the rest
 | Workflow model | replay + suspend, plain async code | independent jobs (no replay) | replay, plain code | step memoization over HTTP | jobs + flows (no replay) |
 | Waits (sleep/signal) | zero-compute suspend | delayed jobs only | zero-compute | zero-compute | delayed jobs only |
 | Sagas (compensation) | built-in — `{ compensate }` on any step | — | manual try/catch pattern | manual | — |
-| Event triggers | `onEvent` + `eventBatch` (debounce/batch), `@OnEvent` / `@OnDiagnostic` | dispatch by hand | schedules; signal-with-start by hand | core feature (debounce, batch) | — |
+| Event triggers | `onEvent` + `eventBatch` (debounce/batch), `@OnEvent`, diagnostics listeners | dispatch by hand | schedules; signal-with-start by hand | core feature (debounce, batch) | — |
 | Per-key mutex | `singleton` (FIFO per key) | — | one run per workflow id | concurrency key = 1 | Pro only (groups) |
 | Durable entities | built-in (`engine.registerEntity`) | — | — | — | — |
 | Cross-language | TS + Python workers, one workflow; wire-compatible with NestJS (`nestjs-durable`) | JS/TS only | per-language SDKs | HTTP (any language) | JS/TS only |
@@ -95,7 +95,7 @@ step dispatch rides your own [transport](/docs/durable/transports) (in-process, 
 DB polling, or BullMQ) instead of inbound HTTP. Inngest's signature event ergonomics have direct analogues
 too: [`onEvent` with `eventBatch`](/docs/durable/authoring/events#coalescing-bursts--eventbatch)
 starts workflows from published events with the same coalescing patterns ("reindex at most once the source
-goes quiet", "process uploads in batches"), and [`@OnEvent` / `@OnDiagnostic`](/docs/durable/authoring/event-triggers)
+goes quiet", "process uploads in batches"), and [`@OnEvent`](/docs/durable/authoring/event-triggers) and [diagnostics listeners](/docs/durable/authoring/diagnostics-listeners)
 bridge the Adonis emitter and diagnostics channels in without wiring.
 
 Choose **Inngest** for serverless/edge architectures or when you want a managed platform with
