@@ -2,7 +2,7 @@
 "@adonis-agora/durable": major
 ---
 
-**Breaking: the config's `role` is renamed to `topology`**, with the same values (`'standalone' | 'control-plane' | 'tenant'`), the same default (`'standalone'`) and the same behaviour. No alias: a `role` key in `config/durable.ts` is now a type error, and at runtime it is ignored (the app boots as `standalone`). `role` is reserved across Agora for the split-deployment axis (`'all' | 'api' | 'worker'`); durable covers that with `drive`, `consumers` and `worker.embedded`.
+**Breaking: the config's `role` is renamed to `topology`**, with the same values (`'standalone' | 'control-plane' | 'tenant'`), the same default (`'standalone'`) and the same behaviour. No alias: a `role` key in `config/durable.ts` is now a type error, and `defineConfig` throws at boot instead of silently booting it as `standalone`. `role` is reserved across Agora for the split-deployment axis (`'all' | 'api' | 'worker'`); durable covers that with `drive`, `consumers` and `worker.embedded`.
 
 - `StandaloneConfig`, `ControlPlaneConfig` and `TenantConfig` are discriminated on `topology`; `defineConfig` defaults `topology` to `'standalone'`.
 - `StoreRunGateway`'s option is `{ topology }` (was `{ role }`).

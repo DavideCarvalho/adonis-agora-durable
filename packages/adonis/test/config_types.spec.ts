@@ -95,6 +95,12 @@ describe('defineConfig — topology-discriminated config', () => {
     expect(defineConfig().topology).toBe('standalone');
   });
 
+  it('refuses the pre-1.0 `role` key instead of booting as standalone', () => {
+    expect(() => defineConfig({ role: 'control-plane' } as never)).toThrow(
+      /`role` was renamed to `topology`/,
+    );
+  });
+
   it('preserves an explicitly-set topology', () => {
     expect(
       defineConfig({

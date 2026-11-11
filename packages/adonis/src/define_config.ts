@@ -450,6 +450,13 @@ export function defineConfig(config: TenantConfig): TenantConfig;
 export function defineConfig(config: ControlPlaneConfig): ControlPlaneConfig;
 export function defineConfig(config?: StandaloneConfig): StandaloneConfig;
 export function defineConfig(config: DurableConfig = { topology: 'standalone' }): DurableConfig {
+  // `role` was renamed to `topology` in 1.0. Refuse the old key: ignoring it would boot a
+  // control-plane or tenant config as `standalone`, silently.
+  if ('role' in (config as object)) {
+    throw new Error(
+      "@adonis-agora/durable: `role` was renamed to `topology` in config/durable.ts (same values: 'standalone' | 'control-plane' | 'tenant'). Rename the key.",
+    );
+  }
   // Default the discriminant so downstream (provider, gateway) can branch on a always-present `topology`
   // without re-deriving it. `...config` wins, so an explicit topology is preserved.
   return { topology: 'standalone', ...config } as DurableConfig;

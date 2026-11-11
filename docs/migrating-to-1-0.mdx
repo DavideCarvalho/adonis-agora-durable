@@ -337,7 +337,7 @@ await runSchedules(engine, schedules, now, { random: () => 0 })
 
 `role` in `config/durable.ts` is now `topology`, with the same values (`'standalone'`,
 `'control-plane'`, `'tenant'`), the same default and the same behaviour. There is no alias: a `role`
-key no longer type-checks, and at runtime it is ignored, so the app boots as `standalone`. Across
+key no longer type-checks, and `defineConfig` throws at boot so it never runs as `standalone` by mistake. Across
 Agora, `role` now means which half of a split deployment a process is; durable covers that with
 `drive`, `consumers` and `worker.embedded`.
 
