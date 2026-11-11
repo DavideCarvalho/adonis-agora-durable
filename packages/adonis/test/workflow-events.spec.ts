@@ -1,30 +1,15 @@
-import { channel } from 'node:diagnostics_channel';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WorkflowEngine } from '../src/engine.js';
 import { attachEventTriggerBridge, type EmitterLike } from '../src/event-trigger-bridge.js';
 import { InMemoryStateStore } from '../src/testing/in-memory-state-store.js';
 import { InMemoryTransport } from '../src/testing/in-memory-transport.js';
-import {
-  eventTriggerCanonicalName,
-  OnDiagnostic,
-  OnEvent,
-  workflowEvents,
-} from '../src/workflow-events.js';
+import { eventTriggerCanonicalName, OnEvent, workflowEvents } from '../src/workflow-events.js';
 
 function makeEngine() {
   const store = new InMemoryStateStore();
   const transport = new InMemoryTransport();
   const engine = new WorkflowEngine({ store, transport });
   return { store, engine };
-}
-
-async function settle(store: InMemoryStateStore, runId: string) {
-  for (let i = 0; i < 200; i += 1) {
-    await new Promise((r) => setImmediate(r));
-    const run = await store.getRun(runId);
-    if (run && run.status !== 'running' && run.status !== 'suspended') return run;
-  }
-  throw new Error(`run ${runId} did not settle`);
 }
 
 const disposers: Array<() => void> = [];
@@ -61,44 +46,34 @@ function makeEmitter() {
 
 describe('event-triggered workflows', () => {
   it('stamps static on via decorators and normalizes it', () => {
-    @OnEvent({ event: 'agora:payments:payment.succeeded' })
-    @OnDiagnostic({ lib: 'payments', event: 'payment.succeeded' })
+    @OnEvent({ event: 'order:placed' })
+    @OnEvent({ event: 'order:paid' })
     class W {
-      static workflow = { name: 'process-payment' };
+      static workflow = { name: 'process-order' };
       async run() {}
     }
     const triggers = workflowEvents(W);
-    expect(triggers).toHaveLength(2);
-    expect(triggers[0]).toMatchObject({
-      source: 'emitter',
-      event: 'agora:payments:payment.succeeded',
-      workflow: 'process-payment',
-    });
-    expect(triggers[1]).toMatchObject({
-      source: 'diagnostics',
-      lib: 'payments',
-      event: 'payment.succeeded',
-      workflow: 'process-payment',
-    });
+    expect(triggers).toEqual([
+      { source: 'emitter', event: 'order:placed', workflow: 'process-order' },
+      { source: 'emitter', event: 'order:paid', workflow: 'process-order' },
+    ]);
   });
 
-  it('derives the canonical engine event name for exact triggers', () => {
+  it('fails loudly on a `static on` trigger with the removed diagnostics source', () => {
+    class W {
+      static workflow = { name: 'legacy' };
+      static on = [{ source: 'diagnostics', lib: 'payments', event: 'payment.succeeded' }];
+      async run() {}
+    }
+    expect(() => workflowEvents(W)).toThrow(/source "diagnostics".*diagnostics listener/);
+  });
+
+  it('derives the canonical engine event name', () => {
     expect(eventTriggerCanonicalName({ source: 'emitter', event: 'x', workflow: 'w' })).toBe('x');
-    expect(
-      eventTriggerCanonicalName({
-        source: 'diagnostics',
-        lib: 'payments',
-        event: 'payment.succeeded',
-        workflow: 'w',
-      }),
-    ).toBe('agora:payments:payment.succeeded');
-    expect(
-      eventTriggerCanonicalName({ source: 'diagnostics', lib: 'payments', workflow: 'w' }),
-    ).toBeNull();
   });
 
   it('bridges an exact Adonis emitter event into a fresh run (payload as input)', async () => {
-    const { store, engine } = makeEngine();
+    const { engine } = makeEngine();
     const { emitter, emit } = makeEmitter();
 
     const seen: Array<{ input: unknown }> = [];
@@ -119,81 +94,8 @@ describe('event-triggered workflows', () => {
     expect(seen).toEqual([{ input: { orderId: '1' } }]);
   });
 
-  it('bridges an exact diagnostics channel event via publishEvent', async () => {
-    const { store, engine } = makeEngine();
-    const seen: Array<{ input: unknown }> = [];
-    engine.register(
-      'on-payment',
-      '1',
-      async (_ctx, input: unknown) => {
-        seen.push({ input });
-      },
-      { onEvent: ['agora:payments:payment.succeeded'] },
-    );
-    engine.registerEventTriggers([
-      {
-        source: 'diagnostics',
-        lib: 'payments',
-        event: 'payment.succeeded',
-        workflow: 'on-payment',
-      },
-    ]);
-    disposers.push(attachEventTriggerBridge(engine.discoveredEventTriggers, { engine }));
-
-    channel('agora:payments:payment.succeeded').publish({
-      v: 1,
-      lib: 'payments',
-      event: 'payment.succeeded',
-      payload: { externalReference: 'pay_1' },
-    });
-    await new Promise((r) => setTimeout(r, 150));
-    expect(seen).toEqual([{ input: { externalReference: 'pay_1' } }]);
-  });
-
-  it('starts a workflow directly for regex/any diagnostics triggers', async () => {
-    // Seed the diagnostics registry (as the loaded `@adonis-agora/diagnostics` would), so
-    // the bridge can discover the `agora:payments:*` channels.
-    const registryKey = Symbol.for('@agora/diagnostics:registry');
-    const registry = (globalThis as Record<symbol, unknown>)[registryKey] as
-      | { channels: Set<string>; listeners: Set<(name: string) => void> }
-      | undefined;
-    const seeded = registry ?? {
-      channels: new Set<string>(),
-      listeners: new Set<(name: string) => void>(),
-    };
-    (globalThis as Record<symbol, unknown>)[registryKey] = seeded;
-    seeded.channels.add('agora:payments:payment.succeeded');
-    seeded.channels.add('agora:payments:charge.created');
-
-    const { store, engine } = makeEngine();
-    const seen: Array<{ input: unknown }> = [];
-    engine.register('on-any', '1', async (_ctx, input: unknown) => {
-      seen.push({ input });
-    });
-    engine.registerEventTriggers([
-      { source: 'diagnostics', lib: 'payments', event: /^payment\./, workflow: 'on-any' },
-    ]);
-    disposers.push(attachEventTriggerBridge(engine.discoveredEventTriggers, { engine }));
-
-    channel('agora:payments:payment.succeeded').publish({
-      v: 1,
-      lib: 'payments',
-      event: 'payment.succeeded',
-      payload: { id: 'p1' },
-    });
-    // A non-matching event must NOT start it.
-    channel('agora:payments:charge.created').publish({
-      v: 1,
-      lib: 'payments',
-      event: 'charge.created',
-      payload: { id: 'c1' },
-    });
-    await new Promise((r) => setTimeout(r, 150));
-    expect(seen).toEqual([{ input: { id: 'p1' } }]);
-  });
-
   it('detaches all subscriptions on dispose', async () => {
-    const { store, engine } = makeEngine();
+    const { engine } = makeEngine();
     const { emitter, emit } = makeEmitter();
     const seen: Array<{ input: unknown }> = [];
     engine.register(

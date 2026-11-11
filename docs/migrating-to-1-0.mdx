@@ -239,3 +239,58 @@ After:
 ```ts title="tests/functional/schedules.spec.ts"
 await runSchedules(engine, schedules, now, { random: () => 0 })
 ```
+
+## `@OnDiagnostic` is removed from durable
+
+Durable no longer starts workflows from `@adonis-agora/diagnostics` events: the `@OnDiagnostic`
+workflow decorator, its `DiagnosticsTriggerConfig` type and `static on` entries with
+`source: 'diagnostics'` are gone. A `static on` entry with that source fails the app's boot.
+`@OnEvent`, `@OnWorkflowCompleted` and `@OnWorkflowFailed` are unchanged.
+
+Listeners now live in `@adonis-agora/diagnostics`: its own `@OnDiagnostic` marks a listener method,
+and the diagnostics transport decides how the listener runs.
+
+Before:
+
+```ts title="app/workflows/process_payment_workflow.ts"
+import { BaseWorkflow, OnDiagnostic, type WorkflowCtx } from '@adonis-agora/durable'
+
+@OnDiagnostic({ lib: 'payments', event: 'payment.succeeded' })
+export default class ProcessPaymentWorkflow extends BaseWorkflow {
+  static workflow = { name: 'process-payment' }
+
+  async run(ctx: WorkflowCtx, input: { externalReference: string }) {
+    // ...
+  }
+}
+```
+
+After, remove the decorator from the workflow and dispatch it from a diagnostics listener. The event
+id in the run id keeps one run per event:
+
+```ts title="app/listeners/diagnostics/process_payment.ts"
+import { OnDiagnostic, type DiagnosticEventOf } from '@adonis-agora/diagnostics'
+import ProcessPaymentWorkflow from '#workflows/process_payment_workflow'
+
+export default class ProcessPayment {
+  @OnDiagnostic('payments', 'payment.succeeded')
+  async handle(event: DiagnosticEventOf<'payments', 'payment.succeeded'>) {
+    await ProcessPaymentWorkflow.dispatch(event.payload, { runId: `evt:${event.id}` })
+  }
+}
+```
+
+If the workflow only wrapped a side effect so it would be retried, you may not need a workflow at all.
+Select `transports.durable()` in `config/diagnostics.ts` and write the side effect in the listener:
+each listener call then runs as a durable run, retried with backoff and idempotent per event.
+
+```ts title="config/diagnostics.ts"
+import { defineConfig, transports } from '@adonis-agora/diagnostics'
+
+export default defineConfig({
+  default: 'durable',
+  transports: { durable: transports.durable({ retries: 5 }) },
+})
+```
+
+See [Diagnostics listeners](/docs/durable/authoring/diagnostics-listeners).

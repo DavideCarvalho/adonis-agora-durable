@@ -1,0 +1,123 @@
+---
+title: Diagnostics listeners
+description: Run every @adonis-agora/diagnostics listener call as a durable run, retried with backoff, idempotent per event, and visible in the console.
+icon: Ear
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+`@adonis-agora/diagnostics` decides how its listeners run through a transport. With
+`transports.durable()`, each listener call for an event becomes one durable run:
+
+- it runs once, on whichever process drives durable runs (a `durable:work` worker, or the web
+  process itself with the embedded worker);
+- a listener that throws is retried with backoff;
+- the same event never runs the same listener twice;
+- every call is a run you can find, inspect and retry in the durable console.
+
+## Set it up
+
+Install and configure durable as usual (`node ace configure @adonis-agora/durable`), then select the
+durable transport in `config/diagnostics.ts`:
+
+```ts title="config/diagnostics.ts"
+import { defineConfig, transports } from '@adonis-agora/diagnostics'
+
+export default defineConfig({
+  default: 'durable',
+  transports: {
+    durable: transports.durable({ retries: 5 }),
+  },
+})
+```
+
+Listeners are plain diagnostics listeners. Nothing in them is durable-specific:
+
+```ts title="app/listeners/diagnostics/track_agent_run.ts"
+import { OnDiagnostic, type DiagnosticEventOf } from '@adonis-agora/diagnostics'
+import AgentUsage from '#models/agent_usage'
+
+export default class TrackAgentRun {
+  @OnDiagnostic('agent', 'run.finished')
+  async handle(event: DiagnosticEventOf<'agent', 'run.finished'>) {
+    await AgentUsage.create({ runId: event.payload.runId, tokens: event.payload.usage.total })
+  }
+}
+```
+
+Every process that boots the app registers the same listeners, so any worker can run any call.
+
+<Callout type="warn" title="Some process must drive runs">
+The listener runs where durable runs execute. If your web processes set `drive: false`, run
+`node ace durable:work` somewhere, or the calls wait in the `pending` state.
+</Callout>
+
+## Options
+
+`transports.durable(options)` sets the retry policy of every listener call.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `retries` | `3` | Attempts before the run fails, the first one included. |
+| `backoff` | `'exp'` | `'fixed'` keeps the delay constant; `'exp'` doubles it after each attempt. |
+| `backoffMs` | `1000` | Delay before the second attempt, in ms. |
+| `backoffMaxMs` | `30000` | Longest delay between two attempts, in ms. |
+| `jitter` | `false` | Waits a random 50 to 100% of each delay. |
+
+An invalid value (`retries: 0`, a negative delay) fails the app's boot.
+
+## What you see in the console
+
+Each call is a run of the `durable.diagnostics.listener` workflow:
+
+| Field | Value |
+| --- | --- |
+| Run id | `diag:<event id>:<listener id>`, for example `diag:6f1c…:app/listeners/diagnostics/track_agent_run#handle` |
+| Origin | `@adonis-agora/diagnostics` |
+| Tags | `diagnostics`, `lib:<lib>`, `event:<event>`, `listener:<listener id>` |
+| Input | `{ listenerId, envelope }`: the listener and the full event (`id`, `lib`, `event`, `ts`, `traceId`, `payload`) |
+| Steps | one step, `handle`, whose attempts are the listener's attempts |
+
+Filter by tag to find every call of a listener (`listener:app/listeners/diagnostics/track_agent_run#handle`)
+or every call for an event (`event:run.finished`). A failed call can be retried from the console
+like any other run.
+
+## How a call behaves
+
+- **One run per event and listener.** The run id comes from the event id, so the same event handed
+  over twice, by one process or by two, starts the run once.
+- **Retries.** When the listener throws, the `handle` step retries it with the configured backoff.
+  Once `retries` attempts have failed, the run fails with the listener's error.
+- **Unknown listeners fail at once.** When the process running the call has no listener with that
+  id, for example during a deploy that renamed it, the run fails immediately with the code
+  `E_UNKNOWN_DIAGNOSTICS_LISTENER`, without retrying. Retry it from the console once the listener is
+  deployed everywhere.
+- **No echo on the bus.** These runs do not publish their own `agora:durable:*` events, so a listener
+  on `durable` events never triggers itself.
+
+The durable transport needs a durable engine in the process: the `standalone` and `control-plane`
+roles have one. A store-less `tenant` pod has none, and boot fails with "durable is not configured".
+
+## Starting a workflow from an event
+
+To start one of your workflows when a diagnostics event fires, call it from a listener. Use the event
+id in the run id, so a repeated event does not start a second run:
+
+```ts title="app/listeners/diagnostics/process_payment.ts"
+import { OnDiagnostic, type DiagnosticEventOf } from '@adonis-agora/diagnostics'
+import ProcessPaymentWorkflow from '#workflows/process_payment_workflow'
+
+export default class ProcessPayment {
+  @OnDiagnostic('payments', 'payment.succeeded')
+  async handle(event: DiagnosticEventOf<'payments', 'payment.succeeded'>) {
+    await ProcessPaymentWorkflow.dispatch(event.payload, { runId: `evt:${event.id}` })
+  }
+}
+```
+
+`dispatch` returns once the run is stored; `start` would wait for the workflow to finish.
+
+## See also
+
+- **[Event-triggered workflows](/docs/durable/authoring/event-triggers)**: start a workflow from an AdonisJS emitter event.
+- **[Diagnostics](/docs/durable/observability/diagnostics)**: durable's own events on the diagnostics bus.

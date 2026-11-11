@@ -13,9 +13,9 @@ import { fileURLToPath } from 'node:url';
  * workflow cannot fail to provide — a FILE that belongs to the declaring package — mapped to the
  * nearest enclosing `package.json` `name`. In order of precision:
  *
- *   1. **The class's declaring file**, captured by a class decorator (`@Scheduled`, `@OnEvent`,
- *      `@OnDiagnostic`) at decoration time — the one moment we are guaranteed to be executing inside
- *      the declaring module. Exact, but only present on decorated classes.
+ *   1. **The class's declaring file**, captured by a class decorator (`@Scheduled`, `@OnEvent`) at
+ *      decoration time — the one moment we are guaranteed to be executing inside the declaring
+ *      module. Exact, but only present on decorated classes.
  *   2. **The discovered module's file**: the `app/workflows` scan knows the absolute path of every
  *      module it imports, and a multi-root generated barrel keys each module by its app-relative path.
  *      A single-root barrel keys modules by name only, so its modules resolve from the app root the

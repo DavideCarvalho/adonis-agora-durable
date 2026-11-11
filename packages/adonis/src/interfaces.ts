@@ -61,7 +61,7 @@ export interface WorkflowRun {
    * at start from the workflow registration's `origin` (or a per-start override).
    *
    * The registration's origin is DERIVED unless declared: the nearest `package.json` `name` of the
-   * class's declaring file (captured by `@Scheduled` / `@OnEvent` / `@OnDiagnostic`), else of the
+   * class's declaring file (captured by `@Scheduled` / `@OnEvent`), else of the
    * discovered module (`app/workflows/…`, a built `build/…`), else of the code calling
    * `registerWorkflowClass` / `engine.register`. An explicit `static workflow.origin` or `register`
    * `origin` option always wins. Derivation never guesses: when nothing resolves, the run has none.

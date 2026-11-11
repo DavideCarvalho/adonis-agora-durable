@@ -62,7 +62,7 @@ export interface WorkflowOptions {
    * Package attribution stamped on every run of this workflow (see `WorkflowRun.origin`) — which
    * package's code produced it, e.g. `@adonis-agora/catalog-pipeline`. Powers the console's origin
    * facet. Usually OMITTED: the origin is derived from the nearest `package.json` `name` of the
-   * class's declaring file (captured by `@Scheduled` / `@OnEvent` / `@OnDiagnostic`), else of the
+   * class's declaring file (captured by `@Scheduled` / `@OnEvent`), else of the
    * discovered module (`app/workflows/…` → the app), else of the code calling
    * `registerWorkflowClass` (a lib → the lib). Set it only to override that — e.g. an app that
    * hand-registers a lib's undecorated class would otherwise be credited with it. A value here

@@ -5,6 +5,7 @@ import { mergeSchedules, runWorkerLoop, type WorkerLogger } from '../src/command
 import type { ControlPlaneConfig, TenantConfig } from '../src/config_types.js';
 import type { ControlPlaneContext } from '../src/control-planes/factory.js';
 import type { DurableConfig } from '../src/define_config.js';
+import { stopDiagnosticsDeliveries } from '../src/diagnostics/transport.js';
 import { discoveryRoots, type RootedBarrel } from '../src/discovery-roots.js';
 import { parseDuration } from '../src/duration.js';
 import { attachEventTriggerBridge, type EmitterLike } from '../src/event-trigger-bridge.js';
@@ -525,9 +526,9 @@ export default class DurableProvider {
     void this.#reportUnattributedWorkflows(registered).catch(() => undefined);
     void this.#reportUnservedOnErrorRoutes(engine).catch(() => undefined);
 
-    // Event-triggered workflows (`static on` / `@OnEvent` / `@OnDiagnostic`): bridge the
-    // Adonis emitter + the diagnostics bus into the engine. Registered AFTER discovery so
-    // every trigger (incl. the engine's `onEvent` subscribers) is in place.
+    // Event-triggered workflows (`static on` / `@OnEvent`): bridge the Adonis emitter into the
+    // engine. Registered AFTER discovery so every trigger (incl. the engine's `onEvent`
+    // subscribers) is in place.
     const triggers = engine.discoveredEventTriggers;
     if (triggers.length > 0) {
       const emitter = await this.#resolveEmitter();
@@ -860,6 +861,9 @@ export default class DurableProvider {
     // so another instance recovers them at once.
     const engine = this.#engine;
     this.#engine = null;
+    // Diagnostics deliveries (`transports.durable()`) still creating their runs finish first, so no
+    // listener call is lost to the closing store, whichever provider shuts down first.
+    if (engine) await stopDiagnosticsDeliveries(engine).catch(() => undefined);
     if (engine && !embedded) await engine.drain(this.#drainTimeoutMs).catch(() => undefined);
     // Stop republishing tenant events before the transport connections drop.
     this.#responder?.stop();
