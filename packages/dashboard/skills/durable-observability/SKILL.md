@@ -46,17 +46,24 @@ export default defineConfig({
   // enabled: true,          // default true; false registers no routes at all
   path: '/durable',
   authorize: async (ctx) => {
-    // boolean | { allowed, reason?: 'unauthenticated' | 'forbidden' }
+    // boolean | { allowed, reason?: 'unauthenticated' | 'forbidden' } | { redirectTo }
     if (!(await ctx.auth.check())) return { allowed: false, reason: 'unauthenticated' } // 401
     return ctx.auth.user?.isAdmin === true // false / { allowed: false } -> 403
   },
+  // authorize: ConsoleAccess, // an authorizer class (built by the container, so `@inject()` works)
+  // authorize: () => import('#policies/console_access'), // a lazy import of one
 })
 ```
 
-`authorize` returns `AuthorizeResult = boolean | AuthorizeDecision`
-(`{ allowed: boolean; reason?: 'unauthenticated' | 'forbidden' }`). Only `true`
+`authorize` takes the shared `ConsoleAuthorize` contract (`ConsoleAuthorize`,
+`ConsoleAuthorizer`, `ConsoleAuthorizerClass` and `ConsoleAuthorizeResult` are
+exported from `@adonis-agora/durable/dashboard`): an inline function, an
+authorizer class, or a lazy import of one. It returns a boolean,
+`{ allowed, reason? }`, or `{ redirectTo: '/login' }`. Only `true`
 or `allowed: true` passes; `reason: 'unauthenticated'` → `401`, every other
-denial (incl. a throwing hook) → `403`. A hook that redirects keeps its redirect.
+denial (incl. a throwing hook) → `403`; `{ redirectTo }` → `302` for a page
+navigation, `401` for an API call. A hook that already answered the request (a
+redirect, a body) keeps its answer.
 
 The default `authorize` fails closed in **every** environment: it requires a
 bearer token equal to `DURABLE_DASHBOARD_TOKEN`, denying everything when that
