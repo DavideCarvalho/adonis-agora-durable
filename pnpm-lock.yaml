@@ -203,6 +203,9 @@ importers:
         specifier: '>=0.11.2 <2.0.0 || >=1.0.0-rc.0 <2.0.0'
         version: 0.11.2(@adonisjs/core@7.6.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(@adonisjs/lucid@22.4.2(@adonisjs/assembler@8.6.0(typescript@7.0.2))(@adonisjs/core@7.6.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.0.3)(luxon@3.7.2)(mysql2@3.24.6(@types/node@26.6.5))(pg@8.23.1)(supports-color@10.2.2))
     devDependencies:
+      '@adonis-agora/diagnostics':
+        specifier: 1.0.0-rc.1
+        version: 1.0.0-rc.1(28e833b373746389d520ffb0e1f68e2f)
       '@adonis-agora/durable-dashboard':
         specifier: workspace:*
         version: link:../dashboard
@@ -377,6 +380,28 @@ importers:
         version: 5.1.0(@opentelemetry/api@1.10.0)(@types/node@26.6.5)(happy-dom@21.0.4)(jsdom@31.0.0)(vite@8.3.6(@types/node@26.6.5)(jiti@2.7.0)(yaml@2.9.1))
 
 packages:
+
+  '@adonis-agora/diagnostics@1.0.0-rc.1':
+    resolution: {integrity: sha512-w6op6N1DBxOKdkL0fUspt6hAs1CPsKL+FUXcxVFwFswg6OWdjwJDdwYBNTsjI8XO4aQt7eze3bgYRsFlnMpC7A==}
+    engines: {node: '>=24'}
+    peerDependencies:
+      '@adonis-agora/durable': '>=1.0.0 <2.0.0 || >=1.0.0-rc.0 <2.0.0'
+      '@adonisjs/core': ^7.3.0
+      '@adonisjs/queue': ^0.6.0 || ^0.7.0
+      '@adonisjs/redis': ^9.2.0 || ^10.0.0 || ^11.0.0
+      '@opentelemetry/api': ^1.0.0
+      ioredis: ^5 || ^6
+    peerDependenciesMeta:
+      '@adonis-agora/durable':
+        optional: true
+      '@adonisjs/queue':
+        optional: true
+      '@adonisjs/redis':
+        optional: true
+      '@opentelemetry/api':
+        optional: true
+      ioredis:
+        optional: true
 
   '@adonis-agora/filter-client@0.4.0':
     resolution: {integrity: sha512-qQpyuBJfEQh1T/5bP4ZWf8mnbh+F0/9dAetotpMcdt8lTvUm+kxvm3MSUg2X0Ueq/ue0BsKMeQQ1dyI++5dckw==}
@@ -3740,6 +3765,15 @@ packages:
         optional: true
 
 snapshots:
+
+  '@adonis-agora/diagnostics@1.0.0-rc.1(28e833b373746389d520ffb0e1f68e2f)':
+    dependencies:
+      '@adonisjs/core': 7.6.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1)
+    optionalDependencies:
+      '@adonisjs/queue': 0.7.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(@adonisjs/core@7.6.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(@adonisjs/lucid@22.4.2(@adonisjs/assembler@8.6.0(typescript@7.0.2))(@adonisjs/core@7.6.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.0.3)(luxon@3.7.2)(mysql2@3.24.6(@types/node@26.6.5))(pg@8.23.1)(supports-color@10.2.2))(@adonisjs/redis@11.0.0(@adonisjs/core@7.6.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(supports-color@10.2.2))(@opentelemetry/api@1.10.0)(ioredis@6.0.0(supports-color@10.2.2))(knex@3.3.0(better-sqlite3@13.0.3)(mysql2@3.24.6(@types/node@26.6.5))(pg@8.23.1)(supports-color@10.2.2))
+      '@adonisjs/redis': 11.0.0(@adonisjs/core@7.6.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(supports-color@10.2.2)
+      '@opentelemetry/api': 1.10.0
+      ioredis: 6.0.0(supports-color@10.2.2)
 
   '@adonis-agora/filter-client@0.4.0': {}
 
