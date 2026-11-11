@@ -1,5 +1,20 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.8
+
+### Patch Changes
+
+- [#495](https://github.com/DavideCarvalho/adonis-agora-durable/pull/495) [`ac19140`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/ac1914059808a48d239fbb52dd9ce26b1d68e493) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Console fixes found by a smoke test of the 1.0 console:
+  
+  - **Actions work under shield.** Every write the console sends (cancel, retry, update, signal, task, bulk, schedules) carries the `XSRF-TOKEN` cookie back as `x-xsrf-token`, and a write is never redirected silently: a refused request (a redirect, or any non-2xx answer) shows as an error on the page instead of looking like nothing happened.
+  - **The `window.__DURABLE_BASE__` / `__DURABLE_API__` overrides are gone.** The provider's JSON config block is the only source; without it the console uses `/durable` and `/durable/api`.
+  - **The run detail of a waiting run** carries what the run waits on (`run.waiting`, as list rows do), so "Send update", "Deliver signal" and the task actions show whatever page the list is on, and the header reads `awaiting` (or `suspended` for a run parked on nothing named) instead of `running`.
+  - **A `cancelling` run** reads "Cancelling" instead of falling through to "Saga compensated".
+  - **The status chips' counts (ALL included)** are recounted with every list refresh.
+  - The dashboard package no longer lists a README it does not ship.
+
+- [#495](https://github.com/DavideCarvalho/adonis-agora-durable/pull/495) [`ac19140`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/ac1914059808a48d239fbb52dd9ce26b1d68e493) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - **A namespaced engine serves its namespace's steps.** With no `partition`, the db, queue and bullmq transports now consume `<name>@<namespace>` for an engine whose namespace is set (and not `default`), matching what that engine dispatches to and what nestjs-durable's `servingPartition()` does. Before, they consumed the bare `<name>`, so a namespaced engine with no `partition` never ran its own dispatched steps and its runs stayed suspended. An explicit `partition` still wins; `partition: 'default'` keeps serving the bare tokens.
+
 ## 1.0.0-rc.7
 
 ### Patch Changes
