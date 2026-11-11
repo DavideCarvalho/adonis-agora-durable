@@ -335,10 +335,14 @@ Correct:
 transports.bullmq({ connection: REDIS_URL, partition: 'david-dev' })
 ```
 
-Mechanism: a worker on no partition serves the bare `<name>` tokens — exactly
-the queues the deployed fleet consumes — so the local process steals production
-tasks; docs call this out under Tenancy pitfalls ("competes for, and steals, the
-deployed fleet's tasks"). Source: `docs/concepts/tenancy.mdx`.
+Mechanism: a worker on no partition and no non-`default` namespace serves the
+bare `<name>` tokens — exactly the queues the deployed fleet consumes — so the
+local process steals production tasks; docs call this out under Tenancy pitfalls
+("competes for, and steals, the deployed fleet's tasks"). With a non-`default`
+namespace and no `partition`, the `db`/`queue`/`bullmq` transports serve
+`<name>@<namespace>` instead, matching what that engine dispatches to (an
+explicit `partition`, including `'default'` for the bare tokens, still wins).
+Source: `docs/concepts/tenancy.mdx`.
 
 ### HIGH a db-transport tenant pod on a database of its own
 

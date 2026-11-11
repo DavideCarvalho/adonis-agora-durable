@@ -2,8 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CONFIG_ELEMENT_ID, durableClient } from './durable-client.js';
 
 /**
- * Where the client gets its API base from: the provider's JSON data block first, the window
- * globals second, `/durable/api` last. The block exists because a host CSP with
+ * Where the client gets its API base from: the provider's JSON data block, else `/durable/api`. The block exists because a host CSP with
  * `script-src 'self' 'nonce-…'` refuses the inline script the globals used to arrive in, and the
  * console then 404s on every request while rendering perfectly.
  */
@@ -31,8 +30,6 @@ const originalFetch = globalThis.fetch;
 afterEach(() => {
   globalThis.fetch = originalFetch;
   document.getElementById(CONFIG_ELEMENT_ID)?.remove();
-  Reflect.deleteProperty(window, '__DURABLE_BASE__');
-  Reflect.deleteProperty(window, '__DURABLE_API__');
 });
 
 describe('the injected config block', () => {
@@ -43,22 +40,8 @@ describe('the injected config block', () => {
     expect(urls[0]?.startsWith('/ops/durable/api/')).toBe(true);
   });
 
-  it('wins over the window globals', async () => {
-    injectConfig({ base: '', api: '/api' });
-    window.__DURABLE_API__ = '/stale/api';
+  it('falls back to /durable/api when there is no block', async () => {
     const urls = captureFetch();
-    await durableClient.workers();
-    expect(urls[0]?.startsWith('/api/')).toBe(true);
-  });
-
-  it('falls through to the globals, then /durable/api, when there is no block', async () => {
-    window.__DURABLE_API__ = '/g/api';
-    let urls = captureFetch();
-    await durableClient.workers();
-    expect(urls[0]?.startsWith('/g/api/')).toBe(true);
-
-    Reflect.deleteProperty(window, '__DURABLE_API__');
-    urls = captureFetch();
     await durableClient.workers();
     expect(urls[0]?.startsWith('/durable/api/')).toBe(true);
   });

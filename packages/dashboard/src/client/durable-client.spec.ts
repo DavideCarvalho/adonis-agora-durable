@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  CONFIG_ELEMENT_ID,
   DurableActionError,
   deriveRunState,
   durableClient,
@@ -11,8 +12,6 @@ import {
  *  `window` for the scope of a test so a `location.href` assignment never triggers a real (jsdom)
  *  navigation — matches `@dudousxd/nestjs-durable-dashboard`'s own client spec's approach. */
 interface FakeWindow {
-  __DURABLE_BASE__?: string;
-  __DURABLE_API__?: string;
   location: { href: string; pathname: string; search: string };
 }
 
@@ -474,7 +473,6 @@ describe('durableClient.values: the picker enumeration', () => {
 describe('durableClient: 401 handling (session gone mid-console)', () => {
   beforeEach(() => {
     (globalThis as { window?: FakeWindow }).window = {
-      __DURABLE_BASE__: '/durable',
       location: { href: '', pathname: '/durable/runs/abc', search: '?tab=timeline' },
     };
   });
@@ -531,12 +529,17 @@ describe('durableClient: 401 handling (session gone mid-console)', () => {
 describe('durableClient: root-mounted base (path: "")', () => {
   afterEach(() => {
     delete (globalThis as { window?: FakeWindow }).window;
+    document.getElementById(CONFIG_ELEMENT_ID)?.remove();
     vi.unstubAllGlobals();
   });
 
   it('honors an explicitly injected empty base rather than falling back to /durable', async () => {
+    const block = document.createElement('script');
+    block.type = 'application/json';
+    block.id = CONFIG_ELEMENT_ID;
+    block.textContent = JSON.stringify({ base: '', api: '/api' });
+    document.head.appendChild(block);
     (globalThis as { window?: FakeWindow }).window = {
-      __DURABLE_BASE__: '',
       location: { href: '', pathname: '/runs/abc', search: '' },
     };
     vi.stubGlobal(
@@ -614,5 +617,68 @@ describe('deriveRunState: a run waiting on its onError handler', () => {
       status: 'awaiting',
       detail: 'failure handler line-dead-letter',
     });
+  });
+});
+
+describe('durableClient: actions under shield (CSRF)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    document.cookie = 'XSRF-TOKEN=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';
+  });
+
+  it('sends the XSRF-TOKEN cookie back as x-xsrf-token on every write, and never follows a redirect', async () => {
+    document.cookie = `XSRF-TOKEN=${encodeURIComponent('tok/en=')}; path=/`;
+    const calls: RequestInit[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        calls.push(init ?? {});
+        return jsonResponse({ result: { runId: 'r1', status: 'cancelling' } }, 200);
+      }),
+    );
+    await durableClient.cancel('r1', { compensate: true });
+    await durableClient.update('r1', 'set-limit', 5).catch(() => undefined);
+    for (const init of calls) {
+      expect((init.headers as Record<string, string>)['x-xsrf-token']).toBe('tok/en=');
+      expect(init.redirect).toBe('manual');
+    }
+    expect(calls).toHaveLength(2);
+  });
+
+  it('a GET carries no CSRF header', async () => {
+    document.cookie = 'XSRF-TOKEN=abc; path=/';
+    const inits: Array<RequestInit | undefined> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        inits.push(init);
+        return jsonResponse([], 200);
+      }),
+    );
+    await durableClient.workers();
+    expect(inits[0]?.headers).toBeUndefined();
+  });
+
+  it('turns a redirect (a refused CSRF token) into a visible error instead of a silent success', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        const res = new Response(null, { status: 302, headers: { Location: '/durable' } });
+        return res;
+      }),
+    );
+    const error = await durableClient.cancel('r1').catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(DurableActionError);
+    expect((error as Error).message).toMatch(/redirected/);
+  });
+
+  it('surfaces a non-2xx answer with the body’s own error copy', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse({ error: 'run r1 is terminal' }, 409)),
+    );
+    const error = await durableClient.retry('r1').catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(DurableActionError);
+    expect((error as Error).message).toBe('run r1 is terminal');
   });
 });

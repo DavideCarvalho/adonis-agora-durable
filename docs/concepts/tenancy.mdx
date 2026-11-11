@@ -91,8 +91,9 @@ export default defineConfig({
 ```
 
 Every routing token becomes `<name>@<partition>`, so two pools serving the same step name never cross.
-A worker on no partition serves the bare token — which is the same queue every un-partitioned process
-in the deployment is on.
+A transport with no `partition` serves its engine's namespace (any namespace but `default`), so a
+namespaced engine runs the steps it dispatches with no extra setting. With neither, it serves the bare
+token, the same queue every un-partitioned process in the deployment is on.
 
 On the dispatch side the suffix comes from **the run's namespace**, not from the engine doing the
 dispatching (a step's own `partition` still wins when it names one). That is what lets a single operator
