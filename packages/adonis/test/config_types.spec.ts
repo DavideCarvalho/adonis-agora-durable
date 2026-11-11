@@ -3,7 +3,7 @@ import type { ControlPlaneConfig, StandaloneConfig, TenantConfig } from '../src/
 import { defineConfig, stores, transports } from '../src/define_config.js';
 
 /**
- * Wave-1 Piece B — the role-discriminated `DurableConfig` union (spec §5).
+ * Wave-1 Piece B — the topology-discriminated `DurableConfig` union (spec §5).
  *
  * This file has TWO layers:
  *  - **Type-level** assertions in `typeContracts()` — never executed, but type-checked by
@@ -12,7 +12,7 @@ import { defineConfig, stores, transports } from '../src/define_config.js';
  *      `pnpm typecheck` (or `node_modules/.bin/tsc -p tsconfig.tests.json`)
  *    Prove-by-mutation: delete `store?: never` from {@link TenantConfig} and the `@ts-expect-error`
  *    on the store-bearing tenant config becomes "unused", failing the type-check.
- *  - **Runtime** assertions in the `describe` block — run by vitest — proving the `role` default.
+ *  - **Runtime** assertions in the `describe` block — run by vitest — proving the `topology` default.
  */
 
 // --- minimal type-equality helpers (no vitest `expectTypeOf` dependency) ---
@@ -22,11 +22,11 @@ type Expect<T extends true> = T;
 
 /**
  * Compile-time proof of the discrimination. Never called — `tsc` still checks it. Each block asserts
- * a valid per-role config both compiles AND narrows to the right union member; each `@ts-expect-error`
+ * a valid per-topology config both compiles AND narrows to the right union member; each `@ts-expect-error`
  * asserts an invalid shape is rejected.
  */
 function typeContracts(): void {
-  // A config with NO role narrows to StandaloneConfig (the default member) and keeps every legacy field.
+  // A config with NO topology narrows to StandaloneConfig (the default member) and keeps every legacy field.
   const legacy = defineConfig({
     transport: 'memory',
     transports: { memory: transports.memory() },
@@ -36,13 +36,13 @@ function typeContracts(): void {
   });
   type _Legacy = Expect<Equal<typeof legacy, StandaloneConfig>>;
 
-  // An explicit standalone role narrows the same way.
-  const standalone = defineConfig({ role: 'standalone', transport: 'memory' });
+  // An explicit standalone topology narrows the same way.
+  const standalone = defineConfig({ topology: 'standalone', transport: 'memory' });
   type _Standalone = Expect<Equal<typeof standalone, StandaloneConfig>>;
 
   // A control-plane config narrows to ControlPlaneConfig and accepts `verifyTenant`.
   const controlPlane = defineConfig({
-    role: 'control-plane',
+    topology: 'control-plane',
     store: 'lucid',
     stores: { lucid: stores.lucid() },
     transport: 'bull',
@@ -53,7 +53,7 @@ function typeContracts(): void {
 
   // A tenant config narrows to TenantConfig — store-less, with partition + wire options.
   const tenant = defineConfig({
-    role: 'tenant',
+    topology: 'tenant',
     partition: 'acme',
     transport: 'bull',
     transports: { bull: transports.memory() },
@@ -68,55 +68,61 @@ function typeContracts(): void {
   // the type system, not a runtime check. (The directive sits on the call line because that is where
   // an overload-resolution error surfaces.)
   // @ts-expect-error — `store` is forbidden on a tenant config (store?: never — compile-time isolation)
-  defineConfig({ role: 'tenant', partition: 'acme', transport: 'bull', store: 'lucid' });
+  defineConfig({ topology: 'tenant', partition: 'acme', transport: 'bull', store: 'lucid' });
 
   // ...and it may not carry a `stores` map either. (Kept on ONE line: TypeScript >= 7 reports the
   // overload error at the first object-literal property, so a multi-line literal would put the
   // diagnostic on a different line than the directive.)
   const lucidStores = { lucid: stores.lucid() };
   // @ts-expect-error — `stores` is forbidden on a tenant config (stores?: never)
-  defineConfig({ role: 'tenant', partition: 'acme', transport: 'bull', stores: lucidStores });
+  defineConfig({ topology: 'tenant', partition: 'acme', transport: 'bull', stores: lucidStores });
 
   // `partition` is required on a tenant config.
   // @ts-expect-error — missing required `partition`
-  defineConfig({ role: 'tenant', transport: 'bull' });
+  defineConfig({ topology: 'tenant', transport: 'bull' });
 
   // `store`/`transport` are required on a control-plane config.
   // @ts-expect-error — missing required `store` and `transport`
-  defineConfig({ role: 'control-plane' });
+  defineConfig({ topology: 'control-plane' });
 }
 // Reference (never call) so the type-level assertions are compiled but not run at test time.
 void typeContracts;
 
-describe('defineConfig — role-discriminated config', () => {
-  it('defaults the role to standalone when omitted (backward-compat)', () => {
-    // Prove-by-mutation: remove `role: 'standalone'` from defineConfig's return and this fails.
-    expect(defineConfig({}).role).toBe('standalone');
-    expect(defineConfig().role).toBe('standalone');
+describe('defineConfig — topology-discriminated config', () => {
+  it('defaults the topology to standalone when omitted', () => {
+    // Prove-by-mutation: remove `topology: 'standalone'` from defineConfig's return and this fails.
+    expect(defineConfig({}).topology).toBe('standalone');
+    expect(defineConfig().topology).toBe('standalone');
   });
 
-  it('preserves an explicitly-set role', () => {
+  it('refuses the pre-1.0 `role` key instead of booting as standalone', () => {
+    expect(() => defineConfig({ role: 'control-plane' } as never)).toThrow(
+      /`role` was renamed to `topology`/,
+    );
+  });
+
+  it('preserves an explicitly-set topology', () => {
     expect(
       defineConfig({
-        role: 'control-plane',
+        topology: 'control-plane',
         store: 'lucid',
         stores: { lucid: stores.lucid() },
         transport: 'bull',
         transports: { bull: transports.memory() },
-      }).role,
+      }).topology,
     ).toBe('control-plane');
 
     expect(
       defineConfig({
-        role: 'tenant',
+        topology: 'tenant',
         partition: 'acme',
         transport: 'bull',
         transports: { bull: transports.memory() },
-      }).role,
+      }).topology,
     ).toBe('tenant');
   });
 
-  it('returns the config fields unchanged, with the role stamped on', () => {
+  it('returns the config fields unchanged, with the topology stamped on', () => {
     const cfg = defineConfig({
       namespace: 'pool-a',
       store: 'lucid',
@@ -125,7 +131,7 @@ describe('defineConfig — role-discriminated config', () => {
       transports: { memory: transports.memory() },
     });
     expect(cfg).toMatchObject({
-      role: 'standalone',
+      topology: 'standalone',
       namespace: 'pool-a',
       store: 'lucid',
       transport: 'memory',

@@ -100,7 +100,7 @@ export default defineConfig({
 })
 ```
 
-Run the step handlers on `node ace durable:work` pods, which also tick the loop. The [`queue`](/docs/durable/transports/queue) driver rides `@adonisjs/queue`; [`db`](/docs/durable/transports/db) needs no broker at all; [`bullmq`](/docs/durable/transports/bullmq) is the one to pick for a [cross-ecosystem fleet](/docs/durable/cluster/interop). For a store-less worker fleet, see [roles](/docs/durable/cluster/roles-and-config).
+Run the step handlers on `node ace durable:work` pods, which also tick the loop. The [`queue`](/docs/durable/transports/queue) driver rides `@adonisjs/queue`; [`db`](/docs/durable/transports/db) needs no broker at all; [`bullmq`](/docs/durable/transports/bullmq) is the one to pick for a [cross-ecosystem fleet](/docs/durable/cluster/interop). For a store-less worker fleet, see [topologies](/docs/durable/cluster/topology-and-config).
 
 **Keep workflow bodies off the web pods if they are heavy.** By default a pod executes the runs it starts (and the ones it requeues or recovers) right away, in-process. A web pod that should only enqueue sets `drive: false`, and `consumers: 'never'` so it claims no broker jobs either:
 
@@ -112,7 +112,7 @@ export default defineConfig({
 })
 ```
 
-A started run then stays `pending` until a `durable:work` pod's next poll picks it up. `durable:work` drives through that poll whatever `drive` says, so one config file serves both kinds of pod. What still executes on a `drive: false` pod is a resume it is asked for directly — an `engine.signal` or webhook it handles, a compensating cancel — under the run's lease, like on any instance. `drive: false` together with `worker: { embedded: true }` is a contradiction and throws at boot, and an explicit `runDispatcher` still wins over it. `role: 'control-plane'` never drives in-process either, and also stops serving `app/steps` in that process.
+A started run then stays `pending` until a `durable:work` pod's next poll picks it up. `durable:work` drives through that poll whatever `drive` says, so one config file serves both kinds of pod. What still executes on a `drive: false` pod is a resume it is asked for directly — an `engine.signal` or webhook it handles, a compensating cancel — under the run's lease, like on any instance. `drive: false` together with `worker: { embedded: true }` is a contradiction and throws at boot, and an explicit `runDispatcher` still wins over it. `topology: 'control-plane'` never drives in-process either, and also stops serving `app/steps` in that process.
 
 ## 3. Crash recovery is a lease
 
@@ -188,7 +188,7 @@ export default defineConfig({
 })
 ```
 
-`drain(timeoutMs)` stops recovery, timer and pending pickups, then waits for every in-flight execution — including continue-as-new links and deferred children — to settle. It does not cancel anything: if the timeout wins, it releases the leases this process still holds, so the next process's `recoverIncomplete()` replays those runs from their last checkpoint immediately instead of after `leaseMs`. Size the timeout above your typical in-flight turn, and below the orchestrator's grace period (Kubernetes' `terminationGracePeriodSeconds`, 30s by default). A `role: 'tenant'` pod binds no engine and has nothing to drain.
+`drain(timeoutMs)` stops recovery, timer and pending pickups, then waits for every in-flight execution — including continue-as-new links and deferred children — to settle. It does not cancel anything: if the timeout wins, it releases the leases this process still holds, so the next process's `recoverIncomplete()` replays those runs from their last checkpoint immediately instead of after `leaseMs`. Size the timeout above your typical in-flight turn, and below the orchestrator's grace period (Kubernetes' `terminationGracePeriodSeconds`, 30s by default). A `topology: 'tenant'` pod binds no engine and has nothing to drain.
 
 ## 6. Replay-safe deploys
 
@@ -261,7 +261,7 @@ export default defineConfig({
 })
 ```
 
-Unset, a standalone engine is in the `'default'` pool: it drives only runs stamped `'default'` (and rows written before namespaces existed, which read back as `'default'`), never another pool's. Only a `role: 'control-plane'` engine with no namespace is the operator that drives every pool — that is how one control plane serves many tenant pools.
+Unset, a standalone engine is in the `'default'` pool: it drives only runs stamped `'default'` (and rows written before namespaces existed, which read back as `'default'`), never another pool's. Only a `topology: 'control-plane'` engine with no namespace is the operator that drives every pool — that is how one control plane serves many tenant pools.
 
 See [Tenancy](/docs/durable/concepts/tenancy) and the [two-pools mistake](/docs/durable/reliability/failure-modes#namespaces-the-classic-two-pools-mistake).
 

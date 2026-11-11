@@ -107,7 +107,7 @@ function wireControlPlane(
   options: { verify?: ReturnType<typeof hmacTenantVerifier>; namespace?: string } = {},
 ): WorkflowEngine {
   const engine = makeEngine(options.namespace ?? 'acme');
-  const gateway = new StoreRunGateway(engine, { role: 'control-plane' });
+  const gateway = new StoreRunGateway(engine, { topology: 'control-plane' });
   const responder = new RunRequestResponder(transport, gateway, {
     ...(options.verify ? { verifyTenant: options.verify } : {}),
     subscribeEngineEvents: (listener) => engine.subscribe(listener),
@@ -127,7 +127,7 @@ describe('ProxyRunGateway ↔ RunRequestResponder round-trip (prefix-only, no to
     proxy = new ProxyRunGateway(transport, { partition: 'acme', requestTimeoutMs: 500 });
   });
 
-  it('topology() reports the tenant role + partition — synchronous, no round-trip', () => {
+  it('topology() reports the tenant topology + partition — synchronous, no round-trip', () => {
     expect(proxy.topology()).toEqual({ role: 'tenant', tenant: 'acme' });
   });
 
@@ -392,7 +392,10 @@ describe('republishLifecycle over the round-trip', () => {
     const operator = new WorkflowEngine({ store });
     operator.register('echo', '1', async (_ctx, input) => input);
     const wire = new FakeP4Transport();
-    new RunRequestResponder(wire, new StoreRunGateway(operator, { role: 'control-plane' })).start();
+    new RunRequestResponder(
+      wire,
+      new StoreRunGateway(operator, { topology: 'control-plane' }),
+    ).start();
     const tenantA = new ProxyRunGateway(wire, { partition: 'acme', requestTimeoutMs: 500 });
     const tenantB = new ProxyRunGateway(wire, { partition: 'evil', requestTimeoutMs: 500 });
     const ids = [
@@ -507,7 +510,10 @@ describe('republishLifecycle over the round-trip', () => {
       });
     }
     const wire = new FakeP4Transport();
-    new RunRequestResponder(wire, new StoreRunGateway(operator, { role: 'control-plane' })).start();
+    new RunRequestResponder(
+      wire,
+      new StoreRunGateway(operator, { topology: 'control-plane' }),
+    ).start();
     const tenantA = new ProxyRunGateway(wire, { partition: 'acme', requestTimeoutMs: 500 });
     const tenantB = new ProxyRunGateway(wire, { partition: 'evil', requestTimeoutMs: 500 });
 
@@ -550,7 +556,10 @@ describe('republishLifecycle over the round-trip', () => {
       await new Promise((r) => setTimeout(r, 5));
     }
     const wire = new FakeP4Transport();
-    new RunRequestResponder(wire, new StoreRunGateway(operator, { role: 'control-plane' })).start();
+    new RunRequestResponder(
+      wire,
+      new StoreRunGateway(operator, { topology: 'control-plane' }),
+    ).start();
     const tenantA = new ProxyRunGateway(wire, { partition: 'acme', requestTimeoutMs: 500 });
 
     expect(

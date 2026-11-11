@@ -35,7 +35,7 @@ import { transports } from './transports/factory.js';
 import type { WorkflowRef } from './workflow-ref.js';
 
 /**
- * The **shared** fields of `config/durable.ts`, common to every {@link DurableConfig} role. Everything
+ * The **shared** fields of `config/durable.ts`, common to every {@link DurableConfig} topology. Everything
  * here is optional — by default the engine uses an in-process
  * state store + transport (single-process, no extra infra). Pick a `transport`/`store` by name from
  * the `transports`/`stores` maps to run cross-process or persist durably; build the entries with the
@@ -80,10 +80,10 @@ export interface BaseDurableConfig {
    * Which topology this engine runs as (spec §3): `'standalone'` (default — control-plane + embedded
    * worker), `'control-plane'` (pure coordinator), or `'tenant'` (store-less thin pod). Selected
    * explicitly, never inferred. Omit it and {@link defineConfig} defaults to `'standalone'`, so a
-   * config written before roles existed behaves identically. The concrete per-role shape is a member
+   * config that omits it behaves identically. The concrete per-topology shape is a member
    * of the {@link DurableConfig} union; this base only declares the discriminant for shared reads.
    */
-  role?: 'standalone' | 'control-plane' | 'tenant';
+  topology?: 'standalone' | 'control-plane' | 'tenant';
   /**
    * Name of the transport (a key of {@link transports}) the engine dispatches over. Omit for the
    * in-process transport (single-process, no extra infra).
@@ -97,7 +97,7 @@ export interface BaseDurableConfig {
    * and a step can pin any of them by name with `ctx.step(step, input, { transport: 'db' })`. Each
    * one gets the same consumer deferral, namespace and shutdown as `transport`. Only the transports
    * named here (and `transport`) are built: the rest of `transports` stays a menu. Store-backed
-   * roles only; a `tenant` pod uses its one `transport`.
+   * topologies only; a `tenant` pod uses its one `transport`.
    */
   transportPool?: string[];
   /**
@@ -181,7 +181,7 @@ export interface BaseDurableConfig {
    * queue names. Set distinct values to safely share ONE state store + broker across
    * non-interchangeable pools (e.g. local dev vs a cluster).
    *
-   * Absent, it depends on the role. A `standalone` engine (the default role) is in `'default'`: it
+   * Absent, it depends on the topology. A `standalone` engine (the default topology) is in `'default'`: it
    * drives only the default pool (runs stamped `'default'`, and legacy rows stored without a
    * namespace, which every shipped store reads back as `'default'`) — byte-identical to a
    * single-pool deployment. A `control-plane` engine with no namespace is the OPERATOR: it drives,
@@ -433,28 +433,33 @@ export interface BaseDurableConfig {
 }
 
 /**
- * Shape of `config/durable.ts` — a **role-discriminated union** (spec §5). TypeScript narrows the
- * accepted config on the `role` literal, so each topology gets exactly the right fields and an
+ * Shape of `config/durable.ts` — a **topology-discriminated union** (spec §5). TypeScript narrows the
+ * accepted config on the `topology` literal, so each topology gets exactly the right fields and an
  * invalid combination is a compile error. The headline invariant: a `tenant` config may not name a
  * store (`store?: never` on {@link TenantConfig}), making store-less isolation a compile-time fact.
- * A config with no `role` lands on {@link StandaloneConfig} — the default — preserving the
- * pre-roles config byte-for-byte.
+ * A config with no `topology` lands on {@link StandaloneConfig} — the default.
  */
 export type DurableConfig = StandaloneConfig | ControlPlaneConfig | TenantConfig;
 
 /**
  * Identity helper giving `config/durable.ts` full type-checking. Overloaded so the return type
- * **narrows on `role`**: pass a `tenant` config and you get a {@link TenantConfig} back, etc. The
- * `role` is defaulted to `'standalone'` at runtime, so a config that omits it (every config written
- * before roles existed) still boots as the single-process standalone engine.
+ * **narrows on `topology`**: pass a `tenant` config and you get a {@link TenantConfig} back, etc. The
+ * `topology` is defaulted to `'standalone'` at runtime, so a config that omits it still boots as the single-process standalone engine.
  */
 export function defineConfig(config: TenantConfig): TenantConfig;
 export function defineConfig(config: ControlPlaneConfig): ControlPlaneConfig;
 export function defineConfig(config?: StandaloneConfig): StandaloneConfig;
-export function defineConfig(config: DurableConfig = { role: 'standalone' }): DurableConfig {
-  // Default the discriminant so downstream (provider, gateway) can branch on a always-present `role`
-  // without re-deriving it. `...config` wins, so an explicit role is preserved.
-  return { role: 'standalone', ...config } as DurableConfig;
+export function defineConfig(config: DurableConfig = { topology: 'standalone' }): DurableConfig {
+  // `role` was renamed to `topology` in 1.0. Refuse the old key: ignoring it would boot a
+  // control-plane or tenant config as `standalone`, silently.
+  if ('role' in (config as object)) {
+    throw new Error(
+      "@adonis-agora/durable: `role` was renamed to `topology` in config/durable.ts (same values: 'standalone' | 'control-plane' | 'tenant'). Rename the key.",
+    );
+  }
+  // Default the discriminant so downstream (provider, gateway) can branch on a always-present `topology`
+  // without re-deriving it. `...config` wins, so an explicit topology is preserved.
+  return { topology: 'standalone', ...config } as DurableConfig;
 }
 
 export type {

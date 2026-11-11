@@ -14,7 +14,7 @@ The `@adonis-agora/durable/worker` subpath is the whole worker surface, and impo
 
 ## The usual path: `durable:worker`
 
-Most worker pods need no code from this subpath. Configure the pod as a [`tenant` role](/docs/durable/cluster/roles-and-config#tenant-store-less-thin-pod), write your step handlers under `app/steps` as usual, and run the command:
+Most worker pods need no code from this subpath. Configure the pod as a [`tenant` topology](/docs/durable/cluster/topology-and-config#tenant-store-less-thin-pod), write your step handlers under `app/steps` as usual, and run the command:
 
 ```bash
 node ace durable:worker
@@ -135,6 +135,6 @@ Reach for these when you are writing a transport of your own, or bridging durabl
 
 ## Next steps
 
-- **[Roles & config](/docs/durable/cluster/roles-and-config)** — how a `tenant` pod is declared, and the `runGateway` its API side uses.
+- **[Topology & config](/docs/durable/cluster/topology-and-config)** — how a `tenant` pod is declared, and the `runGateway` its API side uses.
 - **[Handshake & capability negotiation](/docs/durable/cluster/handshake)** — what the descriptor is matched against.
 - **[Cross-ecosystem interop](/docs/durable/cluster/interop)** — the same contract, spoken by a Python worker.

@@ -67,7 +67,7 @@ import { runValueAdapter } from './run-values.js';
 /**
  * The bounded read/control surface the JSON handlers drive — declared STRUCTURALLY (a port), not by
  * importing the concrete `WorkflowEngine` class, so the same handlers serve BOTH durable topologies
- * (design §8): a store role passes an adapter over the real {@link
+ * (design §8): a store topology passes an adapter over the real {@link
  * import('../engine.js').WorkflowEngine} (`storeDashboardEngine`); a store-less `tenant` pod passes an
  * adapter over its {@link import('../run-gateway/interface.js').RunGateway} (`gatewayDashboardEngine`).
  * Store presence is therefore invisible to the handlers. Mirrors the `RunGatewayEngine` port pattern
@@ -876,13 +876,14 @@ export async function workers(deps: Deps): Promise<ApiResponse> {
   return ok(groups);
 }
 
-/** `GET /topology` — this deployment's durable role, for the header badge. Pure/local (no engine
- *  round-trip): the role is already known by `dashboard_provider.ts` from `config/durable.ts`. */
+/** `GET /topology` — this deployment's durable topology, for the header badge. Pure/local (no engine
+ *  round-trip): it is already known by `dashboard_provider.ts` from `config/durable.ts`. */
 export function topology(
-  role: 'standalone' | 'control-plane' | 'tenant',
+  durableTopology: 'standalone' | 'control-plane' | 'tenant',
   tenant?: string,
 ): ApiResponse {
-  return ok(tenant !== undefined ? { role, tenant } : { role });
+  // The body keeps aviary's `DurableTopology` wire shape (`{ role, tenant? }`).
+  return ok(tenant !== undefined ? { role: durableTopology, tenant } : { role: durableTopology });
 }
 
 /**

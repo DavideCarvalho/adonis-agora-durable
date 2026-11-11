@@ -97,7 +97,7 @@ async function cluster(gatewayOverride?: (g: StoreRunGateway) => RunGateway) {
   const acmeEngine = makeEngine(store, 'acme');
   const globexEngine = makeEngine(store, 'globex');
   const wire = new Wire();
-  const base = new StoreRunGateway(acmeEngine, { role: 'control-plane' });
+  const base = new StoreRunGateway(acmeEngine, { topology: 'control-plane' });
   new RunRequestResponder(wire, gatewayOverride ? gatewayOverride(base) : base, {
     verifyTenant: async ({ tenant }) => (tenant ? { tenant } : null),
   }).start();

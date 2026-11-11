@@ -333,6 +333,46 @@ After:
 await runSchedules(engine, schedules, now, { random: () => 0 })
 ```
 
+## The config's `role` is renamed to `topology`
+
+`role` in `config/durable.ts` is now `topology`, with the same values (`'standalone'`,
+`'control-plane'`, `'tenant'`), the same default and the same behaviour. There is no alias: a `role`
+key no longer type-checks, and `defineConfig` throws at boot so it never runs as `standalone` by mistake. Across
+Agora, `role` now means which half of a split deployment a process is; durable covers that with
+`drive`, `consumers` and `worker.embedded`.
+
+Before:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  role: 'control-plane',
+  store: 'lucid',
+  transport: 'bullmq',
+  // ...
+})
+```
+
+After:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  topology: 'control-plane',
+  store: 'lucid',
+  transport: 'bullmq',
+  // ...
+})
+```
+
+The same rename applies elsewhere:
+
+- `new StoreRunGateway(engine, { role })` is `new StoreRunGateway(engine, { topology })`.
+- `dashboardEngineForRole` from `@adonis-agora/durable/dashboard` is `dashboardEngineForTopology`.
+- A custom transport that implements the optional `useTenantRole()` hook renames it to
+  `useTenantTopology()`.
+
+`runGateway.topology()` and `GET <path>/api/topology` still answer `{ role, tenant? }`, the shape
+Aviary's console reads. See [Topology & config](/docs/durable/cluster/topology-and-config).
+
 ## `@OnDiagnostic` is removed from durable
 
 Durable no longer starts workflows from `@adonis-agora/diagnostics` events: the `@OnDiagnostic`

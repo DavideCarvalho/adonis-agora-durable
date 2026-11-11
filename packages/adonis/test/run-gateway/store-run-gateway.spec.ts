@@ -35,7 +35,7 @@ describe('StoreRunGateway (store-backed RunGateway)', () => {
     it('topology() reports standalone by default and control-plane when configured', () => {
       const { engine } = makeEngine();
       expect(new StoreRunGateway(engine).topology()).toEqual({ role: 'standalone' });
-      expect(new StoreRunGateway(engine, { role: 'control-plane' }).topology()).toEqual({
+      expect(new StoreRunGateway(engine, { topology: 'control-plane' }).topology()).toEqual({
         role: 'control-plane',
       });
     });

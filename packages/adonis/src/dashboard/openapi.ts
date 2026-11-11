@@ -550,7 +550,7 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
       },
       '/topology': {
         get: {
-          summary: "This deployment's durable role",
+          summary: "This deployment's durable topology",
           responses: { '200': jsonResponse('`{ role, tenant? }`.', { type: 'object' }) },
         },
       },

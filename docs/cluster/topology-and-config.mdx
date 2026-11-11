@@ -1,6 +1,6 @@
 ---
-title: Roles & config
-description: The role-discriminated config/durable.ts, the worker vs api entrypoints for a store-less pod, and layered tenant authentication — with store-less isolation enforced at compile time.
+title: Topology & config
+description: The topology-discriminated config/durable.ts, the worker vs api entrypoints for a store-less pod, and layered tenant authentication — with store-less isolation enforced at compile time.
 icon: SlidersHorizontal
 ---
 
@@ -8,17 +8,17 @@ import { Callout } from 'fumadocs-ui/components/callout';
 import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
 import { Steps, Step } from 'fumadocs-ui/components/steps';
 
-`config/durable.ts` is a **role-discriminated union**. You pick the topology with a single `role` field, and TypeScript narrows the accepted shape on the `role` literal — so an invalid combination (a store-less `tenant` pod that names a store) is a **compile error**, not a runtime surprise.
+`topology` is the Agora-wide cluster-shape setting (`'standalone'`, `'control-plane'` or `'tenant'`, where a tenant is a process with no state of its own); see [Topologies](/docs/durable/cluster) for the shared vocabulary and how it combines with `role`. In durable, `config/durable.ts` is a **topology-discriminated union**. You pick the topology with a single `topology` field, and TypeScript narrows the accepted shape on the `topology` literal — so an invalid combination (a store-less `tenant` pod that names a store) is a **compile error**, not a runtime surprise.
 
 ## Standalone (the default)
 
-Omit `role` entirely and you get `standalone` — a control plane plus an embedded worker, identical to a config written before roles existed.
+Omit `topology` entirely and you get `standalone` — a control plane plus an embedded worker. It is the default.
 
 ```ts title="config/durable.ts"
 import { defineConfig, transports, stores } from '@adonis-agora/durable'
 
 export default defineConfig({
-  // role: 'standalone' is the default — you can omit it
+  // topology: 'standalone' is the default — you can omit it
   transport: 'queue',
   transports: { queue: transports.queue({ connection: 'redis' }) },
   store: 'lucid',
@@ -37,7 +37,7 @@ import { defineConfig, transports, stores } from '@adonis-agora/durable'
 import { hmacTenantVerifier } from '@adonis-agora/durable'
 
 export default defineConfig({
-  role: 'control-plane',
+  topology: 'control-plane',
   transport: 'bullmq',
   transports: { bullmq: transports.bullmq({ connection: { host: '127.0.0.1', port: 6379 } }) },
   store: 'lucid',
@@ -61,7 +61,7 @@ A `tenant` pod **never owns a store**. Everything round-trips over the wire via 
 import { defineConfig, transports } from '@adonis-agora/durable'
 
 export default defineConfig({
-  role: 'tenant',
+  topology: 'tenant',
   transport: 'bullmq',
   transports: {
     bullmq: transports.bullmq({ connection: process.env.REDIS_URL! }),
@@ -82,7 +82,7 @@ On the `queue` transport the pod needs no database either: pass `workerKeys: fal
 
 ```ts title="config/durable.ts (tenant, queue transport)"
 export default defineConfig({
-  role: 'tenant',
+  topology: 'tenant',
   transport: 'queue',
   transports: { queue: transports.queue({ connection: 'redis', workerKeys: false }) },
   partition: 'acme-corp',
@@ -94,7 +94,7 @@ On the `db` transport the pod reaches the control plane's database for the trans
 
 ```ts title="config/durable.ts (tenant, db transport)"
 export default defineConfig({
-  role: 'tenant',
+  topology: 'tenant',
   transport: 'db',
   transports: { db: transports.db() },
   partition: 'acme-corp',
@@ -103,20 +103,20 @@ export default defineConfig({
 ```
 
 <Callout type="warn">
-The three layers of store-less isolation: **(1) type** — a `tenant` config cannot mention a store; **(2) container** — the provider registers no store binding for the tenant role, so resolving one throws; **(3) object** — the `WorkerRuntime` and `ProxyRunGateway` have no store field at all.
+The three layers of store-less isolation: **(1) type** — a `tenant` config cannot mention a store; **(2) container** — the provider registers no store binding for the tenant topology, so resolving one throws; **(3) object** — the `WorkerRuntime` and `ProxyRunGateway` have no store field at all.
 </Callout>
 
-## What each role validates
+## What each topology validates
 
-The checks split into compile-time (the config's type) and boot-time (the provider, when it builds the role's objects):
+The checks split into compile-time (the config's type) and boot-time (the provider, when it builds the topology's objects):
 
-| `role` | Requires | Forbids | Checked at boot |
+| `topology` | Requires | Forbids | Checked at boot |
 | --- | --- | --- | --- |
 | `standalone` (or omitted) | nothing — no `store` selects the in-memory store, no `transport` the in-memory transport | — | Serves `app/steps` in-process. Starts the `RunRequestResponder` (and honours `verifyTenant`) when the transport carries the run-request methods, like a `control-plane`. |
 | `control-plane` | `store` **and** `transport` (both typed required) | — | Serves no `app/steps`. Uses `NOOP_RUN_DISPATCHER` unless `runDispatcher` is set. The responder is started only on a transport with the run-request methods (`onRunRequest`, `onStartRun`, `publishRunReply`, `publishTenantEvent`). |
 | `tenant` | `transport` and `partition` (both typed required); optional `tenant.token`, `requestTimeoutMs`, `capabilities` | `store`, `stores` (typed `never`) | Resolving the `RunGateway` throws when the transport lacks the store-less methods (`dispatchStartRun`, `dispatchRunRequest`, `onRunReply`, `onTenantEvent`). Resolving the worker runtime throws when the transport cannot serve handlers (`handle()`). No engine and no store are bound, so resolving either throws. |
 
-`partition` is the axis a `tenant` pod is named by: it suffixes the routing tokens the pod's descriptor advertises and is the tenant the proxy claims on the wire when no token is set (and, unless the transport sets its own, the partition of the queues it consumes). `namespace` stays a separate, optional field on every role (a run scope; absent, it is `'default'` on `standalone` and every pool on `control-plane`); a tenant pod passes it to its transport and worker runtime. What each axis actually partitions is [Tenancy](/docs/durable/concepts/tenancy).
+`partition` is the axis a `tenant` pod is named by: it suffixes the routing tokens the pod's descriptor advertises and is the tenant the proxy claims on the wire when no token is set (and, unless the transport sets its own, the partition of the queues it consumes). `namespace` stays a separate, optional field on every topology (a run scope; absent, it is `'default'` on `standalone` and every pool on `control-plane`); a tenant pod passes it to its transport and worker runtime. What each axis actually partitions is [Tenancy](/docs/durable/concepts/tenancy).
 
 ## Worker vs api — the entrypoint decides
 
@@ -144,7 +144,7 @@ The ordinary **HTTP server**. Every durable read, control action, and run-start 
 node bin/server.js
 ```
 
-Mount the [dashboard](/docs/durable/observability/dashboard) and it works unchanged — its reads proxy to the control plane over the wire. One exception: the fleet panel's live worker list reads the store role's transport, which a `tenant` pod does not bind, so on a tenant pod that panel shows diagnostics only.
+Mount the [dashboard](/docs/durable/observability/dashboard) and it works unchanged — its reads proxy to the control plane over the wire. One exception: the fleet panel's live worker list reads the store topology's transport, which a `tenant` pod does not bind, so on a tenant pod that panel shows diagnostics only.
 
 </Tab>
 
@@ -154,7 +154,7 @@ Run both processes on one pod if you want (less isolated; usually kept separate)
 
 ## Reading and steering runs: `runGateway`
 
-Every role exposes the same read/control surface, the `RunGateway`, from `services/main`:
+Every topology exposes the same read/control surface, the `RunGateway`, from `services/main`:
 
 ```ts title="app/controllers/runs_controller.ts"
 import { runGateway } from '@adonis-agora/durable/services/main'
@@ -175,13 +175,13 @@ export default class RunsController {
 }
 ```
 
-**This is what makes application code portable across the three roles.** On a store role the gateway reads the store directly; on a store-less `tenant` pod the identical call becomes a wire request answered by the control plane. The controller above is byte-identical either way — you never branch on `role`, and moving a pod from `standalone` to `tenant` changes only `config/durable.ts`.
+**This is what makes application code portable across the three topologies.** On a store topology the gateway reads the store directly; on a store-less `tenant` pod the identical call becomes a wire request answered by the control plane. The controller above is byte-identical either way — you never branch on `topology`, and moving a pod from `standalone` to `tenant` changes only `config/durable.ts`.
 
 The full surface:
 
 | Verb | Purpose |
 | --- | --- |
-| `topology()` | this pod's `role`, plus its `tenant` on a store-less pod. Synchronous — no round-trip. |
+| `topology()` | this pod's topology (as the `role` field), plus its `tenant` on a store-less pod. Synchronous — no round-trip. |
 | `getRun(runId)` | one run, or `null` |
 | `listRuns(query)` | a filtered listing (status, workflow, tag, namespace, search attributes) |
 | `getCheckpoints(runId)` | the run's step timeline |
@@ -230,7 +230,7 @@ Every fallback happens on the reply, with no timeout wait. After the control pla
 
 Every request gets a reply: a gateway that throws (in `listRuns`, `workerHealth`, the ownership read, or a tenant verifier) becomes an error reply, so a tenant never waits out `requestTimeoutMs` for an answer that will never come.
 
-On a store role, `engine` (the default export of `services/main`) is still there for everything the gateway does not cover — registering workflows, driving poll loops, `getEvent`, `update`, the task verbs. On a `tenant` pod there is no engine to resolve, which is exactly the point: reach for `runGateway` in anything that must run on more than one role.
+On a store topology, `engine` (the default export of `services/main`) is still there for everything the gateway does not cover — registering workflows, driving poll loops, `getEvent`, `update`, the task verbs. On a `tenant` pod there is no engine to resolve, which is exactly the point: reach for `runGateway` in anything that must run on more than one topology.
 
 ## Layered tenant authentication
 

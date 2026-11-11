@@ -49,7 +49,7 @@ describe('durable:worker — several stepsPath / workflowsPath roots', () => {
     await ace.app.init();
     await ace.app.boot();
     ace.app.config.set('durable', {
-      role: 'tenant',
+      topology: 'tenant',
       stepsPath: ['app/orders/steps', 'app/billing/steps'],
       workflowsPath: ['app/orders/flows', 'app/billing/flows'],
     });

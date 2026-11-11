@@ -25,10 +25,11 @@ import type { WorkflowRef } from '../workflow-ref.js';
 /**
  * Which durable topology a gateway speaks for — surfaced so an operator/consumer can tell a control
  * plane from a tenant (or a single-process standalone) at a glance. Cheap, synchronous, LOCAL
- * knowledge: no round-trip. Byte-compatible with aviary's `DurableTopology`, plus a `standalone` role
+ * knowledge: no round-trip. Byte-compatible with aviary's `DurableTopology`, plus a `standalone` value
  * for the single-process deployment this package targets first (aviary is cluster-only, so it never
  * needed one). The store-backed gateway ({@link RunGateway} via `StoreRunGateway`) is the operator; a
- * later `ProxyRunGateway` is the `tenant`.
+ * later `ProxyRunGateway` is the `tenant`. The field is named `role` for that wire compatibility; its value
+ * is the config's `topology`.
  */
 export interface DurableTopology {
   role: 'control-plane' | 'standalone' | 'tenant';
@@ -62,7 +63,7 @@ export interface StartRunOptions extends StartOptions {
  * `start`, `getSearchAttributes`) take engine-faithful shapes.
  */
 export interface RunGateway {
-  /** This deployment's durable role — synchronous, local metadata (no store/transport hit). */
+  /** This deployment's durable topology (config `topology`) — synchronous, local metadata (no store/transport hit). */
   topology(): DurableTopology;
 
   /** Read a run's current persisted state, or null if unknown. */

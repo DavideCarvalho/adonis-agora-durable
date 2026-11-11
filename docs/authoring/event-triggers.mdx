@@ -57,7 +57,7 @@ No config needed. The provider reads the triggers from discovered workflow class
 A few consequences of how the bridge is wired:
 
 - **It is in-process.** The emitter is local to one Node process, so an event starts runs only in the process that emitted it. A fact emitted on a web replica is published by that replica; workers don't see it. To fan a fact out across processes, call [`engine.publishEvent`](/docs/durable/authoring/events#publishing-an-event) from a shared transport consumer instead, or emit it on the diagnostics bus and handle it with a [durable diagnostics listener](/docs/durable/authoring/diagnostics-listeners).
-- **It needs an engine.** The bridge is attached by the provider's `boot` on the roles that own one (`standalone` and `control-plane`). A store-less `tenant` pod attaches no bridge, and neither does a warmed-up command (`node ace codegen` and similar) that never starts the app.
+- **It needs an engine.** The bridge is attached by the provider's `boot` on the topologies that own one (`standalone` and `control-plane`). A store-less `tenant` pod attaches no bridge, and neither does a warmed-up command (`node ace codegen` and similar) that never starts the app.
 
 ### Triggering from your own app events
 

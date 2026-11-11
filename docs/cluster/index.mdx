@@ -6,38 +6,48 @@ icon: Network
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
-By default `@adonis-agora/durable` runs as a **single process**: one engine that owns the store, dispatches work, and executes the step bodies itself. That is all most apps ever need. When you want to scale the executor pool independently, isolate tenants, or run a **store-less worker pod that never touches your database**, you select a different **topology** — a single `role` field in `config/durable.ts`. Your workflows and steps do not change.
+`topology` is the shape of the cluster a process belongs to. It is Agora-wide vocabulary, not a durable-only setting: every Agora library with a central mode takes the same three values, and durable is one of them.
+
+- **`standalone`** (the default) — the process does everything in-process and owns its state.
+- **`control-plane`** — the process owns the state and serves the other processes.
+- **`tenant`** — the process has **no state of its own** and depends on a control plane for it. "Tenant" here means a stateless process, not one of your customers: an API or dashboard pod with no store is a tenant too.
+
+`topology` is independent of `role`, the other Agora axis, which says which half of a split deployment a process is (`'all'`, `'api'` or `'worker'`). The two combine: a `standalone` app can still split its web pods from its worker pods, and a `tenant` pod can be either a worker or an API pod. Durable has no `role` field; it covers that axis with `drive`, `consumers` and `worker.embedded` (see [Production](/docs/durable/production)).
+
+The vocabulary around a tenant is shared too: `partition` names which tenant a process is, `tenant: { token }` is the signed claim it presents, `verifyTenant` on the control plane checks that claim, and `capabilities` lists extra features a tenant advertises. On `topology: 'tenant'`, `store` and `stores` are `never`, so naming a store is a compile error. How a tenant reaches its control plane is each library's own business.
+
+In durable, the connection is a **broker transport** (`bullmq`, `queue` or `db`): a tenant pod sends every read, control action and run start to the control plane over it and consumes step tasks from it. By default durable runs `standalone`: one engine that owns the store, dispatches work, and executes the step bodies itself. That is all most apps ever need. When you want to scale the executor pool independently, isolate tenants, or run a **store-less worker pod that never touches your database**, set `topology` in `config/durable.ts`. Your workflows and steps do not change.
 
 <Callout type="info">
 Every topology runs the **same durable engine over the same wire**. Splitting the control plane from the workers does not change execution semantics: each `ctx.step` is still dispatched and checkpointed. The only thing that moves is *where the code that executes the bodies lives*.
 </Callout>
 
-## The three roles
+## The three topologies
 
-| Role | Owns the store | Executes step bodies | Serves HTTP / dashboard | Read/control surface |
+| Topology | Owns the store | Executes step bodies | Serves HTTP / dashboard | Read/control surface |
 |------|:---:|:---:|:---:|------|
 | `standalone` *(default)* | ✅ | ✅ (embedded worker) | optional | direct (store) |
 | `control-plane` | ✅ | ❌ | optional | direct (store) |
 | `tenant` (worker) | ❌ | ✅ | ❌ | proxied over the wire |
 | `tenant` (api/dashboard) | ❌ | ❌ | ✅ | proxied over the wire |
 
-- **`standalone`** — a control plane **plus an embedded worker** in one process. This is the behavior of a config written before roles existed: omit `role` and you get it. Zero infrastructure with the in-process transport and in-memory store; swap in a broker transport and the [Lucid store](/docs/durable/stores/lucid) for production (see [Choosing a transport](/docs/durable/transports/choosing)). On a transport that carries the store-less protocol (`bullmq`, `queue`, `db`) it also answers `tenant` pods, exactly like a `control-plane`.
+- **`standalone`** — a control plane **plus an embedded worker** in one process. It is the default: omit `topology` and you get it. Zero infrastructure with the in-process transport and in-memory store; swap in a broker transport and the [Lucid store](/docs/durable/stores/lucid) for production (see [Choosing a transport](/docs/durable/transports/choosing)). On a transport that carries the store-less protocol (`bullmq`, `queue`, `db`) it also answers `tenant` pods, exactly like a `control-plane`.
 - **`control-plane`** — a pure coordinator. It owns the store and does everything *except* run your bodies: dispatch, crash recovery, timers, retention, and answering read/control requests from thin pods. Bodies execute on separate `tenant` worker pods.
-- **`tenant`** — a **store-less thin pod**. It never owns a store; every read, control action, and run-start round-trips over the wire to the control plane. Whether a tenant pod is a *worker* or an *api/dashboard* pod is decided by the **entrypoint you launch**, not extra config (see [Roles & config](/docs/durable/cluster/roles-and-config)).
+- **`tenant`** — a **store-less thin pod**. It never owns a store; every read, control action, and run-start round-trips over the wire to the control plane. Whether a tenant pod is a *worker* or an *api/dashboard* pod is decided by the **entrypoint you launch**, not extra config (see [Topology & config](/docs/durable/cluster/topology-and-config)).
 
 ### Dispatch and execution are separate
 
-**Every** role dispatches over the transport — that never changes. What changes is who is *subscribed* to the queue a dispatch lands on. Two routing tokens have to agree:
+**Every** topology dispatches over the transport — that never changes. What changes is who is *subscribed* to the queue a dispatch lands on. Two routing tokens have to agree:
 
 - **Dispatch side.** A step is routed to `<name>@<tenant>`, where the tenant comes from **the run's namespace** (or the step's own `partition`, which wins). A `default`/unset namespace routes to the bare `<name>`.
-- **Consume side.** A worker subscribes `<name>@<partition>` for every handler it serves, where the suffix is **its transport's `partition`** (`transports.bullmq({ partition })`, `transports.queue({ partition })` or `transports.db({ partition })`) — bare when unset. On a `tenant` pod the transport defaults to the pod's required top-level `partition`, which the provider also gives the gateway and the worker descriptor, so all three agree (see [Roles & config](/docs/durable/cluster/roles-and-config#tenant-store-less-thin-pod)).
+- **Consume side.** A worker subscribes `<name>@<partition>` for every handler it serves, where the suffix is **its transport's `partition`** (`transports.bullmq({ partition })`, `transports.queue({ partition })` or `transports.db({ partition })`) — bare when unset. On a `tenant` pod the transport defaults to the pod's required top-level `partition`, which the provider also gives the gateway and the worker descriptor, so all three agree (see [Topology & config](/docs/durable/cluster/topology-and-config#tenant-store-less-thin-pod)).
 
 A process executes a step body when, and only when, those two tokens match. There is no fallback: nothing "runs it anyway" because no worker showed up — the step stays pending (or the run parks `blocked` when the step [`requires`](/docs/durable/cluster/handshake#capability-aware-routing) capabilities no live worker advertises). See [Tenancy](/docs/durable/concepts/tenancy) for how a run's namespace is chosen.
 
-Two consequences of the roles above:
+Two consequences of the topologies above:
 
 - **`standalone` serves `app/steps` itself** (the embedded worker); **`control-plane` does not** — the provider skips step registration for it, so its steps only run where a worker consumes the matching token.
-- **A `control-plane` still runs the workflow bodies** — the deterministic coordinator code in `app/workflows` that decides which step to dispatch next. Unless you set `runDispatcher`, the role uses `NOOP_RUN_DISPATCHER`, so `engine.start()` never runs a body inline on the calling (e.g. HTTP) process; the run is left `pending` for the [`durable:work`](/docs/durable/cli) poll loop, which replays the body and dispatches each `ctx.step` to the workers. A standalone web pod gets the same behaviour with `drive: false`. A control plane with no `namespace` is the operator and drives every pool's runs; a standalone engine with no `namespace` drives only the `'default'` pool. See [where a run actually executes](/docs/durable/reliability/failure-modes#where-a-run-actually-executes).
+- **A `control-plane` still runs the workflow bodies** — the deterministic coordinator code in `app/workflows` that decides which step to dispatch next. Unless you set `runDispatcher`, the topology uses `NOOP_RUN_DISPATCHER`, so `engine.start()` never runs a body inline on the calling (e.g. HTTP) process; the run is left `pending` for the [`durable:work`](/docs/durable/cli) poll loop, which replays the body and dispatches each `ctx.step` to the workers. A standalone web pod gets the same behaviour with `drive: false`. A control plane with no `namespace` is the operator and drives every pool's runs; a standalone engine with no `namespace` drives only the `'default'` pool. See [where a run actually executes](/docs/durable/reliability/failure-modes#where-a-run-actually-executes).
 
 ## When to reach for each
 
@@ -46,7 +56,7 @@ Reach for a split topology when you have a concrete driver — not by default. `
 </Callout>
 
 - **Scale the executor pool independently.** CPU-heavy steps shouldn't compete with the coordinator. `control-plane` + N `tenant` workers lets you scale the workers without touching the coordinator.
-- **Isolation & security.** A `tenant` worker pod has **no database credentials and no store binding at all** — a compromised worker cannot read or corrupt durable state. Isolation here is a structural fact, enforced at compile time (a `tenant` config *cannot name a store* — see [Roles & config](/docs/durable/cluster/roles-and-config)), not a runtime check.
+- **Isolation & security.** A `tenant` worker pod has **no database credentials and no store binding at all** — a compromised worker cannot read or corrupt durable state. Isolation here is a structural fact, enforced at compile time (a `tenant` config *cannot name a store* — see [Topology & config](/docs/durable/cluster/topology-and-config)), not a runtime check.
 - **Per-tenant routing.** Route each tenant's runs to its own pool of pods with a `<name>@<tenant>` queue suffix, sharing one control plane and one store. See [Tenancy](/docs/durable/concepts/tenancy) for the `namespace` vs `partition` axes and the isolation boundary.
 - **Polyglot / thin workers.** Because the `bullmq` transport's wire is byte-compatible with the aviary (`nestjs-durable`) engine, a **Python worker** or a **NestJS worker** can execute your workflows' steps against the *same* Adonis control plane. See [Cross-ecosystem interop](/docs/durable/cluster/interop).
 
@@ -58,13 +68,13 @@ The seam is the **control plane ↔ worker** boundary on the transport:
 - A **worker** pulls a task, runs the body through the shared step handler, and publishes the result. It holds no durable state.
 - A **store-less api/dashboard pod** never executes anything; it turns every read/control/start into a wire request answered by the control plane's `RunRequestResponder`.
 
-Three bundled transports carry that seam for store-less pods: `bullmq` (Redis, and the wire NestJS and Python workers speak), `queue` (any `@adonisjs/queue` adapter) and `db` (the control plane's own database, for pods that can reach it). See [Roles & config](/docs/durable/cluster/roles-and-config#control-plane) for choosing between them.
+Three bundled transports carry that seam for store-less pods: `bullmq` (Redis, and the wire NestJS and Python workers speak), `queue` (any `@adonisjs/queue` adapter) and `db` (the control plane's own database, for pods that can reach it). See [Topology & config](/docs/durable/cluster/topology-and-config#control-plane) for choosing between them.
 
-Your application code — `BaseWorkflow` subclasses in `app/workflows`, `@Step` handlers in `app/steps` — is **identical across every role**. The dashboard, routes, and `services/main` reads all go through one `RunGateway` interface that is either backed directly by the store or proxied over the wire, so nothing above that line can tell whether a store is present.
+Your application code — `BaseWorkflow` subclasses in `app/workflows`, `@Step` handlers in `app/steps` — is **identical across every topology**. The dashboard, routes, and `services/main` reads all go through one `RunGateway` interface that is either backed directly by the store or proxied over the wire, so nothing above that line can tell whether a store is present.
 
 ## Next steps
 
-- **[Roles & config](/docs/durable/cluster/roles-and-config)** — the role-discriminated `config/durable.ts`, the worker vs api entrypoints, and layered tenant authentication.
+- **[Topology & config](/docs/durable/cluster/topology-and-config)** — the topology-discriminated `config/durable.ts`, the worker vs api entrypoints, and layered tenant authentication.
 - **[Tenancy](/docs/durable/concepts/tenancy)** — what `namespace` and `partition` partition, and the boundary that keeps a store-less pod to its own runs.
 - **[Handshake & capability negotiation](/docs/durable/cluster/handshake)** — how a mixed fleet stays version-safe: descriptors, negotiation, capability-aware routing, and blocked runs.
 - **[Cross-ecosystem interop](/docs/durable/cluster/interop)** — run Adonis, NestJS, and Python workers on one control plane.

@@ -5,7 +5,7 @@ import type { RunGateway } from '../run-gateway/interface.js';
 import { whenBootedApp } from './booted_app.js';
 
 /**
- * The ACTIVE role's {@link RunGateway} — the store-less-cluster read/control/start surface (design §8).
+ * The ACTIVE topology's {@link RunGateway} — the store-less-cluster read/control/start surface (design §8).
  * On `standalone`/`control-plane` it is the store-backed `StoreRunGateway`; on `tenant` it is the
  * `ProxyRunGateway` that round-trips over the wire. App/dashboard/CLI code reads the SAME object either
  * way, so store presence is invisible above this line:
@@ -18,9 +18,9 @@ import { whenBootedApp } from './booted_app.js';
 let runGateway: RunGateway;
 
 /**
- * The singleton {@link WorkflowEngine} — bound ONLY on the store roles (`standalone`/`control-plane`).
+ * The singleton {@link WorkflowEngine} — bound ONLY on the store topologies (`standalone`/`control-plane`).
  * A `tenant` pod owns no engine (structural isolation), so this stays `undefined` there; use
- * {@link runGateway} for role-agnostic access.
+ * {@link runGateway} for topology-agnostic access.
  *
  * ```ts
  * import engine from '@adonis-agora/durable/services/main'
@@ -35,10 +35,10 @@ let engine: WorkflowEngine;
 const app = await whenBootedApp();
 await app.booted(async () => {
   const config = app.config.get<DurableConfig>('durable', {});
-  const role = config.role ?? 'standalone';
+  const topology = config.topology ?? 'standalone';
   runGateway = await app.container.make(DURABLE_RUN_GATEWAY);
-  // Expose the engine only for store roles — a tenant pod has no engine binding to resolve.
-  if (role !== 'tenant') {
+  // Expose the engine only for store topologies — a tenant pod has no engine binding to resolve.
+  if (topology !== 'tenant') {
     engine = await app.container.make(WorkflowEngine);
   }
 });

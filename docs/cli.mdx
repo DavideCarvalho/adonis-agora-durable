@@ -6,7 +6,7 @@ icon: SquareTerminal
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
-`@adonis-agora/durable` ships seven ace commands: two long-running workers (`durable:work` for a store-backed pod, `durable:worker` for a [store-less thin pod](/docs/durable/cluster/roles-and-config)), a run **lister**, a **retry**, a lifecycle **republish**, a replay-fixture **exporter**, and a **workflow generator**. Except for `durable:worker`, they all resolve the [`WorkflowEngine`](/docs/durable/concepts/workflows-and-steps) bound by the provider, so they operate on the same engine (and store) your app is configured with.
+`@adonis-agora/durable` ships seven ace commands: two long-running workers (`durable:work` for a store-backed pod, `durable:worker` for a [store-less thin pod](/docs/durable/cluster/topology-and-config)), a run **lister**, a **retry**, a lifecycle **republish**, a replay-fixture **exporter**, and a **workflow generator**. Except for `durable:worker`, they all resolve the [`WorkflowEngine`](/docs/durable/concepts/workflows-and-steps) bound by the provider, so they operate on the same engine (and store) your app is configured with.
 
 ```bash
 node ace configure @adonis-agora/durable
@@ -42,13 +42,13 @@ Any [scheduled workflows](/docs/durable/authoring/scheduling) registered under `
 
 ## `durable:worker` — the store-less worker
 
-The worker for a `role: 'tenant'` pod: it serves step bodies and never touches a state store. It boots the container-bound `WorkerRuntime`, registers every handler under `stepsPath` (default `app/steps`; every directory when it's an array), advertises its descriptor and heartbeat so the control plane can route to it, and drains on `SIGINT`/`SIGTERM`.
+The worker for a `topology: 'tenant'` pod: it serves step bodies and never touches a state store. It boots the container-bound `WorkerRuntime`, registers every handler under `stepsPath` (default `app/steps`; every directory when it's an array), advertises its descriptor and heartbeat so the control plane can route to it, and drains on `SIGINT`/`SIGTERM`.
 
 ```bash
 node ace durable:worker
 ```
 
-It takes no flags — everything comes from `config/durable.ts` (`partition`, which falls back to `namespace` and then `'default'`; `namespace`; `transport`; `stepsPath`; `workflowsPath`, whose workflow names it advertises in the descriptor). On a `role: 'tenant'` pod it uses the runtime the provider bound, which publishes the descriptor and heartbeat on the shared Redis. On any other role it builds a self-contained runtime from the configured transport whose advertising is a no-op, and it throws when that transport cannot serve handlers (no `handle()`). Running it on a store-backed role logs a warning and points you at `durable:work`; see [Thin workers](/docs/durable/cluster/thin-workers) for the full topology.
+It takes no flags — everything comes from `config/durable.ts` (`partition`, which falls back to `namespace` and then `'default'`; `namespace`; `transport`; `stepsPath`; `workflowsPath`, whose workflow names it advertises in the descriptor). On a `topology: 'tenant'` pod it uses the runtime the provider bound, which publishes the descriptor and heartbeat on the shared Redis. On any other topology it builds a self-contained runtime from the configured transport whose advertising is a no-op, and it throws when that transport cannot serve handlers (no `handle()`). Running it on a store-backed topology logs a warning and points you at `durable:work`; see [Thin workers](/docs/durable/cluster/thin-workers) for the full topology.
 
 ## `durable:runs` — list runs
 

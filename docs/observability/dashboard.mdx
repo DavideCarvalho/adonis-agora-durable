@@ -247,7 +247,7 @@ The console routes client-side on the URL hash (`#/run/<id>` for a run, `#/workf
 | `status` | one of `pending`, `running`, `suspended`, `blocked`, `cancelling`, `completed`, `failed`, `cancelled`, `dead`. An unrecognised value is ignored, not rejected. Repeat for a set. |
 | `workflow` | exact workflow-name match. Repeatable — repeats match ANY of them. |
 | `tag` | exact match against the run's tags. Repeatable — repeats match runs carrying ANY of them. |
-| `namespace` | exact match against the run's [worker-pool namespace](/docs/durable/cluster/roles-and-config) — omit it and the listing spans every namespace. Repeatable — repeats match ANY of them. |
+| `namespace` | exact match against the run's [worker-pool namespace](/docs/durable/cluster/topology-and-config) — omit it and the listing spans every namespace. Repeatable — repeats match ANY of them. |
 | `origin` | exact match against the run's [package attribution](/docs/durable/concepts/workflows-and-steps#run-origin--package-attribution). One value only: a repeat keeps the first. The "unknown" bucket (absent origin) can't be expressed as an exact match — the console filters that one client-side. |
 | `createdAfter` / `createdBefore` | time-range bounds on the run's creation, as epoch ms or an ISO date string — pushed down server-side. |
 | `attr` | a [search-attribute](/docs/durable/authoring/queries-and-updates) filter, `key:op:value`. Repeatable, and repeats are ANDed — opaque in the envelope too (`filter[attr]`), since attribute keys are dynamic; `filter[attr.<key>][<op>]=value` works as well. |
@@ -363,7 +363,7 @@ The runs list already *names* what a suspended run is parked on (the [`waiting`]
 - **`POST /api/runs/:id/updates/:name`** delivers `{ arg? }` to a [`ctx.onUpdate(name)`](/docs/durable/authoring/queries-and-updates#updates) point. The workflow's registered validator arbitrates **server-side**: a rejection answers `422` with the reason, and nothing is delivered.
 - **`POST /api/runs/:id/tasks/:name/complete`** (body `{ result? }`) and **`.../fail`** (body `{ error }`, a string; it defaults to `failed from console`) settle an external [`ctx.task`](/docs/durable/authoring/external-tasks#external-async-completion-tasks--ctxtask) — the console equivalents of `engine.completeTask` / `engine.failTask`. The response is honest about delivery: `{ result, delivered: true }` when a live waiter consumed it, `{ result: null, delivered: false }` when no waiter was live *yet* and the completion was **buffered** for the run to consume when it reaches the task's wait — buffered is success, not a 404.
 
-On a store-less `tenant` pod these verbs answer `404`: they need the engine's signal surface. `retry`, `retry-with-input` and `continue` do work there; they ride the wire to the control plane (see [the gateway verbs](/docs/durable/cluster/roles-and-config#reading-and-steering-runs-rungateway)).
+On a store-less `tenant` pod these verbs answer `404`: they need the engine's signal surface. `retry`, `retry-with-input` and `continue` do work there; they ride the wire to the control plane (see [the gateway verbs](/docs/durable/cluster/topology-and-config#reading-and-steering-runs-rungateway)).
 
 #### Bulk actions
 
@@ -449,7 +449,7 @@ These are the console's Schedules tab, riding [`engine.listSchedules` / `setSche
 | --- | --- | --- |
 | `GET` | `/durable/api/workers` | per-worker heartbeats, grouped by routing token |
 | `GET` | `/durable/api/health` | the compact shape: queue depth and a `stalled` flag per group |
-| `GET` | `/durable/api/topology` | this pod's `role`, plus its `tenant` when it is a store-less pod |
+| `GET` | `/durable/api/topology` | this pod's topology (as the `role` field), plus its `tenant` when it is a store-less pod |
 | `GET` | `/durable/api/compat` | protocol/capability negotiation across the fleet, plus blocked runs |
 | `GET` | `/durable/api/workflows/:name/lifecycle` | who starts whom through [lifecycle events](/docs/durable/authoring/lifecycle-events): `{ workflow, startsOnSettle, startedBy, triggerCounts? }` (see [Workflow pages](#workflow-pages)); on a tenant pod only its namespace's subscriptions, `501` when its control plane is older than the verb |
 | `GET` | `/durable/api/openapi.json` | the machine-readable API contract (OpenAPI 3.1) |

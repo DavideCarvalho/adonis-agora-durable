@@ -131,7 +131,7 @@ function makeApp(config: DurableConfig, appRoot = '/app') {
   return { app, container };
 }
 
-describe('DurableProvider — role branching (standalone)', () => {
+describe('DurableProvider — topology branching (standalone)', () => {
   it('binds the engine + a standalone StoreRunGateway, and runs end-to-end (embedded worker)', async () => {
     const { app, container } = makeApp({});
     new DurableProvider(app).register();
@@ -182,10 +182,10 @@ describe('DurableProvider — role branching (standalone)', () => {
   });
 });
 
-describe('DurableProvider — role branching (control-plane)', () => {
+describe('DurableProvider — topology branching (control-plane)', () => {
   function controlPlaneConfig(transport: InMemoryTransport): DurableConfig {
     return {
-      role: 'control-plane',
+      topology: 'control-plane',
       store: 'mem',
       stores: { mem: async () => new InMemoryStateStore() },
       transport: 'p4',
@@ -228,13 +228,13 @@ describe('DurableProvider — role branching (control-plane)', () => {
   });
 });
 
-describe('DurableProvider — role branching (tenant, store-less)', () => {
+describe('DurableProvider — topology branching (tenant, store-less)', () => {
   function tenantConfig(
     transport: InMemoryTransport,
     extra: Record<string, unknown> = {},
   ): DurableConfig {
     return {
-      role: 'tenant',
+      topology: 'tenant',
       transport: 'p4',
       transports: { p4: async () => transport },
       partition: 'acme',
@@ -299,9 +299,9 @@ describe('DurableProvider — role branching (tenant, store-less)', () => {
   });
 });
 
-describe('DurableProvider — tenant / control-plane roles over the queue transport', () => {
+describe('DurableProvider — tenant / control-plane topologies over the queue transport', () => {
   // The provider feature-detects the store-less protocol methods instead of naming a transport, so the
-  // `@adonisjs/queue` transport now qualifies for both roles.
+  // `@adonisjs/queue` transport now qualifies for both topologies.
   const queueTransport = (adapter: MockAdapter, keys: MemoryWorkerKeys) =>
     transports.queue({
       adapter: () => adapter,
@@ -312,7 +312,7 @@ describe('DurableProvider — tenant / control-plane roles over the queue transp
 
   it('a tenant pod gets a ProxyRunGateway and a WorkerRuntime over transports.queue()', async () => {
     const { app, container } = makeApp({
-      role: 'tenant',
+      topology: 'tenant',
       transport: 'queue',
       transports: { queue: queueTransport(new MockAdapter(), new MemoryWorkerKeys()) },
       partition: 'acme',
@@ -330,7 +330,7 @@ describe('DurableProvider — tenant / control-plane roles over the queue transp
   it('a store-less tenant pod (no key store) forwards its worker advertisement to the control plane', async () => {
     const adapter = new MockAdapter();
     const { app, container } = makeApp({
-      role: 'tenant',
+      topology: 'tenant',
       transport: 'queue',
       transports: {
         queue: transports.queue({
@@ -357,7 +357,7 @@ describe('DurableProvider — tenant / control-plane roles over the queue transp
   it('a control plane on transports.queue() binds and starts a RunRequestResponder', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const { app, container } = makeApp({
-      role: 'control-plane',
+      topology: 'control-plane',
       store: 'mem',
       stores: { mem: async () => new InMemoryStateStore() },
       transport: 'queue',

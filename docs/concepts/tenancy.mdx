@@ -46,7 +46,7 @@ It isolates two things at once:
 Both follow one **default-is-bare** rule: `'default'` (the default value) leaves every name
 byte-identical to a single-pool deployment. Only a real, non-default namespace prefixes anything.
 
-**What an unset `namespace` means depends on the role.** On a `standalone` engine (the default role)
+**What an unset `namespace` means depends on the topology.** On a `standalone` engine (the default topology)
 it means `'default'`: the provider gives the engine `namespace: 'default'`, so it drives, recovers and
 resumes only the default pool's runs. That includes legacy rows written before runs carried a
 namespace: the Lucid schema heal adds the column as `NOT NULL DEFAULT 'default'`, and every shipped store
@@ -62,7 +62,7 @@ operator: a process that must drive every pool is a `control-plane`.
 <Callout type="warn">
 Behaviour change. A standalone engine without a `namespace` used to be the operator, driving every
 pool's runs on a shared store. It now stays in `'default'`. If you relied on that, move the process to
-`role: 'control-plane'`.
+`topology: 'control-plane'`.
 </Callout>
 
 <Callout type="info">
@@ -83,7 +83,7 @@ transports.bullmq({ connection: process.env.REDIS_URL, partition: 'acme' })
 
 // Worker side — a store-less pod declares the tenant it serves
 export default defineConfig({
-  role: 'tenant',
+  topology: 'tenant',
   transport: 'bullmq',
   transports: { bullmq: transports.bullmq({ connection: process.env.REDIS_URL }) },
   partition: 'acme',
@@ -118,8 +118,8 @@ the store crosses the transport as plain JSON, in the same shapes the NestJS and
 - **`TenantEvent`**: lifecycle events re-published per tenant, so a tenant's dashboard can tail its
   own runs live.
 
-Which verbs each role exposes is covered in
-[Reading and steering runs](/docs/durable/cluster/roles-and-config#reading-and-steering-runs-rungateway).
+Which verbs each topology exposes is covered in
+[Reading and steering runs](/docs/durable/cluster/topology-and-config#reading-and-steering-runs-rungateway).
 
 ## The isolation boundary
 
@@ -145,7 +145,7 @@ The guarantee therefore holds even against a misbehaving client.
 <Callout type="warn">
 It is only as strong as the claim it reads. The `tenant` on a wire request is asserted by the caller.
 Pair this with
-[layered tenant authentication](/docs/durable/cluster/roles-and-config#layered-tenant-authentication):
+[layered tenant authentication](/docs/durable/cluster/topology-and-config#layered-tenant-authentication):
 network/prefix segmentation, plus a signed token the control plane derives the tenant *from* instead of
 trusting the body.
 </Callout>
@@ -216,7 +216,7 @@ to different deployments.
 ## Next steps
 
 - **[Topologies](/docs/durable/cluster)** — the deployment shapes these axes ride on.
-- **[Roles & config](/docs/durable/cluster/roles-and-config)** — the role-discriminated config, the
+- **[Topology & config](/docs/durable/cluster/topology-and-config)** — the topology-discriminated config, the
   `runGateway` surface, and layered tenant authentication.
 - **[Thin workers](/docs/durable/cluster/thin-workers)** — the store-less runtime that serves a
   partition.

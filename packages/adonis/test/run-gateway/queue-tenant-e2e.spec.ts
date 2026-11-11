@@ -74,7 +74,7 @@ describe('tenant pod ⇄ control plane over QueueTransport (end to end)', () => 
     expect(hasResponderCapability(cpTransport)).toBe(true);
     const responder = new RunRequestResponder(
       cpTransport,
-      new StoreRunGateway(engine, { role: 'control-plane' }),
+      new StoreRunGateway(engine, { topology: 'control-plane' }),
       {
         verifyTenant: hmacTenantVerifier(SECRET),
         subscribeEngineEvents: (listener) => engine.subscribe(listener),
@@ -94,8 +94,8 @@ describe('tenant pod ⇄ control plane over QueueTransport (end to end)', () => 
       token: signTenantToken('acme', SECRET),
       requestTimeoutMs: 2000,
     });
-    // What the provider does for a tenant pod: declare the role, then advertise through the transport.
-    tenantTransport.useTenantRole();
+    // What the provider does for a tenant pod: declare the topology, then advertise through the transport.
+    tenantTransport.useTenantTopology();
     const runtime = new WorkerRuntime({
       transport: tenantTransport,
       partition: 'acme',

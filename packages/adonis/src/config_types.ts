@@ -1,14 +1,14 @@
 import type { BaseDurableConfig } from './define_config.js';
 
 /**
- * Role-discriminated config members for `config/durable.ts` (see
+ * Topology-discriminated config members for `config/durable.ts` (see
  * `docs/superpowers/specs/2026-07-17-store-less-cluster-design.md` §5). The engine's topology is
- * selected explicitly by `role` — never inferred — and TypeScript narrows the accepted shape on the
- * `role` literal so an invalid combination (a store-less `tenant` pod that names a store) is a
+ * selected explicitly by `topology` — never inferred — and TypeScript narrows the accepted shape on the
+ * `topology` literal so an invalid combination (a store-less `tenant` pod that names a store) is a
  * **compile error**, not a runtime assertion.
  *
  * These members are additive over {@link BaseDurableConfig} (today's field-for-field config): every
- * existing field stays available on every role, so a config written before roles existed keeps
+ * existing field stays available on every topology, so a config that omits `topology` keeps
  * type-checking and behaving identically (it lands on {@link StandaloneConfig}, the default).
  */
 
@@ -38,14 +38,14 @@ export type TenantVerifier = (input: {
 }) => VerifiedTenant | null | Promise<VerifiedTenant | null>;
 
 /**
- * Single-process engine: a control-plane **plus an embedded worker** (spec §3). The default role, so
- * a config with no `role` lands here — reproducing today's single-process behavior byte-for-byte.
+ * Single-process engine: a control-plane **plus an embedded worker** (spec §3). The default topology, so
+ * a config with no `topology` lands here — reproducing today's single-process behavior byte-for-byte.
  * `store`/`transport` stay optional (omitting them selects the in-memory store/transport — the
- * zero-infra default), unlike the coordinator roles.
+ * zero-infra default), unlike the coordinator topologies.
  */
 export interface StandaloneConfig extends BaseDurableConfig {
-  /** Optional here so a config with no `role` still type-checks and defaults to `'standalone'`. */
-  role?: 'standalone';
+  /** Optional here so a config with no `topology` still type-checks and defaults to `'standalone'`. */
+  topology?: 'standalone';
   /**
    * Verifier for tenant tokens on incoming `RunRequest`/`StartRunMessage`s, as on a `control-plane`. A
    * standalone engine on a transport that carries the store-less protocol (`bullmq`, `queue`, `db`) also
@@ -60,7 +60,7 @@ export interface StandaloneConfig extends BaseDurableConfig {
  * transport, so both are required here.
  */
 export interface ControlPlaneConfig extends BaseDurableConfig {
-  role: 'control-plane';
+  topology: 'control-plane';
   /** A coordinator owns durable state — required (a key of {@link BaseDurableConfig.stores}). */
   store: string;
   /** Required — the broker the coordinator dispatches over (a key of {@link BaseDurableConfig.transports}). */
@@ -76,11 +76,11 @@ export interface ControlPlaneConfig extends BaseDurableConfig {
 /**
  * Store-less "thin" pod (spec §3): a worker (`durable:worker`) or an api/dashboard pod. It NEVER owns
  * a store — everything round-trips over the wire via the `ProxyRunGateway`. That isolation is a
- * **compile-time fact**: `store`/`stores` are `never`, so `defineConfig({ role: 'tenant', store })`
+ * **compile-time fact**: `store`/`stores` are `never`, so `defineConfig({ topology: 'tenant', store })`
  * fails to type-check.
  */
 export interface TenantConfig extends BaseDurableConfig {
-  role: 'tenant';
+  topology: 'tenant';
   /**
    * FORBIDDEN — a store-less pod may not name a store. `never` makes any `store` value a compile
    * error, so tenant isolation is enforced by the type system, not a runtime `if (this.store)`.

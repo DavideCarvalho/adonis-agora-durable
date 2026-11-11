@@ -627,7 +627,7 @@ export class BullMQTransport implements Transport {
   }
 
   /**
-   * Capability hook consumed by the `tenant`-role provider: mint a DEDICATED Redis client the
+   * Capability hook consumed by the `tenant`-topology provider: mint a DEDICATED Redis client the
    * store-less {@link WorkerRuntime}'s registry uses to publish/refresh its `-worker-descriptor:`
    * and `-worker-heartbeat:` keys (SET…EX). Dedicated so the registry disconnecting on worker
    * drain never tears down the transport's own broker clients. The returned `RedisLike` structurally

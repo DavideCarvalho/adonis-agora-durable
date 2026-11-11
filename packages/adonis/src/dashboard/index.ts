@@ -53,7 +53,7 @@ export { BlockedDiagnosticsRecorder } from './diagnostics-recorder.js';
 export type { DashboardContainer } from './gateway-adapter.js';
 
 // Store-less `tenant` dashboard: adapt the RunGateway to the handlers' read/control port (design §8).
-export { dashboardEngineForRole, gatewayDashboardEngine } from './gateway-adapter.js';
+export { dashboardEngineForTopology, gatewayDashboardEngine } from './gateway-adapter.js';
 export type { ApiRequest, ApiResponse, DashboardEngine, Deps } from './handlers.js';
 export {
   bulkAction,

@@ -159,7 +159,7 @@ export interface RunRequestResponderOptions {
    * Warn at construction when no {@link verifyTenant} is set. Default `true`. The durable provider
    * passes `false` for a `standalone` engine: there the responder only answers tenant pods if you run
    * some, and anyone with broker access can already enqueue steps and results, so the warning was
-   * noise on every boot of an app that never uses tenants. An explicit `role: 'control-plane'` keeps it.
+   * noise on every boot of an app that never uses tenants. An explicit `topology: 'control-plane'` keeps it.
    */
   warnWithoutVerifier?: boolean | undefined;
 }

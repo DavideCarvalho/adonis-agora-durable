@@ -86,7 +86,7 @@ Better still, use the built-in `compensate` option ([Sagas](/docs/durable/reliab
 
 **Cause:** `pending` means persisted, not yet picked up. On the default dispatcher the starting process picks it up on a microtask, so a lingering `pending` means that did not happen and no worker loop picked it up afterwards:
 
-- **No dispatcher executes it, and no loop is running.** `role: 'control-plane'`, or a `runDispatcher` that does nothing, leaves every start `pending` for `engine.runPending()` — which only the worker loop calls. With no `durable:work` and no `worker: { embedded: true }`, nothing ever does.
+- **No dispatcher executes it, and no loop is running.** `topology: 'control-plane'`, or a `runDispatcher` that does nothing, leaves every start `pending` for `engine.runPending()` — which only the worker loop calls. With no `durable:work` and no `worker: { embedded: true }`, nothing ever does.
 - **The starting process died or was draining.** A process that is shutting down refuses to pick up new runs, and one that crashed between the write and the pickup takes the microtask with it. The run stays `pending` for the next worker-loop tick.
 - **Namespace mismatch.** The poll paths only act on runs in the engine's own `namespace`. A run started with `opts.namespace` (or from a pool) that no engine polls just sits — see [Tenancy](/docs/durable/concepts/tenancy#pitfalls).
 
@@ -333,6 +333,6 @@ Each entry below is a bug in an older release, not a configuration mistake. If t
 
 **Symptom:** several apps share one database through the Lucid store, and only some of them set `namespace`. The app that leaves `namespace` unset recovers, resumes and sweeps runs belonging to the other apps' pools, then fails them with `workflow <name> is not registered` or runs their code against the wrong app.
 
-**Cause:** before 0.51 an engine without `namespace` was the operator on every role. The operator scopes nothing: its poll, recovery and timer sweeps cover every namespace in the store, so a plain `standalone` app on a shared store acted as the fleet's operator without meaning to.
+**Cause:** before 0.51 an engine without `namespace` was the operator on every topology. The operator scopes nothing: its poll, recovery and timer sweeps cover every namespace in the store, so a plain `standalone` app on a shared store acted as the fleet's operator without meaning to.
 
-**Fix:** upgrade to 0.51. On `role: 'standalone'` an absent `namespace` now means the `'default'` pool, so the engine drives only `'default'` runs (rows written before the upgrade read back as `'default'`). Only a `control-plane` with no `namespace` is still the operator. If you relied on a standalone app driving every pool, give that duty to a control plane. Before upgrading, set an explicit `namespace` on every app that shares the store. See [Tenancy](/docs/durable/concepts/tenancy).
+**Fix:** upgrade to 0.51. On `topology: 'standalone'` an absent `namespace` now means the `'default'` pool, so the engine drives only `'default'` runs (rows written before the upgrade read back as `'default'`). Only a `control-plane` with no `namespace` is still the operator. If you relied on a standalone app driving every pool, give that duty to a control plane. Before upgrading, set an explicit `namespace` on every app that shares the store. See [Tenancy](/docs/durable/concepts/tenancy).

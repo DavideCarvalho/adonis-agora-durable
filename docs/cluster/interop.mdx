@@ -21,7 +21,7 @@ Interop rides one transport: [`transports.bullmq(...)`](/docs/durable/transports
 import { defineConfig, transports, stores } from '@adonis-agora/durable'
 
 export default defineConfig({
-  role: 'control-plane',
+  topology: 'control-plane',
   transport: 'bullmq',
   transports: {
     bullmq: transports.bullmq({ connection: { host: '127.0.0.1', port: 6379 } }),
@@ -102,10 +102,10 @@ where `P` is the effective prefix (`durable`, or `durable-<namespace>`; the cont
 
 <Tab value="NestJS CP → Adonis worker">
 
-Point a store-less **Adonis** `tenant` worker (see [Roles & config](/docs/durable/cluster/roles-and-config)) at the same Redis and `prefix` a NestJS/aviary control plane dispatches over, with the same `partition` on `transports.bullmq()` that the NestJS side routes to (`default` keeps the queues bare). Register the handler names the NestJS workflows call; the Adonis worker advertises its descriptor, the aviary control plane negotiates it as routable, and steps it dispatches execute on the Adonis worker with the result flowing back.
+Point a store-less **Adonis** `tenant` worker (see [Topology & config](/docs/durable/cluster/topology-and-config)) at the same Redis and `prefix` a NestJS/aviary control plane dispatches over, with the same `partition` on `transports.bullmq()` that the NestJS side routes to (`default` keeps the queues bare). Register the handler names the NestJS workflows call; the Adonis worker advertises its descriptor, the aviary control plane negotiates it as routable, and steps it dispatches execute on the Adonis worker with the result flowing back.
 
 ```bash
-# On the Adonis worker pod (role: 'tenant', bullmq transport, same Redis)
+# On the Adonis worker pod (topology: 'tenant', bullmq transport, same Redis)
 node ace durable:worker
 ```
 

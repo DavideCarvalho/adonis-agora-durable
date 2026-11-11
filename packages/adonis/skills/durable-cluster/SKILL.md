@@ -2,12 +2,12 @@
 name: durable-cluster
 description: >-
   Scale @adonis-agora/durable across processes and runtimes: the
-  role-discriminated config (standalone, control-plane, store-less tenant with
+  topology-discriminated config (standalone, control-plane, store-less tenant with
   compile-time store exclusion), durable:work vs durable:worker entrypoints,
   WorkerRuntime + RedisWorkerRegistry descriptors, handshake negotiation
   (compatible/degraded/incompatible) and capability routing (requires → blocked
   runs), layered tenant auth (signTenantToken/hmacTenantVerifier/verifyTenant),
-  runGateway as the role-portable read/control surface, namespace vs partition,
+  runGateway as the topology-portable read/control surface, namespace vs partition,
   tenant pods over bullmq, the @adonisjs/queue transport or the db transport, and Python
   (durable-worker) / NestJS interop over the bullmq wire. Use when
   splitting web from workers, isolating tenants, or adding polyglot workers.
@@ -19,7 +19,7 @@ metadata:
   framework: adonisjs
 sources:
   - 'DavideCarvalho/adonis-durable:docs/cluster/index.mdx'
-  - 'DavideCarvalho/adonis-durable:docs/cluster/roles-and-config.mdx'
+  - 'DavideCarvalho/adonis-durable:docs/cluster/topology-and-config.mdx'
   - 'DavideCarvalho/adonis-durable:docs/cluster/thin-workers.mdx'
   - 'DavideCarvalho/adonis-durable:docs/cluster/handshake.mdx'
   - 'DavideCarvalho/adonis-durable:docs/cluster/interop.mdx'
@@ -29,14 +29,22 @@ sources:
 
 # Cluster topologies & interop
 
-`config/durable.ts` is a **role-discriminated union**: one `role` field picks
+`config/durable.ts` is a **topology-discriminated union**: one `topology` field picks
 the topology and TypeScript narrows the rest. Workflows (`app/workflows`) and
-steps (`app/steps`) are byte-identical across every role — only where bodies
+steps (`app/steps`) are byte-identical across every topology — only where bodies
 execute changes.
 
-| Role | Owns the store | Executes bodies | Serves HTTP |
+`topology` is Agora-wide vocabulary (the cluster shape), not durable-only: a
+`tenant` is any process with no state of its own (API/dashboard pods included),
+not a customer. It is independent of the separate `role` axis (`all`/`api`/
+`worker`); durable has no `role` field and covers that axis with `drive`,
+`consumers` and `worker.embedded`. Durable connects tenants over a broker
+transport (`bullmq`/`queue`/`db`) with `partition`, `tenant.token`,
+`verifyTenant` and `capabilities`.
+
+| Topology | Owns the store | Executes bodies | Serves HTTP |
 |------|:---:|:---:|:---:|
-| `standalone` (default — omit `role`) | ✅ | ✅ embedded | optional |
+| `standalone` (default — omit `topology`) | ✅ | ✅ embedded | optional |
 | `control-plane` | ✅ required | ❌ | optional |
 | `tenant` | ❌ typed `never` | worker pods ✅ | api/dashboard pod |
 
@@ -48,7 +56,7 @@ Split fleet: a pure coordinator plus store-less tenant workers.
 import { defineConfig, hmacTenantVerifier, stores, transports } from '@adonis-agora/durable'
 
 export default defineConfig({
-  role: 'control-plane',
+  topology: 'control-plane',
   transport: 'bullmq', // or 'queue' / 'db' for Adonis-only fleets
   transports: { bullmq: transports.bullmq({ connection: { host: '127.0.0.1', port: 6379 } }) },
   store: 'lucid',
@@ -61,7 +69,7 @@ export default defineConfig({
 import { defineConfig, transports } from '@adonis-agora/durable'
 
 export default defineConfig({
-  role: 'tenant',
+  topology: 'tenant',
   transport: 'bullmq',
   transports: { bullmq: transports.bullmq({ connection: process.env.REDIS_URL }) },
   partition: 'acme-corp', // which pool this pod serves (required)
@@ -91,7 +99,7 @@ database:
 
 ```ts title="config/durable.ts (tenant pod, queue transport)"
 export default defineConfig({
-  role: 'tenant',
+  topology: 'tenant',
   transport: 'queue',
   transports: { queue: transports.queue({ connection: 'redis', workerKeys: false }) },
   partition: 'acme-corp',
@@ -117,9 +125,9 @@ applies a decision by run id). Needs the
 
 ## Core patterns
 
-### Pattern 1 — role-portable code via `runGateway`
+### Pattern 1 — topology-portable code via `runGateway`
 
-Every role exposes the same read/control surface; identical controller code runs
+Every topology exposes the same read/control surface; identical controller code runs
 on a store pod (direct reads) or a store-less pod (wire requests answered by the
 control plane's `RunRequestResponder`):
 
@@ -146,7 +154,7 @@ Verbs: `getRun`, `listRuns`, `getCheckpoints`, `getRunChildren`,
 `workerHealth`, `subscribe`, `topology()`, and the NestJS gateway's `retry`
 (in-place requeue), `continue` (breakpoint), `retryWithInput`, `runFacets`,
 `runValueFacets`, `waitingFor` (optional on the interface; both built-in
-gateways implement them, tenant-scoped by the responder). Never branch on `role`.
+gateways implement them, tenant-scoped by the responder). Never branch on `topology`.
 
 ```ts
 // Each fan of more than 50 members — or declared wider than 50 — comes back as one FanSummary in `fans`.
@@ -162,7 +170,7 @@ tenant console degrades `retry` to a re-dispatch; it remembers the old control
 plane for a minute. `republishLifecycle` and `workflowLifecycle` have no fallback —
 the proxy rejects with `RunGatewayError` (`unsupported-request`), which the dashboard
 answers as `501`. Every request gets a reply, even when the gateway throws.
-Source: `docs/cluster/roles-and-config.mdx`.
+Source: `docs/cluster/topology-and-config.mdx`.
 
 ### Pattern 2 — capability-aware routing and blocked runs
 
@@ -256,7 +264,7 @@ fails fast rather than hanging. Source: `docs/python.mdx`,
 
 ## Common mistakes
 
-### HIGH launching `durable:worker` on a store-backed role
+### HIGH launching `durable:worker` on a store-backed topology
 
 Wrong:
 
@@ -270,7 +278,7 @@ Correct:
 node ace durable:work     # the store-backed dispatch/recovery/timers/schedules loop
 ```
 
-Mechanism: `durable:worker` boots the store-less `WorkerRuntime`; on a role that
+Mechanism: `durable:worker` boots the store-less `WorkerRuntime`; on a topology that
 owns a store it logs a warning and refuses — the two commands are different
 topologies, not aliases. Source: `docs/cli.mdx`.
 
@@ -350,14 +358,14 @@ Wrong:
 
 ```ts
 // the pod's default Lucid connection is its own app database
-defineConfig({ role: 'tenant', transport: 'db', transports: { db: transports.db() }, partition: 'acme' })
+defineConfig({ topology: 'tenant', transport: 'db', transports: { db: transports.db() }, partition: 'acme' })
 ```
 
 Correct:
 
 ```ts
 // a connection to the CONTROL PLANE's database (config/database.ts), used only for the transport tables
-defineConfig({ role: 'tenant', transport: 'db', transports: { db: transports.db({ connection: 'durable' }) }, partition: 'acme' })
+defineConfig({ topology: 'tenant', transport: 'db', transports: { db: transports.db({ connection: 'durable' }) }, partition: 'acme' })
 ```
 
 Mechanism: on `db` the wire IS the transport tables, so a pod writing its

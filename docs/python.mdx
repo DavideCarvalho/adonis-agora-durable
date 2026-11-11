@@ -64,7 +64,7 @@ same **name**. Two things have to line up:
 import { defineConfig, transports, stores } from '@adonis-agora/durable'
 
 export default defineConfig({
-  role: 'control-plane',
+  topology: 'control-plane',
   transport: 'bullmq',
   transports: { bullmq: transports.bullmq({ connection: { host: '127.0.0.1', port: 6379 } }) },
   store: 'lucid',
@@ -264,7 +264,7 @@ control message and the handler bails out on its own at a safe point.
 import { defineConfig, transports, controlPlanes } from '@adonis-agora/durable'
 
 export default defineConfig({
-  role: 'control-plane',
+  topology: 'control-plane',
   transport: 'bullmq',
   transports: { bullmq: transports.bullmq({ connection: { host: '127.0.0.1', port: 6379 } }) },
   controlPlane: controlPlanes.redis({ connection: 'main' }), // channel `durable-control`

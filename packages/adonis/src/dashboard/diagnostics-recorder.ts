@@ -36,7 +36,7 @@ export interface RecordedBlock {
  * - `controlPlaneDescriptor()` is the CP side the events were negotiated against.
  *
  * Bounded by an LRU-ish cap on the per-run map (oldest evicted) so a long-lived control plane never
- * grows this without bound. Store-role only: a `tenant` pod owns no engine to subscribe to, so its
+ * grows this without bound. Store-topology only: a `tenant` pod owns no engine to subscribe to, so its
  * panel shows `blocked` runs (reason from `run.error.message`) without the enriched delta.
  */
 export class BlockedDiagnosticsRecorder {

@@ -219,7 +219,7 @@ describe('an absent namespace', () => {
     await store.createRun(run('theirs', 'other'));
     await store.createRun(run('ours', 'default'));
     const { resolve } = fakeApp(
-      withStore(store, { role: 'control-plane' } as Partial<DurableConfig>),
+      withStore(store, { topology: 'control-plane' } as Partial<DurableConfig>),
     );
     const engine = await resolve();
     engine.register('echo', '1', async (_ctx, input) => input);

@@ -11,7 +11,7 @@ A run is durable but it is not opaque. While it is in flight — suspended on a 
 - **Queries** publish a named value from inside the run (`ctx.setEvent`) and read the latest one from outside (`engine.getEvent`) with no side effect on the run.
 - **Updates** expose a named update point inside the run (`ctx.onUpdate`) that suspends until an external `engine.update` delivers an argument — gated by an optional validator that can reject the update *before* it touches the run.
 
-The examples import the engine singleton with `import engine from '@adonis-agora/durable/services/main'`. It is bound on the `standalone` and `control-plane` roles; a store-less `tenant` pod has no engine, so `getEvent` / `update` are not available there (the dashboard's routes for them answer 404 on that topology). See [Roles & config](/docs/durable/cluster/roles-and-config#reading-and-steering-runs-rungateway).
+The examples import the engine singleton with `import engine from '@adonis-agora/durable/services/main'`. It is bound on the `standalone` and `control-plane` topologies; a store-less `tenant` pod has no engine, so `getEvent` / `update` are not available there (the dashboard's routes for them answer 404 on that topology). See [Topology & config](/docs/durable/cluster/topology-and-config#reading-and-steering-runs-rungateway).
 
 ## Queries
 

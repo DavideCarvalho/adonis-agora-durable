@@ -23,7 +23,7 @@ import { scanRunValueFacets } from '../run-value-facets.js';
 import type { DashboardEngine } from './handlers.js';
 
 /**
- * The slice of {@link import('../engine.js').WorkflowEngine} a store role's {@link
+ * The slice of {@link import('../engine.js').WorkflowEngine} a store topology's {@link
  * storeDashboardEngine} delegates to. Declared structurally (not by importing the concrete class) so
  * this module depends only on the verbs it forwards — mirrors `run-gateway/store-run-gateway.ts`'s
  * `RunGatewayEngine` pattern. The real `WorkflowEngine` is structurally assignable to this (every
@@ -200,7 +200,7 @@ export function storeDashboardEngine(engine: StoreEngineLike): DashboardEngine {
  * - `requeue` → the gateway's `redispatchPending` (the operator recovery verb; the extra
  *   `redispatched` count on the result is a harmless superset of `RunResult`);
  * - `subscribe(runId, onEvent)` → the gateway's own per-run `subscribe` (already scoped, no filtering
- *   needed here — unlike the store-role adapter above).
+ *   needed here — unlike the store-topology adapter above).
  *
  * `getRunChildren` (parent→child fan-out) rides the P4 read surface too (a `getRunChildren`
  * `RunRequestKind` verb), so a store-less tenant pod's run detail view lists children round-tripped over
@@ -318,31 +318,31 @@ async function orOlder<T>(work: Promise<T>, older: () => Promise<T>): Promise<T>
   }
 }
 
-/** The minimal container surface {@link dashboardEngineForRole} resolves bindings through. */
+/** The minimal container surface {@link dashboardEngineForTopology} resolves bindings through. */
 export interface DashboardContainer {
   make(key: unknown): Promise<unknown>;
 }
 
 /**
- * Resolve the dashboard's read/control port for the active durable `role` (design §5) — the single seam
+ * Resolve the dashboard's read/control port for the active durable `topology` (design §5) — the single seam
  * that makes the dashboard store-agnostic:
  *
  * - **`tenant`** (store-less): resolve the {@link DURABLE_RUN_GATEWAY} token (a `ProxyRunGateway`) and
  *   adapt it — the engine binding is deliberately ABSENT on a tenant pod (structural isolation), so we
  *   MUST NOT reach for `WorkflowEngine` here;
- * - **store roles** (`standalone`/`control-plane`): resolve the concrete `WorkflowEngine` and adapt it
+ * - **store topologies** (`standalone`/`control-plane`): resolve the concrete `WorkflowEngine` and adapt it
  *   via {@link storeDashboardEngine} — every verb still forwards 1:1, just through an explicit wrapper
  *   instead of a raw cast (see that function's doc for why).
  *
  * `engineToken` is injected (rather than imported) so the module doesn't hard-depend on the engine class
  * for the tenant path — the tenant branch never touches it.
  */
-export async function dashboardEngineForRole(
-  role: 'standalone' | 'control-plane' | 'tenant',
+export async function dashboardEngineForTopology(
+  durableTopology: 'standalone' | 'control-plane' | 'tenant',
   container: DashboardContainer,
   engineToken: unknown,
 ): Promise<DashboardEngine> {
-  if (role === 'tenant') {
+  if (durableTopology === 'tenant') {
     const gateway = (await container.make(DURABLE_RUN_GATEWAY)) as RunGateway;
     return gatewayDashboardEngine(gateway);
   }

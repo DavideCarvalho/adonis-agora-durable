@@ -14,7 +14,7 @@ library:
     Durable cross-app workflows for AdonisJS — deterministic replay engine,
     AdonisJS binding (BaseWorkflow / @Step / defineStep), config-driven
     transports (memory / eventEmitter / queue / db / bullmq) and state stores
-    (in-memory / lucid), cluster roles, dashboard, OTel, Telescope, testing
+    (in-memory / lucid), cluster topologies, dashboard, OTel, Telescope, testing
     harness, ace CLI, and an ESLint determinism plugin. Port of
     @dudousxd/nestjs-durable-core.
   primary_framework: AdonisJS
@@ -86,7 +86,7 @@ domains:
     title: Cluster topologies & interop
     slug: cluster
     description: >-
-      role-discriminated config (standalone / control-plane / tenant), thin
+      topology-discriminated config (standalone / control-plane / tenant), thin
       WorkerRuntime, worker descriptors + handshake negotiation, capability
       routing (`requires`) and blocked runs, layered tenant auth, Python and
       NestJS workers over the BullMQ wire.
@@ -663,12 +663,12 @@ skills:
     package: '@adonis-agora/durable'
     type: core
     description: >-
-      Scale out with cluster roles (standalone/control-plane/tenant), thin
+      Scale out with cluster topologies (standalone/control-plane/tenant), thin
       store-less workers, descriptor handshake and capability routing
       (requires → blocked), signed tenant auth, Python/NestJS interop over the
       BullMQ wire.
     covers:
-      - role standalone/control-plane/tenant
+      - topology standalone/control-plane/tenant
       - durable:worker
       - WorkerRuntime
       - RedisWorkerRegistry
@@ -689,9 +689,9 @@ skills:
       - Add Python or NestJS workers to one control plane
       - Route capability-gated steps and diagnose blocked runs
     failure_modes:
-      - mistake: launching durable:worker on a store-backed role
+      - mistake: launching durable:worker on a store-backed topology
         mechanism: >-
-          durable:worker is the store-less tenant loop; on a role that owns a
+          durable:worker is the store-less tenant loop; on a topology that owns a
           store it warns and refuses — the store-backed loop is durable:work.
         wrong_pattern: |
           node ace durable:worker   # on a standalone/control-plane pod

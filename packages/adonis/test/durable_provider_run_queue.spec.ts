@@ -130,7 +130,7 @@ describe('DurableProvider and the transport run queue', () => {
   it('a control plane never consumes the run queue', async () => {
     const transport = new RunQueueTransport();
     const { provider, resolve } = fakeApp(
-      config(new InMemoryStateStore(), transport, { role: 'control-plane' }),
+      config(new InMemoryStateStore(), transport, { topology: 'control-plane' }),
     );
     await resolve();
     expect(transport.handler).toBeUndefined();
