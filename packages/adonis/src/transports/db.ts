@@ -493,6 +493,17 @@ export class DbTransport implements Transport, ControlPlane {
     this.#namespace = namespace;
   }
 
+  /**
+   * The partition this instance serves (the `@<partition>` suffix of the routing tokens it consumes):
+   * the explicit `partition`, else its namespace when that is set and not `default`. A namespaced
+   * engine stamps its runs with its namespace and dispatches their steps to `<name>@<namespace>`, so
+   * it serves those tokens by default, as nestjs-durable's `servingPartition()` does.
+   */
+  #servingPartition(): string | undefined {
+    if (this.#partition !== undefined) return this.#partition;
+    return this.#namespace && this.#namespace !== 'default' ? this.#namespace : undefined;
+  }
+
   /** The concrete `namespace` column value this instance stamps/claims: the set namespace, or
    *  `'default'` when absent — so the un-namespaced and `"default"` schemes claim the same rows. */
   #namespaceValue(): string {
@@ -634,7 +645,7 @@ export class DbTransport implements Transport, ControlPlane {
 
   /** Serve `name`'s routing token on the shared task loop (started on the first call). */
   #serve(name: string): void {
-    const token = tenantGroup(sanitizeQueueToken(name), this.#partition);
+    const token = tenantGroup(sanitizeQueueToken(name), this.#servingPartition());
     const isNew = !this.#servedTokens.has(token);
     this.#servedTokens.add(token);
     if (!this.#taskLoop) {

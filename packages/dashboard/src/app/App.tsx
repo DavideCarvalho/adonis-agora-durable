@@ -1334,12 +1334,23 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   // (exhausted retries) appends a suffix to whichever of the three applies — the run's own error
   // stays displayed as the ORIGINAL failure regardless.
   const compBanner =
-    compensations.length > 0
+    compensations.length > 0 || run.status === 'cancelling'
       ? (() => {
           const failedSuffix =
             compSummary.failed > 0
               ? ` ${compSummary.failed} undo${compSummary.failed === 1 ? '' : 's'} failed after retries — check ${compSummary.failed === 1 ? 'it' : 'them'} below.`
               : '';
+          // A compensating cancel in flight: `cancelling` until the undo has run, whether or not any
+          // compensation is recorded yet (the resume that runs them may not have started).
+          if (run.status === 'cancelling') {
+            return {
+              title: 'Cancelling',
+              subtitle:
+                compensations.length > 0
+                  ? `undoing completed steps in reverse before cancelling (${compSummary.done} of ${compSummary.total} done).${failedSuffix}`
+                  : 'a compensating cancel is undoing the saga; the run becomes cancelled when it is done.',
+            };
+          }
           if (compSummary.pending > 0) {
             return {
               title: 'Compensating',
@@ -1377,11 +1388,13 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
   // outright (as `origin app`) rather than omitting.
   const origin = knownOrigin(run.origin);
   // What a human can DO about a suspended run's wait (deliver signal / send update / complete or
-  // fail a task). Tokens come from the timeline's in-flight signal checkpoints, with the run's
-  // list-row `waiting` stamp as fallback — the detail response itself carries no `waiting` (only
-  // `GET /runs` runs the bulk waiter scan), and the sibling list is already polled here anyway.
-  const listRowWaiting = siblingRuns.find((r) => r.id === run.id)?.waiting;
-  const waitTargets = run.status === 'suspended' ? waitTargetsOf(body, listRowWaiting) : [];
+  // fail a task). Tokens come from the timeline's in-flight signal checkpoints, with the run's own
+  // `waiting` stamp (the detail carries it, like a list row) as fallback, whatever page is loaded.
+  const waiting = run.waiting ?? siblingRuns.find((r) => r.id === run.id)?.waiting;
+  const waitTargets = run.status === 'suspended' ? waitTargetsOf(body, waiting) : [];
+  // An action the server refused (or answered with a redirect, e.g. an expired CSRF token): said on
+  // the page, never swallowed.
+  const actionFailure = [retry, cancel, cont, redispatch].find((m) => m.error)?.error;
 
   return (
     <div className="flex h-full flex-col">
@@ -1656,6 +1669,17 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
           </Button>
         </div>
       )}
+      {actionFailure && (
+        <div
+          role="alert"
+          className="flex items-center gap-3 border-b border-rose-500/30 bg-rose-500/10 px-7 py-3 text-[12px] text-rose-200"
+        >
+          <span className="font-medium">Action failed:</span>
+          <span className="mono min-w-0 flex-1 truncate">
+            {actionFailure instanceof Error ? actionFailure.message : String(actionFailure)}
+          </span>
+        </div>
+      )}
       {waitTargets.length > 0 && (
         <WaitingActions
           runId={run.id}
@@ -1906,6 +1930,7 @@ export function App() {
   const attrPredicates = attrFilter;
   const {
     data: runsPages,
+    dataUpdatedAt: runsUpdatedAt,
     isPending: runsPending,
     fetchNextPage,
     hasNextPage,
@@ -1952,6 +1977,11 @@ export function App() {
     refetchInterval: 3000,
   });
   const runs = useMemo(() => runsPages?.pages.flatMap((p) => p.runs) ?? [], [runsPages]);
+  // The status chips (ALL included) are counted by their own query: refresh them with every list
+  // refresh, so a run that started or settled moves the counts when it moves the list.
+  useEffect(() => {
+    if (runsUpdatedAt > 0) void qc.invalidateQueries({ queryKey: ['run-values', 'status'] });
+  }, [runsUpdatedAt, qc]);
   // Worker health, joined into each run row (no-worker) and the banner. Shares the `['workers']` cache
   // with the Workers panel (same queryKey → one fetch); polled a touch faster so "no worker" clears
   // promptly once a worker rejoins.
@@ -2276,6 +2306,15 @@ export function App() {
       </Dialog>
       {/* Bulk result toast: the server's `{ matched, applied }`, plus the cap warning when the
           matched set hit the 500-run ceiling and runs beyond it were left untouched. */}
+      {bulk.error && (
+        <div
+          role="alert"
+          className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-md border border-rose-500/40 bg-rose-500/15 px-4 py-2 text-[12px] text-rose-200"
+        >
+          Bulk action failed:{' '}
+          {bulk.error instanceof Error ? bulk.error.message : String(bulk.error)}
+        </div>
+      )}
       {bulkNotice && (
         <output className="rise fixed bottom-4 right-4 z-50 flex max-w-sm items-start gap-3 rounded-lg border border-line bg-panel-2 px-4 py-3 text-left shadow-2xl">
           <div className="min-w-0 flex-1 text-[12px]">

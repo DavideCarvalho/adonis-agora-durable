@@ -518,6 +518,17 @@ export class BullMQTransport implements Transport {
     this.#namespace = namespace;
   }
 
+  /**
+   * The partition this instance serves (the `@<partition>` suffix of the routing tokens it consumes):
+   * the explicit `partition`, else its namespace when that is set and not `default`. A namespaced
+   * engine stamps its runs with its namespace and dispatches their steps to `<name>@<namespace>`, so
+   * it serves those tokens by default, as nestjs-durable's `servingPartition()` does.
+   */
+  #servingPartition(): string | undefined {
+    if (this.#partition !== undefined) return this.#partition;
+    return this.#namespace && this.#namespace !== 'default' ? this.#namespace : undefined;
+  }
+
   /** The user's `onError` when supplied, else undefined (so the helper falls back to console.warn). */
   #subscribeErrorSink(): ((err: unknown) => void) | undefined {
     return this.#hasOnError ? this.#onError : undefined;
@@ -704,7 +715,7 @@ export class BullMQTransport implements Transport {
    */
   handle(name: string, fn: StepHandler): void {
     this.#handlers.set(name, fn);
-    this.#ensureTaskWorker(routingToken(name, this.#partition));
+    this.#ensureTaskWorker(routingToken(name, this.#servingPartition()));
   }
 
   /**
@@ -716,7 +727,7 @@ export class BullMQTransport implements Transport {
    */
   handleWorkflow(name: string, turn: WorkflowTurnHandler): void {
     this.#workflowTurns.set(name, turn);
-    this.#ensureTaskWorker(routingToken(name, this.#partition));
+    this.#ensureTaskWorker(routingToken(name, this.#servingPartition()));
   }
 
   /** Start (once per routing token) the discriminating task worker + its liveness heartbeat. Shared by

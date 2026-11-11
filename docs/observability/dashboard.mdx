@@ -325,7 +325,7 @@ Both cancel routes read `compensate` from **either** the query string or the JSO
 Anything else is a `400`. That is deliberate: the two ways to guess at an unreadable value are "skip an undo the operator asked for" and "run an undo they did not", and both would be silent. An explicit rejection is the only answer that cannot mislead.
 
 <Callout type="info">
-A compensating cancel answers with the run's **pre-cancel** status, not `cancelled`. The undo replays the workflow's saga in the background so the HTTP request never blocks on it: the completed steps' compensations run in reverse order, each visible as a `compensate:<step>` event in the timeline, and the run reaches `cancelled` once they finish — watch the run's [stream](#live-tailing-one-run) or poll it rather than reading the response body as the final state. A plain cancel is terminal in the response itself.
+A compensating cancel answers with the status `cancelling`, not `cancelled`. The undo replays the workflow's saga in the background so the HTTP request never blocks on it: the completed steps' compensations run in reverse order, each visible as a `compensate:<step>` event in the timeline, and the run reaches `cancelled` once they finish — watch the run's [stream](#live-tailing-one-run) or poll it rather than reading the response body as the final state. A plain cancel is terminal in the response itself.
 </Callout>
 
 The response is `{ matched, applied }`. `matched` is how many runs the filter returned; `applied` is how many the action actually changed. They differ when a run has already moved on — a run that throws or answers "nothing to do" is skipped rather than aborting the batch.

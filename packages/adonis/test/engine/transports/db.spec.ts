@@ -263,7 +263,8 @@ describe.each(dbBackends())('on $name', ({ makeMemoryDb, makeTransportDb }) => {
           return { from: 'beta' };
         });
 
-        await alphaEngine.dispatch(task({ input: { n: 21 } }));
+        // A namespaced engine dispatches to `<name>@<namespace>`, the token a namespaced worker serves.
+        await alphaEngine.dispatch(task({ input: { n: 21 }, group: 'math.double@alpha' }));
         await waitFor(async () => alphaResults.length === 1);
 
         expect(alphaResults).toEqual([{ from: 'alpha', n: 42 }]);

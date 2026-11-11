@@ -578,6 +578,9 @@ export function deriveRunState(
 
   if (groupIsStalled(run.workflow, ctx.health))
     return { status: 'no-worker', detail: run.workflow };
+  // With the timeline in hand, nothing is in flight and nothing names the wait: the run is parked,
+  // not running. A list row has no timeline, and a suspended run there may well have a step out.
+  if (ctx.timeline) return { status: 'suspended' };
   return { status: 'running' };
 }
 
@@ -591,15 +594,6 @@ export function runDisplayStatus(run: WorkflowRun, timeline?: StepCheckpoint[]):
 
 // ── HTTP transport ─────────────────────────────────────────────────────────────────────────────────
 
-declare global {
-  interface Window {
-    /** UI mount base (e.g. `/durable`). Test/escape-hatch override; see {@link readConfig}. */
-    __DURABLE_BASE__?: string;
-    /** JSON API base (e.g. `/durable/api`). Test/escape-hatch override; see {@link readConfig}. */
-    __DURABLE_API__?: string;
-  }
-}
-
 /** `id` of the JSON data block the provider injects into `index.html` (`spa.ts`'s `CONFIG_ELEMENT_ID`). */
 export const CONFIG_ELEMENT_ID = 'durable-dashboard-config';
 
@@ -610,8 +604,7 @@ export const CONFIG_ELEMENT_ID = 'durable-dashboard-config';
  * `script-src 'self' 'nonce-…'` (shield's `@nonce`) refuses an un-nonced inline script without a
  * word, so the globals were never set, the URLs below fell back to `/durable/api`, and a console
  * mounted anywhere else answered 404 to all of its own requests while rendering perfectly. A data
- * block is never executed, so no policy can refuse it. The `window.__DURABLE_*__` globals are still
- * honoured, AFTER the block, so a test or a hand-embedding host can set them.
+ * block is never executed, so no policy can refuse it.
  */
 function readConfig(): { base?: unknown; api?: unknown } {
   if (typeof document === 'undefined') return {};
@@ -631,9 +624,6 @@ function uiBase(): string {
   // silently fall through to the `/durable` default instead of honoring it.
   const injected = readConfig().base;
   if (typeof injected === 'string') return injected;
-  if (typeof window !== 'undefined' && typeof window.__DURABLE_BASE__ === 'string') {
-    return window.__DURABLE_BASE__;
-  }
   return '/durable';
 }
 
@@ -651,9 +641,6 @@ export function logoutUrl(): string {
 function apiBase(): string {
   const injected = readConfig().api;
   if (typeof injected === 'string') return injected;
-  if (typeof window !== 'undefined' && typeof window.__DURABLE_API__ === 'string') {
-    return window.__DURABLE_API__;
-  }
   return `${uiBase()}/api`;
 }
 
@@ -687,13 +674,52 @@ function redirectToAuthSurface(modes: readonly string[] | undefined): void {
   window.location.href = base;
 }
 
-async function http<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(apiBase() + path, init);
+/**
+ * The host app's CSRF token, when it sets one: shield publishes it as an `XSRF-TOKEN` cookie for a
+ * browser client to echo back in `x-xsrf-token`. Without it every action POST is refused (shield
+ * answers with a redirect). No cookie, no header: a host without shield needs none.
+ */
+function csrfHeader(): Record<string, string> {
+  if (typeof document === 'undefined') return {};
+  const match = /(?:^|;\s*)XSRF-TOKEN=([^;]*)/.exec(document.cookie);
+  const token = match?.[1];
+  if (!token) return {};
+  return { 'x-xsrf-token': decodeURIComponent(token) };
+}
+
+/** What a request that the server answered with a redirect, not with the API's JSON, throws. */
+const REDIRECTED =
+  'The server redirected this request instead of answering it, usually because the session or its CSRF token expired. Reload the page and try again.';
+
+/**
+ * Send one API request. A write (anything but GET) carries the CSRF header and does not follow a
+ * redirect: shield answers a refused token with a 302 to the page, which `fetch` would otherwise
+ * follow to an HTML 200 the console then mistakes for success. A 401 goes to the auth surface.
+ */
+async function send(path: string, init?: RequestInit): Promise<Response> {
+  const write = (init?.method ?? 'GET').toUpperCase() !== 'GET';
+  const res = await fetch(apiBase() + path, {
+    ...init,
+    ...(write
+      ? {
+          headers: { ...(init?.headers as Record<string, string> | undefined), ...csrfHeader() },
+          redirect: 'manual' as const,
+        }
+      : {}),
+  });
   if (res.status === 401) {
     redirectToAuthSurface(await readAuthModes(res));
     throw new Error('Session expired; redirecting to sign-in.');
   }
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (res.type === 'opaqueredirect' || res.redirected || (res.status >= 300 && res.status < 400)) {
+    throw new DurableActionError(res.status, REDIRECTED, undefined);
+  }
+  return res;
+}
+
+async function http<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await send(path, init);
+  if (!res.ok) throw await actionError(res);
   return (await res.json()) as T;
 }
 
@@ -728,27 +754,26 @@ export function waitingOnTokens(error: unknown): string[] | undefined {
 /** Same transport as {@link http}, but a non-OK answer throws a {@link DurableActionError} with the
  *  parsed body attached (401 still redirects to the auth surface first, like every other request). */
 async function httpAction<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(apiBase() + path, init);
-  if (res.status === 401) {
-    redirectToAuthSurface(await readAuthModes(res));
-    throw new Error('Session expired; redirecting to sign-in.');
-  }
-  if (!res.ok) {
-    let body: unknown;
-    try {
-      body = await res.json();
-    } catch {
-      body = undefined;
-    }
-    const copy =
-      typeof body === 'object' &&
-      body !== null &&
-      typeof (body as { error?: unknown }).error === 'string'
-        ? (body as { error: string }).error
-        : `${res.status} ${res.statusText}`;
-    throw new DurableActionError(res.status, copy, body);
-  }
+  const res = await send(path, init);
+  if (!res.ok) throw await actionError(res);
   return (await res.json()) as T;
+}
+
+/** A non-2xx answer as a {@link DurableActionError}, its message the body's `error` when it has one. */
+async function actionError(res: Response): Promise<DurableActionError> {
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    body = undefined;
+  }
+  const copy =
+    typeof body === 'object' &&
+    body !== null &&
+    typeof (body as { error?: unknown }).error === 'string'
+      ? (body as { error: string }).error
+      : `${res.status} ${res.statusText}`;
+  return new DurableActionError(res.status, copy, body);
 }
 
 /** `POST` a JSON body (or none) through {@link httpAction}. `JSON.stringify` drops `undefined`

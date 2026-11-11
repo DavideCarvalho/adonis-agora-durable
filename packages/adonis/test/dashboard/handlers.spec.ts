@@ -228,6 +228,15 @@ describe('JSON handlers', () => {
     expect(typeof step?.durationMs).toBe('number');
   });
 
+  it('getRun names what a suspended run is waiting on, as the list rows do', async () => {
+    await raw.start('waiter', {}, 'run-waiting');
+    await raw.waitForRun('run-waiting');
+    const res = await getRun(deps, req({ params: { id: 'run-waiting' } }));
+    const body = res.body as { run: { status: string; waiting?: { on: string; name: string } } };
+    expect(body.run.status).toBe('suspended');
+    expect(body.run.waiting).toEqual({ on: 'signal', name: 'go' });
+  });
+
   it('getRun 404s for an unknown run', async () => {
     const res = await getRun(deps, req({ params: { id: 'nope' } }));
     expect(res.status).toBe(404);

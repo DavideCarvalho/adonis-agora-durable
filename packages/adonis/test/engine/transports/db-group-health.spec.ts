@@ -112,15 +112,21 @@ describe.each(dbBackends())('on $name', ({ makeTransportDb }) => {
 
     it('is namespace-scoped: depth and workers of another namespace are not counted', async () => {
       db = await makeTransportDb();
+      // A namespaced worker serves `<token>@<namespace>`, the token its engine dispatches to.
+      const otherToken = `${TOKEN}@other`;
       const other = make({ namespace: 'other' });
-      await other.dispatch(task(1));
+      await other.dispatch(task(1, { group: otherToken }));
       const worker = make({ namespace: 'other', instanceId: 'wo' });
       worker.deferConsumers(); // keep the row pending
       worker.handle(NAME, async () => 'x');
       worker.startConsumers();
       const engine = make();
-      await until(async () => (await other.groupHealth(TOKEN)).liveWorkers.length === 1);
-      expect(await engine.groupHealth(TOKEN)).toEqual({ group: TOKEN, depth: 0, liveWorkers: [] });
+      await until(async () => (await other.groupHealth(otherToken)).liveWorkers.length === 1);
+      expect(await engine.groupHealth(otherToken)).toEqual({
+        group: otherToken,
+        depth: 0,
+        liveWorkers: [],
+      });
     });
   });
 });

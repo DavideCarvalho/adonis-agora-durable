@@ -621,6 +621,17 @@ export class QueueTransport implements Transport, ControlPlane {
   }
 
   /**
+   * The partition this instance serves (the `@<partition>` suffix of the routing tokens it consumes):
+   * the explicit `partition`, else its namespace when that is set and not `default`. A namespaced
+   * engine stamps its runs with its namespace and dispatches their steps to `<name>@<namespace>`, so
+   * it serves those tokens by default, as nestjs-durable's `servingPartition()` does.
+   */
+  #servingPartition(): string | undefined {
+    if (this.#partition !== undefined) return this.#partition;
+    return this.#namespace && this.#namespace !== 'default' ? this.#namespace : undefined;
+  }
+
+  /**
    * The prefix every queue name is built from, folding in the namespace: a set, non-`"default"`
    * namespace appends `-<namespace>`; otherwise the bare prefix (so the un-namespaced and `"default"`
    * schemes are byte-identical — production names never change). Keep ALL name builders routed through
@@ -725,7 +736,7 @@ export class QueueTransport implements Transport, ControlPlane {
    */
   handle(name: string, fn: StepHandler): void {
     this.#handlers.set(name, fn);
-    this.#ensureTaskLoop(tenantGroup(sanitizeQueueToken(name), this.#partition));
+    this.#ensureTaskLoop(tenantGroup(sanitizeQueueToken(name), this.#servingPartition()));
   }
 
   /**
@@ -736,7 +747,7 @@ export class QueueTransport implements Transport, ControlPlane {
    */
   handleWorkflow(name: string, turn: WorkflowTurnHandler): void {
     this.#workflowTurns.set(name, turn);
-    this.#ensureTaskLoop(tenantGroup(sanitizeQueueToken(name), this.#partition));
+    this.#ensureTaskLoop(tenantGroup(sanitizeQueueToken(name), this.#servingPartition()));
   }
 
   /** Start (once per routing token) the task loop shared by {@link handle} and {@link handleWorkflow}. */

@@ -464,9 +464,13 @@ export async function getRun(deps: Deps, req: ApiRequest): Promise<ApiResponse> 
   if (detail.etag && detail.notModified) return notModified(detail.etag);
   const checkpoint = (cp: StepCheckpoint) =>
     redacted(deps.redact?.checkpoint, summarizeCheckpoint(cp));
+  // What a suspended run is parked on (a signal, an update, a task, a child), as the list rows carry
+  // it, so the console offers the matching action from the run itself.
+  const waitingOf =
+    detail.run.status === 'suspended' ? await waitingResolver(engine, [detail.run]) : undefined;
   return {
     ...ok({
-      run: redacted(deps.redact?.run, detailRun(detail.run)),
+      run: redacted(deps.redact?.run, detailRun(detail.run, waitingOf)),
       timeline: detail.timeline.map(checkpoint),
       children: detail.children,
       ...(detail.fans ? { fans: detail.fans.map((fan) => serializeFan(fan, checkpoint)) } : {}),
@@ -933,10 +937,10 @@ function summarizeRun(run: WorkflowRun, waitingOf?: (run: WorkflowRun) => RunWai
 }
 
 /** Fuller run shape for the detail view. */
-function detailRun(run: WorkflowRun) {
+function detailRun(run: WorkflowRun, waitingOf?: (run: WorkflowRun) => RunWaiting | undefined) {
   return {
     // recoveryAttempts already comes through from summarizeRun.
-    ...summarizeRun(run),
+    ...summarizeRun(run, waitingOf),
     input: run.input,
     output: run.output,
     error: run.error,

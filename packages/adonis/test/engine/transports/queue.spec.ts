@@ -273,7 +273,8 @@ describe('QueueTransport', () => {
         return { from: 'beta' };
       });
 
-      await alphaEngine.dispatch(task({ name: 'ext.echo' }));
+      // A namespaced engine dispatches to `<name>@<namespace>`, the token a namespaced worker serves.
+      await alphaEngine.dispatch(task({ name: 'ext.echo', group: 'ext.echo@alpha' }));
       await until(() => alphaResults.length === 1);
 
       expect(alphaResults[0]!.output).toEqual({ from: 'alpha', input: { hello: 'world' } });

@@ -161,6 +161,37 @@ kubectl rollout restart deployment/tenant-acme
 
 A control plane already on 0.50 or later can still be upgraded in either order.
 
+## A namespaced engine serves its namespace's steps
+
+An engine with a `namespace` (other than `default`) dispatches its runs' steps to `<name>@<namespace>`.
+Its transport now serves that partition by default, the way the NestJS fleet does: a `transports.db`,
+`transports.queue` or `transports.bullmq` with no `partition` consumes `<name>@<namespace>`. Before,
+it consumed the bare `<name>`, so a namespaced engine without a `partition` never ran its own steps
+and its runs stayed suspended.
+
+Before:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  namespace: 'bulas',
+  transport: 'queue',
+  transports: { queue: transports.queue({ connection: 'redis', partition: 'bulas' }) }, // had to be repeated
+})
+```
+
+After:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  namespace: 'bulas',
+  transport: 'queue',
+  transports: { queue: transports.queue({ connection: 'redis' }) }, // serves `<name>@bulas`
+})
+```
+
+An explicit `partition` still wins. If a namespaced pod deliberately served the bare tokens (a worker
+pool shared with the default namespace), set `partition: 'default'` on its transport to keep that.
+
 ## Transports no longer accept `group`
 
 `transports.queue`, `transports.db` and `transports.eventEmitter`, and the `QueueTransport`,
