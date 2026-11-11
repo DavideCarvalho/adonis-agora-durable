@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.7
+
+### Patch Changes
+
+- [#494](https://github.com/DavideCarvalho/adonis-agora-durable/pull/494) [`ecf801b`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/ecf801bbede4ba7156d2f939797c52e6e59107e5) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The db and queue transports no longer hand work to a handler that they claimed after shutdown began. A poll already in flight when `stop()`/`close()` was called could claim a row or pop a job that arrived meanwhile and run it while the pod was going away (or after a run-queue consumer's own `stop()` resolved). Every claiming loop now gives back what it claimed once the transport (or the loop) is stopping: the db transport's results, heartbeat, control and message loops (decisions, step events, start-run, run requests and replies, tenant events) and its run queue on a transport stop, and every queue-transport loop (tasks, results, heartbeats, control, run queue and the tenant protocol). The db task loop already did.
+
 ## 1.0.0-rc.6
 
 ### Patch Changes
