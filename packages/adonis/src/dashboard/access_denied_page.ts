@@ -36,7 +36,7 @@ export interface AccessDeniedInfo {
   reason: AccessDeniedReason;
   /** The console's mount path (`/durable`; `''` when mounted at the root). */
   basePath: string;
-  /** Where "Sign in" points, when the provider knows one. */
+  /** The app's login page, when the console knows one (`accessDenied.loginHref`). */
   loginHref?: string;
   /** A developer-facing detail (e.g. a thrown hook's message). Providers set it OUTSIDE production only. */
   detail?: string;
@@ -59,7 +59,7 @@ export interface AccessDeniedPageOptions {
   homeHref?: string | false;
   /** Label of the "Back to app" button. */
   homeLabel?: string;
-  /** Where "Sign in" points. Default: the built-in login page when one exists; `false` hides it. */
+  /** Where "Sign in" points (your app's login page). Default: none; `false` hides it. */
   loginHref?: string | false;
   /** Label of the "Sign in" button. */
   loginLabel?: string;
