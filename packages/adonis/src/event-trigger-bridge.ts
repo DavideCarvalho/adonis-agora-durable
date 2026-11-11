@@ -65,6 +65,15 @@ export function attachEventTriggerBridge(
   options: EventTriggerBridgeOptions,
 ): () => void {
   const wires: Wire[] = [];
+  for (const trigger of triggers) {
+    // Only emitter triggers exist; a hand-built trigger with another source (the removed
+    // `source: 'diagnostics'`) must fail, not silently subscribe an emitter event of that name.
+    if ((trigger as { source?: unknown }).source !== 'emitter') {
+      throw new Error(
+        `durable: event trigger of workflow "${trigger.workflow}" has source "${String((trigger as { source?: unknown }).source)}"; only 'emitter' (\`@OnEvent\`) is supported.`,
+      );
+    }
+  }
   for (const trigger of triggers) wires.push(wireEmitter(trigger, options));
   return () => {
     while (wires.length) wires.pop()?.disposer();

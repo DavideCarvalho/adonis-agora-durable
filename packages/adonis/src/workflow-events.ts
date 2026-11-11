@@ -20,7 +20,7 @@ import {
  * run (`@OnEvent`). The durable provider bridges the emitter into the engine (a fresh run per
  * matching event, payload as input), mirroring how `static schedule`/`@Scheduled` bridge time into
  * the engine. To start a workflow from a `@adonis-agora/diagnostics` event, write a diagnostics
- * listener that calls `MyWorkflow.start(...)`.
+ * listener that calls `MyWorkflow.dispatch(event.payload, { runId: `evt:${event.id}` })`.
  *
  * Two authoring forms, exactly like schedules:
  * - the `@OnEvent(...)` decorator (named params), and
@@ -69,7 +69,7 @@ export function workflowEvents(target: unknown): NormalizedEventTrigger[] {
     // trigger that would never fire.
     if ((t as { source?: unknown }).source !== 'emitter') {
       throw new Error(
-        `durable: workflow "${meta.name}" declares a \`static on\` trigger with source "${String((t as { source?: unknown }).source)}". Only 'emitter' (\`@OnEvent\`) is supported; to start a workflow from a diagnostics event, write a diagnostics listener that calls \`${meta.name}\`'s \`start()\`, or use \`transports.durable()\`.`,
+        `durable: workflow "${meta.name}" declares a \`static on\` trigger with source "${String((t as { source?: unknown }).source)}". Only 'emitter' (\`@OnEvent\`) is supported; to start a workflow from a diagnostics event, write a diagnostics listener that dispatches it (\`dispatch(event.payload, { runId: \`evt:\${event.id}\` })\`), or use \`transports.durable()\`.`,
       );
     }
     return { ...t, workflow: meta.name };

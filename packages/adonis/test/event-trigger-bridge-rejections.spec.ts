@@ -48,4 +48,12 @@ describe('event-trigger bridge — a failing start or publish is reported, not u
     expect(reported).toHaveLength(1);
     expect((reported[0] as Error).message).toBe('store down');
   });
+
+  it('a hand-built trigger with a source other than emitter fails instead of wiring', () => {
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
+    const legacy = { source: 'diagnostics', event: 'payment.succeeded', workflow: 'w' };
+    expect(() =>
+      attachEventTriggerBridge([legacy as never], { engine, emitter: { on() {}, off() {} } }),
+    ).toThrow(/source "diagnostics"/);
+  });
 });
