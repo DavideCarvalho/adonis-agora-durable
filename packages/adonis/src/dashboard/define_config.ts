@@ -9,6 +9,14 @@ import {
   type ResolvedDashboardAuth,
   resolveDashboardAuth,
 } from './auth.js';
+import {
+  type ConsoleAuthorize,
+  type ConsoleAuthorizeGate,
+  type ConsoleAuthorizeResult,
+  type ConsoleDecision,
+  normalizeConsoleDecision,
+  resolveConsoleAuthorize,
+} from './console_authorize.js';
 
 /**
  * The function form of {@link DurableDashboardConfig.accessDenied}: render (or answer) a refused
@@ -26,57 +34,32 @@ export type AccessDeniedOption = GenericAccessDeniedOption<HttpContext>;
  * A structured answer from an {@link AuthorizeHook}: whether the request may proceed and, when it may
  * not, why. The `reason` picks the status: `'unauthenticated'` (nobody is signed in) → `401`,
  * `'forbidden'` (signed in, not allowed) → `403`. No reason → `403` (fail closed).
- *
- * This is the shared Agora dashboard-gate contract — the same shape every `@adonis-agora` console
- * accepts, so one hook (e.g. `@adonis-agora/authz`'s `authorizeByRoles`) can gate them all.
  */
 export interface AuthorizeDecision {
   allowed: boolean;
   reason?: 'unauthenticated' | 'forbidden';
 }
 
-/** What an {@link AuthorizeHook} may return: a bare boolean or an {@link AuthorizeDecision}. */
-export type AuthorizeResult = boolean | AuthorizeDecision;
+/**
+ * What an {@link AuthorizeHook} may return: the shared {@link ConsoleAuthorizeResult} (a boolean,
+ * a decision, or `{ redirectTo }`) or an {@link AuthorizeDecision}.
+ */
+export type AuthorizeResult = ConsoleAuthorizeResult | AuthorizeDecision;
 
 /**
- * Authorization guard for the dashboard. Runs before every dashboard route (API + HTML). May be
- * async (e.g. an auth lookup). Return:
- *
- * - `true` or `{ allowed: true }` → the request proceeds;
- * - `{ allowed: false, reason: 'unauthenticated' }` → `401` (the access-denied page with the
- *   "sign in" story for a page navigation, `{ error: 'unauthorized' }` for an API request);
- * - `{ allowed: false, reason: 'forbidden' }`, `{ allowed: false }` or `false` → `403` (the
- *   access-denied page, or `{ error: 'forbidden' }`).
- *
- * A hook that THROWS is a denial (`403`), never a pass. A hook that answers the request itself — a
- * redirect to the host's login page, most commonly — keeps its answer: the provider writes nothing
- * over it.
- *
- * It receives the AdonisJS {@link HttpContext}, so it can read the session,
- * a bearer token, an IP allow-list, etc.
+ * The function form of `authorize`. It receives the AdonisJS {@link HttpContext}, so it can read the
+ * session, a bearer token, an IP allow-list, etc. May be async.
  */
 export type AuthorizeHook = (ctx: HttpContext) => AuthorizeResult | Promise<AuthorizeResult>;
 
 /**
  * Collapse an {@link AuthorizeResult} into a decision. Only `true` or an object with
- * `allowed === true` allows: anything else — `false`, `{ allowed: false }`, a truthy non-boolean, a
- * missing value — denies. (A decision OBJECT is truthy, so a `!result` check would wave
- * `{ allowed: false }` through; this is why the guard never tests the raw value.)
+ * `allowed === true` allows; `{ redirectTo }` is an unauthenticated denial carrying the redirect
+ * target; anything else — `false`, `{ allowed: false }`, a truthy non-boolean, a missing value —
+ * denies with `403`.
  */
-export function normalizeAuthorizeResult(result: unknown): AuthorizeDecision {
-  if (result === true) return { allowed: true };
-  if (
-    typeof result === 'object' &&
-    result !== null &&
-    (result as AuthorizeDecision).allowed === true
-  ) {
-    return { allowed: true };
-  }
-  const reason =
-    typeof result === 'object' && result !== null
-      ? (result as AuthorizeDecision).reason
-      : undefined;
-  return { allowed: false, reason: reason === 'unauthenticated' ? 'unauthenticated' : 'forbidden' };
+export function normalizeAuthorizeResult(result: unknown): ConsoleDecision {
+  return normalizeConsoleDecision(result);
 }
 
 /** Shape of `config/durable_dashboard.ts`. */
@@ -93,18 +76,18 @@ export interface DurableDashboardConfig {
    */
   path?: string;
   /**
-   * Per-request authorization guard — see {@link AuthorizeHook} for what it may return
-   * (`boolean` or an {@link AuthorizeDecision}; `reason: 'unauthenticated'` → `401`, otherwise a
-   * denial is `403`). Defaults to {@link defaultAuthorize}, which FAILS CLOSED in
-   * EVERY environment: it requires a bearer token matching `DURABLE_DASHBOARD_TOKEN` (denying
-   * everything when that env var is unset) — unless {@link dashboardAuth} is configured (the
-   * session guard is then the gate) or {@link allowUnauthenticated} explicitly opts out.
+   * Who may reach the console. Runs before every dashboard route (API + HTML). Takes the shared
+   * {@link ConsoleAuthorize} contract — an inline function, an authorizer class (resolved through the
+   * container, so `@inject()` works), or a lazy import of one (`() => import('#policies/console_access')`).
+   * It returns a boolean, `{ allowed, reason? }` (`reason: 'unauthenticated'` → `401`, any other
+   * denial `403`) or `{ redirectTo }` (`302` for a page, `401` for an API call). A throw is a `403`.
    *
-   * (Before 0.37 the default was open outside `NODE_ENV=production` — which left every dev/staging
-   * deployment, and any box where NODE_ENV was unset or spelled differently, with an unauthenticated
-   * console whose destructive endpoints a malicious web page could drive via cross-site POSTs.)
+   * Omitted, the console FAILS CLOSED in every environment: it requires a bearer token matching
+   * `DURABLE_DASHBOARD_TOKEN` (denying everything when that env var is unset) — unless
+   * {@link dashboardAuth} is configured (the session guard is then the gate) or
+   * {@link allowUnauthenticated} explicitly opts out.
    */
-  authorize?: AuthorizeHook;
+  authorize?: ConsoleAuthorize | AuthorizeHook;
   /**
    * Explicitly serve the dashboard WITHOUT any authentication. This is the loaded footgun the old
    * "open outside production" default was — now it at least has to be spelled out in config, so a
@@ -164,7 +147,8 @@ export interface DurableDashboardConfig {
 export interface ResolvedDurableDashboardConfig {
   enabled: boolean;
   path: string;
-  authorize: AuthorizeHook;
+  /** The resolved `authorize` gate (or the default guard): one call per request, never throws. */
+  authorize: ConsoleAuthorizeGate;
   /** Resolved built-in login config, or `null` when `dashboardAuth` is unconfigured. */
   dashboardAuth: ResolvedDashboardAuth | null;
   /** The host's `accessDenied` option as given, or `null` for the built-in page with defaults. */
@@ -268,7 +252,7 @@ export function resolveConfig(config: DurableDashboardConfig = {}): ResolvedDura
   //  3. `allowUnauthenticated: true` -> consciously open (warned once at resolve time);
   //  4. else the fail-closed token guard.
   const hasDashboardAuth = config.dashboardAuth !== undefined;
-  let authorize: AuthorizeHook;
+  let authorize: ConsoleAuthorize | AuthorizeHook;
   if (config.authorize) {
     authorize = config.authorize;
   } else if (hasDashboardAuth) {
@@ -288,7 +272,7 @@ export function resolveConfig(config: DurableDashboardConfig = {}): ResolvedDura
   return {
     enabled: config.enabled ?? true,
     path: trimmed === '/' ? '' : trimmed,
-    authorize,
+    authorize: resolveConsoleAuthorize(authorize),
     // Validate + resolve now so a misconfigured secret/login fails closed at boot,
     // not on the first login attempt. `null` when `dashboardAuth` is omitted.
     dashboardAuth: resolveDashboardAuth(config.dashboardAuth),

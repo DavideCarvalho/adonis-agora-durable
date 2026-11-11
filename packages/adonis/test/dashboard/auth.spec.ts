@@ -94,13 +94,13 @@ describe('resolveConfig', () => {
   it('the default guard is the fail-closed token guard (denies with no token env)', async () => {
     setEnv('DURABLE_DASHBOARD_TOKEN', undefined);
     const c = resolveConfig();
-    expect(await c.authorize(fakeCtx())).toBe(false);
+    expect(await c.authorize(fakeCtx())).toEqual({ allowed: false, reason: 'forbidden' });
   });
 
   it('allowUnauthenticated: true consciously opens the guard', async () => {
     setEnv('DURABLE_DASHBOARD_TOKEN', undefined);
     const c = resolveConfig({ allowUnauthenticated: true });
-    expect(await c.authorize(fakeCtx())).toBe(true);
+    expect(await c.authorize(fakeCtx())).toEqual({ allowed: true });
   });
 
   it('a configured dashboardAuth makes the session guard the gate (authorize passes)', async () => {
@@ -109,7 +109,7 @@ describe('resolveConfig', () => {
       dashboardAuth: { secret: 's3cret-key', login: () => ({ id: 'u1' }) },
     });
     // authorize alone passes — enforce() still requires the session cookie on every route.
-    expect(await c.authorize(fakeCtx())).toBe(true);
+    expect(await c.authorize(fakeCtx())).toEqual({ allowed: true });
     expect(c.dashboardAuth).not.toBeNull();
   });
 
@@ -127,7 +127,7 @@ describe('resolveConfig', () => {
         return false;
       },
     });
-    expect(await c.authorize({} as HttpContext)).toBe(false);
+    expect(await c.authorize({} as HttpContext)).toEqual({ allowed: false, reason: 'forbidden' });
     expect(seen).toBe(true);
   });
 

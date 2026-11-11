@@ -32,7 +32,7 @@ export default defineConfig({
 | --- | --- | --- |
 | `enabled` | `true` | When `false`, no routes are registered at all. |
 | `path` | `'/durable'` | Route prefix the console mounts under. `'/'` mounts at the root. |
-| `authorize` | see below | Per-request guard: `(ctx: HttpContext) => AuthorizeResult \| Promise<AuthorizeResult>`, where `AuthorizeResult = boolean \| { allowed: boolean; reason?: 'unauthenticated' \| 'forbidden' }`. |
+| `authorize` | token guard (see below) | Who may reach the console: a function `(ctx) => result`, an authorizer class, or a lazy import of one. See [Authorization](#authorization). |
 | `dashboardAuth` | absent | Opt-in [session layer](/docs/durable/observability/dashboard-auth) on top of `authorize`. |
 | `allowUnauthenticated` | `false` | Local development only: serve the console with no auth at all (warns at boot). See below. |
 | `audit` | app logger | `(entry) => void` sink for every mutating attempt: `{ at, actor, method, path }`. |
@@ -41,7 +41,7 @@ export default defineConfig({
 
 ### Authorization
 
-The default `authorize` **fails closed in every environment**: it requires a bearer token equal to the `DURABLE_DASHBOARD_TOKEN` env var, and denies everything when that var is unset. (Before 0.37 it was open outside `NODE_ENV=production` — which left dev boxes, staging, and any deployment with a misspelled/unset `NODE_ENV` serving an unauthenticated console.) The token is accepted from an `Authorization: Bearer <token>` header or an `x-durable-token` header, compared in constant time; the `?token=` query param works on **GET and HEAD only** (it exists for the SSE live-tail, whose `EventSource` cannot set headers) — never on a mutating route, so a leaked/logged URL can't act as a destructive magic link.
+The default `authorize` **fails closed in every environment**: it requires a bearer token equal to the `DURABLE_DASHBOARD_TOKEN` env var, and denies everything when that var is unset. The token is accepted from an `Authorization: Bearer <token>` header or an `x-durable-token` header, compared in constant time; the `?token=` query param works on **GET and HEAD only** (it exists for the SSE live-tail, whose `EventSource` cannot set headers) — never on a mutating route, so a leaked/logged URL can't act as a destructive magic link.
 
 <Callout type="info" title="The token gate is for scripts and proxies, not browsers">
 The bundled console never attaches a token: its page navigation, its `fetch` calls and its `EventSource` carry only the browser's cookies. The default token gate therefore suits machine clients (a script, a Prometheus scrape of [`/api/metrics`](#live-queries-webhooks-and-metrics)) or a reverse proxy that injects the header. For operators in a browser, use [`dashboardAuth`](/docs/durable/observability/dashboard-auth) or an `authorize` hook that reads your app's own session cookie.
@@ -60,16 +60,56 @@ Two request-level guards apply on top of whatever gate you pick:
 
 Every mutating attempt is also **audited** before its handler runs — actor (session name/id, `token`, or `anonymous`), method and path without the query string — through the app logger, or your own `audit` hook on the config. Reads are not audited. Payloads an operator submits (fix-and-replay input, signal/update/task bodies, webhook callbacks) are capped at 1 MiB (`413`). A handler that throws answers a generic `500 { "error": "internal error" }`; the detail goes to the app logger, never to the client.
 
-Override `authorize` with your own session/role/IP guard. It returns a bare `boolean` or a decision object `{ allowed, reason? }` (the `AuthorizeDecision` / `AuthorizeResult` types, exported from `@adonis-agora/durable/dashboard` — the same contract every `@adonis-agora` console accepts). A denial gets JSON for an API call and the [access-denied page](#the-access-denied-page) for a browser:
+Override `authorize` with your own guard. It takes the same contract as every `@adonis-agora` console (`ConsoleAuthorize`, exported from `@adonis-agora/durable/dashboard`), in three forms:
 
-| Hook result | Status | API body |
+```ts title="config/durable_dashboard.ts"
+import { defineConfig } from '@adonis-agora/durable/dashboard'
+import ConsoleAccess from '#policies/console_access'
+
+export default defineConfig({
+  // 1. an inline function
+  authorize: (ctx) => ctx.auth.user?.isAdmin === true,
+
+  // 2. an authorizer class (built by the container, so `@inject()` works)
+  // authorize: ConsoleAccess,
+
+  // 3. a lazy import of that class
+  // authorize: () => import('#policies/console_access'),
+})
+```
+
+```ts title="app/policies/console_access.ts"
+import { inject } from '@adonisjs/core'
+import type { HttpContext } from '@adonisjs/core/http'
+import type { ConsoleAuthorizer } from '@adonis-agora/durable/dashboard'
+import AuditService from '#services/audit_service'
+
+@inject()
+export default class ConsoleAccess implements ConsoleAuthorizer {
+  constructor(private audit: AuditService) {}
+
+  async authorize(ctx: HttpContext) {
+    if (!(await ctx.auth.check())) return { redirectTo: '/login' }
+    const allowed = ctx.auth.user!.isAdmin
+    await this.audit.record('durable-console', ctx.auth.user!.id, allowed)
+    return allowed
+  }
+}
+```
+
+The class is the same for every console, so one `ConsoleAccess` can gate durable, telescope, media, payments and agent.
+
+What `authorize` returns decides the answer. A denial gets JSON for an API call and the [access-denied page](#the-access-denied-page) for a browser:
+
+| Result | Status | API body |
 | --- | --- | --- |
 | `true` / `{ allowed: true }` | request proceeds | — |
 | `{ allowed: false, reason: 'unauthenticated' }` | `401` | `{ "error": "unauthorized" }` |
 | `{ allowed: false, reason: 'forbidden' }`, `{ allowed: false }`, `false` | `403` | `{ "error": "forbidden" }` |
-| the hook throws | `403` | `{ "error": "forbidden" }` |
+| `{ redirectTo: '/login' }` | `302` to that path for a page, `401` for an API call | `{ "error": "unauthorized" }` |
+| it throws | `403` | `{ "error": "forbidden" }` |
 
-Only `true` or `allowed: true` lets a request through — any other value denies. A hook that already answered the request (a redirect to your login page, a body) keeps its answer; the provider writes nothing over it.
+Only `true` or `allowed: true` lets a request through — any other value denies. A guard that already answered the request itself (`ctx.response.redirect(...)`, a body) keeps its answer; the console writes nothing over it.
 
 ```ts
 export default defineConfig({

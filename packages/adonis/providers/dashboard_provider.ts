@@ -27,7 +27,6 @@ import {
   type DashboardAuditEntry,
   type DurableDashboardConfig,
   isProduction,
-  normalizeAuthorizeResult,
   type ResolvedDurableDashboardConfig,
   resolveConfig,
 } from '../src/dashboard/define_config.js';
@@ -669,7 +668,8 @@ export default class DashboardProvider {
    * token/custom) with the optional `dashboardAuth` session guard — BOTH must pass:
    *
    * 1. `authorize` denies -> the built-in (or host-customised) access-denied PAGE for a `page`
-   *    request, JSON for an `api` request. `reason: 'unauthenticated'` is a `401`
+   *    request, JSON for an `api` request; `{ redirectTo }` is a `302` there for a `page` request and
+   *    a `401` for an `api` request. `reason: 'unauthenticated'` is a `401`
    *    (`{ error: 'unauthorized' }`); `false`, `{ allowed: false }`, `reason: 'forbidden'` or a
    *    throwing hook is a `403` (`{ error: 'forbidden' }`). A hook that already answered the request
    *    (a redirect, a body) keeps its answer.
@@ -696,18 +696,15 @@ export default class DashboardProvider {
       ctx.response.status(403).json({ error: 'cross-site request rejected' });
       return false;
     }
-    // Never test the raw result: a decision OBJECT is truthy, so `{ allowed: false }` would pass a
-    // `!result` check. A throwing hook is a denial (403), never a 500 and never a pass.
-    let decision: ReturnType<typeof normalizeAuthorizeResult>;
-    try {
-      decision = normalizeAuthorizeResult(await config.authorize(ctx));
-    } catch (error) {
-      void this.warnAuthorizeThrow(error).catch(() => undefined);
-      decision = { allowed: false, reason: 'forbidden' };
-    }
+    // The resolved gate never throws: a throwing `authorize` comes back as a 403 carrying the error.
+    const decision = await config.authorize(ctx);
     if (!decision.allowed) {
+      if (decision.error !== undefined)
+        void this.warnAuthorizeThrow(decision.error).catch(() => undefined);
       const unauthenticated = decision.reason === 'unauthenticated';
-      if (mode === 'page') {
+      if (mode === 'page' && decision.redirectTo !== undefined && !responseAnswered(ctx)) {
+        ctx.response.redirect().toPath(decision.redirectTo);
+      } else if (mode === 'page') {
         await this.denyPage(
           ctx,
           config,

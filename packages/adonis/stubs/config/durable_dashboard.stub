@@ -12,9 +12,10 @@ import { defineConfig } from '@adonis-agora/durable/dashboard'
  * bearer token equal to \`DURABLE_DASHBOARD_TOKEN\`, and denies everything when
  * that env var is unset. Replace \`authorize\` with your own guard (session,
  * role, IP allow-list, …), or set \`allowUnauthenticated: true\` for a trusted
- * local network only. \`authorize\` returns a boolean or a decision
- * \`{ allowed, reason?: 'unauthenticated' | 'forbidden' }\` — \`'unauthenticated'\`
- * answers 401, any other denial 403.
+ * local network only. \`authorize\` is a function, an authorizer class, or a
+ * lazy import of one (\`() => import('#policies/console_access')\`). It returns a
+ * boolean, a decision \`{ allowed, reason?: 'unauthenticated' | 'forbidden' }\`
+ * (\`'unauthenticated'\` answers 401, any other denial 403) or \`{ redirectTo }\`.
  *
  * \`dashboardAuth\` is an ADDITIVE, optional session gate on top of \`authorize\` —
  * a signed cookie minted via a built-in login page (Mode B: \`login\`) and/or a
@@ -26,6 +27,7 @@ export default defineConfig({
   // enabled: true,
   // path: '/durable',
   // authorize: (ctx) => ctx.auth.user?.isAdmin === true,
+  // authorize: () => import('#policies/console_access'),
   // dashboardAuth: {
   //   secret: env.get('DURABLE_DASHBOARD_SECRET'),
   //   ttl: '8h',

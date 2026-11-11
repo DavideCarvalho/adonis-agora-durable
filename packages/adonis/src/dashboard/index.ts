@@ -36,6 +36,16 @@ export type { CompatSource, FleetGroup, FleetTransport } from './compat.js';
 export { compat, enumerateLiveFleet, mergeFleets } from './compat.js';
 export { formatProtocolRange, outcomeClass, outcomeLabel } from './compat-view.js';
 export type {
+  ConsoleAuthorize,
+  ConsoleAuthorizeGate,
+  ConsoleAuthorizeResult,
+  ConsoleAuthorizer,
+  ConsoleAuthorizerClass,
+  ConsoleDecision,
+} from './console_authorize.js';
+// The shared console `authorize` contract (function, class, lazy import).
+export { normalizeConsoleDecision, resolveConsoleAuthorize } from './console_authorize.js';
+export type {
   AccessDeniedOption,
   AccessDeniedRenderer,
   AuthorizeDecision,
