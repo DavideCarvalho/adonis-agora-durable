@@ -58,8 +58,11 @@ export default defineConfig({
 `ConsoleAuthorizer`, `ConsoleAuthorizerClass` and `ConsoleAuthorizeResult` are
 exported from `@adonis-agora/durable/dashboard`): an inline function, an
 authorizer class, or a lazy import of one. It returns a boolean,
-`{ allowed, reason? }`, or `{ redirectTo: '/login' }`. Only `true`
-or `allowed: true` passes; `reason: 'unauthenticated'` → `401`, every other
+`{ allowed: true, tenants? }`, `{ allowed: false, reason? }`, or
+`{ redirectTo: '/login' }`. Only `true`
+or `allowed: true` passes; with tenancy on, `{ allowed: true, tenants: [...] | '*' }`
+grants more organizations (omit for the viewer's own active tenant);
+`reason: 'unauthenticated'` → `401`, every other
 denial (incl. a throwing hook) → `403`; `{ redirectTo }` → `302` for a page
 navigation, `401` for an API call. A hook that already answered the request (a
 redirect, a body) keeps its answer.

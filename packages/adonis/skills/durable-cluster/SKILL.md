@@ -36,7 +36,8 @@ execute changes.
 
 `topology` is Agora-wide vocabulary (the cluster shape), not durable-only: a
 `tenant` is any process with no state of its own (API/dashboard pods included),
-not a customer. It is independent of the separate `role` axis (`all`/`api`/
+not a customer — customer isolation is the separate `tenancy` / `tenantId`
+(organizations), which shares one pool by default. It is independent of the separate `role` axis (`all`/`api`/
 `worker`); durable has no `role` field and covers that axis with `drive`,
 `consumers` and `worker.embedded`. Durable connects tenants over a broker
 transport (`bullmq`/`queue`/`db`) with `partition`, `tenant.token`,
