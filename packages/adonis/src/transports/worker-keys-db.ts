@@ -22,7 +22,7 @@ export function lucidWorkerKeys(db: Database, opts: LucidWorkerKeysOptions = {})
   let schemaReady: Promise<void> | undefined;
   const ensureSchema = (): Promise<void> => {
     if (opts.autoCreate === false) return Promise.resolve();
-    schemaReady ??= createWorkerKeysTable(db);
+    schemaReady ??= createWorkerKeysTable(db, opts.connectionName);
     return schemaReady;
   };
   return {

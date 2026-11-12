@@ -520,7 +520,8 @@ export class DbTransport implements Transport, ControlPlane {
 
   #ensureSchema(): Promise<void> {
     if (!this.#autoCreate) return Promise.resolve();
-    if (!this.#schemaReady) this.#schemaReady = createDurableTransportTables(this.#db);
+    if (!this.#schemaReady)
+      this.#schemaReady = createDurableTransportTables(this.#db, this.#connectionName);
     return this.#schemaReady;
   }
 

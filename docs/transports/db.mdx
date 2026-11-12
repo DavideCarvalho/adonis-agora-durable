@@ -183,17 +183,13 @@ The run queue lives in the same table. Without it every run start falls back to 
 | `inboxSweepIntervalMs` | `30000` | How often an instance that addressed rows deletes those whose recipient is gone. `0` disables the janitor. |
 
 
-`transports.db(config)` returns the lazy driver thunk used in `config/durable.ts`; the underlying class is `DbTransport`, also exported from `@adonis-agora/durable` for constructing a worker-side instance directly. `@adonis-agora/durable` also exports `TRANSPORT_TABLES`, `createDurableTransportTables(db)`, and `dropDurableTransportTables(db)` for managing the schema yourself.
+`transports.db(config)` returns the lazy driver thunk used in `config/durable.ts`; the underlying class is `DbTransport`, also exported from `@adonis-agora/durable` for constructing a worker-side instance directly. `@adonis-agora/durable` also exports `TRANSPORT_TABLES`, `createDurableTransportTables(db, connectionName?)`, and `dropDurableTransportTables(db, connectionName?)` for managing the schema yourself.
 
 Constructing `DbTransport` directly takes the same options with two differences: the Lucid `Database` goes in `db`, and the connection name is `connectionName` (not `connection`). It also accepts one option `transports.db()` does not forward:
 
 | Option | Default | Description |
 | --- | --- | --- |
 | `workerKeysCacheMs` | `5000` | How long a read of the worker advertisement table is reused. The engine asks before every dispatch; `0` reads every time. |
-
-<Callout type="warn">
-`autoCreate` runs its idempotent DDL through the `Database`'s **default** connection, even when you set `connection`. If the transport tables live on a non-default connection, run the published migration against that connection (or call `createDurableTransportTables` yourself) rather than relying on `autoCreate`.
-</Callout>
 
 ## The tables
 
