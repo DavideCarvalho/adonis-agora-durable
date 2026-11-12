@@ -201,7 +201,7 @@
     "@poppinss/hooks": "7.3.1",
     "@tanstack/intent": "0.5.6",
     "@types/better-sqlite3": "9.6.0",
-    "@types/node": "26.6.5",
+    "@types/node": "26.6.6",
     "arktype": "2.2.9",
     "better-sqlite3": "13.0.3",
     "bullmq": "6.7.2",
