@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.16
+
+### Minor Changes
+
+- [#512](https://github.com/DavideCarvalho/adonis-agora-durable/pull/512) [`a3e57aa`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/a3e57aa056a4ed202178e9a0154815c2ff4be87b) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - New `schema` option: the durable tables can live in a database schema of their own (a database on MySQL) while the app's connection keeps its default. Set it once at the top level of `config/durable.ts` (`schema: 'durable'`) for every durable table, or per piece with `stores.lucid({ schema })`, `transports.db({ schema })` and the queue transport's `workerKeysSchema`. Every statement the store, the db transport and the worker-key table issue names the schema, on any connection, the app's own transaction included; nothing changes the connection's `search_path` (which leaks behind PgBouncer in transaction mode). Boot creates the schema when it creates the tables, catalog lookups, the schema-heal lock and index checks are scoped to it, and SQLite with a `schema` fails at boot. `createDurableTables`, `dropDurableTables`, `createDurableTransportTables` and `dropDurableTransportTables` take `{ schema }`, the published migrations carry a `schema` constant, and `agora:doctor --deep` gains a `durable.schema` check. Without `schema`, nothing changes.
+
 ## 1.0.0-rc.15
 
 ### Patch Changes
