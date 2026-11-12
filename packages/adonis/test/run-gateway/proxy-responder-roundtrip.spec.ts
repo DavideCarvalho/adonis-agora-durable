@@ -306,6 +306,142 @@ describe('proxy fail-fast (spec §8)', () => {
   });
 });
 
+describe('tenant token as a function', () => {
+  const SECRET = 'fn-token-secret';
+
+  /** Record the `tenant` field of every message that reaches the control plane. */
+  function recordClaims(transport: FakeP4Transport): string[] {
+    const seen: string[] = [];
+    const request = transport.dispatchRunRequest.bind(transport);
+    const start = transport.dispatchStartRun.bind(transport);
+    transport.dispatchRunRequest = async (msg) => {
+      seen.push(msg.tenant);
+      return request(msg);
+    };
+    transport.dispatchStartRun = async (msg) => {
+      seen.push(msg.tenant);
+      return start(msg);
+    };
+    return seen;
+  }
+
+  it('a synchronous function is called before every request and its value sent as-is', async () => {
+    const transport = new FakeP4Transport();
+    const engine = wireControlPlane(transport, { verify: hmacTenantVerifier(SECRET) });
+    const seen = recordClaims(transport);
+    let calls = 0;
+    const token = signTenantToken('acme', SECRET);
+    const proxy = new ProxyRunGateway(transport, {
+      partition: 'acme',
+      token: () => {
+        calls++;
+        return token;
+      },
+      requestTimeoutMs: 500,
+    });
+    const started = await proxy.start('echo', { ok: true });
+    await engine.waitForRun(started.runId);
+    expect((await proxy.getRun(started.runId))?.namespace).toBe('acme');
+    expect(calls).toBe(2);
+    expect(seen).toEqual([token, token]);
+  });
+
+  it('an async function is awaited, so a token that changes between requests is picked up', async () => {
+    const transport = new FakeP4Transport();
+    const engine = wireControlPlane(transport, { verify: hmacTenantVerifier(SECRET) });
+    const seen = recordClaims(transport);
+    const tokens = [
+      signTenantToken('acme', SECRET, { ttlMs: 60_000 }),
+      signTenantToken('acme', SECRET, { ttlMs: 120_000 }),
+    ];
+    let next = 0;
+    const proxy = new ProxyRunGateway(transport, {
+      partition: 'acme',
+      token: async () => {
+        await new Promise((r) => setTimeout(r, 1));
+        return tokens[Math.min(next++, tokens.length - 1)] as string;
+      },
+      requestTimeoutMs: 500,
+    });
+    const started = await proxy.start('echo', {});
+    await engine.waitForRun(started.runId);
+    await proxy.listRuns({});
+    expect(seen).toEqual(tokens);
+  });
+
+  it('a token the control plane rejects still fails as unauthorized', async () => {
+    const transport = new FakeP4Transport();
+    wireControlPlane(transport, { verify: hmacTenantVerifier(SECRET) });
+    const proxy = new ProxyRunGateway(transport, {
+      partition: 'acme',
+      token: async () => signTenantToken('acme', 'the-wrong-secret'),
+      requestTimeoutMs: 500,
+    });
+    await expect(proxy.listRuns({})).rejects.toThrow(/unauthorized|invalid/i);
+  });
+
+  it('a function that throws fails the request at once with its error, and sends nothing', async () => {
+    const transport = new FakeP4Transport();
+    wireControlPlane(transport, { verify: hmacTenantVerifier(SECRET) });
+    const seen = recordClaims(transport);
+    const proxy = new ProxyRunGateway(transport, {
+      partition: 'acme',
+      token: async () => {
+        throw new Error('identity provider unreachable');
+      },
+      requestTimeoutMs: 5_000,
+    });
+    const started = Date.now();
+    await expect(proxy.getRun('r1')).rejects.toThrow('identity provider unreachable');
+    await expect(proxy.start('echo', {})).rejects.toThrow('identity provider unreachable');
+    expect(Date.now() - started).toBeLessThan(1_000); // not the request timeout
+    expect(seen).toEqual([]);
+  });
+
+  it('a synchronous throw is handled the same way', async () => {
+    const transport = new FakeP4Transport();
+    wireControlPlane(transport);
+    const proxy = new ProxyRunGateway(transport, {
+      partition: 'acme',
+      token: () => {
+        throw new Error('no token yet');
+      },
+      requestTimeoutMs: 5_000,
+    });
+    await expect(proxy.listRuns({})).rejects.toThrow('no token yet');
+  });
+
+  it('a function that returns an empty token fails the request instead of sending it', async () => {
+    const transport = new FakeP4Transport();
+    wireControlPlane(transport);
+    const seen = recordClaims(transport);
+    const proxy = new ProxyRunGateway(transport, {
+      partition: 'acme',
+      token: async () => '',
+      requestTimeoutMs: 5_000,
+    });
+    await expect(proxy.listRuns({})).rejects.toThrow(/returned no token/);
+    expect(seen).toEqual([]);
+  });
+
+  it('a failure clears up: the next request calls the function again', async () => {
+    const transport = new FakeP4Transport();
+    wireControlPlane(transport, { verify: hmacTenantVerifier(SECRET) });
+    let fail = true;
+    const proxy = new ProxyRunGateway(transport, {
+      partition: 'acme',
+      token: async () => {
+        if (fail) throw new Error('transient');
+        return signTenantToken('acme', SECRET);
+      },
+      requestTimeoutMs: 500,
+    });
+    await expect(proxy.listRuns({})).rejects.toThrow('transient');
+    fail = false;
+    await expect(proxy.listRuns({})).resolves.toEqual([]);
+  });
+});
+
 describe('republishLifecycle over the round-trip', () => {
   let transport: FakeP4Transport;
   let engine: WorkflowEngine;

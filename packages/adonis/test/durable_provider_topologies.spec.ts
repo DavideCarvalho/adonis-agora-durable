@@ -372,3 +372,118 @@ describe('DurableProvider — tenant / control-plane topologies over the queue t
     vi.restoreAllMocks();
   });
 });
+
+describe('DurableProvider — tenant auth in class form, built through the container', () => {
+  /** Records what crosses the wire, in both directions. */
+  class RecordingP4Transport extends P4Transport {
+    readonly replies: RunReply[] = [];
+    readonly requests: RunRequest[] = [];
+    override async publishRunReply(reply: RunReply): Promise<void> {
+      this.replies.push(reply);
+    }
+    override async dispatchRunRequest(msg: RunRequest): Promise<void> {
+      this.requests.push(msg);
+    }
+  }
+
+  class KeyRing {
+    readonly valid = new Map([['key-acme', 'acme']]);
+  }
+
+  class KeyRingVerifier {
+    constructor(private ring: KeyRing) {}
+    verify({ token }: { token?: string | undefined }) {
+      const tenant = token ? this.ring.valid.get(token) : undefined;
+      return tenant ? { tenant } : null;
+    }
+  }
+
+  class StaticCredentials {
+    constructor(private value: string) {}
+    token() {
+      return this.value;
+    }
+  }
+
+  it('control plane: a verifyTenant class is made by the container and answers every request', async () => {
+    const transport = new RecordingP4Transport();
+    const { app, container } = makeApp({
+      topology: 'control-plane',
+      store: 'mem',
+      stores: { mem: async () => new InMemoryStateStore() },
+      transport: 'p4',
+      transports: { p4: async () => transport },
+      verifyTenant: KeyRingVerifier,
+    } as DurableConfig);
+    let builds = 0;
+    container.bind(KeyRingVerifier, () => {
+      builds++;
+      return new KeyRingVerifier(new KeyRing());
+    });
+    const provider = new DurableProvider(app);
+    provider.register();
+    await provider.boot();
+    await container.make(DURABLE_RUN_REQUEST_RESPONDER);
+
+    const ask = async (requestId: string, tenant: string) => {
+      await transport.runRequestHandler?.({
+        requestId,
+        tenant,
+        body: { kind: 'listRuns', query: {} },
+      });
+      return transport.replies.find((r) => r.requestId === requestId)?.result;
+    };
+    expect(await ask('r1', 'key-acme')).toEqual({ ok: true, data: [] });
+    expect(await ask('r2', 'forged')).toMatchObject({ ok: false, error: { code: 'unauthorized' } });
+    expect(builds).toBe(1);
+  });
+
+  it('control plane: a lazy-imported verifyTenant class is imported once', async () => {
+    const transport = new RecordingP4Transport();
+    let imports = 0;
+    const { app, container } = makeApp({
+      topology: 'control-plane',
+      store: 'mem',
+      stores: { mem: async () => new InMemoryStateStore() },
+      transport: 'p4',
+      transports: { p4: async () => transport },
+      verifyTenant: async () => {
+        imports++;
+        return { default: KeyRingVerifier };
+      },
+    } as DurableConfig);
+    container.bind(KeyRingVerifier, () => new KeyRingVerifier(new KeyRing()));
+    const provider = new DurableProvider(app);
+    provider.register();
+    await provider.boot();
+    await container.make(DURABLE_RUN_REQUEST_RESPONDER);
+    for (const id of ['a', 'b', 'c']) {
+      await transport.runRequestHandler?.({
+        requestId: id,
+        tenant: 'key-acme',
+        body: { kind: 'listRuns', query: {} },
+      });
+    }
+    expect(transport.replies.map((r) => r.result.ok)).toEqual([true, true, true]);
+    expect(imports).toBe(1);
+  });
+
+  it('tenant: a tenant.token class is made by the container and its token sent on the wire', async () => {
+    const transport = new RecordingP4Transport();
+    const { app, container } = makeApp({
+      topology: 'tenant',
+      transport: 'p4',
+      transports: { p4: async () => transport },
+      partition: 'acme',
+      requestTimeoutMs: 20,
+      tenant: { token: StaticCredentials },
+    } as DurableConfig);
+    container.bind(StaticCredentials, () => new StaticCredentials('key-acme'));
+    new DurableProvider(app).register();
+
+    const gateway = await container.make(DURABLE_RUN_GATEWAY);
+    // Nobody answers on this transport: the request times out, but it was sent with the token.
+    await expect(gateway.listRuns({})).rejects.toThrow(/did not answer/);
+    expect(transport.requests.map((r) => r.tenant)).toEqual(['key-acme']);
+  });
+});

@@ -73,7 +73,7 @@ export default defineConfig({
   transport: 'bullmq',
   transports: { bullmq: transports.bullmq({ connection: process.env.REDIS_URL }) },
   partition: 'acme-corp', // which pool this pod serves (required)
-  tenant: { token: process.env.DURABLE_TENANT_TOKEN }, // its signed claim
+  tenant: { token: process.env.DURABLE_TENANT_TOKEN }, // or a function/credentials class
   requestTimeoutMs: 10_000,
   // store: 'lucid'  // ❌ COMPILE ERROR — a tenant config cannot name a store
 })
@@ -83,6 +83,13 @@ export default defineConfig({
 node ace durable:work    # store-backed loop: pending, recovery, timers, sweeps, schedules
 node ace durable:worker  # store-less tenant loop: serves app/steps, heartbeats, drains
 ```
+
+`verifyTenant` takes a function (`hmacTenantVerifier(secret)`), a class implementing
+`TenantVerifierContract` (`verify({ token })` → `{ tenant, capabilities? } | null`; built
+through the container), a lazy import of one, or an object with `verify`. `tenant.token`
+takes a string, a function called before every request, or the same forms of a
+`TenantCredentialsContract` (`token()`). Ready-made pieces for `@adonisjs/auth` access
+tokens, authkit and any OIDC provider are in the "Authenticate tenants" docs page.
 
 Isolation is three-layered: type (`store` is `never` on tenant), container (no
 store binding registered), object (`WorkerRuntime`/`ProxyRunGateway` have no

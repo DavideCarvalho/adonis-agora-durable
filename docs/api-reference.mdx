@@ -410,11 +410,14 @@ const detail = await runGateway.getRunDetail?.(runId, { summarizeFansOver: 50 })
 | Export | Signature | Notes |
 | --- | --- | --- |
 | `StoreRunGateway` | `new StoreRunGateway(engine: RunGatewayEngine, options?: { topology?: 'standalone' \| 'control-plane' })` | The store-backed gateway the provider binds on the store topologies. |
-| `ProxyRunGateway` | `new ProxyRunGateway(transport: ProxyTransport, options: { partition: string; token?: string; requestTimeoutMs?: number })` | The tenant pod's gateway. `requestTimeoutMs` is the config's `requestTimeoutMs`. |
+| `ProxyRunGateway` | `new ProxyRunGateway(transport: ProxyTransport, options: { partition: string; token?: string \| (() => string \| Promise<string>); requestTimeoutMs?: number })` | The tenant pod's gateway. A `token` function is called before every request. `requestTimeoutMs` is the config's `requestTimeoutMs`. |
 | `RunGatewayError` / `RunGatewayErrorCode` | `class extends Error { code: RunGatewayErrorCode \| undefined }` / `'unauthorized' \| 'cross-tenant' \| 'bad-request' \| 'unsupported-request' \| string` | What a `ProxyRunGateway` call the control plane refused rejects with. `bad-request`: the request was malformed or asked for something the tenant may not do (the dashboard answers `400`). `unsupported-request`: the control plane is older than the verb (for `republishLifecycle` and `workflowLifecycle`, also an empty `ok` reply). |
 | `RunRequestResponder` | `new RunRequestResponder(transport: ResponderTransport, gateway: RunGateway, options?: { verifyTenant?; subscribeEngineEvents? })` | Answers proxied run requests on the control plane; a request it cannot serve is answered `UNSUPPORTED_RUN_REQUEST`. |
 | `signTenantToken` | `signTenantToken(tenant: string, secret: string, opts?: { ttlMs?: number; now?: number }): string` | Mint a pod's HMAC tenant claim (`config.tenant.token`); `ttlMs` makes it expire. |
-| `hmacTenantVerifier` | `hmacTenantVerifier(secret: string \| string[], capabilities?: string[]): TenantVerifier` | The matching `verifyTenant`. A list of secrets allows rotation. See [Layered tenant authentication](/docs/durable/cluster/topology-and-config#layered-tenant-authentication). |
+| `hmacTenantVerifier` | `hmacTenantVerifier(secret: string \| string[], capabilities?: string[]): TenantVerifier` | The matching `verifyTenant`. A list of secrets allows rotation. See [Authenticate tenants](/docs/durable/cluster/authenticate-tenants#with-a-shared-secret-hmac). |
+| `TenantVerifierContract` | `interface { verify(input: TenantVerifierInput): VerifiedTenant \| null \| Promise<VerifiedTenant \| null> }` | The class form of `verifyTenant`. `TenantVerifierInput` is `{ token?: string; tenant?: string }`; `VerifiedTenant` is `{ tenant: string; capabilities?: string[] }`. See [Authenticate tenants](/docs/durable/cluster/authenticate-tenants#the-contracts). |
+| `TenantCredentialsContract` | `interface { token(): string \| Promise<string> }` | The class form of `tenant.token`. |
+| `resolveTenantVerifier` / `resolveTenantToken` | `resolveTenantVerifier(option: TenantVerifierOption, make?): TenantVerifier` / `resolveTenantToken(option: TenantTokenOption, make?): string \| (() => string \| Promise<string>)` | Turn any accepted form into the function a hand-built `RunRequestResponder` / `ProxyRunGateway` takes. `make` builds classes (default `new Class()`; the provider passes the container). |
 
 ## Run detail and fan types
 
@@ -497,10 +500,10 @@ Topology-specific fields:
 | Topology | Field | Type | Notes |
 | --- | --- | --- | --- |
 | `control-plane` | `store`, `transport` | `string` | Both required. |
-| `control-plane`, `standalone` | `verifyTenant` | `TenantVerifier` | Verifies tenant tokens on incoming requests (a standalone engine answers tenant pods too when its transport carries the store-less protocol). See [Layered tenant authentication](/docs/durable/cluster/topology-and-config#layered-tenant-authentication). |
+| `control-plane`, `standalone` | `verifyTenant` | `TenantVerifierOption` | Verifies tenant tokens on incoming requests (a standalone engine answers tenant pods too when its transport carries the store-less protocol): a function, a `TenantVerifierContract` class, a lazy import of one, or an object with `verify`. See [Authenticate tenants](/docs/durable/cluster/authenticate-tenants). |
 | `tenant` | `store`, `stores` | `never` | A store-less pod may not name a store; any value is a compile error. |
 | `tenant` | `transport`, `partition` | `string` | Both required. `partition` suffixes the pod's `<name>@<tenant>` routing tokens. |
-| `tenant` | `tenant` | `{ token?: string }` | The pod's signed claim. |
+| `tenant` | `tenant` | `{ token?: TenantTokenOption }` | The token the pod sends: a string, a function called before every request, a `TenantCredentialsContract` class, a lazy import of one, or an object with `token()`. |
 | `tenant` | `capabilities` | `string[]` | Extra advertised features beyond registered handler names. |
 | `tenant` | `requestTimeoutMs` | `number` | `ProxyRunGateway` round-trip timeout. See [Thin workers](/docs/durable/cluster/thin-workers). |
 

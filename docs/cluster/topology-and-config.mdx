@@ -42,7 +42,7 @@ export default defineConfig({
   transports: { bullmq: transports.bullmq({ connection: { host: '127.0.0.1', port: 6379 } }) },
   store: 'lucid',
   stores: { lucid: stores.lucid({ connection: 'pg' }) },
-  // Optional: verify signed tenant tokens on incoming wire requests (see below)
+  // Optional: verify tenant tokens on incoming wire requests (see Authenticate tenants)
   verifyTenant: hmacTenantVerifier(process.env.DURABLE_TENANT_SECRET!),
 })
 ```
@@ -67,7 +67,7 @@ export default defineConfig({
     bullmq: transports.bullmq({ connection: process.env.REDIS_URL! }),
   },
   partition: 'acme-corp',            // which tenant this pod serves (required) — see Tenancy
-  tenant: { token: process.env.DURABLE_TENANT_TOKEN }, // its signed claim
+  tenant: { token: process.env.DURABLE_TENANT_TOKEN }, // its token: a string or a function
   requestTimeoutMs: 10_000,          // ProxyRunGateway round-trip timeout (default 10_000)
   capabilities: ['gpu'],             // optional: extra capabilities the worker advertises
   // store: 'lucid'                  // ❌ compile error — a tenant pod may not name a store
@@ -114,7 +114,7 @@ The checks split into compile-time (the config's type) and boot-time (the provid
 | --- | --- | --- | --- |
 | `standalone` (or omitted) | nothing — no `store` selects the in-memory store, no `transport` the in-memory transport | — | Serves `app/steps` in-process. Starts the `RunRequestResponder` (and honours `verifyTenant`) when the transport carries the run-request methods, like a `control-plane`. |
 | `control-plane` | `store` **and** `transport` (both typed required) | — | Serves no `app/steps`. Uses `NOOP_RUN_DISPATCHER` unless `runDispatcher` is set. The responder is started only on a transport with the run-request methods (`onRunRequest`, `onStartRun`, `publishRunReply`, `publishTenantEvent`). |
-| `tenant` | `transport` and `partition` (both typed required); optional `tenant.token`, `requestTimeoutMs`, `capabilities` | `store`, `stores` (typed `never`) | Resolving the `RunGateway` throws when the transport lacks the store-less methods (`dispatchStartRun`, `dispatchRunRequest`, `onRunReply`, `onTenantEvent`). Resolving the worker runtime throws when the transport cannot serve handlers (`handle()`). No engine and no store are bound, so resolving either throws. |
+| `tenant` | `transport` and `partition` (both typed required); optional `tenant.token` (a string, a function, or a credentials class), `requestTimeoutMs`, `capabilities` | `store`, `stores` (typed `never`) | Resolving the `RunGateway` throws when the transport lacks the store-less methods (`dispatchStartRun`, `dispatchRunRequest`, `onRunReply`, `onTenantEvent`). Resolving the worker runtime throws when the transport cannot serve handlers (`handle()`). No engine and no store are bound, so resolving either throws. |
 
 `partition` is the axis a `tenant` pod is named by: it suffixes the routing tokens the pod's descriptor advertises and is the tenant the proxy claims on the wire when no token is set (and, unless the transport sets its own, the partition of the queues it consumes). `namespace` stays a separate, optional field on every topology (a run scope; absent, it is `'default'` on `standalone` and every pool on `control-plane`); a tenant pod passes it to its transport and worker runtime. What each axis actually partitions is [Tenancy](/docs/durable/concepts/tenancy).
 
@@ -248,26 +248,20 @@ Each tenant runs on a segmented transport prefix/namespace behind a Redis/networ
 
 <Step>
 
-### Signed token on top
+### Token on top
 
-Each `tenant` pod carries a secret-signed token. The control plane's `RunRequestResponder` **verifies the signature and derives the tenant from the token**, ignoring any `tenant` in the request body. Defense in depth.
+Each `tenant` pod sends a token with every request (`tenant.token`), and the control plane's `RunRequestResponder` **verifies it and derives the tenant from it** (`verifyTenant`), ignoring any `tenant` in the request body. The token can be an `@adonisjs/auth` access token, an authkit or other OIDC access token, or an HMAC-signed claim; `tenant.token` can be a string or a function that returns a fresh token for each request. [Authenticate tenants](/docs/durable/cluster/authenticate-tenants) has a working setup for each.
 
 ```ts
-import { signTenantToken, hmacTenantVerifier } from '@adonis-agora/durable'
+// Control plane
+verifyTenant: () => import('#tenants/access_token_tenant_verifier'),
 
-// On the tenant pod — mint the token it presents (config.tenant.token):
-const token = signTenantToken('acme-corp', process.env.DURABLE_TENANT_SECRET!)
-// Optionally expiring (the `.exp<epochMs>` suffix is signed, so it can't be stripped/extended);
-// a captured token then stops replaying after the ttl instead of being valid forever:
-const shortLived = signTenantToken('acme-corp', process.env.DURABLE_TENANT_SECRET!, { ttlMs: 24 * 60 * 60 * 1000 })
-
-// On the control plane — verify it (config.verifyTenant). A secret LIST makes rotation a
-// two-step deploy: verify with [next, current] first, then re-mint tokens with `next` at leisure:
-verifyTenant: hmacTenantVerifier([process.env.DURABLE_TENANT_SECRET_NEXT!, process.env.DURABLE_TENANT_SECRET!])
+// Tenant pod
+tenant: { token: env.get('DURABLE_TENANT_TOKEN') },
 ```
 
 <Callout type="warn">
-Without `verifyTenant`, the wire `tenant` field is trusted **verbatim** — any process with broker access can list, signal, cancel and start runs as any tenant (prefix/network isolation only). The responder now logs a loud warning at start when no verifier is configured; treat running without one as a conscious choice that your broker is fully isolated per tenant, not a default.
+Without `verifyTenant`, the wire `tenant` field is trusted **verbatim** — any process with broker access can list, signal, cancel and start runs as any tenant (prefix/network isolation only). The responder logs a warning at start when no verifier is configured; treat running without one as a conscious choice that your broker is fully isolated per tenant, not a default.
 </Callout>
 
 </Step>
@@ -278,6 +272,7 @@ The `RunRequestResponder` is the **trust boundary**. Beyond checking the token, 
 
 ## Next steps
 
+- **[Authenticate tenants](/docs/durable/cluster/authenticate-tenants)** — `verifyTenant` and `tenant.token` with `@adonisjs/auth`, authkit, any OIDC provider, or HMAC.
 - **[Tenancy](/docs/durable/concepts/tenancy)** — what `namespace` and `partition` actually partition, and the rules that decide which namespace a new run gets.
 - **[Thin workers](/docs/durable/cluster/thin-workers)** — the store-less worker runtime, from `durable:worker` down to the turn runner.
 - **[Handshake & capability negotiation](/docs/durable/cluster/handshake)** — keep a mixed fleet version-safe.

@@ -1,5 +1,15 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import type { TenantVerifier, VerifiedTenant } from '../config_types.js';
+import type {
+  ContractClass,
+  TenantCredentialsContract,
+  TenantTokenOption,
+  TenantTokenSource,
+  TenantVerifier,
+  TenantVerifierContract,
+  TenantVerifierInput,
+  TenantVerifierOption,
+  VerifiedTenant,
+} from '../config_types.js';
 
 /**
  * Layered tenant auth (spec §9). On a store-less pod the `tenant` on a `RunRequest`/`StartRunMessage`
@@ -110,4 +120,173 @@ function constantTimeEquals(a: string, b: string): boolean {
   const bb = Buffer.from(b);
   if (ab.length !== bb.length) return false;
   return timingSafeEqual(ab, bb);
+}
+
+// ---------------------------------------------------------------------------
+// the forms `verifyTenant` and `tenant.token` accept
+// ---------------------------------------------------------------------------
+
+/** Builds a contract class. The provider passes the container's `make`, so `@inject()` works. */
+export type ContractClassMaker = <T>(Class: ContractClass<T>) => T | Promise<T>;
+
+const construct: ContractClassMaker = (Class) => new Class();
+
+function implementsMethod<T>(value: unknown, method: string): value is T {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    typeof (value as Record<string, unknown>)[method] === 'function'
+  );
+}
+
+/**
+ * A class: one with the contract method on its prototype, or any `class` declaration (a contract whose
+ * method is an instance field, `verify = async () => ...`, has nothing on its prototype). The instance
+ * is checked for the method once built.
+ */
+function isContractClass<T>(value: unknown, method: string): value is ContractClass<T> {
+  if (typeof value !== 'function') return false;
+  if (
+    typeof (value as { prototype?: Record<string, unknown> }).prototype?.[method] === 'function'
+  ) {
+    return true;
+  }
+  return /^class[\s{]/.test(Function.prototype.toString.call(value));
+}
+
+/**
+ * The class or object a lazy import's module exports as default, or `undefined` when `value` is not a
+ * module (no `default` key). A module whose default export is neither throws: it is a misconfigured
+ * lazy import, and must never be mistaken for a result.
+ */
+function lazyDefault<T>(
+  value: unknown,
+  method: string,
+  contract: string,
+): ContractClass<T> | T | undefined {
+  if (value === null || typeof value !== 'object' || !('default' in value)) return undefined;
+  const candidate = (value as { default: unknown }).default;
+  if (isContractClass<T>(candidate, method) || implementsMethod<T>(candidate, method)) {
+    return candidate;
+  }
+  throw new TypeError(
+    `the lazy import's default export must be a class implementing ${contract} (with a ${method}() method)`,
+  );
+}
+
+/**
+ * One instance per contract class or lazy module, built on first use and checked for the contract's
+ * method. A failed build is forgotten, so the next call tries again instead of failing forever.
+ */
+function memoizedInstance<T>(
+  source: ContractClass<T> | T,
+  make: ContractClassMaker,
+  method: string,
+  contract: string,
+): () => Promise<T> {
+  let instance: Promise<T> | undefined;
+  return () => {
+    instance ??= Promise.resolve(
+      typeof source === 'function' ? make(source as ContractClass<T>) : source,
+    )
+      .then((built) => {
+        if (!implementsMethod<T>(built, method)) {
+          throw new TypeError(`${contract} instance has no ${method}() method`);
+        }
+        return built;
+      })
+      .catch((err: unknown) => {
+        instance = undefined;
+        throw err;
+      });
+    return instance;
+  };
+}
+
+/** A verifier's answer, checked: `null` rejects, `{ tenant }` with a non-empty string accepts, and
+ *  anything else throws, so a malformed result can never be taken for an accepted tenant. */
+function checkVerified(result: unknown): VerifiedTenant | null {
+  if (result === null || result === undefined) return null;
+  const tenant = (result as { tenant?: unknown }).tenant;
+  if (typeof result === 'object' && typeof tenant === 'string' && tenant.length > 0) {
+    return result as VerifiedTenant;
+  }
+  throw new TypeError('`verifyTenant` must return { tenant: string, capabilities? } or null');
+}
+
+/**
+ * Turn any `verifyTenant` form into the function the responder calls:
+ *
+ * - a function is called with the request's input; when it resolves to a module whose `default` is a
+ *   {@link TenantVerifierContract} class (or object), it was a lazy import: the class is built once
+ *   and used from then on;
+ * - a class with a `verify` method is built once through `make` (the container in the provider);
+ * - an object with a `verify` method is used as-is.
+ */
+export function resolveTenantVerifier(
+  option: TenantVerifierOption,
+  make: ContractClassMaker = construct,
+): TenantVerifier {
+  const V = 'TenantVerifierContract';
+  if (implementsMethod<TenantVerifierContract>(option, 'verify')) {
+    return async (input) => checkVerified(await option.verify(input));
+  }
+  if (isContractClass<TenantVerifierContract>(option, 'verify')) {
+    const instance = memoizedInstance(option, make, 'verify', V);
+    return async (input) => checkVerified(await (await instance()).verify(input));
+  }
+  if (typeof option !== 'function') {
+    throw new TypeError(
+      '`verifyTenant` must be a function, a class implementing TenantVerifierContract, or a lazy import of one.',
+    );
+  }
+  const fn = option as (input: TenantVerifierInput) => unknown;
+  let lazy: (() => Promise<TenantVerifierContract>) | undefined;
+  return async (input) => {
+    if (lazy) return checkVerified(await (await lazy()).verify(input));
+    const result = await fn(input);
+    const source = lazyDefault<TenantVerifierContract>(result, 'verify', V);
+    if (source !== undefined) {
+      lazy ??= memoizedInstance(source, make, 'verify', V);
+      return checkVerified(await (await lazy()).verify(input));
+    }
+    return checkVerified(result);
+  };
+}
+
+/**
+ * Turn any `tenant.token` form into what the wire layer sends: a string stays a string; a function,
+ * a {@link TenantCredentialsContract} class (built once through `make`), an object with a `token`
+ * method, or a lazy import of a class becomes a function called before every request.
+ */
+export function resolveTenantToken(
+  option: TenantTokenOption,
+  make: ContractClassMaker = construct,
+): TenantTokenSource {
+  if (typeof option === 'string') return option;
+  const C = 'TenantCredentialsContract';
+  if (implementsMethod<TenantCredentialsContract>(option, 'token')) {
+    return () => option.token();
+  }
+  if (isContractClass<TenantCredentialsContract>(option, 'token')) {
+    const instance = memoizedInstance(option, make, 'token', C);
+    return async () => (await instance()).token();
+  }
+  if (typeof option !== 'function') {
+    throw new TypeError(
+      '`tenant.token` must be a string, a function, a class implementing TenantCredentialsContract, or a lazy import of one.',
+    );
+  }
+  const fn = option as () => unknown;
+  let lazy: (() => Promise<TenantCredentialsContract>) | undefined;
+  return async () => {
+    if (lazy) return (await lazy()).token();
+    const result = await fn();
+    const source = lazyDefault<TenantCredentialsContract>(result, 'token', C);
+    if (source !== undefined) {
+      lazy ??= memoizedInstance(source, make, 'token', C);
+      return (await lazy()).token();
+    }
+    return result as string;
+  };
 }

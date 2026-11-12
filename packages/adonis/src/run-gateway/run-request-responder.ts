@@ -651,7 +651,9 @@ export class RunRequestResponder {
   async #resolveTenant(wireTenant: string): Promise<string | null> {
     if (!this.#verifyTenant) return wireTenant;
     const verified = await this.#verifyTenant({ token: wireTenant, tenant: wireTenant });
-    return verified ? verified.tenant : null;
+    // Fail closed: only a non-empty string tenant is an acceptance.
+    const tenant = verified?.tenant;
+    return typeof tenant === 'string' && tenant.length > 0 ? tenant : null;
   }
 }
 
