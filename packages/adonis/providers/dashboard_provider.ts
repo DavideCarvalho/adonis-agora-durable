@@ -16,6 +16,14 @@ import {
   mergeFleets,
 } from '../src/dashboard/compat.js';
 import {
+  durableConsoleSearch,
+  listVisibleConsoles,
+  otherConsoles,
+  readAgoraConsoles,
+  registerAgoraConsole,
+  searchConsoles,
+} from '../src/dashboard/console_switcher.js';
+import {
   type DashboardAuditEntry,
   type DurableDashboardConfig,
   NO_AUTHORIZE_WARNING,
@@ -69,6 +77,9 @@ import { DURABLE_TRANSPORT } from '../src/role_bindings.js';
  * on any non-`file:` `import.meta.url`, which would make this provider unimportable under a test
  * runner that doesn't use real file URLs.
  */
+/** This console's id in the app's `'agora.consoles'` registry. */
+const CONSOLE_ID = 'durable';
+
 let spaDir: string | undefined;
 function spaDirectory(): string {
   spaDir ??= fileURLToPath(new URL('../assets/spa/', import.meta.url));
@@ -107,6 +118,8 @@ function spaDirectory(): string {
  * - `GET  /api/workers`               -> worker-group health (full heartbeats; SPA)
  * - `GET  /api/topology`              -> this deployment's durable topology
  * - `GET  /api/compat`                -> fleet health / protocol-compatibility panel
+ * - `GET  /api/consoles`              -> the other Agora consoles this viewer may open (switcher)
+ * - `GET  /api/consoles/search?q=`    -> search across those consoles (and this one)
  * - `GET  /api/openapi.json`          -> the machine-readable API contract (OpenAPI 3.1)
  */
 export default class DashboardProvider {
@@ -147,6 +160,10 @@ export default class DashboardProvider {
     // Developer tools on the app's dev MCP endpoint, when `@adonis-agora/agent/mcp_provider` bound
     // its hub (its `register()` ran before any `boot()`). Gated by this console's own `authorize`.
     await this.registerDevTools(config, durableTopology);
+
+    // The console switcher: this console joins the app's `'agora.consoles'` registry so the other
+    // Agora consoles can link to it (and search it), and it can link to them.
+    await this.registerConsole(config, durableTopology);
 
     // Route registration can't happen synchronously in `boot()` — see the long-standing note this
     // provider always carried: the router singleton isn't committed until the app's "booted" hooks
@@ -209,6 +226,47 @@ export default class DashboardProvider {
         return result.body;
       },
     });
+  }
+
+  private async registerConsole(
+    config: ResolvedDurableDashboardConfig,
+    durableTopology: 'standalone' | 'control-plane' | 'tenant',
+  ): Promise<void> {
+    const deps = this.consoleDeps(config, durableTopology);
+    let logger: { warn(message: string): void } | undefined;
+    try {
+      logger = await this.app.container.make('logger');
+    } catch {
+      logger = undefined;
+    }
+    await registerAgoraConsole(
+      this.app.container,
+      {
+        id: CONSOLE_ID,
+        title: 'Workflows',
+        package: '@adonis-agora/durable',
+        icon: 'workflow',
+        path: config.path === '' ? '/' : config.path,
+        order: 10,
+        authorize: config.authorize,
+        search: durableConsoleSearch(async () => {
+          const d = await deps();
+          return {
+            getRun: (id) => d.engine.getRun(id),
+            workflows: async (q, limit) => {
+              const res = await runValues(d, {
+                params: {},
+                query: { field: 'workflow', search: q, limit: String(limit) },
+              });
+              return res.status === 200
+                ? (res.body as Array<{ value: string | null; count: number }>)
+                : [];
+            },
+          };
+        }, config.path),
+      },
+      logger,
+    );
   }
 
   private async attachDiagnostics(
@@ -343,6 +401,26 @@ export default class DashboardProvider {
       .post(`${apiBase}/schedules/:key/:action`, json(scheduleAction))
       .as('durable_dashboard.schedules.action');
     router.post(`${apiBase}/bulk/:action`, json(bulkAction)).as('durable_dashboard.bulk');
+    // The console switcher: the other Agora consoles this viewer may open, and a search across them.
+    router
+      .get(`${apiBase}/consoles`, async (ctx: HttpContext) => {
+        if (!(await this.enforce(config, ctx, 'api'))) return;
+        const registry = await readAgoraConsoles(this.app.container);
+        ctx.response.header('cache-control', 'private, no-store');
+        return ctx.response.status(200).json(await listVisibleConsoles(registry, CONSOLE_ID, ctx));
+      })
+      .as('durable_dashboard.consoles');
+    router
+      .get(`${apiBase}/consoles/search`, async (ctx: HttpContext) => {
+        if (!(await this.enforce(config, ctx, 'api'))) return;
+        const registry = await readAgoraConsoles(this.app.container);
+        const q = ctx.request.qs().q;
+        ctx.response.header('cache-control', 'private, no-store');
+        return ctx.response
+          .status(200)
+          .json(await searchConsoles(registry, CONSOLE_ID, ctx, typeof q === 'string' ? q : ''));
+      })
+      .as('durable_dashboard.consoles.search');
     router
       .get(
         `${apiBase}/health`,
@@ -418,7 +496,14 @@ export default class DashboardProvider {
         return ctx.response
           .header('content-type', 'text/html; charset=utf-8')
           .header('cache-control', 'no-store, must-revalidate')
-          .send(renderIndexHtml(html, config.path, apiBase));
+          .send(
+            renderIndexHtml(html, config.path, apiBase, {
+              switcher: {
+                endpoint: `${apiBase}/consoles`,
+                others: otherConsoles(await readAgoraConsoles(this.app.container), CONSOLE_ID),
+              },
+            }),
+          );
       })
       .as('durable_dashboard.index');
 

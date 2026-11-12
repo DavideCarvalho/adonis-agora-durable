@@ -1,8 +1,10 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { readSwitcherConfig } from '../client/console-switcher';
 import {
   BULK_MATCH_CAP,
+  CONFIG_ELEMENT_ID,
   deriveRunState,
   durableClient,
   type FanSummary,
@@ -42,6 +44,7 @@ import { type HealthSummary, summarizeHealth } from '../client/summarize-health'
 import { throttle } from '../client/throttle';
 import { AttributeFilters } from './AttributeFilters';
 import { CompatHealth } from './CompatPanel';
+import { ConsoleSwitcher } from './ConsoleSwitcher';
 import { childChips, republishSummary, republishTargets, triggerChips } from './child-link';
 import { BoltIcon, PlayIcon, RetryIcon, SearchIcon, XIcon } from './icons';
 import { OriginFacets } from './OriginFacets';
@@ -69,6 +72,9 @@ import {
   workflowFromHash,
   workflowHash,
 } from './WorkflowLifecycle';
+
+/** The console switcher config the provider put in the page (absent when this console is alone). */
+const switcherConfig = readSwitcherConfig(CONFIG_ELEMENT_ID);
 
 /** The console's top-level views: the runs board (list + detail) and the schedules table. */
 type ConsoleView = 'runs' | 'schedules';
@@ -266,26 +272,32 @@ function Header({
       : 'control plane';
   return (
     <header className="z-10 flex items-center gap-4 border-b border-line px-5 py-3">
-      <div className="flex items-center gap-2.5">
-        <div className="grid h-7 w-7 place-items-center rounded-md border border-brand/30 bg-brand/10">
-          <LogoMark className="h-4 w-4 text-brand" />
-        </div>
-        <div className="leading-none">
-          <div className="text-sm font-semibold tracking-tight">durable</div>
-          <div
-            className={`mono text-[10px] uppercase tracking-[0.2em] ${
-              isTenant ? 'text-amber-400/80' : 'text-zinc-600'
-            }`}
-            title={
-              isTenant
-                ? `Tenant deployment — partition ${topology?.tenant ?? '(unnamed)'}`
-                : 'Control-plane deployment'
-            }
-          >
-            {roleLabel}
+      <ConsoleSwitcher
+        config={switcherConfig}
+        current={{ title: 'Workflows', package: '@adonis-agora/durable' }}
+        brand={
+          <div className="flex items-center gap-2.5">
+            <div className="grid h-7 w-7 place-items-center rounded-md border border-brand/30 bg-brand/10">
+              <LogoMark className="h-4 w-4 text-brand" />
+            </div>
+            <div className="leading-none">
+              <div className="text-sm font-semibold tracking-tight">durable</div>
+              <div
+                className={`mono text-[10px] uppercase tracking-[0.2em] ${
+                  isTenant ? 'text-amber-400/80' : 'text-zinc-600'
+                }`}
+                title={
+                  isTenant
+                    ? `Tenant deployment — partition ${topology?.tenant ?? '(unnamed)'}`
+                    : 'Control-plane deployment'
+                }
+              >
+                {roleLabel}
+              </div>
+            </div>
           </div>
-        </div>
-      </div>
+        }
+      />
       {/* Top-level view nav, drawn like the status chips (plain pressed buttons, not Tabs — there is
           no in-header panel to wire, the whole main area swaps). A tenant deployment never sees the
           schedules entry: its gateway has no runtime schedule control, `GET /schedules` just 404s —

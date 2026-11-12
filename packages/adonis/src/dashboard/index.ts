@@ -34,6 +34,22 @@ export {
   resolveConsoleAuthorize,
 } from './console_authorize.js';
 export type {
+  AgoraConsoleEntry,
+  AgoraConsoleIcon,
+  AgoraConsoleRegistry,
+  AgoraConsoleSearchHit,
+  ConsoleSearchResults,
+  VisibleConsole,
+  VisibleConsoles,
+} from './console_switcher.js';
+// The cross-console switcher registry (`'agora.consoles'`) and global search.
+export {
+  AGORA_CONSOLES_BINDING,
+  listVisibleConsoles,
+  registerAgoraConsole,
+  searchConsoles,
+} from './console_switcher.js';
+export type {
   AccessDeniedOption,
   AccessDeniedRenderer,
   AuthorizeDecision,
