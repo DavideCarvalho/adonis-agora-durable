@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import type { WorkflowRun } from '../../src/index.js';
 import type { RunGateway, StartRunOptions } from '../../src/run-gateway/interface.js';
 import { tenantScopedGateway } from '../../src/run-gateway/tenant-scoped-gateway.js';
 import type { EngineTenancy, RunTenantFilter } from '../../src/tenancy.js';
-import type { WorkflowRun } from '../../src/index.js';
 
 const at = new Date('2026-11-12T00:00:00.000Z');
 const run = (id: string, tenantId?: string): WorkflowRun => ({
@@ -53,7 +53,10 @@ const tenancy = (filter: RunTenantFilter): EngineTenancy => ({
 describe('tenantScopedGateway (a tenant pod)', () => {
   it('stamps the active tenant on starts; an explicit tenantId wins', async () => {
     const { gateway, started } = fakeGateway();
-    const scoped = tenantScopedGateway(gateway, tenancy({ mode: 'tenant', tenant: { id: 'acme', kind: 'organization' } }));
+    const scoped = tenantScopedGateway(
+      gateway,
+      tenancy({ mode: 'tenant', tenant: { id: 'acme', kind: 'organization' } }),
+    );
     await scoped.start('w', {});
     await scoped.start('w', {}, { tenantId: null });
     expect(started).toEqual([{ tenantId: 'acme', tenantKind: 'organization' }, { tenantId: null }]);
@@ -61,7 +64,10 @@ describe('tenantScopedGateway (a tenant pod)', () => {
 
   it("narrows reads and refuses actions on another tenant's runs", async () => {
     const { gateway, cancelled } = fakeGateway();
-    const scoped = tenantScopedGateway(gateway, tenancy({ mode: 'tenant', tenant: { id: 'acme' } }));
+    const scoped = tenantScopedGateway(
+      gateway,
+      tenancy({ mode: 'tenant', tenant: { id: 'acme' } }),
+    );
     expect((await scoped.listRuns({})).map((r) => r.id)).toEqual(['a']);
     expect(await scoped.getRun('g')).toBeNull();
     expect(await scoped.cancel('g')).toBeNull();
