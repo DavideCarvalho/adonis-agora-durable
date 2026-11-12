@@ -1,7 +1,20 @@
 {{{
   exports({ to: app.migrationsPath(`${new Date().getTime()}_create_durable_transport_worker_keys.ts`) })
 }}}
+import app from '@adonisjs/core/services/app'
 import { BaseSchema } from '@adonisjs/lucid/schema'
+
+/**
+ * The database schema the tables live in (a database on MySQL): the top-level
+ * \`schema\` of config/durable.ts, read when the migration runs (\`undefined\` uses the
+ * connection's current schema). If you set it on \`transports.db({ schema })\` (or on the queue
+ * transport's \`workerKeysSchema\`) instead, put that value here.
+ */
+const configured = app.config.get('durable.schema', undefined)
+const schema = typeof configured === 'string' ? configured : undefined
+
+/** \`name\` in {@link schema}: Knex quotes \`schema.table\` part by part. */
+const inSchema = (name: string) => (schema ? \`\${schema}.\${name}\` : name)
 
 /**
  * The worker advertisement keys for the @adonis-agora/durable \`db\` transport: the descriptor and
@@ -10,7 +23,16 @@ import { BaseSchema } from '@adonisjs/lucid/schema'
  */
 export default class extends BaseSchema {
   async up() {
-    this.schema.createTable('durable_transport_worker_keys', (table) => {
+    if (schema) {
+      // Runs before the tables below (calls run in order); \`??\` quotes the name as an identifier.
+      this.defer(async (db) => {
+        await db.rawQuery(
+          db.dialect.name === 'mysql' ? 'create database if not exists ??' : 'create schema if not exists ??',
+          [schema]
+        )
+      })
+    }
+    this.schema.createTable(inSchema('durable_transport_worker_keys'), (table) => {
       table.string('key', 512).primary()
       table.text('value', 'longtext').notNullable()
       table.bigInteger('expires_at').notNullable()
@@ -19,6 +41,6 @@ export default class extends BaseSchema {
   }
 
   async down() {
-    this.schema.dropTableIfExists('durable_transport_worker_keys')
+    this.schema.dropTableIfExists(inSchema('durable_transport_worker_keys'))
   }
 }

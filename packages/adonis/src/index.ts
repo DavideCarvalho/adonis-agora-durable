@@ -203,6 +203,7 @@ export {
   createDurableTransportTables,
   dropDurableTransportTables,
   TRANSPORT_TABLES,
+  type TransportTablesOptions,
 } from './transports/db-schema.js';
 export {
   EventEmitterTransport,

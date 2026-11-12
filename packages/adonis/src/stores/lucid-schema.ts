@@ -1,6 +1,17 @@
 import { createHash } from 'node:crypto';
 import type { Database } from '@adonisjs/lucid/database';
 import type { QueryClientContract } from '@adonisjs/lucid/types/database';
+import {
+  assertSchemaSupported,
+  ensureSchemaExists,
+  hasColumn,
+  mysqlLockName,
+  qualify,
+  schemaBuilder,
+  schemaLockKey,
+  validateSchemaName,
+  whereSchema,
+} from '../sql-schema.js';
 
 /**
  * The canonical durable table names. They match the cross-adapter snake_case contract the other
@@ -43,6 +54,12 @@ export interface CreateDurableTablesOptions {
    * {@link DURABLE_SCHEMA_META_TABLE}). For a database whose durable tables were changed by hand.
    */
   force?: boolean;
+  /**
+   * The database schema the tables live in (a database on MySQL), created when missing. Every
+   * statement names it, so the connection's own default schema is left alone. Omit for the
+   * connection's current schema. Not supported on SQLite.
+   */
+  schema?: string | undefined;
 }
 
 /**
@@ -112,11 +129,14 @@ function schemaFingerprint(collation: string | undefined): string {
     .digest('hex');
 }
 
-async function readSchemaFingerprint(client: QueryClientContract): Promise<string | undefined> {
-  if (!(await client.schema.hasTable(DURABLE_SCHEMA_META_TABLE))) return undefined;
+async function readSchemaFingerprint(
+  client: QueryClientContract,
+  schema: string | undefined,
+): Promise<string | undefined> {
+  if (!(await schemaBuilder(client, schema).hasTable(DURABLE_SCHEMA_META_TABLE))) return undefined;
   const q = client
     .query()
-    .from(DURABLE_SCHEMA_META_TABLE)
+    .from(qualify(schema, DURABLE_SCHEMA_META_TABLE))
     .select('fingerprint')
     .where('id', SCHEMA_META_ROW);
   // A locking read on MySQL: under REPEATABLE READ a plain read could answer from a snapshot older
@@ -128,10 +148,11 @@ async function readSchemaFingerprint(client: QueryClientContract): Promise<strin
 
 async function writeSchemaFingerprint(
   client: QueryClientContract,
+  schema: string | undefined,
   fingerprint: string,
 ): Promise<void> {
-  if (!(await client.schema.hasTable(DURABLE_SCHEMA_META_TABLE))) {
-    await client.schema.createTable(DURABLE_SCHEMA_META_TABLE, (table) => {
+  if (!(await schemaBuilder(client, schema).hasTable(DURABLE_SCHEMA_META_TABLE))) {
+    await schemaBuilder(client, schema).createTable(DURABLE_SCHEMA_META_TABLE, (table) => {
       table.string('id', 32).primary();
       table.string('fingerprint', 64).notNullable();
       table.bigInteger('applied_at').notNullable();
@@ -139,7 +160,7 @@ async function writeSchemaFingerprint(
   }
   await client
     .insertQuery()
-    .table(DURABLE_SCHEMA_META_TABLE)
+    .table(qualify(schema, DURABLE_SCHEMA_META_TABLE))
     .knexQuery.insert({ id: SCHEMA_META_ROW, fingerprint, applied_at: Date.now() })
     .onConflict('id')
     .merge();
@@ -154,22 +175,32 @@ async function writeSchemaFingerprint(
  */
 async function withSchemaLock(
   connection: QueryClientContract,
+  schema: string | undefined,
   logger: DurableSchemaLogger,
   work: (client: QueryClientContract) => Promise<void>,
 ): Promise<void> {
+  // With a schema, the lock is that schema's: two installs in two schemas of one database heal
+  // independently. Without one, the keys are unchanged.
   switch (connection.dialect.name) {
     case 'postgres':
       await connection.transaction(async (trx) => {
-        await trx.rawQuery('select pg_advisory_xact_lock(?)', [PG_SCHEMA_LOCK_KEY]);
+        await trx.rawQuery('select pg_advisory_xact_lock(?)', [
+          schemaLockKey(PG_SCHEMA_LOCK_KEY, schema),
+        ]);
         await work(trx);
       });
       return;
     case 'mysql':
       await connection.transaction(async (trx) => {
-        const result = (await trx.rawQuery(
-          "select get_lock(concat('durable_schema:', database()), ?) as got",
-          [MYSQL_SCHEMA_LOCK_TIMEOUT_S],
-        )) as [Array<{ got: number | string | null }>, unknown];
+        // The lock is named after the database the tables are in: the configured one, else the
+        // connection's.
+        const lockName: { sql: string; bindings: string[] } = schema
+          ? { sql: '?', bindings: [mysqlLockName('durable_schema:', schema)] }
+          : { sql: "concat('durable_schema:', database())", bindings: [] };
+        const result = (await trx.rawQuery(`select get_lock(${lockName.sql}, ?) as got`, [
+          ...lockName.bindings,
+          MYSQL_SCHEMA_LOCK_TIMEOUT_S,
+        ])) as [Array<{ got: number | string | null }>, unknown];
         const got = Number(result[0]?.[0]?.got) === 1;
         if (!got) {
           logger.warn(
@@ -181,7 +212,7 @@ async function withSchemaLock(
         } finally {
           if (got) {
             await trx
-              .rawQuery("select release_lock(concat('durable_schema:', database()))")
+              .rawQuery(`select release_lock(${lockName.sql})`, lockName.bindings)
               .catch(() => undefined);
           }
         }
@@ -215,7 +246,7 @@ function repairWarning(repairs: string[]): string {
 }
 
 /**
- * Does an index with this name exist in the connection's current schema? Returns `null` for
+ * Does an index with this name exist in `schema` (the connection's current schema when unset)? Returns `null` for
  * dialects outside the store's three declared targets (SQLite / Postgres / MySQL), which the
  * caller handles by falling back to the legacy best-effort create.
  *
@@ -229,16 +260,13 @@ function repairWarning(repairs: string[]): string {
  */
 async function indexExists(
   connection: QueryClientContract,
+  schema: string | undefined,
   indexName: string,
 ): Promise<boolean | null> {
   switch (connection.dialect.name) {
     case 'postgres': {
-      const rows = await connection
-        .query()
-        .from('pg_indexes')
-        .where('indexname', indexName)
-        .andWhereRaw('schemaname = current_schema()')
-        .limit(1);
+      const q = connection.query().from('pg_indexes').where('indexname', indexName);
+      const rows = await whereSchema(q, connection, 'schemaname', schema).limit(1);
       return rows.length > 0;
     }
     case 'sqlite3':
@@ -253,12 +281,11 @@ async function indexExists(
       return rows.length > 0;
     }
     case 'mysql': {
-      const rows = await connection
+      const q = connection
         .query()
         .from('information_schema.statistics')
-        .where('index_name', indexName)
-        .andWhereRaw('table_schema = database()')
-        .limit(1);
+        .where('index_name', indexName);
+      const rows = await whereSchema(q, connection, 'table_schema', schema).limit(1);
       return rows.length > 0;
     }
     default:
@@ -286,6 +313,9 @@ async function indexExists(
  * prefer the published migration (`node ace configure @adonis-agora/durable`); this helper is for standalone
  * use, tests, and `ensureSchema`.
  *
+ * Pass `options.schema` to put the tables in their own database schema (created when missing): every
+ * statement names it, on any connection. It must match the store's `schema`.
+ *
  * Pass `connectionName` to provision the tables on a dedicated Lucid connection — it must match the
  * connection the store reads/writes on, or `ensureSchema` would create the tables where the store
  * never looks. Omit it to use the `Database` default connection.
@@ -301,30 +331,36 @@ export async function createDurableTables(
   options: CreateDurableTablesOptions = {},
 ): Promise<void> {
   const connection = db.connection(connectionName);
+  const schema = validateSchemaName(options.schema, 'createDurableTables');
+  assertSchemaSupported(connection, schema, 'createDurableTables');
   const logger = options.logger ?? console;
   const collation =
     connection.dialect.name === 'mysql' ? configuredCollation(connection, options) : undefined;
   const expected = schemaFingerprint(collation);
   // The steady-state boot: one catalog probe and one PK read, no per-table checks.
-  if (!options.force && (await readSchemaFingerprint(connection)) === expected) return;
-  await withSchemaLock(connection, logger, async (client) => {
+  if (!options.force && (await readSchemaFingerprint(connection, schema)) === expected) return;
+  // Outside the lock's transaction: a failed CREATE SCHEMA would abort it.
+  await ensureSchemaExists(connection, schema);
+  await withSchemaLock(connection, schema, logger, async (client) => {
     // A sibling may have healed while this process waited for the lock.
-    if (!options.force && (await readSchemaFingerprint(client)) === expected) return;
-    await healDurableTables(client, collation, logger);
-    await writeSchemaFingerprint(client, expected);
+    if (!options.force && (await readSchemaFingerprint(client, schema)) === expected) return;
+    await healDurableTables(client, schema, collation, logger);
+    await writeSchemaFingerprint(client, schema, expected);
   });
 }
 
 /** The additive check-and-repair behind {@link createDurableTables}, on one client (or transaction). */
 async function healDurableTables(
   client: QueryClientContract,
+  schema: string | undefined,
   collation: string | undefined,
   logger: DurableSchemaLogger,
 ): Promise<void> {
   // Knex's schema builder is stateful — operations chained on one instance run together. Take a FRESH
   // `client.schema` for every hasTable/createTable so each DDL statement executes exactly once, all on
-  // the store's own connection (or the lock-holding transaction).
-  const conn = () => client.schema;
+  // the store's own connection (or the lock-holding transaction), scoped to the configured schema.
+  const conn = () => schemaBuilder(client, schema);
+  const columnExists = (table: string, column: string) => hasColumn(client, schema, table, column);
   const isMysql = client.dialect.name === 'mysql';
   // MySQL: create new tables with the configured collation (CONVERT below aligns existing ones).
   const charset = collation?.split('_')[0];
@@ -348,7 +384,7 @@ async function healDurableTables(
     columns: string[],
     indexName: string,
   ): Promise<void> => {
-    const known = await indexExists(client, indexName);
+    const known = await indexExists(client, schema, indexName);
     if (known === true) return;
     if (known === null) {
       try {
@@ -402,14 +438,14 @@ async function healDurableTables(
     // Auto-migrate an older runs table by adding any columns introduced after its creation. Each is
     // applied independently so a table missing several catches up. Mirrors the in-place pattern other
     // adapters use; new columns are nullable / carry a DEFAULT so existing rows read back unchanged.
-    if (!(await conn().hasColumn(DURABLE_TABLES.runs, 'priority'))) {
+    if (!(await columnExists(DURABLE_TABLES.runs, 'priority'))) {
       // Nullable (no default) so existing rows read back as "unprioritised" and the FIFO path is unchanged.
       await conn().alterTable(DURABLE_TABLES.runs, (table) => {
         table.integer('priority');
       });
       repairs.push(`${DURABLE_TABLES.runs}.priority`);
     }
-    if (!(await conn().hasColumn(DURABLE_TABLES.runs, 'namespace'))) {
+    if (!(await columnExists(DURABLE_TABLES.runs, 'namespace'))) {
       // DEFAULT 'default' so every pre-namespace row reads back in the reserved 'default' partition —
       // byte-identical behavior for a single-pool deploy that adds the column.
       await conn().alterTable(DURABLE_TABLES.runs, (table) => {
@@ -418,14 +454,14 @@ async function healDurableTables(
       });
       repairs.push(`${DURABLE_TABLES.runs}.namespace`);
     }
-    if (!(await conn().hasColumn(DURABLE_TABLES.runs, 'origin'))) {
+    if (!(await columnExists(DURABLE_TABLES.runs, 'origin'))) {
       // Origin attribution wave: nullable, so an app-own/legacy run reads back with no origin.
       await conn().alterTable(DURABLE_TABLES.runs, (table) => {
         table.string('origin');
       });
       repairs.push(`${DURABLE_TABLES.runs}.origin`);
     }
-    if (!(await conn().hasColumn(DURABLE_TABLES.runs, 'awaiting_decision_task_id'))) {
+    if (!(await columnExists(DURABLE_TABLES.runs, 'awaiting_decision_task_id'))) {
       // Remote-turn decision marker (multi-instance decisions): nullable, so an existing run reads back
       // as "not awaiting a dispatched turn". TEXT: it embeds the run id plus a UUID.
       await conn().alterTable(DURABLE_TABLES.runs, (table) => {
@@ -433,7 +469,7 @@ async function healDurableTables(
       });
       repairs.push(`${DURABLE_TABLES.runs}.awaiting_decision_task_id`);
     }
-    if (!(await conn().hasColumn(DURABLE_TABLES.runs, 'wake_requested_at'))) {
+    if (!(await columnExists(DURABLE_TABLES.runs, 'wake_requested_at'))) {
       // Refused-wake marker (a wake that found another instance's lease): nullable, so an existing
       // run reads back as "no turn requested".
       await conn().alterTable(DURABLE_TABLES.runs, (table) => {
@@ -442,7 +478,7 @@ async function healDurableTables(
       });
       repairs.push(`${DURABLE_TABLES.runs}.wake_requested_at`);
     }
-    if (!(await conn().hasColumn(DURABLE_TABLES.runs, 'tenant_id'))) {
+    if (!(await columnExists(DURABLE_TABLES.runs, 'tenant_id'))) {
       // Tenancy: nullable, so an existing run reads back with no tenant.
       await conn().alterTable(DURABLE_TABLES.runs, (table) => {
         table.string('tenant_id');
@@ -485,7 +521,7 @@ async function healDurableTables(
       table.index(['run_id', 'parallel_group', 'seq'], 'durable_step_checkpoints_group_idx');
     });
   } else {
-    if (!(await conn().hasColumn(DURABLE_TABLES.checkpoints, 'parallel_group'))) {
+    if (!(await columnExists(DURABLE_TABLES.checkpoints, 'parallel_group'))) {
       // Auto-migrate an older checkpoints table: add the nullable `parallel_group` column in place.
       // Nullable (no default) so a legacy (non-parallel) checkpoint reads back untagged.
       await conn().alterTable(DURABLE_TABLES.checkpoints, (table) => {
@@ -493,7 +529,7 @@ async function healDurableTables(
       });
       repairs.push(`${DURABLE_TABLES.checkpoints}.parallel_group`);
     }
-    if (!(await conn().hasColumn(DURABLE_TABLES.checkpoints, 'last_heartbeat_at'))) {
+    if (!(await columnExists(DURABLE_TABLES.checkpoints, 'last_heartbeat_at'))) {
       // Heartbeat-persistence wave: nullable, so a step whose handler never beats reads back with
       // no liveness claim (absent ≠ silent-since-epoch).
       await conn().alterTable(DURABLE_TABLES.checkpoints, (table) => {
@@ -507,7 +543,7 @@ async function healDurableTables(
         `${DURABLE_TABLES.checkpoints}.heartbeat_progress`,
       );
     }
-    if (!(await conn().hasColumn(DURABLE_TABLES.checkpoints, 'queue'))) {
+    if (!(await columnExists(DURABLE_TABLES.checkpoints, 'queue'))) {
       // Durable flow-control release: the admitted queue is persisted on the pending checkpoint so
       // ANY instance receiving the result can free the slot. Nullable — a non-queued step reads back
       // with no slot to release.
@@ -553,7 +589,7 @@ async function healDurableTables(
       table.index(['run_id'], 'durable_signal_waiters_run_idx');
     });
   } else {
-    if (!(await conn().hasColumn(DURABLE_TABLES.signalWaiters, 'parallel_group'))) {
+    if (!(await columnExists(DURABLE_TABLES.signalWaiters, 'parallel_group'))) {
       // Auto-migrate an older signal_waiters table: add the nullable `parallel_group` column in
       // place. Nullable (no default) so a legacy (non-fan) waiter reads back untagged and the await
       // is unchanged.
@@ -585,10 +621,11 @@ async function healDurableTables(
       [DURABLE_TABLES.signalWaiters, 'durable_signal_waiters_token_prefix_idx'],
       [DURABLE_TABLES.bufferedSignals, 'durable_buffered_signals_token_prefix_idx'],
     ] as const) {
-      if (await indexExists(client, indexName)) continue;
+      if (await indexExists(client, schema, indexName)) continue;
+      // The index lands in its table's schema: `create index "i" on "s"."t"`.
       await client.rawQuery('create index ?? on ?? (?? varchar_pattern_ops)', [
         indexName,
-        table,
+        qualify(schema, table),
         'token',
       ]);
       if (!created.has(table)) repairs.push(`${table}.${indexName}`);
@@ -631,7 +668,7 @@ async function healDurableTables(
       // The worker tick's "due by T" scan: `paused = false AND next_fire_at <= T`.
       table.index(['paused', 'next_fire_at'], 'durable_schedules_due_idx');
     });
-  } else if (!(await conn().hasColumn(DURABLE_TABLES.schedules, 'tenant_id'))) {
+  } else if (!(await columnExists(DURABLE_TABLES.schedules, 'tenant_id'))) {
     // Tenancy: nullable, so an existing schedule (and every run it fires) has no tenant.
     await conn().alterTable(DURABLE_TABLES.schedules, (table) => {
       table.string('tenant_id');
@@ -644,9 +681,9 @@ async function healDurableTables(
   // an operator needs to know their schema was behind and by what, and a burst of lines is easier to
   // lose than a single one.
   if (isMysql) {
-    repairs.push(...(await widenMysqlJsonColumns(client)));
+    repairs.push(...(await widenMysqlJsonColumns(client, schema)));
     if (collation && charset) {
-      repairs.push(...(await alignMysqlCollation(client, charset, collation, logger)));
+      repairs.push(...(await alignMysqlCollation(client, schema, charset, collation, logger)));
     }
   }
 
@@ -661,8 +698,11 @@ async function healDurableTables(
  * since MySQL rebuilds the table for each; a table already widened is not touched. Returns the
  * columns it changed.
  */
-async function widenMysqlJsonColumns(client: QueryClientContract): Promise<string[]> {
-  return widenMysqlLongtextColumns(client, DURABLE_JSON_COLUMNS);
+async function widenMysqlJsonColumns(
+  client: QueryClientContract,
+  schema: string | undefined,
+): Promise<string[]> {
+  return widenMysqlLongtextColumns(client, DURABLE_JSON_COLUMNS, schema);
 }
 
 /**
@@ -673,14 +713,19 @@ async function widenMysqlJsonColumns(client: QueryClientContract): Promise<strin
 export async function widenMysqlLongtextColumns(
   client: QueryClientContract,
   spec: Record<string, { columns: string[]; notNull?: string[] }>,
+  schema?: string | undefined,
 ): Promise<string[]> {
   const tables = Object.keys(spec);
-  const rows = (await client
+  const q = client
     .query()
     .from('information_schema.columns')
     .select('table_name as t', 'column_name as c', 'data_type as d')
-    .whereRaw('table_schema = database()')
-    .whereIn('table_name', tables)) as Array<{ t: string; c: string; d: string }>;
+    .whereIn('table_name', tables);
+  const rows = (await whereSchema(q, client, 'table_schema', schema)) as Array<{
+    t: string;
+    c: string;
+    d: string;
+  }>;
   const widened: string[] = [];
   for (const [table, columns] of Object.entries(spec)) {
     const narrow = columns.columns.filter((column) => {
@@ -694,7 +739,7 @@ export async function widenMysqlLongtextColumns(
           `modify \`${column}\` longtext ${columns.notNull?.includes(column) ? 'not null' : 'null'}`,
       )
       .join(', ');
-    await client.rawQuery(`alter table \`${table}\` ${modify}`);
+    await client.rawQuery(`alter table ?? ${modify}`, [qualify(schema, table)]);
     widened.push(...narrow.map((column) => `${table}.${column} (longtext)`));
   }
   return widened;
@@ -707,23 +752,28 @@ export async function widenMysqlLongtextColumns(
  */
 async function alignMysqlCollation(
   client: QueryClientContract,
+  schema: string | undefined,
   charset: string,
   collation: string,
   logger: DurableSchemaLogger,
 ): Promise<string[]> {
   const tables = [...Object.values(DURABLE_TABLES), DURABLE_SCHEMA_META_TABLE];
-  const rows = (await client
+  const q = client
     .query()
     .from('information_schema.tables')
     .select('table_name as t', 'table_collation as c')
-    .whereRaw('table_schema = database()')
-    .whereIn('table_name', tables)) as Array<{ t: string; c: string | null }>;
+    .whereIn('table_name', tables);
+  const rows = (await whereSchema(q, client, 'table_schema', schema)) as Array<{
+    t: string;
+    c: string | null;
+  }>;
   const converted: string[] = [];
   for (const row of rows) {
     if (row.c == null || row.c === collation) continue;
     try {
       await client.rawQuery(
-        `alter table \`${row.t}\` convert to character set ${charset} collate ${collation}`,
+        `alter table ?? convert to character set ${charset} collate ${collation}`,
+        [qualify(schema, row.t)],
       );
       converted.push(`${row.t} (collation ${collation})`);
     } catch (err) {
@@ -737,9 +787,18 @@ async function alignMysqlCollation(
   return converted;
 }
 
-/** Drop every durable table (reverse FK order). Used by tests and migration `down`. */
-export async function dropDurableTables(db: Database, connectionName?: string): Promise<void> {
-  const conn = () => db.connection(connectionName).schema;
+/**
+ * Drop every durable table (reverse FK order), in `options.schema` when set (the schema itself is
+ * left). Used by tests and migration `down`.
+ */
+export async function dropDurableTables(
+  db: Database,
+  connectionName?: string,
+  options: { schema?: string | undefined } = {},
+): Promise<void> {
+  const schema = validateSchemaName(options.schema, 'dropDurableTables');
+  assertSchemaSupported(db.connection(connectionName), schema, 'dropDurableTables');
+  const conn = () => schemaBuilder(db.connection(connectionName), schema);
   await conn().dropTableIfExists(DURABLE_SCHEMA_META_TABLE);
   await conn().dropTableIfExists(DURABLE_TABLES.schedules);
   await conn().dropTableIfExists(DURABLE_TABLES.bufferedEvents);

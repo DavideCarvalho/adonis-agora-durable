@@ -61,6 +61,7 @@ tenant verification) apply.
 | `durable.tenant-token` | A `tenant` pod sets `tenant.token`. |
 | `durable.cron-parser` | Cron schedules have `cron-parser` 5 installed. |
 | `durable.store-tables` | With `autoSchema: false`, the durable tables exist (`--deep`). |
+| `durable.schema` | With a `schema` on the SQL store, the schema exists, the durable tables are in it, and the connection can write there (`--deep`). |
 | `durable.console-gate` | The console sets `authorize` (warning locally, error in production). |
 | `durable.peers` | Every peer dependency installed is in its supported range. |
 | `durable.agora-siblings` | No 0.x Agora lib is installed next to a 1.x one. |

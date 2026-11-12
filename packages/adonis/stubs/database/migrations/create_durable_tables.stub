@@ -1,9 +1,19 @@
 {{{
   exports({ to: app.migrationsPath(`${new Date().getTime()}_create_durable_tables.ts`) })
 }}}
+import app from '@adonisjs/core/services/app'
 import { BaseSchema } from '@adonisjs/lucid/schema'
 import db from '@adonisjs/lucid/services/db'
 import { createDurableTables, dropDurableTables } from '@adonis-agora/durable'
+
+/**
+ * The database schema the durable tables live in (a database on MySQL): the top-level
+ * \`schema\` of config/durable.ts, read when the migration runs (\`undefined\` uses the
+ * connection's current schema). If you set it on \`stores.lucid({ schema })\` instead,
+ * put that value here.
+ */
+const configured = app.config.get('durable.schema', undefined)
+const schema = typeof configured === 'string' ? configured : undefined
 
 /**
  * Durable workflow tables for the @adonis-agora/durable \`lucid\` state store: runs, step checkpoints,
@@ -39,10 +49,10 @@ export default class extends BaseSchema {
   static disableTransactions = true
 
   async up() {
-    await createDurableTables(db, this.db.connectionName)
+    await createDurableTables(db, this.db.connectionName, { schema })
   }
 
   async down() {
-    await dropDurableTables(db, this.db.connectionName)
+    await dropDurableTables(db, this.db.connectionName, { schema })
   }
 }

@@ -132,6 +132,32 @@ Reach for `autoSchema: false` when the app's database user may not run DDL at bo
 With the boot-time provisioning off, a database that is behind the installed library version stays behind. The published migration has already run, so `node ace migration:run` alone does not re-run it. After an upgrade that changes the schema (the changelog says so, and `DURABLE_SCHEMA_REVISION` changes), add a new migration whose `up()` calls `createDurableTables(db, this.db.connectionName)`, the same body as the published one, and run `node ace migration:run`.
 </Callout>
 
+## Database schema
+
+Set `schema` to keep the durable tables in a schema of their own (a database on MySQL) while the app's tables stay where they are:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  // Every durable table: the store's, the db transport's and the worker keys'.
+  schema: 'durable',
+  store: 'lucid',
+  stores: { lucid: stores.lucid() },
+})
+```
+
+The top-level `schema` applies to every durable table. `stores.lucid({ schema })`, `transports.db({ schema })` and the queue transport's `workerKeysSchema` override it for one piece.
+
+Every statement then names the schema (`"durable"."durable_workflow_runs"`), on whatever connection the store uses, your app's own transactions included. With `autoSchema` on, boot creates the schema (`CREATE SCHEMA IF NOT EXISTS`) along with the tables. If the connection's role can't create it, boot fails with a message naming the schema and the grant it needs; create it once yourself (`CREATE SCHEMA "durable"`) and boot again. With `autoSchema: false`, the published migrations read the top-level `schema` from `config/durable.ts` when they run, create the schema, and put the tables in it. If you set `schema` on a single piece instead (`stores.lucid({ schema })`, `transports.db({ schema })`), put that value in the migration's `schema` constant.
+
+<Callout type="warn" title="Don't use searchPath for this">
+Don't point a Lucid connection's `searchPath` at the schema instead. Knex sends `SET search_path` on the session, and behind PgBouncer in transaction mode that setting leaks to other clients' connections. The `schema` option never changes the session.
+</Callout>
+
+- **MySQL / MariaDB:** `schema` is a database name (`` `durable`.`durable_workflow_runs` ``). Boot creates it with `CREATE DATABASE IF NOT EXISTS` when it creates the tables.
+- **SQLite:** has no schemas. Setting `schema` on a SQLite connection fails at boot.
+
+`node ace agora:doctor --deep` checks, when a `schema` is set, that the schema exists, that the durable tables are in it, and that the connection can write there.
+
 ## The repair warning
 
 `createDurableTables` is additive-only. When it finds a table that exists but is missing a column the current library writes, it adds the column with an `ALTER TABLE` — every added column is nullable or defaulted, so existing rows read back unchanged. When at least one such repair is actually applied, it logs a single warning:

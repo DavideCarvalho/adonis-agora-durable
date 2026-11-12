@@ -215,6 +215,7 @@ export default class DurableProvider {
 
       const ctx: TransportContext & StoreContext & ControlPlaneContext & AdmissionContext = {
         app: this.app,
+        ...(config.schema !== undefined ? { schema: config.schema } : {}),
       };
       // An absent namespace is the default pool on a standalone engine, and the operator (every pool)
       // only on a control plane: a standalone process sharing a store with other pools must never
@@ -468,6 +469,7 @@ export default class DurableProvider {
           app: this.app,
           partition: config.partition,
           ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
+          ...(config.schema !== undefined ? { schema: config.schema } : {}),
         });
         transport.useNamespace?.(config.namespace ?? 'default');
         // A transport whose behaviour depends on serving a store-less pod adapts to it here.

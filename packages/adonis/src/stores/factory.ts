@@ -33,6 +33,12 @@ export interface LucidStoreConfig {
    * prepared statements (PgBouncer in transaction mode before 1.21 does not). Default off.
    */
   preparedStatements?: boolean;
+  /**
+   * The database schema the durable tables live in (a database on MySQL): every statement names it,
+   * and `autoSchema` creates it. Defaults to the top-level `schema`, else the connection's current
+   * schema. Not supported on SQLite.
+   */
+  schema?: string;
 }
 
 /**
@@ -64,6 +70,9 @@ export const stores = {
         ...(config.collation !== undefined ? { collation: config.collation } : {}),
         ...(config.preparedStatements !== undefined
           ? { preparedStatements: config.preparedStatements }
+          : {}),
+        ...((config.schema ?? ctx.schema) !== undefined
+          ? { schema: config.schema ?? ctx.schema }
           : {}),
       });
     };

@@ -1,5 +1,12 @@
 import type { Database } from '@adonisjs/lucid/database';
 import type { QueryClientContract } from '@adonisjs/lucid/types/database';
+import {
+  assertSchemaSupported,
+  ensureSchemaExists,
+  hasColumn,
+  schemaBuilder,
+  validateSchemaName,
+} from '../sql-schema.js';
 import { widenMysqlLongtextColumns } from '../stores/lucid-schema.js';
 
 type AlterTableBuilder = Parameters<
@@ -9,12 +16,43 @@ type CreateTableBuilder = Parameters<
   Parameters<ReturnType<Database['connection']>['schema']['createTable']>[1]
 >[0];
 
-/**
- * A FRESH client on `connectionName` (the `Database` default connection when absent) per call, since
- * Knex's schema builder is stateful.
- */
-function connect(db: Database, connectionName: string | undefined): QueryClientContract {
-  return connectionName ? db.connection(connectionName) : db.connection();
+/** Options of the transport DDL helpers. */
+export interface TransportTablesOptions {
+  /**
+   * The database schema the tables live in (a database on MySQL), created when missing. Every
+   * statement names it. Omit for the connection's current schema. Not supported on SQLite.
+   */
+  schema?: string | undefined;
+}
+
+/** Where the DDL runs: a Lucid connection (the default one when absent) and a schema. */
+interface Target {
+  db: Database;
+  connectionName: string | undefined;
+  schema: string | undefined;
+}
+
+/** A {@link Target} from a helper's arguments, its schema validated against the connection. */
+function target(
+  db: Database,
+  connectionName: string | undefined,
+  options: TransportTablesOptions,
+  owner: string,
+): Target {
+  const schema = validateSchemaName(options.schema, owner);
+  const out = { db, connectionName, schema };
+  assertSchemaSupported(connect(out), schema, owner);
+  return out;
+}
+
+/** A FRESH client on the target's connection per call, since Knex's schema builder is stateful. */
+function connect(t: Target): QueryClientContract {
+  return t.connectionName ? t.db.connection(t.connectionName) : t.db.connection();
+}
+
+/** A fresh schema builder on the target's connection, scoped to its schema. */
+function ddl(t: Target): QueryClientContract['schema'] {
+  return schemaBuilder(connect(t), t.schema);
 }
 
 /**
@@ -23,17 +61,15 @@ function connect(db: Database, connectionName: string | undefined): QueryClientC
  * success. Only an error that leaves the table missing is rethrown.
  */
 async function createTableIfMissing(
-  db: Database,
-  connectionName: string | undefined,
+  t: Target,
   name: string,
   build: (table: CreateTableBuilder) => void,
 ): Promise<void> {
-  const schema = () => connect(db, connectionName).schema;
-  if (await schema().hasTable(name)) return;
+  if (await ddl(t).hasTable(name)) return;
   try {
-    await schema().createTable(name, build);
+    await ddl(t).createTable(name, build);
   } catch (err) {
-    if (!(await schema().hasTable(name))) throw err;
+    if (!(await ddl(t).hasTable(name))) throw err;
   }
 }
 
@@ -80,9 +116,19 @@ export const WORKER_KEYS_TABLE = 'durable_transport_worker_keys';
  * heartbeat keys a worker runtime advertises. The queue transport keeps its advertisement here without
  * the db transport's other tables.
  */
-export async function createWorkerKeysTable(db: Database, connectionName?: string): Promise<void> {
-  await createTableIfMissing(db, connectionName, WORKER_KEYS_TABLE, buildWorkerKeysTable);
-  await widenPayloadColumns(db, connectionName, [WORKER_KEYS_TABLE]);
+export async function createWorkerKeysTable(
+  db: Database,
+  connectionName?: string,
+  options: TransportTablesOptions = {},
+): Promise<void> {
+  const t = target(db, connectionName, options, 'createWorkerKeysTable');
+  await ensureSchemaExists(connect(t), t.schema);
+  await createWorkerKeysTableIn(t);
+}
+
+async function createWorkerKeysTableIn(t: Target): Promise<void> {
+  await createTableIfMissing(t, WORKER_KEYS_TABLE, buildWorkerKeysTable);
+  await widenPayloadColumns(t, [WORKER_KEYS_TABLE]);
 }
 
 /**
@@ -101,17 +147,13 @@ export const TRANSPORT_JSON_COLUMNS: Record<string, { columns: string[]; notNull
 };
 
 /** MySQL only: widen the {@link TRANSPORT_JSON_COLUMNS} of `tables` that are still `text`. */
-async function widenPayloadColumns(
-  db: Database,
-  connectionName: string | undefined,
-  tables: string[],
-): Promise<void> {
-  const client = connect(db, connectionName);
+async function widenPayloadColumns(t: Target, tables: string[]): Promise<void> {
+  const client = connect(t);
   if (client.dialect.name !== 'mysql') return;
   const spec = Object.fromEntries(
     tables.flatMap((t) => (TRANSPORT_JSON_COLUMNS[t] ? [[t, TRANSPORT_JSON_COLUMNS[t]]] : [])),
   );
-  await widenMysqlLongtextColumns(client, spec);
+  await widenMysqlLongtextColumns(client, spec, t.schema);
 }
 
 function buildWorkerKeysTable(table: CreateTableBuilder): void {
@@ -136,9 +178,12 @@ function buildWorkerKeysTable(table: CreateTableBuilder): void {
 export async function createDurableTransportTables(
   db: Database,
   connectionName?: string,
+  options: TransportTablesOptions = {},
 ): Promise<void> {
   // Knex's schema builder is stateful — createTableIfMissing takes a FRESH client's `schema`
   // per hasTable/createTable so each DDL statement executes exactly once.
+  const t = target(db, connectionName, options, 'createDurableTransportTables');
+  await ensureSchemaExists(connect(t), t.schema);
 
   for (const table of [
     TRANSPORT_TABLES.tasks,
@@ -146,24 +191,19 @@ export async function createDurableTransportTables(
     TRANSPORT_TABLES.heartbeats,
     TRANSPORT_TABLES.control,
   ]) {
-    await createTableIfMissing(
-      db,
-      connectionName,
-      table,
-      TRANSPORT_TABLE_DEFS[table] as TableBuild,
-    );
+    await createTableIfMissing(t, table, TRANSPORT_TABLE_DEFS[table] as TableBuild);
   }
 
-  await createMessagesTable(db, connectionName);
-  await createWorkerKeysTable(db, connectionName);
+  await createTableIfMissing(t, TRANSPORT_TABLES.messages, buildMessagesTable);
+  await createWorkerKeysTableIn(t);
 
   // Upgrade path: a deployment created by an older version already has these tables (so the guards
   // above skipped them) but lacks the columns added since. Back-fill them — idempotent via
   // `hasColumn`, and every added column is `notNullable` with a default, so legacy in-flight rows
   // read exactly as they did before.
-  await ensureAddedColumns(db, connectionName);
+  await ensureAddedColumns(t);
   // MySQL: a table created while the payload columns were `text` gets them widened to `longtext`.
-  await widenPayloadColumns(db, connectionName, Object.keys(TRANSPORT_JSON_COLUMNS));
+  await widenPayloadColumns(t, Object.keys(TRANSPORT_JSON_COLUMNS));
 }
 
 /**
@@ -172,8 +212,14 @@ export async function createDurableTransportTables(
  * consumer of the kind, else the instance id of the one it is for (a run reply, a tenant event, a
  * decision for the engine that dispatched the turn). `reply_to` carries a request's requester.
  */
-export async function createMessagesTable(db: Database, connectionName?: string): Promise<void> {
-  await createTableIfMissing(db, connectionName, TRANSPORT_TABLES.messages, buildMessagesTable);
+export async function createMessagesTable(
+  db: Database,
+  connectionName?: string,
+  options: TransportTablesOptions = {},
+): Promise<void> {
+  const t = target(db, connectionName, options, 'createMessagesTable');
+  await ensureSchemaExists(connect(t), t.schema);
+  await createTableIfMissing(t, TRANSPORT_TABLES.messages, buildMessagesTable);
 }
 
 function buildMessagesTable(table: CreateTableBuilder): void {
@@ -205,7 +251,7 @@ function buildMessagesTable(table: CreateTableBuilder): void {
  * - `kind` on the tasks table, `'step'` — what a row carries: a step, or a remote workflow turn; a
  *   legacy row is a step, the only kind there was.
  */
-async function ensureAddedColumns(db: Database, connectionName: string | undefined): Promise<void> {
+async function ensureAddedColumns(t: Target): Promise<void> {
   const added: Array<{ table: string; column: string; add: (t: AlterTableBuilder) => void }> = [
     ...Object.values(TRANSPORT_TABLES).map((table) => ({
       table,
@@ -237,12 +283,12 @@ async function ensureAddedColumns(db: Database, connectionName: string | undefin
     },
   ];
   for (const { table, column, add } of added) {
-    if (await connect(db, connectionName).schema.hasColumn(table, column)) continue;
+    if (await hasColumn(connect(t), t.schema, table, column)) continue;
     try {
-      await connect(db, connectionName).schema.alterTable(table, add);
+      await ddl(t).alterTable(table, add);
     } catch (err) {
       // Another instance added it first (the same race as createTableIfMissing).
-      if (!(await connect(db, connectionName).schema.hasColumn(table, column))) throw err;
+      if (!(await hasColumn(connect(t), t.schema, table, column))) throw err;
     }
   }
 }
@@ -328,12 +374,14 @@ export const TRANSPORT_TABLE_DEFS: Record<string, TableBuild> = {
   [WORKER_KEYS_TABLE]: buildWorkerKeysTable,
 };
 
-/** Drop every transport table. Used by tests and the migration `down`. */
+/** Drop every transport table (in `options.schema`, which is left). Used by tests and the migration `down`. */
 export async function dropDurableTransportTables(
   db: Database,
   connectionName?: string,
+  options: TransportTablesOptions = {},
 ): Promise<void> {
-  const conn = () => connect(db, connectionName).schema;
+  const t = target(db, connectionName, options, 'dropDurableTransportTables');
+  const conn = () => ddl(t);
   await conn().dropTableIfExists(WORKER_KEYS_TABLE);
   await conn().dropTableIfExists(TRANSPORT_TABLES.messages);
   await conn().dropTableIfExists(TRANSPORT_TABLES.control);

@@ -56,10 +56,10 @@ describe('the durable migration stub delegates instead of copying the DDL', () =
 
   it('calls createDurableTables in up() and dropDurableTables in down()', () => {
     expect(stub).toMatch(
-      /async up\(\)\s*\{\s*await createDurableTables\(db, this\.db\.connectionName\)/,
+      /async up\(\)\s*\{\s*await createDurableTables\(db, this\.db\.connectionName, \{ schema \}\)/,
     );
     expect(stub).toMatch(
-      /async down\(\)\s*\{\s*await dropDurableTables\(db, this\.db\.connectionName\)/,
+      /async down\(\)\s*\{\s*await dropDurableTables\(db, this\.db\.connectionName, \{ schema \}\)/,
     );
   });
 

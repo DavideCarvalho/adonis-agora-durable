@@ -118,6 +118,14 @@ export interface BaseDurableConfig {
    */
   autoSchema?: boolean;
   /**
+   * The database schema every durable table lives in (a database on MySQL): the Lucid store's, the
+   * db transport's and the worker-key table's, each of which can override it with its own `schema`.
+   * Every statement names it, so the app's connection keeps its own default schema; boot creates it
+   * when it creates the tables. Do NOT get the same effect with a connection `searchPath`: behind
+   * PgBouncer in transaction mode a `SET search_path` leaks to other clients. Not supported on SQLite.
+   */
+  schema?: string;
+  /**
    * Cross-instance broadcast for lifecycle events + cancellation. Omit for single-instance. Either a
    * ready {@link ControlPlane} instance, or a {@link ControlPlaneFactory} built with the
    * {@link controlPlanes} factory (e.g. `controlPlanes.redis({ connection: 'main' })`) so the peer
