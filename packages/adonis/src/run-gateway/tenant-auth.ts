@@ -139,41 +139,79 @@ function implementsMethod<T>(value: unknown, method: string): value is T {
   );
 }
 
+/**
+ * A class: one with the contract method on its prototype, or any `class` declaration (a contract whose
+ * method is an instance field, `verify = async () => ...`, has nothing on its prototype). The instance
+ * is checked for the method once built.
+ */
 function isContractClass<T>(value: unknown, method: string): value is ContractClass<T> {
-  return (
-    typeof value === 'function' &&
+  if (typeof value !== 'function') return false;
+  if (
     typeof (value as { prototype?: Record<string, unknown> }).prototype?.[method] === 'function'
-  );
+  ) {
+    return true;
+  }
+  return /^class[\s{]/.test(Function.prototype.toString.call(value));
 }
 
-/** The class or object a lazy import's module exports as default, if `value` is such a module. */
-function lazyDefault<T>(value: unknown, method: string): ContractClass<T> | T | undefined {
+/**
+ * The class or object a lazy import's module exports as default, or `undefined` when `value` is not a
+ * module (no `default` key). A module whose default export is neither throws: it is a misconfigured
+ * lazy import, and must never be mistaken for a result.
+ */
+function lazyDefault<T>(
+  value: unknown,
+  method: string,
+  contract: string,
+): ContractClass<T> | T | undefined {
   if (value === null || typeof value !== 'object' || !('default' in value)) return undefined;
   const candidate = (value as { default: unknown }).default;
   if (isContractClass<T>(candidate, method) || implementsMethod<T>(candidate, method)) {
     return candidate;
   }
-  return undefined;
+  throw new TypeError(
+    `the lazy import's default export must be a class implementing ${contract} (with a ${method}() method)`,
+  );
 }
 
 /**
- * One instance per contract class or lazy module, built on first use. A failed build is forgotten, so
- * the next call tries again instead of failing forever.
+ * One instance per contract class or lazy module, built on first use and checked for the contract's
+ * method. A failed build is forgotten, so the next call tries again instead of failing forever.
  */
 function memoizedInstance<T>(
   source: ContractClass<T> | T,
   make: ContractClassMaker,
+  method: string,
+  contract: string,
 ): () => Promise<T> {
   let instance: Promise<T> | undefined;
   return () => {
     instance ??= Promise.resolve(
       typeof source === 'function' ? make(source as ContractClass<T>) : source,
-    ).catch((err: unknown) => {
-      instance = undefined;
-      throw err;
-    });
+    )
+      .then((built) => {
+        if (!implementsMethod<T>(built, method)) {
+          throw new TypeError(`${contract} instance has no ${method}() method`);
+        }
+        return built;
+      })
+      .catch((err: unknown) => {
+        instance = undefined;
+        throw err;
+      });
     return instance;
   };
+}
+
+/** A verifier's answer, checked: `null` rejects, `{ tenant }` with a non-empty string accepts, and
+ *  anything else throws, so a malformed result can never be taken for an accepted tenant. */
+function checkVerified(result: unknown): VerifiedTenant | null {
+  if (result === null || result === undefined) return null;
+  const tenant = (result as { tenant?: unknown }).tenant;
+  if (typeof result === 'object' && typeof tenant === 'string' && tenant.length > 0) {
+    return result as VerifiedTenant;
+  }
+  throw new TypeError('`verifyTenant` must return { tenant: string, capabilities? } or null');
 }
 
 /**
@@ -189,12 +227,13 @@ export function resolveTenantVerifier(
   option: TenantVerifierOption,
   make: ContractClassMaker = construct,
 ): TenantVerifier {
+  const V = 'TenantVerifierContract';
   if (implementsMethod<TenantVerifierContract>(option, 'verify')) {
-    return (input) => option.verify(input);
+    return async (input) => checkVerified(await option.verify(input));
   }
   if (isContractClass<TenantVerifierContract>(option, 'verify')) {
-    const instance = memoizedInstance(option, make);
-    return async (input) => (await instance()).verify(input);
+    const instance = memoizedInstance(option, make, 'verify', V);
+    return async (input) => checkVerified(await (await instance()).verify(input));
   }
   if (typeof option !== 'function') {
     throw new TypeError(
@@ -204,14 +243,14 @@ export function resolveTenantVerifier(
   const fn = option as (input: TenantVerifierInput) => unknown;
   let lazy: (() => Promise<TenantVerifierContract>) | undefined;
   return async (input) => {
-    if (lazy) return (await lazy()).verify(input);
+    if (lazy) return checkVerified(await (await lazy()).verify(input));
     const result = await fn(input);
-    const source = lazyDefault<TenantVerifierContract>(result, 'verify');
+    const source = lazyDefault<TenantVerifierContract>(result, 'verify', V);
     if (source !== undefined) {
-      lazy ??= memoizedInstance(source, make);
-      return (await lazy()).verify(input);
+      lazy ??= memoizedInstance(source, make, 'verify', V);
+      return checkVerified(await (await lazy()).verify(input));
     }
-    return result as VerifiedTenant | null;
+    return checkVerified(result);
   };
 }
 
@@ -225,11 +264,12 @@ export function resolveTenantToken(
   make: ContractClassMaker = construct,
 ): TenantTokenSource {
   if (typeof option === 'string') return option;
+  const C = 'TenantCredentialsContract';
   if (implementsMethod<TenantCredentialsContract>(option, 'token')) {
     return () => option.token();
   }
   if (isContractClass<TenantCredentialsContract>(option, 'token')) {
-    const instance = memoizedInstance(option, make);
+    const instance = memoizedInstance(option, make, 'token', C);
     return async () => (await instance()).token();
   }
   if (typeof option !== 'function') {
@@ -242,9 +282,9 @@ export function resolveTenantToken(
   return async () => {
     if (lazy) return (await lazy()).token();
     const result = await fn();
-    const source = lazyDefault<TenantCredentialsContract>(result, 'token');
+    const source = lazyDefault<TenantCredentialsContract>(result, 'token', C);
     if (source !== undefined) {
-      lazy ??= memoizedInstance(source, make);
+      lazy ??= memoizedInstance(source, make, 'token', C);
       return (await lazy()).token();
     }
     return result as string;

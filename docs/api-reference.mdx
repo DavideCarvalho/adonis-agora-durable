@@ -417,7 +417,7 @@ const detail = await runGateway.getRunDetail?.(runId, { summarizeFansOver: 50 })
 | `hmacTenantVerifier` | `hmacTenantVerifier(secret: string \| string[], capabilities?: string[]): TenantVerifier` | The matching `verifyTenant`. A list of secrets allows rotation. See [Authenticate tenants](/docs/durable/cluster/authenticate-tenants#with-a-shared-secret-hmac). |
 | `TenantVerifierContract` | `interface { verify(input: TenantVerifierInput): VerifiedTenant \| null \| Promise<VerifiedTenant \| null> }` | The class form of `verifyTenant`. `TenantVerifierInput` is `{ token?: string; tenant?: string }`; `VerifiedTenant` is `{ tenant: string; capabilities?: string[] }`. See [Authenticate tenants](/docs/durable/cluster/authenticate-tenants#the-contracts). |
 | `TenantCredentialsContract` | `interface { token(): string \| Promise<string> }` | The class form of `tenant.token`. |
-| `resolveTenantVerifier` / `resolveTenantToken` | `resolveTenantVerifier(option: TenantVerifierOption, make?): TenantVerifier` / `resolveTenantToken(option: TenantTokenOption, make?): string \| (() => Promise<string>)` | Turn any accepted form into the function a hand-built `RunRequestResponder` / `ProxyRunGateway` takes. `make` builds classes (default `new Class()`; the provider passes the container). |
+| `resolveTenantVerifier` / `resolveTenantToken` | `resolveTenantVerifier(option: TenantVerifierOption, make?): TenantVerifier` / `resolveTenantToken(option: TenantTokenOption, make?): string \| (() => string \| Promise<string>)` | Turn any accepted form into the function a hand-built `RunRequestResponder` / `ProxyRunGateway` takes. `make` builds classes (default `new Class()`; the provider passes the container). |
 
 ## Run detail and fan types
 

@@ -214,3 +214,48 @@ describe('config types accept every form', () => {
     expect(true).toBe(true);
   });
 });
+
+describe('malformed forms fail closed with a clear error', () => {
+  class FieldVerifier {
+    verify = async ({ token }: TenantVerifierInput) => (token === 'ok' ? { tenant: 'acme' } : null);
+  }
+  class FieldCredentials {
+    token = () => 'field-token';
+  }
+
+  it('a contract class whose method is an instance field is built, not called', async () => {
+    const verify = resolveTenantVerifier(FieldVerifier);
+    expect(await verify({ token: 'ok' })).toEqual({ tenant: 'acme' });
+    expect(await verify({ token: 'no' })).toBeNull();
+    const token = resolveTenantToken(FieldCredentials) as () => Promise<string>;
+    expect(await token()).toBe('field-token');
+  });
+
+  it('a class without the method throws instead of being called as a function', async () => {
+    class Empty {}
+    await expect(resolveTenantVerifier(Empty as never)({ token: 't' })).rejects.toThrow(
+      /no verify\(\) method/,
+    );
+  });
+
+  it('a lazy import whose default export is not a contract throws; it is never an acceptance', async () => {
+    const verify = resolveTenantVerifier(
+      async () => ({ default: () => ({ tenant: 'x' }) }) as never,
+    );
+    await expect(verify({ token: 't' })).rejects.toThrow(/default export must be a class/);
+    const token = resolveTenantToken(
+      async () => ({ default: 'nope' }) as never,
+    ) as () => Promise<string>;
+    await expect(token()).rejects.toThrow(/default export must be a class/);
+  });
+
+  it('a verifier result without a string tenant throws instead of being accepted', async () => {
+    await expect(resolveTenantVerifier(() => ({}) as never)({ token: 't' })).rejects.toThrow(
+      /must return/,
+    );
+    await expect(
+      resolveTenantVerifier({ verify: () => ({ tenant: '' }) })({ token: 't' }),
+    ).rejects.toThrow(/must return/);
+    expect(await resolveTenantVerifier(() => undefined as never)({ token: 't' })).toBeNull();
+  });
+});
