@@ -621,6 +621,53 @@ A live heartbeat proves the worker *process* is alive, not that the step is prog
 - **Broker bridge (BullMQ and queue)** — when a task job reaches a terminal `failed` state with no result (its worker crashed, or it stalled past the broker's stalled-count limit), the transport publishes a retryable failed result for the step, so the engine settles the checkpoint and its normal retry re-dispatches. That bridge lives in the consumer: a worker on another SDK that does not implement it still leaves the step `pending`.
 - **Self-heal** — set `remoteRedispatchMs` (and optionally `remoteRedispatchMax`, default `10`) in `config/durable.ts`, and a reconcile pass re-dispatches a remote step still `pending` past the window by itself, recording a `warn`-level `step.redispatched` event on the checkpoint; the `step.started` event of that re-drive carries `redispatched: true`, so an alert can tell "re-driven after a lost worker" apart from "retried after a failure". Once the bound is spent, the step fails with `remote_step_lost`. This is off by default. See [Failure modes](/docs/durable/reliability/failure-modes#lost-remote-dispatch-the-run-suspends-and-nothing-auto-redrives-it) for the window-sizing rules.
 
+## Switching between consoles
+
+When the app has other Agora consoles (telescope, payments, media, the agent console, the authkit
+admin), the durable brand at the top left becomes a menu that links to them. It lists only the
+consoles the current viewer may open: each one is asked through its own `authorize`. With no other
+console, or none this viewer may open, the brand stays as it is. There is nothing to configure.
+
+<kbd>Ctrl</kbd>/<kbd>⌘</kbd> + <kbd>K</kbd> opens a search across those consoles: a run id opens
+the run, a workflow name opens the workflow's page, and the other consoles answer with their own
+hits (payments, users, entries).
+
+The menu runs the other consoles' `authorize` on each page load. If yours writes an audit trail,
+skip it for these checks: the request carries `ctx.agoraProbe === true` while they run.
+
+```ts title="app/policies/console_access.ts"
+export default class ConsoleAccess {
+  async authorize(ctx: HttpContext) {
+    const allowed = ctx.auth.user?.isAdmin === true
+    if (!(ctx as { agoraProbe?: boolean }).agoraProbe) await audit.record('console.open', ctx)
+    return allowed
+  }
+}
+```
+
+A console your app mounts by itself can join the menu with `registerAgoraConsole` from a provider's
+`boot()`:
+
+```ts title="providers/reports_provider.ts"
+import type { ApplicationService } from '@adonisjs/core/types'
+import { registerAgoraConsole } from '@adonis-agora/durable/dashboard'
+
+export default class ReportsProvider {
+  constructor(protected app: ApplicationService) {}
+
+  async boot() {
+    await registerAgoraConsole(this.app.container, {
+      id: 'reports',
+      title: 'Reports',
+      icon: 'generic',
+      path: '/reports',
+      order: 60,
+      authorize: async (ctx) => ({ allowed: ctx.auth.user?.isAdmin === true }),
+    })
+  }
+}
+```
+
 ## MCP tools
 
 When the app registers `@adonis-agora/agent/mcp_provider`, the console's data is also served to coding agents (Claude Code, Cursor, Claude Desktop) on the app's dev MCP endpoint, `/mcp/agora`. There is nothing to configure here: the tools follow this console's `authorize`, so whoever can open the console can use them, and nobody else. A disabled console (`enabled: false`) serves no tools. The [agent docs](/docs/agent/dev-tools) show how to connect a client.

@@ -41,6 +41,16 @@ export interface InjectedConfig {
   base: string;
   /** JSON API base (`/durable/api`). */
   api: string;
+  /** The console switcher, present only when other Agora consoles are registered in the app. */
+  switcher?: SwitcherConfig;
+}
+
+/** Where the SPA asks which other consoles the viewer may open, and how many are registered. */
+export interface SwitcherConfig {
+  /** `GET` it for the consoles the viewer may open; `<endpoint>/search?q=` searches them. */
+  endpoint: string;
+  /** Registered consoles other than this one (before any `authorize` runs). */
+  others: number;
 }
 
 /**
@@ -58,9 +68,18 @@ export interface InjectedConfig {
  * failure looked like a routing bug rather than a policy one. The globals are still read by the
  * client as a fallback (tests, hand-embedding), but this is no longer how the provider speaks.
  */
-export function renderIndexHtml(html: string, basePath: string, apiBasePath: string): string {
+export function renderIndexHtml(
+  html: string,
+  basePath: string,
+  apiBasePath: string,
+  extra: { switcher?: SwitcherConfig } = {},
+): string {
   const based = html.split(BASE_PLACEHOLDER).join(`${basePath}/`);
-  const config: InjectedConfig = { base: basePath, api: apiBasePath };
+  const config: InjectedConfig = {
+    base: basePath,
+    api: apiBasePath,
+    ...(extra.switcher && extra.switcher.others > 0 ? { switcher: extra.switcher } : {}),
+  };
   // `<` escaped as `\u003c` inside the JSON: a data block ends at the first `</script`, and a
   // config value must not be able to close it early. Valid JSON either way.
   const json = JSON.stringify(config).replace(/</g, '\\u003c');
