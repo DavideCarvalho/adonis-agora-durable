@@ -1,3 +1,4 @@
+import type { TenantTokenSource } from '../config_types.js';
 import { childIdsOf } from '../fan-join.js';
 import type {
   EngineEvent,
@@ -98,8 +99,9 @@ export interface ProxyRunGatewayOptions {
    * {@link StartRunMessage}. The responder verifies it and DERIVES the real tenant from it, ignoring
    * the body (spec §9). Omit to run token-less on prefix/network isolation alone (aviary-compatible) —
    * then the raw `partition` travels in the `tenant` field and the responder trusts it directly.
+   * A function is called before every request and its result sent as-is; it owns its own caching.
    */
-  token?: string | undefined;
+  token?: TenantTokenSource | undefined;
   /** Round-trip timeout (ms) for a proxied read/control/start. Default 10_000. Spec §8: on timeout the
    *  proxy fails fast with a clear error rather than hanging a request forever. */
   requestTimeoutMs?: number | undefined;
@@ -147,7 +149,7 @@ interface PendingReply {
 export class ProxyRunGateway implements RunGateway {
   readonly #transport: ProxyTransport;
   readonly #partition: string;
-  readonly #wireTenant: string;
+  readonly #wireTenant: TenantTokenSource;
   readonly #timeoutMs: number;
   readonly #pending = new Map<string, PendingReply>();
   readonly #capabilityTtlMs: number;
@@ -209,11 +211,23 @@ export class ProxyRunGateway implements RunGateway {
     });
   }
 
+  /** The value of the wire `tenant` field for the next request: the static token or partition, or
+   *  what the token function returns now. A failing or empty function result fails the request. */
+  async #tenantClaim(): Promise<string> {
+    const source = this.#wireTenant;
+    if (typeof source === 'string') return source;
+    const token = await source();
+    if (typeof token !== 'string' || token.length === 0) {
+      throw new Error('durable tenant token function returned no token');
+    }
+    return token;
+  }
+
   /** Publish a read/control {@link RunRequest} with a freshly minted `requestId` and await its reply. */
   #request<T>(body: RunRequestKind): Promise<T> {
     const requestId = globalThis.crypto.randomUUID();
-    return this.#awaitReply<T>(requestId, body.kind, () =>
-      this.#transport.dispatchRunRequest({ requestId, tenant: this.#wireTenant, body }),
+    return this.#awaitReply<T>(requestId, body.kind, async () =>
+      this.#transport.dispatchRunRequest({ requestId, tenant: await this.#tenantClaim(), body }),
     );
   }
 
@@ -325,8 +339,8 @@ export class ProxyRunGateway implements RunGateway {
    */
   start(workflow: WorkflowRef, input: unknown, opts?: StartRunOptions): Promise<RunResult> {
     const runId = opts?.runId ?? globalThis.crypto.randomUUID();
-    const msg: StartRunMessage = {
-      tenant: this.#wireTenant,
+    const msg = (tenant: string): StartRunMessage => ({
+      tenant,
       // A `WorkflowRef` is a class or a string; the wire carries the registered NAME. The engine's
       // string overload accepts both at runtime, so resolve to the string form on the wire.
       workflow: workflow as string,
@@ -334,8 +348,10 @@ export class ProxyRunGateway implements RunGateway {
       runId,
       ...(opts?.tags !== undefined ? { tags: opts.tags } : {}),
       ...(opts?.searchAttributes !== undefined ? { searchAttributes: opts.searchAttributes } : {}),
-    };
-    return this.#awaitReply<RunResult>(runId, 'start', () => this.#transport.dispatchStartRun(msg));
+    });
+    return this.#awaitReply<RunResult>(runId, 'start', async () =>
+      this.#transport.dispatchStartRun(msg(await this.#tenantClaim())),
+    );
   }
 
   signal(runId: string, signal: string, payload?: unknown): Promise<RunResult | null> {

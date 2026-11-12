@@ -22,6 +22,8 @@ import {
   registerStepsFromDir,
   registerWorkflowsFromBarrel,
   registerWorkflowsFromDir,
+  resolveTenantToken,
+  resolveTenantVerifier,
   type StateStore,
   type StepServer,
   type StepsBarrel,
@@ -162,7 +164,11 @@ export default class DurableProvider {
         const transport = this.#transport;
         if (!hasResponderCapability(transport)) return null;
         const gateway = await this.app.container.make(DURABLE_RUN_GATEWAY);
-        const verifyTenant = (config as ControlPlaneConfig).verifyTenant;
+        const verifyOption = (config as ControlPlaneConfig).verifyTenant;
+        // Classes (and lazy-imported ones) are built through the container, so `@inject()` works.
+        const verifyTenant = verifyOption
+          ? resolveTenantVerifier(verifyOption, (Class) => this.app.container.make(Class))
+          : undefined;
         return new RunRequestResponder(transport, gateway, {
           ...(verifyTenant ? { verifyTenant } : {}),
           // Only an explicit control plane is a tenant deployment; a standalone app boots quietly.
@@ -396,7 +402,13 @@ export default class DurableProvider {
       }
       return new ProxyRunGateway(transport, {
         partition: config.partition,
-        ...(config.tenant?.token !== undefined ? { token: config.tenant.token } : {}),
+        ...(config.tenant?.token !== undefined
+          ? {
+              token: resolveTenantToken(config.tenant.token, (Class) =>
+                this.app.container.make(Class),
+              ),
+            }
+          : {}),
         ...(config.requestTimeoutMs !== undefined
           ? { requestTimeoutMs: config.requestTimeoutMs }
           : {}),

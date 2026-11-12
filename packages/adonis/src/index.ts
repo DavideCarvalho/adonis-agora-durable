@@ -51,7 +51,13 @@ export type {
   ControlPlaneConfig,
   StandaloneConfig,
   TenantConfig,
+  TenantCredentialsContract,
+  TenantTokenOption,
+  TenantTokenSource,
   TenantVerifier,
+  TenantVerifierContract,
+  TenantVerifierInput,
+  TenantVerifierOption,
   VerifiedTenant,
 } from './config_types.js';
 export * from './control-flow-signal.js';
@@ -127,7 +133,13 @@ export {
   StoreRunGateway,
   type StoreRunGatewayOptions,
 } from './run-gateway/store-run-gateway.js';
-export { hmacTenantVerifier, signTenantToken } from './run-gateway/tenant-auth.js';
+export {
+  type ContractClassMaker,
+  hmacTenantVerifier,
+  resolveTenantToken,
+  resolveTenantVerifier,
+  signTenantToken,
+} from './run-gateway/tenant-auth.js';
 export * from './run-pagination.js';
 export * from './run-value-facets.js';
 export * from './run-waiting.js';

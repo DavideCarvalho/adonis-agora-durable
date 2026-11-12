@@ -105,7 +105,11 @@ describe('tenant pod with a top-level partition only (provider-built transport)'
     return { store, cpTransport };
   }
 
-  async function tenantPod(adapter: MockAdapter, transportPartition?: string) {
+  async function tenantPod(
+    adapter: MockAdapter,
+    transportPartition?: string,
+    token: string | (() => string | Promise<string>) = signTenantToken('acme', SECRET),
+  ) {
     const { app, container } = makeApp({
       topology: 'tenant',
       transport: 'queue',
@@ -120,7 +124,7 @@ describe('tenant pod with a top-level partition only (provider-built transport)'
       },
       partition: 'acme',
       instanceId: 'acme-pod',
-      tenant: { token: signTenantToken('acme', SECRET) },
+      tenant: { token },
       requestTimeoutMs: 2000,
     } as DurableConfig);
     const provider = new DurableProvider(app);
@@ -155,6 +159,28 @@ describe('tenant pod with a top-level partition only (provider-built transport)'
     // The pod advertises its partitioned group, not the bare one.
     await until(async () => (await cpTransport.listWorkerGroups()).includes('charge@acme'));
     expect(await cpTransport.listWorkerGroups()).not.toContain('charge');
+  });
+
+  it('takes the tenant token from a function in config/durable.ts, called on every request', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const adapter = new MockAdapter();
+    const { store } = controlPlane(adapter);
+    let calls = 0;
+    const { proxy, runtime } = await tenantPod(adapter, undefined, async () => {
+      calls++;
+      return signTenantToken('acme', SECRET);
+    });
+    runtime.handle('charge', async () => ({ ref: 'ch_fn' }));
+    void runtime.start();
+    cleanups.push(() => runtime.stop());
+
+    const started = await proxy.start('checkout', { amount: 1 });
+    await until(async () => terminal(await store.getRun(started.runId)));
+    expect(await proxy.getRun(started.runId)).toMatchObject({
+      status: 'completed',
+      namespace: 'acme',
+    });
+    expect(calls).toBe(2);
   });
 
   it('an explicit transport-level partition still wins over the top-level one', async () => {
