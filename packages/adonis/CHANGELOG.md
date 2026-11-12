@@ -1,5 +1,17 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.13
+
+### Minor Changes
+
+- [#506](https://github.com/DavideCarvalho/adonis-agora-durable/pull/506) [`affd693`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/affd693c87166eca0f0782531355029e96025a39) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `node ace agora:doctor`: one health check for every installed `@adonis-agora` lib, with `--json`, `--lib`, `--deep`, `--only`, `--strict`, `--verbose` and `--no-boot`; exit `0` (no error), `1` (an error, or a warning with `--strict`) or `2` (the doctor could not run). `node ace durable:doctor` runs durable's checks only: `durable.config`, `durable.verify-tenant`, `durable.tenant-token`, `durable.cron-parser`, `durable.store-tables` (`--deep`), `durable.console-gate`, plus `durable.peers` and `durable.agora-siblings`. New `@adonis-agora/durable/doctor` entry with the checks, read by `--no-boot`.
+
+- [#505](https://github.com/DavideCarvalho/adonis-agora-durable/pull/505) [`4f26653`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/4f26653ca10b7dde113a898a8c9d19f7ecdf3e44) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The durable console joins the Agora console switcher. It registers itself in the app's `'agora.consoles'` registry (created by whichever console boots first), and its brand becomes a menu to the other Agora consoles the viewer may open, each checked with that console's own `authorize` (300 ms each, in parallel; `ctx.agoraProbe` is `true` while they run). Ctrl/Cmd-K searches every console the viewer may open; durable answers run ids and workflow names. New routes: `GET <path>/api/consoles` and `GET <path>/api/consoles/search?q=`, behind the console's `authorize`. `registerAgoraConsole` is exported from `@adonis-agora/durable/dashboard` for consoles an app mounts itself. Nothing changes for an app with a single console.
+
+- [#504](https://github.com/DavideCarvalho/adonis-agora-durable/pull/504) [`fcee542`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/fcee542faa575256b6e087c7efd0d5c457177fa6) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The durable console now serves its data to coding agents on the app's dev MCP endpoint (`/mcp/agora`) when the app registers `@adonis-agora/agent/mcp_provider`. Fourteen `durable_*` tools, gated by the console's own `authorize`: reads (`durable_list_runs`, `durable_get_run`, `durable_list_fan_members`, `durable_count_runs_by`, `durable_get_health`, `durable_list_workers`, `durable_list_schedules`, `durable_get_run_event`) are listed by default and go through the console's `redact` hooks; actions (`durable_retry_run`, `durable_cancel_run`, `durable_continue_run`, `durable_signal_run`, `durable_trigger_schedule`, `durable_pause_schedule`) only when the app opts in, and are recorded by the console's `audit` hook with the actor `mcp:<caller>`. No configuration in this package.
+  
+  New `anyAuthorize(...authorizers)` in `@adonis-agora/durable/dashboard`: allows a request when any of the given `authorize` forms does, e.g. a console token for MCP clients or a signed-in admin.
+
 ## 1.0.0-rc.12
 
 ### Minor Changes
