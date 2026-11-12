@@ -28,6 +28,7 @@ export type {
 } from './console_authorize.js';
 // The shared console `authorize` contract (function, class, lazy import).
 export {
+  anyAuthorize,
   authorizeByToken,
   normalizeConsoleDecision,
   resolveConsoleAuthorize,
@@ -48,6 +49,20 @@ export {
   normalizeAuthorizeResult,
   resolveConfig,
 } from './define_config.js';
+export type {
+  DevTool,
+  DevToolAuditEntry,
+  DevToolCall,
+  DevToolInputProperty,
+  DevToolInputSchema,
+  DevToolsCaller,
+  DevToolsDecision,
+  DevToolsHub,
+  DevToolsLib,
+  DurableDevToolsOptions,
+} from './dev_tools.js';
+// Developer tools for the app's dev MCP endpoint (`@adonis-agora/agent`), when it has one.
+export { DEV_TOOLS_BINDING, durableDevTools, registerDurableDevTools } from './dev_tools.js';
 export type { EngineEventSource, RecordedBlock } from './diagnostics-recorder.js';
 export { BlockedDiagnosticsRecorder } from './diagnostics-recorder.js';
 export type { DashboardContainer } from './gateway-adapter.js';
