@@ -150,7 +150,9 @@ export default class DashboardProvider {
   }
 
   async boot() {
-    await registerDoctorChecks(this.app.container, durableConsoleDoctorChecks);
+    await registerDoctorChecks(this.app.container, durableConsoleDoctorChecks).catch(
+      () => undefined,
+    );
     const config = resolveConfig(
       this.app.config.get<DurableDashboardConfig>('durable_dashboard', {}),
       { inProduction: this.app.inProduction },

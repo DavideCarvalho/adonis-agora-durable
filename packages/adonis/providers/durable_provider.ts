@@ -489,7 +489,7 @@ export default class DurableProvider {
   async boot() {
     // `node ace agora:doctor` reads these after boot. Registered here rather than in `register()`,
     // which AdonisJS does not await.
-    await registerDoctorChecks(this.app.container, durableDoctorChecks);
+    await registerDoctorChecks(this.app.container, durableDoctorChecks).catch(() => undefined);
     // A warmed-up app (`node ace codegen` & co. — `app.boot()` + `app.warmUp()`, then `terminate()`)
     // never starts, so its providers' `shutdown()` never runs. Resolving the engine here would build
     // the transport and store — opening the broker / Redis / database connections nothing would ever

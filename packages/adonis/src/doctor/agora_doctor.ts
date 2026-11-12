@@ -87,6 +87,9 @@ export async function registerDoctorChecks(
   container: ContainerLike,
   checks: readonly AgoraDoctorCheck[],
 ): Promise<void> {
+  // A container without value bindings (a test double) has nowhere to keep them.
+  if (typeof container.hasBinding !== 'function' || typeof container.bindValue !== 'function')
+    return;
   if (!container.hasBinding(AGORA_DOCTOR_BINDING)) {
     const fresh: AgoraDoctorRegistry = { version: 1, checks: [] };
     container.bindValue(AGORA_DOCTOR_BINDING, fresh);
