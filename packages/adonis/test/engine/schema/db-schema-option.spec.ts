@@ -350,6 +350,12 @@ describe('schema option: what it refuses', () => {
       await expect(
         createDurableTransportTables(db, undefined, { schema: 'durable' }),
       ).rejects.toThrow(message);
+      await expect(dropDurableTables(db, undefined, { schema: 'durable' })).rejects.toThrow(
+        message,
+      );
+      await expect(
+        dropDurableTransportTables(db, undefined, { schema: 'durable' }),
+      ).rejects.toThrow(message);
       const ctx = { app: { container: { make: async () => db } }, schema: 'durable' } as never;
       await expect(stores.lucid()(ctx)).rejects.toThrow(message);
       await expect(transports.db()(ctx)).rejects.toThrow(message);

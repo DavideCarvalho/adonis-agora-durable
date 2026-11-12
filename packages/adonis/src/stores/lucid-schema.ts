@@ -797,6 +797,7 @@ export async function dropDurableTables(
   options: { schema?: string | undefined } = {},
 ): Promise<void> {
   const schema = validateSchemaName(options.schema, 'dropDurableTables');
+  assertSchemaSupported(db.connection(connectionName), schema, 'dropDurableTables');
   const conn = () => schemaBuilder(db.connection(connectionName), schema);
   await conn().dropTableIfExists(DURABLE_SCHEMA_META_TABLE);
   await conn().dropTableIfExists(DURABLE_TABLES.schedules);

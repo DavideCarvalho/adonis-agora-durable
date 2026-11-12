@@ -21,11 +21,13 @@ const inSchema = (name: string) => (schema ? \`\${schema}.\${name}\` : name)
 export default class extends BaseSchema {
   async up() {
     if (schema) {
-      this.schema.raw(
-        this.db.dialect.name === 'mysql'
-          ? \`create database if not exists \\\`\${schema}\\\`\`
-          : \`create schema if not exists "\${schema}"\`
-      )
+      // Runs before the tables below (calls run in order); \`??\` quotes the name as an identifier.
+      this.defer(async (db) => {
+        await db.rawQuery(
+          db.dialect.name === 'mysql' ? 'create database if not exists ??' : 'create schema if not exists ??',
+          [schema]
+        )
+      })
     }
     this.schema.createTable(inSchema('durable_transport_worker_keys'), (table) => {
       table.string('key', 512).primary()
