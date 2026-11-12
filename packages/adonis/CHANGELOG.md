@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.15
+
+### Patch Changes
+
+- [#511](https://github.com/DavideCarvalho/adonis-agora-durable/pull/511) [`13b6776`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/13b6776c58db0f3b776984e8206a6e4e95d48c41) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The db transport's `autoCreate`, the Lucid worker-key store and `createDurableTransportTables` / `dropDurableTransportTables` now create and drop the transport tables on the configured connection (`connection` / `connectionName` / `workerKeysConnection`) instead of always on the default one. The two helpers take an optional `connectionName` second argument, like `createDurableTables`.
+
 ## 1.0.0-rc.14
 
 ### Minor Changes
