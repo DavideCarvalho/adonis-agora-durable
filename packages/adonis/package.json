@@ -1,7 +1,7 @@
 {
   "name": "@adonis-agora/durable",
   "version": "1.0.0-rc.12",
-  "description": "Durable cross-app workflows for AdonisJS — deterministic replay engine, AdonisJS binding, ace commands, dashboard, OpenTelemetry, Telescope, testing harness and Redis admission, all in one package. Part of the Agora ecosystem.",
+  "description": "Durable cross-app workflows for AdonisJS \u2014 deterministic replay engine, AdonisJS binding, ace commands, dashboard, OpenTelemetry, Telescope, testing harness and Redis admission, all in one package. Part of the Agora ecosystem.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -111,6 +111,11 @@
       "import": "./dist/src/diagnostics/index.js",
       "default": "./dist/src/diagnostics/index.js"
     },
+    "./doctor": {
+      "types": "./dist/src/doctor/index.d.ts",
+      "import": "./dist/src/doctor/index.js",
+      "default": "./dist/src/doctor/index.js"
+    },
     "./commands": {
       "types": "./dist/commands/main.d.ts",
       "import": "./dist/commands/main.js",
@@ -137,7 +142,8 @@
     "prepack": "pnpm run build",
     "test": "vitest run --passWithNoTests",
     "test:watch": "vitest",
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.tests.json"
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.tests.json",
+    "check:agora-doctor": "node ../../scripts/check-agora-doctor.mjs ."
   },
   "dependencies": {
     "@adonis-agora/filter": ">=0.11.2 <2.0.0 || >=1.0.0-rc.0 <2.0.0"

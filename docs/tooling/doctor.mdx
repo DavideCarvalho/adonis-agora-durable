@@ -1,0 +1,68 @@
+---
+title: Health check
+description: node ace agora:doctor checks the configuration of every installed Agora lib, durable included, and exits non-zero when something is wrong. Run it locally or as a CI step.
+icon: Stethoscope
+---
+
+`node ace agora:doctor` checks how every installed `@adonis-agora` lib is configured in your app and
+tells you what to change. `node ace durable:doctor` runs durable's checks only.
+
+```sh
+node ace agora:doctor
+```
+
+```
+@adonis-agora doctor · production · 3 libs · 18 checks
+
+durable 1.0.0
+  ✔ Config is valid
+  ✖ Control plane verifies tenants
+    topology is 'control-plane' and verifyTenant is not set: any caller can act as a tenant.
+    fix: Set `verifyTenant` in config/durable.ts (hmacTenantVerifier or an authkit verifier).
+  ! Console access in production
+    The console has no authorize: it denies every request in production.
+
+18 checks: 15 ok · 1 warn · 2 error
+```
+
+## Flags
+
+| Flag | What it does |
+| --- | --- |
+| `--json` | Prints one JSON object to stdout (`version`, `env`, `summary`, `libs`, `results`). |
+| `--lib=durable,payments` | Only these libs. |
+| `--deep` | Also runs the checks that touch the database, Redis or the network. |
+| `--only=durable.verify-tenant` | One check, by id. |
+| `--strict` | Warnings fail the run too. |
+| `--verbose` | Shows skipped checks and every message. |
+| `--no-boot` | Checks the config files without booting the providers, for when the app does not boot. |
+
+Exit codes: `0` when nothing is an error, `1` when a check failed (or warned, with `--strict`), `2`
+when the doctor itself could not run (an unknown `--only`, libs from different releases, or an app
+that does not boot: fix the boot error, or run with `--no-boot`).
+
+## In CI
+
+```yaml title=".github/workflows/ci.yml"
+- run: node ace agora:doctor --json --strict
+  env:
+    NODE_ENV: production
+```
+
+Run it with `NODE_ENV=production` so the checks that are stricter in production (console access,
+tenant verification) apply.
+
+## Durable's checks
+
+| Id | Checks |
+| --- | --- |
+| `durable.config` | `config/durable.ts` loads, its `topology` is valid, `store` and `transport` name configured entries. |
+| `durable.verify-tenant` | A `control-plane` sets `verifyTenant` (warning locally, error in production). |
+| `durable.tenant-token` | A `tenant` pod sets `tenant.token`. |
+| `durable.cron-parser` | Cron schedules have `cron-parser` 5 installed. |
+| `durable.store-tables` | With `autoSchema: false`, the durable tables exist (`--deep`). |
+| `durable.console-gate` | The console sets `authorize` (warning locally, error in production). |
+| `durable.peers` | Every peer dependency installed is in its supported range. |
+| `durable.agora-siblings` | No 0.x Agora lib is installed next to a 1.x one. |
+
+Check ids do not change within 1.x, so you can use them in `--only` and in CI allow-lists.

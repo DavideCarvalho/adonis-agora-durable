@@ -7,6 +7,8 @@ import type { ControlPlaneContext } from '../src/control-planes/factory.js';
 import type { DurableConfig } from '../src/define_config.js';
 import { stopDiagnosticsDeliveries } from '../src/diagnostics/transport.js';
 import { discoveryRoots, type RootedBarrel } from '../src/discovery-roots.js';
+import { registerDoctorChecks } from '../src/doctor/agora_doctor.js';
+import { durableDoctorChecks } from '../src/doctor/checks.js';
 import { parseDuration } from '../src/duration.js';
 import { attachEventTriggerBridge, type EmitterLike } from '../src/event-trigger-bridge.js';
 import {
@@ -485,6 +487,9 @@ export default class DurableProvider {
    * container-bound {@link WorkerRuntime} from the `durable:worker` command instead).
    */
   async boot() {
+    // `node ace agora:doctor` reads these after boot. Registered here rather than in `register()`,
+    // which AdonisJS does not await.
+    await registerDoctorChecks(this.app.container, durableDoctorChecks).catch(() => undefined);
     // A warmed-up app (`node ace codegen` & co. — `app.boot()` + `app.warmUp()`, then `terminate()`)
     // never starts, so its providers' `shutdown()` never runs. Resolving the engine here would build
     // the transport and store — opening the broker / Redis / database connections nothing would ever
