@@ -184,16 +184,17 @@ describe('runAgoraDoctor', () => {
     ];
     const byLib = await runAgoraDoctor(fakeApp(root), checks, { libs: ['payments'] });
     expect(new Set(byLib.report.results.map((r) => r.lib))).toEqual(new Set(['payments']));
+    // Without --deep the deep check is listed as skipped (agora:doctor 1.1), not run.
     expect(
-      (await runAgoraDoctor(fakeApp(root), checks)).report.results.some(
+      (await runAgoraDoctor(fakeApp(root), checks)).report.results.find(
         (r) => r.id === 'durable.deep',
-      ),
-    ).toBe(false);
+      )?.status,
+    ).toBe('skip');
     expect(
-      (await runAgoraDoctor(fakeApp(root), checks, { deep: true })).report.results.some(
+      (await runAgoraDoctor(fakeApp(root), checks, { deep: true })).report.results.find(
         (r) => r.id === 'durable.deep',
-      ),
-    ).toBe(true);
+      )?.status,
+    ).toBe('ok');
     const only = await runAgoraDoctor(fakeApp(root), checks, { only: 'durable.a' });
     expect(only.report.results.map((r) => r.id)).toEqual(['durable.a']);
     await expect(runAgoraDoctor(fakeApp(root), checks, { only: 'nope' })).rejects.toBeInstanceOf(
