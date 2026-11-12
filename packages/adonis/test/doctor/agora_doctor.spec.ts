@@ -31,6 +31,8 @@ async function fixtureApp(
   deps: Record<string, string> = {},
 ): Promise<void> {
   await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'app', dependencies: deps }));
+  // A pnpm install (the siblings check reads versions from it).
+  await mkdir(join(root, 'node_modules', '.pnpm'), { recursive: true });
   for (const [name, manifest] of Object.entries(packages)) {
     const dir = join(root, 'node_modules', name);
     await mkdir(dir, { recursive: true });

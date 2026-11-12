@@ -38,8 +38,8 @@ durable 1.0.0
 | `--no-boot` | Checks the config files without booting the providers, for when the app does not boot. |
 
 Exit codes: `0` when nothing is an error, `1` when a check failed (or warned, with `--strict`), `2`
-when the doctor itself could not run (an unknown `--only`, libs from different releases). If the app
-does not boot, Adonis reports the boot error first: fix it, or run with `--no-boot`.
+when the doctor itself could not run (an unknown `--only`, libs from different releases, or an app
+that does not boot: fix the boot error, or run with `--no-boot`).
 
 ## In CI
 

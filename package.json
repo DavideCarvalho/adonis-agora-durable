@@ -23,8 +23,7 @@
     "format": "biome format --write .",
     "changeset": "changeset",
     "release": "pnpm --filter './packages/*' build && changeset publish",
-    "version-packages": "changeset version && node scripts/sync-version-literals.mjs && biome check --write .",
-    "check:agora-doctor": "node scripts/check-agora-doctor.mjs --reference-dir packages/adonis/dist/agora-doctor"
+    "version-packages": "changeset version && node scripts/sync-version-literals.mjs && biome check --write ."
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "0.18.5",
