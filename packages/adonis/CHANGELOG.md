@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.12
+
+### Minor Changes
+
+- [#502](https://github.com/DavideCarvalho/adonis-agora-durable/pull/502) [`cb9b0dc`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/cb9b0dc88a6c4ba21ee55f0c88a5aad6143dd698) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Tenant authentication works with any auth stack. `tenant.token` now also accepts a function, called before every request so a short-lived token (an OAuth access token, an `@adonisjs/auth` access token read from a vault) can refresh itself; the wire format is unchanged. Two new interfaces, `TenantVerifierContract` (`verify()`) and `TenantCredentialsContract` (`token()`), let you write `verifyTenant` and `tenant.token` as classes: both settings accept a function, a class built through the container (`@inject()` works), a lazy import of one, or an object implementing the contract. `hmacTenantVerifier` and `signTenantToken` are unchanged. A new "Authenticate tenants" guide has working setups for `@adonisjs/auth` access tokens, authkit, any OIDC provider, and HMAC.
+
 ## 1.0.0-rc.11
 
 ### Major Changes
