@@ -198,6 +198,7 @@ function pick(body: unknown, path: string): unknown {
   let cursor: unknown = body;
   for (const part of path.split('.')) {
     if (cursor === null || typeof cursor !== 'object') return undefined;
+    if (!Object.hasOwn(cursor, part)) return undefined;
     cursor = (cursor as Record<string, unknown>)[part];
   }
   return cursor;

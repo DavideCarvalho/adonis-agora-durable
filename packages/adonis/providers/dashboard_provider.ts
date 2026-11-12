@@ -175,6 +175,25 @@ export default class DashboardProvider {
     durableTopology: 'standalone' | 'control-plane' | 'tenant',
   ): Promise<void> {
     const deps = this.consoleDeps(config, durableTopology);
+    // An auxiliary feature: a hub that throws must not take the app's boot down with it.
+    try {
+      await this.registerDurableDevToolsInto(config, deps);
+    } catch (error) {
+      try {
+        const logger = await this.app.container.make('logger');
+        logger.warn(
+          `[durable_dashboard] could not register the developer tools: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      } catch {
+        /* logging must never break boot */
+      }
+    }
+  }
+
+  private async registerDurableDevToolsInto(
+    config: ResolvedDurableDashboardConfig,
+    deps: () => Promise<Deps>,
+  ): Promise<void> {
     await registerDurableDevTools(this.app.container, {
       authorize: config.authorize,
       deps,

@@ -175,7 +175,8 @@ export function authorizeByToken(
  * ```
  *
  * When none allows: `401` if any of them said "unauthenticated" (redirecting when one asked to),
- * `403` otherwise. A throwing authorizer counts as a `403` and the next one is still tried.
+ * `403` otherwise. A throwing authorizer counts as a `403` (its error is logged like a throwing
+ * `authorize`) and the next one is still tried.
  */
 export function anyAuthorize(
   ...authorizers: ConsoleAuthorize[]
@@ -187,9 +188,15 @@ export function anyAuthorize(
   return async (ctx: HttpContext): Promise<ConsoleAuthorizeResult> => {
     let unauthenticated = false;
     let redirectTo: string | undefined;
+    let error: unknown;
+    let threw = false;
     for (const authorize of resolved) {
       const decision = await authorize(ctx);
       if (decision.allowed) return { allowed: true };
+      if (decision.error !== undefined && !threw) {
+        threw = true;
+        error = decision.error;
+      }
       if (decision.reason !== 'unauthenticated') continue;
       if (decision.redirectTo !== undefined && redirectTo === undefined) {
         redirectTo = decision.redirectTo;
@@ -197,8 +204,9 @@ export function anyAuthorize(
       unauthenticated = true;
     }
     if (redirectTo !== undefined) return { redirectTo };
-    return unauthenticated
-      ? { allowed: false, reason: 'unauthenticated' }
-      : { allowed: false, reason: 'forbidden' };
+    if (unauthenticated) return { allowed: false, reason: 'unauthenticated' };
+    // Rethrow an inner authorizer's error so the console still logs it (a throw is a 403).
+    if (threw) throw error;
+    return { allowed: false, reason: 'forbidden' };
   };
 }

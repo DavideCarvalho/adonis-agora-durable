@@ -165,6 +165,16 @@ describe('durable dev tools', () => {
     expect(field.value).toBe('x'.repeat(10_000));
   });
 
+  it('field never walks the prototype chain', async () => {
+    const id = await start(raw, 'greet', { name: 'x' });
+    await raw.waitForRun(id);
+    for (const field of ['__proto__', 'constructor', 'run.constructor']) {
+      await expect(
+        tool(tools, 'durable_get_run').run({ id, field }, { ...call, limits }),
+      ).rejects.toThrow(`has no field "${field}"`);
+    }
+  });
+
   it('answers a tool error for an unknown run', async () => {
     await expect(
       tool(tools, 'durable_get_run').run({ id: 'nope' }, { ...call, limits }),
@@ -300,6 +310,17 @@ describe('anyAuthorize', () => {
     expect(await forbidden(ctxWith())).toEqual({ allowed: false, reason: 'forbidden' });
   });
 
+  it('rethrows an inner error when nobody allowed or asked to sign in', async () => {
+    const boom = new Error('misconfigured');
+    const gate = anyAuthorize(
+      () => {
+        throw boom;
+      },
+      () => false,
+    );
+    await expect(gate(ctxWith())).rejects.toBe(boom);
+  });
+
   it('needs at least one authorizer', () => {
     expect(() => anyAuthorize()).toThrow('at least one');
   });
@@ -354,6 +375,39 @@ describe('DashboardProvider — dev tools registration', () => {
 
   it('registers nothing when the console is disabled', async () => {
     expect(await boot({ enabled: false, authorize: () => true }, true)).toEqual([]);
+  });
+
+  it('a hub that throws does not break boot', async () => {
+    const ignitor = new IgnitorFactory()
+      .withCoreProviders()
+      .withCoreConfig()
+      .merge({
+        config: { durable_dashboard: { authorize: () => true } },
+        rcFileContents: {
+          providers: [
+            async () => ({
+              default: class {
+                constructor(
+                  protected app: { container: { bindValue(k: string, v: unknown): void } },
+                ) {}
+                register() {
+                  this.app.container.bindValue('agora.devTools', {
+                    version: 1,
+                    register: () => {
+                      throw new Error('hub exploded');
+                    },
+                  });
+                }
+              },
+            }),
+            () => import('../../providers/dashboard_provider.js'),
+          ],
+        },
+      })
+      .create(pathToFileURL(`${appRoot}/`));
+    const app = ignitor.createApp('web');
+    await app.init();
+    await expect(app.boot()).resolves.toBeUndefined();
   });
 
   it('boots without the hub', async () => {
