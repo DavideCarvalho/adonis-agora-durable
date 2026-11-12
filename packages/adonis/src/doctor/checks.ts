@@ -96,7 +96,7 @@ export function checkTenantToken(config: AnyConfig | undefined): AgoraDoctorResu
   return { status: 'ok', message: 'The tenant pod presents a token.' };
 }
 
-/** `durable.cron-parser`: cron schedules need cron-parser 4 or 5. */
+/** `durable.cron-parser`: cron schedules need cron-parser 5. */
 export async function checkCronParser(
   config: AnyConfig | undefined,
   appRoot: string,
@@ -116,10 +116,10 @@ export async function checkCronParser(
     };
   }
   const major = Number(version.split('.')[0]);
-  if (major !== 4 && major !== 5) {
+  if (major !== 5) {
     return {
       status: 'error',
-      message: `cron-parser ${version} is installed; durable reads majors 4 and 5.`,
+      message: `cron-parser ${version} is installed; durable reads cron-parser 5.`,
       fix: 'Install cron-parser 5: npm install cron-parser@5',
       docs: `${DOCS}/authoring/scheduling`,
     };

@@ -310,8 +310,10 @@ describe('durable checks', () => {
       expect((await checkCronParser({}, root)).status).toBe('skip');
       await fixtureApp(root, {});
       expect((await checkCronParser(cron, root)).status).toBe('error');
-      await fixtureApp(root, { 'cron-parser': { version: '4.9.0' } });
+      await fixtureApp(root, { 'cron-parser': { version: '5.1.0' } });
       expect((await checkCronParser(cron, root)).status).toBe('ok');
+      await fixtureApp(root, { 'cron-parser': { version: '4.9.0' } });
+      expect((await checkCronParser(cron, root)).status).toBe('error');
       await fixtureApp(root, { 'cron-parser': { version: '3.5.0' } });
       expect((await checkCronParser(cron, root)).status).toBe('error');
     } finally {
