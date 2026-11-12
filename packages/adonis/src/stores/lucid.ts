@@ -247,13 +247,15 @@ export class LucidStateStore implements StateStore {
 
   /**
    * What `agora:doctor` reports for a store with a `schema`: whether the schema exists, which durable
-   * tables are missing from it, and whether the connection can write there (a probe row inserted into
-   * the schema marker table, in a transaction that is rolled back).
+   * tables are missing from it, which of `optionalTables` (tables other pieces create when they first
+   * run, like the db transport's) are in it, and whether the connection can write there (a probe row
+   * inserted into the schema marker table, in a transaction that is rolled back).
    */
-  async inspectSchema(): Promise<{
+  async inspectSchema(optionalTables: string[] = []): Promise<{
     schema: string | undefined;
     schemaExists: boolean;
     missingTables: string[];
+    optionalPresent: string[];
     writeError: string | undefined;
   }> {
     const client = this.client();
@@ -262,6 +264,12 @@ export class LucidStateStore implements StateStore {
     const missingTables: string[] = [];
     for (const table of [...Object.values(DURABLE_TABLES), DURABLE_SCHEMA_META_TABLE]) {
       if (!schemaExists || !(await hasTable(client, schema, table))) missingTables.push(table);
+    }
+    const optionalPresent: string[] = [];
+    if (schemaExists) {
+      for (const table of optionalTables) {
+        if (await hasTable(client, schema, table)) optionalPresent.push(table);
+      }
     }
     let writeError: string | undefined;
     if (!missingTables.includes(DURABLE_SCHEMA_META_TABLE)) {
@@ -278,7 +286,7 @@ export class LucidStateStore implements StateStore {
         if (error !== rollback) writeError = error instanceof Error ? error.message : String(error);
       }
     }
-    return { schema, schemaExists, missingTables, writeError };
+    return { schema, schemaExists, missingTables, optionalPresent, writeError };
   }
 
   // --- runs ---------------------------------------------------------------

@@ -1,16 +1,19 @@
 {{{
   exports({ to: app.migrationsPath(`${new Date().getTime()}_create_durable_tables.ts`) })
 }}}
+import app from '@adonisjs/core/services/app'
 import { BaseSchema } from '@adonisjs/lucid/schema'
 import db from '@adonisjs/lucid/services/db'
 import { createDurableTables, dropDurableTables } from '@adonis-agora/durable'
 
 /**
- * The database schema the durable tables live in (a database on MySQL), e.g. \`'durable'\`. Keep it
- * equal to \`schema\` in config/durable.ts; \`undefined\` uses the connection's current schema. Not
- * supported on SQLite.
+ * The database schema the durable tables live in (a database on MySQL): the top-level
+ * \`schema\` of config/durable.ts, read when the migration runs (\`undefined\` uses the
+ * connection's current schema). If you set it on \`stores.lucid({ schema })\` instead,
+ * put that value here.
  */
-const schema = undefined
+const configured = app.config.get('durable.schema', undefined)
+const schema = typeof configured === 'string' ? configured : undefined
 
 /**
  * Durable workflow tables for the @adonis-agora/durable \`lucid\` state store: runs, step checkpoints,

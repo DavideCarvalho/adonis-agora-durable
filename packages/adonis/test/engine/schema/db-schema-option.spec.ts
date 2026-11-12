@@ -20,6 +20,7 @@ import { DbTransport } from '../../../src/transports/db.js';
 import { makeMemoryDb } from '../../../src/transports/db-helpers.js';
 import {
   createDurableTransportTables,
+  createWorkerKeysTable,
   dropDurableTransportTables,
   TRANSPORT_TABLES,
   WORKER_KEYS_TABLE,
@@ -227,6 +228,24 @@ describe.each(schemaBackends())('schema option on $name', (backend) => {
     await createDurableTables(h.db, undefined, { schema: h.schema });
     const ok = await checkSchema(app);
     expect(ok).toMatchObject({ status: 'ok' });
+    // No transport has run yet: reported, not an error.
+    expect(ok.message).toContain('not created yet');
+
+    // The queue transport's worker keys alone are a complete set.
+    await createWorkerKeysTable(h.db, undefined, { schema: h.schema });
+    expect(await checkSchema(app)).toMatchObject({ status: 'ok' });
+
+    // The db transport's tables, all of them: checked and reported.
+    await createDurableTransportTables(h.db, undefined, { schema: h.schema });
+    const withTransport = await checkSchema(app);
+    expect(withTransport.status).toBe('ok');
+    expect(withTransport.message).toContain('db transport tables');
+
+    // Some of them only: an error naming what is missing.
+    await h.db.connection().schema.withSchema(h.schema).dropTable(TRANSPORT_TABLES.messages);
+    const partial = await checkSchema(app);
+    expect(partial.status).toBe('error');
+    expect(partial.message).toContain(TRANSPORT_TABLES.messages);
     expectAllQualified(h);
   });
 

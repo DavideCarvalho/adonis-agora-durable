@@ -154,10 +154,11 @@ export async function checkStoreTables(app: ApplicationService): Promise<AgoraDo
 /** The store surface the schema check reads (the Lucid store has it). */
 interface SchemaInspectable {
   schemaName: string | undefined;
-  inspectSchema(): Promise<{
+  inspectSchema(optionalTables?: string[]): Promise<{
     schema: string | undefined;
     schemaExists: boolean;
     missingTables: string[];
+    optionalPresent: string[];
     writeError: string | undefined;
   }>;
 }
@@ -191,7 +192,13 @@ export async function checkSchema(app: ApplicationService): Promise<AgoraDoctorR
   if (typeof store.inspectSchema !== 'function' || store.schemaName === undefined) {
     return { status: 'skip', message: 'No `schema` is set.' };
   }
-  const { schema, schemaExists, missingTables, writeError } = await store.inspectSchema();
+  // The db transport and worker-key tables are created by the transport on first use, so they may
+  // not be there yet; when some are, they must be complete. Looked up in the store's schema on its
+  // connection (a transport given a schema of its own is not inspected).
+  const { TRANSPORT_TABLES, WORKER_KEYS_TABLE } = await import('../transports/db-schema.js');
+  const transportTables = [...Object.values(TRANSPORT_TABLES), WORKER_KEYS_TABLE];
+  const { schema, schemaExists, missingTables, optionalPresent, writeError } =
+    await store.inspectSchema(transportTables);
   if (!schemaExists) {
     return {
       status: 'error',
@@ -216,9 +223,30 @@ export async function checkSchema(app: ApplicationService): Promise<AgoraDoctorR
       docs: `${DOCS}/stores/lucid#database-schema`,
     };
   }
+  // Only the worker-key table: what the queue transport creates on its own.
+  const workerKeysOnly = optionalPresent.length === 1 && optionalPresent[0] === WORKER_KEYS_TABLE;
+  if (
+    optionalPresent.length > 0 &&
+    !workerKeysOnly &&
+    optionalPresent.length < transportTables.length
+  ) {
+    const missing = transportTables.filter((t) => !optionalPresent.includes(t));
+    return {
+      status: 'error',
+      message: `The schema "${schema}" has some db transport tables but lacks ${missing.join(', ')}.`,
+      fix: 'Boot the db transport once with autoCreate on, or run the durable transport migrations (they read `schema` from config/durable.ts).',
+      docs: `${DOCS}/transports/db#the-tables`,
+    };
+  }
+  const transport =
+    optionalPresent.length === 0
+      ? 'the db transport tables are not created yet (the transport creates them on first use)'
+      : workerKeysOnly
+        ? 'so is the worker-key table'
+        : 'so are the db transport tables';
   return {
     status: 'ok',
-    message: `The durable tables are in the schema "${schema}" and writable.`,
+    message: `The durable tables are in the schema "${schema}" and writable; ${transport}.`,
   };
 }
 

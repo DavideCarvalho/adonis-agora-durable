@@ -1,14 +1,17 @@
 {{{
   exports({ to: app.migrationsPath(`${new Date().getTime()}_create_durable_transport_messages.ts`) })
 }}}
+import app from '@adonisjs/core/services/app'
 import { BaseSchema } from '@adonisjs/lucid/schema'
 
 /**
- * The database schema these tables live in (a database on MySQL), e.g. \`'durable'\`. Keep it equal
- * to \`schema\` in config/durable.ts; \`undefined\` uses the connection's current schema. Not
- * supported on SQLite.
+ * The database schema the tables live in (a database on MySQL): the top-level
+ * \`schema\` of config/durable.ts, read when the migration runs (\`undefined\` uses the
+ * connection's current schema). If you set it on \`transports.db({ schema })\` (or on the queue
+ * transport's \`workerKeysSchema\`) instead, put that value here.
  */
-const schema = undefined
+const configured = app.config.get('durable.schema', undefined)
+const schema = typeof configured === 'string' ? configured : undefined
 
 /** \`name\` in {@link schema}: Knex quotes \`schema.table\` part by part. */
 const inSchema = (name: string) => (schema ? \`\${schema}.\${name}\` : name)
