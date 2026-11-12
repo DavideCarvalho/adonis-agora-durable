@@ -14,6 +14,8 @@ import {
   type RunPredicates,
   type RunStatus,
   type StepCheckpoint,
+  selectedTenant,
+  type TenantPicker,
   type WorkerStatus,
   type WorkflowRun,
   waitTargetsOf,
@@ -55,6 +57,7 @@ import { parentRunIdOf, retryOriginOf } from './run-lineage';
 import { SchedulesPanel } from './SchedulesPanel';
 import { SpansTimeline } from './SpansTimeline';
 import { StepDetailPanel } from './StepDetailPanel';
+import { TenantPickerControl, tenantLabel, useTenantPicker } from './TenantPicker';
 import { badgeVariants, Badge as Chip } from './ui/badge';
 import { Button } from './ui/button';
 import { cn } from './ui/cn';
@@ -327,6 +330,7 @@ function Header({
           {STATUSES.map((s) => chip(s, s, counts[s] ?? 0))}
         </div>
       )}
+      <TenantPickerControl />
       <RunIdSearch onOpenRun={onOpenRun} />
       <WorkersHealth onOpenRun={onOpenRun} />
       <div className="flex items-center gap-2 text-xs text-zinc-500">
@@ -809,10 +813,13 @@ function RunRow({
   onSelectTag,
   onSelectNamespace,
   onSelectOrigin,
+  tenantPicker: picker,
 }: {
   r: WorkflowRun;
   allRuns: WorkflowRun[];
   health: GroupHealth[];
+  /** The organization picker (tenancy), to label the run's organization. */
+  tenantPicker?: TenantPicker | undefined;
   selected?: string | undefined;
   onSelect: (id?: string) => void;
   onSelectTag: (tag: string) => void;
@@ -826,6 +833,8 @@ function RunRow({
   // invalid markup inside the row's own button, so the row stays the keyboard target.
   const tenant = r.namespace && r.namespace !== 'default' ? r.namespace : undefined;
   const origin = knownOrigin(r.origin);
+  // The organization column: shown while the viewer looks at several organizations at once.
+  const showOrg = picker?.mode === 'pick' && selectedTenant() === undefined;
   return (
     <button
       type="button"
@@ -841,13 +850,23 @@ function RunRow({
             <Chip
               variant="tenant"
               className="mono shrink-0 cursor-pointer px-1 text-[9px] hover:border-sky-400/60 hover:text-sky-200"
-              title={`Tenant / worker-pool partition — click to show only ${tenant}`}
+              title={`Namespace (worker pool) — click to show only ${tenant}`}
               onClick={(e) => {
                 e.stopPropagation();
                 onSelectNamespace(tenant);
               }}
             >
               {tenant}
+            </Chip>
+          )}
+          {showOrg && (
+            <Chip
+              variant="tenant"
+              className="shrink-0 px-1 text-[9px]"
+              title="Organization this run belongs to"
+              data-run-org=""
+            >
+              {r.tenantId ? tenantLabel(picker, r.tenantId) : 'no organization'}
             </Chip>
           )}
           {/* Origin, when the run HAS one. An app-own run shows no chip here rather than
@@ -932,7 +951,10 @@ export function RunsList({
   hasMore,
   loadingMore,
   onLoadMore,
+  tenantPicker,
 }: {
+  /** The organization picker (tenancy): labels runs, and explains an empty list for a viewer with none. */
+  tenantPicker?: TenantPicker | undefined;
   runs: WorkflowRun[];
   /** The FULL (unfiltered) run list — needed to place a run among its singleton siblings even when the
    *  leader is filtered out of `runs`. */
@@ -994,7 +1016,11 @@ export function RunsList({
   if (runs.length === 0) {
     return (
       <div className="flex flex-col items-start gap-2 p-6 text-sm text-zinc-600">
-        <span>{emptyNotice.message}</span>
+        <span>
+          {tenantPicker?.mode === 'none'
+            ? 'Choose an organization to see its data.'
+            : emptyNotice.message}
+        </span>
         {emptyNotice.unclassified !== undefined && (
           <>
             <span className="text-[11px] text-zinc-500">
@@ -1042,6 +1068,7 @@ export function RunsList({
                 onSelectTag={onSelectTag}
                 onSelectNamespace={onSelectNamespace}
                 onSelectOrigin={onSelectOrigin}
+                tenantPicker={tenantPicker}
               />
             </li>
           );
@@ -1433,7 +1460,7 @@ function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: string) => v
               <Chip
                 variant="tenant"
                 className="mono py-0.5"
-                title="Tenant / worker-pool partition this run belongs to"
+                title="Namespace (worker pool) this run belongs to"
               >
                 {tenant}
               </Chip>
@@ -1851,6 +1878,7 @@ function runIdFromHash(): string | undefined {
 }
 
 export function App() {
+  const tenantPicker = useTenantPicker();
   const [filter, setFilter] = useState<RunStatus | 'all'>('all');
   // Arrays, not strings: each of these controls takes SEVERAL values, ORed within the axis and
   // ANDed across them — comparing two tenants, or two tags, is one query rather than two views.
@@ -2097,7 +2125,7 @@ export function App() {
       filter !== 'all' ? `status ${filter}` : undefined,
       workflowFilter.length > 0 ? `workflow ${workflowFilter.join(', ')}` : undefined,
       tagFilter.length > 0 ? `tag ${tagFilter.join(', ')}` : undefined,
-      namespaceFilter.length > 0 ? `tenant ${namespaceFilter.join(', ')}` : undefined,
+      namespaceFilter.length > 0 ? `namespace ${namespaceFilter.join(', ')}` : undefined,
       attrPredicates.length > 0 ? `attr ${attrPredicates.join(' · ')}` : undefined,
       originFilter.kind === 'origin' ? `origin ${originLabel(originFilter.origin)}` : undefined,
     ]
@@ -2170,11 +2198,11 @@ export function App() {
                     field="namespace"
                     scope={namespaceScope}
                     glyph="@"
-                    label="filter by tenant"
-                    placeholder="filter by tenant / namespace…"
+                    label="filter by namespace"
+                    placeholder="filter by namespace…"
                     value={namespaceFilter}
                     onChange={setNamespaceFilter}
-                    title="Tenant / worker-pool partition (WorkflowRun.namespace). None selected shows every tenant."
+                    title="Namespace: the worker pool a run belongs to (WorkflowRun.namespace). None selected shows every namespace."
                   />
                 </div>
                 <AttributeFilters value={attrFilter} onChange={setAttrFilter} scope={attrScope} />
@@ -2222,6 +2250,7 @@ export function App() {
                   // scroll offset from the pre-filter list would otherwise leave the view scrolled deep
                   // into a now much-shorter list.
                   key={runsListResetKey}
+                  tenantPicker={tenantPicker}
                   runs={shown}
                   allRuns={runs}
                   health={health}

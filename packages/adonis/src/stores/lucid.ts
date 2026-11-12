@@ -1550,7 +1550,7 @@ export class LucidStateStore implements StateStore {
       if (scan !== undefined) q.limit(scan);
       return runValueFacetsFromRuns(((await q) as RunRow[]).map(rowToRun), axis, opts);
     }
-    const column = axis.field;
+    const column = axis.field === 'tenant' ? 'tenant_id' : axis.field;
     const needle = opts?.search?.trim().toLowerCase();
     // One pass over the matching runs (the shape `runFacets` uses), not a self semi-join on `id`.
     const q = this.scopedRuns(query)
@@ -1593,6 +1593,19 @@ export class LucidStateStore implements StateStore {
       } else q.whereRaw('1 = 0');
     }
     if (query.origin) q.where('origin', query.origin);
+    if (query.tenantId !== undefined) q.where('tenant_id', query.tenantId);
+    if (query.tenantIds) {
+      // `tenant_id IN (...)`, with `null` standing for "no tenant"; an empty set matches nothing.
+      const ids = query.tenantIds.filter((id): id is string => id !== null);
+      const withNull = query.tenantIds.includes(null);
+      if (ids.length === 0 && !withNull) q.whereRaw('1 = 0');
+      else {
+        q.andWhere((or: AnyQuery) => {
+          if (ids.length) or.orWhereIn('tenant_id', ids);
+          if (withNull) or.orWhereNull('tenant_id');
+        });
+      }
+    }
     if (query.status) q.where('status', query.status);
     if (query.statuses) {
       // `status IN (...)`; an empty set matches nothing (mirrors the in-memory store).
@@ -2065,7 +2078,13 @@ const RUN_BASE_COLUMNS = [
   'updated_at',
 ] as const;
 /** Runs columns that arrived in later schema waves: read only when the table has them. */
-const RUN_OPTIONAL_COLUMNS = ['origin', 'awaiting_decision_task_id', 'wake_requested_at'] as const;
+const RUN_OPTIONAL_COLUMNS = [
+  'origin',
+  'awaiting_decision_task_id',
+  'wake_requested_at',
+  'tenant_id',
+  'tenant_kind',
+] as const;
 /** Checkpoint columns that arrived in later schema waves: read only when the table has them. */
 const CHECKPOINT_OPTIONAL_COLUMNS = [
   'queue',
@@ -2354,6 +2373,8 @@ interface ScheduleRow {
   tags: string | null;
   spec: string;
   state: string;
+  tenant_id?: string | null;
+  tenant_kind?: string | null;
   created_at: number | string;
   updated_at: number | string;
 }
@@ -2368,6 +2389,10 @@ function scheduleToRow(r: ScheduleRecord): Record<string, unknown> {
     tags: r.tags?.length ? JSON.stringify(r.tags) : null,
     spec: JSON.stringify(r.spec),
     state: JSON.stringify(r.state),
+    // Only when set: a schedule with no tenant saves on a schema without the columns.
+    ...(r.tenantId !== undefined
+      ? { tenant_id: r.tenantId, tenant_kind: r.tenantKind ?? null }
+      : {}),
     created_at: r.createdAt.getTime(),
     updated_at: r.updatedAt.getTime(),
   };
@@ -2385,6 +2410,8 @@ function rowToSchedule(row: ScheduleRow): ScheduleRecord {
     paused: row.paused === true || row.paused === 1 || row.paused === '1' || row.paused === 'true',
     nextFireAt: row.next_fire_at == null ? null : Number(row.next_fire_at),
     ...(tags?.length ? { tags } : {}),
+    ...(row.tenant_id != null ? { tenantId: row.tenant_id } : {}),
+    ...(row.tenant_kind != null ? { tenantKind: row.tenant_kind } : {}),
     spec:
       parseJsonColumn<Record<string, unknown>>(
         row.spec,

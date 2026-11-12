@@ -1496,6 +1496,55 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
       expect(await store.listSignalWaiters('tok-keep')).toHaveLength(1);
     });
 
+    // ---- tenancy ------------------------------------------------------------------------------
+
+    t('round-trips a run tenant and filters by tenantIds (null = no tenant)', async () => {
+      await store.createRun(run({ id: 'a', tenantId: 'acme', tenantKind: 'organization' }));
+      await store.createRun(run({ id: 'g', tenantId: 'globex' }));
+      await store.createRun(run({ id: 'n' }));
+      const a = await store.getRun('a');
+      expect(a?.tenantId).toBe('acme');
+      expect(a?.tenantKind).toBe('organization');
+      expect((await store.getRun('n'))?.tenantId).toBeUndefined();
+      const ids = async (tenantIds: Array<string | null>) =>
+        (await store.listRuns({ tenantIds })).map((r) => r.id).sort();
+      expect(await ids(['acme'])).toEqual(['a']);
+      expect(await ids([null])).toEqual(['n']);
+      expect(await ids(['acme', null])).toEqual(['a', 'n']);
+      expect(await ids([])).toEqual([]);
+      expect((await store.listRuns({ tenantId: 'globex' })).map((r) => r.id)).toEqual(['g']);
+      expect(await store.countRuns?.({ tenantIds: ['acme', 'globex'] })).toBe(2);
+      await store.updateRun('n', { tenantId: 'acme', tenantKind: 'organization' });
+      expect((await store.getRun('n'))?.tenantId).toBe('acme');
+      if (store.runValueFacets) {
+        const rows = await store.runValueFacets({ field: 'tenant' }, {});
+        expect(rows.sort((x, y) => String(x.value).localeCompare(String(y.value)))).toEqual([
+          { value: 'acme', count: 2 },
+          { value: 'globex', count: 1 },
+        ]);
+      }
+    });
+
+    t('round-trips a schedule tenant', async () => {
+      if (!store.saveSchedule || !store.getSchedule) return;
+      await store.saveSchedule({
+        id: 's1',
+        namespace: 'default',
+        workflow: 'checkout',
+        paused: false,
+        nextFireAt: null,
+        spec: {},
+        state: {},
+        tenantId: 'acme',
+        tenantKind: 'organization',
+        createdAt: at,
+        updatedAt: at,
+      });
+      const loaded = await store.getSchedule('s1');
+      expect(loaded?.tenantId).toBe('acme');
+      expect(loaded?.tenantKind).toBe('organization');
+    });
+
     t('runFacets counts the matching runs by (status, origin)', async () => {
       expect(store.runFacets).toBeDefined();
       if (!store.runFacets) return;

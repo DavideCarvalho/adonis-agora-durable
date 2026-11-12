@@ -1,0 +1,140 @@
+---
+title: Organizations
+description: Scope runs by the customer they belong to. Once tenancy is on in @adonis-agora/context, every run carries the active organization, a resumed run gets it back, and each organization sees its own runs only.
+icon: Users
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+When your app serves several customers (organizations, clinics, accounts), durable can keep each
+one's runs apart. A run started while a customer is active belongs to that customer: its children,
+its `continueAsNew` chain and the schedules created for it carry the same customer, and code running
+for another customer cannot see or act on it.
+
+This is not the [worker pool](/docs/durable/concepts/tenancy) a run executes on (`namespace`). The two
+are independent: every customer's runs can share one pool.
+
+## Turn it on
+
+Tenancy is off until you enable it in `@adonis-agora/context`. With authkit organizations, the active
+organization is the customer; without authkit, set it yourself once per request.
+
+```ts title="config/context.ts"
+import { defineConfig } from '@adonis-agora/context'
+
+export default defineConfig({
+  tenancy: { enabled: true, kinds: ['organization'] },
+})
+```
+
+```ts title="app/middleware/clinic_middleware.ts"
+import { Context } from '@adonis-agora/context'
+import type { HttpContext } from '@adonisjs/core/http'
+import type { NextFn } from '@adonisjs/core/types/http'
+
+export default class ClinicMiddleware {
+  async handle(ctx: HttpContext, next: NextFn) {
+    const clinic = await ctx.auth.user!.related('clinic').query().firstOrFail()
+    Context.setTenant({ id: clinic.id, kind: 'clinic' })
+    return next()
+  }
+}
+```
+
+Durable follows `config/context.ts` by default. To set it apart, use `tenancy` in `config/durable.ts`:
+
+```ts title="config/durable.ts"
+export default defineConfig({
+  tenancy: {
+    enabled: true,          // or 'inherit' (default), or `tenancy: false` to opt out
+    kinds: ['clinic'],      // the tenant kinds durable honours
+    nullRows: 'tenantless', // or 'shared': customers also see runs started with no customer
+  },
+})
+```
+
+## Starting runs
+
+Start runs as usual. The active customer is stamped on the run:
+
+```ts title="app/controllers/orders_controller.ts"
+import durable from '@adonis-agora/durable/services/main'
+import type { HttpContext } from '@adonisjs/core/http'
+
+export default class OrdersController {
+  async store({ request }: HttpContext) {
+    const order = await Order.create(request.only(['sku', 'quantity']))
+    await durable.start('checkout', { orderId: order.id }, `checkout:${order.id}`)
+    return order
+  }
+}
+```
+
+Pass `tenantId` to choose the customer yourself, or `tenantId: null` for a run that belongs to no
+customer:
+
+```ts
+await durable.start('nightly-report', {}, `report:${day}`, { tenantId: org.id, tenantKind: 'organization' })
+```
+
+A run resumed later by a timer, a signal or a worker after a restart runs with its customer active
+again, so `Context.tenant()` and anything that reads it inside your steps see the same customer as
+the request that started it.
+
+## What each customer sees
+
+| Code running for | Sees |
+| --- | --- |
+| customer A | A's runs |
+| a request with no customer | runs with no customer |
+| `Context.allTenants(() => …)` | every run |
+| a worker, recovery, an ace command | every run |
+
+`getRun`, `listRuns`, `cancel`, `requeue`, `signal`, `continue`, `update`, `completeTask`,
+`retryWithInput`, `getEvent`, `deleteRun` and `engine.schedules` follow that rule. A run of another
+customer reads as missing (`null`), never as forbidden. Events published with `publishEvent` reach the
+publishing customer's runs only.
+
+To list one customer's runs from an admin command:
+
+```ts title="commands/customer_runs.ts"
+import { Context } from '@adonis-agora/context'
+import durable from '@adonis-agora/durable/services/main'
+
+const runs = await Context.withTenant({ id: args.org, kind: 'organization' }, () =>
+  durable.listRuns({ status: 'failed' }),
+)
+```
+
+## Schedules
+
+A schedule created with `engine.schedules.create()` while a customer is active belongs to that
+customer, and every run it fires does too. An upsert keeps the customer it was created under.
+Schedules from `config/durable.ts` belong to no customer.
+
+## Store-less pods
+
+A `tenant` pod sends the active customer with each start. The control plane keeps it only when the
+pod's verified token grants it, through the `capabilities` your `verifyTenant` returns:
+
+```ts title="config/durable.ts (control plane)"
+verifyTenant: async ({ token }) => {
+  const pod = await PodToken.verify(token)
+  if (!pod) return null
+  return { tenant: pod.partition, capabilities: ['tenancy:*'] } // or ['tenancy:org-42']
+},
+```
+
+Without the capability the run starts with no customer. The pod's own reads (`listRuns`, `getRun`,
+the console) show the active customer's runs only.
+
+## Existing runs
+
+The columns are added at boot when `autoSchema` is on (the default). With `autoSchema: false`, rerun
+your durable migration. Runs started before tenancy was on belong to no customer: requests without a
+customer still see them, and so do customers when `nullRows: 'shared'`.
+
+<Callout title="The console">
+The durable console shows the viewer's own organization, with an organization picker when the viewer
+may see more. See [Organizations in the console](/docs/durable/observability/dashboard#organizations).
+</Callout>

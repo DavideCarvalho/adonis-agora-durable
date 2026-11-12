@@ -106,9 +106,36 @@ export interface WorkflowRun {
   searchAttributes?: Record<string, string | number | boolean>;
   /** The package that declared the workflow. NOTE: always `undefined` today (gap #1). */
   origin?: string;
+  /** The organization (tenant) the run belongs to, when the app turned tenancy on. */
+  tenantId?: string;
+  tenantKind?: string;
   createdAt: string;
   updatedAt: string;
   waiting?: RunWaiting;
+}
+
+/** The console's "Organization" control (`GET /tenants`). */
+export interface TenantPicker {
+  /** `off`: tenancy off. `none`: the viewer has no organization. `fixed`: one. `pick`: several. */
+  mode: 'off' | 'none' | 'fixed' | 'pick';
+  /** The viewer may see every organization (and "All organizations" is offered). */
+  all: boolean;
+  selected: string | null;
+  tenants: Array<{ id: string; label: string }>;
+}
+
+/** The organization picked in this page's URL (`?tenant=`), sent with every API call. */
+export function selectedTenant(): string | undefined {
+  if (typeof window === 'undefined') return undefined;
+  const value = new URLSearchParams(window.location.search).get('tenant');
+  return value && value !== '*' ? value : undefined;
+}
+
+/** `path` with the picked organization appended as `tenant=` (no-op when none is picked). */
+export function withTenant(path: string): string {
+  const tenant = selectedTenant();
+  if (tenant === undefined) return path;
+  return `${path}${path.includes('?') ? '&' : '?'}tenant=${encodeURIComponent(tenant)}`;
 }
 
 export interface RunDetail {
@@ -677,7 +704,7 @@ const REDIRECTED =
 async function send(path: string, init?: RequestInit): Promise<Response> {
   const method = (init?.method ?? 'GET').toUpperCase();
   const write = method !== 'GET' && method !== 'HEAD';
-  const res = await fetch(apiBase() + path, {
+  const res = await fetch(apiBase() + withTenant(path), {
     ...init,
     ...(write
       ? {
@@ -883,6 +910,16 @@ export const durableClient = {
   topology(): Promise<DurableTopology> {
     return http<DurableTopology>('/topology');
   },
+  /** The organizations this viewer may pick (tenancy). */
+  tenants(): Promise<TenantPicker> {
+    return http<TenantPicker>('/tenants');
+  },
+  /** Record a switch to `tenant` (`'*'` = all organizations); the server audits it. */
+  selectTenant(tenant: string): Promise<{ tenant: string }> {
+    return http<{ tenant: string }>(`/tenants/${encodeURIComponent(tenant)}/select`, {
+      method: 'POST',
+    });
+  },
   /** Fleet health / protocol compatibility (per-group negotiation + blocked runs) for the Compat
    *  panel. Bare `CompatReport`, unwrapped — the server's `compat` handler sends the body as-is. */
   compat(): Promise<CompatReport> {
@@ -1037,7 +1074,9 @@ export const durableClient = {
   streamRun(id: string, onEvent: (event: EngineEvent) => void): () => void {
     // A runtime without EventSource (a server render, a DOM shim) gets no live tail; the poll stays.
     if (typeof EventSource === 'undefined') return () => {};
-    const source = new EventSource(`${apiBase()}/runs/${encodeURIComponent(id)}/stream`);
+    const source = new EventSource(
+      `${apiBase()}${withTenant(`/runs/${encodeURIComponent(id)}/stream`)}`,
+    );
     source.onmessage = (msg) => {
       try {
         onEvent(JSON.parse(msg.data) as EngineEvent);

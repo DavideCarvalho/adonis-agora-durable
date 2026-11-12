@@ -99,8 +99,11 @@ export interface DevToolAuditEntry {
 
 /** What {@link durableDevTools} needs from the console. */
 export interface DurableDevToolsOptions {
-  /** The console's read/control port, resolved per call (the same `Deps` the console routes use). */
-  deps: () => Promise<Deps>;
+  /**
+   * The console's read/control port, resolved per call (the same `Deps` the console routes use), for
+   * the MCP request's context when there is one (so the console's tenant scope applies).
+   */
+  deps: (ctx?: HttpContext) => Promise<Deps>;
   /** Records an action (retry, cancel, …) before it runs, like a console POST. */
   audit?: (entry: DevToolAuditEntry) => void;
   /** The fleet compatibility panel's body, when the console can build it (`GET /api/compat`). */
@@ -253,10 +256,10 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
           },
         },
       },
-      run: async (input) => {
+      run: async (input, tc) => {
         const size = limitOf(input);
         const page = typeof input.page === 'number' && input.page >= 1 ? Math.trunc(input.page) : 1;
-        const body = (await call(listRuns, await options.deps(), {
+        const body = (await call(listRuns, await options.deps(tc.ctx), {
           query: { ...runFilterQuery(input), page: String(page), size: String(size) },
         })) as { runs: unknown[] };
         return { items: body.runs, next: nextPage(page, body.runs.length, size) };
@@ -280,9 +283,9 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
         },
         required: ['id'],
       },
-      run: async (input) => {
+      run: async (input, tc) => {
         const id = required(input, 'id');
-        const body = (await call(getRun, await options.deps(), {
+        const body = (await call(getRun, await options.deps(tc.ctx), {
           params: { id },
           query: input.full === true ? { full: 'true' } : {},
         })) as Record<string, unknown>;
@@ -328,11 +331,11 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
         },
         required: ['id', 'group'],
       },
-      run: async (input) => {
+      run: async (input, tc) => {
         const limit = limitOf(input);
         const offset =
           typeof input.offset === 'number' && input.offset >= 0 ? Math.trunc(input.offset) : 0;
-        const body = (await call(getFanMembers, await options.deps(), {
+        const body = (await call(getFanMembers, await options.deps(tc.ctx), {
           params: { id: required(input, 'id'), group: required(input, 'group') },
           query: {
             offset: String(offset),
@@ -370,9 +373,9 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
         },
         required: ['field'],
       },
-      run: async (input) => {
+      run: async (input, tc) => {
         const field = required(input, 'field');
-        const values = await call(runValues, await options.deps(), {
+        const values = await call(runValues, await options.deps(tc.ctx), {
           query: { ...runFilterQuery(input), field, limit: String(limitOf(input)) },
         });
         return { field, values };
@@ -384,8 +387,8 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
       description:
         'Fleet health: per worker group, the queue backlog and live workers (stalled = backlog with no worker), how many runs are pending, dead or blocked, and the protocol-compatibility panel when available.',
       input: { type: 'object', properties: {} },
-      run: async () => {
-        const deps = await options.deps();
+      run: async (_input, tc) => {
+        const deps = await options.deps(tc.ctx);
         const groups = (await call(async (d) => health(d), deps, {})) as { groups: unknown[] };
         const counts: Record<string, number> = {};
         if (deps.engine.countRuns) {
@@ -414,7 +417,9 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
       description:
         "Worker groups with every live worker's heartbeat (instance id, last beat, namespace) and the queue depth.",
       input: { type: 'object', properties: {} },
-      run: async () => ({ items: await call(async (d) => workers(d), await options.deps(), {}) }),
+      run: async (_input, tc) => ({
+        items: await call(async (d) => workers(d), await options.deps(tc.ctx), {}),
+      }),
     },
     {
       name: 'durable_list_schedules',
@@ -423,8 +428,8 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
         'Cron/interval schedules: key, workflow, cron or interval, paused (and whether by a runtime override), last and next fire, and the current window run status.',
       input: { type: 'object', properties: {} },
       available: supports(options, 'listSchedules'),
-      run: async () => {
-        const body = (await call(listSchedules, await options.deps(), {})) as {
+      run: async (_input, tc) => {
+        const body = (await call(listSchedules, await options.deps(tc.ctx), {})) as {
           schedules: unknown[];
         };
         return { items: body.schedules, next: null };
@@ -444,8 +449,8 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
         required: ['id', 'key'],
       },
       available: supports(options, 'getEvent'),
-      run: async (input) => {
-        const body = (await call(getRunEvent, await options.deps(), {
+      run: async (input, tc) => {
+        const body = (await call(getRunEvent, await options.deps(tc.ctx), {
           params: { id: required(input, 'id'), key: required(input, 'key') },
         })) as Record<string, unknown>;
         return 'value' in body ? { ...body, value: truncateBlob(body.value) } : body;
@@ -461,10 +466,10 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
         properties: { id: { type: 'string', description: 'Run id.' } },
         required: ['id'],
       },
-      run: async (input, ctx) => {
+      run: async (input, tc) => {
         const id = required(input, 'id');
-        audited('durable_retry_run', id, ctx.caller);
-        return call(retryRun, await options.deps(), { params: { id } });
+        audited('durable_retry_run', id, tc.caller);
+        return call(retryRun, await options.deps(tc.ctx), { params: { id } });
       },
     },
     {
@@ -481,10 +486,10 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
         },
         required: ['id'],
       },
-      run: async (input, ctx) => {
+      run: async (input, tc) => {
         const id = required(input, 'id');
-        audited('durable_cancel_run', id, ctx.caller);
-        return call(cancelRun, await options.deps(), {
+        audited('durable_cancel_run', id, tc.caller);
+        return call(cancelRun, await options.deps(tc.ctx), {
           params: { id },
           body: { compensate: input.compensate === true },
         });
@@ -500,10 +505,10 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
         properties: { id: { type: 'string', description: 'Run id.' } },
         required: ['id'],
       },
-      run: async (input, ctx) => {
+      run: async (input, tc) => {
         const id = required(input, 'id');
-        audited('durable_continue_run', id, ctx.caller);
-        return call(continueRun, await options.deps(), { params: { id } });
+        audited('durable_continue_run', id, tc.caller);
+        return call(continueRun, await options.deps(tc.ctx), { params: { id } });
       },
     },
     {
@@ -522,7 +527,7 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
         required: ['id', 'token'],
       },
       available: supports(options, 'signal'),
-      run: async (input, ctx) => {
+      run: async (input, tc) => {
         const id = required(input, 'id');
         const token = required(input, 'token');
         let payload: unknown;
@@ -534,8 +539,8 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
             throw new DevToolError('payload must be valid JSON');
           }
         }
-        audited('durable_signal_run', id, ctx.caller);
-        return call(signalRun, await options.deps(), {
+        audited('durable_signal_run', id, tc.caller);
+        return call(signalRun, await options.deps(tc.ctx), {
           params: { id },
           body: {
             token,
@@ -556,10 +561,12 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
         required: ['key'],
       },
       available: supports(options, 'triggerSchedule'),
-      run: async (input, ctx) => {
+      run: async (input, tc) => {
         const key = required(input, 'key');
-        audited('durable_trigger_schedule', key, ctx.caller);
-        return call(scheduleAction, await options.deps(), { params: { key, action: 'trigger' } });
+        audited('durable_trigger_schedule', key, tc.caller);
+        return call(scheduleAction, await options.deps(tc.ctx), {
+          params: { key, action: 'trigger' },
+        });
       },
     },
     {
@@ -576,11 +583,11 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
         required: ['key'],
       },
       available: supports(options, 'setSchedulePaused'),
-      run: async (input, ctx) => {
+      run: async (input, tc) => {
         const key = required(input, 'key');
         const action = input.paused === false ? 'resume' : 'pause';
-        audited('durable_pause_schedule', key, ctx.caller);
-        return call(scheduleAction, await options.deps(), { params: { key, action } });
+        audited('durable_pause_schedule', key, tc.caller);
+        return call(scheduleAction, await options.deps(tc.ctx), { params: { key, action } });
       },
     },
   ];

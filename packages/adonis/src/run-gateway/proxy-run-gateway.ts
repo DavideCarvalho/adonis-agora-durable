@@ -348,6 +348,9 @@ export class ProxyRunGateway implements RunGateway {
       runId,
       ...(opts?.tags !== undefined ? { tags: opts.tags } : {}),
       ...(opts?.searchAttributes !== undefined ? { searchAttributes: opts.searchAttributes } : {}),
+      ...(typeof opts?.tenantId === 'string' && opts.tenantId !== ''
+        ? { tenantId: opts.tenantId, ...(opts.tenantKind ? { tenantKind: opts.tenantKind } : {}) }
+        : {}),
     });
     return this.#awaitReply<RunResult>(runId, 'start', async () =>
       this.#transport.dispatchStartRun(msg(await this.#tenantClaim())),

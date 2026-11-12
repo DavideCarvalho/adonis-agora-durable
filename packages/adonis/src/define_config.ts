@@ -23,6 +23,7 @@ import type { QueueConfig } from './queue.js';
 import type { ScheduledWorkflow } from './scheduler.js';
 import type { LucidStoreConfig, StoreContext, StoreFactory } from './stores/factory.js';
 import { stores } from './stores/factory.js';
+import type { DurableTenancyOption } from './tenancy.js';
 import type {
   DbTransportConfig,
   EventEmitterTransportConfig,
@@ -387,6 +388,14 @@ export interface BaseDurableConfig {
    * workers: each window's run id is deterministic and advancing a schedule is a compare-and-set.
    */
   persistedSchedules?: boolean;
+  /**
+   * Tenancy: scope runs by the customer (organization, clinic, …) they belong to. `'inherit'`
+   * (default) follows `tenancy.enabled` in `config/context.ts`; `false` turns it off here; an object
+   * sets `enabled`, the `kinds` durable honours, `nullRows` (what a tenant sees of runs with no
+   * tenant: `'tenantless'`, default, or `'shared'`) and `namespace` (route a tenant to its own pool).
+   * Not the worker pool: that is `namespace`.
+   */
+  tenancy?: DurableTenancyOption;
   /**
    * Run the worker loop **inside this process** instead of a separate `node ace durable:work` pod.
    * The loop is the same one the command drives (pending, recovery, timers, timeouts, schedules), so

@@ -11,7 +11,14 @@ import type { HttpContext } from '@adonisjs/core/http';
  */
 export type ConsoleAuthorizeResult =
   | boolean
-  | { allowed: true }
+  | {
+      allowed: true;
+      /**
+       * With tenancy on: the tenants (organizations) this viewer may see in the console, or `'*'`
+       * for every tenant plus runs with no tenant. Omit for the viewer's own active tenant.
+       */
+      tenants?: '*' | string[];
+    }
   | { allowed: false; reason?: 'unauthenticated' | 'forbidden' }
   | { redirectTo: string };
 
@@ -34,7 +41,7 @@ export type ConsoleAuthorize =
 
 /** A normalized console decision. A denial always carries a reason (`401` vs `403`). */
 export type ConsoleDecision =
-  | { allowed: true }
+  | { allowed: true; tenants?: '*' | string[] }
   | {
       allowed: false;
       reason: 'unauthenticated' | 'forbidden';
@@ -68,8 +75,22 @@ function lazyModuleClass(value: unknown): ConsoleAuthorizerClass | undefined {
 export function normalizeConsoleDecision(result: unknown): ConsoleDecision {
   if (result === true) return { allowed: true };
   if (typeof result !== 'object' || result === null) return { allowed: false, reason: 'forbidden' };
-  const record = result as { allowed?: unknown; reason?: unknown; redirectTo?: unknown };
-  if (record.allowed === true) return { allowed: true };
+  const record = result as {
+    allowed?: unknown;
+    reason?: unknown;
+    redirectTo?: unknown;
+    tenants?: unknown;
+  };
+  if (record.allowed === true) {
+    if (record.tenants === '*') return { allowed: true, tenants: '*' };
+    if (Array.isArray(record.tenants)) {
+      return {
+        allowed: true,
+        tenants: record.tenants.filter((t): t is string => typeof t === 'string' && t !== ''),
+      };
+    }
+    return { allowed: true };
+  }
   if (typeof record.redirectTo === 'string' && record.redirectTo !== '') {
     return { allowed: false, reason: 'unauthenticated', redirectTo: record.redirectTo };
   }
@@ -192,7 +213,11 @@ export function anyAuthorize(
     let threw = false;
     for (const authorize of resolved) {
       const decision = await authorize(ctx);
-      if (decision.allowed) return { allowed: true };
+      if (decision.allowed) {
+        return decision.tenants !== undefined
+          ? { allowed: true, tenants: decision.tenants }
+          : { allowed: true };
+      }
       if (decision.error !== undefined && !threw) {
         threw = true;
         error = decision.error;

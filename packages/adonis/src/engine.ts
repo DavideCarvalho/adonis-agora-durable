@@ -222,6 +222,15 @@ import {
   validateStandardSync,
 } from './standard-schema.js';
 import { StickyCache, StickyContinuation } from './sticky-continuation.js';
+import {
+  type EngineTenancy,
+  intersectTenantIds,
+  type RunTenant,
+  type RunTenantFilter,
+  runTenantOf,
+  runVisible,
+  tenantScopeIds,
+} from './tenancy.js';
 import { sanitizeQueueToken, tenantGroup } from './tenant-group.js';
 import { TransportPool } from './transport-pool.js';
 import { workflowAls } from './workflow-als.js';
@@ -289,6 +298,13 @@ export interface StartOptions {
    * workflow's registered `concurrency`. See {@link ConcurrencyQuota}.
    */
   concurrency?: ConcurrencyQuota | undefined;
+  /**
+   * The tenant (customer) this run belongs to. Omit to take the active tenant when tenancy is on
+   * (`config/context.ts`), or none; `null` starts it with no tenant whatever the context says.
+   */
+  tenantId?: string | null | undefined;
+  /** The kind of {@link tenantId} (`'organization'`, `'clinic'`, …). */
+  tenantKind?: string | undefined;
 }
 
 /** One row of {@link WorkflowEngine.listSchedules} — a schedule with its live control state. */
@@ -879,6 +895,12 @@ export interface WorkflowEngineDeps {
    */
   rehydrate?: (<T>(carrier: Record<string, unknown> | undefined, fn: () => T) => T) | undefined;
   /**
+   * Tenancy: which customer's runs an app-facing call may see, and how a resumed run gets its tenant
+   * back. The AdonisJS provider builds it from `@adonis-agora/context`; omit for no tenancy (every
+   * call sees every run, as without it).
+   */
+  tenancy?: EngineTenancy | undefined;
+  /**
    * Attempts for each saga compensation when the run fails (a transient undo — e.g. a refund API
    * hiccup — gets another try). Default 1 (no retry). Compensations must be idempotent.
    */
@@ -1083,6 +1105,7 @@ export class WorkflowEngine {
   private readonly context?: (() => Record<string, unknown> | undefined) | undefined;
   /** Establish the originating context ambiently around a local step body (see {@link WorkflowEngineDeps.rehydrate}). Default passthrough. */
   private readonly rehydrate: <T>(carrier: Record<string, unknown> | undefined, fn: () => T) => T;
+  private readonly tenancy: EngineTenancy | undefined;
   private readonly compensationRetries: number;
   private readonly compensationTimeoutMs: number;
   private readonly retention:
@@ -1373,6 +1396,7 @@ export class WorkflowEngine {
     this.context = deps.context;
     // Default passthrough: with no bridge supplied, a local step body runs exactly as before.
     this.rehydrate = deps.rehydrate ?? ((_carrier, fn) => fn());
+    this.tenancy = deps.tenancy;
     this.compensationRetries = Math.max(1, deps.compensationRetries ?? 1);
     this.compensationTimeoutMs = Math.max(1_000, deps.compensationTimeoutMs ?? 300_000);
     this.retention = deps.retention;
@@ -1386,6 +1410,8 @@ export class WorkflowEngine {
         start: (workflow, input, runId, opts) => this.start(workflow, input, runId, opts),
         getRun: (runId) => this.store.getRun(runId),
         isDraining: () => this.draining,
+        tenant: () => this.startTenant(undefined),
+        visible: (record) => this.runVisibleNow({ tenantId: record.tenantId } as WorkflowRun),
       },
       { namespace: this.namespace, clock: this.clock },
     );
@@ -2360,6 +2386,8 @@ export class WorkflowEngine {
     this.trackEffect(
       this.start(target, input, `dlq:${run.id}`, {
         ...(run.namespace !== undefined ? { namespace: run.namespace } : {}),
+        tenantId: run.tenantId ?? null,
+        ...(run.tenantKind ? { tenantKind: run.tenantKind } : {}),
       }).catch((err: unknown) => {
         console.warn(
           `[adonis-durable] could not start dead-letter workflow ${target} for run ${run.id}: ${
@@ -3560,6 +3588,13 @@ export class WorkflowEngine {
    */
   async republishLifecycle(target: RepublishLifecycleTarget): Promise<RepublishLifecycleResult> {
     const result: RepublishLifecycleResult = { runs: 0, started: 0, failed: [] };
+    if (
+      'runId' in target &&
+      typeof target.runId === 'string' &&
+      (await this.runHidden(target.runId))
+    ) {
+      return result;
+    }
     // A backfill usually follows a deploy: read the fleet's subscriptions now, not from the cache.
     await this.refreshAnnouncedSubscriptions();
     const publish = async (run: WorkflowRun): Promise<void> => {
@@ -3834,6 +3869,8 @@ export class WorkflowEngine {
     // Idempotent by run id: a redelivered trigger (at-least-once queues) or a scheduler re-tick for
     // the same id is a no-op, returning the existing run's state instead of starting a duplicate.
     const existing = async (prior: WorkflowRun): Promise<RunResult> => {
+      // Another tenant's run id: answer like a clash, never with that run's state.
+      if (!this.runVisibleNow(prior)) throw new Error(`run ${runId} already exists`);
       // A PENDING prior still needs an executor: re-nudge the dispatcher so a redelivered trigger —
       // or a continuation persisted pre-settle (see the ContinueAsNew handoff) picked up by a custom
       // dispatcher — doesn't sit `pending` until the next poll. Idempotent: execution is leased, so
@@ -3883,6 +3920,9 @@ export class WorkflowEngine {
     // Compared against the ENGINE clock (injectable), not wall time — the same clock the timer
     // poller will use to decide the run is due.
     const delayed = startAtMs !== undefined && startAtMs > this.clock();
+    const tenant = this.startTenant(opts);
+    const tenantNamespace =
+      tenant && opts?.namespace === undefined ? this.tenancy?.namespace?.(tenant) : undefined;
     const run: WorkflowRun = {
       id: runId,
       workflow: name,
@@ -3890,7 +3930,10 @@ export class WorkflowEngine {
       status: delayed ? 'suspended' : 'pending',
       ...(delayed ? { wakeAt: startAtMs } : {}),
       origin: opts?.origin ?? registered.origin,
-      namespace: opts?.namespace ?? this.namespace,
+      namespace: opts?.namespace ?? tenantNamespace ?? this.namespace,
+      ...(tenant
+        ? { tenantId: tenant.id, ...(tenant.kind ? { tenantKind: tenant.kind } : {}) }
+        : {}),
       input,
       tags,
       searchAttributes: opts?.searchAttributes,
@@ -3963,6 +4006,16 @@ export class WorkflowEngine {
     onAlreadySettled?: (settled: RunResult) => Promise<void>,
     limiter?: BoundedRunner,
   ): void {
+    // The tenant is read NOW, inside the parent's turn: a bounded handoff may run later, elsewhere.
+    if (opts?.tenantId === undefined) {
+      const tenant = this.startTenant(opts);
+      if (tenant)
+        opts = {
+          ...opts,
+          tenantId: tenant.id,
+          ...(tenant.kind ? { tenantKind: tenant.kind } : {}),
+        };
+    }
     const handoff = async (): Promise<void> => {
       // Defer one microtask: never reentrantly resume the parent that is still suspending/settling.
       await Promise.resolve();
@@ -4001,8 +4054,53 @@ export class WorkflowEngine {
   }
 
   /** Read a run's current persisted state (or null if unknown). A thin pass-through to the store. */
-  getRun(runId: string): Promise<WorkflowRun | null> {
-    return this.store.getRun(runId);
+  async getRun(runId: string): Promise<WorkflowRun | null> {
+    const run = await this.store.getRun(runId);
+    return run && this.runVisibleNow(run) ? run : null;
+  }
+
+  /** The tenant a new run gets: the explicit option, else the active tenant (tenancy on), else none. */
+  private startTenant(opts: StartOptions | undefined): RunTenant | undefined {
+    if (opts?.tenantId === null) return undefined;
+    if (typeof opts?.tenantId === 'string' && opts.tenantId !== '') {
+      return opts.tenantKind ? { id: opts.tenantId, kind: opts.tenantKind } : { id: opts.tenantId };
+    }
+    const filter = this.tenantFilterNow();
+    return filter.mode === 'tenant' ? filter.tenant : undefined;
+  }
+
+  /** How the current app-facing call is scoped (`system` inside the engine's own work). */
+  private tenantFilterNow(): RunTenantFilter {
+    if (!this.tenancy || engineInternal.getStore() === true) return { mode: 'system' };
+    return this.tenancy.filter();
+  }
+
+  /** Whether the current call may see `run` (always, with tenancy off). */
+  private runVisibleNow(run: WorkflowRun): boolean {
+    if (!this.tenancy) return true;
+    return runVisible(this.tenantFilterNow(), run, this.tenancy.nullRows);
+  }
+
+  /** Whether `runId` exists but the current call may not see it (an app-facing guard: answer not-found). */
+  private async runHidden(runId: string): Promise<boolean> {
+    if (!this.tenancy) return false;
+    const filter = this.tenantFilterNow();
+    if (filter.mode === 'system' || filter.mode === 'all') return false;
+    const run = await this.store.getRun(runId);
+    return run !== null && !runVisible(filter, run, this.tenancy.nullRows);
+  }
+
+  /** `query` confined to the runs the current call may see. */
+  private tenantScoped<Q extends RunFacetQuery>(query: Q): Q {
+    if (!this.tenancy) return query;
+    const ids = tenantScopeIds(this.tenantFilterNow(), this.tenancy.nullRows);
+    if (ids === undefined) return query;
+    return { ...query, tenantIds: intersectTenantIds(query.tenantIds, ids) };
+  }
+
+  /** Run `fn` as the engine's own work: app-facing tenant guards do not apply inside it. */
+  private asEngine<T>(fn: () => T): T {
+    return this.tenancy ? engineInternal.run(true, fn) : fn();
   }
 
   /**
@@ -4011,7 +4109,7 @@ export class WorkflowEngine {
    * through the engine rather than reaching for its private store.
    */
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
-    const scoped = withoutBookkeepingRuns(query);
+    const scoped = withoutBookkeepingRuns(this.tenantScoped(query));
     const runs = await this.store.listRuns(scoped);
     const hidden = scoped.excludeWorkflows;
     return hidden?.length ? runs.filter((run) => !hidden.includes(run.workflow)) : runs;
@@ -4028,7 +4126,7 @@ export class WorkflowEngine {
     query: RunFacetQuery,
     opts?: RunValueFacetOptions,
   ): Promise<RunValueFacetRow[]> {
-    const scoped = withoutBookkeepingRuns(query);
+    const scoped = withoutBookkeepingRuns(this.tenantScoped(query));
     if (this.store.runValueFacets) {
       return this.store.runValueFacets(axis, scoped, opts);
     }
@@ -4036,7 +4134,8 @@ export class WorkflowEngine {
   }
 
   /** List a run's step checkpoints (its timeline). Part of the engine's read API; see {@link listRuns}. */
-  listCheckpoints(runId: string): Promise<StepCheckpoint[]> {
+  async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {
+    if (await this.runHidden(runId)) return [];
     return this.store.listCheckpoints(runId);
   }
 
@@ -4045,7 +4144,7 @@ export class WorkflowEngine {
    * has {@link StateStore.runFacets} (else counted over a listing). Part of the engine's read API.
    */
   runFacets(query: RunFacetQuery): Promise<RunFacetRow[]> {
-    return runFacetsOf(this.store, withoutBookkeepingRuns(query));
+    return runFacetsOf(this.store, withoutBookkeepingRuns(this.tenantScoped(query)));
   }
 
   /**
@@ -4054,6 +4153,7 @@ export class WorkflowEngine {
    * instead of the whole history, and carries an `etag` that `options.ifNoneMatch` can match.
    */
   async getRunDetail(runId: string, options?: RunDetailOptions): Promise<RunDetail | null> {
+    if (await this.runHidden(runId)) return null;
     const source = this.detailSource();
     const withExtras = async (detail: RunDetail): Promise<RunDetail> => {
       const extras = await this.lifecycleDetail(detail.run);
@@ -4210,7 +4310,8 @@ export class WorkflowEngine {
   }
 
   /** One page of a summarized fan's members (see `loadFanMembers`), versioned like {@link getRunDetail}. */
-  getFanMembers(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null> {
+  async getFanMembers(runId: string, group: string, query: FanPageQuery): Promise<FanPage | null> {
+    if (await this.runHidden(runId)) return null;
     return loadFanMembers(this.detailSource(), runId, group, query);
   }
 
@@ -4558,7 +4659,7 @@ export class WorkflowEngine {
 
   async deleteRun(runId: string): Promise<number> {
     const run = await this.store.getRun(runId);
-    if (!run) return 0;
+    if (!run || !this.runVisibleNow(run)) return 0;
     // Collect children BEFORE deleting this run's checkpoints (getRunChildren reads them).
     let deleted = 0;
     for (const childId of await this.getRunChildren(runId)) {
@@ -4641,7 +4742,7 @@ export class WorkflowEngine {
         if (status === undefined) continue; // already gone
         if (!TERMINAL_RUN_STATUSES.includes(status as TerminalRunStatus)) {
           if (!cancelLive) continue;
-          await this.cancel(id).catch(() => undefined);
+          await this.asEngine(() => this.cancel(id)).catch(() => undefined);
         }
         doomed.push(id);
       }
@@ -4836,7 +4937,10 @@ export class WorkflowEngine {
         this.latest.get(run.workflow);
     }
     if (!registered) throw new WorkflowNotRegistered(run.workflow, run.workflowVersion);
-    return this.track(runId, this.execute(run, registered.fn));
+    return this.track(
+      runId,
+      this.inRunTenant(run, () => this.execute(run, registered.fn)),
+    );
   }
 
   /**
@@ -5730,6 +5834,7 @@ export class WorkflowEngine {
   async requeue(runId: string, _seen?: Set<string>): Promise<RunResult | null> {
     const seen = _seen ?? new Set<string>();
     if (seen.has(runId)) return null;
+    if (_seen === undefined && (await this.runHidden(runId))) return null;
     seen.add(runId);
     const run = await this.store.getRun(runId);
     if (!run) return null;
@@ -5880,7 +5985,7 @@ export class WorkflowEngine {
    */
   async redispatchPending(runId: string): Promise<(RunResult & { redispatched: number }) | null> {
     const run = await this.store.getRun(runId);
-    if (!run) return null;
+    if (!run || !this.runVisibleNow(run)) return null;
     const pending = (await this.store.listCheckpoints(runId)).filter(
       (cp) => cp.kind === 'remote' && cp.status === 'pending',
     );
@@ -5921,11 +6026,17 @@ export class WorkflowEngine {
     newRunId?: string,
   ): Promise<{ runId: string } | null> {
     const run = await this.store.getRun(runId);
-    if (!run) return null;
+    if (!run || !this.runVisibleNow(run)) return null;
     const id = newRunId ?? `${runId}~retry~${globalThis.crypto.randomUUID().slice(0, 8)}`;
     // Inherit the original run's namespace so a retry lands in the SAME worker-pool partition (an
-    // operator-routed run keeps its tenant on retry, rather than falling back to the engine's own).
-    await this.start(run.workflow, input, id, { tags: run.tags, namespace: run.namespace });
+    // operator-routed run keeps its pool on retry, rather than falling back to the engine's own),
+    // and its tenant (or none).
+    await this.start(run.workflow, input, id, {
+      tags: run.tags,
+      namespace: run.namespace,
+      tenantId: run.tenantId ?? null,
+      ...(run.tenantKind ? { tenantKind: run.tenantKind } : {}),
+    });
     return { runId: id };
   }
 
@@ -6205,7 +6316,9 @@ export class WorkflowEngine {
     const waiters = await this.store.listSignalWaiters(eventPrefix(name));
     for (const w of waiters) {
       if (eventMatches(payload, eventMatchOf(w.token))) {
-        await this.signal(w.token, payload);
+        // With tenancy on, a tenant's event reaches its own runs only.
+        if (await this.runHidden(w.runId)) continue;
+        await this.asEngine(() => this.signal(w.token, payload));
         touched += 1;
       }
     }
@@ -6228,6 +6341,12 @@ export class WorkflowEngine {
     // Nobody received it live (no waiter matched, no subscriber exists/started) — buffer ONE copy
     // unless the caller opted out. `touched > 0` covers BOTH the waiter fan-out and the subscriber loop.
     if (touched > 0 || opts?.buffer === false) return touched;
+    // A buffered copy carries no tenant and would reach whichever run waits next, so a publisher
+    // scoped to one tenant (or to none) does not buffer: its event reaches live waiters only.
+    if (this.tenancy) {
+      const mode = this.tenantFilterNow().mode;
+      if (mode === 'tenant' || mode === 'tenantless') return touched;
+    }
     const bufferedId = globalThis.crypto.randomUUID();
     await this.store.bufferEvent({ name, payload, id: bufferedId, publishedAt: this.clock() });
     // Re-check: a waiter may have registered in the window between the miss above and this buffer
@@ -6339,6 +6458,7 @@ export class WorkflowEngine {
    * side's write, and the destructive `take*` ops arbitrate so a signal is never delivered twice.
    */
   async signal(token: string, payload: unknown): Promise<RunResult | null> {
+    if (await this.signalHidden(token)) return null;
     const waiter = await this.store.takeSignalWaiter(token);
     if (waiter) return this.deliverSignal(waiter, payload);
     // No one was waiting yet — buffer it so the next `waitForSignal(token)` consumes it instead of
@@ -6357,6 +6477,20 @@ export class WorkflowEngine {
       return null;
     }
     return this.deliverSignal(lateWaiter, reclaimed.payload);
+  }
+
+  /** Whether a run another tenant owns is the one waiting on `token` (an app-facing signal is dropped). */
+  private async signalHidden(token: string): Promise<boolean> {
+    if (!this.tenancy) return false;
+    const filter = this.tenantFilterNow();
+    if (filter.mode === 'system' || filter.mode === 'all') return false;
+    const waiters = await this.store.listSignalWaiters(token);
+    for (const waiter of waiters) {
+      if (waiter.token !== token) continue;
+      const run = await this.store.getRun(waiter.runId);
+      if (run && !runVisible(filter, run, this.tenancy.nullRows)) return true;
+    }
+    return false;
   }
 
   /**
@@ -6398,15 +6532,21 @@ export class WorkflowEngine {
    * null if no run is waiting on the task (e.g. a duplicate/late delivery) — a safe no-op.
    */
   async completeTask(runId: string, name: string, result: unknown): Promise<RunResult | null> {
-    return this.signal(`task:${runId}:${name}`, {
-      ok: true,
-      value: result,
-    } satisfies Completion<unknown>);
+    if (await this.runHidden(runId)) return null;
+    return this.asEngine(() =>
+      this.signal(`task:${runId}:${name}`, {
+        ok: true,
+        value: result,
+      } satisfies Completion<unknown>),
+    );
   }
 
   /** Report that a `ctx.task` failed — the run resumes and throws a FatalError at the task. */
   async failTask(runId: string, name: string, error: string): Promise<RunResult | null> {
-    return this.signal(`task:${runId}:${name}`, { ok: false, error } satisfies Completion<never>);
+    if (await this.runHidden(runId)) return null;
+    return this.asEngine(() =>
+      this.signal(`task:${runId}:${name}`, { ok: false, error } satisfies Completion<never>),
+    );
   }
 
   /**
@@ -6469,7 +6609,7 @@ export class WorkflowEngine {
         ) {
           return;
         }
-        const resumed = await this.signal(token, completion);
+        const resumed = await this.asEngine(() => this.signal(token, completion));
         // The parent may settle the child from its run row between the look above and the buffer
         // write (a join that registers its waiter only now): it then stamped the child first, and the
         // copy just buffered would never be read.
@@ -6550,7 +6690,7 @@ export class WorkflowEngine {
       : settled.status === 'completed'
         ? { ok: true, value: settled.output }
         : failedCompletion(settled.error ?? { message: settled.status });
-    await this.signal(token, completion);
+    await this.asEngine(() => this.signal(token, completion));
   }
 
   /**
@@ -6560,7 +6700,8 @@ export class WorkflowEngine {
    * cancelled. Without it, cancellation is immediate (no undo).
    */
   async cancel(runId: string, opts?: { compensate?: boolean }): Promise<RunResult | null> {
-    return this.cancelOnce(runId, opts, true);
+    if (await this.runHidden(runId)) return null;
+    return this.asEngine(() => this.cancelOnce(runId, opts, true));
   }
 
   private async cancelOnce(
@@ -6700,7 +6841,7 @@ export class WorkflowEngine {
     opts?: { compensate?: boolean },
   ): Promise<void> {
     for (const id of await this.getRunChildren(parentRunId)) {
-      await this.cancel(id, opts).catch(() => undefined);
+      await this.asEngine(() => this.cancel(id, opts)).catch(() => undefined);
     }
   }
 
@@ -6760,7 +6901,7 @@ export class WorkflowEngine {
    * the full listing for a store without one.
    */
   countRuns(query: Omit<RunQuery, 'page' | 'size'>): Promise<number> {
-    return countRuns(this.store, withoutBookkeepingRuns(query));
+    return countRuns(this.store, withoutBookkeepingRuns(this.tenantScoped(query)));
   }
 
   /**
@@ -7160,6 +7301,18 @@ export class WorkflowEngine {
     await this.resumeImplicit(runId).catch((err) => {
       if (!(err instanceof NamespaceMismatch)) throw err;
     });
+  }
+
+  /**
+   * Run a turn with the run's own tenant active, so a resume driven by a timer, a signal or recovery
+   * (no request around it) sees the tenant the run was started under, and what the turn starts or
+   * dispatches carries it. A run with no tenant runs as before.
+   */
+  private inRunTenant<T>(run: WorkflowRun, fn: () => Promise<T>): Promise<T> {
+    const tenant = runTenantOf(run);
+    if (!this.tenancy || !tenant) return fn();
+    const tenancy = this.tenancy;
+    return engineInternal.run(false, () => tenancy.run(tenant, fn));
   }
 
   private async execute(run: WorkflowRun, fn: WorkflowFn): Promise<RunResult> {
@@ -8935,7 +9088,17 @@ export class WorkflowEngine {
         // converges on the already-persisted continuation (idempotent by the continuation id).
         // `dispatch: false`: the tracked handoff below owns the pickup. The continuation inherits
         // the parent RUN's namespace so a tenant's chain stays in its worker-pool partition.
-        await this.startCore(run.workflow, err.input, nextId, { namespace: run.namespace }, false);
+        await this.startCore(
+          run.workflow,
+          err.input,
+          nextId,
+          {
+            namespace: run.namespace,
+            tenantId: run.tenantId ?? null,
+            ...(run.tenantKind ? { tenantKind: run.tenantKind } : {}),
+          },
+          false,
+        );
         // Conditional, like every settle: a cancel persisted after the re-read above (`cancelling`, or a
         // plain `cancelled`) must win over this completion. The continuation already exists then, and
         // nothing has handed it off: cancel it, and unwind this run if the cancel compensates.
@@ -8946,7 +9109,7 @@ export class WorkflowEngine {
           updatedAt: new Date(),
         });
         if (!completed) {
-          await this.cancel(nextId);
+          await this.asEngine(() => this.cancel(nextId));
           const current = await this.store.getRun(run.id);
           if (current?.status === 'cancelling' && !this.leaseLostRuns.has(run.id)) {
             return await this.compensateAndCancel(run, compensations);
@@ -8967,7 +9130,11 @@ export class WorkflowEngine {
         // continuation has entered `inflight` and settled, so `drain()` can't return before the next
         // run's store writes land. Still deferred; its startCore call converges on the run persisted
         // above (prior-run branch) and drives the pickup.
-        this.handoffRun(run.workflow, err.input, nextId, { namespace: run.namespace });
+        this.handoffRun(run.workflow, err.input, nextId, {
+          namespace: run.namespace,
+          tenantId: run.tenantId ?? null,
+          ...(run.tenantKind ? { tenantKind: run.tenantKind } : {}),
+        });
         return { runId: run.id, status: 'completed' };
       }
       if (err instanceof WorkflowBlocked) {
@@ -9403,7 +9570,7 @@ export class WorkflowEngine {
       // escape `drain()` onto a torn-down connection ("Transaction query already complete"). The
       // one-microtask defer is preserved; the promise is registered synchronously.
       cancelChild: (childId) => {
-        this.trackEffect(Promise.resolve().then(() => this.cancel(childId)));
+        this.trackEffect(Promise.resolve().then(() => this.asEngine(() => this.cancel(childId))));
       },
       // Shallow-merge into the run's searchAttributes (the ctx primitive makes this exactly-once).
       upsertSearchAttributes: async (runId, attrs) => {
@@ -9466,10 +9633,11 @@ export class WorkflowEngine {
    * paused at a breakpoint.
    */
   async continue(runId: string): Promise<RunResult | null> {
+    if (await this.runHidden(runId)) return null;
     const checkpoints = await this.store.listCheckpoints(runId);
     const bp = checkpoints.find(isBreakpoint);
     if (!bp) return null;
-    return this.signal(breakpointToken(runId, bp.seq), undefined);
+    return this.asEngine(() => this.signal(breakpointToken(runId, bp.seq), undefined));
   }
 
   /**
@@ -9478,6 +9646,7 @@ export class WorkflowEngine {
    * never published that key. The suspend-model counterpart of a Temporal query.
    */
   async getEvent<TValue = unknown>(runId: string, key: string): Promise<TValue | undefined> {
+    if (await this.runHidden(runId)) return undefined;
     const name = `event:${key}`;
     // Targeted read: the highest-seq checkpoint for this name is the most recent value (a re-published
     // key overwrites at a higher seq), matching the old "last in seq order wins" scan. Falls back to a
@@ -9514,7 +9683,8 @@ export class WorkflowEngine {
    */
   async update(runId: string, name: string, arg: unknown): Promise<UpdateResult> {
     const run = await this.store.getRun(runId);
-    if (!run) return { accepted: false, reason: `run ${runId} not found` };
+    if (!run || !this.runVisibleNow(run))
+      return { accepted: false, reason: `run ${runId} not found` };
     const validate = this.updateValidators.get(`${run.workflow}:${name}`);
     if (validate) {
       try {
@@ -9524,7 +9694,7 @@ export class WorkflowEngine {
         return { accepted: false, reason: err instanceof Error ? err.message : String(err) };
       }
     }
-    const result = await this.signal(`update:${runId}:${name}`, arg);
+    const result = await this.asEngine(() => this.signal(`update:${runId}:${name}`, arg));
     return { accepted: true, run: result };
   }
 
@@ -11532,6 +11702,9 @@ function turnBeatKey(runId: string): string {
 /** The run whose remote turn is being enqueued in the current async context — lets the decision
  *  handler spot a transport delivering the decision from inside its own `dispatchWorkflowTask`. */
 const turnDispatchAls = new AsyncLocalStorage<string>();
+
+/** `true` while the engine does its own work: app-facing tenant guards do not apply inside it. */
+const engineInternal = new AsyncLocalStorage<boolean>();
 
 /** Tolerance (ms) between the worker's clock, which stamps a persisted heartbeat, and this engine's,
  *  when deciding whether a beat belongs to the current attempt (see `awaitWithHeartbeat`). */

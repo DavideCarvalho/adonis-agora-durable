@@ -99,7 +99,9 @@ describe.skipIf(postgres.length === 0).each(postgres)(
         await store.getRun('r1');
         await store.getCheckpoint('r1', 0);
         knex.off('query', listen);
-        expect(seen.some((sql) => sql.includes('"wake_requested_at" from'))).toBe(true);
+        expect(
+          seen.some((sql) => sql.startsWith('select') && sql.includes('"wake_requested_at"')),
+        ).toBe(true);
         expect(seen.some((sql) => sql.includes('"heartbeat_progress" from'))).toBe(true);
       } finally {
         await db.manager.closeAll();

@@ -69,6 +69,13 @@ export interface ScheduleOptions {
    * the schedule moves on to its next window.
    */
   concurrency?: ConcurrencyQuota | undefined;
+  /**
+   * The tenant the schedule (and every run it fires) belongs to. Omit to take the active tenant when
+   * tenancy is on, or none; `null` for none. An upsert keeps the tenant it was created under.
+   */
+  tenantId?: string | null | undefined;
+  /** The kind of {@link tenantId}. */
+  tenantKind?: string | undefined;
 }
 
 /** A schedule as `engine.schedules.get/list` describe it. */
@@ -153,6 +160,10 @@ export interface ScheduleHost {
   getRun(runId: string): Promise<WorkflowRun | null>;
   /** True once the engine began shutting down; `tick` fires nothing more after that. */
   isDraining?(): boolean;
+  /** The active tenant a new schedule belongs to (tenancy on), or undefined. */
+  tenant?(): { id: string; kind?: string | undefined } | undefined;
+  /** Whether the current caller may see a schedule of this tenant (tenancy on). */
+  visible?(record: Pick<ScheduleRecord, 'tenantId'>): boolean;
 }
 
 /** Engine-level knobs for the client. */
@@ -250,16 +261,24 @@ export class ScheduleClient {
   /** The schedule `id`, or null. */
   async get(id: string): Promise<ScheduleDescription | null> {
     const record = await this.requireStore().getSchedule(id);
-    return record ? describe(record) : null;
+    return record && this.visible(record) ? describe(record) : null;
+  }
+
+  private visible(record: ScheduleRecord): boolean {
+    return this.host.visible?.(record) ?? true;
   }
 
   /** Schedules matching `query`, soonest-due first. */
   async list(query: ScheduleListQuery = {}): Promise<ScheduleDescription[]> {
-    return (await this.requireStore().listSchedules(query)).map(describe);
+    return (await this.requireStore().listSchedules(query))
+      .filter((record) => this.visible(record))
+      .map(describe);
   }
 
   /** Delete the schedule. Runs it already started are left alone. Returns whether it existed. */
-  delete(id: string): Promise<boolean> {
+  async delete(id: string): Promise<boolean> {
+    const record = await this.requireStore().getSchedule(id);
+    if (record && !this.visible(record)) return false;
     return this.requireStore().deleteSchedule(id);
   }
 
@@ -403,7 +422,7 @@ export class ScheduleClient {
 
   private async mustGet(id: string): Promise<ScheduleRecord> {
     const record = await this.requireStore().getSchedule(id);
-    if (!record) throw new ScheduleNotFoundError(id);
+    if (!record || !this.visible(record)) throw new ScheduleNotFoundError(id);
     return record;
   }
 
@@ -417,6 +436,17 @@ export class ScheduleClient {
     // An upsert that doesn't say otherwise keeps a paused schedule paused.
     const paused = opts.paused ?? existing?.paused ?? false;
     const window = nextWindowAfter(spec, now); // also validates the cron/timezone up front
+    // Another tenant's schedule id: a clash, never a takeover.
+    if (existing && !this.visible(existing)) throw new Error(`schedule ${opts.id} already exists`);
+    // The tenant: explicit, else the one it was created under, else the active one.
+    const tenant =
+      opts.tenantId === null
+        ? undefined
+        : typeof opts.tenantId === 'string' && opts.tenantId !== ''
+          ? { id: opts.tenantId, kind: opts.tenantKind }
+          : existing?.tenantId !== undefined
+            ? { id: existing.tenantId, kind: existing.tenantKind }
+            : this.host.tenant?.();
     const record: ScheduleRecord = {
       id: opts.id,
       namespace: opts.namespace ?? this.options.namespace ?? DEFAULT_NAMESPACE,
@@ -429,6 +459,9 @@ export class ScheduleClient {
         ...((existing?.state as StateDoc | undefined) ?? {}),
         window,
       }) as Record<string, unknown>,
+      ...(tenant
+        ? { tenantId: tenant.id, ...(tenant.kind ? { tenantKind: tenant.kind } : {}) }
+        : {}),
       createdAt: existing?.createdAt ?? new Date(now),
       updatedAt: new Date(now),
     };
@@ -500,6 +533,9 @@ function startOptions(record: ScheduleRecord): StartOptions {
     searchAttributes: spec.searchAttributes,
     priority: spec.priority,
     concurrency: spec.concurrency,
+    // Every fire carries the tenant the schedule was created under (or none).
+    tenantId: record.tenantId ?? null,
+    tenantKind: record.tenantKind,
   }) as StartOptions;
 }
 

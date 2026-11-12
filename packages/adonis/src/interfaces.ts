@@ -74,6 +74,15 @@ export interface WorkflowRun {
    */
   origin?: string | undefined;
   /**
+   * The customer (organization, clinic, account, …) this run's data belongs to, when the app turned
+   * tenancy on: stamped at start from the active tenant (or `StartOptions.tenantId`), inherited by
+   * child runs, `continueAsNew` and schedule fires. Absent for a run started with no tenant. Not the
+   * worker pool: that is {@link namespace}.
+   */
+  tenantId?: string | undefined;
+  /** The kind of {@link tenantId} (`'organization'`, `'clinic'`, …), when known. */
+  tenantKind?: string | undefined;
+  /**
    * Worker-pool partition this run belongs to (default `'default'`). A worker only picks up /
    * recovers / resumes-timers-for / times-out runs in its OWN namespace, so one shared state store
    * can host non-interchangeable pools (e.g. local dev vs a cluster) without them stealing each
@@ -1257,6 +1266,13 @@ export interface RunQuery {
    */
   wakeBefore?: number | undefined;
   /**
+   * Only runs of these tenants ({@link WorkflowRun.tenantId}); `null` in the list matches runs with no
+   * tenant. Empty array = matches nothing. Omit for every tenant.
+   */
+  tenantIds?: Array<string | null> | undefined;
+  /** Only runs of this tenant. ANDed with {@link tenantIds}. */
+  tenantId?: string | undefined;
+  /**
    * 1-based page number for offset pagination, defaulting to `1`. Structurally the same paging
    * shape `@adonis-agora/filter` takes (`FilterInput.page`/`.size`, resolved to its
    * `ResolvedPagination`), so every Agora listing — this engine's, a Lucid model's — is paged the
@@ -1359,7 +1375,7 @@ export interface ScopedRetentionPolicy {
  * `attributeValue` lists the values recorded under ONE key (its right-hand side).
  */
 export type RunValueAxis =
-  | { field: 'workflow' | 'status' | 'namespace' | 'origin' | 'tag' | 'attributeKey' }
+  | { field: 'workflow' | 'status' | 'namespace' | 'origin' | 'tenant' | 'tag' | 'attributeKey' }
   | { field: 'attributeValue'; key: string };
 
 /**
@@ -1807,6 +1823,15 @@ export interface StartRunMessage {
   tags?: string[] | undefined;
   /** Typed, queryable run data to stamp on the run (same as {@link StartOptions.searchAttributes}). */
   searchAttributes?: SearchAttributes | undefined;
+  /**
+   * The customer (organization, …) the run belongs to, as the pod's request saw it — not the
+   * partition. Optional and ignored by peers that do not know it. The control plane keeps it only
+   * when the pod's verified token grants `tenancy:*` or `tenancy:<tenantId>`; otherwise the run has
+   * no tenant.
+   */
+  tenantId?: string | undefined;
+  /** The kind of {@link tenantId}. */
+  tenantKind?: string | undefined;
 }
 
 /**
@@ -2907,6 +2932,9 @@ export interface ScheduleRecord {
   spec: Record<string, unknown>;
   /** The schedule's bookkeeping (last fire, last run id, last error…) — opaque to the store. */
   state: Record<string, unknown>;
+  /** The tenant it was created under; every run it fires carries it. */
+  tenantId?: string | undefined;
+  tenantKind?: string | undefined;
   createdAt: Date;
   updatedAt: Date;
 }

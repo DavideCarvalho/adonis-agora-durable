@@ -557,7 +557,8 @@ export class RunRequestResponder {
    */
   async #handleStart(msg: StartRunMessage): Promise<RunReply | undefined> {
     const correlationId = msg.runId;
-    const tenant = await this.#resolveTenant(msg.tenant);
+    const verified = await this.#verifyClaim(msg.tenant);
+    const tenant = verified?.tenant ?? null;
     if (tenant === null) {
       return correlationId === undefined
         ? undefined
@@ -574,6 +575,11 @@ export class RunRequestResponder {
         ...(msg.searchAttributes !== undefined ? { searchAttributes: msg.searchAttributes } : {}),
         // Force the run's namespace to the verified tenant — never a body claim (anti-IDOR at the root).
         namespace: tenant,
+        // The customer the pod claims, kept only when its token grants it (else no tenant).
+        tenantId: trustedCustomerTenant(msg.tenantId, verified?.capabilities),
+        ...(msg.tenantKind && trustedCustomerTenant(msg.tenantId, verified?.capabilities)
+          ? { tenantKind: msg.tenantKind }
+          : {}),
       });
       return reply(correlationId ?? result.runId, { ok: true, data: result });
     } catch (err) {
@@ -649,12 +655,36 @@ export class RunRequestResponder {
   }
 
   async #resolveTenant(wireTenant: string): Promise<string | null> {
-    if (!this.#verifyTenant) return wireTenant;
+    return (await this.#verifyClaim(wireTenant))?.tenant ?? null;
+  }
+
+  /** The verified partition and the capabilities its token grants (none without a verifier). */
+  async #verifyClaim(
+    wireTenant: string,
+  ): Promise<{ tenant: string; capabilities: string[] } | null> {
+    if (!this.#verifyTenant) return { tenant: wireTenant, capabilities: [] };
     const verified = await this.#verifyTenant({ token: wireTenant, tenant: wireTenant });
     // Fail closed: only a non-empty string tenant is an acceptance.
     const tenant = verified?.tenant;
-    return typeof tenant === 'string' && tenant.length > 0 ? tenant : null;
+    if (typeof tenant !== 'string' || tenant.length === 0) return null;
+    return {
+      tenant,
+      capabilities: Array.isArray(verified?.capabilities) ? verified.capabilities : [],
+    };
   }
+}
+
+/**
+ * The customer tenant a pod claims on a start, when its token grants it: `tenancy:*` (any customer)
+ * or `tenancy:<id>` (that one). Otherwise `null`: the run starts with no tenant.
+ */
+export function trustedCustomerTenant(
+  claimed: string | undefined,
+  capabilities: readonly string[] | undefined,
+): string | null {
+  if (typeof claimed !== 'string' || claimed === '') return null;
+  const granted = capabilities ?? [];
+  return granted.includes('tenancy:*') || granted.includes(`tenancy:${claimed}`) ? claimed : null;
 }
 
 /** A runId-bearing request addressed a run of another tenant. */

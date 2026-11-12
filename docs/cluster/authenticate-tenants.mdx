@@ -47,7 +47,7 @@ Called on the control plane for every request a tenant pod sends.
 
 - `input.token` is the token the pod sent. It is `undefined` when the pod sends none.
 - `input.tenant` is what the request claims. Never use it to decide the tenant.
-- Return `{ tenant, capabilities? }` to accept. `tenant` is the partition the pod acts as: its runs are created in, and confined to, that namespace.
+- Return `{ tenant, capabilities? }` to accept. `tenant` is the partition the pod acts as: its runs are created in, and confined to, that namespace. A capability `tenancy:*` (or `tenancy:<id>`) lets the pod start runs for its active [organization](/docs/durable/concepts/organizations); without it, the pod's runs belong to no organization.
 - Return `null` to reject. The pod's call fails with a `RunGatewayError` whose `code` is `unauthorized`.
 - Throw when you cannot decide (your database or the identity provider is down). The pod's call fails with the error message, and the next request calls `verify` again.
 
