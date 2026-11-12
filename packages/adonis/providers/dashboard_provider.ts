@@ -66,6 +66,8 @@ import {
 import { openApiDocument } from '../src/dashboard/openapi.js';
 import { contentTypeFor, renderIndexHtml } from '../src/dashboard/spa.js';
 import type { DurableConfig } from '../src/define_config.js';
+import { registerDoctorChecks } from '../src/doctor/agora_doctor.js';
+import { durableConsoleDoctorChecks } from '../src/doctor/checks.js';
 import { WorkflowEngine } from '../src/index.js';
 import { collectMetrics, type MetricsCollector } from '../src/metrics.js';
 import { DURABLE_TRANSPORT } from '../src/role_bindings.js';
@@ -148,6 +150,7 @@ export default class DashboardProvider {
   }
 
   async boot() {
+    await registerDoctorChecks(this.app.container, durableConsoleDoctorChecks);
     const config = resolveConfig(
       this.app.config.get<DurableDashboardConfig>('durable_dashboard', {}),
       { inProduction: this.app.inProduction },
