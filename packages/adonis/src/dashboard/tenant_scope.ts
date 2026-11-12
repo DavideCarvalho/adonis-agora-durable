@@ -148,7 +148,47 @@ function confine(engine: DashboardEngine, ids: Array<string | null>): DashboardE
     const fn = engine.runValueFacets.bind(engine);
     scoped.runValueFacets = (axis, query, opts) => fn(axis, narrow(query), opts);
   }
-  // A signal addresses a token, not a run: the console's signal route checks the run first
-  // (`signalRun` reads `getRun`, which is scoped above), so the token path stays as is.
+  // Waiters name runs: only the scoped ones are listed, and a signal whose live waiter belongs to a
+  // run outside the scope is not delivered (the console's routes check the run itself first).
+  const waiterVisible = async (waiter: { runId: string }) => sees(waiter.runId);
+  if (engine.listSignalWaiters) {
+    const fn = engine.listSignalWaiters.bind(engine);
+    scoped.listSignalWaiters = async (prefix) => {
+      const out = [];
+      for (const w of await fn(prefix)) if (await waiterVisible(w)) out.push(w);
+      return out;
+    };
+  }
+  if (engine.listSignalWaitersByRunIds) {
+    const fn = engine.listSignalWaitersByRunIds.bind(engine);
+    scoped.listSignalWaitersByRunIds = async (runIds) => {
+      const mine: string[] = [];
+      for (const id of runIds) if (await sees(id)) mine.push(id);
+      return mine.length > 0 ? fn(mine) : [];
+    };
+  }
+  if (engine.waitingFor) {
+    const fn = engine.waitingFor.bind(engine);
+    scoped.waitingFor = async (runIds) => {
+      const mine: string[] = [];
+      for (const id of runIds) if (await sees(id)) mine.push(id);
+      return mine.length > 0 ? fn(mine) : {};
+    };
+  }
+  if (engine.signal) {
+    const fn = engine.signal.bind(engine);
+    const listWaiters = engine.listSignalWaiters?.bind(engine);
+    scoped.signal = async (token, payload) => {
+      if (listWaiters) {
+        for (const w of await listWaiters(token)) {
+          if (w.token === token && !(await waiterVisible(w))) return null;
+        }
+      }
+      // A webhook token names its run: `wh:<runId>:<seq>`.
+      const webhook = /^wh:(.+):\d+$/.exec(token);
+      if (webhook?.[1] !== undefined && !(await sees(webhook[1]))) return null;
+      return fn(token, payload);
+    };
+  }
   return scoped;
 }

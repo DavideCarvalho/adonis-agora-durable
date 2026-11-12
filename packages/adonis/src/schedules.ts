@@ -442,7 +442,7 @@ export class ScheduleClient {
     const tenant =
       opts.tenantId === null
         ? undefined
-        : typeof opts.tenantId === 'string'
+        : typeof opts.tenantId === 'string' && opts.tenantId !== ''
           ? { id: opts.tenantId, kind: opts.tenantKind }
           : existing?.tenantId !== undefined
             ? { id: existing.tenantId, kind: existing.tenantKind }

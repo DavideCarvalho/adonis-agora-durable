@@ -156,10 +156,9 @@ export function contextEngineTenancy(
       const filter = slot.tenantFilter(config.kinds ? { kinds: config.kinds } : undefined);
       if (filter.mode === 'tenant') {
         const tenant = (filter as { tenant: { id: string; kind?: string } }).tenant;
-        return {
-          mode: 'tenant',
-          tenant: tenant.kind ? { id: tenant.id, kind: tenant.kind } : { id: tenant.id },
-        };
+        // `unknown` is the slot's spelling of "no kind" (a legacy id, a resumed kind-less run).
+        const kind = tenant.kind && tenant.kind !== 'unknown' ? tenant.kind : undefined;
+        return { mode: 'tenant', tenant: kind ? { id: tenant.id, kind } : { id: tenant.id } };
       }
       return { mode: filter.mode };
     },

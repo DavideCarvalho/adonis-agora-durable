@@ -6341,6 +6341,12 @@ export class WorkflowEngine {
     // Nobody received it live (no waiter matched, no subscriber exists/started) — buffer ONE copy
     // unless the caller opted out. `touched > 0` covers BOTH the waiter fan-out and the subscriber loop.
     if (touched > 0 || opts?.buffer === false) return touched;
+    // A buffered copy carries no tenant and would reach whichever run waits next, so a publisher
+    // scoped to one tenant (or to none) does not buffer: its event reaches live waiters only.
+    if (this.tenancy) {
+      const mode = this.tenantFilterNow().mode;
+      if (mode === 'tenant' || mode === 'tenantless') return touched;
+    }
     const bufferedId = globalThis.crypto.randomUUID();
     await this.store.bufferEvent({ name, payload, id: bufferedId, publishedAt: this.clock() });
     // Re-check: a waiter may have registered in the window between the miss above and this buffer

@@ -95,6 +95,15 @@ describe('scopedDashboardEngine', () => {
     expect(await engine.listCheckpoints('g')).toEqual([]);
   });
 
+  it("does not deliver a signal to another tenant's waiter, nor list its waiters", async () => {
+    const raw = await seeded();
+    const engine = scopedDashboardEngine(storeDashboardEngine(raw), ['acme']);
+    expect(await engine.signal?.('go', 1)).toBeNull();
+    expect((await raw.getRun('g'))?.status).toBe('suspended');
+    const waiters = (await engine.listSignalWaiters?.('')) ?? [];
+    expect(waiters.every((w) => w.runId === 'a')).toBe(true);
+  });
+
   it('no scope = no confinement', async () => {
     const raw = await seeded();
     const engine = scopedDashboardEngine(storeDashboardEngine(raw), undefined);

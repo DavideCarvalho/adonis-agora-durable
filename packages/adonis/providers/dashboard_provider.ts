@@ -385,12 +385,15 @@ export default class DashboardProvider {
         WorkflowEngine,
       );
       const slot = tenancySlot();
-      const rows = base.runValueFacets
-        ? await (slot
-            ? slot.allTenants(() => base.runValueFacets?.({ field: 'tenant' }, {}, { limit: 200 }))
-            : base.runValueFacets({ field: 'tenant' }, {}, { limit: 200 }))
-        : [];
-      ids = (rows ?? []).map((row) => row.value).filter((v): v is string => typeof v === 'string');
+      // Paged: every organization that has runs, not only the first page of them.
+      ids = [];
+      const facets = base.runValueFacets?.bind(base);
+      for (let offset = 0; facets && offset < 10_000; offset += 200) {
+        const page = () => facets({ field: 'tenant' }, {}, { limit: 200, offset });
+        const rows = (await (slot ? slot.allTenants(page) : page())) ?? [];
+        for (const row of rows) if (typeof row.value === 'string') ids.push(row.value);
+        if (rows.length < 200) break;
+      }
     } else {
       ids = scope.authorized;
     }

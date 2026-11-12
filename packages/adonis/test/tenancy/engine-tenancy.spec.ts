@@ -168,6 +168,12 @@ describe('tenancy on', () => {
     expect(seenTenant).toEqual(['acme']);
   });
 
+  it('a tenant-scoped publish reaches live waiters only (nothing buffered for another tenant)', async () => {
+    const { engine } = makeEngine();
+    expect(await asTenant('acme', () => engine.publishEvent('order.placed', { id: 1 }))).toBe(0);
+    expect(await engine.publishEvent('order.placed', { id: 2 })).toBe(0);
+  });
+
   it('child runs inherit the parent tenant', async () => {
     const { engine } = makeEngine();
     await asTenant('acme', () => engine.start('parent', {}, 'p'));

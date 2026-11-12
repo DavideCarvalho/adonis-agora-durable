@@ -82,8 +82,27 @@ export function tenantScopedGateway(inner: RunGateway, tenancy: EngineTenancy): 
     const fn = inner.runValueFacets.bind(inner);
     gateway.runValueFacets = (axis, query, opts) => fn(axis, scoped(query), opts);
   }
-  if (inner.waitingFor) gateway.waitingFor = inner.waitingFor.bind(inner);
-  if (inner.republishLifecycle) gateway.republishLifecycle = inner.republishLifecycle.bind(inner);
+  if (inner.waitingFor) {
+    const fn = inner.waitingFor.bind(inner);
+    // Only the runs this tenant may see: wait state names signal tokens.
+    gateway.waitingFor = async (runIds) => {
+      const mine: string[] = [];
+      for (const id of runIds) if (await visible(id)) mine.push(id);
+      return mine.length > 0 ? fn(mine) : {};
+    };
+  }
+  if (inner.republishLifecycle) {
+    const fn = inner.republishLifecycle.bind(inner);
+    gateway.republishLifecycle = async (target) => {
+      const filter = tenancy.filter();
+      const scoped = filter.mode === 'tenant' || filter.mode === 'tenantless';
+      // A workflow-wide republish spans every customer's runs: only an unscoped caller may ask.
+      if (scoped && !('runId' in target)) return { runs: 0, started: 0, failed: [] };
+      if ('runId' in target && !(await visible(target.runId)))
+        return { runs: 0, started: 0, failed: [] };
+      return fn(target);
+    };
+  }
   if (inner.workflowLifecycle) gateway.workflowLifecycle = inner.workflowLifecycle.bind(inner);
   return gateway;
 }

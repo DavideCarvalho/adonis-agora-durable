@@ -75,6 +75,36 @@ describe('tenantScopedGateway (a tenant pod)', () => {
     expect(cancelled).toEqual(['a']);
   });
 
+  it('waitingFor and republishLifecycle stay within the tenant', async () => {
+    const { gateway } = fakeGateway();
+    const seen: string[][] = [];
+    let republished = 0;
+    Object.assign(gateway, {
+      waitingFor: async (ids: string[]) => {
+        seen.push(ids);
+        return {};
+      },
+      republishLifecycle: async () => {
+        republished += 1;
+        return { runs: 1, started: 1, failed: [] };
+      },
+    });
+    const scoped = tenantScopedGateway(
+      gateway,
+      tenancy({ mode: 'tenant', tenant: { id: 'acme' } }),
+    );
+    await scoped.waitingFor?.(['a', 'g']);
+    expect(seen).toEqual([['a']]);
+    expect(await scoped.republishLifecycle?.({ workflow: 'w' })).toEqual({
+      runs: 0,
+      started: 0,
+      failed: [],
+    });
+    await scoped.republishLifecycle?.({ runId: 'g' });
+    await scoped.republishLifecycle?.({ runId: 'a' });
+    expect(republished).toBe(1);
+  });
+
   it('passes everything through with no tenant context (system)', async () => {
     const { gateway } = fakeGateway();
     const scoped = tenantScopedGateway(gateway, tenancy({ mode: 'system' }));
