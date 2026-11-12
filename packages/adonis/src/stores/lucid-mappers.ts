@@ -39,6 +39,9 @@ export interface RunRow {
   awaiting_decision_task_id?: string | null;
   /** Nullable + optional: the column arrived in a later schema wave (durable refused wakes). */
   wake_requested_at?: number | string | null;
+  /** Nullable + optional: the columns arrived in a later schema wave (tenancy). */
+  tenant_id?: string | null;
+  tenant_kind?: string | null;
   created_at: number | string;
   updated_at: number | string;
 }
@@ -189,6 +192,10 @@ export function runToRow(run: WorkflowRun): RunRow {
     ...(run.awaitingDecisionTaskId !== undefined
       ? { awaiting_decision_task_id: run.awaitingDecisionTaskId }
       : {}),
+    // Only when set, for the same reason: a run with no tenant inserts on a schema without the column.
+    ...(run.tenantId !== undefined
+      ? { tenant_id: run.tenantId, tenant_kind: run.tenantKind ?? null }
+      : {}),
     created_at: run.createdAt.getTime(),
     updated_at: run.updatedAt.getTime(),
   };
@@ -221,6 +228,8 @@ export function runPatchToRow(patch: Partial<WorkflowRun>): Partial<RunRow> {
     row.awaiting_decision_task_id = patch.awaitingDecisionTaskId ?? null;
   }
   if ('wakeRequestedAt' in patch) row.wake_requested_at = patch.wakeRequestedAt ?? null;
+  if ('tenantId' in patch) row.tenant_id = patch.tenantId ?? null;
+  if ('tenantKind' in patch) row.tenant_kind = patch.tenantKind ?? null;
   if (patch.createdAt != null) row.created_at = patch.createdAt.getTime();
   if (patch.updatedAt != null) row.updated_at = patch.updatedAt.getTime();
   return row;
@@ -244,6 +253,8 @@ export function rowToRun(row: RunRow): WorkflowRun {
   const wakeAt = toNum(row.wake_at);
   if (wakeAt !== undefined) run.wakeAt = wakeAt;
   if (row.origin != null) run.origin = row.origin;
+  if (row.tenant_id != null) run.tenantId = row.tenant_id;
+  if (row.tenant_kind != null) run.tenantKind = row.tenant_kind;
   if (row.locked_by != null) run.lockedBy = row.locked_by;
   const lockedUntil = toNum(row.locked_until);
   if (lockedUntil !== undefined) run.lockedUntil = lockedUntil;

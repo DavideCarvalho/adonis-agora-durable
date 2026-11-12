@@ -322,12 +322,12 @@ export interface DurableSearchSource {
  * contain `q` open the workflow's page. `base` is the console's mount path (`''` at the root).
  */
 export function durableConsoleSearch(
-  source: () => Promise<DurableSearchSource>,
+  source: (ctx: HttpContext) => Promise<DurableSearchSource>,
   base: string,
 ): (ctx: HttpContext, q: string, limit: number) => Promise<AgoraConsoleSearchHit[]> {
   const shell = base === '' ? '/' : base;
-  return async (_ctx, q, limit) => {
-    const reader = await source();
+  return async (ctx, q, limit) => {
+    const reader = await source(ctx);
     const hits: AgoraConsoleSearchHit[] = [];
     const run = await reader.getRun(q).catch(() => null);
     if (run) {

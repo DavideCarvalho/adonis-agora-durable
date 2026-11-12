@@ -876,6 +876,11 @@ export class InMemoryStateStore implements StateStore {
             );
     }
     if (query.origin) runs = runs.filter((r) => r.origin === query.origin);
+    if (query.tenantId !== undefined) runs = runs.filter((r) => r.tenantId === query.tenantId);
+    if (query.tenantIds) {
+      const allowed = query.tenantIds;
+      runs = runs.filter((r) => allowed.includes(r.tenantId ?? null));
+    }
     if (query.status) runs = runs.filter((r) => r.status === query.status);
     if (query.statuses) runs = runs.filter((r) => query.statuses?.includes(r.status));
     if (query.tag) runs = runs.filter((r) => r.tags?.includes(query.tag as string));

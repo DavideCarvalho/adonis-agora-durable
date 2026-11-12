@@ -15,6 +15,7 @@ import {
   type FleetTransport,
   mergeFleets,
 } from '../src/dashboard/compat.js';
+import type { ConsoleDecision } from '../src/dashboard/console_authorize.js';
 import {
   durableConsoleSearch,
   listVisibleConsoles,
@@ -65,12 +66,18 @@ import {
 } from '../src/dashboard/handlers.js';
 import { openApiDocument } from '../src/dashboard/openapi.js';
 import { contentTypeFor, renderIndexHtml } from '../src/dashboard/spa.js';
+import {
+  type ConsoleTenantScope,
+  resolveConsoleTenantScope,
+  scopedDashboardEngine,
+} from '../src/dashboard/tenant_scope.js';
 import type { DurableConfig } from '../src/define_config.js';
 import { registerDoctorChecks } from '../src/doctor/agora_doctor.js';
 import { durableConsoleDoctorChecks } from '../src/doctor/checks.js';
 import { WorkflowEngine } from '../src/index.js';
 import { collectMetrics, type MetricsCollector } from '../src/metrics.js';
 import { DURABLE_TRANSPORT } from '../src/role_bindings.js';
+import { tenancyEnabled, tenancySlot } from '../src/tenancy.js';
 
 /**
  * Directory of the built SPA (`dist/spa`, copied in by `copy:stubs` — see `package.json`), relative to
@@ -129,6 +136,11 @@ export default class DashboardProvider {
 
   private warnedOnAuthorizeThrow = false;
 
+  /** Each request's `authorize` verdict, read again for the console's tenant scope. */
+  private readonly decisions = new WeakMap<HttpContext, ConsoleDecision>();
+  /** Each request's resolved tenant scope. */
+  private readonly scopes = new WeakMap<HttpContext, ConsoleTenantScope>();
+
   /** SSE connections currently open, per client address (and in total) — see streamRun. */
   private readonly sseByAddress = new Map<string, number>();
   private sseTotal = 0;
@@ -180,16 +192,83 @@ export default class DashboardProvider {
     });
   }
 
-  /** The console's read/control port, resolved per request (see {@link registerRoutes}). */
+  /**
+   * The console's read/control port, resolved per request (see {@link registerRoutes}). With tenancy
+   * on and a request at hand, it is confined to the tenants this viewer may see (see
+   * {@link consoleTenantScope}); the process counters, which span every tenant, are then left out
+   * unless the viewer sees every tenant.
+   */
   private consoleDeps(
     config: ResolvedDurableDashboardConfig,
     durableTopology: 'standalone' | 'control-plane' | 'tenant',
-  ): () => Promise<Deps> {
-    return async () => ({
-      engine: await dashboardEngineForTopology(durableTopology, this.app.container, WorkflowEngine),
-      ...(config.redact ? { redact: config.redact } : {}),
-      ...(this.metricsCollector ? { metrics: this.metricsCollector } : {}),
+  ): (ctx?: HttpContext) => Promise<Deps> {
+    return async (ctx) => {
+      const base = await dashboardEngineForTopology(
+        durableTopology,
+        this.app.container,
+        WorkflowEngine,
+      );
+      const scope = ctx ? await this.consoleTenantScope(config, ctx) : undefined;
+      const slot = scope ? tenancySlot() : undefined;
+      const engine = scope
+        ? scopedDashboardEngine(base, scope.ids, slot ? (fn) => slot.allTenants(fn) : undefined)
+        : base;
+      const metrics = scope && scope.ids !== undefined ? undefined : this.metricsCollector;
+      return {
+        engine,
+        ...(config.redact ? { redact: config.redact } : {}),
+        ...(metrics ? { metrics } : {}),
+      };
+    };
+  }
+
+  /** Whether tenancy is on for durable (config/durable.ts `tenancy`, else config/context.ts). */
+  private tenancyOn(): boolean {
+    return tenancyEnabled(this.app.config.get<DurableConfig>('durable', {}).tenancy);
+  }
+
+  /**
+   * The tenants this viewer may see in the console, once per request, or `undefined` with tenancy
+   * off. `authorize` may grant `tenants` (`'*'` or a list); otherwise it is the viewer's own active
+   * tenant. A `?tenant=` pick outside the grant is answered with nothing and audited.
+   */
+  private async consoleTenantScope(
+    config: ResolvedDurableDashboardConfig,
+    ctx: HttpContext,
+  ): Promise<ConsoleTenantScope | undefined> {
+    if (!this.tenancyOn()) return undefined;
+    const known = this.scopes.get(ctx);
+    if (known) return known;
+    let decision = this.decisions.get(ctx);
+    if (decision === undefined) {
+      decision = await config.authorize(ctx);
+      this.decisions.set(ctx, decision);
+    }
+    const granted = decision.allowed ? decision.tenants : undefined;
+    const slot = tenancySlot();
+    const option = this.app.config.get<DurableConfig>('durable', {}).tenancy;
+    const kinds = typeof option === 'object' ? option.kinds : undefined;
+    const filter = slot?.tenantFilter(kinds ? { kinds } : undefined);
+    const own =
+      filter?.mode === 'tenant'
+        ? (filter as { tenant: { id: string; kind?: string; slug?: string } }).tenant
+        : undefined;
+    const picked = ctx.request.qs().tenant;
+    const scope = resolveConsoleTenantScope({
+      granted,
+      own: own ? { id: own.id, kind: own.kind, slug: own.slug } : undefined,
+      selected: typeof picked === 'string' ? picked : undefined,
     });
+    if (scope.forged) {
+      this.recordAudit(config, {
+        at: new Date(),
+        actor: auditActor(ctx),
+        method: 'TENANT',
+        path: `${ctx.request.url(false)} outside scope: tenant=${scope.selected ?? ''}`,
+      });
+    }
+    this.scopes.set(ctx, scope);
+    return scope;
   }
 
   private async registerDevTools(
@@ -214,7 +293,7 @@ export default class DashboardProvider {
 
   private async registerDurableDevToolsInto(
     config: ResolvedDurableDashboardConfig,
-    deps: () => Promise<Deps>,
+    deps: (ctx?: HttpContext) => Promise<Deps>,
   ): Promise<void> {
     await registerDurableDevTools(this.app.container, {
       authorize: config.authorize,
@@ -254,8 +333,8 @@ export default class DashboardProvider {
         path: config.path === '' ? '/' : config.path,
         order: 10,
         authorize: config.authorize,
-        search: durableConsoleSearch(async () => {
-          const d = await deps();
+        search: durableConsoleSearch(async (ctx) => {
+          const d = await deps(ctx);
           return {
             getRun: (id) => d.engine.getRun(id),
             workflows: async (q, limit) => {
@@ -272,6 +351,47 @@ export default class DashboardProvider {
       },
       logger,
     );
+  }
+
+  /**
+   * What the console's "Organization" control shows: off (tenancy off), `none` (a viewer with no
+   * tenant), `fixed` (one tenant), or `pick` (several, or every tenant with `all`).
+   */
+  private async tenantPicker(
+    config: ResolvedDurableDashboardConfig,
+    ctx: HttpContext,
+  ): Promise<{
+    mode: 'off' | 'none' | 'fixed' | 'pick';
+    all: boolean;
+    selected: string | null;
+    tenants: Array<{ id: string; label: string }>;
+  }> {
+    const scope = await this.consoleTenantScope(config, ctx);
+    if (!scope) return { mode: 'off', all: false, selected: null, tenants: [] };
+    if (scope.authorized === 'none')
+      return { mode: 'none', all: false, selected: null, tenants: [] };
+    let ids: string[];
+    if (scope.authorized === '*') {
+      // Every tenant that has runs, read across tenants.
+      const base = await dashboardEngineForTopology(
+        this.durableTopology(),
+        this.app.container,
+        WorkflowEngine,
+      );
+      const slot = tenancySlot();
+      const rows = base.runValueFacets
+        ? await (slot
+            ? slot.allTenants(() => base.runValueFacets?.({ field: 'tenant' }, {}, { limit: 200 }))
+            : base.runValueFacets({ field: 'tenant' }, {}, { limit: 200 }))
+        : [];
+      ids = (rows ?? []).map((row) => row.value).filter((v): v is string => typeof v === 'string');
+    } else {
+      ids = scope.authorized;
+    }
+    const labels = await tenantLabelsFor(ids, scope.own);
+    const tenants = ids.map((id) => ({ id, label: labels[id] ?? id }));
+    const mode = scope.authorized === '*' || ids.length > 1 ? 'pick' : 'fixed';
+    return { mode, all: scope.authorized === '*', selected: scope.selected ?? null, tenants };
   }
 
   private async attachDiagnostics(
@@ -303,8 +423,6 @@ export default class DashboardProvider {
     // Resolve the dashboard's read/control port lazily per request, branched by topology (design §5/§8):
     // a store topology adapts the engine (built by @adonis-agora/durable's provider); a store-less `tenant`
     // pod resolves the DURABLE_RUN_GATEWAY token (a ProxyRunGateway) and adapts it — NO engine, NO store.
-    const resolveEngine = (): Promise<DashboardEngine> =>
-      dashboardEngineForTopology(durableTopology, this.app.container, WorkflowEngine);
     const deps = this.consoleDeps(config, durableTopology);
 
     this.registerSpaRoutes(router, config, apiBase);
@@ -317,7 +435,7 @@ export default class DashboardProvider {
         // on record. Reads (GET) are not audited (they'd drown the log).
         if (isMutatingMethod(ctx)) this.audit(config, ctx);
         try {
-          const result = await handler(await deps(), toApiRequest(ctx));
+          const result = await handler(await deps(ctx), toApiRequest(ctx));
           for (const [name, value] of Object.entries(result.headers ?? {})) {
             ctx.response.header(name, value);
           }
@@ -383,7 +501,7 @@ export default class DashboardProvider {
       .get(`${apiBase}/metrics`, async (ctx: HttpContext) => {
         if (!(await this.enforce(config, ctx, 'api'))) return;
         try {
-          const text = await metricsText(await deps());
+          const text = await metricsText(await deps(ctx));
           ctx.response.header('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
           return ctx.response.status(200).send(text);
         } catch (error) {
@@ -406,6 +524,36 @@ export default class DashboardProvider {
       .post(`${apiBase}/schedules/:key/:action`, json(scheduleAction))
       .as('durable_dashboard.schedules.action');
     router.post(`${apiBase}/bulk/:action`, json(bulkAction)).as('durable_dashboard.bulk');
+    // Tenancy: which organizations this viewer may pick, and an audited record of a switch.
+    router
+      .get(`${apiBase}/tenants`, async (ctx: HttpContext) => {
+        if (!(await this.enforce(config, ctx, 'api'))) return;
+        ctx.response.header('cache-control', 'private, no-store');
+        try {
+          return ctx.response.status(200).json(await this.tenantPicker(config, ctx));
+        } catch (error) {
+          void this.logServerError(error);
+          return ctx.response.status(500).json({ error: 'internal error' });
+        }
+      })
+      .as('durable_dashboard.tenants');
+    router
+      .post(`${apiBase}/tenants/:id/select`, async (ctx: HttpContext) => {
+        if (!(await this.enforce(config, ctx, 'api'))) return;
+        // The audit line (actor, `POST …/tenants/<id>/select`) is the record of the switch.
+        this.audit(config, ctx);
+        const scope = await this.consoleTenantScope(config, ctx);
+        const id = String(ctx.params.id);
+        const allowed =
+          scope === undefined ||
+          id === '*' ||
+          scope.authorized === '*' ||
+          (Array.isArray(scope.authorized) && scope.authorized.includes(id));
+        return ctx.response
+          .status(allowed ? 200 : 404)
+          .json(allowed ? { tenant: id } : { error: 'not found' });
+      })
+      .as('durable_dashboard.tenants.select');
     // The console switcher: the other Agora consoles this viewer may open, and a search across them.
     router
       .get(`${apiBase}/consoles`, async (ctx: HttpContext) => {
@@ -456,7 +604,11 @@ export default class DashboardProvider {
       .get(`${apiBase}/runs/:id/stream`, async (ctx: HttpContext) => {
         if (!(await this.enforce(config, ctx, 'api'))) return;
         const id = ctx.params.id as string;
-        const engine = await resolveEngine();
+        const { engine } = await deps(ctx);
+        // A run outside the viewer's tenants streams nothing: answer like an unknown run.
+        if ((await engine.getRun(id)) === null && this.tenancyOn()) {
+          return ctx.response.status(404).json({ error: `run ${id} not found` });
+        }
         await this.streamRun(ctx, engine, id);
       })
       .as('durable_dashboard.runs.stream');
@@ -467,7 +619,7 @@ export default class DashboardProvider {
       .get(`${apiBase}/compat`, async (ctx: HttpContext) => {
         if (!(await this.enforce(config, ctx, 'api'))) return;
         try {
-          const result = await compat(await this.compatSource(await resolveEngine()));
+          const result = await compat(await this.compatSource((await deps(ctx)).engine));
           return ctx.response.status(result.status).json(result.body);
         } catch (error) {
           void this.logServerError(error);
@@ -698,6 +850,7 @@ export default class DashboardProvider {
     }
     // The resolved gate never throws: a throwing `authorize` comes back as a 403 carrying the error.
     const decision = await config.authorize(ctx);
+    this.decisions.set(ctx, decision);
     if (decision.allowed) return true;
     if (decision.error !== undefined)
       void this.warnAuthorizeThrow(decision.error).catch(() => undefined);
@@ -831,8 +984,38 @@ export function auditActor(ctx: HttpContext): string {
 function toApiRequest(ctx: HttpContext): ApiRequest {
   return {
     params: ctx.params as Record<string, string | undefined>,
-    query: ctx.request.qs() as Record<string, string | string[] | undefined>,
+    // `tenant` picks the console's organization (see consoleTenantScope); it is not a run filter.
+    query: withoutTenantParam(ctx.request.qs() as Record<string, string | string[] | undefined>),
     body: ctx.request.body(),
     headers: { 'if-none-match': ctx.request.header('if-none-match') },
   };
+}
+
+function withoutTenantParam(
+  query: Record<string, string | string[] | undefined>,
+): Record<string, string | string[] | undefined> {
+  if (!('tenant' in query)) return query;
+  const { tenant: _tenant, ...rest } = query;
+  return rest;
+}
+
+/**
+ * Display labels for tenant ids: the viewer's own tenant by its slug, the rest through context's
+ * label resolver (`tenancy.label` in config/context.ts, or the one authkit installs), else the id.
+ */
+async function tenantLabelsFor(
+  ids: string[],
+  own: { id: string; slug?: string | undefined } | undefined,
+): Promise<Record<string, string>> {
+  const labels: Record<string, string> = {};
+  const slot = tenancySlot();
+  if (slot?.tenantLabels && ids.length > 0) {
+    try {
+      Object.assign(labels, await slot.tenantLabels(ids));
+    } catch {
+      /* labels are cosmetic: fall back to ids */
+    }
+  }
+  if (own?.slug && labels[own.id] === undefined) labels[own.id] = own.slug;
+  return labels;
 }

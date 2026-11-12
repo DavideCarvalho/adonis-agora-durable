@@ -922,6 +922,8 @@ function summarizeRun(run: WorkflowRun, waitingOf?: (run: WorkflowRun) => RunWai
     status: run.status,
     namespace: run.namespace,
     origin: run.origin,
+    ...(run.tenantId !== undefined ? { tenantId: run.tenantId } : {}),
+    ...(run.tenantKind !== undefined ? { tenantKind: run.tenantKind } : {}),
     tags: run.tags ?? [],
     createdAt: run.createdAt.toISOString(),
     updatedAt: run.updatedAt.toISOString(),

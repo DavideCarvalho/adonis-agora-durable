@@ -60,7 +60,7 @@ export const DURABLE_SCHEMA_META_TABLE = 'durable_schema_meta';
  * once on its next boot and then goes back to the one-row read. A test pins the SQLite DDL to this
  * number, so a schema change without a bump fails CI.
  */
-export const DURABLE_SCHEMA_REVISION = 5;
+export const DURABLE_SCHEMA_REVISION = 6;
 
 const SCHEMA_META_ROW = 'durable';
 
@@ -383,9 +383,13 @@ async function healDurableTables(
       table.integer('priority');
       table.text('awaiting_decision_task_id');
       table.bigInteger('wake_requested_at');
+      table.string('tenant_id');
+      table.string('tenant_kind');
       table.bigInteger('created_at').notNullable();
       table.bigInteger('updated_at').notNullable();
       table.index(['status'], 'durable_runs_status_idx');
+      // Tenancy: a tenant's runs, newest first.
+      table.index(['tenant_id', 'created_at'], 'durable_runs_tenant_idx');
       table.index(['status', 'wake_at'], 'durable_runs_due_idx');
       table.index(['status', 'wake_requested_at'], 'durable_runs_wake_requested_idx');
       // Worker-pool partition: scopes the poll/recovery queries (namespace + status + createdAt).
@@ -437,6 +441,15 @@ async function healDurableTables(
         table.index(['status', 'wake_requested_at'], 'durable_runs_wake_requested_idx');
       });
       repairs.push(`${DURABLE_TABLES.runs}.wake_requested_at`);
+    }
+    if (!(await conn().hasColumn(DURABLE_TABLES.runs, 'tenant_id'))) {
+      // Tenancy: nullable, so an existing run reads back with no tenant.
+      await conn().alterTable(DURABLE_TABLES.runs, (table) => {
+        table.string('tenant_id');
+        table.string('tenant_kind');
+        table.index(['tenant_id', 'created_at'], 'durable_runs_tenant_idx');
+      });
+      repairs.push(`${DURABLE_TABLES.runs}.tenant_id`);
     }
     // Index-only repair: the dashboard's default (unfiltered) listing orders by created_at DESC —
     // without this a page load over a large table is a full sort.
@@ -611,11 +624,20 @@ async function healDurableTables(
       table.text('tags', 'longtext');
       table.text('spec', 'longtext').notNullable();
       table.text('state', 'longtext').notNullable();
+      table.string('tenant_id');
+      table.string('tenant_kind');
       table.bigInteger('created_at').notNullable();
       table.bigInteger('updated_at').notNullable();
       // The worker tick's "due by T" scan: `paused = false AND next_fire_at <= T`.
       table.index(['paused', 'next_fire_at'], 'durable_schedules_due_idx');
     });
+  } else if (!(await conn().hasColumn(DURABLE_TABLES.schedules, 'tenant_id'))) {
+    // Tenancy: nullable, so an existing schedule (and every run it fires) has no tenant.
+    await conn().alterTable(DURABLE_TABLES.schedules, (table) => {
+      table.string('tenant_id');
+      table.string('tenant_kind');
+    });
+    repairs.push(`${DURABLE_TABLES.schedules}.tenant_id`);
   }
 
   // ONE warning for the whole call, listing every column added, or none at all. Not one per ALTER:

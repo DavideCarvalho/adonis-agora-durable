@@ -42,12 +42,13 @@ export function isEngineMintedTag(value: string | null): boolean {
  */
 export function axisIsRunColumn(
   axis: RunValueAxis,
-): axis is { field: 'workflow' | 'status' | 'namespace' | 'origin' } {
+): axis is { field: 'workflow' | 'status' | 'namespace' | 'origin' | 'tenant' } {
   return (
     axis.field === 'workflow' ||
     axis.field === 'status' ||
     axis.field === 'namespace' ||
-    axis.field === 'origin'
+    axis.field === 'origin' ||
+    axis.field === 'tenant'
   );
 }
 
@@ -64,6 +65,9 @@ function valuesOf(run: WorkflowRun, axis: RunValueAxis): Array<string | null> {
     case 'origin':
       // `null` is origin's absent bucket (`app`, the app's own runs) — the console must count it.
       return [run.origin ?? null];
+    case 'tenant':
+      // `null` is the no-tenant bucket.
+      return [run.tenantId ?? null];
     case 'tag':
       return run.tags ?? [];
     case 'attributeKey':

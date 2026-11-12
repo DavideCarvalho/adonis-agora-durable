@@ -126,6 +126,7 @@ export {
   type ResponderTransport,
   RunRequestResponder,
   type RunRequestResponderOptions,
+  trustedCustomerTenant,
   UNSUPPORTED_RUN_REQUEST,
 } from './run-gateway/run-request-responder.js';
 export {
@@ -140,6 +141,7 @@ export {
   resolveTenantVerifier,
   signTenantToken,
 } from './run-gateway/tenant-auth.js';
+export { tenantScopedGateway } from './run-gateway/tenant-scoped-gateway.js';
 export * from './run-pagination.js';
 export * from './run-value-facets.js';
 export * from './run-waiting.js';
@@ -177,6 +179,13 @@ export {
   type DurableSchemaLogger,
   dropDurableTables,
 } from './stores/lucid-schema.js';
+export type {
+  DurableTenancyOption,
+  EngineTenancy,
+  RunTenant,
+  RunTenantFilter,
+} from './tenancy.js';
+export { contextEngineTenancy, runTenantOf, runVisible } from './tenancy.js';
 export * from './tenant-group.js';
 export { InMemoryStateStore } from './testing/in-memory-state-store.js';
 export { InMemoryTransport } from './testing/in-memory-transport.js';

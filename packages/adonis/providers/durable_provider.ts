@@ -48,8 +48,10 @@ import {
   hasResponderCapability,
   NOOP_RUN_DISPATCHER,
 } from '../src/role_bindings.js';
+import { tenantScopedGateway } from '../src/run-gateway/tenant-scoped-gateway.js';
 import { resolveSchedules } from '../src/scheduler.js';
 import { setBootedApp } from '../src/services/booted_app.js';
+import { contextEngineTenancy } from '../src/tenancy.js';
 import {
   NoopWorkerRegistry,
   RedisWorkerRegistry,
@@ -358,6 +360,9 @@ export default class DurableProvider {
         // carrier through verbatim. The carrier is producer-owned and shape-opaque; the worker's
         // scope slot round-trips the whole snapshot via Context.run, so no field-picking is needed.
         ...(accessor ? { context: () => accessor.get() } : {}),
+        // Tenancy (off unless config/context.ts or `tenancy` turns it on): which tenant's runs an
+        // app-facing call sees, and the tenant a resumed run gets back.
+        ...(config.tenancy !== false ? { tenancy: contextEngineTenancy(config.tenancy) } : {}),
         // Trace continuation on dispatched remote tasks. An explicit `config.traceparent` wins;
         // otherwise best-effort from @adonis-agora/diagnostics-otel's global slot (no hard dep).
         ...(config.traceparent
@@ -402,7 +407,7 @@ export default class DurableProvider {
           `@agora/durable: topology 'tenant' needs a transport with the P4 store-less methods (dispatchStartRun/dispatchRunRequest/onRunReply/onTenantEvent); the selected transport ("${config.transport}") does not expose them.`,
         );
       }
-      return new ProxyRunGateway(transport, {
+      const proxy = new ProxyRunGateway(transport, {
         partition: config.partition,
         ...(config.tenant?.token !== undefined
           ? {
@@ -415,6 +420,9 @@ export default class DurableProvider {
           ? { requestTimeoutMs: config.requestTimeoutMs }
           : {}),
       });
+      // Tenancy on the pod side: new runs carry the active tenant, reads see that tenant's runs.
+      const tenancy = config.tenancy === false ? undefined : contextEngineTenancy(config.tenancy);
+      return tenancy ? tenantScopedGateway(proxy, tenancy) : proxy;
     });
 
     this.app.container.singleton(DURABLE_WORKER_RUNTIME, async () => {
