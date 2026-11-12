@@ -96,6 +96,7 @@ Upgrading an app from 0.6 to 0.7:
 | `workerHeartbeatIntervalMs` | `10000` | How often a worker refreshes the [liveness key](#worker-health) of each step name it serves. A key lives at least 35s (three intervals when that is longer). |
 | `workerKeys` | the app database | Where the [worker advertisement](/docs/durable/transports#worker-advertisement) lives. Default: the `durable_transport_worker_keys` table through `@adonisjs/lucid`, when the app has it. Pass any `WorkerKeyStore` to keep the keys elsewhere, or `false` to advertise nothing. |
 | `workerKeysConnection` | default Lucid connection | Lucid connection the default worker-key table lives on. |
+| `workerKeysSchema` | top-level `schema` | Database schema the default worker-key table lives in (a database on MySQL). See [Database schema](/docs/durable/stores/lucid#database-schema). |
 | `workerKeysCacheMs` | `5000` | How long a read of the worker keys is reused. |
 | `inboxTtlMs` | `30_000` | [Tenant pods](#tenant-pods-over-the-queue-transport): how long an announced inbox or live-tail subscription stays recorded. The pod re-announces every third of it, so a dead pod stops receiving pushes within about this long. |
 | `tenantSubscribersCacheMs` | `1000` | Control plane: how long a read of a tenant's live subscribers is reused when publishing events. `0` reads the store on every event. |

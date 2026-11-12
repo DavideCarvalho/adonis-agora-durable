@@ -4,6 +4,16 @@
 import { BaseSchema } from '@adonisjs/lucid/schema'
 
 /**
+ * The database schema these tables live in (a database on MySQL), e.g. \`'durable'\`. Keep it equal
+ * to \`schema\` in config/durable.ts; \`undefined\` uses the connection's current schema. Not
+ * supported on SQLite.
+ */
+const schema = undefined
+
+/** \`name\` in {@link schema}: Knex quotes \`schema.table\` part by part. */
+const inSchema = (name: string) => (schema ? \`\${schema}.\${name}\` : name)
+
+/**
  * The message channel of the @adonis-agora/durable \`db\` transport: remote-workflow decisions and step
  * events, and the store-less (tenant pod) protocol's start-run, run-request, run-reply and tenant-event
  * rows. Also adds the \`kind\` column (\`step\` / \`workflow\`) to \`durable_transport_tasks\` when an
@@ -12,7 +22,14 @@ import { BaseSchema } from '@adonisjs/lucid/schema'
  */
 export default class extends BaseSchema {
   async up() {
-    this.schema.createTable('durable_transport_messages', (table) => {
+    if (schema) {
+      this.schema.raw(
+        this.db.dialect.name === 'mysql'
+          ? \`create database if not exists \\\`\${schema}\\\`\`
+          : \`create schema if not exists "\${schema}"\`
+      )
+    }
+    this.schema.createTable(inSchema('durable_transport_messages'), (table) => {
       table.increments('id').primary()
       table.string('kind', 32).notNullable()
       table.string('namespace').notNullable().defaultTo('default')
@@ -29,15 +46,22 @@ export default class extends BaseSchema {
     // it with one, whichever of the two migrations runs first.)
     // Each check takes a fresh schema builder: a Knex schema builder is stateful.
     this.defer(async (db) => {
-      if (!(await db.schema.hasTable('durable_transport_tasks'))) return
-      if (await db.schema.hasColumn('durable_transport_tasks', 'kind')) return
-      await db.schema.alterTable('durable_transport_tasks', (table) => {
+      if (!(await (schema ? db.schema.withSchema(schema) : db.schema).hasTable('durable_transport_tasks'))) return
+      // With a schema, the catalog is asked directly: Knex's MySQL hasColumn ignores withSchema.
+      const hasKind = schema
+        ? (await db
+            .from('information_schema.columns')
+            .where({ table_schema: schema, table_name: 'durable_transport_tasks', column_name: 'kind' })
+            .first()) !== null
+        : await db.schema.hasColumn('durable_transport_tasks', 'kind')
+      if (hasKind) return
+      await db.schema.alterTable(inSchema('durable_transport_tasks'), (table) => {
         table.string('kind', 16).notNullable().defaultTo('step')
       })
     })
   }
 
   async down() {
-    this.schema.dropTableIfExists('durable_transport_messages')
+    this.schema.dropTableIfExists(inSchema('durable_transport_messages'))
   }
 }

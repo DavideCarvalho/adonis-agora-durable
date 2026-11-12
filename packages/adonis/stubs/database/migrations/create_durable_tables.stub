@@ -6,6 +6,13 @@ import db from '@adonisjs/lucid/services/db'
 import { createDurableTables, dropDurableTables } from '@adonis-agora/durable'
 
 /**
+ * The database schema the durable tables live in (a database on MySQL), e.g. \`'durable'\`. Keep it
+ * equal to \`schema\` in config/durable.ts; \`undefined\` uses the connection's current schema. Not
+ * supported on SQLite.
+ */
+const schema = undefined
+
+/**
  * Durable workflow tables for the @adonis-agora/durable \`lucid\` state store: runs, step checkpoints,
  * the search-attribute side-table, signal waiters, buffered signals, buffered events and persisted
  * schedules (seven tables, plus the one-row \`durable_schema_meta\` marker).
@@ -39,10 +46,10 @@ export default class extends BaseSchema {
   static disableTransactions = true
 
   async up() {
-    await createDurableTables(db, this.db.connectionName)
+    await createDurableTables(db, this.db.connectionName, { schema })
   }
 
   async down() {
-    await dropDurableTables(db, this.db.connectionName)
+    await dropDurableTables(db, this.db.connectionName, { schema })
   }
 }

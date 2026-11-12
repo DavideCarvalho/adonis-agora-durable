@@ -26,11 +26,16 @@ export interface TransportContext {
   partition?: string | undefined;
   /** The process's top-level `instanceId`, the default for a transport without its own. */
   instanceId?: string | undefined;
+  /**
+   * The process's top-level `schema`, the database schema of every durable table a driver without
+   * its own `schema` creates and reads (the Lucid store, the db transport, the worker-key table).
+   */
+  schema?: string | undefined;
 }
 
 /** A transport option that falls back to the provider-forwarded top-level value. */
 function inherited(
-  key: 'partition' | 'instanceId',
+  key: 'partition' | 'instanceId' | 'schema',
   own: string | undefined,
   ctx: TransportContext,
 ): Record<string, string> {
@@ -153,6 +158,11 @@ export interface QueueTransportConfig {
   workerKeys?: WorkerKeyStore | false;
   /** Lucid connection the default worker-key table lives on. Defaults to the default connection. */
   workerKeysConnection?: string;
+  /**
+   * Database schema the default worker-key table lives in (a database on MySQL). Defaults to the
+   * top-level `schema`, else the connection's current schema. Not supported on SQLite.
+   */
+  workerKeysSchema?: string;
   /** How long a read of the worker keys is reused (ms). Default 5000. */
   workerKeysCacheMs?: number;
   /**
@@ -184,7 +194,11 @@ async function queueWorkerKeys(
     return undefined;
   }
   const { lucidWorkerKeys } = await import('./worker-keys-db.js');
-  return lucidWorkerKeys(db, { connectionName: config.workerKeysConnection });
+  const schema = config.workerKeysSchema ?? ctx.schema;
+  return lucidWorkerKeys(db, {
+    connectionName: config.workerKeysConnection,
+    ...(schema !== undefined ? { schema } : {}),
+  });
 }
 
 /** Options for the aviary-compatible BullMQ transport (the cross-ecosystem interop path). */
@@ -267,6 +281,12 @@ export interface DbTransportConfig {
   namespace?: string;
   /** Lucid connection name to use. Defaults to the `Database` default connection. */
   connection?: string;
+  /**
+   * Database schema the transport tables live in (a database on MySQL): every statement names it,
+   * and `autoCreate` creates it. Defaults to the top-level `schema`, else the connection's current
+   * schema. Not supported on SQLite.
+   */
+  schema?: string;
   /** Poll interval (ms) for the result/task/heartbeat/control loops. Default 200ms. */
   pollIntervalMs?: number;
   /** How long a claimed-but-unfinished row is owned before it's reclaimable (crash recovery). Default 30s. */
@@ -496,6 +516,7 @@ export const transports = {
         ...inherited('partition', config.partition, ctx),
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
         ...(config.connection !== undefined ? { connectionName: config.connection } : {}),
+        ...inherited('schema', config.schema, ctx),
         ...(config.pollIntervalMs !== undefined ? { pollIntervalMs: config.pollIntervalMs } : {}),
         ...(config.leaseMs !== undefined ? { leaseMs: config.leaseMs } : {}),
         ...(config.batchSize !== undefined ? { batchSize: config.batchSize } : {}),

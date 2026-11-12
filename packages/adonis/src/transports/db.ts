@@ -26,6 +26,13 @@ import {
 } from '../interfaces.js';
 import { atLeastOne, Pollers, type PollLoop } from '../pollers.js';
 import { runStepHandler, type StepHandler, withTurnHeartbeat } from '../protocol.js';
+import {
+  assertSchemaSupported,
+  hasColumn,
+  hasTable,
+  qualifyAll,
+  validateSchemaName,
+} from '../sql-schema.js';
 import { sanitizeQueueToken, tenantGroup } from '../tenant-group.js';
 import type { DescriptorRedis } from '../worker-runtime/registry.js';
 import type { WorkflowTurnHandler } from '../workflow-turn.js';
@@ -221,6 +228,12 @@ export interface DbTransportOptions {
   namespace?: string;
   /** Lucid connection name to use. Defaults to the `Database` default connection. */
   connectionName?: string;
+  /**
+   * Database schema the transport tables live in (a database on MySQL): every statement names it,
+   * and `autoCreate` creates it. Omit for the connection's current schema. Not supported on SQLite
+   * (the constructor throws).
+   */
+  schema?: string | undefined;
   /** Poll interval (ms) for the result/task/heartbeat/control loops. Default 200ms. */
   pollIntervalMs?: number;
   /** How long a claimed-but-unfinished row is owned before it's reclaimable (crash recovery). Default 30s. */
@@ -352,6 +365,10 @@ export class DbTransport implements Transport, ControlPlane {
   #namespace: string | undefined;
   readonly #explicitNamespace: boolean;
   readonly #connectionName: string | undefined;
+  /** The schema the tables live in, or undefined for the connection's current one. */
+  readonly #schema: string | undefined;
+  /** The transport table names, qualified with {@link #schema}. */
+  readonly #t: { [K in keyof typeof TRANSPORT_TABLES]: string };
   readonly #pollIntervalMs: number;
   readonly #leaseMs: number;
   readonly #batchSize: number;
@@ -432,6 +449,10 @@ export class DbTransport implements Transport, ControlPlane {
     this.#namespace = options.namespace;
     this.#explicitNamespace = options.namespace !== undefined;
     this.#connectionName = options.connectionName;
+    this.#schema = validateSchemaName(options.schema, 'transports.db');
+    if (this.#schema !== undefined)
+      assertSchemaSupported(this.#client(), this.#schema, 'transports.db');
+    this.#t = qualifyAll(TRANSPORT_TABLES, this.#schema);
     this.#pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     this.#leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
     this.#batchSize = options.batchSize ?? DEFAULT_BATCH_SIZE;
@@ -521,7 +542,11 @@ export class DbTransport implements Transport, ControlPlane {
   #ensureSchema(): Promise<void> {
     if (!this.#autoCreate) return Promise.resolve();
     if (!this.#schemaReady)
-      this.#schemaReady = createDurableTransportTables(this.#db, this.#connectionName);
+      this.#schemaReady = createDurableTransportTables(
+        this.#db,
+        this.#connectionName,
+        this.#schema !== undefined ? { schema: this.#schema } : {},
+      );
     return this.#schemaReady;
   }
 
@@ -547,7 +572,7 @@ export class DbTransport implements Transport, ControlPlane {
     for (let at = 0; at < tasks.length; at += TASK_INSERT_CHUNK) {
       await this.#client()
         .insertQuery()
-        .table(TRANSPORT_TABLES.tasks)
+        .table(this.#t.tasks)
         .knexQuery.insert(
           tasks.slice(at, at + TASK_INSERT_CHUNK).map((task) => ({
             step_id: task.stepId,
@@ -663,7 +688,7 @@ export class DbTransport implements Transport, ControlPlane {
   async heartbeat(beat: Heartbeat): Promise<void> {
     await this.#ensureSchema();
     await this.#client()
-      .table(TRANSPORT_TABLES.heartbeats)
+      .table(this.#t.heartbeats)
       .insert({
         run_id: beat.runId,
         seq: beat.seq,
@@ -695,7 +720,7 @@ export class DbTransport implements Transport, ControlPlane {
       this.#hasTaskColumn('priority'),
     ]);
     const { rows, token } = await this.#claim<TaskRow>(
-      TRANSPORT_TABLES.tasks,
+      this.#t.tasks,
       Math.min(free, this.#batchSize),
       [...this.#servedTokens],
       'step_id',
@@ -704,7 +729,7 @@ export class DbTransport implements Transport, ControlPlane {
     if (rows.length === 0) return false;
     if (this.#pollers.closed) {
       // close() began while this round was claiming: don't start work it would only abandon.
-      await this.#handBack(TRANSPORT_TABLES.tasks, [token]);
+      await this.#handBack(this.#t.tasks, [token]);
       return false;
     }
     // `free` was read before the claim's round trips. The adaptive limit may have dropped meanwhile
@@ -717,7 +742,7 @@ export class DbTransport implements Transport, ControlPlane {
       const excess = rows.splice(fits);
       await this.#client()
         .knexQuery()
-        .from(TRANSPORT_TABLES.tasks)
+        .from(this.#t.tasks)
         .where('claimed_by', token)
         .whereIn(
           'step_id',
@@ -727,7 +752,7 @@ export class DbTransport implements Transport, ControlPlane {
       if (rows.length === 0) return true;
     }
     this.#hold(
-      TRANSPORT_TABLES.tasks,
+      this.#t.tasks,
       token,
       rows.map((row) => row.step_id),
     );
@@ -778,7 +803,7 @@ export class DbTransport implements Transport, ControlPlane {
       if (row.reclaims != null && Number(row.reclaims) > this.#maxStalledCount) {
         // Its workers keep dying on it (or blocking past the lease): running it again would just
         // stall the next one. Fail it RETRYABLE so the engine's durable retry decides.
-        this.#release(TRANSPORT_TABLES.tasks, token, task.stepId);
+        this.#release(this.#t.tasks, token, task.stepId);
         await this.#settleTask(
           task.stepId,
           token,
@@ -787,7 +812,7 @@ export class DbTransport implements Transport, ControlPlane {
         return;
       }
       if (!(await this.#stillHolds(task.stepId, token))) {
-        this.#release(TRANSPORT_TABLES.tasks, token, task.stepId);
+        this.#release(this.#t.tasks, token, task.stepId);
         this.#onError(
           new Error(
             `[DbTransport] lost the claim on task ${task.stepId} before running it — another worker took it over; not running it here`,
@@ -808,7 +833,7 @@ export class DbTransport implements Transport, ControlPlane {
         ok = result.status === 'completed';
         // Stop renewing before settling: the settle deletes the row, and a renewal racing it would
         // count the row as lost.
-        this.#release(TRANSPORT_TABLES.tasks, token, task.stepId);
+        this.#release(this.#t.tasks, token, task.stepId);
         if (!(await this.#settleTask(task.stepId, token, result))) {
           if (this.#handedBack.has(token)) {
             this.#onError(
@@ -832,7 +857,7 @@ export class DbTransport implements Transport, ControlPlane {
       // lease — at-least-once, like a crash.
       this.#onError(err);
     } finally {
-      this.#release(TRANSPORT_TABLES.tasks, token, task.stepId);
+      this.#release(this.#t.tasks, token, task.stepId);
     }
   }
 
@@ -854,8 +879,8 @@ export class DbTransport implements Transport, ControlPlane {
         if (!payload) throw new Error('empty payload');
         ({ replyTo, ...task } = payload);
       } catch (err) {
-        this.#release(TRANSPORT_TABLES.tasks, token, id);
-        await this.#deleteClaimed(TRANSPORT_TABLES.tasks, 'step_id', id, token);
+        this.#release(this.#t.tasks, token, id);
+        await this.#deleteClaimed(this.#t.tasks, 'step_id', id, token);
         this.#onError(
           new Error(
             `[DbTransport] dropped workflow task ${id}: unreadable payload (${String(err)})`,
@@ -864,8 +889,8 @@ export class DbTransport implements Transport, ControlPlane {
         return;
       }
       if (row.reclaims != null && Number(row.reclaims) > this.#maxStalledCount) {
-        this.#release(TRANSPORT_TABLES.tasks, token, id);
-        await this.#deleteClaimed(TRANSPORT_TABLES.tasks, 'step_id', id, token);
+        this.#release(this.#t.tasks, token, id);
+        await this.#deleteClaimed(this.#t.tasks, 'step_id', id, token);
         this.#onError(
           new Error(
             `[DbTransport] dropped workflow task ${id} (run ${task.runId}): its claim lapsed more than ${this.#maxStalledCount} times. No decision is written: as on bullmq and queue, the turn is re-driven by the executor's timeoutMs or by recovery`,
@@ -874,7 +899,7 @@ export class DbTransport implements Transport, ControlPlane {
         return;
       }
       if (!(await this.#stillHolds(id, token))) {
-        this.#release(TRANSPORT_TABLES.tasks, token, id);
+        this.#release(this.#t.tasks, token, id);
         this.#onError(
           new Error(
             `[DbTransport] lost the claim on workflow task ${id} before running it — another worker took it over; not running it here`,
@@ -886,7 +911,7 @@ export class DbTransport implements Transport, ControlPlane {
       this.#controller.onStart();
       try {
         const decision = await this.#replayTurn(task);
-        this.#release(TRANSPORT_TABLES.tasks, token, id);
+        this.#release(this.#t.tasks, token, id);
         if (!(await this.#settleWorkflow(id, token, decision, replyTo))) {
           this.#onError(
             new Error(
@@ -903,7 +928,7 @@ export class DbTransport implements Transport, ControlPlane {
     } catch (err) {
       this.#onError(err);
     } finally {
-      this.#release(TRANSPORT_TABLES.tasks, token, id);
+      this.#release(this.#t.tasks, token, id);
     }
   }
 
@@ -947,7 +972,7 @@ export class DbTransport implements Transport, ControlPlane {
     const settled = await this.#client().transaction(async (trx) => {
       const deleted = await trx
         .knexQuery()
-        .from(TRANSPORT_TABLES.tasks)
+        .from(this.#t.tasks)
         .where('step_id', id)
         .where('claimed_by', token)
         .delete();
@@ -982,7 +1007,7 @@ export class DbTransport implements Transport, ControlPlane {
   async #stillHolds(stepId: string, token: string): Promise<boolean> {
     const updated = await this.#client()
       .knexQuery()
-      .from(TRANSPORT_TABLES.tasks)
+      .from(this.#t.tasks)
       .where('step_id', stepId)
       .where('claimed_by', token)
       .update({ claimed_at: this.#now() });
@@ -998,7 +1023,7 @@ export class DbTransport implements Transport, ControlPlane {
     return this.#client().transaction(async (trx) => {
       const deleted = await trx
         .knexQuery()
-        .from(TRANSPORT_TABLES.tasks)
+        .from(this.#t.tasks)
         .where('step_id', stepId)
         .where('claimed_by', token)
         .delete();
@@ -1011,7 +1036,7 @@ export class DbTransport implements Transport, ControlPlane {
   async #insertResult(result: StepResult, client: Client = this.#client()): Promise<void> {
     await client
       .insertQuery()
-      .table(TRANSPORT_TABLES.results)
+      .table(this.#t.results)
       .knexQuery.insert({
         step_id: result.stepId,
         run_id: result.runId,
@@ -1037,7 +1062,7 @@ export class DbTransport implements Transport, ControlPlane {
   /** Engine side: settle step results, up to {@link DbTransportOptions.resultConcurrency} at once. The
    *  results loop never backs off when idle — a result is on the critical path of every step. */
   onResult(handler: (result: StepResult) => Promise<void>): void {
-    const table = TRANSPORT_TABLES.results;
+    const table = this.#t.results;
     // Rounds of up to RESULT_ROUND rows, up to max(RESULT_IN_FLIGHT, resultConcurrency) in a handler
     // at once: the engine writes one run's results that are in hand together, so handing over a few
     // at a time made a wide fan settle a few per write. A round's settled rows go in one DELETE.
@@ -1119,7 +1144,7 @@ export class DbTransport implements Transport, ControlPlane {
   onHeartbeat(handler: (beat: Heartbeat) => Promise<void>): void {
     this.#startLoop(
       async () =>
-        (await this.#drain<HeartbeatRow>(TRANSPORT_TABLES.heartbeats, 'id', 1, async (row) => {
+        (await this.#drain<HeartbeatRow>(this.#t.heartbeats, 'id', 1, async (row) => {
           await handler({
             runId: row.run_id,
             seq: Number(row.seq),
@@ -1186,7 +1211,7 @@ export class DbTransport implements Transport, ControlPlane {
     await this.#ensureSchema();
     const stamped: ControlMessage = msg.from ? msg : { ...msg, from: this.#instanceId };
     await this.#client()
-      .table(TRANSPORT_TABLES.control)
+      .table(this.#t.control)
       .insert({
         payload: JSON.stringify(stamped),
         namespace: this.#namespaceValue(),
@@ -1199,7 +1224,7 @@ export class DbTransport implements Transport, ControlPlane {
   onControl(handler: (msg: ControlMessage) => void): void {
     this.#startLoop(
       async () =>
-        (await this.#drain<ControlRow>(TRANSPORT_TABLES.control, 'id', 1, async (row) => {
+        (await this.#drain<ControlRow>(this.#t.control, 'id', 1, async (row) => {
           const msg = fromJson<ControlPayload>(row.payload);
           if (msg) handler(msg);
         })) > 0,
@@ -1228,7 +1253,7 @@ export class DbTransport implements Transport, ControlPlane {
     let known = this.#messagesTable;
     if (!known) {
       known = this.#ensureSchema()
-        .then(() => this.#client().schema.hasTable(TRANSPORT_TABLES.messages))
+        .then(() => hasTable(this.#client(), this.#schema, TRANSPORT_TABLES.messages))
         .catch((err) => {
           this.#messagesTable = undefined; // unknown yet (a transient error): ask again next time
           this.#onError(err);
@@ -1245,7 +1270,7 @@ export class DbTransport implements Transport, ControlPlane {
   }
 
   #messagesMissing(): string {
-    return `[DbTransport] the ${TRANSPORT_TABLES.messages} table does not exist, so remote workflows and store-less tenant pods do not work on this transport. Run the create_durable_transport_messages migration (node ace configure @adonis-agora/durable publishes it), or enable autoCreate`;
+    return `[DbTransport] the ${this.#t.messages} table does not exist, so remote workflows and store-less tenant pods do not work on this transport. Run the create_durable_transport_messages migration (node ace configure @adonis-agora/durable publishes it), or enable autoCreate`;
   }
 
   /** Insert `rows` of `kind` in one statement. */
@@ -1259,7 +1284,7 @@ export class DbTransport implements Transport, ControlPlane {
     const at = this.#now();
     await client
       .insertQuery()
-      .table(TRANSPORT_TABLES.messages)
+      .table(this.#t.messages)
       .knexQuery.insert(
         rows.map((row) => ({
           kind,
@@ -1299,7 +1324,7 @@ export class DbTransport implements Transport, ControlPlane {
     const tick = async (): Promise<boolean> => {
       if (!(await this.#messagesReady(false))) return false;
       const handled = await this.#drain<MessageRow>(
-        TRANSPORT_TABLES.messages,
+        this.#t.messages,
         'id',
         1,
         async (row) => {
@@ -1357,7 +1382,7 @@ export class DbTransport implements Transport, ControlPlane {
     const recipients = (
       (await this.#client()
         .knexQuery()
-        .from(TRANSPORT_TABLES.messages)
+        .from(this.#t.messages)
         .distinct('recipient')
         .where('namespace', namespace)
         .whereNot('recipient', '')
@@ -1369,7 +1394,7 @@ export class DbTransport implements Transport, ControlPlane {
     if (dead.length === 0) return;
     await this.#client()
       .knexQuery()
-      .from(TRANSPORT_TABLES.messages)
+      .from(this.#t.messages)
       .where('namespace', namespace)
       .whereIn('recipient', dead)
       .where('created_at', '<', cutoff)
@@ -1394,7 +1419,7 @@ export class DbTransport implements Transport, ControlPlane {
     if (!hasMessages) throw new Error(this.#messagesMissing());
     if (!hasKind) {
       throw new Error(
-        `[DbTransport] ${TRANSPORT_TABLES.tasks} has no "kind" column, so remote workflow turns cannot be dispatched on it. Run the create_durable_transport_messages migration, or enable autoCreate`,
+        `[DbTransport] ${this.#t.tasks} has no "kind" column, so remote workflow turns cannot be dispatched on it. Run the create_durable_transport_messages migration, or enable autoCreate`,
       );
     }
     const payload: WorkflowTaskPayload = {
@@ -1403,7 +1428,7 @@ export class DbTransport implements Transport, ControlPlane {
     };
     await this.#client()
       .insertQuery()
-      .table(TRANSPORT_TABLES.tasks)
+      .table(this.#t.tasks)
       .knexQuery.insert({
         step_id: task.taskId,
         run_id: task.runId,
@@ -1505,7 +1530,7 @@ export class DbTransport implements Transport, ControlPlane {
     const existing = this.#stopRuns.get(namespace);
     if (existing) return existing;
     const concurrency = atLeastOne(opts.concurrency, 1);
-    const table = TRANSPORT_TABLES.messages;
+    const table = this.#t.messages;
     // Rows in a handler. A poll claims only as many rows as there are free slots and hands each off,
     // so one long turn never keeps the other slots (or a run dispatched meanwhile) waiting.
     const inFlight = new Set<Promise<void>>();
@@ -1761,7 +1786,7 @@ export class DbTransport implements Transport, ControlPlane {
     if (own.length === 0) return;
     await this.#client()
       .knexQuery()
-      .from(TRANSPORT_TABLES.messages)
+      .from(this.#t.messages)
       .where('namespace', this.#namespaceValue())
       .where('recipient', this.#instanceId)
       .whereIn('kind', own)
@@ -1882,12 +1907,12 @@ export class DbTransport implements Transport, ControlPlane {
     let known = this.#taskColumns.get(column);
     if (!known) {
       known = this.#ensureSchema()
-        .then(() => this.#client().schema.hasColumn(TRANSPORT_TABLES.tasks, column))
+        .then(() => hasColumn(this.#client(), this.#schema, TRANSPORT_TABLES.tasks, column))
         .then((has) => {
           if (!has) {
             this.#onError(
               new Error(
-                `[DbTransport] ${TRANSPORT_TABLES.tasks} has no "${column}" column, so ${MISSING_COLUMN[column].effect}. Add it — ${MISSING_COLUMN[column].ddl} — or enable autoCreate`,
+                `[DbTransport] ${this.#t.tasks} has no "${column}" column, so ${MISSING_COLUMN[column].effect}. Add it — ${MISSING_COLUMN[column].ddl} — or enable autoCreate`,
               ),
             );
           }
@@ -2064,7 +2089,7 @@ export class DbTransport implements Transport, ControlPlane {
     const [counted, entries] = await Promise.all([
       this.#client()
         .knexQuery()
-        .from(TRANSPORT_TABLES.tasks)
+        .from(this.#t.tasks)
         .where('namespace', this.#namespaceValue())
         .where('grp', group)
         .count({ n: '*' })
@@ -2098,6 +2123,7 @@ export class DbTransport implements Transport, ControlPlane {
       // while the schema is still being created never races its CREATE.
       const keys = lucidWorkerKeys(this.#db, {
         connectionName: this.#connectionName,
+        ...(this.#schema !== undefined ? { schema: this.#schema } : {}),
         autoCreate: false,
         now: () => this.#now(),
       });

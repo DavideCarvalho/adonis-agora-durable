@@ -151,6 +151,77 @@ export async function checkStoreTables(app: ApplicationService): Promise<AgoraDo
   }
 }
 
+/** The store surface the schema check reads (the Lucid store has it). */
+interface SchemaInspectable {
+  schemaName: string | undefined;
+  inspectSchema(): Promise<{
+    schema: string | undefined;
+    schemaExists: boolean;
+    missingTables: string[];
+    writeError: string | undefined;
+  }>;
+}
+
+/**
+ * `durable.schema` (deep): with a `schema` on the SQL store (its own or the top-level one), the
+ * schema exists, the durable tables are in it, and the connection can write there. Skipped (and so
+ * silent) without one.
+ */
+export async function checkSchema(app: ApplicationService): Promise<AgoraDoctorResult> {
+  const config = durableConfig(app);
+  const factory = config?.store !== undefined ? config.stores?.[config.store] : undefined;
+  if (topologyOf(config) === 'tenant' || factory === undefined) {
+    return { status: 'skip', message: 'No SQL store in this process.' };
+  }
+  let store: Partial<SchemaInspectable>;
+  try {
+    store = (await factory({
+      app,
+      ...(config?.schema !== undefined ? { schema: config.schema } : {}),
+    })) as Partial<SchemaInspectable>;
+  } catch (error) {
+    if (config?.schema === undefined) return { status: 'skip', message: 'No `schema` is set.' };
+    return {
+      status: 'error',
+      message: `The store could not be built with schema "${config.schema}": ${error instanceof Error ? error.message : String(error)}`,
+      fix: 'Use a valid schema name on a Postgres or MySQL connection.',
+      docs: `${DOCS}/stores/lucid#database-schema`,
+    };
+  }
+  if (typeof store.inspectSchema !== 'function' || store.schemaName === undefined) {
+    return { status: 'skip', message: 'No `schema` is set.' };
+  }
+  const { schema, schemaExists, missingTables, writeError } = await store.inspectSchema();
+  if (!schemaExists) {
+    return {
+      status: 'error',
+      message: `The schema "${schema}" does not exist.`,
+      fix: `Boot once with autoSchema on (it creates the schema), or run CREATE SCHEMA "${schema}" (CREATE DATABASE on MySQL) and the durable migrations.`,
+      docs: `${DOCS}/stores/lucid#database-schema`,
+    };
+  }
+  if (missingTables.length > 0) {
+    return {
+      status: 'error',
+      message: `The schema "${schema}" lacks ${missingTables.join(', ')}.`,
+      fix: `Boot once with autoSchema on, or run the durable migrations with the same \`schema\`.`,
+      docs: `${DOCS}/stores/lucid#database-schema`,
+    };
+  }
+  if (writeError !== undefined) {
+    return {
+      status: 'error',
+      message: `The connection cannot write to the schema "${schema}": ${writeError.split('\n')[0]}`,
+      fix: `Grant the connection's role USAGE on the schema and INSERT/UPDATE/DELETE on its tables.`,
+      docs: `${DOCS}/stores/lucid#database-schema`,
+    };
+  }
+  return {
+    status: 'ok',
+    message: `The durable tables are in the schema "${schema}" and writable.`,
+  };
+}
+
 /** `durable.console-gate`: the console has an `authorize`. */
 export function checkConsoleGate(
   dashboard: Record<string, unknown> | undefined,
@@ -205,6 +276,13 @@ export const durableDoctorChecks: AgoraDoctorCheck[] = [
     title: 'Durable tables exist',
     cost: 'deep',
     run: (app) => checkStoreTables(app),
+  },
+  {
+    id: 'durable.schema',
+    lib: 'durable',
+    title: 'Durable tables in their schema',
+    cost: 'deep',
+    run: (app) => checkSchema(app),
   },
 ];
 
