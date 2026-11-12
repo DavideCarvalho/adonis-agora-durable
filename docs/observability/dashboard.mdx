@@ -139,15 +139,18 @@ export default defineConfig({
 curl -H "Authorization: Bearer $CONSOLE_TOKEN" https://app.example.com/durable/api/runs
 ```
 
-To let both operators and scripts in, combine them in a function:
+To let both operators and scripts in, pass both to `anyAuthorize`. It allows a request when any of them does, tried in order:
 
 ```ts title="config/durable_dashboard.ts"
-const byToken = authorizeByToken({ token: env.get('CONSOLE_TOKEN') })
-const byRole = authorizeByRoles({ roles: ['ADMIN'] })
+import env from '#start/env'
+import { authorizeByRoles } from '@adonis-agora/authz'
+import { anyAuthorize, authorizeByToken, defineConfig } from '@adonis-agora/durable/dashboard'
 
 export default defineConfig({
-  authorize: async (ctx) =>
-    ctx.request.header('authorization') ? byToken(ctx) : byRole(ctx),
+  authorize: anyAuthorize(
+    authorizeByToken({ token: env.get('CONSOLE_TOKEN') }),
+    authorizeByRoles({ roles: ['ADMIN'] }),
+  ),
 })
 ```
 
@@ -617,6 +620,34 @@ A live heartbeat proves the worker *process* is alive, not that the step is prog
 - **Re-dispatch** — `POST /api/runs/:id/redispatch` (the console's *Re-dispatch* action) re-enqueues every `pending` remote step on the run, bumping its `attempts`, so the idempotent step re-runs and its result resumes the run. It is the same as `engine.redispatchPending(runId)`.
 - **Broker bridge (BullMQ and queue)** — when a task job reaches a terminal `failed` state with no result (its worker crashed, or it stalled past the broker's stalled-count limit), the transport publishes a retryable failed result for the step, so the engine settles the checkpoint and its normal retry re-dispatches. That bridge lives in the consumer: a worker on another SDK that does not implement it still leaves the step `pending`.
 - **Self-heal** — set `remoteRedispatchMs` (and optionally `remoteRedispatchMax`, default `10`) in `config/durable.ts`, and a reconcile pass re-dispatches a remote step still `pending` past the window by itself, recording a `warn`-level `step.redispatched` event on the checkpoint; the `step.started` event of that re-drive carries `redispatched: true`, so an alert can tell "re-driven after a lost worker" apart from "retried after a failure". Once the bound is spent, the step fails with `remote_step_lost`. This is off by default. See [Failure modes](/docs/durable/reliability/failure-modes#lost-remote-dispatch-the-run-suspends-and-nothing-auto-redrives-it) for the window-sizing rules.
+
+## MCP tools
+
+When the app registers `@adonis-agora/agent/mcp_provider`, the console's data is also served to coding agents (Claude Code, Cursor, Claude Desktop) on the app's dev MCP endpoint, `/mcp/agora`. There is nothing to configure here: the tools follow this console's `authorize`, so whoever can open the console can use them, and nobody else. A disabled console (`enabled: false`) serves no tools. The [agent docs](/docs/agent/dev-tools) show how to connect a client.
+
+```sh
+claude mcp add --transport http agora http://localhost:3333/mcp/agora \
+  --header "Authorization: Bearer $CONSOLE_TOKEN"
+```
+
+Reads are listed by default. They return what the console shows, through the same `redact` hooks:
+
+| Tool | What it returns |
+| --- | --- |
+| `durable_list_runs` | Runs, newest first. Filters: `status`, `workflow`, `tag`, `namespace`, `createdAfter`/`createdBefore`. Paged with `page` and `limit`. |
+| `durable_get_run` | One run with its step timeline, children, fans and lifecycle links. Input, output and error over 4 KB are cut; `field: 'run.output'` (or `timeline.3.input`) returns one in full. |
+| `durable_list_fan_members` | One page of a wide fan's members (`failed: true` for the failed ones). |
+| `durable_count_runs_by` | How many runs take each value of `status`, `workflow`, `namespace`, `tag`, `attr` or `attr.<key>`. |
+| `durable_get_health` | Queue backlog and live workers per group, pending/dead/blocked counts, fleet compatibility. |
+| `durable_list_workers` | Every live worker's heartbeat. |
+| `durable_list_schedules` | Schedules with their pause state and next fire. |
+| `durable_get_run_event` | The latest value a run published with `ctx.setEvent`. |
+
+The actions are hidden until the app opts in with `devTools: { actions: ['durable'] }` in `config/mcp.ts`:
+`durable_retry_run`, `durable_cancel_run` (`compensate` for the saga undo), `durable_continue_run`,
+`durable_signal_run` (`payload` as a JSON string), `durable_trigger_schedule` and
+`durable_pause_schedule` (`paused: false` resumes). Each one goes through your `audit` hook like a
+console action, with the actor `mcp:<caller>` and the method `MCP`.
 
 ## Fleet health
 

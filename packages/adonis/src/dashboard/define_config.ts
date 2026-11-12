@@ -138,11 +138,13 @@ export interface DashboardAuditEntry {
   at: Date;
   /**
    * The signed-in user (`ctx.auth.user`'s `email`, `name` or `id`), `'bearer'` for a caller with an
-   * `Authorization` header and no user, else `'anonymous'`.
+   * `Authorization` header and no user, else `'anonymous'`. An action run from a developer tool
+   * over MCP is `'mcp:<caller>'` (`mcp:token:3f9a1c2b7d10`, `mcp:user:42`).
    */
   actor: string;
+  /** The HTTP method, or `'MCP'` for a developer tool. */
   method: string;
-  /** The request path (no query string). */
+  /** The request path (no query string), or `'<tool> <run id or schedule key>'` for a developer tool. */
   path: string;
 }
 

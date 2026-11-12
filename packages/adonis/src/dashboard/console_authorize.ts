@@ -162,3 +162,43 @@ export function authorizeByToken(
     return { allowed: false, reason: 'unauthenticated' };
   };
 }
+
+/**
+ * An `authorize` that allows a request when ANY of `authorizers` allows it, tried in order — e.g. a
+ * machine token for MCP clients OR a signed-in admin for the browser:
+ *
+ * ```ts
+ * authorize: anyAuthorize(
+ *   authorizeByToken({ token: env.get('CONSOLE_TOKEN') }),
+ *   (ctx) => ctx.auth.user?.isAdmin === true,
+ * ),
+ * ```
+ *
+ * When none allows: `401` if any of them said "unauthenticated" (redirecting when one asked to),
+ * `403` otherwise. A throwing authorizer counts as a `403` and the next one is still tried.
+ */
+export function anyAuthorize(
+  ...authorizers: ConsoleAuthorize[]
+): (ctx: HttpContext) => Promise<ConsoleAuthorizeResult> {
+  if (authorizers.length === 0) {
+    throw new Error('anyAuthorize: pass at least one authorize');
+  }
+  const resolved = authorizers.map((authorize) => resolveConsoleAuthorize(authorize));
+  return async (ctx: HttpContext): Promise<ConsoleAuthorizeResult> => {
+    let unauthenticated = false;
+    let redirectTo: string | undefined;
+    for (const authorize of resolved) {
+      const decision = await authorize(ctx);
+      if (decision.allowed) return { allowed: true };
+      if (decision.reason !== 'unauthenticated') continue;
+      if (decision.redirectTo !== undefined && redirectTo === undefined) {
+        redirectTo = decision.redirectTo;
+      }
+      unauthenticated = true;
+    }
+    if (redirectTo !== undefined) return { redirectTo };
+    return unauthenticated
+      ? { allowed: false, reason: 'unauthenticated' }
+      : { allowed: false, reason: 'forbidden' };
+  };
+}

@@ -22,6 +22,7 @@ import {
   type ResolvedDurableDashboardConfig,
   resolveConfig,
 } from '../src/dashboard/define_config.js';
+import { registerDurableDevTools } from '../src/dashboard/dev_tools.js';
 import { BlockedDiagnosticsRecorder } from '../src/dashboard/diagnostics-recorder.js';
 import { dashboardEngineForTopology } from '../src/dashboard/gateway-adapter.js';
 import {
@@ -143,6 +144,10 @@ export default class DashboardProvider {
 
     const durableTopology = this.durableTopology();
 
+    // Developer tools on the app's dev MCP endpoint, when `@adonis-agora/agent/mcp_provider` bound
+    // its hub (its `register()` ran before any `boot()`). Gated by this console's own `authorize`.
+    await this.registerDevTools(config, durableTopology);
+
     // Route registration can't happen synchronously in `boot()` — see the long-standing note this
     // provider always carried: the router singleton isn't committed until the app's "booted" hooks
     // run, which fire strictly AFTER every provider's own `boot()`.
@@ -150,6 +155,40 @@ export default class DashboardProvider {
       const router = await this.app.container.make('router');
       this.registerRoutes(router, config, durableTopology);
       await this.attachDiagnostics(durableTopology);
+    });
+  }
+
+  /** The console's read/control port, resolved per request (see {@link registerRoutes}). */
+  private consoleDeps(
+    config: ResolvedDurableDashboardConfig,
+    durableTopology: 'standalone' | 'control-plane' | 'tenant',
+  ): () => Promise<Deps> {
+    return async () => ({
+      engine: await dashboardEngineForTopology(durableTopology, this.app.container, WorkflowEngine),
+      ...(config.redact ? { redact: config.redact } : {}),
+      ...(this.metricsCollector ? { metrics: this.metricsCollector } : {}),
+    });
+  }
+
+  private async registerDevTools(
+    config: ResolvedDurableDashboardConfig,
+    durableTopology: 'standalone' | 'control-plane' | 'tenant',
+  ): Promise<void> {
+    const deps = this.consoleDeps(config, durableTopology);
+    await registerDurableDevTools(this.app.container, {
+      authorize: config.authorize,
+      deps,
+      audit: (entry) =>
+        this.recordAudit(config, {
+          at: new Date(),
+          actor: entry.actor,
+          method: 'MCP',
+          path: `${entry.tool} ${entry.target}`,
+        }),
+      compat: async () => {
+        const result = await compat(await this.compatSource((await deps()).engine));
+        return result.body;
+      },
     });
   }
 
@@ -184,11 +223,7 @@ export default class DashboardProvider {
     // pod resolves the DURABLE_RUN_GATEWAY token (a ProxyRunGateway) and adapts it — NO engine, NO store.
     const resolveEngine = (): Promise<DashboardEngine> =>
       dashboardEngineForTopology(durableTopology, this.app.container, WorkflowEngine);
-    const deps = async (): Promise<Deps> => ({
-      engine: await resolveEngine(),
-      ...(config.redact ? { redact: config.redact } : {}),
-      ...(this.metricsCollector ? { metrics: this.metricsCollector } : {}),
-    });
+    const deps = this.consoleDeps(config, durableTopology);
 
     this.registerSpaRoutes(router, config, apiBase);
 
@@ -463,12 +498,20 @@ export default class DashboardProvider {
   /** Record one mutating console action (see DashboardAuditEntry). Never throws into the request. */
   private audit(config: ResolvedDurableDashboardConfig, ctx: HttpContext): void {
     try {
-      const entry: DashboardAuditEntry = {
+      this.recordAudit(config, {
         at: new Date(),
         actor: auditActor(ctx),
         method: ctx.request.method().toUpperCase(),
         path: ctx.request.url(false),
-      };
+      });
+    } catch {
+      /* auditing must never break the action */
+    }
+  }
+
+  /** Hand one audit entry to the host's sink, or the default logger line. Never throws. */
+  private recordAudit(config: ResolvedDurableDashboardConfig, entry: DashboardAuditEntry): void {
+    try {
       if (config.audit) {
         // Typed `void`, but an async hook is assignable to it: catch its rejection too.
         const pending = config.audit(entry) as unknown;
