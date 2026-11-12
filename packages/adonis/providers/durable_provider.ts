@@ -51,7 +51,7 @@ import {
 import { tenantScopedGateway } from '../src/run-gateway/tenant-scoped-gateway.js';
 import { resolveSchedules } from '../src/scheduler.js';
 import { setBootedApp } from '../src/services/booted_app.js';
-import { contextEngineTenancy } from '../src/tenancy.js';
+import { contextEngineTenancy, tenancyEnabled } from '../src/tenancy.js';
 import {
   NoopWorkerRegistry,
   RedisWorkerRegistry,
@@ -421,7 +421,8 @@ export default class DurableProvider {
           : {}),
       });
       // Tenancy on the pod side: new runs carry the active tenant, reads see that tenant's runs.
-      const tenancy = config.tenancy === false ? undefined : contextEngineTenancy(config.tenancy);
+      if (!tenancyEnabled(config.tenancy)) return proxy;
+      const tenancy = contextEngineTenancy(config.tenancy);
       return tenancy ? tenantScopedGateway(proxy, tenancy) : proxy;
     });
 

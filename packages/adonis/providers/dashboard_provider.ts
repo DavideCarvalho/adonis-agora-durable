@@ -248,7 +248,13 @@ export default class DashboardProvider {
     const slot = tenancySlot();
     const option = this.app.config.get<DurableConfig>('durable', {}).tenancy;
     const kinds = typeof option === 'object' ? option.kinds : undefined;
-    const filter = slot?.tenantFilter(kinds ? { kinds } : undefined);
+    // `tenancy.required` makes a missing tenant throw: in the console that is just "no organization".
+    let filter: ReturnType<NonNullable<typeof slot>['tenantFilter']> | undefined;
+    try {
+      filter = slot?.tenantFilter(kinds ? { kinds } : undefined);
+    } catch {
+      filter = undefined;
+    }
     const own =
       filter?.mode === 'tenant'
         ? (filter as { tenant: { id: string; kind?: string; slug?: string } }).tenant
