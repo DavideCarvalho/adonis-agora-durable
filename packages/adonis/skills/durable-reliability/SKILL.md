@@ -10,7 +10,7 @@ description: >-
   the dead-letter queue (maxRecoveryAttempts, deadLetterWorkflow, deadLetter()
   method, onDead, retryWithInput), retention (maxAge/maxCount policies), the
   stuck-run playbook (stranded signature, redispatchPending,
-  remoteRedispatchMs, remoteAdvanceSilenceMs for remote workflow turns), ace ops commands (durable:work/runs/retry --stale), and
+  remoteRedispatchMs, remoteAdvanceSilenceMs for remote workflow turns), ace ops commands (durable:work, durable:runs, durable:runs:retry --stale), and
   the testing harness (createTestEngine, tick, failOnce, conformance kits).
 license: MIT
 metadata:
