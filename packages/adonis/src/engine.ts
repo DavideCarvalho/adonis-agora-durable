@@ -1189,6 +1189,8 @@ export class WorkflowEngine {
   #allSchedules: readonly ScheduledWorkflow<string>[] = [];
   /** Runtime pause overrides by schedule key (console-issued; win over the config's `paused`). */
   readonly #schedulePauseOverrides = new Map<string, boolean>();
+  /** Schedule-pause broadcasts still being handed to the control plane (see {@link flushControl}). */
+  readonly #controlInFlight = new Set<Promise<unknown>>();
   /** Flow-control admission backend for remote steps (see {@link registerQueue}). */
   private readonly admission: AdmissionBackend;
   /** Runs on THIS instance blocked on admission, by queue — woken early on a freed-slot signal. */
@@ -1844,11 +1846,23 @@ export class WorkflowEngine {
     if (!known) return false;
     this.#schedulePauseOverrides.set(key, paused);
     if (this.controlPlane) {
-      void this.controlPlane
+      const sent = this.controlPlane
         .publishControl({ kind: 'schedulePause', key, paused, from: this.instanceId })
-        .catch(() => undefined);
+        .catch(() => undefined)
+        .finally(() => this.#controlInFlight.delete(sent));
+      this.#controlInFlight.add(sent);
     }
     return true;
+  }
+
+  /**
+   * Wait until the schedule pauses this instance broadcast have been handed to the control plane. A
+   * short-lived process (an ace command) calls it before it exits. Resolves `false` when the engine
+   * has no control plane, so a pause reached this process only.
+   */
+  async flushControl(): Promise<boolean> {
+    await Promise.allSettled([...this.#controlInFlight]);
+    return this.controlPlane !== undefined;
   }
 
   /**
@@ -11237,7 +11251,7 @@ export class WorkflowEngine {
     // batch result resurrected a `failed` run into `suspended`, which then continued executing as if
     // the failure never happened, racing whatever the operator did about it, and after any saga
     // compensations already ran). Terminal is terminal — recovery of a failed run belongs to an
-    // explicit `requeue`/`durable:retry`, never to a stray result.
+    // explicit `requeue`/`durable:runs:retry`, never to a stray result.
     if (cp.status !== 'pending') {
       if (!terminal) return { cp, run };
       return undefined;

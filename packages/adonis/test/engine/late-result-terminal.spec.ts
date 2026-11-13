@@ -32,7 +32,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * kept executing the dispatched batch; when the batch's result finally landed, the engine settled
  * the checkpoint and resumed the FAILED run — `failed` flipped to `suspended` and the workflow
  * carried on as if the failure never happened, racing whatever the operator had done about it.
- * Terminal is terminal: recovery belongs to an explicit `requeue`/`durable:retry`.
+ * Terminal is terminal: recovery belongs to an explicit `requeue`/`durable:runs:retry`.
  */
 describe('late results for terminal runs', () => {
   async function failedRunWithLateWorker() {

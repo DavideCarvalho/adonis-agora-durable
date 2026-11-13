@@ -158,12 +158,16 @@ export interface DashboardAuditEntry {
   /**
    * The signed-in user (`ctx.auth.user`'s `email`, `name` or `id`), `'bearer'` for a caller with an
    * `Authorization` header and no user, else `'anonymous'`. An action run from a developer tool
-   * over MCP is `'mcp:<caller>'` (`mcp:token:3f9a1c2b7d10`, `mcp:user:42`).
+   * over MCP is `'mcp:<caller>'` (`mcp:token:3f9a1c2b7d10`, `mcp:user:42`); one run from an ace
+   * command is `'cli:<os user>'` (or `'cli'`).
    */
   actor: string;
-  /** The HTTP method, or `'MCP'` for a developer tool. */
+  /** The HTTP method, `'MCP'` for a developer tool, or `'CLI'` for an ace command. */
   method: string;
-  /** The request path (no query string), or `'<tool> <run id or schedule key>'` for a developer tool. */
+  /**
+   * The request path (no query string), `'<tool> <run id or schedule key>'` for a developer tool, or
+   * `'<command> <target>'` for an ace command (`durable:runs:cancel ord-42`).
+   */
   path: string;
 }
 

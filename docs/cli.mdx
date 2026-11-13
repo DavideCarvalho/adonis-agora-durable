@@ -1,12 +1,12 @@
 ---
 title: CLI
-description: Ace commands for durable — durable:work runs the store-backed worker loop, durable:worker runs a store-less thin worker, durable:runs lists runs (including the --stale view), durable:retry re-enqueues a run, durable:lifecycle:republish publishes settled runs' lifecycle events again, durable:export captures a replay fixture for CI, and make:workflow scaffolds a workflow.
+description: Ace commands for durable — the worker loops (durable:work, durable:worker), an operator command for everything the console does (runs, run actions, bulk, schedules, workers, health), durable:lifecycle:republish, durable:export for replay fixtures, and make:workflow.
 icon: SquareTerminal
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
-`@adonis-agora/durable` ships seven ace commands: two long-running workers (`durable:work` for a store-backed pod, `durable:worker` for a [store-less thin pod](/docs/durable/cluster/topology-and-config)), a run **lister**, a **retry**, a lifecycle **republish**, a replay-fixture **exporter**, and a **workflow generator**. Except for `durable:worker`, they all resolve the [`WorkflowEngine`](/docs/durable/concepts/workflows-and-steps) bound by the provider, so they operate on the same engine (and store) your app is configured with.
+`@adonis-agora/durable` ships two long-running workers (`durable:work` for a store-backed pod, `durable:worker` for a [store-less thin pod](/docs/durable/cluster/topology-and-config)), an [operator command](#operator-commands) for everything the console does, a lifecycle **republish**, a replay-fixture **exporter** and a **workflow generator**. They run against the engine (and store) your app is configured with.
 
 ```bash
 node ace configure @adonis-agora/durable
@@ -50,56 +50,207 @@ node ace durable:worker
 
 It takes no flags — everything comes from `config/durable.ts` (`partition`, which falls back to `namespace` and then `'default'`; `namespace`; `transport`; `stepsPath`; `workflowsPath`, whose workflow names it advertises in the descriptor). On a `topology: 'tenant'` pod it uses the runtime the provider bound, which publishes the descriptor and heartbeat on the shared Redis. On any other topology it builds a self-contained runtime from the configured transport whose advertising is a no-op, and it throws when that transport cannot serve handlers (no `handle()`). Running it on a store-backed topology logs a warning and points you at `durable:work`; see [Thin workers](/docs/durable/cluster/thin-workers) for the full topology.
 
+## Operator commands
+
+Everything the [console](/docs/durable/observability/dashboard) does is also an ace command. Each one runs the console's own handler, so it validates, answers and refuses exactly like the console: the same filters, the same `redact` hooks, the same `404` for an unknown run.
+
+| Console | Command |
+| --- | --- |
+| Runs list, filters | `durable:runs` |
+| Run detail | `durable:runs:show <id>` |
+| Fan members | `durable:runs:fan <id> <group>` |
+| Filter pickers (counts per value) | `durable:runs:values <field>` |
+| Published event value | `durable:runs:event <id> <key>` |
+| Retry | `durable:runs:retry <id>` |
+| Fix and replay | `durable:runs:replay <id> --input '<json>'` |
+| Redispatch a lost step | `durable:runs:redispatch <id>` |
+| Cancel / cancel + undo | `durable:runs:cancel <id> [--compensate]` |
+| Continue from a breakpoint | `durable:runs:continue <id>` |
+| Send a signal | `durable:runs:signal <id> <token> [--payload '<json>']` |
+| Send an update | `durable:runs:update <id> <name> [--arg '<json>']` |
+| Complete / fail a task | `durable:tasks:complete <runId> <name>` / `durable:tasks:fail <runId> <name>` |
+| Bulk retry / cancel | `durable:runs:bulk <retry\|cancel> [filters]` |
+| Lifecycle links of a workflow | `durable:workflows:lifecycle <name>` |
+| Republish a lifecycle event | `durable:lifecycle:republish --run <id>` |
+| Schedules | `durable:schedules` |
+| Pause / resume / run now | `durable:schedules:pause <key>` / `:resume <key>` / `:trigger <key>` |
+| Workers panel | `durable:workers` |
+| Health | `durable:health` |
+
+What they share:
+
+- **`--json`** prints the console's JSON answer (`{ data, meta }` for a list) instead of a table.
+- **Exit code `1`** on any refusal: an unknown run, a bad flag, a token the run is not waiting on, a declined confirmation.
+- **Confirmation.** `durable:runs:cancel`, `durable:runs:redispatch`, `durable:tasks:fail` and `durable:runs:bulk` ask before acting. `--force` skips the question; without a terminal (CI, a cron) they refuse unless you pass `--force`.
+- **Audit.** Every action goes through the console's [`audit` hook](/docs/durable/observability/dashboard#request-guards-and-audit) (or the log line) before it runs, with the actor `cli:<os user>`, the method `CLI` and the path `<command> <target>`.
+- **Tenancy.** With [tenancy](/docs/durable/concepts/tenancy) on, a command reads every tenant; `--tenant <id>` confines it to one, like the console's organization picker. Without tenancy, `--tenant` is refused.
+- **Topology.** On a store-less `tenant` pod the commands go through the run gateway, like the console there; what the gateway cannot do answers the console's `404` / `501`.
+
+They boot the app but start no worker and no server. An action that resumes a run hands it to the workers the same way the console does.
+
+### Run filters
+
+`durable:runs`, `durable:runs:values` and `durable:runs:bulk` take the console's run filter. Several values, repeated or comma separated, match any of them; different flags combine.
+
+| Flag | Matches |
+| --- | --- |
+| `--status` | `pending` / `running` / `suspended` / `blocked` / `cancelling` / `completed` / `failed` / `cancelled` / `dead` |
+| `--workflow` | workflow name |
+| `--tag` | a tag the run carries |
+| `--namespace` | worker namespace |
+| `--origin` | origin attribution |
+| `--attr` | a search-attribute predicate `key:op:value` (`tier:eq:pro`, `amount:gte:100`, `tier:in:pro\|enterprise`); repeat to AND them |
+| `--created-after` / `--created-before` | creation time, ISO date or date-time |
+
+```bash
+node ace durable:runs --status failed,dead --workflow checkout
+node ace durable:runs:values status --created-after 2026-11-01
+node ace durable:runs:values attr.tier --workflow checkout
+```
+
 ## `durable:runs` — list runs
 
-Lists recent runs, optionally filtered by status and workflow, reading through `engine.listRuns`.
+Lists runs, newest first.
 
 ```bash
 node ace durable:runs
-node ace durable:runs --status=failed
-node ace durable:runs --workflow=checkout --limit=100
+node ace durable:runs --status failed
+node ace durable:runs --workflow checkout --page 2 --size 100
+node ace durable:runs --json
 ```
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--status` | — | filter: `pending` / `running` / `suspended` / `blocked` / `cancelling` / `completed` / `failed` / `cancelled` / `dead` |
-| `--workflow` | — | filter by workflow name |
-| `--limit` | `50` | max runs to list |
+| [run filters](#run-filters) | — | `--status`, `--workflow`, `--tag`, … |
+| `--page` | `1` | page, 1-based |
+| `--size` | `50` | rows per page, at most `200` |
 | `--stale` | — | show only runs that look stranded. Bare `--stale` uses the 15-minute default; `--stale=1h` or `--stale=90s` sets your own threshold. |
 
-The table has the columns `RUN`, `WORKFLOW`, `STATUS`, `UPDATED`, `RECOVERY` and `PENDING`:
+The table has the columns `RUN`, `WORKFLOW`, `STATUS`, `UPDATED`, `RECOVERY` and `PENDING`, then the page and the total:
 
 ```text
 RUN        WORKFLOW  STATUS     UPDATED  RECOVERY  PENDING
 ord-42     checkout  suspended  4h32m    -         4h32m (attempt 1)
 ord-43     checkout  suspended  41m3s    -         41m3s (attempt 1, hb 12s)
 ord-40     checkout  completed  2d6h     -         -
+page 1 of 1 (3 total)
 ```
 
-Every row also carries liveness signals — how long ago the run was updated, how many times recovery has picked it up, and the age of its oldest `pending` remote step. That matters because `suspended` alone cannot tell a run mid-step apart from a run whose dispatch was lost.
+Every row carries liveness signals: how long ago the run was updated, how many times recovery has picked it up, and the age of its oldest `pending` remote step. `suspended` alone cannot tell a run mid-step apart from a run whose dispatch was lost.
 
-`--stale` is the query that separates them. It narrows the listing to `running`/`suspended` runs whose oldest pending remote step is older than the threshold — [the stranded signature](/docs/durable/reliability/failure-modes#the-stranded-signature) — and prints a recovery hint for each one (`engine.redispatchPending(runId)` or `node ace durable:retry <runId>`). A step whose worker [heartbeat](/docs/durable/reliability/failure-modes) is younger than the threshold is excluded however old the step is: a beating worker is mid-flight, and re-driving it would run it twice.
+`--stale` is the query that separates them. It keeps the runs whose oldest pending remote step is older than the threshold, [the stranded signature](/docs/durable/reliability/failure-modes#the-stranded-signature), and prints a recovery hint for each one. A step whose worker [heartbeat](/docs/durable/reliability/failure-modes) is younger than the threshold is left out however old the step is: a beating worker is mid-flight, and re-driving it would run it twice.
 
 ```bash
 # What has been sitting on a remote step for over an hour?
 node ace durable:runs --stale=1h
 ```
 
-The threshold is a single-unit duration: `ms`, `s`, `m`, `h` or `d` (`90s`, `15m`, `4h`, `2d`). Anything else (`--stale=15mins`) silently falls back to the 15-minute default rather than failing. Without `--status`, `--stale` scopes the query to `running`/`suspended` so newer terminal runs do not push stale candidates out of the `--limit` window.
+The threshold is a single-unit duration: `ms`, `s`, `m`, `h` or `d` (`90s`, `15m`, `4h`, `2d`). Anything else (`--stale=15mins`) falls back to the 15-minute default. Without `--status`, `--stale` reads only `running` / `suspended` / `cancelling` runs, and it applies to the page it reads, so raise `--size` for a wide sweep. Set the threshold above your longest legitimate step that does not heartbeat.
 
-Set the threshold above your longest legitimate step that does not heartbeat, or a slow-but-healthy run shows up as stranded.
+With `--json` each row also carries `pending`: the oldest pending remote step (`seq`, `name`, `attempts`, `ageMs`, `heartbeatAgeMs`), or `null`.
 
-For the listing to show runs across processes, the engine must be backed by a [persistent store](/docs/durable/stores/lucid) (`config/durable.ts`) — the default in-memory store only sees this process's runs.
+For the listing to show runs across processes, the engine must be backed by a [persistent store](/docs/durable/stores/lucid); the in-memory store only sees this process's runs.
 
-## `durable:retry` — re-enqueue a run
-
-Re-enqueues a run for a worker to (re-)execute. It calls `engine.requeue(runId)`: the run goes back to `pending`, any stale lease is cleared, and a worker resumes it (replaying its checkpoints, re-attempting the failed step).
+## `durable:runs:show` — one run
 
 ```bash
-node ace durable:retry checkout:1234
+node ace durable:runs:show ord-42
+node ace durable:runs:show ord-42 --json
+node ace durable:runs:show ord-42 --field run.output     # one value, in full
+node ace durable:runs:show ord-42 --field timeline.3.error
 ```
 
-An unknown run id exits `1` with `Run <id> not found.`. Run `durable:work` (or any worker) to pick it up afterward. This is the terminal equivalent of the dashboard's retry button — handy for replaying a [dead](/docs/durable/reliability/dead-letter) run once you've shipped a fix.
+Prints the run (status, namespace, tags, what it is waiting on, input, output, error) and its step timeline, then its wide fans and child runs. A fan with more than 50 members is summarized; `--full` lists every member in the timeline instead, and `durable:runs:fan <id> <group>` pages through one (`--failed` for the failed members, `--page`, `--size` up to `500`).
+
+## `durable:runs:values` — count runs by a field
+
+```bash
+node ace durable:runs:values status
+node ace durable:runs:values workflow --status failed
+node ace durable:runs:values attr            # search-attribute keys
+node ace durable:runs:values attr.tier       # one key's values
+```
+
+Counts the runs matching the [run filters](#run-filters) by `status`, `workflow`, `namespace`, `tag`, `attr` or `attr.<key>`. `--limit` (default `20`) and `--search` narrow the values.
+
+## `durable:runs:event` — a published value
+
+```bash
+node ace durable:runs:event ord-42 progress
+```
+
+Prints the latest value the run published for that key with `ctx.setEvent`. It has no side effect.
+
+## Run actions
+
+```bash
+node ace durable:runs:retry ord-42
+node ace durable:runs:replay ord-42 --input '{"sku":"A-1","qty":2}'
+node ace durable:runs:redispatch ord-42
+node ace durable:runs:cancel ord-42 --compensate
+node ace durable:runs:continue ord-42
+node ace durable:runs:signal ord-42 approved --payload '{"by":"ana"}'
+node ace durable:runs:update ord-42 setPriority --arg '"high"'
+node ace durable:tasks:complete ord-42 kyc --result '{"ok":true}'
+node ace durable:tasks:fail ord-42 kyc --error 'document rejected'
+```
+
+- **`durable:runs:retry`** puts a failed, dead or stuck run back to `pending`: a worker replays its completed steps from their checkpoints and runs the failed one again with a fresh budget. Handy for a [dead](/docs/durable/reliability/dead-letter) run once you have shipped a fix.
+- **`durable:runs:replay`** starts a fresh run of the same workflow with a corrected `--input` (JSON, required) and prints its id. The original run stays as it is.
+- **`durable:runs:redispatch`** sends a run's pending remote steps to their workers again, for a step whose job was lost. A step a worker is still running runs twice, so it asks first.
+- **`durable:runs:cancel`** cancels the run; `--compensate` also runs the compensations of its completed steps ([sagas](/docs/durable/reliability/sagas)). Asks first.
+- **`durable:runs:continue`** resumes a run paused at `ctx.breakpoint()`, and fails when it is not paused at one.
+- **`durable:runs:signal`** delivers `--payload` (JSON) to a run waiting on that token (`ctx.waitForSignal`). A token the run is not waiting on is refused, and the error lists the ones it waits on; `--buffer` keeps the signal for the run's next wait instead.
+- **`durable:runs:update`** delivers `--arg` (JSON) to the run's `ctx.onUpdate(name)`. The workflow's validator decides; a rejection fails with its reason.
+- **`durable:tasks:complete`** / **`durable:tasks:fail`** report on a [`ctx.task`](/docs/durable/authoring/external-tasks). When the run is not waiting on the task yet, the completion is kept until it is. `durable:tasks:fail` asks first.
+
+Payloads are capped at 1 MiB, like the console's.
+
+## `durable:runs:bulk` — act on a filter
+
+```bash
+# What would be retried?
+node ace durable:runs:bulk retry --status failed --workflow checkout --dry-run
+
+node ace durable:runs:bulk retry --status failed --workflow checkout --force
+node ace durable:runs:bulk cancel --tag import-2026-11 --compensate
+```
+
+Retries or cancels every run matching the [run filters](#run-filters), at most 500. A run that cannot take the action (already settled, for a cancel) is skipped; the result reports how many matched and how many it applied to. `--dry-run` lists the matching runs and stops. Without `--dry-run` it asks first, naming how many runs it will touch; with no filter that is every run, up to 500.
+
+## Schedules
+
+```bash
+node ace durable:schedules
+node ace durable:schedules --workflow nightly-report --sort -nextFireAt
+node ace durable:schedules:trigger nightly-report
+node ace durable:schedules:pause nightly-report
+node ace durable:schedules:resume nightly-report
+```
+
+`durable:schedules` lists the [schedules](/docs/durable/authoring/scheduling) the worker ticks (`config/durable.ts` plus the colocated `static schedule`s): cadence, paused, the current window's last and next fire, and that window's run status. Filters: `--workflow`, `--namespace`, `--paused true|false`; `--sort` by `key` (default), `workflow`, `nextFireAt` or `lastFireAt` (`-` for descending); `--page`, `--size` (default `100`, at most `200`). A pause set at runtime lives in the running workers, so the listing shows the configured state.
+
+`durable:schedules:trigger` fires the current window now. It is idempotent: a window that already fired answers its existing run.
+
+`durable:schedules:pause` / `:resume` broadcast the change on the [control plane](/docs/durable/transports/control-plane) to every ticking worker, and wait for it to go out before the command exits. Without a control plane the change would reach no worker, so they refuse. Like the console's, it is a runtime override: the next deploy goes back to the config.
+
+## Workers and health
+
+```bash
+node ace durable:workers
+node ace durable:health
+node ace durable:health --json
+```
+
+`durable:workers` lists every worker group with its queue depth and each live worker's last heartbeat. `durable:health` prints, per group, the backlog, the live workers and whether it is **stalled** (work queued, no live worker), then how many runs are pending, dead and blocked. It exits `1` when a group is stalled, so it works as a probe.
+
+## `durable:workflows:lifecycle` — lifecycle links
+
+```bash
+node ace durable:workflows:lifecycle ingestion
+```
+
+Lists the workflows that start when this one settles and the ones whose settling starts it ([lifecycle events](/docs/durable/authoring/lifecycle-events)), and whether each subscription is registered in this app.
 
 ## `durable:lifecycle:republish` — republish lifecycle events
 
@@ -123,7 +274,7 @@ node ace durable:lifecycle:republish --workflow ingestion --kind failed \
 | `--limit` | With `--workflow`: at most this many runs. Default 1000. |
 | `--subscriber` | Only this subscribing workflow. |
 
-It prints how many runs it published and subscriber runs it started, then one line per subscriber it could not start, and exits `1` when any failed or the flags name no target.
+`--run` refuses a run that has not settled. It prints how many runs it published and subscriber runs it started, then one line per subscriber it could not start (`--json` for the result object), and exits `1` when any failed or the flags name no target.
 
 ## `durable:export` — capture a replay fixture
 
@@ -158,11 +309,11 @@ The pieces these commands are made of are exported from `@adonis-agora/durable`,
 | --- | --- |
 | `runWorkerLoop(engine, opts)` | the whole `durable:work` loop, including `startConsumers()` and graceful drain (`WorkerLoopOptions`: `intervalMs`, `drainTimeoutMs`, `stopSignal`, `schedules`, `logger`) |
 | `runTick(engine, opts)` | one tick of it — pending, recovery, timers, timeouts, schedules, retention, stalled sweep; returns a `TickResult` with per-phase counts and the caught phase `errors` |
-| `listRuns(source, opts)` | the `durable:runs` query (`ListRunsOptions`: `status`, `statuses`, `workflow`, `limit`); `source` is any `RunLister`, so an engine or a raw `StateStore` |
+| `listRuns(source, opts)` | a recent-runs query (`ListRunsOptions`: `status`, `statuses`, `workflow`, `limit`); `source` is any `RunLister`, so an engine or a raw `StateStore` |
 | `attachLiveness(engine, runs)` | annotate runs with update age, recovery attempts and pending-step age |
 | `filterStale(liveRuns, thresholdMs)` / `DEFAULT_STALE_MS` | the `--stale` predicate and its 15-minute default |
 | `renderRunsTable(liveRuns)` / `staleHint(runId)` | the terminal table and the per-run retry hint |
-| `retryRun(engine, runId)` | the `durable:retry` action |
+| `retryRun(engine, runId)` | `engine.requeue(runId)` |
 | `parseDurationMs(input)` | parse `'1h'` / `'90s'` the way `--stale` does |
 
 For example, an ops endpoint that reports stranded runs without shelling out to ace:
@@ -181,7 +332,3 @@ export default class OpsController {
   }
 }
 ```
-
-## What the CLI does not do
-
-There is no single-run inspector and no cancel command. To look at one run's step timeline, open it in the [dashboard](/docs/durable/observability/dashboard) or read `engine.listCheckpoints(runId)`; to cancel, call `engine.cancel(runId)` from a script or use the dashboard's cancel action.

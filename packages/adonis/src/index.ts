@@ -24,7 +24,7 @@ export {
 } from './base-workflow.js';
 export * from './codec-state-store.js';
 // --- ace command building blocks --------------------------------------------
-// The pieces `durable:work` / `durable:runs` / `durable:retry` are built from, exported so an app can
+// The pieces `durable:work` / `durable:runs` / `durable:runs:retry` are built from, exported so an app can
 // compose its own command or scheduler on top of them without re-implementing the loop.
 export {
   attachLiveness,

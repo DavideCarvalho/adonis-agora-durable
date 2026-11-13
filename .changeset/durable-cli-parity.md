@@ -1,0 +1,7 @@
+---
+"@adonis-agora/durable": major
+---
+
+Everything the durable console does is now an ace command, running the console's own handlers (same validation, tenant scope, redaction and audit). New: `durable:runs:show`, `durable:runs:fan`, `durable:runs:values`, `durable:runs:event`, `durable:runs:replay`, `durable:runs:redispatch`, `durable:runs:cancel`, `durable:runs:continue`, `durable:runs:signal`, `durable:runs:update`, `durable:runs:bulk`, `durable:tasks:complete`, `durable:tasks:fail`, `durable:schedules`, `durable:schedules:pause`, `durable:schedules:resume`, `durable:schedules:trigger`, `durable:workers`, `durable:health` and `durable:workflows:lifecycle`. Lists and shows take `--json`; every command takes `--tenant` when tenancy is on; cancel, redispatch, task fail and bulk ask for confirmation unless `--force` (and refuse without a terminal), bulk has `--dry-run`. Actions are recorded through the console's `audit` hook with the actor `cli:<os user>` and the method `CLI`.
+
+Breaking: `durable:retry` is renamed `durable:runs:retry` (no alias). `durable:runs` reads through the console's `GET /runs`: it takes the console's filters (`--status` and `--workflow` accept several values, plus `--tag`, `--namespace`, `--origin`, `--attr`, `--created-after`, `--created-before`) and pages with `--page` / `--size` instead of `--limit`; bare `--stale` now parses. `durable:lifecycle:republish --run` goes through the console's republish route, so an unsettled run is refused. New `engine.flushControl()` waits for schedule pauses to reach the control plane.

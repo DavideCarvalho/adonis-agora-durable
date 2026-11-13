@@ -216,7 +216,7 @@ describe('attachLiveness / filterStale — telling "working" apart from "strande
 describe('staleHint', () => {
   it('points at both recovery paths that actually exist', () => {
     const hint = staleHint('stuck1');
-    expect(hint).toContain("engine.redispatchPending('stuck1')");
-    expect(hint).toContain('node ace durable:retry stuck1');
+    expect(hint).toContain('node ace durable:runs:retry stuck1');
+    expect(hint).toContain('node ace durable:runs:redispatch stuck1');
   });
 });

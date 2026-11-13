@@ -325,6 +325,7 @@ import engine from '@adonis-agora/durable/services/main'
 | --- | --- | --- |
 | `listSchedules` | `listSchedules(now?: number): Promise<ScheduleInfo[]>` | Config and colocated schedules with their live state. See [Runtime control](/docs/durable/authoring/scheduling#runtime-control--pause-resume-run-now). |
 | `setSchedulePaused` | `setSchedulePaused(key: string, paused: boolean): boolean` | Pause or resume a schedule, fleet-wide over the control plane. |
+| `flushControl` | `flushControl(): Promise<boolean>` | Wait until the schedule pauses this instance broadcast reached the control plane; `false` when there is no control plane. For a short-lived process. |
 | `triggerSchedule` | `triggerSchedule(key: string, now?: number): Promise<RunResult \| null>` | Start the current window now (idempotent by its run id). |
 | `schedules` | `readonly schedules: ScheduleClient` — `create` / `upsert` / `get` / `list` / `pause` / `resume` / `trigger` / `delete` / `tick` | Persisted, runtime-managed schedules stored in `durable_schedules`, fired when [`persistedSchedules`](#durableconfig) is on. `create` throws `ScheduleAlreadyExistsError`; the others throw `ScheduleNotFoundError` on an unknown id. See [Persisted schedules](/docs/durable/authoring/persisted-schedules). |
 
@@ -540,7 +541,7 @@ Root exports for wiring the engine's lifecycle events into your own tooling. The
 
 ## Command building blocks
 
-The pieces `durable:work`, `durable:runs` and `durable:retry` are built from, exported so an app can compose its own command or scheduler without re-implementing the loop. See [Building your own](/docs/durable/cli#building-your-own).
+The pieces `durable:work` and `durable:runs` are built from, exported so an app can compose its own command or scheduler without re-implementing the loop. See [Building your own](/docs/durable/cli#building-your-own).
 
 | Export | Signature | Notes |
 | --- | --- | --- |
@@ -549,7 +550,7 @@ The pieces `durable:work`, `durable:runs` and `durable:retry` are built from, ex
 | `listRuns` | `listRuns(source: RunLister, opts: { status?, statuses?, workflow?, limit? }): Promise<WorkflowRun[]>` | The `durable:runs` query. |
 | `attachLiveness` / `filterStale` | `attachLiveness(source, runs, now?): Promise<RunLiveness[]>` / `filterStale(liveRuns, thresholdMs = DEFAULT_STALE_MS)` | Add each run's age and oldest pending remote step; keep the ones idle past the threshold (`DEFAULT_STALE_MS` is 15 minutes). |
 | `renderRunsTable` / `staleHint` / `parseDurationMs` | `renderRunsTable(liveRuns): string`, `staleHint(runId): string`, `parseDurationMs(input): number \| undefined` | The `durable:runs` table, its remediation hint, and its `--stale` parser. |
-| `retryRun` | `retryRun(engine, runId): Promise<RunResult \| null>` | `engine.requeue(runId)`, what `durable:retry` calls. |
+| `retryRun` | `retryRun(engine, runId): Promise<RunResult \| null>` | `engine.requeue(runId)`. |
 
 ## Discovery helpers
 
@@ -650,5 +651,5 @@ Only `completed`, `failed`, `cancelled` and `dead` are terminal (`TerminalRunSta
 | `@adonis-agora/durable/admission-redis` | `RedisAdmissionBackend`, for passing an instance directly. See [Flow control](/docs/durable/reliability/flow-control). |
 | `@adonis-agora/durable/control-plane-redis` | `RedisControlPlane`, for passing an instance directly. See [Control plane](/docs/durable/transports/control-plane). |
 | `@adonis-agora/durable/diagnostics` | The module behind `@adonis-agora/diagnostics`' `transports.durable()`: `isConfigured`, `createDeliveryTransport`, `DurableDeliveryTransport`, `diagnosticsRunId`, `diagnosticsRunTags` and the `DIAGNOSTICS_LISTENER_WORKFLOW` / `DIAGNOSTICS_LISTENER_ORIGIN` / `DIAGNOSTICS_DEFAULT_RETRY` constants. Diagnostics loads it for you; you only select the transport. See [Diagnostics listeners](/docs/durable/authoring/diagnostics-listeners). |
-| `@adonis-agora/durable/commands` | The ace commands: `durable:work`, `durable:worker`, `durable:runs`, `durable:retry`, `durable:lifecycle:republish`, `durable:export` and `make:workflow`. See [CLI](/docs/durable/cli). |
+| `@adonis-agora/durable/commands` | The ace commands: the workers (`durable:work`, `durable:worker`), the operator commands (`durable:runs*`, `durable:tasks:*`, `durable:schedules*`, `durable:workers`, `durable:health`, `durable:workflows:lifecycle`, `durable:lifecycle:republish`), `durable:export` and `make:workflow`. See [CLI](/docs/durable/cli). |
 | `@adonis-agora/durable/configure` | The `node ace configure` hook (also re-exported from the root). |
