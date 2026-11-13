@@ -1,5 +1,11 @@
 # @adonis-agora/durable-dashboard
 
+## 1.0.0-rc.8
+
+### Patch Changes
+
+- [#521](https://github.com/DavideCarvalho/adonis-agora-durable/pull/521) [`b87144c`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/b87144cb021d97dd3ec85c23efce66942a7edc5e) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Console: the bundled Sora and JetBrains Mono fonts load again. The build dropped their `@font-face` rules (`sideEffects: false`), and their URLs inside the CSS kept the unmounted base path; the console fell back to system fonts.
+
 ## 1.0.0-rc.7
 
 ### Minor Changes
