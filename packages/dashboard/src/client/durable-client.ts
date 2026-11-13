@@ -277,15 +277,14 @@ export interface FanSummary {
   failures: StepCheckpoint[];
 }
 
-/** One page of a summarized fan's members, in seq order. `total` counts every matching member. */
-export interface FanPage {
-  items: StepCheckpoint[];
-  total: number;
-}
+/** One page of a summarized fan's members, in seq order; `meta.total` counts every matching member. */
+export type FanPage = OffsetPage<StepCheckpoint>;
 
 export interface FanPageOptions {
-  offset?: number | undefined;
-  limit?: number | undefined;
+  /** 1-based page. */
+  page?: number | undefined;
+  /** Members per page (the server caps it at 500). */
+  size?: number | undefined;
   /** Only failed members (a failed step, or a child that failed). */
   failed?: boolean | undefined;
 }
@@ -297,7 +296,7 @@ export interface DurableTopology {
   tenant?: string;
 }
 
-/** One ticked schedule with its live control state — `GET /schedules`' rows, verbatim (the server
+/** One ticked schedule with its live control state — `GET /schedules`' `data` rows, verbatim (the server
  *  serializes the engine's `ScheduleInfo` as-is: the fire instants stay epoch ms, not ISO strings,
  *  unlike a run row's `createdAt`). Exactly one of `cron`/`everyMs` is set per schedule. */
 export interface ScheduleInfo {
@@ -802,35 +801,27 @@ export interface RunFilterOptions {
   origin?: string | undefined;
 }
 
+import { FilterQueryBuilder, type OffsetPage } from '@adonis-agora/filter-client';
 import type { RunPredicates, RunValueField, RunValueRow } from './run-query-string.js';
 // The console's filter shapes live in `run-query-string.ts` (built on the filter lib's builder
 // classes); re-exported here because `./client` resolves to this file.
 import { runQueryString } from './run-query-string.js';
 
+export type { OffsetPage, OffsetPageMeta } from '@adonis-agora/filter-client';
 export type { RunPredicates, RunValueField, RunValueRow } from './run-query-string.js';
 
-/** `page`/`size` for a `/runs` page request — mirrors `handlers.ts`'s `listRuns` query params, and
- *  the offset-pagination shape the rest of the Agora ecosystem takes (`@adonis-agora/filter`'s
- *  `page`/`size`). `page` is 1-BASED; the server defaults it to 1, defaults `size` to 50 and caps
- *  `size` at 200. Both optional. */
+/** `page`/`size` for a `/runs` page request. `page` is 1-based; the server defaults it to 1,
+ *  defaults `size` to 50 and caps `size` at 200. Both optional. */
 export interface RunPageOptions {
   page?: number;
   size?: number;
 }
 
-/** One page of `/runs`, WITH the pagination metadata the plain {@link durableClient.runs} throws away.
- *  The envelope key is `meta` — AdonisJS/Lucid's own `.paginate()` convention, which is where
- *  `@adonis-agora/filter`'s offset path lands, so every `@adonis-agora/*` listing spells it the same.
- *  `meta.count` is how many runs THIS page returned (not a total) — `count === meta.size` is the
- *  server's only "there might be more" signal, since it never counts the full match set. */
-export interface RunsPage {
-  runs: WorkflowRun[];
-  meta: { page: number; size: number; count: number };
-}
+/** One page of `/runs`: `{ data, meta: { total, perPage, currentPage, lastPage, firstPage } }`. */
+export type RunsPage = OffsetPage<WorkflowRun>;
 
-interface RunsListResponse {
-  runs: WorkflowRun[];
-  meta: { page: number; size: number; count: number };
+/** `GET /runs`' answer: the page, plus every run status for the chips. */
+interface RunsListResponse extends RunsPage {
   statuses: RunStatus[];
 }
 
@@ -853,12 +844,11 @@ export const durableClient = {
     attr?: string[],
     opts?: RunFilterOptions,
   ): Promise<WorkflowRun[]> {
-    const { runs } = await durableClient.runsPage(status, tag, attr, opts);
-    return runs;
+    const { data } = await durableClient.runsPage(status, tag, attr, opts);
+    return data;
   },
-  /** Same filters as {@link runs}, plus real `page`/`size` paging — and, unlike {@link runs}, keeps
-   *  the server's `meta` window instead of discarding it, so a caller (the infinite-scrolling runs
-   *  list) can tell whether another page might exist. */
+  /** Same filters as {@link runs}, plus `page`/`size` paging, keeping the server's `meta` (the
+   *  total and the last page) so the infinite-scrolling runs list knows when to stop. */
   async runsPage(
     status?: RunStatus,
     tag?: string | string[],
@@ -868,7 +858,7 @@ export const durableClient = {
   ): Promise<RunsPage> {
     const qs = runQueryString({ status, tag, attr, ...opts }, page ?? {});
     const res = await http<RunsListResponse>(qs ? `/runs?${qs}` : '/runs');
-    return { runs: res.runs, meta: res.meta };
+    return { data: res.data, meta: res.meta };
   },
   /**
    * The distinct values one filter field takes across the runs matching the OTHER active predicates,
@@ -895,17 +885,19 @@ export const durableClient = {
   },
   /** One page of a summarized fan's members — the ones {@link run} left out of its timeline. */
   fanMembers(runId: string, group: string, opts: FanPageOptions = {}): Promise<FanPage> {
-    const params = new URLSearchParams();
-    if (opts.offset !== undefined) params.set('offset', String(opts.offset));
-    if (opts.limit !== undefined) params.set('limit', String(opts.limit));
-    if (opts.failed) params.set('failed', 'true');
-    const qs = params.toString();
+    const builder = new FilterQueryBuilder();
+    if (opts.failed) builder.where('status', 'failed');
+    if (opts.page !== undefined || opts.size !== undefined) {
+      builder.page(opts.page ?? 1, opts.size ?? 100);
+    }
+    const qs = builder.toQueryString();
     const path = `/runs/${encodeURIComponent(runId)}/fans/${encodeURIComponent(group)}`;
     return http<FanPage>(qs ? `${path}?${qs}` : path);
   },
   /** Per-group worker health (queue backlog + live worker heartbeats) for the Workers panel. */
-  workers(): Promise<GroupHealth[]> {
-    return http<GroupHealth[]>('/workers');
+  async workers(): Promise<GroupHealth[]> {
+    const res = await http<{ data: GroupHealth[] }>('/workers');
+    return res.data;
   },
   topology(): Promise<DurableTopology> {
     return http<DurableTopology>('/topology');
@@ -1051,12 +1043,17 @@ export const durableClient = {
       { error },
     );
   },
-  /** The ticked schedules with live control state + fire windows (`GET /schedules`, unwrapped from
-   *  its `{ schedules }` envelope). 404s on a topology without runtime schedule control (a
-   *  store-less `tenant` pod) — the Schedules view gates on the topology role before asking. */
+  /** Every ticked schedule with live control state + fire windows, sorted by key (`GET /schedules`,
+   *  walked page by page). 404s on a topology without runtime schedule control (a store-less
+   *  `tenant` pod) — the Schedules view gates on the topology role before asking. */
   async schedules(): Promise<ScheduleInfo[]> {
-    const res = await http<{ schedules: ScheduleInfo[] }>('/schedules');
-    return res.schedules;
+    const all: ScheduleInfo[] = [];
+    for (let page = 1; ; page += 1) {
+      const qs = new FilterQueryBuilder().page(page, 200).toQueryString();
+      const res = await http<OffsetPage<ScheduleInfo>>(`/schedules?${qs}`);
+      all.push(...res.data);
+      if (res.meta.currentPage >= res.meta.lastPage) return all;
+    }
   },
   /** Pause/resume one schedule fleet-wide at runtime (`POST /schedules/:key/pause|resume`). */
   setSchedulePaused(key: string, paused: boolean): Promise<{ key: string; paused: boolean }> {

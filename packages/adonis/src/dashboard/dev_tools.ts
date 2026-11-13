@@ -165,15 +165,31 @@ const RUN_FILTER_PROPERTIES: Record<string, DevToolInputProperty> = {
   createdBefore: { type: 'string', description: 'Only runs created at or before (ISO date).' },
 };
 
+/** The tool's run filters as the console's `filter[...]` envelope (`{ filter: { status: [...] } }`). */
 function runFilterQuery(input: Record<string, unknown>): Record<string, unknown> {
-  const query: Record<string, unknown> = {};
+  const filter: Record<string, unknown> = {};
   for (const key of Object.keys(RUN_FILTER_PROPERTIES)) {
     const value = input[key];
     if (Array.isArray(value) ? value.length > 0 : value !== undefined && value !== '') {
-      query[key] = Array.isArray(value) ? value.map(String) : String(value);
+      filter[key] = Array.isArray(value) ? value.map(String) : String(value);
     }
   }
-  return query;
+  return Object.keys(filter).length > 0 ? { filter } : {};
+}
+
+/** The `{ data, meta }` page a console list handler answers. */
+interface ListPage {
+  data: unknown[];
+  meta: { currentPage: number; lastPage: number; total: number };
+}
+
+/** The page after `page`, or `null` on the last one. */
+function nextOf(body: ListPage): number | null {
+  return body.meta.currentPage < body.meta.lastPage ? body.meta.currentPage + 1 : null;
+}
+
+function pageOf(input: Record<string, unknown>): number {
+  return typeof input.page === 'number' && input.page >= 1 ? Math.trunc(input.page) : 1;
 }
 
 /** Cut one value to {@link DEV_TOOL_FIELD_BYTES} of JSON, ending with `…(truncated, N bytes)`. */
@@ -219,10 +235,6 @@ function supports(options: DurableDevToolsOptions, method: string): () => Promis
   };
 }
 
-function nextPage(page: number, returned: number, size: number): number | null {
-  return returned >= size ? page + 1 : null;
-}
-
 /**
  * The durable console's developer tools: the same handlers (and so the same `redact` hooks) the
  * console's JSON API runs, under `durable_*` names. Reads are listed by default; the actions (retry,
@@ -257,12 +269,14 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
         },
       },
       run: async (input, tc) => {
-        const size = limitOf(input);
-        const page = typeof input.page === 'number' && input.page >= 1 ? Math.trunc(input.page) : 1;
         const body = (await call(listRuns, await options.deps(tc.ctx), {
-          query: { ...runFilterQuery(input), page: String(page), size: String(size) },
-        })) as { runs: unknown[] };
-        return { items: body.runs, next: nextPage(page, body.runs.length, size) };
+          query: {
+            ...runFilterQuery(input),
+            page: String(pageOf(input)),
+            size: String(limitOf(input)),
+          },
+        })) as ListPage;
+        return { items: body.data, next: nextOf(body) };
       },
     },
     {
@@ -314,14 +328,14 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
       name: 'durable_list_fan_members',
       kind: 'read',
       description:
-        "One page of a wide fan's member steps (a fan `durable_get_run` summarized), in order. Paged by `offset`; returns { items, next, total }.",
+        "One page of a wide fan's member steps (a fan `durable_get_run` summarized), in order. Paged: pass `next` back as `page`. Returns { items, next, total }.",
       input: {
         type: 'object',
         properties: {
           id: { type: 'string', description: 'Run id.' },
           group: { type: 'string', description: 'The fan group, from the run detail `fans`.' },
           failed: { type: 'boolean', description: 'Only failed members.' },
-          offset: { type: 'integer', minimum: 0, description: 'Members to skip (default 0).' },
+          page: { type: 'integer', minimum: 1, description: '1-based page (default 1).' },
           limit: {
             type: 'integer',
             minimum: 1,
@@ -332,22 +346,18 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
         required: ['id', 'group'],
       },
       run: async (input, tc) => {
-        const limit = limitOf(input);
-        const offset =
-          typeof input.offset === 'number' && input.offset >= 0 ? Math.trunc(input.offset) : 0;
         const body = (await call(getFanMembers, await options.deps(tc.ctx), {
           params: { id: required(input, 'id'), group: required(input, 'group') },
           query: {
-            offset: String(offset),
-            limit: String(limit),
-            ...(input.failed === true ? { failed: 'true' } : {}),
+            page: String(pageOf(input)),
+            size: String(limitOf(input)),
+            ...(input.failed === true ? { filter: { status: 'failed' } } : {}),
           },
-        })) as { items: unknown[]; total: number };
-        const end = offset + body.items.length;
+        })) as ListPage;
         return {
-          items: body.items.map(truncateBlobs),
-          next: end < body.total ? end : null,
-          total: body.total,
+          items: body.data.map(truncateBlobs),
+          next: nextOf(body),
+          total: body.meta.total,
         };
       },
     },
@@ -389,7 +399,7 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
       input: { type: 'object', properties: {} },
       run: async (_input, tc) => {
         const deps = await options.deps(tc.ctx);
-        const groups = (await call(async (d) => health(d), deps, {})) as { groups: unknown[] };
+        const groups = (await call(async (d) => health(d), deps, {})) as { data: unknown[] };
         const counts: Record<string, number> = {};
         if (deps.engine.countRuns) {
           for (const status of ['pending', 'dead', 'blocked'] as const) {
@@ -405,7 +415,7 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
           }
         }
         return {
-          groups: groups.groups,
+          groups: groups.data,
           ...(Object.keys(counts).length > 0 ? { runs: counts } : {}),
           ...(compatBody !== undefined ? { compat: compatBody } : {}),
         };
@@ -417,22 +427,36 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
       description:
         "Worker groups with every live worker's heartbeat (instance id, last beat, namespace) and the queue depth.",
       input: { type: 'object', properties: {} },
-      run: async (_input, tc) => ({
-        items: await call(async (d) => workers(d), await options.deps(tc.ctx), {}),
-      }),
+      run: async (_input, tc) => {
+        const body = (await call(async (d) => workers(d), await options.deps(tc.ctx), {})) as {
+          data: unknown[];
+        };
+        return { items: body.data };
+      },
     },
     {
       name: 'durable_list_schedules',
       kind: 'read',
       description:
-        'Cron/interval schedules: key, workflow, cron or interval, paused (and whether by a runtime override), last and next fire, and the current window run status.',
-      input: { type: 'object', properties: {} },
+        'Cron/interval schedules: key, workflow, cron or interval, paused (and whether by a runtime override), last and next fire, and the current window run status. Paged: pass `next` back as `page`. Returns { items, next }.',
+      input: {
+        type: 'object',
+        properties: {
+          page: { type: 'integer', minimum: 1, description: '1-based page (default 1).' },
+          limit: {
+            type: 'integer',
+            minimum: 1,
+            maximum: MAX_LIMIT,
+            description: 'Rows (default 20).',
+          },
+        },
+      },
       available: supports(options, 'listSchedules'),
-      run: async (_input, tc) => {
-        const body = (await call(listSchedules, await options.deps(tc.ctx), {})) as {
-          schedules: unknown[];
-        };
-        return { items: body.schedules, next: null };
+      run: async (input, tc) => {
+        const body = (await call(listSchedules, await options.deps(tc.ctx), {
+          query: { page: String(pageOf(input)), size: String(limitOf(input)) },
+        })) as ListPage;
+        return { items: body.data, next: nextOf(body) };
       },
     },
     {

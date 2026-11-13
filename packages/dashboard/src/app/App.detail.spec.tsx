@@ -43,7 +43,10 @@ vi.mock('../client/durable-client', async (importOriginal) => {
       retryWithInput: (...args: unknown[]) => retryWithInput(...args),
       streamRun: () => () => {},
       runs: vi.fn().mockResolvedValue([]),
-      runsPage: vi.fn().mockResolvedValue({ runs: [], meta: { page: 1, size: 100, count: 0 } }),
+      runsPage: vi.fn().mockResolvedValue({
+        data: [],
+        meta: { total: 0, perPage: 100, currentPage: 1, lastPage: 1, firstPage: 1 },
+      }),
       values: vi.fn().mockResolvedValue([]),
       workers: vi.fn().mockResolvedValue([]),
       topology: vi.fn().mockResolvedValue({ role: 'standalone' }),

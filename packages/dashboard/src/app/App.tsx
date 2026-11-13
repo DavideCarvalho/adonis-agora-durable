@@ -970,7 +970,7 @@ export function RunsList({
    *  "these runs do not exist" when the truth is "this filter cannot match them". */
   emptyNotice: ReturnType<typeof emptyRunsNotice>;
   /** True while the server may still hold more runs matching the current tag/attr/namespace filter
-   *  beyond what's been fetched (the last page came back full — see `RunsPage.meta`). */
+   *  beyond what's been fetched (`meta.currentPage < meta.lastPage`). */
   hasMore?: boolean;
   /** True while a scroll-triggered `/runs?page=…` fetch is in flight. */
   loadingMore?: boolean;
@@ -1978,11 +1978,9 @@ export function App() {
       ),
     // 1-based, matching the server's `?page=` (and the ecosystem's `@adonis-agora/filter` shape).
     initialPageParam: 1,
-    // The server never returns a total match count (see `RunsPage`'s doc) — a full page is the only
-    // signal that more might exist; a short page means the store is exhausted.
     getNextPageParam: (lastPage) => {
-      const { page, size, count } = lastPage.meta;
-      return count === size ? page + 1 : undefined;
+      const { currentPage, lastPage: last } = lastPage.meta;
+      return currentPage < last ? currentPage + 1 : undefined;
     },
     // Keep the run list live. NOTE: on an infinite query this refetches EVERY already-loaded page (not
     // just the first) each interval, so cost grows with how far an operator has scrolled — acceptable
@@ -1990,7 +1988,7 @@ export function App() {
     // of runs.
     refetchInterval: 3000,
   });
-  const runs = useMemo(() => runsPages?.pages.flatMap((p) => p.runs) ?? [], [runsPages]);
+  const runs = useMemo(() => runsPages?.pages.flatMap((p) => p.data) ?? [], [runsPages]);
   // The status chips (ALL included) are counted by their own query: refresh them with every list
   // refresh, so a run that started or settled moves the counts when it moves the list.
   useEffect(() => {

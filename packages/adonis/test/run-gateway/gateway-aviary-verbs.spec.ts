@@ -211,7 +211,7 @@ describe('a tenant pod’s console over the new verbs', () => {
     await acme.start('await-go', {}, { runId: 'cw1' });
     await new Promise((r) => setTimeout(r, 20));
     const res = await listRuns({ engine: port }, { params: {}, query: {}, body: undefined });
-    const row = (res.body as { runs: Array<{ id: string; waiting?: unknown }> }).runs.find(
+    const row = (res.body as { data: Array<{ id: string; waiting?: unknown }> }).data.find(
       (r) => r.id === 'cw1',
     );
     expect(row?.waiting).toEqual({ on: 'signal', name: 'go' });

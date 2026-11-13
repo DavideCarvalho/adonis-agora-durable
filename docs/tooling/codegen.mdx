@@ -175,12 +175,12 @@ if (detail?.run?.status === 'failed') {
 
 What the generated types cover:
 
-- **Fully shaped:** the components `RunStatus`, `RunSummary`, `Checkpoint`, `RunResult` and `Error`, the `GET /runs` page (`runs`, `meta`, `statuses`), the `GET /runs/{id}` detail (`run`, `timeline`, `children`, `fans`, `childCount`) and its `GET /runs/{id}/fans/{group}` page, path and query parameters, and request bodies.
+- **Fully shaped:** the components `RunStatus`, `RunSummary`, `Checkpoint`, `RunResult` and `Error`, the list pages (`data`, `meta`; `GET /runs` adds `statuses`) of `GET /runs`, `GET /runs/{id}/fans/{group}` and `GET /schedules`, the `GET /runs/{id}` detail (`run`, `timeline`, `children`, `fans`, `childCount`) path and query parameters, and request bodies.
 - **Conditional run detail:** `GET /runs/{id}` declares an `If-None-Match` header parameter and a bodiless `304`. The `200` carries an `ETag` with `Cache-Control: private, no-cache`, so a poller that sends the last `ETag` back pays nothing for an unchanged run; with `openapi-fetch`, check `response.status === 304` before reading `data`.
 - **Non-JSON routes:** `GET /metrics` is Prometheus text (`text/plain`, format 0.0.4), not JSON — fetch it as text or point a scraper at it (see [Metrics](/docs/durable/observability/metrics)).
 - **Other 0.51 routes:** `GET /runs/{id}/events/{key}` returns `{ value }` (the latest value the run published with `ctx.setEvent`, `value` absent when never published), and `POST /webhooks/{token}` delivers a `ctx.webhook()` callback (`404` for an unknown or no-longer-waiting token, `413` for an oversized body).
-- **Loosely typed:** many action and fleet responses (retry, cancel, bulk, schedules, health, workers, topology, compat, …) are declared as a plain `object`, so you get the route and its parameters typed but should narrow the response yourself. The [dashboard page](/docs/durable/observability/dashboard#where-it-mounts) documents what each returns.
-- Filters beyond `page` / `size` on `GET /runs` (the `filter[...]` envelope and flat `status` / `workflow` / `tag` / … params) are described in prose rather than as declared parameters. Pass them as extra query keys.
+- **Loosely typed:** many action and fleet responses (retry, cancel, bulk, topology, compat, …) are declared as a plain `object`, so you get the route and its parameters typed but should narrow the response yourself. The [dashboard page](/docs/durable/observability/dashboard#where-it-mounts) documents what each returns.
+- The `filter[...]` envelope is declared as one `deepObject` parameter; the fields each list takes are described in its prose (see [the dashboard page](/docs/durable/observability/dashboard#reading-runs)).
 
 `GET /runs/{id}/stream` is a Server-Sent Events endpoint, so read it with `EventSource` (see [Live-tailing one run](/docs/durable/observability/dashboard#live-tailing-one-run)) rather than through the generated client.
 

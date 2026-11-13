@@ -107,7 +107,7 @@ describe('durable dev tools', () => {
       next: number | null;
     };
     const viaApi = await listRuns(deps, { params: {}, query: { page: '1', size: '20' } });
-    expect(viaTool.items).toEqual((viaApi.body as { runs: unknown[] }).runs);
+    expect(viaTool.items).toEqual((viaApi.body as { data: unknown[] }).data);
     expect(viaTool.next).toBeNull();
   });
 
@@ -190,6 +190,46 @@ describe('durable dev tools', () => {
     )) as { field: string; values: Array<{ value: string; count: number }> };
     expect(out.field).toBe('workflow');
     expect(out.values).toContainEqual(expect.objectContaining({ value: 'greet', count: 2 }));
+  });
+
+  it('durable_count_runs_by scopes by the filters', async () => {
+    await raw.waitForRun(await start(raw, 'greet', { name: 'a' }));
+    await start(raw, 'waiter', {});
+    const out = (await tool(tools, 'durable_count_runs_by').run(
+      { field: 'status', workflow: 'waiter' },
+      { ...call, limits },
+    )) as { values: Array<{ value: string; count: number }> };
+    // Only the waiter run is in scope (its exact status depends on timing).
+    expect(out.values.reduce((n, v) => n + v.count, 0)).toBe(1);
+  });
+
+  it('durable_list_schedules pages the schedules with next', async () => {
+    const schedule = (key: string) => ({
+      key,
+      workflow: 'greet',
+      paused: false,
+      pausedAtRuntime: false,
+      lastFireAt: 0,
+      nextFireAt: 1,
+      currentWindowRunId: `w-${key}`,
+    });
+    const scheduled = durableDevTools({
+      deps: async () => ({
+        engine: { ...deps.engine, listSchedules: async () => ['c', 'a', 'b'].map(schedule) },
+      }),
+    });
+    const first = (await tool(scheduled, 'durable_list_schedules').run(
+      { limit: 2 },
+      { ...call, limits },
+    )) as { items: Array<{ key: string }>; next: number | null };
+    expect(first.items.map((s) => s.key)).toEqual(['a', 'b']);
+    expect(first.next).toBe(2);
+    const second = (await tool(scheduled, 'durable_list_schedules').run(
+      { limit: 2, page: 2 },
+      { ...call, limits },
+    )) as { items: Array<{ key: string }>; next: number | null };
+    expect(second.items.map((s) => s.key)).toEqual(['c']);
+    expect(second.next).toBeNull();
   });
 
   it('durable_get_health reports groups and run counts', async () => {

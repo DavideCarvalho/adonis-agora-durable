@@ -199,13 +199,13 @@ describe('the console over HTTP with tenancy on', () => {
     }
   }
   const ids = (body: Record<string, unknown>) =>
-    (body.runs as Array<{ id: string }>).map((r) => r.id).sort();
+    (body.data as Array<{ id: string }>).map((r) => r.id).sort();
 
   it("a viewer sees their own organization's runs only", async () => {
     const app = await boot(() => true);
     const res = await get(app, '/durable/api/runs', 'acme');
     expect(ids(res.body)).toEqual(['a']);
-    expect((res.body.runs as Array<{ tenantId?: string }>)[0]?.tenantId).toBe('acme');
+    expect((res.body.data as Array<{ tenantId?: string }>)[0]?.tenantId).toBe('acme');
     expect((await get(app, '/durable/api/runs/g', 'acme')).status).toBe(404);
     const picker = await get(app, '/durable/api/tenants', 'acme');
     expect(picker.body).toEqual({

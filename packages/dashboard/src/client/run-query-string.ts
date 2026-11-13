@@ -53,7 +53,7 @@ function narrow(
  * disagree about what the operator selected — a bulk retry scoped more widely than the list it was
  * launched from acts on runs nobody looked at.
  *
- * Attribute predicates travel opaque (`attr=key:op:value`, one string or a list): attribute keys
+ * Attribute predicates travel opaque (`filter[attr]=key:op:value`, one string or a list): attribute keys
  * are dynamic, so no envelope field could own them, and the one string carries key, operator and
  * operand through unchanged.
  */
@@ -70,8 +70,6 @@ export function runQueryString(
   narrow(builder, 'workflow', predicates.workflow);
   narrow(builder, 'tag', predicates.tag);
   narrow(builder, 'namespace', predicates.namespace);
-  // The engine has no `origin` column — the server reads but ignores it — so sending it keeps a
-  // hand-built URL and the console's requests spelling the filter the same way.
   if (predicates.origin) builder.where('origin', predicates.origin);
 
   const attrPredicates: string[] = [];
@@ -87,19 +85,15 @@ export function runQueryString(
     builder.where('attr', attrPredicates.length === 1 ? attrPredicates[0] : attrPredicates);
   }
 
-  // Offset paging as the ecosystem spells it: a 1-based `page` and a `size`, flat on the wire
-  // (`?page=2&size=100`) — the same shape `@adonis-agora/filter` parses into `FilterInput.page`/
-  // `.size`. Sent through `set()` rather than the builder's `page(page, size)` helper so a caller
-  // that names only one of the two doesn't get the helper's own `size` default (25) invented
-  // underneath it — the server owns that default (50), and it must stay the one that applies.
+  // Offset paging: a 1-based `page` and a `size` (`?page=2&size=100`). Sent through `set()` rather
+  // than the builder's `page(page, size)` so a caller that names only one of the two leaves the
+  // other to the server's default (page 1, size 50) instead of the builder's own (25).
   if (paginate.page !== undefined) builder.set('page', paginate.page);
   if (paginate.size !== undefined) builder.set('size', paginate.size);
 
   // The values-picker envelope rides the same builder: the scope above plus the axis it
-  // enumerates. `limit`/`offset`/`search` here bound the offered VALUES, not the run list — that
-  // is filter's own group-by-count shape, deliberately left as-is while the run listing moved to
-  // `page`/`size`. The two never mix because a values call never sends a page window (and vice
-  // versa).
+  // enumerates. `limit`/`offset`/`search` here bound the offered VALUES — that is filter's own
+  // group-by-count wire format. A values call never sends a page window (and vice versa).
   if (groupByCount) {
     builder.groupByCount(groupByCount.field, {
       ...(groupByCount.limit !== undefined && { limit: groupByCount.limit }),

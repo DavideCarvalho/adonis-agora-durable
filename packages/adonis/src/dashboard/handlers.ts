@@ -2,6 +2,9 @@ import {
   applyCustomFilter,
   groupByCountFromRequest,
   InvalidColumnFilterError,
+  offsetPage,
+  parsePageParams,
+  resolveSort,
 } from '@adonis-agora/filter';
 import type { ScheduleInfo } from '../engine.js';
 import type {
@@ -37,7 +40,8 @@ import {
 } from '../run-detail-summary.js';
 import { RUN_VALUE_FACET_LIMIT } from '../run-value-facets.js';
 import { indexWaitersByRun, resolveRunWaiting } from '../run-waiting.js';
-import { RUN_STATUSES, RunFilter } from './run-filter.js';
+import { FanMemberDraft, FanMemberFilter, ScheduleDraft, ScheduleFilter } from './list-filters.js';
+import { RUN_FILTER_FIELDS, RUN_STATUSES, RunFilter } from './run-filter.js';
 import { RunQueryDraft } from './run-query-draft.js';
 import { runValueAdapter } from './run-values.js';
 
@@ -54,13 +58,9 @@ import { runValueAdapter } from './run-values.js';
  * with no HTTP server. The provider adapts an AdonisJS `HttpContext` to these
  * shapes.
  *
- * `listRuns`/`getRun`/`retryRun`/`redispatchPendingRun`/`cancelRun`/`health` are the original
- * handlers this file always had (response shapes unchanged, so a hand-written client over the
- * JSON API keeps working — see `compat.ts`/`compat-view.ts`).
- * `workers`, `topology`, `retryWithInputRun`, `continueRun`, `runValues`, and `bulkAction` are
- * additions that give the new `@adonis-agora/durable-dashboard` React SPA parity with
- * `@dudousxd/nestjs-durable-dashboard`'s `DurableApiController` (fix-and-replay, bulk retry/cancel,
- * breakpoint continue, full worker heartbeats, topology badge, value pickers). The SSE `runs/:id/stream` route is wired directly in
+ * The list routes (`GET /runs`, `/runs/:id/fans/:group`, `/schedules`) speak the
+ * `@adonis-agora/filter` wire format: `filter[...]`, `sort`, `page`/`size`, and a
+ * `{ data, meta }` answer. The SSE `runs/:id/stream` route is wired directly in
  * `providers/dashboard_provider.ts` since streaming needs the raw HTTP response, not a JSON `ApiResponse`.
  */
 
@@ -194,8 +194,8 @@ function redacted(
 export interface ApiRequest {
   /** Route params, e.g. `{ id: 'run-1' }`. */
   params: Record<string, string | undefined>;
-  /** Decoded query string — nested when the client sends the filter envelope
-   *  (`filter[where][0][field]`), flat for the legacy spelling. */
+  /** Decoded query string, nested for the filter envelope (`filter[status]=failed` arrives as
+   *  `{ filter: { status: 'failed' } }`). */
   query: Record<string, unknown>;
   /** Parsed JSON body (for POST actions). */
   body?: unknown;
@@ -335,26 +335,67 @@ function readFlag(req: ApiRequest, key: string): boolean | typeof INVALID_FLAG {
   return fromQuery ?? false;
 }
 
-/** Build a {@link RunQuery} from the query params shared by `listRuns`, `bulkAction` and the
- *  `runValues` scope — by running the console's {@link RunFilter} class over them (the filter
- *  lib's unified class form, with a draft in place of a Lucid builder).
- *
- *  Both spellings feed the same class: the flat form the console has always sent
- *  (`?status=failed&tag=etl`, repeatable for a set, `attr=key:op:value` repeats) and the structured
- *  `filter[...]` envelope `@adonis-agora/filter-client` builds. A refused filter
- *  (`InvalidColumnFilterError` — unknown field, unsupported operator, a group the draft cannot
- *  express) throws, and every caller maps it to `400` — a typo'd filter fails loudly instead of
- *  silently widening.
- *
- *  `page`/`size` never enter the draft (no method owns those endpoint mechanics — the caller
- *  reads them), and neither does `origin`: the engine has no `origin` column, so the class reads
- *  but ignores it and a client that always sends it never 400s. */
+/**
+ * Refuse a filter field sent bare (`?status=failed`, `?attr.tier=pro`) instead of inside
+ * `filter[...]`. The filter lib would otherwise dispatch it to the same-named method; refusing it
+ * keeps one spelling on the wire, and a stale client that would have scoped a bulk action by it
+ * gets a `400` instead of acting on everything.
+ */
+function assertNoBareFilterFields(query: ApiRequest['query'], fields: readonly string[]): void {
+  for (const key of Object.keys(query)) {
+    const head = key.split('.')[0] ?? key;
+    if (fields.includes(head)) {
+      throw new InvalidColumnFilterError(`Send "${key}" as filter[${key}].`);
+    }
+  }
+}
+
+/** Run `cls` over the request's `filter[...]` envelope onto `draft`, refusing bare filter fields. */
+async function applyListFilter<D>(
+  draft: D,
+  cls: Parameters<typeof applyCustomFilter<D>>[1],
+  query: ApiRequest['query'],
+  fields: readonly string[],
+): Promise<D> {
+  assertNoBareFilterFields(query, fields);
+  await applyCustomFilter(draft, cls, { request: { qs: () => ({ ...query }) } });
+  return draft;
+}
+
+/** Build a {@link RunQuery} from the `filter[...]` envelope `listRuns`, `bulkAction` and the
+ *  `runValues` scope share, by running the console's {@link RunFilter} class over it. A refused
+ *  filter (`InvalidColumnFilterError`: unknown field, unsupported operator, an `OR` group, a bare
+ *  filter field) throws, and every caller maps it to `400`. */
 async function runFilterQuery(
   query: ApiRequest['query'],
 ): Promise<Omit<RunQuery, 'page' | 'size'>> {
-  const draft = new RunQueryDraft();
-  await applyCustomFilter(draft, RunFilter, { request: { qs: () => ({ ...query }) } });
+  const draft = await applyListFilter(new RunQueryDraft(), RunFilter, query, RUN_FILTER_FIELDS);
   return draft.query;
+}
+
+/** The one order the run stores list in: newest first. */
+const RUN_SORT = [{ field: 'createdAt', direction: 'desc' }] as const;
+
+/**
+ * Check `sort` against an endpoint whose store lists in one fixed order: absent, or exactly that
+ * order, else `InvalidColumnFilterError`.
+ */
+function assertFixedSort(
+  sort: unknown,
+  fixed: readonly { field: string; direction: 'asc' | 'desc' }[],
+): void {
+  const fields = [...new Set(fixed.map((item) => item.field))];
+  const items = resolveSort(sort as string | string[] | undefined, { sortable: fields });
+  if (items.length === 0) return;
+  const same =
+    items.length === fixed.length &&
+    items.every(
+      (item, i) => item.field === fixed[i]?.field && item.direction === fixed[i]?.direction,
+    );
+  if (!same) {
+    const spelled = fixed.map((s) => (s.direction === 'desc' ? `-${s.field}` : s.field)).join(',');
+    throw new InvalidColumnFilterError(`This list is sorted by "${spelled}" only.`);
+  }
 }
 
 /** Map a refused run filter to `400` (see {@link runFilterQuery}); rethrow anything else. */
@@ -367,23 +408,18 @@ function filterRejection(error: unknown): ApiResponse {
  * `GET /runs/values` — the distinct values one filter axis takes across the runs matching every
  * OTHER active predicate, with counts — what the console's pickers list instead of asking an
  * operator to type a value blind. Served through the filter lib's `groupByCountFromRequest` with
- * the console's adapter: the scope rides the same params as `listRuns`, and `field`/`limit`/
- * `offset`/`search` ride top-level (with the `groupByCount[field]` envelope as fallback).
+ * the console's adapter: the scope rides the same `filter[...]` envelope as `listRuns`, and the
+ * axis rides `groupByCount[field]` (`limit`/`offset`/`search` likewise, or top-level).
  *
- * A picker pages as it scrolls and narrows as the operator types, both against the whole matching
- * set rather than the fetched page.
- *
- * Note this endpoint keeps `limit`/`offset` while `GET /runs` moved to `page`/`size`: it is not a
- * listing of runs but filter's own group-by-count aggregation, and `limit`/`offset` IS that
- * feature's shape in `@adonis-agora/filter` (`groupByCount[limit]`/`groupByCount[offset]`,
- * `GroupByCountFromRequestOptions`). Matching the lib per surface is the point — respelling this
- * one as `page`/`size` would diverge from it, not align with it.
+ * It keeps `limit`/`offset`: it is filter's own group-by-count aggregation, not a listing, and
+ * that is the aggregation's wire format.
  */
 export async function runValues(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
   const qs = req.query;
   const field = firstQuery(qs.field);
   const search = firstQuery(qs.search)?.trim();
   try {
+    assertNoBareFilterFields(qs, RUN_FILTER_FIELDS);
     return ok(
       await groupByCountFromRequest(
         new RunQueryDraft(),
@@ -403,40 +439,63 @@ export async function runValues(deps: Deps, req: ApiRequest): Promise<ApiRespons
   }
 }
 
+/** `GET /runs` page sizes: 50 by default, at most 200. */
+const RUNS_PAGE = { defaultSize: 50, maxSize: 200 } as const;
+
 /**
- * `GET /runs` — list runs filtered by status/workflow/tag/namespace/search-attributes, paginated.
+ * `GET /runs` — runs matching the `filter[...]` envelope (status, workflow, tag, namespace, origin,
+ * created range, search attributes), newest first, offset-paged (`page`, 1-based, and `size`).
  *
- * Paging is `?page=&size=`: a 1-BASED page number (default `1`) and a page size (default `50`,
- * capped at `200`) — the same offset-pagination shape `@adonis-agora/filter` takes, so one console
- * builder spells paging identically against this engine and against a Lucid-backed listing. The
- * 0-based offset it resolves to never appears on the wire; the store computes it (`runPageWindow`).
+ * Answers `{ data, meta: { total, perPage, currentPage, lastPage, firstPage }, statuses }`:
+ * `statuses` is every run status, for the console's chips. `sort` accepts `-createdAt` only (the
+ * stores' one order); anything else, and any refused filter, is a `400`.
  */
 export async function listRuns(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
   const { engine } = deps;
-  const size = Math.min(intQuery(req.query.size, 50), 200);
-  // A page below 1 reads as the first page rather than 400ing — same tolerance the other params get.
-  const page = Math.max(1, intQuery(req.query.page, 1));
+  const { page, size } = parsePageParams(req.query, RUNS_PAGE);
 
   let filter: Omit<RunQuery, 'page' | 'size'>;
   try {
+    assertFixedSort(req.query.sort, RUN_SORT);
     filter = await runFilterQuery(req.query);
   } catch (error) {
     return filterRejection(error);
   }
-  const query: RunQuery = { page, size, ...filter };
 
-  const runs = await engine.listRuns(query);
+  const [runs, total] = await Promise.all([
+    engine.listRuns({ ...filter, page, size }),
+    countMatching(engine, filter),
+  ]);
   // Resolve what each suspended run on THIS page is parked on — signal / webhook / child /
   // breakpoint — with no per-run timeline fetch. Prefers the targeted per-page lookup (`run_id IN
-  // (...)`, indexed) over the legacy full-table waiter scan; absent on a topology that can't do
-  // either yet (see `DashboardEngine.listSignalWaiters`'s doc), where the `waiting` stamp is
-  // simply skipped, same as `@dudousxd/nestjs-durable-dashboard`.
+  // (...)`, indexed) over the full waiter scan; absent on a topology that can't do either, where
+  // the `waiting` stamp is simply skipped.
   const waitingOf = await waitingResolver(engine, runs);
   return ok({
-    runs: runs.map((run) => redacted(deps.redact?.run, summarizeRun(run, waitingOf))),
-    meta: { page, size, count: runs.length },
+    ...offsetPage(
+      runs.map((run) => redacted(deps.redact?.run, summarizeRun(run, waitingOf))),
+      { total, page, size },
+    ),
     statuses: RUN_STATUSES,
   });
+}
+
+/**
+ * How many runs match `filter`: the port's `countRuns`, else (no count on the port, or a tenant
+ * pod's control plane too old to answer one) the length of the full listing.
+ */
+async function countMatching(
+  engine: DashboardEngine,
+  filter: Omit<RunQuery, 'page' | 'size'>,
+): Promise<number> {
+  if (engine.countRuns) {
+    try {
+      return await engine.countRuns(filter);
+    } catch (err) {
+      if ((err as { code?: unknown } | null)?.code !== 'unsupported-request') throw err;
+    }
+  }
+  return (await engine.listRuns(filter)).length;
 }
 
 /** A fan wider than this comes back from `GET /runs/:id` as one summary, unless `?full=true`. */
@@ -487,39 +546,49 @@ export async function getRun(deps: Deps, req: ApiRequest): Promise<ApiResponse> 
   };
 }
 
+/** `GET /runs/:id/fans/:group` page sizes: 100 by default, at most 500. */
+const FAN_PAGE = { defaultSize: 100, maxSize: 500 } as const;
+
 /**
- * `GET /runs/:id/fans/:group` — one page of a summarized fan's members, in seq order, with the
- * total. Query: `offset`, `limit` (at most 500, default 100), `failed=true` for failed members only.
+ * `GET /runs/:id/fans/:group` — one page of a summarized fan's members, in seq order,
+ * offset-paged (`page`, `size` up to 500, default 100). `filter[status]=failed` keeps the failed
+ * members only; `sort` accepts `seq` only. Answers `{ data, meta }`.
  */
 export async function getFanMembers(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
   const { engine } = deps;
   const id = req.params.id;
   const group = req.params.group;
   if (!id || !group) return notFound('run id and fan group are required');
-  const failed = readFlag(req, 'failed');
-  if (failed === INVALID_FLAG) return badRequest('failed must be a boolean');
-  const number = (key: string): number | undefined => {
-    const raw = firstQuery(req.query[key]);
-    return raw === undefined ? undefined : Number(raw);
-  };
+  const { page, size } = parsePageParams(req.query, FAN_PAGE);
+  let failedOnly: boolean;
+  try {
+    assertFixedSort(req.query.sort, [{ field: 'seq', direction: 'asc' }]);
+    ({ failedOnly } = await applyListFilter(new FanMemberDraft(), FanMemberFilter, req.query, [
+      'status',
+    ]));
+  } catch (error) {
+    return filterRejection(error);
+  }
   const ifNoneMatch = req.headers?.['if-none-match'];
   const query: FanPageQuery = {
-    offset: number('offset'),
-    limit: number('limit'),
-    failedOnly: failed,
+    offset: (page - 1) * size,
+    limit: size,
+    failedOnly,
     ...(ifNoneMatch ? { ifNoneMatch } : {}),
   };
-  const page = engine.getFanMembers
+  const members = engine.getFanMembers
     ? await engine.getFanMembers(id, group, query)
     : await loadFanMembers(engine, id, group, query);
-  if (!page) return notFound(`run ${id} not found`);
-  if (page.etag && page.notModified) return notModified(page.etag);
+  if (!members) return notFound(`run ${id} not found`);
+  if (members.etag && members.notModified) return notModified(members.etag);
   return {
-    ...ok({
-      items: page.items.map((cp) => redacted(deps.redact?.checkpoint, summarizeCheckpoint(cp))),
-      total: page.total,
-    }),
-    ...(page.etag ? { headers: etagHeaders(page.etag) } : {}),
+    ...ok(
+      offsetPage(
+        members.items.map((cp) => redacted(deps.redact?.checkpoint, summarizeCheckpoint(cp))),
+        { total: members.total, page, size },
+      ),
+    ),
+    ...(members.etag ? { headers: etagHeaders(members.etag) } : {}),
   };
 }
 
@@ -779,11 +848,47 @@ export async function failTaskRun(deps: Deps, req: ApiRequest): Promise<ApiRespo
   return ok({ result, delivered: result != null });
 }
 
-/** `GET /schedules` — the ticked schedules with live control state and fire windows. */
-export async function listSchedules(deps: Deps, _req: ApiRequest): Promise<ApiResponse> {
+/** `GET /schedules` page sizes: 100 by default, at most 200. */
+const SCHEDULES_PAGE = { defaultSize: 100, maxSize: 200 } as const;
+/** The fields `GET /schedules` sorts by. */
+const SCHEDULE_SORTABLE = ['key', 'workflow', 'nextFireAt', 'lastFireAt'] as const;
+
+/**
+ * `GET /schedules` — the ticked schedules with live control state and fire windows, offset-paged
+ * (`page`, `size`). Filters: `filter[workflow]`, `filter[namespace]`, `filter[paused]`. Sort by
+ * `key` (default), `workflow`, `nextFireAt` or `lastFireAt`. Answers `{ data, meta }`.
+ */
+export async function listSchedules(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
   const { engine } = deps;
   if (!engine.listSchedules) return notFound('schedules are not available on this topology yet');
-  return ok({ schedules: await engine.listSchedules() });
+  const { page, size } = parsePageParams(req.query, SCHEDULES_PAGE);
+  let draft: ScheduleDraft;
+  let sort: ReturnType<typeof resolveSort<(typeof SCHEDULE_SORTABLE)[number]>>;
+  try {
+    sort = resolveSort(req.query.sort as string | string[] | undefined, {
+      sortable: SCHEDULE_SORTABLE,
+      default: 'key',
+    });
+    draft = await applyListFilter(new ScheduleDraft(), ScheduleFilter, req.query, [
+      'workflow',
+      'namespace',
+      'paused',
+    ]);
+  } catch (error) {
+    return filterRejection(error);
+  }
+  const rows = (await engine.listSchedules()).filter((s) => draft.matches(s));
+  rows.sort((a, b) => {
+    for (const { field, direction } of sort) {
+      const x = a[field];
+      const y = b[field];
+      const order = x < y ? -1 : x > y ? 1 : 0;
+      if (order !== 0) return direction === 'desc' ? -order : order;
+    }
+    return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
+  });
+  const start = (page - 1) * size;
+  return ok(offsetPage(rows.slice(start, start + size), { total: rows.length, page, size }));
 }
 
 /** `POST /schedules/:key/:action` — `pause` / `resume` / `trigger` a schedule at runtime. */
@@ -813,7 +918,7 @@ export async function scheduleAction(deps: Deps, req: ApiRequest): Promise<ApiRe
 
 /**
  * `POST /bulk/:action` (`action` = `retry`|`cancel`) — apply an action to every run matching the same
- * filter `listRuns` accepts (status/workflow/tag/namespace/attr), capped at 500 matches. Skips (does
+ * `filter[...]` envelope `listRuns` accepts, capped at 500 matches. Skips (does
  * not abort on) a run that can't take the action (e.g. already terminal). Mirrors
  * `@dudousxd/nestjs-durable-dashboard`'s `DashboardService.bulk`.
  */
@@ -851,12 +956,12 @@ export async function bulkAction(deps: Deps, req: ApiRequest): Promise<ApiRespon
   return ok({ matched: runs.length, applied });
 }
 
-/** `GET /health` — per-group worker health (queue backlog + live worker heartbeats), reduced to a
- *  compact shape. Kept as a public endpoint for hand-written clients; the console uses `/workers`. */
+/** `GET /health` — per-group worker health (queue backlog + live worker count), reduced to a
+ *  compact shape: `{ data: [{ group, depth, liveWorkers, stalled }] }`. */
 export async function health(deps: Deps): Promise<ApiResponse> {
   const groups: GroupHealth[] = await deps.engine.workerHealth();
   return ok({
-    groups: groups.map((g) => ({
+    data: groups.map((g) => ({
       group: g.group,
       depth: g.depth,
       liveWorkers: g.liveWorkers.length,
@@ -867,13 +972,10 @@ export async function health(deps: Deps): Promise<ApiResponse> {
 }
 
 /** `GET /workers` — full per-group worker health (every live worker's heartbeat, not just a count),
- *  for the new SPA's Workers panel (`pivot-by-worker.ts`/`group-by-partition.ts` need per-instance
- *  `instanceId`/`lastBeatAt`). Raw `GroupHealth[]`, unwrapped — matches
- *  `@dudousxd/nestjs-durable-dashboard`'s `GET /workers` shape byte for byte (minus the `status`
- *  telemetry field, which the AdonisJS engine's heartbeat doesn't carry — see `durable-client.ts`). */
+ *  for the console's Workers panel: `{ data: GroupHealth[] }`, one entry per routing token. */
 export async function workers(deps: Deps): Promise<ApiResponse> {
   const groups = await deps.engine.workerHealth();
-  return ok(groups);
+  return ok({ data: groups });
 }
 
 /** `GET /topology` — this deployment's durable topology, for the header badge. Pure/local (no engine

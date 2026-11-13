@@ -234,56 +234,88 @@ The console routes client-side on the URL hash (`#/run/<id>` for a run, `#/workf
 | `GET` | `/durable/api/runs` | list runs — see the filters below |
 | `GET` | `/durable/api/runs/values` | distinct values of one filter axis, with counts — what the pickers list |
 | `GET` | `/durable/api/runs/:id` | run detail: the run, its step `timeline`, its `children`, its lifecycle links (`triggered`, `triggeredBy` with the source's `status` and `traceId`), `lifecycleSubscribers`, `lifecycleDeliveries`, its `ctx.waitForRun` links (`waitsFor`, `awaitedBy`) and its workflow's `workflowLifecycle` (absent when no workflow starts it or starts on it); a fan of more than 50 members comes back summarized in `fans` unless `?full=true` |
-| `GET` | `/durable/api/runs/:id/fans/:group` | one page of a summarized fan's members (`offset`, `limit` up to 500, `failed=true`), with the `total` |
+| `GET` | `/durable/api/runs/:id/fans/:group` | one page of a summarized fan's members, in seq order — see [paging a fan](#paging-a-fans-members) |
 | `GET` | `/durable/api/runs/:id/stream` | Server-Sent Events: this run's lifecycle events, live |
 
-`GET /api/runs` accepts two spellings of the same filter, both served by the console's
-`RunFilter` class (a `BaseModelFilter` over a run-query draft):
+Every list route here speaks the [`@adonis-agora/filter`](/docs/filter) wire format: filters in the
+`filter[...]` envelope, `sort`, offset paging with `page` / `size`, and a `{ data, meta }` answer.
+[`@adonis-agora/filter-client`](/docs/filter/guides/client) builds these query strings.
 
-- the flat spelling the console has always sent: `?status=failed&tag=etl` (repeat a key for a
-  set: `?tag=etl&tag=nightly`), `attr` as `key:op:value` repeats;
-- the structured envelope `@adonis-agora/filter-client` builds: `filter[status]=failed`,
-  `filter[tag][]=etl&filter[tag][]=nightly`, `filter[attr]=tier:eq:enterprise`.
+`GET /api/runs` filters:
+
+| Filter | Meaning |
+| --- | --- |
+| `filter[status]` | one of `pending`, `running`, `suspended`, `blocked`, `cancelling`, `completed`, `failed`, `cancelled`, `dead`. A set (`filter[status][]=failed&filter[status][]=dead`) matches any of them. |
+| `filter[workflow]` | exact workflow-name match; a set matches any of them. |
+| `filter[tag]` | exact match against the run's tags; a set matches runs carrying any of them. |
+| `filter[namespace]` | exact match against the run's [worker-pool namespace](/docs/durable/cluster/topology-and-config) — omit it and the listing spans every namespace. A set matches any of them. |
+| `filter[origin]` | exact match against the run's [package attribution](/docs/durable/concepts/workflows-and-steps#run-origin--package-attribution). The "unknown" bucket (absent origin) can't be expressed as an exact match — the console filters that one client-side. |
+| `filter[createdAfter]` / `filter[createdBefore]` | time-range bounds on the run's creation, as epoch ms or an ISO date string. |
+| `filter[attr]` | a [search-attribute](/docs/durable/authoring/queries-and-updates) predicate, `key:op:value`; a set is ANDed. `filter[attr.<key>][<op>]=value` works as well. |
 
 | Param | Meaning |
 | --- | --- |
-| `status` | one of `pending`, `running`, `suspended`, `blocked`, `cancelling`, `completed`, `failed`, `cancelled`, `dead`. An unrecognised value is ignored, not rejected. Repeat for a set. |
-| `workflow` | exact workflow-name match. Repeatable — repeats match ANY of them. |
-| `tag` | exact match against the run's tags. Repeatable — repeats match runs carrying ANY of them. |
-| `namespace` | exact match against the run's [worker-pool namespace](/docs/durable/cluster/topology-and-config) — omit it and the listing spans every namespace. Repeatable — repeats match ANY of them. |
-| `origin` | exact match against the run's [package attribution](/docs/durable/concepts/workflows-and-steps#run-origin--package-attribution). One value only: a repeat keeps the first. The "unknown" bucket (absent origin) can't be expressed as an exact match — the console filters that one client-side. |
-| `createdAfter` / `createdBefore` | time-range bounds on the run's creation, as epoch ms or an ISO date string — pushed down server-side. |
-| `attr` | a [search-attribute](/docs/durable/authoring/queries-and-updates) filter, `key:op:value`. Repeatable, and repeats are ANDed — opaque in the envelope too (`filter[attr]`), since attribute keys are dynamic; `filter[attr.<key>][<op>]=value` works as well. |
+| `sort` | `-createdAt` (newest first) — the only order the stores list in, and the default. |
 | `page` | 1-based page number, default `1` |
 | `size` | page size, default `50`, capped at `200` |
 
-The `attr` ops are `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in` — opaque through both spellings (`filter[attr.<key>][<op>]` takes the filter lib's canonical names: `equals`, `notEquals`, `gt`, `gte`, `lt`, `lte`, and `in`/`isAnyOf`). Values are coerced: `true`/`false` become booleans, anything numeric becomes a number, everything else stays a string. Only the first two colons delimit, so a value may contain colons of its own. `in` takes a `|`-separated set (`tier:in:pro|enterprise`) and matches it as OR inside the one predicate — two `eq` predicates on one key are ANDed like every other pair, which no run can satisfy.
+The `attr` ops are `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in` (`filter[attr.<key>][<op>]` takes the filter lib's names: `equals`, `notEquals`, `gt`, `gte`, `lt`, `lte`, and `in`/`isAnyOf`). Values are coerced: `true`/`false` become booleans, anything numeric becomes a number, everything else stays a string. Only the first two colons delimit, so a value may contain colons of its own. `in` takes a `|`-separated set (`tier:in:pro|enterprise`) and matches it as OR inside the one predicate — two `eq` predicates on one key are ANDed like every other pair, which no run can satisfy.
 
 ```
-GET /durable/api/runs?namespace=eu-west&attr=amount:gte:5000&attr=tier:eq:enterprise&status=failed
+GET /durable/api/runs?filter[namespace]=eu-west&filter[attr][]=amount:gte:5000&filter[attr][]=tier:eq:enterprise&filter[status]=failed&page=1&size=50
 ```
 
-A refused structured filter — unknown field, unsupported operator, a group the draft cannot express — answers `400` instead of silently widening. Unknown flat params stay ignored, so old callers (and endpoint mechanics like `page`) keep working. (`static throwOnInvalid` on the filter class is what makes the envelope strict.)
+```ts
+import { filterQuery } from '@adonis-agora/filter-client'
 
-Paging is the same offset shape every Agora library takes (`@adonis-agora/filter`'s `page`/`size`): a **1-based** page number and a page size, `?page=2&size=100`. The 0-based offset it resolves to is the store's business, never the wire's.
+const qs = filterQuery()
+  .where('namespace', 'eu-west')
+  .where('status', 'failed')
+  .where('attr', ['amount:gte:5000', 'tier:eq:enterprise'])
+  .page(1, 50)
+  .toQueryString()
 
-The response is `{ runs, meta: { page, size, count }, statuses }`. The envelope key is `meta`, the same name AdonisJS/Lucid's own `.paginate()` uses — every `@adonis-agora/*` listing spells it that way. `meta.count` is how many rows this page returned, not a total — `count === size` is the "there may be more" signal.
+const { data, meta, statuses } = await fetch(`/durable/api/runs?${qs}`).then((r) => r.json())
+```
 
-<Callout type="warn">
-  **Breaking in 0.39.0.** This endpoint took `?limit=&offset=` (0-based) before, and answered under a
-  `page` envelope key. `limit`/`offset` are now ignored like any other unknown flat param — a stale
-  client gets an unpaged first page rather than a `400`, so translate as `page = offset / limit + 1`,
-  `size = limit`; and read the window off `body.meta` instead of `body.page`. Same `page`/`size` rename
-  on `RunQuery` (`engine.listRuns({ page, size })`) and on the cross-pod `listRuns` gateway request.
-</Callout>
+The answer:
+
+```json
+{
+  "data": [{ "id": "run-1", "workflow": "checkout", "status": "failed", "...": "..." }],
+  "meta": { "total": 120, "perPage": 50, "currentPage": 1, "lastPage": 3, "firstPage": 1 },
+  "statuses": ["pending", "running", "suspended", "blocked", "cancelling", "completed", "failed", "cancelled", "dead"]
+}
+```
+
+`meta.total` counts every run the filter matches. `statuses` lists every run status, for a status picker.
+
+A request the endpoint can't read answers `400` instead of silently widening: an unknown filter field, an operator the field doesn't take, an `OR` group, a `sort` other than `-createdAt`, or a filter field sent bare (`?status=failed` instead of `filter[status]=failed`).
 
 #### The picker enumeration
 
-`GET /api/runs/values` answers what the console's tag, tenant and attribute pickers list: the distinct values one axis takes across the runs matching every OTHER active predicate, with counts — most common first, engine-minted tags (`singleton:<key>`) last. Served through the filter lib's `groupByCountFromRequest` with the console's adapter. The axis rides `groupByCount[field]` (`workflow`, `status`, `namespace`, `tag`, `attr` for the keys in use, `attr.<key>` for the values under one key — top-level `field` works too); the scope rides the same params as `GET /api/runs` (minus `status`, which is deliberately dropped so the offers don't collapse to the status being viewed). `limit` bounds the rows (default `100`, capped at `200`), `offset` pages them, `search` narrows them server-side — this endpoint keeps `limit`/`offset` on purpose: it is filter's own group-by-count aggregation (`groupByCount[limit]`/`groupByCount[offset]`), not a run listing, so `limit`/`offset` IS the aligned spelling here — a rare value outside the first page stays reachable by typing. The response is a bare `[{ value, count }]` array.
+`GET /api/runs/values` answers what the console's tag, tenant and attribute pickers list: the distinct values one axis takes across the runs matching every OTHER active predicate, with counts — most common first, engine-minted tags (`singleton:<key>`) last. The axis rides `groupByCount[field]` (`workflow`, `status`, `namespace`, `tag`, `attr` for the keys in use, `attr.<key>` for the values under one key); the scope rides the same `filter[...]` envelope as `GET /api/runs` (minus `status`, which is dropped so the offers don't collapse to the status being viewed). It is the filter lib's group-by-count aggregation, so it pages the way that aggregation does: `groupByCount[limit]` bounds the rows (default `100`, capped at `200`), `groupByCount[offset]` pages them, `groupByCount[search]` narrows them server-side, so a rare value outside the first page stays reachable by typing. The response is a bare `[{ value, count }]` array.
+
+```ts
+const qs = filterQuery()
+  .where('namespace', 'eu-west')
+  .groupByCount('tag', { limit: 20, search: 'nig' })
+  .toQueryString()
+const rows = await fetch(`/durable/api/runs/values?${qs}`).then((r) => r.json())
+// [{ value: 'nightly', count: 14 }]
+```
 
 There is no separate checkpoints route: a run's step timeline comes back as the `timeline` array of `GET /api/runs/:id`, each entry carrying `seq`, `name`, `kind`, `status`, `attempts`, `workerGroup`, input/output/error, `events`, `parallelGroup`, and the derived `durationMs` / `queueMs`.
 
-A fan with more than 50 members (a `ctx.all` over children or over a step, a polyglot gather) is summarized: its members leave `timeline`, and the fan comes back as one entry of `fans` with its `group`, `label`, seq range, `size` (members started so far), `total` (its declared size: a `ctx.all` group carries it as `all:<seq>:n<size>`, a step fan as `steps:<seq>:<size>`), `notStarted`, `failFast`, `counts` by status (a failed child counts as `failed`), start and finish, and its first 20 failed members. A fan declared wider than 50 is summarized even while only a few of its waves have been sent. `children` then lists the first 200 child run ids and `childCount` carries the total. `GET /api/runs/:id/fans/:group` pages the members on demand. `?full=true` returns the detail unsummarized. On a store-less tenant pod the control plane summarizes before the detail crosses the wire.
+A fan with more than 50 members (a `ctx.all` over children or over a step, a polyglot gather) is summarized: its members leave `timeline`, and the fan comes back as one entry of `fans` with its `group`, `label`, seq range, `size` (members started so far), `total` (its declared size: a `ctx.all` group carries it as `all:<seq>:n<size>`, a step fan as `steps:<seq>:<size>`), `notStarted`, `failFast`, `counts` by status (a failed child counts as `failed`), start and finish, and its first 20 failed members. A fan declared wider than 50 is summarized even while only a few of its waves have been sent. `children` then lists the first 200 child run ids and `childCount` carries the total. `GET /api/runs/:id/fans/:group` pages the members on demand (below). `?full=true` returns the detail unsummarized. On a store-less tenant pod the control plane summarizes before the detail crosses the wire.
+
+#### Paging a fan's members
+
+`GET /api/runs/:id/fans/:group` answers one page of the fan's members in seq order, as `{ data, meta }` with `meta.total` the member count. `page` and `size` (default `100`, capped at `500`) page it, `filter[status]=failed` keeps the failed members only, and `sort` takes `seq` only. Any other filter or sort is a `400`.
+
+```
+GET /durable/api/runs/run-1/fans/steps:12:40000?filter[status]=failed&page=1&size=100
+```
 
 #### Polling the run detail: ETag and 304
 
@@ -370,11 +402,11 @@ On a store-less `tenant` pod these verbs answer `404`: they need the engine's si
 
 #### Bulk actions
 
-`POST /api/bulk/:action` applies one action to **everything a filter matches**, where `:action` is `retry` or `cancel` (anything else is a `400`). The selection comes from the query string, using the same filters as `GET /api/runs` (`status`, `workflow`, `tag`, `namespace`, `origin`, `createdAfter` / `createdBefore`, `attr`, in either spelling) — there is no id list to assemble:
+`POST /api/bulk/:action` applies one action to **everything a filter matches**, where `:action` is `retry` or `cancel` (anything else is a `400`). The selection comes from the query string, in the same `filter[...]` envelope as `GET /api/runs` — there is no id list to assemble. A refused filter, including a filter field sent bare, is a `400` and acts on nothing:
 
 ```
-POST /durable/api/bulk/retry?status=failed&workflow=charge-order&namespace=eu-west
-POST /durable/api/bulk/cancel?status=suspended&tag=stuck&compensate=true
+POST /durable/api/bulk/retry?filter[status]=failed&filter[workflow]=charge-order&filter[namespace]=eu-west
+POST /durable/api/bulk/cancel?filter[status]=suspended&filter[tag]=stuck&compensate=true
 ```
 
 `?compensate=true` runs the [saga compensations](/docs/durable/reliability/sagas) and is honoured for `cancel` only.
@@ -444,7 +476,7 @@ durable_group_live_workers{group="reports"} 0
 | `POST` | `/durable/api/schedules/:key/resume` | resume it |
 | `POST` | `/durable/api/schedules/:key/trigger` | fire the current window now (idempotent) |
 
-These are the console's Schedules tab, riding [`engine.listSchedules` / `setSchedulePaused` / `triggerSchedule`](/docs/durable/authoring/scheduling#runtime-control--pause-resume-run-now). The listing returns `{ schedules }`, each entry carrying the cadence (`cron`/`everyMs`/`timezone`), the *effective* `paused` state with a `pausedAtRuntime` flag telling you whether a console override (which wins over config until the next deploy) is in force, the current window's `lastFireAt`/`nextFireAt`/`currentWindowRunId`, and that run's `lastRunStatus` when it exists. `trigger` is idempotent by the window's deterministic run id — triggering a window that already fired returns the existing run rather than forking a duplicate. An unknown `:key` answers `404`; an action other than `pause`/`resume`/`trigger` is a `400`.
+These are the console's Schedules tab, riding [`engine.listSchedules` / `setSchedulePaused` / `triggerSchedule`](/docs/durable/authoring/scheduling#runtime-control--pause-resume-run-now). The listing is a `{ data, meta }` page (`page`, `size` default `100` and capped at `200`), sorted by `key` unless `sort` names `workflow`, `nextFireAt` or `lastFireAt` (`-` for descending); `filter[workflow]`, `filter[namespace]` and `filter[paused]=true|false` narrow it. Each entry carries the cadence (`cron`/`everyMs`/`timezone`), the *effective* `paused` state with a `pausedAtRuntime` flag telling you whether a console override (which wins over config until the next deploy) is in force, the current window's `lastFireAt`/`nextFireAt`/`currentWindowRunId`, and that run's `lastRunStatus` when it exists. `trigger` is idempotent by the window's deterministic run id — triggering a window that already fired returns the existing run rather than forking a duplicate. An unknown `:key` answers `404`; an action other than `pause`/`resume`/`trigger` is a `400`.
 
 ### Fleet and topology
 
@@ -457,11 +489,11 @@ These are the console's Schedules tab, riding [`engine.listSchedules` / `setSche
 | `GET` | `/durable/api/workflows/:name/lifecycle` | who starts whom through [lifecycle events](/docs/durable/authoring/lifecycle-events): `{ workflow, startsOnSettle, startedBy, triggerCounts? }` (see [Workflow pages](#workflow-pages)); on a tenant pod only its namespace's subscriptions, `501` when its control plane is older than the verb |
 | `GET` | `/durable/api/openapi.json` | the machine-readable API contract (OpenAPI 3.1) |
 
-`GET /api/workers` returns the raw `GroupHealth[]` — for each routing token, its queue `depth` and the **individual live workers** with their `instanceId` and `lastBeatAt`. That is what tells "one worker is wedged" apart from "the whole group is down".
+`GET /api/workers` returns `{ data: GroupHealth[] }` — for each routing token, its queue `depth` and the **individual live workers** with their `instanceId` and `lastBeatAt`. That is what tells "one worker is wedged" apart from "the whole group is down".
 
 On the [BullMQ](/docs/durable/cluster/interop), [queue](/docs/durable/transports/queue#worker-health) and db transports, each worker's heartbeat also carries a live `status` telemetry snapshot (`WorkerStatus`) that the console renders on its worker cards: the concurrency mode and limit (`fixed` or `adaptive`, with `min`/`max`), `inFlight`, RSS (`rssBytes`, plus `rssLimitBytes`/`rssPct` when a ceiling is known), `cpuPct`, `throughputPerMin`, `p95Ms`, and the last adaptive concurrency adjustment with its reason. Workers that beat without one (a thin worker runtime's compact beat) omit `status` — the cards degrade to liveness only.
 
-`GET /api/health` is the older, compact view of the same data: it collapses `liveWorkers` to a count and adds `stalled: depth > 0 && liveWorkers === 0`. It stays for hand-written clients and probes; prefer `/api/workers` for anything new.
+`GET /api/health` is the compact view of the same data, `{ data: [{ group, depth, liveWorkers, stalled }] }`: it collapses `liveWorkers` to a count and adds `stalled: depth > 0 && liveWorkers === 0`, which suits a probe.
 
 `GET /api/compat` powers the compatibility panel described below: per group, each pod's protocol range and capabilities with a `compatible` / `degraded` / `incompatible` outcome and the exact reason, alongside every `blocked` run and why it parked.
 
@@ -712,11 +744,11 @@ Reads are listed by default. They return what the console shows, through the sam
 | --- | --- |
 | `durable_list_runs` | Runs, newest first. Filters: `status`, `workflow`, `tag`, `namespace`, `createdAfter`/`createdBefore`. Paged with `page` and `limit`. |
 | `durable_get_run` | One run with its step timeline, children, fans and lifecycle links. Input, output and error over 4 KB are cut; `field: 'run.output'` (or `timeline.3.input`) returns one in full. |
-| `durable_list_fan_members` | One page of a wide fan's members (`failed: true` for the failed ones). |
+| `durable_list_fan_members` | One page of a wide fan's members (`failed: true` for the failed ones). Paged with `page` and `limit`. |
 | `durable_count_runs_by` | How many runs take each value of `status`, `workflow`, `namespace`, `tag`, `attr` or `attr.<key>`. |
 | `durable_get_health` | Queue backlog and live workers per group, pending/dead/blocked counts, fleet compatibility. |
 | `durable_list_workers` | Every live worker's heartbeat. |
-| `durable_list_schedules` | Schedules with their pause state and next fire. |
+| `durable_list_schedules` | Schedules with their pause state and next fire. Paged with `page` and `limit`. |
 | `durable_get_run_event` | The latest value a run published with `ctx.setEvent`. |
 
 The actions are hidden until the app opts in with `devTools: { actions: ['durable'] }` in `config/mcp.ts`:
@@ -790,7 +822,7 @@ The JSON API is a small, framework-light surface — `listRuns`, `getRun`, `runV
 
 ```ts
 // Retry every run that failed on a transient charge error, in one call.
-const res = await fetch('/durable/api/bulk/retry?status=failed&workflow=charge-order', {
+const res = await fetch('/durable/api/bulk/retry?filter[status]=failed&filter[workflow]=charge-order', {
   method: 'POST',
   headers,
 })

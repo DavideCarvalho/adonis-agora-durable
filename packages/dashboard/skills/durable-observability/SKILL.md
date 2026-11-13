@@ -105,12 +105,17 @@ const { result } = await res.json()
 result.runId // 'run-abc~retry~1f4c9e02'
 ```
 
-Apply an action to everything a filter matches — same filters as `GET /api/runs`
-(`status`, `workflow`, `tag`, `namespace`, repeatable `attr=key:op:value`):
+The list routes (`GET /api/runs`, `/api/runs/:id/fans/:group`, `/api/schedules`) take the
+`@adonis-agora/filter` wire format — `filter[status]=failed`, `filter[tag][]=a&filter[tag][]=b`,
+`filter[attr]=key:op:value`, `sort`, `page` / `size` — and answer
+`{ data, meta: { total, perPage, currentPage, lastPage, firstPage } }` (`GET /api/runs` adds
+`statuses`). A filter field sent bare (`?status=failed`), an unknown field or an unknown sort is a `400`.
+
+Apply an action to everything a filter matches — the same `filter[...]` envelope as `GET /api/runs`:
 
 ```bash
-curl -X POST '/durable/api/bulk/retry?status=failed&workflow=charge-order&namespace=eu-west'
-curl -X POST '/durable/api/bulk/cancel?status=suspended&tag=stuck&compensate=true'
+curl -X POST '/durable/api/bulk/retry?filter[status]=failed&filter[workflow]=charge-order&filter[namespace]=eu-west'
+curl -X POST '/durable/api/bulk/cancel?filter[status]=suspended&filter[tag]=stuck&compensate=true'
 ```
 
 Bulk acts on at most **500 runs per call**, no paging — compare `matched` to 500
