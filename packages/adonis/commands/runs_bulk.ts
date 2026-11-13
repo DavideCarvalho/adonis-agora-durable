@@ -1,6 +1,6 @@
 import { args, flags } from '@adonisjs/core/ace';
 import { CliRefusal, RunFilterCommand } from '../src/commands/console_command.js';
-import { renderRunsTable } from '../src/commands/runs.js';
+import { attachLiveness, renderRunsTable } from '../src/commands/runs.js';
 import { bulkAction, listRuns } from '../src/dashboard/handlers.js';
 import type { WorkflowRun } from '../src/index.js';
 
@@ -38,29 +38,42 @@ export default class DurableRunsBulk extends RunFilterCommand {
     }
     const query = this.runFilter();
     const deps = await this.deps();
-    const preview = await this.call<{
-      data: Array<Record<string, unknown> & { updatedAt: string }>;
-      meta: { total: number };
-    }>(listRuns, { query: { ...query, size: '200' } }, deps);
-    const matched = preview.meta.total;
+    // The runs the action would touch: the first BULK_CAP of the same newest-first listing.
+    type Page = {
+      data: Array<Record<string, unknown> & { id: string; updatedAt: string }>;
+      meta: { total: number; lastPage: number };
+    };
+    const first = await this.call<Page>(listRuns, { query: { ...query, size: '200' } }, deps);
+    const matched = first.meta.total;
     const acting = Math.min(matched, BULK_CAP);
     const scope =
       Object.keys(query).length > 0 ? 'matching the filter' : 'of every run (no filter)';
 
     if (this.dryRun) {
+      const rows = [...first.data];
+      for (let page = 2; rows.length < acting && page <= first.meta.lastPage; page += 1) {
+        const next = await this.call<Page>(
+          listRuns,
+          { query: { ...query, size: '200', page: String(page) } },
+          deps,
+        );
+        rows.push(...next.data);
+      }
+      const affected = rows.slice(0, acting);
       if (this.json) {
-        this.printJson({ action: this.action, matched, wouldApply: acting, data: preview.data });
+        this.printJson({ action: this.action, matched, wouldApply: acting, data: affected });
         return;
       }
-      const rows = preview.data.map((row) => ({
-        run: { ...row, updatedAt: new Date(row.updatedAt) } as unknown as WorkflowRun,
-        ageMs: Date.now() - new Date(row.updatedAt).getTime(),
-        recoveryAttempts: Number(row.recoveryAttempts ?? 0),
-        stalePending: null,
-      }));
-      this.logger.log(renderRunsTable(rows));
+      const runs = affected.map(
+        (row) => ({ ...row, updatedAt: new Date(row.updatedAt) }) as unknown as WorkflowRun,
+      );
+      const live = await attachLiveness(
+        { listRuns: async () => runs, listCheckpoints: (id) => deps.engine.listCheckpoints(id) },
+        runs,
+      );
+      this.logger.log(renderRunsTable(live));
       this.logger.info(
-        `Dry run: ${this.action} would act on ${acting} run(s) ${scope} (${matched} matched${matched > BULK_CAP ? `, capped at ${BULK_CAP}` : ''}).`,
+        `Dry run: ${this.action} would act on these ${acting} run(s) ${scope} (${matched} matched${matched > BULK_CAP ? `, capped at the newest ${BULK_CAP}` : ''}).`,
       );
       return;
     }
