@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.17
+
+### Major Changes
+
+- [#519](https://github.com/DavideCarvalho/adonis-agora-durable/pull/519) [`b0675e5`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/b0675e5ed48a9e2e61b7c3e404539829363ec8b4) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The console's list routes speak the `@adonis-agora/filter` wire format. `GET /api/runs`, `GET /api/runs/:id/fans/:group` and `GET /api/schedules` take filters in `filter[...]` (a filter field sent bare is a `400`, as are unknown fields and operators), `sort` checked against an allow-list (`-createdAt` only on runs, `seq` only on fan members; `key`, `workflow`, `nextFireAt`, `lastFireAt` on schedules), and `page` / `size`, and answer `{ data, meta: { total, perPage, currentPage, lastPage, firstPage } }`. `GET /api/runs` keeps `statuses` next to them and now reports the total (`countRuns`, or a full listing on a port without one). Fan members page by `page` / `size` instead of `offset` / `limit` and filter with `filter[status]=failed` instead of `failed=true`. Schedules gain `filter[workflow]`, `filter[namespace]`, `filter[paused]`. The scope of `POST /api/bulk/:action` and `GET /api/runs/values` is `filter[...]` too (values keeps `groupByCount[limit]` / `[offset]`). `GET /api/workers` answers `{ data }` instead of the bare array, `GET /api/health` `{ data }` instead of `{ groups }`. The console uses `@adonis-agora/filter-client` 1.0 rc. The dev tools `durable_list_fan_members` and `durable_list_schedules` page with `page` / `limit`. Requires `@adonis-agora/filter` 1.0.0-rc.5 or newer. The OpenAPI document declares the new parameters and envelopes.
+
 ## 1.0.0-rc.16
 
 ### Minor Changes
