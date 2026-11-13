@@ -399,7 +399,9 @@ describe('durable:runs:bulk', () => {
       '--dry-run',
       '--json',
     ]);
-    expect(json(out)).toMatchObject({ action: 'retry', matched: 2, wouldApply: 2 });
+    const preview = json(out);
+    expect(preview).toMatchObject({ action: 'retry', matched: 2, wouldApply: 2 });
+    expect((preview.data as unknown[]).length).toBe(2);
     expect(audits).toHaveLength(0);
     expect((await engine.getRun(a))?.status).toBe('failed');
   });
