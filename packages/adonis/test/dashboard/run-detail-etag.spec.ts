@@ -108,17 +108,17 @@ describe('run detail ETag / 304', () => {
     const group = detail.fans[0]?.group as string;
     const page = await getFanMembers(
       deps,
-      req({ params: { id: 'p', group }, query: { limit: '5' } }),
+      req({ params: { id: 'p', group }, query: { size: '5' } }),
     );
     expect(page.status).toBe(200);
-    expect((page.body as { items: unknown[]; total: number }).total).toBe(80);
+    expect((page.body as { meta: { total: number } }).meta.total).toBe(80);
     const etag = page.headers?.etag as string;
     expect(etag).toMatch(/^"fp-/);
     const again = await getFanMembers(
       deps,
       req({
         params: { id: 'p', group },
-        query: { limit: '5' },
+        query: { size: '5' },
         headers: { 'if-none-match': etag },
       }),
     );

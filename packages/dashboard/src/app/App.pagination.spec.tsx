@@ -70,8 +70,17 @@ function wrapper({ children }: { children: ReactNode }) {
   return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
 }
 
-function page(runs: RunsPage['runs'], meta: RunsPage['meta']): RunsPage {
-  return { runs, meta };
+function page(data: RunsPage['data'], at: { page: number; size: number; total: number }): RunsPage {
+  return {
+    data,
+    meta: {
+      total: at.total,
+      perPage: at.size,
+      currentPage: at.page,
+      lastPage: Math.max(1, Math.ceil(at.total / at.size)),
+      firstPage: 1,
+    },
+  };
 }
 
 function run(id: string, tag?: string) {
@@ -99,7 +108,7 @@ describe('App: real pagination wiring (useInfiniteQuery over durableClient.runsP
   });
 
   it('fetches page 1 on mount (paging is 1-based, like the rest of the ecosystem)', async () => {
-    runsPage.mockResolvedValue(page([run('r1')], { page: 1, size: 100, count: 1 }));
+    runsPage.mockResolvedValue(page([run('r1')], { page: 1, size: 100, total: 1 }));
     render(<App />, { wrapper });
 
     await waitFor(() => expect(runsPage).toHaveBeenCalled());
@@ -114,12 +123,12 @@ describe('App: real pagination wiring (useInfiniteQuery over durableClient.runsP
   });
 
   it('resets to page 1 on a NEW query rather than continuing the old accumulated pages when the tag filter changes', async () => {
-    runsPage.mockResolvedValue(page([run('r1')], { page: 1, size: 100, count: 1 }));
+    runsPage.mockResolvedValue(page([run('r1')], { page: 1, size: 100, total: 1 }));
     render(<App />, { wrapper });
     await waitFor(() => expect(runsPage).toHaveBeenCalledTimes(1));
 
     runsPage.mockClear();
-    runsPage.mockResolvedValue(page([run('r2', 'tier:pro')], { page: 1, size: 100, count: 1 }));
+    runsPage.mockResolvedValue(page([run('r2', 'tier:pro')], { page: 1, size: 100, total: 1 }));
 
     // The tag filter is a value picker now: open it, type the tag, take it as typed.
     fireEvent.click(screen.getByLabelText('filter by tag'));
@@ -142,11 +151,10 @@ describe('App: real pagination wiring (useInfiniteQuery over durableClient.runsP
     expect(pageArg.page).toBe(1);
   });
 
-  it('requests the next page once the loaded page came back full (server\'s only "more may exist" signal)', async () => {
-    // A full page (count === size) on page 1 — `hasNextPage` should flip true.
+  it('requests the next page while meta.currentPage < meta.lastPage', async () => {
     const firstPage = Array.from({ length: 5 }, (_, i) => run(`r${i}`));
-    runsPage.mockResolvedValueOnce(page(firstPage, { page: 1, size: 5, count: 5 }));
-    runsPage.mockResolvedValue(page([run('r5')], { page: 2, size: 5, count: 1 }));
+    runsPage.mockResolvedValueOnce(page(firstPage, { page: 1, size: 5, total: 6 }));
+    runsPage.mockResolvedValue(page([run('r5')], { page: 2, size: 5, total: 6 }));
 
     render(<App />, { wrapper });
     await waitFor(() => expect(runsPage).toHaveBeenCalledTimes(1));
@@ -164,5 +172,15 @@ describe('App: real pagination wiring (useInfiniteQuery over durableClient.runsP
       ]
     )[4];
     expect(secondCallPageArg.page).toBe(2);
+  });
+
+  it('stops at the last page even when it came back full', async () => {
+    const full = Array.from({ length: 5 }, (_, i) => run(`r${i}`));
+    runsPage.mockResolvedValue(page(full, { page: 1, size: 5, total: 5 }));
+
+    render(<App />, { wrapper });
+    await waitFor(() => expect(runsPage).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(runsPage).toHaveBeenCalledTimes(1);
   });
 });

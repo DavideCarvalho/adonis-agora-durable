@@ -35,7 +35,7 @@ const runsPage =
       tag?: string | string[],
       attr?: string[],
       opts?: { namespace?: string | string[]; workflow?: string | string[]; origin?: string },
-      page?: { limit?: number; offset?: number },
+      page?: { page?: number; size?: number },
     ) => Promise<RunsPage>
   >();
 const bulk = vi.fn<(...args: unknown[]) => Promise<{ matched: number; applied: number }>>();
@@ -84,8 +84,8 @@ function run(id: string, status: RunStatus = 'failed') {
 /** Render, click the `failed` status chip, and wait for the bulk bar to appear. */
 async function renderWithFailedFilter() {
   runsPage.mockResolvedValue({
-    runs: [run('r-failed')],
-    meta: { page: 1, size: 100, count: 1 },
+    data: [run('r-failed')],
+    meta: { total: 1, perPage: 100, currentPage: 1, lastPage: 1, firstPage: 1 },
   });
   render(<App />, { wrapper });
   await waitFor(() => expect(runsPage).toHaveBeenCalled());
@@ -115,7 +115,10 @@ describe('App: status chips are a SERVER-side filter (the list and the bulk filt
   });
 
   it('offers `blocked` and `cancelling` chips (first-class engine statuses)', async () => {
-    runsPage.mockResolvedValue({ runs: [], meta: { page: 1, size: 100, count: 0 } });
+    runsPage.mockResolvedValue({
+      data: [],
+      meta: { total: 0, perPage: 100, currentPage: 1, lastPage: 1, firstPage: 1 },
+    });
     render(<App />, { wrapper });
     expect(screen.getByRole('button', { name: 'blocked 0' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'cancelling 0' })).toBeTruthy();

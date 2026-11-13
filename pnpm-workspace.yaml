@@ -19,8 +19,8 @@ ignoredBuiltDependencies:
 minimumReleaseAgeExclude:
   - '@xyflow/react@12.11.3'
   - '@xyflow/system@0.0.80'
-  - '@adonis-agora/filter-client@0.3.0'
-  - '@adonis-agora/filter@0.9.0'
+  - '@adonis-agora/filter-client@0.3.0 || 1.0.0-rc.1'
+  - '@adonis-agora/filter@0.9.0 || 1.0.0-rc.5'
   - '@adonisjs/queue@0.7.0'
   - '@boringnode/queue@0.9.0'
   - '@adonis-agora/diagnostics@1.0.0-rc.1'

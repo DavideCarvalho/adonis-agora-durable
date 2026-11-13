@@ -504,15 +504,27 @@ function matchesAttr(run: WorkflowRun, entry: string): boolean {
   }
 }
 
-/** Read one predicate under BOTH spellings the server accepts: the `filter[...]` envelope the
- *  console's `FilterQueryBuilder` emits (`filter[tag]=x` scalar, `filter[tag][]=a&filter[tag][]=b`
- *  set) and the flat legacy form a hand-built URL uses (`tag=x`, repeatable). */
+/** Read one predicate from the `filter[...]` envelope the console's `FilterQueryBuilder` emits
+ *  (`filter[tag]=x` scalar, `filter[tag][]=a&filter[tag][]=b` set). */
 function predicate(params: URLSearchParams, key: string): string[] {
-  return [
-    ...params.getAll(`filter[${key}]`),
-    ...params.getAll(`filter[${key}][]`),
-    ...params.getAll(key),
-  ];
+  return [...params.getAll(`filter[${key}]`), ...params.getAll(`filter[${key}][]`)];
+}
+
+/** One offset page of `rows`, as the server answers it (`{ data, meta }`). */
+function offsetPage<T>(rows: T[], params: URLSearchParams, defaultSize: number, maxSize: number) {
+  const size = Math.min(Math.max(Number(params.get('size') ?? defaultSize) || 1, 1), maxSize);
+  const page = Math.max(Number(params.get('page') ?? 1) || 1, 1);
+  const offset = (page - 1) * size;
+  return {
+    data: rows.slice(offset, offset + size),
+    meta: {
+      total: rows.length,
+      perPage: size,
+      currentPage: page,
+      lastPage: Math.max(1, Math.ceil(rows.length / size)),
+      firstPage: 1,
+    },
+  };
 }
 
 /** The server-side predicates the console can send: exact match, ANDed, absent = don't narrow.
@@ -644,23 +656,18 @@ function body(path: string, init?: RequestInit): MockAnswer {
     }
     return postBody(route ?? '', payload);
   }
-  if (route === '/schedules') return { status: 200, payload: { schedules } };
+  if (route === '/schedules') {
+    const sorted = [...schedules].sort((a, b) => a.key.localeCompare(b.key));
+    return { status: 200, payload: offsetPage(sorted, params, 100, 200) };
+  }
   if (route === '/runs') {
-    // The real envelope (`{ runs, meta, statuses}`), with the same predicate semantics as the
+    // The real envelope (`{ data, meta, statuses }`), with the same predicate semantics as the
     // server — otherwise the tenant/tag/attr boxes in the preview would look broken, and a
     // screenshot of them would be a lie.
-    // Same 1-based `page`/`size` the real endpoint parses, resolved to a 0-based slice here.
-    const size = Math.min(Math.max(Number(params.get('size') ?? 50) || 0, 0), 200);
-    const page = Math.max(Number(params.get('page') ?? 1) || 1, 1);
-    const offset = (page - 1) * size;
     const matching = scopedRuns(params).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     return {
       status: 200,
-      payload: {
-        runs: matching.slice(offset, offset + size),
-        meta: { page, size, count: Math.min(size, Math.max(matching.length - offset, 0)) },
-        statuses: STATUSES,
-      },
+      payload: { ...offsetPage(matching, params, 50, 200), statuses: STATUSES },
     };
   }
   if (route === '/runs/values') {
@@ -699,7 +706,7 @@ function body(path: string, init?: RequestInit): MockAnswer {
       .slice(offset, offset + limit);
     return { status: 200, payload: rows };
   }
-  if (route === '/workers') return { status: 200, payload: workers };
+  if (route === '/workers') return { status: 200, payload: { data: workers } };
   if (route === '/topology') return { status: 200, payload: topology };
   if (route === '/compat') return { status: 200, payload: compat };
   const run = route?.match(/^\/runs\/(.+)$/)?.[1];

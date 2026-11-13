@@ -89,6 +89,62 @@ const errorBody = {
   required: ['error'],
 } as const;
 
+/** The `meta` of an offset page (`@adonis-agora/filter`'s `offsetPage`). */
+const offsetMeta = {
+  type: 'object',
+  properties: {
+    total: { type: 'integer', description: 'Rows matching the request across every page.' },
+    perPage: { type: 'integer' },
+    currentPage: { type: 'integer' },
+    lastPage: { type: 'integer' },
+    firstPage: { type: 'integer' },
+  },
+  required: ['total', 'perPage', 'currentPage', 'lastPage', 'firstPage'],
+} as const;
+
+/** An offset page of `item`: `{ data, meta }`. */
+const offsetPageOf = (item: unknown, extra: Record<string, unknown> = {}) =>
+  ({
+    type: 'object',
+    properties: {
+      data: { type: 'array', items: item },
+      meta: { $ref: '#/components/schemas/OffsetMeta' },
+      ...extra,
+    },
+    required: ['data', 'meta'],
+  }) as const;
+
+/** `page` / `size` query params with the endpoint's size policy. */
+const pageParams = (defaultSize: number, maxSize: number) =>
+  [
+    {
+      name: 'page',
+      in: 'query',
+      schema: { type: 'integer', minimum: 1, default: 1 },
+      description: '1-based page number.',
+    },
+    {
+      name: 'size',
+      in: 'query',
+      schema: { type: 'integer', minimum: 1, maximum: maxSize, default: defaultSize },
+      description: `Page size, capped at ${maxSize}.`,
+    },
+  ] as const;
+
+/** A `filter[<field>]` query param (deepObject: `filter[status]=failed`, `filter[tag][]=a`). */
+const filterParam = (description: string) =>
+  ({
+    name: 'filter',
+    in: 'query',
+    style: 'deepObject',
+    explode: true,
+    schema: { type: 'object', additionalProperties: true },
+    description,
+  }) as const;
+
+const sortParam = (description: string) =>
+  ({ name: 'sort', in: 'query', schema: { type: 'string' }, description }) as const;
+
 const idParam = {
   name: 'id',
   in: 'path',
@@ -143,64 +199,73 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
         RunSummary: runSummary,
         Checkpoint: checkpoint,
         RunResult: runResult,
+        OffsetMeta: offsetMeta,
         Error: errorBody,
       },
     },
     paths: {
       '/runs': {
         get: {
-          summary: 'List runs (filtered, paginated)',
+          summary: 'List runs (filtered, newest first, offset-paged)',
           description:
-            'Filters ride the `filter[...]` envelope or flat params: status/statuses, workflow(s), ' +
-            'tag(s), namespace(s), origin, createdAfter/createdBefore (epoch ms or ISO), and typed ' +
-            'search-attribute predicates (`filter[attr.<key>][<op>]`).',
+            'Filters ride the `filter[...]` envelope: `status`, `workflow`, `tag`, `namespace` (one ' +
+            'value or a set: `filter[tag][]=a&filter[tag][]=b`), `origin`, `createdAfter` / ' +
+            '`createdBefore` (epoch ms or ISO), and search attributes (`filter[attr]=key:op:value`, ' +
+            'or `filter[attr.<key>][<op>]=value`). An unknown field or operator, or a filter field ' +
+            'sent bare (`?status=`), is a 400.',
           parameters: [
-            { name: 'page', in: 'query', schema: { type: 'integer', minimum: 1, default: 1 } },
-            {
-              name: 'size',
-              in: 'query',
-              schema: { type: 'integer', maximum: 200, default: 50 },
-            },
+            filterParam('Run predicates (see the description).'),
+            sortParam('`-createdAt` only (the default); anything else is a 400.'),
+            ...pageParams(50, 200),
           ],
           responses: {
-            '200': jsonResponse('The page of runs.', {
-              type: 'object',
-              properties: {
-                runs: { type: 'array', items: { $ref: '#/components/schemas/RunSummary' } },
-                meta: { type: 'object' },
-                statuses: { type: 'array', items: { type: 'string' } },
-              },
-            }),
-            '400': err('An unreadable filter.'),
+            '200': jsonResponse(
+              'The page of runs, and every run status (`statuses`) for the chips.',
+              offsetPageOf(
+                { $ref: '#/components/schemas/RunSummary' },
+                { statuses: { type: 'array', items: { $ref: '#/components/schemas/RunStatus' } } },
+              ),
+            ),
+            '400': err('A refused filter or sort.'),
           },
         },
       },
       '/runs/values': {
         get: {
           summary: 'Distinct values of one filter axis, with counts (the pickers)',
+          description:
+            "The scope rides the same `filter[...]` envelope as `GET /runs` (minus `status`). This is filter's group-by-count aggregation, so it pages by `limit` / `offset`.",
           parameters: [
             {
-              name: 'field',
+              name: 'groupByCount[field]',
               in: 'query',
               required: true,
-              schema: {
-                type: 'string',
-                enum: [
-                  'workflow',
-                  'status',
-                  'namespace',
-                  'origin',
-                  'tag',
-                  'attributeKey',
-                  'attributeValue',
-                ],
-              },
+              schema: { type: 'string' },
+              description:
+                "`workflow`, `status`, `namespace`, `tag`, `attr` (attribute keys) or `attr.<key>` (one key's values). Top-level `field` works too.",
             },
-            { name: 'key', in: 'query', schema: { type: 'string' } },
-            { name: 'search', in: 'query', schema: { type: 'string' } },
-            { name: 'limit', in: 'query', schema: { type: 'integer' } },
+            { name: 'groupByCount[search]', in: 'query', schema: { type: 'string' } },
+            {
+              name: 'groupByCount[limit]',
+              in: 'query',
+              schema: { type: 'integer', maximum: 200, default: 100 },
+            },
+            { name: 'groupByCount[offset]', in: 'query', schema: { type: 'integer', default: 0 } },
+            filterParam('The scope, as on `GET /runs`.'),
           ],
-          responses: { '200': jsonResponse('Value rows.', { type: 'object' }) },
+          responses: {
+            '200': jsonResponse('Value rows, most common first.', {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  value: { type: ['string', 'null'] },
+                  count: { type: 'integer' },
+                },
+              },
+            }),
+            '400': err('A refused filter, or a field with no values.'),
+          },
         },
       },
       '/runs/{id}': {
@@ -241,20 +306,18 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
           parameters: [
             idParam,
             { name: 'group', in: 'path', required: true, schema: { type: 'string' } },
-            { name: 'offset', in: 'query', schema: { type: 'integer' } },
-            { name: 'limit', in: 'query', schema: { type: 'integer' } },
-            { name: 'failed', in: 'query', schema: { type: 'boolean' } },
+            filterParam('`filter[status]=failed` keeps the failed members only.'),
+            sortParam('`seq` only (the default).'),
+            ...pageParams(100, 500),
             ifNoneMatchParam,
           ],
           responses: {
             '304': notModifiedResponse,
-            '200': jsonResponse('A page of members.', {
-              type: 'object',
-              properties: {
-                items: { type: 'array', items: { $ref: '#/components/schemas/Checkpoint' } },
-                total: { type: 'integer' },
-              },
-            }),
+            '200': jsonResponse(
+              'A page of members.',
+              offsetPageOf({ $ref: '#/components/schemas/Checkpoint' }),
+            ),
+            '400': err('A refused filter or sort.'),
             '404': err('Unknown run.'),
           },
         },
@@ -427,6 +490,7 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
         post: {
           summary: 'Bulk retry/cancel every run matching a filter (capped at 500 per call)',
           parameters: [
+            filterParam('The runs to act on, as on `GET /runs`.'),
             {
               name: 'action',
               in: 'path',
@@ -435,7 +499,10 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
             },
             { name: 'compensate', in: 'query', schema: { type: 'boolean' } },
           ],
-          responses: { '200': jsonResponse('`{ matched, applied }` counts.', { type: 'object' }) },
+          responses: {
+            '200': jsonResponse('`{ matched, applied }` counts.', { type: 'object' }),
+            '400': err('A refused filter.'),
+          },
         },
       },
       '/workflows/{name}/lifecycle': {
@@ -456,8 +523,18 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
       '/schedules': {
         get: {
           summary: 'The ticked schedules with control state and fire windows',
+          parameters: [
+            filterParam(
+              '`filter[workflow]`, `filter[namespace]` (one or a set), `filter[paused]`.',
+            ),
+            sortParam(
+              '`key` (default), `workflow`, `nextFireAt`, `lastFireAt`; `-` for descending.',
+            ),
+            ...pageParams(100, 200),
+          ],
           responses: {
-            '200': jsonResponse('Schedule rows.', { type: 'object' }),
+            '200': jsonResponse('A page of schedules.', offsetPageOf({ type: 'object' })),
+            '400': err('A refused filter or sort.'),
             '404': err('Unavailable on this topology.'),
           },
         },
@@ -483,7 +560,16 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
       '/health': {
         get: {
           summary: 'Worker-group health (compact)',
-          responses: { '200': jsonResponse('Groups.', { type: 'object' }) },
+          responses: {
+            '200': jsonResponse(
+              '`{ data }`: per group, `group`, `depth`, `liveWorkers`, `stalled`.',
+              {
+                type: 'object',
+                properties: { data: { type: 'array', items: { type: 'object' } } },
+                required: ['data'],
+              },
+            ),
+          },
         },
       },
       '/runs/{id}/events/{key}': {
@@ -545,7 +631,13 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
       '/workers': {
         get: {
           summary: 'Worker-group health with full heartbeats (incl. WorkerStatus telemetry)',
-          responses: { '200': jsonResponse('Groups + heartbeats.', { type: 'object' }) },
+          responses: {
+            '200': jsonResponse('`{ data }`: per group, its depth and live workers.', {
+              type: 'object',
+              properties: { data: { type: 'array', items: { type: 'object' } } },
+              required: ['data'],
+            }),
+          },
         },
       },
       '/topology': {

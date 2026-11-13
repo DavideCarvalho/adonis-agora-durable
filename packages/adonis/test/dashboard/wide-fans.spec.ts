@@ -128,35 +128,56 @@ describe('GET /runs/:id with a wide fan', () => {
 });
 
 describe('GET /runs/:id/fans/:group', () => {
+  type FanBody = {
+    data: { seq: number }[];
+    meta: { total: number; perPage: number; currentPage: number; lastPage: number };
+  };
+
   it('pages the members in seq order, with the total', async () => {
     const deps = { engine: storeDashboardEngine(await wideRun()) };
     const res = await getFanMembers(
       deps,
-      req({ params: { id: 'p', group: 'steps:0:80' }, query: { offset: '70', limit: '50' } }),
+      req({ params: { id: 'p', group: 'steps:0:80' }, query: { page: '2', size: '50' } }),
     );
-    const page = res.body as { items: { seq: number }[]; total: number };
-    expect(page.total).toBe(80);
-    expect(page.items.map((c) => c.seq)).toEqual(Array.from({ length: 10 }, (_, i) => 70 + i));
+    const page = res.body as FanBody;
+    expect(page.meta).toEqual({
+      total: 80,
+      perPage: 50,
+      currentPage: 2,
+      lastPage: 2,
+      firstPage: 1,
+    });
+    expect(page.data.map((c) => c.seq)).toEqual(Array.from({ length: 30 }, (_, i) => 50 + i));
   });
 
-  it('filters to failed members', async () => {
+  it('filters to failed members with filter[status]=failed', async () => {
     const deps = { engine: storeDashboardEngine(await wideRun()) };
     const res = await getFanMembers(
       deps,
-      req({ params: { id: 'p', group: 'steps:0:80' }, query: { failed: 'true' } }),
+      req({ params: { id: 'p', group: 'steps:0:80' }, query: { filter: { status: 'failed' } } }),
     );
-    expect((res.body as { items: { seq: number }[] }).items.map((c) => c.seq)).toEqual([3, 40]);
+    const page = res.body as FanBody;
+    expect(page.data.map((c) => c.seq)).toEqual([3, 40]);
+    expect(page.meta.total).toBe(2);
   });
 
-  it('404s for an unknown run and 400s for a bad flag', async () => {
+  it('404s for an unknown run and 400s for a refused filter or sort', async () => {
     const deps = { engine: storeDashboardEngine(await wideRun()) };
     expect((await getFanMembers(deps, req({ params: { id: 'nope', group: 'g' } }))).status).toBe(
       404,
     );
-    const bad = await getFanMembers(
-      deps,
-      req({ params: { id: 'p', group: 'steps:0:80' }, query: { failed: 'maybe' } }),
-    );
-    expect(bad.status).toBe(400);
+    for (const query of [
+      { status: 'failed' },
+      { filter: { status: 'completed' } },
+      { filter: { name: 'x' } },
+      { sort: '-seq' },
+      { sort: 'name' },
+    ]) {
+      const bad = await getFanMembers(
+        deps,
+        req({ params: { id: 'p', group: 'steps:0:80' }, query }),
+      );
+      expect(bad.status, JSON.stringify(query)).toBe(400);
+    }
   });
 });

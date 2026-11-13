@@ -133,9 +133,9 @@ describe('dashboard redaction hooks', () => {
     await flush();
 
     const list = (await listRuns(deps, { params: {}, query: {} })).body as {
-      runs: Array<Record<string, unknown>>;
+      data: Array<Record<string, unknown>>;
     };
-    expect(list.runs[0]?.output).toBe('[redacted]');
+    expect(list.data[0]?.output).toBe('[redacted]');
 
     const detail = (await getRun(deps, { params: { id: 'r1' }, query: {} })).body as {
       run: Record<string, unknown>;

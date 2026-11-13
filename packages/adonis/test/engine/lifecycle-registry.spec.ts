@@ -317,9 +317,9 @@ describe('lifecycle subscription registry', () => {
 
     const deps = { engine: storeDashboardEngine(engine) };
     const page = await listRunsHandler(deps, { params: {}, query: {} });
-    expect(
-      (page.body as { runs: { workflow: string }[] }).runs.map((r) => r.workflow).sort(),
-    ).toEqual(['ingest', 'x']);
+    const body = page.body as { data: { workflow: string }[]; meta: { total: number } };
+    expect(body.data.map((r) => r.workflow).sort()).toEqual(['ingest', 'x']);
+    expect(body.meta.total).toBe(2);
     const picker = await runValues(deps, { params: {}, query: { field: 'workflow' } });
     expect((picker.body as { value: string }[]).map((r) => r.value).sort()).toEqual([
       'ingest',

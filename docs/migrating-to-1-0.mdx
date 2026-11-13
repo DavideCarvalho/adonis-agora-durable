@@ -137,6 +137,39 @@ curl -X POST https://app.example.com/durable/api/runs/order-42/updates/set-limit
   -H 'content-type: application/json' -d '{ "arg": 500 }'
 ```
 
+## The dashboard list routes take `filter[...]` and answer `{ data, meta }`
+
+`GET <path>/api/runs`, `GET <path>/api/runs/:id/fans/:group` and `GET <path>/api/schedules` speak the
+[`@adonis-agora/filter`](/docs/filter) wire format, and so does the scope of `POST <path>/api/bulk/:action`
+and `GET <path>/api/runs/values`. The 1.0 console already does; change any script or client of your own:
+
+- Filters go inside `filter[...]`: `?status=failed&tag=etl` becomes `?filter[status]=failed&filter[tag]=etl`.
+  A filter field sent bare is a `400`, so a stale bulk call acts on nothing.
+- `GET /api/runs` answers `{ data, meta: { total, perPage, currentPage, lastPage, firstPage }, statuses }`
+  (it was `{ runs, meta: { page, size, count }, statuses }`). Page with `page` / `size` as before; stop when
+  `meta.currentPage === meta.lastPage`. `sort` takes `-createdAt` only.
+- `GET /api/runs/:id/fans/:group` pages with `page` / `size` (it took `offset` / `limit`), filters with
+  `filter[status]=failed` (it took `failed=true`) and answers `{ data, meta }` (it was `{ items, total }`;
+  the total is `meta.total`).
+- `GET /api/schedules` answers `{ data, meta }` (it was `{ schedules }`), paged by `page` / `size` (100 rows
+  by default), with `filter[workflow]`, `filter[namespace]`, `filter[paused]` and `sort`.
+- `GET /api/workers` answers `{ data: GroupHealth[] }` (it was the bare array) and `GET /api/health`
+  answers `{ data: [...] }` (it was `{ groups: [...] }`).
+
+Before:
+
+```sh
+curl 'https://app.example.com/durable/api/runs?status=failed&page=2&size=50'
+curl -X POST 'https://app.example.com/durable/api/bulk/retry?status=failed&workflow=charge-order'
+```
+
+After:
+
+```sh
+curl 'https://app.example.com/durable/api/runs?filter[status]=failed&page=2&size=50'
+curl -X POST 'https://app.example.com/durable/api/bulk/retry?filter[status]=failed&filter[workflow]=charge-order'
+```
+
 ## The console without `authorize`: open in development, `403` in production
 
 Without `authorize`, the console used to require a bearer token equal to `DURABLE_DASHBOARD_TOKEN`

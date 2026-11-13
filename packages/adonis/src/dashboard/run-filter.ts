@@ -21,7 +21,7 @@ export const RUN_STATUSES: readonly RunStatus[] = [
  *  absent or blank entry is dropped rather than stringified: `?namespace=` is what a cleared
  *  filter box sends, and filtering for a tenant literally named "undefined" would silently empty
  *  the console. */
-function list(value: unknown): string[] {
+export function listValues(value: unknown): string[] {
   return asList(value)
     .filter((v) => v !== undefined && v !== null && v !== '')
     .map(String);
@@ -67,7 +67,7 @@ const ATTR_OPERATORS: Record<string, AttributeOp> = {
 /** An instant from the wire: epoch ms (number or numeric string), or an ISO-8601 date string.
  *  Unparseable/blank values are ignored (never a 400 — same tolerance as the other axes). */
 function parseInstant(value: unknown): number | undefined {
-  const [first] = list(value);
+  const [first] = listValues(value);
   if (first === undefined) return undefined;
   const asNumber = Number(first);
   if (Number.isFinite(asNumber) && first.trim() !== '') return asNumber;
@@ -83,24 +83,18 @@ function assertSetOperator(axis: string, operator: string): void {
 }
 
 /**
- * The console's run filter, as a class — one method per request key, narrowing a {@link RunQueryDraft}.
+ * The console's run filter, as a class — one method per filter field, narrowing a {@link RunQueryDraft}.
  *
  * This is the filter lib's unified class form (`BaseFilter`, shared with model filters) driven by
- * `applyCustomFilter` with a draft in place of a Lucid builder. Every predicate is reachable two
- * ways, and both are the same request to this class: the flat form the console has always sent
- * (`?status=failed&tag=etl`, repeatable for a set, `attr=key:op:value` repeats) dispatches through
- * bare-key hoisting, and the structured envelope (`filter[status]=failed`, `filter[tag][]=etl`,
- * `filter[attr]=tier:eq:pro`) dispatches to the SAME methods with `(value, operator, field)`.
- * Keeping the flat spelling working is not politeness to old callers — it is what lets a run
- * row's tag chip stay a plain link.
+ * `applyCustomFilter` with a draft in place of a Lucid builder. Each method receives
+ * `(value, operator, field)` from the `filter[...]` envelope: `filter[status]=failed`,
+ * `filter[tag][]=etl`, `filter[attr]=tier:eq:pro`, `filter[attr.tier][equals]=pro`.
  *
- * Two deliberate divergences from a model filter, both load-bearing:
- * - `$query` is a {@link RunQueryDraft}, not SQL: there is nothing to append to, "building" is
- *   filling named predicates in, and everything the wire format can express but `RunQuery` cannot
- *   (`OR` groups, dotted `attr.<key>` fields) is refused at dispatch instead of accumulated.
- * - Unknown structured fields fail loudly (`InvalidColumnFilterError` → `400`) instead of
- *   silently widening the listing — which matters because the bulk actions act on the matched set.
- *   Bare legacy keys stay lenient (unknown ones are ignored, so pagination params keep working).
+ * `$query` is a {@link RunQueryDraft}, not SQL: there is nothing to append to, "building" is
+ * filling named predicates in, and everything the wire format can express but `RunQuery` cannot
+ * (`OR` groups) is refused at dispatch instead of accumulated. Unknown fields and operators fail
+ * loudly (`InvalidColumnFilterError` → `400`) instead of silently widening the listing — which
+ * matters because the bulk actions act on the matched set.
  */
 export class RunFilter extends BaseFilter<RunQueryDraft> {
   declare $query: RunQueryDraft;
@@ -108,7 +102,7 @@ export class RunFilter extends BaseFilter<RunQueryDraft> {
   /** One status narrows; several match ANY of them. Unknown values are ignored, not rejected. */
   status(value: unknown, operator: string): void {
     assertSetOperator('status', operator);
-    const values = list(value)
+    const values = listValues(value)
       .map((v) => parseStatus(v))
       .filter((v): v is RunStatus => v !== undefined);
     if (values.length === 0) return;
@@ -132,7 +126,7 @@ export class RunFilter extends BaseFilter<RunQueryDraft> {
   /** One workflow narrows; several match ANY of them. */
   workflow(value: unknown, operator: string): void {
     assertSetOperator('workflow', operator);
-    const values = list(value);
+    const values = listValues(value);
     if (values.length === 0) return;
     this.$query.narrow(values.length === 1 ? { workflow: values[0] } : { workflows: values });
   }
@@ -140,7 +134,7 @@ export class RunFilter extends BaseFilter<RunQueryDraft> {
   /** One tag narrows to runs carrying it; several match runs carrying ANY of them. */
   tag(value: unknown, operator: string): void {
     assertSetOperator('tag', operator);
-    const values = list(value);
+    const values = listValues(value);
     if (values.length === 0) return;
     this.$query.narrow(values.length === 1 ? { tag: values[0] } : { tags: values });
   }
@@ -148,7 +142,7 @@ export class RunFilter extends BaseFilter<RunQueryDraft> {
   /** One namespace narrows; several match ANY of them. A blank param is the same as an absent one. */
   namespace(value: unknown, operator: string): void {
     assertSetOperator('namespace', operator);
-    const values = list(value);
+    const values = listValues(value);
     if (values.length === 0) return;
     this.$query.narrow(values.length === 1 ? { namespace: values[0] } : { namespaces: values });
   }
@@ -158,7 +152,7 @@ export class RunFilter extends BaseFilter<RunQueryDraft> {
    *  absence, exactly as the NestJS API behaves. */
   origin(value: unknown, operator: string): void {
     assertSetOperator('origin', operator);
-    const values = list(value);
+    const values = listValues(value);
     if (values.length === 0) return;
     this.$query.narrow({ origin: values[0] });
   }
@@ -212,3 +206,17 @@ function coerceOperand(raw: unknown): string | number | boolean {
 function asStringList(value: unknown): string | string[] {
   return asList(value).filter((v): v is string => typeof v === 'string');
 }
+
+/** The fields {@link RunFilter} owns. Sent flat (`?status=failed`) instead of inside
+ *  `filter[...]`, they are refused with a `400` rather than read: a bulk action that silently
+ *  dropped its scope would act on every run. */
+export const RUN_FILTER_FIELDS = [
+  'status',
+  'workflow',
+  'tag',
+  'namespace',
+  'origin',
+  'attr',
+  'createdAfter',
+  'createdBefore',
+] as const;

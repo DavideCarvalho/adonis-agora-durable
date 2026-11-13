@@ -616,14 +616,15 @@ function FanMembers({
       queryKey: ['fan', runId, group, failedOnly, page],
       queryFn: () =>
         durableClient.fanMembers(runId, group, {
-          offset: page * FAN_PAGE_SIZE,
-          limit: FAN_PAGE_SIZE,
+          // `fanPagesInView` counts pages from 0; the server's are 1-based.
+          page: page + 1,
+          size: FAN_PAGE_SIZE,
           failed: failedOnly,
         }),
       refetchInterval: live ? 5000 : (false as const),
     })),
   });
-  const fetchedTotal = results.find((r) => r.data !== undefined)?.data?.total;
+  const fetchedTotal = results.find((r) => r.data !== undefined)?.data?.meta.total;
   useEffect(() => {
     if (fetchedTotal !== undefined) setTotal(fetchedTotal);
   }, [fetchedTotal]);
@@ -632,7 +633,7 @@ function FanMembers({
     return at < 0 ? undefined : results[at];
   };
   const memberAt = (index: number): StepCheckpoint | undefined =>
-    resultAt(index)?.data?.items[index % FAN_PAGE_SIZE];
+    resultAt(index)?.data?.data[index % FAN_PAGE_SIZE];
 
   const failedPage = results.find((r) => r.isError);
   if (total === undefined && failedPage) {

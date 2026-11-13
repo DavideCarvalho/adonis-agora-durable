@@ -9,6 +9,7 @@ import {
   getRun,
   health,
   listRuns,
+  listSchedules,
   redispatchPendingRun,
   retryRun,
   retryWithInputRun,
@@ -93,39 +94,52 @@ describe('JSON handlers', () => {
     ({ raw, undone, deps } = makeEngine());
   });
 
-  it('listRuns returns started runs with status badges', async () => {
+  type RunsBody = {
+    data: Array<{ id: string; status: string; workflow: string }>;
+    meta: {
+      total: number;
+      perPage: number;
+      currentPage: number;
+      lastPage: number;
+      firstPage: number;
+    };
+    statuses: string[];
+  };
+  const runsBody = (res: { body: unknown }) => res.body as RunsBody;
+  const runIds = (res: { body: unknown }) => runsBody(res).data.map((r) => r.id);
+
+  it('listRuns answers { data, meta, statuses }', async () => {
     await raw.start('greet', {}, 'run-ok');
     await raw.waitForRun('run-ok');
 
     const res = await listRuns(deps, req());
     expect(res.status).toBe(200);
-    const body = res.body as { runs: Array<{ id: string; status: string }>; statuses: string[] };
-    expect(body.runs.map((r) => r.id)).toContain('run-ok');
-    expect(body.runs.find((r) => r.id === 'run-ok')?.status).toBe('completed');
+    const body = runsBody(res);
+    expect(body.data.find((r) => r.id === 'run-ok')?.status).toBe('completed');
+    expect(body.meta).toEqual({ total: 1, perPage: 50, currentPage: 1, lastPage: 1, firstPage: 1 });
     expect(body.statuses).toContain('failed');
     expect(body.statuses).toContain('blocked');
   });
 
-  it('listRuns filters by status', async () => {
+  it('listRuns filters by filter[status]', async () => {
     await raw.start('greet', {}, 'run-ok');
     await raw.waitForRun('run-ok');
     await raw.start('boom', {}, 'run-bad');
     await raw.waitForRun('run-bad');
 
-    const res = await listRuns(deps, req({ query: { status: 'failed' } }));
-    const body = res.body as { runs: Array<{ id: string }> };
-    expect(body.runs.map((r) => r.id)).toEqual(['run-bad']);
+    const res = await listRuns(deps, req({ query: { filter: { status: 'failed' } } }));
+    expect(runIds(res)).toEqual(['run-bad']);
+    expect(runsBody(res).meta.total).toBe(1);
   });
 
-  it('listRuns filters by workflow', async () => {
+  it('listRuns filters by filter[workflow]', async () => {
     await raw.start('greet', {}, 'g1');
     await raw.start('boom', {}, 'b1');
     await raw.waitForRun('g1');
     await raw.waitForRun('b1');
 
-    const res = await listRuns(deps, req({ query: { workflow: 'greet' } }));
-    const body = res.body as { runs: Array<{ id: string; workflow: string }> };
-    expect(body.runs.every((r) => r.workflow === 'greet')).toBe(true);
+    const res = await listRuns(deps, req({ query: { filter: { workflow: 'greet' } } }));
+    expect(runsBody(res).data.map((r) => r.workflow)).toEqual(['greet']);
   });
 
   it('listRuns filters by tag and search-attribute predicate', async () => {
@@ -134,15 +148,37 @@ describe('JSON handlers', () => {
     await raw.waitForRun('g-tag');
     await raw.waitForRun('g-attr');
 
-    const byTag = await listRuns(deps, req({ query: { tag: 'team:core' } }));
-    expect((byTag.body as { runs: Array<{ id: string }> }).runs.map((r) => r.id)).toEqual([
-      'g-tag',
-    ]);
+    const byTag = await listRuns(deps, req({ query: { filter: { tag: 'team:core' } } }));
+    expect(runIds(byTag)).toEqual(['g-tag']);
 
-    const byAttr = await listRuns(deps, req({ query: { attr: 'amount:gte:200' } }));
-    expect((byAttr.body as { runs: Array<{ id: string }> }).runs.map((r) => r.id)).toEqual([
-      'g-attr',
-    ]);
+    const byAttr = await listRuns(deps, req({ query: { filter: { attr: 'amount:gte:200' } } }));
+    expect(runIds(byAttr)).toEqual(['g-attr']);
+
+    const structured = await listRuns(
+      deps,
+      req({ query: { filter: { 'attr.amount': { gte: '200' } } } }),
+    );
+    expect(runIds(structured)).toEqual(['g-attr']);
+  });
+
+  it('listRuns 400s a filter field sent bare, an unknown field and an unknown sort', async () => {
+    await raw.start('greet', {}, 'g1');
+    await raw.waitForRun('g1');
+
+    for (const query of [
+      { status: 'failed' },
+      { tag: 'etl' },
+      { 'attr.amount': 'x' },
+      { filter: { nope: 'x' } },
+      { filter: { status: { contains: 'fail' } } },
+      { sort: 'workflow' },
+      { sort: 'createdAt' },
+      { sort: '-createdAt,id' },
+    ]) {
+      const res = await listRuns(deps, req({ query }));
+      expect(res.status, JSON.stringify(query)).toBe(400);
+    }
+    expect((await listRuns(deps, req({ query: { sort: '-createdAt' } }))).status).toBe(200);
   });
 
   describe("listRuns paging — 1-based `page`/`size`, the ecosystem's offset shape", () => {
@@ -154,56 +190,81 @@ describe('JSON handlers', () => {
       }
     }
 
-    const ids = (res: Awaited<ReturnType<typeof listRuns>>): string[] =>
-      (res.body as { runs: Array<{ id: string }> }).runs.map((r) => r.id);
-    const meta = (res: Awaited<ReturnType<typeof listRuns>>) =>
-      (res.body as { meta: { page: number; size: number; count: number } }).meta;
+    const meta = (res: { body: unknown }) => runsBody(res).meta;
 
-    it('walks disjoint pages: page 2 of size 2 is the remainder, not a re-read of page 1', async () => {
+    it('walks disjoint pages, with the total and the last page', async () => {
       await threeRuns();
 
       const first = await listRuns(deps, req({ query: { page: '1', size: '2' } }));
       const second = await listRuns(deps, req({ query: { page: '2', size: '2' } }));
 
-      expect(ids(first)).toHaveLength(2);
-      expect(ids(second)).toHaveLength(1);
-      expect(new Set([...ids(first), ...ids(second)]).size).toBe(3);
+      expect(runIds(first)).toHaveLength(2);
+      expect(runIds(second)).toHaveLength(1);
+      expect(new Set([...runIds(first), ...runIds(second)]).size).toBe(3);
+      expect(meta(first)).toEqual({
+        total: 3,
+        perPage: 2,
+        currentPage: 1,
+        lastPage: 2,
+        firstPage: 1,
+      });
+      expect(meta(second).currentPage).toBe(2);
     });
 
-    it('defaults to page 1 and echoes the resolved window back in the envelope', async () => {
+    it('defaults to page 1, size 50', async () => {
       await threeRuns();
 
-      // `size` alone means the first page — `page` defaults to 1, never 0.
-      expect(meta(await listRuns(deps, req({ query: { size: '2' } })))).toEqual({
-        page: 1,
-        size: 2,
-        count: 2,
-      });
+      expect(meta(await listRuns(deps, req({ query: { size: '2' } }))).currentPage).toBe(1);
       expect(meta(await listRuns(deps, req({ query: {} })))).toEqual({
-        page: 1,
-        size: 50,
-        count: 3,
+        total: 3,
+        perPage: 50,
+        currentPage: 1,
+        lastPage: 1,
+        firstPage: 1,
       });
     });
 
     it('caps `size` at 200 and reads a page below 1 as the first page', async () => {
       await threeRuns();
 
-      expect(meta(await listRuns(deps, req({ query: { size: '5000' } }))).size).toBe(200);
-      expect(meta(await listRuns(deps, req({ query: { page: '0', size: '2' } }))).page).toBe(1);
-      expect(ids(await listRuns(deps, req({ query: { page: '0', size: '2' } })))).toEqual(
-        ids(await listRuns(deps, req({ query: { page: '1', size: '2' } }))),
+      expect(meta(await listRuns(deps, req({ query: { size: '5000' } }))).perPage).toBe(200);
+      expect(meta(await listRuns(deps, req({ query: { page: '0', size: '2' } }))).currentPage).toBe(
+        1,
+      );
+      expect(runIds(await listRuns(deps, req({ query: { page: '0', size: '2' } })))).toEqual(
+        runIds(await listRuns(deps, req({ query: { page: '1', size: '2' } }))),
       );
     });
 
-    it('ignores the pre-0.39 `limit`/`offset` spelling instead of 400ing on it', async () => {
+    it('counts the matching set, not the store', async () => {
       await threeRuns();
+      await raw.start('boom', {}, 'bad');
+      await raw.waitForRun('bad');
 
-      // Unknown flat params stay lenient (they are how old callers sent endpoint mechanics), so an
-      // un-upgraded client gets an unpaged first page rather than an error.
-      const res = await listRuns(deps, req({ query: { limit: '1', offset: '2' } }));
-      expect(res.status).toBe(200);
-      expect(meta(res)).toEqual({ page: 1, size: 50, count: 3 });
+      const res = await listRuns(
+        deps,
+        req({ query: { filter: { workflow: 'greet' }, page: '1', size: '1' } }),
+      );
+      expect(meta(res)).toMatchObject({ total: 3, lastPage: 3 });
+    });
+
+    it("counts by listing when a tenant pod's control plane is too old to count", async () => {
+      await threeRuns();
+      const port = {
+        ...deps.engine,
+        countRuns: async () => {
+          throw Object.assign(new Error('unknown verb'), { code: 'unsupported-request' });
+        },
+      };
+      const res = await listRuns({ engine: port }, req({ query: { size: '2' } }));
+      expect(meta(res)).toMatchObject({ total: 3, lastPage: 2 });
+    });
+
+    it('counts by listing when the port has no countRuns', async () => {
+      await threeRuns();
+      const { countRuns: _count, ...port } = deps.engine;
+      const res = await listRuns({ engine: port }, req({ query: { size: '2' } }));
+      expect(meta(res)).toMatchObject({ total: 3, lastPage: 2 });
     });
   });
 
@@ -336,7 +397,7 @@ describe('JSON handlers', () => {
 
     const res = await bulkAction(
       deps,
-      req({ params: { action: 'retry' }, query: { status: 'failed' } }),
+      req({ params: { action: 'retry' }, query: { filter: { status: 'failed' } } }),
     );
     expect(res.status).toBe(200);
     const body = res.body as { matched: number; applied: number };
@@ -353,6 +414,17 @@ describe('JSON handlers', () => {
   it('bulkAction 400s on an unknown action', async () => {
     const res = await bulkAction(deps, req({ params: { action: 'nuke' }, query: {} }));
     expect(res.status).toBe(400);
+  });
+
+  it('bulkAction 400s a bare filter field instead of acting on every run', async () => {
+    await raw.start('boom', {}, 'bulk-bare');
+    await raw.waitForRun('bulk-bare');
+    const res = await bulkAction(
+      deps,
+      req({ params: { action: 'retry' }, query: { status: 'failed' } }),
+    );
+    expect(res.status).toBe(400);
+    expect((await raw.getRun('bulk-bare'))?.status).toBe('failed');
   });
 
   describe('runValues: the picker enumeration', () => {
@@ -407,7 +479,10 @@ describe('JSON handlers', () => {
     it('scopes the enumeration by the other filters, searches and pages server-side', async () => {
       await seed();
       // Under one tenant, only that tenant's tags are offered.
-      const scoped = await runValues(deps, req({ query: { field: 'tag', namespace: 'globex' } }));
+      const scoped = await runValues(
+        deps,
+        req({ query: { field: 'tag', filter: { namespace: 'globex' } } }),
+      );
       expect(scoped.body as FacetRow[]).toEqual([{ value: 'nightly', count: 1 }]);
 
       // Search narrows before the bound.
@@ -428,7 +503,10 @@ describe('JSON handlers', () => {
       await seed();
       // `v-c` is the only failed run, but the tag picker still offers every tenant's tags: status
       // is the axis being viewed, not a scope for the other axes.
-      const res = await runValues(deps, req({ query: { field: 'tag', status: 'failed' } }));
+      const res = await runValues(
+        deps,
+        req({ query: { field: 'tag', filter: { status: 'failed' } } }),
+      );
       expect(res.status).toBe(200);
       expect(res.body as FacetRow[]).toEqual([
         { value: 'etl', count: 2 },
@@ -444,18 +522,11 @@ describe('JSON handlers', () => {
 
     it('listRuns accepts repeated tag params as a set (union) and attr in-sets', async () => {
       await seed();
-      const union = await listRuns(deps, req({ query: { tag: ['etl', 'nope'] } }));
-      expect((union.body as { runs: Array<{ id: string }> }).runs.map((r) => r.id).sort()).toEqual([
-        'v-a',
-        'v-b',
-      ]);
+      const union = await listRuns(deps, req({ query: { filter: { tag: ['etl', 'nope'] } } }));
+      expect(runIds(union).sort()).toEqual(['v-a', 'v-b']);
 
-      const inSet = await listRuns(deps, req({ query: { attr: 'tier:in:pro|free' } }));
-      expect((inSet.body as { runs: Array<{ id: string }> }).runs.map((r) => r.id).sort()).toEqual([
-        'v-a',
-        'v-b',
-        'v-c',
-      ]);
+      const inSet = await listRuns(deps, req({ query: { filter: { attr: 'tier:in:pro|free' } } }));
+      expect(runIds(inSet).sort()).toEqual(['v-a', 'v-b', 'v-c']);
     });
 
     it('falls back to a bounded listRuns scan on a port without runValueFacets', async () => {
@@ -486,9 +557,7 @@ describe('JSON handlers', () => {
         deps,
         req({ query: { filter: { tag: ['etl'], namespace: ['acme', 'globex'] } } }),
       );
-      expect((listed.body as { runs: Array<{ id: string }> }).runs.map((r) => r.id).sort()).toEqual(
-        ['v-a', 'v-b'],
-      );
+      expect(runIds(listed).sort()).toEqual(['v-a', 'v-b']);
     });
 
     it('reads the groupByCount envelope block for the axis and its bounds', async () => {
@@ -525,9 +594,13 @@ describe('JSON handlers', () => {
         }),
       );
       expect(ored.status).toBe(400);
-      // …while the legacy spelling stays lenient: unknown bare keys are ignored.
+      // Bare keys no filter method owns are not filters, and are ignored.
       const lenient = await listRuns(deps, req({ query: { whatever: 'x' } }));
       expect(lenient.status).toBe(200);
+      // A bare filter field is refused on the pickers too.
+      expect((await runValues(deps, req({ query: { field: 'tag', tag: 'etl' } }))).status).toBe(
+        400,
+      );
     });
   });
 
@@ -669,7 +742,7 @@ describe('JSON handlers', () => {
         deps,
         req({
           params: { action: 'cancel' },
-          query: { status: 'suspended', compensate: 'true' },
+          query: { filter: { status: 'suspended' }, compensate: 'true' },
         }),
       );
 
@@ -686,7 +759,7 @@ describe('JSON handlers', () => {
         deps,
         req({
           params: { action: 'cancel' },
-          query: { status: 'suspended' },
+          query: { filter: { status: 'suspended' } },
           body: { compensate: true },
         }),
       );
@@ -703,7 +776,7 @@ describe('JSON handlers', () => {
         deps,
         req({
           params: { action: 'cancel' },
-          query: { status: 'suspended', compensate: 'false' },
+          query: { filter: { status: 'suspended' }, compensate: 'false' },
         }),
       );
 
@@ -720,7 +793,7 @@ describe('JSON handlers', () => {
         deps,
         req({
           params: { action: 'cancel' },
-          query: { status: 'suspended', compensate: 'sure' },
+          query: { filter: { status: 'suspended' }, compensate: 'sure' },
         }),
       );
 
@@ -731,16 +804,87 @@ describe('JSON handlers', () => {
     });
   });
 
-  it('health returns a groups array', async () => {
-    const res = await health(deps);
-    expect(res.status).toBe(200);
-    const body = res.body as { groups: unknown[] };
-    expect(Array.isArray(body.groups)).toBe(true);
+  describe('listSchedules', () => {
+    const schedule = (key: string, over: Record<string, unknown> = {}) => ({
+      key,
+      workflow: 'greet',
+      paused: false,
+      pausedAtRuntime: false,
+      lastFireAt: 0,
+      nextFireAt: 0,
+      currentWindowRunId: `w-${key}`,
+      ...over,
+    });
+    const port = (rows: ReturnType<typeof schedule>[]): Deps => ({
+      engine: { ...deps.engine, listSchedules: async () => rows },
+    });
+    const keys = (res: { body: unknown }) =>
+      (res.body as { data: Array<{ key: string }> }).data.map((s) => s.key);
+
+    it('answers { data, meta }, sorted by key, offset-paged', async () => {
+      const d = port(['c', 'a', 'b'].map((k) => schedule(k)));
+      const first = await listSchedules(d, req({ query: { size: '2' } }));
+      expect(keys(first)).toEqual(['a', 'b']);
+      expect((first.body as { meta: unknown }).meta).toEqual({
+        total: 3,
+        perPage: 2,
+        currentPage: 1,
+        lastPage: 2,
+        firstPage: 1,
+      });
+      expect(keys(await listSchedules(d, req({ query: { size: '2', page: '2' } })))).toEqual(['c']);
+    });
+
+    it('filters by workflow, namespace and paused, and sorts by the allow-list', async () => {
+      const d = port([
+        schedule('a', { workflow: 'x', nextFireAt: 3 }),
+        schedule('b', { workflow: 'y', namespace: 'eu', paused: true, nextFireAt: 1 }),
+        schedule('c', { workflow: 'y', nextFireAt: 2 }),
+      ]);
+      expect(keys(await listSchedules(d, req({ query: { filter: { workflow: 'y' } } })))).toEqual([
+        'b',
+        'c',
+      ]);
+      expect(keys(await listSchedules(d, req({ query: { filter: { namespace: 'eu' } } })))).toEqual(
+        ['b'],
+      );
+      expect(keys(await listSchedules(d, req({ query: { filter: { paused: 'false' } } })))).toEqual(
+        ['a', 'c'],
+      );
+      expect(keys(await listSchedules(d, req({ query: { sort: 'nextFireAt' } })))).toEqual([
+        'b',
+        'c',
+        'a',
+      ]);
+      expect(keys(await listSchedules(d, req({ query: { sort: '-workflow,key' } })))).toEqual([
+        'b',
+        'c',
+        'a',
+      ]);
+    });
+
+    it('400s an unknown filter field, a bare filter field and an unknown sort', async () => {
+      const d = port([schedule('a')]);
+      for (const query of [
+        { filter: { cron: 'x' } },
+        { workflow: 'greet' },
+        { filter: { paused: 'maybe' } },
+        { sort: 'cron' },
+      ]) {
+        expect((await listSchedules(d, req({ query }))).status, JSON.stringify(query)).toBe(400);
+      }
+    });
   });
 
-  it('workers returns the full GroupHealth[] (unwrapped, with per-instance heartbeats)', async () => {
+  it('health answers { data }', async () => {
+    const res = await health(deps);
+    expect(res.status).toBe(200);
+    expect(Array.isArray((res.body as { data: unknown[] }).data)).toBe(true);
+  });
+
+  it('workers answers { data: GroupHealth[] }', async () => {
     const res = await workers(deps);
     expect(res.status).toBe(200);
-    expect(Array.isArray(res.body)).toBe(true);
+    expect(Array.isArray((res.body as { data: unknown[] }).data)).toBe(true);
   });
 });

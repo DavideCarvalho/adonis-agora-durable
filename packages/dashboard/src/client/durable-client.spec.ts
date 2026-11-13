@@ -25,15 +25,20 @@ function jsonResponse(body: unknown, status: number): Response {
 describe('durableClient: unwrapping the AdonisJS backend response envelopes', () => {
   afterEach(() => vi.unstubAllGlobals());
 
-  it('unwraps GET /runs { runs, meta, statuses } to a bare WorkflowRun[]', async () => {
+  it('unwraps GET /runs { data, meta, statuses } to a bare WorkflowRun[]', async () => {
     const run = { id: 'r1', workflow: 'w', workflowVersion: '1', status: 'completed' as const };
     vi.stubGlobal(
       'fetch',
-      vi
-        .fn()
-        .mockResolvedValue(
-          jsonResponse({ runs: [run], meta: { page: 1, size: 50, count: 1 }, statuses: [] }, 200),
+      vi.fn().mockResolvedValue(
+        jsonResponse(
+          {
+            data: [run],
+            meta: { total: 1, perPage: 50, currentPage: 1, lastPage: 1, firstPage: 1 },
+            statuses: [],
+          },
+          200,
         ),
+      ),
     );
     await expect(durableClient.runs()).resolves.toEqual([run]);
   });
@@ -61,10 +66,14 @@ describe('durableClient: unwrapping the AdonisJS backend response envelopes', ()
     });
   });
 
-  it('workers() and topology() are NOT wrapped — the AdonisJS backend returns them bare', async () => {
+  it('workers() unwraps GET /workers { data } to the bare GroupHealth[]', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn().mockResolvedValue(jsonResponse([{ group: 'g', depth: 0, liveWorkers: [] }], 200)),
+      vi
+        .fn()
+        .mockResolvedValue(
+          jsonResponse({ data: [{ group: 'g', depth: 0, liveWorkers: [] }] }, 200),
+        ),
     );
     await expect(durableClient.workers()).resolves.toEqual([
       { group: 'g', depth: 0, liveWorkers: [] },
@@ -177,7 +186,7 @@ describe('durableClient: human-in-the-loop verbs (signal / update / task) and sc
     expect(JSON.parse(calls[1]?.init?.body as string)).toEqual({ error: 'rejected by reviewer' });
   });
 
-  it('schedules() unwraps GET /schedules { schedules } to the bare ScheduleInfo[]', async () => {
+  it('schedules() walks every page of GET /schedules into the bare ScheduleInfo[]', async () => {
     const row = {
       key: 'nightly',
       workflow: 'nightlyReport',
@@ -188,9 +197,25 @@ describe('durableClient: human-in-the-loop verbs (signal / update / task) and sc
       nextFireAt: 2,
       currentWindowRunId: 'w1',
     };
-    const { calls } = capture(() => jsonResponse({ schedules: [row] }, 200));
-    await expect(durableClient.schedules()).resolves.toEqual([row]);
-    expect(calls[0]?.url).toBe('/durable/api/schedules');
+    let page = 0;
+    const { calls } = capture(() => {
+      page += 1;
+      return jsonResponse(
+        {
+          data: [{ ...row, key: `k${page}` }],
+          meta: { total: 2, perPage: 1, currentPage: page, lastPage: 2, firstPage: 1 },
+        },
+        200,
+      );
+    });
+    await expect(durableClient.schedules()).resolves.toEqual([
+      { ...row, key: 'k1' },
+      { ...row, key: 'k2' },
+    ]);
+    expect(calls.map((c) => c.url)).toEqual([
+      '/durable/api/schedules?page=1&size=200',
+      '/durable/api/schedules?page=2&size=200',
+    ]);
   });
 
   it('setSchedulePaused posts pause/resume and triggerSchedule unwraps the started run', async () => {
@@ -279,7 +304,14 @@ describe('durableClient: the run-list / bulk query string', () => {
       vi.fn((url: string) => {
         calls.push(url);
         return Promise.resolve(
-          jsonResponse({ runs: [], meta: { page: 1, size: 50, count: 0 }, statuses: [] }, 200),
+          jsonResponse(
+            {
+              data: [],
+              meta: { total: 0, perPage: 50, currentPage: 1, lastPage: 1, firstPage: 1 },
+              statuses: [],
+            },
+            200,
+          ),
         );
       }),
     );
@@ -327,7 +359,14 @@ describe('durableClient.runsPage: real pagination (unlike runs(), keeps the `met
       vi.fn((url: string) => {
         calls.push(url);
         return Promise.resolve(
-          jsonResponse({ runs: [], meta: { page: 1, size: 50, count: 0 }, statuses: [] }, 200),
+          jsonResponse(
+            {
+              data: [],
+              meta: { total: 0, perPage: 50, currentPage: 1, lastPage: 1, firstPage: 1 },
+              statuses: [],
+            },
+            200,
+          ),
         );
       }),
     );
@@ -344,7 +383,14 @@ describe('durableClient.runsPage: real pagination (unlike runs(), keeps the `met
       vi.fn((url: string) => {
         calls.push(url);
         return Promise.resolve(
-          jsonResponse({ runs: [run], meta: { page: 2, size: 100, count: 1 }, statuses: [] }, 200),
+          jsonResponse(
+            {
+              data: [run],
+              meta: { total: 101, perPage: 100, currentPage: 2, lastPage: 2, firstPage: 1 },
+              statuses: [],
+            },
+            200,
+          ),
         );
       }),
     );
@@ -354,7 +400,10 @@ describe('durableClient.runsPage: real pagination (unlike runs(), keeps the `met
       size: 100,
     });
 
-    expect(page).toEqual({ runs: [run], meta: { page: 2, size: 100, count: 1 } });
+    expect(page).toEqual({
+      data: [run],
+      meta: { total: 101, perPage: 100, currentPage: 2, lastPage: 2, firstPage: 1 },
+    });
     const query = new URLSearchParams(calls[0]?.split('?')[1] ?? '');
     expect(query.get('page')).toBe('2');
     expect(query.get('size')).toBe('100');
@@ -546,7 +595,15 @@ describe('durableClient.fanMembers', () => {
       'fetch',
       vi.fn((url: string) => {
         calls.push(url);
-        return Promise.resolve(jsonResponse({ items: [], total: 0 }, 200));
+        return Promise.resolve(
+          jsonResponse(
+            {
+              data: [],
+              meta: { total: 0, perPage: 50, currentPage: 1, lastPage: 1, firstPage: 1 },
+            },
+            200,
+          ),
+        );
       }),
     );
     return { calls };
@@ -562,14 +619,19 @@ describe('durableClient.fanMembers', () => {
 
   it('sends the page window and the failed-only filter', async () => {
     const { calls } = captureUrl();
-    await durableClient.fanMembers('r1', 'all:3', { offset: 200, limit: 100, failed: true });
-    expect(calls[0]).toBe('/durable/api/runs/r1/fans/all%3A3?offset=200&limit=100&failed=true');
+    await durableClient.fanMembers('r1', 'all:3', { page: 3, size: 100, failed: true });
+    const [path, search] = (calls[0] ?? '').split('?');
+    expect(path).toBe('/durable/api/runs/r1/fans/all%3A3');
+    const query = new URLSearchParams(search);
+    expect(query.get('filter[status]')).toBe('failed');
+    expect(query.get('page')).toBe('3');
+    expect(query.get('size')).toBe('100');
   });
 
-  it('omits failed=false rather than sending it', async () => {
+  it('sends no filter when failed is false', async () => {
     const { calls } = captureUrl();
-    await durableClient.fanMembers('r1', 'g', { offset: 0, failed: false });
-    expect(calls[0]).toBe('/durable/api/runs/r1/fans/g?offset=0');
+    await durableClient.fanMembers('r1', 'g', { page: 1, size: 100, failed: false });
+    expect(calls[0]).toBe('/durable/api/runs/r1/fans/g?page=1&size=100');
   });
 });
 
