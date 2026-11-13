@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.21
+
+### Patch Changes
+
+- [#523](https://github.com/DavideCarvalho/adonis-agora-durable/pull/523) [`f20e28d`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/f20e28d28e674d5d5a4f63b8223aae52a2b9dc5f) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `durable:runs:bulk --dry-run` lists every run the action would touch (up to 500, paging the listing) instead of the first 200, and its table shows the same liveness columns as `durable:runs`.
+
 ## 1.0.0-rc.20
 
 ### Major Changes
