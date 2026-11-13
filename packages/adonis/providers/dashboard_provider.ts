@@ -16,6 +16,7 @@ import {
   mergeFleets,
 } from '../src/dashboard/compat.js';
 import type { ConsoleDecision } from '../src/dashboard/console_authorize.js';
+import { resolveSignOut, resolveViewer } from '../src/dashboard/console_shell.js';
 import {
   durableConsoleSearch,
   listVisibleConsoles,
@@ -638,6 +639,27 @@ export default class DashboardProvider {
       .as('durable_dashboard.compat');
   }
 
+  /**
+   * The console-shell fields of the page's data block: the switcher, ⌘K search (whenever a console
+   * registry exists — this console registers its own search), the signed-in viewer and the
+   * sign-out (the host's option, else the one an account console announced on the registry).
+   */
+  private async shellFields(
+    config: ResolvedDurableDashboardConfig,
+    ctx: HttpContext,
+    apiBase: string,
+  ): Promise<Parameters<typeof renderIndexHtml>[3]> {
+    const registry = await readAgoraConsoles(this.app.container);
+    const viewer = await resolveViewer(ctx, config.viewer);
+    const signOut = resolveSignOut(ctx, config.signOut, registry);
+    return {
+      switcher: { endpoint: `${apiBase}/consoles`, others: otherConsoles(registry, CONSOLE_ID) },
+      ...(registry ? { search: { endpoint: `${apiBase}/consoles/search` } } : {}),
+      ...(viewer ? { viewer } : {}),
+      ...(signOut ? { signOut } : {}),
+    };
+  }
+
   /** Mount the React SPA at `config.path` plus its hashed asset bundle. */
   private registerSpaRoutes(
     router: HttpRouterService,
@@ -663,12 +685,12 @@ export default class DashboardProvider {
           .header('content-type', 'text/html; charset=utf-8')
           .header('cache-control', 'no-store, must-revalidate')
           .send(
-            renderIndexHtml(html, config.path, apiBase, {
-              switcher: {
-                endpoint: `${apiBase}/consoles`,
-                others: otherConsoles(await readAgoraConsoles(this.app.container), CONSOLE_ID),
-              },
-            }),
+            renderIndexHtml(
+              html,
+              config.path,
+              apiBase,
+              await this.shellFields(config, ctx, apiBase),
+            ),
           );
       })
       .as('durable_dashboard.index');

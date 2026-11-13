@@ -3,7 +3,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, render, screen, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { EngineEvent, RunDetail } from '../client/durable-client';
+import type { RunDetail } from '../client/durable-client';
 
 // No jest-dom in this package (see `OriginFacets.spec.tsx`) — plain DOM assertions only.
 

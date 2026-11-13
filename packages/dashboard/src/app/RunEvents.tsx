@@ -1,11 +1,11 @@
 import { useSyncExternalStore } from 'react';
+import { Badge as Chip } from '../agora-kit/ui/badge';
+import { Button } from '../agora-kit/ui/button';
 import type { EngineEvent, LifecycleDelivery } from '../client/durable-client';
 import { EVENT_TAIL_LIMIT, type EventTail, type TailedEvent } from '../client/event-tail';
 import { childRunIdOf } from './child-link';
 import { LifecycleDeliveries } from './RunLifecycle';
 import { parentRunIdOf } from './run-lineage';
-import { Badge as Chip } from './ui/badge';
-import { Button } from './ui/button';
 
 /** A link from one event to another run, and which way it points. */
 export interface EventLink {
@@ -114,11 +114,11 @@ export function RunEvents({
   const events = useEventTail(tail);
   return (
     <section aria-label="Events" className="mt-3" data-testid="run-events">
-      <h3 className="text-[10px] uppercase tracking-wider text-zinc-500">
+      <h3 className="text-[10px] uppercase tracking-wider text-dim">
         Events{events.length > 0 ? ` · ${events.length}` : ''}
       </h3>
       {events.length === 0 ? (
-        <p className="mt-1 text-[11px] text-zinc-500">
+        <p className="mt-1 text-[11px] text-dim">
           Live only: the engine events of this run show here as they arrive while the page is open
           (the last {tail.limit}). Nothing is stored, so earlier events are not shown.
         </p>
@@ -130,26 +130,26 @@ export function RunEvents({
               className="flex flex-wrap items-center gap-1.5 text-[11px]"
               data-type={event.type}
             >
-              <span className="mono text-zinc-500">{timeOf(event.at)}</span>
+              <span className="mono text-dim">{timeOf(event.at)}</span>
               <Chip
                 variant={
                   event.type === 'run.trigger_failed' ||
                   event.type.endsWith('.failed') ||
                   event.type === 'run.unrouted'
-                    ? 'danger'
-                    : 'outline'
+                    ? 'destructive'
+                    : 'neutral'
                 }
                 className="mono"
               >
                 {event.type}
               </Chip>
-              <span className="text-zinc-300">{eventSummary(event)}</span>
+              <span className="text-fg-2">{eventSummary(event)}</span>
               {eventLinks(event).map((link) => (
                 <span key={`${link.rel}:${link.runId}`} className="flex items-center gap-1">
-                  <span className="text-[10px] text-zinc-600">{LINK_LABEL[link.rel]}</span>
+                  <span className="text-[10px] text-faint">{LINK_LABEL[link.rel]}</span>
                   <Button
                     variant="chip"
-                    size="xs"
+                    size="micro"
                     onClick={() => onOpenRun(link.runId)}
                     className="mono max-w-[24rem] truncate px-1.5 py-0"
                     title={link.runId}

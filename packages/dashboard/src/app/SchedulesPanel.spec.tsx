@@ -3,8 +3,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { TooltipProvider } from '../agora-kit/ui/tooltip';
 import type { RunResult, ScheduleInfo } from '../client/durable-client';
-import { TooltipProvider } from './ui/tooltip';
 
 // No jest-dom in this package (see `OriginFacets.spec.tsx`) — plain DOM assertions only.
 

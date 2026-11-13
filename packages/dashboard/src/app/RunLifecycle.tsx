@@ -1,3 +1,6 @@
+import { cn } from '../agora-kit/lib/utils';
+import { Badge as Chip } from '../agora-kit/ui/badge';
+import { Button } from '../agora-kit/ui/button';
 import type {
   LifecycleDelivery,
   RunDetail,
@@ -5,9 +8,6 @@ import type {
   RunWaitLink,
 } from '../client/durable-client';
 import { CopyButton } from './StepDetailPanel';
-import { Badge as Chip } from './ui/badge';
-import { Button } from './ui/button';
-import { cn } from './ui/cn';
 
 /** The tag a settled run carries while its lifecycle event is still owed to some subscriber. */
 export const LIFECYCLE_PENDING_TAG = 'durable:lifecycle:pending';
@@ -61,7 +61,7 @@ const ORPHAN_TITLE =
 function RunStatusChip({ status }: { status: RunStatus | undefined }) {
   if (!status) return null;
   return (
-    <Chip variant="status" className={`s-${status} text-[10px]`}>
+    <Chip variant="bare" className={`s-${status} text-[10px]`}>
       {status}
     </Chip>
   );
@@ -71,7 +71,7 @@ function RunChip({ runId, onOpenRun }: { runId: string; onOpenRun: (id: string) 
   return (
     <Button
       variant="chip"
-      size="xs"
+      size="micro"
       onClick={() => onOpenRun(runId)}
       className="mono max-w-[28rem] truncate px-1.5 py-0"
       title={runId}
@@ -94,17 +94,20 @@ export function LifecycleSourceLine({
 }) {
   return (
     <div className="mt-1.5 flex flex-wrap items-center gap-1" data-testid="lifecycle-source">
-      <span className="text-[10px] text-zinc-600">started by</span>
+      <span className="text-[10px] text-faint">started by</span>
       <RunChip runId={source.runId} onOpenRun={onOpenRun} />
-      <span className="text-[10px] text-zinc-600">on</span>
-      <Chip className={cn('text-[10px]', source.kind === 'failed' ? 's-failed' : 's-completed')}>
+      <span className="text-[10px] text-faint">on</span>
+      <Chip
+        variant="neutral"
+        className={cn('text-[10px]', source.kind === 'failed' ? 's-failed' : 's-completed')}
+      >
         {source.kind}
       </Chip>
       <RunStatusChip status={source.status} />
       {source.traceId && (
         <span className="ml-1 flex items-center gap-1">
-          <span className="text-[10px] text-zinc-600">trace</span>
-          <span className="mono text-[10px] text-zinc-400" title="The source run's trace id">
+          <span className="text-[10px] text-faint">trace</span>
+          <span className="mono text-[10px] text-fg-2" title="The source run's trace id">
             {source.traceId}
           </span>
           <CopyButton value={source.traceId} />
@@ -136,14 +139,14 @@ export function RunWaits({
           className="flex flex-wrap items-center gap-1"
           data-testid="waits-for"
         >
-          <span className="text-[10px] text-amber-300/80">Waiting for run</span>
+          <span className="text-[10px] text-warn/80">Waiting for run</span>
           <RunChip runId={link.runId} onOpenRun={onOpenRun} />
           <RunStatusChip status={link.status} />
         </div>
       ))}
       {awaitedBy.length > 0 && (
         <div className="flex flex-wrap items-center gap-1" data-testid="awaited-by">
-          <span className="text-[10px] text-zinc-600">Awaited by</span>
+          <span className="text-[10px] text-faint">Awaited by</span>
           {awaitedBy.map((link) => (
             <span key={`${link.runId}#${link.seq}`} className="flex items-center gap-1">
               <RunChip runId={link.runId} onOpenRun={onOpenRun} />
@@ -177,7 +180,7 @@ export function LifecycleDeliveries({
   if (deliveries.length === 0) return null;
   return (
     <section aria-label="Lifecycle subscribers" className="mt-3">
-      <h3 className="text-[10px] uppercase tracking-wider text-zinc-500">Lifecycle subscribers</h3>
+      <h3 className="text-[10px] uppercase tracking-wider text-dim">Lifecycle subscribers</h3>
       <ul className="mt-1 flex flex-col gap-1">
         {deliveries.map((delivery) => {
           const known = delivery.state === 'failed' ? errors?.get(delivery.subscriber) : undefined;
@@ -191,9 +194,11 @@ export function LifecycleDeliveries({
               className="flex flex-wrap items-center gap-1.5"
               data-state={d.state}
             >
-              <span className="mono text-[12px] text-zinc-200">{d.subscriber}</span>
+              <span className="mono text-[12px] text-fg">{d.subscriber}</span>
               <Chip
-                variant={d.state === 'owed' ? 'warn' : d.state === 'failed' ? 'danger' : 'outline'}
+                variant={
+                  d.state === 'owed' ? 'warn' : d.state === 'failed' ? 'destructive' : 'neutral'
+                }
                 className="text-[10px]"
                 title={
                   d.state === 'not-started'
@@ -210,7 +215,7 @@ export function LifecycleDeliveries({
               {d.runId && <RunChip runId={d.runId} onOpenRun={onOpenRun} />}
               {d.state === 'started' && <RunStatusChip status={d.status} />}
               {d.state === 'failed' && d.error === undefined && (
-                <span className="text-[10px] text-zinc-500">
+                <span className="text-[10px] text-dim">
                   see the run.trigger_failed event for the reason
                 </span>
               )}
@@ -238,7 +243,7 @@ export function LifecyclePendingFilter({
   return (
     <Button
       variant="ghost"
-      size="xs"
+      size="micro"
       aria-pressed={on}
       title="Settled runs whose lifecycle event is still owed to a subscriber (tag durable:lifecycle:pending)"
       onClick={() =>
@@ -248,7 +253,7 @@ export function LifecyclePendingFilter({
       }
       className={cn(
         'mono rounded-md border-line',
-        on && 'border-amber-500/40 bg-amber-500/10 text-amber-200 hover:text-amber-100',
+        on && 'border-warn/40 bg-warn/10 text-warn hover:text-warn',
       )}
     >
       lifecycle pending

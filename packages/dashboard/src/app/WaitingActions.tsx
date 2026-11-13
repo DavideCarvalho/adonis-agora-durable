@@ -1,5 +1,7 @@
 import { useMutation } from '@tanstack/react-query';
 import { useState } from 'react';
+import { ActionDialog as Dialog } from '../agora-kit/blocks/action-dialog';
+import { Button } from '../agora-kit/ui/button';
 import {
   DurableActionError,
   durableClient,
@@ -7,8 +9,6 @@ import {
   waitingOnTokens,
 } from '../client/durable-client';
 import { BoltIcon, CheckIcon, XIcon } from './icons';
-import { Button } from './ui/button';
-import { Dialog } from './ui/dialog';
 import { InputField } from './ui/input';
 
 /**
@@ -64,7 +64,7 @@ function JsonField({
   return (
     <>
       <label
-        className="mono mb-1.5 mt-3 block text-[10px] uppercase tracking-[0.18em] text-zinc-500"
+        className="mono mb-1.5 mt-3 block text-[10px] uppercase tracking-[0.18em] text-dim"
         htmlFor={id}
       >
         {label}
@@ -75,7 +75,7 @@ function JsonField({
         spellCheck={false}
         placeholder={hint}
         onChange={(e) => onDraft(e.target.value)}
-        className="mono h-40 w-full resize-y rounded-lg border border-line bg-black/40 p-3 text-[11.5px] leading-relaxed text-zinc-300 placeholder:text-zinc-700 focus:border-zinc-600 focus:outline-none"
+        className="mono h-40 w-full resize-y rounded-lg border border-line bg-sunken/40 p-3 text-[11.5px] leading-relaxed text-fg-2 placeholder:text-faint focus:border-line-strong focus:outline-none"
       />
     </>
   );
@@ -202,16 +202,16 @@ export function WaitingActions({
 
   return (
     <>
-      <div className="flex flex-wrap items-center gap-3 border-b border-sky-500/30 bg-sky-500/10 px-7 py-3">
+      <div className="flex flex-wrap items-center gap-3 border-b border-info/30 bg-info/10 px-7 py-3">
         <span
-          className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-sky-500/40 bg-sky-500/15 text-sm text-sky-300"
+          className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-info/40 bg-info/15 text-sm text-info"
           aria-hidden
         >
           ✋
         </span>
         <div className="min-w-0 flex-1">
-          <div className="text-[13px] font-medium text-sky-200">Waiting on a human</div>
-          <div className="mono truncate text-[11px] text-sky-300/70">
+          <div className="text-[13px] font-medium text-info">Waiting on a human</div>
+          <div className="mono truncate text-[11px] text-info/70">
             this run is suspended until someone answers the wait{targets.length === 1 ? '' : 's'}{' '}
             below
           </div>
@@ -220,12 +220,12 @@ export function WaitingActions({
           {targets.map((target) =>
             target.kind === 'task' ? (
               <span key={target.token} className="flex items-center gap-1.5">
-                <span className="mono max-w-[180px] truncate text-[10px] text-sky-300/80">
+                <span className="mono max-w-[180px] truncate text-[10px] text-info/80">
                   task {target.name}
                 </span>
                 <Button
                   variant="brand"
-                  size="xs"
+                  size="micro"
                   disabled={tenantPod || pending}
                   title={tenantPod ? TENANT_REASON : `Complete task "${target.name}" with a result`}
                   onClick={() => openDialog({ verb: 'task-complete', name: target.name })}
@@ -235,8 +235,8 @@ export function WaitingActions({
                   Complete task
                 </Button>
                 <Button
-                  variant="danger"
-                  size="xs"
+                  variant="destructive"
+                  size="micro"
                   disabled={tenantPod || pending}
                   title={tenantPod ? TENANT_REASON : `Fail task "${target.name}" with a reason`}
                   onClick={() => openDialog({ verb: 'task-fail', name: target.name })}
@@ -248,12 +248,12 @@ export function WaitingActions({
               </span>
             ) : target.kind === 'update' ? (
               <span key={target.token} className="flex items-center gap-1.5">
-                <span className="mono max-w-[180px] truncate text-[10px] text-sky-300/80">
+                <span className="mono max-w-[180px] truncate text-[10px] text-info/80">
                   update {target.name}
                 </span>
                 <Button
                   variant="info"
-                  size="xs"
+                  size="micro"
                   disabled={tenantPod || pending}
                   title={tenantPod ? TENANT_REASON : `Send a validated update to "${target.name}"`}
                   onClick={() => openDialog({ verb: 'update', name: target.name })}
@@ -265,12 +265,12 @@ export function WaitingActions({
               </span>
             ) : (
               <span key={target.token} className="flex items-center gap-1.5">
-                <span className="mono max-w-[180px] truncate text-[10px] text-sky-300/80">
+                <span className="mono max-w-[180px] truncate text-[10px] text-info/80">
                   signal {target.token}
                 </span>
                 <Button
                   variant="info"
-                  size="xs"
+                  size="micro"
                   disabled={tenantPod || pending}
                   title={tenantPod ? TENANT_REASON : `Deliver a payload on "${target.token}"`}
                   onClick={() => openDialog({ verb: 'signal', token: target.token })}
@@ -290,12 +290,15 @@ export function WaitingActions({
           if (!next) close();
         }}
         title={dialogTitle}
-        subtitle={dialogSubtitle}
+        description={dialogSubtitle}
         footer={
           <>
-            <Button onClick={close}>Cancel</Button>
+            <Button variant="outline" size="sm" onClick={close}>
+              Cancel
+            </Button>
             <Button
-              variant={open?.verb === 'task-fail' ? 'danger' : 'info'}
+              size="sm"
+              variant={open?.verb === 'task-fail' ? 'destructive' : 'info'}
               disabled={pending}
               onClick={submit}
             >
@@ -307,7 +310,7 @@ export function WaitingActions({
         {open?.verb === 'signal' && (
           <>
             <label
-              className="mono mb-1.5 block text-[10px] uppercase tracking-[0.18em] text-zinc-500"
+              className="mono mb-1.5 block text-[10px] uppercase tracking-[0.18em] text-dim"
               htmlFor="deliver-signal-token"
             >
               token
@@ -363,7 +366,7 @@ export function WaitingActions({
         {open?.verb === 'task-fail' && (
           <>
             <label
-              className="mono mb-1.5 block text-[10px] uppercase tracking-[0.18em] text-zinc-500"
+              className="mono mb-1.5 block text-[10px] uppercase tracking-[0.18em] text-dim"
               htmlFor="fail-task-reason"
             >
               reason
@@ -389,7 +392,7 @@ export function WaitingActions({
         )}
         {offeredTokens && offeredTokens.length > 0 && (
           <div className="mt-2">
-            <div className="mono mb-1 text-[10px] uppercase tracking-[0.18em] text-zinc-500">
+            <div className="mono mb-1 text-[10px] uppercase tracking-[0.18em] text-dim">
               waiting on — pick one
             </div>
             <div className="flex flex-wrap gap-1">
@@ -397,7 +400,7 @@ export function WaitingActions({
                 <Button
                   key={offered}
                   variant="chip"
-                  size="xs"
+                  size="micro"
                   className="mono"
                   onClick={() => {
                     setToken(offered);

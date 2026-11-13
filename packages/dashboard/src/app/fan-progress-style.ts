@@ -10,16 +10,16 @@ export const FAN_PROGRESS_SEGMENTS: readonly {
   text: string;
   label: string;
 }[] = [
-  { key: 'completed', className: 'bg-emerald-500/60', text: 'text-emerald-300', label: 'done' },
-  { key: 'failed', className: 'bg-red-500/70', text: 'text-red-300', label: 'failed' },
+  { key: 'completed', className: 'bg-good/60', text: 'text-good', label: 'done' },
+  { key: 'failed', className: 'bg-bad/70', text: 'text-bad', label: 'failed' },
   { key: 'running', className: 'bg-live/70', text: 'text-live', label: 'running' },
-  { key: 'pending', className: 'bg-zinc-500/60', text: 'text-zinc-300', label: 'pending' },
+  { key: 'pending', className: 'bg-dim/60', text: 'text-fg-2', label: 'pending' },
   {
     key: 'interrupted',
-    className: 'bg-amber-500/60',
-    text: 'text-amber-300',
+    className: 'bg-warn/60',
+    text: 'text-warn',
     label: 'interrupted',
   },
-  { key: 'notStarted', className: 'bg-zinc-700/70', text: 'text-zinc-400', label: 'not started' },
-  { key: 'skipped', className: 'bg-zinc-700/40', text: 'text-zinc-500', label: 'never ran' },
+  { key: 'notStarted', className: 'bg-line-strong/70', text: 'text-fg-2', label: 'not started' },
+  { key: 'skipped', className: 'bg-line-strong/40', text: 'text-dim', label: 'never ran' },
 ];

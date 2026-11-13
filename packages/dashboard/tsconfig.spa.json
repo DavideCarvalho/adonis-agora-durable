@@ -10,7 +10,13 @@
     "jsx": "react-jsx",
     "verbatimModuleSyntax": false
   },
-  "include": ["src/client/**/*.ts", "src/app/**/*.ts", "src/app/**/*.tsx"],
+  "include": [
+    "src/client/**/*.ts",
+    "src/app/**/*.ts",
+    "src/app/**/*.tsx",
+    "src/agora-kit/**/*.ts",
+    "src/agora-kit/**/*.tsx"
+  ],
   "exclude": [
     "**/*.spec.ts",
     "**/*.spec.tsx",

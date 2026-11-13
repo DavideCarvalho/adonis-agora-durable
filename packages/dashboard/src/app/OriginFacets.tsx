@@ -1,3 +1,5 @@
+import { cn } from '../agora-kit/lib/utils';
+import { Button } from '../agora-kit/ui/button';
 import type { WorkflowRun } from '../client/durable-client';
 import {
   hasNamedOrigin,
@@ -6,8 +8,6 @@ import {
   originFilterKey,
   sameOriginFilter,
 } from '../client/run-origin';
-import { Button } from './ui/button';
-import { cn } from './ui/cn';
 
 /**
  * The "which library produced this run" facet: one chip per origin, with its count, plus `all` and
@@ -43,7 +43,7 @@ export function OriginFacets({
     // A plain container with a visible caption, exactly like the header's status chip row — the
     // caption is the label, so there is no `role="group"` for `useSemanticElements` to object to.
     <div className="flex flex-wrap items-center gap-1 border-b border-line px-2 py-1.5">
-      <span className="mono shrink-0 text-[10px] uppercase tracking-[0.18em] text-zinc-600">
+      <span className="mono shrink-0 text-[10px] uppercase tracking-[0.18em] text-faint">
         origin
       </span>
       {facets.map((facet) => {
@@ -60,12 +60,12 @@ export function OriginFacets({
               'mono max-w-full gap-1 rounded-md',
               // The app's own runs are not a package, so their chip is not styled like one — dim and
               // italic sets it apart without dressing it up as a real origin.
-              facet.filter.kind === 'unknown' && 'italic text-zinc-500',
-              selected && 'border-zinc-600 bg-zinc-900 text-zinc-100 hover:text-zinc-100',
+              facet.filter.kind === 'unknown' && 'italic text-dim',
+              selected && 'border-line-strong bg-hover text-fg hover:text-fg',
             )}
           >
             <span className="truncate">{facet.label}</span>
-            <span className="tnum shrink-0 text-zinc-600">{facet.count}</span>
+            <span className="tnum shrink-0 text-faint">{facet.count}</span>
           </Button>
         );
       })}

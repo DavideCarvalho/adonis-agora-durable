@@ -1,11 +1,15 @@
 import { useQuery } from '@tanstack/react-query';
+import { RegionError } from '../agora-kit/blocks/error-boundary';
+import { PageHeader } from '../agora-kit/blocks/page-header';
+import { Panel } from '../agora-kit/blocks/panel';
+import { Badge as Chip } from '../agora-kit/ui/badge';
+import { Skeleton } from '../agora-kit/ui/skeleton';
 import {
   durableClient,
   type LifecycleSubscriptionLink,
   type WorkflowLifecycleLinks,
   type WorkflowLifecyclePage,
 } from '../client/durable-client';
-import { Badge as Chip } from './ui/badge';
 
 /** The console URL hash of a workflow's page (`#/workflow/<name>`). */
 export function workflowHash(workflow: string): string {
@@ -56,9 +60,9 @@ function LinkList({
 }) {
   return (
     <section aria-label={title} className="min-w-0">
-      <h3 className="text-[10px] uppercase tracking-wider text-zinc-500">{title}</h3>
+      <h3 className="text-[10px] uppercase tracking-wider text-dim">{title}</h3>
       {links.length === 0 ? (
-        <p className="mt-1 text-[11px] text-zinc-600">{empty}</p>
+        <p className="mt-1 text-[11px] text-faint">{empty}</p>
       ) : (
         <ul className="mt-1 flex flex-col gap-1">
           {links.map((link) => (
@@ -68,19 +72,24 @@ function LinkList({
             >
               <a
                 href={workflowHash(link.workflow)}
-                className="mono text-[12px] text-zinc-200 underline-offset-2 hover:underline"
+                className="mono text-[12px] text-fg underline-offset-2 hover:underline"
               >
                 {link.workflow}
               </a>
-              <Chip className={link.kind === 'failed' ? 's-failed' : 's-completed'}>
+              <Chip
+                variant="neutral"
+                className={link.kind === 'failed' ? 's-failed' : 's-completed'}
+              >
                 on {link.kind}
               </Chip>
               {subscriptionTraits(link).map((trait) => (
-                <Chip key={trait}>{trait}</Chip>
+                <Chip variant="neutral" key={trait}>
+                  {trait}
+                </Chip>
               ))}
               {triggerCountLabel(counts, link.workflow) && (
                 <span
-                  className={`mono text-[10px] ${counts?.[link.workflow]?.failed ? 'text-bad' : 'text-zinc-500'}`}
+                  className={`mono text-[10px] ${counts?.[link.workflow]?.failed ? 'text-bad' : 'text-dim'}`}
                   title="Counted by this dashboard's server process since it started"
                 >
                   {triggerCountLabel(counts, link.workflow)}
@@ -128,24 +137,24 @@ export function WorkflowPage({ workflow }: { workflow: string }) {
     refetchInterval: 10_000,
   });
   return (
-    <div className="flex h-full flex-col">
-      <div className="border-b border-line px-7 py-5">
-        <h2 className="text-lg font-semibold tracking-tight">{workflow}</h2>
-        <p className="mt-1 text-[11px] text-zinc-500">
-          Lifecycle events: registered here and announced by live workers.
-        </p>
-      </div>
-      <div className="px-7 py-5">
+    <div className="flex flex-col gap-5">
+      <PageHeader
+        title={<span className="mono">{workflow}</span>}
+        description="Lifecycle events: registered here and announced by live workers."
+      />
+      <Panel title="Lifecycle" description="who starts when it settles, and who starts it">
         {error ? (
-          <p className="text-[11px] text-bad">
-            {error instanceof Error ? error.message : String(error)}
-          </p>
+          <RegionError title="Lifecycle could not be loaded" error={error} />
         ) : isPending || !data ? (
-          <p className="text-[11px] text-zinc-600">Loading…</p>
+          <div className="flex flex-col gap-2" aria-hidden>
+            <Skeleton className="h-3 w-48" />
+            <Skeleton className="h-3 w-64" />
+            <Skeleton className="h-3 w-40" />
+          </div>
         ) : (
           <WorkflowLifecycleLists links={data} counts={data.triggerCounts} />
         )}
-      </div>
+      </Panel>
     </div>
   );
 }

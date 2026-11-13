@@ -124,7 +124,7 @@ describe('WorkflowPage', () => {
     render(wrap(<WorkflowPage workflow="ingest" />));
     await waitFor(() => expect(screen.getByText('refresh')).toBeTruthy());
     expect(workflowLifecycle).toHaveBeenCalledWith('ingest');
-    expect(screen.getByRole('heading', { level: 2 }).textContent).toBe('ingest');
+    expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('ingest');
   });
 
   it('shows how many runs each subscriber was started for, and how many starts failed', async () => {
