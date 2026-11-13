@@ -255,8 +255,8 @@ importers:
         specifier: 13.0.3
         version: 13.0.3
       bullmq:
-        specifier: 6.7.2
-        version: 6.7.2(ioredis@6.0.0(supports-color@10.2.2))(pg@8.23.1)
+        specifier: 6.7.3
+        version: 6.7.3(ioredis@6.0.0(supports-color@10.2.2))(pg@8.23.1)
       cron-parser:
         specifier: 5.10.4
         version: 5.10.4
@@ -2031,8 +2031,8 @@ packages:
     resolution: {integrity: sha512-nEh+kZOPY1w+gcCMobZ6ETUp9WfibndnosbpwB1iJk/8Gt5ZF2bhS6+B6bPYz424KtwsR6Rflc3tCz1/ghX2dQ==}
     engines: {node: '>=4.0'}
 
-  bullmq@6.7.2:
-    resolution: {integrity: sha512-JCoMvkTD9FAX8TY3qQXIkB+ybZYDpTqV09EshxwYjzn2oTdqagKUIF/GWjtYl9bahPO2DHm3sWjijFGHeIf6XQ==}
+  bullmq@6.7.3:
+    resolution: {integrity: sha512-0ROchqVhgJw2ajv62GrN1cGMpDabxpTJAp5ZDlm/qL7f+B+CdFJAcu70U3zbD/D3hc6NZxbdHvRMPTC0aEl77A==}
     engines: {node: '>=14.18.0'}
     peerDependencies:
       bullmq-otel: '>=2.0.0'
@@ -2160,10 +2160,6 @@ packages:
 
   cookie-es@3.1.1:
     resolution: {integrity: sha512-UaXxwISYJPTr9hwQxMFYZ7kNhSXboMXP+Z3TRX6f1/NyaGPfuNUZOWP1pUEb75B2HjfklIYLVRfWiFZJyC6Npg==}
-
-  cron-parser@5.10.3:
-    resolution: {integrity: sha512-Fwlmlgiyoj5e7XDCy5T3ueFd3imgt714k7xjAzhkOBUrUgQxWtsjS7kWSEN3efDX34bebxBJAmPoCSisHvjlpw==}
-    engines: {node: '>=18'}
 
   cron-parser@5.10.4:
     resolution: {integrity: sha512-TagNqYzoV/C7Ty7VAQjrQg+57WsEOuQEUh0tWT5Dc+l/GOuoAdWVIzFU0CqYdQswqdjUalrdmOvaMtQhErYZTA==}
@@ -5307,9 +5303,9 @@ snapshots:
     dependencies:
       '@types/node': 26.6.6
 
-  bullmq@6.7.2(ioredis@6.0.0(supports-color@10.2.2))(pg@8.23.1):
+  bullmq@6.7.3(ioredis@6.0.0(supports-color@10.2.2))(pg@8.23.1):
     dependencies:
-      cron-parser: 5.10.3
+      cron-parser: 5.10.4
       msgpackr: 2.1.4
       node-abort-controller: 3.1.1
       semver: 7.8.6
@@ -5414,10 +5410,6 @@ snapshots:
   content-type@2.1.0: {}
 
   cookie-es@3.1.1: {}
-
-  cron-parser@5.10.3:
-    dependencies:
-      luxon: 3.7.2
 
   cron-parser@5.10.4:
     dependencies:
