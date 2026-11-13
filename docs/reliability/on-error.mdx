@@ -94,7 +94,7 @@ item. In Python: `raise FatalError("line 3 is invalid", "invalid_line", details=
 
 ## Retrying a run
 
-Retrying a failed run (from the dashboard, `node ace durable:retry <runId>`, or `engine.requeue(runId)`) runs its **body** again. A handoff the run made before is retired: it stays in
+Retrying a failed run (from the dashboard, `node ace durable:runs:retry <runId>`, or `engine.requeue(runId)`) runs its **body** again. A handoff the run made before is retired: it stays in
 the timeline, renamed `onError:retried:<handler id>`, and is never followed again, and the run's
 `onError:<code>` tag is removed. If the body fails again, the engine hands the new failure to a new
 handler run (`<runId>.onError.1`, then `.2`, …), tagged again.

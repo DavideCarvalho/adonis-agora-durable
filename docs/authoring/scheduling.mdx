@@ -248,7 +248,7 @@ rather than being detected and driven with the wrong entry point.
 
 ## Runtime control — pause, resume, run now
 
-`paused` in config is a deploy-time switch. For the operator's version — "stop the nightly sync *now*, without shipping a config change" — the engine exposes runtime schedule control, and the [dashboard](/docs/durable/observability/dashboard#schedules) drives the same three calls from its Schedules tab:
+`paused` in config is a deploy-time switch. For the operator's version — "stop the nightly sync *now*, without shipping a config change" — the engine exposes runtime schedule control, and the [dashboard](/docs/durable/observability/dashboard#schedules) drives the same three calls from its Schedules tab, and so do `node ace durable:schedules`, `durable:schedules:pause` / `:resume` and `durable:schedules:trigger` ([CLI](/docs/durable/cli#schedules)):
 
 ```ts
 // Every schedule this engine ticks, with its live control state and fire windows:

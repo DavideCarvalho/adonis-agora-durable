@@ -23,7 +23,7 @@ export default defineConfig({
 })
 ```
 
-Omit `maxRecoveryAttempts` for unlimited recovery (the default). A `dead` run is terminal but **not lost**: it stays fully inspectable in the [dashboard](/docs/durable/observability/dashboard) — its history, its checkpoints, its error — and it can be retried from there (or via [`durable:retry`](/docs/durable/cli)) once you've shipped a fix. A retry (`engine.requeue`) of a `dead` or `failed` run resets its `recoveryAttempts` to 0, so the retried run gets the full budget again. Requeueing a run that is still live keeps its count. The point is that one poison pill no longer keeps the process crashing for every other run.
+Omit `maxRecoveryAttempts` for unlimited recovery (the default). A `dead` run is terminal but **not lost**: it stays fully inspectable in the [dashboard](/docs/durable/observability/dashboard) — its history, its checkpoints, its error — and it can be retried from there (or via [`durable:runs:retry`](/docs/durable/cli)) once you've shipped a fix. A retry (`engine.requeue`) of a `dead` or `failed` run resets its `recoveryAttempts` to 0, so the retried run gets the full budget again. Requeueing a run that is still live keeps its count. The point is that one poison pill no longer keeps the process crashing for every other run.
 
 ## An unregistered workflow
 
@@ -170,4 +170,4 @@ When the cause was bad input, `engine.retryWithInput(runId, input, newRunId?)` s
 const { runId } = (await engine.retryWithInput(deadRunId, { ...originalInput, fixed: true }))!
 ```
 
-It is a **new** run with a clean history (`newRunId` defaults to `<runId>~retry~<8 hex chars>`), started with the original run's tags and namespace; the dead run stays as it is, inspectable. It resolves to `{ runId }`, or `null` when `deadRunId` is unknown. When the input was fine and the fix was a deploy, retry the run itself instead (`engine.requeue(runId)` / `durable:retry`), which replays its completed steps and resets `recoveryAttempts`.
+It is a **new** run with a clean history (`newRunId` defaults to `<runId>~retry~<8 hex chars>`), started with the original run's tags and namespace; the dead run stays as it is, inspectable. It resolves to `{ runId }`, or `null` when `deadRunId` is unknown. When the input was fine and the fix was a deploy, retry the run itself instead (`engine.requeue(runId)` / `durable:runs:retry`), which replays its completed steps and resets `recoveryAttempts`.

@@ -142,7 +142,7 @@ status into a handler workflow — the engine starts it as `dlq:<runId>`
 (idempotent) with a `DeadLetter` input `{ deadRunId, workflow, input, error }`
 in the dead run's namespace. A run
 whose remote step is still in flight is parked `suspended`, never counted, and a
-retry (`requeue` / `durable:retry`) of a `dead`/`failed` run resets
+retry (`requeue` / `durable:runs:retry`) of a `dead`/`failed` run resets
 `recoveryAttempts` to 0:
 
 ```ts title="config/durable.ts"
@@ -168,7 +168,7 @@ throws. A `dlq:` handler run that dies is not routed again; a failed start
 (handler not registered) is `console.warn`-ed. `engine.onDead(run => …)` still
 fires first and is the manual escape hatch (keep the `dlq:<runId>` id).
 
-A dead run stays inspectable and retriable (`durable:retry <runId>`, dashboard
+A dead run stays inspectable and retriable (`durable:runs:retry <runId>`, dashboard
 retry, or `engine.retryWithInput(runId, fixedInput)` for bad data).
 Source: `docs/reliability/dead-letter.mdx`.
 
@@ -194,9 +194,15 @@ signature: status `suspended`, stale `updatedAt`, newest checkpoint
 `kind: 'remote' / status: 'pending'`, old `enqueuedAt`. Find it, then heal it:
 
 ```bash
-node ace durable:runs --stale=1h   # threshold above your longest legitimate step
-node ace durable:retry checkout:1234
+node ace durable:runs --stale=1h          # threshold above your longest legitimate step
+node ace durable:runs:redispatch checkout:1234 --force   # re-send the lost step
+node ace durable:runs:retry checkout:1234                # or re-run from its checkpoints
 ```
+
+Every console action has an ace twin that runs the console's own handler
+(`durable:runs:show`, `durable:runs:cancel`, `durable:runs:signal`,
+`durable:runs:bulk`, `durable:schedules:pause`, `durable:health`, …; `--json` on
+reads, `--force` to skip a confirmation). See `docs/cli.mdx`.
 
 ```ts title="app/controllers/ops_controller.ts"
 import type { HttpContext } from '@adonisjs/core/http'

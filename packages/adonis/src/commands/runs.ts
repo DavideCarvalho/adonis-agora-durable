@@ -240,7 +240,7 @@ export function parseDurationMs(input: string): number | undefined {
 export function staleHint(runId: string): string {
   return (
     `Run ${runId} looks stranded (pending remote step exceeds the threshold). Recover it with ` +
-    `\`engine.redispatchPending('${runId}')\` or \`node ace durable:retry ${runId}\`.`
+    `\`node ace durable:runs:redispatch ${runId}\` (re-send a lost step) or \`node ace durable:runs:retry ${runId}\`.`
   );
 }
 

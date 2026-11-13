@@ -25,7 +25,7 @@ are installed only when used.
 | `@adonis-agora/durable/otel` | OpenTelemetry spans + lightweight metrics — one trace per run, one span per step (needs `@opentelemetry/api`) |
 | `@adonis-agora/durable/telescope` | a `@adonis-agora/telescope` extension — a Workflows health dashboard (golden signals) |
 | `@adonis-agora/durable/dashboard` | a self-contained web dashboard + JSON API for inspecting/operating runs (wire `@adonis-agora/durable/dashboard_provider`) |
-| `@adonis-agora/durable/commands` | the ace commands — `durable:work`, `durable:runs`, `durable:retry` |
+| `@adonis-agora/durable/commands` | the ace commands — `durable:work`, and one per console action (`durable:runs`, `durable:runs:retry`, `durable:runs:cancel`, `durable:schedules`, …) |
 | `@adonis-agora/durable/testing` | test harness + asserts + fault injection + deterministic replay — no `vitest` required, importable from any test runner |
 | `@adonis-agora/durable/testing/conformance` | cross-backend conformance suite generators for custom store/backend implementations (needs `vitest`) |
 | `@adonis-agora/durable/admission-redis` | Redis-backed global admission backend for fleet-wide concurrency/rate/priority/fairness (needs `@adonisjs/redis` + `ioredis`) |

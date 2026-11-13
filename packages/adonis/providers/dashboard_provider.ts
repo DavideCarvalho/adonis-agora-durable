@@ -8,6 +8,7 @@ import {
   type AccessDeniedInfo,
   resolveAccessDeniedPage,
 } from '../src/dashboard/access_denied_page.js';
+import { recordConsoleAudit } from '../src/dashboard/audit.js';
 import {
   type CompatSource,
   compat,
@@ -803,24 +804,7 @@ export default class DashboardProvider {
 
   /** Hand one audit entry to the host's sink, or the default logger line. Never throws. */
   private recordAudit(config: ResolvedDurableDashboardConfig, entry: DashboardAuditEntry): void {
-    try {
-      if (config.audit) {
-        // Typed `void`, but an async hook is assignable to it: catch its rejection too.
-        const pending = config.audit(entry) as unknown;
-        if (pending instanceof Promise) pending.catch(() => undefined);
-        return;
-      }
-      void this.app.container
-        .make('logger')
-        .then((logger) => {
-          logger.info(
-            `[durable_dashboard] audit actor=${entry.actor} ${entry.method} ${entry.path}`,
-          );
-        })
-        .catch(() => undefined);
-    } catch {
-      /* auditing must never break the action */
-    }
+    recordConsoleAudit(config.audit, () => this.app.container.make('logger'), entry);
   }
 
   /** Route a handler 500's detail to the app logger (the client only ever sees a generic body). */

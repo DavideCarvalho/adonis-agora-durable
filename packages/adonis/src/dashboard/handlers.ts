@@ -971,6 +971,28 @@ export async function health(deps: Deps): Promise<ApiResponse> {
   });
 }
 
+/** What {@link fleetHealth} answers. */
+export interface FleetHealth {
+  /** Per worker group: queue backlog, live workers, and `stalled` (backlog with no worker). */
+  groups: Array<{ group: string; depth: number; liveWorkers: number; stalled: boolean }>;
+  /** How many runs are pending, dead and blocked, when the port can count runs. */
+  runs?: Record<'pending' | 'dead' | 'blocked', number>;
+}
+
+/**
+ * The fleet health the `durable_get_health` developer tool and `node ace durable:health` report: the
+ * {@link health} groups plus the pending / dead / blocked run counts.
+ */
+export async function fleetHealth(deps: Deps): Promise<FleetHealth> {
+  const groups = ((await health(deps)).body as { data: FleetHealth['groups'] }).data;
+  if (!deps.engine.countRuns) return { groups };
+  const runs = { pending: 0, dead: 0, blocked: 0 };
+  for (const status of ['pending', 'dead', 'blocked'] as const) {
+    runs[status] = await deps.engine.countRuns({ status });
+  }
+  return { groups, runs };
+}
+
 /** `GET /workers` — full per-group worker health (every live worker's heartbeat, not just a count),
  *  for the console's Workers panel: `{ data: GroupHealth[] }`, one entry per routing token. */
 export async function workers(deps: Deps): Promise<ApiResponse> {

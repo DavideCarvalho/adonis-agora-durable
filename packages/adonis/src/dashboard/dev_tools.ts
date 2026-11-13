@@ -6,10 +6,10 @@ import {
   cancelRun,
   continueRun,
   type Deps,
+  fleetHealth,
   getFanMembers,
   getRun,
   getRunEvent,
-  health,
   listRuns,
   listSchedules,
   retryRun,
@@ -398,14 +398,7 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
         'Fleet health: per worker group, the queue backlog and live workers (stalled = backlog with no worker), how many runs are pending, dead or blocked, and the protocol-compatibility panel when available.',
       input: { type: 'object', properties: {} },
       run: async (_input, tc) => {
-        const deps = await options.deps(tc.ctx);
-        const groups = (await call(async (d) => health(d), deps, {})) as { data: unknown[] };
-        const counts: Record<string, number> = {};
-        if (deps.engine.countRuns) {
-          for (const status of ['pending', 'dead', 'blocked'] as const) {
-            counts[status] = await deps.engine.countRuns({ status });
-          }
-        }
+        const { groups, runs } = await fleetHealth(await options.deps(tc.ctx));
         let compatBody: unknown;
         if (options.compat) {
           try {
@@ -415,8 +408,8 @@ export function durableDevTools(options: DurableDevToolsOptions): DevTool[] {
           }
         }
         return {
-          groups: groups.data,
-          ...(Object.keys(counts).length > 0 ? { runs: counts } : {}),
+          groups,
+          ...(runs ? { runs } : {}),
           ...(compatBody !== undefined ? { compat: compatBody } : {}),
         };
       },

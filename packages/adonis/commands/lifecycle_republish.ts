@@ -1,19 +1,20 @@
-import { BaseCommand, flags } from '@adonisjs/core/ace';
-import type { CommandOptions } from '@adonisjs/core/types/ace';
+import { flags } from '@adonisjs/core/ace';
+import { CliRefusal, DurableConsoleCommand } from '../src/commands/console_command.js';
 import { renderRepublishResult, republishLifecycleTarget } from '../src/commands/runs.js';
-import { WorkflowEngine } from '../src/index.js';
+import { republishLifecycleRun } from '../src/dashboard/handlers.js';
+import type { RepublishLifecycleResult } from '../src/lifecycle-events.js';
 
 /**
  * `node ace durable:lifecycle:republish --run <id>` or `--workflow <name> [--since] [--until]` — publish
- * settled runs' lifecycle events again (`engine.republishLifecycle`). Backfills a subscriber
- * registered after the runs settled, or retries one that failed; a subscriber run that already
- * exists is not started again. Subscribers this app cannot deliver to are marked owed, for the
- * lifecycle sweep of an instance that can.
+ * settled runs' lifecycle events again. `--run` goes through the console's
+ * `POST /runs/:id/republish-lifecycle`; `--workflow` through the same port's `republishLifecycle`.
+ * Backfills a subscriber registered after the runs settled, or retries one that failed; a subscriber
+ * run that already exists is not started again. Subscribers this app cannot deliver to are marked
+ * owed, for the lifecycle sweep of an instance that can.
  */
-export default class DurableLifecycleRepublish extends BaseCommand {
+export default class DurableLifecycleRepublish extends DurableConsoleCommand {
   static override commandName = 'durable:lifecycle:republish';
   static override description = "Publish settled runs' lifecycle events again";
-  static override options: CommandOptions = { startApp: true };
 
   @flags.string({ flagName: 'run', description: 'One settled run id' })
   declare runId?: string;
@@ -36,7 +37,7 @@ export default class DurableLifecycleRepublish extends BaseCommand {
   @flags.string({ description: 'Only this subscribing workflow' })
   declare subscriber?: string;
 
-  override async run(): Promise<void> {
+  protected async perform(): Promise<void> {
     const target = republishLifecycleTarget({
       run: this.runId,
       workflow: this.workflow,
@@ -46,14 +47,27 @@ export default class DurableLifecycleRepublish extends BaseCommand {
       limit: this.limit,
       subscriber: this.subscriber,
     });
-    if ('error' in target) {
-      this.logger.error(target.error);
-      this.exitCode = 1;
-      return;
+    if ('error' in target) throw new CliRefusal(target.error);
+    const deps = await this.deps();
+    this.audit('runId' in target ? target.runId : `workflow ${target.workflow}`);
+    let result: RepublishLifecycleResult;
+    if ('runId' in target) {
+      ({ result } = await this.call<{ result: RepublishLifecycleResult }>(
+        republishLifecycleRun,
+        {
+          params: { id: target.runId },
+          body: target.subscriber ? { subscriber: target.subscriber } : {},
+        },
+        deps,
+      ));
+    } else {
+      if (!deps.engine.republishLifecycle) {
+        throw new CliRefusal('republish is unavailable on this topology');
+      }
+      result = await deps.engine.republishLifecycle(target);
     }
-    const engine = await this.app.container.make(WorkflowEngine);
-    const result = await engine.republishLifecycle(target);
-    this.logger.info(renderRepublishResult(result));
     if (result.failed.length > 0) this.exitCode = 1;
+    if (this.json) return this.printJson({ result });
+    this.logger.info(renderRepublishResult(result));
   }
 }

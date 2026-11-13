@@ -94,7 +94,7 @@ A step that names a flow-control [`queue`](/docs/durable/reliability/flow-contro
 
 ### Retrying after the budget is spent
 
-Exhausting `retries` fails the run (unless a [saga](/docs/durable/reliability/sagas), an [`onError`](/docs/durable/reliability/on-error) route or the workflow's own `catch` handles it). A retry of the run — the dashboard's retry, `node ace durable:retry <runId>`, or `engine.requeue(runId)` — resets every failed checkpoint to a fresh first attempt (`attempts` back to 0, `retryable` forced back on, due immediately), so the replay re-dispatches the failed step with its full budget instead of re-throwing the recorded failure. Completed steps are not re-run.
+Exhausting `retries` fails the run (unless a [saga](/docs/durable/reliability/sagas), an [`onError`](/docs/durable/reliability/on-error) route or the workflow's own `catch` handles it). A retry of the run — the dashboard's retry, `node ace durable:runs:retry <runId>`, or `engine.requeue(runId)` — resets every failed checkpoint to a fresh first attempt (`attempts` back to 0, `retryable` forced back on, due immediately), so the replay re-dispatches the failed step with its full budget instead of re-throwing the recorded failure. Completed steps are not re-run.
 
 <CodeFlow scene="retries" />
 
