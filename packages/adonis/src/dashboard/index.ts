@@ -33,6 +33,14 @@ export {
   normalizeConsoleDecision,
   resolveConsoleAuthorize,
 } from './console_authorize.js';
+// The console shell's data-block fields: who is signed in, and how to sign out.
+export type {
+  ConsoleSignOut,
+  ConsoleViewer,
+  SignOutOption,
+  ViewerHook,
+} from './console_shell.js';
+export { resolveSignOut, resolveViewer, viewerFromUser } from './console_shell.js';
 export type {
   AgoraConsoleEntry,
   AgoraConsoleIcon,

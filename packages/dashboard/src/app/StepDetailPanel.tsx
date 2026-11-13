@@ -32,16 +32,16 @@ function clockMs(at: number): string {
 }
 
 const SUB_TONE: Record<NonNullable<StepEvent['status']>, string> = {
-  ok: 'border-emerald-500/25 bg-emerald-500/10 text-emerald-300',
-  failed: 'border-red-500/25 bg-red-500/10 text-red-300',
-  skipped: 'border-amber-500/25 bg-amber-500/10 text-amber-300',
+  ok: 'border-good/25 bg-good/10 text-good',
+  failed: 'border-bad/25 bg-bad/10 text-bad',
+  skipped: 'border-warn/25 bg-warn/10 text-warn',
 };
 
 const LEVEL_TONE: Record<StepEvent['level'], string> = {
-  debug: 'text-zinc-500',
-  info: 'text-zinc-300',
-  warn: 'text-amber-300',
-  error: 'text-red-300',
+  debug: 'text-dim',
+  info: 'text-fg-2',
+  warn: 'text-warn',
+  error: 'text-bad',
 };
 
 const SUB_ORDER: Array<NonNullable<StepEvent['status']>> = ['ok', 'failed', 'skipped'];
@@ -49,9 +49,9 @@ const SUB_ORDER: Array<NonNullable<StepEvent['status']>> = ['ok', 'failed', 'ski
 function LogLine({ e }: { e: StepEvent }) {
   return (
     <div className="flex gap-2 py-0.5">
-      <span className="shrink-0 text-zinc-600 tnum">{clockMs(e.at)}</span>
+      <span className="shrink-0 text-faint tnum">{clockMs(e.at)}</span>
       <span className={`shrink-0 uppercase ${LEVEL_TONE[e.level]}`}>{e.level}</span>
-      <span className="min-w-0 break-words text-zinc-300">{e.message}</span>
+      <span className="min-w-0 break-words text-fg-2">{e.message}</span>
     </div>
   );
 }
@@ -62,9 +62,7 @@ function SubProcessRow({ sub, showGroup = true }: { sub: SubProcess; showGroup?:
   const hasMessage = sub.terminal?.message !== undefined && sub.terminal.message !== sub.name;
   const expandable = sub.phases.length > 0 || sub.logs.length > 0 || hasMessage;
   const [open, setOpen] = useState(sub.status === 'failed'); // surface failures without a click
-  const tone = sub.status
-    ? SUB_TONE[sub.status]
-    : 'border-amber-500/25 bg-amber-500/10 text-amber-300';
+  const tone = sub.status ? SUB_TONE[sub.status] : 'border-warn/25 bg-warn/10 text-warn';
 
   return (
     <li className={`rounded-md border ${tone}`}>
@@ -78,21 +76,21 @@ function SubProcessRow({ sub, showGroup = true }: { sub: SubProcess; showGroup?:
         <span className="flex min-w-0 items-center gap-2">
           {expandable && (
             <span
-              className={`text-[9px] text-zinc-500 transition-transform duration-150 ${open ? '' : '-rotate-90'}`}
+              className={`text-[9px] text-dim transition-transform duration-150 ${open ? '' : '-rotate-90'}`}
             >
               ▼
             </span>
           )}
-          <span className="mono truncate text-zinc-200">{sub.name}</span>
+          <span className="mono truncate text-fg">{sub.name}</span>
           {showGroup && sub.group && (
-            <span className="mono shrink-0 text-[10px] uppercase tracking-wider text-zinc-500">
+            <span className="mono shrink-0 text-[10px] uppercase tracking-wider text-dim">
               {sub.group}
             </span>
           )}
         </span>
         <span className="mono flex shrink-0 items-center gap-2 text-[10px] uppercase tracking-wider">
           {sub.durationMs !== undefined && (
-            <span className="tnum text-zinc-400">{fmtMs(sub.durationMs)}</span>
+            <span className="tnum text-fg-2">{fmtMs(sub.durationMs)}</span>
           )}
           <span>{sub.status ?? 'running'}</span>
         </span>
@@ -105,10 +103,10 @@ function SubProcessRow({ sub, showGroup = true }: { sub: SubProcess; showGroup?:
               {sub.phases.map((p, i) => (
                 // biome-ignore lint/suspicious/noArrayIndexKey: phases are an append-only log with no id; (at, phase) can repeat
                 <li key={`${p.at}-${p.phase}-${i}`} className="flex gap-2">
-                  <span className="shrink-0 text-zinc-600 tnum">{clockMs(p.at)}</span>
-                  <span className="text-zinc-400">{p.phase}</span>
+                  <span className="shrink-0 text-faint tnum">{clockMs(p.at)}</span>
+                  <span className="text-fg-2">{p.phase}</span>
                   {sub.startedAt !== undefined && (
-                    <span className="text-zinc-600 tnum">+{fmtMs(p.at - sub.startedAt)}</span>
+                    <span className="text-faint tnum">+{fmtMs(p.at - sub.startedAt)}</span>
                   )}
                 </li>
               ))}
@@ -118,8 +116,8 @@ function SubProcessRow({ sub, showGroup = true }: { sub: SubProcess; showGroup?:
             <div
               className={`mono mb-2 rounded border p-2 text-[11px] ${
                 sub.status === 'failed'
-                  ? 'border-red-500/25 bg-red-500/10 text-red-200'
-                  : 'border-line bg-black/20 text-zinc-300'
+                  ? 'border-bad/25 bg-bad/10 text-bad'
+                  : 'border-line bg-sunken/20 text-fg-2'
               }`}
             >
               {sub.terminal.message}
@@ -153,7 +151,7 @@ function StepEvents({ events }: { events: StepEvent[] }) {
       {subs.length > 0 && (
         <section className="rise">
           <div className="mb-1.5 flex items-center justify-between">
-            <span className="mono text-[10px] uppercase tracking-[0.18em] text-zinc-500">
+            <span className="mono text-[10px] uppercase tracking-[0.18em] text-dim">
               sub-processes · {subs.length}
             </span>
             <span className="mono flex gap-2 text-[10px] uppercase tracking-wider">
@@ -176,7 +174,7 @@ function StepEvents({ events }: { events: StepEvent[] }) {
               .sort(([a], [b]) => (a === '—' ? 1 : b === '—' ? -1 : a.localeCompare(b)))
               .map(([group, groupSubs]) => (
                 <div key={group} className="mb-2">
-                  <div className="mono mb-1 text-[10px] uppercase tracking-wider text-zinc-500">
+                  <div className="mono mb-1 text-[10px] uppercase tracking-wider text-dim">
                     {group}
                   </div>
                   <ul className="flex flex-col gap-1">
@@ -198,10 +196,10 @@ function StepEvents({ events }: { events: StepEvent[] }) {
 
       {stepLogs.length > 0 && (
         <section className="rise">
-          <div className="mono mb-1.5 text-[10px] uppercase tracking-[0.18em] text-zinc-500">
+          <div className="mono mb-1.5 text-[10px] uppercase tracking-[0.18em] text-dim">
             logs · {stepLogs.length}
           </div>
-          <div className="mono max-h-64 overflow-auto rounded-lg border border-line bg-black/40 p-2.5 text-[11px] leading-relaxed">
+          <div className="mono max-h-64 overflow-auto rounded-lg border border-line bg-sunken/40 p-2.5 text-[11px] leading-relaxed">
             {stepLogs.map((e, i) => (
               // biome-ignore lint/suspicious/noArrayIndexKey: log lines are append-only with no id; timestamps can repeat
               <LogLine key={`${e.at}-${i}`} e={e} />
@@ -218,7 +216,7 @@ export function CopyButton({ value }: { value: string }) {
   return (
     <button
       type="button"
-      className="flex items-center gap-1 rounded border border-line px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-zinc-500 transition-colors hover:text-zinc-200"
+      className="flex items-center gap-1 rounded border border-line px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-dim transition-colors hover:text-fg"
       onClick={async () => {
         try {
           await navigator.clipboard.writeText(value);
@@ -240,10 +238,10 @@ export function Json({ label, value }: { label: string; value: unknown }) {
   return (
     <section className="rise">
       <div className="mb-1.5 flex items-center justify-between">
-        <span className="mono text-[10px] uppercase tracking-[0.18em] text-zinc-500">{label}</span>
+        <span className="mono text-[10px] uppercase tracking-[0.18em] text-dim">{label}</span>
         <CopyButton value={text} />
       </div>
-      <pre className="mono max-h-64 overflow-auto rounded-lg border border-line bg-black/40 p-3 text-[11.5px] leading-relaxed text-zinc-300">
+      <pre className="mono max-h-64 overflow-auto rounded-lg border border-line bg-sunken/40 p-3 text-[11.5px] leading-relaxed text-fg-2">
         {text}
       </pre>
     </section>
@@ -255,15 +253,15 @@ export function ErrorBlock({ error }: { error: StepError }) {
   return (
     <>
       <section className="rise">
-        <div className="mono mb-1.5 flex items-center gap-2 text-[10px] uppercase tracking-[0.18em] text-red-400/80">
+        <div className="mono mb-1.5 flex items-center gap-2 text-[10px] uppercase tracking-[0.18em] text-bad/80">
           <span>error</span>
           {error.code && (
-            <span className="rounded border border-red-500/30 px-1.5 py-px normal-case tracking-normal text-red-300">
+            <span className="rounded border border-bad/30 px-1.5 py-px normal-case tracking-normal text-bad">
               {error.code}
             </span>
           )}
         </div>
-        <div className="mono rounded-lg border border-red-500/25 bg-red-500/10 p-3 text-[11.5px] leading-relaxed text-red-200">
+        <div className="mono rounded-lg border border-bad/25 bg-bad/10 p-3 text-[11.5px] leading-relaxed text-bad">
           {error.message}
         </div>
       </section>
@@ -275,10 +273,8 @@ export function ErrorBlock({ error }: { error: StepError }) {
 function Field({ k, v, mono = true }: { k: string; v: React.ReactNode; mono?: boolean }) {
   return (
     <div className="flex items-baseline justify-between gap-3 py-1.5">
-      <span className="mono shrink-0 text-[10px] uppercase tracking-[0.16em] text-zinc-600">
-        {k}
-      </span>
-      <span className={`truncate text-right text-[12px] text-zinc-200 ${mono ? 'mono tnum' : ''}`}>
+      <span className="mono shrink-0 text-[10px] uppercase tracking-[0.16em] text-faint">{k}</span>
+      <span className={`truncate text-right text-[12px] text-fg ${mono ? 'mono tnum' : ''}`}>
         {v}
       </span>
     </div>
@@ -310,17 +306,17 @@ function ChildRunInline({
       return next;
     });
   if (!data) {
-    return <div className="mono px-2 py-2 text-[10px] text-zinc-600">loading child run…</div>;
+    return <div className="mono px-2 py-2 text-[10px] text-faint">loading child run…</div>;
   }
   if (data.timeline.length === 0) {
     return (
-      <div className="mono px-2 py-2 text-[10px] text-zinc-600">
+      <div className="mono px-2 py-2 text-[10px] text-faint">
         no steps recorded yet — child {data.run.status}
       </div>
     );
   }
   return (
-    <div className="mt-2 max-h-80 space-y-1 overflow-auto rounded-md border border-line bg-black/20 p-1.5">
+    <div className="mt-2 max-h-80 space-y-1 overflow-auto rounded-md border border-line bg-sunken/20 p-1.5">
       <RunSpans
         run={data.run}
         timeline={data.timeline}
@@ -367,15 +363,15 @@ export function StepDetailPanel({
             <span
               className={`grid h-6 w-6 shrink-0 place-items-center rounded-md ${
                 failed
-                  ? 'bg-red-500/15 text-red-300'
+                  ? 'bg-bad/15 text-bad'
                   : pending
-                    ? 'bg-amber-500/15 text-amber-300'
-                    : 'bg-emerald-500/15 text-emerald-300'
+                    ? 'bg-warn/15 text-warn'
+                    : 'bg-good/15 text-good'
               }`}
             >
               <Icon width={13} height={13} />
             </span>
-            <h3 className="truncate text-[15px] font-semibold tracking-tight text-zinc-50">
+            <h3 className="truncate text-[15px] font-semibold tracking-tight text-fg">
               {step.name}
             </h3>
           </div>
@@ -386,7 +382,7 @@ export function StepDetailPanel({
         <button
           type="button"
           onClick={onClose}
-          className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-line text-zinc-500 transition-colors hover:text-zinc-200"
+          className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-line text-dim transition-colors hover:text-fg"
           aria-label="Close"
         >
           <XIcon />
@@ -394,16 +390,16 @@ export function StepDetailPanel({
       </div>
 
       <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-auto px-5 py-4">
-        <div className="rounded-lg border border-line bg-black/20 px-3.5 py-1">
+        <div className="rounded-lg border border-line bg-sunken/20 px-3.5 py-1">
           <Field k="seq" v={`#${step.seq}`} />
           {queueMs >= 1 && (
-            <Field k="queued" v={<span className="text-sky-300">{fmtMs(queueMs)}</span>} />
+            <Field k="queued" v={<span className="text-info">{fmtMs(queueMs)}</span>} />
           )}
           <Field
             k="duration"
             v={
               pending ? (
-                <span className="text-amber-300">running…</span>
+                <span className="text-warn">running…</span>
               ) : (
                 fmtDur(step.startedAt, step.finishedAt)
               )
@@ -412,7 +408,7 @@ export function StepDetailPanel({
           <Field
             k="attempts"
             v={
-              <span className={step.attempts > 1 ? 'text-amber-300' : ''}>
+              <span className={step.attempts > 1 ? 'text-warn' : ''}>
                 {step.attempts > 1 && <BoltIcon width={11} height={11} className="mr-1 inline" />}
                 {step.attempts}
               </span>
@@ -433,14 +429,14 @@ export function StepDetailPanel({
         {childRunId && (
           <section className="rise">
             <div className="mb-1.5 flex items-center justify-between">
-              <span className="mono text-[10px] uppercase tracking-[0.18em] text-zinc-500">
+              <span className="mono text-[10px] uppercase tracking-[0.18em] text-dim">
                 child run
               </span>
               {onOpenRun && (
                 <button
                   type="button"
                   onClick={() => onOpenRun(childRunId)}
-                  className="mono rounded border border-line px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-zinc-500 transition-colors hover:text-zinc-200"
+                  className="mono rounded border border-line px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-dim transition-colors hover:text-fg"
                 >
                   open ↗
                 </button>
@@ -449,16 +445,16 @@ export function StepDetailPanel({
             <button
               type="button"
               onClick={() => setChildOpen((v) => !v)}
-              className="flex w-full items-center gap-2 rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2.5 py-1.5 text-left transition-colors hover:bg-indigo-500/20"
+              className="flex w-full items-center gap-2 rounded-md border border-violet/30 bg-violet/10 px-2.5 py-1.5 text-left transition-colors hover:bg-violet/20"
               title={childOpen ? 'Collapse child run' : 'Expand child run inline'}
             >
               <span
-                className="inline-block text-[9px] text-indigo-300 transition-transform"
+                className="inline-block text-[9px] text-violet transition-transform"
                 style={{ transform: childOpen ? 'rotate(90deg)' : 'rotate(0deg)' }}
               >
                 ▸
               </span>
-              <span className="mono truncate text-[11px] text-indigo-300">{childRunId}</span>
+              <span className="mono truncate text-[11px] text-violet">{childRunId}</span>
             </button>
             {childOpen && <ChildRunInline id={childRunId} onOpenRun={onOpenRun} />}
           </section>

@@ -1,11 +1,11 @@
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useMemo, useRef, useState } from 'react';
+import { cn } from '../../agora-kit/lib/utils';
+import { Badge } from '../../agora-kit/ui/badge';
+import { Button } from '../../agora-kit/ui/button';
+import { Popover, PopoverContent, PopoverTrigger } from '../../agora-kit/ui/popover';
 import { CheckIcon, XIcon } from '../icons';
-import { Badge } from './badge';
-import { Button } from './button';
-import { cn } from './cn';
 import { Input } from './input';
-import { Popover, PopoverContent, PopoverTrigger } from './popover';
 
 /** How close to the bottom of the list a scroll gets before the next page is asked for. */
 const LOAD_MORE_MARGIN_PX = 48;
@@ -159,14 +159,14 @@ export function MultiSelect({
         aria-selected={selected}
         onClick={() => toggle(option.value)}
         className={cn(
-          'mono flex w-full items-center gap-2 px-2 py-1 text-left text-xs hover:bg-zinc-800',
-          selected ? 'text-zinc-100' : 'text-zinc-400',
+          'mono flex w-full items-center gap-2 px-2 py-1 text-left text-xs hover:bg-hover',
+          selected ? 'text-fg' : 'text-fg-2',
         )}
       >
         <span className="w-3 shrink-0">{selected && <CheckIcon width={12} height={12} />}</span>
         <span className="truncate">{option.value}</span>
         {/* A count of 0 means "selected, but outside the current scope" — no runs to show. */}
-        <span className="ml-auto shrink-0 text-[10px] text-zinc-600">{option.count}</span>
+        <span className="ml-auto shrink-0 text-[10px] text-faint">{option.count}</span>
       </button>
     );
   };
@@ -179,9 +179,9 @@ export function MultiSelect({
     !value.includes(custom);
 
   return (
-    <div className="flex items-center gap-1.5 rounded-md border border-line px-2 py-1 transition-colors focus-within:border-zinc-600">
+    <div className="flex items-center gap-1.5 rounded-md border border-line px-2 py-1 transition-colors focus-within:border-line-strong">
       {glyph !== undefined && (
-        <span className="shrink-0 text-zinc-600" aria-hidden>
+        <span className="shrink-0 text-faint" aria-hidden>
           {glyph}
         </span>
       )}
@@ -192,21 +192,21 @@ export function MultiSelect({
               type="button"
               aria-label={label}
               title={title ?? label}
-              className="mono flex min-w-0 flex-1 flex-wrap items-center gap-1 py-0.5 text-left text-xs text-zinc-200 focus:outline-none"
+              className="mono flex min-w-0 flex-1 flex-wrap items-center gap-1 py-0.5 text-left text-xs text-fg focus:outline-none"
             />
           }
         >
           {value.length === 0 ? (
-            <span className="text-zinc-600">{placeholder}</span>
+            <span className="text-faint">{placeholder}</span>
           ) : (
             value.map((v) => (
-              <Badge key={v} className="mono max-w-[10rem] truncate">
+              <Badge variant="neutral" key={v} className="mono max-w-[10rem] truncate">
                 {v}
               </Badge>
             ))
           )}
         </PopoverTrigger>
-        <PopoverContent align="start" className="w-72 p-0">
+        <PopoverContent align="start" className="w-72 gap-0 overflow-hidden p-0">
           <div className="border-b border-line px-2">
             <Input
               autoFocus
@@ -240,20 +240,18 @@ export function MultiSelect({
                   toggle(custom);
                   setSearch('');
                 }}
-                className="mono flex w-full items-center gap-2 px-2 py-1 text-left text-xs text-zinc-300 hover:bg-zinc-800"
+                className="mono flex w-full items-center gap-2 px-2 py-1 text-left text-xs text-fg-2 hover:bg-hover"
               >
-                <span className="w-3 shrink-0 text-zinc-600">+</span>
+                <span className="w-3 shrink-0 text-faint">+</span>
                 <span className="truncate">{custom}</span>
-                <span className="ml-auto text-[10px] text-zinc-600">use as typed</span>
+                <span className="ml-auto text-[10px] text-faint">use as typed</span>
               </button>
             )}
             {loadingMore && shown.length > 0 && (
-              <p className="px-2 py-1 text-[10px] text-zinc-600">loading more…</p>
+              <p className="px-2 py-1 text-[10px] text-faint">loading more…</p>
             )}
             {shown.length === 0 && !canAddCustom && (
-              <p
-                className={cn('px-2 py-2 text-[11px]', failed ? 'text-rose-300' : 'text-zinc-600')}
-              >
+              <p className={cn('px-2 py-2 text-[11px]', failed ? 'text-bad' : 'text-faint')}>
                 {failed
                   ? "couldn't load values — type one instead"
                   : loading
@@ -289,7 +287,7 @@ export function MultiSelect({
       {value.length > 0 && (
         <Button
           variant="ghost"
-          size="icon"
+          size="icon-sm"
           onClick={() => onChange([])}
           title={`clear ${label}`}
           aria-label={`clear ${label}`}

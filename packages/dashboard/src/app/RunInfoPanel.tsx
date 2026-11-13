@@ -9,7 +9,7 @@ export function RunInfoPanel({ run, onClose }: { run: WorkflowRun; onClose: () =
     <aside className="absolute inset-y-0 right-0 z-30 flex w-[380px] max-w-[90%] flex-col border-l border-line bg-panel/95 shadow-2xl backdrop-blur-md rise">
       <div className="flex items-start justify-between gap-3 border-b border-line px-5 py-4">
         <div className="min-w-0">
-          <h3 className="truncate text-[15px] font-semibold tracking-tight text-zinc-50">
+          <h3 className="truncate text-[15px] font-semibold tracking-tight text-fg">
             {run.workflow}
           </h3>
           <div className={`mono mt-1 text-[11px] uppercase tracking-wider s-${run.status}`}>
@@ -19,7 +19,7 @@ export function RunInfoPanel({ run, onClose }: { run: WorkflowRun; onClose: () =
         <button
           type="button"
           onClick={onClose}
-          className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-line text-zinc-500 transition-colors hover:text-zinc-200"
+          className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-line text-dim transition-colors hover:text-fg"
           aria-label="Close"
         >
           <XIcon />
@@ -29,7 +29,7 @@ export function RunInfoPanel({ run, onClose }: { run: WorkflowRun; onClose: () =
         {run.error && <ErrorBlock error={run.error} />}
         {run.input !== undefined && <Json label="input" value={run.input} />}
         {run.output !== undefined && <Json label="output" value={run.output} />}
-        {hasNothing && <div className="text-sm text-zinc-600">No input/output recorded.</div>}
+        {hasNothing && <div className="text-sm text-faint">No input/output recorded.</div>}
       </div>
     </aside>
   );

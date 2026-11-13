@@ -6,6 +6,8 @@
  * ecosystem.
  */
 
+import type { ConsoleSignOut, ConsoleViewer } from './console_shell.js';
+
 /** Placeholder base Vite bakes into asset URLs (`packages/dashboard/vite.config.ts`); rewritten to the
  *  configured dashboard `path` at serve time — the SAME built bundle mounts at any path with no rebuild. */
 export const BASE_PLACEHOLDER = '/__DURABLE_DASHBOARD__/';
@@ -43,6 +45,12 @@ export interface InjectedConfig {
   api: string;
   /** The console switcher, present only when other Agora consoles are registered in the app. */
   switcher?: SwitcherConfig;
+  /** ⌘K search across the consoles (`GET <endpoint>?q=`), present when a registry exists. */
+  search?: { endpoint: string };
+  /** Who is signed in (sidebar footer). Absent → no user row. */
+  viewer?: ConsoleViewer;
+  /** How the footer signs out. Absent → no sign-out control. */
+  signOut?: ConsoleSignOut;
 }
 
 /** Where the SPA asks which other consoles the viewer may open, and how many are registered. */
@@ -72,13 +80,21 @@ export function renderIndexHtml(
   html: string,
   basePath: string,
   apiBasePath: string,
-  extra: { switcher?: SwitcherConfig } = {},
+  extra: {
+    switcher?: SwitcherConfig;
+    search?: { endpoint: string };
+    viewer?: ConsoleViewer;
+    signOut?: ConsoleSignOut;
+  } = {},
 ): string {
   const based = html.split(BASE_PLACEHOLDER).join(`${basePath}/`);
   const config: InjectedConfig = {
     base: basePath,
     api: apiBasePath,
     ...(extra.switcher && extra.switcher.others > 0 ? { switcher: extra.switcher } : {}),
+    ...(extra.search ? { search: extra.search } : {}),
+    ...(extra.viewer ? { viewer: extra.viewer } : {}),
+    ...(extra.signOut ? { signOut: extra.signOut } : {}),
   };
   // `<` escaped as `\u003c` inside the JSON: a data block ends at the first `</script`, and a
   // config value must not be able to close it early. Valid JSON either way.

@@ -148,9 +148,9 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
   // `--good`.
   const tone = failed
     ? {
-        rail: 'bg-red-400',
-        badge: 'bg-red-500/15 text-red-300',
-        pill: 'bg-red-500/20 text-red-300',
+        rail: 'bg-bad',
+        badge: 'bg-bad/15 text-bad',
+        pill: 'bg-bad/20 text-bad',
       }
     : pending
       ? {
@@ -159,9 +159,9 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
           pill: 'bg-live/20 text-live',
         }
       : {
-          rail: 'bg-emerald-400',
-          badge: 'bg-emerald-500/15 text-emerald-300',
-          pill: 'bg-emerald-500/20 text-emerald-300',
+          rail: 'bg-good',
+          badge: 'bg-good/15 text-good',
+          pill: 'bg-good/20 text-good',
         };
   return (
     <div
@@ -170,23 +170,23 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
         data.selected
           ? 'border-brand/60 ring-2 ring-brand/30'
           : failed
-            ? 'border-red-500/40 hover:border-red-400/60'
+            ? 'border-bad/40 hover:border-bad/60'
             : showChildChrome
-              ? 'border-indigo-500/40 hover:border-indigo-400/60'
-              : 'border-line hover:border-zinc-600'
+              ? 'border-violet/40 hover:border-violet/60'
+              : 'border-line hover:border-line-strong'
       }`}
     >
       {/* status rail */}
       <span
         className={`absolute inset-y-0 left-0 w-[3px] ${tone.rail} ${pending ? 'animate-pulse' : ''}`}
       />
-      <Handle type="target" position={Position.Left} className="!border-0 !bg-zinc-600" />
+      <Handle type="target" position={Position.Left} className="!border-0 !bg-line-strong" />
       <div className="py-2.5 pl-3.5 pr-3">
         <div className="flex items-center gap-2">
           <span className={`grid h-5 w-5 shrink-0 place-items-center rounded ${tone.badge}`}>
             <Icon width={12} height={12} />
           </span>
-          <span className="truncate text-[13px] font-medium text-zinc-100">{data.name}</span>
+          <span className="truncate text-[13px] font-medium text-fg">{data.name}</span>
           <span
             className={`ml-auto grid h-4 w-4 shrink-0 place-items-center rounded-full ${tone.pill} ${pending ? 'animate-pulse' : ''}`}
           >
@@ -199,7 +199,7 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
             )}
           </span>
         </div>
-        <div className="mono mt-1.5 flex items-center gap-1.5 text-[10px] text-zinc-500">
+        <div className="mono mt-1.5 flex items-center gap-1.5 text-[10px] text-dim">
           {isChild ? (
             <span className="flex items-center gap-1">
               {/* A collapsed single-step wrapper has nothing further to expand — no chevron. */}
@@ -212,7 +212,7 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
                     if (data.childRunId) data.onToggleChild?.(data.childRunId);
                   }}
                   title={data.childExpanded ? 'Collapse child flow' : 'Expand child flow inline'}
-                  className="grid h-4 w-4 place-items-center rounded border border-indigo-500/30 bg-indigo-500/10 text-indigo-300 transition-colors hover:border-indigo-400/60 hover:bg-indigo-500/20 hover:text-indigo-200"
+                  className="grid h-4 w-4 place-items-center rounded border border-violet/30 bg-violet/10 text-violet transition-colors hover:border-violet/60 hover:bg-violet/20 hover:text-violet"
                 >
                   <span
                     className="inline-block text-[9px] transition-transform"
@@ -230,39 +230,37 @@ function StepCardNode({ data }: NodeProps<Node<StepData>>) {
                   if (data.childRunId) data.onOpenRun?.(data.childRunId);
                 }}
                 title="Open the child run"
-                className="rounded border border-indigo-500/30 bg-indigo-500/10 px-1 text-indigo-300 transition-colors hover:border-indigo-400/60 hover:bg-indigo-500/20 hover:text-indigo-200"
+                className="rounded border border-violet/30 bg-violet/10 px-1 text-violet transition-colors hover:border-violet/60 hover:bg-violet/20 hover:text-violet"
               >
                 child ↗
               </button>
             </span>
           ) : (
-            <span className="rounded border border-line px-1 text-zinc-400">{data.kind}</span>
+            <span className="rounded border border-line px-1 text-fg-2">{data.kind}</span>
           )}
           {data.attempts > 1 && (
-            <span className="flex items-center gap-0.5 text-amber-300">
+            <span className="flex items-center gap-0.5 text-warn">
               <BoltIcon width={9} height={9} />
               {data.attempts}
             </span>
           )}
           {data.workerGroup && <span className="truncate">@{data.workerGroup}</span>}
-          <span className="tnum ml-auto text-zinc-400">
+          <span className="tnum ml-auto text-fg-2">
             #{data.seq}
-            {data.duration && <span className="text-zinc-600"> · {data.duration}</span>}
+            {data.duration && <span className="text-faint"> · {data.duration}</span>}
           </span>
         </div>
         {data.subs && (
           <div className="mono mt-1.5 flex items-center gap-2 border-t border-line pt-1.5 text-[10px]">
-            {data.subs.ok > 0 && <span className="text-emerald-300">{data.subs.ok} ok</span>}
-            {data.subs.failed > 0 && (
-              <span className="text-red-300">{data.subs.failed} failed</span>
-            )}
+            {data.subs.ok > 0 && <span className="text-good">{data.subs.ok} ok</span>}
+            {data.subs.failed > 0 && <span className="text-bad">{data.subs.failed} failed</span>}
             {data.subs.skipped > 0 && (
-              <span className="text-amber-300">{data.subs.skipped} skipped</span>
+              <span className="text-warn">{data.subs.skipped} skipped</span>
             )}
           </div>
         )}
       </div>
-      <Handle type="source" position={Position.Right} className="!border-0 !bg-zinc-600" />
+      <Handle type="source" position={Position.Right} className="!border-0 !bg-line-strong" />
     </div>
   );
 }
@@ -274,30 +272,30 @@ function FanCardNode({ data }: NodeProps<Node<FanData>>) {
   const status = fanStatus(fan, data.runFinished);
   const failed = status === 'failed';
   const pending = status === 'pending' || status === 'running';
-  const rail = failed ? 'bg-red-400' : pending ? 'bg-live' : 'bg-emerald-400';
+  const rail = failed ? 'bg-bad' : pending ? 'bg-live' : 'bg-good';
   const pct = (n: number) => `${(n / Math.max(progress.total, 1)) * 100}%`;
   return (
     <div
       title={`parallel fan ${fan.group}`}
       className={`relative w-[208px] overflow-hidden rounded-xl border bg-panel/95 shadow-lg backdrop-blur ${
-        failed ? 'border-red-500/40' : 'border-indigo-500/40'
+        failed ? 'border-bad/40' : 'border-violet/40'
       }`}
     >
       <span
         className={`absolute inset-y-0 left-0 w-[3px] ${rail} ${pending ? 'animate-pulse' : ''}`}
       />
-      <Handle type="target" position={Position.Left} className="!border-0 !bg-zinc-600" />
+      <Handle type="target" position={Position.Left} className="!border-0 !bg-line-strong" />
       <div className="py-2.5 pl-3.5 pr-3">
         <div className="flex items-center gap-2">
-          <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-indigo-500/15 text-[11px] text-indigo-300">
+          <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-violet/15 text-[11px] text-violet">
             ⑃
           </span>
-          <span className="truncate text-[13px] font-medium text-zinc-100">{fan.label}</span>
-          <span className="mono tnum ml-auto shrink-0 text-[11px] text-zinc-400">
+          <span className="truncate text-[13px] font-medium text-fg">{fan.label}</span>
+          <span className="mono tnum ml-auto shrink-0 text-[11px] text-fg-2">
             {fanSizeLabel(progress)}
           </span>
         </div>
-        <div className="mt-2 flex h-1.5 overflow-hidden rounded-full bg-zinc-800">
+        <div className="mt-2 flex h-1.5 overflow-hidden rounded-full bg-hover">
           {FAN_PROGRESS_SEGMENTS.map((seg) => (
             <span
               key={seg.key}
@@ -315,12 +313,12 @@ function FanCardNode({ data }: NodeProps<Node<FanData>>) {
               </span>
             ) : null,
           )}
-          <span className="ml-auto text-zinc-500">
+          <span className="ml-auto text-dim">
             #{fan.firstSeq}–{fan.lastSeq}
           </span>
         </div>
       </div>
-      <Handle type="source" position={Position.Right} className="!border-0 !bg-zinc-600" />
+      <Handle type="source" position={Position.Right} className="!border-0 !bg-line-strong" />
     </div>
   );
 }
@@ -333,10 +331,10 @@ function TerminalNode({ data }: NodeProps<Node<EndData>>) {
     <div
       className={`s-${data.status} flex items-center gap-2 rounded-full border border-current/30 bg-panel px-3.5 py-1.5`}
     >
-      <Handle type="target" position={Position.Left} className="!border-0 !bg-zinc-600" />
+      <Handle type="target" position={Position.Left} className="!border-0 !bg-line-strong" />
       <span className={`dot ${live ? 'pulse' : ''}`} />
       <span className="mono text-[11px] uppercase tracking-wider">{data.label}</span>
-      <Handle type="source" position={Position.Right} className="!border-0 !bg-zinc-600" />
+      <Handle type="source" position={Position.Right} className="!border-0 !bg-line-strong" />
     </div>
   );
 }
@@ -414,7 +412,7 @@ export function WorkflowGraph({
       id: `${source}->${target}`,
       source,
       target,
-      style: { stroke: failed ? '#f87171' : 'var(--line)', strokeWidth: 1.5 },
+      style: { stroke: failed ? 'var(--agora-bad)' : 'var(--agora-line-strong)', strokeWidth: 1.5 },
     });
     // The branch from a child node down into its expanded sub-flow's first step — dashed + indigo so
     // it reads as "drills into a sub-workflow", distinct from the solid main-flow edges.
@@ -422,7 +420,7 @@ export function WorkflowGraph({
       id: `${source}=>${target}`,
       source,
       target,
-      style: { stroke: '#818cf8', strokeWidth: 1.5, strokeDasharray: '4 3' },
+      style: { stroke: 'var(--agora-violet)', strokeWidth: 1.5, strokeDasharray: '4 3' },
     });
 
     // A connector is a node the *next* step links from, plus whether its source failed (so the edge
@@ -614,7 +612,10 @@ export function WorkflowGraph({
         animated: live,
         // In flight is `--live`, not the brand accent: this edge is reporting run state, and the
         // node it points at (the `running` terminal pill) is already that blue.
-        style: { stroke: live ? 'var(--live)' : 'var(--line)', strokeWidth: live ? 2 : 1.5 },
+        style: {
+          stroke: live ? 'var(--agora-live)' : 'var(--agora-line-strong)',
+          strokeWidth: live ? 2 : 1.5,
+        },
       });
     }
 
@@ -657,7 +658,12 @@ export function WorkflowGraph({
       panOnScroll
       minZoom={0.3}
     >
-      <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#1c1c22" />
+      <Background
+        variant={BackgroundVariant.Dots}
+        gap={22}
+        size={1}
+        color="var(--agora-line-strong)"
+      />
       <Controls showInteractive={false} position="bottom-right" />
     </ReactFlow>
   );

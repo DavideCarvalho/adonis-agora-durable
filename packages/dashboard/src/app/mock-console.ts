@@ -706,6 +706,71 @@ function body(path: string, init?: RequestInit): MockAnswer {
       .slice(offset, offset + limit);
     return { status: 200, payload: rows };
   }
+  if (route === '/consoles') {
+    return {
+      status: 200,
+      payload: {
+        version: 1,
+        current: 'durable',
+        consoles: [
+          {
+            id: 'telescope',
+            title: 'Telescope',
+            package: '@adonis-agora/telescope',
+            icon: 'telescope',
+            href: '/telescope',
+          },
+          {
+            id: 'payments',
+            title: 'Payments',
+            package: '@adonis-agora/payments',
+            icon: 'payments',
+            href: '/payments',
+          },
+          {
+            id: 'authkit',
+            title: 'Identity',
+            package: '@adonis-agora/authkit-server',
+            icon: 'identity',
+            href: '/admin',
+          },
+        ],
+      },
+    };
+  }
+  if (route === '/consoles/search') {
+    const q = params.get('q') ?? '';
+    const hits = runs
+      .filter((r) => r.id.includes(q) || r.workflow.toLowerCase().includes(q.toLowerCase()))
+      .slice(0, 5)
+      .map((r) => ({
+        title: r.id,
+        subtitle: `run · ${r.workflow} · ${r.status}`,
+        href: `/durable#/run/${r.id}`,
+      }));
+    return {
+      status: 200,
+      payload: {
+        version: 1,
+        q,
+        results: [
+          ...(hits.length ? [{ id: 'durable', title: 'Workflows', icon: 'workflow', hits }] : []),
+          {
+            id: 'payments',
+            title: 'Payments',
+            icon: 'payments',
+            hits: [
+              {
+                title: `pi_${q}93kd`,
+                subtitle: 'payment · R$ 120,00 · succeeded',
+                href: '/payments#/payments/pi_93kd',
+              },
+            ],
+          },
+        ],
+      },
+    };
+  }
   if (route === '/workers') return { status: 200, payload: { data: workers } };
   if (route === '/topology') return { status: 200, payload: topology };
   if (route === '/compat') return { status: 200, payload: compat };
@@ -727,6 +792,21 @@ function body(path: string, init?: RequestInit): MockAnswer {
  * handed back to the real `fetch`, so the page still loads normally.
  */
 export function installMockConsoleApi(): void {
+  // The data block the provider renders: switcher, ⌘K search, viewer, sign-out.
+  if (!document.getElementById('durable-dashboard-config')) {
+    const block = document.createElement('script');
+    block.type = 'application/json';
+    block.id = 'durable-dashboard-config';
+    block.textContent = JSON.stringify({
+      base: '/durable',
+      api: '/durable/api',
+      switcher: { endpoint: '/durable/api/consoles', others: 3 },
+      search: { endpoint: '/durable/api/consoles/search' },
+      viewer: { label: 'ops@example.test', email: 'ops@example.test', role: 'admin' },
+      signOut: { action: '/account/logout', csrfToken: 'preview' },
+    });
+    document.head.appendChild(block);
+  }
   const real = window.fetch.bind(window);
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;

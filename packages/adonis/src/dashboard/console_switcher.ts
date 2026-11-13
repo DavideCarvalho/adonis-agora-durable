@@ -14,6 +14,11 @@ export const AGORA_CONSOLES_BINDING = 'agora.consoles';
 export interface AgoraConsoleRegistry {
   readonly version: 1;
   readonly entries: AgoraConsoleEntry[];
+  /**
+   * Optional, set by an account console (authkit): how a viewer signs out of the app. Every console
+   * reads it structurally to offer "Sign out" in its sidebar footer. A string is a POST action path.
+   */
+  account?: { signOut?: string | { action: string } | { href: string } };
 }
 
 /** The icon a console shows in the switcher. An unknown value renders as `generic`. */

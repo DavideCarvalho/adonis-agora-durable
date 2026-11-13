@@ -1,230 +1,87 @@
 @import "tailwindcss";
+@import "tw-animate-css";
+/* The Agora console kit: tokens (dark + light), shadcn variable mapping, Tailwind theme. */
+@import "../agora-kit/tokens.css";
 
-/* Tailwind 4 scans the package directory for class names by default (respecting .gitignore); pin the
-   sources explicitly so the previously-configured `content` globs stay the contract. */
+/* Tailwind 4 scans the package directory by default; pin the sources explicitly. */
 @source "../../index.html";
 @source "../../preview.html";
 @source "./";
+@source "../agora-kit";
 
-/* ── Aviary token → Tailwind colour (Tailwind 4 edition of the former `tailwind.config.ts`) ────────
-   `@theme inline` makes each utility emit `var(--token)` directly (not a copy of its value), and
-   Tailwind 4 applies opacity modifiers to ANY colour via `color-mix` — so `bg-brand/10` is
-   `color-mix(in oklab, var(--accent) 10%, transparent)`. That is exactly what the Tailwind 3 config
-   had to hand-roll with colour *functions* ("The Tailwind 3 opacity trap" in AVIARY-UI.md); the trap
-   no longer exists in v4, so the mapping is plain aliases.
+/* ── Durable-only styles. Everything shared lives in `agora-kit/tokens.css`. ───────────────────── */
 
-   shadcn's semantic names → Aviary tokens (the mapping table in AVIARY-UI.md), rather than shadcn's
-   default palette. This is what makes a vendored `bg-background` / `text-muted-foreground` primitive
-   land on this console's own neutrals with no edit. Three of these are traps, because the two
-   systems use the same word for different things:
-     · shadcn `accent` is a subtle HOVER SURFACE, not a brand hue → `--panel-2`
-     · shadcn `muted` is a SURFACE → `--panel-2`
-     · Aviary `--muted` is dim TEXT → `muted-foreground`
-   The Aviary brand hue gets its own name (`brand`, below) so the two can never be confused. */
-@theme inline {
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
-
-  --color-background: var(--bg);
-  --color-foreground: var(--text);
-  --color-card: var(--panel);
-  --color-card-foreground: var(--text);
-  --color-popover: var(--panel-2);
-  --color-popover-foreground: var(--text);
-  --color-primary: var(--accent);
-  --color-primary-foreground: var(--bg);
-  --color-secondary: var(--panel-2);
-  --color-secondary-foreground: var(--text);
-  --color-muted: var(--panel-2);
-  --color-muted-foreground: var(--muted);
-  --color-accent: var(--panel-2);
-  --color-accent-foreground: var(--text);
-  --color-destructive: var(--bad);
-  --color-destructive-foreground: var(--bg);
-  --color-border: var(--line);
-  --color-input: var(--line);
-  --color-ring: var(--accent);
-
-  /* Aviary's own names, for this console's hand-written classes. */
-  --color-brand: var(--accent);
-  --color-panel: var(--panel);
-  --color-panel-2: var(--panel-2);
-  --color-line: var(--line);
-  --color-line-soft: var(--line-soft);
-  --color-good: var(--good);
-  --color-warn: var(--warn);
-  --color-bad: var(--bad);
-  --color-live: var(--live);
-}
-
-/* Tailwind 3 preflight parity: v4 changed two defaults this console relied on implicitly. */
-@layer base {
-  /* v4 defaults `border-color` to `currentColor`; v3 used the neutral-200 grey. Keep borders on the
-     console's line token unless a class says otherwise. */
-  *,
-  ::after,
-  ::before,
-  ::backdrop,
-  ::file-selector-button {
-    border-color: var(--line);
-  }
-  /* v4 makes buttons `cursor: default`; v3 kept `pointer`. */
-  button:not(:disabled),
-  [role="button"]:not(:disabled) {
-    cursor: pointer;
-  }
-}
-
-/* ── Aviary console tokens ──────────────────────────────────────────────────────────────────────
-   Source of truth: `AVIARY-UI.md` (repo root of the nestjs libs checkout — this file is copied
-   verbatim from `@dudousxd/nestjs-durable-dashboard`'s `src/app/index.css` so the AdonisJS console
-   matches its NestJS sibling pixel-for-pixel). The neutrals, the status hues and the spacing are
-   IDENTICAL across every Aviary console in the ecosystem (NestJS: agent, durable, media, telescope;
-   AdonisJS: durable, and any sibling console that follows); `--accent` is the single per-console
-   variable. If you change anything here, change it in `AVIARY-UI.md` and in every other console in
-   the same session — a token that lands in one console only is invisible until someone puts two
-   screenshots side by side.
-   ──────────────────────────────────────────────────────────────────────────────────────────────── */
+/* Run / step status hues. Semantic, never decorative: dark values first, light overrides below. */
 :root {
-  /* Shared. Identical in all four consoles. Do not tune per console. */
-  --bg: #09090b;
-  --panel: #0c0c0f;
-  --panel-2: #101017; /* elevated surface: modal/dialog, drawer, popover, menu */
-  --line: #1c1c22;
-  --line-soft: #16161a;
-  --text: #e7e7ea;
-  --muted: #76767f;
-
-  /* Status. Semantic, never decorative — the `.s-*` hues below are built from these. */
-  --good: #34d399;
-  --warn: #fbbf24;
-  --bad: #f87171;
-  --live: #60a5fa; /* in flight: a workflow mid-execution, a step a worker is running now */
-
-  /* Per console. This is the ONLY line that differs between them.
-     NOTE: durable's accent is currently the SAME value as `--good`, so green carries two meanings
-     here (healthy AND interactive). AVIARY-UI.md flags this as an open brand decision; it is left
-     as-is deliberately rather than silently re-picked. */
-  /* Lime, not the emerald this used to be: emerald IS `--good`, so the same hue meant both
-     "this step succeeded" and "this is interactive". Durable picked last and had the least room —
-     bad 0, its own no-worker 25, warn 45, good 160, media cyan 187, live 217, its own sleeping 239,
-     agent violet 258, telescope magenta 300, its own dead 347. Lime sits mid-arc at 82: 37 from
-     --warn, 78 from --good. Pink separates further but a pink primary action shares a row with a
-     red FAILED badge and borrows an alarm it does not mean. See AVIARY-UI.md. */
-  --accent: #a3e635;
+  --durable-sleeping: #818cf8;
+  --durable-cancelling: #f59e0b;
+  --durable-cancelled: #71717a;
+  --durable-dead: #e11d48;
+  --durable-pending: #94a3b8;
+  --durable-act: #fb923c;
+  --durable-queued: #a78bfa;
+}
+html.light,
+[data-theme="light"] {
+  --durable-sleeping: #4f46e5;
+  --durable-cancelling: #b45309;
+  --durable-cancelled: #71717a;
+  --durable-dead: #be123c;
+  --durable-pending: #64748b;
+  --durable-act: #c2410c;
+  --durable-queued: #7c3aed;
 }
 
-* {
-  box-sizing: border-box;
-}
-
-html,
-body,
-#root {
-  height: 100%;
-}
-
-body {
-  margin: 0;
-  background: var(--bg);
-  color: var(--text);
-  font-family: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
-  -webkit-font-smoothing: antialiased;
-}
-
-/* Faint blueprint grid + top glow — atmosphere, not noise. */
-.app-bg {
-  position: fixed;
-  inset: 0;
-  z-index: 0;
-  pointer-events: none;
-  background-image:
-    radial-gradient(
-      900px 400px at 78% -8%,
-      color-mix(in srgb, var(--accent) 8%, transparent),
-      transparent 70%
-    ),
-    linear-gradient(to right, var(--line-soft) 1px, transparent 1px),
-    linear-gradient(to bottom, var(--line-soft) 1px, transparent 1px);
-  background-size:
-    100% 100%,
-    44px 44px,
-    44px 44px;
-  mask-image: linear-gradient(to bottom, black, black 60%, transparent);
-  opacity: 0.5;
-}
-
-.mono {
-  font-family: "JetBrains Mono", ui-monospace, monospace;
-}
-
-.tnum {
-  font-variant-numeric: tabular-nums;
-}
-
-/* Status hues */
 .s-running {
-  color: var(--live);
+  color: var(--agora-live);
 }
 .s-suspended {
-  color: var(--warn);
+  color: var(--agora-warn);
 }
-/* Display-only refinements of `suspended` (see runDisplayStatus): a run actively running a remote
-   step renders as `s-running`; these cover the genuinely-parked reasons. */
+/* Parked on a durable timer — a calm indigo, distinct from the active blue of `running`. */
 .s-sleeping {
-  /* Parked on a durable timer — a calm indigo, distinct from the active blue of `running`. */
-  color: #818cf8;
+  color: var(--durable-sleeping);
 }
+/* Waiting on an external signal — amber, like the suspended state it refines. */
 .s-awaiting {
-  /* Waiting on an external signal — amber, like the suspended state it refines. */
-  color: var(--warn);
+  color: var(--agora-warn);
 }
 .s-completed {
-  color: var(--good);
+  color: var(--agora-good);
 }
 .s-failed {
-  color: var(--bad);
+  color: var(--agora-bad);
 }
-/* Compensating cancel in progress: a transient, in-flight amber — distinct from the grey terminal
-   `cancelled` it flips to once the rollback completes. */
+/* Compensating cancel in progress: transient amber, distinct from the grey terminal `cancelled`. */
 .s-cancelling {
-  color: #f59e0b;
+  color: var(--durable-cancelling);
 }
 .s-cancelled {
-  color: #71717a;
+  color: var(--durable-cancelled);
 }
-/* Dead-letter: recovery gave up (poison pill). A starker red than a normal failure. */
+/* Dead-letter: recovery gave up. A starker red than a normal failure. */
 .s-dead {
-  color: #e11d48;
+  color: var(--durable-dead);
 }
-/* Queued: a run enqueued by `start` awaiting a worker, or a remote step dispatched and awaiting its
-   worker result (in-flight). A calmer slate than the amber of a durably-suspended run. */
+/* Queued: enqueued by `start` awaiting a worker, or a remote step awaiting its result. */
 .s-pending {
-  color: #94a3b8;
+  color: var(--durable-pending);
 }
-/* Blocked: waiting on a handler that has NO live worker — it can't progress until one rejoins. A warm
-   orange that reads as "act on this", distinct from the terminal red of `failed`/`dead`. */
-.s-no-worker {
-  color: #fb923c;
-}
-/* Blocked (first-class engine status): parked because no COMPATIBLE worker exists — a protocol or
-   capability mismatch (see the compat panel), which starting another worker of the same old build
-   cannot fix. Same warm act-on-this orange as `s-no-worker`, and deliberately not the terminal red
-   of `failed`/`dead`: a blocked run resumes on its own once a compatible worker joins. */
-.s-blocked {
-  color: #fb923c;
-}
-/* Queued behind a singleton leader: fine, just waiting its turn — a muted violet, not an alarm. */
-.s-queued {
-  color: #a78bfa;
-}
-/* Stale pending step: a remote step dispatched and still awaiting its worker result well past
-   STALE_PENDING_MS — likely a lost dispatch (crashed worker / dropped job) that needs a manual
-   re-dispatch. Same warm orange as `s-no-worker` (both read "act on this"). */
+/* No live worker / no compatible worker / stale dispatch: a warm "act on this" orange — not the
+   terminal red of failed/dead, because these resume on their own once a worker joins. */
+.s-no-worker,
+.s-blocked,
 .s-stale {
-  color: #fb923c;
+  color: var(--durable-act);
+}
+/* Queued behind a singleton leader: fine, just waiting its turn. */
+.s-queued {
+  color: var(--durable-queued);
 }
 
 .dot {
+  display: inline-block;
+  flex-shrink: 0;
   width: 7px;
   height: 7px;
   border-radius: 999px;
@@ -244,52 +101,32 @@ body {
     opacity: 0.35;
   }
 }
-
-@keyframes rise {
-  from {
-    opacity: 0;
-    transform: translateY(6px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
+/* Old name for the kit's entrance animation, used by the run detail panels. */
 .rise {
-  animation: rise 0.32s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  animation: agora-rise 0.28s cubic-bezier(0.2, 0.7, 0.2, 1) both;
 }
 
-/* react-flow dark surfaces */
+/* react-flow on the console tokens (both themes). */
 .react-flow {
   --xy-background-color: transparent;
-  --xy-edge-stroke-default: var(--line);
+  --xy-edge-stroke-default: var(--agora-line-strong);
   --xy-attribution-background-color: transparent;
 }
 .react-flow__edge-path {
   stroke-width: 1.5;
 }
 .react-flow__controls {
-  border: 1px solid var(--line);
+  border: 1px solid var(--agora-line);
   border-radius: 8px;
   overflow: hidden;
   box-shadow: none;
 }
 .react-flow__controls-button {
-  background: var(--panel);
-  border-bottom: 1px solid var(--line);
-  color: var(--muted);
-  fill: var(--muted);
+  background: var(--agora-panel);
+  border-bottom: 1px solid var(--agora-line);
+  color: var(--agora-muted);
+  fill: var(--agora-muted);
 }
 .react-flow__controls-button:hover {
-  background: #18181b;
-}
-
-::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
-}
-::-webkit-scrollbar-thumb {
-  background: #26262c;
-  border: 3px solid var(--bg);
-  border-radius: 999px;
+  background: var(--agora-hover);
 }

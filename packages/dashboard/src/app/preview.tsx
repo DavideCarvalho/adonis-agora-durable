@@ -2,7 +2,9 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import type { RunDetail, StepCheckpoint } from '../client/durable-client';
-import { App } from './App';
+import '../agora-kit/fonts';
+import { ThemeProvider } from '../agora-kit/theme';
+import { App, DURABLE_ACCENT } from './App';
 import { installMockConsoleApi } from './mock-console';
 import { RunSpans } from './SpansTimeline';
 // Same two stylesheets `main.tsx` loads, in the same order — without react-flow's own CSS the
@@ -104,14 +106,13 @@ if (isConsole) installMockConsoleApi();
 
 createRoot(document.getElementById('root') as HTMLElement).render(
   <StrictMode>
-    <QueryClientProvider client={queryClient}>
-      {isConsole ? (
-        <App />
-      ) : (
-        <>
-          <div className="app-bg" />
+    <ThemeProvider storageKey="agora-durable-theme" accent={DURABLE_ACCENT}>
+      <QueryClientProvider client={queryClient}>
+        {isConsole ? (
+          <App />
+        ) : (
           <div className="relative z-10 mx-auto max-w-3xl p-8">
-            <div className="mb-3 mono text-[10px] uppercase tracking-[0.2em] text-zinc-500">
+            <div className="mb-3 mono text-[10px] uppercase tracking-[0.2em] text-dim">
               preview · parallel-fan timeline
             </div>
             <div className="rounded-lg border border-line bg-panel p-2">
@@ -127,8 +128,8 @@ createRoot(document.getElementById('root') as HTMLElement).render(
               />
             </div>
           </div>
-        </>
-      )}
-    </QueryClientProvider>
+        )}
+      </QueryClientProvider>
+    </ThemeProvider>
   </StrictMode>,
 );

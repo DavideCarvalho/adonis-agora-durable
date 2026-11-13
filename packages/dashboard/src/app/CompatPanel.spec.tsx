@@ -1,9 +1,14 @@
 // @vitest-environment happy-dom
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
+import { TooltipProvider } from '../agora-kit/ui/tooltip';
 import type { CompatPod, CompatReport } from '../client/durable-client';
-import { CompatHealth, fleetOutcome, formatProtocolRange } from './CompatPanel';
-import { TooltipProvider } from './ui/tooltip';
+import {
+  BlockedRunsList,
+  CompatFleetTable,
+  fleetOutcome,
+  formatProtocolRange,
+} from './CompatPanel';
 
 // No jest-dom in this package (see `OriginFacets.spec.tsx`) — plain DOM assertions only.
 
@@ -41,7 +46,8 @@ function report(overrides: Partial<CompatReport> = {}): CompatReport {
 function renderPanel(compat: CompatReport, onOpenRun = vi.fn()) {
   render(
     <TooltipProvider>
-      <CompatHealth compat={compat} onOpenRun={onOpenRun} />
+      <CompatFleetTable compat={compat} />
+      <BlockedRunsList blocked={compat.blocked} onOpenRun={onOpenRun} />
     </TooltipProvider>,
   );
   return onOpenRun;
@@ -73,13 +79,13 @@ describe('fleetOutcome: the worst pod outcome wins the fleet chip tone', () => {
   });
 });
 
-describe('CompatHealth: the fleet compatibility view', () => {
+describe('CompatFleetTable / BlockedRunsList: the Workers page compatibility panels', () => {
   it('says "no descriptors" when no worker has advertised, instead of an empty all-green claim', () => {
     renderPanel(report());
     expect(screen.getByText('no descriptors')).toBeTruthy();
   });
 
-  it("opens the fleet popover with each pod's protocol band, outcome and red-flag reason", () => {
+  it("lists each pod's protocol band, outcome and red-flag reason", () => {
     renderPanel(
       report({
         groups: [
@@ -104,7 +110,6 @@ describe('CompatHealth: the fleet compatibility view', () => {
         incompatibleCount: 1,
       }),
     );
-    fireEvent.click(screen.getByText('fleet'));
     expect(screen.getByText('worker-media-1')).toBeTruthy();
     expect(screen.getByText('v2')).toBeTruthy();
     expect(
@@ -130,7 +135,6 @@ describe('CompatHealth: the fleet compatibility view', () => {
         blockedCount: 1,
       }),
     );
-    fireEvent.click(screen.getByText('blocked'));
     fireEvent.click(screen.getByText('mediaTranscode'));
     expect(onOpenRun).toHaveBeenCalledWith('med-1');
   });

@@ -36,6 +36,8 @@ export default defineConfig({
 | `audit` | app logger | `(entry) => void` sink for every mutating attempt: `{ at, actor, method, path }`. |
 | `redact` | absent | `{ run?, checkpoint? }` hooks applied to every serialized run and checkpoint right before it leaves the API. See [Redacting payloads](#redacting-payloads). |
 | `accessDenied` | built-in page | Tweak or replace the [access-denied page](#the-access-denied-page). |
+| `viewer` | `ctx.auth.user` | `(ctx) => ({ label, email?, role? }) \| null`: who the sidebar footer shows as signed in. See [Signed-in user and sign-out](#signed-in-user-and-sign-out). |
+| `signOut` | announced by authkit | The footer's sign-out: a POST action path, `{ href }` for a link, or `false` for none. |
 
 ### Authorization
 
@@ -201,6 +203,25 @@ export default defineConfig({
 
 An `authorize` hook that already wrote a redirect still wins — the provider never overwrites a `location` header, with or without `accessDenied`.
 
+### Signed-in user and sign-out
+
+The sidebar footer shows who is signed in, a light/dark toggle, and a sign-out button.
+
+Without `viewer`, the console reads `ctx.auth.user` when the request is already authenticated: the label is `fullName`, `name` or `email`, and the role is the first of `role` or `roles`. Pass `viewer` to show something else, or return `null` to hide the user row:
+
+```ts title="config/durable_dashboard.ts"
+export default defineConfig({
+  authorize: (ctx) => ctx.auth.user?.isAdmin === true,
+  viewer: (ctx) => {
+    const user = ctx.auth.user
+    return user ? { label: user.fullName, email: user.email, role: 'admin' } : null
+  },
+  signOut: '/logout',
+})
+```
+
+A string `signOut` is a path the button POSTs to, with the request's CSRF token as `_csrf` when shield is installed. `{ href: '/bye' }` renders a link instead. Without `signOut`, the console uses the sign-out that authkit's account console registers. `false` removes the button. Only same-origin paths are accepted.
+
 ### Redacting payloads
 
 The store may hold payloads encrypted (a codec-wrapped store), but the console reads through the codec, so operators always see them **decoded**. `redact` keeps a card number or PII out of the operator's browser. Each hook receives the serialized shape and returns what to send. It runs on the runs list, the run detail and fan member pages:
@@ -225,7 +246,7 @@ All routes are relative to `path` (default `/durable`), and every one of them ru
 | `GET` | `/durable` | the React console (`index.html`, with the base path and API base injected) |
 | `GET` | `/durable/assets/:file` | the console's hashed JS/CSS bundle, served immutable |
 
-The console routes client-side on the URL hash (`#/run/<id>` for a run, `#/workflow/<name>` for a [workflow's page](#workflow-pages)), so a deep link needs no server-side rewrite.
+The console routes client-side on the URL hash, so a deep link needs no server-side rewrite: `#/run/<id>` opens a run, `#/workflow/<name>` a [workflow's page](#workflow-pages), `#/workers` the Workers page and `#/schedules` the Schedules page.
 
 ### Reading runs
 
@@ -501,6 +522,9 @@ The routes are all named (`durable_dashboard.index`, `durable_dashboard.runs.sho
 
 ## What it shows
 
+The sidebar has two groups. **Monitor** holds Runs and Workers. **Operations** holds Schedules, and is empty on a tenant deployment. The brand at the top switches to the other Agora consoles you may open. The topbar holds the organization picker, a run-id quick open and ⌘K search across every console. Below 768px the sidebar opens as a drawer. The theme is remembered per browser.
+
+- **Workers** — the live fleet: one row per pod with its partition, the handlers it serves and its load (in-flight against its concurrency limit, RAM, CPU, throughput, p95 and the adaptive controller's last move). It also lists partitions with their worker, handler, queued and starved counts, queues that have work and no worker, the protocol negotiation of each pod against the control plane, and runs `blocked` for lack of a compatible worker.
 - **Runs** — every run with its status, filterable by status, workflow, tag, namespace, [origin](/docs/durable/concepts/workflows-and-steps#run-origin--package-attribution), creation time and search attribute. The tag, tenant and attribute filters are value pickers: they list what the runs actually contain (counted server-side over the rest of the active filter, searchable, paged), take several values at once, and still accept a typed value. `pending` is a run created and enqueued but not yet picked up; a `dead` run carries a distinct badge so a [poison pill](/docs/durable/reliability/dead-letter) is easy to spot.
 - **What a suspended run is waiting on** — a `suspended` run parked on a signal, a webhook callback, a child run or a breakpoint is surfaced as **waiting**, with what it is blocked on right in the row (`signal approve`, `child ord-42.child.0`, `breakpoint`). See below.
 - **Step timeline** — the selected run's steps in order, tagged by kind (local / remote / sleep / signal), with worker group, queue wait and duration. In-flight steps appear while they run, not only on completion — a remote step in flight reads as `pending`, and a local step's executing body as `running` (the [`trackStepStart`](/docs/durable/concepts/workflows-and-steps#in-flight-visibility) option).
@@ -675,7 +699,7 @@ export default defineConfig({
 })
 ```
 
-The header then shows an **Organization** picker: "All organizations" first, then each organization
+The topbar then shows an **Organization** picker: "All organizations" first, then each organization
 by name (the labels come from `tenancy.label` in `config/context.ts`, or authkit). The pick lives in
 the URL (`?tenant=org-42`), so a link opens the same view, and each switch is written to the
 console's audit hook. While several organizations are shown, each run row names its organization.

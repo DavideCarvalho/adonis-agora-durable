@@ -1,10 +1,10 @@
 import { useState } from 'react';
+import { Badge } from '../agora-kit/ui/badge';
+import { Button } from '../agora-kit/ui/button';
+import { Popover, PopoverContent, PopoverTrigger } from '../agora-kit/ui/popover';
 import type { RunPredicates } from '../client/durable-client';
 import { XIcon } from './icons';
-import { Badge } from './ui/badge';
-import { Button } from './ui/button';
 import { Input } from './ui/input';
-import { Popover, PopoverContent, PopoverTrigger } from './ui/popover';
 import { ValuePicker } from './ValuePicker';
 
 /** The operators a search-attribute predicate can carry, in the words an operator reads them in. */
@@ -89,8 +89,8 @@ export function AttributeFilters({ value, onChange, scope }: AttributeFiltersPro
     // The same bordered row the tag and tenant pickers use. It used to be a small dashed "+"
     // affordance, which read as an empty decoration next to two controls that look like filters —
     // an operator had no reason to think there was anything behind it.
-    <div className="mt-1.5 flex items-center gap-1.5 rounded-md border border-line px-2 py-1 transition-colors focus-within:border-zinc-600">
-      <span className="shrink-0 text-zinc-600" aria-hidden>
+    <div className="mt-1.5 flex items-center gap-1.5 rounded-md border border-line px-2 py-1 transition-colors focus-within:border-line-strong">
+      <span className="shrink-0 text-faint" aria-hidden>
         ⛃
       </span>
       <Popover
@@ -106,31 +106,31 @@ export function AttributeFilters({ value, onChange, scope }: AttributeFiltersPro
               type="button"
               aria-label="filter by search attribute"
               title="Typed search attributes (WorkflowRun.searchAttributes)"
-              className="mono flex min-w-0 flex-1 flex-wrap items-center gap-1 py-0.5 text-left text-xs text-zinc-200 focus:outline-none"
+              className="mono flex min-w-0 flex-1 flex-wrap items-center gap-1 py-0.5 text-left text-xs text-fg focus:outline-none"
             />
           }
         >
           {value.length === 0 ? (
-            <span className="text-zinc-600">filter by attribute…</span>
+            <span className="text-faint">filter by attribute…</span>
           ) : (
             value.map((predicate) => (
-              <Badge key={predicate} variant="attr" className="mono max-w-[12rem] truncate">
+              <Badge key={predicate} variant="violet" className="mono max-w-[12rem] truncate">
                 {label(predicate)}
               </Badge>
             ))
           )}
         </PopoverTrigger>
-        <PopoverContent align="start" className="w-80 p-2">
+        <PopoverContent align="start" className="w-80 gap-0 p-2">
           <div className="flex flex-col gap-1.5">
             {value.length > 0 && (
               <div className="flex flex-wrap gap-1 border-b border-line pb-1.5">
                 {value.map((predicate) => (
-                  <Badge key={predicate} variant="attr" className="mono gap-1 py-0.5">
+                  <Badge key={predicate} variant="violet" className="mono gap-1 py-0.5">
                     {label(predicate)}
                     <Button
                       variant="ghost"
-                      size="icon"
-                      className="h-3 w-3 text-indigo-300/70 hover:text-indigo-100"
+                      size="icon-sm"
+                      className="h-3 w-3 text-violet/70 hover:text-violet"
                       title={`remove ${label(predicate)}`}
                       aria-label={`remove ${label(predicate)}`}
                       onClick={() => onChange(value.filter((p) => p !== predicate))}
@@ -160,10 +160,10 @@ export function AttributeFilters({ value, onChange, scope }: AttributeFiltersPro
               aria-label="operator"
               value={op}
               onChange={(e) => setOp(e.target.value as Op)}
-              className="mono rounded-md border border-line bg-transparent px-2 py-1.5 text-xs text-zinc-200 focus:border-zinc-600 focus:outline-none"
+              className="mono rounded-md border border-line bg-transparent px-2 py-1.5 text-xs text-fg focus:border-line-strong focus:outline-none"
             >
               {OPERATORS.map((entry) => (
-                <option key={entry.op} value={entry.op} className="bg-zinc-900">
+                <option key={entry.op} value={entry.op} className="bg-hover">
                   {entry.label}
                 </option>
               ))}
@@ -180,8 +180,8 @@ export function AttributeFilters({ value, onChange, scope }: AttributeFiltersPro
                 onChange={setOperands}
               />
             ) : (
-              <div className="flex items-center gap-1.5 rounded-md border border-line px-2 focus-within:border-zinc-600">
-                <span className="shrink-0 text-zinc-600" aria-hidden>
+              <div className="flex items-center gap-1.5 rounded-md border border-line px-2 focus-within:border-line-strong">
+                <span className="shrink-0 text-faint" aria-hidden>
                   =
                 </span>
                 <Input
@@ -210,7 +210,7 @@ export function AttributeFilters({ value, onChange, scope }: AttributeFiltersPro
       {value.length > 0 && (
         <Button
           variant="ghost"
-          size="icon"
+          size="icon-sm"
           onClick={() => onChange([])}
           title="clear attribute filters"
           aria-label="clear attribute filters"

@@ -2,7 +2,7 @@
 import { render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { WorkflowRun } from '../client/durable-client';
-import { RunsList } from './App';
+import { RunsList } from './runs/RunsList';
 
 // No jest-dom in this package (see `OriginFacets.spec.tsx`): every assertion here reads a plain DOM
 // property/attribute rather than a jest-dom matcher.

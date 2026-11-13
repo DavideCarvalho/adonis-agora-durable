@@ -1,10 +1,17 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { EmptyState } from '../agora-kit/blocks/empty-state';
+import { ErrorBoundary } from '../agora-kit/blocks/error-boundary';
+import { Hint as Tooltip } from '../agora-kit/blocks/hint';
+import { PageHeader } from '../agora-kit/blocks/page-header';
+import { Panel } from '../agora-kit/blocks/panel';
+import { ClockIcon } from '../agora-kit/icons';
+import { cn } from '../agora-kit/lib/utils';
+import { PageBody } from '../agora-kit/shell/app-shell';
+import { Badge as Chip } from '../agora-kit/ui/badge';
+import { Button } from '../agora-kit/ui/button';
+import { Skeleton } from '../agora-kit/ui/skeleton';
 import { durableClient, type ScheduleInfo } from '../client/durable-client';
 import { PlayIcon } from './icons';
-import { Badge as Chip } from './ui/badge';
-import { Button } from './ui/button';
-import { cn } from './ui/cn';
-import { Tooltip } from './ui/tooltip';
 
 /**
  * The Schedules view: every ticked schedule (`GET /schedules`) with its cadence, fire windows and
@@ -55,7 +62,7 @@ export function relUntilMs(atMs: number, nowMs = Date.now()): string {
 }
 
 const COLUMNS =
-  'grid grid-cols-[minmax(140px,1.2fr)_minmax(120px,1fr)_minmax(110px,0.9fr)_90px_90px_minmax(110px,0.9fr)_auto] items-center gap-3 px-5';
+  'grid grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,0.8fr)_minmax(0,0.8fr)_80px_minmax(0,1.3fr)_176px] items-center gap-3 px-4';
 
 function ScheduleRow({ s, onOpenRun }: { s: ScheduleInfo; onOpenRun: (id: string) => void }) {
   const qc = useQueryClient();
@@ -78,25 +85,25 @@ function ScheduleRow({ s, onOpenRun }: { s: ScheduleInfo; onOpenRun: (id: string
   return (
     <li className={cn(COLUMNS, 'py-3')}>
       <div className="min-w-0">
-        <div className="mono truncate text-[12px] text-zinc-200">{s.key}</div>
+        <div className="mono truncate text-[12px] text-fg">{s.key}</div>
         {s.overlap === 'skip' && (
-          <div className="mono text-[9px] uppercase tracking-wider text-zinc-600">no overlap</div>
+          <div className="mono text-[9px] uppercase tracking-wider text-faint">no overlap</div>
         )}
       </div>
-      <div className="mono flex min-w-0 items-center gap-1.5 text-[11px] text-zinc-400">
+      <div className="mono flex min-w-0 items-center gap-1.5 text-[11px] text-fg-2">
         <span className="truncate">{s.workflow}</span>
         {tenant && (
-          <Chip variant="tenant" className="mono shrink-0 px-1 text-[9px]">
+          <Chip variant="info" className="mono shrink-0 px-1 text-[9px]">
             {tenant}
           </Chip>
         )}
       </div>
-      <span className="mono truncate text-[11px] text-zinc-300" title={cadenceOf(s)}>
+      <span className="mono truncate text-[11px] text-fg-2" title={cadenceOf(s)}>
         {cadenceOf(s)}
       </span>
-      <span className="mono truncate text-[10px] text-zinc-500">{s.timezone ?? 'UTC'}</span>
+      <span className="mono truncate text-[10px] text-dim">{s.timezone ?? 'UTC'}</span>
       <span
-        className={cn('mono tnum text-[11px]', s.paused ? 'text-zinc-600' : 'text-zinc-400')}
+        className={cn('mono tnum text-[11px]', s.paused ? 'text-faint' : 'text-fg-2')}
         title={new Date(s.nextFireAt).toISOString()}
       >
         {s.paused ? '—' : relUntilMs(s.nextFireAt)}
@@ -110,16 +117,13 @@ function ScheduleRow({ s, onOpenRun }: { s: ScheduleInfo; onOpenRun: (id: string
             title={`Open the current window's run (${s.currentWindowRunId})`}
             className="cursor-pointer"
           >
-            <Chip variant="status" className={`s-${s.lastRunStatus} text-[11px] hover:underline`}>
+            <Chip variant="bare" className={`s-${s.lastRunStatus} text-[11px] hover:underline`}>
               <span className={`dot s-${s.lastRunStatus}`} aria-hidden />
               {s.lastRunStatus}
             </Chip>
           </button>
         ) : (
-          <span
-            className="mono text-[11px] text-zinc-600"
-            title="The current window has no run yet"
-          >
+          <span className="mono text-[11px] text-faint" title="The current window has no run yet">
             —
           </span>
         )}
@@ -131,7 +135,7 @@ function ScheduleRow({ s, onOpenRun }: { s: ScheduleInfo; onOpenRun: (id: string
                 : 'Paused in the schedule config.'
             }
           >
-            <Chip variant="warn" className="mono py-0.5 uppercase tracking-wider">
+            <Chip variant="warn" className="mono min-w-0 py-0.5 uppercase tracking-wider">
               paused{s.pausedAtRuntime ? ' · runtime override' : ''}
             </Chip>
           </Tooltip>
@@ -140,7 +144,7 @@ function ScheduleRow({ s, onOpenRun }: { s: ScheduleInfo; onOpenRun: (id: string
       <span className="flex shrink-0 items-center justify-end gap-2">
         <Button
           variant={s.paused ? 'outline' : 'warn'}
-          size="xs"
+          size="micro"
           disabled={setPaused.isPending}
           onClick={() => setPaused.mutate(!s.paused)}
           className="mono uppercase tracking-wider"
@@ -154,7 +158,7 @@ function ScheduleRow({ s, onOpenRun }: { s: ScheduleInfo; onOpenRun: (id: string
         </Button>
         <Button
           variant="brand"
-          size="xs"
+          size="micro"
           disabled={trigger.isPending}
           onClick={() => trigger.mutate()}
           className="mono uppercase tracking-wider"
@@ -165,7 +169,7 @@ function ScheduleRow({ s, onOpenRun }: { s: ScheduleInfo; onOpenRun: (id: string
         </Button>
       </span>
       {(setPaused.error || trigger.error) && (
-        <div role="alert" className="mono col-span-full text-[11px] text-rose-300">
+        <div role="alert" className="mono col-span-full text-[11px] text-bad">
           {(() => {
             const failure = setPaused.error ?? trigger.error;
             return `Action failed: ${failure instanceof Error ? failure.message : String(failure)}`;
@@ -189,57 +193,107 @@ export function SchedulesPanel({ onOpenRun }: { onOpenRun: (id: string) => void 
     // immediately, not hammer an endpoint that will keep 404ing.
     retry: false,
   });
+  return (
+    <PageBody>
+      <PageHeader
+        title="Schedules"
+        description={
+          schedules
+            ? `${schedules.length} ticked schedule${schedules.length === 1 ? '' : 's'} · pause/resume is a fleet-wide runtime override · "Run now" fires the current window`
+            : 'Ticked schedules, their cadence and their current window.'
+        }
+      />
+      <ErrorBoundary label="Schedules">
+        <SchedulesView
+          schedules={schedules}
+          error={error}
+          loading={isPending}
+          onOpenRun={onOpenRun}
+        />
+      </ErrorBoundary>
+    </PageBody>
+  );
+}
+
+/** Presentational: the schedules table in its four states (loading, unavailable, empty, rows). */
+export function SchedulesView({
+  schedules,
+  error,
+  loading,
+  onOpenRun,
+}: {
+  schedules: ScheduleInfo[] | undefined;
+  error: Error | null;
+  loading: boolean;
+  onOpenRun: (id: string) => void;
+}) {
   if (error) {
     return (
-      <div className="grid h-full place-items-center p-8 text-center">
-        <div className="max-w-md">
-          <p className="text-sm text-zinc-400">Schedules are not available here.</p>
-          <p className="mono mt-2 text-[11px] text-zinc-600">
-            This deployment's server has no runtime schedule control (a tenant topology, or a server
-            older than the endpoint) — `GET /schedules` answered: {error.message}
-          </p>
-        </div>
-      </div>
-    );
-  }
-  if (isPending) {
-    return <div className="p-8 text-sm text-zinc-600">Loading schedules…</div>;
-  }
-  if (schedules.length === 0) {
-    return (
-      <div className="grid h-full place-items-center text-sm text-zinc-600">
-        No schedules registered.
-      </div>
+      <Panel title="Ticked schedules" flush>
+        <EmptyState
+          icon={<ClockIcon />}
+          title="Schedules are not available here."
+          description={
+            <span className="mono text-[11px]">
+              This deployment's server has no runtime schedule control (a tenant topology, or a
+              server older than the endpoint) — `GET /schedules` answered: {error.message}
+            </span>
+          }
+        />
+      </Panel>
     );
   }
   return (
-    <div className="flex h-full min-h-0 flex-col">
-      <div className="border-b border-line px-5 py-4">
-        <h2 className="text-lg font-semibold tracking-tight">Schedules</h2>
-        <p className="mono mt-1 text-[11px] text-zinc-600">
-          {schedules.length} ticked schedule{schedules.length === 1 ? '' : 's'} · pause/resume is a
-          fleet-wide runtime override · "Run now" fires the current window
-        </p>
+    <Panel
+      title="Ticked schedules"
+      description="key · workflow · cadence · next fire · current window"
+      flush
+    >
+      <div className="overflow-x-auto">
+        <div className="min-w-[860px]">
+          <div
+            className={cn(
+              COLUMNS,
+              'border-b border-border py-2.5 text-[10.5px] font-medium uppercase tracking-[0.14em] text-dim',
+            )}
+          >
+            <span>key</span>
+            <span>workflow</span>
+            <span>cadence</span>
+            <span>timezone</span>
+            <span>next fire</span>
+            <span>last run</span>
+            <span className="text-right">actions</span>
+          </div>
+          {loading || !schedules ? (
+            <ul className="divide-y divide-line-soft" aria-hidden>
+              {['a', 'b', 'c', 'd'].map((k) => (
+                <li key={k} className={cn(COLUMNS, 'py-3.5')}>
+                  <Skeleton className="h-3 w-32" />
+                  <Skeleton className="h-3 w-24" />
+                  <Skeleton className="h-3 w-20" />
+                  <Skeleton className="h-3 w-12" />
+                  <Skeleton className="h-3 w-12" />
+                  <Skeleton className="h-3 w-16" />
+                  <Skeleton className="ml-auto h-6 w-28" />
+                </li>
+              ))}
+            </ul>
+          ) : schedules.length === 0 ? (
+            <EmptyState
+              icon={<ClockIcon />}
+              title="No schedules registered."
+              description="Declare a schedule on a workflow and it shows up here once the ticker runs."
+            />
+          ) : (
+            <ul className="divide-y divide-line-soft">
+              {schedules.map((s) => (
+                <ScheduleRow key={s.key} s={s} onOpenRun={onOpenRun} />
+              ))}
+            </ul>
+          )}
+        </div>
       </div>
-      <div
-        className={cn(
-          COLUMNS,
-          'mono border-b border-line py-2 text-[9px] uppercase tracking-[0.18em] text-zinc-600',
-        )}
-      >
-        <span>key</span>
-        <span>workflow</span>
-        <span>cadence</span>
-        <span>timezone</span>
-        <span>next fire</span>
-        <span>last run</span>
-        <span className="text-right">actions</span>
-      </div>
-      <ul className="min-h-0 flex-1 divide-y divide-line-soft overflow-auto">
-        {schedules.map((s) => (
-          <ScheduleRow key={s.key} s={s} onOpenRun={onOpenRun} />
-        ))}
-      </ul>
-    </div>
+    </Panel>
   );
 }
