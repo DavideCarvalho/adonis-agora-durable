@@ -238,7 +238,14 @@ export default defineConfig({
 
 ## With authkit
 
-If the control plane runs [authkit](/docs/authkit), there is nothing to write. Create a service-tenant client in the authkit console (or with `node ace authkit:clients:create`), give it a partition and its capabilities, and use authkit's verifier and token source:
+If the control plane runs [authkit](/docs/authkit), there is nothing to write. Create a service-tenant client in the authkit console, or with `node ace authkit:client create`, give it a partition and its capabilities, and use authkit's verifier and token source:
+
+```bash
+node ace authkit:client create --client-id=durable-acme --partition=acme-corp --capability=gpu
+```
+
+The command prints the client secret once. Pass `--capability` once per capability.
+
 
 ```ts title="config/durable.ts (control plane, the authkit app)"
 import { authkitTenantVerifier } from '@adonis-agora/authkit-server'

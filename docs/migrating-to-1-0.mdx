@@ -460,3 +460,32 @@ export default defineConfig({
 ```
 
 See [Diagnostics listeners](/docs/durable/authoring/diagnostics-listeners).
+
+## Renamed CLI commands
+
+Operator commands live under `durable:runs:*`, `durable:schedules:*` and `durable:tasks:*`. One
+command is renamed, without an alias:
+
+| Before | After |
+| --- | --- |
+| `node ace durable:retry <id>` | `node ace durable:runs:retry <id>` |
+
+No other command is renamed or removed. Update scripts, cron jobs and runbooks that call
+`durable:retry`.
+
+`durable:runs` changes its flags:
+
+- `--limit` is removed. Use `--page` and `--size` (default 50 rows, at most 200).
+- `--status` and `--workflow` take several values, repeated or comma separated.
+- It takes the console's other run filters too: `--tag`, `--namespace`, `--origin`, `--attr`,
+  `--created-after` and `--created-before`.
+
+```sh
+# before
+node ace durable:runs --status=failed --limit=100
+
+# after
+node ace durable:runs --status failed,dead --size 100
+```
+
+See [CLI](/docs/durable/cli) for every command.

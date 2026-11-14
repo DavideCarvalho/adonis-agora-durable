@@ -269,6 +269,43 @@ A bounded wait takes **two** logical positions (the deadline and the wait), so a
 
 **Fix:** set a distinct `namespace` per pool. See [the two-pools mistake](/docs/durable/reliability/failure-modes#namespaces-the-classic-two-pools-mistake).
 
+## Two copies of @adonis-agora/durable
+
+**Symptom:** jobs or workflows that extend `BaseWorkflow`, or an app base class such as `JobWorkflow` from a shared workspace package, fail with:
+
+```
+Cannot construct "[class WorkflowEngine]" class. Container is not able to resolve its dependencies. Did you forget to use @inject() decorator?
+```
+
+**Cause:** two copies of `@adonis-agora/durable` are installed. The app's provider registered the engine from one copy, and the workflow class asks the container for the `WorkflowEngine` of the other copy, which nothing registered.
+
+**Check:**
+
+```bash
+pnpm why @adonis-agora/durable
+```
+
+Or search `pnpm-lock.yaml` for more than one `@adonis-agora/durable@<version>(<peers>)` entry, and look at which importers use which one.
+
+In a pnpm workspace with injected workspace packages, this usually means a peer resolves one way for the app and another way for the shared package. Cases seen in practice:
+
+- `@boringnode/queue` pulls in a different `@opentelemetry/core` major for the shared package than for the app;
+- the shared package declares the optional peer `@adonisjs/queue` and the app does not.
+
+**Fix:** make the peers resolve the same way on both sides. Declare the same peer versions in the app as in the shared package, or pin them with `pnpm.overrides`:
+
+```json title="package.json"
+{
+  "pnpm": {
+    "overrides": {
+      "@opentelemetry/core": "^2.0.0"
+    }
+  }
+}
+```
+
+Then run `pnpm install` again and check that `pnpm why @adonis-agora/durable` (or `pnpm-lock.yaml`) shows a single variant.
+
 ## Upgrade notes: failures fixed in 0.50 and 0.51
 
 Each entry below is a bug in an older release, not a configuration mistake. If the symptom matches and you are on an affected version, upgrading is the fix; the workaround is for when you cannot upgrade yet.
