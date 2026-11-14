@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { resetConsoleCache } from '../console-data';
 import { parseShellConfig, readShellConfig } from '../shell-config';
 import { ThemeProvider } from '../theme';
+import { AppShell } from './app-shell';
 import {
   ConsoleSearch,
   filterCommands,
@@ -48,6 +49,7 @@ const consoles = {
       href: '/telescope',
     },
     { id: 'payments', title: 'Payments', icon: 'payments', href: '/payments' },
+    { id: 'cms', title: 'CMS', icon: 'cms', href: '/admin' },
     { id: 'odd', title: 'Odd', icon: 'nope', href: '/odd' },
     { id: 'evil', title: 'Evil', icon: 'generic', href: '//evil.example' },
     { id: 'evil2', title: 'Evil 2', icon: 'generic', href: 'javascript:alert(1)' },
@@ -94,10 +96,18 @@ describe('ConsoleSwitcher', () => {
     expect(items[0]?.getAttribute('aria-current')).toBe('page');
     expect(items[0]?.textContent).toContain('Workflows');
     const links = items.filter((el) => el.tagName === 'A');
-    expect(links.map((a) => a.getAttribute('href'))).toEqual(['/telescope', '/payments', '/odd']);
+    expect(links.map((a) => a.getAttribute('href'))).toEqual([
+      '/telescope',
+      '/payments',
+      '/admin',
+      '/odd',
+    ]);
     expect(links[0]?.textContent).toContain('@adonis-agora/telescope');
+    // cms has its own glyph on an orange tile.
+    expect(links[2]?.querySelector('svg')?.getAttribute('data-icon')).toBe('cms');
+    expect(links[2]?.querySelector('[data-accent]')?.getAttribute('data-accent')).toBe('#fb923c');
     // An unknown icon renders the generic one.
-    expect(links[2]?.querySelector('svg')?.getAttribute('data-icon')).toBe('generic');
+    expect(links[3]?.querySelector('svg')?.getAttribute('data-icon')).toBe('generic');
   });
 
   it('closes on Escape', async () => {
@@ -315,6 +325,43 @@ describe('ConsoleSearch commands', () => {
     fireEvent.change(input, { target: { value: 'qqq' } });
     expect(screen.getByText('Nothing found.')).toBeTruthy();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('AppShell nav', () => {
+  it('gives a collapsible section toggle the same focus ring as the nav items', async () => {
+    render(
+      <AppShell
+        brand={{ name: 'telescope', mark: <span />, current }}
+        nav={[
+          {
+            section: 'Monitor',
+            items: [{ id: 'requests', label: 'Requests', icon: <span />, onSelect: () => {} }],
+          },
+          {
+            section: 'Watchers',
+            collapsible: true,
+            items: [{ id: 'queries', label: 'Queries', icon: <span />, onSelect: () => {} }],
+          },
+        ]}
+        activeId="requests"
+        shell={{}}
+        title="Requests"
+      >
+        <p>page</p>
+      </AppShell>,
+    );
+    const toggle = await screen.findByRole('button', { name: /Watchers/ });
+    const item = screen.getByRole('button', { name: 'Requests' });
+    for (const cls of ['ring-sidebar-ring', 'outline-hidden', 'focus-visible:ring-2']) {
+      expect(item.className.split(/\s+/)).toContain(cls);
+      expect(toggle.className.split(/\s+/)).toContain(cls);
+    }
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    await act(async () => {
+      fireEvent.click(toggle);
+    });
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
   });
 });
 

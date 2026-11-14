@@ -29,6 +29,8 @@ export type AgoraConsoleIcon =
   | 'payments'
   | 'agent'
   | 'identity'
+  | 'flags'
+  | 'cms'
   | 'generic';
 
 /** One hit of a console's global search. */
@@ -94,6 +96,8 @@ const ICONS = new Set<AgoraConsoleIcon>([
   'payments',
   'agent',
   'identity',
+  'flags',
+  'cms',
   'generic',
 ]);
 /** How long another console's `authorize` (or `search`) may take before it is left out. */
