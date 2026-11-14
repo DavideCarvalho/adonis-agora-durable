@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.24
+
+### Patch Changes
+
+- [#526](https://github.com/DavideCarvalho/adonis-agora-durable/pull/526) [`8b9f48a`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/8b9f48aaec0faf03c646fb07c14ca2601dcacc6b) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Server: the `agora.consoles` registry accepts the `flags` and `cms` icon keys, so those consoles show their own tile instead of `generic`. Console: the console switcher shows the CMS console with its own orange tile and glyph, and the kit gains a 16px `DocumentIcon`; the collapsible nav section toggle has a test pinning its focus ring (Agora console kit round 3).
+
 ## 1.0.0-rc.23
 
 ### Patch Changes
