@@ -207,7 +207,11 @@ An `authorize` hook that already wrote a redirect still wins — the provider ne
 
 The sidebar footer shows who is signed in, a light/dark toggle, and a sign-out button.
 
-Without `viewer`, the console reads `ctx.auth.user` when the request is already authenticated: the label is `fullName`, `name` or `email`, and the role is the first of `role` or `roles`. Pass `viewer` to show something else, or return `null` to hide the user row:
+Each console has its own fixed accent colour: authkit indigo `#625fff`, durable lime `#a3e635`, telescope magenta `#e879f9`, payments cyan `#22d3ee`, media amber `#fbbf24`, agent rose `#fb7185` and flags emerald `#34d399`. The cms admin is the only one an app can rebrand (`admin.theme`). Every console has the light/dark toggle in the sidebar footer, remembered per browser.
+
+Without `viewer`, the footer reads `ctx.auth.user` once the request is already authenticated; it never triggers authentication itself. The label is `fullName`, `name` or `email`. Roles come from the user's `role`, `roles` and `globalRoles` (strings, `{ name }` objects or authz role rows `{ role }`) and, when authkit is installed, from the global roles of authkit's per-request identity. The footer shows one of them: the first admin-like one (a name containing `admin`, such as `ADMIN` or `org_admin`), else the first. A `viewer(ctx)` hook replaces all of this.
+
+Pass `viewer` to show something else, or return `null` to hide the user row:
 
 ```ts title="config/durable_dashboard.ts"
 export default defineConfig({
