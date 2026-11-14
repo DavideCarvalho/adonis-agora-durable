@@ -57,6 +57,7 @@ tenant verification) apply.
 | Id | Checks |
 | --- | --- |
 | `durable.config` | `config/durable.ts` loads, its `topology` is valid, `store` and `transport` name configured entries. |
+| `durable.single-copy` | Only one copy of `@adonis-agora/durable` is loaded. See [Two copies of @adonis-agora/durable](/docs/durable/troubleshooting#two-copies-of-adonis-agoradurable). |
 | `durable.verify-tenant` | A `control-plane` sets `verifyTenant` (warning locally, error in production). |
 | `durable.tenant-token` | A `tenant` pod sets `tenant.token`. |
 | `durable.cron-parser` | Cron schedules have `cron-parser` 5 installed. |

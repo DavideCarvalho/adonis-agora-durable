@@ -133,7 +133,9 @@
     "README.md",
     "CHANGELOG.md"
   ],
-  "sideEffects": false,
+  "sideEffects": [
+    "./dist/src/copy-guard.js"
+  ],
   "scripts": {
     "build": "pnpm run clean && tsc -p tsconfig.build.json && pnpm run copy:stubs && pnpm run check:dist",
     "check:dist": "node ../../scripts/assert-build-output.mjs dist src/index.js",

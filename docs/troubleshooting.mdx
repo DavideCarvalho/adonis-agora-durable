@@ -277,6 +277,19 @@ A bounded wait takes **two** logical positions (the deadline and the wait), so a
 Cannot construct "[class WorkflowEngine]" class. Container is not able to resolve its dependencies. Did you forget to use @inject() decorator?
 ```
 
+Since 1.0.0-rc.25 the app does not get that far: it fails at boot, naming each copy:
+
+```
+@adonis-agora/durable is loaded 2 times, from different installs:
+  - 1.0.0-rc.25 at /app/node_modules/.pnpm/@adonis-agora+durable@1.0.0-rc.25_<peers-a>/node_modules/@adonis-agora/durable
+  - 1.0.0-rc.25 at /app/node_modules/.pnpm/@adonis-agora+durable@1.0.0-rc.25_<peers-b>/node_modules/@adonis-agora/durable
+Each copy has its own WorkflowEngine class, so a workflow from one copy cannot resolve the engine the other copy registered (`Cannot construct "[class WorkflowEngine]" class`).
+Make every package resolve one copy: declare the same peer dependency versions in the app as in the workspace packages that depend on @adonis-agora/durable (or pin them with pnpm.overrides), reinstall, and check that `pnpm why @adonis-agora/durable` shows a single variant.
+See https://davidecarvalho.github.io/agora/docs/durable/troubleshooting#two-copies-of-adonis-agoradurable
+```
+
+`node ace agora:doctor` reports the same problem as the `durable.single-copy` check.
+
 **Cause:** two copies of `@adonis-agora/durable` are installed. The app's provider registered the engine from one copy, and the workflow class asks the container for the `WorkflowEngine` of the other copy, which nothing registered.
 
 **Check:**

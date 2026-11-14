@@ -1,4 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+// Records this copy of the package, so the provider can refuse to boot with two of them loaded.
+import './copy-guard.js';
 import { type AdmissionBackend, InMemoryAdmissionBackend } from './admission.js';
 import { backoffDelay, MAX_BACKOFF_MS } from './backoff.js';
 import { BoundedRunner } from './bounded-runner.js';
