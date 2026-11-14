@@ -1,5 +1,13 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.25
+
+### Patch Changes
+
+- [#532](https://github.com/DavideCarvalho/adonis-agora-durable/pull/532) [`f0bd40e`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/f0bd40e7fd272e2f9fd576f3ddd285cf6144d855) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Console sidebar matches the old authkit admin console exactly (Agora console kit): nav rows are 32px with no gap between them, section labels and the brand/switcher header use authkit's spacing, the footer role shows as sent (no forced uppercase), and the theme toggle sits left-aligned with a 13px icon next to a 26px sign-out button.
+
+- [#530](https://github.com/DavideCarvalho/adonis-agora-durable/pull/530) [`30dd3e6`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/30dd3e6527da2e80bc246a8fe2250a9b662fdd4e) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Fail at boot when two copies of `@adonis-agora/durable` are loaded in one process (for example two pnpm peer-resolution variants), naming both installs and the fix, instead of failing later with `Cannot construct "[class WorkflowEngine]" class`. `node ace agora:doctor` reports the same problem as the new `durable.single-copy` check.
+
 ## 1.0.0-rc.24
 
 ### Patch Changes
