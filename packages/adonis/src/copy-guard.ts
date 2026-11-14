@@ -87,9 +87,18 @@ export function duplicateCopyMessage(copies: readonly DurableCopy[]): string {
   ].join('\n');
 }
 
-/** This module's copy: the real path of the nearest `package.json` named `@adonis-agora/durable`. */
-function thisCopy(): DurableCopy {
-  const start = dirname(fileURLToPath(import.meta.url));
+/**
+ * This module's copy: the real path of the nearest `package.json` named `@adonis-agora/durable`.
+ * `null` when the module was not loaded from a file path (a bundler or a non-`file:` URL): the guard
+ * then stays out of the way rather than break the import.
+ */
+function thisCopy(): DurableCopy | null {
+  let start: string;
+  try {
+    start = dirname(fileURLToPath(import.meta.url));
+  } catch {
+    return null;
+  }
   let dir = start;
   for (;;) {
     try {
@@ -120,4 +129,5 @@ function realPath(path: string): string {
   }
 }
 
-registerDurableCopy(thisCopy());
+const self = thisCopy();
+if (self !== null) registerDurableCopy(self);

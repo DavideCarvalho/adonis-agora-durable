@@ -288,7 +288,7 @@ Make every package resolve one copy: declare the same peer dependency versions i
 See https://davidecarvalho.github.io/agora/docs/durable/troubleshooting#two-copies-of-adonis-agoradurable
 ```
 
-`node ace agora:doctor` reports the same problem as the `durable.single-copy` check.
+`node ace agora:doctor` reports the same problem as the `durable.single-copy` check. The boot check only sees copies from 1.0.0-rc.25 or later; with an older copy in the mix you still get the `Cannot construct` error above.
 
 **Cause:** two copies of `@adonis-agora/durable` are installed. The app's provider registered the engine from one copy, and the workflow class asks the container for the `WorkflowEngine` of the other copy, which nothing registered.
 

@@ -76,6 +76,7 @@ export type {
 } from './control-planes/factory.js';
 // --- config-driven control-plane drivers ------------------------------------
 export { controlPlanes } from './control-planes/factory.js';
+export { DuplicateDurableCopyError, type DurableCopy } from './copy-guard.js';
 export type { DurableConfig } from './define_config.js';
 // --- AdonisJS integration ---------------------------------------------------
 export { defineConfig } from './define_config.js';
