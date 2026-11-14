@@ -4,6 +4,7 @@ import type { AdmissionContext } from '../src/admissions/factory.js';
 import { mergeSchedules, runWorkerLoop, type WorkerLogger } from '../src/commands/worker.js';
 import type { ControlPlaneConfig, TenantConfig } from '../src/config_types.js';
 import type { ControlPlaneContext } from '../src/control-planes/factory.js';
+import { sealDurableCopies } from '../src/copy-guard.js';
 import type { DurableConfig } from '../src/define_config.js';
 import { stopDiagnosticsDeliveries } from '../src/diagnostics/transport.js';
 import { discoveryRoots, type RootedBarrel } from '../src/discovery-roots.js';
@@ -126,6 +127,10 @@ export default class DurableProvider {
   constructor(protected app: ApplicationService) {}
 
   register() {
+    // Two installs of this package in one process (a pnpm peer-variant split) each carry their own
+    // WorkflowEngine class, and workflows from the second one cannot resolve the engine bound here.
+    // Fail the boot naming both, and make a copy that loads later fail on load.
+    sealDurableCopies();
     // Hand the booted app to `services/main` so its eager population reads the SAME @adonisjs/core
     // copy bin/server booted, never a pnpm-split non-booted one (see services/booted_app.ts).
     setBootedApp(this.app);

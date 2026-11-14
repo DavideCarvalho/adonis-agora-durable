@@ -1,4 +1,11 @@
 import type { ApplicationService } from '@adonisjs/core/types';
+import {
+  DUPLICATE_COPY_DOCS,
+  DUPLICATE_COPY_FIX,
+  type DurableCopyRegistry,
+  durableCopies,
+  durableCopyRegistry,
+} from '../copy-guard.js';
 import type { DurableConfig } from '../define_config.js';
 import { type AgoraDoctorCheck, type AgoraDoctorResult, installedVersion } from './agora_doctor.js';
 
@@ -272,6 +279,26 @@ export function checkConsoleGate(
   };
 }
 
+/** `durable.single-copy`: one install of `@adonis-agora/durable` is loaded in this process. */
+export function checkSingleCopy(
+  registry: DurableCopyRegistry = durableCopyRegistry(),
+): AgoraDoctorResult {
+  const copies = durableCopies(registry);
+  if (copies.length <= 1) {
+    const only = copies[0];
+    return {
+      status: 'ok',
+      message: only ? `One copy loaded (${only.version}).` : 'One copy loaded.',
+    };
+  }
+  return {
+    status: 'error',
+    message: `${copies.length} copies of @adonis-agora/durable are loaded: ${copies.map((c) => `${c.version} at ${c.root}`).join('; ')}.`,
+    fix: DUPLICATE_COPY_FIX,
+    docs: DUPLICATE_COPY_DOCS,
+  };
+}
+
 /** The checks `@adonis-agora/durable`'s provider registers. */
 export const durableDoctorChecks: AgoraDoctorCheck[] = [
   {
@@ -279,6 +306,12 @@ export const durableDoctorChecks: AgoraDoctorCheck[] = [
     lib: 'durable',
     title: 'Config is valid',
     run: (app) => checkConfig(durableConfig(app)),
+  },
+  {
+    id: 'durable.single-copy',
+    lib: 'durable',
+    title: 'One copy of the package',
+    run: () => checkSingleCopy(),
   },
   {
     id: 'durable.verify-tenant',
