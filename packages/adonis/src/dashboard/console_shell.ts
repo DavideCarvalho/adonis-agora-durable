@@ -38,36 +38,98 @@ function text(value: unknown): string | undefined {
   return undefined;
 }
 
-/** The first role of a user, from `role`, `roles: string[]` or `roles: [{ name }]`. */
-function roleOf(user: Record<string, unknown>): string | undefined {
-  const direct = text(user.role);
-  if (direct) return direct;
-  const roles = user.roles;
-  if (Array.isArray(roles)) {
-    for (const role of roles) {
-      const name =
-        text(role) ??
-        (typeof role === 'object' && role !== null
-          ? text((role as { name?: unknown }).name)
-          : undefined);
-      if (name) return name;
-    }
+/** A role's name: a string, or an object's `name` / `role` (an authz role row has `role`). */
+function roleName(value: unknown): string | undefined {
+  if (typeof value === 'string') return text(value);
+  if (typeof value !== 'object' || value === null) return undefined;
+  const r = value as { name?: unknown; role?: unknown };
+  return text(r.name) ?? text(r.role);
+}
+
+/** Every role name in a field that is one role or a list of them. */
+function roleNames(value: unknown): string[] {
+  const list = Array.isArray(value) ? value : [value];
+  const names: string[] = [];
+  for (const item of list) {
+    const name = roleName(item);
+    if (name) names.push(name);
   }
-  return undefined;
+  return names;
+}
+
+/** The one role the footer shows: the first admin-like one (`ADMIN`, `org_admin`), else the first. */
+export function pickRole(names: readonly string[]): string | undefined {
+  return names.find((name) => /admin/i.test(name)) ?? names[0];
+}
+
+/** Read a property without letting a throwing getter escape. */
+function read(source: unknown, key: string): unknown {
+  if (typeof source !== 'object' || source === null) return undefined;
+  try {
+    return (source as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
 }
 
 /**
- * A viewer from any user-ish object: `fullName` / `name` / `email` for the label, `email`, and the
- * first of `role` / `roles`. `undefined` when nothing usable is there.
+ * The roles a user object carries: `role`, `roles` (strings, `{ name }` or `{ role }` rows) and
+ * `globalRoles`, in that order.
  */
-export function viewerFromUser(user: unknown): ConsoleViewer | undefined {
+function rolesOf(user: unknown): string[] {
+  return [
+    ...roleNames(read(user, 'role')),
+    ...roleNames(read(user, 'roles')),
+    ...roleNames(read(user, 'globalRoles')),
+  ];
+}
+
+/**
+ * A viewer from any user-ish object: `fullName` / `name` / `email` for the label, `email`, and one
+ * role from `role` / `roles` / `globalRoles` plus `extraRoles` (an admin-like one first, else the
+ * first). `undefined` when nothing usable is there.
+ */
+export function viewerFromUser(
+  user: unknown,
+  extraRoles: readonly string[] = [],
+): ConsoleViewer | undefined {
   if (typeof user !== 'object' || user === null) return undefined;
-  const u = user as Record<string, unknown>;
-  const email = text(u.email);
-  const label = text(u.fullName) ?? text(u.name) ?? email;
+  const email = text(read(user, 'email'));
+  const label = text(read(user, 'fullName')) ?? text(read(user, 'name')) ?? email;
   if (!label) return undefined;
-  const role = roleOf(u);
+  const role = pickRole([...rolesOf(user), ...extraRoles]);
   return { label, ...(email ? { email } : {}), ...(role ? { role } : {}) };
+}
+
+/** How long the footer waits for authkit's per-request identity before giving up on the role. */
+const IDENTITY_TIMEOUT_MS = 250;
+
+/**
+ * The global roles of authkit's per-request identity (`ctx.authkit`), read structurally: the
+ * already-resolved `identity` when there is one, else `getIdentity()` (memoized per request) under
+ * a short timeout. Any failure means no roles.
+ */
+async function authkitRoles(ctx: HttpContext): Promise<string[]> {
+  const authkit = read(ctx, 'authkit');
+  if (typeof authkit !== 'object' || authkit === null) return [];
+  let identity = read(authkit, 'identity');
+  const getIdentity = read(authkit, 'getIdentity');
+  if ((identity === null || identity === undefined) && typeof getIdentity === 'function') {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      identity = await Promise.race([
+        Promise.resolve(getIdentity.call(authkit)),
+        new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => resolve(undefined), IDENTITY_TIMEOUT_MS);
+        }),
+      ]);
+    } catch {
+      identity = undefined;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return roleNames(read(identity, 'globalRoles'));
 }
 
 /** Keep only the fields the SPA renders, as trimmed non-empty strings. */
@@ -84,7 +146,8 @@ function cleanViewer(value: unknown): ConsoleViewer | undefined {
 /**
  * The viewer for this request: the host's `viewer(ctx)` hook when configured (a throw or an empty
  * answer means no user row), else a structural read of `ctx.auth?.user` — only when the request is
- * already authenticated; it never triggers an authentication.
+ * already authenticated; it never triggers an authentication. The fallback's role also looks at
+ * authkit's per-request identity (`ctx.authkit`, its `globalRoles`) once a user is there.
  */
 export async function resolveViewer(
   ctx: HttpContext,
@@ -97,13 +160,10 @@ export async function resolveViewer(
       return undefined;
     }
   }
-  try {
-    const auth = (ctx as unknown as { auth?: { user?: unknown } }).auth;
-    return viewerFromUser(auth?.user);
-  } catch {
-    // Some guards throw on `.user` before authentication; that just means "no viewer".
-    return undefined;
-  }
+  // `read` swallows guards that throw on `.user` before authentication: that just means "no viewer".
+  const user = read(read(ctx, 'auth'), 'user');
+  if (!viewerFromUser(user)) return undefined;
+  return viewerFromUser(user, await authkitRoles(ctx));
 }
 
 /** The request's CSRF token when `@adonisjs/shield` (or anything like it) put one on the request. */
