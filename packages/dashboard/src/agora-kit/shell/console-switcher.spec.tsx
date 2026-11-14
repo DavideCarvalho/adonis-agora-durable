@@ -281,6 +281,7 @@ describe('ConsoleSearch loading', () => {
     });
     expect(screen.getByText(/didn't answer/)).toBeTruthy();
     expect(screen.queryByText('Nothing found.')).toBeNull();
+    expect(screen.getByRole('status').textContent).toBe('Search failed');
     expect(spinner()).toBeNull();
     fetchMock.mockReturnValueOnce(respond(paymentsHit('pi_9')));
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
