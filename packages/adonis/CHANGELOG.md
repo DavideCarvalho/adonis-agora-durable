@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.23
+
+### Patch Changes
+
+- [#525](https://github.com/DavideCarvalho/adonis-agora-durable/pull/525) [`c5c0aa2`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/c5c0aa24ed7fde78d91cfd97a35497d4142e11d1) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Console ⌘K shows its loading state: a spinner in the search box while a request is in flight, skeleton rows until the first answer, earlier hits kept but dimmed during a re-search, "Nothing found" only after an empty answer, and a quiet "didn't answer" line with Retry when the search fails. Synced with the shared console kit (DataTable `rowClassName`/`subRow`, ⌘K console-local `commands`, collapsible nav sections).
+
 ## 1.0.0-rc.22
 
 ### Patch Changes
