@@ -5,7 +5,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { resetConsoleCache } from '../console-data';
 import { parseShellConfig, readShellConfig } from '../shell-config';
 import { ThemeProvider } from '../theme';
-import { ConsoleSearch, useSearchShortcut } from './console-search';
+import {
+  ConsoleSearch,
+  filterCommands,
+  type SearchCommand,
+  useSearchShortcut,
+} from './console-search';
 import { ConsoleSwitcher } from './console-switcher';
 import { UserFooter } from './user-footer';
 
@@ -184,6 +189,131 @@ describe('ConsoleSearch', () => {
       target: { value: 'ann' },
     });
     await waitFor(() => expect(screen.getByText('ann@x.test')).toBeTruthy(), { timeout: 2000 });
+  });
+});
+
+function deferred() {
+  let resolve!: (value: Response) => void;
+  const promise = new Promise<Response>((r) => {
+    resolve = r;
+  });
+  return {
+    promise,
+    resolve: (body: unknown, status = 200) =>
+      resolve(new Response(JSON.stringify(body), { status })),
+  };
+}
+
+const paymentsHit = (title: string) => ({
+  results: [
+    {
+      id: 'payments',
+      title: 'Payments',
+      icon: 'payments',
+      hits: [{ title, href: `/payments#/p/${title}` }],
+    },
+  ],
+});
+
+async function openAndType(value: string) {
+  render(<SearchHarness />);
+  await act(async () => {
+    fireEvent.keyDown(window, { key: 'k', metaKey: true });
+  });
+  const input = await screen.findByRole('combobox', { name: 'Search all consoles' });
+  fireEvent.change(input, { target: { value } });
+  return input;
+}
+
+const spinner = () => document.querySelector('[data-agora-search-spinner]');
+const skeleton = () => document.querySelector('[data-agora-search-skeleton]');
+const listbox = () => document.querySelector('[cmdk-list]');
+
+describe('ConsoleSearch loading', () => {
+  it('shows a spinner and skeleton rows while the first answer loads, never "Nothing found"', async () => {
+    const first = deferred();
+    fetchMock.mockReturnValue(first.promise);
+    await openAndType('zzz');
+    expect(spinner()).toBeTruthy();
+    expect(skeleton()).toBeTruthy();
+    expect(listbox()?.getAttribute('aria-busy')).toBe('true');
+    expect(screen.queryByText('Nothing found.')).toBeNull();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1), { timeout: 2000 });
+    expect(screen.queryByText('Nothing found.')).toBeNull();
+    await act(async () => {
+      first.resolve({ results: [] });
+    });
+    await waitFor(() => expect(screen.getByText('Nothing found.')).toBeTruthy());
+    expect(spinner()).toBeNull();
+    expect(skeleton()).toBeNull();
+    expect(listbox()?.getAttribute('aria-busy')).toBe('false');
+  });
+
+  it('keeps the previous hits visible but dimmed during a re-search', async () => {
+    fetchMock.mockReturnValueOnce(respond(paymentsHit('pi_1')));
+    const input = await openAndType('pi');
+    await waitFor(() => expect(screen.getByText('pi_1')).toBeTruthy(), { timeout: 2000 });
+    expect(document.querySelector('[data-stale]')).toBeNull();
+
+    const second = deferred();
+    fetchMock.mockReturnValueOnce(second.promise);
+    fireEvent.change(input, { target: { value: 'pi_2' } });
+    expect(screen.getByText('pi_1')).toBeTruthy();
+    expect(document.querySelector('[data-stale]')).toBeTruthy();
+    expect(spinner()).toBeTruthy();
+    expect(skeleton()).toBeNull();
+    expect(screen.queryByText('Nothing found.')).toBeNull();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2), { timeout: 2000 });
+    await act(async () => {
+      second.resolve(paymentsHit('pi_2'));
+    });
+    await waitFor(() => expect(screen.getByText('pi_2')).toBeTruthy());
+    expect(screen.queryByText('pi_1')).toBeNull();
+    expect(document.querySelector('[data-stale]')).toBeNull();
+    expect(spinner()).toBeNull();
+  });
+
+  it('shows a quiet error line (not "Nothing found") when the search fails, and retries', async () => {
+    fetchMock.mockReturnValueOnce(respond({ error: 'boom' }, 500));
+    await openAndType('ord');
+    await waitFor(() => expect(document.querySelector('[data-agora-search-error]')).toBeTruthy(), {
+      timeout: 2000,
+    });
+    expect(screen.getByText(/didn't answer/)).toBeTruthy();
+    expect(screen.queryByText('Nothing found.')).toBeNull();
+    expect(spinner()).toBeNull();
+    fetchMock.mockReturnValueOnce(respond(paymentsHit('pi_9')));
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(screen.getByText('pi_9')).toBeTruthy(), { timeout: 2000 });
+    expect(document.querySelector('[data-agora-search-error]')).toBeNull();
+  });
+});
+
+describe('ConsoleSearch commands', () => {
+  const commands: SearchCommand[] = [
+    { id: 'runs', label: 'Runs', group: 'Pages', onSelect: vi.fn() },
+    { id: 'workers', label: 'Workers', group: 'Pages', keywords: ['nodes'], onSelect: vi.fn() },
+  ];
+
+  it('filterCommands matches label and keywords, case-insensitively', () => {
+    expect(filterCommands(commands, '').map((c) => c.id)).toEqual(['runs', 'workers']);
+    expect(filterCommands(commands, 'NOD').map((c) => c.id)).toEqual(['workers']);
+    expect(filterCommands(commands, 'x')).toEqual([]);
+  });
+
+  it('lists local commands without a search endpoint and runs the chosen one', async () => {
+    const onOpenChange = vi.fn();
+    render(<ConsoleSearch commands={commands} open onOpenChange={onOpenChange} />);
+    const input = await screen.findByRole('combobox', { name: 'Search' });
+    expect(screen.getByText('Runs')).toBeTruthy();
+    fireEvent.change(input, { target: { value: 'nodes' } });
+    expect(screen.queryByText('Runs')).toBeNull();
+    fireEvent.click(screen.getByText('Workers'));
+    expect(commands[1]?.onSelect).toHaveBeenCalled();
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    fireEvent.change(input, { target: { value: 'qqq' } });
+    expect(screen.getByText('Nothing found.')).toBeTruthy();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 
