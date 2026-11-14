@@ -3,6 +3,12 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- Inline, so the browser's automatic /favicon.ico probe is not a 404 in the host app's log:
+         the provider serves only `<path>` and `<path>/assets/:file`, nothing at the site root. -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%2309090b'/%3E%3Cpath d='M17.5 9A6 6 0 1 0 18 13' fill='none' stroke='%23a3e635' stroke-width='1.8' stroke-linecap='round'/%3E%3Cpath d='M18 5.5V9h-3.5' fill='none' stroke='%23a3e635' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"
+    />
     <title>durable · control plane</title>
   </head>
   <body>
