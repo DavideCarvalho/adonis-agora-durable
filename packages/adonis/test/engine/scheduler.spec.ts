@@ -86,7 +86,7 @@ describe('runSchedules', () => {
     expect(started).toBe(1);
 
     await engine.signal('go', undefined); // bucket 1 completes
-    await fireAndSettle(engine, sched, 3000); // bucket 3 → prev (bucket 2) never ran → starts
+    await fireAndSettle(engine, sched, 3000); // bucket 3 → nothing in flight any more → starts
     expect(started).toBe(2);
   });
 
@@ -398,6 +398,164 @@ describe('runSchedules — custo por tick', () => {
     const afterFirst = reads();
     await runSchedules(engine, schedules, 61_000);
     expect(reads()).toBe(afterFirst);
+  });
+});
+
+describe("runSchedules — overlap: 'skip' covers every earlier window", () => {
+  /** A workflow that suspends until `go` is signalled, counting how many runs entered it. */
+  function slowEngine(store: InMemoryStateStore) {
+    const engine = new WorkflowEngine({ store });
+    const started: string[] = [];
+    engine.register('slow', '1', async (ctx) => {
+      await ctx.localStep('enter', async () => {
+        started.push(ctx.runId);
+      });
+      await ctx.waitForSignal('go');
+    });
+    return { engine, started };
+  }
+
+  /** Signal `go` (only one run waits on it at a time in these tests) and let `runId` finish. */
+  async function release(engine: WorkflowEngine, runId: string) {
+    await engine.signal('go', undefined);
+    await engine.waitForRun(runId);
+  }
+
+  it('N in flight → N+1, N+2 and N+3 all skipped; fires again once N completes', async () => {
+    // The production bug: N+2 checked only N+1, which never ran (skipped), so it started a second
+    // run next to N — overlap protection failed every other window.
+    const store = new InMemoryStateStore();
+    const { engine, started } = slowEngine(store);
+    const sched: ScheduledWorkflow[] = [
+      { key: 's', workflow: 'slow', everyMs: 1000, overlap: 'skip' },
+    ];
+
+    await fireAndSettle(engine, sched, 1000); // N = bucket 1
+    expect(started).toEqual(['sched:s:1']);
+    for (const t of [2000, 3000, 3500, 4000]) {
+      expect(await runSchedules(engine, sched, t)).toEqual([]);
+    }
+    expect(started).toEqual(['sched:s:1']);
+    expect(await store.getRun('sched:s:3')).toBeNull();
+
+    await release(engine, 'sched:s:1');
+    expect(await runSchedules(engine, sched, 4500)).toEqual(['sched:s:4']);
+  });
+
+  it('a restarted process (empty memo) still sees the run in flight', async () => {
+    const store = new InMemoryStateStore();
+    const first = slowEngine(store);
+    const sched: ScheduledWorkflow[] = [
+      { key: 's', workflow: 'slow', everyMs: 1000, overlap: 'skip' },
+    ];
+    await fireAndSettle(first.engine, sched, 1000);
+
+    // A fresh engine over the same store, ticking many windows later — the old run is nowhere
+    // near the previous window, and this process never saw it start.
+    const restarted = new WorkflowEngine({ store });
+    restarted.register('slow', '1', async () => {});
+    expect(await runSchedules(restarted, sched, 50_000)).toEqual([]);
+    expect(await runSchedules(restarted, sched, 51_000)).toEqual([]);
+
+    await release(first.engine, 'sched:s:1');
+    expect(await runSchedules(restarted, sched, 52_000)).toEqual(['sched:s:52']);
+  });
+
+  it('a run another instance started blocks this instance too', async () => {
+    const store = new InMemoryStateStore();
+    const a = slowEngine(store);
+    const b = slowEngine(store);
+    const sched: ScheduledWorkflow[] = [
+      { key: 's', workflow: 'slow', everyMs: 1000, overlap: 'skip' },
+    ];
+
+    expect(await runSchedules(a.engine, sched, 1000)).toEqual(['sched:s:1']);
+    // b ticks the same window (idempotent) and then the next ones — all held back by a's run.
+    expect(await runSchedules(b.engine, sched, 1000)).toEqual([]);
+    expect(await runSchedules(b.engine, sched, 2000)).toEqual([]);
+    expect(await runSchedules(a.engine, sched, 3000)).toEqual([]);
+    expect(await runSchedules(b.engine, sched, 4000)).toEqual([]);
+
+    await release(a.engine, 'sched:s:1');
+    expect(await runSchedules(b.engine, sched, 5000)).toEqual(['sched:s:5']);
+    expect(await runSchedules(a.engine, sched, 5000)).toEqual([]);
+  });
+
+  it('a backfill under skip starts one window at a time', async () => {
+    const store = new InMemoryStateStore();
+    const { engine } = slowEngine(store);
+    const sched: ScheduledWorkflow[] = [
+      { key: 's', workflow: 'slow', everyMs: 1000, overlap: 'skip', backfill: { maxCatchup: 3 } },
+    ];
+    expect(await runSchedules(engine, sched, 10_000)).toEqual(['sched:s:7']);
+    expect(await runSchedules(engine, sched, 10_500)).toEqual([]);
+    await release(engine, 'sched:s:7');
+    expect(await runSchedules(engine, sched, 10_600)).toEqual(['sched:s:8']);
+  });
+
+  it('applies to cron schedules: no new fire while an earlier fire is in flight', async () => {
+    const store = new InMemoryStateStore();
+    const { engine, started } = slowEngine(store);
+    const sched: ScheduledWorkflow[] = [
+      { key: 'c', workflow: 'slow', cron: '*/15 * * * *', timezone: 'UTC', overlap: 'skip' },
+    ];
+    const at = (h: number, m: number) => Date.UTC(2026, 0, 1, h, m, 5);
+
+    await fireAndSettle(engine, sched, at(2, 0));
+    const first = `sched:c:${Date.UTC(2026, 0, 1, 2, 0)}`;
+    expect(started).toEqual([first]);
+    for (const [h, m] of [
+      [2, 15],
+      [2, 30],
+      [2, 45],
+      [3, 0],
+    ] as const) {
+      expect(await runSchedules(engine, sched, at(h, m))).toEqual([]);
+    }
+
+    await release(engine, first);
+    expect(await runSchedules(engine, sched, at(3, 1))).toEqual([
+      `sched:c:${Date.UTC(2026, 0, 1, 3, 0)}`,
+    ]);
+  });
+
+  it('a cron without overlap still fires every window', async () => {
+    const store = new InMemoryStateStore();
+    const { engine, started } = slowEngine(store);
+    const sched: ScheduledWorkflow[] = [
+      { key: 'c', workflow: 'slow', cron: '*/15 * * * *', timezone: 'UTC' },
+    ];
+    await runSchedules(engine, sched, Date.UTC(2026, 0, 1, 2, 0, 5));
+    await runSchedules(engine, sched, Date.UTC(2026, 0, 1, 2, 15, 5));
+    await engine.waitForRun(`sched:c:${Date.UTC(2026, 0, 1, 2, 15)}`).catch(() => undefined);
+    expect(started).toHaveLength(2);
+  });
+
+  it('while blocked, each tick costs one primary-key read', async () => {
+    const store = new InMemoryStateStore();
+    const { engine } = slowEngine(store);
+    let gets = 0;
+    let lists = 0;
+    const counted = {
+      start: engine.start.bind(engine),
+      getRun: async (id: string) => {
+        gets += 1;
+        return engine.getRun(id);
+      },
+      listRuns: async (q: Parameters<WorkflowEngine['listRuns']>[0]) => {
+        lists += 1;
+        return engine.listRuns(q);
+      },
+    };
+    const sched: ScheduledWorkflow[] = [
+      { key: 's', workflow: 'slow', everyMs: 1000, overlap: 'skip' },
+    ];
+    await runSchedules(counted, sched, 1000);
+    gets = 0;
+    lists = 0;
+    for (const t of [2000, 2100, 3000, 4000]) await runSchedules(counted, sched, t);
+    expect(gets).toBe(4);
+    expect(lists).toBe(0);
   });
 });
 

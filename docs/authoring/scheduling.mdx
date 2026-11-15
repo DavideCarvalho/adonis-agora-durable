@@ -240,7 +240,7 @@ rather than being detected and driven with the wrong entry point.
 ## Pausing and overlap
 
 - `paused: true` skips a schedule entirely while it's set — handy for disabling a job without removing it.
-- `overlap: 'skip'` won't start a new window while the immediately preceding window's run is still `running` or `suspended`. The default, `'allow'`, starts each window regardless, so a slow run and a fresh one can be in flight together. It applies to fixed-interval schedules only (it checks the previous `everyMs` bucket) — cron windows aren't adjacent ids, so `overlap` has no effect on a `cron` schedule.
+- `overlap: 'skip'` won't start a new window while any earlier run of the schedule is still in flight (pending, running, suspended, blocked or cancelling). Every window that comes due in the meantime is skipped, and the schedule fires again at the first window after that run finishes. It works the same for `everyMs` and `cron` schedules. With `backfill`, missed windows are started one at a time. The default, `'allow'`, starts each window regardless, so a slow run and a fresh one can be in flight together.
 
 ```ts
 { key: 'slow-sync', workflow: 'slow-sync', everyMs: 60_000, overlap: 'skip' }
