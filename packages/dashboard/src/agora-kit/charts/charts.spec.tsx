@@ -58,12 +58,18 @@ describe('chart rows', () => {
     });
   });
 
-  it('treats no rows or all-zero values as empty', () => {
+  it('treats no rows as empty, and all-zero values only when asked', () => {
+    const zeros = toChartRows(days, day, [{ key: 'z', label: 'z', value: () => 0 }]);
     expect(isEmptyChart([])).toBe(true);
-    expect(isEmptyChart(toChartRows(days, day, [{ key: 'z', label: 'z', value: () => 0 }]))).toBe(
-      true,
-    );
-    expect(isEmptyChart(toChartRows(days, day, cost))).toBe(false);
+    expect(isEmptyChart(zeros)).toBe(false);
+    expect(isEmptyChart(zeros, true)).toBe(true);
+    expect(isEmptyChart(toChartRows(days, day, cost), true)).toBe(false);
+  });
+
+  it('keeps count axes on whole numbers', () => {
+    const small = toChartRows(days, day, [{ key: 'n', label: 'n', value: (d: Day) => d.failed }]);
+    expect(valueTicks(small, true, undefined).count).toBe(3);
+    expect(valueTicks(small, false, undefined).count).toBe(4);
   });
 
   it('builds tooltip content: formatted title, one swatched row per series, extra rows', () => {
