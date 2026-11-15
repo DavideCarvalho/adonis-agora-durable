@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.28
+
+### Patch Changes
+
+- [#544](https://github.com/DavideCarvalho/adonis-agora-durable/pull/544) [`73e03d8`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/73e03d8ab8edc1280f9131ba5747ce36b45903fe) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Ships the current console: chart tooltips (TanStack Charts) and ⌘K navigation to pages and consoles. The console is bundled into this package, so the dashboard-only release did not reach apps.
+
 ## 1.0.0-rc.27
 
 ### Patch Changes
