@@ -2,7 +2,7 @@
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
 import { BarChart } from './bar-chart';
-import { chartTooltip, isEmptyChart, toChartRows } from './chart-kit';
+import { chartTooltip, isEmptyChart, toChartRows, valueTicks } from './chart-kit';
 import { DonutChart } from './donut-chart';
 import { Sparkline } from './sparkline';
 import { TimeSeriesChart } from './time-series-chart';
@@ -133,9 +133,14 @@ describe('BarChart', () => {
     expect(tooltipText()).toContain('failed');
   });
 
-  it('renders the empty state when every value is zero', () => {
+  it('draws an all-zero window by default and shows the empty state with emptyWhenZero', () => {
     const zero = days.map((d) => ({ ...d, runs: 0, failed: 0 }));
-    render(<BarChart data={zero} x={day} series={runs} ariaLabel="runs per day" />);
+    const { unmount } = render(
+      <BarChart data={zero} x={day} series={runs} ariaLabel="runs per day" />,
+    );
+    expect(screen.getByRole('img', { name: 'runs per day' })).toBeTruthy();
+    unmount();
+    render(<BarChart data={zero} x={day} series={runs} ariaLabel="runs per day" emptyWhenZero />);
     expect(screen.getByText('No data in this window.')).toBeTruthy();
   });
 });
