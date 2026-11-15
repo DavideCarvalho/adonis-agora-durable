@@ -1,5 +1,11 @@
 # @adonis-agora/durable-dashboard
 
+## 1.0.0-rc.13
+
+### Patch Changes
+
+- [#540](https://github.com/DavideCarvalho/adonis-agora-durable/pull/540) [`a562ef3`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/a562ef38ca45dee4cd62005522525bc6adb0b26d) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The console kit gains charts on TanStack Charts (`agora-kit/charts`: TimeSeriesChart, BarChart, Sparkline, DonutChart) with a themed tooltip on hover and keyboard focus. No chart in this console uses it yet; nothing changes on screen and its JS bundle stays the same (the chart styles add a few lines of CSS).
+
 ## 1.0.0-rc.12
 
 ### Patch Changes
