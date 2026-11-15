@@ -1,53 +1,118 @@
 ---
 title: Authenticate tenants
-description: Prove which tenant a store-less pod is. Write a verifier for the control plane and a credentials source for the tenant, with @adonisjs/auth access tokens, authkit, any OIDC provider, or a shared HMAC secret.
+description: Prove which tenant a store-less pod is. Verify tokens on the control plane and send them from the tenant, with authkit, @adonisjs/auth access tokens, or a shared secret per partition.
 icon: KeyRound
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
-import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
 
-A `tenant` pod sends a token with every request it makes to the control plane. The control plane checks the token and decides which tenant the pod is; whatever the request claims about itself is ignored. Two settings in `config/durable.ts` carry this:
+A `tenant` pod sends a token with every request it makes to the control plane. The control plane checks the token and decides which partition the pod is; whatever the request claims about itself is ignored. Two settings in `config/durable.ts` carry this:
 
-- `verifyTenant`, on the control plane: turns a token into `{ tenant, capabilities }`, or rejects it.
-- `tenant.token`, on the tenant pod: the token to send.
+- `verifyTenant`, on the control plane: turns a token into `{ partition, environment?, capabilities }`, or rejects it.
+- `tenant: { partition, token }`, on the tenant pod: who the pod is and the token it sends.
 
-Durable does not care where the token comes from. Pick the setup that matches what your app already runs:
+Pick the setup that matches what your app already runs:
 
 | You have | Control plane | Tenant pod |
 | --- | --- | --- |
+| [authkit](#with-authkit) (in this app or on another server) | `authkitTenantVerifier({ issuer, resource })` | `authkitTenantToken({ issuer, clientId, clientSecret, resource })` |
 | [`@adonisjs/auth`](#with-adonisjsauth-access-tokens) | Verify access tokens with your tokens provider | A static access token |
-| [authkit](#with-authkit) | `authkitTenantVerifier()` | `authkitTenantToken(...)` |
-| [Any OIDC provider](#with-any-oidc-provider) (Keycloak, Auth0, Entra ID...) | Verify JWTs against the provider's keys | `client_credentials`, refreshed before expiry |
-| [Nothing](#with-a-shared-secret-hmac) | `hmacTenantVerifier(secret)` | `signTenantToken(partition, secret)` |
+| [Nothing](#with-a-shared-secret) | `sharedSecretVerifier({ partitions })` | The partition's secret, or a `signTenantToken` of it |
 
 <Callout type="warn">
 Without `verifyTenant`, the control plane trusts the tenant a request names. Any process that can reach the broker can then read, signal, cancel and start runs as any tenant. Run without a verifier only when each tenant's broker access is already isolated.
 </Callout>
 
+## With authkit
+
+Each tenant app is a service-tenant client of your authkit server. It gets a short-lived JWT access token for `urn:agora:durable` with the `client_credentials` grant, and the control plane checks it against authkit's keys, locally. Neither side has to run authkit-server: both helpers come from `@adonis-agora/authkit-client`, and they find authkit's endpoints through `{issuer}/.well-known/openid-configuration`.
+
+```sh
+npm i @adonis-agora/authkit-client
+```
+
+Create the client on the authkit server, in its console or with:
+
+```bash
+node ace authkit:client create --client-id=durable-acme --partition=acme-corp --capability=tenancy:*
+```
+
+The command prints the client secret once. Pass `--capability` once per capability. The same client can also ask for tokens for other Agora resources (`urn:agora:flags`, `urn:agora:config`): one client per app, not one per product.
+
+```ts title="config/durable.ts (control plane)"
+import env from '#start/env'
+import { authkitTenantVerifier } from '@adonis-agora/authkit-client'
+
+export default defineConfig({
+  topology: 'control-plane',
+  // ...
+  verifyTenant: authkitTenantVerifier({
+    issuer: env.get('AUTHKIT_ISSUER'),
+    resource: 'urn:agora:durable',
+  }),
+})
+```
+
+```ts title="config/durable.ts (tenant)"
+import env from '#start/env'
+import { authkitTenantToken } from '@adonis-agora/authkit-client'
+
+export default defineConfig({
+  topology: 'tenant',
+  // ...
+  tenant: {
+    partition: 'acme-corp',
+    token: authkitTenantToken({
+      issuer: env.get('AUTHKIT_ISSUER'),
+      clientId: env.get('DURABLE_TENANT_CLIENT_ID'),
+      clientSecret: env.get('DURABLE_TENANT_CLIENT_SECRET'),
+      resource: 'urn:agora:durable',
+    }),
+  },
+})
+```
+
+The control plane accepts a token only when its signature, issuer, `aud` (the resource), `typ: at+jwt` and expiry check out and it carries a `partition` claim. The partition, the capabilities and the environment all come from the token. `tenant.partition` should match the client's partition: a pod that names another one still only acts as its own.
+
+To serve one environment only, pin it; tokens for another environment, or without one, are refused:
+
+```ts
+verifyTenant: authkitTenantVerifier({
+  issuer: env.get('AUTHKIT_ISSUER'),
+  resource: 'urn:agora:durable',
+  environment: 'production',
+}),
+```
+
+When the control plane runs inside the authkit app, `authkitTenantVerifier` from `@adonis-agora/authkit-server` does the same without discovery, and returns the same result. Rotating a client secret, disabling a client and the token options are on authkit's [Service tenants](/docs/authkit/service-tenants) page.
+
+<Callout type="info">
+Another OIDC provider works too when it issues RFC 9068 JWT access tokens (`typ: at+jwt`) for `client_credentials` clients, with `client_id` (equal to `sub`), `partition` and `capabilities` claims: point `issuer` at it.
+</Callout>
+
 ## The contracts
 
-Both settings accept a function, or a class you write in its own file. The classes implement one of two interfaces exported by `@adonis-agora/durable`.
+Both settings also accept a class you write in its own file, for a verifier or a token source of your own. The classes implement one of two interfaces exported by `@adonis-agora/durable`.
 
 ### `TenantVerifierContract`
 
 ```ts
-import type { TenantVerifierContract, TenantVerifierInput, VerifiedTenant } from '@adonis-agora/durable'
+import type { TenantVerifierContract, TenantVerifierRequest, VerifiedTenant } from '@adonis-agora/durable'
 
 export default class MyTenantVerifier implements TenantVerifierContract {
-  async verify({ token }: TenantVerifierInput): Promise<VerifiedTenant | null> {
+  async verify({ token }: TenantVerifierRequest): Promise<VerifiedTenant | null> {
     // ...
   }
 }
 ```
 
-#### `verify(input)`
+#### `verify(request)`
 
 Called on the control plane for every request a tenant pod sends.
 
-- `input.token` is the token the pod sent. It is `undefined` when the pod sends none.
-- `input.tenant` is what the request claims. Never use it to decide the tenant.
-- Return `{ tenant, capabilities? }` to accept. `tenant` is the partition the pod acts as: its runs are created in, and confined to, that namespace. A capability `tenancy:*` (or `tenancy:<id>`) lets the pod start runs for its active [organization](/docs/durable/concepts/organizations); without it, the pod's runs belong to no organization.
+- `request.token` is the token the pod sent. It is `undefined` when the pod sends none.
+- `request.partition` is what the request claims. Never use it to decide the partition.
+- Return `{ partition, environment?, capabilities }` to accept. `partition` is the tenant the pod acts as: its runs are created in, and confined to, that namespace. A capability `tenancy:*` (or `tenancy:<id>`) lets the pod start runs for its active [organization](/docs/durable/concepts/organizations); without it, the pod's runs belong to no organization.
 - Return `null` to reject. The pod's call fails with a `RunGatewayError` whose `code` is `unauthorized`.
 - Throw when you cannot decide (your database or the identity provider is down). The pod's call fails with the error message, and the next request calls `verify` again.
 
@@ -79,7 +144,7 @@ Called on the tenant pod before every request it sends.
 
 ```ts title="config/durable.ts (control plane)"
 // 1. A function
-verifyTenant: hmacTenantVerifier(env.get('DURABLE_TENANT_SECRET')),
+verifyTenant: authkitTenantVerifier({ issuer: env.get('AUTHKIT_ISSUER'), resource: 'urn:agora:durable' }),
 
 // 2. A class. The container builds it once, so @inject() works
 verifyTenant: MyTenantVerifier,
@@ -88,16 +153,16 @@ verifyTenant: MyTenantVerifier,
 verifyTenant: () => import('#tenants/my_tenant_verifier'),
 
 // 4. An object that has a verify() method
-verifyTenant: new OidcTenantVerifier({ ... }),
+verifyTenant: new MyTenantVerifier(),
 ```
 
-`tenant.token` takes a string, a function, or the same class, lazy import and object forms with a `token()` method:
+`tenant.token` takes a string, a function, an object with `get()`, or the same class, lazy import and object forms with a `token()` method:
 
 ```ts title="config/durable.ts (tenant)"
-tenant: { token: env.get('DURABLE_TENANT_TOKEN') },
-tenant: { token: async () => vault.read('durable/token') },
-tenant: { token: () => import('#tenants/my_tenant_credentials') },
-tenant: { token: new ClientCredentials({ ... }) },
+tenant: { partition: 'acme-corp', token: env.get('DURABLE_TENANT_TOKEN') },
+tenant: { partition: 'acme-corp', token: async () => vault.read('durable/token') },
+tenant: { partition: 'acme-corp', token: { get: () => vault.read('durable/token') } },
+tenant: { partition: 'acme-corp', token: () => import('#tenants/my_tenant_credentials') },
 ```
 
 ## With `@adonisjs/auth` access tokens
@@ -172,7 +237,7 @@ Revoke a pod with `ServiceTenant.accessTokens.delete(tenant, tokenId)`, or delet
 ```ts title="app/tenants/access_token_tenant_verifier.ts"
 import { createHash } from 'node:crypto'
 import { Secret } from '@adonisjs/core/helpers'
-import type { TenantVerifierContract, TenantVerifierInput, VerifiedTenant } from '@adonis-agora/durable'
+import type { TenantVerifierContract, TenantVerifierRequest, VerifiedTenant } from '@adonis-agora/durable'
 import ServiceTenant from '#models/service_tenant'
 
 /**
@@ -191,7 +256,7 @@ export default class AccessTokenTenantVerifier implements TenantVerifierContract
     this.#maxEntries = options.maxEntries ?? 10_000
   }
 
-  async verify({ token }: TenantVerifierInput): Promise<VerifiedTenant | null> {
+  async verify({ token }: TenantVerifierRequest): Promise<VerifiedTenant | null> {
     if (!token) return null
     // Keyed by a hash, so the cache never holds a usable token.
     const key = createHash('sha256').update(token).digest('base64url')
@@ -202,7 +267,7 @@ export default class AccessTokenTenantVerifier implements TenantVerifierContract
     const accessToken = await ServiceTenant.accessTokens.verify(new Secret(token))
     const owner = accessToken ? await ServiceTenant.find(accessToken.tokenableId) : null
     const result =
-      accessToken && owner ? { tenant: owner.partition, capabilities: accessToken.abilities } : null
+      accessToken && owner ? { partition: owner.partition, capabilities: accessToken.abilities } : null
 
     let until = Date.now() + this.#cacheTtlMs
     if (accessToken?.expiresAt) until = Math.min(until, accessToken.expiresAt.getTime())
@@ -230,256 +295,53 @@ export default defineConfig({
 ```ts title="config/durable.ts (tenant)"
 export default defineConfig({
   topology: 'tenant',
-  partition: 'acme-corp',
   // ...
-  tenant: { token: env.get('DURABLE_TENANT_TOKEN') },
+  tenant: { partition: 'acme-corp', token: env.get('DURABLE_TENANT_TOKEN') },
 })
 ```
 
-## With authkit
+## With a shared secret
 
-If the control plane runs [authkit](/docs/authkit), there is nothing to write. Create a service-tenant client in the authkit console, or with `node ace authkit:client create`, give it a partition and its capabilities, and use authkit's verifier and token source:
-
-```bash
-node ace authkit:client create --client-id=durable-acme --partition=acme-corp --capability=gpu
-```
-
-The command prints the client secret once. Pass `--capability` once per capability.
-
-
-```ts title="config/durable.ts (control plane, the authkit app)"
-import { authkitTenantVerifier } from '@adonis-agora/authkit-server'
-
-verifyTenant: authkitTenantVerifier(),
-```
-
-```ts title="config/durable.ts (tenant)"
-import { authkitTenantToken } from '@adonis-agora/authkit-client'
-
-tenant: {
-  token: authkitTenantToken({
-    issuer: env.get('AUTHKIT_ISSUER'),
-    clientId: env.get('DURABLE_TENANT_CLIENT_ID'),
-    clientSecret: env.get('DURABLE_TENANT_CLIENT_SECRET'),
-  }),
-},
-```
-
-Rotating a secret, disabling a client and the server-side config are on authkit's [Service tenants](/docs/authkit/service-tenants) page.
-
-## With any OIDC provider
-
-Each tenant pod is an OAuth client of your identity provider. It gets a short-lived JWT access token with the `client_credentials` grant and sends it; the control plane checks the token's signature against the provider's published keys, without calling the provider for each message. These two classes use [`jose`](https://github.com/panva/jose) (`npm i jose`).
-
-Configure each client on the provider to issue JWT access tokens that carry:
-
-- `aud`: the control plane's resource identifier, e.g. `urn:agora:durable`, requested with `resource` (RFC 8707);
-- `partition`: the tenant the client acts as;
-- `capabilities` (optional): a string array.
-
-The provider's discovery document (`{issuer}/.well-known/openid-configuration`) lists the `jwks_uri` and `token_endpoint` used below.
-
-### The control plane
-
-```ts title="app/tenants/oidc_tenant_verifier.ts"
-import { createRemoteJWKSet, errors, jwtVerify } from 'jose'
-import type { TenantVerifierContract, TenantVerifierInput, VerifiedTenant } from '@adonis-agora/durable'
-
-export interface OidcTenantVerifierOptions {
-  /** The IdP's issuer; must equal the token's `iss`. */
-  issuer: string
-  /** The control plane's resource identifier; must be in the token's `aud`. */
-  audience: string
-  /** The IdP's key set (`jwks_uri` in `{issuer}/.well-known/openid-configuration`). */
-  jwksUri: string
-  /** Claim naming the partition. Default `partition`. */
-  partitionClaim?: string
-  /** Claim listing the capabilities. Default `capabilities`. */
-  capabilitiesClaim?: string
-}
-
-/**
- * Verifies JWT access tokens (RFC 9068) issued by any OIDC provider, locally: the signing keys are
- * fetched once and cached by `jose`, which fetches them again when a token names a key it has not
- * seen (key rotation). Only asymmetric algorithms are accepted, never `none` or `HS*`.
- */
-export class OidcTenantVerifier implements TenantVerifierContract {
-  #options: OidcTenantVerifierOptions
-  #jwks: ReturnType<typeof createRemoteJWKSet>
-
-  constructor(options: OidcTenantVerifierOptions) {
-    this.#options = options
-    this.#jwks = createRemoteJWKSet(new URL(options.jwksUri))
-  }
-
-  async verify({ token }: TenantVerifierInput): Promise<VerifiedTenant | null> {
-    if (!token) return null
-    try {
-      const { payload } = await jwtVerify(token, this.#jwks, {
-        issuer: this.#options.issuer,
-        audience: this.#options.audience,
-        algorithms: ['RS256', 'PS256', 'ES256', 'EdDSA'],
-        requiredClaims: ['exp'],
-        clockTolerance: 30,
-      })
-      const tenant = payload[this.#options.partitionClaim ?? 'partition']
-      if (typeof tenant !== 'string' || tenant === '') return null
-      const capabilities = payload[this.#options.capabilitiesClaim ?? 'capabilities']
-      return {
-        tenant,
-        capabilities: Array.isArray(capabilities)
-          ? capabilities.filter((c): c is string => typeof c === 'string')
-          : undefined,
-      }
-    } catch (error) {
-      // A bad token is a rejection. A key set that cannot be fetched is an error the tenant sees.
-      if (error instanceof errors.JOSEError && !(error instanceof errors.JWKSTimeout)) return null
-      throw error
-    }
-  }
-}
-```
+With no identity provider and no user store, give each partition its own secret, known only to the control plane and to that partition's pods:
 
 ```ts title="config/durable.ts (control plane)"
-import { OidcTenantVerifier } from '#tenants/oidc_tenant_verifier'
+import env from '#start/env'
+import { defineConfig, sharedSecretVerifier } from '@adonis-agora/durable'
 
 export default defineConfig({
   topology: 'control-plane',
   // ...
-  verifyTenant: new OidcTenantVerifier({
-    issuer: env.get('OIDC_ISSUER'),
-    audience: 'urn:agora:durable',
-    jwksUri: env.get('OIDC_JWKS_URI'),
+  verifyTenant: sharedSecretVerifier({
+    partitions: {
+      'acme-corp': env.get('DURABLE_ACME_SECRET'),
+      globex: { secret: env.get('DURABLE_GLOBEX_SECRET'), capabilities: ['tenancy:*'] },
+    },
   }),
 })
 ```
 
-### The tenant pod
-
-```ts title="app/tenants/client_credentials.ts"
-import type { TenantCredentialsContract } from '@adonis-agora/durable'
-
-export interface ClientCredentialsOptions {
-  /** The IdP's token endpoint (`token_endpoint` in its discovery document). */
-  tokenEndpoint: string
-  clientId: string
-  clientSecret: string
-  /** The control plane's resource identifier, sent as `resource` (RFC 8707). */
-  resource: string
-  scope?: string
-  /** Fetch a new token this many seconds before the current one expires. Default 60. */
-  refreshSkewSec?: number
-}
-
-/**
- * Gets the tenant's access token with the OAuth `client_credentials` grant and keeps it fresh. Calls
- * made while a request to the IdP is in flight share it. When the IdP fails, the current token is
- * kept while it is still valid and the IdP is not asked again for 5 seconds.
- */
-export class ClientCredentials implements TenantCredentialsContract {
-  #options: ClientCredentialsOptions
-  #current: { token: string; refreshAt: number; expiresAt: number } | undefined
-  #inflight: Promise<string> | undefined
-  #retryAt = 0
-
-  constructor(options: ClientCredentialsOptions) {
-    this.#options = options
-  }
-
-  async token(): Promise<string> {
-    const now = Date.now()
-    const current = this.#current
-    if (current && now < current.refreshAt) return current.token
-    const stillValid = current && now < current.expiresAt ? current.token : undefined
-    if (stillValid && now < this.#retryAt) return stillValid
-
-    this.#inflight ??= this.#fetch().finally(() => {
-      this.#inflight = undefined
-    })
-    try {
-      return await this.#inflight
-    } catch (error) {
-      this.#retryAt = Date.now() + 5_000
-      if (stillValid) return stillValid
-      throw error
-    }
-  }
-
-  async #fetch(): Promise<string> {
-    const { clientId, clientSecret, resource, scope } = this.#options
-    const body = new URLSearchParams({ grant_type: 'client_credentials', resource })
-    if (scope) body.set('scope', scope)
-    const basic = Buffer.from(
-      `${encodeURIComponent(clientId)}:${encodeURIComponent(clientSecret)}`
-    ).toString('base64')
-    const response = await fetch(this.#options.tokenEndpoint, {
-      method: 'POST',
-      headers: {
-        authorization: `Basic ${basic}`,
-        'content-type': 'application/x-www-form-urlencoded',
-        accept: 'application/json',
-      },
-      body,
-      signal: AbortSignal.timeout(10_000),
-    })
-    // Never put the response body in the error: it is not ours to log.
-    if (!response.ok) throw new Error(`token endpoint answered HTTP ${response.status}`)
-    const json = (await response.json()) as { access_token?: unknown; expires_in?: unknown }
-    if (typeof json.access_token !== 'string') throw new Error('token response has no access_token')
-
-    const lifetimeMs = (typeof json.expires_in === 'number' ? json.expires_in : 300) * 1000
-    const skewMs = (this.#options.refreshSkewSec ?? 60) * 1000
-    const now = Date.now()
-    this.#current = {
-      token: json.access_token,
-      expiresAt: now + lifetimeMs,
-      // A token shorter-lived than the skew is refreshed at half its life instead.
-      refreshAt: now + (skewMs < lifetimeMs ? lifetimeMs - skewMs : lifetimeMs / 2),
-    }
-    this.#retryAt = 0
-    return json.access_token
-  }
-}
-```
-
 ```ts title="config/durable.ts (tenant)"
-import { ClientCredentials } from '#tenants/client_credentials'
-
 export default defineConfig({
   topology: 'tenant',
-  partition: 'acme-corp',
   // ...
-  tenant: {
-    token: new ClientCredentials({
-      tokenEndpoint: env.get('OIDC_TOKEN_ENDPOINT'),
-      clientId: env.get('DURABLE_TENANT_CLIENT_ID'),
-      clientSecret: env.get('DURABLE_TENANT_CLIENT_SECRET'),
-      resource: 'urn:agora:durable',
-    }),
-  },
+  tenant: { partition: 'acme-corp', token: env.get('DURABLE_ACME_SECRET') },
 })
 ```
 
-## With a shared secret (HMAC)
+A partition entry is a secret, a list of secrets, or `{ secret, environment?, capabilities? }`. Two partitions sharing a secret is a boot error.
 
-With no user store and no identity provider, sign each pod's partition with a secret only the control plane and you know:
+The plain secret travels with every request. To keep it off the broker, send a short-lived token signed with it instead:
 
-```ts
-import { hmacTenantVerifier, signTenantToken } from '@adonis-agora/durable'
+```ts title="config/durable.ts (tenant)"
+import { signTenantToken } from '@adonis-agora/durable'
 
-// Mint the token a pod presents (once, e.g. in an ace command); ttlMs makes it expire:
-const token = signTenantToken('acme-corp', env.get('DURABLE_TENANT_SECRET'), {
-  ttlMs: 24 * 60 * 60 * 1000,
-})
-
-// Control plane. A list of secrets lets you rotate: verify with [next, current], re-mint, drop current.
-verifyTenant: hmacTenantVerifier([env.get('DURABLE_TENANT_SECRET_NEXT'), env.get('DURABLE_TENANT_SECRET')]),
-
-// Tenant pod:
-tenant: { token: env.get('DURABLE_TENANT_TOKEN') },
+tenant: {
+  partition: 'acme-corp',
+  token: () => signTenantToken('acme-corp', env.get('DURABLE_ACME_SECRET'), { ttlMs: 5 * 60_000 }),
+},
 ```
 
-`hmacTenantVerifier(secret, capabilities)` grants the same `capabilities` to every pod; the token carries none of its own.
+To rotate a secret, list both on the control plane (`'acme-corp': [next, current]`), move the pods to `next`, then drop `current`.
 
 ## Wire compatibility
 

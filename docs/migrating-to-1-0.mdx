@@ -406,6 +406,47 @@ The same rename applies elsewhere:
 `runGateway.topology()` and `GET <path>/api/topology` still answer `{ role, tenant? }`, the shape
 Aviary's console reads. See [Topology & config](/docs/durable/cluster/topology-and-config).
 
+## Tenant auth: `tenant: { partition, token }`, `{ partition }` from verifiers, `sharedSecretVerifier`
+
+These only concern `control-plane` and `tenant` deployments. There are no aliases.
+
+- A tenant pod's `partition` moved into the `tenant` block. `defineConfig` throws at boot when it
+  finds the old top-level key.
+- A `verifyTenant` returns `{ partition, environment?, capabilities }` instead of
+  `{ tenant, capabilities? }`, and receives `{ token, partition? }` instead of `{ token, tenant? }`.
+  A verifier that still returns `{ tenant }` fails the request instead of accepting it. The types
+  are `VerifiedTenant` and `TenantVerifierRequest` (was `TenantVerifierInput`).
+- `hmacTenantVerifier(secret, capabilities)` is replaced by `sharedSecretVerifier({ partitions })`:
+  one secret per partition. Pods keep sending a `signTenantToken(partition, secret)` token (signed
+  with their partition's secret now), or the plain secret.
+- With authkit, use `authkitTenantVerifier({ issuer, resource: 'urn:agora:durable' })` and
+  `authkitTenantToken(...)` from `@adonis-agora/authkit-client`, on any server. The in-process
+  `authkitTenantVerifier()` of `@adonis-agora/authkit-server` returns the same shape from
+  authkit-server 1.0.0-rc.25 on.
+
+Before:
+
+```ts title="config/durable.ts"
+// control plane
+verifyTenant: hmacTenantVerifier(env.get('DURABLE_TENANT_SECRET')),
+
+// tenant pod
+partition: 'acme-corp',
+tenant: { token: signTenantToken('acme-corp', env.get('DURABLE_TENANT_SECRET')) },
+```
+
+After:
+
+```ts title="config/durable.ts"
+// control plane
+verifyTenant: sharedSecretVerifier({ partitions: { 'acme-corp': env.get('DURABLE_ACME_SECRET') } }),
+
+// tenant pod
+tenant: { partition: 'acme-corp', token: env.get('DURABLE_ACME_SECRET') },
+```
+
+See [Authenticate tenants](/docs/durable/cluster/authenticate-tenants).
+
 ## `@OnDiagnostic` is removed from durable
 
 Durable no longer starts workflows from `@adonis-agora/diagnostics` events: the `@OnDiagnostic`

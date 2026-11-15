@@ -47,17 +47,16 @@ function typeContracts(): void {
     stores: { lucid: stores.lucid() },
     transport: 'bull',
     transports: { bull: transports.memory() },
-    verifyTenant: ({ token }) => (token ? { tenant: 'acme' } : null),
+    verifyTenant: ({ token }) => (token ? { partition: 'acme', capabilities: [] } : null),
   });
   type _ControlPlane = Expect<Equal<typeof controlPlane, ControlPlaneConfig>>;
 
   // A tenant config narrows to TenantConfig — store-less, with partition + wire options.
   const tenant = defineConfig({
     topology: 'tenant',
-    partition: 'acme',
     transport: 'bull',
     transports: { bull: transports.memory() },
-    tenant: { token: 'signed-claim' },
+    tenant: { partition: 'acme', token: 'signed-claim' },
     capabilities: ['saga', 'search-attr-v2'],
     requestTimeoutMs: 5_000,
   });
@@ -67,19 +66,22 @@ function typeContracts(): void {
   // compile error (`Type 'string' is not assignable to type 'never'`), so isolation is enforced by
   // the type system, not a runtime check. (The directive sits on the call line because that is where
   // an overload-resolution error surfaces.)
+  const acme = { partition: 'acme' };
   // @ts-expect-error — `store` is forbidden on a tenant config (store?: never — compile-time isolation)
-  defineConfig({ topology: 'tenant', partition: 'acme', transport: 'bull', store: 'lucid' });
+  defineConfig({ topology: 'tenant', tenant: acme, transport: 'bull', store: 'lucid' });
 
   // ...and it may not carry a `stores` map either. (Kept on ONE line: TypeScript >= 7 reports the
   // overload error at the first object-literal property, so a multi-line literal would put the
   // diagnostic on a different line than the directive.)
   const lucidStores = { lucid: stores.lucid() };
   // @ts-expect-error — `stores` is forbidden on a tenant config (stores?: never)
-  defineConfig({ topology: 'tenant', partition: 'acme', transport: 'bull', stores: lucidStores });
+  defineConfig({ topology: 'tenant', tenant: acme, transport: 'bull', stores: lucidStores });
 
-  // `partition` is required on a tenant config.
-  // @ts-expect-error — missing required `partition`
+  // `tenant.partition` is required on a tenant config.
+  // @ts-expect-error — missing required `tenant`
   defineConfig({ topology: 'tenant', transport: 'bull' });
+  // @ts-expect-error — missing required `tenant.partition`
+  defineConfig({ topology: 'tenant', transport: 'bull', tenant: { token: 'x' } });
 
   // `store`/`transport` are required on a control-plane config.
   // @ts-expect-error — missing required `store` and `transport`
@@ -115,7 +117,7 @@ describe('defineConfig — topology-discriminated config', () => {
     expect(
       defineConfig({
         topology: 'tenant',
-        partition: 'acme',
+        tenant: { partition: 'acme' },
         transport: 'bull',
         transports: { bull: transports.memory() },
       }).topology,

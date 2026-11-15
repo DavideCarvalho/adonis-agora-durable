@@ -5,6 +5,7 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { installOrgLabeler } from '@adonis-agora/authkit-client';
 import { IgnitorFactory } from '@adonisjs/core/factories';
 import type { HttpContext } from '@adonisjs/core/http';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -130,9 +131,18 @@ const slot = {
   withTenant: <T>(input: { id: string; kind: string } | null, fn: () => T): T =>
     als.run(input ? { tenant: input } : {}, fn),
   allTenants: <T>(fn: () => T): T => als.run({ all: true }, fn),
-  tenantLabels: async (ids: string[]) =>
-    Object.fromEntries(ids.map((id) => [id, id.toUpperCase()])),
+  tenantLabels: async (ids: string[]): Promise<Record<string, string>> => {
+    // Like context: a resolver registered with setTenantLabeler (authkit-client installs one),
+    // else this stand-in's own `tenancy.label`.
+    if (registeredLabeler) return registeredLabeler(ids, {});
+    return Object.fromEntries(ids.map((id) => [id, id.toUpperCase()]));
+  },
+  setTenantLabeler: (resolver: TenantLabeler | undefined) => {
+    registeredLabeler = resolver;
+  },
 };
+type TenantLabeler = (ids: string[], opts: { kind?: string }) => Promise<Record<string, string>>;
+let registeredLabeler: TenantLabeler | undefined;
 
 describe('the console over HTTP with tenancy on', () => {
   let appRoot: string;
@@ -143,6 +153,7 @@ describe('the console over HTTP with tenancy on', () => {
     audits.length = 0;
   });
   afterEach(async () => {
+    registeredLabeler = undefined;
     delete (globalThis as Record<symbol, unknown>)[SLOT];
     await rm(appRoot, { recursive: true, force: true });
   });
@@ -244,5 +255,40 @@ describe('the console over HTTP with tenancy on', () => {
     expect(audits.some((line) => line.startsWith('TENANT') && line.includes('tenant=globex'))).toBe(
       true,
     );
+  });
+
+  it('the org picker shows the labels authkit-client registers with Context.setTenantLabeler', async () => {
+    const asked: string[][] = [];
+    expect(
+      installOrgLabeler(async (orgIds) => {
+        asked.push([...orgIds].sort());
+        const names: Record<string, string> = { acme: 'Acme Inc', globex: 'Globex Corp' };
+        return Object.fromEntries(orgIds.filter((id) => names[id]).map((id) => [id, names[id]!]));
+      }),
+    ).toBe(true);
+    const app = await boot(() => ({ allowed: true, tenants: '*' }));
+    const picker = await get(app, '/durable/api/tenants', 'acme');
+    const tenants = picker.body.tenants as Array<{ id: string; label: string }>;
+    expect([...tenants].sort((a, b) => a.id.localeCompare(b.id))).toEqual([
+      { id: 'acme', label: 'Acme Inc' },
+      { id: 'globex', label: 'Globex Corp' },
+    ]);
+    expect(asked).toEqual([['acme', 'globex']]);
+  });
+
+  it("a labeler with no name for an org falls back to the viewer's slug, else the id", async () => {
+    installOrgLabeler(async () => ({}));
+    const own = await get(await boot(() => true), '/durable/api/tenants', 'acme');
+    expect(own.body.tenants).toEqual([{ id: 'acme', label: 'acme-slug' }]);
+    const all = await get(
+      await boot(() => ({ allowed: true, tenants: '*' })),
+      '/durable/api/tenants',
+      'acme',
+    );
+    const tenants = all.body.tenants as Array<{ id: string; label: string }>;
+    expect([...tenants].sort((a, b) => a.id.localeCompare(b.id))).toEqual([
+      { id: 'acme', label: 'acme' },
+      { id: 'globex', label: 'globex' },
+    ]);
   });
 });

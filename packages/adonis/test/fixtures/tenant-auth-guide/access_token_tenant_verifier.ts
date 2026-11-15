@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { Secret } from '@adonisjs/core/helpers';
 import type {
   TenantVerifierContract,
-  TenantVerifierInput,
+  TenantVerifierRequest,
   VerifiedTenant,
 } from '../../../src/index.js';
 import ServiceTenant from './service_tenant.js';
@@ -23,7 +23,7 @@ export default class AccessTokenTenantVerifier implements TenantVerifierContract
     this.#maxEntries = options.maxEntries ?? 10_000;
   }
 
-  async verify({ token }: TenantVerifierInput): Promise<VerifiedTenant | null> {
+  async verify({ token }: TenantVerifierRequest): Promise<VerifiedTenant | null> {
     if (!token) return null;
     // Keyed by a hash, so the cache never holds a usable token.
     const key = createHash('sha256').update(token).digest('base64url');
@@ -35,7 +35,7 @@ export default class AccessTokenTenantVerifier implements TenantVerifierContract
     const owner = accessToken ? await ServiceTenant.find(accessToken.tokenableId) : null;
     const result =
       accessToken && owner
-        ? { tenant: owner.partition, capabilities: accessToken.abilities }
+        ? { partition: owner.partition, capabilities: accessToken.abilities }
         : null;
 
     let until = Date.now() + this.#cacheTtlMs;

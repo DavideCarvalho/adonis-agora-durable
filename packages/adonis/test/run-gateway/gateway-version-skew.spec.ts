@@ -101,7 +101,7 @@ async function controlPlane(wire: Wire, gatewayOverride?: (g: RunGateway) => Run
   await until(async () => (await store.getRun('p'))?.status === 'completed');
   const base = new StoreRunGateway(engine, { topology: 'control-plane' });
   new RunRequestResponder(wire, gatewayOverride ? gatewayOverride(base) : base, {
-    verifyTenant: async ({ tenant }) => (tenant ? { tenant } : null),
+    verifyTenant: async ({ token }) => (token ? { partition: token, capabilities: [] } : null),
   }).start();
   return engine;
 }

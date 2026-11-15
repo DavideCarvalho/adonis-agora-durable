@@ -13,32 +13,38 @@ import type { BaseDurableConfig } from './define_config.js';
  */
 
 /**
- * The identity a {@link TenantVerifier} derives from a tenant's signed claim — the trust output the
+ * What a {@link TenantVerifier} returns for a token it accepts — the trust output the
  * `RunRequestResponder` uses to force `namespace`/ownership on a store-less pod's requests (spec §9).
+ * Every field comes from the verified token, never from the request. The same shape every Agora
+ * control plane uses, so authkit-client's `authkitTenantVerifier` plugs in as-is (extra fields such
+ * as its `clientId`/`expiresAt` are allowed and ignored).
  */
 export interface VerifiedTenant {
-  /** The tenant/partition the token authenticates as — the responder trusts THIS, never the body. */
-  tenant: string;
-  /** Capabilities the token grants, if the issuer scopes them. */
-  capabilities?: string[] | undefined;
+  /** The partition (app) the token authenticates as — the responder trusts THIS, never the body. */
+  partition: string;
+  /** The environment the token is for, when it names one. */
+  environment?: string | undefined;
+  /** Capabilities the token grants (`[]` for none), e.g. `tenancy:*` to start runs for any customer. */
+  capabilities: string[];
 }
 
-/** What a tenant verifier receives for each incoming request. */
-export interface TenantVerifierInput {
-  /** The token presented on the request (absent when a pod runs token-less on prefix isolation alone). */
+/** What a tenant verifier receives for each incoming request. Only `token` is trusted, once verified. */
+export interface TenantVerifierRequest {
+  /** The token presented on the request (the wire `tenant` field). */
   token?: string | undefined;
-  /** The tenant the request *claims* to be — advisory only; the verifier derives the real one. */
-  tenant?: string | undefined;
+  /** The partition the request claims to be — advisory only; the verifier derives the real one. */
+  partition?: string | undefined;
 }
 
 /**
- * Verifies a tenant's signed claim on the **responder** side (a `control-plane`), returning the
+ * Verifies a tenant's token on the **responder** side (a `control-plane`), returning the
  * {@link VerifiedTenant} it authenticates as — or `null`/throwing to reject a tampered/invalid token.
  * A control-plane *verifies* tokens; it does not *carry* one (that is {@link TenantConfig.tenant}).
- * The function form of `verifyTenant` (what `hmacTenantVerifier` returns).
+ * The function form of `verifyTenant` (what `sharedSecretVerifier` and authkit-client's
+ * `authkitTenantVerifier` return).
  */
 export type TenantVerifier = (
-  input: TenantVerifierInput,
+  request: TenantVerifierRequest,
 ) => VerifiedTenant | null | Promise<VerifiedTenant | null>;
 
 /**
@@ -47,11 +53,11 @@ export type TenantVerifier = (
  */
 export interface TenantVerifierContract {
   /**
-   * Turn the wire token into the tenant it authenticates as. Return `null` (or throw) to reject:
-   * the request is answered `unauthorized` and never touches a run. The returned `tenant` is trusted
-   * as-is, so derive it from the verified token, never from `input.tenant`.
+   * Turn the wire token into the partition it authenticates as. Return `null` (or throw) to reject:
+   * the request is answered `unauthorized` and never touches a run. The returned `partition` is
+   * trusted as-is, so derive it from the verified token, never from `request.partition`.
    */
-  verify(input: TenantVerifierInput): VerifiedTenant | null | Promise<VerifiedTenant | null>;
+  verify(request: TenantVerifierRequest): VerifiedTenant | null | Promise<VerifiedTenant | null>;
 }
 
 /**
@@ -73,7 +79,7 @@ export type ContractClass<T> = new (...args: any[]) => T;
 
 /**
  * The `verifyTenant` option, in the same forms as a console `authorize`: an inline function (e.g.
- * `hmacTenantVerifier(secret)`), a class implementing {@link TenantVerifierContract} (built through the
+ * `sharedSecretVerifier({ partitions })` or authkit-client's `authkitTenantVerifier(...)`), a class implementing {@link TenantVerifierContract} (built through the
  * container once, so `@inject()` works), a lazy import of a module whose default export is such a class
  * (`() => import('#tenants/verifier')`, imported once), or an object implementing the contract.
  */
@@ -84,13 +90,15 @@ export type TenantVerifierOption =
   | (() => Promise<{ default: ContractClass<TenantVerifierContract> | TenantVerifierContract }>);
 
 /**
- * The `tenant.token` option: a string, a function called before every request, a class implementing
- * {@link TenantCredentialsContract} (built through the container once), a lazy import of a module whose
- * default export is such a class, or an object implementing the contract.
+ * The `tenant.token` option: a string, a function called before every request (e.g. authkit-client's
+ * `authkitTenantToken(...)`), an object with `get()` (or `token()`), a class implementing
+ * {@link TenantCredentialsContract} (built through the container once), or a lazy import of a module
+ * whose default export is such a class.
  */
 export type TenantTokenOption =
   | string
   | (() => string | Promise<string>)
+  | { get(): string | Promise<string> }
   | TenantCredentialsContract
   | ContractClass<TenantCredentialsContract>
   | (() => Promise<{
@@ -156,16 +164,32 @@ export interface TenantConfig extends BaseDurableConfig {
   stores?: never;
   /** Required — the broker a tenant pod dispatches/consumes over. */
   transport: string;
-  /** Required — which tenant this pod is; suffixes its `<name>@<tenant>` routing tokens (spec §6.1). */
-  partition: string;
   /**
-   * The pod's signed claim, presented on every wire request (verified by the control-plane, spec §9).
-   * A string, a function called before each request (e.g. an OAuth access token that refreshes
-   * itself), a class implementing {@link TenantCredentialsContract}, or a lazy import of one.
+   * Required — who this pod is and how it proves it to the control plane:
+   *
+   * - `partition`: which tenant (app) this pod is; suffixes its `<name>@<partition>` routing tokens
+   *   (spec §6.1) and names its runs' namespace.
+   * - `token`: the claim presented on every wire request (verified by the control plane's
+   *   `verifyTenant`, spec §9). A string, a function called before each request (e.g.
+   *   authkit-client's `authkitTenantToken(...)`), an object with `get()`, a class implementing
+   *   {@link TenantCredentialsContract}, or a lazy import of one. Without one the raw partition
+   *   travels instead and is trusted only by a control plane with no verifier.
+   * - `url`: not used by durable (tenants reach the control plane through `transport`); accepted so
+   *   the same `tenant` block reads the same in every Agora lib.
    */
-  tenant?: { token?: TenantTokenOption | undefined };
+  tenant: TenantIdentityConfig;
   /** Extra advertised features beyond registered handler names (spec §7 capability negotiation). */
   capabilities?: string[];
   /** `ProxyRunGateway` request timeout (ms) for a proxied read/control round-trip (spec §8). */
   requestTimeoutMs?: number;
+}
+
+/** The `tenant` block of a `tenant` pod (see {@link TenantConfig.tenant}). */
+export interface TenantIdentityConfig {
+  /** Not used by durable: tenants reach the control plane through the broker (`transport`). */
+  url?: string | undefined;
+  /** Which tenant (app) this pod is. */
+  partition: string;
+  /** The claim presented on every wire request. */
+  token?: TenantTokenOption | undefined;
 }

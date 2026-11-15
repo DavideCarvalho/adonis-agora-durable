@@ -121,7 +121,7 @@ pod's verified token grants it, through the `capabilities` your `verifyTenant` r
 verifyTenant: async ({ token }) => {
   const pod = await PodToken.verify(token)
   if (!pod) return null
-  return { tenant: pod.partition, capabilities: ['tenancy:*'] } // or ['tenancy:org-42']
+  return { partition: pod.partition, capabilities: ['tenancy:*'] } // or ['tenancy:org-42']
 },
 ```
 

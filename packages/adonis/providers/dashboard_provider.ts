@@ -600,10 +600,11 @@ export default class DashboardProvider {
     router
       .get(`${apiBase}/topology`, async (ctx: HttpContext) => {
         if (!(await this.enforce(config, ctx, 'api'))) return;
-        // Only a `TenantConfig` carries a `partition` (its `<name>@<tenant>` routing suffix, spec
+        // Only a `TenantConfig` carries a `tenant.partition` (its `<name>@<tenant>` routing suffix, spec
         // §6.1) — the field this dashboard's `DurableTopology.tenant` badge actually names.
         const durableConfig = this.app.config.get<DurableConfig>('durable', {});
-        const tenant = durableConfig.topology === 'tenant' ? durableConfig.partition : undefined;
+        const tenant =
+          durableConfig.topology === 'tenant' ? durableConfig.tenant.partition : undefined;
         const result = topology(durableTopology, tenant);
         return ctx.response.status(result.status).json(result.body);
       })
@@ -1016,7 +1017,8 @@ function withoutTenantParam(
 
 /**
  * Display labels for tenant ids: the viewer's own tenant by its slug, the rest through context's
- * label resolver (`tenancy.label` in config/context.ts, or the one authkit installs), else the id.
+ * label resolver (`tenancy.label` in config/context.ts, or the one authkit-server or authkit-client
+ * registers with `Context.setTenantLabeler`), else the id.
  */
 async function tenantLabelsFor(
   ids: string[],

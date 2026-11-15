@@ -414,7 +414,7 @@ export default class DurableProvider {
         );
       }
       const proxy = new ProxyRunGateway(transport, {
-        partition: config.partition,
+        partition: config.tenant.partition,
         ...(config.tenant?.token !== undefined
           ? {
               token: resolveTenantToken(config.tenant.token, (Class) =>
@@ -441,7 +441,7 @@ export default class DurableProvider {
       }
       return new WorkerRuntime({
         transport: transport as unknown as WorkerTransport,
-        partition: config.partition,
+        partition: config.tenant.partition,
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
         ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
         ...(config.capabilities !== undefined ? { capabilities: config.capabilities } : {}),
@@ -472,7 +472,7 @@ export default class DurableProvider {
         // when the transport entry doesn't repeat the partition (an explicit one there wins).
         const transport = await this.#resolveTransport(config, {
           app: this.app,
-          partition: config.partition,
+          partition: config.tenant.partition,
           ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
           ...(config.schema !== undefined ? { schema: config.schema } : {}),
         });

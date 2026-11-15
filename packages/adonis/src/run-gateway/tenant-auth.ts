@@ -6,56 +6,47 @@ import type {
   TenantTokenSource,
   TenantVerifier,
   TenantVerifierContract,
-  TenantVerifierInput,
   TenantVerifierOption,
+  TenantVerifierRequest,
   VerifiedTenant,
 } from '../config_types.js';
 
 /**
- * Layered tenant auth (spec §9). On a store-less pod the `tenant` on a `RunRequest`/`StartRunMessage`
- * is only a CLAIM; without a signed proof the isolation boundary is meaningless. This module provides
- * the default defense-in-depth on top of prefix/network isolation: a symmetric HMAC token a tenant pod
- * carries and presents in the `tenant` wire field, which the control-plane {@link TenantVerifier}
- * checks and DERIVES the real tenant from — never trusting the body.
+ * Tenant auth without an identity provider (spec §9). On a store-less pod the `tenant` on a
+ * `RunRequest`/`StartRunMessage` is only a CLAIM; without a proof the isolation boundary is
+ * meaningless. {@link sharedSecretVerifier} is the zero-infra verifier: one secret per partition,
+ * known to the control plane and to that partition's pods. A pod presents either the secret itself
+ * or a short-lived token signed with it ({@link signTenantToken}), in the existing `tenant` wire field
+ * (no envelope change). The control plane derives the partition from the token, never the body.
  *
- * The token is deliberately tiny and self-describing (`<tenant>.<base64url-hmac>`), so it fits the
- * existing byte-compatible `tenant: string` wire field with NO envelope change: an aviary/Python
- * control plane that doesn't verify simply treats the whole string as the tenant name (and finds no
- * runs — a safe failure), while an Adonis control plane configured with {@link hmacTenantVerifier}
- * verifies the signature and scopes to the embedded tenant.
- *
- * HMAC (shared secret) is the zero-infra default; a deployment that prefers asymmetric / issued tokens
- * supplies its own {@link TenantVerifier} in `config/durable.ts` instead. Prefix/network segmentation
- * is a deployment concern (Redis ACLs, per-tenant prefixes) and lives outside this code.
+ * With an identity provider, use authkit-client's `authkitTenantVerifier` instead (JWT access tokens
+ * verified against the issuer's keys); both return the same {@link VerifiedTenant}.
  */
 
-/** Separator between the tenant claim and its signature in a token. `.` is URL/JSON-safe and never
- *  appears in the base64url signature, so the LAST `.` unambiguously splits the two halves — a tenant
- *  name may itself contain dots. */
+/** Separator between the claim and its signature in a signed token. `.` is URL/JSON-safe and never
+ *  appears in the base64url signature, so the LAST `.` unambiguously splits the two halves — a
+ *  partition name may itself contain dots. */
 const TOKEN_SEP = '.';
 
-/** The HMAC digest, byte-for-byte, that authenticates `tenant` under `secret`. */
-function sign(tenant: string, secret: string): string {
-  return createHmac('sha256', secret).update(tenant).digest('base64url');
+/** The HMAC digest, byte-for-byte, that authenticates `claim` under `secret`. */
+function sign(claim: string, secret: string): string {
+  return createHmac('sha256', secret).update(claim).digest('base64url');
 }
 
 /**
- * Mint the signed token a tenant pod presents: `` `${tenant}.${base64url(HMAC-SHA256(secret, tenant))}` ``.
- * Put it on the pod's `config/durable.ts` as `tenant.token`; the pod carries only the token (never the
- * secret), and the control plane verifies it with the SAME `secret` via {@link hmacTenantVerifier}.
+ * Mint a signed token for `partition`: `` `${partition}.${base64url(HMAC-SHA256(secret, partition))}` ``
+ * (with `ttlMs`, the claim gains a signed `.exp<epochMs>` suffix). Use it as the pod's `tenant.token`
+ * when the broker traffic should carry a short-lived token instead of the secret itself; the control
+ * plane verifies it with the same partition secret via {@link sharedSecretVerifier}.
  */
 export function signTenantToken(
-  tenant: string,
+  partition: string,
   secret: string,
   opts?: {
     /**
-     * Optional lifetime: the claim gains a `.exp<epochMs>` suffix, signed together with the tenant,
-     * and {@link hmacTenantVerifier} rejects the token once that instant passes. Without it the
-     * token never expires — observable broker traffic (an un-ACL'd shared Redis, a dump) then holds
-     * a credential valid FOREVER, and rotation means re-keying the whole fleet at once. Additive:
-     * expiring and legacy tokens verify side by side, and a non-verifying aviary/Python control
-     * plane still treats the whole string as an (unknown) tenant name — a safe failure.
-     * Tenant names ending in `.exp<digits>` are reserved by this scheme.
+     * Lifetime: the claim gains a `.exp<epochMs>` suffix, signed together with the partition, and
+     * {@link sharedSecretVerifier} rejects the token once that instant passes. Without it the token
+     * never expires. Partition names ending in `.exp<digits>` are reserved by this scheme.
      */
     ttlMs?: number;
     /** Injectable clock for tests. */
@@ -64,51 +55,122 @@ export function signTenantToken(
 ): string {
   const claim =
     opts?.ttlMs !== undefined
-      ? `${tenant}${TOKEN_SEP}exp${(opts.now ?? Date.now()) + opts.ttlMs}`
-      : tenant;
+      ? `${partition}${TOKEN_SEP}exp${(opts.now ?? Date.now()) + opts.ttlMs}`
+      : partition;
   return `${claim}${TOKEN_SEP}${sign(claim, secret)}`;
 }
 
 /** The trailing expiry marker an expiring token's claim carries (see signTenantToken). */
 const EXP_SUFFIX = /\.exp(\d+)$/;
 
+/** One partition of {@link sharedSecretVerifier}. */
+export interface SharedSecretPartition {
+  /** The partition's secret. A list verifies with any of them, so rotation is two deploys, not one. */
+  secret: string | string[];
+  /** The environment its tokens are for, returned as `environment`. */
+  environment?: string | undefined;
+  /** What its tokens grant, e.g. `['tenancy:*']`. Default: none. */
+  capabilities?: string[] | undefined;
+}
+
+export interface SharedSecretVerifierOptions {
+  /** Partition name → its secret (or secrets, or a {@link SharedSecretPartition}). */
+  partitions: Record<string, string | string[] | SharedSecretPartition>;
+}
+
+interface ResolvedPartition {
+  partition: string;
+  secrets: string[];
+  environment: string | undefined;
+  capabilities: string[];
+}
+
 /**
- * Build the control-plane-side {@link TenantVerifier} for {@link signTenantToken}-minted tokens under
- * `secret`. It parses the token, recomputes the HMAC over the embedded tenant, and compares it in
- * CONSTANT TIME (`timingSafeEqual`) — so a tampered tenant, a forged/absent signature, or a token
- * signed with a different secret all return `null` (rejected). The verified tenant is DERIVED from the
- * token's own claim, and the advisory `tenant` on the request body is ignored (spec §9).
+ * The control-plane `verifyTenant` for deployments without an identity provider: one shared secret
+ * per partition.
  *
- * `capabilities`, if given, is a static grant stamped onto every {@link VerifiedTenant} this verifier
- * authenticates (the HMAC token carries no scoped claims of its own); omit for none.
+ * ```ts
+ * verifyTenant: sharedSecretVerifier({
+ *   partitions: {
+ *     shop: env.get('DURABLE_SHOP_SECRET'),
+ *     billing: { secret: env.get('DURABLE_BILLING_SECRET'), capabilities: ['tenancy:*'] },
+ *   },
+ * })
+ * ```
+ *
+ * A pod's token is either its partition's secret (plain) or a {@link signTenantToken} of it. Every
+ * comparison is constant time. A tampered, expired or unknown token returns `null` (rejected). Two
+ * partitions sharing a secret, or an empty secret, throw here, at boot.
  */
-export function hmacTenantVerifier(
-  secret: string | string[],
-  capabilities?: string[],
-): TenantVerifier {
-  // Accepting a LIST of secrets makes rotation a two-step deploy instead of a big bang: verify with
-  // [next, current] everywhere first, then re-mint tenant tokens with `next` at leisure.
-  const secrets = Array.isArray(secret) ? secret : [secret];
-  return ({ token }): VerifiedTenant | null => {
-    // The signed token travels in the request's `tenant` field, so the responder passes it as `token`.
-    if (typeof token !== 'string' || token.length === 0) return null;
-    const sep = token.lastIndexOf(TOKEN_SEP);
-    if (sep <= 0 || sep === token.length - 1) return null; // no claim or no signature half
-    const claim = token.slice(0, sep);
-    const presented = token.slice(sep + 1);
-    if (!secrets.some((s) => constantTimeEquals(presented, sign(claim, s)))) return null;
-    // Expiring claim (`<tenant>.exp<epochMs>`): the suffix is INSIDE the signature, so an attacker
-    // can neither strip nor extend it. Reject once the instant passes; a legacy claim (no suffix)
-    // is the tenant verbatim, exactly as before.
-    const exp = EXP_SUFFIX.exec(claim);
-    if (exp) {
-      const expiresAt = Number(exp[1]);
-      if (!Number.isFinite(expiresAt) || Date.now() > expiresAt) return null;
-      const tenant = claim.slice(0, claim.length - (exp[0]?.length ?? 0));
-      if (tenant.length === 0) return null;
-      return capabilities !== undefined ? { tenant, capabilities } : { tenant };
+export function sharedSecretVerifier(options: SharedSecretVerifierOptions): TenantVerifier {
+  const entries = Object.entries(options?.partitions ?? {});
+  if (entries.length === 0) {
+    throw new TypeError('sharedSecretVerifier: `partitions` must name at least one partition');
+  }
+  const partitions = new Map<string, ResolvedPartition>();
+  const owners = new Map<string, string>();
+  for (const [partition, entry] of entries) {
+    const config: SharedSecretPartition =
+      typeof entry === 'string' || Array.isArray(entry) ? { secret: entry } : entry;
+    const secrets = Array.isArray(config.secret) ? config.secret : [config.secret];
+    if (!partition || secrets.length === 0 || secrets.some((s) => typeof s !== 'string' || !s)) {
+      throw new TypeError(
+        `sharedSecretVerifier: partition "${partition}" needs a non-empty secret`,
+      );
     }
-    return capabilities !== undefined ? { tenant: claim, capabilities } : { tenant: claim };
+    for (const secret of secrets) {
+      const owner = owners.get(secret);
+      if (owner !== undefined && owner !== partition) {
+        throw new TypeError(
+          `sharedSecretVerifier: partitions "${owner}" and "${partition}" share a secret; give each its own`,
+        );
+      }
+      owners.set(secret, partition);
+    }
+    partitions.set(partition, {
+      partition,
+      secrets,
+      environment: config.environment,
+      capabilities: config.capabilities ?? [],
+    });
+  }
+
+  const accept = (p: ResolvedPartition): VerifiedTenant => ({
+    partition: p.partition,
+    ...(p.environment !== undefined ? { environment: p.environment } : {}),
+    capabilities: [...p.capabilities],
+  });
+
+  return ({ token }): VerifiedTenant | null => {
+    if (typeof token !== 'string' || token.length === 0) return null;
+
+    // A signed token: `<partition>[.exp<ms>].<sig>`, signed with that partition's secret.
+    const sep = token.lastIndexOf(TOKEN_SEP);
+    if (sep > 0 && sep < token.length - 1) {
+      const claim = token.slice(0, sep);
+      const presented = token.slice(sep + 1);
+      const exp = EXP_SUFFIX.exec(claim);
+      const name = exp ? claim.slice(0, claim.length - (exp[0]?.length ?? 0)) : claim;
+      const entry = partitions.get(name);
+      if (entry?.secrets.some((s) => constantTimeEquals(presented, sign(claim, s)))) {
+        // The expiry is INSIDE the signature, so it can be neither stripped nor extended.
+        if (exp) {
+          const expiresAt = Number(exp[1]);
+          if (!Number.isFinite(expiresAt) || Date.now() > expiresAt) return null;
+        }
+        return accept(entry);
+      }
+    }
+
+    // The plain secret. Compare against every secret (no early exit) so timing does not reveal
+    // which partition, if any, came close.
+    let match: ResolvedPartition | undefined;
+    for (const entry of partitions.values()) {
+      for (const secret of entry.secrets) {
+        if (constantTimeEquals(token, secret)) match = entry;
+      }
+    }
+    return match ? accept(match) : null;
   };
 }
 
@@ -203,15 +265,27 @@ function memoizedInstance<T>(
   };
 }
 
-/** A verifier's answer, checked: `null` rejects, `{ tenant }` with a non-empty string accepts, and
+/** A verifier's answer, checked: `null` rejects, `{ partition }` with a non-empty string accepts, and
  *  anything else throws, so a malformed result can never be taken for an accepted tenant. */
 function checkVerified(result: unknown): VerifiedTenant | null {
   if (result === null || result === undefined) return null;
-  const tenant = (result as { tenant?: unknown }).tenant;
-  if (typeof result === 'object' && typeof tenant === 'string' && tenant.length > 0) {
-    return result as VerifiedTenant;
+  const r = result as { partition?: unknown; environment?: unknown; capabilities?: unknown };
+  if (typeof result !== 'object' || typeof r.partition !== 'string' || r.partition.length === 0) {
+    throw new TypeError(
+      '`verifyTenant` must return { partition: string, environment?, capabilities: string[] } or null',
+    );
   }
-  throw new TypeError('`verifyTenant` must return { tenant: string, capabilities? } or null');
+  if (
+    r.capabilities !== undefined &&
+    (!Array.isArray(r.capabilities) || r.capabilities.some((c) => typeof c !== 'string'))
+  ) {
+    throw new TypeError('`verifyTenant` returned non-string `capabilities`');
+  }
+  return {
+    partition: r.partition,
+    ...(typeof r.environment === 'string' && r.environment ? { environment: r.environment } : {}),
+    capabilities: (r.capabilities as string[] | undefined) ?? [],
+  };
 }
 
 /**
@@ -240,7 +314,7 @@ export function resolveTenantVerifier(
       '`verifyTenant` must be a function, a class implementing TenantVerifierContract, or a lazy import of one.',
     );
   }
-  const fn = option as (input: TenantVerifierInput) => unknown;
+  const fn = option as (request: TenantVerifierRequest) => unknown;
   let lazy: (() => Promise<TenantVerifierContract>) | undefined;
   return async (input) => {
     if (lazy) return checkVerified(await (await lazy()).verify(input));
@@ -256,8 +330,8 @@ export function resolveTenantVerifier(
 
 /**
  * Turn any `tenant.token` form into what the wire layer sends: a string stays a string; a function,
- * a {@link TenantCredentialsContract} class (built once through `make`), an object with a `token`
- * method, or a lazy import of a class becomes a function called before every request.
+ * an object with `get()` or `token()`, a {@link TenantCredentialsContract} class (built once through
+ * `make`), or a lazy import of a class becomes a function called before every request.
  */
 export function resolveTenantToken(
   option: TenantTokenOption,
@@ -265,6 +339,9 @@ export function resolveTenantToken(
 ): TenantTokenSource {
   if (typeof option === 'string') return option;
   const C = 'TenantCredentialsContract';
+  if (implementsMethod<{ get(): string | Promise<string> }>(option, 'get')) {
+    return () => option.get();
+  }
   if (implementsMethod<TenantCredentialsContract>(option, 'token')) {
     return () => option.token();
   }
@@ -274,7 +351,7 @@ export function resolveTenantToken(
   }
   if (typeof option !== 'function') {
     throw new TypeError(
-      '`tenant.token` must be a string, a function, a class implementing TenantCredentialsContract, or a lazy import of one.',
+      '`tenant.token` must be a string, a function, an object with get(), a class implementing TenantCredentialsContract, or a lazy import of one.',
     );
   }
   const fn = option as () => unknown;

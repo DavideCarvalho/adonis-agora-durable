@@ -12,11 +12,11 @@ import {
   signalRun,
 } from '../../src/dashboard/handlers.js';
 import type { StepCheckpoint } from '../../src/interfaces.js';
-import { hmacTenantVerifier, signTenantToken } from '../../src/run-gateway/tenant-auth.js';
+import { sharedSecretVerifier, signTenantToken } from '../../src/run-gateway/tenant-auth.js';
 
-/** The HMAC verifier is synchronous — narrow the union for the assertions below. */
+/** The shared-secret verifier is synchronous — narrow the union for the assertions below. */
 const verifySync = (verifier: TenantVerifier, token: string): VerifiedTenant | null =>
-  verifier({ token, tenant: token }) as VerifiedTenant | null;
+  verifier({ token }) as VerifiedTenant | null;
 
 import { InMemoryStateStore, InMemoryTransport, WorkflowEngine } from '../../src/index.js';
 
@@ -206,19 +206,19 @@ describe('CodecStateStore extended coverage', () => {
 
 describe('tenant tokens — expiry and secret rotation', () => {
   it('legacy tokens keep verifying; expiring tokens verify until their instant, then reject', () => {
-    const verify = hmacTenantVerifier('s3cret');
+    const verify = sharedSecretVerifier({ partitions: { acme: 's3cret' } });
     const legacy = signTenantToken('acme', 's3cret');
-    expect(verifySync(verify, legacy)?.tenant).toBe('acme');
+    expect(verifySync(verify, legacy)?.partition).toBe('acme');
 
     const live = signTenantToken('acme', 's3cret', { ttlMs: 60_000 });
-    expect(verifySync(verify, live)?.tenant).toBe('acme');
+    expect(verifySync(verify, live)?.partition).toBe('acme');
 
     const expired = signTenantToken('acme', 's3cret', { ttlMs: 60_000, now: Date.now() - 120_000 });
     expect(verifySync(verify, expired)).toBeNull();
   });
 
   it('the expiry is inside the signature — stripping or extending it rejects', () => {
-    const verify = hmacTenantVerifier('s3cret');
+    const verify = sharedSecretVerifier({ partitions: { acme: 's3cret' } });
     const token = signTenantToken('acme', 's3cret', { ttlMs: 1_000, now: Date.now() - 120_000 });
     const sig = token.slice(token.lastIndexOf('.') + 1);
     expect(verifySync(verify, `acme.${sig}`)).toBeNull(); // stripped
@@ -229,9 +229,11 @@ describe('tenant tokens — expiry and secret rotation', () => {
   it('accepts a secret LIST for two-step rotation', () => {
     const old = signTenantToken('acme', 'old-secret');
     const fresh = signTenantToken('acme', 'new-secret');
-    const verify = hmacTenantVerifier(['new-secret', 'old-secret']);
-    expect(verifySync(verify, old)?.tenant).toBe('acme');
-    expect(verifySync(verify, fresh)?.tenant).toBe('acme');
-    expect(verifySync(hmacTenantVerifier(['new-secret']), old)).toBeNull();
+    const verify = sharedSecretVerifier({ partitions: { acme: ['new-secret', 'old-secret'] } });
+    expect(verifySync(verify, old)?.partition).toBe('acme');
+    expect(verifySync(verify, fresh)?.partition).toBe('acme');
+    expect(
+      verifySync(sharedSecretVerifier({ partitions: { acme: ['new-secret'] } }), old),
+    ).toBeNull();
   });
 });
