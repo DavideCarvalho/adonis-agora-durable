@@ -1,5 +1,11 @@
 # @adonis-agora/durable-dashboard
 
+## 1.0.0-rc.14
+
+### Patch Changes
+
+- [#543](https://github.com/DavideCarvalho/adonis-agora-durable/pull/543) [`83849ce`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/83849ce9721d227e3100a1872915e8efaefaae29) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - ⌘K now navigates: it lists every page of the console's sidebar and every other Agora console you can open ("Go to Workflows", found by "durable" too), matched case- and accent-insensitively, before the console's own commands and the cross-console search hits. ⌘K opens even without a search endpoint, and shows the pages and consoles before anything is typed.
+
 ## 1.0.0-rc.13
 
 ### Patch Changes
