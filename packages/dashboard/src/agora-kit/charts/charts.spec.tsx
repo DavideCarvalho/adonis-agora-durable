@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest';
 import { BarChart } from './bar-chart';
 import { chartTooltip, isEmptyChart, toChartRows } from './chart-kit';
+import { DonutChart } from './donut-chart';
 import { Sparkline } from './sparkline';
 import { TimeSeriesChart } from './time-series-chart';
 
@@ -168,5 +169,71 @@ describe('Sparkline', () => {
       />,
     );
     expect(screen.getByRole('img', { name: 'throughput' })).toBeTruthy();
+  });
+});
+
+describe('DonutChart', () => {
+  const outcomes = [
+    { key: 'completed', n: 30, color: 'var(--agora-good)' },
+    { key: 'failed', n: 10, color: 'var(--agora-bad)' },
+    { key: 'running', n: 0, color: 'var(--agora-info)' },
+  ];
+  type Outcome = (typeof outcomes)[number];
+  const name = (o: Outcome) => o.key;
+  const count = (o: Outcome) => o.n;
+  const tone = (o: Outcome) => o.color;
+
+  it('renders a named, focusable chart with its centre label', () => {
+    render(
+      <DonutChart
+        data={outcomes}
+        label={name}
+        value={count}
+        color={tone}
+        ariaLabel="run outcomes"
+        centerLabel="40"
+        centerSub="runs"
+      />,
+    );
+    const surface = screen.getByRole('img', { name: 'run outcomes' });
+    expect(surface.getAttribute('tabindex')).toBe('0');
+    expect(screen.getByText('40')).toBeTruthy();
+    expect(screen.getByText('runs')).toBeTruthy();
+  });
+
+  it('shows the slice name, formatted value and share on keyboard focus', async () => {
+    render(
+      <DonutChart
+        data={outcomes}
+        label={name}
+        value={count}
+        color={tone}
+        valueLabel="runs"
+        formatValue={(n) => `${n} runs`}
+        ariaLabel="run outcomes"
+      />,
+    );
+    await focusChart('run outcomes');
+    // focus lands on one slice; whichever it is, the tooltip carries its value and share
+    const text = tooltipText();
+    expect(
+      (text.includes('completed') && text.includes('30 runs') && text.includes('75%')) ||
+        (text.includes('failed') && text.includes('10 runs') && text.includes('25%')),
+    ).toBe(true);
+    expect(text).toContain('share');
+  });
+
+  it('renders the empty state when the total is zero', () => {
+    render(
+      <DonutChart
+        data={outcomes.map((o) => ({ ...o, n: 0 }))}
+        label={name}
+        value={count}
+        ariaLabel="run outcomes"
+        empty="No runs."
+      />,
+    );
+    expect(screen.queryByRole('img', { name: 'run outcomes' })).toBeNull();
+    expect(screen.getByText('No runs.')).toBeTruthy();
   });
 });
