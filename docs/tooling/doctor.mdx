@@ -18,7 +18,7 @@ durable 1.0.0
   ✔ Config is valid
   ✖ Control plane verifies tenants
     topology is 'control-plane' and verifyTenant is not set: any caller can act as a tenant.
-    fix: Set `verifyTenant` in config/durable.ts (hmacTenantVerifier or an authkit verifier).
+    fix: Set `verifyTenant` in config/durable.ts (sharedSecretVerifier, or authkit-client's authkitTenantVerifier).
   ! Console access in production
     The console has no authorize: it denies every request in production.
 

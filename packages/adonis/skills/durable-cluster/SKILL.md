@@ -6,7 +6,7 @@ description: >-
   compile-time store exclusion), durable:work vs durable:worker entrypoints,
   WorkerRuntime + RedisWorkerRegistry descriptors, handshake negotiation
   (compatible/degraded/incompatible) and capability routing (requires → blocked
-  runs), layered tenant auth (signTenantToken/hmacTenantVerifier/verifyTenant),
+  runs), layered tenant auth (verifyTenant with authkitTenantVerifier or sharedSecretVerifier, tenant: { partition, token }),
   runGateway as the topology-portable read/control surface, namespace vs partition,
   tenant pods over bullmq, the @adonisjs/queue transport or the db transport, and Python
   (durable-worker) / NestJS interop over the bullmq wire. Use when
@@ -40,7 +40,7 @@ not a customer — customer isolation is the separate `tenancy` / `tenantId`
 (organizations), which shares one pool by default. It is independent of the separate `role` axis (`all`/`api`/
 `worker`); durable has no `role` field and covers that axis with `drive`,
 `consumers` and `worker.embedded`. Durable connects tenants over a broker
-transport (`bullmq`/`queue`/`db`) with `partition`, `tenant.token`,
+transport (`bullmq`/`queue`/`db`) with `tenant: { partition, token }`,
 `verifyTenant` and `capabilities`.
 
 | Topology | Owns the store | Executes bodies | Serves HTTP |
@@ -54,7 +54,8 @@ transport (`bullmq`/`queue`/`db`) with `partition`, `tenant.token`,
 Split fleet: a pure coordinator plus store-less tenant workers.
 
 ```ts title="config/durable.ts (control plane)"
-import { defineConfig, hmacTenantVerifier, stores, transports } from '@adonis-agora/durable'
+import { authkitTenantVerifier } from '@adonis-agora/authkit-client'
+import { defineConfig, stores, transports } from '@adonis-agora/durable'
 
 export default defineConfig({
   topology: 'control-plane',
@@ -62,7 +63,8 @@ export default defineConfig({
   transports: { bullmq: transports.bullmq({ connection: { host: '127.0.0.1', port: 6379 } }) },
   store: 'lucid',
   stores: { lucid: stores.lucid({ connection: 'pg' }) },
-  verifyTenant: hmacTenantVerifier(process.env.DURABLE_TENANT_SECRET!),
+  // without authkit: sharedSecretVerifier({ partitions: { 'acme-corp': secret } })
+  verifyTenant: authkitTenantVerifier({ issuer: process.env.AUTHKIT_ISSUER!, resource: 'urn:agora:durable' }),
 })
 ```
 
@@ -73,8 +75,10 @@ export default defineConfig({
   topology: 'tenant',
   transport: 'bullmq',
   transports: { bullmq: transports.bullmq({ connection: process.env.REDIS_URL }) },
-  partition: 'acme-corp', // which pool this pod serves (required)
-  tenant: { token: process.env.DURABLE_TENANT_TOKEN }, // or a function/credentials class
+  tenant: {
+    partition: 'acme-corp', // which pool this pod serves (required)
+    token: process.env.DURABLE_TENANT_TOKEN, // or authkitTenantToken({...}) / a function / { get() }
+  },
   requestTimeoutMs: 10_000,
   // store: 'lucid'  // ❌ COMPILE ERROR — a tenant config cannot name a store
 })
@@ -85,12 +89,14 @@ node ace durable:work    # store-backed loop: pending, recovery, timers, sweeps,
 node ace durable:worker  # store-less tenant loop: serves app/steps, heartbeats, drains
 ```
 
-`verifyTenant` takes a function (`hmacTenantVerifier(secret)`), a class implementing
-`TenantVerifierContract` (`verify({ token })` → `{ tenant, capabilities? } | null`; built
-through the container), a lazy import of one, or an object with `verify`. `tenant.token`
-takes a string, a function called before every request, or the same forms of a
-`TenantCredentialsContract` (`token()`). Ready-made pieces for `@adonisjs/auth` access
-tokens, authkit and any OIDC provider are in the "Authenticate tenants" docs page.
+`verifyTenant` takes a function (`authkitTenantVerifier({ issuer, resource })` from
+`@adonis-agora/authkit-client`, or `sharedSecretVerifier({ partitions })`), a class implementing
+`TenantVerifierContract` (`verify({ token })` → `{ partition, environment?, capabilities } | null`;
+built through the container), a lazy import of one, or an object with `verify`. The partition
+always comes from the token, never the request. `tenant.token` takes a string, a function called
+before every request (`authkitTenantToken({...})`), an object with `get()`, or the same forms of a
+`TenantCredentialsContract` (`token()`). The `@adonisjs/auth` access-token recipe is in the
+"Authenticate tenants" docs page.
 
 Isolation is three-layered: type (`store` is `never` on tenant), container (no
 store binding registered), object (`WorkerRuntime`/`ProxyRunGateway` have no
@@ -110,8 +116,7 @@ export default defineConfig({
   topology: 'tenant',
   transport: 'queue',
   transports: { queue: transports.queue({ connection: 'redis', workerKeys: false }) },
-  partition: 'acme-corp',
-  tenant: { token: process.env.DURABLE_TENANT_TOKEN },
+  tenant: { partition: 'acme-corp', token: process.env.DURABLE_TENANT_TOKEN },
 })
 ```
 
@@ -366,14 +371,14 @@ Wrong:
 
 ```ts
 // the pod's default Lucid connection is its own app database
-defineConfig({ topology: 'tenant', transport: 'db', transports: { db: transports.db() }, partition: 'acme' })
+defineConfig({ topology: 'tenant', transport: 'db', transports: { db: transports.db() }, tenant: { partition: 'acme' } })
 ```
 
 Correct:
 
 ```ts
 // a connection to the CONTROL PLANE's database (config/database.ts), used only for the transport tables
-defineConfig({ topology: 'tenant', transport: 'db', transports: { db: transports.db({ connection: 'durable' }) }, partition: 'acme' })
+defineConfig({ topology: 'tenant', transport: 'db', transports: { db: transports.db({ connection: 'durable' }) }, tenant: { partition: 'acme' } })
 ```
 
 Mechanism: on `db` the wire IS the transport tables, so a pod writing its

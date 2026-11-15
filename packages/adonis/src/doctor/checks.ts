@@ -82,7 +82,7 @@ export function checkVerifyTenant(
     status: inProduction ? 'error' : 'warn',
     message:
       "topology is 'control-plane' and verifyTenant is not set: any caller can act as a tenant.",
-    fix: 'Set `verifyTenant` in config/durable.ts (hmacTenantVerifier or an authkit verifier).',
+    fix: "Set `verifyTenant` in config/durable.ts (sharedSecretVerifier, or authkit-client's authkitTenantVerifier).",
     docs: `${DOCS}/cluster/authenticate-tenants`,
   };
 }
@@ -96,7 +96,7 @@ export function checkTenantToken(config: AnyConfig | undefined): AgoraDoctorResu
       status: 'error',
       message:
         "topology is 'tenant' and tenant.token is not set: the control plane cannot tell who this pod is.",
-      fix: 'Set `tenant: { token }` in config/durable.ts (a string, a function or a credentials class).',
+      fix: 'Set `tenant: { partition, token }` in config/durable.ts (a string, a function or a credentials class).',
       docs: `${DOCS}/cluster/authenticate-tenants`,
     };
   }

@@ -234,7 +234,7 @@ export default defineConfig({
   transports: { queue: transports.queue({ connection: 'redis' }) },
   store: 'lucid',
   stores: { lucid: stores.lucid({ connection: 'pg' }) },
-  verifyTenant: hmacTenantVerifier(process.env.DURABLE_TENANT_SECRET!),
+  verifyTenant: sharedSecretVerifier({ partitions: { 'acme-corp': process.env.DURABLE_ACME_SECRET! } }),
 })
 ```
 
@@ -245,8 +245,7 @@ export default defineConfig({
   // No database on the pod: its advertisement and subscriptions go to the control plane.
   // The transport's `partition` decides which `<name>@acme-corp` task queues the pod consumes.
   transports: { queue: transports.queue({ connection: 'redis', workerKeys: false, partition: 'acme-corp' }) },
-  partition: 'acme-corp',
-  tenant: { token: process.env.DURABLE_TENANT_TOKEN },
+  tenant: { partition: 'acme-corp', token: process.env.DURABLE_ACME_SECRET },
 })
 ```
 

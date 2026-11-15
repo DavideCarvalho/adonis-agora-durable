@@ -6,7 +6,7 @@ import { hasProxyCapability, hasResponderCapability } from '../../src/role_bindi
 import { ProxyRunGateway } from '../../src/run-gateway/proxy-run-gateway.js';
 import { RunRequestResponder } from '../../src/run-gateway/run-request-responder.js';
 import { StoreRunGateway } from '../../src/run-gateway/store-run-gateway.js';
-import { hmacTenantVerifier, signTenantToken } from '../../src/run-gateway/tenant-auth.js';
+import { sharedSecretVerifier, signTenantToken } from '../../src/run-gateway/tenant-auth.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
 import { QueueTransport } from '../../src/transports/queue.js';
 import { MockAdapter } from '../../src/transports/queue-mock-adapter.js';
@@ -76,7 +76,9 @@ describe('tenant pod ⇄ control plane over QueueTransport (end to end)', () => 
       cpTransport,
       new StoreRunGateway(engine, { topology: 'control-plane' }),
       {
-        verifyTenant: hmacTenantVerifier(SECRET),
+        verifyTenant: sharedSecretVerifier({
+          partitions: { acme: SECRET, globex: `${SECRET}:globex` },
+        }),
         subscribeEngineEvents: (listener) => engine.subscribe(listener),
       },
     );
@@ -182,7 +184,7 @@ describe('tenant pod ⇄ control plane over QueueTransport (end to end)', () => 
     cleanups.push(() => globexTransport.close());
     const globex = new ProxyRunGateway(globexTransport, {
       partition: 'globex',
-      token: signTenantToken('globex', SECRET),
+      token: signTenantToken('globex', `${SECRET}:globex`),
       requestTimeoutMs: 2000,
     });
     const acmeRun = await proxy.start('await-go', {});

@@ -87,7 +87,7 @@ export default defineConfig({
   topology: 'tenant',
   transport: 'bullmq',
   transports: { bullmq: transports.bullmq({ connection: process.env.REDIS_URL }) },
-  partition: 'acme',
+  tenant: { partition: 'acme', token: process.env.DURABLE_TENANT_TOKEN },
 })
 ```
 

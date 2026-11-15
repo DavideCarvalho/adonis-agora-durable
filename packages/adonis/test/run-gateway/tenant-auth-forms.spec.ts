@@ -3,13 +3,13 @@ import { describe, expect, it } from 'vitest';
 import type {
   TenantCredentialsContract,
   TenantVerifierContract,
-  TenantVerifierInput,
+  TenantVerifierRequest,
 } from '../../src/config_types.js';
 import { defineConfig } from '../../src/define_config.js';
 import {
-  hmacTenantVerifier,
   resolveTenantToken,
   resolveTenantVerifier,
+  sharedSecretVerifier,
   signTenantToken,
 } from '../../src/run-gateway/tenant-auth.js';
 
@@ -24,9 +24,9 @@ class TenantDirectory {
 
 class DirectoryVerifier implements TenantVerifierContract {
   constructor(readonly directory: TenantDirectory) {}
-  verify({ token }: TenantVerifierInput) {
-    const tenant = token ? this.directory.partitionOf(token) : null;
-    return tenant ? { tenant, capabilities: ['read'] } : null;
+  verify({ token }: TenantVerifierRequest) {
+    const partition = token ? this.directory.partitionOf(token) : null;
+    return partition ? { partition, capabilities: ['read'] } : null;
   }
 }
 
@@ -66,17 +66,41 @@ function maker() {
 }
 
 describe('resolveTenantVerifier', () => {
-  it('function form: called with the input, its result returned (hmacTenantVerifier keeps working)', async () => {
-    const verify = resolveTenantVerifier(hmacTenantVerifier('s3cret'));
-    expect(await verify({ token: signTenantToken('acme', 's3cret') })).toEqual({ tenant: 'acme' });
+  it('function form: called with the request, its result returned (sharedSecretVerifier)', async () => {
+    const verify = resolveTenantVerifier(sharedSecretVerifier({ partitions: { acme: 's3cret' } }));
+    expect(await verify({ token: signTenantToken('acme', 's3cret') })).toEqual({
+      partition: 'acme',
+      capabilities: [],
+    });
     expect(await verify({ token: signTenantToken('acme', 'other') })).toBeNull();
+  });
+
+  it('a function that also has verify() (authkit-client style) is called as a function', async () => {
+    const verify = resolveTenantVerifier(
+      Object.assign(async () => ({ partition: 'acme', capabilities: ['x'], clientId: 'c' }), {
+        verify: async () => null,
+      }),
+    );
+    // Extra fields (clientId, expiresAt) are dropped; the contract fields are kept.
+    expect(await verify({ token: 't' })).toEqual({ partition: 'acme', capabilities: ['x'] });
+  });
+
+  it('environment is kept and a missing capabilities becomes []', async () => {
+    const verify = resolveTenantVerifier(
+      async () => ({ partition: 'acme', environment: 'production' }) as never,
+    );
+    expect(await verify({ token: 't' })).toEqual({
+      partition: 'acme',
+      environment: 'production',
+      capabilities: [],
+    });
   });
 
   it('class form: built once through the container (constructor DI works) and verify() called', async () => {
     const m = maker();
     const verify = resolveTenantVerifier(DirectoryVerifier, m.make);
     expect(await verify({ token: 'good:acme' })).toEqual({
-      tenant: 'acme',
+      partition: 'acme',
       capabilities: ['read'],
     });
     expect(await verify({ token: 'bad' })).toBeNull();
@@ -95,8 +119,8 @@ describe('resolveTenantVerifier', () => {
       verify({ token: 'good:globex' }),
     ]);
     expect(results).toEqual([
-      { tenant: 'acme', capabilities: ['read'] },
-      { tenant: 'globex', capabilities: ['read'] },
+      { partition: 'acme', capabilities: ['read'] },
+      { partition: 'globex', capabilities: ['read'] },
     ]);
     expect(await verify({ token: 'nope' })).toBeNull();
     expect(imports).toBeLessThanOrEqual(2); // concurrent first calls may both import; never again after
@@ -108,7 +132,7 @@ describe('resolveTenantVerifier', () => {
   it('object form: an instance implementing the contract is used as-is', async () => {
     const instance = new DirectoryVerifier(new TenantDirectory());
     const verify = resolveTenantVerifier(instance);
-    expect(await verify({ token: 'good:acme' })).toMatchObject({ tenant: 'acme' });
+    expect(await verify({ token: 'good:acme' })).toMatchObject({ partition: 'acme' });
     expect(instance.directory.lookups).toEqual(['good:acme']);
   });
 
@@ -120,7 +144,7 @@ describe('resolveTenantVerifier', () => {
     });
     await expect(verify({ token: 'good:acme' })).rejects.toThrow('container not ready');
     fail = false;
-    expect(await verify({ token: 'good:acme' })).toMatchObject({ tenant: 'acme' });
+    expect(await verify({ token: 'good:acme' })).toMatchObject({ partition: 'acme' });
   });
 
   it('a verifier that throws propagates the error (the responder answers it as an error reply)', async () => {
@@ -175,6 +199,13 @@ describe('resolveTenantToken', () => {
     expect(await fn()).toBe('from-object');
   });
 
+  it('token source form: an object with get() is called per request', async () => {
+    let calls = 0;
+    const fn = resolveTenantToken({ get: async () => `got-${++calls}` }) as () => Promise<string>;
+    expect(await fn()).toBe('got-1');
+    expect(await fn()).toBe('got-2');
+  });
+
   it('rejects a value that is none of the forms', () => {
     expect(() => resolveTenantToken(42 as never)).toThrow(TypeError);
   });
@@ -182,7 +213,10 @@ describe('resolveTenantToken', () => {
 
 describe('config types accept every form', () => {
   it('verifyTenant and tenant.token type-check in each form', () => {
-    defineConfig({ topology: 'standalone', verifyTenant: hmacTenantVerifier('s') });
+    defineConfig({
+      topology: 'standalone',
+      verifyTenant: sharedSecretVerifier({ partitions: { a: 's' } }),
+    });
     defineConfig({ topology: 'standalone', verifyTenant: DirectoryVerifier });
     defineConfig({
       topology: 'standalone',
@@ -192,32 +226,44 @@ describe('config types accept every form', () => {
       topology: 'standalone',
       verifyTenant: new DirectoryVerifier(new TenantDirectory()),
     });
-    defineConfig({ topology: 'tenant', transport: 'q', partition: 'a', tenant: { token: 'x' } });
+    defineConfig({ topology: 'tenant', transport: 'q', tenant: { partition: 'a', token: 'x' } });
     defineConfig({
       topology: 'tenant',
       transport: 'q',
-      partition: 'a',
-      tenant: { token: async () => 'x' },
+      tenant: { partition: 'a', token: async () => 'x' },
     });
     defineConfig({
       topology: 'tenant',
       transport: 'q',
-      partition: 'a',
-      tenant: { token: VaultCredentials },
+      tenant: { partition: 'a', token: VaultCredentials },
     });
     defineConfig({
       topology: 'tenant',
       transport: 'q',
-      partition: 'a',
-      tenant: { token: async () => ({ default: VaultCredentials }) },
+      tenant: { partition: 'a', token: async () => ({ default: VaultCredentials }) },
+    });
+    defineConfig({
+      topology: 'tenant',
+      transport: 'q',
+      tenant: { partition: 'a', token: { get: async () => 'x' } },
     });
     expect(true).toBe(true);
+  });
+
+  it('a tenant config with the pre-1.0 top-level `partition` throws at boot', () => {
+    expect(() =>
+      defineConfig({ topology: 'tenant', transport: 'q', partition: 'a' } as never),
+    ).toThrow(/moved into the `tenant` block/);
+    expect(() => defineConfig({ topology: 'tenant', transport: 'q' } as never)).toThrow(
+      /needs `tenant: \{ partition, token \}`/,
+    );
   });
 });
 
 describe('malformed forms fail closed with a clear error', () => {
   class FieldVerifier {
-    verify = async ({ token }: TenantVerifierInput) => (token === 'ok' ? { tenant: 'acme' } : null);
+    verify = async ({ token }: TenantVerifierRequest) =>
+      token === 'ok' ? { partition: 'acme', capabilities: [] } : null;
   }
   class FieldCredentials {
     token = () => 'field-token';
@@ -225,7 +271,7 @@ describe('malformed forms fail closed with a clear error', () => {
 
   it('a contract class whose method is an instance field is built, not called', async () => {
     const verify = resolveTenantVerifier(FieldVerifier);
-    expect(await verify({ token: 'ok' })).toEqual({ tenant: 'acme' });
+    expect(await verify({ token: 'ok' })).toEqual({ partition: 'acme', capabilities: [] });
     expect(await verify({ token: 'no' })).toBeNull();
     const token = resolveTenantToken(FieldCredentials) as () => Promise<string>;
     expect(await token()).toBe('field-token');
@@ -240,7 +286,7 @@ describe('malformed forms fail closed with a clear error', () => {
 
   it('a lazy import whose default export is not a contract throws; it is never an acceptance', async () => {
     const verify = resolveTenantVerifier(
-      async () => ({ default: () => ({ tenant: 'x' }) }) as never,
+      async () => ({ default: () => ({ partition: 'x' }) }) as never,
     );
     await expect(verify({ token: 't' })).rejects.toThrow(/default export must be a class/);
     const token = resolveTenantToken(
@@ -249,13 +295,24 @@ describe('malformed forms fail closed with a clear error', () => {
     await expect(token()).rejects.toThrow(/default export must be a class/);
   });
 
-  it('a verifier result without a string tenant throws instead of being accepted', async () => {
+  it('a verifier result without a string partition throws instead of being accepted', async () => {
     await expect(resolveTenantVerifier(() => ({}) as never)({ token: 't' })).rejects.toThrow(
       /must return/,
     );
     await expect(
-      resolveTenantVerifier({ verify: () => ({ tenant: '' }) })({ token: 't' }),
+      resolveTenantVerifier({ verify: () => ({ partition: '', capabilities: [] }) })({
+        token: 't',
+      }),
     ).rejects.toThrow(/must return/);
+    // The pre-1.0 `{ tenant }` shape is refused, never read as an acceptance.
+    await expect(
+      resolveTenantVerifier(() => ({ tenant: 'acme' }) as never)({ token: 't' }),
+    ).rejects.toThrow(/must return/);
+    await expect(
+      resolveTenantVerifier(() => ({ partition: 'acme', capabilities: [1] }) as never)({
+        token: 't',
+      }),
+    ).rejects.toThrow(/capabilities/);
     expect(await resolveTenantVerifier(() => undefined as never)({ token: 't' })).toBeNull();
   });
 });

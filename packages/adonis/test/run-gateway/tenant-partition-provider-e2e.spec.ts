@@ -9,7 +9,7 @@ import { DURABLE_RUN_GATEWAY, DURABLE_WORKER_RUNTIME } from '../../src/role_bind
 import type { ProxyRunGateway } from '../../src/run-gateway/proxy-run-gateway.js';
 import { RunRequestResponder } from '../../src/run-gateway/run-request-responder.js';
 import { StoreRunGateway } from '../../src/run-gateway/store-run-gateway.js';
-import { hmacTenantVerifier, signTenantToken } from '../../src/run-gateway/tenant-auth.js';
+import { sharedSecretVerifier, signTenantToken } from '../../src/run-gateway/tenant-auth.js';
 import { InMemoryStateStore } from '../../src/testing/in-memory-state-store.js';
 import { transports } from '../../src/transports/factory.js';
 import { QueueTransport } from '../../src/transports/queue.js';
@@ -93,7 +93,9 @@ describe('tenant pod with a top-level partition only (provider-built transport)'
       cpTransport,
       new StoreRunGateway(engine, { topology: 'control-plane' }),
       {
-        verifyTenant: hmacTenantVerifier(SECRET),
+        verifyTenant: sharedSecretVerifier({
+          partitions: { acme: SECRET, globex: `${SECRET}:globex` },
+        }),
         subscribeEngineEvents: (listener) => engine.subscribe(listener),
       },
     );
@@ -122,9 +124,8 @@ describe('tenant pod with a top-level partition only (provider-built transport)'
           ...(transportPartition !== undefined ? { partition: transportPartition } : {}),
         }),
       },
-      partition: 'acme',
       instanceId: 'acme-pod',
-      tenant: { token },
+      tenant: { partition: 'acme', token },
       requestTimeoutMs: 2000,
     } as DurableConfig);
     const provider = new DurableProvider(app);

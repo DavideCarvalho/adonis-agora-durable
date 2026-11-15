@@ -237,7 +237,7 @@ describe('DurableProvider — topology branching (tenant, store-less)', () => {
       topology: 'tenant',
       transport: 'p4',
       transports: { p4: async () => transport },
-      partition: 'acme',
+      tenant: { partition: 'acme' },
       ...extra,
     } as DurableConfig;
   }
@@ -315,7 +315,7 @@ describe('DurableProvider — tenant / control-plane topologies over the queue t
       topology: 'tenant',
       transport: 'queue',
       transports: { queue: queueTransport(new MockAdapter(), new MemoryWorkerKeys()) },
-      partition: 'acme',
+      tenant: { partition: 'acme' },
     } as DurableConfig);
     const provider = new DurableProvider(app);
     provider.register();
@@ -340,7 +340,7 @@ describe('DurableProvider — tenant / control-plane topologies over the queue t
           stalledCheckIntervalMs: 0,
         }),
       },
-      partition: 'acme',
+      tenant: { partition: 'acme' },
     } as DurableConfig);
     const provider = new DurableProvider(app);
     provider.register();
@@ -393,8 +393,8 @@ describe('DurableProvider — tenant auth in class form, built through the conta
   class KeyRingVerifier {
     constructor(private ring: KeyRing) {}
     verify({ token }: { token?: string | undefined }) {
-      const tenant = token ? this.ring.valid.get(token) : undefined;
-      return tenant ? { tenant } : null;
+      const partition = token ? this.ring.valid.get(token) : undefined;
+      return partition ? { partition, capabilities: [] } : null;
     }
   }
 
@@ -474,9 +474,8 @@ describe('DurableProvider — tenant auth in class form, built through the conta
       topology: 'tenant',
       transport: 'p4',
       transports: { p4: async () => transport },
-      partition: 'acme',
       requestTimeoutMs: 20,
-      tenant: { token: StaticCredentials },
+      tenant: { partition: 'acme', token: StaticCredentials },
     } as DurableConfig);
     container.bind(StaticCredentials, () => new StaticCredentials('key-acme'));
     new DurableProvider(app).register();

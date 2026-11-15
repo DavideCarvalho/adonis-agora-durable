@@ -52,12 +52,13 @@ export type {
   StandaloneConfig,
   TenantConfig,
   TenantCredentialsContract,
+  TenantIdentityConfig,
   TenantTokenOption,
   TenantTokenSource,
   TenantVerifier,
   TenantVerifierContract,
-  TenantVerifierInput,
   TenantVerifierOption,
+  TenantVerifierRequest,
   VerifiedTenant,
 } from './config_types.js';
 export * from './control-flow-signal.js';
@@ -137,9 +138,11 @@ export {
 } from './run-gateway/store-run-gateway.js';
 export {
   type ContractClassMaker,
-  hmacTenantVerifier,
   resolveTenantToken,
   resolveTenantVerifier,
+  type SharedSecretPartition,
+  type SharedSecretVerifierOptions,
+  sharedSecretVerifier,
   signTenantToken,
 } from './run-gateway/tenant-auth.js';
 export { tenantScopedGateway } from './run-gateway/tenant-scoped-gateway.js';

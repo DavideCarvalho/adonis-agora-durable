@@ -120,7 +120,7 @@ export default defineConfig({
   transports: { db: transports.db() },
   store: 'lucid',
   stores: { lucid: stores.lucid() },
-  verifyTenant: hmacTenantVerifier(process.env.DURABLE_TENANT_SECRET!),
+  verifyTenant: sharedSecretVerifier({ partitions: { 'acme-corp': process.env.DURABLE_ACME_SECRET! } }),
 })
 ```
 
@@ -130,8 +130,7 @@ export default defineConfig({
   transport: 'db',
   // The transport's `partition` decides which `<name>@acme-corp` rows the pod claims.
   transports: { db: transports.db({ partition: 'acme-corp' }) },
-  partition: 'acme-corp',
-  tenant: { token: process.env.DURABLE_TENANT_TOKEN },
+  tenant: { partition: 'acme-corp', token: process.env.DURABLE_ACME_SECRET },
 })
 ```
 

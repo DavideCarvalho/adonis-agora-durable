@@ -33,8 +33,7 @@ A standalone engine with no `namespace` is in the `'default'` pool: it drives on
 A pure coordinator: it owns the store and the transport, dispatches work, recovers crashes, fires timers, prunes retention, and answers thin-pod requests — but runs **no** embedded worker. Both `store` and `transport` are **required** here.
 
 ```ts title="config/durable.ts (control plane)"
-import { defineConfig, transports, stores } from '@adonis-agora/durable'
-import { hmacTenantVerifier } from '@adonis-agora/durable'
+import { defineConfig, sharedSecretVerifier, stores, transports } from '@adonis-agora/durable'
 
 export default defineConfig({
   topology: 'control-plane',
@@ -43,7 +42,9 @@ export default defineConfig({
   store: 'lucid',
   stores: { lucid: stores.lucid({ connection: 'pg' }) },
   // Optional: verify tenant tokens on incoming wire requests (see Authenticate tenants)
-  verifyTenant: hmacTenantVerifier(process.env.DURABLE_TENANT_SECRET!),
+  verifyTenant: sharedSecretVerifier({
+    partitions: { 'acme-corp': process.env.DURABLE_ACME_SECRET! },
+  }),
 })
 ```
 
@@ -66,15 +67,17 @@ export default defineConfig({
   transports: {
     bullmq: transports.bullmq({ connection: process.env.REDIS_URL! }),
   },
-  partition: 'acme-corp',            // which tenant this pod serves (required) — see Tenancy
-  tenant: { token: process.env.DURABLE_TENANT_TOKEN }, // its token: a string or a function
+  tenant: {
+    partition: 'acme-corp',          // which tenant this pod serves (required) — see Tenancy
+    token: process.env.DURABLE_TENANT_TOKEN, // its token: a string, a function or a token source
+  },
   requestTimeoutMs: 10_000,          // ProxyRunGateway round-trip timeout (default 10_000)
   capabilities: ['gpu'],             // optional: extra capabilities the worker advertises
   // store: 'lucid'                  // ❌ compile error — a tenant pod may not name a store
 })
 ```
 
-The top-level `partition` reaches all three: the `ProxyRunGateway` (the tenant it claims on the wire), the worker runtime (the routing tokens its descriptor advertises) and the transport, which subscribes the `<name>@acme-corp` task queues the control plane dispatches the tenant's steps to. The top-level `instanceId` is the transport's default too, so the runtime's and the transport's liveness keys carry the same id. A `partition` or `instanceId` set on the transport itself wins.
+`tenant.partition` reaches all three: the `ProxyRunGateway` (the tenant it claims on the wire), the worker runtime (the routing tokens its descriptor advertises) and the transport, which subscribes the `<name>@acme-corp` task queues the control plane dispatches the tenant's steps to. The top-level `instanceId` is the transport's default too, so the runtime's and the transport's liveness keys carry the same id. A `partition` or `instanceId` set on the transport itself wins.
 
 `capabilities` lists what the pod advertises beyond its handler names in its [descriptor](/docs/durable/cluster/handshake#the-worker-descriptor); a step's [`requires`](/docs/durable/cluster/handshake#capability-aware-routing) is matched against it.
 
@@ -85,8 +88,7 @@ export default defineConfig({
   topology: 'tenant',
   transport: 'queue',
   transports: { queue: transports.queue({ connection: 'redis', workerKeys: false }) },
-  partition: 'acme-corp',
-  tenant: { token: process.env.DURABLE_TENANT_TOKEN },
+  tenant: { partition: 'acme-corp', token: process.env.DURABLE_TENANT_TOKEN },
 })
 ```
 
@@ -97,8 +99,7 @@ export default defineConfig({
   topology: 'tenant',
   transport: 'db',
   transports: { db: transports.db() },
-  partition: 'acme-corp',
-  tenant: { token: process.env.DURABLE_TENANT_TOKEN },
+  tenant: { partition: 'acme-corp', token: process.env.DURABLE_TENANT_TOKEN },
 })
 ```
 
@@ -250,14 +251,14 @@ Each tenant runs on a segmented transport prefix/namespace behind a Redis/networ
 
 ### Token on top
 
-Each `tenant` pod sends a token with every request (`tenant.token`), and the control plane's `RunRequestResponder` **verifies it and derives the tenant from it** (`verifyTenant`), ignoring any `tenant` in the request body. The token can be an `@adonisjs/auth` access token, an authkit or other OIDC access token, or an HMAC-signed claim; `tenant.token` can be a string or a function that returns a fresh token for each request. [Authenticate tenants](/docs/durable/cluster/authenticate-tenants) has a working setup for each.
+Each `tenant` pod sends a token with every request (`tenant.token`), and the control plane's `RunRequestResponder` **verifies it and derives the tenant from it** (`verifyTenant`), ignoring any `tenant` in the request body. The token can be an authkit access token (`authkitTenantToken` / `authkitTenantVerifier` from `@adonis-agora/authkit-client`), an `@adonisjs/auth` access token, or a per-partition shared secret (`sharedSecretVerifier`); `tenant.token` can be a string, a function that returns a fresh token for each request, or an object with `get()`. [Authenticate tenants](/docs/durable/cluster/authenticate-tenants) has a working setup for each.
 
 ```ts
 // Control plane
 verifyTenant: () => import('#tenants/access_token_tenant_verifier'),
 
 // Tenant pod
-tenant: { token: env.get('DURABLE_TENANT_TOKEN') },
+tenant: { partition: 'acme-corp', token: env.get('DURABLE_TENANT_TOKEN') },
 ```
 
 <Callout type="warn">

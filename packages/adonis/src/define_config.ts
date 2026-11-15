@@ -474,6 +474,21 @@ export function defineConfig(config: DurableConfig = { topology: 'standalone' })
       "@adonis-agora/durable: `role` was renamed to `topology` in config/durable.ts (same values: 'standalone' | 'control-plane' | 'tenant'). Rename the key.",
     );
   }
+  if ((config as { topology?: unknown }).topology === 'tenant') {
+    // `partition` moved into the `tenant` block in 1.0 (`tenant: { partition, token }`), the same
+    // place every Agora lib reads it. Refuse the old key instead of booting a pod with no partition.
+    if ('partition' in (config as object)) {
+      throw new Error(
+        '@adonis-agora/durable: `partition` moved into the `tenant` block in config/durable.ts: `tenant: { partition, token }`.',
+      );
+    }
+    const partition = (config as { tenant?: { partition?: unknown } }).tenant?.partition;
+    if (typeof partition !== 'string' || partition.length === 0) {
+      throw new Error(
+        "@adonis-agora/durable: topology 'tenant' needs `tenant: { partition, token }` in config/durable.ts.",
+      );
+    }
+  }
   // Default the discriminant so downstream (provider, gateway) can branch on a always-present `topology`
   // without re-deriving it. `...config` wins, so an explicit topology is preserved.
   return { topology: 'standalone', ...config } as DurableConfig;

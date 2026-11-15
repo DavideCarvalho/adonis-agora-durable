@@ -262,8 +262,8 @@ export class RunRequestResponder {
       console.warn(
         '[adonis-durable] run-request responder started WITHOUT a tenant verifier: the wire ' +
           '`tenant` claim is trusted verbatim (prefix/network isolation only). Any broker client ' +
-          'can act as any tenant. Configure `verifyTenant` (e.g. hmacTenantVerifier(secret)) and ' +
-          'signed tenant tokens unless your broker is fully isolated per tenant.',
+          "can act as any tenant. Configure `verifyTenant` (sharedSecretVerifier or authkit-client's " +
+          'authkitTenantVerifier) and tenant tokens unless your broker is fully isolated per tenant.',
       );
     }
     this.#subscribeEngineEvents = options.subscribeEngineEvents;
@@ -558,7 +558,7 @@ export class RunRequestResponder {
   async #handleStart(msg: StartRunMessage): Promise<RunReply | undefined> {
     const correlationId = msg.runId;
     const verified = await this.#verifyClaim(msg.tenant);
-    const tenant = verified?.tenant ?? null;
+    const tenant = verified?.partition ?? null;
     if (tenant === null) {
       return correlationId === undefined
         ? undefined
@@ -655,20 +655,21 @@ export class RunRequestResponder {
   }
 
   async #resolveTenant(wireTenant: string): Promise<string | null> {
-    return (await this.#verifyClaim(wireTenant))?.tenant ?? null;
+    return (await this.#verifyClaim(wireTenant))?.partition ?? null;
   }
 
   /** The verified partition and the capabilities its token grants (none without a verifier). */
   async #verifyClaim(
     wireTenant: string,
-  ): Promise<{ tenant: string; capabilities: string[] } | null> {
-    if (!this.#verifyTenant) return { tenant: wireTenant, capabilities: [] };
-    const verified = await this.#verifyTenant({ token: wireTenant, tenant: wireTenant });
-    // Fail closed: only a non-empty string tenant is an acceptance.
-    const tenant = verified?.tenant;
-    if (typeof tenant !== 'string' || tenant.length === 0) return null;
+  ): Promise<{ partition: string; capabilities: string[] } | null> {
+    if (!this.#verifyTenant) return { partition: wireTenant, capabilities: [] };
+    // The wire `tenant` field carries the token; the partition comes only from what it verifies to.
+    const verified = await this.#verifyTenant({ token: wireTenant });
+    // Fail closed: only a non-empty string partition is an acceptance.
+    const partition = verified?.partition;
+    if (typeof partition !== 'string' || partition.length === 0) return null;
     return {
-      tenant,
+      partition,
       capabilities: Array.isArray(verified?.capabilities) ? verified.capabilities : [],
     };
   }
