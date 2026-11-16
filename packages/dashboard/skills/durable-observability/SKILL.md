@@ -58,10 +58,12 @@ export default defineConfig({
 `ConsoleAuthorizer`, `ConsoleAuthorizerClass` and `ConsoleAuthorizeResult` are
 exported from `@adonis-agora/durable/dashboard`): an inline function, an
 authorizer class, or a lazy import of one. It returns a boolean,
-`{ allowed: true, tenants? }`, `{ allowed: false, reason? }`, or
+`{ allowed: true, tenants?, apps? }`, `{ allowed: false, reason? }`, or
 `{ redirectTo: '/login' }`. Only `true`
 or `allowed: true` passes; with tenancy on, `{ allowed: true, tenants: [...] | '*' }`
-grants more organizations (omit for the viewer's own active tenant);
+grants more organizations (omit for the viewer's own active tenant); on a
+control plane, `{ allowed: true, apps: [...] | '*' }` scopes to tenant apps
+(omit for every app);
 `reason: 'unauthenticated'` → `401`, every other
 denial (incl. a throwing hook) → `403`; `{ redirectTo }` → `302` for a page
 navigation, `401` for an API call. A hook that already answered the request (a
@@ -165,7 +167,17 @@ export default defineConfig({
 Every bridge (`collectMetrics`, `attachDurableMetrics`, `attachDurableOtel`, the
 diagnostics bridge Telescope reads) handles only the events its own instance
 produced; another pod's events, re-delivered over the control plane, are skipped
-(`isRemoteEvent(event)`), so a fleet counts and traces each event once.
+(`isRemoteEvent(event)`), so a fleet counts and traces each event once — except
+a `control-plane`'s diagnostics bridge, which is the one place every tenant's
+workflow lifecycle is recorded: it stamps each event of a tenant's run, step
+events included, with `app` (the tenant's partition, on the diagnostics envelope via
+`emit(…, { app })` and in the payload, plus `namespace` on step events) and
+emits it in the run's
+trace (`runTraceId(runId)` from `@adonis-agora/durable`). A `tenant` pod still
+emits no lifecycle events of its own, and runs each step and workflow turn in
+its run's trace when Telescope is loaded, so what it records inside a step
+joins the control plane's entries on `trace:<id>`. Standalone apps are
+unchanged.
 
 The mounted dashboard also serves `GET <path>/api/metrics` (these counters plus
 `durable_pending_runs` / `durable_running_runs` / `durable_dead_runs` and
@@ -202,7 +214,11 @@ Rollups (success rate, throughput, duration percentiles, top failures) come from
 captured entries bounded by Telescope's prune window; current-state gauges
 (dead/suspended/running/pending NOW) read live from the store via
 `engine.countRuns` (an exact `COUNT`, falling back to a capped `listRuns`
-listing on stores without it). The **Worker health** table lists every group
+listing on stores without it). On a `control-plane` install Telescope there:
+the provider registers the tagging watcher itself, which tags those entries
+`app:<partition>` next to `lib:durable`, and every `durable.*` data provider
+takes `{ app }` to show one tenant. The durable console's `authorize` may return
+`apps: '*' | string[]` to scope a viewer to tenant apps. The **Worker health** table lists every group
 (STARVED first); the **Workers** table has one row per live instance (mode,
 limit, saturation, RAM/CPU, steps/min, p95, last adjustment; `n/a` = no status
 reported, `—` = nothing measured yet). Copies of one event recorded by several

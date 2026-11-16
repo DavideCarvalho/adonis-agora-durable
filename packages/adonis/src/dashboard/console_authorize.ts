@@ -18,6 +18,11 @@ export type ConsoleAuthorizeResult =
        * for every tenant plus runs with no tenant. Omit for the viewer's own active tenant.
        */
       tenants?: '*' | string[];
+      /**
+       * On a control plane: the tenant apps (partitions) this viewer may see in the console, or `'*'`
+       * for every app plus the control plane's own runs. Omit for every app.
+       */
+      apps?: '*' | string[];
     }
   | { allowed: false; reason?: 'unauthenticated' | 'forbidden' }
   | { redirectTo: string };
@@ -41,7 +46,7 @@ export type ConsoleAuthorize =
 
 /** A normalized console decision. A denial always carries a reason (`401` vs `403`). */
 export type ConsoleDecision =
-  | { allowed: true; tenants?: '*' | string[] }
+  | { allowed: true; tenants?: '*' | string[]; apps?: '*' | string[] }
   | {
       allowed: false;
       reason: 'unauthenticated' | 'forbidden';
@@ -80,16 +85,17 @@ export function normalizeConsoleDecision(result: unknown): ConsoleDecision {
     reason?: unknown;
     redirectTo?: unknown;
     tenants?: unknown;
+    apps?: unknown;
   };
   if (record.allowed === true) {
-    if (record.tenants === '*') return { allowed: true, tenants: '*' };
-    if (Array.isArray(record.tenants)) {
-      return {
-        allowed: true,
-        tenants: record.tenants.filter((t): t is string => typeof t === 'string' && t !== ''),
-      };
-    }
-    return { allowed: true };
+    const decision: { allowed: true; tenants?: '*' | string[]; apps?: '*' | string[] } = {
+      allowed: true,
+    };
+    const tenants = scopeList(record.tenants);
+    if (tenants !== undefined) decision.tenants = tenants;
+    const apps = scopeList(record.apps);
+    if (apps !== undefined) decision.apps = apps;
+    return decision;
   }
   if (typeof record.redirectTo === 'string' && record.redirectTo !== '') {
     return { allowed: false, reason: 'unauthenticated', redirectTo: record.redirectTo };
@@ -98,6 +104,13 @@ export function normalizeConsoleDecision(result: unknown): ConsoleDecision {
     allowed: false,
     reason: record.reason === 'unauthenticated' ? 'unauthenticated' : 'forbidden',
   };
+}
+
+/** A `tenants` / `apps` grant: `'*'`, a list of non-empty ids, or `undefined` (not granted). */
+function scopeList(value: unknown): '*' | string[] | undefined {
+  if (value === '*') return '*';
+  if (!Array.isArray(value)) return undefined;
+  return value.filter((t): t is string => typeof t === 'string' && t !== '');
 }
 
 async function runAuthorizer(
@@ -214,9 +227,12 @@ export function anyAuthorize(
     for (const authorize of resolved) {
       const decision = await authorize(ctx);
       if (decision.allowed) {
-        return decision.tenants !== undefined
-          ? { allowed: true, tenants: decision.tenants }
-          : { allowed: true };
+        // The first allow wins, with the grants it carries (none = every tenant / app).
+        return {
+          allowed: true,
+          ...(decision.tenants !== undefined ? { tenants: decision.tenants } : {}),
+          ...(decision.apps !== undefined ? { apps: decision.apps } : {}),
+        };
       }
       if (decision.error !== undefined && !threw) {
         threw = true;

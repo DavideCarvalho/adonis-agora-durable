@@ -58,9 +58,33 @@ new DurableTelescopeWatcher().register({ record: (entry) => safeRecord(entry, 'd
 
 It records each `agora:durable:<type>` event as the generic watcher does (same `diagnostic` type, `durable:<type>` family and content, so every panel below reads it unchanged) and adds the tags durable's NestJS twin records: `durable`, the event type, `run:<id>`, `parent:<id>`, `workflow:<name>`, `kind:<step kind>`, `failed`, `routed` / `unrouted` with `onError:<code|*>`, `triggered` with the started run's `run:<id>` (so a `run:<id>` search shows the trigger from both runs), `trigger_failed` with `subscriber:<name>`, and on the `run.started` of a lifecycle-started run `lifecycle`, `source:<source run id>` and `sourceTrace:<trace id>` (from `sourceTraceparent`, when the source recorded its span). `register()` claims every `durable:<type>` key in `@adonis-agora/diagnostics`' claim registry, so the generic watcher (from `@adonis-agora/telescope` 0.6.0) skips them and nothing is recorded twice; `dispose()` gives them back. `buildDurableEntry`, `durableEntryTags`, `DURABLE_DIAGNOSTIC_EVENTS` and `traceIdOfTraceparent` are exported with it.
 
-Telescope groups entries into a trace by their `traceId` and has no span links, so a lifecycle-started run is linked to its source by those tags, not by a shared trace: open the source run's trace and search `source:<its run id>`, or the started run's entries and search `sourceTrace:`. The traces are the ones `@adonis-agora/context` resolves where the events are emitted; durable does not derive a trace from the run id.
+Telescope groups entries into a trace by their `traceId` and has no span links, so a lifecycle-started run is linked to its source by those tags, not by a shared trace: open the source run's trace and search `source:<its run id>`, or the started run's entries and search `sourceTrace:`. The traces are the ones `@adonis-agora/context` resolves where the events are emitted; durable does not derive a trace from the run id, except for a tenant's runs on a control plane (below).
 
 A dead-lettered run shows up as a `run.failed` entry with `error.code: 'max_recovery_attempts'` (see [Dead-letter queue](/docs/durable/reliability/dead-letter)), so it counts toward the failure rollups.
+
+## Observability with a control plane
+
+With `topology: 'control-plane'` and tenant pods, the control plane is where every tenant's workflows are recorded. Install Telescope on the control plane and register the extension there; the tenant apps don't need Telescope to show up in it.
+
+```ts title="config/telescope.ts (control plane)"
+import { defineConfig } from '@adonis-agora/telescope'
+import { durableTelescopeExtension } from '@adonis-agora/durable/telescope'
+
+export default defineConfig({
+  extensions: [durableTelescopeExtension()],
+  // When this Telescope sends its entries to a central server: send each tenant's as that app's.
+  tenant: { relay: true },
+})
+```
+
+- **Every transition of a tenant's run is recorded once, on the control plane**: run started, suspended, completed and failed, step started, completed and failed, triggers and routing. A tenant pod records none of them, so nothing is counted twice when a tenant also runs Telescope.
+- **Each entry names its app.** The diagnostics event carries `app` on its envelope (`@adonis-agora/diagnostics` 1.0.0-rc.6 and later) and in its payload, with the run's partition as `namespace` on step events too, and the entry is tagged `app:<partition>` next to `lib:durable` and the usual `run:<id>` / `workflow:<name>` tags. The control plane registers the tagging watcher by itself; registering your own `DurableTelescopeWatcher` replaces it. When the control plane's Telescope relays to a central server, the token it sends with needs `telescope:ingest:relay` for those entries to be stored as the tenant's.
+- **The control plane's own runs** (no namespace, `'default'`, or its own `namespace`) carry no `app`.
+- **Filter the dashboard by app.** Every `durable.*` provider takes `{ app: '<partition>' }`: the live counts, Stuck runs and Owed lifecycle events read that tenant's runs, Worker health and Workers keep its `<name>@<partition>` groups, and the history panels count the events attributed to it.
+
+A tenant pod that also runs Telescope records what happens inside a step (its queries, HTTP calls, exceptions). It runs each step, and each workflow turn, in its run's trace, and the control plane records that run's lifecycle entries in the same trace, so `trace:<id>` shows both sides. The trace id is `runTraceId(runId)`, exported from `@adonis-agora/durable`. An OpenTelemetry span active in the pod still wins there, as it does for any Telescope entry.
+
+Standalone apps are unchanged: events carry no `app` and keep the trace `@adonis-agora/context` resolves.
 
 ## The Workflows dashboard
 

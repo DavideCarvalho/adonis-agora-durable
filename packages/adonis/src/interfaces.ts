@@ -2842,7 +2842,9 @@ export interface EngineEvent {
   runId: string;
   workflow?: string | undefined;
   /** The worker-pool partition the run belongs to (stamped on `run.*` lifecycle events), so an
-   *  operator control plane can attribute each event to its tenant/pool. Absent on step events. */
+   *  operator control plane can attribute each event to its tenant/pool. The engine leaves it off
+   *  step events; a control plane's diagnostics bridge fills it in on every event of a tenant's run
+   *  it forwards (with `app`, see `attachDurableDiagnostics`). */
   namespace?: string | undefined;
   seq?: number | undefined;
   name?: string | undefined;

@@ -8,6 +8,7 @@ import {
   type AccessDeniedInfo,
   resolveAccessDeniedPage,
 } from '../src/dashboard/access_denied_page.js';
+import { appScopedDashboardEngine, grantedApps } from '../src/dashboard/app_scope.js';
 import { recordConsoleAudit } from '../src/dashboard/audit.js';
 import {
   type CompatSource,
@@ -211,17 +212,48 @@ export default class DashboardProvider {
         WorkflowEngine,
       );
       const scope = ctx ? await this.consoleTenantScope(config, ctx) : undefined;
+      const apps = ctx ? await this.consoleApps(config, ctx) : undefined;
       const slot = scope ? tenancySlot() : undefined;
+      const byApp = apps ? appScopedDashboardEngine(base, apps) : base;
       const engine = scope
-        ? scopedDashboardEngine(base, scope.ids, slot ? (fn) => slot.allTenants(fn) : undefined)
-        : base;
-      const metrics = scope && scope.ids !== undefined ? undefined : this.metricsCollector;
+        ? scopedDashboardEngine(byApp, scope.ids, slot ? (fn) => slot.allTenants(fn) : undefined)
+        : byApp;
+      // The process counters span every tenant and app: only a viewer who sees them all gets them.
+      const metrics =
+        (scope && scope.ids !== undefined) || apps !== undefined
+          ? undefined
+          : this.metricsCollector;
       return {
         engine,
         ...(config.redact ? { redact: config.redact } : {}),
         ...(metrics ? { metrics } : {}),
       };
     };
+  }
+
+  /** `authorize`'s decision for this request, asked once. */
+  private async consoleDecision(
+    config: ResolvedDurableDashboardConfig,
+    ctx: HttpContext,
+  ): Promise<ConsoleDecision> {
+    let decision = this.decisions.get(ctx);
+    if (decision === undefined) {
+      decision = await config.authorize(ctx);
+      this.decisions.set(ctx, decision);
+    }
+    return decision;
+  }
+
+  /**
+   * The apps (tenant partitions) this viewer may see, or `undefined` for every app: `authorize`'s
+   * `apps` grant, when it names a list.
+   */
+  private async consoleApps(
+    config: ResolvedDurableDashboardConfig,
+    ctx: HttpContext,
+  ): Promise<string[] | undefined> {
+    const decision = await this.consoleDecision(config, ctx);
+    return decision.allowed ? grantedApps(decision.apps) : undefined;
   }
 
   /** Whether tenancy is on for durable (config/durable.ts `tenancy`, else config/context.ts). */
@@ -241,11 +273,7 @@ export default class DashboardProvider {
     if (!this.tenancyOn()) return undefined;
     const known = this.scopes.get(ctx);
     if (known) return known;
-    let decision = this.decisions.get(ctx);
-    if (decision === undefined) {
-      decision = await config.authorize(ctx);
-      this.decisions.set(ctx, decision);
-    }
+    const decision = await this.consoleDecision(config, ctx);
     const granted = decision.allowed ? decision.tenants : undefined;
     const slot = tenancySlot();
     const option = this.app.config.get<DurableConfig>('durable', {}).tenancy;
@@ -617,8 +645,9 @@ export default class DashboardProvider {
         if (!(await this.enforce(config, ctx, 'api'))) return;
         const id = ctx.params.id as string;
         const { engine } = await deps(ctx);
-        // A run outside the viewer's tenants streams nothing: answer like an unknown run.
-        if ((await engine.getRun(id)) === null && this.tenancyOn()) {
+        // A run outside the viewer's tenants or apps streams nothing: answer like an unknown run.
+        const confined = this.tenancyOn() || (await this.consoleApps(config, ctx)) !== undefined;
+        if (confined && (await engine.getRun(id)) === null) {
           return ctx.response.status(404).json({ error: `run ${id} not found` });
         }
         await this.streamRun(ctx, engine, id);

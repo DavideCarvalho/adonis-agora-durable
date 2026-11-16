@@ -50,8 +50,10 @@ import {
   NOOP_RUN_DISPATCHER,
 } from '../src/role_bindings.js';
 import { tenantScopedGateway } from '../src/run-gateway/tenant-scoped-gateway.js';
+import { enableRunTraceScope } from '../src/run-trace.js';
 import { resolveSchedules } from '../src/scheduler.js';
 import { setBootedApp } from '../src/services/booted_app.js';
+import { registerControlPlaneWatcher } from '../src/telescope/watcher.js';
 import { contextEngineTenancy, tenancyEnabled } from '../src/tenancy.js';
 import {
   NoopWorkerRegistry,
@@ -108,6 +110,7 @@ const UNSERVED_ROUTES_RECHECK_MS = 30_000;
 
 export default class DurableProvider {
   #detachDiagnostics: (() => void) | null = null;
+  #runTraceScopeEnabled = false;
   #transport: (Transport & { close?: () => Promise<void> }) | null = null;
   /** The `transportPool` transports built alongside {@link #transport}, closed with it on shutdown. */
   #pooledTransports: Array<Transport & { close?: () => Promise<void> }> = [];
@@ -869,14 +872,39 @@ export default class DurableProvider {
   async ready() {
     if (this.#isWarmup()) return;
     const config = this.app.config.get<DurableConfig>('durable', {});
-    if ((config.topology ?? 'standalone') === 'tenant') return;
+    const topology = config.topology ?? 'standalone';
+    if (topology === 'tenant') {
+      // The control plane records this pod's runs; the pod records only what happens inside a
+      // step, in the run's trace, so the two views join (see `withRunTrace`).
+      enableRunTraceScope();
+      this.#runTraceScopeEnabled = true;
+      return;
+    }
     // Before the diagnostics gate below: the embedded worker must start whether or not
     // `@adonis-agora/diagnostics` is installed, and that gate returns early when it is not.
     await this.#startEmbeddedWorker(config);
     const emit = (globalThis as Record<symbol, unknown>)[DIAGNOSTICS_EMIT];
     if (typeof emit !== 'function') return;
     const engine = await this.app.container.make(WorkflowEngine);
-    this.#detachDiagnostics = attachDurableDiagnostics(engine);
+    if (topology !== 'control-plane') {
+      this.#detachDiagnostics = attachDurableDiagnostics(engine);
+      return;
+    }
+    // A control plane records the lifecycle of every tenant's runs, each attributed to its app.
+    const ownNamespace = config.namespace;
+    const detachBridge = attachDurableDiagnostics(engine, {
+      tenants: {
+        namespaceOf: async (runId) => (await engine.getRun(runId))?.namespace,
+        ...(ownNamespace !== undefined ? { own: [ownNamespace] } : {}),
+      },
+    });
+    // Registered whether or not Telescope has loaded yet: the recorder reads its runtime per entry,
+    // so a Telescope that boots after this still gets the tagged entries.
+    const detachWatcher = registerControlPlaneWatcher();
+    this.#detachDiagnostics = () => {
+      detachBridge();
+      detachWatcher();
+    };
   }
 
   async shutdown() {
@@ -903,6 +931,10 @@ export default class DurableProvider {
     this.#responder = null;
     this.#detachDiagnostics?.();
     this.#detachDiagnostics = null;
+    if (this.#runTraceScopeEnabled) {
+      enableRunTraceScope(false);
+      this.#runTraceScopeEnabled = false;
+    }
     this.#detachEventTriggers?.();
     this.#detachEventTriggers = undefined;
     // Release the transport's broker workers / queues / connections so a deploy hands off cleanly.

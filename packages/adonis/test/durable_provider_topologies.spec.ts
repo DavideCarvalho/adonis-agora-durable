@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import type { ApplicationService, ContainerBindings } from '@adonisjs/core/types';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import DurableProvider from '../providers/durable_provider.js';
 import type { DurableConfig } from '../src/define_config.js';
 import {
@@ -484,5 +484,94 @@ describe('DurableProvider — tenant auth in class form, built through the conta
     // Nobody answers on this transport: the request times out, but it was sent with the token.
     await expect(gateway.listRuns({})).rejects.toThrow(/did not answer/);
     expect(transport.requests.map((r) => r.tenant)).toEqual(['key-acme']);
+  });
+});
+
+describe('DurableProvider — lifecycle events per topology (ready)', () => {
+  const EMIT = Symbol.for('@agora/diagnostics:emit');
+  const RUNTIME = Symbol.for('@agora/telescope:runtime');
+  const TRACE_SCOPE_ENABLED = Symbol.for('@agora/durable:run-trace-scope');
+  const AUTO = Symbol.for('@agora/durable:telescope-auto-watcher');
+  const CLAIMS = Symbol.for('@agora/diagnostics:claims');
+  const g = globalThis as Record<symbol, unknown>;
+
+  function capture(): Array<{ event: string; payload: { runId: string; app?: string } }> {
+    const seen: Array<{ event: string; payload: { runId: string; app?: string } }> = [];
+    g[EMIT] = (_lib: string, event: string, payload: unknown) =>
+      seen.push({ event, payload: payload as { runId: string; app?: string } });
+    return seen;
+  }
+
+  afterEach(() => {
+    delete g[EMIT];
+    delete g[RUNTIME];
+    delete g[TRACE_SCOPE_ENABLED];
+    delete g[AUTO];
+    delete g[CLAIMS];
+  });
+
+  /** Emit an engine event the way the engine does for a state transition it persists. */
+  function emitOn(engine: WorkflowEngine, event: Record<string, unknown>): void {
+    (engine as unknown as { emit(e: Record<string, unknown>): void }).emit(event);
+  }
+
+  function storeConfig(topology: 'standalone' | 'control-plane'): DurableConfig {
+    return {
+      topology,
+      store: 'mem',
+      stores: { mem: async () => new InMemoryStateStore() },
+      workflowsPath: false,
+      stepsPath: false,
+    } as DurableConfig;
+  }
+
+  it("control plane: its bridge attributes a tenant's run to the tenant app, and registers the tagging watcher", async () => {
+    const seen = capture();
+    // Telescope not loaded yet at ready(): the watcher is registered anyway (it reads the runtime per entry).
+    const { app, container } = makeApp(storeConfig('control-plane'));
+    const provider = new DurableProvider(app);
+    provider.register();
+    await provider.ready();
+    const engine = await container.make(WorkflowEngine);
+    emitOn(engine, { type: 'run.started', runId: 'r-acme', workflow: 'w', namespace: 'acme' });
+    emitOn(engine, { type: 'step.started', runId: 'r-acme', seq: 1, name: 's' });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(seen.map((e) => e.event)).toEqual(['run.started', 'step.started']);
+    expect(seen.every((e) => e.payload.app === 'acme')).toBe(true);
+    expect((g[AUTO] as { watcher?: unknown }).watcher).toBeDefined();
+    await provider.shutdown();
+    expect((g[AUTO] as { watcher?: unknown }).watcher).toBeUndefined();
+  });
+
+  it('standalone: events are forwarded as before (no app), and no watcher is registered', async () => {
+    const seen = capture();
+    g[RUNTIME] = { store: { record: () => undefined }, paused: false };
+    const { app, container } = makeApp(storeConfig('standalone'));
+    const provider = new DurableProvider(app);
+    provider.register();
+    await provider.ready();
+    const engine = await container.make(WorkflowEngine);
+    emitOn(engine, { type: 'run.started', runId: 'r-acme', workflow: 'w', namespace: 'acme' });
+    expect(seen.map((e) => e.event)).toEqual(['run.started']);
+    expect(seen.some((e) => 'app' in e.payload)).toBe(false);
+    expect(g[AUTO]).toBeUndefined();
+    await provider.shutdown();
+  });
+
+  it('tenant: emits no lifecycle events of its own and runs steps in their run trace', async () => {
+    const seen = capture();
+    const { app } = makeApp({
+      topology: 'tenant',
+      transport: 'p4',
+      transports: { p4: async () => new P4Transport() },
+      tenant: { partition: 'acme' },
+    } as DurableConfig);
+    const provider = new DurableProvider(app);
+    provider.register();
+    await provider.ready();
+    expect(g[TRACE_SCOPE_ENABLED]).toBe(true);
+    expect(seen).toEqual([]);
+    await provider.shutdown();
+    expect(g[TRACE_SCOPE_ENABLED]).toBeUndefined();
   });
 });

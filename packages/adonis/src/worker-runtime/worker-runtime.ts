@@ -7,6 +7,7 @@ import {
 } from '../handshake/descriptor.js';
 import type { WorkflowStepEvent } from '../interfaces.js';
 import type { StepHandler } from '../protocol.js';
+import { withRunTrace } from '../run-trace.js';
 import {
   buildInstanceId,
   WORKER_HEARTBEAT_INTERVAL_MS,
@@ -215,15 +216,17 @@ export class WorkerRuntime {
     // so a later re-register is picked up without re-wiring). No-op if the transport can't carry turns.
     if (firstBody && this.#transport.handleWorkflow) {
       this.#transport.handleWorkflow(name, (task) =>
-        runWorkflowTurn(this.#workflowBodies, task, {
-          partition: this.#partition,
-          ...(this.#transport.dispatchStepEvent
-            ? {
-                onStep: (event: WorkflowStepEvent) =>
-                  void this.#transport.dispatchStepEvent?.(event),
-              }
-            : {}),
-        }),
+        withRunTrace(task, () =>
+          runWorkflowTurn(this.#workflowBodies, task, {
+            partition: this.#partition,
+            ...(this.#transport.dispatchStepEvent
+              ? {
+                  onStep: (event: WorkflowStepEvent) =>
+                    void this.#transport.dispatchStepEvent?.(event),
+                }
+              : {}),
+          }),
+        ),
       );
     }
     const isNew = !this.#workflows.has(name);

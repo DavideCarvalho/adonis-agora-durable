@@ -147,6 +147,7 @@ export {
 } from './run-gateway/tenant-auth.js';
 export { tenantScopedGateway } from './run-gateway/tenant-scoped-gateway.js';
 export * from './run-pagination.js';
+export { enableRunTraceScope, runTraceId, withRunTrace } from './run-trace.js';
 export * from './run-value-facets.js';
 export * from './run-waiting.js';
 export * from './scheduler.js';
