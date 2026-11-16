@@ -168,7 +168,9 @@ produced; another pod's events, re-delivered over the control plane, are skipped
 (`isRemoteEvent(event)`), so a fleet counts and traces each event once — except
 a `control-plane`'s diagnostics bridge, which is the one place every tenant's
 workflow lifecycle is recorded: it stamps each event of a tenant's run, step
-events included, with `app` (the tenant's partition) and emits it in the run's
+events included, with `app` (the tenant's partition, on the diagnostics envelope via
+`emit(…, { app })` and in the payload, plus `namespace` on step events) and
+emits it in the run's
 trace (`runTraceId(runId)` from `@adonis-agora/durable`). A `tenant` pod still
 emits no lifecycle events of its own, and runs each step and workflow turn in
 its run's trace when Telescope is loaded, so what it records inside a step
@@ -213,7 +215,8 @@ captured entries bounded by Telescope's prune window; current-state gauges
 listing on stores without it). On a `control-plane` install Telescope there:
 the provider registers the tagging watcher itself, which tags those entries
 `app:<partition>` next to `lib:durable`, and every `durable.*` data provider
-takes `{ app }` to show one tenant. The **Worker health** table lists every group
+takes `{ app }` to show one tenant. The durable console's `authorize` may return
+`apps: '*' | string[]` to limit a viewer to some tenant apps. The **Worker health** table lists every group
 (STARVED first); the **Workers** table has one row per live instance (mode,
 limit, saturation, RAM/CPU, steps/min, p95, last adjustment; `n/a` = no status
 reported, `—` = nothing measured yet). Copies of one event recorded by several
