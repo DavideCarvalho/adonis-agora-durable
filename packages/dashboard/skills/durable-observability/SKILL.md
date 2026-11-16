@@ -165,7 +165,15 @@ export default defineConfig({
 Every bridge (`collectMetrics`, `attachDurableMetrics`, `attachDurableOtel`, the
 diagnostics bridge Telescope reads) handles only the events its own instance
 produced; another pod's events, re-delivered over the control plane, are skipped
-(`isRemoteEvent(event)`), so a fleet counts and traces each event once.
+(`isRemoteEvent(event)`), so a fleet counts and traces each event once — except
+a `control-plane`'s diagnostics bridge, which is the one place every tenant's
+workflow lifecycle is recorded: it stamps each event of a tenant's run, step
+events included, with `app` (the tenant's partition) and emits it in the run's
+trace (`runTraceId(runId)` from `@adonis-agora/durable`). A `tenant` pod still
+emits no lifecycle events of its own, and runs each step and workflow turn in
+its run's trace when Telescope is loaded, so what it records inside a step
+joins the control plane's entries on `trace:<id>`. Standalone apps are
+unchanged.
 
 The mounted dashboard also serves `GET <path>/api/metrics` (these counters plus
 `durable_pending_runs` / `durable_running_runs` / `durable_dead_runs` and
@@ -202,7 +210,10 @@ Rollups (success rate, throughput, duration percentiles, top failures) come from
 captured entries bounded by Telescope's prune window; current-state gauges
 (dead/suspended/running/pending NOW) read live from the store via
 `engine.countRuns` (an exact `COUNT`, falling back to a capped `listRuns`
-listing on stores without it). The **Worker health** table lists every group
+listing on stores without it). On a `control-plane` install Telescope there:
+the provider registers the tagging watcher itself, which tags those entries
+`app:<partition>` next to `lib:durable`, and every `durable.*` data provider
+takes `{ app }` to show one tenant. The **Worker health** table lists every group
 (STARVED first); the **Workers** table has one row per live instance (mode,
 limit, saturation, RAM/CPU, steps/min, p95, last adjustment; `n/a` = no status
 reported, `—` = nothing measured yet). Copies of one event recorded by several
