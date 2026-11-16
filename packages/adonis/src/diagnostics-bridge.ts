@@ -54,6 +54,11 @@ export interface TenantAttribution {
   own?: readonly string[] | undefined;
   /** How many run → app answers to keep (oldest dropped first). Default 10,000. */
   cacheSize?: number | undefined;
+  /**
+   * How long one read may take before the event is forwarded unattributed (the run's next event
+   * reads again). Default 5,000 ms.
+   */
+  lookupTimeoutMs?: number | undefined;
 }
 
 /** A tenant app of `namespace`, or `undefined` for the control plane's own runs. */
@@ -64,27 +69,33 @@ function tenantAppOf(namespace: string | undefined, own: ReadonlySet<string>): s
 
 /**
  * Remembers which app each run belongs to and stamps it on that run's events, in emission order. An
- * event whose run is not known yet waits for one store read; the events behind it wait too, so a
- * run's `step.completed` is never forwarded before its `step.started`.
+ * event whose run is not known yet waits for one store read; that run's later events wait behind it
+ * (a run's `step.completed` is never forwarded before its `step.started`), other runs' do not. A read
+ * that fails or takes longer than `lookupTimeoutMs` forwards the event unattributed and is retried on
+ * the run's next event.
  */
 class TenantStamper {
   readonly #lookup: (runId: string) => Promise<string | undefined>;
   readonly #own: ReadonlySet<string>;
   readonly #max: number;
+  readonly #timeoutMs: number;
   /** runId → app (`null`: the control plane's own run). */
   readonly #apps = new Map<string, string | null>();
-  #queue: Promise<void> | null = null;
-  #queued = 0;
+  /** runId → the last queued event of that run, while one is waiting on a read. */
+  readonly #tails = new Map<string, Promise<void>>();
 
   constructor(options: TenantAttribution) {
     this.#lookup = (runId) => options.namespaceOf(runId);
     this.#own = new Set(options.own ?? []);
     this.#max = Math.max(1, options.cacheSize ?? 10_000);
+    this.#timeoutMs = Math.max(1, options.lookupTimeoutMs ?? 5_000);
   }
 
   /** Call `forward` with `event` stamped with its app (when it has one), now or once it is known. */
   stamp(event: EngineEvent, forward: (event: EngineEvent & { app?: string }) => void): void {
-    if (this.#queue === null) {
+    const runId = event.runId;
+    const tail = this.#tails.get(runId);
+    if (tail === undefined) {
       const known = this.#known(event);
       if (known !== undefined) {
         forward(this.#with(event, known));
@@ -92,30 +103,42 @@ class TenantStamper {
         return;
       }
     }
-    this.#queued += 1;
-    const previous = this.#queue ?? Promise.resolve();
-    this.#queue = previous.then(async () => {
+    const next = (tail ?? Promise.resolve()).then(async () => {
       try {
         let app = this.#known(event);
         if (app === undefined) {
-          let namespace: string | undefined;
-          try {
-            namespace = await this.#lookup(event.runId);
-          } catch {
-            namespace = undefined;
+          const namespace = await this.#read(runId);
+          if (namespace === FAILED) {
+            app = null; // not remembered: the run's next event reads again
+          } else {
+            app = tenantAppOf(namespace, this.#own) ?? null;
+            this.#remember(runId, app);
           }
-          app = tenantAppOf(namespace, this.#own) ?? null;
-          this.#remember(event.runId, app);
         }
         forward(this.#with(event, app));
         this.#settle(event);
       } catch {
         // Recording must never break the engine, nor stall the events behind this one.
-      } finally {
-        this.#queued -= 1;
-        if (this.#queued === 0) this.#queue = null;
       }
     });
+    this.#tails.set(runId, next);
+    void next.then(() => {
+      if (this.#tails.get(runId) === next) this.#tails.delete(runId);
+    });
+  }
+
+  /** The run's namespace, or {@link FAILED} when the read threw or did not answer in time. */
+  async #read(runId: string): Promise<string | undefined | typeof FAILED> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<typeof FAILED>((resolve) => {
+      timer = setTimeout(() => resolve(FAILED), this.#timeoutMs);
+      (timer as { unref?: () => void }).unref?.();
+    });
+    try {
+      return await Promise.race([this.#lookup(runId).catch((): typeof FAILED => FAILED), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /** The app of `event`'s run when it can be answered without a read (`null`: no app). */
@@ -148,6 +171,9 @@ class TenantStamper {
     }
   }
 }
+
+/** A namespace read that threw or timed out. */
+const FAILED: unique symbol = Symbol('failed');
 
 /**
  * Bridge engine lifecycle events onto the `@adonis-agora/diagnostics` bus as `agora:durable:<type>`

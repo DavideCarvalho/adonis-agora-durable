@@ -77,9 +77,6 @@ const CONTEXT_ACCESSOR = Symbol.for('@agora/context:accessor');
  */
 const OTEL_TRACEPARENT = Symbol.for('@agora/otel:traceparent');
 
-/** The runtime `@adonis-agora/telescope` publishes once loaded (read structurally, never imported). */
-const TELESCOPE_RUNTIME = Symbol.for('@agora/telescope:runtime');
-
 /** `@adonis-agora/diagnostics`'s emit capability slot (set at that package's module load when installed). */
 const DIAGNOSTICS_EMIT = Symbol.for('@agora/diagnostics:emit');
 
@@ -901,10 +898,9 @@ export default class DurableProvider {
         ...(ownNamespace !== undefined ? { own: [ownNamespace] } : {}),
       },
     });
-    const detachWatcher =
-      (globalThis as Record<symbol, unknown>)[TELESCOPE_RUNTIME] !== undefined
-        ? registerControlPlaneWatcher()
-        : () => undefined;
+    // Registered whether or not Telescope has loaded yet: the recorder reads its runtime per entry,
+    // so a Telescope that boots after this still gets the tagged entries.
+    const detachWatcher = registerControlPlaneWatcher();
     this.#detachDiagnostics = () => {
       detachBridge();
       detachWatcher();

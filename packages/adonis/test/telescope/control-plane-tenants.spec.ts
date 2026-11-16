@@ -202,6 +202,35 @@ describe('providers filtered by `query.app`', () => {
     expect(res.rows.map((r) => r.group)).toEqual(['charge@acme']);
   });
 
+  it("entry-backed: asks the store for the app's own entries, so other apps' volume cannot crowd it out", async () => {
+    const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
+    const asked: Array<{ tag: string | undefined; limit: number | undefined }> = [];
+    const ctx: ExtensionContext = {
+      store: {
+        list: async (q) => {
+          asked.push({ tag: q?.tag, limit: q?.limit });
+          return q?.tag === 'app:acme'
+            ? [
+                entry('run.completed', { runId: '1', workflow: 'w', app: 'acme' }),
+                {
+                  content: { lib: 'http', event: 'x', payload: { app: 'acme' } },
+                  createdAt: new Date(),
+                },
+              ]
+            : [];
+        },
+      },
+      container: { make: async () => engine as never },
+      config: {},
+    };
+    expect(
+      await durableTimeseriesProvider().resolve({ metric: 'total', app: 'acme', limit: 300 }, ctx),
+    ).toEqual({
+      value: 1,
+    });
+    expect(asked).toEqual([{ tag: 'app:acme', limit: 300 }]);
+  });
+
   it('entry-backed: timeseries counts only the events attributed to that app', async () => {
     const engine = new WorkflowEngine({ store: new InMemoryStateStore() });
     const ctx = makeCtx(engine, [

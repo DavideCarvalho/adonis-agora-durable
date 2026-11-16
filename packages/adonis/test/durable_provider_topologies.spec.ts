@@ -527,7 +527,7 @@ describe('DurableProvider — lifecycle events per topology (ready)', () => {
 
   it("control plane: its bridge attributes a tenant's run to the tenant app, and registers the tagging watcher", async () => {
     const seen = capture();
-    g[RUNTIME] = { store: { record: () => undefined }, paused: false };
+    // Telescope not loaded yet at ready(): the watcher is registered anyway (it reads the runtime per entry).
     const { app, container } = makeApp(storeConfig('control-plane'));
     const provider = new DurableProvider(app);
     provider.register();

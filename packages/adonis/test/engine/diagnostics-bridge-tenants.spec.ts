@@ -92,7 +92,7 @@ describe('attachDurableDiagnostics on a control plane (tenants)', () => {
     expect(seen.every((e) => e.traceId === undefined)).toBe(true);
   });
 
-  it('reads the namespace of a run it has not seen once, and keeps later events behind that read', async () => {
+  it("reads an unseen run's namespace once, keeps that run's events behind the read, not other runs'", async () => {
     const seen = capture();
     const source = manualSource();
     let reads = 0;
@@ -112,36 +112,55 @@ describe('attachDurableDiagnostics on a control plane (tenants)', () => {
     // A step event of a run resumed after a restart: no namespace on it.
     source.push({ type: 'step.started', runId: 'r1', seq: 1, name: 's' });
     source.push({ type: 'step.completed', runId: 'r1', seq: 1, name: 's' });
-    // An event of another run that carries its namespace still waits its turn.
+    // Another run's event is not held behind r1's read.
     source.push({ type: 'run.started', runId: 'r2', namespace: 'acme' });
-    expect(seen).toEqual([]);
+    expect(seen.map((e) => e.payload.runId)).toEqual(['r2']);
     release();
     await flush();
     off();
 
     expect(reads).toBe(1);
     expect(seen.map((e) => [e.event, e.payload.runId, e.payload.app])).toEqual([
+      ['run.started', 'r2', 'acme'],
       ['step.started', 'r1', 'globex'],
       ['step.completed', 'r1', 'globex'],
-      ['run.started', 'r2', 'acme'],
     ]);
   });
 
-  it('forwards an event unattributed when the read fails', async () => {
+  it("forwards unattributed when the read fails, and reads again on the run's next event", async () => {
     const seen = capture();
     const source = manualSource();
+    let calls = 0;
     const off = attachDurableDiagnostics(source, {
       tenants: {
         namespaceOf: async () => {
-          throw new Error('store down');
+          calls += 1;
+          if (calls === 1) throw new Error('store down');
+          return 'acme';
         },
       },
     });
     source.push({ type: 'step.started', runId: 'r1', seq: 1, name: 's' });
     await flush();
+    source.push({ type: 'step.completed', runId: 'r1', seq: 1, name: 's' });
+    await flush();
     off();
-    expect(seen).toHaveLength(1);
-    expect(seen[0]?.payload.app).toBeUndefined();
+    expect(calls).toBe(2);
+    expect(seen.map((e) => e.payload.app)).toEqual([undefined, 'acme']);
+  });
+
+  it('does not let a read that never answers stall the run forever', async () => {
+    const seen = capture();
+    const source = manualSource();
+    const off = attachDurableDiagnostics(source, {
+      tenants: { namespaceOf: () => new Promise(() => undefined), lookupTimeoutMs: 10 },
+    });
+    source.push({ type: 'step.started', runId: 'r1', seq: 1, name: 's' });
+    source.push({ type: 'step.completed', runId: 'r1', seq: 1, name: 's' });
+    await new Promise((r) => setTimeout(r, 50));
+    off();
+    expect(seen.map((e) => e.event)).toEqual(['step.started', 'step.completed']);
+    expect(seen.every((e) => e.payload.app === undefined)).toBe(true);
   });
 
   it('standalone (no tenants option) forwards exactly what the engine produced', async () => {

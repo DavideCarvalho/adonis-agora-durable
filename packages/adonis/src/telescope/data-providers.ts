@@ -15,7 +15,7 @@ import type { DataProvider, ExtensionContext, TelescopeEntryLike } from './teles
  *
  * Every provider takes `query.app` (a tenant partition) on a control plane: the engine-backed ones
  * then read that tenant's runs (`namespace`) and worker groups (`<name>@<app>`), the entry-backed
- * ones the events the control plane attributed to it (`payload.app`). Without it they cover every app.
+ * ones the events the control plane recorded for it (its `app:<app>` entries). Without it they cover every app.
  */
 
 const STATE_CAP = 10_000;
@@ -114,30 +114,50 @@ export function dedupeRunEvents<E extends TelescopeEntryLike>(entries: readonly 
 }
 
 /**
- * Reads of {@link fetchEntries} still in flight, by store and limit. The bundled dashboard resolves
- * half a dozen widgets at once, each asking for the same (up to 5,000-entry) list: concurrent asks
- * share one read. Nothing is kept once a read settles, so no answer is ever older than its request.
+ * Reads of {@link fetchEntries} still in flight, by store, limit and app. The bundled dashboard
+ * resolves half a dozen widgets at once, each asking for the same (up to 5,000-entry) list: concurrent
+ * asks share one read. Nothing is kept once a read settles, so no answer is ever older than its request.
  */
-const entriesInFlight = new WeakMap<object, Map<number, Promise<TelescopeEntryLike[]>>>();
+const entriesInFlight = new WeakMap<object, Map<string, Promise<TelescopeEntryLike[]>>>();
 
 /** Fetch captured `agora:durable:*` lifecycle entries from Telescope storage (newest-first), with
- *  cross-pod copies of one event collapsed (see {@link dedupeRunEvents}). Callers must not mutate the
- *  returned array: concurrent callers share it. */
-function fetchEntries(ctx: ExtensionContext, limit = 5_000): Promise<TelescopeEntryLike[]> {
+ *  cross-pod copies of one event collapsed (see {@link dedupeRunEvents}). With `app`, the store is
+ *  asked for that app's entries (`app:<partition>`, which a control plane tags them with), so the
+ *  `limit` newest are that app's, not every app's. Callers must not mutate the returned array:
+ *  concurrent callers share it. */
+function fetchEntries(
+  ctx: ExtensionContext,
+  limit = 5_000,
+  app?: string | undefined,
+): Promise<TelescopeEntryLike[]> {
   const store = ctx.store as object;
-  let byLimit = entriesInFlight.get(store);
-  if (!byLimit) {
-    byLimit = new Map();
-    entriesInFlight.set(store, byLimit);
+  let byKey = entriesInFlight.get(store);
+  if (!byKey) {
+    byKey = new Map();
+    entriesInFlight.set(store, byKey);
   }
-  const pending = byLimit.get(limit);
+  const key = `${limit}:${app ?? ''}`;
+  const pending = byKey.get(key);
   if (pending) return pending;
-  const read = (async () =>
-    dedupeRunEvents(await ctx.store.list({ type: 'diagnostic', tag: 'lib:durable', limit })))();
-  const inFlight = byLimit;
-  inFlight.set(limit, read);
+  const read = (async () => {
+    if (app === undefined) {
+      return dedupeRunEvents(
+        await ctx.store.list({ type: 'diagnostic', tag: 'lib:durable', limit }),
+      );
+    }
+    const listed = await ctx.store.list({ type: 'diagnostic', tag: `app:${app}`, limit });
+    // The app's tag spans every lib's entries: keep durable's.
+    return dedupeRunEvents(
+      ofApp(
+        listed.filter((e) => (e.content as { lib?: unknown } | undefined)?.lib === 'durable'),
+        app,
+      ),
+    );
+  })();
+  const inFlight = byKey;
+  inFlight.set(key, read);
   const forget = () => {
-    if (inFlight.get(limit) === read) inFlight.delete(limit);
+    if (inFlight.get(key) === read) inFlight.delete(key);
   };
   read.then(forget, forget);
   return read;
@@ -417,7 +437,7 @@ export function durableFailedTriggersProvider(): DataProvider {
     name: 'durable.failedTriggers',
     async resolve(query, ctx) {
       const limit = Math.min(200, Math.max(10, Number(query?.limit ?? 50)));
-      const entries = ofApp(await fetchEntries(ctx), appOf(query));
+      const entries = await fetchEntries(ctx, undefined, appOf(query));
       const rows = entries
         .filter((e) => contentOf(e).event === 'run.trigger_failed')
         .sort((a, b) => +new Date(b.createdAt ?? 0) - +new Date(a.createdAt ?? 0))
@@ -447,7 +467,7 @@ export function durableLifecycleTriggersProvider(): DataProvider {
   return {
     name: 'durable.lifecycleTriggers',
     async resolve(query, ctx) {
-      const entries = ofApp(await fetchEntries(ctx), appOf(query)).filter((e) => {
+      const entries = (await fetchEntries(ctx, undefined, appOf(query))).filter((e) => {
         const event = contentOf(e).event;
         return event === 'run.triggered' || event === 'run.trigger_failed';
       });
@@ -494,7 +514,7 @@ export function durableTimeseriesProvider(): DataProvider {
     name: 'durable.timeseries',
     async resolve(query, ctx) {
       const limit = Math.min(5_000, Math.max(100, Number(query?.limit ?? 2_000)));
-      const entries = ofApp(await fetchEntries(ctx, limit), appOf(query));
+      const entries = await fetchEntries(ctx, limit, appOf(query));
       let completed = 0;
       let failed = 0;
       const failByWorkflow = new Map<string, number>();
@@ -528,7 +548,7 @@ export function durableDurationProvider(): DataProvider {
   return {
     name: 'durable.duration',
     async resolve(query, ctx) {
-      const entries = ofApp(await fetchEntries(ctx), appOf(query));
+      const entries = await fetchEntries(ctx, undefined, appOf(query));
       const startedAt = new Map<string, number>();
       for (const e of entries) {
         const c = contentOf(e);
@@ -578,7 +598,7 @@ export function durableRunsOverTimeProvider(): DataProvider {
   return {
     name: 'durable.runsOverTime',
     async resolve(query, ctx) {
-      const entries = ofApp(await fetchEntries(ctx), appOf(query));
+      const entries = await fetchEntries(ctx, undefined, appOf(query));
       const n = Math.max(1, Number(query?.buckets ?? 24));
       const now = Date.now();
       let minT = now;
@@ -612,7 +632,7 @@ export function durableSuccessRateProvider(): DataProvider {
   return {
     name: 'durable.successRate',
     async resolve(query, ctx) {
-      const entries = ofApp(await fetchEntries(ctx), appOf(query));
+      const entries = await fetchEntries(ctx, undefined, appOf(query));
       const windowMs = Number(query?.windowMs ?? 24 * 60 * 60 * 1000);
       const now = Date.now();
       const { current, previous } = splitWindows(entries, windowMs, now);
@@ -639,7 +659,7 @@ export function durableThroughputProvider(): DataProvider {
   return {
     name: 'durable.throughput',
     async resolve(query, ctx) {
-      const entries = ofApp(await fetchEntries(ctx), appOf(query));
+      const entries = await fetchEntries(ctx, undefined, appOf(query));
       const windowMs = Number(query?.windowMs ?? 24 * 60 * 60 * 1000);
       const now = Date.now();
       const { current, previous } = splitWindows(entries, windowMs, now);
