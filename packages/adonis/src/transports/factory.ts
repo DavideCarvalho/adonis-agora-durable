@@ -269,6 +269,27 @@ export interface BullMQTransportConfig {
    * holding its job (whose lock keeps renewing) forever. Unset = no ceiling.
    */
   stepTimeoutMs?: number;
+  /**
+   * The worker registry (liveness and handshake descriptors). Workers write one hash per routing
+   * token, read without walking the Redis keyspace, next to the per-instance keys older readers use.
+   */
+  workerRegistry?: {
+    /**
+     * Also read the per-instance keys of workers that do not write the registry hashes (an older
+     * version, the NestJS or Python SDK), with one SCAN walk shared by the whole process and run at
+     * most once per `legacyScanIntervalMs`. Set `false` once every worker runs this version.
+     * Default `true`.
+     */
+    legacyScan?: boolean;
+    /** The least time (ms) between two compatibility walks. Default `60_000`. */
+    legacyScanIntervalMs?: number;
+    /**
+     * A separate ioredis connection (options, a URL or a `Redis` instance) for the registry hashes,
+     * e.g. another db of the same server. Unset uses `connection`. The per-instance keys stay on
+     * `connection`. Every process of the fleet must use the same value.
+     */
+    connection?: unknown;
+  };
 }
 
 /** Options for the DB-table-backed (`@adonisjs/lucid`) transport. */
@@ -496,6 +517,10 @@ export const transports = {
         typeof config.concurrency === 'number' ? config.concurrency : 1,
         config.drainDelay,
       );
+      const registryDeps =
+        config.workerRegistry?.connection !== undefined
+          ? await createBullMQDeps(config.workerRegistry.connection)
+          : undefined;
       return new BullMQTransport({
         deps,
         ...(config.concurrency !== undefined ? { concurrency: config.concurrency } : {}),
@@ -510,6 +535,19 @@ export const transports = {
         ...(config.onError !== undefined ? { onError: config.onError } : {}),
         ...(config.pingIntervalMs !== undefined ? { pingIntervalMs: config.pingIntervalMs } : {}),
         ...(config.stepTimeoutMs !== undefined ? { stepTimeoutMs: config.stepTimeoutMs } : {}),
+        ...(config.workerRegistry !== undefined
+          ? {
+              workerRegistry: {
+                ...(config.workerRegistry.legacyScan !== undefined
+                  ? { legacyScan: config.workerRegistry.legacyScan }
+                  : {}),
+                ...(config.workerRegistry.legacyScanIntervalMs !== undefined
+                  ? { legacyScanIntervalMs: config.workerRegistry.legacyScanIntervalMs }
+                  : {}),
+                ...(registryDeps ? { makeRedis: registryDeps.makeRedis } : {}),
+              },
+            }
+          : {}),
       });
     };
   },
