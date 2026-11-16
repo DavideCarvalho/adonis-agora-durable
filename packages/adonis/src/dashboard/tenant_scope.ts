@@ -77,11 +77,30 @@ export function scopedDashboardEngine(
 }
 
 function confine(engine: DashboardEngine, ids: Array<string | null>): DashboardEngine {
-  const narrow = <Q extends Pick<RunQuery, 'tenantIds'>>(query: Q): Q => ({
-    ...query,
-    tenantIds: intersectTenantIds(query.tenantIds, ids),
+  return confineEngine(engine, {
+    narrow: (query) => ({ ...query, tenantIds: intersectTenantIds(query.tenantIds, ids) }),
+    visible: (run) => visible(ids, run),
   });
-  const sees = async (runId: string) => visible(ids, await engine.getRun(runId));
+}
+
+/** How a console scope narrows run listings and decides whether one run is visible. */
+export interface EngineConfinement {
+  /** Narrow a run query (listings, counts, facets) to the scope. */
+  narrow<Q extends RunQuery | Omit<RunQuery, 'page' | 'size'>>(query: Q): Q;
+  /** Whether `run` (`null`: unknown) is inside the scope. */
+  visible(run: WorkflowRun | null): boolean;
+  /** Narrow the worker-health groups too (default: every group). */
+  groups?(group: string): boolean;
+}
+
+/**
+ * The console's read/control port confined by `scope`: listings are narrowed, a run outside the
+ * scope reads as missing, and actions on it answer not-found. Every handler stays unchanged.
+ */
+export function confineEngine(engine: DashboardEngine, scope: EngineConfinement): DashboardEngine {
+  const narrow = <Q extends RunQuery | Omit<RunQuery, 'page' | 'size'>>(query: Q): Q =>
+    scope.narrow(query);
+  const sees = async (runId: string) => scope.visible(await engine.getRun(runId));
   const guard =
     <A extends unknown[], R>(fn: (runId: string, ...rest: A) => Promise<R>, hidden: R) =>
     async (runId: string, ...rest: A): Promise<R> =>
@@ -91,7 +110,7 @@ function confine(engine: DashboardEngine, ids: Array<string | null>): DashboardE
     ...engine,
     getRun: async (runId) => {
       const run = await engine.getRun(runId);
-      return visible(ids, run) ? run : null;
+      return scope.visible(run) ? run : null;
     },
     listRuns: (query) => engine.listRuns(narrow(query)),
     listCheckpoints: guard((id) => engine.listCheckpoints(id), []),
@@ -102,7 +121,10 @@ function confine(engine: DashboardEngine, ids: Array<string | null>): DashboardE
     retryWithInput: guard((id, input: unknown) => engine.retryWithInput(id, input), null),
     continue: guard((id) => engine.continue(id), null),
     subscribe: (runId, onEvent) => engine.subscribe(runId, onEvent),
-    workerHealth: (extra) => engine.workerHealth(extra),
+    workerHealth: async (extra) => {
+      const groups = await engine.workerHealth(extra);
+      return scope.groups ? groups.filter((g) => scope.groups?.(g.group) ?? true) : groups;
+    },
   };
   if (engine.getRunDetail) {
     const fn = engine.getRunDetail.bind(engine);

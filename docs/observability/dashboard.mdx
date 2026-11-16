@@ -710,6 +710,22 @@ console's audit hook. While several organizations are shown, each run row names 
 Retry, cancel and the other actions only reach runs of the organizations the viewer may see; a
 `?tenant=` outside them shows nothing and is audited.
 
+## Apps on a control plane
+
+On a [control plane](/docs/durable/cluster), each tenant app's runs live in its partition (the run's namespace). By default the console shows every app. Return `apps` from `authorize` to limit a viewer to some of them: a list of partitions, or `'*'` for every app plus the control plane's own runs. It is the same `apps` grant Telescope's and the other Agora consoles take, so one authorizer covers them all.
+
+```ts title="config/durable_dashboard.ts"
+export default defineConfig({
+  authorize: async (ctx) => {
+    const user = await ctx.auth.authenticate()
+    if (user.isAdmin) return { allowed: true, apps: '*' }
+    return { allowed: true, apps: await user.appPartitions() } // e.g. ['entre-textos']
+  },
+})
+```
+
+With a list, every listing, count and namespace filter is limited to those apps, a run of another app reads as not found (its page, live tail and every action), Worker health keeps their `<name>@<app>` groups, and Schedules keeps the schedules pinned to them. The process-wide counters on `/metrics` are left out.
+
 ## Switching between consoles
 
 When the app has other Agora consoles (telescope, payments, media, the agent console, the authkit

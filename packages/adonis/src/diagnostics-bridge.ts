@@ -16,7 +16,7 @@ type EmitFn = (
   lib: string,
   event: string,
   payload: unknown,
-  options?: { traceId?: string },
+  options?: { traceId?: string; app?: string },
 ) => void;
 
 /** Options for {@link attachDurableDiagnostics}. */
@@ -151,8 +151,10 @@ class TenantStamper {
     return this.#apps.get(event.runId);
   }
 
+  /** A tenant's event carries its app, and its partition as `namespace` (step events have none). */
   #with(event: EngineEvent, app: string | null): EngineEvent & { app?: string } {
-    return app === null ? event : { ...event, app };
+    if (app === null) return event;
+    return event.namespace === undefined ? { ...event, namespace: app, app } : { ...event, app };
   }
 
   #remember(runId: string, app: string | null): void {
@@ -224,16 +226,18 @@ export function attachDurableDiagnostics(
 }
 
 /**
- * Emit an event a control plane attributed: a tenant's run is recorded in its run trace
- * ({@link runTraceId}), the one its tenant pod records the step's own work in.
+ * Emit an event a control plane attributed: a tenant's run names its app on the envelope (`app`, the
+ * field `@adonis-agora/diagnostics` 1.0.0-rc.6 stamps and Telescope tags `app:<name>` from) as well
+ * as in the payload, and is recorded in its run trace ({@link runTraceId}), the one its tenant pod
+ * records the step's own work in.
  */
 function forwardTenant(event: EngineEvent & { app?: string }): void {
   if (event.app === undefined) forward(event);
-  else forward(event, runTraceId(event.runId));
+  else forward(event, { traceId: runTraceId(event.runId), app: event.app });
 }
 
 /** Emit one engine event on the diagnostics bus, with the child / lifecycle links it implies. */
-function forward(event: EngineEvent, traceId?: string): void {
+function forward(event: EngineEvent, options?: { traceId: string; app: string }): void {
   const emit = (globalThis as Record<symbol, unknown>)[EMIT_SLOT] as EmitFn | undefined;
   if (typeof emit !== 'function') return;
   const parentRunId = parentRunIdOf(event.runId);
@@ -250,6 +254,6 @@ function forward(event: EngineEvent, traceId?: string): void {
           ...(source ? { lifecycleSourceRunId: source.runId, lifecycleKind: source.kind } : {}),
         }
       : event,
-    ...(traceId !== undefined ? [{ traceId }] : []),
+    ...(options !== undefined ? [options] : []),
   );
 }

@@ -65,6 +65,8 @@ interface DiagnosticEnvelope {
   traceId?: string;
   payload: unknown;
   durationMs?: number;
+  /** The tenant app the event is about (`@adonis-agora/diagnostics` 1.0.0-rc.6+). */
+  app?: string;
 }
 
 /** What the diagnostics bridge adds to an {@link EngineEvent} payload. */
@@ -144,6 +146,9 @@ export function buildDurableEntry(envelope: DiagnosticEnvelope): TelescopeRecord
       ...durableEntryTags({
         ...payload,
         type: (payload.type ?? envelope.event) as EngineEventType,
+        // The envelope's `app` is the source of truth; the payload's is the fallback for an emitter
+        // that predates it.
+        ...(typeof envelope.app === 'string' && envelope.app !== '' ? { app: envelope.app } : {}),
       }),
     ],
     content: {
