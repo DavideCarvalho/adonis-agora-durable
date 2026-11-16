@@ -207,8 +207,8 @@ importers:
         specifier: 1.0.0-rc.7
         version: 1.0.0-rc.7(6e980f4eb6be4eb04c1fb5cdf6976f1e)
       '@adonis-agora/diagnostics':
-        specifier: 1.0.0-rc.2
-        version: 1.0.0-rc.2(558a9af5882fe0115f6d6f9fe5db87e5)
+        specifier: 1.0.0-rc.4
+        version: 1.0.0-rc.4(558a9af5882fe0115f6d6f9fe5db87e5)
       '@adonis-agora/durable-dashboard':
         specifier: workspace:*
         version: link:../dashboard
@@ -424,8 +424,8 @@ packages:
     resolution: {integrity: sha512-j1+CXcEFCZHhOR9Ge2bqmtuJ5jDLBLVZb1cIJ5JSoJfvC1S0ugqsaLuHdYgQi2Qz4MogDEmYMIVcCZjGW0oCow==}
     engines: {node: '>=24'}
 
-  '@adonis-agora/diagnostics@1.0.0-rc.2':
-    resolution: {integrity: sha512-qEWDKKa8e4ztfKwHX63Lg3qJSP3girNIHGZljXGvS5PQ/6GWVJ6326HrTySVQXsa1SxJsYk2mN/cWOsVpOGB9A==}
+  '@adonis-agora/diagnostics@1.0.0-rc.4':
+    resolution: {integrity: sha512-YQAApd/2d5rrlf0yreSu8bZybHjbHFzMrbddNq0NJalXjegQp5Iu1X+J3cYjkUBRzEqLBw3WvQGZ4ZOy1DPJFg==}
     engines: {node: '>=24'}
     peerDependencies:
       '@adonis-agora/durable': '>=1.0.0 <2.0.0 || >=1.0.0-rc.0 <2.0.0'
@@ -4318,7 +4318,7 @@ snapshots:
 
   '@adonis-agora/authkit-core@1.0.0-rc.3': {}
 
-  '@adonis-agora/diagnostics@1.0.0-rc.2(558a9af5882fe0115f6d6f9fe5db87e5)':
+  '@adonis-agora/diagnostics@1.0.0-rc.4(558a9af5882fe0115f6d6f9fe5db87e5)':
     dependencies:
       '@adonisjs/core': 7.6.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1)
     optionalDependencies:
