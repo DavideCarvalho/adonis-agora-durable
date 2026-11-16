@@ -71,14 +71,14 @@ export const OWED_LIFECYCLE_SWEEP_INTERVAL_MS = 10_000;
 
 const owedSweptAt = new WeakMap<WorkflowEngine, number>();
 
-/** Whether this tick reads the owed runs: the first tick, then once per interval (clock going back resets it). */
+/**
+ * Whether this tick reads the owed runs: until a sweep that read them succeeds, then once per
+ * interval (a clock that goes back reads them again).
+ */
 function owedSweepDue(engine: WorkflowEngine, now: number | undefined): boolean {
   const at = now ?? Date.now();
   const last = owedSweptAt.get(engine);
-  if (last !== undefined && at >= last && at - last < OWED_LIFECYCLE_SWEEP_INTERVAL_MS)
-    return false;
-  owedSweptAt.set(engine, at);
-  return true;
+  return !(last !== undefined && at >= last && at - last < OWED_LIFECYCLE_SWEEP_INTERVAL_MS);
 }
 
 /** Execute a single poll-loop tick. See {@link TickResult}. Never throws — phase errors are collected. */
@@ -131,9 +131,13 @@ async function runTickInScope(engine: WorkflowEngine, options: TickOptions): Pro
   });
   // Lifecycle events a settled run still owes (its process died before publishing). A no-op
   // without lifecycle subscribers.
-  await phase('sweepLifecycleEvents', async () =>
-    engine.sweepLifecycleEvents(now, undefined, { owed: owedSweepDue(engine, now) }),
-  );
+  const owed = owedSweepDue(engine, now);
+  await phase('sweepLifecycleEvents', async () => {
+    const published = await engine.sweepLifecycleEvents(now, undefined, { owed });
+    // Only a sweep that got through starts the interval: a failed one is retried on the next tick.
+    if (owed) owedSweptAt.set(engine, now ?? Date.now());
+    return published;
+  });
   // Buffered child completions nothing will consume: a bounded slice per tick, self-throttled
   // between full passes. Housekeeping, so it runs beside the tick instead of inside it.
   startBufferedSweep(engine, now, result);

@@ -65,4 +65,29 @@ describe('worker tick: owed lifecycle sweep', () => {
     expect(owedA).toEqual([true]);
     expect(owedB).toEqual([true]);
   });
+
+  it('a failed owed sweep is retried on the next tick', async () => {
+    const engine = new WorkflowEngine({
+      store: new InMemoryStateStore(),
+      transport: new InMemoryTransport(),
+    });
+    const owed: (boolean | undefined)[] = [];
+    let fail = true;
+    const original = engine.sweepLifecycleEvents.bind(engine);
+    engine.sweepLifecycleEvents = async (nowMs, limit, options) => {
+      owed.push(options?.owed);
+      if (options?.owed !== false && fail) {
+        fail = false;
+        throw new Error('database blip');
+      }
+      return original(nowMs, limit, options);
+    };
+
+    const first = await runTick(engine, { now: 1_000_000 });
+    await runTick(engine, { now: 1_001_000 });
+    await runTick(engine, { now: 1_002_000 });
+
+    expect(first.errors.map((e) => e.phase)).toContain('sweepLifecycleEvents');
+    expect(owed).toEqual([true, true, false]);
+  });
 });
