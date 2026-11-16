@@ -69,6 +69,8 @@ interface DiagnosticEnvelope {
 
 /** What the diagnostics bridge adds to an {@link EngineEvent} payload. */
 type BridgedEvent = Partial<EngineEvent> & {
+  /** The tenant app of the run, stamped by a control plane's bridge. */
+  app?: string;
   parentRunId?: string;
   lifecycleSourceRunId?: string;
   lifecycleKind?: string;
@@ -88,11 +90,14 @@ export function traceIdOfTraceparent(traceparent: string | undefined): string | 
  * `kind:<step kind>`, `failed` on `run.failed`, `routed`/`unrouted` with `onError:<code|*>`,
  * `triggered` with the started run's `run:<id>`, `trigger_failed` with `subscriber:<name>`, and on
  * the `run.started` of a run a lifecycle event started, `lifecycle`, `source:<source run id>` and
- * `sourceTrace:<trace id>` when the source recorded its span.
+ * `sourceTrace:<trace id>` when the source recorded its span. An event a control plane attributed to
+ * a tenant app (its `app` field) is also tagged `app:<tenant partition>`, which is how Telescope
+ * attributes the entry to that app (a relaying control plane's entries are stored as the app's).
  */
 export function durableEntryTags(event: BridgedEvent): string[] {
   const type = event.type ?? 'unknown';
   const tags = ['durable', type];
+  if (typeof event.app === 'string' && event.app !== '') tags.push(`app:${event.app}`);
   if (event.runId) tags.push(`run:${event.runId}`);
   if (event.parentRunId) tags.push(`parent:${event.parentRunId}`);
   if (event.workflow) tags.push(`workflow:${event.workflow}`);
@@ -180,6 +185,12 @@ export class DurableTelescopeWatcher {
 
   register(ctx: WatcherContext): void {
     this.dispose();
+    // A watcher the host wires by hand replaces the one a control plane registered on its own.
+    const auto = autoWatcherSlot();
+    if (auto.watcher !== undefined && auto.watcher !== this) {
+      auto.watcher.dispose();
+      auto.watcher = undefined;
+    }
     this.disposers.push(claimDurableDiagnostics(DURABLE_DIAGNOSTIC_EVENTS));
     for (const event of DURABLE_DIAGNOSTIC_EVENTS) {
       const channel = `agora:durable:${event}`;
@@ -201,4 +212,64 @@ export class DurableTelescopeWatcher {
   dispose(): void {
     while (this.disposers.length) this.disposers.pop()?.();
   }
+}
+
+/** The watcher a control plane registered on its own (see {@link registerControlPlaneWatcher}). */
+const AUTO_WATCHER = Symbol.for('@agora/durable:telescope-auto-watcher');
+
+function autoWatcherSlot(): { watcher?: DurableTelescopeWatcher | undefined } {
+  const g = globalThis as Record<symbol, unknown>;
+  let slot = g[AUTO_WATCHER] as { watcher?: DurableTelescopeWatcher } | undefined;
+  if (slot === undefined) {
+    slot = {};
+    g[AUTO_WATCHER] = slot;
+  }
+  return slot;
+}
+
+/** The runtime `@adonis-agora/telescope` publishes (structural mirror of the slice read here). */
+interface TelescopeRuntimeLike {
+  store: { record(entry: TelescopeRecordInput): unknown } | null;
+  paused?: boolean;
+}
+
+const TELESCOPE_RUNTIME = Symbol.for('@agora/telescope:runtime');
+
+/**
+ * Record into the Telescope store of this process, read per entry from the runtime slot Telescope
+ * publishes: nothing while Telescope is absent, not booted or paused (its overload guard).
+ */
+export function telescopeRuntimeRecorder(): WatcherContext {
+  return {
+    record(entry) {
+      const runtime = (globalThis as Record<symbol, unknown>)[TELESCOPE_RUNTIME] as
+        | TelescopeRuntimeLike
+        | undefined;
+      const store = runtime?.store;
+      if (!store || runtime?.paused === true) return;
+      void Promise.resolve(store.record(entry)).catch(() => undefined);
+    },
+  };
+}
+
+/**
+ * On a control plane, record durable's events through the tagging watcher without the host wiring
+ * it, so every tenant's events carry their `app:<partition>` tag. Skipped when a watcher is already
+ * registered (the `durable:*` keys are claimed); a host that registers its own later replaces this
+ * one. Returns the release.
+ */
+export function registerControlPlaneWatcher(
+  ctx: WatcherContext = telescopeRuntimeRecorder(),
+): () => void {
+  const slot = autoWatcherSlot();
+  if (slot.watcher !== undefined) return () => undefined;
+  if ((claimsRegistry().get('durable:run.started') ?? 0) > 0) return () => undefined;
+  const watcher = new DurableTelescopeWatcher();
+  watcher.register(ctx);
+  slot.watcher = watcher;
+  return () => {
+    if (slot.watcher !== watcher) return;
+    watcher.dispose();
+    slot.watcher = undefined;
+  };
 }

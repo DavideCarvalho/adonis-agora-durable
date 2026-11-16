@@ -12,6 +12,10 @@ import type { DataProvider, ExtensionContext, TelescopeEntryLike } from './teles
  *
  * No durable-specific watcher is needed: the `@adonis-agora/durable` provider already bridges engine events
  * onto the diagnostics bus, and Telescope's generic watcher records them.
+ *
+ * Every provider takes `query.app` (a tenant partition) on a control plane: the engine-backed ones
+ * then read that tenant's runs (`namespace`) and worker groups (`<name>@<app>`), the entry-backed
+ * ones the events the control plane attributed to it (`payload.app`). Without it they cover every app.
  */
 
 const STATE_CAP = 10_000;
@@ -22,9 +26,35 @@ const STATE_CAP = 10_000;
  * {@link STATE_CAP}. A wide `ctx.all` fan can put tens of thousands of runs in one status, which the
  * capped listing would both under-count and pay for by loading every row.
  */
-function countByStatus(engine: WorkflowEngine, status: RunStatus): Promise<number> {
-  if (typeof engine.countRuns === 'function') return engine.countRuns({ status });
-  return engine.listRuns({ status, size: STATE_CAP }).then((runs) => runs.length);
+function countByStatus(
+  engine: WorkflowEngine,
+  status: RunStatus,
+  app?: string | undefined,
+): Promise<number> {
+  const scope = app !== undefined ? { namespace: app } : {};
+  if (typeof engine.countRuns === 'function') return engine.countRuns({ status, ...scope });
+  return engine.listRuns({ status, ...scope, size: STATE_CAP }).then((runs) => runs.length);
+}
+
+/**
+ * The tenant app a provider is asked about (`query.app`), or `undefined` for every app. On a control
+ * plane, a tenant's runs live in its partition (`run.namespace`) and the events the control plane
+ * recorded for them carry it as `payload.app`.
+ */
+function appOf(query: Record<string, unknown> | undefined): string | undefined {
+  const app = query?.app;
+  return typeof app === 'string' && app !== '' ? app : undefined;
+}
+
+/** `entries` of `app` only (every entry when `app` is undefined). */
+function ofApp<E extends TelescopeEntryLike>(entries: E[], app: string | undefined): E[] {
+  if (app === undefined) return entries;
+  return entries.filter((e) => contentOf(e).payload?.app === app);
+}
+
+/** Whether a worker group serves `app` (its routing token is suffixed `@<app>`). */
+function groupOfApp(group: string, app: string | undefined): boolean {
+  return app === undefined || group.endsWith(`@${app}`);
 }
 
 /** The Telescope diagnostic-entry content the durable bridge produces (`payload` is the EngineEvent). */
@@ -35,6 +65,8 @@ interface DurableEntryContent {
     runId?: string;
     durationMs?: number;
     at?: string | number;
+    /** The tenant app of the run, on a control plane. */
+    app?: string;
     /** The subscriber of a `run.triggered` / `run.trigger_failed`. */
     name?: string;
     error?: { message?: string };
@@ -158,7 +190,7 @@ export function durableStateProvider(): DataProvider {
     async resolve(query, ctx) {
       const engine = await engineOf(ctx);
       const status = (query?.status as RunStatus) ?? 'dead';
-      return { value: await countByStatus(engine, status) };
+      return { value: await countByStatus(engine, status, appOf(query)) };
     },
   };
 }
@@ -172,9 +204,11 @@ export function durableRecentFailuresProvider(): DataProvider {
       const limit = Math.min(200, Math.max(10, Number(query?.limit ?? 50)));
       const windowMs = query?.windowMs === undefined ? 24 * 60 * 60 * 1000 : Number(query.windowMs);
       const cutoff = windowMs > 0 ? Date.now() - windowMs : 0;
+      const app = appOf(query);
+      const scope = app !== undefined ? { namespace: app } : {};
       const [failed, dead] = await Promise.all([
-        engine.listRuns({ status: 'failed', size: limit }),
-        engine.listRuns({ status: 'dead', size: limit }),
+        engine.listRuns({ status: 'failed', ...scope, size: limit }),
+        engine.listRuns({ status: 'dead', ...scope, size: limit }),
       ]);
       const rows = [...failed, ...dead]
         .filter((r) => +new Date(r.updatedAt) >= cutoff)
@@ -197,7 +231,8 @@ export function durableWorkerHealthProvider(): DataProvider {
     name: 'durable.workerHealth',
     async resolve(query, ctx) {
       const engine = await engineOf(ctx);
-      const health = await engine.workerHealth();
+      const app = appOf(query);
+      const health = (await engine.workerHealth()).filter((g) => groupOfApp(g.group, app));
       const isStarved = (g: { depth: number; liveWorkers: unknown[] }) =>
         g.depth > 0 && g.liveWorkers.length === 0;
       if ((query?.metric as string) === 'starvedCount') {
@@ -251,9 +286,10 @@ function measured(n: number | undefined, status: WorkerStatus | undefined): numb
 export function durableWorkerStatusProvider(): DataProvider {
   return {
     name: 'durable.workerStatus',
-    async resolve(_query, ctx) {
+    async resolve(query, ctx) {
       const engine = await engineOf(ctx);
-      const health = await engine.workerHealth();
+      const app = appOf(query);
+      const health = (await engine.workerHealth()).filter((g) => groupOfApp(g.group, app));
       const rows = health
         .slice()
         .sort((a, b) => Number(b.depth > 0) - Number(a.depth > 0) || a.group.localeCompare(b.group))
@@ -309,10 +345,11 @@ const STATE_BREAKDOWN_PALETTE = [
 export function durableStateBreakdownProvider(): DataProvider {
   return {
     name: 'durable.stateBreakdown',
-    async resolve(_query, ctx) {
+    async resolve(query, ctx) {
       const engine = await engineOf(ctx);
+      const app = appOf(query);
       const counts = await Promise.all(
-        STATE_BREAKDOWN_STATUSES.map((status) => countByStatus(engine, status)),
+        STATE_BREAKDOWN_STATUSES.map((status) => countByStatus(engine, status, app)),
       );
       const segments = STATE_BREAKDOWN_STATUSES.map((label, i) => ({
         label,
@@ -343,10 +380,12 @@ export function durableOwedLifecycleProvider(): DataProvider {
     name: 'durable.owedLifecycle',
     async resolve(query, ctx) {
       const engine = await engineOf(ctx);
+      const app = appOf(query);
       const owedQuery = {
         tag: LIFECYCLE_PENDING_TAG,
         statuses: ['completed', 'failed', 'cancelled', 'dead'] as RunStatus[],
         updatedBefore: Date.now() - LIFECYCLE_GRACE_MS,
+        ...(app !== undefined ? { namespace: app } : {}),
       };
       if ((query?.metric as string) === 'count') {
         return { value: await engine.countRuns(owedQuery) };
@@ -378,7 +417,7 @@ export function durableFailedTriggersProvider(): DataProvider {
     name: 'durable.failedTriggers',
     async resolve(query, ctx) {
       const limit = Math.min(200, Math.max(10, Number(query?.limit ?? 50)));
-      const entries = await fetchEntries(ctx);
+      const entries = ofApp(await fetchEntries(ctx), appOf(query));
       const rows = entries
         .filter((e) => contentOf(e).event === 'run.trigger_failed')
         .sort((a, b) => +new Date(b.createdAt ?? 0) - +new Date(a.createdAt ?? 0))
@@ -408,7 +447,7 @@ export function durableLifecycleTriggersProvider(): DataProvider {
   return {
     name: 'durable.lifecycleTriggers',
     async resolve(query, ctx) {
-      const entries = (await fetchEntries(ctx)).filter((e) => {
+      const entries = ofApp(await fetchEntries(ctx), appOf(query)).filter((e) => {
         const event = contentOf(e).event;
         return event === 'run.triggered' || event === 'run.trigger_failed';
       });
@@ -455,7 +494,7 @@ export function durableTimeseriesProvider(): DataProvider {
     name: 'durable.timeseries',
     async resolve(query, ctx) {
       const limit = Math.min(5_000, Math.max(100, Number(query?.limit ?? 2_000)));
-      const entries = await fetchEntries(ctx, limit);
+      const entries = ofApp(await fetchEntries(ctx, limit), appOf(query));
       let completed = 0;
       let failed = 0;
       const failByWorkflow = new Map<string, number>();
@@ -489,7 +528,7 @@ export function durableDurationProvider(): DataProvider {
   return {
     name: 'durable.duration',
     async resolve(query, ctx) {
-      const entries = await fetchEntries(ctx);
+      const entries = ofApp(await fetchEntries(ctx), appOf(query));
       const startedAt = new Map<string, number>();
       for (const e of entries) {
         const c = contentOf(e);
@@ -539,7 +578,7 @@ export function durableRunsOverTimeProvider(): DataProvider {
   return {
     name: 'durable.runsOverTime',
     async resolve(query, ctx) {
-      const entries = await fetchEntries(ctx);
+      const entries = ofApp(await fetchEntries(ctx), appOf(query));
       const n = Math.max(1, Number(query?.buckets ?? 24));
       const now = Date.now();
       let minT = now;
@@ -573,7 +612,7 @@ export function durableSuccessRateProvider(): DataProvider {
   return {
     name: 'durable.successRate',
     async resolve(query, ctx) {
-      const entries = await fetchEntries(ctx);
+      const entries = ofApp(await fetchEntries(ctx), appOf(query));
       const windowMs = Number(query?.windowMs ?? 24 * 60 * 60 * 1000);
       const now = Date.now();
       const { current, previous } = splitWindows(entries, windowMs, now);
@@ -600,7 +639,7 @@ export function durableThroughputProvider(): DataProvider {
   return {
     name: 'durable.throughput',
     async resolve(query, ctx) {
-      const entries = await fetchEntries(ctx);
+      const entries = ofApp(await fetchEntries(ctx), appOf(query));
       const windowMs = Number(query?.windowMs ?? 24 * 60 * 60 * 1000);
       const now = Date.now();
       const { current, previous } = splitWindows(entries, windowMs, now);

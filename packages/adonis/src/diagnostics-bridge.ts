@@ -3,6 +3,7 @@ import { parentRunIdOf } from './fan-join.js';
 import type { EngineEvent } from './interfaces.js';
 import { lifecycleSourceOf } from './lifecycle-events.js';
 import { isRemoteEvent } from './remote-event.js';
+import { runTraceId } from './run-trace.js';
 
 /** The minimal engine surface the bridge needs: a lifecycle-event subscription. */
 export interface DurableEventSource {
@@ -11,7 +12,12 @@ export interface DurableEventSource {
 
 /** The `@adonis-agora/diagnostics` emit capability, published on this slot at that package's module load. */
 const EMIT_SLOT = Symbol.for('@agora/diagnostics:emit');
-type EmitFn = (lib: string, event: string, payload: unknown) => void;
+type EmitFn = (
+  lib: string,
+  event: string,
+  payload: unknown,
+  options?: { traceId?: string },
+) => void;
 
 /** Options for {@link attachDurableDiagnostics}. */
 export interface DurableDiagnosticsOptions {
@@ -23,6 +29,124 @@ export interface DurableDiagnosticsOptions {
    * the whole fleet into a recorder of its own, and nowhere else.
    */
   includeRemote?: boolean | undefined;
+  /**
+   * Attribute each event to the tenant app whose run it is: a control plane sets it, so it is the one
+   * place every tenant's workflow lifecycle is recorded (see {@link TenantAttribution}). Every
+   * forwarded event of a tenant's run then carries `app: <tenant partition>`, step events included.
+   * Omitted (standalone): events are forwarded exactly as the engine produced them.
+   */
+  tenants?: TenantAttribution | undefined;
+}
+
+/**
+ * How the bridge finds the tenant app of a run on a control plane. A tenant's runs live in the
+ * worker-pool partition the tenant's token verified to (`run.namespace`); `run.*` events carry it,
+ * `step.*` events do not, so the bridge remembers it per run and, for a run it has not seen an event
+ * of yet (a run resumed after a restart, another pod's run), reads it once.
+ */
+export interface TenantAttribution {
+  /** The namespace (tenant partition) of `runId`, or `undefined` when the run is unknown. */
+  namespaceOf(runId: string): Promise<string | undefined>;
+  /**
+   * The control plane's own namespaces: runs in these are its own, not a tenant's, and get no `app`.
+   * `'default'` and an absent namespace are always the control plane's.
+   */
+  own?: readonly string[] | undefined;
+  /** How many run → app answers to keep (oldest dropped first). Default 10,000. */
+  cacheSize?: number | undefined;
+}
+
+/** A tenant app of `namespace`, or `undefined` for the control plane's own runs. */
+function tenantAppOf(namespace: string | undefined, own: ReadonlySet<string>): string | undefined {
+  if (namespace === undefined || namespace === '' || namespace === 'default') return undefined;
+  return own.has(namespace) ? undefined : namespace;
+}
+
+/**
+ * Remembers which app each run belongs to and stamps it on that run's events, in emission order. An
+ * event whose run is not known yet waits for one store read; the events behind it wait too, so a
+ * run's `step.completed` is never forwarded before its `step.started`.
+ */
+class TenantStamper {
+  readonly #lookup: (runId: string) => Promise<string | undefined>;
+  readonly #own: ReadonlySet<string>;
+  readonly #max: number;
+  /** runId → app (`null`: the control plane's own run). */
+  readonly #apps = new Map<string, string | null>();
+  #queue: Promise<void> | null = null;
+  #queued = 0;
+
+  constructor(options: TenantAttribution) {
+    this.#lookup = (runId) => options.namespaceOf(runId);
+    this.#own = new Set(options.own ?? []);
+    this.#max = Math.max(1, options.cacheSize ?? 10_000);
+  }
+
+  /** Call `forward` with `event` stamped with its app (when it has one), now or once it is known. */
+  stamp(event: EngineEvent, forward: (event: EngineEvent & { app?: string }) => void): void {
+    if (this.#queue === null) {
+      const known = this.#known(event);
+      if (known !== undefined) {
+        forward(this.#with(event, known));
+        this.#settle(event);
+        return;
+      }
+    }
+    this.#queued += 1;
+    const previous = this.#queue ?? Promise.resolve();
+    this.#queue = previous.then(async () => {
+      try {
+        let app = this.#known(event);
+        if (app === undefined) {
+          let namespace: string | undefined;
+          try {
+            namespace = await this.#lookup(event.runId);
+          } catch {
+            namespace = undefined;
+          }
+          app = tenantAppOf(namespace, this.#own) ?? null;
+          this.#remember(event.runId, app);
+        }
+        forward(this.#with(event, app));
+        this.#settle(event);
+      } catch {
+        // Recording must never break the engine, nor stall the events behind this one.
+      } finally {
+        this.#queued -= 1;
+        if (this.#queued === 0) this.#queue = null;
+      }
+    });
+  }
+
+  /** The app of `event`'s run when it can be answered without a read (`null`: no app). */
+  #known(event: EngineEvent): string | null | undefined {
+    if (event.namespace !== undefined) {
+      const app = tenantAppOf(event.namespace, this.#own) ?? null;
+      this.#remember(event.runId, app);
+      return app;
+    }
+    return this.#apps.get(event.runId);
+  }
+
+  #with(event: EngineEvent, app: string | null): EngineEvent & { app?: string } {
+    return app === null ? event : { ...event, app };
+  }
+
+  #remember(runId: string, app: string | null): void {
+    if (this.#apps.has(runId)) this.#apps.delete(runId);
+    else if (this.#apps.size >= this.#max) {
+      const oldest = this.#apps.keys().next().value;
+      if (oldest !== undefined) this.#apps.delete(oldest);
+    }
+    this.#apps.set(runId, app);
+  }
+
+  /** A settled run emits nothing more: forget it. */
+  #settle(event: EngineEvent): void {
+    if (event.type === 'run.completed' || event.type === 'run.failed') {
+      this.#apps.delete(event.runId);
+    }
+  }
 }
 
 /**
@@ -48,6 +172,12 @@ export interface DurableDiagnosticsOptions {
  * ended, so its entries link back to the source run; its `run.started` also carries the source's
  * `sourceTraceparent` when the engine knows it.
  *
+ * With {@link DurableDiagnosticsOptions.tenants} (what the provider passes on a control plane), every
+ * event of a tenant's run also carries `app`, the tenant's partition, so one control plane records
+ * the lifecycle of every tenant's workflows, each attributed to its app, and each of those events is
+ * emitted with its run's trace id ({@link runTraceId}): the trace the tenant pod records the step's
+ * own work in.
+ *
  * @returns an unsubscribe function that detaches the bridge from the engine.
  */
 export function attachDurableDiagnostics(
@@ -55,27 +185,45 @@ export function attachDurableDiagnostics(
   options: DurableDiagnosticsOptions = {},
 ): () => void {
   const includeRemote = options.includeRemote === true;
+  const stamper = options.tenants ? new TenantStamper(options.tenants) : undefined;
   return engine.subscribe((event: EngineEvent) => {
     if (!includeRemote && isRemoteEvent(event)) return;
     // A run delivering a diagnostics listener call (`transports.durable()`) is not echoed back onto
     // the bus: a listener on `durable` events would start a delivery run for each one, forever.
     if (isDiagnosticsDeliveryEvent(event)) return;
-    const emit = (globalThis as Record<symbol, unknown>)[EMIT_SLOT] as EmitFn | undefined;
-    if (typeof emit !== 'function') return;
-    const parentRunId = parentRunIdOf(event.runId);
-    const source = event.workflow
-      ? lifecycleSourceOf({ id: event.runId, workflow: event.workflow })
-      : undefined;
-    emit(
-      'durable',
-      event.type,
-      parentRunId || source
-        ? {
-            ...event,
-            ...(parentRunId ? { parentRunId } : {}),
-            ...(source ? { lifecycleSourceRunId: source.runId, lifecycleKind: source.kind } : {}),
-          }
-        : event,
-    );
+    if (typeof (globalThis as Record<symbol, unknown>)[EMIT_SLOT] !== 'function') return;
+    if (stamper) stamper.stamp(event, forwardTenant);
+    else forward(event);
   });
+}
+
+/**
+ * Emit an event a control plane attributed: a tenant's run is recorded in its run trace
+ * ({@link runTraceId}), the one its tenant pod records the step's own work in.
+ */
+function forwardTenant(event: EngineEvent & { app?: string }): void {
+  if (event.app === undefined) forward(event);
+  else forward(event, runTraceId(event.runId));
+}
+
+/** Emit one engine event on the diagnostics bus, with the child / lifecycle links it implies. */
+function forward(event: EngineEvent, traceId?: string): void {
+  const emit = (globalThis as Record<symbol, unknown>)[EMIT_SLOT] as EmitFn | undefined;
+  if (typeof emit !== 'function') return;
+  const parentRunId = parentRunIdOf(event.runId);
+  const source = event.workflow
+    ? lifecycleSourceOf({ id: event.runId, workflow: event.workflow })
+    : undefined;
+  emit(
+    'durable',
+    event.type,
+    parentRunId || source
+      ? {
+          ...event,
+          ...(parentRunId ? { parentRunId } : {}),
+          ...(source ? { lifecycleSourceRunId: source.runId, lifecycleKind: source.kind } : {}),
+        }
+      : event,
+    ...(traceId !== undefined ? [{ traceId }] : []),
+  );
 }

@@ -1,5 +1,6 @@
 import { runInStepLogger } from './ambient-step.js';
 import type { Heartbeat, RemoteTask, StepEvent, StepLogger, StepResult } from './interfaces.js';
+import { withRunTrace } from './run-trace.js';
 import { createStepLogger } from './step-logger.js';
 import { runOutsideWorkflowCtx } from './workflow-als.js';
 
@@ -142,31 +143,40 @@ export async function runStepHandler(
           beat(progress);
         }
       : beat;
-  const settled = withRestoredContext(task.context, async () => {
-    try {
-      // Outside any ambient workflow ctx: an in-process transport runs the handler on the parent
-      // body's async path, but a handler is not the body (see `runOutsideWorkflowCtx`).
-      const logger = createStepLogger(events, Date.now, handlerBeat, signal);
-      const output = await runOutsideWorkflowCtx(() =>
-        runInStepLogger(logger, () => handler(task.input, logger)),
-      );
-      return withEvents({ ...base, status: 'completed', output });
-    } catch (err) {
-      // Carry `code`/`retryable` off the thrown error if present, so the engine's durable retry can
-      // honour a worker's "don't retry this" verdict (e.g. a declined card).
-      const e = err as { message?: string; code?: string; retryable?: boolean; details?: unknown };
-      return withEvents({
-        ...base,
-        status: 'failed',
-        error: {
-          message: err instanceof Error ? err.message : String(err),
-          ...(typeof e?.code === 'string' ? { code: e.code } : {}),
-          ...(e?.details !== undefined ? { details: e.details } : {}),
-          ...(typeof e?.retryable === 'boolean' ? { retryable: e.retryable } : {}),
-        },
-      });
-    }
-  });
+  // On a tenant pod, the step's own work (queries, HTTP calls) is recorded in its run's trace, the one
+  // the control plane records the run's lifecycle in (see `withRunTrace`). A no-op elsewhere.
+  const settled = withRunTrace(task, () =>
+    withRestoredContext(task.context, async () => {
+      try {
+        // Outside any ambient workflow ctx: an in-process transport runs the handler on the parent
+        // body's async path, but a handler is not the body (see `runOutsideWorkflowCtx`).
+        const logger = createStepLogger(events, Date.now, handlerBeat, signal);
+        const output = await runOutsideWorkflowCtx(() =>
+          runInStepLogger(logger, () => handler(task.input, logger)),
+        );
+        return withEvents({ ...base, status: 'completed', output });
+      } catch (err) {
+        // Carry `code`/`retryable` off the thrown error if present, so the engine's durable retry can
+        // honour a worker's "don't retry this" verdict (e.g. a declined card).
+        const e = err as {
+          message?: string;
+          code?: string;
+          retryable?: boolean;
+          details?: unknown;
+        };
+        return withEvents({
+          ...base,
+          status: 'failed',
+          error: {
+            message: err instanceof Error ? err.message : String(err),
+            ...(typeof e?.code === 'string' ? { code: e.code } : {}),
+            ...(e?.details !== undefined ? { details: e.details } : {}),
+            ...(typeof e?.retryable === 'boolean' ? { retryable: e.retryable } : {}),
+          },
+        });
+      }
+    }),
+  );
   try {
     return await settled;
   } finally {

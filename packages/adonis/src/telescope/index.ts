@@ -31,5 +31,7 @@ export {
   DURABLE_DIAGNOSTIC_EVENTS,
   DurableTelescopeWatcher,
   durableEntryTags,
+  registerControlPlaneWatcher,
+  telescopeRuntimeRecorder,
   traceIdOfTraceparent,
 } from './watcher.js';
