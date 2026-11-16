@@ -62,6 +62,25 @@ export function mergeSchedules(
 
 const settledCount = (results: RunResult[]): number => results.length;
 
+/**
+ * How often a worker reads the settled runs that still owe a lifecycle event. It is the recovery
+ * path for a publish that never happened (the live publish gets a 30s grace first), and the read
+ * filters on a tag no index serves, so doing it on every 1s tick scanned the runs table each second.
+ */
+export const OWED_LIFECYCLE_SWEEP_INTERVAL_MS = 10_000;
+
+const owedSweptAt = new WeakMap<WorkflowEngine, number>();
+
+/** Whether this tick reads the owed runs: the first tick, then once per interval (clock going back resets it). */
+function owedSweepDue(engine: WorkflowEngine, now: number | undefined): boolean {
+  const at = now ?? Date.now();
+  const last = owedSweptAt.get(engine);
+  if (last !== undefined && at >= last && at - last < OWED_LIFECYCLE_SWEEP_INTERVAL_MS)
+    return false;
+  owedSweptAt.set(engine, at);
+  return true;
+}
+
 /** Execute a single poll-loop tick. See {@link TickResult}. Never throws — phase errors are collected. */
 export async function runTick(
   engine: WorkflowEngine,
@@ -112,7 +131,9 @@ async function runTickInScope(engine: WorkflowEngine, options: TickOptions): Pro
   });
   // Lifecycle events a settled run still owes (its process died before publishing). A no-op
   // without lifecycle subscribers.
-  await phase('sweepLifecycleEvents', async () => engine.sweepLifecycleEvents(now));
+  await phase('sweepLifecycleEvents', async () =>
+    engine.sweepLifecycleEvents(now, undefined, { owed: owedSweepDue(engine, now) }),
+  );
   // Buffered child completions nothing will consume: a bounded slice per tick, self-throttled
   // between full passes. Housekeeping, so it runs beside the tick instead of inside it.
   startBufferedSweep(engine, now, result);
