@@ -12,7 +12,7 @@ import {
   grantedApps,
   narrowToApps,
 } from '../../src/dashboard/app_scope.js';
-import { normalizeConsoleDecision } from '../../src/dashboard/console_authorize.js';
+import { anyAuthorize, normalizeConsoleDecision } from '../../src/dashboard/console_authorize.js';
 import { storeDashboardEngine } from '../../src/dashboard/gateway-adapter.js';
 import { InMemoryStateStore, InMemoryTransport, WorkflowEngine } from '../../src/index.js';
 
@@ -27,6 +27,17 @@ describe('the `apps` grant', () => {
       apps: ['acme'],
     });
     expect(normalizeConsoleDecision({ allowed: true, apps: 'acme' })).toEqual({ allowed: true });
+  });
+
+  it('anyAuthorize keeps the apps grant of the authorizer that allows', async () => {
+    const ctx = {} as HttpContext;
+    const gate = anyAuthorize(
+      () => false,
+      () => ({ allowed: true as const, apps: ['acme'], tenants: '*' as const }),
+    );
+    expect(await gate(ctx)).toEqual({ allowed: true, apps: ['acme'], tenants: '*' });
+    // An allow with no grant still means every app.
+    expect(await anyAuthorize(() => true)(ctx)).toEqual({ allowed: true });
   });
 
   it("'*' and an omitted grant confine nothing", () => {

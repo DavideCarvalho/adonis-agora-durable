@@ -227,9 +227,12 @@ export function anyAuthorize(
     for (const authorize of resolved) {
       const decision = await authorize(ctx);
       if (decision.allowed) {
-        return decision.tenants !== undefined
-          ? { allowed: true, tenants: decision.tenants }
-          : { allowed: true };
+        // The first allow wins, with the grants it carries (none = every tenant / app).
+        return {
+          allowed: true,
+          ...(decision.tenants !== undefined ? { tenants: decision.tenants } : {}),
+          ...(decision.apps !== undefined ? { apps: decision.apps } : {}),
+        };
       }
       if (decision.error !== undefined && !threw) {
         threw = true;
