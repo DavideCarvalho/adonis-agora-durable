@@ -58,10 +58,12 @@ export default defineConfig({
 `ConsoleAuthorizer`, `ConsoleAuthorizerClass` and `ConsoleAuthorizeResult` are
 exported from `@adonis-agora/durable/dashboard`): an inline function, an
 authorizer class, or a lazy import of one. It returns a boolean,
-`{ allowed: true, tenants? }`, `{ allowed: false, reason? }`, or
+`{ allowed: true, tenants?, apps? }`, `{ allowed: false, reason? }`, or
 `{ redirectTo: '/login' }`. Only `true`
 or `allowed: true` passes; with tenancy on, `{ allowed: true, tenants: [...] | '*' }`
-grants more organizations (omit for the viewer's own active tenant);
+grants more organizations (omit for the viewer's own active tenant); on a
+control plane, `{ allowed: true, apps: [...] | '*' }` scopes to tenant apps
+(omit for every app);
 `reason: 'unauthenticated'` → `401`, every other
 denial (incl. a throwing hook) → `403`; `{ redirectTo }` → `302` for a page
 navigation, `401` for an API call. A hook that already answered the request (a
@@ -216,7 +218,7 @@ listing on stores without it). On a `control-plane` install Telescope there:
 the provider registers the tagging watcher itself, which tags those entries
 `app:<partition>` next to `lib:durable`, and every `durable.*` data provider
 takes `{ app }` to show one tenant. The durable console's `authorize` may return
-`apps: '*' | string[]` to limit a viewer to some tenant apps. The **Worker health** table lists every group
+`apps: '*' | string[]` to scope a viewer to tenant apps. The **Worker health** table lists every group
 (STARVED first); the **Workers** table has one row per live instance (mode,
 limit, saturation, RAM/CPU, steps/min, p95, last adjustment; `n/a` = no status
 reported, `—` = nothing measured yet). Copies of one event recorded by several
