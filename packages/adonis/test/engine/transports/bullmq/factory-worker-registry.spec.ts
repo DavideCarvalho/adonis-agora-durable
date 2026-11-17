@@ -5,11 +5,14 @@ import { transports } from '../../../../src/transports/factory.js';
 
 /**
  * `transports.bullmq({ workerRegistry })` from config/durable.ts down to the transport, with
- * `bullmq`/`ioredis` mocked: `connection` gets its own Redis client for the hashes, and
- * `legacyScan: false` turns the compatibility walk off.
+ * `bullmq`/`ioredis` mocked: `connection` gets its own Redis client for the hashes,
+ * `legacyScan: false` turns the compatibility walk off and `legacyWrites: false` the keys older
+ * readers read.
  */
 
-const clients = vi.hoisted(() => [] as Array<{ options: Record<string, unknown>; scans: number }>);
+const clients = vi.hoisted(
+  () => [] as Array<{ options: Record<string, unknown>; scans: number; sets: number }>,
+);
 
 vi.mock('bullmq', () => ({
   Queue: class {
@@ -29,11 +32,13 @@ vi.mock('ioredis', () => ({
   Redis: class {
     readonly options: Record<string, unknown>;
     scans = 0;
+    sets = 0;
     constructor(options: Record<string, unknown>) {
       this.options = options;
       clients.push(this);
     }
     async set() {
+      this.sets += 1;
       return 'OK';
     }
     async scan() {
@@ -110,5 +115,21 @@ describe('transports.bullmq({ workerRegistry })', () => {
     await transport.listWorkerDescriptors('charge');
     expect(clients.reduce((n, c) => n + c.scans, 0)).toBeGreaterThan(0);
     await transport.close();
+  });
+
+  it("older readers' keys are written by default, and not with `legacyWrites: false`", async () => {
+    const sets = () => clients.reduce((n, c) => n + c.sets, 0);
+    const legacy = await build();
+    legacy.handle('charge', async () => ({}));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(sets()).toBeGreaterThan(0);
+    await legacy.close();
+
+    clients.length = 0;
+    const current = await build({ legacyWrites: false, legacyWriteIntervalMs: 60_000 });
+    current.handle('charge', async () => ({}));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(sets()).toBe(0);
+    await current.close();
   });
 });

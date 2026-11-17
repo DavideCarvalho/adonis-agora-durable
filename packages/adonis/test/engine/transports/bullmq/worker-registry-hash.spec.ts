@@ -8,9 +8,11 @@ import type {
 } from '../../../../src/transports/bullmq/deps.js';
 
 // ---------------------------------------------------------------------------
-// The worker registry: one hash per routing token (heartbeats, descriptors) indexed by a sorted set,
-// written next to the per-instance keys. Readers must not walk the keyspace per token or per dispatch;
-// the per-instance keys of older writers are read by one shared, throttled walk.
+// The worker registry: ONE hash per prefix (`<P>-workers:instances`), one field per writing instance
+// listing every token it serves. A writer costs one HSET per beat whatever its token count; a process
+// reads with one HGETALL, reused for 30s. Older readers' keys (per-instance keys, rc.31 per-token
+// hashes) are written on a slower cadence while `legacyWrites` is on; older writers' per-instance
+// keys are read by one shared, throttled walk.
 // ---------------------------------------------------------------------------
 
 type Value = string | Map<string, string> | Map<string, number>;
@@ -20,6 +22,8 @@ type Value = string | Map<string, string> | Map<string, number>;
 class FakeRedis implements RedisLike {
   readonly data: Map<string, Value>;
   readonly ttl = new Map<string, number>();
+  /** The `EX` seconds of the last SET of each key. */
+  readonly ex = new Map<string, number>();
   readonly calls = new Map<string, number>();
   constructor(data = new Map<string, Value>()) {
     this.data = data;
@@ -62,9 +66,10 @@ class FakeRedis implements RedisLike {
     const v = this.data.get(key);
     return typeof v === 'string' ? v : null;
   }
-  async set(key: string, value: string): Promise<unknown> {
+  async set(key: string, value: string, ...args: (string | number)[]): Promise<unknown> {
     this.#count('set');
     this.data.set(key, value);
+    if (args[0] === 'EX') this.ex.set(key, Number(args[1]));
     return 'OK';
   }
   async del(...keys: string[]): Promise<number> {
@@ -200,33 +205,138 @@ function crowded(redis: FakeRedis, n = 5_000): FakeRedis {
   return redis;
 }
 
+const INSTANCES = 'durable-workers:instances';
 const descriptor = (instanceId: string) => JSON.stringify({ instanceId, capabilities: [] });
 const beat = (ts = Date.now()) => JSON.stringify({ ts });
 const field = (value: string, expiresAt: number) => JSON.stringify({ expiresAt, value });
 const flush = () => new Promise((resolve) => setImmediate(resolve));
+/** SCAN calls of one compatibility walk of `redis` (COUNT 10_000). */
+const walkOf = (redis: FakeRedis) => Math.ceil(redis.data.size / 10_000);
+
+/** The fields of the instances hash, parsed. */
+function instances(redis: FakeRedis): Record<
+  string,
+  {
+    v: number;
+    instance: string;
+    expiresAt: number;
+    heartbeats: Array<{ value: string; expiresAt: number; tokens: string[] }>;
+    descriptors: Array<{ value: string; expiresAt: number; tokens: string[] }>;
+  }
+> {
+  const hash = redis.data.get(INSTANCES);
+  if (!(hash instanceof Map)) return {};
+  return Object.fromEntries([...(hash as Map<string, string>)].map(([f, v]) => [f, JSON.parse(v)]));
+}
+
+/** What a 1.0.0-rc.31 reader does: the token index, then one HGETALL per token hash. */
+async function rc31Heartbeats(
+  redis: FakeRedis,
+): Promise<Array<{ token: string; instance: string }>> {
+  const now = Date.now();
+  const tokens = await redis.zrangebyscore('durable-workers:tokens', now);
+  const out: Array<{ token: string; instance: string }> = [];
+  for (const token of tokens) {
+    for (const [instance, stored] of Object.entries(
+      await redis.hgetall(`durable-workers:heartbeats:${token}`),
+    )) {
+      const { expiresAt } = JSON.parse(stored) as { expiresAt: number };
+      if (expiresAt > now) out.push({ token, instance });
+    }
+  }
+  return out;
+}
+
+/** A record of the instances hash as another writer would store it. */
+function record(
+  instance: string,
+  expiresAt: number,
+  kinds: { heartbeats?: Record<string, string[]>; descriptors?: Record<string, string[]> },
+): string {
+  const groups = (by: Record<string, string[]> = {}) =>
+    Object.entries(by).map(([value, tokens]) => ({ value, expiresAt, tokens }));
+  return JSON.stringify({
+    v: 1,
+    instance,
+    expiresAt,
+    heartbeats: groups(kinds.heartbeats),
+    descriptors: groups(kinds.descriptors),
+  });
+}
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
-describe('BullMQ worker registry hashes', () => {
-  it('a worker writes its heartbeat to the per-instance key AND its token hash, indexed', async () => {
+describe('BullMQ worker registry: one field per instance', () => {
+  it('a worker writes ONE field listing every token it serves, once per beat', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval'] });
     const redis = new FakeRedis();
-    const worker = transport(redis);
-    worker.handle('charge', async () => ({}));
+    const worker = transport(redis, { workerRegistry: { legacyWrites: false } });
+    const tokens = Array.from({ length: 85 }, (_, i) => `step-${i}`);
+    for (const t of tokens) worker.handle(t, async () => ({}));
     await flush();
 
-    expect(typeof redis.data.get('durable-worker-heartbeat:charge:self')).toBe('string');
-    const hash = redis.data.get('durable-workers:heartbeats:charge') as Map<string, string>;
-    const stored = JSON.parse(hash.get('self') as string) as { expiresAt: number; value: string };
+    const fields = instances(redis);
+    expect(Object.keys(fields)).toHaveLength(1);
+    const [name, stored] = Object.entries(fields)[0] as [
+      string,
+      ReturnType<typeof instances>[string],
+    ];
+    expect(name.startsWith('self#')).toBe(true);
+    expect(stored.instance).toBe('self');
+    // One beat value for all tokens: one group, not 85 copies.
+    expect(stored.heartbeats).toHaveLength(1);
+    expect(stored.heartbeats[0]?.tokens.sort()).toEqual([...tokens].sort());
     expect(stored.expiresAt).toBeGreaterThan(Date.now() + 30_000);
-    expect(JSON.parse(stored.value).ts).toBeTypeOf('number');
-    expect([...(redis.data.get('durable-workers:tokens') as Map<string, number>).keys()]).toEqual([
-      'charge',
-    ]);
-    // The hash and the index carry a TTL, so a token nobody writes any more disappears.
-    expect(redis.ttl.get('durable-workers:heartbeats:charge')).toBeGreaterThan(0);
-    expect(redis.ttl.get('durable-workers:tokens')).toBeGreaterThan(0);
+    expect(redis.ttl.get(INSTANCES)).toBeGreaterThan(0);
+    // No per-instance key, no rc.31 hash.
+    expect(redis.n('set')).toBe(0);
+    expect([...redis.data.keys()].filter((k) => k !== INSTANCES)).toEqual([]);
+
+    const before = redis.total();
+    const hsets = redis.n('hset');
+    vi.advanceTimersByTime(10_000);
+    await flush();
+    expect(redis.n('hset')).toBe(hsets + 1);
+    expect(redis.total()).toBe(before + 1); // the beat is that one HSET
+    await worker.close();
+  });
+
+  it('legacy writes: per-instance keys and rc.31 hash fields, refreshed once per legacyWriteIntervalMs', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval'] });
+    const clock = vi.spyOn(Date, 'now');
+    const t0 = Date.now();
+    clock.mockReturnValue(t0);
+    const redis = new FakeRedis();
+    const worker = transport(redis);
+    for (const t of ['charge', 'mail', 'render']) worker.handle(t, async () => ({}));
+    await flush();
+
+    // Written at once for a new token, living three intervals.
+    expect(redis.n('set')).toBe(3);
+    expect(redis.ex.get('durable-worker-heartbeat:charge:self')).toBe(90);
+    const rc31 = JSON.parse(
+      (redis.data.get('durable-workers:heartbeats:charge') as Map<string, string>).get(
+        'self',
+      ) as string,
+    ) as { expiresAt: number };
+    expect(rc31.expiresAt).toBe(t0 + 90_000);
+
+    // Beats inside the interval only rewrite the instances field.
+    for (let i = 1; i <= 2; i += 1) {
+      clock.mockReturnValue(t0 + i * 10_000);
+      vi.advanceTimersByTime(10_000);
+      await flush();
+    }
+    expect(redis.n('set')).toBe(3);
+    // The interval is up: each key once more.
+    clock.mockReturnValue(t0 + 30_000);
+    vi.advanceTimersByTime(10_000);
+    await flush();
+    await flush();
+    expect(redis.n('set')).toBe(6);
     await worker.close();
   });
 
@@ -243,8 +353,35 @@ describe('BullMQ worker registry hashes', () => {
     await worker.close();
   });
 
+  it('an rc.31 reader (per-token hashes) still sees a new writer', async () => {
+    const redis = new FakeRedis();
+    const worker = transport(redis);
+    worker.handle('charge', async () => ({}));
+    worker.handle('mail', async () => ({}));
+    await flush();
+    await flush();
+
+    expect((await rc31Heartbeats(redis)).sort((a, b) => a.token.localeCompare(b.token))).toEqual([
+      { token: 'charge', instance: 'self' },
+      { token: 'mail', instance: 'self' },
+    ]);
+    await worker.close();
+  });
+
+  it('with legacyWrites: false older readers no longer see the writer', async () => {
+    const redis = new FakeRedis();
+    const worker = transport(redis, { workerRegistry: { legacyWrites: false } });
+    worker.handle('charge', async () => ({}));
+    await flush();
+    expect(await rc31Heartbeats(redis)).toEqual([]);
+    expect(await transport(hashless(redis), { instanceId: 'dash' }).listWorkerGroups()).toEqual([]);
+    // A reader on this version does.
+    expect(await transport(redis, { instanceId: 'dash' }).listWorkerGroups()).toEqual(['charge']);
+    await worker.close();
+  });
+
   it('a new reader sees an old writer through the compatibility walk', async () => {
-    const redis = crowded(new FakeRedis());
+    const redis = crowded(new FakeRedis(), 25_000);
     redis.data.set('durable-worker-heartbeat:render:py-1', beat());
     redis.data.set('durable-worker-descriptor:render:py-1', descriptor('py-1'));
     const reader = transport(redis, { instanceId: 'dash' });
@@ -255,18 +392,23 @@ describe('BullMQ worker registry hashes', () => {
     ]);
     expect((await reader.readAllWorkerDescriptors()).map((d) => d.instanceId)).toEqual(['py-1']);
     expect((await reader.readAllWorkerHeartbeats()).map((h) => h.instanceId)).toEqual(['py-1']);
-    // Heartbeats and descriptors came from ONE walk, shared by every read above.
-    expect(redis.n('scan')).toBe(Math.ceil(redis.data.size / 1_000));
+    // Heartbeats and descriptors came from ONE walk shared by every read above, 10k keys a call.
+    expect(redis.n('scan')).toBe(walkOf(redis));
+    expect(redis.n('scan')).toBe(3);
   });
 
-  it('merges hash fields and walked keys, the hash field winning for the same instance', async () => {
+  it('merges the instances hash and walked keys, the hash winning for the same instance', async () => {
     const redis = new FakeRedis();
     const now = Date.now();
     redis.data.set(
-      'durable-workers:descriptors:render',
-      new Map([['new-1', field(descriptor('new-1'), now + 30_000)]]),
+      INSTANCES,
+      new Map([
+        [
+          'new-1#a',
+          record('new-1', now + 30_000, { descriptors: { [descriptor('new-1')]: ['render'] } }),
+        ],
+      ]),
     );
-    redis.data.set('durable-workers:tokens', new Map([['render', now + 600_000]]));
     redis.data.set('durable-worker-descriptor:render:new-1', descriptor('stale-copy'));
     redis.data.set('durable-worker-descriptor:render:old-1', descriptor('old-1'));
     const reader = transport(redis, { instanceId: 'dash' });
@@ -275,88 +417,67 @@ describe('BullMQ worker registry hashes', () => {
     expect(ids).toEqual(['new-1', 'old-1']);
   });
 
-  it('skips a field past its expiresAt, and a malformed one', async () => {
+  it('skips expired, malformed and unknown-version fields', async () => {
     const redis = new FakeRedis();
     const now = Date.now();
     redis.data.set(
-      'durable-workers:heartbeats:charge',
+      INSTANCES,
       new Map([
-        ['live', field(beat(now), now + 30_000)],
-        ['dead', field(beat(now - 60_000), now - 1)],
-        ['junk', '{nope'],
+        ['live#a', record('live', now + 30_000, { heartbeats: { [beat(now)]: ['charge'] } })],
+        ['dead#a', record('dead', now - 1, { heartbeats: { [beat(now - 60_000)]: ['charge'] } })],
+        ['junk#a', '{nope'],
+        ['future#a', JSON.stringify({ v: 2, instance: 'future', expiresAt: now + 30_000 })],
       ]),
     );
-    redis.data.set('durable-workers:tokens', new Map([['charge', now + 600_000]]));
     const reader = transport(redis, { instanceId: 'dash', workerRegistry: { legacyScan: false } });
 
     const health = await reader.groupHealth('charge');
     expect(health.liveWorkers.map((w) => w.instanceId)).toEqual(['live']);
   });
 
-  it('a writer prunes expired fields and stale index entries, not on every beat', async () => {
-    const redis = new FakeRedis();
-    const now = Date.now();
-    redis.data.set(
-      'durable-workers:heartbeats:charge',
-      new Map([['gone', field(beat(now - 60_000), now - 1)]]),
-    );
-    redis.data.set(
-      'durable-workers:tokens',
-      new Map([
-        ['charge', now + 600_000],
-        ['retired', now - 1],
-      ]),
-    );
-    const worker = transport(redis);
-    worker.handle('charge', async () => ({}));
-    await flush();
+  it('reads: one HGETALL per process per 30s, whatever the token count or the readers', async () => {
+    const redis = crowded(new FakeRedis());
+    const engineSide = transport(redis, { instanceId: 'engine' });
+    const tokens = Array.from({ length: 85 }, (_, i) => `step-${i}`);
+    const walk = walkOf(redis);
 
-    const hash = redis.data.get('durable-workers:heartbeats:charge') as Map<string, string>;
-    expect([...hash.keys()]).toEqual(['self']);
-    expect([...(redis.data.get('durable-workers:tokens') as Map<string, number>).keys()]).toEqual([
-      'charge',
-    ]);
-
-    // Steady beats are one SET and one HSET; the upkeep (TTL, index, prune) waits its interval.
-    vi.useFakeTimers({ toFake: ['setInterval'] });
-    try {
-      const fresh = transport(redis, { instanceId: 'other' });
-      fresh.handle('mail', async () => ({}));
-      await flush();
-      const before = { hgetall: redis.n('hgetall'), zadd: redis.n('zadd'), hset: redis.n('hset') };
-      vi.advanceTimersByTime(10_000);
-      await flush();
-      expect(redis.n('hset') - before.hset).toBe(1);
-      expect(redis.n('hgetall')).toBe(before.hgetall);
-      expect(redis.n('zadd')).toBe(before.zadd);
-      // Five minutes later the next beat sees to the hash again.
-      const at = Date.now();
-      vi.spyOn(Date, 'now').mockReturnValue(at + 5 * 60_000);
-      vi.advanceTimersByTime(10_000);
-      await flush();
-      expect(redis.n('hgetall')).toBe(before.hgetall + 1);
-      expect(redis.n('zadd')).toBe(before.zadd + 1);
-      await fresh.close();
-    } finally {
-      vi.useRealTimers();
+    // A dispatch-heavy loop, plus every other reader of the process.
+    for (let round = 0; round < 20; round += 1) {
+      await Promise.all(tokens.map((t) => engineSide.listWorkerDescriptors(t)));
+      await engineSide.readAllWorkerDescriptors();
+      await engineSide.readAllWorkerHeartbeats();
+      await engineSide.groupHealth('step-1');
     }
-    await worker.close();
+    expect(redis.n('hgetall')).toBe(1);
+    expect(redis.n('scan')).toBe(walk); // ONE compatibility walk
+
+    const clock = vi.spyOn(Date, 'now');
+    const at = Date.now();
+    clock.mockReturnValue(at + 29_000);
+    await Promise.all(tokens.map((t) => engineSide.listWorkerDescriptors(t)));
+    expect(redis.n('hgetall')).toBe(1);
+    clock.mockReturnValue(at + 31_000);
+    await Promise.all(tokens.map((t) => engineSide.listWorkerDescriptors(t)));
+    expect(redis.n('hgetall')).toBe(2);
+    // `fresh` (the engine's re-read before it parks a run) re-reads the hash, never the keyspace.
+    await engineSide.listWorkerDescriptors('step-0', { fresh: true });
+    expect(redis.n('hgetall')).toBe(3);
+    expect(redis.n('scan')).toBe(walk);
   });
 
-  it('close() removes its own fields and per-instance keys, and leaves other instances alone', async () => {
+  it("another instance's new worker is seen once the read is due, or at once by a fresh read", async () => {
     const redis = new FakeRedis();
-    const peer = transport(redis, { instanceId: 'peer' });
-    peer.handle('charge', async () => ({}));
-    const worker = transport(redis);
-    worker.handle('charge', async () => ({}));
-    await flush();
+    const reader = transport(redis, { instanceId: 'dash', workerRegistry: { legacyScan: false } });
+    expect(await reader.listWorkerDescriptors('render')).toEqual([]);
 
+    const worker = transport(redis, { instanceId: 'pod-1', workerRegistry: { legacyScan: false } });
+    const writer = worker.createDescriptorRedis();
+    await writer.set('durable-worker-descriptor:render:pod-1', descriptor('pod-1'), 'EX', 35);
+    expect(await reader.listWorkerDescriptors('render')).toEqual([]); // the 30s read
+    expect(
+      (await reader.listWorkerDescriptors('render', { fresh: true })).map((d) => d.instanceId),
+    ).toEqual(['pod-1']);
     await worker.close();
-    const hash = redis.data.get('durable-workers:heartbeats:charge') as Map<string, string>;
-    expect([...hash.keys()]).toEqual(['peer']);
-    expect(redis.data.has('durable-worker-heartbeat:charge:self')).toBe(false);
-    expect(redis.data.has('durable-worker-heartbeat:charge:peer')).toBe(true);
-    await peer.close();
   });
 
   it('own freshly registered handler is visible at once, despite a cached read', async () => {
@@ -364,33 +485,103 @@ describe('BullMQ worker registry hashes', () => {
     const t = transport(redis);
     expect(await t.listWorkerGroups()).toEqual([]);
     t.handle('charge', async () => ({}));
-    await flush();
     expect(await t.listWorkerGroups()).toEqual(['charge']);
     await t.close();
   });
 
-  it('many tokens with zero descriptors: one HGETALL per token per window, never a SCAN per token', async () => {
-    const redis = crowded(new FakeRedis());
-    const engineSide = transport(redis, { instanceId: 'engine' });
-    const tokens = Array.from({ length: 78 }, (_, i) => `step-${i}`);
-    const walk = Math.ceil(redis.data.size / 1_000);
+  it('close() removes its own field, keys and rc.31 fields, and leaves other instances alone', async () => {
+    const redis = new FakeRedis();
+    const peer = transport(redis, { instanceId: 'peer' });
+    peer.handle('charge', async () => ({}));
+    const worker = transport(redis);
+    worker.handle('charge', async () => ({}));
+    await flush();
+    await flush();
 
-    // A dispatch-heavy loop: every token asked many times.
-    for (let round = 0; round < 20; round += 1) {
-      await Promise.all(tokens.map((t) => engineSide.listWorkerDescriptors(t)));
+    await worker.close();
+    expect(Object.values(instances(redis)).map((r) => r.instance)).toEqual(['peer']);
+    const hash = redis.data.get('durable-workers:heartbeats:charge') as Map<string, string>;
+    expect([...hash.keys()]).toEqual(['peer']);
+    expect(redis.data.has('durable-worker-heartbeat:charge:self')).toBe(false);
+    expect(redis.data.has('durable-worker-heartbeat:charge:peer')).toBe(true);
+    await peer.close();
+  });
+
+  it('a writer deletes other writers expired fields and refreshes the TTL, not on every beat', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval'] });
+    const clock = vi.spyOn(Date, 'now');
+    const t0 = Date.now();
+    clock.mockReturnValue(t0);
+    const redis = new FakeRedis();
+    redis.data.set(
+      INSTANCES,
+      new Map([
+        ['gone#a', record('gone', t0 - 1, { heartbeats: { [beat(t0 - 60_000)]: ['charge'] } })],
+      ]),
+    );
+    const worker = transport(redis, { workerRegistry: { legacyWrites: false } });
+    worker.handle('charge', async () => ({}));
+    await flush();
+    await flush();
+    expect(Object.values(instances(redis)).map((r) => r.instance)).toEqual(['self']);
+    const upkeep = { hgetall: redis.n('hgetall'), pexpire: redis.n('pexpire') };
+
+    clock.mockReturnValue(t0 + 10_000);
+    vi.advanceTimersByTime(10_000);
+    await flush();
+    expect(redis.n('hgetall')).toBe(upkeep.hgetall);
+    expect(redis.n('pexpire')).toBe(upkeep.pexpire);
+    // Five minutes later a beat sees to the hash again.
+    clock.mockReturnValue(t0 + 5 * 60_000 + 1);
+    vi.advanceTimersByTime(10_000);
+    await flush();
+    await flush();
+    expect(redis.n('hgetall')).toBe(upkeep.hgetall + 1);
+    expect(redis.n('pexpire')).toBe(upkeep.pexpire + 1);
+    await worker.close();
+  });
+
+  it('rc.31 hashes: TTL and index refreshed every 10 minutes, pruned every 30, never per beat', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval'] });
+    const clock = vi.spyOn(Date, 'now');
+    const t0 = Date.now();
+    clock.mockReturnValue(t0);
+    const redis = new FakeRedis();
+    redis.data.set(
+      'durable-workers:heartbeats:charge',
+      new Map([['gone', field(beat(t0 - 60_000), t0 - 1)]]),
+    );
+    redis.data.set(
+      'durable-workers:tokens',
+      new Map([
+        ['charge', t0 + 600_000],
+        ['retired', t0 - 1],
+      ]),
+    );
+    const worker = transport(redis);
+    worker.handle('charge', async () => ({}));
+    await flush();
+    await flush();
+    const hash = redis.data.get('durable-workers:heartbeats:charge') as Map<string, string>;
+    expect([...hash.keys()]).toEqual(['self']);
+    expect([...(redis.data.get('durable-workers:tokens') as Map<string, number>).keys()]).toEqual([
+      'charge',
+    ]);
+    const zadds = redis.n('zadd');
+    // Legacy refreshes every 30s for 9 minutes: an HSET each, no index upkeep.
+    for (let s = 30; s < 600; s += 30) {
+      clock.mockReturnValue(t0 + s * 1000);
+      vi.advanceTimersByTime(10_000);
+      await flush();
+      await flush();
     }
-    expect(redis.n('scan')).toBe(walk); // ONE compatibility walk for every token and round
-    expect(redis.n('hgetall')).toBe(tokens.length);
-
-    // Past the descriptor reuse window: another HGETALL per token, still no walk (throttled to 60s).
-    const at = Date.now();
-    vi.spyOn(Date, 'now').mockReturnValue(at + 6_000);
-    await Promise.all(tokens.map((t) => engineSide.listWorkerDescriptors(t)));
-    expect(redis.n('scan')).toBe(walk);
-    expect(redis.n('hgetall')).toBe(2 * tokens.length);
-    // `fresh` (the engine's re-read before it parks a run) re-reads the hash, not the keyspace.
-    await engineSide.listWorkerDescriptors('step-0', { fresh: true });
-    expect(redis.n('scan')).toBe(walk);
+    expect(redis.n('zadd')).toBe(zadds);
+    clock.mockReturnValue(t0 + 600_000);
+    vi.advanceTimersByTime(10_000);
+    await flush();
+    await flush();
+    expect(redis.n('zadd')).toBe(zadds + 1);
+    await worker.close();
   });
 
   it('the compatibility walk runs at most once per legacyScanIntervalMs, serving the last walk meanwhile', async () => {
@@ -400,24 +591,23 @@ describe('BullMQ worker registry hashes', () => {
       instanceId: 'dash',
       workerRegistry: { legacyScanIntervalMs: 30_000 },
     });
-    const walk = Math.ceil(redis.data.size / 1_000);
     const at = Date.now();
     const clock = vi.spyOn(Date, 'now');
 
     await reader.readAllWorkerDescriptors();
-    expect(redis.n('scan')).toBe(walk);
+    expect(redis.n('scan')).toBe(1);
     clock.mockReturnValue(at + 29_000);
     await reader.readAllWorkerDescriptors();
     await reader.readAllWorkerHeartbeats();
-    expect(redis.n('scan')).toBe(walk);
+    expect(redis.n('scan')).toBe(1);
 
     // Due: the reader is answered from the last walk while the next one runs behind it.
     redis.data.set('durable-worker-descriptor:render:py-2', descriptor('py-2'));
     clock.mockReturnValue(at + 31_000);
     expect((await reader.readAllWorkerDescriptors()).map((d) => d.instanceId)).toEqual(['py-1']);
-    const next = walk + Math.ceil(redis.data.size / 1_000);
-    await vi.waitFor(() => expect(redis.n('scan')).toBe(next));
+    await vi.waitFor(() => expect(redis.n('scan')).toBe(2));
     await flush();
+    clock.mockReturnValue(at + 62_000);
     expect((await reader.readAllWorkerDescriptors()).map((d) => d.instanceId).sort()).toEqual([
       'py-1',
       'py-2',
@@ -435,37 +625,84 @@ describe('BullMQ worker registry hashes', () => {
     expect(redis.n('scan')).toBe(0);
   });
 
-  it('drops a walked heartbeat whose own TTL ended since the walk', async () => {
+  it('keeps a walked heartbeat for its TTL plus a walk interval, then drops it', async () => {
     const redis = new FakeRedis();
     redis.data.set('durable-worker-heartbeat:render:py-1', beat());
     const reader = transport(redis, { instanceId: 'dash' });
     expect(await reader.listWorkerGroups()).toEqual(['render']);
 
     const at = Date.now();
-    vi.spyOn(Date, 'now').mockReturnValue(at + 40_000);
-    // Inside the 60s walk interval, but the beat is older than its 35s TTL.
+    const clock = vi.spyOn(Date, 'now');
+    clock.mockReturnValue(at + 40_000);
+    expect(await reader.listWorkerGroups()).toEqual(['render']);
+    // The key is gone and the last walk's beat is older than 35s + 60s.
+    redis.data.delete('durable-worker-heartbeat:render:py-1');
+    clock.mockReturnValue(at + 96_000);
     expect(await reader.listWorkerGroups()).toEqual([]);
   });
 
-  it('the worker runtime writer mirrors its keys into the hashes, and removes them on stop', async () => {
+  it('the worker runtime writer: one field for a whole beat, removed on stop', async () => {
     const redis = new FakeRedis();
-    const t = transport(redis, { workerRegistry: { legacyScan: false } });
+    const t = transport(redis, { workerRegistry: { legacyScan: false, legacyWrites: false } });
     const writer = t.createDescriptorRedis();
+    const tokens = ['render', 'charge', 'mail'];
 
-    await writer.set('durable-worker-descriptor:render:pod-1', descriptor('pod-1'), 'EX', 35);
-    await writer.set('durable-worker-heartbeat:render:pod-1', beat(), 'EX', 35);
-    expect(typeof redis.data.get('durable-worker-descriptor:render:pod-1')).toBe('string');
+    await Promise.all(
+      tokens.flatMap((tok) => [
+        writer.set(`durable-worker-descriptor:${tok}:pod-1`, descriptor('pod-1'), 'EX', 35),
+        writer.set(`durable-worker-heartbeat:${tok}:pod-1`, beat(), 'EX', 35),
+      ]),
+    );
+    expect(redis.n('hset')).toBe(1);
+    expect(redis.n('set')).toBe(0);
+    const stored = Object.values(instances(redis));
+    expect(stored.map((r) => r.instance)).toEqual(['pod-1']);
+    expect(stored[0]?.descriptors[0]?.tokens.sort()).toEqual(['charge', 'mail', 'render']);
     expect((await t.listWorkerDescriptors('render')).map((d) => d.instanceId)).toEqual(['pod-1']);
-    expect(await t.listWorkerGroups()).toEqual(['render']);
+    expect((await t.listWorkerGroups()).sort()).toEqual(['charge', 'mail', 'render']);
 
     await writer.del?.(
-      'durable-worker-descriptor:render:pod-1',
-      'durable-worker-heartbeat:render:pod-1',
+      ...tokens.flatMap((tok) => [
+        `durable-worker-descriptor:${tok}:pod-1`,
+        `durable-worker-heartbeat:${tok}:pod-1`,
+      ]),
     );
-    expect(redis.data.has('durable-workers:descriptors:render')).toBe(false);
-    expect(redis.data.has('durable-worker-descriptor:render:pod-1')).toBe(false);
+    expect(redis.data.has(INSTANCES)).toBe(false);
     expect(await t.listWorkerDescriptors('render', { fresh: true })).toEqual([]);
     expect(await t.listWorkerGroups()).toEqual([]);
+  });
+
+  it('the worker runtime writer keeps the per-instance keys for older readers by default', async () => {
+    const redis = new FakeRedis();
+    const t = transport(redis);
+    const writer = t.createDescriptorRedis();
+    await writer.set('durable-worker-descriptor:render:pod-1', descriptor('pod-1'), 'EX', 35);
+    expect(redis.data.get('durable-worker-descriptor:render:pod-1')).toBe(descriptor('pod-1'));
+    // The same value again inside the interval is not rewritten; a changed descriptor is, at once.
+    await writer.set('durable-worker-descriptor:render:pod-1', descriptor('pod-1'), 'EX', 35);
+    expect(redis.n('set')).toBe(1);
+    await writer.set('durable-worker-descriptor:render:pod-1', descriptor('pod-1b'), 'EX', 35);
+    expect(redis.n('set')).toBe(2);
+    expect(redis.data.get('durable-worker-descriptor:render:pod-1')).toBe(descriptor('pod-1b'));
+    await writer.del?.('durable-worker-descriptor:render:pod-1');
+    expect(redis.data.has('durable-worker-descriptor:render:pod-1')).toBe(false);
+    expect(redis.data.has('durable-workers:descriptors:render')).toBe(false);
+  });
+
+  it('a client without hash commands keeps the per-instance keys on every beat', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval'] });
+    const redis = new FakeRedis();
+    const old = hashless(redis) as FakeRedis;
+    const worker = transport(old);
+    worker.handle('charge', async () => ({}));
+    await flush();
+    expect(old.n('set')).toBe(1);
+    expect(old.ex.get('durable-worker-heartbeat:charge:self')).toBe(35);
+    vi.advanceTimersByTime(10_000);
+    await flush();
+    expect(old.n('set')).toBe(2);
+    expect(redis.data.has(INSTANCES)).toBe(false);
+    await worker.close();
   });
 
   it('workerRegistry.makeRedis puts the hashes on their own connection, the keys stay put', async () => {
@@ -476,7 +713,8 @@ describe('BullMQ worker registry hashes', () => {
     await flush();
 
     expect(main.data.has('durable-worker-heartbeat:charge:self')).toBe(true);
-    expect(main.data.has('durable-workers:heartbeats:charge')).toBe(false);
+    expect(main.data.has(INSTANCES)).toBe(false);
+    expect(registry.data.has(INSTANCES)).toBe(true);
     expect(registry.data.has('durable-workers:heartbeats:charge')).toBe(true);
 
     const reader = transport(main, {

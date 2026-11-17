@@ -191,3 +191,13 @@ export function workerRegistryHashKey(
 export function workerRegistryIndexKey(effPrefix: string): string {
   return `${effPrefix}-workers:tokens`;
 }
+
+/**
+ * `${P}-workers:instances`: the worker registry, one hash per prefix with one field per writing
+ * instance (`<instance>#<nonce>`), each listing the tokens it serves with their heartbeat and
+ * descriptor values. Like the rc.31 per-token hashes it never matches the `${P}-worker-*` patterns
+ * older readers SCAN.
+ */
+export function workerInstancesKey(effPrefix: string): string {
+  return `${effPrefix}-workers:instances`;
+}

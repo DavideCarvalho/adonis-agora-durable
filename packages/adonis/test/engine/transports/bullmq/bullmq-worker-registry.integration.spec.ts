@@ -4,9 +4,9 @@ import { createBullMQDeps, type RedisLike } from '../../../../src/transports/bul
 import { backendUrl, uniqueRedisPrefix } from '../../../support/backends.js';
 
 /**
- * The worker registry hashes over a real Redis (gated on `DURABLE_REDIS_URL`, required in CI): the
- * ioredis command shapes the transport relies on (HSET/HGETALL/ZRANGEBYSCORE … '+inf'), the dual
- * write, the compatibility walk and the clean removal on close.
+ * The worker registry over a real Redis (gated on `DURABLE_REDIS_URL`, required in CI): the ioredis
+ * command shapes the transport relies on (HSET/HGETALL/ZRANGEBYSCORE … '+inf'), the instances hash,
+ * the keys written for older readers, the compatibility walk and the clean removal on close.
  */
 const REDIS_URL = backendUrl('DURABLE_REDIS_URL');
 
@@ -96,5 +96,55 @@ describe.skipIf(!REDIS_URL)('BullMQ worker registry over real Redis', () => {
     expect(await raw.hgetall(`${prefix}-workers:heartbeats:reg.charge`)).toEqual({});
     expect(await raw.get(`${prefix}-worker-heartbeat:reg.charge:ts-worker`)).toBeNull();
     expect(await raw.hgetall(`${prefix}-workers:descriptors:reg.charge`)).toEqual({});
+  }, 30_000);
+
+  it('legacyWrites: false keeps the whole registry in one hash field per instance', async () => {
+    const prefix = uniqueRedisPrefix('durable-reg');
+    const connection = { url: REDIS_URL } as unknown;
+    const raw = (await createBullMQDeps(connection)).makeRedis() as RedisLike & {
+      hgetall(key: string): Promise<Record<string, string>>;
+      keys(pattern: string): Promise<string[]>;
+      pttl(key: string): Promise<number>;
+    };
+    closers.push(() => raw.disconnect());
+    const options = { prefix, pingIntervalMs: false as const };
+    const registry = { legacyWrites: false, legacyScan: false };
+    const worker = new BullMQTransport({
+      deps: await createBullMQDeps(connection),
+      ...options,
+      instanceId: 'ts-worker',
+      workerRegistry: registry,
+    });
+    const engine = new BullMQTransport({
+      deps: await createBullMQDeps(connection),
+      ...options,
+      instanceId: 'ts-engine',
+      workerRegistry: registry,
+    });
+    closers.push(() => engine.close());
+    for (let i = 0; i < 20; i += 1) worker.handle(`reg.step${i}`, async () => ({}));
+
+    await expect
+      .poll(async () => Object.keys(await raw.hgetall(`${prefix}-workers:instances`)).length, {
+        timeout: 5_000,
+      })
+      .toBe(1);
+    expect(await raw.keys(`${prefix}-worker*`)).toEqual([`${prefix}-workers:instances`]);
+    expect(await raw.pttl(`${prefix}-workers:instances`)).toBeGreaterThan(0);
+    // A fresh engine reads all 20 tokens back with one HGETALL.
+    const reader = new BullMQTransport({
+      deps: await createBullMQDeps(connection),
+      ...options,
+      instanceId: 'ts-reader',
+      workerRegistry: registry,
+    });
+    closers.push(() => reader.close());
+    expect((await reader.listWorkerGroups()).length).toBe(20);
+    expect((await reader.groupHealth('reg.step3')).liveWorkers.map((w) => w.instanceId)).toEqual([
+      'ts-worker',
+    ]);
+
+    await worker.close();
+    expect(await raw.hgetall(`${prefix}-workers:instances`)).toEqual({});
   }, 30_000);
 });

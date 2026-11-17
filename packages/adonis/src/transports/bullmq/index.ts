@@ -8,9 +8,14 @@ export {
   readMemoryLimitBytes,
   resolveConcurrency,
 } from './adaptive-concurrency.js';
-export { BullMQTransport, type BullMQTransportOptions } from './bullmq-transport.js';
+export {
+  BullMQTransport,
+  type BullMQTransportOptions,
+  type WorkerRegistryOptions,
+} from './bullmq-transport.js';
 export {
   type BullMQDeps,
+  type BullMQWorkerOptions,
   createBullMQDeps,
   type JobLike,
   type ProcessFn,
