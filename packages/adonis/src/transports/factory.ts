@@ -270,19 +270,36 @@ export interface BullMQTransportConfig {
    */
   stepTimeoutMs?: number;
   /**
-   * The worker registry (liveness and handshake descriptors). Workers write one hash per routing
-   * token, read without walking the Redis keyspace, next to the per-instance keys older readers use.
+   * How often (ms) each BullMQ worker checks its queue for stalled jobs (BullMQ `stalledInterval`):
+   * jobs whose worker died mid-run go back to waiting at the next check. One check is ~7 Redis
+   * commands per queue, about half of an idle queue's cost. A larger value cuts that cost and makes a
+   * crashed worker's jobs wait up to that long (plus their lock's 30 s) before another worker picks
+   * them up. Default BullMQ's own, `30_000`.
+   */
+  stalledInterval?: number;
+  /**
+   * The worker registry (liveness and handshake descriptors). Each worker instance writes ONE field
+   * of one hash per beat, whatever its token count, and a process reads the hash with one command,
+   * reused for up to 30 s.
    */
   workerRegistry?: {
     /**
-     * Also read the per-instance keys of workers that do not write the registry hashes (an older
-     * version, the NestJS or Python SDK), with one SCAN walk shared by the whole process and run at
+     * Also read the per-instance keys of workers that do not write the registry hash (1.0.0-rc.31
+     * and older, the NestJS or Python SDK), with one SCAN walk shared by the whole process and run at
      * most once per `legacyScanIntervalMs`. Set `false` once every worker runs this version.
      * Default `true`.
      */
     legacyScan?: boolean;
     /** The least time (ms) between two compatibility walks. Default `60_000`. */
     legacyScanIntervalMs?: number;
+    /**
+     * Also write what readers on 1.0.0-rc.31 and older (and the NestJS / Python fleet) read: each
+     * token's per-instance key and rc.31 hash field, refreshed every `legacyWriteIntervalMs`. Set
+     * `false` once every process that reads this Redis runs this version. Default `true`.
+     */
+    legacyWrites?: boolean;
+    /** How often (ms) the keys of `legacyWrites` are refreshed; they live three times that. Default `30_000`. */
+    legacyWriteIntervalMs?: number;
     /**
      * A separate ioredis connection (options, a URL or a `Redis` instance) for the registry hashes,
      * e.g. another db of the same server. Unset uses `connection`. The per-instance keys stay on
@@ -516,6 +533,7 @@ export const transports = {
         config.connection,
         typeof config.concurrency === 'number' ? config.concurrency : 1,
         config.drainDelay,
+        config.stalledInterval !== undefined ? { stalledInterval: config.stalledInterval } : {},
       );
       const registryDeps =
         config.workerRegistry?.connection !== undefined
@@ -543,6 +561,12 @@ export const transports = {
                   : {}),
                 ...(config.workerRegistry.legacyScanIntervalMs !== undefined
                   ? { legacyScanIntervalMs: config.workerRegistry.legacyScanIntervalMs }
+                  : {}),
+                ...(config.workerRegistry.legacyWrites !== undefined
+                  ? { legacyWrites: config.workerRegistry.legacyWrites }
+                  : {}),
+                ...(config.workerRegistry.legacyWriteIntervalMs !== undefined
+                  ? { legacyWriteIntervalMs: config.workerRegistry.legacyWriteIntervalMs }
                   : {}),
                 ...(registryDeps ? { makeRedis: registryDeps.makeRedis } : {}),
               },

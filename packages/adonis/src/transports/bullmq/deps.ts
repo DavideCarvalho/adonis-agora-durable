@@ -198,11 +198,32 @@ function drainDelayOf(value: number | undefined): number {
     : DEFAULT_DRAIN_DELAY_SECONDS;
 }
 
+/**
+ * A usable `stalledInterval` (ms) for BullMQ, or `undefined` to leave BullMQ's default (30 s): a
+ * finite number above 0, capped at the largest delay a timer honours.
+ */
+function stalledIntervalOf(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? Math.min(Math.floor(value), 2 ** 31 - 1)
+    : undefined;
+}
+
+/** Options every BullMQ `Worker` these deps build is created with (see {@link createBullMQDeps}). */
+export interface BullMQWorkerOptions {
+  /**
+   * How often (ms) a worker checks its queue for stalled jobs (BullMQ `stalledInterval`). Unset, or
+   * not a finite number above 0, leaves BullMQ's default (30 s).
+   */
+  stalledInterval?: number | undefined;
+}
+
 export async function createBullMQDeps(
   rawConnection: unknown,
   concurrency = 1,
   drainDelay?: number,
+  workerOptions: BullMQWorkerOptions = {},
 ): Promise<BullMQDeps> {
+  const stalledInterval = stalledIntervalOf(workerOptions.stalledInterval);
   const connection =
     typeof rawConnection === 'string'
       ? redisUrlToOptions(rawConnection)
@@ -261,6 +282,7 @@ export async function createBullMQDeps(
         connection: workerConnection(),
         concurrency: workerConcurrency(opts?.concurrency, defaultConcurrency),
         drainDelay: drainDelayOf(drainDelay),
+        ...(stalledInterval !== undefined ? { stalledInterval } : {}),
       }),
     makeRedis,
   };

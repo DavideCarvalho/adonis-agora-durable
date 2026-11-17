@@ -79,7 +79,13 @@ import {
   settlementToRow,
 } from './lucid-mappers.js';
 import { LucidPgHotPath, quote } from './lucid-pg-hot-path.js';
-import { createDurableTables, DURABLE_SCHEMA_META_TABLE, DURABLE_TABLES } from './lucid-schema.js';
+import {
+  createDurableTables,
+  DURABLE_SCHEMA_META_TABLE,
+  DURABLE_TABLES,
+  LIFECYCLE_PENDING_INDEXED_TAG,
+  LIFECYCLE_PENDING_PREDICATE,
+} from './lucid-schema.js';
 
 /** A Lucid query client — either the connection client or a transaction client. */
 type Client = QueryClientContract | TransactionClientContract;
@@ -1045,6 +1051,24 @@ export class LucidStateStore implements StateStore {
     return (rows as RunRow[]).map(rowToRun);
   }
 
+  async nextDueTimerAt(namespace?: string): Promise<number | undefined> {
+    const suspended = () => {
+      const q = this.fenced(this.client().from(this.t.runs).where('status', 'suspended'));
+      if (namespace !== undefined) q.whereIn('namespace', namespaceFilterValues(namespace));
+      return q;
+    };
+    // Both served by an index: (status, wake_requested_at) and (status, wake_at).
+    const [requested, soonest] = await Promise.all([
+      (await this.hasWakeMarkerColumn())
+        ? suspended().whereNotNull('wake_requested_at').select('id').first()
+        : null,
+      suspended().whereNotNull('wake_at').min('wake_at as at').first(),
+    ]);
+    if (requested) return 0;
+    const at = (soonest as { at?: number | string | null } | null)?.at;
+    return at == null ? undefined : Number(at);
+  }
+
   // --- recovery lease (atomic) --------------------------------------------
 
   async tryLockRun(
@@ -1698,7 +1722,13 @@ export class LucidStateStore implements StateStore {
     }
     // `tags` is stored as a JSON array string; match the quoted token so `etl` doesn't match `etl-foo`.
     // LIKE metacharacters in the tag VALUE are escaped so `50%_off` matches itself, not a pattern.
-    if (query.tag) q.whereRaw(`tags like ? escape '!'`, [`%"${escapeLike(query.tag)}"%`]);
+    if (query.tag === LIFECYCLE_PENDING_INDEXED_TAG && this.client().dialect.name === 'postgres') {
+      // The partial index's own predicate, verbatim (see LIFECYCLE_PENDING_INDEX): the owed-event
+      // listing then reads that small index instead of the whole table.
+      q.whereRaw(LIFECYCLE_PENDING_PREDICATE);
+    } else if (query.tag) {
+      q.whereRaw(`tags like ? escape '!'`, [`%"${escapeLike(query.tag)}"%`]);
+    }
     if (query.tags) {
       if (query.tags.length) {
         q.andWhere((or: AnyQuery) => {

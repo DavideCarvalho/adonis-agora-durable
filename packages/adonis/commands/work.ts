@@ -24,6 +24,13 @@ export default class DurableWork extends BaseCommand {
   @flags.number({ description: 'Drain timeout in milliseconds on shutdown', default: 10_000 })
   declare drainTimeout: number;
 
+  @flags.number({
+    description:
+      'Longest wait in milliseconds between ticks while idle (never past a due timer); at or below --interval keeps a fixed tick',
+    default: 5_000,
+  })
+  declare maxIdleInterval: number;
+
   override async run(): Promise<void> {
     const engine = await this.app.container.make(WorkflowEngine);
     // Recurring schedules fired as the worker tick's 5th phase: those registered in `config/durable.ts`
@@ -52,6 +59,7 @@ export default class DurableWork extends BaseCommand {
     this.logger.info(`durable:work started (interval ${this.interval}ms)`);
     await runWorkerLoop(engine, {
       intervalMs: this.interval,
+      maxIdleIntervalMs: this.maxIdleInterval,
       drainTimeoutMs: this.drainTimeout,
       stopSignal,
       schedules,

@@ -72,6 +72,12 @@ export interface EmbeddedWorkerConfig {
   embedded?: boolean;
   /** Poll interval in ms between ticks. Default 1000 — the same default as `durable:work`. */
   intervalMs?: number;
+  /**
+   * The longest wait in ms between ticks while there is nothing to do: the wait doubles from
+   * `intervalMs` up to this after each idle tick, never past the next known timer or schedule, and
+   * ends when work arrives. At or below `intervalMs` keeps the fixed tick. Default 5000.
+   */
+  maxIdleIntervalMs?: number;
   /** Shutdown budget in ms: the wait for the tick in flight plus `engine.drain`. Default 10_000. */
   drainTimeoutMs?: number;
 }

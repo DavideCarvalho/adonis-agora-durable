@@ -517,6 +517,18 @@ export class InMemoryStateStore implements StateStore {
     return (limit === undefined ? due : due.slice(0, limit)).map(copyRun);
   }
 
+  async nextDueTimerAt(namespace?: string): Promise<number | undefined> {
+    let soonest: number | undefined;
+    for (const r of this.visibleRuns()) {
+      if (r.status !== 'suspended') continue;
+      if (namespace !== undefined && !namespaceMatches(r.namespace, namespace)) continue;
+      if (r.wakeRequestedAt !== undefined) return 0;
+      if (r.wakeAt !== undefined && (soonest === undefined || r.wakeAt < soonest))
+        soonest = r.wakeAt;
+    }
+    return soonest;
+  }
+
   async listOrphanedRuns(
     nowMs: number,
     limit: number,

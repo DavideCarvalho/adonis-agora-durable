@@ -1,6 +1,11 @@
 import type { RunResult, WorkflowEngine } from '../index.js';
 import { withScheduleOrigin } from '../observability-scope.js';
-import { resolveSchedule, runSchedules, type ScheduledWorkflow } from '../scheduler.js';
+import {
+  nextScheduleFireAt,
+  resolveSchedule,
+  runSchedules,
+  type ScheduledWorkflow,
+} from '../scheduler.js';
 
 /** A minimal logger the worker loop writes progress to (the ace command's `this.logger` fits). */
 export interface WorkerLogger {
@@ -211,6 +216,32 @@ function toError(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
 }
 
+/**
+ * `wait`, cut short so the next tick runs no later than the earliest known due time: the engine's
+ * next timer, wake request or persisted schedule, and the next window of `options.schedules`. Never
+ * below `intervalMs` (the regular tick catches what is due sooner). A failed read keeps the regular tick.
+ */
+async function untilDue(
+  engine: WorkflowEngine,
+  options: WorkerLoopOptions,
+  wait: number,
+): Promise<number> {
+  try {
+    const now = Date.now();
+    const stored = await engine.nextDueAt();
+    const scheduled = options.schedules?.length
+      ? nextScheduleFireAt(engine, options.schedules, now)
+      : undefined;
+    let due = wait;
+    for (const at of [stored, scheduled]) {
+      if (at !== undefined) due = Math.min(due, at - Date.now());
+    }
+    return Math.max(options.intervalMs, due);
+  } catch {
+    return options.intervalMs;
+  }
+}
+
 /** Options for {@link runWorkerLoop}. */
 export interface WorkerLoopOptions {
   /** Poll interval in ms between ticks. */
@@ -227,7 +258,21 @@ export interface WorkerLoopOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Recurring schedules to fire each tick (the 5th phase). See {@link TickOptions.schedules}. */
   schedules?: readonly ScheduledWorkflow[];
+  /**
+   * The longest wait (ms) between two ticks while the worker is idle. After a tick that found
+   * nothing to do the wait doubles from `intervalMs` up to this, and goes back to `intervalMs` as soon
+   * as there is work. It never outlasts a known due time (the next timer, wake request or schedule
+   * window, read before each longer wait), and ends at once when another instance enqueues a run
+   * (control-plane nudge) or a run starts or finishes a turn here. Recovery of a crashed instance's
+   * runs and execution timeouts are picked up at most this late. A value at or below `intervalMs`
+   * keeps the fixed tick; so does an engine that cannot be woken (see
+   * `WorkflowEngine.idleBackoffSupported`). Default {@link DEFAULT_MAX_IDLE_INTERVAL_MS}.
+   */
+  maxIdleIntervalMs?: number;
 }
+
+/** Default {@link WorkerLoopOptions.maxIdleIntervalMs}: an idle worker ticks every 5 s at most. */
+export const DEFAULT_MAX_IDLE_INTERVAL_MS = 5_000;
 
 const realSleep = (ms: number): Promise<void> =>
   new Promise((resolve) => {
@@ -265,8 +310,25 @@ export async function runWorkerLoop(
     const t = setTimeout(budgetSpent, drainTimeoutMs);
     (t as { unref?: () => void }).unref?.();
   });
+  // Idle backoff: `wait` grows while ticks find nothing, and a wake-up ends the current wait.
+  const maxIdle = options.maxIdleIntervalMs ?? DEFAULT_MAX_IDLE_INTERVAL_MS;
+  const backoff = maxIdle > options.intervalMs && engine.idleBackoffSupported;
+  let wait = options.intervalMs;
+  let activity = false;
+  let wake: (() => void) | undefined;
+  const unsubscribe = backoff
+    ? engine.onIdleWake((reason) => {
+        activity = true;
+        // `activity` ends only a wait longer than the regular tick; `work` ends any wait.
+        if (reason === 'work' || wait > options.intervalMs) wake?.();
+      })
+    : undefined;
   let ticks = 0;
   while (!stopped) {
+    // Work that arrived during the wait (it ended the wait) counts as this tick's: one regular tick
+    // follows before the loop backs off again.
+    const arrived = activity;
+    activity = false;
     const tick = runTick(engine, options.schedules ? { schedules: options.schedules } : {});
     const result = await Promise.race([tick, outOfBudget]);
     if (result === 'timeout') {
@@ -287,9 +349,18 @@ export async function runWorkerLoop(
       options.logger.error(`tick phase ${phase} failed: ${error.message}`);
     }
     if (stopped) break;
-    // Race the interval against the stop signal so shutdown is prompt, not interval-latent.
-    await Promise.race([sleep(options.intervalMs), options.stopSignal.catch(() => undefined)]);
+    const idle = touched === 0 && result.errors.length === 0 && !activity && !arrived;
+    wait = backoff && idle ? Math.min(wait * 2, maxIdle) : options.intervalMs;
+    if (wait > options.intervalMs) wait = await untilDue(engine, options, wait);
+    // Race the wait against the stop signal (and, while idle, a wake-up) so shutdown is prompt.
+    const woken = new Promise<void>((resolve) => {
+      wake = resolve;
+    });
+    if (activity && wait > options.intervalMs) wake?.(); // something happened during the read
+    await Promise.race([sleep(wait), options.stopSignal.catch(() => undefined), woken]);
+    wake = undefined;
   }
+  unsubscribe?.();
   // A sweep still running beside the last tick stops at its next page (the engine is draining); wait
   // for it within the same budget, so the store is not closed under it.
   const sweep = bufferedSweeps.get(engine);

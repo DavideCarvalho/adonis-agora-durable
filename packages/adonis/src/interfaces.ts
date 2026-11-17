@@ -711,6 +711,15 @@ export interface StateStore {
   listDueTimers(nowMs: number, namespace?: string, limit?: number): Promise<WorkflowRun[]>;
 
   /**
+   * When the next run {@link listDueTimers} returns comes due: the smallest `wakeAt` of the
+   * `suspended` runs (of `namespace`, when given), `0` when one carries a
+   * {@link WorkflowRun.wakeRequestedAt} (due now), `undefined` when none waits on either. The worker
+   * loop asks it before an idle wait longer than its tick, so the wait never outlasts a timer.
+   * Optional: without it the loop never backs off. Two indexed reads on the SQL store.
+   */
+  nextDueTimerAt?(namespace?: string): Promise<number | undefined>;
+
+  /**
    * Atomically acquire the recovery lease on a run for `owner` until `leaseUntilMs`, but only if
    * it is currently unlocked or its lease has expired (`<= nowMs`). Returns whether it was
    * acquired — so concurrent engine instances never recover the same run twice.

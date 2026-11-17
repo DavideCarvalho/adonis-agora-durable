@@ -200,6 +200,7 @@ export {
   type BullMQDeps,
   BullMQTransport,
   type BullMQTransportOptions,
+  type BullMQWorkerOptions,
   type ConcurrencyOption,
   createBullMQDeps,
 } from './transports/bullmq/index.js';

@@ -475,6 +475,9 @@ interface RegisteredWorkflow {
   requires?: string[] | undefined;
 }
 
+/** Why an idle worker loop is woken: see {@link WorkflowEngine.onIdleWake}. */
+export type IdleWakeReason = 'work' | 'activity';
+
 const versionKey = (name: string, version: string): string => `${name}@${version}`;
 
 /**
@@ -1177,6 +1180,8 @@ export class WorkflowEngine {
   private readonly cancelListeners = new Set<(runId: string) => void>();
   /** Callbacks notified when a run is enqueued elsewhere — for low-latency cross-pod dispatch. */
   private readonly enqueuedListeners = new Set<(runId: string) => void>();
+  /** The worker loop's wake-ups while it waits idle; see {@link onIdleWake}. */
+  private readonly idleWakeListeners = new Set<(reason: IdleWakeReason) => void>();
   /** Notified when a run is dead-lettered (moved to `dead`) — a hook for a DLQ handler. */
   private readonly deadListeners = new Set<(run: WorkflowRun) => void>();
   /** The fleet-default dead-letter workflow's name — see {@link WorkflowEngineDeps.deadLetterWorkflow}. */
@@ -1548,6 +1553,7 @@ export class WorkflowEngine {
       } else if (msg.kind === 'enqueued') {
         // A run was enqueued on another instance — let worker subscribers pick it up immediately
         // instead of waiting for the next poll. (Self-broadcasts are already filtered above.)
+        this.wakeIdle('work');
         for (const fn of this.enqueuedListeners) {
           try {
             fn(msg.runId);
@@ -1969,6 +1975,65 @@ export class WorkflowEngine {
   onEnqueued(listener: (runId: string) => void): () => void {
     this.enqueuedListeners.add(listener);
     return () => this.enqueuedListeners.delete(listener);
+  }
+
+  /**
+   * Be told when an idle worker loop should stop waiting: `'work'` when a run was enqueued on
+   * another instance (tick now), `'activity'` when this instance started a run or a turn of one
+   * settled (go back to the regular tick, which also re-reads when the next timer is due). Returns an
+   * unsubscribe function. The worker loop ({@link import('./commands/worker.js').runWorkerLoop})
+   * wires it.
+   */
+  onIdleWake(listener: (reason: IdleWakeReason) => void): () => void {
+    this.idleWakeListeners.add(listener);
+    return () => this.idleWakeListeners.delete(listener);
+  }
+
+  private wakeIdle(reason: IdleWakeReason): void {
+    for (const fn of this.idleWakeListeners) {
+      try {
+        fn(reason);
+      } catch {
+        /* a wake listener must not break the engine */
+      }
+    }
+  }
+
+  /**
+   * Whether a worker loop may wait longer than its tick while idle: new runs must reach this
+   * instance without the pending-run poll (a run queue delivers them, or the control plane's
+   * `enqueued` nudge wakes the loop), and the store must say when its next timer is due
+   * ({@link StateStore.nextDueTimerAt}, plus `listSchedules` with persisted schedules).
+   */
+  get idleBackoffSupported(): boolean {
+    return (
+      (this.runQueue !== undefined || this.controlPlane !== undefined) &&
+      typeof this.store.nextDueTimerAt === 'function' &&
+      (!this.persistedSchedulesEnabled || typeof this.store.listSchedules === 'function')
+    );
+  }
+
+  /**
+   * The earliest time the worker tick has known work (epoch ms): this namespace's next due timer or
+   * wake request ({@link StateStore.nextDueTimerAt}; `0` when one is due now) and, with persisted
+   * schedules, the next schedule to fire. `undefined` when nothing is scheduled. The caller adds its
+   * own in-process schedules (see `nextScheduleFireAt`).
+   */
+  async nextDueAt(): Promise<number | undefined> {
+    const [timer, schedule] = await Promise.all([
+      this.store.nextDueTimerAt?.(this.namespace),
+      this.persistedSchedulesEnabled && this.store.listSchedules
+        ? this.store
+            .listSchedules({
+              paused: false,
+              ...(this.namespace !== undefined ? { namespace: this.namespace } : {}),
+              limit: 1,
+            })
+            .then((rows) => rows[0]?.nextFireAt ?? undefined)
+        : undefined,
+    ]);
+    if (timer === undefined) return schedule ?? undefined;
+    return schedule == null ? timer : Math.min(timer, schedule);
   }
 
   /** Fire cooperative-cancellation listeners for `runId` (a worker bridge aborts in-flight work). */
@@ -3981,6 +4046,8 @@ export class WorkflowEngine {
     // The run is durably enqueued; a dispatcher (in-process by default) executes it — `start` does
     // NOT run the body inline. Await the terminal/suspended state with `waitForRun(runId)` if needed.
     // An internal in-process handoff persists with `dispatch: false` and drives the pickup itself.
+    // A run started here, pending or parked on its start time: an idle worker loop looks again.
+    this.wakeIdle('activity');
     if (dispatch && !delayed) {
       await this.dispatchRun(runId, 'start', { key: String(run.updatedAt.getTime()), run });
       // Nudge worker instances to pick it up now instead of on their next poll (no-op without a control
@@ -5049,6 +5116,8 @@ export class WorkflowEngine {
     this.inflight.set(p, runId);
     const untrack = (): void => {
       this.inflight.delete(p);
+      // A turn may have parked the run on a timer: an idle worker loop re-reads when one is due.
+      this.wakeIdle('activity');
     };
     p.then(untrack, untrack);
     return p;
