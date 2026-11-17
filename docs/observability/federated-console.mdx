@@ -1,0 +1,136 @@
+---
+title: Federated console
+description: One durable console for several apps. Each app keeps its own store and engine; the console reads each app's runs from its store and sends every action to the app that owns the run.
+icon: Network
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+When several apps run durable, each with its own store and its own workers, one of them can show the others' runs in its [console](/docs/durable/observability/dashboard). An app selector picks whose runs you see. Nothing moves: every app keeps its store, its engine and its schedules. The console reads a picked app's runs from that app's store, and every action you take on one of them (cancel, retry, signal, resume, fix-and-replay, schedule pause and trigger) is run by that app's own engine.
+
+## Configure the console app
+
+List the other apps under `apps` in the console app's `config/durable_dashboard.ts`. Each one names where its durable tables are (`store`) and the control plane its engine listens on (`controlPlane`), with that app's own values:
+
+```ts title="config/durable_dashboard.ts"
+import { controlPlanes, stores } from '@adonis-agora/durable'
+import { defineConfig } from '@adonis-agora/durable/dashboard'
+
+export default defineConfig({
+  authorize: (ctx) => ctx.auth.user?.isAdmin === true,
+  appLabel: 'Hub',
+  apps: {
+    'entre-textos': {
+      label: 'Entre Textos',
+      store: stores.lucid({ connection: 'pg', schema: 'entretextos' }),
+      controlPlane: controlPlanes.redis({ connection: 'main', prefix: 'entretextos' }),
+    },
+    'eduliberta': {
+      label: 'EduLiberta',
+      store: stores.lucid({ connection: 'pg', schema: 'eduliberta' }),
+      controlPlane: controlPlanes.redis({ connection: 'main', prefix: 'eduliberta' }),
+    },
+  },
+})
+```
+
+| Option | Description |
+| --- | --- |
+| `apps` | The other apps, by a key of 1–64 characters (`A-Z a-z 0-9 _ . -`). The key is what the URL carries: `?app=entre-textos`. |
+| `apps.<key>.label` | The name in the selector. Defaults to the key. |
+| `apps.<key>.store` | That app's state store. Use the `schema` it keeps its durable tables in. The console only reads it. |
+| `apps.<key>.controlPlane` | That app's control plane, with the `prefix` that app uses. |
+| `apps.<key>.timeoutMs` | How long an action waits for the app to answer. Default `15000`. |
+| `appLabel` | The name of the console's own app in the selector. Default `This app`. |
+
+The store and the control plane are built the first time someone picks the app, not at boot.
+
+<Callout type="warn">
+  The `prefix` must be the one the other app gives `controlPlanes.redis` in its `config/durable.ts`, not the `keyPrefix` of a Redis connection. Both apps must use the same Redis server.
+</Callout>
+
+## Configure each other app
+
+Each app the console shows must answer the console's actions. Turn that on in its `config/durable.ts`:
+
+```ts title="config/durable.ts (the other app)"
+export default defineConfig({
+  // ...its store, transport and control plane, unchanged
+  controlPlane: controlPlanes.redis({ connection: 'main', prefix: 'entretextos' }),
+  consoleCommands: true,
+})
+```
+
+With `consoleCommands: true`, every instance of the app (web and `durable:work`) listens, and exactly one of them runs each action. The app logs one line per action, with who took it in the console:
+
+```
+[durable] federated console: cancel run_01J… by ops@example.com
+```
+
+Anything that can publish on that Redis can ask for these actions, the same trust the control plane's cancel messages already rely on.
+
+## Database access
+
+The console reads the other app's tables with its own connection. On Postgres, give that connection's role read access to the other app's schema, and nothing more:
+
+```sql
+GRANT USAGE ON SCHEMA entretextos TO hub_role;
+GRANT SELECT ON ALL TABLES IN SCHEMA entretextos TO hub_role;
+-- tables the app creates later (a durable upgrade adding one):
+ALTER DEFAULT PRIVILEGES FOR ROLE entretextos_role IN SCHEMA entretextos
+  GRANT SELECT ON TABLES TO hub_role;
+```
+
+The console never writes there. An action is written by the app that owns the run.
+
+If the apps live in different databases, declare a Lucid connection to the other database in the console app's `config/database.ts` and name it in `stores.lucid({ connection })`.
+
+## Using the console
+
+Once `apps` is set, the console's header has an **App** control. Picking an app puts it in the URL (`?app=entre-textos`), so a link or a reload keeps it; picking the console's own app removes it. Switching apps closes the open run and resets the runs board's filters, and stays on Workers or Schedules if you were there.
+
+For the picked app, the console shows:
+
+- its runs, counts and filter pickers, read from its store;
+- a run's detail, timeline and live events (from the app's control plane);
+- its schedules and worker health, asked of its engine;
+- every action on a run, and bulk actions, run by its engine.
+
+When the app does not answer an action (it is down, or `consoleCommands` is off), the action fails with `503` and a message naming the app. Reading its runs keeps working.
+
+Some views stay the console app's own: the `/metrics` counters and the fleet compatibility panel describe the console's process, so for another app the panel lists only its blocked runs. A run detail does not list the lifecycle subscribers of the run's workflow.
+
+If the other app wraps its store in a [`CodecStateStore`](/docs/durable/stores#encrypting-payloads-at-rest), pass the same wrapped store in `apps.<key>.store` so payloads are decoded:
+
+```ts
+import { CodecStateStore } from '@adonis-agora/durable'
+
+store: async (ctx) =>
+  new CodecStateStore(await stores.lucid({ connection: 'pg', schema: 'entretextos' })(ctx), codec),
+```
+
+## Who sees which app
+
+An [`authorize`](/docs/durable/observability/dashboard#authorization) that returns `apps` as a list also limits the selector: an app whose key is not in the list is not offered, and `?app=` naming it answers `404`. `'*'` or no `apps` shows every configured app.
+
+```ts title="config/durable_dashboard.ts"
+authorize: async (ctx) => {
+  const user = await ctx.auth.authenticate()
+  if (user.isAdmin) return { allowed: true, apps: '*' }
+  return { allowed: true, apps: ['eduliberta'] }
+},
+```
+
+The [audit](/docs/durable/observability/dashboard#configuration) line of an action on another app ends with `app=<key>`.
+
+## The API
+
+Every console API route takes `?app=<key>`. `GET <path>/api/apps` lists what the selector offers:
+
+```json
+{
+  "local": { "label": "Hub" },
+  "apps": [{ "id": "entre-textos", "label": "Entre Textos" }],
+  "selected": null
+}
+```

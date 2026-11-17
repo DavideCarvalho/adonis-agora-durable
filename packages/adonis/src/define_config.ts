@@ -296,6 +296,15 @@ export interface BaseDurableConfig {
    */
   consumers?: 'auto' | 'always' | 'never';
   /**
+   * Answer the console commands another app's durable console sends over this app's control plane
+   * (the federated console: `apps` in that app's `config/durable_dashboard.ts`). With it on, an action
+   * taken there on one of this app's runs — cancel, retry, signal, resume, schedule pause/trigger —
+   * is run by THIS app's engine, by exactly one of its instances. Needs a control plane that carries
+   * console commands (`controlPlanes.redis`). Anything that can publish on that Redis can then ask for
+   * those actions: the same trust the control plane's cancel messages already rely on. Default `false`.
+   */
+  consoleCommands?: boolean;
+  /**
    * Opt-in self-heal window (ms) for a remote step with no `timeoutMs` whose dispatched job was LOST
    * — the worker crashed mid-step, or the transport dropped the job (a store flush/eviction, or a
    * broker moving a stalled job to `failed`). By design, the reconcile re-drive re-suspends a

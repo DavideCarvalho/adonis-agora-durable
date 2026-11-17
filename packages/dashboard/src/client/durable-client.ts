@@ -138,6 +138,28 @@ export function withTenant(path: string): string {
   return `${path}${path.includes('?') ? '&' : '?'}tenant=${encodeURIComponent(tenant)}`;
 }
 
+/** The console's app selector (`GET /apps`): this app, and the other apps it also shows. */
+export interface AppPicker {
+  local: { label: string };
+  apps: Array<{ id: string; label: string }>;
+  selected: string | null;
+}
+
+/** The other app picked in this page's URL (`?app=`), sent with every API call; none = this app. */
+export function selectedApp(): string | undefined {
+  if (typeof window === 'undefined') return undefined;
+  const value = new URLSearchParams(window.location.search).get('app');
+  return value || undefined;
+}
+
+/** `path` with the picked organization (`tenant=`) and the picked app (`app=`) appended. */
+export function withScope(path: string): string {
+  const scoped = withTenant(path);
+  const app = selectedApp();
+  if (app === undefined) return scoped;
+  return `${scoped}${scoped.includes('?') ? '&' : '?'}app=${encodeURIComponent(app)}`;
+}
+
 export interface RunDetail {
   run: WorkflowRun;
   timeline: StepCheckpoint[];
@@ -711,7 +733,7 @@ const REDIRECTED =
 async function send(path: string, init?: RequestInit): Promise<Response> {
   const method = (init?.method ?? 'GET').toUpperCase();
   const write = method !== 'GET' && method !== 'HEAD';
-  const res = await fetch(apiBase() + withTenant(path), {
+  const res = await fetch(apiBase() + withScope(path), {
     ...init,
     ...(write
       ? {
@@ -910,6 +932,10 @@ export const durableClient = {
   topology(): Promise<DurableTopology> {
     return http<DurableTopology>('/topology');
   },
+  /** The apps this console shows (the federated console's selector). */
+  apps(): Promise<AppPicker> {
+    return http<AppPicker>('/apps');
+  },
   /** The organizations this viewer may pick (tenancy). */
   tenants(): Promise<TenantPicker> {
     return http<TenantPicker>('/tenants');
@@ -1080,7 +1106,7 @@ export const durableClient = {
     // A runtime without EventSource (a server render, a DOM shim) gets no live tail; the poll stays.
     if (typeof EventSource === 'undefined') return () => {};
     const source = new EventSource(
-      `${apiBase()}${withTenant(`/runs/${encodeURIComponent(id)}/stream`)}`,
+      `${apiBase()}${withScope(`/runs/${encodeURIComponent(id)}/stream`)}`,
     );
     source.onmessage = (msg) => {
       try {

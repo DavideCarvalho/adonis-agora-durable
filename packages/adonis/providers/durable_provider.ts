@@ -5,6 +5,8 @@ import { mergeSchedules, runWorkerLoop, type WorkerLogger } from '../src/command
 import type { ControlPlaneConfig, TenantConfig } from '../src/config_types.js';
 import type { ControlPlaneContext } from '../src/control-planes/factory.js';
 import { sealDurableCopies } from '../src/copy-guard.js';
+import { answerConsoleCommands } from '../src/dashboard/federation.js';
+import { storeDashboardEngine } from '../src/dashboard/gateway-adapter.js';
 import type { DurableConfig } from '../src/define_config.js';
 import { stopDiagnosticsDeliveries } from '../src/diagnostics/transport.js';
 import { discoveryRoots, type RootedBarrel } from '../src/discovery-roots.js';
@@ -524,6 +526,7 @@ export default class DurableProvider {
     // With nothing to do at all, the engine stays unbuilt (lazily resolvable on demand).
     const servesSteps =
       topology === 'standalone' && discoveryRoots(config.stepsPath, 'app/steps').length > 0;
+    if (config.consoleCommands) await this.#answerConsoleCommands();
     if (workflowRoots.length === 0 && !servesSteps && topology !== 'control-plane') return;
     const engine = await this.app.container.make(WorkflowEngine);
     if (workflowRoots.length > 0) await this.#discoverWorkflows(engine, workflowRoots);
@@ -705,6 +708,26 @@ export default class DurableProvider {
       // No `logger` binding — fall through to the console-backed logger below.
     }
     return { info: () => {}, error: (message: string) => console.error(message) };
+  }
+
+  /**
+   * Answer the console commands another app's federated console sends over this app's control plane
+   * (`consoleCommands: true`): its actions on this app's runs are run here, by this engine.
+   */
+  async #answerConsoleCommands() {
+    const engine = await this.app.container.make(WorkflowEngine);
+    const logger = await this.#resolveLogger();
+    const controlPlane = this.#controlPlane;
+    if (
+      !controlPlane ||
+      !answerConsoleCommands(controlPlane, storeDashboardEngine(engine), (line) =>
+        logger.info(line),
+      )
+    ) {
+      logger.error(
+        '[durable] consoleCommands is on, but the control plane cannot carry console commands (use controlPlanes.redis)',
+      );
+    }
   }
 
   /**

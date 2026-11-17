@@ -7,6 +7,7 @@ import { readShellConfig } from '../agora-kit/shell-config';
 import { splitHash, subscribeHashUrl } from '../agora-kit/url-state/hash-url';
 import { NuqsHashAdapter } from '../agora-kit/url-state/nuqs-hash-adapter';
 import { CONFIG_ELEMENT_ID, durableClient } from '../client/durable-client';
+import { AppPickerControl } from './AppPicker';
 import { currentRoute, pushRoute, type Route, sameRoute } from './routes';
 import { LogoMark } from './run-status';
 import { RunIdSearch } from './runs/RunIdSearch';
@@ -175,6 +176,7 @@ function Console() {
       contentClassName={route.page === 'runs' ? 'overflow-hidden' : undefined}
       actions={
         <>
+          <AppPickerControl />
           <TenantPickerControl />
           <div className="hidden md:block">
             <RunIdSearch onOpenRun={openRun} />

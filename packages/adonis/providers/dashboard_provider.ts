@@ -36,6 +36,12 @@ import {
 } from '../src/dashboard/define_config.js';
 import { registerDurableDevTools } from '../src/dashboard/dev_tools.js';
 import { BlockedDiagnosticsRecorder } from '../src/dashboard/diagnostics-recorder.js';
+import {
+  buildFederatedApp,
+  FEDERATED_APP_UNREACHABLE,
+  type FederatedApp,
+  FederatedAppError,
+} from '../src/dashboard/federation.js';
 import { dashboardEngineForTopology } from '../src/dashboard/gateway-adapter.js';
 import {
   type ApiRequest,
@@ -133,6 +139,10 @@ function spaDirectory(): string {
  * - `GET  /api/consoles`              -> the other Agora consoles this viewer may open (switcher)
  * - `GET  /api/consoles/search?q=`    -> search across those consoles (and this one)
  * - `GET  /api/openapi.json`          -> the machine-readable API contract (OpenAPI 3.1)
+ * - `GET  /api/apps`                  -> the apps the selector offers (this one + `apps`)
+ *
+ * With `apps` configured (the federated console), every API route takes `?app=<key>`: the route then
+ * reads that app's store and sends its actions to that app's engine over its control plane.
  */
 export default class DashboardProvider {
   constructor(protected app: ApplicationService) {}
@@ -143,6 +153,8 @@ export default class DashboardProvider {
   private readonly decisions = new WeakMap<HttpContext, ConsoleDecision>();
   /** Each request's resolved tenant scope. */
   private readonly scopes = new WeakMap<HttpContext, ConsoleTenantScope>();
+  /** The configured other apps (federated console), each built once on first use. */
+  private readonly federated = new Map<string, Promise<FederatedApp>>();
 
   /** SSE connections currently open, per client address (and in total) — see streamRun. */
   private readonly sseByAddress = new Map<string, number>();
@@ -206,12 +218,22 @@ export default class DashboardProvider {
     durableTopology: 'standalone' | 'control-plane' | 'tenant',
   ): (ctx?: HttpContext) => Promise<Deps> {
     return async (ctx) => {
+      const selected = ctx ? await this.selectedApp(config, ctx) : undefined;
+      if (selected === null) throw new UnknownConsoleAppError();
+      const scope = ctx ? await this.consoleTenantScope(config, ctx) : undefined;
+      if (selected !== undefined && ctx) {
+        // Another app: its store and its engine. This app's own tenancy slot and counters do not apply.
+        const remote = (await this.federatedApp(config, selected)).engine(auditActor(ctx));
+        return {
+          engine: scope ? scopedDashboardEngine(remote, scope.ids) : remote,
+          ...(config.redact ? { redact: config.redact } : {}),
+        };
+      }
       const base = await dashboardEngineForTopology(
         durableTopology,
         this.app.container,
         WorkflowEngine,
       );
-      const scope = ctx ? await this.consoleTenantScope(config, ctx) : undefined;
       const apps = ctx ? await this.consoleApps(config, ctx) : undefined;
       const slot = scope ? tenancySlot() : undefined;
       const byApp = apps ? appScopedDashboardEngine(base, apps) : base;
@@ -254,6 +276,47 @@ export default class DashboardProvider {
   ): Promise<string[] | undefined> {
     const decision = await this.consoleDecision(config, ctx);
     return decision.allowed ? grantedApps(decision.apps) : undefined;
+  }
+
+  /**
+   * The other app this request is about (`?app=<key>`): its key, `undefined` for this app (no
+   * `?app=`), or `null` for a key that is not configured or that `authorize`'s `apps` grant does not
+   * name (answered like an unknown app).
+   */
+  private async selectedApp(
+    config: ResolvedDurableDashboardConfig,
+    ctx: HttpContext,
+  ): Promise<string | null | undefined> {
+    const picked = ctx.request.qs().app;
+    if (typeof picked !== 'string' || picked === '') return undefined;
+    if (!Object.hasOwn(config.apps, picked)) return null;
+    const granted = await this.consoleApps(config, ctx);
+    return granted === undefined || granted.includes(picked) ? picked : null;
+  }
+
+  /** The other apps this viewer may pick: every configured one, or those `authorize` grants. */
+  private async visibleApps(
+    config: ResolvedDurableDashboardConfig,
+    ctx: HttpContext,
+  ): Promise<Array<{ id: string; label: string }>> {
+    const granted = await this.consoleApps(config, ctx);
+    return Object.entries(config.apps)
+      .filter(([id]) => granted === undefined || granted.includes(id))
+      .map(([id, app]) => ({ id, label: app.label ?? id }));
+  }
+
+  /** The configured app `id`, built (its store and control plane) on first use. */
+  private federatedApp(config: ResolvedDurableDashboardConfig, id: string): Promise<FederatedApp> {
+    let app = this.federated.get(id);
+    if (!app) {
+      const spec = config.apps[id];
+      if (!spec) return Promise.reject(new UnknownConsoleAppError());
+      app = buildFederatedApp(id, spec, { app: this.app });
+      // A failed build (a bad connection name) is retried on the next request, not cached.
+      app.catch(() => this.federated.delete(id));
+      this.federated.set(id, app);
+    }
+    return app;
   }
 
   /** Whether tenancy is on for durable (config/durable.ts `tenancy`, else config/context.ts). */
@@ -482,6 +545,11 @@ export default class DashboardProvider {
           if (result.status === 304) return ctx.response.status(304).send('');
           return ctx.response.status(result.status).json(result.body);
         } catch (error) {
+          const answered = federatedErrorResponse(error);
+          if (answered) {
+            if (answered.status >= 500) void this.logServerError(error);
+            return ctx.response.status(answered.status).json(answered.body);
+          }
           // Generic body on a 500: raw driver/store messages (connection strings, SQL fragments)
           // must not flow to API callers. The detail goes to the app logger instead.
           void this.logServerError(error);
@@ -544,6 +612,8 @@ export default class DashboardProvider {
           ctx.response.header('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
           return ctx.response.status(200).send(text);
         } catch (error) {
+          const answered = federatedErrorResponse(error);
+          if (answered) return ctx.response.status(answered.status).json(answered.body);
           void this.logServerError(error);
           return ctx.response.status(500).json({ error: 'internal error' });
         }
@@ -563,6 +633,19 @@ export default class DashboardProvider {
       .post(`${apiBase}/schedules/:key/:action`, json(scheduleAction))
       .as('durable_dashboard.schedules.action');
     router.post(`${apiBase}/bulk/:action`, json(bulkAction)).as('durable_dashboard.bulk');
+    // The federated console's app selector: this app, then the configured apps this viewer may see.
+    router
+      .get(`${apiBase}/apps`, async (ctx: HttpContext) => {
+        if (!(await this.enforce(config, ctx, 'api'))) return;
+        ctx.response.header('cache-control', 'private, no-store');
+        const selected = await this.selectedApp(config, ctx);
+        return ctx.response.status(200).json({
+          local: { label: config.appLabel },
+          apps: await this.visibleApps(config, ctx),
+          selected: selected ?? null,
+        });
+      })
+      .as('durable_dashboard.apps');
     // Tenancy: which organizations this viewer may pick, and an audited record of a switch.
     router
       .get(`${apiBase}/tenants`, async (ctx: HttpContext) => {
@@ -630,10 +713,14 @@ export default class DashboardProvider {
         if (!(await this.enforce(config, ctx, 'api'))) return;
         // Only a `TenantConfig` carries a `tenant.partition` (its `<name>@<tenant>` routing suffix, spec
         // §6.1) — the field this dashboard's `DurableTopology.tenant` badge actually names.
+        const selected = await this.selectedApp(config, ctx);
+        if (selected === null) return ctx.response.status(404).json({ error: 'unknown app' });
         const durableConfig = this.app.config.get<DurableConfig>('durable', {});
         const tenant =
           durableConfig.topology === 'tenant' ? durableConfig.tenant.partition : undefined;
-        const result = topology(durableTopology, tenant);
+        // Another app runs its own engine over its own store: a standalone deployment as seen here.
+        const result =
+          selected !== undefined ? topology('standalone') : topology(durableTopology, tenant);
         return ctx.response.status(result.status).json(result.body);
       })
       .as('durable_dashboard.topology');
@@ -644,9 +731,19 @@ export default class DashboardProvider {
       .get(`${apiBase}/runs/:id/stream`, async (ctx: HttpContext) => {
         if (!(await this.enforce(config, ctx, 'api'))) return;
         const id = ctx.params.id as string;
-        const { engine } = await deps(ctx);
+        let engine: DashboardEngine;
+        try {
+          engine = (await deps(ctx)).engine;
+        } catch (error) {
+          const answered = federatedErrorResponse(error);
+          if (answered) return ctx.response.status(answered.status).json(answered.body);
+          throw error;
+        }
         // A run outside the viewer's tenants or apps streams nothing: answer like an unknown run.
-        const confined = this.tenancyOn() || (await this.consoleApps(config, ctx)) !== undefined;
+        const confined =
+          this.tenancyOn() ||
+          (await this.consoleApps(config, ctx)) !== undefined ||
+          (await this.selectedApp(config, ctx)) !== undefined;
         if (confined && (await engine.getRun(id)) === null) {
           return ctx.response.status(404).json({ error: `run ${id} not found` });
         }
@@ -660,9 +757,17 @@ export default class DashboardProvider {
       .get(`${apiBase}/compat`, async (ctx: HttpContext) => {
         if (!(await this.enforce(config, ctx, 'api'))) return;
         try {
-          const result = await compat(await this.compatSource((await deps(ctx)).engine));
+          const { engine } = await deps(ctx);
+          // Another app's fleet and diagnostics are not this process's: only its blocked runs.
+          const source =
+            (await this.selectedApp(config, ctx)) !== undefined
+              ? federatedCompatSource(engine)
+              : await this.compatSource(engine);
+          const result = await compat(source);
           return ctx.response.status(result.status).json(result.body);
         } catch (error) {
+          const answered = federatedErrorResponse(error);
+          if (answered) return ctx.response.status(answered.status).json(answered.body);
           void this.logServerError(error);
           return ctx.response.status(500).json({ error: 'internal error' });
         }
@@ -825,7 +930,7 @@ export default class DashboardProvider {
         at: new Date(),
         actor: auditActor(ctx),
         method: ctx.request.method().toUpperCase(),
-        path: ctx.request.url(false),
+        path: withAppQuery(ctx),
       });
     } catch {
       /* auditing must never break the action */
@@ -954,11 +1059,60 @@ export default class DashboardProvider {
   }
 
   async shutdown(): Promise<void> {
+    const apps = [...this.federated.values()];
+    this.federated.clear();
+    await Promise.all(apps.map((app) => app.then((a) => a.close()).catch(() => undefined)));
     this.detachDiagnostics?.();
     this.detachDiagnostics = null;
     this.metricsCollector?.stop();
     this.metricsCollector = null;
   }
+}
+
+/** A request naming an app the console does not show (`?app=`): answered `404`. */
+class UnknownConsoleAppError extends Error {
+  constructor() {
+    super('unknown app');
+    this.name = 'UnknownConsoleAppError';
+  }
+}
+
+/**
+ * The answer to an error of the federated console: `404` for an unknown app, `503` when the owning
+ * app did not answer an action (the message names the app and why), `502` when it answered with an
+ * error of its own (kept in the log). `undefined` for any other error.
+ */
+function federatedErrorResponse(error: unknown): ApiResponse | undefined {
+  if (error instanceof UnknownConsoleAppError) {
+    return { status: 404, body: { error: 'unknown app' } };
+  }
+  if (error instanceof FederatedAppError) {
+    if (error.code === FEDERATED_APP_UNREACHABLE) {
+      return { status: 503, body: { error: error.message } };
+    }
+    if (error.code === 'unsupported-request') {
+      return { status: 501, body: { error: error.message } };
+    }
+    return { status: 502, body: { error: 'the app that owns this run answered with an error' } };
+  }
+  return undefined;
+}
+
+/** The compat panel of another app: its blocked runs, without this process's fleet. */
+function federatedCompatSource(engine: DashboardEngine): CompatSource {
+  return {
+    controlPlaneDescriptor: () => undefined,
+    fleet: () => [],
+    blockedRuns: () => engine.listRuns({ statuses: ['blocked'] }),
+    diagnosticsFor: () => undefined,
+  };
+}
+
+/** The request path for the audit line, with the federated app it acted on (`?app=`) when any. */
+function withAppQuery(ctx: HttpContext): string {
+  const path = ctx.request.url(false);
+  const app = ctx.request.qs().app;
+  return typeof app === 'string' && app !== '' ? `${path} app=${app}` : path;
 }
 
 /** Whether this request can change state (everything but GET/HEAD/OPTIONS). Exported for tests. */

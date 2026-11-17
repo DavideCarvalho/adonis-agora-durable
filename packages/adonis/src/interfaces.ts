@@ -2237,7 +2237,39 @@ export interface ControlPlane {
    * live tail follows runs of every namespace. May be called after {@link onControl}.
    */
   observeAll?(): void;
+  /**
+   * Optional (federated console): send a {@link ConsoleCommand} to the app this control plane
+   * belongs to and wait for the one instance that runs it to answer. Rejects when no instance of the
+   * app listens for console commands, or when none answers within `timeoutMs`.
+   */
+  sendConsoleCommand?(
+    command: ConsoleCommand,
+    options?: { timeoutMs?: number | undefined },
+  ): Promise<ConsoleCommandReply>;
+  /**
+   * Optional (federated console): run the {@link ConsoleCommand}s another app's console sends this
+   * app. Exactly ONE instance of the app runs each command, however many listen. The handler's
+   * result (or its error) is the reply.
+   */
+  onConsoleCommand?(handler: (command: ConsoleCommand) => Promise<unknown>): void;
 }
+
+/**
+ * A console action one app's durable console asks another app's engine to run (the federated
+ * console): `verb` is a method of the console's read/control port, `args` its arguments. `actor` is
+ * who asked, for the owning app's log line.
+ */
+export interface ConsoleCommand {
+  id: string;
+  verb: string;
+  args: unknown[];
+  actor?: string | undefined;
+}
+
+/** The answer to a {@link ConsoleCommand}. */
+export type ConsoleCommandReply =
+  | { id: string; ok: true; data: unknown }
+  | { id: string; ok: false; error: { message: string; code?: string | undefined } };
 
 /** A message on the {@link ControlPlane}. `from` is the originating engine's `instanceId`, so a
  *  broker that echoes a publish back to its own subscriber (e.g. Redis pub/sub) can be deduped by

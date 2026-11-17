@@ -1,4 +1,12 @@
-import type { ControlMessage, ControlPlane, ControlPublishTarget } from '../index.js';
+import { randomUUID } from 'node:crypto';
+import { decodeConsoleValue, encodeConsoleValue } from '../console-commands.js';
+import type {
+  ConsoleCommand,
+  ConsoleCommandReply,
+  ControlMessage,
+  ControlPlane,
+  ControlPublishTarget,
+} from '../index.js';
 import { swallowSubscribe } from '../safe-subscribe.js';
 import { controlChannel, effectivePrefix } from '../transports/bullmq/naming.js';
 
@@ -50,8 +58,10 @@ export interface IoredisSubscriber {
  * through it.
  */
 export interface IoredisPubSub extends IoredisSubscriber {
-  /** Publish a message to a channel (returns a promise; the driver only awaits it). */
+  /** Publish a message to a channel (returns a promise of the receiver count). */
   publish(channel: string, message: string): unknown;
+  /** `SET key value PX ms NX` — claims a console command for one instance. */
+  set?(key: string, value: string, px: 'PX', ms: number, nx: 'NX'): Promise<unknown>;
   /** Build a dedicated subscriber connection (pub/sub can't share a command client). */
   duplicate(): IoredisSubscriber;
 }
@@ -71,8 +81,10 @@ export interface IoredisPubSub extends IoredisSubscriber {
  * on the ioredis path.
  */
 export interface AdonisRedisPubSub {
-  /** Publish a message to a channel (returns a promise; the driver only awaits it). */
+  /** Publish a message to a channel (returns a promise of the receiver count). */
   publish(channel: string, message: string): unknown;
+  /** `SET key value PX ms NX` — claims a console command for one instance. */
+  set?(key: string, value: string, px: 'PX', ms: number, nx: 'NX'): Promise<unknown>;
   /** Subscribe to a channel; the handler receives each payload directly. */
   subscribe(channel: string, handler: (message: string) => void): unknown;
   /** Subscribe to a channel pattern; the handler receives the channel and each payload. */
@@ -147,6 +159,11 @@ export interface RedisControlPlaneOptions {
   pingIntervalMs?: number | false;
 }
 
+/** How long a console command waits for its answer by default. */
+export const CONSOLE_COMMAND_TIMEOUT_MS = 15_000;
+/** How long the claim on a console command lives (longer than any answer is waited for). */
+const CONSOLE_CLAIM_TTL_MS = 120_000;
+
 /** The `kind`s of a {@link ControlMessage}. */
 const CONTROL_KINDS: ReadonlySet<string> = new Set<ControlMessage['kind']>([
   'event',
@@ -216,6 +233,12 @@ export class RedisControlPlane implements ControlPlane {
   private readonly pingIntervalMs: number | false;
   private pingWatchdogTimer: ReturnType<typeof setInterval> | undefined;
   private closed = false;
+  /** Raw-ioredis path: the handler of each exactly-subscribed channel on the duplicated subscriber. */
+  private readonly channelHandlers = new Map<string, (payload: string) => void>();
+  /** Console commands this instance sent and still waits on, by id. */
+  private readonly pendingCommands = new Map<string, (reply: ConsoleCommandReply) => void>();
+  private repliesSubscribed: Promise<void> | undefined;
+  private commandsSubscribed = false;
 
   constructor(options: RedisControlPlaneOptions) {
     this.connection = options.connection;
@@ -269,6 +292,16 @@ export class RedisControlPlane implements ControlPlane {
     return controlChannel(effectivePrefix(this.prefix, namespace || undefined));
   }
 
+  /** The channel console commands for this app go to (see {@link sendConsoleCommand}). */
+  get consoleChannel(): string {
+    return `${this.prefix}-console`;
+  }
+
+  /** The channel the answers to console commands come back on. */
+  get consoleReplyChannel(): string {
+    return `${this.prefix}-console-reply`;
+  }
+
   /**
    * Adopt the engine's namespace — unless one was passed to the constructor (an explicit one always
    * wins), or the channel is already subscribed. The engine calls it before it subscribes.
@@ -309,11 +342,8 @@ export class RedisControlPlane implements ControlPlane {
       handler(msg);
     };
     if (isIoredisClient(this.connection)) {
-      // raw ioredis: a subscriber connection can't run normal commands → use a dedicated dup.
-      const sub = this.connection.duplicate();
-      this.subscriber = sub;
-      swallowSubscribe(sub.subscribe(this.channel), () => this.closed, 'control-plane');
-      sub.on?.('message', (_channel, payload) => deliver(payload));
+      const sub = this.ioredisSubscriber();
+      this.subscribeChannel(this.channel, (payload) => deliver(payload));
       this.subscribePattern = (pattern) => {
         if (typeof sub.psubscribe !== 'function') return;
         // ioredis's `autoResubscribe` restores pattern subscriptions on reconnect too.
@@ -321,14 +351,9 @@ export class RedisControlPlane implements ControlPlane {
         sub.on?.('pmessage', (_pattern, _channel, payload) => deliver(payload, true));
       };
       this.armPattern();
-      this.trackSubscriber(sub);
     } else {
       // `@adonisjs/redis` connection: manages its own subscriber connection; handler gets the message.
-      swallowSubscribe(
-        this.connection.subscribe(this.channel, (payload) => deliver(payload)),
-        () => this.closed,
-        'control-plane',
-      );
+      this.subscribeChannel(this.channel, (payload) => deliver(payload));
       const connection = this.connection;
       this.subscribePattern = (pattern) => {
         if (typeof connection.psubscribe !== 'function') return;
@@ -339,13 +364,171 @@ export class RedisControlPlane implements ControlPlane {
         );
       };
       this.armPattern();
-      // The connection keeps its ioredis subscriber on the public `ioSubscriberConnection` field
-      // (created by the subscribe above, replaced if it ends). Watch THAT one: it has the same
-      // silent-death failure mode as the duplicated subscriber on the ioredis path. Read on every
-      // tick, never held, and never disconnected by close(): the connection belongs to the app.
-      const adonis = this.connection as { ioSubscriberConnection?: IoredisSubscriber };
-      this.startPingWatchdog(() => adonis.ioSubscriberConnection);
     }
+  }
+
+  /**
+   * The raw-ioredis path's dedicated subscriber (a subscriber connection can't run normal commands),
+   * made once and shared by every channel this control plane listens on: payloads are routed to the
+   * channel's handler.
+   */
+  private ioredisSubscriber(): IoredisSubscriber {
+    if (this.subscriber) return this.subscriber;
+    const sub = (this.connection as IoredisPubSub).duplicate();
+    this.subscriber = sub;
+    sub.on?.('message', (channel, payload) => this.channelHandlers.get(channel)?.(payload));
+    this.trackSubscriber(sub);
+    return sub;
+  }
+
+  /**
+   * Subscribe `handler` to exactly `channel`, on either client. Returns once the subscription is in
+   * place (or failed: a failure is logged, never thrown).
+   */
+  private subscribeChannel(channel: string, handler: (payload: string) => void): Promise<void> {
+    let result: unknown;
+    if (isIoredisClient(this.connection)) {
+      const sub = this.ioredisSubscriber();
+      this.channelHandlers.set(channel, handler);
+      result = sub.subscribe(channel);
+    } else {
+      result = this.connection.subscribe(channel, handler);
+    }
+    swallowSubscribe(result, () => this.closed, 'control-plane');
+    const settled = Promise.resolve(result).then(
+      () => undefined,
+      () => undefined,
+    );
+    if (isIoredisClient(this.connection)) return settled;
+    // The connection keeps its ioredis subscriber on the public `ioSubscriberConnection` field
+    // (created by the subscribe above, replaced if it ends). Watch THAT one: it has the same
+    // silent-death failure mode as the duplicated subscriber on the ioredis path. Read on every
+    // tick, never held, and never disconnected by close(): the connection belongs to the app.
+    const adonis = this.connection as { ioSubscriberConnection?: IoredisSubscriber };
+    this.startPingWatchdog(() => adonis.ioSubscriberConnection);
+    return settled;
+  }
+
+  /**
+   * Send `command` to the app whose control plane this is (same prefix) and wait for its answer.
+   * Every instance of that app that runs console commands hears it; one claims it and answers.
+   * Rejects at once when nobody listens on the app's console channel, and after `timeoutMs`
+   * (default {@link CONSOLE_COMMAND_TIMEOUT_MS}) when nobody answers.
+   */
+  async sendConsoleCommand(
+    command: ConsoleCommand,
+    options: { timeoutMs?: number | undefined } = {},
+  ): Promise<ConsoleCommandReply> {
+    if (!this.repliesSubscribed) {
+      // The answer can come back within a millisecond: the subscription must be in place first.
+      this.repliesSubscribed = this.subscribeChannel(this.consoleReplyChannel, (payload) => {
+        let reply: ConsoleCommandReply;
+        try {
+          reply = JSON.parse(payload) as ConsoleCommandReply;
+        } catch {
+          return;
+        }
+        this.pendingCommands.get(reply?.id)?.(reply);
+      });
+    }
+    await this.repliesSubscribed;
+    const timeoutMs = options.timeoutMs ?? CONSOLE_COMMAND_TIMEOUT_MS;
+    return new Promise<ConsoleCommandReply>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingCommands.delete(command.id);
+        reject(
+          new Error(
+            `no instance of the "${this.prefix}" app answered the console command ${command.verb} within ${timeoutMs}ms`,
+          ),
+        );
+      }, timeoutMs);
+      timer.unref?.();
+      this.pendingCommands.set(command.id, (reply) => {
+        clearTimeout(timer);
+        this.pendingCommands.delete(command.id);
+        resolve({ ...reply, ...(reply.ok ? { data: decodeConsoleValue(reply.data) } : {}) });
+      });
+      const sent = Promise.resolve(
+        this.connection.publish(
+          this.consoleChannel,
+          JSON.stringify({ ...command, args: encodeConsoleValue(command.args) }),
+        ),
+      );
+      sent.then(
+        (receivers) => {
+          // Redis answers how many subscribers got it: none means no instance runs console commands.
+          if (typeof receivers === 'number' && receivers === 0) {
+            clearTimeout(timer);
+            this.pendingCommands.delete(command.id);
+            reject(
+              new Error(
+                `no instance of the "${this.prefix}" app listens for console commands (is it up, with \`consoleCommands: true\` in config/durable.ts?)`,
+              ),
+            );
+          }
+        },
+        (err: unknown) => {
+          clearTimeout(timer);
+          this.pendingCommands.delete(command.id);
+          reject(err instanceof Error ? err : new Error(String(err)));
+        },
+      );
+    });
+  }
+
+  /**
+   * Run the console commands other apps' consoles send this app. Every instance subscribes; the one
+   * that wins `SET <prefix>-console-claim:<id> NX` runs the command and publishes the answer, so a
+   * command runs once however many web and worker processes the app has.
+   */
+  onConsoleCommand(handler: (command: ConsoleCommand) => Promise<unknown>): void {
+    if (this.commandsSubscribed) return;
+    this.commandsSubscribed = true;
+    const instance = randomUUID();
+    this.subscribeChannel(this.consoleChannel, (payload) => {
+      void this.runConsoleCommand(payload, instance, handler).catch(() => undefined);
+    });
+  }
+
+  private async runConsoleCommand(
+    payload: string,
+    instance: string,
+    handler: (command: ConsoleCommand) => Promise<unknown>,
+  ): Promise<void> {
+    let command: ConsoleCommand;
+    try {
+      command = JSON.parse(payload) as ConsoleCommand;
+    } catch {
+      return;
+    }
+    if (typeof command?.id !== 'string' || typeof command.verb !== 'string') return;
+    if (typeof this.connection.set === 'function') {
+      const won = await this.connection.set(
+        `${this.prefix}-console-claim:${command.id}`,
+        instance,
+        'PX',
+        CONSOLE_CLAIM_TTL_MS,
+        'NX',
+      );
+      if (won !== 'OK') return;
+    }
+    let reply: ConsoleCommandReply;
+    try {
+      const args = decodeConsoleValue(command.args);
+      const data = await handler({ ...command, args: Array.isArray(args) ? args : [] });
+      reply = { id: command.id, ok: true, data: encodeConsoleValue(data) };
+    } catch (err) {
+      const code = (err as { code?: unknown } | null)?.code;
+      reply = {
+        id: command.id,
+        ok: false,
+        error: {
+          message: err instanceof Error ? err.message : String(err),
+          ...(typeof code === 'string' ? { code } : {}),
+        },
+      };
+    }
+    await this.connection.publish(this.consoleReplyChannel, JSON.stringify(reply));
   }
 
   /**
@@ -427,6 +610,10 @@ export class RedisControlPlane implements ControlPlane {
   /** Stop the watchdog and tear down the dedicated subscriber connection (ioredis path). */
   async close(): Promise<void> {
     this.closed = true;
+    for (const [id, settle] of this.pendingCommands) {
+      settle({ id, ok: false, error: { message: 'control plane closed' } });
+    }
+    this.pendingCommands.clear();
     if (this.pingWatchdogTimer) clearInterval(this.pingWatchdogTimer);
     this.pingWatchdogTimer = undefined;
     this.subscriber?.disconnect?.();
