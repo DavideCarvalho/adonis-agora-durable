@@ -4,6 +4,7 @@
   "pages": [
     "index",
     "dashboard",
+    "federated-console",
     "events-and-interceptors",
     "otel",
     "metrics",

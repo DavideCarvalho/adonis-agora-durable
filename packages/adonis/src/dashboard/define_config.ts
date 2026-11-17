@@ -12,6 +12,7 @@ import {
   resolveConsoleAuthorize,
 } from './console_authorize.js';
 import type { ConsoleViewer, SignOutOption, ViewerHook } from './console_shell.js';
+import type { FederatedConsoleApp } from './federation.js';
 
 /**
  * The function form of {@link DurableDashboardConfig.accessDenied}: render (or answer) a refused
@@ -125,9 +126,30 @@ export interface DurableDashboardConfig {
    * announces on the `agora.consoles` registry, when there is one. Same-origin paths only.
    */
   signOut?: SignOutOption;
+  /**
+   * Other apps this console also shows (the federated console), by a key that becomes their
+   * `?app=` in the console's URL. Each keeps its own store and engine: the console reads that app's
+   * store and sends every action to that app's engine over its control plane.
+   *
+   * ```ts
+   * apps: {
+   *   'entre-textos': {
+   *     label: 'Entre Textos',
+   *     store: stores.lucid({ connection: 'pg', schema: 'entretextos' }),
+   *     controlPlane: controlPlanes.redis({ connection: 'main', prefix: 'entretextos' }),
+   *   },
+   * }
+   * ```
+   *
+   * Keys are 1–64 characters of `[A-Za-z0-9_.-]`. An `authorize` that grants `apps` as a list hides
+   * the apps it does not name.
+   */
+  apps?: Record<string, FederatedConsoleApp>;
+  /** The name of THIS app in the app selector (shown once `apps` is set). Defaults to `This app`. */
+  appLabel?: string;
 }
 
-export type { ConsoleViewer, SignOutOption, ViewerHook };
+export type { ConsoleViewer, FederatedConsoleApp, SignOutOption, ViewerHook };
 
 /** A fully-resolved config — every field present (defaults applied). */
 export interface ResolvedDurableDashboardConfig {
@@ -150,7 +172,14 @@ export interface ResolvedDurableDashboardConfig {
   viewer: ViewerHook | null;
   /** The host's `signOut` option, or `null` for the registry's announced one. */
   signOut: SignOutOption | null;
+  /** The other apps the console shows (empty: none). */
+  apps: Record<string, FederatedConsoleApp>;
+  /** The name of this app in the app selector. */
+  appLabel: string;
 }
+
+/** What a federated app's key may look like (it travels in the URL as `?app=`). */
+export const FEDERATED_APP_KEY = /^[A-Za-z0-9_.-]{1,64}$/;
 
 /** One audited mutating console action — who (actor), what (method + path), when. */
 export interface DashboardAuditEntry {
@@ -209,7 +238,22 @@ export function resolveConfig(
     redact: config.redact ?? null,
     viewer: config.viewer ?? null,
     signOut: config.signOut ?? null,
+    apps: validApps(config.apps),
+    appLabel: config.appLabel ?? 'This app',
   };
+}
+
+function validApps(
+  apps: Record<string, FederatedConsoleApp> | undefined,
+): Record<string, FederatedConsoleApp> {
+  for (const key of Object.keys(apps ?? {})) {
+    if (!FEDERATED_APP_KEY.test(key)) {
+      throw new Error(
+        `[@adonis-agora/durable] durable_dashboard.apps: "${key}" is not a valid app key (1–64 characters of A-Z, a-z, 0-9, _ . -)`,
+      );
+    }
+  }
+  return { ...(apps ?? {}) };
 }
 
 /** Identity helper giving `config/durable_dashboard.ts` full type-checking. */

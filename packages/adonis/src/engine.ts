@@ -60,14 +60,7 @@ import {
   type OnEventEntry,
   toEventSubscription,
 } from './events.js';
-import {
-  childIdsOf,
-  FOLDED_PREFIX,
-  fanOfWaiter,
-  parentRunIdOf,
-  parseStepFanGroup,
-  stepFanGroup,
-} from './fan-join.js';
+import { fanOfWaiter, parentRunIdOf, parseStepFanGroup, stepFanGroup } from './fan-join.js';
 import {
   type AnnouncedWorkflow,
   aggregateAnnouncements,
@@ -224,6 +217,7 @@ import {
   validateStandardSync,
 } from './standard-schema.js';
 import { StickyCache, StickyContinuation } from './sticky-continuation.js';
+import { runChildrenFromStore, withoutBookkeepingRuns } from './store-reads.js';
 import {
   type EngineTenancy,
   intersectTenantIds,
@@ -6952,20 +6946,7 @@ export class WorkflowEngine {
    * group folded into one `fan:` checkpoint stands for every child in it.
    */
   async getRunChildren(parentRunId: string): Promise<string[]> {
-    const childIds = new Set<string>();
-    // The parent's own waiters only (an indexed `WHERE run_id` when the store has it).
-    for (const w of await listSignalWaitersOfRuns(this.store, [parentRunId])) {
-      if (w.token.startsWith('child:')) childIds.add(w.token.slice('child:'.length));
-    }
-    // Targeted read: only the child-edge checkpoints, not the whole history. Falls back to a full
-    // listCheckpoints + in-JS prefix scan for a custom store that omits the method.
-    const childCheckpoints = this.store.listCheckpointsByNamePrefix
-      ? await this.store.listCheckpointsByNamePrefix(parentRunId, CHILD_EDGE_PREFIXES)
-      : (await this.store.listCheckpoints(parentRunId)).filter((cp) =>
-          CHILD_EDGE_PREFIXES.some((p) => cp.name.startsWith(p)),
-        );
-    for (const id of childIdsOf(childCheckpoints)) childIds.add(id);
-    return [...childIds];
+    return runChildrenFromStore(this.store, parentRunId);
   }
 
   /**
@@ -11750,20 +11731,6 @@ function servedNamespace(namespace: string | undefined, group: string | undefine
   return group && at >= 0 && at < group.length - 1 ? group.slice(at + 1) : 'default';
 }
 
-function withoutBookkeepingRuns<
-  Q extends Pick<RunQuery, 'workflow' | 'workflows' | 'excludeWorkflows'>,
->(query: Q): Q {
-  if (
-    query.workflow === LIFECYCLE_REGISTRY_WORKFLOW ||
-    query.workflows?.includes(LIFECYCLE_REGISTRY_WORKFLOW)
-  ) {
-    return query;
-  }
-  const excluded = query.excludeWorkflows ?? [];
-  if (excluded.includes(LIFECYCLE_REGISTRY_WORKFLOW)) return query;
-  return { ...query, excludeWorkflows: [...excluded, LIFECYCLE_REGISTRY_WORKFLOW] };
-}
-
 /** `value` when it has at least one own key, else undefined. */
 function nonEmptyObject<T extends object>(value: T): T | undefined {
   return Object.keys(value).length > 0 ? value : undefined;
@@ -11812,6 +11779,3 @@ export class RemoteStepError extends Error {
     this.stepError = stepError;
   }
 }
-
-/** Checkpoint names that record a parent→child edge: an awaited child, a folded group of them, a spawn. */
-const CHILD_EDGE_PREFIXES = ['signal:child:', FOLDED_PREFIX, 'spawn:'];

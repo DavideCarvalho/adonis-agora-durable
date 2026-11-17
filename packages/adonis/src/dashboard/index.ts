@@ -69,6 +69,7 @@ export type {
 } from './define_config.js';
 export {
   defineConfig,
+  FEDERATED_APP_KEY,
   NO_AUTHORIZE_WARNING,
   normalizeAuthorizeResult,
   resolveConfig,
@@ -89,6 +90,16 @@ export type {
 export { DEV_TOOLS_BINDING, durableDevTools, registerDurableDevTools } from './dev_tools.js';
 export type { EngineEventSource, RecordedBlock } from './diagnostics-recorder.js';
 export { BlockedDiagnosticsRecorder } from './diagnostics-recorder.js';
+export type { ConsoleCommandVerb, FederatedConsoleApp } from './federation.js';
+// The federated console: other apps' runs, read from their stores, acted on through their engines.
+export {
+  answerConsoleCommands,
+  buildFederatedApp,
+  CONSOLE_COMMAND_VERBS,
+  FEDERATED_APP_UNREACHABLE,
+  FederatedApp,
+  FederatedAppError,
+} from './federation.js';
 export type { DashboardContainer } from './gateway-adapter.js';
 
 // Store-less `tenant` dashboard: adapt the RunGateway to the handlers' read/control port (design §8).

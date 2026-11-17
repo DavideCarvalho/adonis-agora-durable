@@ -38,6 +38,8 @@ export default defineConfig({
 | `accessDenied` | built-in page | Tweak or replace the [access-denied page](#the-access-denied-page). |
 | `viewer` | `ctx.auth.user` | `(ctx) => ({ label, email?, role? }) \| null`: who the sidebar footer shows as signed in. See [Signed-in user and sign-out](#signed-in-user-and-sign-out). |
 | `signOut` | announced by authkit | The footer's sign-out: a POST action path, `{ href }` for a link, or `false` for none. |
+| `apps` | none | Other apps whose runs this console also shows, each read from its own store and acted on by its own engine. See [Federated console](/docs/durable/observability/federated-console). |
+| `appLabel` | `'This app'` | The name of this app in the app selector, once `apps` is set. |
 
 ### Authorization
 
@@ -734,6 +736,10 @@ export default defineConfig({
 ```
 
 With a list, every listing, count and namespace filter is limited to those apps, a run of another app reads as not found (its page, live tail and every action), Worker health keeps their `<name>@<app>` groups, and Schedules keeps the schedules pinned to them. The process-wide counters on `/metrics` are left out.
+
+## Other apps' runs
+
+To show the runs of other apps that keep their own store and engine, with an app selector, see [Federated console](/docs/durable/observability/federated-console).
 
 ## Switching between consoles
 

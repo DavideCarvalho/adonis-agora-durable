@@ -181,6 +181,44 @@ const jsonResponse = (description: string, schema: unknown) =>
 const err = (description: string) =>
   jsonResponse(description, { $ref: '#/components/schemas/Error' });
 
+/**
+ * The federated console's `?app=<key>`: the route reads that app's store and sends its actions to
+ * that app's engine over its control plane. Every route but `/openapi.json` and `/apps` takes it.
+ */
+const appParam = {
+  name: 'app',
+  in: 'query',
+  required: false,
+  description:
+    "Another app's key from `apps` in config/durable_dashboard.ts (see `GET /apps`); absent = this " +
+    'app. An unknown key, or one `authorize` does not grant, is a 404. An action the owning app did ' +
+    'not answer is a 503, one it does not support a 501, and one it answered with an error a 502.',
+  schema: { type: 'string' },
+} as const;
+
+/** Paths that are about the console itself, not about one app's runs. */
+const APP_UNSCOPED = new Set(['/openapi.json', '/apps']);
+
+/** Every operation of `paths`, except {@link APP_UNSCOPED}, also takes {@link appParam}. */
+function withAppParam(paths: Record<string, Record<string, unknown>>) {
+  for (const [path, operations] of Object.entries(paths)) {
+    if (APP_UNSCOPED.has(path)) continue;
+    for (const operation of Object.values(operations) as Array<{
+      parameters?: unknown[];
+      responses?: Record<string, unknown>;
+    }>) {
+      operation.parameters = [
+        ...(operation.parameters ?? []),
+        { $ref: '#/components/parameters/App' },
+      ];
+      if (operation.responses && !operation.responses['404']) {
+        operation.responses['404'] = err('`?app=` names an app this console does not show.');
+      }
+    }
+  }
+  return paths;
+}
+
 /** Build the OpenAPI 3.1 document, with `servers` rooted at the mounted dashboard `apiBase`. */
 export function openApiDocument(apiBase: string): Record<string, unknown> {
   return {
@@ -202,8 +240,9 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
         OffsetMeta: offsetMeta,
         Error: errorBody,
       },
+      parameters: { App: appParam },
     },
-    paths: {
+    paths: withAppParam({
       '/runs': {
         get: {
           summary: 'List runs (filtered, newest first, offset-paged)',
@@ -658,6 +697,46 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
           responses: { '200': jsonResponse('The OpenAPI document.', { type: 'object' }) },
         },
       },
-    },
+      '/apps': {
+        get: {
+          summary: "The federated console's app selector",
+          description:
+            'This app, the configured `apps` this viewer may see (all of them, or those the ' +
+            "`authorize` decision's `apps` grant names), and the one `?app=` selects.",
+          parameters: [
+            {
+              name: 'app',
+              in: 'query',
+              required: false,
+              description:
+                'The app to echo back as `selected` (an unknown or ungranted key is `null`).',
+              schema: { type: 'string' },
+            },
+          ],
+          responses: {
+            '200': jsonResponse('`{ local, apps, selected }`.', {
+              type: 'object',
+              properties: {
+                local: {
+                  type: 'object',
+                  properties: { label: { type: 'string' } },
+                  description: 'This app.',
+                },
+                apps: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: { id: { type: 'string' }, label: { type: 'string' } },
+                    required: ['id', 'label'],
+                  },
+                },
+                selected: { type: ['string', 'null'] },
+              },
+              required: ['local', 'apps', 'selected'],
+            }),
+          },
+        },
+      },
+    }),
   };
 }
