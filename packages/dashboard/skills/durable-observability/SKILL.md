@@ -111,7 +111,10 @@ The list routes (`GET /api/runs`, `/api/runs/:id/fans/:group`, `/api/schedules`)
 `@adonis-agora/filter` wire format — `filter[status]=failed`, `filter[tag][]=a&filter[tag][]=b`,
 `filter[attr]=key:op:value`, `sort`, `page` / `size` — and answer
 `{ data, meta: { total, perPage, currentPage, lastPage, firstPage } }` (`GET /api/runs` adds
-`statuses`). A filter field sent bare (`?status=failed`), an unknown field or an unknown sort is a `400`.
+`statuses`). `GET /api/runs` pages by cursor when asked with `first` / `after`: each page seeks
+past the previous page's last run on `(createdAt, id)` with no count, answering
+`{ data, meta: { nextCursor, prevCursor, hasNext, hasPrev }, statuses }`; `page` / `size` keep
+the offset envelope and its `total`. A filter field sent bare (`?status=failed`), an unknown field or an unknown sort is a `400`.
 
 Apply an action to everything a filter matches — the same `filter[...]` envelope as `GET /api/runs`:
 
