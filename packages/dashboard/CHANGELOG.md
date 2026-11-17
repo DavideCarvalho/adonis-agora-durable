@@ -1,5 +1,11 @@
 # @adonis-agora/durable-dashboard
 
+## 1.0.0-rc.16
+
+### Minor Changes
+
+- [#557](https://github.com/DavideCarvalho/adonis-agora-durable/pull/557) [`9b21406`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/9b214063bc1f597cf397d9ba0c4ce04fe8ed910a) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The Runs board's filters now live in the URL, so a filtered view can be shared, bookmarked and reloaded, and back/forward step through it: status, workflow, tag, namespace, attribute predicates and origin sit in the hash's query (`#?status=failed&tag=vip`, `#/run/<id>?status=failed`). A value at its default is left out, so existing `#/run/<id>` links open as before, and the filters still survive a trip to Workers and back.
+
 ## 1.0.0-rc.15
 
 ### Minor Changes
