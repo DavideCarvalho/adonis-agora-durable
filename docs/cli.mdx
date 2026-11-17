@@ -21,12 +21,16 @@ The long-running worker. On an interval it picks up pending runs, recovers crash
 ```bash
 node ace durable:work
 node ace durable:work --interval=500 --drain-timeout=15000
+node ace durable:work --max-idle-interval=10000
 ```
 
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--interval` | `1000` | poll interval in ms between ticks |
 | `--drain-timeout` | `10000` | shutdown budget in ms, from the stop signal: the wait for the tick in flight plus the drain |
+| `--max-idle-interval` | `5000` | longest wait in ms between ticks while idle; at or below `--interval` keeps a fixed tick |
+
+While ticks find nothing to do, the loop waits longer each time: 2 s, 4 s, then `--max-idle-interval`. It goes back to `--interval` as soon as there is work. It never waits past what it knows is due: before a longer wait it reads when the next timer or wake request comes due (and the next [persisted schedule](/docs/durable/authoring/persisted-schedules)), and works out the next window of the `schedules` in config. A run enqueued on another instance ends the wait at once through the control plane's nudge, and a run that starts or finishes a turn in this process brings back the regular tick. What it does not know ahead is picked up at most `--max-idle-interval` late: recovery of a crashed instance's runs and execution timeouts. Without a control plane and without a run queue, a run started on another process is found only by the poll, so the loop keeps the fixed tick.
 
 Each tick runs `engine.runPending()` → `engine.recoverIncomplete()` → `engine.resumeDueTimers()` → `engine.sweepTimeouts()` → `engine.sweepLifecycleEvents()` (owed [lifecycle events](/docs/durable/authoring/lifecycle-events#delivery-exactly-once-per-subscriber) and `ctx.waitForRun` waiters) → fire due [schedules](/docs/durable/authoring/scheduling) (the `schedules` from `config/durable.ts` merged with any colocated `static schedule`, config winning on a key collision, then the [persisted schedules](/docs/durable/authoring/persisted-schedules) when `persistedSchedules` is on) → `engine.sweepRetention()` ([retention eviction](/docs/durable/reliability/retention), self-throttled to once a minute) → `engine.sweepStalled()` (the [stalled-run pager](/docs/durable/reliability/failure-modes#the-stalled-run-pager--onstalled--stalledafter), same throttle, a no-op without listeners). Each phase is isolated: one that throws (a transient store hiccup) is logged as `tick phase <name> failed: …` and the rest of the tick still runs.
 

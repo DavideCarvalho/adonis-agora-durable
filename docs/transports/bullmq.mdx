@@ -131,6 +131,19 @@ transports.bullmq({
 })
 ```
 
+## Stalled-job checks (`stalledInterval`)
+
+Every `stalledInterval` ms each worker checks its queue for jobs whose worker died mid-run, and puts them back in the queue for another worker. On an idle queue this check is about half of the queue's Redis commands. A larger value makes that cheaper, and makes the jobs of a crashed worker wait longer before another worker picks them up: up to the job lock (30 s) plus `stalledInterval`. Default BullMQ's own, `30_000`.
+
+```ts title="config/durable.ts"
+transports.bullmq({
+  connection: env.get('REDIS_URL'),
+  stalledInterval: 120_000, // ms: a crashed worker's steps resume within ~2.5 min
+})
+```
+
+With 85 idle step queues, `120_000` instead of the default saves about 15 Redis commands per second (≈0.17 per queue). Runs are not lost either way; only the restart of a crashed worker's in-flight steps is delayed. A clean shutdown hands its running steps back at once (see [Shutdown](#shutdown)), so deploys are not affected.
+
 ## Result concurrency
 
 `concurrency` applies to the **task** queues a worker consumes. The engine side consumes the shared `<P>-results` queue, and holds at least 512 results at once per instance, or `resultConcurrency` when that is higher. A non-finite or sub-1 value is ignored, and a fractional value is rounded down.
@@ -210,7 +223,7 @@ It is off by default. Pick a value comfortably above your slowest legitimate ste
 
 ## Worker liveness
 
-Each served routing token gets a liveness entry for the worker instance. Its value is `{ ts, status }`, where `status` is the live concurrency snapshot. Every token is refreshed on one shared **10s** interval, and the entry lives **35s**. A worker that stops refreshing disappears from the registry when its entry expires, and a worker that shuts down cleanly removes its entries right away.
+Each served routing token gets a liveness entry for the worker instance. Its value is `{ ts, status }`, where `status` is the live concurrency snapshot. All tokens are refreshed together every **10s**, and the entry lives **35s**. A worker that stops refreshing disappears from the registry when its entry expires, and a worker that shuts down cleanly removes its entries right away.
 
 Workers that run the store-less [worker runtime](/docs/durable/cluster/thin-workers) also publish a [handshake](/docs/durable/cluster/handshake) descriptor per token. Per-group health, meaning queue depth (waiting + active + delayed + prioritized) plus live workers, comes from the same registry.
 
@@ -220,31 +233,35 @@ The transport also reads the registry fleet-wide: `readAllWorkerDescriptors()` a
 
 ### Where the registry lives
 
-A worker writes each entry twice:
+Each worker instance keeps **one field** of the hash `<P>-workers:instances`, listing every token it serves with its liveness value (and, for a worker runtime, its descriptor). It rewrites that field once per 10s beat, whatever its token count. An engine reads the whole hash with one `HGETALL`, shared by every read in the process (routing before a dispatch, worker health, the fleet's announced subscriptions) and reused for up to **30s**. A worker's own new handler shows up in its own process at once, and the engine reads again, without waiting, before it parks a run as blocked.
 
-- as a field of its token's hash, `<P>-workers:heartbeats:<token>` or `<P>-workers:descriptors:<token>`, with the token listed in the sorted set `<P>-workers:tokens`. The engine reads these with one `HGETALL` per token, so the cost does not grow with the size of the Redis db;
-- as a per-instance key, `<P>-worker-heartbeat:<token>:<instanceId>` or `<P>-worker-descriptor:<token>:<instanceId>`, which older versions of this package and the NestJS and Python SDKs read and write.
+Older versions of this package (1.0.0-rc.31 and earlier) and the NestJS and Python SDKs read and write per-instance keys instead, `<P>-worker-heartbeat:<token>:<instanceId>` and `<P>-worker-descriptor:<token>:<instanceId>`; 1.0.0-rc.31 also reads the per-token hashes `<P>-workers:heartbeats:<token>` / `<P>-workers:descriptors:<token>`. So that a mixed fleet keeps seeing each other:
 
-To see workers that only write per-instance keys, the engine also walks those keys with `SCAN`. The walk is shared by every read in the process and runs at most once per `legacyScanIntervalMs` (60s by default), so a worker that only writes per-instance keys can take up to that long to appear, and its descriptor (which routing reads) up to that long to disappear after it stops. A heartbeat read is reused for 5s and a token's descriptors for 5s; a worker's own new handler shows up at once.
+- `legacyWrites` (default `true`): a worker also writes those keys, each refreshed every `legacyWriteIntervalMs` (30s) and living three times that. A changed descriptor is written at once.
+- `legacyScan` (default `true`): an engine also walks the per-instance keys with `SCAN`, at most once per `legacyScanIntervalMs` (60s), shared by the whole process. A worker that only writes per-instance keys can take up to that long to appear, and its descriptor up to that long to disappear after it stops.
 
 ```ts
 transports.bullmq({
   connection: env.get('REDIS_URL'),
   workerRegistry: {
-    legacyScan: true, // default; set false once every worker writes the hashes
+    legacyWrites: true, // default; false once every reader runs this version
+    legacyWriteIntervalMs: 30_000, // default
+    legacyScan: true, // default; false once every worker runs this version
     legacyScanIntervalMs: 60_000, // default
-    connection: { ...redisOptions, db: 2 }, // optional: keep the registry hashes on another db
+    connection: { ...redisOptions, db: 2 }, // optional: keep the registry hash on another db
   },
 })
 ```
+
+With both turned off, an instance with 85 handlers costs the registry about 0.2 Redis commands per second: one `HSET` per 10s beat and one `HGETALL` per 30s. With the defaults it is about 6 per second, almost all of it the keys written for older readers.
 
 `workerRegistry.connection` takes the same forms as `connection` and holds the registry hashes; the per-instance keys stay on `connection`. Every process of the fleet must use the same value. Upstash only offers db `0`, so on Upstash point it at a separate database, or leave it unset.
 
 ### Upgrading a fleet
 
-1. Deploy this version everywhere. Engines read both the hashes and the per-instance keys, and workers write both, so engines and workers on different versions keep seeing each other while the deploy rolls. Runs in progress are not affected: the registry only advertises workers.
-2. Once every worker that shares the Redis (including NestJS and Python workers) writes the hashes, set `workerRegistry: { legacyScan: false }` on the engines. The engine then never walks the keyspace.
-3. A later major version stops writing the per-instance keys.
+1. Deploy this version everywhere, with the defaults. Its workers still write what older engines and consoles read, and its engines still read older workers, so a rolling deploy keeps every side visible. Runs in progress are not affected: the registry only advertises workers.
+2. Once every process that **reads** the registry runs this version (engines, consoles, control planes, and no NestJS or Python control plane reads this Redis), set `legacyWrites: false` on the workers.
+3. Once every process that **writes** the registry runs this version (no NestJS or Python worker shares the Redis either), set `legacyScan: false` on the engines. The engine then never walks the keyspace.
 
 ## Subscriber health (`pingIntervalMs`)
 
@@ -267,7 +284,7 @@ The same transport also carries:
 
 ## Shutdown
 
-`closeTimeoutMs` (default `5000` ms) limits how long `close()` waits for a graceful shutdown. `0` skips the wait. Workers close first, concurrently, so a step that is still running can publish its result. The queues close after that. Both phases share one deadline. `close()` first aborts the `log.signal` of every step still running, so a long step can stop between units of work and finish inside the budget (see [Stopping a long step on shutdown](/docs/durable/concepts/workflows-and-steps#stopping-a-long-step-on-shutdown)). A step still running when the deadline passes is handed back to the broker: `moveToDelayed(now)` under its lock, which does not count an attempt, so another worker runs it at once instead of BullMQ finding it stalled after the process is gone (and, past `maxStalledCount`, failing it with "job stalled more than allowable limit"). Its handler keeps running until the process exits, but publishes nothing. Then the transport disconnects its pub/sub, heartbeat and liveness connections. A job that could not be handed back (its lock already lost) is still recovered through BullMQ's stalled-job handling and the [crash-recovery bridge](#crash-recovery). `close()` does not delete the process's liveness keys: the worker stays listed for up to 35 s after it stops. The provider calls `close()` on app shutdown.
+`closeTimeoutMs` (default `5000` ms) limits how long `close()` waits for a graceful shutdown. `0` skips the wait. Workers close first, concurrently, so a step that is still running can publish its result. The queues close after that. Both phases share one deadline. `close()` first aborts the `log.signal` of every step still running, so a long step can stop between units of work and finish inside the budget (see [Stopping a long step on shutdown](/docs/durable/concepts/workflows-and-steps#stopping-a-long-step-on-shutdown)). A step still running when the deadline passes is handed back to the broker: `moveToDelayed(now)` under its lock, which does not count an attempt, so another worker runs it at once instead of BullMQ finding it stalled after the process is gone (and, past `maxStalledCount`, failing it with "job stalled more than allowable limit"). Its handler keeps running until the process exits, but publishes nothing. Then the transport disconnects its pub/sub, heartbeat and liveness connections. A job that could not be handed back (its lock already lost) is still recovered through BullMQ's stalled-job handling and the [crash-recovery bridge](#crash-recovery). `close()` removes the process's registry entries, so the worker drops out of the fleet view at once. The provider calls `close()` on app shutdown.
 
 ## Options — `transports.bullmq(config)`
 
@@ -287,7 +304,9 @@ The same transport also carries:
 | `replyAliveTtlMs` | `15_000` | How long an engine's reply alive key outlives its last refresh. |
 | `replySweepMs` | `5_000` | How often a transport moves dead engines' routed results to the shared queue. |
 | `replyDrainIdleMs` | `90_000` | How long a dead engine's emptied reply queue is still watched before it is forgotten. |
-| `workerRegistry` | `{ legacyScan: true, legacyScanIntervalMs: 60_000 }` | How the worker registry is read, and an optional separate `connection` for its hashes. See [Where the registry lives](#where-the-registry-lives). |
+| `drainDelay` | `30` | Seconds a worker blocks on an empty queue before polling it again. See [Idle queues](#idle-queues-draindelay). |
+| `stalledInterval` | `30_000` (BullMQ's) | How often (ms) each worker checks its queue for jobs of a crashed worker. See [Stalled-job checks](#stalled-job-checks-stalledinterval). |
+| `workerRegistry` | `{ legacyWrites: true, legacyWriteIntervalMs: 30_000, legacyScan: true, legacyScanIntervalMs: 60_000 }` | What the worker registry writes and reads for older versions, and an optional separate `connection` for its hash. See [Where the registry lives](#where-the-registry-lives). |
 | `onError` | swallowed / `console.warn` | Receives background failures: heartbeat refresh errors, result-publish errors, pub/sub subscribe failures and subscriber connection errors, unreadable fleet keyspaces, and a result the transport gave up on. |
 
 `transports.bullmq(config)` returns the lazy driver thunk used in `config/durable.ts`. The underlying `BullMQTransport` class (with `createBullMQDeps`) is also exported from `@adonis-agora/durable` if you want to build one by hand.
@@ -304,10 +323,9 @@ The same transport also carries:
 | `<P>-decisions` | queue | workers → engine | remote workflow decisions |
 | `<P>-step-events` | queue | workers → engine | streamed local-step lifecycle from remote workflows |
 | `<P>-heartbeat` | pub/sub | workers → engine | liveness for `timeoutMs` steps |
-| `<P>-workers:heartbeats:<token>` | hash, field per instance | workers → engine | worker liveness + live status, value `{ expiresAt, value }` |
-| `<P>-workers:descriptors:<token>` | hash, field per instance | workers → engine | a [worker runtime](/docs/durable/cluster/thin-workers)'s handshake descriptor, value `{ expiresAt, value }` |
-| `<P>-workers:tokens` | sorted set | workers → engine | the tokens with a registry hash |
-| `<P>-worker-heartbeat:<token>:<instance>` | key, `EX 35` | workers → engine | worker liveness + live status (per-instance form) |
+| `<P>-workers:instances` | hash, field per instance | workers → engine | the worker registry: each instance's tokens with their liveness + live status and [worker runtime](/docs/durable/cluster/thin-workers) descriptor |
+| `<P>-workers:heartbeats:<token>`, `<P>-workers:descriptors:<token>`, `<P>-workers:tokens` | hash per token, sorted set | workers → engine | the registry as 1.0.0-rc.31 reads it (written while `legacyWrites` is on) |
+| `<P>-worker-heartbeat:<token>:<instance>` | key, TTL'd | workers → engine | worker liveness + live status (per-instance form, read by older versions and the other SDKs) |
 | `<P>-worker-descriptor:<token>:<instance>` | key, TTL'd | workers → engine | handshake descriptor (per-instance form) |
 | `<P>-runs` | queue | engine → engines | the [run queue](/docs/durable/reliability/multi-instance#where-a-run-executes) of the namespace in `<P>`: runs for any driving instance of that namespace to execute (job `run`, a `RunDispatch`; a start's job id is `start-<runId>-<key>`; the run's `priority` becomes the job priority) |
 | `<P>-start-run`, `<P>-run-request` | queue | tenant → control plane | store-less start / read / control requests |
