@@ -120,6 +120,17 @@ Total parallelism across a fleet is `concurrency × replicas`. In both modes, th
 
 The transport's `concurrency` is separate from a [flow-control queue](/docs/durable/reliability/flow-control)'s `concurrency`. That one limits what the engine *admits*. This one limits how many admitted steps a worker *runs* at once.
 
+## Idle queues (`drainDelay`)
+
+A worker blocks on each empty queue for `drainDelay` seconds before it polls that queue again. A new job wakes it at once, and a delayed job's due time shortens the wait, so `drainDelay` only sets how often **idle** queues are polled. Each poll costs a handful of Redis commands per queue, so a fleet with many step queues pays for it on every idle queue. Default `30`.
+
+```ts title="config/durable.ts"
+transports.bullmq({
+  connection: { host: env.get('REDIS_HOST'), port: env.get('REDIS_PORT') },
+  drainDelay: 30, // seconds
+})
+```
+
 ## Result concurrency
 
 `concurrency` applies to the **task** queues a worker consumes. The engine side consumes the shared `<P>-results` queue, and holds at least 512 results at once per instance, or `resultConcurrency` when that is higher. A non-finite or sub-1 value is ignored, and a fractional value is rounded down.

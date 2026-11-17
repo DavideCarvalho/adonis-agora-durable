@@ -3415,12 +3415,20 @@ export class WorkflowEngine {
    * last {@link LIFECYCLE_HEAL_WINDOW_MS} (see {@link healLifecycleEvents}). Returns how many marked
    * runs it published plus how many waiters it woke; healed runs are not counted.
    */
-  async sweepLifecycleEvents(nowMs: number = this.clock(), limit = 100): Promise<number> {
+  async sweepLifecycleEvents(
+    nowMs: number = this.clock(),
+    limit = 100,
+    options: { owed?: boolean } = {},
+  ): Promise<number> {
     await this.heartbeatLifecycleRegistry();
     // A failed read is tried again on every tick, so unresolved runs resolve once the fleet is back.
     if (this.announcedSubscriptionsSnapshot?.ok === false)
       await this.refreshAnnouncedSubscriptions();
     else await this.freshAnnouncedSubscriptions();
+    // `owed: false`: only the cheap per-tick work (registry row, subscription snapshot, run waiters).
+    // The owed-run listing filters settled runs by tag, which no index can serve; the heal reads
+    // recently settled runs per source workflow.
+    if (options.owed === false) return this.sweepRunWaits(limit);
     const actionable = await this.lifecycleActionableRuns(nowMs, limit);
     let published = 0;
     for (const run of actionable) {

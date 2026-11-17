@@ -220,6 +220,13 @@ export interface BullMQTransportConfig {
   /** Logical deployment namespace, segmenting every queue/channel/key. `"default"`/absent = unchanged. */
   namespace?: string;
   /**
+   * How long (seconds) each BullMQ worker blocks on an EMPTY queue before polling it again (BullMQ
+   * `drainDelay`). A new job wakes the worker at once and a delayed job's due time shortens the wait,
+   * so this only sets how often idle queues are re-polled: one poll is ~7 Redis commands, per queue.
+   * Default 30 (BullMQ's own default is 5).
+   */
+  drainDelay?: number;
+  /**
    * How many tasks a worker runs concurrently from each of its queues (BullMQ `Worker` concurrency).
    * A number pins it: default 1, and a non-finite or sub-1 value falls back to 1.
    *
@@ -487,6 +494,7 @@ export const transports = {
       const deps = await createBullMQDeps(
         config.connection,
         typeof config.concurrency === 'number' ? config.concurrency : 1,
+        config.drainDelay,
       );
       return new BullMQTransport({
         deps,

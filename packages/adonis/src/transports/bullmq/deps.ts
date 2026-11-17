@@ -177,9 +177,20 @@ function withUrlResolved(connection: unknown): unknown {
   return { ...redisUrlToOptions(url), ...rest };
 }
 
+/** Seconds a BullMQ worker blocks on an empty queue before polling it again (BullMQ's default is 5). */
+export const DEFAULT_DRAIN_DELAY_SECONDS = 30;
+
+/** A usable `drainDelay`: a finite number above 0, else the default. */
+function drainDelayOf(value: number | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? value
+    : DEFAULT_DRAIN_DELAY_SECONDS;
+}
+
 export async function createBullMQDeps(
   rawConnection: unknown,
   concurrency = 1,
+  drainDelay?: number,
 ): Promise<BullMQDeps> {
   const connection =
     typeof rawConnection === 'string'
@@ -238,6 +249,7 @@ export async function createBullMQDeps(
       new Worker(name, (job, token) => process(job, token), {
         connection: workerConnection(),
         concurrency: workerConcurrency(opts?.concurrency, defaultConcurrency),
+        drainDelay: drainDelayOf(drainDelay),
       }),
     makeRedis,
   };
