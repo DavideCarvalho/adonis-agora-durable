@@ -51,6 +51,7 @@ const STUBS = [
   { path: 'database/migrations/create_durable_transport_tables.stub' },
   { path: 'database/migrations/create_durable_transport_worker_keys.stub' },
   { path: 'database/migrations/create_durable_transport_messages.stub' },
+  { path: 'database/migrations/add_durable_run_list_indexes.stub' },
   { path: 'make/workflow/main.stub', entity: 'order' },
 ];
 

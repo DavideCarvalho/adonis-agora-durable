@@ -1,0 +1,34 @@
+{{{
+  exports({ to: app.migrationsPath(`${new Date().getTime() + 4}_add_durable_run_list_indexes.ts`) })
+}}}
+import app from '@adonisjs/core/services/app'
+import { BaseSchema } from '@adonisjs/lucid/schema'
+import db from '@adonisjs/lucid/services/db'
+import { createDurableRunListIndexes, dropDurableRunListIndexes } from '@adonis-agora/durable'
+
+/**
+ * The database schema the durable tables live in: the top-level \`schema\` of config/durable.ts.
+ */
+const configured = app.config.get('durable.schema', undefined)
+const schema = typeof configured === 'string' ? configured : undefined
+
+/**
+ * The runs board's list index: a status chip reads its newest runs straight from
+ * \`(status, created_at, id)\` instead of sorting every run of that status. Run it once on an
+ * existing install; it creates only what is missing.
+ *
+ * On Postgres the index is built CONCURRENTLY, so the runs table stays writable while it builds.
+ * That cannot run inside a transaction, hence \`disableTransactions\` and the connection checked out
+ * through \`db\`.
+ */
+export default class extends BaseSchema {
+  static disableTransactions = true
+
+  async up() {
+    await createDurableRunListIndexes(db, this.db.connectionName, { schema })
+  }
+
+  async down() {
+    await dropDurableRunListIndexes(db, this.db.connectionName, { schema })
+  }
+}
