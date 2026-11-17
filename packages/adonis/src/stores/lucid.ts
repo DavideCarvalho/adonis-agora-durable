@@ -1051,6 +1051,24 @@ export class LucidStateStore implements StateStore {
     return (rows as RunRow[]).map(rowToRun);
   }
 
+  async nextDueTimerAt(namespace?: string): Promise<number | undefined> {
+    const suspended = () => {
+      const q = this.fenced(this.client().from(this.t.runs).where('status', 'suspended'));
+      if (namespace !== undefined) q.whereIn('namespace', namespaceFilterValues(namespace));
+      return q;
+    };
+    // Both served by an index: (status, wake_requested_at) and (status, wake_at).
+    const [requested, soonest] = await Promise.all([
+      (await this.hasWakeMarkerColumn())
+        ? suspended().whereNotNull('wake_requested_at').select('id').first()
+        : null,
+      suspended().whereNotNull('wake_at').min('wake_at as at').first(),
+    ]);
+    if (requested) return 0;
+    const at = (soonest as { at?: number | string | null } | null)?.at;
+    return at == null ? undefined : Number(at);
+  }
+
   // --- recovery lease (atomic) --------------------------------------------
 
   async tryLockRun(

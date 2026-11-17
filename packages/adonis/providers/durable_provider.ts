@@ -676,6 +676,9 @@ export default class DurableProvider {
     );
     this.#embeddedWorkerLoop = runWorkerLoop(engine, {
       intervalMs: config.worker.intervalMs ?? 1000,
+      ...(config.worker.maxIdleIntervalMs !== undefined
+        ? { maxIdleIntervalMs: config.worker.maxIdleIntervalMs }
+        : {}),
       drainTimeoutMs: this.#drainTimeoutMs,
       stopSignal,
       schedules,
