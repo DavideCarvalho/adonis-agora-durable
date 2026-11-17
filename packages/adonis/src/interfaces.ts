@@ -2192,6 +2192,11 @@ export interface GroupHealth {
   queueDepth?: number;
   /** `depth` was counted from a sample of the shared queue's jobs and may undercount. */
   depthSampled?: boolean;
+  /**
+   * The part of `depth` still waiting on the group's own (per-handler) queue while it is drained
+   * after a switch to a shared {@link queue}. Not part of `queueDepth`.
+   */
+  drainingDepth?: number;
 }
 
 /**

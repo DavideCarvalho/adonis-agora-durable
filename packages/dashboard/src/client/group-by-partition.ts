@@ -51,6 +51,8 @@ export function groupByPartition(groups: GroupHealth[]): PartitionView[] {
           group.queue,
           Math.max(sharedDepth.get(group.queue) ?? 0, group.queueDepth ?? group.depth),
         );
+        // The backlog still draining from the group's old queue is not in `queueDepth`.
+        totalDepth += group.drainingDepth ?? 0;
       } else {
         totalDepth += group.depth;
       }

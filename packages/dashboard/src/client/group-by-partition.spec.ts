@@ -83,6 +83,15 @@ describe('groupByPartition', () => {
     expect(groupByPartition([group({ group: 'A', depth: 1 })])[0]?.sharedQueues).toEqual([]);
   });
 
+  it("adds the backlog still draining from a group's old queue to the partition total", () => {
+    const shared = { queue: 'durable-taskgroup', queueDepth: 10 };
+    const [view] = groupByPartition([
+      group({ group: 'charge', depth: 9, ...shared, drainingDepth: 5 }),
+      group({ group: 'refund', depth: 6, ...shared }),
+    ]);
+    expect(view.totalDepth).toBe(15);
+  });
+
   it('empty input returns an empty array', () => {
     expect(groupByPartition([])).toEqual([]);
   });

@@ -2394,6 +2394,7 @@ export class BullMQTransport implements Transport {
       queue: name,
       queueDepth: snapshot.total,
       ...(snapshot.sampled ? { depthSampled: true } : {}),
+      ...(legacyDepth > 0 ? { drainingDepth: legacyDepth } : {}),
     };
   }
 
