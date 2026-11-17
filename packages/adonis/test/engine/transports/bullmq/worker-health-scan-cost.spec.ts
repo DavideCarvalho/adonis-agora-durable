@@ -143,7 +143,7 @@ describe('BullMQ worker health — SCAN cost', () => {
 
     // … and once it is older than the reuse window (well under the 35s key TTL) a new walk sees changes.
     const now = Date.now();
-    vi.spyOn(Date, 'now').mockReturnValue(now + 1_500);
+    vi.spyOn(Date, 'now').mockReturnValue(now + 5_500);
     redis.store.delete('durable-worker-heartbeat:reports:pod-2');
     const fresh = await engine.workerHealth();
     expect(redis.scanCalls).toBe(2 * walk(redis, 1_000));

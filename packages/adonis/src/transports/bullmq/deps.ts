@@ -70,6 +70,17 @@ export interface RedisLike {
   /** Batched read — optional: a client without it falls back to per-key `get`. */
   mget?(...keys: string[]): Promise<(string | null)[]>;
   /**
+   * The worker registry's hash + sorted-set commands. Optional: a client without them gets no
+   * registry hashes, and worker liveness and descriptors are read from the per-instance keys alone.
+   */
+  hset?(key: string, field: string, value: string): Promise<number>;
+  hgetall?(key: string): Promise<Record<string, string>>;
+  hdel?(key: string, ...fields: string[]): Promise<number>;
+  pexpire?(key: string, ms: number): Promise<number>;
+  zadd?(key: string, score: number, member: string): Promise<unknown>;
+  zrangebyscore?(key: string, min: number | string, max: number | string): Promise<string[]>;
+  zremrangebyscore?(key: string, min: number | string, max: number | string): Promise<number>;
+  /**
    * Liveness probe the subscriber watchdog sends (legal in subscriber mode). Optional: a client
    * without it is simply never probed.
    */

@@ -160,3 +160,34 @@ export function workerHeartbeatKey(effPrefix: string, token: string, instanceId:
 export function workerDescriptorTokenPrefix(effPrefix: string, token: string): string {
   return `${effPrefix}-worker-descriptor:${token}:`;
 }
+
+/**
+ * Prefix of the per-instance worker keys a single SCAN walk reads for compatibility with writers that
+ * only write those keys: `${P}-worker-` covers both `${P}-worker-heartbeat:` and
+ * `${P}-worker-descriptor:` (the walk filters on those two segments).
+ */
+export function legacyWorkerKeysPrefix(effPrefix: string): string {
+  return `${effPrefix}-worker-`;
+}
+
+/** The two kinds of entry the worker registry holds. */
+export type WorkerRegistryKind = 'heartbeats' | 'descriptors';
+
+/**
+ * `${P}-workers:<kind>:<token>`: one hash per routing token, one field per instance, each value
+ * `{ expiresAt, value }`. `workers:` (plural, then `:`) never matches the `${P}-worker-heartbeat:*` /
+ * `${P}-worker-descriptor:*` patterns older readers SCAN, nor the `${P}-worker-*` compatibility walk,
+ * so an older reader never reads a hash as a key, and the walk never visits the hashes.
+ */
+export function workerRegistryHashKey(
+  effPrefix: string,
+  kind: WorkerRegistryKind,
+  token: string,
+): string {
+  return `${effPrefix}-workers:${kind}:${token}`;
+}
+
+/** `${P}-workers:tokens`: sorted set of the routing tokens with a registry hash (score = expiry, ms). */
+export function workerRegistryIndexKey(effPrefix: string): string {
+  return `${effPrefix}-workers:tokens`;
+}
