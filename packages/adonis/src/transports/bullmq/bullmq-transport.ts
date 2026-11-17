@@ -687,10 +687,9 @@ export class BullMQTransport implements Transport {
     const client = this.#deps.makeRedis();
     return {
       set: async (key, value, mode, ttl) => {
-        await Promise.all([
-          client.set(key, value, mode, ttl),
-          this.#mirrorWorkerKey(key, value, ttl),
-        ]);
+        // The per-instance key is the source of truth: mirror it into the hash only once it is written.
+        await client.set(key, value, mode, ttl);
+        await this.#mirrorWorkerKey(key, value, ttl);
       },
       del: async (...keys) => {
         await Promise.all([client.del?.(...keys), this.#unmirrorWorkerKeys(keys)]);
@@ -1405,22 +1404,25 @@ export class BullMQTransport implements Transport {
     const beatOne = (t: string, written?: () => void): void => {
       const effPrefix = this.#effectivePrefix();
       const value = heartbeatKeyValue(Date.now(), this.#workerStatus());
-      void Promise.all([
-        client.set(
+      // The per-instance key first, then its hash field: old and new readers never disagree on a
+      // beat that only half landed.
+      void client
+        .set(
           workerHeartbeatKey(effPrefix, t, this.#instanceId),
           value,
           'EX',
           WORKER_HEARTBEAT_TTL_SECONDS,
-        ),
-        this.#registryWrite(
-          effPrefix,
-          'heartbeats',
-          t,
-          this.#instanceId,
-          value,
-          WORKER_HEARTBEAT_TTL_SECONDS,
-        ),
-      ])
+        )
+        .then(() =>
+          this.#registryWrite(
+            effPrefix,
+            'heartbeats',
+            t,
+            this.#instanceId,
+            value,
+            WORKER_HEARTBEAT_TTL_SECONDS,
+          ),
+        )
         .then(() => written?.())
         .catch((err) => this.#onError(err));
     };
@@ -1597,7 +1599,7 @@ export class BullMQTransport implements Transport {
     const now = Date.now();
     const list =
       tokens ?? (await client.zrangebyscore(workerRegistryIndexKey(effPrefix), now, '+inf'));
-    // Sent together: the client pipelines them on its connection, one round trip for all tokens.
+    // Issued together (concurrently), one command per token: not atomic, not one round trip.
     const hashes = await Promise.all(
       list.map((t) => client.hgetall(workerRegistryHashKey(effPrefix, kind, t))),
     );

@@ -225,7 +225,7 @@ A worker writes each entry twice:
 - as a field of its token's hash, `<P>-workers:heartbeats:<token>` or `<P>-workers:descriptors:<token>`, with the token listed in the sorted set `<P>-workers:tokens`. The engine reads these with one `HGETALL` per token, so the cost does not grow with the size of the Redis db;
 - as a per-instance key, `<P>-worker-heartbeat:<token>:<instanceId>` or `<P>-worker-descriptor:<token>:<instanceId>`, which older versions of this package and the NestJS and Python SDKs read and write.
 
-To see workers that only write per-instance keys, the engine also walks those keys with `SCAN`. The walk is shared by every read in the process and runs at most once per `legacyScanIntervalMs` (60s by default), so a worker that only writes per-instance keys can take up to that long to appear. A heartbeat read is reused for 5s and a token's descriptors for 5s; a worker's own new handler shows up at once.
+To see workers that only write per-instance keys, the engine also walks those keys with `SCAN`. The walk is shared by every read in the process and runs at most once per `legacyScanIntervalMs` (60s by default), so a worker that only writes per-instance keys can take up to that long to appear, and its descriptor (which routing reads) up to that long to disappear after it stops. A heartbeat read is reused for 5s and a token's descriptors for 5s; a worker's own new handler shows up at once.
 
 ```ts
 transports.bullmq({
