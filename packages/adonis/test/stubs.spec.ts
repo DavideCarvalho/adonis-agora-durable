@@ -61,6 +61,7 @@ const PUBLISHED: { path: string; entity?: string }[] = [
   { path: 'database/migrations/create_durable_transport_tables.stub' },
   { path: 'database/migrations/create_durable_transport_worker_keys.stub' },
   { path: 'database/migrations/create_durable_transport_messages.stub' },
+  { path: 'database/migrations/add_durable_run_list_indexes.stub' },
   // Not published by `configure` — emitted by `node ace make:workflow <name>`.
   { path: 'make/workflow/main.stub', entity: 'order' },
 ];

@@ -873,6 +873,76 @@ async function alignMysqlCollation(
 }
 
 /**
+ * The runs board's list index: the status chips page newest first with `(status, created_at, id)`
+ * instead of reading every run of that status to sort it. Not part of {@link createDurableTables}
+ * (boot): on a runs table that already holds millions of rows the build is long, so it ships as the
+ * opt-in `add_durable_run_list_indexes` migration.
+ */
+export const DURABLE_RUN_LIST_INDEXES: ReadonlyArray<readonly [name: string, columns: string[]]> = [
+  ['durable_runs_status_created_id_idx', ['status', 'created_at', 'id']],
+];
+
+/**
+ * Create the missing {@link DURABLE_RUN_LIST_INDEXES} — what the opt-in migration runs, once, on an
+ * existing install. On Postgres each is built `CONCURRENTLY IF NOT EXISTS`, so reads and writes of the
+ * runs table go on while it builds (run it outside a transaction); elsewhere a plain index, skipped
+ * when it is already there.
+ */
+export async function createDurableRunListIndexes(
+  db: Database,
+  connectionName?: string,
+  options: { schema?: string | undefined } = {},
+): Promise<void> {
+  const connection = db.connection(connectionName);
+  const schema = validateSchemaName(options.schema, 'createDurableRunListIndexes');
+  assertSchemaSupported(connection, schema, 'createDurableRunListIndexes');
+  const table = qualify(schema, DURABLE_TABLES.runs);
+  for (const [name, columns] of DURABLE_RUN_LIST_INDEXES) {
+    if (connection.dialect.name === 'postgres') {
+      await connection.rawQuery(
+        `create index concurrently if not exists ?? on ?? (${columns.map(() => '??').join(', ')})`,
+        [name, table, ...columns],
+      );
+      continue;
+    }
+    try {
+      await connection.schema.alterTable(table, (t) => {
+        t.index(columns, name);
+      });
+    } catch (error) {
+      // MySQL and SQLite say "already exists" / "Duplicate key name": the index is there.
+      if (!/already exists|duplicate key name/i.test((error as Error).message)) throw error;
+    }
+  }
+}
+
+/** Drop {@link DURABLE_RUN_LIST_INDEXES} (the opt-in migration's `down()`). */
+export async function dropDurableRunListIndexes(
+  db: Database,
+  connectionName?: string,
+  options: { schema?: string | undefined } = {},
+): Promise<void> {
+  const connection = db.connection(connectionName);
+  const schema = validateSchemaName(options.schema, 'dropDurableRunListIndexes');
+  const table = qualify(schema, DURABLE_TABLES.runs);
+  for (const [name, columns] of DURABLE_RUN_LIST_INDEXES) {
+    if (connection.dialect.name === 'postgres') {
+      await connection.rawQuery('drop index concurrently if exists ??', [qualify(schema, name)]);
+      continue;
+    }
+    try {
+      await connection.schema.alterTable(table, (t) => {
+        t.dropIndex(columns, name);
+      });
+    } catch (error) {
+      if (!/no such index|check that .* exists|can't drop/i.test((error as Error).message)) {
+        throw error;
+      }
+    }
+  }
+}
+
+/**
  * Drop every durable table (reverse FK order), in `options.schema` when set (the schema itself is
  * left). Used by tests and migration `down`.
  */

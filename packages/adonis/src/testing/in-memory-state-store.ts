@@ -940,8 +940,24 @@ export class InMemoryStateStore implements StateStore {
       this.lastAttributeCandidates = ids.size;
       runs = runs.filter((r) => ids.has(r.id));
     }
-    // Newest first (matches the store adapters' `createdAt DESC`) — recent runs on top in the dashboard.
-    runs.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+    // Newest first, `id` breaking a tie (the store adapters' `createdAt DESC, id DESC`) — recent runs
+    // on top in the dashboard.
+    runs.sort(
+      (a, b) =>
+        b.createdAt.getTime() - a.createdAt.getTime() || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0),
+    );
+    const after = query.after;
+    if (after !== undefined) {
+      // Keyset: strictly past the previous page's last run; `page` is ignored.
+      const past = runs.filter(
+        (r) =>
+          r.createdAt.getTime() < after.createdAt ||
+          (r.createdAt.getTime() === after.createdAt && r.id < after.id),
+      );
+      return (query.size === undefined ? past : past.slice(0, Math.max(0, query.size))).map(
+        copyRun,
+      );
+    }
     // 1-based `page`/`size` in, 0-based slice out — same resolution the SQL adapters apply.
     const { limit, offset } = runPageWindow(query);
     return runs.slice(offset, limit === undefined ? undefined : offset + limit).map(copyRun);

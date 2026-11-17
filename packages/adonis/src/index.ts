@@ -176,12 +176,15 @@ export {
 } from './stores/lucid-mappers.js';
 export {
   type CreateDurableTablesOptions,
+  createDurableRunListIndexes,
   createDurableTables,
   DURABLE_JSON_COLUMNS,
+  DURABLE_RUN_LIST_INDEXES,
   DURABLE_SCHEMA_META_TABLE,
   DURABLE_SCHEMA_REVISION,
   DURABLE_TABLES,
   type DurableSchemaLogger,
+  dropDurableRunListIndexes,
   dropDurableTables,
 } from './stores/lucid-schema.js';
 export type {

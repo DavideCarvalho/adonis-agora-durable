@@ -59,7 +59,13 @@ function narrow(
  */
 export function runQueryString(
   predicates: RunPredicates,
-  paginate: { page?: number | undefined; size?: number | undefined } = {},
+  paginate: {
+    page?: number | undefined;
+    size?: number | undefined;
+    /** Page by cursor: `first` (= `size`) and, past the first page, `after`. */
+    cursor?: boolean | undefined;
+    after?: string | undefined;
+  } = {},
   groupByCount?: { field: RunValueField; limit?: number; offset?: number; search?: string },
 ): string {
   // The class, not the `filterQuery()` factory: the console owns query-building (predicates,
@@ -88,8 +94,15 @@ export function runQueryString(
   // Offset paging: a 1-based `page` and a `size` (`?page=2&size=100`). Sent through `set()` rather
   // than the builder's `page(page, size)` so a caller that names only one of the two leaves the
   // other to the server's default (page 1, size 50) instead of the builder's own (25).
-  if (paginate.page !== undefined) builder.set('page', paginate.page);
-  if (paginate.size !== undefined) builder.set('size', paginate.size);
+  if (paginate.cursor) {
+    // Cursor paging (`?first=100&after=…`): no offset and no total; the next page starts after the
+    // last run of this one.
+    if (paginate.size !== undefined) builder.set('first', paginate.size);
+    if (paginate.after !== undefined) builder.set('after', paginate.after);
+  } else {
+    if (paginate.page !== undefined) builder.set('page', paginate.page);
+    if (paginate.size !== undefined) builder.set('size', paginate.size);
+  }
 
   // The values-picker envelope rides the same builder: the scope above plus the axis it
   // enumerates. `limit`/`offset`/`search` here bound the offered VALUES — that is filter's own

@@ -121,6 +121,71 @@ describe('JSON handlers', () => {
     expect(body.statuses).toContain('blocked');
   });
 
+  it('listRuns pages by cursor with first/after: every run once, no total, filters kept', async () => {
+    for (let n = 0; n < 5; n++) {
+      await raw.start('greet', {}, `run-${n}`);
+      await raw.waitForRun(`run-${n}`);
+    }
+    await raw.start('boom', {}, 'run-bad');
+    await raw.waitForRun('run-bad');
+
+    type CursorBody = {
+      data: Array<{ id: string }>;
+      meta: { nextCursor: string | null; hasNext: boolean; hasPrev: boolean; total?: number };
+      statuses: string[];
+    };
+    const seen: string[] = [];
+    let after: string | null = null;
+    for (let guard = 0; guard < 10; guard++) {
+      const res = await listRuns(
+        deps,
+        req({
+          query: { filter: { workflow: 'greet' }, first: '2', ...(after ? { after } : {}) },
+        }),
+      );
+      expect(res.status).toBe(200);
+      const body = res.body as CursorBody;
+      expect(body.meta.total).toBeUndefined();
+      expect(body.meta.hasPrev).toBe(after !== null);
+      expect(body.statuses).toContain('failed');
+      seen.push(...body.data.map((run) => run.id));
+      if (!body.meta.hasNext) break;
+      after = body.meta.nextCursor;
+    }
+    expect(seen.sort()).toEqual(['run-0', 'run-1', 'run-2', 'run-3', 'run-4']);
+
+    for (const query of [{ after: 'forged' }, { before: 'x', last: '2' }]) {
+      expect((await listRuns(deps, req({ query }))).status).toBe(400);
+    }
+  });
+
+  it('listRuns ends the walk instead of repeating runs when the store ignores the cursor', async () => {
+    for (let n = 0; n < 3; n++) {
+      await raw.start('greet', {}, `run-${n}`);
+      await raw.waitForRun(`run-${n}`);
+    }
+    // A store from before `RunQuery.after`: it answers from the top whatever the cursor says.
+    const engine = deps.engine;
+    const legacy: Deps = {
+      engine: {
+        ...engine,
+        listRuns: (query) => {
+          const { after: _ignored, ...rest } = query;
+          return engine.listRuns(rest);
+        },
+      },
+    };
+    const first = (await listRuns(legacy, req({ query: { first: '2' } }))).body as {
+      data: Array<{ id: string }>;
+      meta: { nextCursor: string };
+    };
+    const second = (
+      await listRuns(legacy, req({ query: { first: '2', after: first.meta.nextCursor } }))
+    ).body as { data: Array<{ id: string }>; meta: { hasNext: boolean } };
+    expect(second.data.map((run) => run.id)).not.toContain(first.data[0]?.id);
+    expect(second.data.map((run) => run.id)).not.toContain(first.data[1]?.id);
+  });
+
   it('listRuns filters by filter[status]', async () => {
     await raw.start('greet', {}, 'run-ok');
     await raw.waitForRun('run-ok');

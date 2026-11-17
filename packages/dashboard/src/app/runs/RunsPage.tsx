@@ -251,18 +251,19 @@ export function RunsPage({
           namespace: namespaceFilter.length ? namespaceFilter : undefined,
           workflow: workflowFilter.length ? workflowFilter : undefined,
         },
-        { page: pageParam, size: RUNS_PAGE_SIZE },
+        // By cursor: each page starts after the last run of the one before, so loading more never
+        // re-reads (or counts) the runs above it.
+        { cursor: true, size: RUNS_PAGE_SIZE, ...(pageParam ? { after: pageParam } : {}) },
       ),
-    initialPageParam: 1,
-    getNextPageParam: (lastPage) => {
-      const { currentPage, lastPage: last } = lastPage.meta;
-      return currentPage < last ? currentPage + 1 : undefined;
-    },
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) =>
+      'nextCursor' in lastPage.meta ? (lastPage.meta.nextCursor ?? undefined) : undefined,
     // On an infinite query this refetches EVERY loaded page each interval — fine at this scale.
     refetchInterval: 3000,
   });
   const runs = useMemo(() => runsPages?.pages.flatMap((p) => p.data) ?? [], [runsPages]);
-  const totalMatching = runsPages?.pages[0]?.meta.total;
+  // No total: the list is paged by cursor and counts nothing. "N+" while more can be loaded.
+  const loadedCount = runsPages === undefined ? undefined : runs.length;
   // The status chips are counted by their own query: refresh them with every list refresh.
   useEffect(() => {
     if (runsUpdatedAt > 0) void qc.invalidateQueries({ queryKey: ['run-values', 'status'] });
@@ -402,8 +403,8 @@ export function RunsPage({
           <div>
             <h1 className="text-lg font-bold tracking-[0.01em] text-fg">Runs</h1>
             <p className="mt-1 text-xs text-faint">
-              {totalMatching !== undefined
-                ? `${totalMatching} ${anyFilter ? 'matching' : ''} run${totalMatching === 1 ? '' : 's'} · live`
+              {loadedCount !== undefined && (loadedCount > 0 || anyFilter)
+                ? `${loadedCount}${hasNextPage ? '+' : ''} ${anyFilter ? 'matching' : ''} run${loadedCount === 1 && !hasNextPage ? '' : 's'} · live`
                 : 'Every workflow run, live.'}
             </p>
           </div>

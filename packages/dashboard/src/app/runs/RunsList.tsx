@@ -210,9 +210,9 @@ export function RunsList({
    *  "these runs do not exist" when the truth is "this filter cannot match them". */
   emptyNotice: ReturnType<typeof emptyRunsNotice>;
   /** True while the server may still hold more runs matching the current tag/attr/namespace filter
-   *  beyond what's been fetched (`meta.currentPage < meta.lastPage`). */
+   *  beyond what's been fetched (`meta.hasNext`). */
   hasMore?: boolean;
-  /** True while a scroll-triggered `/runs?page=…` fetch is in flight. */
+  /** True while a scroll-triggered `/runs?after=…` fetch is in flight. */
   loadingMore?: boolean;
   /** Fetch the next page. Called once the virtualizer scrolls the last loaded row into view — the
    *  virtualizer already tracks exactly which rows are visible, so this composes for free instead of

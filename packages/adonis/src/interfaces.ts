@@ -1299,6 +1299,21 @@ export interface RunQuery {
   page?: number | undefined;
   /** Page size — how many runs one page returns. Omit for "every matching run" (no bound). */
   size?: number | undefined;
+  /**
+   * Keyset paging instead of {@link page}: only runs strictly past this position in the newest-first
+   * order `(createdAt DESC, id DESC)` — the `createdAt`/`id` of the last run the previous page
+   * returned. `page` is ignored; {@link size} bounds the page. A deep page then costs what the first
+   * one does (no offset to skip). Every built-in store honours it; a store that predates it returns
+   * from the top, which the console notices and ends the listing on rather than repeating rows.
+   */
+  after?: RunListPosition | undefined;
+}
+
+/** A position in the newest-first run listing — see {@link RunQuery.after}. */
+export interface RunListPosition {
+  /** The run's `createdAt`, epoch milliseconds. */
+  createdAt: number;
+  id: string;
 }
 
 /**
@@ -1308,7 +1323,7 @@ export interface RunQuery {
  * picker stay usable while a status chip is lit: the offered values don't collapse to the one status
  * being viewed.
  */
-export type RunFacetQuery = Omit<RunQuery, 'status' | 'statuses' | 'page' | 'size'>;
+export type RunFacetQuery = Omit<RunQuery, 'status' | 'statuses' | 'page' | 'size' | 'after'>;
 
 /**
  * The run predicates a bulk operation (a scoped retention policy, `engine.purgeRuns`) is confined
