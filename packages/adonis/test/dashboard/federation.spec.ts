@@ -87,6 +87,32 @@ describe('federated console', () => {
     expect((detail.body as { run: { workflow: string } }).run.workflow).toBe('approval');
   });
 
+  it('pages the other app’s runs by cursor, the same walk as this app’s', async () => {
+    const { engineB, app } = setup();
+    for (let i = 1; i <= 5; i += 1) await startRun(engineB, 'approval', {}, `b-page-${i}`);
+    const deps = { engine: app.engine() };
+    type Page = {
+      data: Array<{ id: string }>;
+      meta: { nextCursor: string | null; hasNext: boolean };
+    };
+    const seen: string[] = [];
+    let after: string | undefined;
+    for (let pages = 0; pages < 10; pages += 1) {
+      const res = await listRuns(deps, {
+        params: {},
+        query: { first: '2', ...(after ? { after } : {}) },
+      });
+      expect(res.status).toBe(200);
+      const body = res.body as Page;
+      expect(body.meta).not.toHaveProperty('total');
+      seen.push(...body.data.map((r) => r.id));
+      if (!body.meta.hasNext) break;
+      after = body.meta.nextCursor ?? undefined;
+    }
+    expect(seen).toHaveLength(5);
+    expect(new Set(seen)).toEqual(new Set([1, 2, 3, 4, 5].map((i) => `b-page-${i}`)));
+  });
+
   it('sends a signal to the owning engine, which resumes its run', async () => {
     const { engineB, app, ran, logged, storeA } = setup();
     await startRun(engineB, 'approval', {}, 'b-run-2');
