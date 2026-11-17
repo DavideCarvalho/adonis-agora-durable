@@ -116,6 +116,25 @@ function isIoredisClient(connection: RedisPubSub): connection is IoredisPubSub {
   return 'duplicate' in connection && typeof connection.duplicate === 'function';
 }
 
+/** `SET key value PX <ttl> NX`: `'OK'` for the one caller that wins the key, `null` for the rest. */
+type ConsoleClaim = (key: string, value: string) => Promise<unknown>;
+
+/**
+ * The atomic claim a console command needs, from either client: ioredis and `@adonisjs/redis`
+ * connections both expose `set` (the latter proxies its ioredis commands), and an `@adonisjs/redis`
+ * connection that doesn't still holds the ioredis client as `ioConnection`. `undefined` when neither
+ * can — the caller then refuses to answer commands instead of running each on every instance.
+ */
+function consoleClaim(connection: RedisPubSub): ConsoleClaim | undefined {
+  const target =
+    typeof connection.set === 'function'
+      ? connection
+      : (connection as { ioConnection?: Pick<IoredisPubSub, 'set'> }).ioConnection;
+  const set = target?.set;
+  if (typeof set !== 'function') return undefined;
+  return (key, value) => set.call(target, key, value, 'PX', CONSOLE_CLAIM_TTL_MS, 'NX');
+}
+
 export interface RedisControlPlaneOptions {
   /** An ioredis instance or an `@adonisjs/redis` connection used for pub/sub. */
   connection: RedisPubSub;
@@ -479,20 +498,30 @@ export class RedisControlPlane implements ControlPlane {
   /**
    * Run the console commands other apps' consoles send this app. Every instance subscribes; the one
    * that wins `SET <prefix>-console-claim:<id> NX` runs the command and publishes the answer, so a
-   * command runs once however many web and worker processes the app has.
+   * command runs once however many web and worker processes the app has. Throws when the connection
+   * can't run that `SET` — a command is never run without the claim.
    */
   onConsoleCommand(handler: (command: ConsoleCommand) => Promise<unknown>): void {
     if (this.commandsSubscribed) return;
+    // Fail closed: without an atomic claim every instance would run every command (a cancel or a
+    // retry N times), so refuse to answer at all rather than answer without one.
+    const claim = consoleClaim(this.connection);
+    if (!claim) {
+      throw new Error(
+        `the "${this.prefix}" control plane's Redis connection cannot run \`SET key value PX ms NX\`, so console commands cannot be claimed by one instance; refusing to answer them (pass an ioredis client or an @adonisjs/redis connection)`,
+      );
+    }
     this.commandsSubscribed = true;
     const instance = randomUUID();
     this.subscribeChannel(this.consoleChannel, (payload) => {
-      void this.runConsoleCommand(payload, instance, handler).catch(() => undefined);
+      void this.runConsoleCommand(payload, instance, claim, handler).catch(() => undefined);
     });
   }
 
   private async runConsoleCommand(
     payload: string,
     instance: string,
+    claim: ConsoleClaim,
     handler: (command: ConsoleCommand) => Promise<unknown>,
   ): Promise<void> {
     let command: ConsoleCommand;
@@ -502,16 +531,8 @@ export class RedisControlPlane implements ControlPlane {
       return;
     }
     if (typeof command?.id !== 'string' || typeof command.verb !== 'string') return;
-    if (typeof this.connection.set === 'function') {
-      const won = await this.connection.set(
-        `${this.prefix}-console-claim:${command.id}`,
-        instance,
-        'PX',
-        CONSOLE_CLAIM_TTL_MS,
-        'NX',
-      );
-      if (won !== 'OK') return;
-    }
+    const won = await claim(`${this.prefix}-console-claim:${command.id}`, instance);
+    if (won !== 'OK') return;
     let reply: ConsoleCommandReply;
     try {
       const args = decodeConsoleValue(command.args);

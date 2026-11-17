@@ -93,7 +93,8 @@ export class FederatedAppError extends Error {
 
 /**
  * Run the console commands other apps' consoles send this app, on `controlPlane`, against this app's
- * read/control port. Returns `false` when the control plane cannot carry them.
+ * read/control port. Returns `false` when the control plane cannot carry them; throws when it can
+ * but refuses to (the Redis control plane without an atomic claim), so no command runs unclaimed.
  */
 export function answerConsoleCommands(
   controlPlane: ControlPlane,
@@ -169,12 +170,8 @@ export class FederatedApp {
     return {
       // Reads: the app's store, as its own engine reads it.
       getRun: (runId) => store.getRun(runId),
-      listRuns: async (query) => {
-        const scoped = withoutBookkeepingRuns(query);
-        const runs = await store.listRuns(scoped);
-        const hidden = scoped.excludeWorkflows;
-        return hidden?.length ? runs.filter((run) => !hidden.includes(run.workflow)) : runs;
-      },
+      // The store honors `excludeWorkflows` itself, for the list and the count alike.
+      listRuns: (query) => store.listRuns(withoutBookkeepingRuns(query)),
       listCheckpoints: (runId) => store.listCheckpoints(runId),
       getRunChildren: (runId) => runChildrenFromStore(store, runId),
       getRunDetail: (runId, options) => loadRunDetail(source, runId, options),

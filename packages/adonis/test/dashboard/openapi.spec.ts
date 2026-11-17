@@ -45,8 +45,28 @@ describe('the dashboard OpenAPI document', () => {
       '/topology',
       '/compat',
       '/openapi.json',
+      '/apps',
     ];
     for (const path of expected) expect(doc.paths[path], path).toBeDefined();
     expect(Object.keys(doc.paths).sort()).toEqual([...expected].sort());
+  });
+
+  it('documents the federated console: ?app= on every app-scoped route, the /apps selector', () => {
+    const doc = openApiDocument('/durable/api') as {
+      components: { parameters: Record<string, { name: string; in: string }> };
+      paths: Record<string, Record<string, { parameters?: Array<{ $ref?: string }> }>>;
+    };
+    expect(doc.components.parameters.App).toMatchObject({ name: 'app', in: 'query' });
+    for (const [path, operations] of Object.entries(doc.paths)) {
+      for (const [method, operation] of Object.entries(operations)) {
+        const scoped = (operation.parameters ?? []).some(
+          (p) => p.$ref === '#/components/parameters/App',
+        );
+        expect(scoped, `${method.toUpperCase()} ${path}`).toBe(
+          path !== '/openapi.json' && path !== '/apps',
+        );
+      }
+    }
+    expect(doc.paths['/apps']?.get).toBeDefined();
   });
 });

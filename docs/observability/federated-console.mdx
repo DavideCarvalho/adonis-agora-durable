@@ -67,6 +67,8 @@ With `consoleCommands: true`, every instance of the app (web and `durable:work`)
 [durable] federated console: cancel run_01J… by ops@example.com
 ```
 
+An instance takes an action by setting a short-lived Redis key (`SET … NX`), so the control plane's connection must run Redis commands: an `@adonisjs/redis` connection or an ioredis client both do. If it can't, the app answers no action at all and logs why at boot, rather than running each action on every instance.
+
 Anything that can publish on that Redis can ask for these actions, the same trust the control plane's cancel messages already rely on.
 
 ## Database access

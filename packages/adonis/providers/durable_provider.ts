@@ -718,12 +718,21 @@ export default class DurableProvider {
     const engine = await this.app.container.make(WorkflowEngine);
     const logger = await this.#resolveLogger();
     const controlPlane = this.#controlPlane;
-    if (
-      !controlPlane ||
-      !answerConsoleCommands(controlPlane, storeDashboardEngine(engine), (line) =>
-        logger.info(line),
-      )
-    ) {
+    let answering: boolean;
+    try {
+      answering =
+        !!controlPlane &&
+        answerConsoleCommands(controlPlane, storeDashboardEngine(engine), (line) =>
+          logger.info(line),
+        );
+    } catch (err) {
+      // The control plane refused (no atomic claim): this app answers no console command at all.
+      logger.error(
+        `[durable] consoleCommands is on, but ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
+    if (!answering) {
       logger.error(
         '[durable] consoleCommands is on, but the control plane cannot carry console commands (use controlPlanes.redis)',
       );
