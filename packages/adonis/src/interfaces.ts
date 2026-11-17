@@ -2183,6 +2183,20 @@ export interface GroupHealth {
   depth: number;
   /** Workers with a non-expired heartbeat for this group. */
   liveWorkers: WorkerHeartbeat[];
+  /**
+   * The broker queue the group's tasks wait on, when it is shared with other groups (the BullMQ
+   * transport's `taskQueues: 'grouped'`). Absent when the group has a queue of its own.
+   */
+  queue?: string;
+  /** The shared {@link queue}'s depth across every group on it. */
+  queueDepth?: number;
+  /** `depth` was counted from a sample of the shared queue's jobs and may undercount. */
+  depthSampled?: boolean;
+  /**
+   * The part of `depth` still waiting on the group's own (per-handler) queue while it is drained
+   * after a switch to a shared {@link queue}. Not part of `queueDepth`.
+   */
+  drainingDepth?: number;
 }
 
 /**

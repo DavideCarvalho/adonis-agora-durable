@@ -319,6 +319,15 @@ function PartitionsTable({ partitions }: { partitions: PartitionView[] | undefin
                 aria-hidden
               />
               {p.partition}
+              {p.sharedQueues.length > 0 ? (
+                <Badge
+                  variant="neutral"
+                  className="mono text-[10px]"
+                  title={`Every handler of this partition shares ${p.sharedQueues.join(', ')}`}
+                >
+                  shared queue
+                </Badge>
+              ) : null}
             </span>
           ),
         },
@@ -368,6 +377,7 @@ function StarvedList({ summary }: { summary: HealthSummary | undefined }) {
           <span className="dot s-failed" aria-hidden />
           <span className="mono min-w-0 flex-1 truncate text-[12px] text-fg">{g.group}</span>
           <Badge variant="destructive" className="mono tnum text-[10px]">
+            {g.depthSampled ? '≥' : ''}
             {g.depth} queued · 0 workers
           </Badge>
         </li>

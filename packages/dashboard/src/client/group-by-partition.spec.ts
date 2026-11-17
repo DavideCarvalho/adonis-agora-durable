@@ -68,6 +68,30 @@ describe('groupByPartition', () => {
     expect(views.map((v) => v.partition)).toEqual(['default', 'alpha', 'mid', 'zeta']);
   });
 
+  it('groups on one shared queue count its depth once, exact even when the split was sampled', () => {
+    const shared = { queue: 'durable-taskgroup', queueDepth: 900, depthSampled: true };
+    const views = groupByPartition([
+      group({ group: 'A', depth: 300, ...shared }),
+      group({ group: 'B', depth: 200, ...shared }),
+      group({ group: 'C', depth: 4 }),
+    ]);
+    expect(views[0]).toMatchObject({
+      totalDepth: 904,
+      sharedQueues: ['durable-taskgroup'],
+      handlerCount: 3,
+    });
+    expect(groupByPartition([group({ group: 'A', depth: 1 })])[0]?.sharedQueues).toEqual([]);
+  });
+
+  it("adds the backlog still draining from a group's old queue to the partition total", () => {
+    const shared = { queue: 'durable-taskgroup', queueDepth: 10 };
+    const [view] = groupByPartition([
+      group({ group: 'charge', depth: 9, ...shared, drainingDepth: 5 }),
+      group({ group: 'refund', depth: 6, ...shared }),
+    ]);
+    expect(view.totalDepth).toBe(15);
+  });
+
   it('empty input returns an empty array', () => {
     expect(groupByPartition([])).toEqual([]);
   });

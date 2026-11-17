@@ -37,11 +37,14 @@ import {
   type WorkerLike,
   workerConcurrency,
 } from './deps.js';
+import { HandlerLimiter } from './handler-limiter.js';
 import {
   decisionsName,
   effectivePrefix,
+  groupedTasksName,
   heartbeatChannel,
   legacyWorkerKeysPrefix,
+  queueWorkKeys,
   replyAliveKey,
   replyInstancesKey,
   replyQueueName,
@@ -162,6 +165,32 @@ export interface BullMQTransportOptions {
   replyDrainIdleMs?: number | undefined;
   /** Where and how the worker registry (liveness + descriptors) is kept. See {@link WorkerRegistryOptions}. */
   workerRegistry?: WorkerRegistryOptions | undefined;
+  /**
+   * How step and workflow tasks are laid out on BullMQ queues.
+   *
+   * - `'per-handler'` (default): one queue, one BullMQ `Worker` and one blocking connection per
+   *   handler (`${P}-tasks-<token>`). Byte-compatible with the NestJS and Python SDKs.
+   * - `'grouped'`: every handler of a partition shares ONE queue (`${P}-taskgroup`, or
+   *   `${P}-taskgroup@<partition>`), consumed by one `Worker`; a job is routed to its handler by the
+   *   routing token it carries. Idle polling, stalled checks and blocking connections no longer grow
+   *   with the number of handlers. Each handler keeps its own concurrency limit through an in-process
+   *   limiter. Every process consuming a partition's grouped queue must register the handlers
+   *   dispatched to it; a job for a handler the process lacks is handed back to the queue (delayed
+   *   10 s) for another process. Not understood by the NestJS / Python SDKs.
+   *
+   * Dispatcher and consumers of a fleet must agree; see {@link taskQueueDrain} for switching.
+   */
+  taskQueues?: 'per-handler' | 'grouped' | undefined;
+  /**
+   * While switching layouts, also consume the OTHER layout's queues of the handlers this process
+   * serves, as long as they hold jobs: in `'grouped'` mode the per-handler `${P}-tasks-<token>`
+   * queues (jobs dispatched by processes not yet upgraded, and delayed or stalled ones); in
+   * `'per-handler'` mode the grouped queue (a rollback). A drain worker starts only for a queue that
+   * has waiting, active, delayed, prioritized or paused jobs, and stops once it is empty. Checking
+   * every queue is ONE `EXISTS` per interval. Default `true` with `'grouped'`, `false` with
+   * `'per-handler'`. `{ intervalMs }` sets the check interval (default `60_000`).
+   */
+  taskQueueDrain?: boolean | { intervalMs?: number | undefined } | undefined;
 }
 
 /**
@@ -262,6 +291,26 @@ export class BullMQTransport implements Transport {
   readonly #deferredWorkers: Array<() => void> = [];
 
   readonly #handlers = new Map<string, StepHandler>();
+  // --- Task queue layout (see `taskQueues` / `taskQueueDrain`) ---
+  readonly #taskQueues: 'per-handler' | 'grouped';
+  readonly #drainEnabled: boolean;
+  readonly #drainIntervalMs: number;
+  /** Per-token concurrency of grouped and drained jobs (see HandlerLimiter). Created on first use. */
+  #limiter: HandlerLimiter | undefined;
+  /** Every routing token this process consumes (in either layout). */
+  readonly #servedTokens = new Set<string>();
+  /** The grouped task workers, by queue name, with the tokens each serves. */
+  readonly #groupedWorkers = new Map<string, { worker: WorkerLike; tokens: Set<string> }>();
+  /** Workers draining the other layout's queues, by queue name (see `taskQueueDrain`). */
+  readonly #drainWorkers = new Map<string, { worker: WorkerLike; tokens: Set<string> }>();
+  #drainTimer: ReturnType<typeof setInterval> | undefined;
+  #drainChecking = false;
+  /** How many times each job id was handed back for its handler being at its limit. */
+  readonly #overflowBounces = new Map<string, number>();
+  /** Tokens already reported as dispatched to a process that does not serve them. */
+  readonly #foreignReported = new Set<string>();
+  /** The last per-token depth read of each grouped queue (see #groupedSnapshot). */
+  readonly #groupedSnapshots = new Map<string, { at: number; read: Promise<GroupedSnapshot> }>();
   /** Aborted when `close()` starts: the `log.signal` of every step this worker runs. */
   readonly #shutdown = new AbortController();
   /**
@@ -269,7 +318,10 @@ export class BullMQTransport implements Transport {
    * hook that makes the processor let go. `close()` hands back whatever is still here when its budget
    * runs out.
    */
-  readonly #openTasks = new Map<JobLike, { token: string | undefined; release: () => void }>();
+  readonly #openTasks = new Map<
+    JobLike,
+    { token: string | undefined; release: () => void; parked: boolean }
+  >();
   /** Payloads of jobs handed back by `close()`: their abandoned handler must publish nothing. */
   readonly #handedBack = new WeakSet<object>();
   // Worker-side workflow turn consumers, keyed by workflow name — a `workflow`-shaped job routes here.
@@ -411,6 +463,13 @@ export class BullMQTransport implements Transport {
       DEFAULT_LEGACY_WRITE_INTERVAL_MS,
     );
     this.#makeRegistryRedis = options.workerRegistry?.makeRedis;
+    this.#taskQueues = options.taskQueues === 'grouped' ? 'grouped' : 'per-handler';
+    const drain = options.taskQueueDrain;
+    this.#drainEnabled = drain === undefined ? this.#taskQueues === 'grouped' : drain !== false;
+    this.#drainIntervalMs = positiveMs(
+      typeof drain === 'object' ? drain.intervalMs : undefined,
+      DEFAULT_DRAIN_CHECK_INTERVAL_MS,
+    );
     this.#stepTimeoutMs =
       options.stepTimeoutMs !== undefined &&
       Number.isFinite(options.stepTimeoutMs) &&
@@ -506,12 +565,41 @@ export class BullMQTransport implements Transport {
     if (!this.#controller) {
       this.#controller = new AdaptiveController({
         ...(this.#concurrency !== undefined ? { concurrency: this.#concurrency } : {}),
-        apply: (limit) => {
-          for (const worker of this.#taskWorkers.values()) worker.concurrency = limit;
-        },
+        apply: (limit) => this.#applyLimit(limit),
       });
     }
     return this.#controller;
+  }
+
+  /** A new per-handler limit, from the adaptive controller: every task worker and the limiter take it. */
+  #applyLimit(limit: number): void {
+    for (const worker of this.#taskWorkers.values()) worker.concurrency = limit;
+    this.#limiter?.setLimit(limit);
+    for (const entry of this.#groupedWorkers.values()) {
+      entry.worker.concurrency = groupedSlots(limit, entry.tokens.size);
+    }
+    for (const entry of this.#drainWorkers.values()) {
+      entry.worker.concurrency = groupedSlots(limit, entry.tokens.size);
+    }
+  }
+
+  /** How many jobs of one handler run at once: the controller's limit, else the deps' default. */
+  #taskLimit(): number {
+    return this.#concurrency !== undefined
+      ? this.#concurrencyController().limit
+      : workerConcurrency(this.#deps.defaultConcurrency);
+  }
+
+  #handlerLimiter(): HandlerLimiter {
+    this.#limiter ??= new HandlerLimiter(this.#taskLimit());
+    return this.#limiter;
+  }
+
+  /** The task queue a routing token's jobs go to in this transport's layout. */
+  #taskQueueName(token: string): string {
+    return this.#taskQueues === 'grouped'
+      ? groupedTasksName(this.#effectivePrefix(), token)
+      : tasksName(this.#effectivePrefix(), token);
   }
 
   /**
@@ -769,11 +857,7 @@ export class BullMQTransport implements Transport {
   /** `task.group` already carries the FINAL routing token (computed by the engine) — target that
    *  handler's dedicated queue. Job name `task`; DTO is the raw job data. */
   async dispatch(task: RemoteTask): Promise<void> {
-    await this.#queue(tasksName(this.#effectivePrefix(), task.group)).add(
-      'task',
-      task,
-      taskDispatchOptions(task),
-    );
+    await this.#queue(this.#taskQueueName(task.group)).add('task', task, taskDispatchOptions(task));
   }
 
   /**
@@ -784,7 +868,7 @@ export class BullMQTransport implements Transport {
   async dispatchMany(tasks: RemoteTask[]): Promise<void> {
     const byQueue = new Map<string, RemoteTask[]>();
     for (const task of tasks) {
-      const name = tasksName(this.#effectivePrefix(), task.group);
+      const name = this.#taskQueueName(task.group);
       const queued = byQueue.get(name);
       if (queued) queued.push(task);
       else byQueue.set(name, [task]);
@@ -821,7 +905,7 @@ export class BullMQTransport implements Transport {
   /** engine → workflow worker: a `WorkflowTask` on the workflow's dedicated task queue (same queue a
    *  Python workflow worker consumes). Job name `workflow`; the decision returns on `${P}-decisions`. */
   async dispatchWorkflowTask(task: WorkflowTask): Promise<void> {
-    await this.#queue(tasksName(this.#effectivePrefix(), task.group)).add(
+    await this.#queue(this.#taskQueueName(task.group)).add(
       'workflow',
       task,
       jobOptions(task.priority),
@@ -857,7 +941,12 @@ export class BullMQTransport implements Transport {
   /** Start (once per routing token) the discriminating task worker + its liveness heartbeat. Shared by
    *  {@link handle} (steps) and {@link handleWorkflow} (workflow turns) — both ride `${P}-tasks-<token>`. */
   #ensureTaskWorker(token: string): void {
+    if (this.#taskQueues === 'grouped') {
+      this.#ensureGroupedWorker(token);
+      return;
+    }
     if (this.#taskWorkers.has(token)) return;
+    this.#servedTokens.add(token);
     const controller = this.#concurrencyController();
     // A new worker starts at the controller's live limit, so a token registered after an adaptive
     // move joins at the current limit rather than at `start`.
@@ -866,31 +955,222 @@ export class BullMQTransport implements Transport {
       (job, token) => this.#runTaskJob(job, token),
       this.#concurrency !== undefined ? { concurrency: controller.limit } : undefined,
     );
-    // Terminal-failure bridge: a task job reaching a TERMINAL `failed` state is an INFRASTRUCTURE
-    // failure (worker crash / stalled-count exhaustion), never a handler business error —
-    // `runStepHandler` catches every handler throw and publishes a failed StepResult so the job
-    // SUCCEEDS. `failed` fires only when no StepResult was produced, so without this the run hangs on
-    // its `pending` checkpoint forever. Synthesize a RETRYABLE failed StepResult so the engine settles
-    // the checkpoint and re-dispatches. A PEER replica's worker fails a crashed worker's stalled job,
-    // so this still fires cross-process. (A failed WORKFLOW job carries no step identity, so the bridge
-    // no-ops for it — the turn's liveness window (`remoteAdvanceSilenceMs`) re-drives it instead.)
-    worker.on('failed', (job, error) => {
-      const identity = failedTaskIdentity(job?.data);
-      if (!identity) return; // payload already GC'd, malformed, or a workflow job — nothing safe to publish
-      void this.#bridgeTaskFailure(identity, job?.failedReason ?? error?.message ?? 'unknown');
-    });
+    this.#bridgeFailures(worker);
     this.#taskWorkers.set(token, worker);
     controller.start();
     // Liveness says "a worker consumes this token". A deferred process (a `node ace` producer) has
     // no worker yet, so it must not show up in groupHealth / the dashboard as one: the heartbeat
     // starts with the parked worker, on startConsumers() (the queue and db transports do the same).
-    if (this.#consumersDeferred) {
-      this.#deferredWorkers.push(() => {
-        if (!this.#closing) this.#startWorkerHeartbeat(token);
-      });
-    } else {
+    this.#whenConsuming(() => {
+      if (this.#closing) return;
       this.#startWorkerHeartbeat(token);
+      this.#startDrainChecks();
+    });
+  }
+
+  /**
+   * `taskQueues: 'grouped'`: serve `token` from its partition's shared queue. The queue's one worker
+   * is created with the first token and sized by {@link groupedSlots}, so every handler can run its
+   * full limit even while each other handler has a limit's worth of jobs waiting in-process; the
+   * {@link HandlerLimiter} keeps each handler at its own limit.
+   */
+  #ensureGroupedWorker(token: string): void {
+    if (this.#servedTokens.has(token)) return;
+    this.#servedTokens.add(token);
+    const controller = this.#concurrencyController();
+    const limiter = this.#handlerLimiter();
+    const name = groupedTasksName(this.#effectivePrefix(), token);
+    let entry = this.#groupedWorkers.get(name);
+    if (!entry) {
+      const worker = this.#makeWorker(name, (job, lock) => this.#runGroupedJob(job, lock), {
+        concurrency: groupedSlots(limiter.limit, 1),
+      });
+      this.#bridgeFailures(worker);
+      entry = { worker, tokens: new Set() };
+      this.#groupedWorkers.set(name, entry);
     }
+    entry.tokens.add(token);
+    entry.worker.concurrency = groupedSlots(limiter.limit, entry.tokens.size);
+    controller.start();
+    this.#whenConsuming(() => {
+      if (this.#closing) return;
+      this.#startWorkerHeartbeat(token);
+      this.#startDrainChecks();
+    });
+  }
+
+  /**
+   * Terminal-failure bridge: a task job reaching a TERMINAL `failed` state is an INFRASTRUCTURE
+   * failure (worker crash / stalled-count exhaustion), never a handler business error —
+   * `runStepHandler` catches every handler throw and publishes a failed StepResult so the job
+   * SUCCEEDS. `failed` fires only when no StepResult was produced, so without this the run hangs on
+   * its `pending` checkpoint forever. Synthesize a RETRYABLE failed StepResult so the engine settles
+   * the checkpoint and re-dispatches. A PEER replica's worker fails a crashed worker's stalled job,
+   * so this still fires cross-process. (A failed WORKFLOW job carries no step identity, so the bridge
+   * no-ops for it — the turn's liveness window (`remoteAdvanceSilenceMs`) re-drives it instead.)
+   */
+  #bridgeFailures(worker: WorkerLike): void {
+    worker.on('failed', (job, error) => {
+      const identity = failedTaskIdentity(job?.data);
+      if (!identity) return; // payload already GC'd, malformed, or a workflow job — nothing safe to publish
+      void this.#bridgeTaskFailure(identity, job?.failedReason ?? error?.message ?? 'unknown');
+    });
+  }
+
+  /** Whether this process has the handler (or workflow turn) a task job is for. */
+  #servesTask(data: unknown): boolean {
+    if (isWorkflowTask(data)) return this.#workflowTurns.has(data.workflow);
+    const name = (data as { name?: unknown } | null | undefined)?.name;
+    return typeof name === 'string' && this.#handlers.has(name);
+  }
+
+  /**
+   * The processor of a grouped (or drained) task queue. A job is routed by the routing token in
+   * `data.group`:
+   * - a handler this process does not serve: handed back, delayed {@link FOREIGN_HANDBACK_MS}, for a
+   *   process that does (no attempt is counted);
+   * - a handler under its limit: runs now;
+   * - a handler at its limit: waits in-process for a slot, up to one limit's worth of waiters per
+   *   handler; beyond that the job is handed back with a delay that grows each time, so one handler's
+   *   backlog cannot fill every slot of the shared worker and starve the others.
+   * A job without a token, or a broker that cannot hand a job back (a test fake), runs as before.
+   */
+  async #runGroupedJob(job: JobLike, lock: string | undefined): Promise<void> {
+    const group = (job.data as { group?: unknown } | null | undefined)?.group;
+    if (typeof group !== 'string') return this.#runTaskJob(job, lock);
+    if (!this.#servesTask(job.data)) {
+      if (!job.moveToDelayed) return this.#runTaskJob(job, lock);
+      if (!this.#foreignReported.has(group)) {
+        this.#foreignReported.add(group);
+        this.#onError(
+          new Error(
+            `@agora/durable: a '${group}' task reached a process that does not serve it on the grouped task queue; handing it back for another process. Every process consuming a partition's grouped queue must register the same handlers.`,
+          ),
+        );
+      }
+      return this.#handBack(job, lock, FOREIGN_HANDBACK_MS);
+    }
+    const limiter = this.#handlerLimiter();
+    if (limiter.tryAcquire(group)) return this.#runTaskJob(job, lock, { token: group, held: true });
+    if (job.moveToDelayed && limiter.waiting(group) >= limiter.limit) {
+      return this.#handBack(job, lock, this.#overflowDelay(job, group));
+    }
+    return this.#runTaskJob(job, lock, { token: group, held: false });
+  }
+
+  /** Put an active job back on its queue, delayed `delayMs`, without counting an attempt. */
+  async #handBack(job: JobLike, lock: string | undefined, delayMs: number): Promise<never> {
+    await (job.moveToDelayed as NonNullable<JobLike['moveToDelayed']>)(Date.now() + delayMs, lock);
+    throw handedBackError();
+  }
+
+  /**
+   * How long a job of a handler at its limit waits before it is offered again: the handler's mean
+   * job duration (at least {@link OVERFLOW_MIN_DELAY_MS}, {@link OVERFLOW_DEFAULT_DELAY_MS} before
+   * one finished), doubled for each earlier hand-back of the same job, at most
+   * {@link OVERFLOW_MAX_DELAY_MS}.
+   */
+  #overflowDelay(job: JobLike, token: string): number {
+    const id = job.id;
+    const bounces = id === undefined ? 0 : (this.#overflowBounces.get(id) ?? 0);
+    if (id !== undefined) {
+      this.#overflowBounces.delete(id);
+      this.#overflowBounces.set(id, bounces + 1);
+      if (this.#overflowBounces.size > OVERFLOW_BOUNCES_MAX) {
+        const oldest = this.#overflowBounces.keys().next().value;
+        if (oldest !== undefined) this.#overflowBounces.delete(oldest);
+      }
+    }
+    const base = Math.max(
+      OVERFLOW_MIN_DELAY_MS,
+      this.#limiter?.averageMs(token) ?? OVERFLOW_DEFAULT_DELAY_MS,
+    );
+    return Math.min(OVERFLOW_MAX_DELAY_MS, base * 2 ** Math.min(bounces, 16));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Draining the other layout's task queues (see `taskQueueDrain`)
+  // ---------------------------------------------------------------------------
+
+  /** Start the periodic drain check (once), first run on the next macrotask so a burst of `handle()`
+   *  calls is checked together. */
+  #startDrainChecks(): void {
+    if (!this.#drainEnabled || this.#drainTimer || this.#closing) return;
+    const tick = (): void => {
+      if (this.#drainChecking || this.#closing) return;
+      this.#drainChecking = true;
+      void this.#checkDrains()
+        .catch((err) => this.#onError(err))
+        .finally(() => {
+          this.#drainChecking = false;
+        });
+    };
+    this.#drainTimer = setInterval(tick, this.#drainIntervalMs);
+    this.#drainTimer.unref?.();
+    setTimeout(tick, 0).unref?.();
+  }
+
+  /** The other layout's queue of each served token, with the tokens it carries. */
+  #otherLayoutQueues(): Map<string, Set<string>> {
+    const prefix = this.#effectivePrefix();
+    const queues = new Map<string, Set<string>>();
+    for (const token of this.#servedTokens) {
+      const name =
+        this.#taskQueues === 'grouped' ? tasksName(prefix, token) : groupedTasksName(prefix, token);
+      const tokens = queues.get(name);
+      if (tokens) tokens.add(token);
+      else queues.set(name, new Set([token]));
+    }
+    return queues;
+  }
+
+  /**
+   * One drain check: stop the drain workers whose queue is empty, then look at every other queue
+   * with ONE `EXISTS` over their work keys (chunked at {@link DRAIN_EXISTS_CHUNK} keys) and, only
+   * when something exists, find which queues hold jobs and start a drain worker on each.
+   */
+  async #checkDrains(): Promise<void> {
+    const client = this.#workerRedisClient();
+    if (!client.exists) return;
+    const exists = client.exists.bind(client);
+    const bull = this.#deps.queueKeyPrefix ?? 'bull';
+    const queues = this.#otherLayoutQueues();
+    for (const [name, entry] of [...this.#drainWorkers]) {
+      if (this.#closing) return;
+      const tokens = queues.get(name);
+      if (tokens) {
+        entry.tokens = tokens;
+        entry.worker.concurrency = groupedSlots(this.#handlerLimiter().limit, tokens.size);
+      }
+      if ((await exists(...queueWorkKeys(bull, name))) > 0) continue;
+      this.#drainWorkers.delete(name);
+      await entry.worker.close();
+    }
+    const idle = [...queues.keys()].filter((name) => !this.#drainWorkers.has(name));
+    if (idle.length === 0) return;
+    const keys = idle.flatMap((name) => queueWorkKeys(bull, name));
+    let found = 0;
+    for (let at = 0; at < keys.length && found === 0; at += DRAIN_EXISTS_CHUNK) {
+      found += await exists(...keys.slice(at, at + DRAIN_EXISTS_CHUNK));
+    }
+    if (found === 0) return;
+    for (const name of idle) {
+      if (this.#closing) return;
+      if ((await exists(...queueWorkKeys(bull, name))) === 0) continue;
+      // close() collects the workers it stops when it starts: never add one after that.
+      if (this.#closing) return;
+      const tokens = queues.get(name) as Set<string>;
+      const worker = this.#deps.makeWorker(name, (job, lock) => this.#runGroupedJob(job, lock), {
+        concurrency: groupedSlots(this.#handlerLimiter().limit, tokens.size),
+      });
+      this.#bridgeFailures(worker);
+      this.#drainWorkers.set(name, { worker, tokens });
+    }
+  }
+
+  /** The queues this transport is draining right now (for tests and diagnostics). */
+  get drainingQueues(): string[] {
+    return [...this.#drainWorkers.keys()];
   }
 
   /**
@@ -900,15 +1180,39 @@ export class BullMQTransport implements Transport {
    * must not be completed or failed; the handler itself keeps running until the process exits, and
    * {@link #handedBack} keeps it from publishing.
    */
-  async #runTaskJob(job: JobLike, token: string | undefined): Promise<void> {
+  async #runTaskJob(
+    job: JobLike,
+    token: string | undefined,
+    gate?: { token: string; held: boolean },
+  ): Promise<void> {
     let release!: () => void;
     const released = new Promise<never>((_, reject) => {
       release = () => reject(handedBackError());
     });
     released.catch(() => undefined);
-    this.#openTasks.set(job, { token, release });
+    const open = { token, release, parked: false };
+    this.#openTasks.set(job, open);
     try {
-      await Promise.race([this.#runJob(job.data), released]);
+      if (gate && !gate.held) {
+        // Wait for one of the handler's slots (grouped queue). Handed back meanwhile, give up the
+        // place in line (or the slot just granted) so it is never leaked.
+        const slot = this.#handlerLimiter().acquire(gate.token);
+        open.parked = true;
+        try {
+          await Promise.race([slot.ready, released]);
+        } catch (err) {
+          slot.cancel();
+          throw err;
+        }
+        open.parked = false;
+      }
+      if (gate && job.id !== undefined) this.#overflowBounces.delete(job.id);
+      const startedAt = performance.now();
+      try {
+        await Promise.race([this.#runJob(job.data), released]);
+      } finally {
+        if (gate) this.#handlerLimiter().release(gate.token, performance.now() - startedAt);
+      }
     } finally {
       this.#openTasks.delete(job);
     }
@@ -920,9 +1224,9 @@ export class BullMQTransport implements Transport {
    * stalled once this process is gone (and, past `maxStalledCount`, failing it for good). The same
    * hand-back the queue and db transports do on close.
    */
-  async #handBackOpenTasks(): Promise<void> {
-    const open = [...this.#openTasks];
-    this.#openTasks.clear();
+  async #handBackOpenTasks(onlyParked = false): Promise<void> {
+    const open = [...this.#openTasks].filter(([, task]) => !onlyParked || task.parked);
+    for (const [job] of open) this.#openTasks.delete(job);
     await Promise.allSettled(
       open.map(async ([job, { token, release }]) => {
         if (!job.moveToDelayed) return;
@@ -2054,6 +2358,7 @@ export class BullMQTransport implements Transport {
    *  is a routing token — the same value a dispatch targets. The job counts and the shared registry
    *  read run concurrently. */
   async groupHealth(group: string): Promise<GroupHealth> {
+    if (this.#taskQueues === 'grouped') return this.#groupedHealth(group);
     const [counts, liveWorkers] = await Promise.all([
       this.#queue(tasksName(this.#effectivePrefix(), group)).getJobCounts(
         'waiting',
@@ -2065,6 +2370,70 @@ export class BullMQTransport implements Transport {
     ]);
     const depth = Object.values(counts).reduce((sum, n) => sum + (n ?? 0), 0);
     return { group, depth, liveWorkers };
+  }
+
+  /**
+   * {@link groupHealth} on the grouped layout: the token's share of its partition's queue, read from
+   * one sample of that queue's jobs that every token asking within {@link GROUPED_SNAPSHOT_TTL_MS}
+   * reuses, plus its per-handler queue while that queue is being drained. `queue` / `queueDepth`
+   * name the shared queue and its total; `depthSampled` says the sample did not cover every job.
+   */
+  async #groupedHealth(group: string): Promise<GroupHealth> {
+    const prefix = this.#effectivePrefix();
+    const name = groupedTasksName(prefix, group);
+    const legacy = tasksName(prefix, group);
+    const [snapshot, legacyDepth, liveWorkers] = await Promise.all([
+      this.#groupedSnapshot(name),
+      this.#drainWorkers.has(legacy) ? this.#queueDepth(legacy) : Promise.resolve(0),
+      this.#listLiveWorkers(group),
+    ]);
+    return {
+      group,
+      depth: (snapshot.byToken.get(group) ?? 0) + legacyDepth,
+      liveWorkers,
+      queue: name,
+      queueDepth: snapshot.total,
+      ...(snapshot.sampled ? { depthSampled: true } : {}),
+      ...(legacyDepth > 0 ? { drainingDepth: legacyDepth } : {}),
+    };
+  }
+
+  async #queueDepth(name: string): Promise<number> {
+    const counts = await this.#queue(name).getJobCounts(
+      'waiting',
+      'active',
+      'delayed',
+      'prioritized',
+    );
+    return Object.values(counts).reduce((sum, n) => sum + (n ?? 0), 0);
+  }
+
+  #groupedSnapshot(name: string): Promise<GroupedSnapshot> {
+    const cached = this.#groupedSnapshots.get(name);
+    if (cached && Date.now() - cached.at < GROUPED_SNAPSHOT_TTL_MS) return cached.read;
+    const read = (async (): Promise<GroupedSnapshot> => {
+      const queue = this.#queue(name);
+      const total = await this.#queueDepth(name);
+      const byToken = new Map<string, number>();
+      if (total === 0) return { total, byToken, sampled: false };
+      if (!queue.getJobs) return { total, byToken, sampled: true };
+      const jobs = await queue.getJobs(
+        ['waiting', 'active', 'delayed', 'prioritized'],
+        0,
+        GROUPED_DEPTH_SAMPLE - 1,
+      );
+      let counted = 0;
+      for (const job of jobs) {
+        const token = (job?.data as { group?: unknown } | undefined)?.group;
+        if (typeof token !== 'string') continue;
+        byToken.set(token, (byToken.get(token) ?? 0) + 1);
+        counted += 1;
+      }
+      return { total, byToken, sampled: counted < total };
+    })();
+    this.#groupedSnapshots.set(name, { at: Date.now(), read });
+    read.catch(() => this.#groupedSnapshots.delete(name));
+    return read;
   }
 
   async #listLiveWorkers(group: string): Promise<WorkerHeartbeat[]> {
@@ -2273,6 +2642,8 @@ export class BullMQTransport implements Transport {
     this.#workerHeartbeatTimer = undefined;
     if (this.#pingWatchdogTimer) clearInterval(this.#pingWatchdogTimer);
     this.#pingWatchdogTimer = undefined;
+    if (this.#drainTimer) clearInterval(this.#drainTimer);
+    this.#drainTimer = undefined;
     if (this.#replyBeatTimer) clearInterval(this.#replyBeatTimer);
     if (this.#replySweepTimer) clearInterval(this.#replySweepTimer);
     // Stop taking routed replies first: with the alive key gone, workers send to the shared results
@@ -2295,6 +2666,8 @@ export class BullMQTransport implements Transport {
     const remaining = (): number => Math.max(0, deadline - Date.now());
     const workers: Array<Promise<unknown> | undefined> = [
       ...[...this.#taskWorkers.values()].map((w) => w.close()),
+      ...[...this.#groupedWorkers.values()].map((g) => g.worker.close()),
+      ...[...this.#drainWorkers.values()].map((d) => d.worker.close()),
       this.#resultsWorker?.close(),
       this.#resultBatchesWorker?.close(),
       this.#replyWorker?.close(),
@@ -2309,6 +2682,11 @@ export class BullMQTransport implements Transport {
     // and the workers settling after it stay inside `closeTimeoutMs` too.
     const reserve = Math.min(HAND_BACK_RESERVE_MS, this.#closeTimeoutMs / 5);
     const settled = Promise.allSettled(workers.filter((p) => p !== undefined));
+    // Jobs still waiting for a handler slot (grouped queue) have not started: the workers no longer
+    // fetch, so give them back at once rather than make the close wait for them.
+    if ([...this.#openTasks.values()].some((task) => task.parked)) {
+      await withTimeout(this.#handBackOpenTasks(true), remaining());
+    }
     await withTimeout(settled, remaining() - reserve);
     // A step that outlived the wait goes back to the broker now; its worker then settles at once.
     if (this.#openTasks.size > 0) {
@@ -2656,6 +3034,40 @@ function taskDispatchOptions(task: RemoteTask): ReturnType<typeof taskJobOptions
   const esc = (v: string) => v.replaceAll('%', '%25').replaceAll(':', '%3A');
   const jobId = `task-${esc(key)}`;
   return { ...options, jobId, deduplication: { id: jobId, ttl: TASK_DEDUPE_TTL_MS } };
+}
+
+/** Default `taskQueueDrain.intervalMs`: how often the other layout's queues are checked for jobs. */
+const DEFAULT_DRAIN_CHECK_INTERVAL_MS = 60_000;
+/** Most keys one drain-check `EXISTS` names. */
+const DRAIN_EXISTS_CHUNK = 1_000;
+/** How long a grouped-queue job for a handler this process lacks waits before it is offered again. */
+const FOREIGN_HANDBACK_MS = 10_000;
+/** Bounds of the delay a job of a handler at its limit is handed back with (see #overflowDelay). */
+const OVERFLOW_MIN_DELAY_MS = 250;
+const OVERFLOW_DEFAULT_DELAY_MS = 1_000;
+const OVERFLOW_MAX_DELAY_MS = 30_000;
+/** Most job ids whose hand-back count is remembered. */
+const OVERFLOW_BOUNCES_MAX = 10_000;
+/** How long one per-token depth read of a grouped queue serves every token's groupHealth. */
+const GROUPED_SNAPSHOT_TTL_MS = 2_000;
+/** Most jobs of a grouped queue read to split its depth per token. */
+const GROUPED_DEPTH_SAMPLE = 500;
+
+/**
+ * The concurrency of a worker serving `tokens` handlers off one queue at `limit` each: two limits per
+ * handler. A handler holds at most `limit` running and `limit` waiting jobs (the rest are handed
+ * back), so the waiting ones never take a slot another handler needs to reach its limit.
+ */
+function groupedSlots(limit: number, tokens: number): number {
+  return 2 * limit * Math.max(1, tokens);
+}
+
+/** One read of a grouped task queue: its depth, and how much of it each routing token holds. */
+interface GroupedSnapshot {
+  total: number;
+  byToken: Map<string, number>;
+  /** The jobs read did not cover the whole queue, so `byToken` undercounts. */
+  sampled: boolean;
 }
 
 /** The most task jobs one `addBulk` carries, and how many such calls run at once (`dispatchMany`). */

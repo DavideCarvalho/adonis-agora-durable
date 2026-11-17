@@ -201,3 +201,36 @@ export function workerRegistryIndexKey(effPrefix: string): string {
 export function workerInstancesKey(effPrefix: string): string {
   return `${effPrefix}-workers:instances`;
 }
+
+/**
+ * The partition a routing token carries (the part after its last `@`), or `undefined` for a bare
+ * token. Grouped task queues are per partition, so a dispatcher and a consumer derive the same queue
+ * from the token alone.
+ */
+export function tokenPartition(token: string): string | undefined {
+  const at = token.lastIndexOf('@');
+  return at === -1 ? undefined : token.slice(at + 1);
+}
+
+/**
+ * `${P}-taskgroup` (or `${P}-taskgroup@<partition>`): the ONE task queue every handler of a partition
+ * shares when the transport runs with `taskQueues: 'grouped'`. Jobs keep their `task` / `workflow`
+ * name and carry their routing token in `data.group`, which is what the consumer routes on. It never
+ * matches a per-handler `${P}-tasks-<token>` name, so the two layouts can live side by side while one
+ * drains into the other.
+ */
+export function groupedTasksName(effPrefix: string, token: string): string {
+  const partition = tokenPartition(token);
+  return partition === undefined ? `${effPrefix}-taskgroup` : `${effPrefix}-taskgroup@${partition}`;
+}
+
+/**
+ * The BullMQ keys that exist only while a queue holds unfinished work (Redis drops an empty list or
+ * sorted set). `EXISTS` over them is how the transport learns, in one command for every queue at once,
+ * whether a queue of the other layout still has jobs to drain.
+ */
+export function queueWorkKeys(bullPrefix: string, queueName: string): string[] {
+  return ['wait', 'active', 'paused', 'delayed', 'prioritized', 'waiting-children'].map(
+    (suffix) => `${bullPrefix}:${queueName}:${suffix}`,
+  );
+}

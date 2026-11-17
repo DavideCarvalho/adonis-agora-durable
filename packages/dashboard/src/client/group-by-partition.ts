@@ -8,8 +8,14 @@ export interface PartitionView {
   workerCount: number;
   /** Number of groups (queues) bucketed into this partition. */
   handlerCount: number;
-  /** Sum of `depth` across the partition's groups. */
+  /**
+   * Jobs queued in the partition: the sum of the groups' `depth`, except that groups sharing one
+   * queue (BullMQ `taskQueues: 'grouped'`) count that queue's `queueDepth` once, which stays exact
+   * when the per-group split was sampled.
+   */
   totalDepth: number;
+  /** The shared queues the partition's groups wait on (empty when every group has its own queue). */
+  sharedQueues: string[];
   /** Groups with a nonzero backlog and no live worker. */
   starvedCount: number;
 }
@@ -35,20 +41,33 @@ export function groupByPartition(groups: GroupHealth[]): PartitionView[] {
 
   const views = [...byPartition.entries()].map(([partition, partitionGroups]) => {
     const workerIds = new Set<string>();
+    const sharedDepth = new Map<string, number>();
     let totalDepth = 0;
     let starvedCount = 0;
 
     for (const group of partitionGroups) {
-      totalDepth += group.depth;
+      if (group.queue !== undefined) {
+        sharedDepth.set(
+          group.queue,
+          Math.max(sharedDepth.get(group.queue) ?? 0, group.queueDepth ?? group.depth),
+        );
+        // The backlog still draining from the group's old queue is not in `queueDepth`.
+        totalDepth += group.drainingDepth ?? 0;
+      } else {
+        totalDepth += group.depth;
+      }
       if (group.depth > 0 && group.liveWorkers.length === 0) starvedCount += 1;
       for (const worker of group.liveWorkers) workerIds.add(worker.instanceId);
     }
+
+    for (const depth of sharedDepth.values()) totalDepth += depth;
 
     return {
       partition,
       workerCount: workerIds.size,
       handlerCount: partitionGroups.length,
       totalDepth,
+      sharedQueues: [...sharedDepth.keys()].sort(),
       starvedCount,
     };
   });

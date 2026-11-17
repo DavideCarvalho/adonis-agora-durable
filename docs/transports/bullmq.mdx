@@ -20,7 +20,7 @@ For an **Adonis-only** fleet, the [`queue`](/docs/durable/transports/queue) and 
 
 ## How it works
 
-- `ctx.step` dispatches a task to a **per-name** queue, `<P>-tasks-<token>`. The routing token is the step name with `:` replaced by `-` (BullMQ does not allow `:` in a queue name), plus `@<partition>` when a partition other than `'default'` is set.
+- `ctx.step` dispatches a task to a **per-name** queue, `<P>-tasks-<token>` (or to one queue per partition, see [Grouped task queues](#grouped-task-queues-taskqueues)). The routing token is the step name with `:` replaced by `-` (BullMQ does not allow `:` in a queue name), plus `@<partition>` when a partition other than `'default'` is set.
 - A worker that registered that step name consumes the queue, runs the handler, and adds the result to the shared `<P>-results` queue.
 - The engine-side instance consumes `<P>-results` and checkpoints each result.
 - Heartbeats from long steps (`timeoutMs`) travel on the `<P>-heartbeat` pub/sub channel. Workers advertise themselves with TTL'd Redis keys.
@@ -143,6 +143,59 @@ transports.bullmq({
 ```
 
 With 85 idle step queues, `120_000` instead of the default saves about 15 Redis commands per second (≈0.17 per queue). Runs are not lost either way; only the restart of a crashed worker's in-flight steps is delayed. A clean shutdown hands its running steps back at once (see [Shutdown](#shutdown)), so deploys are not affected.
+
+## Grouped task queues (`taskQueues`)
+
+By default each step and workflow name gets its own queue, and a worker runs one BullMQ `Worker`, with its own blocking Redis connection, per name it serves. Every idle queue is polled and checked for stalled jobs on its own, so the Redis cost of an idle fleet grows with the number of handlers. That matters on a Redis billed per command.
+
+`taskQueues: 'grouped'` puts every handler of a partition on **one** queue, `<P>-taskgroup` (`<P>-taskgroup@<partition>` for a partition other than `'default'`), consumed by one `Worker`. Each job keeps its routing token, and the worker hands it to the matching handler:
+
+```ts title="config/durable.ts"
+transports.bullmq({
+  connection: env.get('REDIS_URL'),
+  taskQueues: 'grouped',
+})
+```
+
+Measured on one process serving 85 handlers, with the worker registry's compatibility writes off, counting every command Redis runs (including those inside Lua scripts, as a per-command billed Redis counts them):
+
+| | `'per-handler'` | `'grouped'` |
+| --- | --- | --- |
+| Idle Redis commands per second | 45.5 | 3.7 |
+| Idle, with `stalledInterval: 120_000` | 30.0 | 2.7 |
+| Redis connections | 190 | 20 |
+| Commands per run of a three-step workflow | 408 | 425 |
+
+A run costs a few more commands, because the shared worker fetches its next job across more slots.
+
+What stays the same:
+
+- **Concurrency per handler.** `concurrency` (fixed or adaptive) still limits each handler on its own. The shared worker runs up to twice the sum of the handlers' limits, and an in-process limiter holds each handler at its limit. A job for a handler already at its limit waits in the worker for a slot (one limit's worth per handler at most); any more are put back on the queue with a short delay that grows each time, so one handler's backlog never fills the slots other handlers need.
+- **Priority** still orders jobs. On a shared queue it orders them across handlers too: a higher-priority step of one handler runs before a lower-priority step of another.
+- **Partitions** each get their own grouped queue, so worker pools stay separate.
+- **Step timeouts, crash recovery, shutdown hand-back** and the [worker registry](#worker-liveness) work as before. Each handler is still advertised on its own, so routing and capability checks see the same fleet.
+- **Worker health** (`groupHealth`, the dashboard's Workers page) reports each handler's share of the shared queue, plus the name and total depth of that queue. On a long backlog the per-handler split is counted from the first 500 jobs of each state (`depthSampled`); the queue's total stays exact.
+
+Every process that consumes a partition's grouped queue must register the handlers dispatched to it. A process that takes a job for a handler it does not have puts the job back, delayed 10 s, for another process, and reports it once through `onError`. To run handler sets apart, give each set its own `partition`.
+
+The NestJS and Python SDKs only read per-handler queues. Keep `'per-handler'` while they share the Redis.
+
+### Switching a fleet
+
+All the processes of a fleet must use the same `taskQueues`: an engine dispatches to the layout it is configured with, and a worker only reads that layout. A rolling deploy mixes both for a while, so a process on `'grouped'` also drains the per-handler queues of the handlers it serves (`taskQueueDrain`, on by default with `'grouped'`). It looks at all of them with one `EXISTS` per minute; when one holds jobs (waiting, delayed, retrying, or left active by a crashed worker), it starts a worker on that queue until it is empty again.
+
+1. Deploy with `taskQueues: 'grouped'` on every process. Jobs that older processes dispatched, or left behind, are drained by the new ones.
+2. Once no older process remains and the per-handler queues are empty, you can set `taskQueueDrain: false` to drop the last check. Leaving it on costs one command a minute.
+
+To go back, deploy `'per-handler'` with `taskQueueDrain: true`, which drains the grouped queue the same way.
+
+```ts title="config/durable.ts"
+transports.bullmq({
+  connection: env.get('REDIS_URL'),
+  taskQueues: 'grouped',
+  taskQueueDrain: { intervalMs: 60_000 }, // default; false turns the drain off
+})
+```
 
 ## Result concurrency
 
@@ -306,6 +359,8 @@ The same transport also carries:
 | `replyDrainIdleMs` | `90_000` | How long a dead engine's emptied reply queue is still watched before it is forgotten. |
 | `drainDelay` | `30` | Seconds a worker blocks on an empty queue before polling it again. See [Idle queues](#idle-queues-draindelay). |
 | `stalledInterval` | `30_000` (BullMQ's) | How often (ms) each worker checks its queue for jobs of a crashed worker. See [Stalled-job checks](#stalled-job-checks-stalledinterval). |
+| `taskQueues` | `'per-handler'` | `'grouped'` puts every handler of a partition on one queue. See [Grouped task queues](#grouped-task-queues-taskqueues). |
+| `taskQueueDrain` | `true` with `'grouped'`, else `false` | Also drain the other layout's queues while they hold jobs; `{ intervalMs }` (default `60_000`) sets how often they are checked. See [Switching a fleet](#switching-a-fleet). |
 | `workerRegistry` | `{ legacyWrites: true, legacyWriteIntervalMs: 30_000, legacyScan: true, legacyScanIntervalMs: 60_000 }` | What the worker registry writes and reads for older versions, and an optional separate `connection` for its hash. See [Where the registry lives](#where-the-registry-lives). |
 | `onError` | swallowed / `console.warn` | Receives background failures: heartbeat refresh errors, result-publish errors, pub/sub subscribe failures and subscriber connection errors, unreadable fleet keyspaces, and a result the transport gave up on. |
 
@@ -316,6 +371,7 @@ The same transport also carries:
 | Name | Kind | Direction | Purpose |
 | --- | --- | --- | --- |
 | `<P>-tasks-<token>` | queue | engine → workers | step dispatch (job `task`) and remote workflow turns (job `workflow`), one queue per routing token |
+| `<P>-taskgroup`, `<P>-taskgroup@<partition>` | queue | engine → workers | the same jobs with `taskQueues: 'grouped'`: one queue per partition, routed by the token in the job's `group` |
 | `<P>-results` | queue | workers → engine | step results (job `result`) |
 | `<P>-results-batch` | queue | workers → engine | step results in batches (job `results`, data `{ results }`), sent only while an engine consumes it |
 | `<P>-results-to-<instance>` | queue | workers → engine | step results routed to the engine instance that dispatched them (jobs `result` / `results`), see [Routed results](#routed-results) |
