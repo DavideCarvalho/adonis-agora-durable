@@ -215,7 +215,7 @@
     "arktype": "2.2.9",
     "better-sqlite3": "13.1.1",
     "bullmq": "6.7.6",
-    "cron-parser": "5.10.5",
+    "cron-parser": "5.10.6",
     "ioredis": "6.0.0",
     "jose": "6.2.17",
     "mysql2": "3.24.6",
