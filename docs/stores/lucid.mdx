@@ -105,6 +105,37 @@ The migration creates seven tables (default names, from the `DURABLE_TABLES` con
 
 The runs table is indexed on `status` and on `(status, wake_at)` so the worker's `listPendingRuns` and `listDueTimers` scans stay fast, on `(namespace, status, created_at)` for the namespaced poll and recovery queries, and on `created_at` for the dashboard's default newest-first listing; on Postgres, the partial index `durable_runs_lifecycle_pending_idx` holds only the settled runs that still owe a [lifecycle event](/docs/durable/authoring/lifecycle-events), which the worker lists every 10 s; checkpoints are keyed `(run_id, seq)` with a `(run_id, name)` index for targeted reads and a `(run_id, parallel_group, seq)` index (`durable_step_checkpoints_group_idx`) for the run detail's per-fan reads; signal waiters are indexed on `run_id` (`durable_signal_waiters_run_idx`), which the [`ctx.all`](/docs/durable/authoring/child-workflows) join barrier's per-child lookup and the run-scoped waiter reads use; buffered signals are indexed on `token`; schedules on `(paused, next_fire_at)` for the tick's due scan; and the attributes table is indexed per `(key, value)` so [search-attribute](/docs/durable/concepts/workflows-and-steps#tags) filters push down to SQL.
 
+### The runs board's list index (opt-in)
+
+`configure` also publishes `add_durable_run_list_indexes`, a migration of its own. It indexes
+`(status, created_at, id)` on the runs table, so a status chip on the console's runs board reads
+its newest runs from an index instead of sorting every run with that status. `createDurableTables`
+does not create it. On Postgres the migration builds it `CONCURRENTLY`, so the runs table stays
+writable during the build. Run it once on an existing install. If you installed before it existed,
+add it yourself:
+
+```ts title="database/migrations/xxxx_add_durable_run_list_indexes.ts"
+import app from '@adonisjs/core/services/app'
+import { BaseSchema } from '@adonisjs/lucid/schema'
+import db from '@adonisjs/lucid/services/db'
+import { createDurableRunListIndexes, dropDurableRunListIndexes } from '@adonis-agora/durable'
+
+const configured = app.config.get('durable.schema', undefined)
+const schema = typeof configured === 'string' ? configured : undefined
+
+export default class extends BaseSchema {
+  static disableTransactions = true
+
+  async up() {
+    await createDurableRunListIndexes(db, this.db.connectionName, { schema })
+  }
+
+  async down() {
+    await dropDurableRunListIndexes(db, this.db.connectionName, { schema })
+  }
+}
+```
+
 ## Who provisions the schema: `autoSchema`
 
 By default the provider provisions the store's schema at boot by calling `ensureSchema()`, which for the Lucid driver is exactly the `createDurableTables(db, connection)` the migration runs. It is idempotent — every table is `hasTable`-guarded and every column `hasColumn`-guarded — so it is safe on a database that already has some or all of the tables. The library managing its own tables is the ecosystem convention, shared with `@adonis-agora/agent`, `@adonis-agora/authz` and `@adonis-agora/telescope`.

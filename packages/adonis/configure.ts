@@ -55,6 +55,12 @@ export async function configure(command: Configure) {
     'database/migrations/create_durable_transport_messages.stub',
     {},
   );
+  // Opt-in on an existing install (CONCURRENTLY on Postgres): the runs board's list index.
+  await codemods.makeUsingStub(
+    stubsRoot,
+    'database/migrations/add_durable_run_list_indexes.stub',
+    {},
+  );
 }
 
 /**

@@ -287,6 +287,13 @@ Every list route here speaks the [`@adonis-agora/filter`](/docs/filter) wire for
 | `sort` | `-createdAt` (newest first) — the only order the stores list in, and the default. |
 | `page` | 1-based page number, default `1` |
 | `size` | page size, default `50`, capped at `200` |
+| `first` | page by cursor instead: page size, default `50`, capped at `200` |
+| `after` | the previous cursor page's `meta.nextCursor` |
+
+With `first`/`after`, each page starts after the last run of the previous one, so page 40 costs
+what page 1 does and nothing counts the whole table. The answer's `meta` is
+`{ nextCursor, prevCursor, hasNext, hasPrev }`, with no total. The runs board pages this way.
+`page`/`size` keep the offset `meta` and its `total`.
 
 The `attr` ops are `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in` (`filter[attr.<key>][<op>]` takes the filter lib's names: `equals`, `notEquals`, `gt`, `gte`, `lt`, `lte`, and `in`/`isAnyOf`). Values are coerced: `true`/`false` become booleans, anything numeric becomes a number, everything else stays a string. Only the first two colons delimit, so a value may contain colons of its own. `in` takes a `|`-separated set (`tier:in:pro|enterprise`) and matches it as OR inside the one predicate — two `eq` predicates on one key are ANDed like every other pair, which no run can satisfy.
 

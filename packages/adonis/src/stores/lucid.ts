@@ -1623,7 +1623,21 @@ export class LucidStateStore implements StateStore {
   async listRuns(query: RunQuery): Promise<WorkflowRun[]> {
     const q = this.scopedRuns(query);
 
-    q.orderBy('created_at', 'desc'); // newest first — recent runs on top in the dashboard
+    // Newest first — recent runs on top in the dashboard — and `id` breaks a tie on `created_at`, so
+    // runs created in the same millisecond keep one order across pages.
+    q.orderBy('created_at', 'desc').orderBy('id', 'desc');
+    const after = query.after;
+    if (after !== undefined) {
+      // Keyset: strictly past the previous page's last run, spelled so every dialect range-scans
+      // `created_at`. No offset at all.
+      q.where((seek: AnyQuery) => {
+        seek.where('created_at', '<=', after.createdAt).where((tie: AnyQuery) => {
+          tie.where('created_at', '<', after.createdAt).orWhere('id', '<', after.id);
+        });
+      });
+      if (query.size !== undefined) q.limit(Math.max(0, Math.trunc(query.size)));
+      return ((await q) as RunRow[]).map(rowToRun);
+    }
     // The 1-based `page`/`size` the caller speaks becomes SQL's 0-based window HERE — the only
     // place this adapter knows about an offset at all (see `runPageWindow`).
     const { limit, offset } = runPageWindow(query);

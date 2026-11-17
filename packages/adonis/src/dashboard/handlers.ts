@@ -1,8 +1,12 @@
 import {
   applyCustomFilter,
+  cursorPage,
+  decodeCursor,
+  encodeCursor,
   groupByCountFromRequest,
   InvalidColumnFilterError,
   offsetPage,
+  parseCursorParams,
   parsePageParams,
   resolveSort,
 } from '@adonis-agora/filter';
@@ -11,6 +15,7 @@ import type {
   EngineEvent,
   GroupHealth,
   RunFacetQuery,
+  RunListPosition,
   RunQuery,
   RunResult,
   RunValueAxis,
@@ -444,24 +449,65 @@ const RUNS_PAGE = { defaultSize: 50, maxSize: 200 } as const;
 
 /**
  * `GET /runs` — runs matching the `filter[...]` envelope (status, workflow, tag, namespace, origin,
- * created range, search attributes), newest first, offset-paged (`page`, 1-based, and `size`).
+ * created range, search attributes), newest first.
  *
- * Answers `{ data, meta: { total, perPage, currentPage, lastPage, firstPage }, statuses }`:
+ * Two paging styles. `first` + `after` (what the console sends) pages by cursor: each page seeks past
+ * the previous one's last run on `(createdAt, id)`, so a deep page costs what the first one does,
+ * and nothing is counted — `{ data, meta: { nextCursor, prevCursor, hasNext, hasPrev }, statuses }`.
+ * `page` + `size` (or no paging at all) keeps the offset envelope with its total:
+ * `{ data, meta: { total, perPage, currentPage, lastPage, firstPage }, statuses }`.
+ *
  * `statuses` is every run status, for the console's chips. `sort` accepts `-createdAt` only (the
- * stores' one order); anything else, and any refused filter, is a `400`.
+ * stores' one order); anything else, any refused filter and a malformed cursor are a `400` (a
+ * well-formed cursor past every run just answers an empty page). Cursor paging is forward only: a
+ * `before` or a `last` is a `400`.
  */
 export async function listRuns(deps: Deps, req: ApiRequest): Promise<ApiResponse> {
   const { engine } = deps;
-  const { page, size } = parsePageParams(req.query, RUNS_PAGE);
 
   let filter: Omit<RunQuery, 'page' | 'size'>;
+  let cursor: { size: number; after?: RunListPosition } | undefined;
   try {
     assertFixedSort(req.query.sort, RUN_SORT);
     filter = await runFilterQuery(req.query);
+    cursor = readRunsCursor(req.query);
   } catch (error) {
     return filterRejection(error);
   }
 
+  if (cursor !== undefined) {
+    const { size, after } = cursor;
+    // One run more than the page, to know whether another follows. A store that predates `after`
+    // answers from the top: dropping what is not strictly past the cursor ends the listing there
+    // instead of serving the same runs again.
+    const fetched = await engine.listRuns({
+      ...filter,
+      size: size + 1,
+      ...(after ? { after } : {}),
+    });
+    const rows = after === undefined ? fetched : fetched.filter((run) => isPast(run, after));
+    const hasNext = rows.length > size;
+    const page = rows.slice(0, size);
+    const waitingOf = await waitingResolver(engine, page);
+    const last = page.at(-1);
+    return ok({
+      ...cursorPage(
+        page.map((run) => redacted(deps.redact?.run, summarizeRun(run, waitingOf))),
+        {
+          nextCursor:
+            hasNext && last !== undefined
+              ? encodeCursor([last.createdAt.getTime(), last.id])
+              : null,
+          prevCursor: null,
+          hasNext,
+          hasPrev: after !== undefined,
+        },
+      ),
+      statuses: RUN_STATUSES,
+    });
+  }
+
+  const { page, size } = parsePageParams(req.query, RUNS_PAGE);
   const [runs, total] = await Promise.all([
     engine.listRuns({ ...filter, page, size }),
     countMatching(engine, filter),
@@ -478,6 +524,41 @@ export async function listRuns(deps: Deps, req: ApiRequest): Promise<ApiResponse
     ),
     statuses: RUN_STATUSES,
   });
+}
+
+/**
+ * The cursor half of a `GET /runs` request, or `undefined` when it pages by `page`/`size` (or not at
+ * all). Throws {@link InvalidColumnFilterError} (a `400`) on `before`/`last` or a malformed cursor.
+ */
+function readRunsCursor(
+  query: Record<string, unknown>,
+): { size: number; after?: RunListPosition } | undefined {
+  const sent = (name: string) => query[name] !== undefined && query[name] !== '';
+  if (!['first', 'after', 'last', 'before'].some(sent)) return undefined;
+  // The raw params decide the direction: `parseCursorParams` folds a `last` without `before` into a
+  // forward page size.
+  if (sent('before') || sent('last')) {
+    throw new InvalidColumnFilterError('GET /runs pages forward only: use after and first.');
+  }
+  const params = parseCursorParams(query, RUNS_PAGE);
+  if (params.after === undefined) return { size: params.size };
+  const values = decodeCursor(params.after);
+  const [createdAt, id] = values ?? [];
+  if (
+    values?.length !== 2 ||
+    typeof createdAt !== 'number' ||
+    !Number.isFinite(createdAt) ||
+    typeof id !== 'string'
+  ) {
+    throw new InvalidColumnFilterError('Invalid cursor.');
+  }
+  return { size: params.size, after: { createdAt, id } };
+}
+
+/** Is `run` strictly past `after` in the newest-first `(createdAt, id)` order? */
+function isPast(run: WorkflowRun, after: RunListPosition): boolean {
+  const at = run.createdAt.getTime();
+  return at < after.createdAt || (at === after.createdAt && run.id < after.id);
 }
 
 /**

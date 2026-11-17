@@ -845,10 +845,28 @@ export type { RunPredicates, RunValueField, RunValueRow } from './run-query-stri
 export interface RunPageOptions {
   page?: number;
   size?: number;
+  /** Page by cursor (what the runs board does): `size` per page, `after` past the first. */
+  cursor?: boolean;
+  /** The previous page's `meta.nextCursor`. */
+  after?: string;
 }
 
-/** One page of `/runs`: `{ data, meta: { total, perPage, currentPage, lastPage, firstPage } }`. */
-export type RunsPage = OffsetPage<WorkflowRun>;
+/** The cursor envelope's `meta`: no total; `nextCursor` goes back as `after`. */
+export interface RunsCursorMeta {
+  nextCursor: string | null;
+  prevCursor: string | null;
+  hasNext: boolean;
+  hasPrev: boolean;
+}
+
+/**
+ * One page of `/runs`: `{ data, meta }` — the cursor `meta` when asked by cursor, else the offset one
+ * (`{ total, perPage, currentPage, lastPage, firstPage }`).
+ */
+export interface RunsPage {
+  data: WorkflowRun[];
+  meta: RunsCursorMeta | OffsetPage<WorkflowRun>['meta'];
+}
 
 /** `GET /runs`' answer: the page, plus every run status for the chips. */
 interface RunsListResponse extends RunsPage {
