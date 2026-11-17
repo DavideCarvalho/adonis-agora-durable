@@ -1,11 +1,13 @@
 import { useQuery } from '@tanstack/react-query';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ErrorBoundary } from '../agora-kit/blocks/error-boundary';
 import { ActivityIcon, ClockIcon, ServerIcon } from '../agora-kit/icons';
 import { AppShell, type NavSection, PageBody } from '../agora-kit/shell/app-shell';
 import { readShellConfig } from '../agora-kit/shell-config';
+import { splitHash, subscribeHashUrl } from '../agora-kit/url-state/hash-url';
+import { NuqsHashAdapter } from '../agora-kit/url-state/nuqs-hash-adapter';
 import { CONFIG_ELEMENT_ID, durableClient } from '../client/durable-client';
-import { currentRoute, pushRoute, type Route } from './routes';
+import { currentRoute, pushRoute, type Route, sameRoute } from './routes';
 import { LogoMark } from './run-status';
 import { RunIdSearch } from './runs/RunIdSearch';
 import { RunsPage, useRunFilters } from './runs/RunsPage';
@@ -33,21 +35,42 @@ function LiveIndicator() {
   );
 }
 
+/** The hash's query (`status=failed&tag=vip`): the runs board's filters, when on the board. */
+function hashSearch(): string {
+  return typeof window === 'undefined' ? '' : splitHash(window.location.hash).search;
+}
+
+/**
+ * The durable console, wrapped in the kit's `NuqsHashAdapter`: the runs board's filters live in
+ * the hash's query (`#/run/<id>?status=failed&tag=vip`), so a filtered view is a link.
+ */
+export function App() {
+  return (
+    <NuqsHashAdapter>
+      <Console />
+    </NuqsHashAdapter>
+  );
+}
+
 /**
  * The durable console: the Agora shell (kit) around three pages — MONITOR (Runs, Workers) and
  * OPERATIONS (Schedules, absent on a tenant deployment, whose gateway has no runtime schedule
  * control) — plus a workflow's page. Every page and region renders inside its own error boundary.
  */
-export function App() {
+function Console() {
   // What the provider put in the page: switcher, ⌘K search, viewer, sign-out (all optional).
   const shell = useMemo(() => readShellConfig(CONFIG_ELEMENT_ID), []);
   const tenantPicker = useTenantPicker();
   const filters = useRunFilters();
   const [route, setRouteState] = useState<Route>(() => currentRoute());
 
+  // The runs board's filters (the hash's query) as last seen on the board — kept current by the
+  // URL subscription below — so leaving for Workers and coming back keeps the operator's
+  // narrowing, as it did when they lived in React state.
+  const runsSearch = useRef(route.page === 'runs' ? hashSearch() : '');
   const navigate = useCallback((next: Route) => {
     setRouteState(next);
-    pushRoute(next);
+    pushRoute(next, next.page === 'runs' ? runsSearch.current : '');
   }, []);
   // Every "open this run" affordance funnels here: it always lands on the runs board.
   const openRun = useCallback((id: string) => navigate({ page: 'runs', runId: id }), [navigate]);
@@ -55,16 +78,17 @@ export function App() {
     (id?: string) => navigate(id ? { page: 'runs', runId: id } : { page: 'runs' }),
     [navigate],
   );
-  // Follow back/forward and external hash edits.
-  useEffect(() => {
-    const sync = () => setRouteState(currentRoute());
-    window.addEventListener('hashchange', sync);
-    window.addEventListener('popstate', sync);
-    return () => {
-      window.removeEventListener('hashchange', sync);
-      window.removeEventListener('popstate', sync);
-    };
-  }, []);
+  // Follow back/forward, external hash edits and the filters' own query-only writes (which fire no
+  // `hashchange`): keep the route object while its page is unchanged.
+  useEffect(
+    () =>
+      subscribeHashUrl(() => {
+        const next = currentRoute();
+        if (next.page === 'runs') runsSearch.current = hashSearch();
+        setRouteState((prev) => (sameRoute(prev, next) ? prev : next));
+      }),
+    [],
+  );
 
   // Topology is fixed for a deployment's lifetime: fetch once. The role is the capability signal.
   const { data: topology } = useQuery({

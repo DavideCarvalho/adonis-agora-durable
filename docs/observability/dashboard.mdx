@@ -252,6 +252,8 @@ All routes are relative to `path` (default `/durable`), and every one of them ru
 
 The console routes client-side on the URL hash, so a deep link needs no server-side rewrite: `#/run/<id>` opens a run, `#/workflow/<name>` a [workflow's page](#workflow-pages), `#/workers` the Workers page and `#/schedules` the Schedules page.
 
+The Runs board's filters are in the URL: copy the link to share a filtered view. `/durable#?status=failed&tag=vip` opens the board on failed runs tagged `vip`, `/durable#/run/<id>?status=failed` opens a run with that filter kept, and back/forward step through your picks. The params are `status`, `workflow`, `tag`, `namespace`, `attr` (comma-separated sets) and `origin` (a package name, or `(app)` for the app's own runs).
+
 ### Reading runs
 
 | Method | Route | Purpose |
