@@ -1,5 +1,16 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.35
+
+### Minor Changes
+
+- [#560](https://github.com/DavideCarvalho/adonis-agora-durable/pull/560) [`b971790`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/b971790241f443da1aa8b212addd5101c006a2ac) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The runs board pages by cursor, so loading more no longer re-reads the runs above or counts the table on every page.
+  
+  - `GET /runs` accepts `first`/`after` and answers `{ data, meta: { nextCursor, prevCursor, hasNext, hasPrev }, statuses }`. It seeks past the last run's `(createdAt, id)` with no `countRuns`. `page`/`size` keep the offset envelope and its `total`.
+  - `RunQuery.after: { createdAt, id }` (new type `RunListPosition`) pages by position: strictly past it in `(createdAt DESC, id DESC)` order, `page` ignored. Both built-in stores implement it. `listRuns` now breaks ties on `createdAt` by `id`, so runs created in the same millisecond keep one order across pages. A store that ignores `after` ends the board's listing instead of repeating runs.
+  - The board's infinite scroll follows `nextCursor`. Its header shows the loaded count (`120+ runs`) instead of a total.
+  - New migration `add_durable_run_list_indexes` (published by `configure`), plus `createDurableRunListIndexes` / `dropDurableRunListIndexes`. It adds `(status, created_at, id)` on the runs table for the status chips, built `CONCURRENTLY` on Postgres. Opt-in: run it once on existing installs (see the Lucid store docs).
+
 ## 1.0.0-rc.34
 
 ### Minor Changes
