@@ -6,5 +6,6 @@ export default defineConfig({
     globals: true,
     include: ['src/**/*.{spec,test}.{ts,tsx}'],
     pool: 'forks',
+    setupFiles: ['./vitest.setup.ts'],
   },
 });
