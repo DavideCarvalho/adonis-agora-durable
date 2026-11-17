@@ -77,7 +77,24 @@ export const DURABLE_SCHEMA_META_TABLE = 'durable_schema_meta';
  * once on its next boot and then goes back to the one-row read. A test pins the SQLite DDL to this
  * number, so a schema change without a bump fails CI.
  */
-export const DURABLE_SCHEMA_REVISION = 6;
+export const DURABLE_SCHEMA_REVISION = 7;
+
+/**
+ * Postgres: the partial index serving the listing of settled runs that still owe a lifecycle event
+ * (`listRuns({ tag: LIFECYCLE_PENDING_TAG })`, every 10 s on every worker). Without it that listing
+ * reads the whole runs table. Only the runs carrying the tag are in it, so it stays tiny.
+ */
+export const LIFECYCLE_PENDING_INDEX = 'durable_runs_lifecycle_pending_idx';
+
+/**
+ * The partial index's predicate. The store's owed listing repeats this text verbatim (a literal, not
+ * a bound parameter), which is what lets the planner prove the index applies on every plan.
+ */
+export const LIFECYCLE_PENDING_PREDICATE = `tags like '%"durable:lifecycle:pending"%' escape '!'`;
+
+/** The tag {@link LIFECYCLE_PENDING_PREDICATE} matches (`LIFECYCLE_PENDING_TAG`, kept here so the
+ *  schema module imports no engine code; a test pins the two together). */
+export const LIFECYCLE_PENDING_INDEXED_TAG = 'durable:lifecycle:pending';
 
 const SCHEMA_META_ROW = 'durable';
 
@@ -341,12 +358,80 @@ export async function createDurableTables(
   if (!options.force && (await readSchemaFingerprint(connection, schema)) === expected) return;
   // Outside the lock's transaction: a failed CREATE SCHEMA would abort it.
   await ensureSchemaExists(connection, schema);
+  const postgres = connection.dialect.name === 'postgres';
+  let healed = false;
   await withSchemaLock(connection, schema, logger, async (client) => {
     // A sibling may have healed while this process waited for the lock.
     if (!options.force && (await readSchemaFingerprint(client, schema)) === expected) return;
     await healDurableTables(client, schema, collation, logger);
-    await writeSchemaFingerprint(client, schema, expected);
+    healed = true;
+    // Postgres records the revision only once the index built outside the lock is in place.
+    if (!postgres) await writeSchemaFingerprint(client, schema, expected);
   });
+  if (!healed) return;
+  // CREATE INDEX CONCURRENTLY cannot run in the lock's transaction, and does not block writes to the
+  // runs table while it builds. Until it is valid the revision stays unrecorded, so the next boot
+  // tries again; the owed listing works without it, only slower.
+  if (await ensureLifecyclePendingIndex(connection, schema, logger)) {
+    await writeSchemaFingerprint(connection, schema, expected);
+  }
+}
+
+/**
+ * Postgres: make sure {@link LIFECYCLE_PENDING_INDEX} exists and is valid, building it with
+ * `CREATE INDEX CONCURRENTLY` (reads and writes of the runs table go on meanwhile). An invalid one
+ * left by a build that died is dropped and built again, unless a build of it is still running (a
+ * sibling process): then this returns `false` and leaves it to that build. A failed build is
+ * reported through `logger` and returns `false`. Every other dialect: `true`, nothing to do (MySQL
+ * has no partial index; SQLite deployments are small enough for the plain scan).
+ */
+export async function ensureLifecyclePendingIndex(
+  connection: QueryClientContract,
+  schema: string | undefined,
+  logger: DurableSchemaLogger = console,
+): Promise<boolean> {
+  if (connection.dialect.name !== 'postgres') return true;
+  const table = qualify(schema, DURABLE_TABLES.runs);
+  try {
+    const state = await pgIndexState(connection, schema, LIFECYCLE_PENDING_INDEX);
+    if (state?.valid) return true;
+    if (state) {
+      if (state.building) return false;
+      await connection.rawQuery('drop index concurrently if exists ??', [
+        qualify(schema, LIFECYCLE_PENDING_INDEX),
+      ]);
+    }
+    await connection.rawQuery(
+      `create index concurrently if not exists ?? on ?? (created_at) where ${LIFECYCLE_PENDING_PREDICATE}`,
+      [LIFECYCLE_PENDING_INDEX, table],
+    );
+    // IF NOT EXISTS returns at once when a sibling's build created the name first.
+    return (await pgIndexState(connection, schema, LIFECYCLE_PENDING_INDEX))?.valid === true;
+  } catch (err) {
+    logger.warn(
+      `@adonis-agora/durable: could not build the index ${LIFECYCLE_PENDING_INDEX} on ${table} (${(err as Error).message}); the next boot tries again. Until then the owed lifecycle listing reads the whole runs table.`,
+    );
+    return false;
+  }
+}
+
+/** A Postgres index's validity, and whether a `CREATE INDEX` of it is running; `undefined` if absent. */
+async function pgIndexState(
+  connection: QueryClientContract,
+  schema: string | undefined,
+  indexName: string,
+): Promise<{ valid: boolean; building: boolean } | undefined> {
+  const result = (await connection.rawQuery(
+    `select i.indisvalid as valid,
+            exists (select 1 from pg_stat_progress_create_index p where p.index_relid = c.oid) as building
+       from pg_class c
+       join pg_namespace n on n.oid = c.relnamespace
+       join pg_index i on i.indexrelid = c.oid
+      where c.relname = ? and n.nspname = ${schema ? '?' : 'current_schema()'}`,
+    schema ? [indexName, schema] : [indexName],
+  )) as { rows: Array<{ valid: boolean; building: boolean }> };
+  const row = result.rows[0];
+  return row ? { valid: row.valid === true, building: row.building === true } : undefined;
 }
 
 /** The additive check-and-repair behind {@link createDurableTables}, on one client (or transaction). */
