@@ -143,4 +143,13 @@ describe('durable step durations in Telescope', () => {
       DurableTelescopeWatcher,
     );
   });
+
+  it('the extension adds no watcher of its own when the host already wired one', () => {
+    installRuntime();
+    const host = new DurableTelescopeWatcher();
+    host.register({ record: () => undefined });
+    cleanups.push(() => host.dispose());
+    durableTelescopeExtension().entryTypes?.({} as never);
+    expect((slot[AUTO_SLOT] as { watcher?: unknown } | undefined)?.watcher).toBeUndefined();
+  });
 });

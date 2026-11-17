@@ -250,7 +250,7 @@ function forward(event: EngineEvent, options?: { traceId: string; app: string })
     : undefined;
   const durationMs =
     typeof event.durationMs === 'number' && Number.isFinite(event.durationMs)
-      ? Math.max(0, event.durationMs)
+      ? Math.max(0, Math.round(event.durationMs))
       : undefined;
   const emitOptions = durationMs === undefined ? options : { ...(options ?? {}), durationMs };
   emit(
