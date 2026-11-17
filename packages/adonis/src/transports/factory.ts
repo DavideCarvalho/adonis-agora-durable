@@ -307,6 +307,24 @@ export interface BullMQTransportConfig {
      */
     connection?: unknown;
   };
+  /**
+   * How step and workflow tasks are laid out on queues. `'per-handler'` (default): one queue, one
+   * BullMQ worker and one blocking connection per handler (`<prefix>-tasks-<handler>`), which is what
+   * the NestJS and Python SDKs read. `'grouped'`: every handler of a partition shares ONE queue
+   * (`<prefix>-taskgroup`), so idle polling, stalled checks and connections stop growing with the
+   * number of handlers; each handler keeps its own `concurrency` through an in-process limiter.
+   * Every process consuming a partition's grouped queue must register the handlers dispatched to it.
+   * Every process of the fleet must use the same value (see `taskQueueDrain` for switching).
+   */
+  taskQueues?: 'per-handler' | 'grouped';
+  /**
+   * Also consume the other layout's queues of the handlers this process serves while they hold jobs:
+   * the per-handler queues in `'grouped'` mode (jobs from processes not yet upgraded, delayed and
+   * stalled ones), the grouped queue in `'per-handler'` mode (a rollback). One `EXISTS` per interval
+   * while they are empty. Default `true` with `'grouped'`, `false` otherwise; `{ intervalMs }` sets
+   * the interval (default `60_000`).
+   */
+  taskQueueDrain?: boolean | { intervalMs?: number };
 }
 
 /** Options for the DB-table-backed (`@adonisjs/lucid`) transport. */
@@ -553,6 +571,8 @@ export const transports = {
         ...(config.onError !== undefined ? { onError: config.onError } : {}),
         ...(config.pingIntervalMs !== undefined ? { pingIntervalMs: config.pingIntervalMs } : {}),
         ...(config.stepTimeoutMs !== undefined ? { stepTimeoutMs: config.stepTimeoutMs } : {}),
+        ...(config.taskQueues !== undefined ? { taskQueues: config.taskQueues } : {}),
+        ...(config.taskQueueDrain !== undefined ? { taskQueueDrain: config.taskQueueDrain } : {}),
         ...(config.workerRegistry !== undefined
           ? {
               workerRegistry: {

@@ -68,6 +68,21 @@ describe('groupByPartition', () => {
     expect(views.map((v) => v.partition)).toEqual(['default', 'alpha', 'mid', 'zeta']);
   });
 
+  it('groups on one shared queue count its depth once, exact even when the split was sampled', () => {
+    const shared = { queue: 'durable-taskgroup', queueDepth: 900, depthSampled: true };
+    const views = groupByPartition([
+      group({ group: 'A', depth: 300, ...shared }),
+      group({ group: 'B', depth: 200, ...shared }),
+      group({ group: 'C', depth: 4 }),
+    ]);
+    expect(views[0]).toMatchObject({
+      totalDepth: 904,
+      sharedQueues: ['durable-taskgroup'],
+      handlerCount: 3,
+    });
+    expect(groupByPartition([group({ group: 'A', depth: 1 })])[0]?.sharedQueues).toEqual([]);
+  });
+
   it('empty input returns an empty array', () => {
     expect(groupByPartition([])).toEqual([]);
   });

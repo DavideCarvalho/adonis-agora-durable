@@ -444,6 +444,12 @@ export interface GroupHealth {
   depth: number;
   liveWorkers: WorkerHeartbeat[];
   kind?: 'workflow' | 'step';
+  /** The broker queue the group shares with other groups (BullMQ `taskQueues: 'grouped'`). */
+  queue?: string;
+  /** That shared queue's depth across all its groups. */
+  queueDepth?: number;
+  /** `depth` was counted from a sample of the shared queue and may undercount. */
+  depthSampled?: boolean;
 }
 
 export interface RunResult {

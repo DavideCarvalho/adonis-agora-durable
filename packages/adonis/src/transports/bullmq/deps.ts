@@ -39,6 +39,11 @@ export interface QueueLike {
    * reads result batches, and publishes one result per job.
    */
   getWorkersCount?(): Promise<number>;
+  /**
+   * Jobs in the given states, `start`..`end` of each. Optional: without it, the per-handler depth of a
+   * grouped task queue cannot be read and every handler reports the queue's depth as zero.
+   */
+  getJobs?(types: string[], start?: number, end?: number): Promise<Array<JobLike | undefined>>;
   close(): Promise<unknown>;
 }
 
@@ -104,6 +109,10 @@ export interface BullMQDeps {
   makeWorker(name: string, process: ProcessFn, opts?: { concurrency?: number }): WorkerLike;
   /** A fresh standalone Redis client (pub/sub needs its own connection; the heartbeat registry reuses one). */
   makeRedis(): RedisLike;
+  /** The concurrency a worker gets when `makeWorker` is given none. Absent reads as 1. */
+  defaultConcurrency?: number | undefined;
+  /** The BullMQ key prefix the queues live under (BullMQ's `prefix`). Absent reads as `bull`. */
+  queueKeyPrefix?: string | undefined;
 }
 
 /**
@@ -285,5 +294,7 @@ export async function createBullMQDeps(
         ...(stalledInterval !== undefined ? { stalledInterval } : {}),
       }),
     makeRedis,
+    defaultConcurrency,
+    queueKeyPrefix: 'bull',
   };
 }
