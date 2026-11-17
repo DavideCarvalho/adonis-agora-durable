@@ -1,5 +1,11 @@
 # @adonis-agora/durable-dashboard
 
+## 1.0.0-rc.15
+
+### Minor Changes
+
+- [#555](https://github.com/DavideCarvalho/adonis-agora-durable/pull/555) [`9c8ad7d`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/9c8ad7dfbc229de85f429cb4908f6e3d24660f71) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The Workers page understands grouped BullMQ task queues: a partition whose handlers share one queue shows a "shared queue" badge and counts that queue's depth once, exact even when the per-handler split was sampled, and a starved handler's sampled depth reads `≥N`.
+
 ## 1.0.0-rc.14
 
 ### Patch Changes

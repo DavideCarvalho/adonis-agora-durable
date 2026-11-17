@@ -1,5 +1,15 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.33
+
+### Minor Changes
+
+- [#555](https://github.com/DavideCarvalho/adonis-agora-durable/pull/555) [`9c8ad7d`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/9c8ad7dfbc229de85f429cb4908f6e3d24660f71) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - New `transports.bullmq({ taskQueues: 'grouped' })`: every step and workflow handler of a partition shares ONE BullMQ queue, `<P>-taskgroup` (`<P>-taskgroup@<partition>`), consumed by one `Worker` that routes each job by the routing token it carries, instead of one queue, one `Worker` and one blocking connection per handler. Idle polling, stalled checks and connections no longer grow with the number of handlers: with 85 handlers in one process, idle Redis commands went from 45.5 to 3.7 per second (30.0 to 2.7 with `stalledInterval: 120_000`) and connections from 190 to 20, while a three-step run costs about 4% more commands (425 instead of 408). The default stays `'per-handler'`, the layout the NestJS and Python SDKs read.
+  
+  Each handler keeps its own `concurrency` (fixed or adaptive) through an in-process limiter: the shared worker runs up to twice the sum of the handlers' limits, a job of a handler at its limit waits in the worker (one limit's worth at most), and the rest go back on the queue with a growing delay, so one handler's backlog cannot starve the others. Priority, partitions, step timeouts, crash recovery, the shutdown hand-back and the per-handler worker registry are unchanged. A process that takes a job for a handler it does not register hands it back (delayed 10s) and reports it once through `onError`, so every process consuming a partition's grouped queue must register the same handlers. `groupHealth` reports each handler's share of the shared queue, with new optional `GroupHealth.queue`, `queueDepth` and `depthSampled`.
+  
+  New `taskQueueDrain` (default `true` with `'grouped'`, `false` otherwise; `{ intervalMs }`, default 60s) keeps a rolling deploy safe: a process also consumes the other layout's queues of the handlers it serves while they hold jobs (waiting, delayed, retrying, or left active by a crashed worker), found with one `EXISTS` per interval over all of them, and stops each drain worker once its queue is empty. Switching back to `'per-handler'` with `taskQueueDrain: true` drains the grouped queue the same way.
+
 ## 1.0.0-rc.32
 
 ### Minor Changes
