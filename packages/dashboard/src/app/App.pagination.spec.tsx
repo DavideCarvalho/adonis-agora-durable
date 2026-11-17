@@ -179,4 +179,50 @@ describe('App: real pagination wiring (useInfiniteQuery over durableClient.runsP
     await new Promise((resolve) => setTimeout(resolve, 200));
     expect(runsPage).toHaveBeenCalledTimes(1);
   });
+  it('a live refresh after a head insert drops no run: each page re-reads after the FRESH page before it', async () => {
+    // A keyset server over a mutable list, newest first, 3 per page; the cursor is the last id.
+    const list = ['r6', 'r5', 'r4', 'r3', 'r2', 'r1'];
+    runsPage.mockImplementation(async (_s, _t, _a, _o, pageArg) => {
+      const start = pageArg?.after ? list.indexOf(pageArg.after) + 1 : 0;
+      const rows = list.slice(start, start + 3);
+      const more = start + 3 < list.length;
+      return page(
+        rows.map((id) => run(id)),
+        more ? rows[rows.length - 1]! : null,
+        pageArg?.after,
+      );
+    });
+
+    render(<App />, { wrapper });
+    // Both pages load (the board asks for the next page while the end of the list is in view).
+    await waitFor(() =>
+      expect(runsPage.mock.calls.map((c) => (c[4] as PageArg).after)).toEqual([undefined, 'r4']),
+    );
+    const loaded = runsPage.mock.calls.length;
+
+    // A run is created at the head: page 1 now ends at r5, and r4 slides onto page 2. A refresh
+    // that re-used page 2's old `after` (r4) would show neither page with r4 in it.
+    list.unshift('n7');
+    await waitFor(
+      () => {
+        const afters = runsPage.mock.calls.slice(loaded).map((c) => (c[4] as PageArg).after);
+        expect(afters).toContain('r5');
+      },
+      { timeout: 6000 },
+    );
+    const refreshAfters = runsPage.mock.calls.slice(loaded).map((c) => (c[4] as PageArg).after);
+    expect(refreshAfters).not.toContain('r4');
+    // Every run the board held before the insert is still on a loaded page, plus the new one; r1
+    // slid past the two loaded pages and waits behind "load more" (page 2 now hands out r2).
+    await waitFor(async () => {
+      const read = new Set<string>();
+      let last: RunsPage | undefined;
+      for (const r of runsPage.mock.results.slice(loaded)) {
+        last = await r.value;
+        for (const row of last.data) read.add(row.id);
+      }
+      expect([...read].sort()).toEqual(['n7', 'r2', 'r3', 'r4', 'r5', 'r6']);
+      expect(last?.meta).toMatchObject({ hasNext: true, nextCursor: 'r2' });
+    });
+  }, 15000);
 });

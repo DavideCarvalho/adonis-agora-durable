@@ -154,8 +154,10 @@ describe('JSON handlers', () => {
     }
     expect(seen.sort()).toEqual(['run-0', 'run-1', 'run-2', 'run-3', 'run-4']);
 
-    for (const query of [{ after: 'forged' }, { before: 'x', last: '2' }]) {
-      expect((await listRuns(deps, req({ query }))).status).toBe(400);
+    // A malformed cursor, and backward paging however it is spelled (`last` alone included: it is
+    // not a forward page size).
+    for (const query of [{ after: 'forged' }, { before: 'x', last: '2' }, { last: '2' }]) {
+      expect((await listRuns(deps, req({ query }))).status, JSON.stringify(query)).toBe(400);
     }
   });
 

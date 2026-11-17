@@ -884,9 +884,11 @@ export const DURABLE_RUN_LIST_INDEXES: ReadonlyArray<readonly [name: string, col
 
 /**
  * Create the missing {@link DURABLE_RUN_LIST_INDEXES} — what the opt-in migration runs, once, on an
- * existing install. On Postgres each is built `CONCURRENTLY IF NOT EXISTS`, so reads and writes of the
- * runs table go on while it builds (run it outside a transaction); elsewhere a plain index, skipped
- * when it is already there.
+ * existing install. On Postgres each is built `CONCURRENTLY`, so reads and writes of the runs table go
+ * on while it builds (run it outside a transaction). An `INVALID` index left by a build that died is
+ * dropped and built again, as {@link ensureLifecyclePendingIndex} does; one a sibling is still
+ * building, or a build that ends invalid, throws, so the migration is not recorded as done.
+ * Elsewhere a plain index, skipped when it is already there.
  */
 export async function createDurableRunListIndexes(
   db: Database,
@@ -896,23 +898,48 @@ export async function createDurableRunListIndexes(
   const connection = db.connection(connectionName);
   const schema = validateSchemaName(options.schema, 'createDurableRunListIndexes');
   assertSchemaSupported(connection, schema, 'createDurableRunListIndexes');
-  const table = qualify(schema, DURABLE_TABLES.runs);
   for (const [name, columns] of DURABLE_RUN_LIST_INDEXES) {
     if (connection.dialect.name === 'postgres') {
-      await connection.rawQuery(
-        `create index concurrently if not exists ?? on ?? (${columns.map(() => '??').join(', ')})`,
-        [name, table, ...columns],
-      );
+      await buildPgIndexConcurrently(connection, schema, name, columns);
       continue;
     }
     try {
-      await connection.schema.alterTable(table, (t) => {
+      await schemaBuilder(connection, schema).alterTable(DURABLE_TABLES.runs, (t) => {
         t.index(columns, name);
       });
     } catch (error) {
       // MySQL and SQLite say "already exists" / "Duplicate key name": the index is there.
       if (!/already exists|duplicate key name/i.test((error as Error).message)) throw error;
     }
+  }
+}
+
+/** Build `name` on the runs table `CONCURRENTLY` unless a valid one is there; heal an invalid one. */
+async function buildPgIndexConcurrently(
+  connection: QueryClientContract,
+  schema: string | undefined,
+  name: string,
+  columns: string[],
+): Promise<void> {
+  const state = await pgIndexState(connection, schema, name);
+  if (state?.valid) return;
+  if (state?.building) {
+    throw new Error(
+      `@adonis-agora/durable: the index ${name} is still being built by another session; run this again once it finishes.`,
+    );
+  }
+  if (state) {
+    await connection.rawQuery('drop index concurrently if exists ??', [qualify(schema, name)]);
+  }
+  await connection.rawQuery(
+    `create index concurrently if not exists ?? on ?? (${columns.map(() => '??').join(', ')})`,
+    [name, qualify(schema, DURABLE_TABLES.runs), ...columns],
+  );
+  // IF NOT EXISTS returns at once when a sibling's build created the name first.
+  if ((await pgIndexState(connection, schema, name))?.valid !== true) {
+    throw new Error(
+      `@adonis-agora/durable: the index ${name} is not valid after its build; run this again to rebuild it.`,
+    );
   }
 }
 
@@ -924,14 +951,14 @@ export async function dropDurableRunListIndexes(
 ): Promise<void> {
   const connection = db.connection(connectionName);
   const schema = validateSchemaName(options.schema, 'dropDurableRunListIndexes');
-  const table = qualify(schema, DURABLE_TABLES.runs);
+  assertSchemaSupported(connection, schema, 'dropDurableRunListIndexes');
   for (const [name, columns] of DURABLE_RUN_LIST_INDEXES) {
     if (connection.dialect.name === 'postgres') {
       await connection.rawQuery('drop index concurrently if exists ??', [qualify(schema, name)]);
       continue;
     }
     try {
-      await connection.schema.alterTable(table, (t) => {
+      await schemaBuilder(connection, schema).alterTable(DURABLE_TABLES.runs, (t) => {
         t.dropIndex(columns, name);
       });
     } catch (error) {

@@ -258,7 +258,10 @@ export function RunsPage({
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
       'nextCursor' in lastPage.meta ? (lastPage.meta.nextCursor ?? undefined) : undefined,
-    // On an infinite query this refetches EVERY loaded page each interval — fine at this scale.
+    // On an infinite query this refetches EVERY loaded page each interval — fine at this scale. A
+    // refetch (TanStack Query v5) re-derives each later page's `after` from the page it just
+    // re-read, via getNextPageParam, so runs inserted at the head shift the pages down and none
+    // falls between two: what slides off the last loaded page waits behind "load more".
     refetchInterval: 3000,
   });
   const runs = useMemo(() => runsPages?.pages.flatMap((p) => p.data) ?? [], [runsPages]);

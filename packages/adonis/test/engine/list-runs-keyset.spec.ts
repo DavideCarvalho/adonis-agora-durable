@@ -113,4 +113,45 @@ describe.each(dbBackends({ mysql: true }))('the opt-in run list index ($name)', 
     expect((await walk(store, { status: 'failed' }, 4)).flat()).toHaveLength(6);
     expect(DURABLE_RUN_LIST_INDEXES.length).toBeGreaterThan(0);
   });
+
+  it('rebuilds an INVALID index a failed concurrent build left behind (Postgres)', async () => {
+    const db = await backend.makeStoreDb();
+    opened.push(db);
+    if (backend.name !== 'postgres') return;
+    const store = new LucidStateStore(db);
+    await seed(store);
+    const [[name]] = DURABLE_RUN_LIST_INDEXES as [readonly [string, string[]]];
+    // A concurrent build that dies (a unique index over duplicate statuses) leaves the name behind,
+    // INVALID; IF NOT EXISTS alone would skip it forever.
+    await expect(
+      db.rawQuery(`create unique index concurrently ${name} on durable_workflow_runs (status)`),
+    ).rejects.toThrow();
+    const state = async () =>
+      (
+        (await db.rawQuery(
+          `select i.indisvalid as valid, pg_get_indexdef(c.oid) as def
+             from pg_class c join pg_index i on i.indexrelid = c.oid
+             join pg_namespace n on n.oid = c.relnamespace
+            where c.relname = ? and n.nspname = current_schema()`,
+          [name],
+        )) as { rows: Array<{ valid: boolean; def: string }> }
+      ).rows[0];
+    expect((await state())?.valid).toBe(false);
+    await createDurableRunListIndexes(db);
+    const healed = await state();
+    expect(healed?.valid).toBe(true);
+    expect(healed?.def).toMatch(/\(status, created_at, id\)/);
+  });
+
+  it('refuses a schema on a connection that has none, both ways', async () => {
+    const db = await backend.makeStoreDb();
+    opened.push(db);
+    if (backend.name !== 'sqlite') return;
+    await expect(createDurableRunListIndexes(db, undefined, { schema: 'tenant' })).rejects.toThrow(
+      /has no schemas/,
+    );
+    await expect(dropDurableRunListIndexes(db, undefined, { schema: 'tenant' })).rejects.toThrow(
+      /has no schemas/,
+    );
+  });
 });
