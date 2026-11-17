@@ -123,22 +123,47 @@ export function durableEntryTags(event: BridgedEvent): string[] {
   return tags;
 }
 
+/** The longest `familyHash` Telescope stores (its `family_hash` column is a `VARCHAR(255)`). */
+const MAX_FAMILY_LENGTH = 255;
+
+/**
+ * The family of a durable entry: `durable:<event>`, and for a step's outcome (`step.completed`,
+ * `step.failed`) `durable:<event>:<step name>`, so Telescope ranks the slowest steps by name from
+ * the family and duration alone (cut to the 255 characters Telescope stores).
+ */
+export function durableEntryFamily(event: string, payload: { name?: unknown }): string {
+  const family = `durable:${event}`;
+  if (event !== 'step.completed' && event !== 'step.failed') return family;
+  if (typeof payload.name !== 'string' || payload.name === '') return family;
+  return `${family}:${payload.name}`.slice(0, MAX_FAMILY_LENGTH);
+}
+
 /**
  * The entry the watcher records for one `agora:durable:*` envelope: the generic diagnostics
- * watcher's entry (`type: 'diagnostic'`, `familyHash: 'durable:<event>'`, the envelope as content,
- * `lib:durable` / `event:<type>` / `trace:<id>` tags), plus {@link durableEntryTags}. The same type,
- * family and content, so the Workflows dashboard's entry-backed panels read it unchanged.
+ * watcher's entry (`type: 'diagnostic'`, the envelope as content, `lib:durable` / `event:<type>` /
+ * `trace:<id>` tags), plus {@link durableEntryTags}. The family is `durable:<event>`, with the step
+ * name after it for a step's outcome ({@link durableEntryFamily}), and a step's `durationMs` (from
+ * the envelope, else its payload) is the entry's duration. The same type and content, so the
+ * Workflows dashboard's entry-backed panels read it unchanged.
  */
 export function buildDurableEntry(envelope: DiagnosticEnvelope): TelescopeRecordInput {
   const traceId = envelope.traceId ?? null;
-  const durationMs = envelope.durationMs ?? null;
   const payload =
     envelope.payload !== null && typeof envelope.payload === 'object'
       ? (envelope.payload as BridgedEvent)
       : {};
+  // An emitter older than the envelope's `durationMs` still has the step's in its payload.
+  const measured = envelope.durationMs ?? payload.durationMs;
+  const durationMs =
+    typeof measured === 'number' && Number.isFinite(measured)
+      ? Math.max(0, Math.round(measured))
+      : null;
   return {
     type: 'diagnostic',
-    familyHash: `${envelope.lib}:${envelope.event}`,
+    familyHash:
+      envelope.lib === 'durable'
+        ? durableEntryFamily(envelope.event, payload)
+        : `${envelope.lib}:${envelope.event}`,
     tags: [
       `lib:${envelope.lib}`,
       `event:${envelope.event}`,
@@ -197,6 +222,7 @@ export class DurableTelescopeWatcher {
       auto.watcher = undefined;
     }
     this.disposers.push(claimDurableDiagnostics(DURABLE_DIAGNOSTIC_EVENTS));
+    this.disposers.push(announceWatcher('enabledWatchers'));
     for (const event of DURABLE_DIAGNOSTIC_EVENTS) {
       const channel = `agora:durable:${event}`;
       const onMessage = (message: unknown): void => {
@@ -236,9 +262,42 @@ function autoWatcherSlot(): { watcher?: DurableTelescopeWatcher | undefined } {
 interface TelescopeRuntimeLike {
   store: { record(entry: TelescopeRecordInput): unknown } | null;
   paused?: boolean;
+  /** The watchers running here, which the console and the instance heartbeat report. */
+  enabledWatchers?: Set<string>;
+  /** The watchers a control plane runs for its tenants (`@adonis-agora/telescope` 1.0.0-rc.31+). */
+  tenantWatchers?: Set<string>;
 }
 
 const TELESCOPE_RUNTIME = Symbol.for('@agora/telescope:runtime');
+
+/** How many registrations hold `durable` in each runtime list (one watcher can replace another). */
+const announced: Record<'enabledWatchers' | 'tenantWatchers', number> = {
+  enabledWatchers: 0,
+  tenantWatchers: 0,
+};
+
+/**
+ * Name `durable` in one of Telescope's watcher lists, so the console tells "no workflow step ran"
+ * apart from "nothing records them" (a no-op without Telescope, or with a version that has no such
+ * list). Returns the idempotent release; `durable` leaves the list with the last holder.
+ */
+function announceWatcher(list: 'enabledWatchers' | 'tenantWatchers'): () => void {
+  announced[list] += 1;
+  telescopeRuntime()?.[list]?.add('durable');
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    announced[list] -= 1;
+    if (announced[list] === 0) telescopeRuntime()?.[list]?.delete('durable');
+  };
+}
+
+function telescopeRuntime(): TelescopeRuntimeLike | undefined {
+  return (globalThis as Record<symbol, unknown>)[TELESCOPE_RUNTIME] as
+    | TelescopeRuntimeLike
+    | undefined;
+}
 
 /**
  * Record into the Telescope store of this process, read per entry from the runtime slot Telescope
@@ -266,6 +325,22 @@ export function telescopeRuntimeRecorder(): WatcherContext {
 export function registerControlPlaneWatcher(
   ctx: WatcherContext = telescopeRuntimeRecorder(),
 ): () => void {
+  // Whichever watcher records here, it records every tenant's events: the console counts `durable`
+  // on for each app in view.
+  const releaseTenants = announceWatcher('tenantWatchers');
+  const releaseWatcher = registerAutoWatcher(ctx);
+  return () => {
+    releaseWatcher();
+    releaseTenants();
+  };
+}
+
+/**
+ * Record durable's events through the tagging watcher into this process's Telescope, unless a
+ * watcher is already registered (the `durable:*` keys are claimed); a host that registers its own
+ * later replaces this one. Returns the release.
+ */
+export function registerAutoWatcher(ctx: WatcherContext = telescopeRuntimeRecorder()): () => void {
   const slot = autoWatcherSlot();
   if (slot.watcher !== undefined) return () => undefined;
   if ((claimsRegistry().get('durable:run.started') ?? 0) > 0) return () => undefined;

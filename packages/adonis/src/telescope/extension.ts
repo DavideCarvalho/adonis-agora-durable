@@ -16,6 +16,7 @@ import {
 } from './data-providers.js';
 import { durableSchedules } from './schedules.js';
 import type { TelescopeExtension } from './telescope-sdk.js';
+import { registerAutoWatcher } from './watcher.js';
 
 /**
  * The first-class `@adonis-agora/telescope` extension for `@adonis-agora/durable`: a "Workflows" health dashboard
@@ -28,9 +29,11 @@ import type { TelescopeExtension } from './telescope-sdk.js';
  * export default defineConfig({ extensions: [durableTelescopeExtension()] })
  * ```
  *
- * No watcher is contributed — the `@adonis-agora/durable` provider already bridges engine events onto the
- * diagnostics bus, and Telescope's generic diagnostics watcher records them; the entry-backed
- * providers read those `tag: 'lib:durable'` entries, the rest query the live engine.
+ * At boot (its `entryTypes` hook) it also records durable's events with {@link registerAutoWatcher}
+ * (the tagging watcher, unless the host wired one), which names `durable` in Telescope's watcher
+ * list and gives each step's outcome its duration and step name, the "Slowest jobs" panel's input.
+ * The `@adonis-agora/durable` provider bridges engine events onto the diagnostics bus; the
+ * entry-backed providers read those `tag: 'lib:durable'` entries, the rest query the live engine.
  *
  * The returned object structurally satisfies `@adonis-agora/telescope`'s `TelescopeExtension` (it is not
  * imported — see `telescope-sdk.ts` for why).
@@ -38,7 +41,11 @@ import type { TelescopeExtension } from './telescope-sdk.js';
 export function durableTelescopeExtension(opts: DurableDashboardOptions = {}): TelescopeExtension {
   return {
     name: 'durable',
-    entryTypes: () => [{ id: 'durable', label: 'Workflows', dot: 'bg-amber-400' }],
+    entryTypes: () => {
+      // Telescope runs the hooks once at boot: record the events the Workflows pages read.
+      registerAutoWatcher();
+      return [{ id: 'durable', label: 'Workflows', dot: 'bg-amber-400' }];
+    },
     dashboards: () => [durableDashboard(opts)],
     dataProviders: () => [
       durableStateProvider(),

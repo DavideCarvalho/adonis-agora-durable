@@ -16,7 +16,7 @@ type EmitFn = (
   lib: string,
   event: string,
   payload: unknown,
-  options?: { traceId?: string; app?: string },
+  options?: { traceId?: string; app?: string; durationMs?: number },
 ) => void;
 
 /** Options for {@link attachDurableDiagnostics}. */
@@ -236,7 +236,11 @@ function forwardTenant(event: EngineEvent & { app?: string }): void {
   else forward(event, { traceId: runTraceId(event.runId), app: event.app });
 }
 
-/** Emit one engine event on the diagnostics bus, with the child / lifecycle links it implies. */
+/**
+ * Emit one engine event on the diagnostics bus, with the child / lifecycle links it implies. An event
+ * that measured its work (`step.completed` / `step.failed`) also stamps its `durationMs` on the
+ * envelope, the field Telescope stores in its `duration_ms` column.
+ */
 function forward(event: EngineEvent, options?: { traceId: string; app: string }): void {
   const emit = (globalThis as Record<symbol, unknown>)[EMIT_SLOT] as EmitFn | undefined;
   if (typeof emit !== 'function') return;
@@ -244,6 +248,11 @@ function forward(event: EngineEvent, options?: { traceId: string; app: string })
   const source = event.workflow
     ? lifecycleSourceOf({ id: event.runId, workflow: event.workflow })
     : undefined;
+  const durationMs =
+    typeof event.durationMs === 'number' && Number.isFinite(event.durationMs)
+      ? Math.max(0, event.durationMs)
+      : undefined;
+  const emitOptions = durationMs === undefined ? options : { ...(options ?? {}), durationMs };
   emit(
     'durable',
     event.type,
@@ -254,6 +263,6 @@ function forward(event: EngineEvent, options?: { traceId: string; app: string })
           ...(source ? { lifecycleSourceRunId: source.runId, lifecycleKind: source.kind } : {}),
         }
       : event,
-    ...(options !== undefined ? [options] : []),
+    ...(emitOptions !== undefined ? [emitOptions] : []),
   );
 }
