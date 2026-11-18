@@ -211,8 +211,7 @@ describe('ComboSelect input text', () => {
 });
 
 describe('ComboSelect creatable, leaving the field', () => {
-  it('keeps typed text as the value on blur, and a pick still wins', async () => {
-    const onValueChange = vi.fn();
+  const creatableQueue = (onValueChange: (v: string | null) => void) =>
     render(
       <ComboSelect
         aria-label="Queue"
@@ -222,16 +221,50 @@ describe('ComboSelect creatable, leaving the field', () => {
         creatable
       />,
     );
+
+  it('keeps typed text as the value on blur, once', async () => {
+    const onValueChange = vi.fn();
+    creatableQueue(onValueChange);
     const input = screen.getByRole('combobox', { name: 'Queue' });
     await type(input, 'billing');
+    await act(async () => {
+      // Tabbing out with the popup open: blur and the focus-out close land together.
+      fireEvent.blur(input);
+      fireEvent.focusOut(input);
+      await new Promise((r) => setTimeout(r, 20));
+    });
+    expect(onValueChange).toHaveBeenCalledTimes(1);
+    expect(onValueChange).toHaveBeenLastCalledWith('billing');
+  });
+
+  it('a pick wins over the pending typed text', async () => {
+    const onValueChange = vi.fn();
+    creatableQueue(onValueChange);
+    const input = screen.getByRole('combobox', { name: 'Queue' });
+    await type(input, 'relat');
+    await pick(/Relatórios/);
     await act(async () => {
       fireEvent.blur(input);
       await new Promise((r) => setTimeout(r, 20));
     });
-    expect(onValueChange).toHaveBeenLastCalledWith('billing');
+    expect(onValueChange).toHaveBeenCalledTimes(1);
+    expect(onValueChange).toHaveBeenLastCalledWith('relatorios');
   });
 
-  it('does not commit typed text without creatable, nor on Escape', async () => {
+  it('Escape reverts even when blur follows in the same tick', async () => {
+    const onValueChange = vi.fn();
+    creatableQueue(onValueChange);
+    const input = screen.getByRole('combobox', { name: 'Queue' });
+    await type(input, 'billing');
+    await act(async () => {
+      fireEvent.keyDown(input, { key: 'Escape' });
+      fireEvent.blur(input);
+      await new Promise((r) => setTimeout(r, 20));
+    });
+    expect(onValueChange).not.toHaveBeenCalled();
+  });
+
+  it('does not commit typed text without creatable', async () => {
     const onValueChange = vi.fn();
     render(
       <ComboSelect
@@ -244,7 +277,6 @@ describe('ComboSelect creatable, leaving the field', () => {
     const input = screen.getByRole('combobox', { name: 'Queue' });
     await type(input, 'billing');
     await act(async () => {
-      fireEvent.keyDown(input, { key: 'Escape' });
       fireEvent.blur(input);
       await new Promise((r) => setTimeout(r, 20));
     });
