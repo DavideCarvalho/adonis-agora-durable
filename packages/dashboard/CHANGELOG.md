@@ -1,5 +1,11 @@
 # @adonis-agora/durable-dashboard
 
+## 1.0.0-rc.19
+
+### Patch Changes
+
+- [#564](https://github.com/DavideCarvalho/adonis-agora-durable/pull/564) [`7762db3`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/7762db30326150b4172e70771ceef181c01c5de7) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Console ⌘K: arrow keys now visibly move the selection. The highlighted item was styled with a bare `data-selected:` (cmdk marks every item `true` or `false`) and with the dialog's own surface color, so moving looked like nothing happened.
+
 ## 1.0.0-rc.18
 
 ### Minor Changes

@@ -1,5 +1,13 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.37
+
+### Patch Changes
+
+- [#564](https://github.com/DavideCarvalho/adonis-agora-durable/pull/564) [`7762db3`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/7762db30326150b4172e70771ceef181c01c5de7) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Console ⌘K: arrow keys now visibly move the selection. The highlighted item was styled with a bare `data-selected:` (cmdk marks every item `true` or `false`) and with the dialog's own surface color, so moving looked like nothing happened.
+
+- [#563](https://github.com/DavideCarvalho/adonis-agora-durable/pull/563) [`e208f50`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/e208f50c860e73aa603ee5ef5ea59607c49099df) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Tenant token capabilities accept wildcards, with the Agora-wide rule (new export `capabilityAllows(granted, required)`): a `*` segment matches one segment and a trailing `*` matches the rest. Stamping a run with a customer tenant is allowed by `tenancy:<id>`, `tenancy:*` or `*`. Tokens holding `*` (previously ignored for tenancy) can now stamp any tenant; a token with only `tenancy:<id>` still can't stamp another one (the run starts with no tenant, as before).
+
 ## 1.0.0-rc.36
 
 ### Minor Changes
