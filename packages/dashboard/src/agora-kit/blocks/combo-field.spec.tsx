@@ -251,3 +251,25 @@ describe('ComboSelect creatable, leaving the field', () => {
     expect(onValueChange).not.toHaveBeenCalled();
   });
 });
+
+describe('ComboSelect creatable, near matches', () => {
+  it('resolves typed text to an existing option ignoring accents and case', async () => {
+    const onValueChange = vi.fn();
+    render(
+      <ComboSelect
+        aria-label="Queue"
+        options={queues}
+        value={null}
+        onValueChange={onValueChange}
+        creatable
+      />,
+    );
+    const input = screen.getByRole('combobox', { name: 'Queue' });
+    await type(input, 'RELATORIOS');
+    await act(async () => {
+      fireEvent.blur(input);
+      await new Promise((r) => setTimeout(r, 20));
+    });
+    expect(onValueChange).toHaveBeenLastCalledWith('relatorios');
+  });
+});
