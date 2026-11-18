@@ -3,9 +3,9 @@ import type { RunGateway, StartRunOptions } from './interface.js';
 
 /**
  * A `tenant` pod's gateway with tenancy applied on the pod side: new runs carry the active tenant
- * (the control plane keeps it only when the pod's token grants `tenancy:*` or `tenancy:<id>`), and
- * the app's reads and actions see that tenant's runs only. Narrowing only: the control plane already
- * confines the pod to its partition.
+ * (the control plane keeps it only when the pod's token grants `tenancy:<id>`, `tenancy:*` or `*`),
+ * and the app's reads and actions see that tenant's runs only. Narrowing only: the control plane
+ * already confines the pod to its partition.
  */
 export function tenantScopedGateway(inner: RunGateway, tenancy: EngineTenancy): RunGateway {
   const visible = async (runId: string): Promise<boolean> => {

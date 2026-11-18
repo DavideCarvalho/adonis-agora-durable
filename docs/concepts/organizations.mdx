@@ -125,7 +125,8 @@ verifyTenant: async ({ token }) => {
 },
 ```
 
-Without the capability the run starts with no customer. The pod's own reads (`listRuns`, `getRun`,
+`tenancy:org-42` allows that customer only; `tenancy:*` or `*` allows any. Without a matching
+capability the run starts with no customer. The pod's own reads (`listRuns`, `getRun`,
 the console) show the active customer's runs only.
 
 ## Existing runs

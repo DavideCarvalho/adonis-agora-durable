@@ -115,6 +115,7 @@ export { isRemoteEvent } from './remote-event.js';
 export * from './remote-workflow-executor.js';
 export * from './run-detail-summary.js';
 export * from './run-facets.js';
+export { capabilityAllows } from './run-gateway/capabilities.js';
 // --- store-less cluster: RunGateway (read/control surface) ------------------
 export type { DurableTopology, RunGateway, StartRunOptions } from './run-gateway/interface.js';
 export {
