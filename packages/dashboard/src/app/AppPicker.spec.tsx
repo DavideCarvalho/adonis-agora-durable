@@ -55,6 +55,29 @@ describe('AppPickerControl', () => {
     expect(withScope('/runs')).toBe('/runs');
   });
 
+  it('tags federated apps in the list, and nothing for this app or an older server', async () => {
+    apps.mockResolvedValue({
+      local: { label: 'Hub' },
+      apps: [
+        { id: 'entre-textos', label: 'Entre Textos', mode: 'federated', actions: 'none' },
+        { id: 'old', label: 'Older server' },
+      ],
+      selected: null,
+    });
+    render(<AppPickerControl />, { wrapper });
+    fireEvent.click(await screen.findByRole('button', { name: 'App' }));
+    const tagged = await screen.findByRole('option', { name: /Entre Textos/ });
+    const badge = tagged.querySelector('[data-app-mode="federated"]');
+    expect(badge?.textContent).toBe('federated');
+    expect(badge?.getAttribute('title')).toContain('Read-only here');
+    expect(
+      screen.getByRole('option', { name: /Older server/ }).querySelector('[data-app-mode]'),
+    ).toBeNull();
+    expect(screen.getByRole('option', { name: 'Hub' }).querySelector('[data-app-mode]')).toBeNull();
+    // The trigger shows this app: no tag.
+    expect(screen.getByRole('button', { name: 'App' }).querySelector('[data-app-mode]')).toBeNull();
+  });
+
   it('keeps the page when it is not a run', async () => {
     apps.mockResolvedValue({
       local: { label: 'Hub' },

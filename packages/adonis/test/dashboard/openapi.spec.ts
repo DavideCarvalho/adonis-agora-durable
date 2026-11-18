@@ -69,4 +69,20 @@ describe('the dashboard OpenAPI document', () => {
     }
     expect(doc.paths['/apps']?.get).toBeDefined();
   });
+
+  it("documents each app's mode and who runs actions, both optional", () => {
+    const doc = openApiDocument('/durable/api') as {
+      paths: Record<string, Record<string, { responses: Record<string, unknown> }>>;
+    };
+    const ok = doc.paths['/apps']?.get?.responses['200'] as {
+      content: { 'application/json': { schema: { properties: { apps: { items: unknown } } } } };
+    };
+    const item = ok.content['application/json'].schema.properties.apps.items as {
+      properties: Record<string, { enum?: string[] }>;
+      required: string[];
+    };
+    expect(item.properties.mode?.enum).toEqual(['control-plane', 'federated']);
+    expect(item.properties.actions?.enum).toEqual(['here', 'app', 'none']);
+    expect(item.required).toEqual(['id', 'label']);
+  });
 });
