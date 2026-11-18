@@ -1,5 +1,11 @@
 # @adonis-agora/durable-dashboard
 
+## 1.0.0-rc.20
+
+### Patch Changes
+
+- [#567](https://github.com/DavideCarvalho/adonis-agora-durable/pull/567) [`bb3ffa5`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/bb3ffa553100dd6a351bc7717e1e7d528f45994b) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Federated console: the App selector says which apps are federated, and who runs actions on them. `GET /apps` now gives each `apps[]` entry `mode: 'federated'` and `actions` (`'app'`: actions are sent to that app, which runs them; `'none'`: a built control plane that cannot carry console commands, so the console only browses that app). The selector tags federated apps (and the trigger, when one is picked), every page shows a notice while a federated app is picked, and with `actions: 'none'` the run, wait, bulk and schedule actions are disabled with the reason. Older servers omit both fields and the console behaves as before.
+
 ## 1.0.0-rc.19
 
 ### Patch Changes
