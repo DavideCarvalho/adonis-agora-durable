@@ -7,6 +7,15 @@
  */
 
 export { ActionDialog } from './blocks/action-dialog';
+export {
+  ComboMultiSelect,
+  type ComboMultiSelectProps,
+  type ComboOption,
+  ComboSelect,
+  type ComboSelectProps,
+  comboItems,
+  comboMatches,
+} from './blocks/combo-field';
 export { type Column, DataTable } from './blocks/data-table';
 export { EmptyState } from './blocks/empty-state';
 export { ErrorBoundary, type ErrorBoundaryProps, RegionError } from './blocks/error-boundary';
