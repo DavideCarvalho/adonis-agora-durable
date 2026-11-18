@@ -6,18 +6,17 @@ import { ComboMultiSelect, ComboSelect, comboItems, comboMatches } from './combo
 
 afterEach(cleanup);
 
-const queues = [
-  { value: 'default', label: 'Default' },
-  { value: 'emails', label: 'E-mails', hint: '12 jobs' },
-  { value: 'relatorios', label: 'Relatórios' },
-];
+const defaultQueue = { value: 'default', label: 'Default' };
+const emailsQueue = { value: 'emails', label: 'E-mails', hint: '12 jobs' };
+const reportsQueue = { value: 'relatorios', label: 'Relatórios' };
+const queues = [defaultQueue, emailsQueue, reportsQueue];
 
 describe('comboMatches / comboItems', () => {
   it('matches label, value and hint, ignoring accents and case', () => {
-    expect(comboMatches(queues[2], 'RELATORIO')).toBe(true);
-    expect(comboMatches(queues[1], '12')).toBe(true);
-    expect(comboMatches(queues[1], 'mails jobs')).toBe(true);
-    expect(comboMatches(queues[0], 'mail')).toBe(false);
+    expect(comboMatches(reportsQueue, 'RELATORIO')).toBe(true);
+    expect(comboMatches(emailsQueue, '12')).toBe(true);
+    expect(comboMatches(emailsQueue, 'mails jobs')).toBe(true);
+    expect(comboMatches(defaultQueue, 'mail')).toBe(false);
   });
 
   it('keeps selected values outside the list and offers typed text when creatable', () => {
@@ -132,5 +131,81 @@ describe('ComboMultiSelect', () => {
       await new Promise((r) => setTimeout(r, 20));
     });
     expect(onChange).toHaveBeenLastCalledWith(['default']);
+  });
+});
+
+function ServerHarness({ onChange }: { onChange: (v: string | null) => void }) {
+  const [query, setQuery] = useState('');
+  const [value, setValue] = useState<string | null>(null);
+  // A fresh array every render, filtered "on the server": the typed text must survive both.
+  const options = ['alpha', 'beta', 'gamma'].filter((o) => o.includes(query));
+  return (
+    <ComboSelect
+      aria-label="Doc"
+      options={options}
+      value={value}
+      onQueryChange={setQuery}
+      onValueChange={(v) => {
+        setValue(v);
+        onChange(v);
+      }}
+    />
+  );
+}
+
+describe('ComboSelect with server-side options', () => {
+  it('keeps the typed text while options change', async () => {
+    const onChange = vi.fn();
+    render(<ServerHarness onChange={onChange} />);
+    const input = screen.getByRole('combobox', { name: 'Doc' }) as HTMLInputElement;
+    await type(input, 'gam');
+    expect(input.value).toBe('gam');
+    expect(screen.queryByRole('option', { name: 'alpha' })).toBeNull();
+    await pick('gamma');
+    expect(onChange).toHaveBeenLastCalledWith('gamma');
+  });
+});
+
+describe('ComboSelect input text', () => {
+  it('shows the selected label, follows outside changes and late labels', async () => {
+    const { rerender } = render(
+      <ComboSelect
+        aria-label="Queue"
+        options={queues}
+        value="relatorios"
+        onValueChange={() => {}}
+      />,
+    );
+    const input = screen.getByRole('combobox', { name: 'Queue' }) as HTMLInputElement;
+    expect(input.value).toBe('Relatórios');
+    rerender(
+      <ComboSelect aria-label="Queue" options={queues} value="emails" onValueChange={() => {}} />,
+    );
+    expect(input.value).toBe('E-mails');
+    rerender(<ComboSelect aria-label="Queue" options={[]} value="late" onValueChange={() => {}} />);
+    expect(input.value).toBe('late');
+    rerender(
+      <ComboSelect
+        aria-label="Queue"
+        options={[{ value: 'late', label: 'Late label' }]}
+        value="late"
+        onValueChange={() => {}}
+      />,
+    );
+    expect(input.value).toBe('Late label');
+  });
+
+  it('goes back to the selected label when closed without a pick', async () => {
+    render(
+      <ComboSelect aria-label="Queue" options={queues} value="emails" onValueChange={() => {}} />,
+    );
+    const input = screen.getByRole('combobox', { name: 'Queue' }) as HTMLInputElement;
+    await type(input, 'rel');
+    expect(input.value).toBe('rel');
+    await act(async () => {
+      fireEvent.keyDown(input, { key: 'Escape' });
+      await new Promise((r) => setTimeout(r, 20));
+    });
+    expect(input.value).toBe('E-mails');
   });
 });
