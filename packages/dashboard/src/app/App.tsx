@@ -7,7 +7,7 @@ import { readShellConfig } from '../agora-kit/shell-config';
 import { splitHash, subscribeHashUrl } from '../agora-kit/url-state/hash-url';
 import { NuqsHashAdapter } from '../agora-kit/url-state/nuqs-hash-adapter';
 import { CONFIG_ELEMENT_ID, durableClient } from '../client/durable-client';
-import { AppPickerControl } from './AppPicker';
+import { AppPickerControl, FederatedAppNotice } from './AppPicker';
 import { currentRoute, pushRoute, type Route, sameRoute } from './routes';
 import { LogoMark } from './run-status';
 import { RunIdSearch } from './runs/RunIdSearch';
@@ -185,25 +185,32 @@ function Console() {
         </>
       }
     >
-      <ErrorBoundary label={TITLES[route.page]} resetKeys={[route.page]}>
-        {route.page === 'workflow' ? (
-          <PageBody>
-            <WorkflowPage workflow={route.workflow} />
-          </PageBody>
-        ) : route.page === 'schedules' && !isTenant ? (
-          <SchedulesPanel onOpenRun={openRun} />
-        ) : route.page === 'workers' ? (
-          <WorkersPage onOpenRun={openRun} />
-        ) : (
-          <RunsPage
-            filters={filters}
-            selected={route.page === 'runs' ? route.runId : undefined}
-            onSelect={selectRun}
-            onOpenRun={openRun}
-            tenantPicker={tenantPicker}
-          />
-        )}
-      </ErrorBoundary>
+      {/* While a federated app is picked: whose data this is and who runs actions, on every page.
+          The runs board fills the content area, so it takes the height left under the notice. */}
+      <div className={route.page === 'runs' ? 'flex h-full min-h-0 flex-col' : undefined}>
+        <FederatedAppNotice className="mx-4 mt-3 shrink-0 md:mx-6" />
+        <div className={route.page === 'runs' ? 'min-h-0 flex-1' : undefined}>
+          <ErrorBoundary label={TITLES[route.page]} resetKeys={[route.page]}>
+            {route.page === 'workflow' ? (
+              <PageBody>
+                <WorkflowPage workflow={route.workflow} />
+              </PageBody>
+            ) : route.page === 'schedules' && !isTenant ? (
+              <SchedulesPanel onOpenRun={openRun} />
+            ) : route.page === 'workers' ? (
+              <WorkersPage onOpenRun={openRun} />
+            ) : (
+              <RunsPage
+                filters={filters}
+                selected={route.page === 'runs' ? route.runId : undefined}
+                onSelect={selectRun}
+                onOpenRun={openRun}
+                tenantPicker={tenantPicker}
+              />
+            )}
+          </ErrorBoundary>
+        </div>
+      </div>
     </AppShell>
   );
 }

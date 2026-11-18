@@ -91,6 +91,8 @@ If the apps live in different databases, declare a Lucid connection to the other
 
 Once `apps` is set, the console's header has an **App** control. Picking an app puts it in the URL (`?app=entre-textos`), so a link or a reload keeps it; picking the console's own app removes it. Switching apps closes the open run and resets the runs board's filters, and stays on Workers or Schedules if you were there.
 
+The selector tags each configured app **federated**, and while one is picked a notice at the top of every page says that its data comes from its own store and that actions are sent to it, which runs them. When the app's control plane can't carry actions at all (a built control plane without console commands), the notice says the app is read-only here and the action buttons are disabled with that reason.
+
 For the picked app, the console shows:
 
 - its runs, counts and filter pickers, read from its store;
@@ -132,7 +134,11 @@ Every console API route takes `?app=<key>`. `GET <path>/api/apps` lists what the
 ```json
 {
   "local": { "label": "Hub" },
-  "apps": [{ "id": "entre-textos", "label": "Entre Textos" }],
+  "apps": [
+    { "id": "entre-textos", "label": "Entre Textos", "mode": "federated", "actions": "app" }
+  ],
   "selected": null
 }
 ```
+
+`mode` is `federated` for every configured app. `actions` says who runs actions on its runs: `app` (they are sent to the app) or `none` (the console only browses it).

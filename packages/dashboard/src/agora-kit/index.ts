@@ -8,6 +8,15 @@
 
 export { ActionDialog } from './blocks/action-dialog';
 export {
+  type AppActions,
+  type AppMode,
+  AppModeBadge,
+  type AppModeInfo,
+  actionsUnavailableReason,
+  FederatedNotice,
+  federatedDescription,
+} from './blocks/app-mode';
+export {
   ComboMultiSelect,
   type ComboMultiSelectProps,
   type ComboOption,

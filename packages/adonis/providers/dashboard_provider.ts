@@ -41,6 +41,7 @@ import {
   FEDERATED_APP_UNREACHABLE,
   type FederatedApp,
   FederatedAppError,
+  federatedAppActions,
 } from '../src/dashboard/federation.js';
 import { dashboardEngineForTopology } from '../src/dashboard/gateway-adapter.js';
 import {
@@ -294,15 +295,25 @@ export default class DashboardProvider {
     return granted === undefined || granted.includes(picked) ? picked : null;
   }
 
-  /** The other apps this viewer may pick: every configured one, or those `authorize` grants. */
+  /**
+   * The other apps this viewer may pick: every configured one, or those `authorize` grants, each
+   * with how the console reaches it (`mode`) and who runs actions on its runs (`actions`).
+   */
   private async visibleApps(
     config: ResolvedDurableDashboardConfig,
     ctx: HttpContext,
-  ): Promise<Array<{ id: string; label: string }>> {
+  ): Promise<Array<{ id: string; label: string; mode: 'federated'; actions: 'app' | 'none' }>> {
     const granted = await this.consoleApps(config, ctx);
+    // Every configured app is federated: its data stays in its own store, and its own engine runs
+    // the actions this console sends it (when its control plane can carry them).
     return Object.entries(config.apps)
       .filter(([id]) => granted === undefined || granted.includes(id))
-      .map(([id, app]) => ({ id, label: app.label ?? id }));
+      .map(([id, app]) => ({
+        id,
+        label: app.label ?? id,
+        mode: 'federated' as const,
+        actions: federatedAppActions(app),
+      }));
   }
 
   /** The configured app `id`, built (its store and control plane) on first use. */

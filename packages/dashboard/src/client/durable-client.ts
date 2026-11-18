@@ -141,7 +141,14 @@ export function withTenant(path: string): string {
 /** The console's app selector (`GET /apps`): this app, and the other apps it also shows. */
 export interface AppPicker {
   local: { label: string };
-  apps: Array<{ id: string; label: string }>;
+  apps: Array<{
+    id: string;
+    label: string;
+    /** How the console reaches the app: `federated` = it reads the app's own store. Older servers omit it. */
+    mode?: 'control-plane' | 'federated' | undefined;
+    /** Who runs actions on its runs: `app` = sent to the app; `none` = browse only; `here` = this server. */
+    actions?: 'here' | 'app' | 'none' | undefined;
+  }>;
   selected: string | null;
 }
 

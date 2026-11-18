@@ -726,7 +726,24 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
                   type: 'array',
                   items: {
                     type: 'object',
-                    properties: { id: { type: 'string' }, label: { type: 'string' } },
+                    properties: {
+                      id: { type: 'string' },
+                      label: { type: 'string' },
+                      mode: {
+                        type: 'string',
+                        enum: ['control-plane', 'federated'],
+                        description:
+                          "How this console reaches the app: `federated` = it reads the app's own " +
+                          'store. Older servers omit it.',
+                      },
+                      actions: {
+                        type: 'string',
+                        enum: ['here', 'app', 'none'],
+                        description:
+                          'Who runs actions on its runs: `app` = sent to the app, which runs them ' +
+                          'itself; `none` = browse only; `here` = this server. Older servers omit it.',
+                      },
+                    },
                     required: ['id', 'label'],
                   },
                 },

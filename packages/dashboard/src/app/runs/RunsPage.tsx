@@ -40,6 +40,7 @@ import {
   UNKNOWN_ORIGIN,
   unknownOriginCount,
 } from '../../client/run-origin';
+import { useAppActionsUnavailable } from '../AppPicker';
 import { AttributeFilters } from '../AttributeFilters';
 import { XIcon } from '../icons';
 import { OriginFacets } from '../OriginFacets';
@@ -361,10 +362,13 @@ export function RunsPage({
   );
   // The `app` facet has no server-side spelling, so a bulk action under it would act on runs NOT on
   // screen. Refusing loudly beats acting wider than the operator can see.
+  // A federated app this console only browses takes no action from here at all.
+  const readOnly = useAppActionsUnavailable();
   const bulkBlocked =
-    originFilter.kind === 'unknown'
+    readOnly ??
+    (originFilter.kind === 'unknown'
       ? "Bulk actions cannot be scoped to the app's own runs — runs with no package origin have no server-side filter. Retry or cancel them from their own run view."
-      : undefined;
+      : undefined);
   const stalledWorkflows = useMemo(
     () => [
       ...new Set(

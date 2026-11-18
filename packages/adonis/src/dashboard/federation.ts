@@ -276,6 +276,18 @@ export class FederatedApp {
   }
 }
 
+/**
+ * Who runs actions on a configured app's runs from this console, as `GET /apps` reports it: `'app'`
+ * (the console sends them to that app over its control plane) or `'none'` when the control plane
+ * given is a built one that cannot carry console commands (the console only browses that app). A
+ * factory is not built just to answer this: the factories this package ships carry them.
+ */
+export function federatedAppActions(config: FederatedConsoleApp): 'app' | 'none' {
+  const plane = config.controlPlane;
+  if (typeof plane === 'function') return 'app';
+  return typeof plane.sendConsoleCommand === 'function' ? 'app' : 'none';
+}
+
 /** Build one configured app: its store and control plane (factories are called once, here). */
 export async function buildFederatedApp(
   id: string,

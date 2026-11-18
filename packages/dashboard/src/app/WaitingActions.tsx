@@ -85,15 +85,20 @@ export function WaitingActions({
   runId,
   targets,
   tenantPod,
+  readOnly,
   onDelivered,
 }: {
   runId: string;
   targets: WaitTarget[];
   tenantPod: boolean;
+  /** Why this console takes no action on this app's runs (a federated app it only browses). */
+  readOnly?: string | undefined;
   /** Called after a successful delivery so the caller refreshes the run (+ list). */
   onDelivered: () => void;
 }) {
   const [open, setOpen] = useState<OpenAction | undefined>(undefined);
+  // Why every delivery below is unavailable here, if it is.
+  const blocked = readOnly ?? (tenantPod ? TENANT_REASON : undefined);
   // One shared JSON draft + error per dialog session (only one dialog is open at a time).
   const [token, setToken] = useState('');
   const [draft, setDraft] = useState('');
@@ -226,8 +231,8 @@ export function WaitingActions({
                 <Button
                   variant="brand"
                   size="micro"
-                  disabled={tenantPod || pending}
-                  title={tenantPod ? TENANT_REASON : `Complete task "${target.name}" with a result`}
+                  disabled={blocked !== undefined || pending}
+                  title={blocked ?? `Complete task "${target.name}" with a result`}
                   onClick={() => openDialog({ verb: 'task-complete', name: target.name })}
                   className="mono uppercase tracking-wider"
                 >
@@ -237,8 +242,8 @@ export function WaitingActions({
                 <Button
                   variant="destructive"
                   size="micro"
-                  disabled={tenantPod || pending}
-                  title={tenantPod ? TENANT_REASON : `Fail task "${target.name}" with a reason`}
+                  disabled={blocked !== undefined || pending}
+                  title={blocked ?? `Fail task "${target.name}" with a reason`}
                   onClick={() => openDialog({ verb: 'task-fail', name: target.name })}
                   className="mono uppercase tracking-wider"
                 >
@@ -254,8 +259,8 @@ export function WaitingActions({
                 <Button
                   variant="info"
                   size="micro"
-                  disabled={tenantPod || pending}
-                  title={tenantPod ? TENANT_REASON : `Send a validated update to "${target.name}"`}
+                  disabled={blocked !== undefined || pending}
+                  title={blocked ?? `Send a validated update to "${target.name}"`}
                   onClick={() => openDialog({ verb: 'update', name: target.name })}
                   className="mono uppercase tracking-wider"
                 >
@@ -271,8 +276,8 @@ export function WaitingActions({
                 <Button
                   variant="info"
                   size="micro"
-                  disabled={tenantPod || pending}
-                  title={tenantPod ? TENANT_REASON : `Deliver a payload on "${target.token}"`}
+                  disabled={blocked !== undefined || pending}
+                  title={blocked ?? `Deliver a payload on "${target.token}"`}
                   onClick={() => openDialog({ verb: 'signal', token: target.token })}
                   className="mono uppercase tracking-wider"
                 >

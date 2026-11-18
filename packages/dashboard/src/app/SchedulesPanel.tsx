@@ -11,6 +11,7 @@ import { Badge as Chip } from '../agora-kit/ui/badge';
 import { Button } from '../agora-kit/ui/button';
 import { Skeleton } from '../agora-kit/ui/skeleton';
 import { durableClient, type ScheduleInfo } from '../client/durable-client';
+import { useAppActionsUnavailable } from './AppPicker';
 import { PlayIcon } from './icons';
 
 /**
@@ -82,6 +83,8 @@ function ScheduleRow({ s, onOpenRun }: { s: ScheduleInfo; onOpenRun: (id: string
     },
   });
   const tenant = s.namespace && s.namespace !== 'default' ? s.namespace : undefined;
+  // A federated app this console only browses: its schedules are shown, not controlled, from here.
+  const readOnly = useAppActionsUnavailable();
   return (
     <li className={cn(COLUMNS, 'py-3')}>
       <div className="min-w-0">
@@ -145,13 +148,14 @@ function ScheduleRow({ s, onOpenRun }: { s: ScheduleInfo; onOpenRun: (id: string
         <Button
           variant={s.paused ? 'outline' : 'warn'}
           size="micro"
-          disabled={setPaused.isPending}
+          disabled={setPaused.isPending || readOnly !== undefined}
           onClick={() => setPaused.mutate(!s.paused)}
           className="mono uppercase tracking-wider"
           title={
-            s.paused
+            readOnly ??
+            (s.paused
               ? 'Resume this schedule fleet-wide (clears the runtime pause)'
-              : 'Pause this schedule fleet-wide, at runtime — the config stays untouched'
+              : 'Pause this schedule fleet-wide, at runtime — the config stays untouched')
           }
         >
           {s.paused ? 'Resume' : 'Pause'}
@@ -159,10 +163,10 @@ function ScheduleRow({ s, onOpenRun }: { s: ScheduleInfo; onOpenRun: (id: string
         <Button
           variant="brand"
           size="micro"
-          disabled={trigger.isPending}
+          disabled={trigger.isPending || readOnly !== undefined}
           onClick={() => trigger.mutate()}
           className="mono uppercase tracking-wider"
-          title="Fire the current window now and open its run"
+          title={readOnly ?? 'Fire the current window now and open its run'}
         >
           <PlayIcon width={10} height={10} />
           Run now

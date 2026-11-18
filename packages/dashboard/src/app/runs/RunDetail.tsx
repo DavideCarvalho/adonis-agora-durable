@@ -28,6 +28,7 @@ import {
   splitCompensations,
 } from '../../client/split-compensations';
 import { throttle } from '../../client/throttle';
+import { useAppActionsUnavailable } from '../AppPicker';
 import { childChips, republishSummary, republishTargets, triggerChips } from '../child-link';
 import { BoltIcon, PlayIcon, RetryIcon, XIcon } from '../icons';
 import { LiveLifecycleDeliveries, RunEvents } from '../RunEvents';
@@ -152,6 +153,9 @@ export function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: strin
     refetchInterval: false,
   });
   const tenantPod = topology?.role === 'tenant';
+  // A federated app this console only browses (`actions: 'none'`): every action below is disabled
+  // with this reason, instead of offering one its control plane cannot carry.
+  const readOnly = useAppActionsUnavailable();
   // Dead-letter link: a `dead` run may have been routed to a `dlq:<id>` handler workflow. Probe for
   // it (retry off so a 404 just hides the link) so we never render a dead link.
   const handlerId =
@@ -563,12 +567,13 @@ export function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: strin
             <Button
               size="sm"
               variant="warn"
-              disabled={cont.isPending || tenantPod}
+              disabled={cont.isPending || tenantPod || readOnly !== undefined}
               onClick={() => cont.mutate()}
               title={
-                tenantPod
+                readOnly ??
+                (tenantPod
                   ? 'Not available on a tenant deployment — resuming a breakpoint needs the control plane.'
-                  : undefined
+                  : undefined)
               }
             >
               <PlayIcon width={12} height={12} />
@@ -578,8 +583,9 @@ export function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: strin
           <Button
             size="sm"
             variant="brand"
-            disabled={!canRetry || retry.isPending}
+            disabled={!canRetry || retry.isPending || readOnly !== undefined}
             onClick={() => retry.mutate()}
+            title={readOnly}
           >
             <RetryIcon width={12} height={12} />
             Retry
@@ -588,9 +594,12 @@ export function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: strin
             <Button
               size="sm"
               variant="info"
-              disabled={redispatch.isPending}
+              disabled={redispatch.isPending || readOnly !== undefined}
               onClick={() => redispatch.mutate()}
-              title="Re-dispatch stuck `pending` remote steps — recovery for a lost step dispatch (crashed worker or dropped job)"
+              title={
+                readOnly ??
+                'Re-dispatch stuck `pending` remote steps — recovery for a lost step dispatch (crashed worker or dropped job)'
+              }
             >
               <BoltIcon width={12} height={12} />
               Re-dispatch
@@ -600,12 +609,15 @@ export function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: strin
             <Button
               size="sm"
               variant="info"
-              disabled={republish.isPending}
+              disabled={republish.isPending || readOnly !== undefined}
               onClick={() => {
                 republish.reset();
                 setRepublishOpen(true);
               }}
-              title="Publish this run's lifecycle event again, to the subscribers it has not started yet"
+              title={
+                readOnly ??
+                "Publish this run's lifecycle event again, to the subscribers it has not started yet"
+              }
             >
               <BoltIcon width={12} height={12} />
               Republish lifecycle event
@@ -615,12 +627,13 @@ export function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: strin
             <Button
               size="sm"
               variant="alt"
-              disabled={fixReplay.isPending || tenantPod}
+              disabled={fixReplay.isPending || tenantPod || readOnly !== undefined}
               onClick={onFixReplay}
               title={
-                tenantPod
+                readOnly ??
+                (tenantPod
                   ? 'Not available on a tenant deployment — fix & replay needs the control plane.'
-                  : 'Edit the input and re-run as a fresh linked run'
+                  : 'Edit the input and re-run as a fresh linked run')
               }
             >
               <RetryIcon width={12} height={12} />
@@ -631,9 +644,11 @@ export function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: strin
             <Button
               size="sm"
               variant="warn"
-              disabled={cancel.isPending}
+              disabled={cancel.isPending || readOnly !== undefined}
               onClick={() => cancel.mutate(true)}
-              title="Cancel and run saga compensations (undo completed steps in reverse)"
+              title={
+                readOnly ?? 'Cancel and run saga compensations (undo completed steps in reverse)'
+              }
               className="bg-transparent"
             >
               <RetryIcon width={12} height={12} />
@@ -644,8 +659,9 @@ export function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: strin
             variant="outline"
             size="sm"
             className="border-line-strong"
-            disabled={!canCancel || cancel.isPending}
+            disabled={!canCancel || cancel.isPending || readOnly !== undefined}
             onClick={() => cancel.mutate(false)}
+            title={readOnly}
           >
             <XIcon width={12} height={12} />
             Cancel
@@ -690,6 +706,7 @@ export function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: strin
           runId={run.id}
           targets={waitTargets}
           tenantPod={tenantPod}
+          readOnly={readOnly}
           onDelivered={invalidate}
         />
       )}

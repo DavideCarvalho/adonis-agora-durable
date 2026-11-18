@@ -9,7 +9,10 @@ import { consoleBus } from '../support/console-bus.js';
 /** The provider's `?app=` selection, reached through its TS-private methods on purpose. */
 interface ProviderInternals {
   selectedApp(config: unknown, ctx: unknown): Promise<string | null | undefined>;
-  visibleApps(config: unknown, ctx: unknown): Promise<Array<{ id: string; label: string }>>;
+  visibleApps(
+    config: unknown,
+    ctx: unknown,
+  ): Promise<Array<{ id: string; label: string; mode?: string; actions?: string }>>;
   consoleDeps(
     config: unknown,
     topology: string,
@@ -69,8 +72,8 @@ describe('federated console — app selection in the provider', () => {
     expect(await p.selectedApp(open, ctxWith({ app: 'nope' }))).toBeNull();
     expect(await p.selectedApp(open, ctxWith({ app: 'toString' }))).toBeNull();
     expect(await p.visibleApps(open, ctxWith({}))).toEqual([
-      { id: 'entre-textos', label: 'Entre Textos' },
-      { id: 'eduliberta', label: 'eduliberta' },
+      { id: 'entre-textos', label: 'Entre Textos', mode: 'federated', actions: 'app' },
+      { id: 'eduliberta', label: 'eduliberta', mode: 'federated', actions: 'app' },
     ]);
 
     const narrowed = resolveConfig({
@@ -79,7 +82,24 @@ describe('federated console — app selection in the provider', () => {
     });
     expect(await p.selectedApp(narrowed, ctxWith({ app: 'entre-textos' }))).toBeNull();
     expect(await p.visibleApps(narrowed, ctxWith({}))).toEqual([
-      { id: 'eduliberta', label: 'eduliberta' },
+      { id: 'eduliberta', label: 'eduliberta', mode: 'federated', actions: 'app' },
+    ]);
+  });
+
+  it('says who runs actions: the app, unless its control plane cannot carry console commands', async () => {
+    const p = await provider();
+    const { sendConsoleCommand: _send, ...browseOnly } = bus.plane();
+    const config = resolveConfig({
+      authorize: () => true,
+      apps: {
+        // A factory is not built to answer `/apps`: the shipped ones carry console commands.
+        factory: { store, controlPlane: async () => bus.plane() },
+        browse: { label: 'Browse only', store, controlPlane: browseOnly },
+      },
+    });
+    expect(await p.visibleApps(config, ctxWith({}))).toEqual([
+      { id: 'factory', label: 'factory', mode: 'federated', actions: 'app' },
+      { id: 'browse', label: 'Browse only', mode: 'federated', actions: 'none' },
     ]);
   });
 
