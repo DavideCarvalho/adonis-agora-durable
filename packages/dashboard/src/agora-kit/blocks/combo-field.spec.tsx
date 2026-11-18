@@ -305,3 +305,40 @@ describe('ComboSelect creatable, near matches', () => {
     expect(onValueChange).toHaveBeenLastCalledWith('relatorios');
   });
 });
+
+describe('ComboSelect review edge cases', () => {
+  it('shows a selected value missing from options as itself, not as "Use …"', async () => {
+    render(
+      <ComboSelect aria-label="Queue" options={queues} value="legacy" onValueChange={() => {}} />,
+    );
+    const input = screen.getByRole('combobox', { name: 'Queue' });
+    await type(input, 'legacy');
+    expect(await screen.findByRole('option', { name: 'legacy' })).toBeTruthy();
+    expect(screen.queryByRole('option', { name: 'Use “legacy”' })).toBeNull();
+  });
+
+  it('does not filter server results again on the client', async () => {
+    render(
+      <ComboSelect
+        aria-label="User"
+        options={[{ value: 'u1', label: 'Robert Smith' }]}
+        value={null}
+        onValueChange={() => {}}
+        onQueryChange={() => {}}
+        serverFiltered
+      />,
+    );
+    // The server matched "bob" by nickname; the label doesn't contain it.
+    await type(screen.getByRole('combobox', { name: 'User' }), 'bob');
+    expect(await screen.findByRole('option', { name: 'Robert Smith' })).toBeTruthy();
+  });
+
+  it('a late label does not overwrite what the user is typing', async () => {
+    const props = { 'aria-label': 'Queue', value: 'late', onValueChange: () => {} };
+    const { rerender } = render(<ComboSelect {...props} options={[]} />);
+    const input = screen.getByRole('combobox', { name: 'Queue' }) as HTMLInputElement;
+    await type(input, 'rel');
+    rerender(<ComboSelect {...props} options={[{ value: 'late', label: 'Late label' }]} />);
+    expect(input.value).toBe('rel');
+  });
+});
