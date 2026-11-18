@@ -209,3 +209,45 @@ describe('ComboSelect input text', () => {
     expect(input.value).toBe('E-mails');
   });
 });
+
+describe('ComboSelect creatable, leaving the field', () => {
+  it('keeps typed text as the value on blur, and a pick still wins', async () => {
+    const onValueChange = vi.fn();
+    render(
+      <ComboSelect
+        aria-label="Queue"
+        options={queues}
+        value={null}
+        onValueChange={onValueChange}
+        creatable
+      />,
+    );
+    const input = screen.getByRole('combobox', { name: 'Queue' });
+    await type(input, 'billing');
+    await act(async () => {
+      fireEvent.blur(input);
+      await new Promise((r) => setTimeout(r, 20));
+    });
+    expect(onValueChange).toHaveBeenLastCalledWith('billing');
+  });
+
+  it('does not commit typed text without creatable, nor on Escape', async () => {
+    const onValueChange = vi.fn();
+    render(
+      <ComboSelect
+        aria-label="Queue"
+        options={queues}
+        value={null}
+        onValueChange={onValueChange}
+      />,
+    );
+    const input = screen.getByRole('combobox', { name: 'Queue' });
+    await type(input, 'billing');
+    await act(async () => {
+      fireEvent.keyDown(input, { key: 'Escape' });
+      fireEvent.blur(input);
+      await new Promise((r) => setTimeout(r, 20));
+    });
+    expect(onValueChange).not.toHaveBeenCalled();
+  });
+});
