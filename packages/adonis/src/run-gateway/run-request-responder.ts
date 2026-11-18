@@ -23,6 +23,7 @@ import {
   type RunDetailSource,
 } from '../run-detail-summary.js';
 import { runFacetsOf } from '../run-facets.js';
+import { capabilityAllows } from './capabilities.js';
 import type { RunGateway } from './interface.js';
 
 /**
@@ -676,16 +677,16 @@ export class RunRequestResponder {
 }
 
 /**
- * The customer tenant a pod claims on a start, when its token grants it: `tenancy:*` (any customer)
- * or `tenancy:<id>` (that one). Otherwise `null`: the run starts with no tenant.
+ * The customer tenant a pod claims on a start, when its token grants `tenancy:<id>`, matched with
+ * {@link capabilityAllows}: `tenancy:<id>` (that one), `tenancy:*` or `*` (any customer). Otherwise
+ * `null`: the run starts with no tenant.
  */
 export function trustedCustomerTenant(
   claimed: string | undefined,
   capabilities: readonly string[] | undefined,
 ): string | null {
   if (typeof claimed !== 'string' || claimed === '') return null;
-  const granted = capabilities ?? [];
-  return granted.includes('tenancy:*') || granted.includes(`tenancy:${claimed}`) ? claimed : null;
+  return capabilityAllows(capabilities ?? [], `tenancy:${claimed}`) ? claimed : null;
 }
 
 /** A runId-bearing request addressed a run of another tenant. */

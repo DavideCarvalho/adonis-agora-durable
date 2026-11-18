@@ -1850,8 +1850,8 @@ export interface StartRunMessage {
   /**
    * The customer (organization, …) the run belongs to, as the pod's request saw it — not the
    * partition. Optional and ignored by peers that do not know it. The control plane keeps it only
-   * when the pod's verified token grants `tenancy:*` or `tenancy:<tenantId>`; otherwise the run has
-   * no tenant.
+   * when the pod's verified token grants `tenancy:<tenantId>`, `tenancy:*` or `*`; otherwise the run
+   * has no tenant.
    */
   tenantId?: string | undefined;
   /** The kind of {@link tenantId}. */

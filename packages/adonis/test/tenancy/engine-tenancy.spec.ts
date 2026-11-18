@@ -244,6 +244,8 @@ describe('helpers', () => {
     expect(trustedCustomerTenant('acme', ['tenancy:*'])).toBe('acme');
     expect(trustedCustomerTenant('acme', ['tenancy:acme'])).toBe('acme');
     expect(trustedCustomerTenant('acme', ['tenancy:globex'])).toBeNull();
+    expect(trustedCustomerTenant('acme', ['*'])).toBe('acme');
+    expect(trustedCustomerTenant('acme', ['tenancy'])).toBeNull();
     expect(trustedCustomerTenant(undefined, ['tenancy:*'])).toBeNull();
   });
 });
