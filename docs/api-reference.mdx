@@ -468,7 +468,7 @@ export default defineConfig({
 | `queues` | `QueueConfig[]` | none | Flow-control queues registered at boot, the declarative `engine.registerQueue`. A duplicate `name` throws at boot; a later `engine.registerQueue` of the same name replaces it. See [Flow control](/docs/durable/reliability/flow-control#registering-a-queue). |
 | `deadLetterWorkflow` | `WorkflowRef` (name, class or ref) | none | Fleet-default handler for `dead` runs, started as `dlq:<deadRunId>` with a `DeadLetter` input in the dead run's namespace. A workflow's `deadLetter()` method or own `deadLetterWorkflow` wins. See [Dead-letter queue](/docs/durable/reliability/dead-letter#routing-to-a-dlq-workflow). |
 | `webhookUrl` | `(token: string) => string` | none | Builds `DurableWebhook.url` for `ctx.webhook()`. See [Durable webhooks](/docs/durable/authoring/webhooks). |
-| `traceparent` | `() => string \| undefined` | wired by `@adonis-agora/diagnostics-otel` when installed | W3C traceparent stamped on dispatched tasks. See [OpenTelemetry](/docs/durable/observability/otel). |
+| `traceparent` | `() => string \| undefined` | wired by `@adonis-agora/diagnostics/otel` when installed | W3C traceparent stamped on dispatched tasks. See [OpenTelemetry](/docs/durable/observability/otel). |
 | `trackStepStart` | `boolean` | `true` | Persist a `running` checkpoint when a local step starts; `false` halves checkpoint writes on hot paths. |
 | `leaseMs` | `number` | `30000` | Recovery lease duration. See [Delivery under multiple instances](/docs/durable/reliability/multi-instance). |
 | `instanceId` | `string` | random | Unique per process; run leases are held by it. |
