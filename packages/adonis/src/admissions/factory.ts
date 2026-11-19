@@ -1,5 +1,6 @@
 import type { AdmissionBackend } from '../admission.js';
 import { resolveRedisService } from '../redis-service.js';
+import { hintStack } from '../stack.js';
 
 /**
  * The minimal application surface an {@link AdmissionFactory} thunk needs at boot to resolve an
@@ -70,7 +71,7 @@ export const admissions = {
    * fleet rather than five per pod. Slots held by a pod that dies are reclaimed once its heartbeat lapses.
    */
   redis(config: RedisAdmissionConfig = {}): AdmissionFactory {
-    return async (ctx) => {
+    const factory: AdmissionFactory = async (ctx) => {
       const { RedisAdmissionBackend } = await import('../admission-redis/index.js');
       const redis = await resolveRedisService(ctx);
       const connection = redis.connection(config.connection ?? 'main') as never;
@@ -83,5 +84,8 @@ export const admissions = {
         ...(config.retryMs !== undefined ? { retryMs: config.retryMs } : {}),
       });
     };
+    return hintStack(factory, [
+      { kind: 'redis', connection: config.connection, purpose: 'admission' },
+    ]);
   },
 };

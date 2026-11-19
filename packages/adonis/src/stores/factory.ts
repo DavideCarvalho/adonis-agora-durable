@@ -1,6 +1,7 @@
 import type { Database } from '@adonisjs/lucid/database';
 import type { StateStore } from '../interfaces.js';
 import { resolveLucidDatabase } from '../resolve-lucid-db.js';
+import { hintStack } from '../stack.js';
 import type { TransportContext } from '../transports/factory.js';
 
 /**
@@ -62,7 +63,7 @@ export interface LucidStoreConfig {
 export const stores = {
   /** Persist runs/checkpoints/timers/signals in SQL via `@adonisjs/lucid`. */
   lucid(config: LucidStoreConfig = {}): StoreFactory {
-    return async (ctx) => {
+    const factory: StoreFactory = async (ctx) => {
       const db = (await resolveLucidDatabase(ctx)) as Database;
       const { LucidStateStore } = await import('./lucid.js');
       return new LucidStateStore(db, {
@@ -76,5 +77,8 @@ export const stores = {
           : {}),
       });
     };
+    return hintStack(factory, [
+      { kind: 'lucid', connection: config.connection, purpose: 'run history' },
+    ]);
   },
 };
