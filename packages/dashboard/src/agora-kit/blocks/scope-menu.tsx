@@ -104,6 +104,8 @@ export function ScopeMenu({
   const choose = (option: ScopeOption | undefined) => {
     if (!option) return;
     setOpen(false);
+    // Back on the trigger, like Escape: the input that had focus is gone.
+    buttonRef.current?.focus();
     const next = option.id === ALL ? undefined : option.id;
     if (next !== current) onChoose(next);
   };
