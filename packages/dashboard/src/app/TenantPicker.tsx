@@ -52,7 +52,14 @@ export function TenantPickerControl() {
   if (!picker || picker.mode === 'off') return null;
 
   if (picker.mode === 'none' || picker.mode === 'fixed') {
-    const only = picker.mode === 'fixed' ? picker.tenants[0] : undefined;
+    if (picker.mode === 'none') {
+      return (
+        <span title="Choose an organization in the app to see its runs">
+          <ScopeChip noun={TENANT_TEXT.noun} label="none" kind="tenant" />
+        </span>
+      );
+    }
+    const only = picker.tenants[0];
     return <ScopeChip noun={TENANT_TEXT.noun} label={only ? only.label : 'none'} kind="tenant" />;
   }
 
