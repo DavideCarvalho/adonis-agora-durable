@@ -2,6 +2,7 @@ import type { Database } from '@adonisjs/lucid/database';
 import type { AdapterFactory } from '@adonisjs/queue/types';
 import type { ControlPlane, Transport } from '../interfaces.js';
 import { resolveLucidDatabase } from '../resolve-lucid-db.js';
+import { hintStack } from '../stack.js';
 import { InMemoryTransport } from '../testing/in-memory-transport.js';
 import type { ConcurrencyOption } from './adaptive-concurrency.js';
 import type { WorkerKeyStore } from './worker-keys.js';
@@ -491,7 +492,7 @@ export const transports = {
 
   /** Run remote steps cross-process over `@adonisjs/queue`, using a connection from `config/queue.ts`. */
   queue(config: QueueTransportConfig = {}): TransportFactory {
-    return async (ctx) => {
+    const factory: TransportFactory = async (ctx) => {
       const { QueueTransport } = await import('./queue.js');
       const adapter = config.adapter ?? (await resolveQueueAdapter(ctx, config.connection));
       const workerKeys = await queueWorkerKeys(ctx, config);
@@ -534,6 +535,20 @@ export const transports = {
           : {}),
       });
     };
+    // The queue backend itself is config/queue.ts's (an opaque adapter); the worker keys are ours.
+    return hintStack(
+      factory,
+      config.workerKeys === undefined
+        ? [
+            {
+              kind: 'lucid',
+              connection: config.workerKeysConnection,
+              purpose: 'worker keys',
+              ifLucid: true,
+            },
+          ]
+        : [],
+    );
   },
 
   /**
@@ -544,7 +559,7 @@ export const transports = {
    * reimplement the control plane). `bullmq`/`ioredis` are imported lazily, only when selected.
    */
   bullmq(config: BullMQTransportConfig): TransportFactory {
-    return async (ctx) => {
+    const factory: TransportFactory = async (ctx) => {
       const { BullMQTransport } = await import('./bullmq/bullmq-transport.js');
       const { createBullMQDeps } = await import('./bullmq/deps.js');
       const deps = await createBullMQDeps(
@@ -594,11 +609,24 @@ export const transports = {
           : {}),
       });
     };
+    return hintStack(factory, [
+      { kind: 'ioredis', connection: config.connection, label: 'bullmq', purpose: 'queues' },
+      ...(config.workerRegistry?.connection !== undefined
+        ? [
+            {
+              kind: 'ioredis' as const,
+              connection: config.workerRegistry.connection,
+              label: 'bullmq registry',
+              purpose: 'worker registry',
+            },
+          ]
+        : []),
+    ]);
   },
 
   /** Run remote steps cross-process over the app's database, using `@adonisjs/lucid` — no broker. */
   db(config: DbTransportConfig = {}): TransportFactory {
-    return async (ctx) => {
+    const factory: TransportFactory = async (ctx) => {
       const db = (await resolveLucidDatabase(ctx)) as Database;
       const { DbTransport } = await import('./db.js');
       return new DbTransport({
@@ -637,5 +665,8 @@ export const transports = {
           : {}),
       });
     };
+    return hintStack(factory, [
+      { kind: 'lucid', connection: config.connection, purpose: 'queues' },
+    ]);
   },
 };

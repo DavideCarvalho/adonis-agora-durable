@@ -1,5 +1,6 @@
 import type { ControlPlane } from '../interfaces.js';
 import { resolveRedisService } from '../redis-service.js';
+import { hintStack } from '../stack.js';
 
 /**
  * The minimal application surface a {@link ControlPlaneFactory} thunk needs at boot to resolve an
@@ -80,7 +81,7 @@ export const controlPlanes = {
    * via the shared `` `${prefix}-control` `` channel.
    */
   redis(config: RedisControlPlaneConfig = {}): ControlPlaneFactory {
-    return async (ctx) => {
+    const factory: ControlPlaneFactory = async (ctx) => {
       const { RedisControlPlane } = await import('../control-plane-redis/redis-control-plane.js');
       const redis = await resolveRedisService(ctx);
       const connection = redis.connection(config.connection ?? 'main') as never;
@@ -92,5 +93,8 @@ export const controlPlanes = {
         ...(config.pingIntervalMs !== undefined ? { pingIntervalMs: config.pingIntervalMs } : {}),
       });
     };
+    return hintStack(factory, [
+      { kind: 'redis', connection: config.connection, purpose: 'control plane' },
+    ]);
   },
 };

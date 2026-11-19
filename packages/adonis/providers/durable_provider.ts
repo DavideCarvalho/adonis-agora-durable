@@ -55,6 +55,7 @@ import { tenantScopedGateway } from '../src/run-gateway/tenant-scoped-gateway.js
 import { enableRunTraceScope } from '../src/run-trace.js';
 import { resolveSchedules } from '../src/scheduler.js';
 import { setBootedApp } from '../src/services/booted_app.js';
+import { describeStackUse, durableStackUses } from '../src/stack.js';
 import { registerControlPlaneWatcher } from '../src/telescope/watcher.js';
 import { contextEngineTenancy, tenancyEnabled } from '../src/tenancy.js';
 import {
@@ -140,6 +141,9 @@ export default class DurableProvider {
     // copy bin/server booted, never a pnpm-split non-booted one (see services/booted_app.ts).
     setBootedApp(this.app);
     const config = this.app.config.get<DurableConfig>('durable', {});
+    // Describe the selected drivers with the app's defaults resolved (the default Lucid
+    // connection and its client), for telescope's Architecture page.
+    describeStackUse(config, durableStackUses(config, this.app.config));
     const topology = config.topology ?? 'standalone';
     if (topology === 'tenant') {
       this.#registerTenantTopology(config as TenantConfig);

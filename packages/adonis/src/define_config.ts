@@ -21,6 +21,7 @@ import { controlPlanes } from './control-planes/factory.js';
 import type { ControlPlane, RunDispatcher, RunScope, TerminalRunStatus } from './interfaces.js';
 import type { QueueConfig } from './queue.js';
 import type { ScheduledWorkflow } from './scheduler.js';
+import { describeStackUse, durableStackUses } from './stack.js';
 import type { LucidStoreConfig, StoreContext, StoreFactory } from './stores/factory.js';
 import { stores } from './stores/factory.js';
 import type { DurableTenancyOption } from './tenancy.js';
@@ -506,7 +507,10 @@ export function defineConfig(config: DurableConfig = { topology: 'standalone' })
   }
   // Default the discriminant so downstream (provider, gateway) can branch on a always-present `topology`
   // without re-deriving it. `...config` wins, so an explicit topology is preserved.
-  return { topology: 'standalone', ...config } as DurableConfig;
+  // What the selected drivers run on, for telescope's Architecture page. The provider refines it
+  // at register, once the app's `database` config names the default Lucid connection.
+  const resolved = { topology: 'standalone', ...config } as DurableConfig;
+  return describeStackUse(resolved, durableStackUses(resolved));
 }
 
 export type {
