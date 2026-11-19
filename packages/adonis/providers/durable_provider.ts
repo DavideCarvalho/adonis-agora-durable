@@ -72,7 +72,7 @@ interface ContextAccessorLike {
 const CONTEXT_ACCESSOR = Symbol.for('@agora/context:accessor');
 
 /**
- * Global slot `@adonis-agora/diagnostics-otel` publishes its `otelTraceparent` under: a
+ * Global slot `@adonis-agora/diagnostics/otel` publishes its `otelTraceparent` under: a
  * `() => string | undefined` returning the active OTel span's W3C `traceparent`.
  * Read structurally so durable continues the OpenTelemetry trace on remote steps
  * with zero config when OTel is installed — and no hard dependency when it is not.
@@ -375,7 +375,7 @@ export default class DurableProvider {
         // app-facing call sees, and the tenant a resumed run gets back.
         ...(config.tenancy !== false ? { tenancy: contextEngineTenancy(config.tenancy) } : {}),
         // Trace continuation on dispatched remote tasks. An explicit `config.traceparent` wins;
-        // otherwise best-effort from @adonis-agora/diagnostics-otel's global slot (no hard dep).
+        // otherwise best-effort from @adonis-agora/diagnostics/otel's global slot (no hard dep).
         ...(config.traceparent
           ? { traceparent: config.traceparent }
           : otelTraceparent

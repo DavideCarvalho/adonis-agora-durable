@@ -170,7 +170,7 @@ export interface BaseDurableConfig {
   webhookUrl?: (token: string) => string;
   /**
    * Supply the current W3C `traceparent` to stamp on every dispatched remote task, so a worker (the
-   * Python SDK included) continues the same distributed trace. When `@adonis-agora/diagnostics-otel`
+   * Python SDK included) continues the same distributed trace. When `@adonis-agora/diagnostics/otel`
    * is installed the provider wires this automatically from the active span — set it here only to
    * override that, or to bridge a tracer durable does not know about. Omit to send none.
    */
