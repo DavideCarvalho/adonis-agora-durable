@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.39
+
+### Patch Changes
+
+- [#570](https://github.com/DavideCarvalho/adonis-agora-durable/pull/570) [`84a0b47`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/84a0b47c0542c3379adc5fc7804c5b601568c443) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - `config/durable.ts` describes what the selected drivers run on under `Symbol.for('@adonis-agora/stack')`: the Lucid store (`run history`), the db transport (`queues`), the queue transport's worker-key table (`worker keys`), a bullmq transport's Redis (`queues`), and the Redis admission (`admission`) and control plane (`control plane`). The provider resolves the default Lucid connection and its client, so telescope's Architecture page shows them with no extra code.
+
 ## 1.0.0-rc.38
 
 ### Patch Changes
