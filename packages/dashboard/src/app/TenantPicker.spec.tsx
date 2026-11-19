@@ -52,7 +52,8 @@ describe('TenantPickerControl', () => {
     });
     render(<TenantPickerControl />, { wrapper });
     expect(await screen.findByText('Acme')).toBeTruthy();
-    expect(document.querySelector('[data-tenant-picker="fixed"]')).not.toBeNull();
+    expect(document.querySelector('[data-tenant-chip]')?.textContent).toBe('OrganizationAcme');
+    expect(screen.queryByRole('button')).toBeNull();
   });
 
   it('says "none" for a viewer with no organization', async () => {
@@ -73,23 +74,22 @@ describe('TenantPickerControl', () => {
     });
     selectTenant.mockResolvedValue({ tenant: 'org-2' });
     render(<TenantPickerControl />, { wrapper });
-    fireEvent.click(await screen.findByRole('button', { name: 'Organization' }));
+    fireEvent.click(await screen.findByRole('button', { name: /^Organization/ }));
     const options = await screen.findAllByRole('option');
     expect(options.map((o) => o.textContent)).toEqual([
       'All organizations',
       'Acmeorg-1',
       'Globexorg-2',
     ]);
-    fireEvent.change(screen.getByRole('textbox', { name: 'search organizations' }), {
+    fireEvent.change(screen.getByRole('combobox', { name: 'Search organizations' }), {
       target: { value: 'glo' },
     });
-    expect(screen.getAllByRole('option').map((o) => o.textContent)).toEqual([
-      'All organizations',
-      'Globexorg-2',
-    ]);
-    fireEvent.click(screen.getByText('Globex'));
+    expect(screen.getAllByRole('option').map((o) => o.textContent)).toEqual(['Globexorg-2']);
+    fireEvent.mouseDown(screen.getByRole('option', { name: /Globex/ }));
     await waitFor(() => expect(selectTenant).toHaveBeenCalledWith('org-2'));
     await waitFor(() => expect(window.location.search).toBe('?tenant=org-2'));
+    expect(screen.getByRole('button', { name: /^Organization/ }).textContent).toContain('Globex');
+    expect(screen.queryByRole('listbox')).toBeNull();
     expect(withTenant('/runs?page=1')).toBe('/runs?page=1&tenant=org-2');
     expect(withTenant('/topology')).toBe('/topology?tenant=org-2');
   });

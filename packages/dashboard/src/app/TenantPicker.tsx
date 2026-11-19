@@ -1,7 +1,7 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { useState } from 'react';
-import { Popover, PopoverContent, PopoverTrigger } from '../agora-kit/ui/popover';
+import { ScopeChip, ScopeMenu } from '../agora-kit/blocks/scope-menu';
 import { durableClient, selectedTenant, type TenantPicker } from '../client/durable-client';
+import { usePageSearch } from './AppPicker';
 
 /** Put the picked organization in the URL (`?tenant=`, absent = all), keeping the hash route. */
 function writeTenantToUrl(tenant: string | undefined): void {
@@ -9,6 +9,8 @@ function writeTenantToUrl(tenant: string | undefined): void {
   if (tenant === undefined) url.searchParams.delete('tenant');
   else url.searchParams.set('tenant', tenant);
   window.history.pushState(null, '', url.toString());
+  // A pushState fires nothing: tell the router and the URL-state adapter the URL moved.
+  window.dispatchEvent(new PopStateEvent('popstate'));
 }
 
 /** The label of the picked organization (or "All organizations"). */
@@ -28,102 +30,53 @@ export function useTenantPicker(): TenantPicker | undefined {
   return data;
 }
 
+const TENANT_TEXT = {
+  noun: 'Organization',
+  all: 'All organizations',
+  some: 'Every organization you can see',
+  search: 'Search organizations',
+  empty: 'No organizations.',
+};
+
 /**
- * The header's "Organization" control (tenancy on): a fixed chip for one organization, a searchable
- * list for several ("All organizations" first when the viewer may see every one). Nothing when
- * tenancy is off.
+ * The header's "Organization" control (tenancy on), in the kit's look: a fixed chip for one
+ * organization (or "none"), a searchable `ScopeMenu` for several ("All organizations" first when
+ * the viewer may see every one). Nothing when tenancy is off.
  */
 export function TenantPickerControl() {
   const picker = useTenantPicker();
   const queryClient = useQueryClient();
-  const [open, setOpen] = useState(false);
-  const [search, setSearch] = useState('');
+  usePageSearch();
   const current = selectedTenant();
 
   if (!picker || picker.mode === 'off') return null;
 
-  const chip =
-    'mono flex items-center gap-1.5 rounded-md border border-line bg-panel px-2 py-1 text-[11px] text-fg-2';
-
-  if (picker.mode === 'none') {
-    return (
-      <span className={chip} title="Choose an organization in the app to see its runs">
-        <span className="text-dim">Organization</span> none
-      </span>
-    );
-  }
-  if (picker.mode === 'fixed') {
-    return (
-      <span className={chip} data-tenant-picker="fixed">
-        <span className="text-dim">Organization</span>
-        {picker.tenants[0]?.label ?? picker.tenants[0]?.id}
-      </span>
-    );
+  if (picker.mode === 'none' || picker.mode === 'fixed') {
+    if (picker.mode === 'none') {
+      return (
+        <span title="Choose an organization in the app to see its runs">
+          <ScopeChip noun={TENANT_TEXT.noun} label="none" kind="tenant" />
+        </span>
+      );
+    }
+    const only = picker.tenants[0];
+    return <ScopeChip noun={TENANT_TEXT.noun} label={only ? only.label : 'none'} kind="tenant" />;
   }
 
   const choose = async (tenant: string | undefined) => {
-    setOpen(false);
-    setSearch('');
     await durableClient.selectTenant(tenant ?? '*').catch(() => undefined);
     writeTenantToUrl(tenant);
     await queryClient.invalidateQueries({ predicate: (q) => q.queryKey[0] !== 'tenants' });
   };
-  const needle = search.trim().toLowerCase();
-  const shown = picker.tenants.filter(
-    (t) =>
-      needle === '' ||
-      t.label.toLowerCase().includes(needle) ||
-      t.id.toLowerCase().includes(needle),
-  );
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger
-        className={`${chip} hover:border-line-strong`}
-        aria-label="Organization"
-        data-tenant-picker="pick"
-      >
-        <span className="text-dim">Organization</span>
-        {tenantLabel(picker, current)}
-      </PopoverTrigger>
-      <PopoverContent align="end" className="w-64 gap-1 p-1">
-        <input
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          placeholder="search organizations…"
-          aria-label="search organizations"
-          className="mb-1 w-full rounded border border-line bg-transparent px-2 py-1 text-xs text-fg outline-none"
-        />
-        <div role="listbox" aria-label="Organizations" className="max-h-72 overflow-y-auto">
-          {picker.all && (
-            <button
-              type="button"
-              role="option"
-              aria-selected={current === undefined}
-              onClick={() => void choose(undefined)}
-              className="w-full rounded px-2 py-1.5 text-left text-xs text-fg hover:bg-panel"
-            >
-              All organizations
-            </button>
-          )}
-          {shown.map((t) => (
-            <button
-              key={t.id}
-              type="button"
-              role="option"
-              aria-selected={current === t.id}
-              onClick={() => void choose(t.id)}
-              className="flex w-full flex-col rounded px-2 py-1.5 text-left text-xs text-fg hover:bg-panel"
-            >
-              <span className="truncate">{t.label}</span>
-              {t.label !== t.id && (
-                <span className="mono truncate text-[10px] text-dim">{t.id}</span>
-              )}
-            </button>
-          ))}
-          {shown.length === 0 && <p className="px-2 py-1.5 text-xs text-dim">No match.</p>}
-        </div>
-      </PopoverContent>
-    </Popover>
+    <ScopeMenu
+      items={picker.tenants}
+      all={picker.all}
+      current={current}
+      text={TENANT_TEXT}
+      labelOf={(id) => tenantLabel(picker, id)}
+      onChoose={(next) => void choose(next)}
+    />
   );
 }

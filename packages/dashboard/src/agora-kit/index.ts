@@ -36,6 +36,12 @@ export { LoadMore, Pager } from './blocks/pager';
 export { Panel } from './blocks/panel';
 export { errorStatus, QueryBoundary, type QueryLike } from './blocks/query-boundary';
 export {
+  ScopeChip,
+  ScopeMenu,
+  type ScopeMenuText,
+  type ScopeOption,
+} from './blocks/scope-menu';
+export {
   fetchSearchGroups,
   loadConsoles,
   resetConsoleCache,
@@ -47,6 +53,7 @@ export {
   searchConsoles,
 } from './console-data';
 export * from './icons';
+export { SCOPE_PARAMS, withPageScope } from './lib/scope-carry';
 export { cn } from './lib/utils';
 export {
   AppShell,

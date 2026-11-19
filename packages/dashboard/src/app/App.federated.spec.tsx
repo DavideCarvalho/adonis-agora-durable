@@ -103,13 +103,16 @@ describe('App: a federated app picked in the App selector', () => {
     window.history.replaceState(null, '', '/durable');
   });
 
-  it('tags the trigger and says, on top of the page, whose data this is and who acts', async () => {
+  it('badges the picked app and says, on top of the page, whose data this is and who acts', async () => {
     apps.mockResolvedValue(picker('app'));
     window.history.replaceState(null, '', '/durable?app=et#/workers');
     render(<App />, { wrapper });
-    const trigger = await screen.findByRole('button', { name: 'App' });
+    const trigger = await screen.findByRole('button', { name: /^App/ });
+    expect(trigger.textContent).toContain('Entre Textos');
     await waitFor(() =>
-      expect(trigger.querySelector('[data-app-mode="federated"]')).not.toBeNull(),
+      expect(
+        document.querySelector('[data-app-picker] [data-app-mode="federated"]'),
+      ).not.toBeNull(),
     );
     const notice = await screen.findByRole('note');
     expect(notice.textContent).toContain("reads Entre Textos's data from Entre Textos's own store");
@@ -122,7 +125,7 @@ describe('App: a federated app picked in the App selector', () => {
     apps.mockResolvedValue({ ...picker('none'), selected: null });
     window.history.replaceState(null, '', '/durable#/workers');
     render(<App />, { wrapper });
-    await screen.findByRole('button', { name: 'App' });
+    await screen.findByRole('button', { name: /^App/ });
     expect(screen.queryByRole('note')).toBeNull();
   });
 
