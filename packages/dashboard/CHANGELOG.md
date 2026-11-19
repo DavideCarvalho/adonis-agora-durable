@@ -1,5 +1,11 @@
 # @adonis-agora/durable-dashboard
 
+## 1.0.0-rc.21
+
+### Patch Changes
+
+- [#571](https://github.com/DavideCarvalho/adonis-agora-durable/pull/571) [`d9c24f9`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/d9c24f93745176b185f6de5fd155512ea4f32b88) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The App and Organization pickers use the console kit's shared `ScopeMenu` / `ScopeChip`, the same searchable picker as telescope's (federated apps hinted, the picked app's mode badge kept). Going to another console, a sidebar page or a ⌘K command keeps `?app=` / `?tenant=`.
+
 ## 1.0.0-rc.20
 
 ### Patch Changes
