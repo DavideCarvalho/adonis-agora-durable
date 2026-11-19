@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.40
+
+### Patch Changes
+
+- [#572](https://github.com/DavideCarvalho/adonis-agora-durable/pull/572) [`b53cc24`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/b53cc24321aaa433a62bf8d05d285a5e1ad13158) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A transport or control plane wrapped by another lib (`encryptedTransport` from `@adonis-agora/crypto-integrations` is a `Proxy`) keeps its infrastructure on telescope's Architecture page: the stack hints also ride on the factory under `Symbol.for('@adonis-agora/durable:stack-hints')`, which a wrapper passes through.
+
 ## 1.0.0-rc.39
 
 ### Patch Changes
