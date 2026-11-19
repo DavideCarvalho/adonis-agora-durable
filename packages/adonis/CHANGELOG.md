@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.41
+
+### Patch Changes
+
+- [#574](https://github.com/DavideCarvalho/adonis-agora-durable/pull/574) [`c5f4f3c`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/c5f4f3c1926587ce812b305672730d401326c561) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Ship the console with the shared App/Organization picker (kit `ScopeMenu`, with its accessible "App: <label>" name, hint search, clamped highlight and focus return).
+
 ## 1.0.0-rc.40
 
 ### Patch Changes

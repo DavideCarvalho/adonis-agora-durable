@@ -1,5 +1,11 @@
 # @adonis-agora/durable-dashboard
 
+## 1.0.0-rc.22
+
+### Patch Changes
+
+- [#574](https://github.com/DavideCarvalho/adonis-agora-durable/pull/574) [`c5f4f3c`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/c5f4f3c1926587ce812b305672730d401326c561) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - App and Organization pickers: screen readers hear "App: Hub" (not the two spans run together), search matches an option's hint, the highlight stays on a real option when the list shrinks, and focus returns to the button after a pick.
+
 ## 1.0.0-rc.21
 
 ### Patch Changes
