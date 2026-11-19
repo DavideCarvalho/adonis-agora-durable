@@ -7,7 +7,7 @@ import { readShellConfig } from '../agora-kit/shell-config';
 import { splitHash, subscribeHashUrl } from '../agora-kit/url-state/hash-url';
 import { NuqsHashAdapter } from '../agora-kit/url-state/nuqs-hash-adapter';
 import { CONFIG_ELEMENT_ID, durableClient } from '../client/durable-client';
-import { AppPickerControl, FederatedAppNotice } from './AppPicker';
+import { AppPickerControl, FederatedAppNotice, usePageSearch } from './AppPicker';
 import { currentRoute, pushRoute, type Route, sameRoute } from './routes';
 import { LogoMark } from './run-status';
 import { RunIdSearch } from './runs/RunIdSearch';
@@ -61,6 +61,8 @@ export function App() {
 function Console() {
   // What the provider put in the page: switcher, ⌘K search, viewer, sign-out (all optional).
   const shell = useMemo(() => readShellConfig(CONFIG_ELEMENT_ID), []);
+  // Re-render the shell on a scope pick: its console links carry `?app=` / `?tenant=`.
+  usePageSearch();
   const tenantPicker = useTenantPicker();
   const filters = useRunFilters();
   const [route, setRouteState] = useState<Route>(() => currentRoute());

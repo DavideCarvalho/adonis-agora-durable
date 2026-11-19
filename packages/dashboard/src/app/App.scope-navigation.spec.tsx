@@ -3,7 +3,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AppPicker, RunDetail, ScheduleInfo } from '../client/durable-client';
+import type { AppPicker, RunDetail, ScheduleInfo, TenantPicker } from '../client/durable-client';
 
 // No jest-dom in this package (see `OriginFacets.spec.tsx`) — plain DOM assertions only.
 
@@ -15,6 +15,7 @@ class NoopResizeObserver {
 }
 
 const apps = vi.fn<() => Promise<AppPicker>>();
+const tenants = vi.fn<() => Promise<TenantPicker>>();
 const getRun = vi.fn<(id: string) => Promise<RunDetail>>();
 const schedules = vi.fn<() => Promise<ScheduleInfo[]>>();
 
@@ -35,7 +36,8 @@ vi.mock('../client/durable-client', async (importOriginal) => {
       }),
       values: vi.fn().mockResolvedValue([]),
       workers: vi.fn().mockResolvedValue([]),
-      tenants: vi.fn().mockResolvedValue({ mode: 'off', all: false, selected: null, tenants: [] }),
+      tenants: () => tenants(),
+      selectTenant: vi.fn().mockResolvedValue({ tenant: 'org-2' }),
       topology: vi.fn().mockResolvedValue({ role: 'standalone' }),
       compat: vi.fn().mockResolvedValue({
         controlPlane: { instanceId: 'cp', protocol: 1, protocolRange: [1, 1], capabilities: [] },
@@ -50,6 +52,8 @@ vi.mock('../client/durable-client', async (importOriginal) => {
 
 // Imported AFTER the mock so `App` picks up the mocked `durableClient`.
 const { App } = await import('./App');
+const { resetConsoleCache } = await import('../agora-kit/console-data');
+const { CONFIG_ELEMENT_ID } = await import('../client/durable-client');
 const { NuqsHashAdapter } = await import('../agora-kit/url-state/nuqs-hash-adapter');
 const { useRunFilters } = await import('./runs/RunsPage');
 
@@ -107,6 +111,8 @@ describe('the picked app (`?app=`) survives in-console navigation', () => {
     schedules.mockReset();
     schedules.mockResolvedValue([]);
     apps.mockResolvedValue(picker('app'));
+    tenants.mockReset();
+    tenants.mockResolvedValue({ mode: 'off', all: false, selected: null, tenants: [] });
   });
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -165,5 +171,52 @@ describe('the picked app (`?app=`) survives in-console navigation', () => {
     act(() => probed?.setStatus('failed'));
     await waitFor(() => expect(window.location.hash).toContain('status=failed'));
     expect(window.location.search).toBe('?app=et');
+  });
+
+  it('into the console switcher right after an organization pick', async () => {
+    resetConsoleCache();
+    const block = document.createElement('script');
+    block.type = 'application/json';
+    block.id = CONFIG_ELEMENT_ID;
+    block.textContent = JSON.stringify({ switcher: { endpoint: '/x/api/consoles', others: 1 } });
+    document.head.appendChild(block);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              version: 1,
+              current: 'x',
+              consoles: [
+                { id: 'telescope', title: 'Telescope', icon: 'telescope', href: '/telescope' },
+              ],
+            }),
+          ),
+      ),
+    );
+    try {
+      window.history.replaceState(null, '', '/durable#/workers');
+      tenants.mockResolvedValue({
+        mode: 'pick',
+        all: true,
+        selected: null,
+        tenants: [
+          { id: 'org-1', label: 'Acme' },
+          { id: 'org-2', label: 'Globex' },
+        ],
+      });
+      render(<App />, { wrapper });
+      fireEvent.click(await screen.findByRole('button', { name: /^Organization/ }));
+      fireEvent.mouseDown(await screen.findByRole('option', { name: /Globex/ }));
+      await waitFor(() => expect(window.location.search).toBe('?tenant=org-2'));
+      await act(async () => {
+        fireEvent.click(await screen.findByRole('button', { name: /switch console/ }));
+      });
+      const link = (await screen.findAllByRole('menuitem')).find((el) => el.tagName === 'A');
+      await waitFor(() => expect(link?.getAttribute('href')).toBe('/telescope?tenant=org-2'));
+    } finally {
+      block.remove();
+    }
   });
 });
