@@ -51,19 +51,35 @@ export type StackHint =
 
 const hints = new WeakMap<object, StackHint[]>();
 
+/**
+ * The hints also ride on the factory under a global symbol, so a wrapper (a `Proxy`, like
+ * `encryptedTransport` from `@adonis-agora/crypto-integrations`) still carries them: the WeakMap
+ * only knows the original object.
+ */
+const HINTS = Symbol.for('@adonis-agora/durable:stack-hints');
+
 /** Record what `factory` would use. Returns `factory`. */
 export function hintStack<T extends object>(factory: T, list: StackHint[]): T {
   hints.set(factory, list);
+  try {
+    Object.defineProperty(factory, HINTS, { value: list, enumerable: false, configurable: true });
+  } catch {
+    // a frozen factory: the WeakMap still has it
+  }
   return factory;
 }
 
 /** What `factory` would use (empty for an in-process driver or a ready instance). */
 export function stackHintsOf(factory: unknown): StackHint[] {
-  return (
-    (factory !== null && (typeof factory === 'object' || typeof factory === 'function')
-      ? hints.get(factory)
-      : undefined) ?? []
-  );
+  if (factory === null || (typeof factory !== 'object' && typeof factory !== 'function')) return [];
+  const known = hints.get(factory);
+  if (known !== undefined) return known;
+  try {
+    const carried = (factory as Record<symbol, unknown>)[HINTS];
+    return Array.isArray(carried) ? (carried as StackHint[]) : [];
+  } catch {
+    return [];
+  }
 }
 
 interface AppConfigLike {

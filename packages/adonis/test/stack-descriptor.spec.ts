@@ -91,4 +91,19 @@ describe('stack descriptor', () => {
       { tech: 'sql', purpose: 'queues' },
     ]);
   });
+
+  it('a wrapped factory (a Proxy, like encryptedTransport) keeps its uses', () => {
+    const inner = transports.db({ connection: 'jobs' });
+    const wrapped = new Proxy(inner, {});
+    const config = defineConfig({
+      transport: 'db',
+      transports: { db: wrapped },
+      store: 'lucid',
+      stores: { lucid: stores.lucid({ connection: 'educacao' }) },
+    });
+    expect(usesOf(config)).toEqual([
+      { tech: 'sql', connection: 'educacao', purpose: 'run history' },
+      { tech: 'sql', connection: 'jobs', purpose: 'queues' },
+    ]);
+  });
 });
