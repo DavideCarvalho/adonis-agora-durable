@@ -62,7 +62,7 @@ await engine.schedules.delete(`brief:${user.id}`)    // its past runs are left a
 - `trigger` starts one run right now, paused or not, with the run id `sched:<id>:manual:<nowMs>`; it doesn't move the schedule's next fire.
 - `list` filters by `namespace`, `workflow`, `tag` and `paused` (with `limit` / `offset`) and returns the soonest-due first.
 - Every run carries the schedule's tags plus `schedule:<id>`, its namespace, and the optional `searchAttributes` / `priority` from the definition. A window's run id is `sched:<id>:<windowMs>`.
-- `get` / `list` describe a schedule with its definition plus `nextFireAt` (jitter included; `null` when paused), `lastFireAt`, `lastRunId`, `fires` (manual triggers excluded), `lastError` and an optional free-form `note` (set on the definition, or by `pause(id, note)`).
+- `get` / `list` describe a schedule with its definition plus `nextFireAt` (jitter included; `null` when paused), `lastFireAt`, `lastRunId`, `fires` (manual triggers excluded), `lastError`, an optional free-form `note` (set on the definition, or by `pause(id, note)`), and `createdAt` / `updatedAt` (`Date`s: `createdAt` is set by `create` and kept by `upsert`; `updatedAt` moves on every change, fires included).
 
 ## Policies
 

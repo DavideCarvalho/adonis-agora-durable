@@ -35,7 +35,7 @@ import { LiveLifecycleDeliveries, RunEvents } from '../RunEvents';
 import { RunInfoPanel } from '../RunInfoPanel';
 import { LifecycleSourceLine, RunWaits } from '../RunLifecycle';
 import { parentRunIdOf, retryOriginOf } from '../run-lineage';
-import { durMs, StatusBadge, StatusDot } from '../run-status';
+import { durMs, fullStamp, StatusBadge, StatusDot, shortDate } from '../run-status';
 import { SpansTimeline } from '../SpansTimeline';
 import { StepDetailPanel } from '../StepDetailPanel';
 import { WaitingActions } from '../WaitingActions';
@@ -484,6 +484,14 @@ export function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: strin
             </span>
           </div>
           <div className="mono mt-1 truncate text-[11px] text-faint">{run.id}</div>
+          <div className="mt-0.5 flex flex-wrap gap-x-3 text-[11px] text-faint">
+            <span title={fullStamp(run.createdAt)} data-run-created="">
+              Created <span className="tnum text-fg-2">{shortDate(run.createdAt)}</span>
+            </span>
+            <span title={fullStamp(run.updatedAt)} data-run-updated="">
+              Updated <span className="tnum text-fg-2">{shortDate(run.updatedAt)}</span>
+            </span>
+          </div>
           {run.tags && run.tags.length > 0 && (
             <div className="mt-1.5 flex flex-wrap gap-1">
               {run.tags.map((t) => (

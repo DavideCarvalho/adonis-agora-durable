@@ -102,6 +102,27 @@ describe('<RunsList> virtualization', () => {
     expect(rendered).toBeLessThan(100);
   });
 
+  it('titles each row with its full updated and created timestamps', () => {
+    const createdAt = new Date(2026, 0, 1, 0, 0, 0).toISOString();
+    const updatedAt = new Date(2026, 0, 9, 18, 30, 0).toISOString();
+    const runs = makeRuns(1).map((r) => ({ ...r, createdAt, updatedAt }));
+    const { container } = render(
+      <RunsList
+        runs={runs}
+        allRuns={runs}
+        health={[]}
+        onSelect={noop}
+        onSelectTag={noop}
+        onSelectNamespace={noop}
+        onSelectOrigin={noop}
+        emptyNotice={emptyNotice}
+      />,
+    );
+    const stamp = container.querySelector('[data-run-updated]') as HTMLElement;
+    const full = (iso: string) => new Date(iso).toLocaleString();
+    expect(stamp.title).toBe(`Updated ${full(updatedAt)} · created ${full(createdAt)}`);
+  });
+
   it("still accounts for every run's height in the scroll track, even though most never mount", () => {
     const runs = makeRuns(500);
     const { container } = render(

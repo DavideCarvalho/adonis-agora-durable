@@ -117,6 +117,24 @@ describe('engine.schedules', () => {
     expect(u.lastRunId).toBe(`sched:u:${T0 + MIN}`);
   });
 
+  it('stamps createdAt once and moves updatedAt on every change', async () => {
+    const { engine, at } = setup();
+    const created = await engine.schedules.create({ id: 't', workflow: 'job', every: '1m' });
+    expect(created.createdAt.getTime()).toBe(T0);
+    expect(created.updatedAt.getTime()).toBe(T0);
+
+    at(T0 + 10_000);
+    const paused = await engine.schedules.pause('t');
+    expect(paused.createdAt.getTime()).toBe(T0);
+    expect(paused.updatedAt.getTime()).toBe(T0 + 10_000);
+
+    at(T0 + 20_000);
+    const replaced = await engine.schedules.upsert({ id: 't', workflow: 'job', every: '5m' });
+    expect(replaced.createdAt.getTime()).toBe(T0);
+    expect(replaced.updatedAt.getTime()).toBe(T0 + 20_000);
+    at(T0);
+  });
+
   it('evaluates cron in its timezone, and triggers on demand', async () => {
     const { engine, store } = setup();
     // 09:00 in São Paulo (UTC-3) on weekdays = 12:00 UTC.
