@@ -103,7 +103,9 @@ describe('<RunsList> virtualization', () => {
   });
 
   it('titles each row with its full updated and created timestamps', () => {
-    const runs = makeRuns(1);
+    const createdAt = new Date(2026, 0, 1, 0, 0, 0).toISOString();
+    const updatedAt = new Date(2026, 0, 9, 18, 30, 0).toISOString();
+    const runs = makeRuns(1).map((r) => ({ ...r, createdAt, updatedAt }));
     const { container } = render(
       <RunsList
         runs={runs}
@@ -117,8 +119,8 @@ describe('<RunsList> virtualization', () => {
       />,
     );
     const stamp = container.querySelector('[data-run-updated]') as HTMLElement;
-    const at = new Date(runs[0]?.updatedAt as string).toLocaleString();
-    expect(stamp.title).toBe(`Updated ${at} · created ${at}`);
+    const full = (iso: string) => new Date(iso).toLocaleString();
+    expect(stamp.title).toBe(`Updated ${full(updatedAt)} · created ${full(createdAt)}`);
   });
 
   it("still accounts for every run's height in the scroll track, even though most never mount", () => {
