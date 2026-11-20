@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 1.0.0-rc.42
+
+### Minor Changes
+
+- [#581](https://github.com/DavideCarvalho/adonis-agora-durable/pull/581) [`c8fcbde`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/c8fcbdea1cd3384707f6e0d624e1c06422276dc0) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Timestamps: ships the console's new run Created/Updated fields, and the state-store conformance suite now asserts that `createdAt` never moves (runs: through `updateRun` / `updateRunIf`; schedules: through `updateSchedule`) while `updatedAt` follows each write to the millisecond. The bundled stores already pass; no schema change.
+
 ## 1.0.0-rc.41
 
 ### Patch Changes

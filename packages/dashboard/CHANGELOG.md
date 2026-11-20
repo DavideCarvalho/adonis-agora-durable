@@ -1,5 +1,11 @@
 # @adonis-agora/durable-dashboard
 
+## 1.0.0-rc.23
+
+### Minor Changes
+
+- [#581](https://github.com/DavideCarvalho/adonis-agora-durable/pull/581) [`c8fcbde`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/c8fcbdea1cd3384707f6e0d624e1c06422276dc0) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Console: the run detail header shows when the run was **Created** and last **Updated** (short date, full local time on hover), and each runs-list row's "updated … ago" stamp carries both full timestamps in its title.
+
 ## 1.0.0-rc.22
 
 ### Patch Changes
