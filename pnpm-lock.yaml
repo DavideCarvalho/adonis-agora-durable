@@ -204,8 +204,8 @@ importers:
         version: 1.0.0-rc.5(@adonisjs/core@7.6.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(@adonisjs/lucid@22.4.2(@adonisjs/assembler@8.6.0(typescript@7.0.2))(@adonisjs/core@7.6.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.2.0)(luxon@3.7.2)(mysql2@3.24.6(@types/node@26.6.6))(pg@8.23.1)(supports-color@10.2.2))
     devDependencies:
       '@adonis-agora/authkit-client':
-        specifier: 1.0.0-rc.11
-        version: 1.0.0-rc.11(739c85612f2f27aec9a7e499f463445e)
+        specifier: 1.0.0-rc.12
+        version: 1.0.0-rc.12(739c85612f2f27aec9a7e499f463445e)
       '@adonis-agora/diagnostics':
         specifier: 1.0.0-rc.6
         version: 1.0.0-rc.6(044d069edfc91c5aca947e93b994f416)
@@ -408,8 +408,8 @@ importers:
 
 packages:
 
-  '@adonis-agora/authkit-client@1.0.0-rc.11':
-    resolution: {integrity: sha512-AjP0OKoCfUve1g18RetRPwkKcMzqqp/wJyOxXnUQrvuTIiSiGKN+nByhX+NcrZ9maJKLD0b0NFnryYUvC4IUEQ==}
+  '@adonis-agora/authkit-client@1.0.0-rc.12':
+    resolution: {integrity: sha512-QXDSrRf6Sb12BONLdLQv+KQxC2CMPcAWRmCbzTNTxDXj7+eW4QQGHJYFiuSzz7BMf6KKisZBYmRwqGFWLivKLQ==}
     engines: {node: '>=24'}
     peerDependencies:
       '@adonis-agora/resilience': '>=0.1.0 <2.0.0 || >=1.0.0-rc.0 <2.0.0'
@@ -4345,7 +4345,7 @@ packages:
 
 snapshots:
 
-  '@adonis-agora/authkit-client@1.0.0-rc.11(739c85612f2f27aec9a7e499f463445e)':
+  '@adonis-agora/authkit-client@1.0.0-rc.12(739c85612f2f27aec9a7e499f463445e)':
     dependencies:
       '@adonis-agora/authkit-core': 1.0.0-rc.4
       '@adonisjs/auth': 10.1.0(76e23f9d5cb3f171f907a4c73a7078af)
