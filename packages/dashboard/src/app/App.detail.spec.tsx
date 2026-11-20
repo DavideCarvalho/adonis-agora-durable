@@ -131,6 +131,31 @@ describe('App: the run detail of a waiting or cancelling run', () => {
     expect(header.textContent).not.toContain('running');
   });
 
+  it('shows when the run was created and last updated, with the full timestamp in the title', async () => {
+    const createdAt = '2026-03-04T10:00:00.000Z';
+    const updatedAt = '2026-03-09T18:30:00.000Z';
+    getRun.mockImplementation((id) => Promise.resolve(detail(id, { createdAt, updatedAt })));
+    window.location.hash = '#/run/t1';
+    const { container } = render(<App />, { wrapper });
+    await screen.findByRole('heading', { name: 'approve' });
+    const created = await waitFor(() => {
+      const el = container.querySelector('[data-run-created]');
+      expect(el).not.toBeNull();
+      return el as HTMLElement;
+    });
+    const updated = container.querySelector('[data-run-updated]') as HTMLElement;
+    const short = (iso: string) =>
+      new Date(iso).toLocaleDateString(undefined, {
+        day: 'numeric',
+        month: 'short',
+        year: 'numeric',
+      });
+    expect(created.textContent).toBe(`Created ${short(createdAt)}`);
+    expect(created.title).toBe(new Date(createdAt).toLocaleString());
+    expect(updated.textContent).toBe(`Updated ${short(updatedAt)}`);
+    expect(updated.title).toBe(new Date(updatedAt).toLocaleString());
+  });
+
   it('a cancelling run with no compensation recorded yet reads Cancelling, not Saga compensated', async () => {
     getRun.mockImplementation((id) => Promise.resolve(detail(id, { status: 'cancelling' })));
     window.location.hash = '#/run/c1';

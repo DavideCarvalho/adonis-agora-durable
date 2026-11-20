@@ -556,6 +556,8 @@ The sidebar has two groups. **Monitor** holds Runs and Workers. **Operations** h
 
 ### Workflow pages
 
+Under the run id, the header shows when the run was **Created** and last **Updated** (a short date, the full local time on hover). Each row of the runs list shows how long ago the run was last updated, with both full timestamps on hover.
+
 The workflow name in a run's header links to that workflow's page (`#/workflow/<name>`), which lists two things:
 
 - **Starts when it settles**: the subscribers of `run.completed:<workflow>` and `run.failed:<workflow>`.

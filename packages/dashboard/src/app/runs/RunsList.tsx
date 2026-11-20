@@ -20,7 +20,7 @@ import {
   originLabel,
   UNKNOWN_ORIGIN_TITLE,
 } from '../../client/run-origin';
-import { relTime, StatusBadge } from '../run-status';
+import { fullStamp, relTime, StatusBadge } from '../run-status';
 import { tenantLabel } from '../TenantPicker';
 
 /** Placeholder rows shown while the first `/runs` fetch is in flight, so the pane never flashes
@@ -143,7 +143,13 @@ function RunRow({
       )}
       <div className="flex items-center justify-between gap-2">
         <span className="mono truncate text-[11px] text-faint">{r.id}</span>
-        <span className="shrink-0 text-[11px] text-faint">{relTime(r.updatedAt)}</span>
+        <span
+          className="shrink-0 text-[11px] text-faint"
+          title={`Updated ${fullStamp(r.updatedAt) ?? '—'} · created ${fullStamp(r.createdAt) ?? '—'}`}
+          data-run-updated=""
+        >
+          {relTime(r.updatedAt)}
+        </span>
       </div>
       {r.tags && r.tags.length > 0 && (
         <div className="flex flex-wrap gap-1">

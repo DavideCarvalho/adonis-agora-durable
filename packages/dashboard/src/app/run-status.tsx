@@ -44,6 +44,19 @@ export const STATUSES: RunStatus[] = [
  *  filtered views never need a second page. */
 export const RUNS_PAGE_SIZE = 100;
 
+/** A timestamp as a short date (`20 Nov 2026`), or `—` when it is missing or unreadable. */
+export function shortDate(iso: string | null | undefined): string {
+  const at = iso ? new Date(iso) : undefined;
+  if (!at || Number.isNaN(at.getTime())) return '—';
+  return at.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+/** The full local timestamp for a `title`, or `undefined` when there is none to show. */
+export function fullStamp(iso: string | null | undefined): string | undefined {
+  const at = iso ? new Date(iso) : undefined;
+  return at && !Number.isNaN(at.getTime()) ? at.toLocaleString() : undefined;
+}
+
 export function relTime(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime();
   const s = Math.round(diff / 1000);

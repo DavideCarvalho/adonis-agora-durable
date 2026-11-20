@@ -1203,6 +1203,8 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         const stamped = new Date(at.getTime() + 120_789);
         expect(await store.updateRunIf('r1', ['suspended'], { updatedAt: stamped })).toBe(true);
         expect((await store.getRun('r1'))?.updatedAt.getTime()).toBe(stamped.getTime());
+        // `createdAt` is set once, by createRun: no update moves it.
+        expect((await store.getRun('r1'))?.createdAt.getTime()).toBe(at.getTime());
       },
     );
 
@@ -2208,6 +2210,12 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
 
       await store.updateSchedule?.('s1', { nextFireAt: null });
       expect(await store.updateSchedule?.('s1', { nextFireAt: NOW }, NOW + 1)).toBe(false);
+      // A patch moves `updatedAt` to the millisecond; `createdAt` stays what the save wrote.
+      const touched = new Date(at.getTime() + 90_321);
+      expect(await store.updateSchedule?.('s1', { paused: false, updatedAt: touched })).toBe(true);
+      const stamps = await store.getSchedule?.('s1');
+      expect(stamps?.updatedAt.getTime()).toBe(touched.getTime());
+      expect(stamps?.createdAt.getTime()).toBe(at.getTime());
       expect(await store.updateSchedule?.('s1', { nextFireAt: NOW }, null)).toBe(true);
       expect(await store.updateSchedule?.('ghost', { paused: true })).toBe(false);
     });
