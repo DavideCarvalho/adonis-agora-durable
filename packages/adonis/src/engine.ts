@@ -373,6 +373,9 @@ function mergeTags(staticTags?: string[], runTags?: string[]): string[] | undefi
 /** A breakpoint checkpoint's `name` is `breakpoint` (or `breakpoint:<label>`). This name — not the
  *  reused `signal` kind — is the explicit marker the dashboard and `continue()` detect it by. */
 const BREAKPOINT = 'breakpoint';
+/** Default {@link WorkflowEngineDeps.remoteResultPollMs}. */
+const DEFAULT_REMOTE_RESULT_POLL_MS = 1_000;
+
 /** Default size of the sticky continuation cache (see {@link WorkflowEngineDeps.stickyRuns}). */
 const DEFAULT_STICKY_RUNS = 2000;
 /** Default idle limit of a parked body in the sticky cache. */
@@ -698,6 +701,8 @@ interface RemoteResolution {
   output: unknown;
   startedAt?: number | undefined;
   events?: StepEvent[] | undefined;
+  /** Read from a checkpoint another instance already settled (and announced): not written again. */
+  settledElsewhere?: boolean | undefined;
 }
 
 interface PendingRemote {
@@ -831,6 +836,15 @@ export interface WorkflowEngineDeps {
    * beats landing elsewhere. Mostly a testing knob.
    */
   heartbeatPersistThrottleMs?: number | undefined;
+  /**
+   * How often (ms) a remote step with a liveness `timeoutMs`, awaited in memory, re-reads its
+   * checkpoint while it waits. With several engine instances sharing the results queue, the result
+   * can be consumed by an instance other than the one awaiting it: that instance settles the
+   * checkpoint, and its `step.completed` broadcast on the control plane ends the wait at once. This
+   * poll ends it with no control plane, or when the broadcast is lost. Default 1000; `0` turns it
+   * off (the wait then ends with the broadcast, or when `timeoutMs` runs out).
+   */
+  remoteResultPollMs?: number | undefined;
   /**
    * Max times {@link remoteRedispatchMs} re-dispatches one lost remote step before giving up and
    * failing it as a {@link RemoteStepError} (`code: 'remote_step_lost'`), so the run fails / dead-letters
@@ -1096,6 +1110,7 @@ export class WorkflowEngine {
   private readonly timerBatchSize: number;
   private readonly eventBufferTtlMs: number | undefined;
   private readonly remoteRedispatchMs: number | undefined;
+  private readonly remoteResultPollMs: number;
   private readonly remoteRedispatchMax: number;
   private readonly remoteAdvanceSilenceMs: number | undefined;
   private readonly waitForRunPollMs: number;
@@ -1391,6 +1406,11 @@ export class WorkflowEngine {
     // Opt-in: unset (or 0) leaves the by-design "re-suspend a lost dispatch, never re-dispatch" behavior.
     this.remoteRedispatchMs = deps.remoteRedispatchMs || undefined;
     this.remoteRedispatchMax = Math.max(1, deps.remoteRedispatchMax ?? 10);
+    const resultPoll = deps.remoteResultPollMs;
+    this.remoteResultPollMs =
+      resultPoll !== undefined && Number.isFinite(resultPoll) && resultPoll >= 0
+        ? resultPoll
+        : DEFAULT_REMOTE_RESULT_POLL_MS;
     // Opt-in: unset (or 0) keeps the unbounded wait for a remote workflow turn's decision.
     this.remoteAdvanceSilenceMs = deps.remoteAdvanceSilenceMs || undefined;
     this.waitForRunPollMs = validPollMs(deps.waitForRunPollMs) ?? DEFAULT_WAIT_FOR_RUN_POLL_MS;
@@ -1534,9 +1554,11 @@ export class WorkflowEngine {
       if (msg.kind === 'event') {
         // `at` may be a string after JSON transit (Redis) — normalize back to a Date.
         this.deliver(markRemoteEvent({ ...msg.event, at: new Date(msg.event.at) }));
+        this.settleAwaitedElsewhere(msg.event);
       } else if (msg.kind === 'events') {
         for (const event of msg.events) {
           this.deliver(markRemoteEvent({ ...event, at: new Date(event.at) }));
+          this.settleAwaitedElsewhere(event);
         }
       } else if (msg.kind === 'cancel') {
         this.notifyCancelled(msg.runId);
@@ -11449,6 +11471,51 @@ export class WorkflowEngine {
     }
   }
 
+  /**
+   * Settle THIS instance's in-memory wait on a remote step from its checkpoint, once another engine
+   * instance has consumed the step's result and settled the row. The results queue is shared: the
+   * instance that consumes a result has no in-memory waiter for it, so it settles the checkpoint and
+   * asks for a resume — which the lease held by this instance's parked turn refuses. Without this, the
+   * wait here only ended when the step's `timeoutMs` ran out (issue #575). `attempt`, when given,
+   * ignores a row an earlier attempt settled. Returns whether a waiter was settled.
+   */
+  private settlePendingFromCheckpoint(
+    cp: StepCheckpoint | null | undefined,
+    attempt?: number,
+  ): boolean {
+    if (!cp?.stepId || (cp.status !== 'completed' && cp.status !== 'failed')) return false;
+    if (attempt !== undefined && cp.attempts < attempt) return false;
+    const waiter = this.pending.get(cp.stepId);
+    if (!waiter) return false;
+    this.pending.delete(cp.stepId);
+    if (cp.status === 'completed') {
+      waiter.resolve({
+        output: cp.output,
+        startedAt: cp.startedAt instanceof Date ? cp.startedAt.getTime() : undefined,
+        events: cp.events,
+        settledElsewhere: true,
+      });
+    } else {
+      waiter.reject(new RemoteStepError(cp.error));
+    }
+    return true;
+  }
+
+  /**
+   * Fast path of {@link settlePendingFromCheckpoint}: another instance broadcast that it settled a
+   * step this instance awaits in memory, so read the row now instead of at the next poll.
+   */
+  private settleAwaitedElsewhere(event: EngineEvent): void {
+    if (event.type !== 'step.completed' && event.type !== 'step.failed') return;
+    if (event.seq === undefined) return;
+    const seq = event.seq;
+    if (!this.pending.has(stepId(event.runId, seq))) return;
+    void this.store
+      .getCheckpoint(event.runId, seq)
+      .then((cp) => this.settlePendingFromCheckpoint(cp))
+      .catch(() => undefined);
+  }
+
   /** The dispatch/await/retry body of {@link callRemoteInMemory}, once routable and admitted. */
   private async callRemoteInMemoryAdmitted<TInput, TOutput>(
     runId: string,
@@ -11504,9 +11571,27 @@ export class WorkflowEngine {
           traceparent: this.traceparent?.(),
           context: this.context?.(),
           attempt,
+          // Ask for the result back here, where the body awaits it: a result consumed by another
+          // instance only reaches this wait through its checkpoint (see below).
+          ...(this.repliesRouted && !this.draining ? { replyTo: this.instanceId } : {}),
         },
         transport,
       );
+      // The result may still land on another instance (no reply routing, a draining instance, a
+      // transport that drops `replyTo`), which settles the checkpoint but cannot reach this wait. Its
+      // `step.completed` broadcast settles it at once (see settleAwaitedElsewhere); this poll is the
+      // net for an instance with no control plane, or a lost broadcast.
+      const poll =
+        this.remoteResultPollMs > 0
+          ? setInterval(() => {
+              if (!this.pending.has(id)) return;
+              void this.store
+                .getCheckpoint(runId, seq)
+                .then((cp) => this.settlePendingFromCheckpoint(cp, attempt))
+                .catch(() => undefined);
+            }, this.remoteResultPollMs)
+          : undefined;
+      (poll as { unref?: () => void } | undefined)?.unref?.();
       try {
         const resolution = step.timeoutMs
           ? await this.awaitWithHeartbeat(
@@ -11550,15 +11635,23 @@ export class WorkflowEngine {
                 output: late.output,
                 startedAt: late.startedAt instanceof Date ? late.startedAt.getTime() : undefined,
                 events: late.events,
+                settledElsewhere: true,
               },
               attempt,
               token,
               enqueuedAt,
             );
           }
+          // A failure another instance settled is the worker's verdict, not a lost worker: surface it
+          // like a failure that reached this wait, instead of re-dispatching the step.
+          if (late?.status === 'failed' && late.attempts >= attempt) {
+            throw new RemoteStepError(late.error);
+          }
           if (attempt < maxAttempts) continue;
         }
         throw err;
+      } finally {
+        if (poll) clearInterval(poll);
       }
     }
   }
@@ -11584,6 +11677,9 @@ export class WorkflowEngine {
           )
         : resolution.output
     ) as TOutput;
+    // The instance that settled the row wrote its `finishedAt` and emitted `step.completed`: writing
+    // it again here would move `finishedAt` and announce the step twice.
+    if (resolution.settledElsewhere) return output;
     // The worker reports when it actually picked the task up; fall back to dispatch time if a
     // transport doesn't carry it (queue-wait then reads as zero rather than going negative).
     const startedAt = resolution.startedAt ? new Date(resolution.startedAt) : enqueuedAt;

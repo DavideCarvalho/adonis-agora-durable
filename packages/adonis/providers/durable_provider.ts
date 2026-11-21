@@ -353,6 +353,9 @@ export default class DurableProvider {
         ...(config.waitForRunPollMs !== undefined
           ? { waitForRunPollMs: config.waitForRunPollMs }
           : {}),
+        ...(config.remoteResultPollMs !== undefined
+          ? { remoteResultPollMs: config.remoteResultPollMs }
+          : {}),
         ...(config.timerBatchSize !== undefined ? { timerBatchSize: config.timerBatchSize } : {}),
         ...(config.stickyRuns !== undefined ? { stickyRuns: config.stickyRuns } : {}),
         ...(config.stickyIdleMs !== undefined ? { stickyIdleMs: config.stickyIdleMs } : {}),
