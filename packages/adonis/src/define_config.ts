@@ -360,6 +360,13 @@ export interface BaseDurableConfig {
    */
   waitForRunPollMs?: number;
   /**
+   * How often (ms) a dispatched `ctx.step` with `timeoutMs` re-reads its checkpoint while the
+   * instance that dispatched it awaits the result. With several instances, the result can reach
+   * another one, which records it; a control plane makes the wait end at once, and this re-read ends
+   * it without one. Default 1000; `0` leaves it to the control plane (or to `timeoutMs`).
+   */
+  remoteResultPollMs?: number;
+  /**
    * The most due timers one timer pass loads and resumes, most overdue first; a larger backlog
    * drains over the next ticks. Every worker runs the pass each tick, and each walks its batch in a
    * shuffled order so instances don't contend for the same leases row by row. Default 500.
