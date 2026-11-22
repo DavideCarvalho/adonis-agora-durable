@@ -200,7 +200,7 @@
     "@adonis-agora/diagnostics": "1.0.0-rc.6",
     "@adonis-agora/durable-dashboard": "workspace:*",
     "@adonisjs/assembler": "8.6.0",
-    "@adonisjs/auth": "10.1.0",
+    "@adonisjs/auth": "10.1.1",
     "@adonisjs/core": "7.6.0",
     "@adonisjs/lucid": "22.4.2",
     "@adonisjs/queue": "0.7.0",
