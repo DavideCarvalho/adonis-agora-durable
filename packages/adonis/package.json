@@ -196,7 +196,7 @@
     }
   },
   "devDependencies": {
-    "@adonis-agora/authkit-client": "1.0.0-rc.12",
+    "@adonis-agora/authkit-client": "1.0.0-rc.13",
     "@adonis-agora/diagnostics": "1.0.0-rc.6",
     "@adonis-agora/durable-dashboard": "workspace:*",
     "@adonisjs/assembler": "8.6.0",
