@@ -187,6 +187,9 @@ export {
   type DurableSchemaLogger,
   dropDurableRunListIndexes,
   dropDurableTables,
+  ensureBootIndexes,
+  RUN_RETENTION_INDEX,
+  RUN_RETENTION_INDEX_COLUMNS,
 } from './stores/lucid-schema.js';
 export type {
   DurableTenancyOption,

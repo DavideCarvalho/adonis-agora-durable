@@ -11,6 +11,7 @@ import {
   dropDurableTables,
   LIFECYCLE_PENDING_INDEX,
   LIFECYCLE_PENDING_INDEXED_TAG,
+  RUN_RETENTION_INDEX,
 } from '../../../src/stores/lucid-schema.js';
 import { dbBackends } from '../../support/backends.js';
 
@@ -272,6 +273,97 @@ describe.each(dbBackends())('on $name', ({ name: backend, makeMemoryDb }) => {
       expect(await db.from(DURABLE_SCHEMA_META_TABLE).select('id')).toEqual([{ id: 'durable' }]);
     });
 
+    it('creates the retention index and a scoped sweep reads it instead of scanning the runs table (Postgres)', async () => {
+      const db = await fresh();
+      await createDurableTables(db);
+      if (!isPostgres(db)) {
+        // Elsewhere the index is built inside the schema lock by the routine repair path.
+        expect(await hasIndex(db, RUN_RETENTION_INDEX)).toBe(true);
+        return;
+      }
+      const { rows } = (await db.rawQuery(
+        `select i.indisvalid as valid, pg_get_indexdef(c.oid) as def
+           from pg_class c join pg_index i on i.indexrelid = c.oid
+           join pg_namespace n on n.oid = c.relnamespace
+          where c.relname = ? and n.nspname = current_schema()`,
+        [RUN_RETENTION_INDEX],
+      )) as { rows: Array<{ valid: boolean; def: string }> };
+      expect(rows[0]?.valid).toBe(true);
+      expect(rows[0]?.def).toMatch(/\(status, updated_at, workflow\)/);
+
+      // A table shaped like a real install: thousands of settled runs, a handful of them past the
+      // cutoff inside one workflow's scope — the steady state the sweep runs in 674 times a day.
+      const now = Date.now();
+      const cutoff = now - 7 * 86_400_000;
+      await db.rawQuery(
+        `insert into ${DURABLE_TABLES.runs}
+           (id, workflow, workflow_version, status, namespace, created_at, updated_at)
+         select 'r' || i,
+                case when i % 5 = 0 then 'swept' else 'busy' end,
+                '1',
+                case when i % 7 = 0 then 'failed' else 'completed' end,
+                'default', ?::bigint - i, ?::bigint - i
+           from generate_series(1, 5000) i`,
+        [now, now],
+      );
+      // 4 expired runs of the swept workflow, and 40 expired ones of the busy workflow (which the
+      // policy's scope excludes): the index must pick the 4 without reading the 40.
+      const sweptIds = ['r5', 'r10', 'r15', 'r20'];
+      const busyIds: string[] = [];
+      for (let i = 1; busyIds.length < 40; i += 1) {
+        if (i % 5 !== 0 && i % 7 !== 0) busyIds.push(`r${i}`);
+      }
+      await db.rawQuery(`update ${DURABLE_TABLES.runs} set updated_at = ? where id = any(?)`, [
+        cutoff - 1_000,
+        sweptIds,
+      ]);
+      await db.rawQuery(`update ${DURABLE_TABLES.runs} set updated_at = ? where id = any(?)`, [
+        cutoff - 1_000,
+        busyIds,
+      ]);
+      await db.rawQuery(`analyze ${DURABLE_TABLES.runs}`);
+
+      // The statement `engine.sweepRetention` sends for a scoped policy, planned as Lucid sends it.
+      const store = new LucidStateStore(db);
+      const knex = db.connection().getWriteClient();
+      const sql: Array<{ sql: string; bindings: unknown[] }> = [];
+      const listener = (q: { sql: string; bindings: unknown[] }) => sql.push(q);
+      knex.on('query', listener);
+      const expired = await store.listRuns({
+        workflows: ['swept'],
+        statuses: ['completed'],
+        namespace: 'default',
+        updatedBefore: cutoff,
+        page: 1,
+        size: 100,
+      });
+      knex.off('query', listener);
+      expect(expired.map((r) => r.id).sort()).toEqual([...sweptIds].sort());
+      const sent = sql.find((q) => q.sql.includes('durable_workflow_runs'));
+      expect(sent).toBeDefined();
+      const text = (sent?.sql ?? '').replace(/\$\d+/g, '?');
+      const plan = (await db.rawQuery(`explain ${text}`, sent?.bindings as never)) as {
+        rows: Array<{ 'QUERY PLAN': string }>;
+      };
+      const planText = plan.rows.map((r) => r['QUERY PLAN']).join('\n');
+      expect(planText).toContain(RUN_RETENTION_INDEX);
+      expect(planText).not.toContain('Seq Scan');
+    });
+
+    it('rebuilds an invalid retention index, and leaves the revision unrecorded until it is valid (Postgres)', async () => {
+      const db = await fresh();
+      await createDurableTables(db);
+      if (!isPostgres(db)) return;
+      await db.rawQuery(`drop index ${RUN_RETENTION_INDEX}`);
+      await db.from(DURABLE_SCHEMA_META_TABLE).delete();
+      // The next boot is forced through the full check and rebuilds it CONCURRENTLY.
+      const warnings: string[] = [];
+      await createDurableTables(db, undefined, { logger: { warn: (m) => warnings.push(m) } });
+      expect(warnings).toEqual([]);
+      expect(await hasIndex(db, RUN_RETENTION_INDEX)).toBe(true);
+      expect(await db.from(DURABLE_SCHEMA_META_TABLE).select('id')).toEqual([{ id: 'durable' }]);
+    });
+
     it('pins the DDL to DURABLE_SCHEMA_REVISION', async () => {
       const db = await fresh();
       await createDurableTables(db);
@@ -283,11 +375,11 @@ describe.each(dbBackends())('on $name', ({ name: backend, makeMemoryDb }) => {
       // Knex upgrade changed how SQLite spells the same DDL, update the digest alone.)
       // One digest per backend: the same DDL, spelled by each dialect.
       expect({ revision: DURABLE_SCHEMA_REVISION, digest }).toEqual({
-        revision: 7,
+        revision: 8,
         digest:
           backend === 'postgres'
-            ? 'f428e7768fdaee50ac36d2ac33e2f8c9779a80c0d90ae7bfb9f1365db1e86b83'
-            : '08cda87e6d7fead504cf9a9cd0fcc84414d6d94ceb03c87fec4a613a1d9242cd',
+            ? '3f8ba1bcdbd396851efefdbf759cb1a1604734b37b6e736d554c41d5a54b40b1'
+            : '5c5599afaa004efabf44e6eede670ab28e344dce58ddfa5bd7ac81239acf081e',
       });
     });
   });

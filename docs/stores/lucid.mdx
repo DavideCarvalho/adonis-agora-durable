@@ -103,7 +103,39 @@ The migration creates seven tables (default names, from the `DURABLE_TABLES` con
 | `durable_buffered_events` | [named events](/docs/durable/concepts/sleep-and-signals#reliable-buffered-events) published before any run was waiting, keyed by `name` and indexed `(name, published_at)` for the oldest-first redelivery scan |
 | `durable_schedules` | persisted [schedules](/docs/durable/authoring/persisted-schedules) (`engine.schedules`): `workflow`, `namespace`, `paused`, `next_fire_at`, tags, the engine-owned `spec` / `state` documents, and `created_at` / `updated_at` |
 
-The runs table is indexed on `status` and on `(status, wake_at)` so the worker's `listPendingRuns` and `listDueTimers` scans stay fast, on `(namespace, status, created_at)` for the namespaced poll and recovery queries, and on `created_at` for the dashboard's default newest-first listing; on Postgres, the partial index `durable_runs_lifecycle_pending_idx` holds only the settled runs that still owe a [lifecycle event](/docs/durable/authoring/lifecycle-events), which the worker lists every 10 s; checkpoints are keyed `(run_id, seq)` with a `(run_id, name)` index for targeted reads and a `(run_id, parallel_group, seq)` index (`durable_step_checkpoints_group_idx`) for the run detail's per-fan reads; signal waiters are indexed on `run_id` (`durable_signal_waiters_run_idx`), which the [`ctx.all`](/docs/durable/authoring/child-workflows) join barrier's per-child lookup and the run-scoped waiter reads use; buffered signals are indexed on `token`; schedules on `(paused, next_fire_at)` for the tick's due scan; and the attributes table is indexed per `(key, value)` so [search-attribute](/docs/durable/concepts/workflows-and-steps#tags) filters push down to SQL.
+The runs table is indexed on `status` and on `(status, wake_at)` so the worker's `listPendingRuns` and `listDueTimers` scans stay fast, on `(namespace, status, created_at)` for the namespaced poll and recovery queries, on `created_at` for the dashboard's default newest-first listing, and on `(status, updated_at, workflow)` (`durable_runs_retention_idx`) so the retention sweep finds the runs a policy expired instead of reading the whole table ([what it buys](#retention-index)); on Postgres, the partial index `durable_runs_lifecycle_pending_idx` holds only the settled runs that still owe a [lifecycle event](/docs/durable/authoring/lifecycle-events), which the worker lists every 10 s; checkpoints are keyed `(run_id, seq)` with a `(run_id, name)` index for targeted reads and a `(run_id, parallel_group, seq)` index (`durable_step_checkpoints_group_idx`) for the run detail's per-fan reads; signal waiters are indexed on `run_id` (`durable_signal_waiters_run_idx`), which the [`ctx.all`](/docs/durable/authoring/child-workflows) join barrier's per-child lookup and the run-scoped waiter reads use; buffered signals are indexed on `token`; schedules on `(paused, next_fire_at)` for the tick's due scan; and the attributes table is indexed per `(key, value)` so [search-attribute](/docs/durable/concepts/workflows-and-steps#tags) filters push down to SQL.
+
+### The retention index
+
+`createDurableTables` also creates `durable_runs_retention_idx` on `(status, updated_at, workflow)`,
+which is what the retention sweep (`engine.sweepRetention`, once a minute) reads.
+
+A sweep pass asks for `status IN (…) AND updated_at <= cutoff`, plus a `workflow IN (…)` when the
+policy has a `scope.workflows` and a `namespace IN (…)`. Without the index every pass is a full
+scan of the runs table: on a 36 k-row / 669 MB install that was ~160 MB of buffers per pass, 674
+passes a day, 372 s of database time, 76 passes over a second and one at 8.9 s — to delete nothing,
+because a healthy install prunes a handful of rows a day. With it, a pass that finds nothing is an
+index scan over two buffers.
+
+`status` leads because every shape of the sweep constrains it (`retention: { completed: '7d' }` and
+a `policies[].statuses` both compile to `status IN (…)`); `updated_at` is the range column; `workflow`
+trails, so a scoped pass stays index-only and the `workflow IN (…)` is a filter over the handful of
+entries the range matched. Measured on a production-shaped table: a scoped pass went 40.9 ms → 0.47 ms
+when nothing was expired, 67.9 ms → 18.6 ms with a full backlog, and with `updated_at` dropped from
+the index the plan falls back to fetching 21 k heap rows to filter an empty result.
+
+It costs almost nothing to write, which is the reason it is not opt-in: `workflow` never changes for
+a run, and `updated_at` is only rewritten by a terminal settle — which already rewrote `status`, a
+column indexed since the first schema. So the index adds an entry to a write that was already
+non-HOT and converts no HOT update into a non-HOT one (measured: the lease CAS, 2 296/day and 100%
+HOT, is unchanged; a settle is 1.19 → 1.25 ms and +150 B of WAL per row, ~110 kB/day on a table that
+settles 703 runs a day). The one shape that would pay for it is a statement that rewrites `updated_at`
+alone, and nothing in the engine issues one.
+
+On Postgres the index is built `CONCURRENTLY` after the boot's schema lock, like the lifecycle
+index, so the runs table stays writable while it builds; elsewhere it is a plain index created with
+the table. A build that dies leaves the revision unrecorded, so the next boot retries — a boot never
+blocks on it, and until it exists the sweep is only slower.
 
 ### The runs board's list index (opt-in)
 
