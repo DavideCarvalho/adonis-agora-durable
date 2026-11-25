@@ -77,7 +77,35 @@ export const DURABLE_SCHEMA_META_TABLE = 'durable_schema_meta';
  * once on its next boot and then goes back to the one-row read. A test pins the SQLite DDL to this
  * number, so a schema change without a bump fails CI.
  */
-export const DURABLE_SCHEMA_REVISION = 7;
+export const DURABLE_SCHEMA_REVISION = 8;
+
+/**
+ * The index behind the retention sweep (`engine.sweepRetention`, once a minute): every pass asks
+ * `status IN (…) AND updated_at <= cutoff` (plus a `workflow IN (…)` scope and a `namespace IN (…)`
+ * when the policy has them), then pages newest-first.
+ *
+ * Without it that pass is a full scan of the runs table. On a 36 k-row / 669 MB install it read
+ * ~160 MB per pass and removed every row by hand, 674 times a day — 372 s of database time, 76
+ * passes over a second, a maximum of 8.9 s — to find nothing. With it a pass that finds nothing is
+ * an index scan over two buffers.
+ *
+ * `status` leads because **every** shape of the sweep constrains it (a per-status
+ * `retention.completed` and a `policies[].statuses` both compile to `status IN (…)`) while
+ * `workflow` is only present for a scoped policy. `updated_at` is the range column. `workflow`
+ * trails, which keeps a scoped pass index-only: the `workflow IN (…)` becomes a filter over the
+ * handful of `(status, updated_at)` entries the range matched.
+ *
+ * Being non-leading, `workflow` costs nothing on write either: it does not change per run, and
+ * `updated_at` — the one column here that a settle rewrites — already moved on every terminal write
+ * through `status`, which has been indexed since the first schema (`durable_runs_status_idx`). So
+ * this index adds an entry to a write that was already heap-visible, and converts no HOT update into
+ * a non-HOT one. Measured on a production-shaped table: `lease CAS` (2296/day, 100% HOT) unchanged,
+ * `settle` (703/day) 1.19 → 1.25 ms and +150 B of WAL per row (~110 kB/day total).
+ */
+export const RUN_RETENTION_INDEX = 'durable_runs_retention_idx';
+
+/** The columns of {@link RUN_RETENTION_INDEX}, in order. */
+export const RUN_RETENTION_INDEX_COLUMNS = ['status', 'updated_at', 'workflow'] as const;
 
 /**
  * Postgres: the partial index serving the listing of settled runs that still owe a lifecycle event
@@ -370,20 +398,107 @@ export async function createDurableTables(
   });
   if (!healed) return;
   // CREATE INDEX CONCURRENTLY cannot run in the lock's transaction, and does not block writes to the
-  // runs table while it builds. Until it is valid the revision stays unrecorded, so the next boot
-  // tries again; the owed listing works without it, only slower.
-  if (await ensureLifecyclePendingIndex(connection, schema, logger)) {
+  // runs table while it builds. Until every one is valid the revision stays unrecorded, so the next
+  // boot tries again; every query those indexes serve works without them, only slower.
+  if (await ensureBootIndexes(connection, schema, logger)) {
     await writeSchemaFingerprint(connection, schema, expected);
   }
 }
 
 /**
- * Postgres: make sure {@link LIFECYCLE_PENDING_INDEX} exists and is valid, building it with
- * `CREATE INDEX CONCURRENTLY` (reads and writes of the runs table go on meanwhile). An invalid one
- * left by a build that died is dropped and built again, unless a build of it is still running (a
- * sibling process): then this returns `false` and leaves it to that build. A failed build is
- * reported through `logger` and returns `false`. Every other dialect: `true`, nothing to do (MySQL
- * has no partial index; SQLite deployments are small enough for the plain scan).
+ * One `CREATE INDEX CONCURRENTLY` of {@link ensureBootIndexes}. `columns` is the raw column list
+ * (`created_at`, `status, updated_at, workflow`); `predicate` is the index's partial `WHERE`, if any,
+ * and must be the literal the store's query repeats so the planner can prove the index applies.
+ */
+interface BootIndexBuild {
+  name: string;
+  columns: string;
+  predicate: string | undefined;
+  /** What gets slower until the index is valid, quoted in the warning when the build fails. */
+  cost: string;
+}
+
+/** The lifecycle-pending index's build spec, shared by {@link ensureBootIndexes} and
+ *  {@link ensureLifecyclePendingIndex} so columns, predicate and cost can never drift apart. */
+const LIFECYCLE_PENDING_BUILD: BootIndexBuild = {
+  name: LIFECYCLE_PENDING_INDEX,
+  columns: 'created_at',
+  predicate: LIFECYCLE_PENDING_PREDICATE,
+  cost: 'the owed lifecycle listing reads the whole runs table',
+};
+
+/** The retention index's build spec. See {@link RUN_RETENTION_INDEX} for why the columns are in
+ *  this order. */
+const RUN_RETENTION_BUILD: BootIndexBuild = {
+  name: RUN_RETENTION_INDEX,
+  columns: RUN_RETENTION_INDEX_COLUMNS.join(', '),
+  predicate: undefined,
+  cost: 'the retention sweep reads the whole runs table once a minute',
+};
+
+/**
+ * Postgres: make sure every index that cannot be built inside the schema lock's transaction exists
+ * and is valid — {@link LIFECYCLE_PENDING_INDEX} and {@link RUN_RETENTION_INDEX} — each with
+ * `CREATE INDEX CONCURRENTLY`, so reads and writes of the runs table go on while it builds. A plain
+ * `create index` inside the boot's transaction would hold a write lock on the runs table for the
+ * length of the build: seconds on a small install, minutes on a large one, and it would block every
+ * step the fleet is running.
+ *
+ * An index left `INVALID` by a build that died is dropped and built again, unless a build of it is
+ * still running (a sibling process) — then this returns `false` and leaves it to that build. A
+ * failed build is reported through `logger` and returns `false`, so the revision stays unrecorded
+ * and the next boot retries. Every other dialect: `true`, nothing to do — a plain index built by
+ * `healDurableTables` covers MySQL, and SQLite deployments are small enough for the plain scan.
+ */
+export async function ensureBootIndexes(
+  connection: QueryClientContract,
+  schema: string | undefined,
+  logger: DurableSchemaLogger = console,
+): Promise<boolean> {
+  if (connection.dialect.name !== 'postgres') return true;
+  const builds = [LIFECYCLE_PENDING_BUILD, RUN_RETENTION_BUILD];
+  let all = true;
+  for (const build of builds) {
+    if (!(await ensurePgIndex(connection, schema, build, logger))) all = false;
+  }
+  return all;
+}
+
+/** One `CREATE INDEX CONCURRENTLY` of {@link ensureBootIndexes}, healed when it is invalid. */
+async function ensurePgIndex(
+  connection: QueryClientContract,
+  schema: string | undefined,
+  build: BootIndexBuild,
+  logger: DurableSchemaLogger,
+): Promise<boolean> {
+  const table = qualify(schema, DURABLE_TABLES.runs);
+  try {
+    const state = await pgIndexState(connection, schema, build.name);
+    if (state?.valid) return true;
+    if (state) {
+      if (state.building) return false;
+      await connection.rawQuery('drop index concurrently if exists ??', [
+        qualify(schema, build.name),
+      ]);
+    }
+    await connection.rawQuery(
+      `create index concurrently if not exists ?? on ?? (${build.columns})` +
+        (build.predicate === undefined ? '' : ` where ${build.predicate}`),
+      [build.name, table],
+    );
+    // IF NOT EXISTS returns at once when a sibling's build created the name first.
+    return (await pgIndexState(connection, schema, build.name))?.valid === true;
+  } catch (err) {
+    logger.warn(
+      `@adonis-agora/durable: could not build the index ${build.name} on ${table} (${(err as Error).message}); the next boot tries again. Until then ${build.cost}.`,
+    );
+    return false;
+  }
+}
+
+/**
+ * Postgres: make sure {@link LIFECYCLE_PENDING_INDEX} exists and is valid. Kept as its own export
+ * (public since it shipped) on top of {@link ensureBootIndexes}; prefer the latter.
  */
 export async function ensureLifecyclePendingIndex(
   connection: QueryClientContract,
@@ -391,28 +506,7 @@ export async function ensureLifecyclePendingIndex(
   logger: DurableSchemaLogger = console,
 ): Promise<boolean> {
   if (connection.dialect.name !== 'postgres') return true;
-  const table = qualify(schema, DURABLE_TABLES.runs);
-  try {
-    const state = await pgIndexState(connection, schema, LIFECYCLE_PENDING_INDEX);
-    if (state?.valid) return true;
-    if (state) {
-      if (state.building) return false;
-      await connection.rawQuery('drop index concurrently if exists ??', [
-        qualify(schema, LIFECYCLE_PENDING_INDEX),
-      ]);
-    }
-    await connection.rawQuery(
-      `create index concurrently if not exists ?? on ?? (created_at) where ${LIFECYCLE_PENDING_PREDICATE}`,
-      [LIFECYCLE_PENDING_INDEX, table],
-    );
-    // IF NOT EXISTS returns at once when a sibling's build created the name first.
-    return (await pgIndexState(connection, schema, LIFECYCLE_PENDING_INDEX))?.valid === true;
-  } catch (err) {
-    logger.warn(
-      `@adonis-agora/durable: could not build the index ${LIFECYCLE_PENDING_INDEX} on ${table} (${(err as Error).message}); the next boot tries again. Until then the owed lifecycle listing reads the whole runs table.`,
-    );
-    return false;
-  }
+  return ensurePgIndex(connection, schema, LIFECYCLE_PENDING_BUILD, logger);
 }
 
 /** A Postgres index's validity, and whether a `CREATE INDEX` of it is running; `undefined` if absent. */
@@ -518,6 +612,9 @@ async function healDurableTables(
       // The dashboard's default (unfiltered) listing orders by created_at DESC — without this a
       // page load over a large table is a full sort.
       table.index(['created_at'], 'durable_runs_created_idx');
+      // The retention sweep: `status IN (…) AND updated_at <= cutoff` (+ the policy's workflow
+      // scope as a trailing filter). See RUN_RETENTION_INDEX.
+      table.index([...RUN_RETENTION_INDEX_COLUMNS], RUN_RETENTION_INDEX);
     });
   } else {
     // Auto-migrate an older runs table by adding any columns introduced after its creation. Each is
@@ -575,6 +672,13 @@ async function healDurableTables(
     // Index-only repair: the dashboard's default (unfiltered) listing orders by created_at DESC —
     // without this a page load over a large table is a full sort.
     await ensureIndex(DURABLE_TABLES.runs, ['created_at'], 'durable_runs_created_idx');
+    // The retention sweep's index. On Postgres it is built CONCURRENTLY AFTER the schema lock
+    // (ensureBootIndexes): an index on the runs table built inside this transaction would hold a
+    // write lock on it for the length of the build — seconds here, minutes on a big install — and
+    // stall every step the fleet is running. Elsewhere a plain in-lock index, which is fine.
+    if (client.dialect.name !== 'postgres') {
+      await ensureIndex(DURABLE_TABLES.runs, [...RUN_RETENTION_INDEX_COLUMNS], RUN_RETENTION_INDEX);
+    }
   }
 
   if (!(await conn().hasTable(DURABLE_TABLES.checkpoints))) {

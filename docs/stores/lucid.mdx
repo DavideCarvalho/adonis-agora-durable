@@ -103,7 +103,42 @@ The migration creates seven tables (default names, from the `DURABLE_TABLES` con
 | `durable_buffered_events` | [named events](/docs/durable/concepts/sleep-and-signals#reliable-buffered-events) published before any run was waiting, keyed by `name` and indexed `(name, published_at)` for the oldest-first redelivery scan |
 | `durable_schedules` | persisted [schedules](/docs/durable/authoring/persisted-schedules) (`engine.schedules`): `workflow`, `namespace`, `paused`, `next_fire_at`, tags, the engine-owned `spec` / `state` documents, and `created_at` / `updated_at` |
 
-The runs table is indexed on `status` and on `(status, wake_at)` so the worker's `listPendingRuns` and `listDueTimers` scans stay fast, on `(namespace, status, created_at)` for the namespaced poll and recovery queries, and on `created_at` for the dashboard's default newest-first listing; on Postgres, the partial index `durable_runs_lifecycle_pending_idx` holds only the settled runs that still owe a [lifecycle event](/docs/durable/authoring/lifecycle-events), which the worker lists every 10 s; checkpoints are keyed `(run_id, seq)` with a `(run_id, name)` index for targeted reads and a `(run_id, parallel_group, seq)` index (`durable_step_checkpoints_group_idx`) for the run detail's per-fan reads; signal waiters are indexed on `run_id` (`durable_signal_waiters_run_idx`), which the [`ctx.all`](/docs/durable/authoring/child-workflows) join barrier's per-child lookup and the run-scoped waiter reads use; buffered signals are indexed on `token`; schedules on `(paused, next_fire_at)` for the tick's due scan; and the attributes table is indexed per `(key, value)` so [search-attribute](/docs/durable/concepts/workflows-and-steps#tags) filters push down to SQL.
+The runs table is indexed on `status` and on `(status, wake_at)` so the worker's `listPendingRuns` and `listDueTimers` scans stay fast, on `(namespace, status, created_at)` for the namespaced poll and recovery queries, on `created_at` for the dashboard's default newest-first listing, and on `(status, updated_at, workflow)` (`durable_runs_retention_idx`) so the retention sweep finds the runs a policy expired instead of reading the whole table ([what it buys](#retention-index)); on Postgres, the partial index `durable_runs_lifecycle_pending_idx` holds only the settled runs that still owe a [lifecycle event](/docs/durable/authoring/lifecycle-events), which the worker lists every 10 s; checkpoints are keyed `(run_id, seq)` with a `(run_id, name)` index for targeted reads and a `(run_id, parallel_group, seq)` index (`durable_step_checkpoints_group_idx`) for the run detail's per-fan reads; signal waiters are indexed on `run_id` (`durable_signal_waiters_run_idx`), which the [`ctx.all`](/docs/durable/authoring/child-workflows) join barrier's per-child lookup and the run-scoped waiter reads use; buffered signals are indexed on `token`; schedules on `(paused, next_fire_at)` for the tick's due scan; and the attributes table is indexed per `(key, value)` so [search-attribute](/docs/durable/concepts/workflows-and-steps#tags) filters push down to SQL.
+
+### The retention index
+
+`createDurableTables` also creates `durable_runs_retention_idx` on `(status, updated_at, workflow)`,
+which is what the retention sweep (`engine.sweepRetention`, once a minute) reads.
+
+A sweep pass asks for `status IN (…) AND updated_at <= cutoff`, plus a `workflow IN (…)` when the
+policy has a `scope.workflows` and a `namespace IN (…)`. Without the index every pass is a full
+scan of the runs table: on a 36 k-row / 669 MB install that was ~160 MB of buffers per pass, 674
+passes a day, 372 s of database time, 76 passes over a second and one at 8.9 s — to delete nothing,
+because a healthy install prunes a handful of rows a day. With it, a pass that finds nothing is an
+index scan over two buffers.
+
+`status` leads because every shape of the sweep constrains it (`retention: { completed: '7d' }` and
+a `policies[].statuses` both compile to `status IN (…)`); `updated_at` is the range column; `workflow`
+trails, so a scoped pass stays index-only and the `workflow IN (…)` is a filter over the handful of
+entries the range matched. Measured on a production-shaped table: a scoped pass went 40.9 ms → 0.47 ms
+when nothing was expired, 67.9 ms → 18.6 ms with a full backlog, and with `updated_at` dropped from
+the index the plan falls back to fetching 21 k heap rows to filter an empty result.
+
+It costs almost nothing to write, which is the reason it is not opt-in: `workflow` never changes for
+a run, and `updated_at` is only rewritten by a terminal settle — which already rewrote `status`, a
+column indexed since the first schema. So the index adds an entry to a write that was already
+non-HOT and converts no HOT update into a non-HOT one (measured: the lease CAS, 2 296/day and 100%
+HOT, is unchanged; a settle is 1.19 → 1.25 ms and +150 B of WAL per row, ~110 kB/day on a table that
+settles 703 runs a day). The one shape that would pay for it is a statement that rewrites `updated_at`
+alone, and nothing in the engine issues one.
+
+On Postgres the index is built `CONCURRENTLY` after the boot's schema lock, like the lifecycle
+index, so the runs table stays writable while it builds; elsewhere it is a plain index created with
+the table. A build that dies leaves the revision unrecorded, so the next boot retries — a boot never
+blocks on it, and until it exists the sweep is only slower. `RUN_RETENTION_INDEX` and
+`RUN_RETENTION_INDEX_COLUMNS` are exported if your tooling needs the name; to build it yourself
+(with `autoSchema: false`, or a role that may not run DDL at boot) use the statement in
+[who provisions the schema](#who-provisions-the-schema-autoschema).
 
 ### The runs board's list index (opt-in)
 
@@ -142,15 +177,18 @@ By default the provider provisions the store's schema at boot by calling `ensure
 
 Every boot of every pod runs it, so it is gated by a fingerprint. The `durable_schema_meta` table holds one row: a hash of `DURABLE_SCHEMA_REVISION` (bumped with every DDL change in the library) and the configured collation. When the row matches, the call reads it and returns — two statements, no table, column or index probes. When it is missing (a fresh database, or one provisioned by an older release) or different (an upgrade that changed the DDL), the full check runs under a cross-process lock — `pg_advisory_xact_lock` on Postgres, `GET_LOCK` on MySQL (a pod waits up to 60 seconds for a sibling, then warns and checks without the lock), none on SQLite — and re-reads the row after taking the lock, so pods booting together against a fresh database don't race the same `CREATE TABLE`, and only one of them does the work. Then it writes the row. `DURABLE_SCHEMA_REVISION`, `DURABLE_SCHEMA_META_TABLE`, `DURABLE_TABLES` and `DURABLE_JSON_COLUMNS` are exported from `@adonis-agora/durable` if your tooling needs them.
 
-On Postgres, `durable_runs_lifecycle_pending_idx` is built with `CREATE INDEX CONCURRENTLY`, after the locked check, so reads and writes of the runs table go on while it builds; the row is written once the index is valid. If the build fails, the boot goes on, logs a warning, and the next boot tries again. The build reads the whole runs table once (a few seconds on a table of several hundred MB) and waits for transactions already open on it to end. If your database user may not run DDL at boot, or you prefer to build it yourself, run:
+On Postgres the two indexes that cannot be built inside the lock's transaction — `durable_runs_lifecycle_pending_idx` and `durable_runs_retention_idx` — are built with `CREATE INDEX CONCURRENTLY` after the locked check, so reads and writes of the runs table go on while they build; the row is written once **both** are valid. If a build fails, the boot goes on, logs a warning naming the index, and the next boot tries again. Each build reads the whole runs table once (a few seconds on a table of several hundred MB) and waits for transactions already open on it to end. If your database user may not run DDL at boot, or you prefer to build them yourself, run:
 
 ```sql
 CREATE INDEX CONCURRENTLY IF NOT EXISTS durable_runs_lifecycle_pending_idx
   ON durable_workflow_runs (created_at)
   WHERE tags LIKE '%"durable:lifecycle:pending"%' ESCAPE '!';
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS durable_runs_retention_idx
+  ON durable_workflow_runs (status, updated_at, workflow);
 ```
 
-(schema-qualify the table if you set `schema`). MySQL has no partial index and SQLite deployments are small, so neither gets one; there the listing reads the table as before.
+(schema-qualify the table if you set `schema`). Both are plain `IF NOT EXISTS` builds: an interrupted one can be re-run, and a build that failed leaves an invalid index behind that this statement will not replace — `DROP INDEX CONCURRENTLY durable_runs_retention_idx` first if `pg_index.indisvalid` is false for it. Until the retention index exists the `sweepRetention` pass is a full scan every minute, and nothing warns you about it at query time. MySQL has no partial index, so it gets no lifecycle index; there and on SQLite the retention index is a plain index created with the table, and the lifecycle listing reads the table as before.
 
 The marker trusts that nobody changes the durable tables by hand. After you do, run the check explicitly with `createDurableTables(db, connectionName, { force: true })`.
 
