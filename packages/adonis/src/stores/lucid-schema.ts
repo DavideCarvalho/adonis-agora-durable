@@ -406,6 +406,37 @@ export async function createDurableTables(
 }
 
 /**
+ * One `CREATE INDEX CONCURRENTLY` of {@link ensureBootIndexes}. `columns` is the raw column list
+ * (`created_at`, `status, updated_at, workflow`); `predicate` is the index's partial `WHERE`, if any,
+ * and must be the literal the store's query repeats so the planner can prove the index applies.
+ */
+interface BootIndexBuild {
+  name: string;
+  columns: string;
+  predicate: string | undefined;
+  /** What gets slower until the index is valid, quoted in the warning when the build fails. */
+  cost: string;
+}
+
+/** The lifecycle-pending index's build spec, shared by {@link ensureBootIndexes} and
+ *  {@link ensureLifecyclePendingIndex} so columns, predicate and cost can never drift apart. */
+const LIFECYCLE_PENDING_BUILD: BootIndexBuild = {
+  name: LIFECYCLE_PENDING_INDEX,
+  columns: 'created_at',
+  predicate: LIFECYCLE_PENDING_PREDICATE,
+  cost: 'the owed lifecycle listing reads the whole runs table',
+};
+
+/** The retention index's build spec. See {@link RUN_RETENTION_INDEX} for why the columns are in
+ *  this order. */
+const RUN_RETENTION_BUILD: BootIndexBuild = {
+  name: RUN_RETENTION_INDEX,
+  columns: RUN_RETENTION_INDEX_COLUMNS.join(', '),
+  predicate: undefined,
+  cost: 'the retention sweep reads the whole runs table once a minute',
+};
+
+/**
  * Postgres: make sure every index that cannot be built inside the schema lock's transaction exists
  * and is valid — {@link LIFECYCLE_PENDING_INDEX} and {@link RUN_RETENTION_INDEX} — each with
  * `CREATE INDEX CONCURRENTLY`, so reads and writes of the runs table go on while it builds. A plain
@@ -425,20 +456,7 @@ export async function ensureBootIndexes(
   logger: DurableSchemaLogger = console,
 ): Promise<boolean> {
   if (connection.dialect.name !== 'postgres') return true;
-  const builds = [
-    {
-      name: LIFECYCLE_PENDING_INDEX,
-      columns: 'created_at',
-      predicate: LIFECYCLE_PENDING_PREDICATE,
-      cost: 'the owed lifecycle listing reads the whole runs table',
-    },
-    {
-      name: RUN_RETENTION_INDEX,
-      columns: RUN_RETENTION_INDEX_COLUMNS.join(', '),
-      predicate: undefined,
-      cost: 'the retention sweep reads the whole runs table once a minute',
-    },
-  ];
+  const builds = [LIFECYCLE_PENDING_BUILD, RUN_RETENTION_BUILD];
   let all = true;
   for (const build of builds) {
     if (!(await ensurePgIndex(connection, schema, build, logger))) all = false;
@@ -450,7 +468,7 @@ export async function ensureBootIndexes(
 async function ensurePgIndex(
   connection: QueryClientContract,
   schema: string | undefined,
-  build: { name: string; columns: string; predicate: string | undefined; cost: string },
+  build: BootIndexBuild,
   logger: DurableSchemaLogger,
 ): Promise<boolean> {
   const table = qualify(schema, DURABLE_TABLES.runs);
@@ -488,17 +506,7 @@ export async function ensureLifecyclePendingIndex(
   logger: DurableSchemaLogger = console,
 ): Promise<boolean> {
   if (connection.dialect.name !== 'postgres') return true;
-  return ensurePgIndex(
-    connection,
-    schema,
-    {
-      name: LIFECYCLE_PENDING_INDEX,
-      columns: 'created_at',
-      predicate: LIFECYCLE_PENDING_PREDICATE,
-      cost: 'the owed lifecycle listing reads the whole runs table',
-    },
-    logger,
-  );
+  return ensurePgIndex(connection, schema, LIFECYCLE_PENDING_BUILD, logger);
 }
 
 /** A Postgres index's validity, and whether a `CREATE INDEX` of it is running; `undefined` if absent. */

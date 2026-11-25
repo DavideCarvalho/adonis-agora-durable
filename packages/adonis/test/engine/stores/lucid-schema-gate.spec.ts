@@ -350,17 +350,60 @@ describe.each(dbBackends())('on $name', ({ name: backend, makeMemoryDb }) => {
       expect(planText).not.toContain('Seq Scan');
     });
 
-    it('rebuilds an invalid retention index, and leaves the revision unrecorded until it is valid (Postgres)', async () => {
+    it('rebuilds a missing retention index, and records the revision once it is valid (Postgres)', async () => {
       const db = await fresh();
       await createDurableTables(db);
       if (!isPostgres(db)) return;
       await db.rawQuery(`drop index ${RUN_RETENTION_INDEX}`);
       await db.from(DURABLE_SCHEMA_META_TABLE).delete();
-      // The next boot is forced through the full check and rebuilds it CONCURRENTLY.
+      // Missing (not invalid): `pgIndexState` returns `undefined`, so the boot creates it.
       const warnings: string[] = [];
       await createDurableTables(db, undefined, { logger: { warn: (m) => warnings.push(m) } });
       expect(warnings).toEqual([]);
       expect(await hasIndex(db, RUN_RETENTION_INDEX)).toBe(true);
+      expect(await db.from(DURABLE_SCHEMA_META_TABLE).select('id')).toEqual([{ id: 'durable' }]);
+    });
+
+    it('drops and rebuilds an INVALID retention index left by a build that died (Postgres)', async () => {
+      const db = await fresh();
+      await createDurableTables(db);
+      if (!isPostgres(db)) return;
+      // A failed `CREATE INDEX CONCURRENTLY` is how a real install gets an invalid index: Postgres
+      // leaves the name behind with `indisvalid = false` instead of rolling it back. A unique build
+      // over duplicate values fails that way (a few thousand rows, over two statuses), and leaves
+      // exactly the state `ensureBootIndexes` has to heal.
+      await db.rawQuery(
+        `insert into ${DURABLE_TABLES.runs}
+           (id, workflow, workflow_version, status, namespace, created_at, updated_at)
+         values ('dup1', 'w', '1', 'completed', 'default', 1, 1),
+                ('dup2', 'w', '1', 'completed', 'default', 2, 2)`,
+      );
+      await db.rawQuery(`drop index ${RUN_RETENTION_INDEX}`);
+      await expect(
+        db.rawQuery(
+          `create unique index concurrently ${RUN_RETENTION_INDEX} on ${DURABLE_TABLES.runs} (status)`,
+        ),
+      ).rejects.toThrow();
+      const { rows } = (await db.rawQuery(
+        `select i.indisvalid as valid from pg_class c join pg_index i on i.indexrelid = c.oid
+          where c.relname = ? and c.relnamespace = current_schema()::regnamespace`,
+        [RUN_RETENTION_INDEX],
+      )) as { rows: Array<{ valid: boolean }> };
+      expect(rows[0]?.valid).toBe(false);
+
+      await db.rawQuery(`delete from ${DURABLE_TABLES.runs}`);
+      await db.from(DURABLE_SCHEMA_META_TABLE).delete();
+      const warnings: string[] = [];
+      await createDurableTables(db, undefined, { logger: { warn: (m) => warnings.push(m) } });
+      expect(warnings).toEqual([]);
+      const healed = (await db.rawQuery(
+        `select i.indisvalid as valid, pg_get_indexdef(c.oid) as def
+           from pg_class c join pg_index i on i.indexrelid = c.oid
+          where c.relname = ? and c.relnamespace = current_schema()::regnamespace`,
+        [RUN_RETENTION_INDEX],
+      )) as { rows: Array<{ valid: boolean; def: string }> };
+      expect(healed.rows[0]?.valid).toBe(true);
+      expect(healed.rows[0]?.def).toMatch(/\(status, updated_at, workflow\)/);
       expect(await db.from(DURABLE_SCHEMA_META_TABLE).select('id')).toEqual([{ id: 'durable' }]);
     });
 

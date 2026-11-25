@@ -135,7 +135,10 @@ alone, and nothing in the engine issues one.
 On Postgres the index is built `CONCURRENTLY` after the boot's schema lock, like the lifecycle
 index, so the runs table stays writable while it builds; elsewhere it is a plain index created with
 the table. A build that dies leaves the revision unrecorded, so the next boot retries — a boot never
-blocks on it, and until it exists the sweep is only slower.
+blocks on it, and until it exists the sweep is only slower. `RUN_RETENTION_INDEX` and
+`RUN_RETENTION_INDEX_COLUMNS` are exported if your tooling needs the name; to build it yourself
+(with `autoSchema: false`, or a role that may not run DDL at boot) use the statement in
+[who provisions the schema](#who-provisions-the-schema-autoschema).
 
 ### The runs board's list index (opt-in)
 
@@ -174,15 +177,18 @@ By default the provider provisions the store's schema at boot by calling `ensure
 
 Every boot of every pod runs it, so it is gated by a fingerprint. The `durable_schema_meta` table holds one row: a hash of `DURABLE_SCHEMA_REVISION` (bumped with every DDL change in the library) and the configured collation. When the row matches, the call reads it and returns — two statements, no table, column or index probes. When it is missing (a fresh database, or one provisioned by an older release) or different (an upgrade that changed the DDL), the full check runs under a cross-process lock — `pg_advisory_xact_lock` on Postgres, `GET_LOCK` on MySQL (a pod waits up to 60 seconds for a sibling, then warns and checks without the lock), none on SQLite — and re-reads the row after taking the lock, so pods booting together against a fresh database don't race the same `CREATE TABLE`, and only one of them does the work. Then it writes the row. `DURABLE_SCHEMA_REVISION`, `DURABLE_SCHEMA_META_TABLE`, `DURABLE_TABLES` and `DURABLE_JSON_COLUMNS` are exported from `@adonis-agora/durable` if your tooling needs them.
 
-On Postgres, `durable_runs_lifecycle_pending_idx` is built with `CREATE INDEX CONCURRENTLY`, after the locked check, so reads and writes of the runs table go on while it builds; the row is written once the index is valid. If the build fails, the boot goes on, logs a warning, and the next boot tries again. The build reads the whole runs table once (a few seconds on a table of several hundred MB) and waits for transactions already open on it to end. If your database user may not run DDL at boot, or you prefer to build it yourself, run:
+On Postgres the two indexes that cannot be built inside the lock's transaction — `durable_runs_lifecycle_pending_idx` and `durable_runs_retention_idx` — are built with `CREATE INDEX CONCURRENTLY` after the locked check, so reads and writes of the runs table go on while they build; the row is written once **both** are valid. If a build fails, the boot goes on, logs a warning naming the index, and the next boot tries again. Each build reads the whole runs table once (a few seconds on a table of several hundred MB) and waits for transactions already open on it to end. If your database user may not run DDL at boot, or you prefer to build them yourself, run:
 
 ```sql
 CREATE INDEX CONCURRENTLY IF NOT EXISTS durable_runs_lifecycle_pending_idx
   ON durable_workflow_runs (created_at)
   WHERE tags LIKE '%"durable:lifecycle:pending"%' ESCAPE '!';
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS durable_runs_retention_idx
+  ON durable_workflow_runs (status, updated_at, workflow);
 ```
 
-(schema-qualify the table if you set `schema`). MySQL has no partial index and SQLite deployments are small, so neither gets one; there the listing reads the table as before.
+(schema-qualify the table if you set `schema`). Both are plain `IF NOT EXISTS` builds: an interrupted one can be re-run, and a build that failed leaves an invalid index behind that this statement will not replace — `DROP INDEX CONCURRENTLY durable_runs_retention_idx` first if `pg_index.indisvalid` is false for it. Until the retention index exists the `sweepRetention` pass is a full scan every minute, and nothing warns you about it at query time. MySQL has no partial index, so it gets no lifecycle index; there and on SQLite the retention index is a plain index created with the table, and the lifecycle listing reads the table as before.
 
 The marker trusts that nobody changes the durable tables by hand. After you do, run the check explicitly with `createDurableTables(db, connectionName, { force: true })`.
 
