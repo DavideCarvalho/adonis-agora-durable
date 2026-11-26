@@ -754,11 +754,43 @@ function statsFingerprint(stats: CheckpointStat[]): string {
 }
 
 /**
- * The ETag of a summarized run detail: the run row as read (so any run field that changes shows)
- * plus its checkpoint buckets, and the threshold it was summarized with.
+ * The run fields a run detail's ETag covers: its identity and state, never its data. `input`,
+ * `output`, `error` and `searchAttributes` are what a host's `redact` hides, and the ETag is sent to
+ * the viewer: an unkeyed hash over them would let a viewer of redacted runs test guesses of a
+ * redacted value offline. None of them changes alone — a run's output and error come with a status,
+ * a retry's input with a status, an upsert of search attributes with `updatedAt` and a checkpoint —
+ * so the validator still moves whenever the body does.
+ */
+const ETAG_RUN_FIELDS = [
+  'id',
+  'workflow',
+  'workflowVersion',
+  'status',
+  'origin',
+  'namespace',
+  'wakeAt',
+  'lockedBy',
+  'lockedUntil',
+  'recoveryAttempts',
+  'tags',
+  'priority',
+  'awaitingDecisionTaskId',
+  'wakeRequestedAt',
+  'createdAt',
+  'updatedAt',
+] as const satisfies ReadonlyArray<keyof WorkflowRun>;
+
+function runFingerprint(run: WorkflowRun): string {
+  return JSON.stringify(ETAG_RUN_FIELDS.map((field) => run[field] ?? null));
+}
+
+/**
+ * The ETag of a summarized run detail: the run's identity and state (see {@link ETAG_RUN_FIELDS},
+ * never its input, output, error or search attributes), its checkpoint buckets, and the threshold it
+ * was summarized with.
  */
 export function runDetailEtag(run: WorkflowRun, stats: CheckpointStat[], over: number): string {
-  return `"rd-${hash(`${over}\u0003${JSON.stringify(run)}\u0003${statsFingerprint(stats)}`)}"`;
+  return `"rd-${hash(`${over}\u0003${runFingerprint(run)}\u0003${statsFingerprint(stats)}`)}"`;
 }
 
 /** The ETag of one page of a fan: its group's buckets and the page asked for. */
