@@ -150,6 +150,11 @@ export interface AppPicker {
     actions?: 'here' | 'app' | 'none' | undefined;
   }>;
   selected: string | null;
+  /**
+   * What this viewer may do (`durable:runs:write`, …), when the console's `authorize` narrows it.
+   * Absent: everything. The console disables what it does not include; the server refuses it anyway.
+   */
+  capabilities?: string[] | undefined;
 }
 
 /** The other app picked in this page's URL (`?app=`), sent with every API call; none = this app. */

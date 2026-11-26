@@ -86,19 +86,32 @@ export function WaitingActions({
   targets,
   tenantPod,
   readOnly,
+  taskReadOnly,
   onDelivered,
 }: {
   runId: string;
   targets: WaitTarget[];
   tenantPod: boolean;
-  /** Why this console takes no action on this app's runs (a federated app it only browses). */
+  /**
+   * Why signals and updates are unavailable here (a federated app this console only browses, or a
+   * viewer without `durable:runs:write`).
+   */
   readOnly?: string | undefined;
+  /**
+   * Why completing or failing a task is unavailable (a federated app this console only browses, or
+   * a viewer without `durable:tasks:write`). Independent of {@link readOnly}.
+   */
+  taskReadOnly?: string | undefined;
   /** Called after a successful delivery so the caller refreshes the run (+ list). */
   onDelivered: () => void;
 }) {
   const [open, setOpen] = useState<OpenAction | undefined>(undefined);
   // Why every delivery below is unavailable here, if it is.
-  const blocked = readOnly ?? (tenantPod ? TENANT_REASON : undefined);
+  const tenantReason = tenantPod ? TENANT_REASON : undefined;
+  // Each delivery is gated by the capability the server checks for it: signals and updates need
+  // `durable:runs:write`, tasks `durable:tasks:write`.
+  const blocked = readOnly ?? tenantReason;
+  const taskBlocked = taskReadOnly ?? tenantReason;
   // One shared JSON draft + error per dialog session (only one dialog is open at a time).
   const [token, setToken] = useState('');
   const [draft, setDraft] = useState('');
@@ -231,8 +244,8 @@ export function WaitingActions({
                 <Button
                   variant="brand"
                   size="micro"
-                  disabled={blocked !== undefined || pending}
-                  title={blocked ?? `Complete task "${target.name}" with a result`}
+                  disabled={taskBlocked !== undefined || pending}
+                  title={taskBlocked ?? `Complete task "${target.name}" with a result`}
                   onClick={() => openDialog({ verb: 'task-complete', name: target.name })}
                   className="mono uppercase tracking-wider"
                 >
@@ -242,8 +255,8 @@ export function WaitingActions({
                 <Button
                   variant="destructive"
                   size="micro"
-                  disabled={blocked !== undefined || pending}
-                  title={blocked ?? `Fail task "${target.name}" with a reason`}
+                  disabled={taskBlocked !== undefined || pending}
+                  title={taskBlocked ?? `Fail task "${target.name}" with a reason`}
                   onClick={() => openDialog({ verb: 'task-fail', name: target.name })}
                   className="mono uppercase tracking-wider"
                 >

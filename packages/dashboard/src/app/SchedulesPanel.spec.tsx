@@ -4,7 +4,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { TooltipProvider } from '../agora-kit/ui/tooltip';
-import type { RunResult, ScheduleInfo } from '../client/durable-client';
+import type { AppPicker, RunResult, ScheduleInfo } from '../client/durable-client';
 
 // No jest-dom in this package (see `OriginFacets.spec.tsx`) — plain DOM assertions only.
 
@@ -12,6 +12,11 @@ const schedules = vi.fn<() => Promise<ScheduleInfo[]>>();
 const setSchedulePaused =
   vi.fn<(key: string, paused: boolean) => Promise<{ key: string; paused: boolean }>>();
 const triggerSchedule = vi.fn<(key: string) => Promise<RunResult>>();
+const apps = vi.fn<() => Promise<AppPicker>>(async () => ({
+  local: { label: 'This app' },
+  apps: [],
+  selected: null,
+}));
 
 vi.mock('../client/durable-client', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../client/durable-client')>();
@@ -22,6 +27,7 @@ vi.mock('../client/durable-client', async (importOriginal) => {
       schedules: () => schedules(),
       setSchedulePaused: (key: string, paused: boolean) => setSchedulePaused(key, paused),
       triggerSchedule: (key: string) => triggerSchedule(key),
+      apps: () => apps(),
     },
   };
 });
@@ -130,6 +136,20 @@ describe('SchedulesPanel: the schedules table', () => {
     await waitFor(() => expect(setSchedulePaused).toHaveBeenCalledWith('nightly-report', true));
     fireEvent.click(screen.getByRole('button', { name: 'Resume' }));
     await waitFor(() => expect(setSchedulePaused).toHaveBeenCalledWith('carrier-poll', false));
+  });
+
+  it('disables Pause and Run now when the viewer’s access does not include schedule control', async () => {
+    apps.mockResolvedValueOnce({
+      local: { label: 'This app' },
+      apps: [],
+      selected: null,
+      capabilities: ['durable:read', 'durable:runs:write'],
+    });
+    await renderPanel([schedule()]);
+    const pause = await screen.findByRole('button', { name: 'Pause' });
+    await waitFor(() => expect((pause as HTMLButtonElement).disabled).toBe(true));
+    fireEvent.click(pause);
+    expect(setSchedulePaused).not.toHaveBeenCalled();
   });
 
   it('Run now triggers the schedule and navigates to the run the server answered with', async () => {

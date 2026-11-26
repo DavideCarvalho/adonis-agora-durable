@@ -9,6 +9,7 @@ import { ScopeMenu } from '../agora-kit/blocks/scope-menu';
 import { subscribeHashUrl } from '../agora-kit/url-state/hash-url';
 import { type AppPicker, durableClient, selectedApp } from '../client/durable-client';
 import { currentRoute, routeHash } from './routes';
+import { viewerLacksReason } from './viewer-capabilities';
 
 /**
  * Put the picked app in the URL (`?app=`, absent = this app). The runs board's filters and an open
@@ -46,11 +47,14 @@ function usePickedApp(): AppPicker['apps'][number] | undefined {
 
 /**
  * Why actions (retry, cancel, signal, schedule control…) are unavailable for the picked app, or
- * undefined when they are: a federated app this console only browses (`actions: 'none'`).
+ * undefined when they are: a federated app this console only browses (`actions: 'none'`), or a
+ * viewer whose access (the console's `authorize`) does not include `required`.
  */
-export function useAppActionsUnavailable(): string | undefined {
+export function useAppActionsUnavailable(required = 'durable:runs:write'): string | undefined {
+  const picker = useAppPicker();
   const app = usePickedApp();
-  return app ? actionsUnavailableReason(app.label, app) : undefined;
+  const federated = app ? actionsUnavailableReason(app.label, app) : undefined;
+  return federated ?? viewerLacksReason(picker?.capabilities, required);
 }
 
 /** The strip at the top of every page while a federated app is picked: whose data, who acts. */
