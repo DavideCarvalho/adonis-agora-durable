@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 0.60.1
+
+### Patch Changes
+
+- [`b1f5a33`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/b1f5a33faf8f2f0db7e67531b1fc4d4dc0a696f4) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The `ETag` of the dashboard's run detail (`GET /runs/:id`) no longer covers the run's `input`, `output`, `error` or `searchAttributes`, which a host's `redact` hook may hide from the viewer. It now covers only the run's identity and state fields, its checkpoint buckets and the summarize threshold, and still changes whenever the response body does. No configuration change is needed.
+
 ## 0.60.0
 
 ### Minor Changes
