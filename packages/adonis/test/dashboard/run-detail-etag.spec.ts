@@ -10,6 +10,7 @@ import {
   type StateStore,
   WorkflowEngine,
 } from '../../src/index.js';
+import { runDetailEtag } from '../../src/run-detail-summary.js';
 import { StoreRunGateway } from '../../src/run-gateway/store-run-gateway.js';
 import { DURABLE_STEP_NAME, type StepRef } from '../../src/step-name-symbol.js';
 import { LucidStateStore } from '../../src/stores/lucid.js';
@@ -169,5 +170,68 @@ describe('run detail ETag / 304', () => {
     } finally {
       await db.manager.closeAll();
     }
+  });
+});
+
+describe('run detail ETag: never a hash of what `redact` hides', () => {
+  const base = {
+    id: 'r1',
+    workflow: 'w',
+    workflowVersion: '1',
+    status: 'completed' as const,
+    createdAt: new Date(1_000),
+    updatedAt: new Date(2_000),
+  };
+
+  it('does not depend on input, output, error or search attributes', () => {
+    const a = runDetailEtag(
+      { ...base, input: { pin: '1234' }, output: { ssn: 'a' }, searchAttributes: { email: 'x@y' } },
+      [],
+      50,
+    );
+    const b = runDetailEtag(
+      {
+        ...base,
+        input: { pin: '9999' },
+        output: { ssn: 'b' },
+        error: { message: 'secret' } as never,
+        searchAttributes: { email: 'z@w' },
+      },
+      [],
+      50,
+    );
+    // A viewer of a redacted run learns nothing about the redacted values from its ETag.
+    expect(a).toBe(b);
+  });
+
+  it('still moves with the run’s state', () => {
+    const etag = runDetailEtag({ ...base, input: {} }, [], 50);
+    expect(runDetailEtag({ ...base, input: {}, status: 'failed' }, [], 50)).not.toBe(etag);
+    expect(runDetailEtag({ ...base, input: {}, updatedAt: new Date(3_000) }, [], 50)).not.toBe(
+      etag,
+    );
+    expect(runDetailEtag({ ...base, input: {}, tags: ['lifecycle:pending'] }, [], 50)).not.toBe(
+      etag,
+    );
+  });
+
+  it('the ETag the viewer of a redacted run gets is the same whatever the redacted value', async () => {
+    const store = new InMemoryStateStore();
+    const engine = new WorkflowEngine({
+      store,
+      transport: new InMemoryTransport(),
+      reconcileMs: 0,
+    });
+    await store.createRun({ ...base, id: 'x', input: { pin: '1234' } } as never);
+    const deps = {
+      engine: storeDashboardEngine(engine),
+      redact: { run: (r: Record<string, unknown>) => ({ ...r, input: '[redacted]' }) },
+    };
+    const first = await getRun(deps, req({ params: { id: 'x' } }));
+    expect((first.body as { run: { input: unknown } }).run.input).toBe('[redacted]');
+    expect(first.headers?.etag).toMatch(/^"rd-/);
+    await store.updateRun('x', { input: { pin: '0000' } });
+    const second = await getRun(deps, req({ params: { id: 'x' } }));
+    expect(second.headers?.etag).toBe(first.headers?.etag);
   });
 });
