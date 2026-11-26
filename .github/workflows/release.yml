@@ -12,7 +12,7 @@ name: Release
 # No "version packages" PR to merge: merging a PR that carries a changeset IS the release.
 on:
   push:
-    branches: [master]
+    branches: [master, release/0.x]
   workflow_dispatch:
 
 # Never run two releases concurrently (avoids a double-publish race). Shared by both paths
