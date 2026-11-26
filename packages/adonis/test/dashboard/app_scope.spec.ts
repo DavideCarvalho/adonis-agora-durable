@@ -12,7 +12,8 @@ import {
   grantedApps,
   narrowToApps,
 } from '../../src/dashboard/app_scope.js';
-import { anyAuthorize, normalizeConsoleDecision } from '../../src/dashboard/console_authorize.js';
+import { anyAuthorize } from '../../src/dashboard/console_authorize.js';
+import { normalizeConsoleDecision } from '../../src/dashboard/console_decision.js';
 import { storeDashboardEngine } from '../../src/dashboard/gateway-adapter.js';
 import { InMemoryStateStore, InMemoryTransport, WorkflowEngine } from '../../src/index.js';
 
@@ -24,9 +25,13 @@ describe('the `apps` grant', () => {
     });
     expect(normalizeConsoleDecision({ allowed: true, apps: ['acme', 3, ''] })).toEqual({
       allowed: true,
-      apps: ['acme'],
+      apps: ['acme', '3'],
     });
-    expect(normalizeConsoleDecision({ allowed: true, apps: 'acme' })).toEqual({ allowed: true });
+    // A malformed grant narrows to none (fail closed), never to every app.
+    expect(normalizeConsoleDecision({ allowed: true, apps: 'acme' })).toEqual({
+      allowed: true,
+      apps: [],
+    });
   });
 
   it('anyAuthorize keeps the apps grant of the authorizer that allows', async () => {

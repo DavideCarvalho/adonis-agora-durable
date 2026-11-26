@@ -156,6 +156,7 @@ export function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: strin
   // A federated app this console only browses (`actions: 'none'`): every action below is disabled
   // with this reason, instead of offering one its control plane cannot carry.
   const readOnly = useAppActionsUnavailable();
+  const taskReadOnly = useAppActionsUnavailable('durable:tasks:write');
   // Dead-letter link: a `dead` run may have been routed to a `dlq:<id>` handler workflow. Probe for
   // it (retry off so a 404 just hides the link) so we never render a dead link.
   const handlerId =
@@ -715,6 +716,7 @@ export function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: strin
           targets={waitTargets}
           tenantPod={tenantPod}
           readOnly={readOnly}
+          taskReadOnly={taskReadOnly}
           onDelivered={invalidate}
         />
       )}

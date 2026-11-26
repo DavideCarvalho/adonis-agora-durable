@@ -3,11 +3,17 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { RunResult, WaitTarget } from '../client/durable-client';
+import type { AppPicker, RunResult, WaitTarget } from '../client/durable-client';
 
 // No jest-dom in this package (see `OriginFacets.spec.tsx`) — plain DOM assertions only.
 
 const signal = vi.fn<(id: string, token: string, payload?: unknown) => Promise<RunResult>>();
+const completeTask = vi.fn<(id: string, name: string, result?: unknown) => Promise<RunResult>>();
+const apps = vi.fn<() => Promise<AppPicker>>(async () => ({
+  local: { label: 'This app' },
+  apps: [],
+  selected: null,
+}));
 
 vi.mock('../client/durable-client', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../client/durable-client')>();
@@ -16,6 +22,8 @@ vi.mock('../client/durable-client', async (importOriginal) => {
     durableClient: {
       ...actual.durableClient,
       signal: (id: string, token: string, payload?: unknown) => signal(id, token, payload),
+      completeTask: (id: string, name: string, result?: unknown) => completeTask(id, name, result),
+      apps: () => apps(),
     },
   };
 });
@@ -24,6 +32,23 @@ vi.mock('../client/durable-client', async (importOriginal) => {
 // from the SAME (mocked) module graph so `instanceof` in the component matches.
 const { DurableActionError } = await import('../client/durable-client');
 const { WaitingActions } = await import('./WaitingActions');
+const { useAppActionsUnavailable } = await import('./AppPicker');
+
+/** The panel as the run page mounts it: each verb gated by the viewer's capability for it. */
+function GatedPanel({ targets }: { targets: WaitTarget[] }) {
+  const readOnly = useAppActionsUnavailable();
+  const taskReadOnly = useAppActionsUnavailable('durable:tasks:write');
+  return (
+    <WaitingActions
+      runId="run-1"
+      targets={targets}
+      tenantPod={false}
+      readOnly={readOnly}
+      taskReadOnly={taskReadOnly}
+      onDelivered={vi.fn()}
+    />
+  );
+}
 
 function wrapper({ children }: { children: ReactNode }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -122,6 +147,52 @@ describe('WaitingActions: the deliver-signal dialog', () => {
       expect(button.disabled).toBe(true);
       expect(button.title).toContain('Not available on a tenant deployment');
     }
+  });
+
+  it('gates each verb by its own capability: a viewer with only durable:tasks:write completes tasks, not signals', async () => {
+    apps.mockResolvedValueOnce({
+      local: { label: 'This app' },
+      apps: [],
+      selected: null,
+      capabilities: ['durable:tasks:write'],
+    });
+    completeTask.mockResolvedValue({ status: 'resumed' } as unknown as RunResult);
+    render(
+      <GatedPanel targets={[signalTarget, { kind: 'task', token: 'task:run-1:qa', name: 'qa' }]} />,
+      { wrapper },
+    );
+    const signalButton = screen.getByRole('button', {
+      name: 'Deliver signal',
+    }) as HTMLButtonElement;
+    await waitFor(() => expect(signalButton.disabled).toBe(true));
+    expect(signalButton.title).toContain('durable:runs:write');
+    const complete = screen.getByRole('button', { name: 'Complete task' }) as HTMLButtonElement;
+    const fail = screen.getByRole('button', { name: 'Fail task' }) as HTMLButtonElement;
+    expect(complete.disabled).toBe(false);
+    expect(fail.disabled).toBe(false);
+    fireEvent.click(complete);
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: /complete/i }));
+    await waitFor(() => expect(completeTask).toHaveBeenCalledWith('run-1', 'qa', undefined));
+  });
+
+  it('a viewer with only durable:runs:write delivers signals, not tasks', async () => {
+    apps.mockResolvedValueOnce({
+      local: { label: 'This app' },
+      apps: [],
+      selected: null,
+      capabilities: ['durable:runs:write'],
+    });
+    render(
+      <GatedPanel targets={[signalTarget, { kind: 'task', token: 'task:run-1:qa', name: 'qa' }]} />,
+      { wrapper },
+    );
+    const complete = screen.getByRole('button', { name: 'Complete task' }) as HTMLButtonElement;
+    await waitFor(() => expect(complete.disabled).toBe(true));
+    expect(complete.title).toContain('durable:tasks:write');
+    expect(
+      (screen.getByRole('button', { name: 'Deliver signal' }) as HTMLButtonElement).disabled,
+    ).toBe(false);
   });
 
   it('renders nothing at all when the run waits on nothing actionable', () => {

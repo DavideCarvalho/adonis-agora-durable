@@ -1,5 +1,5 @@
 import type { HttpContext } from '@adonisjs/core/http';
-import type { ConsoleDecision } from './console_authorize.js';
+import type { ConsoleDecision } from './console_decision.js';
 import {
   type ApiRequest,
   type ApiResponse,

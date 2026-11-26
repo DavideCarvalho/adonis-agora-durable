@@ -20,6 +20,7 @@ export default defineConfig({
   authorize: (ctx) => ctx.auth.user?.isAdmin === true,
   appLabel: 'Hub',
   apps: {
+    // The key is the app's name: its crypto partition and its authkit app name (see `partition`).
     'entre-textos': {
       label: 'Entre Textos',
       store: stores.lucid({ connection: 'pg', schema: 'entretextos' }),
@@ -34,16 +35,26 @@ export default defineConfig({
 })
 ```
 
+With `@adonis-agora/crypto` in the console app (the Agora Hub runs it embedded), that is all: the actions are authenticated with no other line ([Authenticating the console](#authenticating-the-console)).
+
 | Option | Description |
 | --- | --- |
 | `apps` | The other apps, by a key of 1–64 characters (`A-Z a-z 0-9 _ . -`). The key is what the URL carries: `?app=entre-textos`. |
 | `apps.<key>.label` | The name in the selector. Defaults to the key. |
 | `apps.<key>.store` | That app's state store. Use the `schema` it keeps its durable tables in. The console only reads it. |
-| `apps.<key>.controlPlane` | That app's control plane, with the `prefix` that app uses. |
+| `apps.<key>.controlPlane` | That app's control plane, with the `prefix` that app uses: `controlPlanes.redis({ connection, prefix })`. |
+| `apps.<key>.controlPlane.partition` | That app's crypto partition and authkit app name, for the automatic modes. Defaults to the key. |
+| `apps.<key>.controlPlane.crypto` / `.token` + `.publicKey` / `.secret` | Explicit authentication ([Authenticating the console](#authenticating-the-console)). `crypto: false` / `token: false` turn the automatic modes off. |
+| `apps.<key>.actions` | `false`: browse-only. The console reads the app's runs and sends it no action, and needs no authentication for it. Default `true`. |
 | `apps.<key>.timeoutMs` | How long an action waits for the app to answer. Default `15000`. |
 | `appLabel` | The name of the console's own app in the selector. Default `This app`. |
 
-The store and the control plane are built the first time someone picks the app, not at boot.
+The store and the control plane are built the first time someone picks the app, not at boot. How each app's actions are authenticated is resolved at boot (in the web process), and logged once:
+
+```
+[@adonis-agora/durable] console commands to "entre-textos": crypto (auto, key console-durable, partition entre-textos)
+[@adonis-agora/durable] console commands to "eduliberta": crypto (auto, key console-durable, partition eduliberta)
+```
 
 <Callout type="warn">
   The `prefix` must be the one the other app gives `controlPlanes.redis` in its `config/durable.ts`, not the `keyPrefix` of a Redis connection. Both apps must use the same Redis server.
@@ -51,25 +62,297 @@ The store and the control plane are built the first time someone picks the app, 
 
 ## Configure each other app
 
-Each app the console shows must answer the console's actions. Turn that on in its `config/durable.ts`:
+Each app the console shows must answer the console. Turn that on in its `config/durable.ts`:
 
 ```ts title="config/durable.ts (the other app)"
 export default defineConfig({
   // ...its store, transport and control plane, unchanged
   controlPlane: controlPlanes.redis({ connection: 'main', prefix: 'entretextos' }),
-  consoleCommands: true,
+  consoleCommands: {
+    // The console may act (cancel, retry, signal, approve a task, pause or trigger a schedule).
+    // Without it, it only reads (schedules, worker health, lifecycle links, events).
+    actions: true,
+  },
 })
 ```
 
-With `consoleCommands: true`, every instance of the app (web and `durable:work`) listens, and exactly one of them runs each action. The app logs one line per action, with who took it in the console:
+With `@adonis-agora/crypto` in the app, that is all (`consoleCommands: true` is enough for a read-only console). Otherwise add one of the [authentication modes](#authenticating-the-console).
+
+With `consoleCommands` set, every instance of the app (web and `durable:work`) listens, and exactly one of them runs each action. The configuration is checked at boot; the channel opens once the web server has booted, or when a `durable:work` loop starts. A one-off ace command (`node ace migration:run`, `durable:runs`…) never subscribes to it. The app logs at boot how it answers, then one line per action, with who took it in the console:
 
 ```
+[@adonis-agora/durable] console commands: crypto (auto, key console-durable); actions on
 [durable] federated console: cancel run_01J… by ops@example.com
 ```
 
 An instance takes an action by setting a short-lived Redis key (`SET … NX`), so the control plane's connection must run Redis commands: an `@adonisjs/redis` connection or an ioredis client both do. If it can't, the app answers no action at all and logs why at boot, rather than running each action on every instance.
 
-Anything that can publish on that Redis can ask for these actions, the same trust the control plane's cancel messages already rely on.
+<Callout type="warn">
+  **Breaking:** the app answers nothing unauthenticated, and `consoleCommands` with no way to authenticate fails the boot (in the web process; an ace command only logs it). Actions also need `consoleCommands.actions: true`.
+</Callout>
+
+## Authenticating the console
+
+Actions travel over Redis, and Redis is not a trust boundary: whoever can publish on it (another app on a shared instance, a leaked password, an SSRF) must not be able to cancel a run, retry it with any input, send a signal, approve a human task or trigger a schedule, nor forge the app's answer. So the app answers **nothing** unauthenticated. None of authkit, authz or `@adonis-agora/crypto` is required: each mode below stands on its own.
+
+### Together with @adonis-agora/crypto: nothing to configure
+
+When `@adonis-agora/crypto` is booted in the console app and in each app (the common Agora setup: the Hub runs crypto embedded, the apps are its crypto tenants), the libs find each other and there is **no line of auth config** in `config/durable.ts` or `config/durable_dashboard.ts`:
+
+- Each action is encrypted with the key **`console-durable`** (`aes256-gcm`) of the **owning app's partition**. The console seals it for the app (`apps.<key>.controlPlane.partition`, by default the key in `apps`, so name the entry after the app's crypto partition); the app opens it with its own crypto client. Nothing in an action (verb, run, input, viewer) is readable on Redis, and the answer carries a MAC under a one-off secret that travelled inside the sealed action.
+- The key is created at boot where crypto is embedded (the Hub). On a crypto tenant, the crypto server creates it on the console's first action; the app checks it at boot with a decrypt and logs one line per outcome: missing (info: it will be created), refused or unreachable (warnings). After a warning, the next action's own decrypt is the retry. A server with provisioning off needs it created once:
+
+  ```sh
+  node ace crypto:keys:create console-durable --type aes256-gcm --application entre-textos
+  ```
+- An app opens its own `console-*` keys with **no grant** (an existing `crypto:decrypt:console-*` grant is harmless). Crypto keeps, rotates and audits the key: each action is one encrypt row (the console) and one decrypt row (the app).
+
+What each setup needs:
+
+| Setup | Config lines | Grants |
+| --- | --- | --- |
+| Together: crypto embedded in the Hub (the console) | none | none |
+| Crypto in a separate app | none | console app's crypto client: `crypto:seal:console-*` |
+| authkit without crypto | none (app-call token + key directory: the app publishes its command key, the console seals to it) | console app: `durable:console:*` (or narrower) on the owning app, in authkit — without crypto the token is mandatory and caps every action |
+| Neither | `consoleCommands.secret` and `controlPlane.secret` (the same value) | none |
+
+`crypto:seal:console-*` covers every Agora lib's console key (`console-durable`, `console-config`…) at once, and lets the console encrypt with another app's key, never decrypt; it needs a current `@adonis-agora/crypto` on the crypto server (an older one refuses, and the console says to upgrade it or to configure `crypto` explicitly).
+
+### With authkit too: the token comes on its own
+
+When `@adonis-agora/authkit-client` is booted with **calls between apps** (`service` + `apps` in `config/authkit.ts`), both sides reuse it, again with no line of config: the console adds an app-call token for the app (`aud = urn:agora:app:<app>`) to each sealed action, and the app verifies it. The token's audience binds it to the app, and its capabilities (what authkit granted the console app there) cap every action, narrowed by the viewer's own. Grant the console app, once, in authkit: `durable:console:*` (or narrower, see [Capabilities](#capabilities)) on each app it manages.
+
+The token must travel sealed: with crypto, or to the app's command public key. That key needs no line either: an app in token mode publishes it to **authkit's key directory** at boot (purpose `console:durable`, its public half only, through its own authenticated client), and the console looks it up there for the app's partition — never over Redis. An explicit `controlPlane.publicKey` ([token mode](#with-authkit-explicit-token-mode)) still wins. With no key to seal to, the action fails with what to do.
+
+### A Hub with both: each app is reached the way it can be
+
+A Hub with embedded crypto and authkit can federate crypto apps and authkit-only apps side by side, with no line in either app's config. For each app the console decides at its first action, then caches the choice for 5 minutes (and decides again when the app does not answer): when the app published a key to authkit's directory (an app publishes one only when token mode is its only way in: an app with crypto publishes nothing), it sends an app-call token sealed to that key; otherwise it seals with crypto. When that token cannot be minted (a stale key from an older version of the app, no grant), the action goes by crypto, with the warning below. Any failure (no answer, a refusal) makes the console decide again at the next action. The boot log says so:
+
+```
+[@adonis-agora/durable] console commands to "eduliberta": auto (authkit key directory if the app publishes one, else crypto (auto, key console-durable, partition eduliberta))
+```
+
+In crypto mode the app-call token is optional (it only narrows what the console may do): when minting it fails (no grant, `invalid_target`, authkit down) the action is sent crypto-only, and the console logs once `console commands to "<app>": sending without an authkit app-call token (crypto only): <reason>. To attach it: grant the console's service client durable:console:* on "<app>" in authkit.`, trying again after 5 minutes. In token mode the token is required, and the same hint comes with the error.
+
+The `APP_KEY` token mode derives its key from is read the same way in every Agora lib: `config/app.ts`'s `appKey`, else the default entry of `config/encryption.ts` (AdonisJS 7), else the `APP_KEY` environment variable. An app with crypto does not warn that authkit cannot publish its key (crypto is enough; the doctor notes it); a crypto tenant checks its key with crypto's `hasKey` when the server has it, so the check writes no error row to crypto's audit.
+
+### Explicit crypto
+
+Set `crypto` to use another cipher: a crypto client for the app's partition when the console is a tenant of a crypto server it cannot `seal` with, a key other than `console-durable`, or [your own KMS](#bring-your-own). An explicit option is used as given, and no automatic mode is added on top.
+
+```ts title="config/durable_dashboard.ts (the console)"
+import { createCryptoClient } from '@adonis-agora/crypto-core'
+
+// apps['entre-textos']
+controlPlane: controlPlanes.redis({
+  connection: 'main',
+  prefix: 'entretextos',
+  crypto: {
+    // A client of entre-textos' partition, whose token holds crypto:encrypt:console-durable there.
+    cipher: createCryptoClient({ url: env.get('CRYPTO_URL'), partition: 'entre-textos', token: … }),
+  },
+}),
+```
+
+```ts title="config/durable.ts (the app)"
+import crypto from '@adonis-agora/crypto/services/main'
+
+consoleCommands: {
+  crypto: { cipher: () => crypto.client! },
+  actions: true,
+},
+```
+
+Pass a function where crypto is not ready yet when the config is read: it is called on the first action. With an explicit `verifyTenant` too, every crypto action must also carry a valid token.
+
+### With authkit (explicit token mode)
+
+1. In authkit, create a **service-tenant client** for the console, for the resource `urn:agora:durable`, with `partition` set to the owning app (`entre-textos`) and the [capabilities](#capabilities) the console may use there:
+
+   ```sh
+   node ace authkit:client create --client-id=hub-durable-entretextos --partition=entre-textos \
+     --capability=durable:runs:write --capability=durable:read
+   ```
+
+   One client per app the console manages.
+2. On the app, set `consoleCommands.verifyTenant`; the token must be for this app (`consoleCommands.partition`, by default its crypto partition, else its `namespace`). It needs its `APP_KEY`:
+
+   ```ts title="config/durable.ts (the owning app)"
+   import { authkitTenantVerifier } from '@adonis-agora/authkit-client'
+
+   consoleCommands: {
+     verifyTenant: authkitTenantVerifier({
+       issuer: env.get('AUTHKIT_ISSUER'),
+       resource: 'urn:agora:durable',
+     }),
+     partition: 'entre-textos',
+     actions: true,
+   },
+   ```
+
+   A `control-plane` uses its own `verifyTenant` when `consoleCommands.verifyTenant` is not set (safe: every action needs a console capability, which a tenant's token does not carry). `verifyTenant: false` turns that and the authkit app-call verification off.
+3. Print the app's console-command public key, where the app runs (it is derived from `APP_KEY` and the control plane's `prefix`, the same on every instance, and logged at boot too):
+
+   ```sh
+   node ace durable:console-key
+   # or, when config/durable.ts does not use controlPlanes.redis:
+   node ace durable:console-key --prefix=entretextos
+   ```
+4. On the console, set `token` and that `publicKey`:
+
+   ```ts title="config/durable_dashboard.ts (the console)"
+   import { authkitTenantToken } from '@adonis-agora/authkit-client'
+
+   apps: {
+     'entre-textos': {
+       store: stores.lucid({ connection: 'pg', schema: 'entretextos' }),
+       controlPlane: controlPlanes.redis({
+         connection: 'main',
+         prefix: 'entretextos',
+         token: authkitTenantToken({
+           issuer: env.get('AUTHKIT_ISSUER'),
+           clientId: env.get('HUB_DURABLE_ENTRETEXTOS_CLIENT_ID'),
+           clientSecret: env.get('HUB_DURABLE_ENTRETEXTOS_CLIENT_SECRET'),
+           resource: 'urn:agora:durable',
+         }),
+         publicKey: env.get('ENTRETEXTOS_CONSOLE_KEY'),
+       }),
+     },
+   },
+   ```
+
+What happens on each action:
+
+- The console seals the whole action, its token included, to the app's public key. It is configured on the console, never read from Redis, so nobody on Redis can make the console seal to their key. A Redis reader sees an id and ciphertext: no token to lift and replay, no action to alter.
+- The app opens it, refuses it if it is over a minute old, and verifies the token. The token's `partition` must be this app's (on a control plane, one of its tenant apps, whose runs alone it then touches), and its capabilities must allow the action; otherwise the action answers `403` ("the console's token lacks …").
+- The answer carries a MAC under a one-off secret that travelled inside the sealed action, so the console ignores a forged answer.
+- A refused token answers `401`; the console drops its cached token and fetches a new one on the next action.
+
+A new `APP_KEY` changes the key: print it again and update the console.
+
+### Without authkit or crypto (shared secret)
+
+Generate one random secret per pair of apps (16 characters at least; `openssl rand -base64 32` prints a good one) and set the same value on both sides: `apps.<key>.controlPlane.secret` on the console, `consoleCommands.secret` on the app.
+
+```ts title="config/durable_dashboard.ts (the console)"
+// apps['entre-textos']
+controlPlane: controlPlanes.redis({
+  connection: 'main',
+  prefix: 'entretextos',
+  secret: env.get('ENTRETEXTOS_CONSOLE_SECRET'),
+}),
+```
+
+```ts title="config/durable.ts (the app)"
+consoleCommands: { secret: env.get('ENTRETEXTOS_CONSOLE_SECRET'), actions: true },
+```
+
+Every action and every answer carries an HMAC under that secret, bound to the app's `prefix`, and an action over a minute old is refused (a replay inside that minute reuses the action's id, which runs once). Keep the secret out of the repository, like `APP_KEY`. Whoever holds it is the console, so treat it like an admin credential and rotate it (on both sides) when someone who had it leaves. The action itself is readable on Redis (signed, not encrypted).
+
+### Compared
+
+| | crypto (automatic or explicit) | authkit token | shared secret |
+| --- | --- | --- | --- |
+| Config lines | none together with crypto | none with authkit's app-call tokens and key directory; else `token` + `publicKey`, `verifyTenant` | `secret` on both sides |
+| Actions encrypted with | the `console-durable` key | a key derived from the app's `APP_KEY` | — (HMAC only) |
+| Who the console is | whoever may encrypt (or `seal`) with the key | the token's client | whoever holds the secret |
+| Capped by | the viewer's capabilities | the token's capabilities ∩ the viewer's | the viewer's capabilities |
+| Rotation and audit | crypto's | rotate `APP_KEY` (give the console the new public key) | rotate on both sides |
+| Revoke the console | take its `crypto:encrypt` / `crypto:seal` grant | disable its authkit client | rotate the secret |
+
+Whatever the mode, an action over a minute old is refused, the same action published again (a replay) runs once at most (its id is claimed for two minutes), and the answer is authenticated, so the console ignores one from anyone but the app. Only the console-command channels (`<prefix>-console`, `<prefix>-console-reply`) are authenticated: the control plane's lifecycle events and cancel broadcasts, and the broker's step traffic, stay a trusted boundary as before.
+
+### Capabilities
+
+Every action carries the viewer's capabilities, and the app refuses one without them (`403`, code `capabilities-required`). The console sends what its `authorize` returns as `capabilities` (kept to the names below; `access: 'read'` keeps the reads only), or all of them when it does not narrow:
+
+| Capability | Actions |
+| --- | --- |
+| `durable:read` (or `durable:console:read`) | schedules, worker health, lifecycle links, published events |
+| `durable:runs:write` | cancel, retry, fix-and-replay, requeue, redispatch, continue, signal, update, republish a lifecycle event |
+| `durable:tasks:write` | complete or fail a task (human approvals) |
+| `durable:schedules:write` | pause, resume, run a schedule now |
+| `durable:console:write` | every action above, and the reads (write implies read) |
+| `durable:console:*`, `durable:*`, `*` | everything |
+| `durable:runs:*` (a `durable:` grant ending in `*`) | what starts with it (`durable:runs:write`) |
+
+No other `*` grants anything: `*:console:*`, `durable:*:write`, `*:read` or `durable:console:w*` allow nothing (one matcher, identical in every Agora lib, checks tokens, viewers and the console's own buttons).
+
+In token mode the token's capabilities apply too: an action needs both ("the viewer lacks …" or "the console's token lacks …"). Every verb needs its capability, reads included. And every action (not the reads) also needs `consoleCommands.actions: true` on the app.
+
+The viewer's capabilities apply to the console's **own app** too: a viewer whose `authorize` narrows them cannot cancel, retry, signal, complete a task or control a schedule here either (`403`, "the viewer lacks …"), and the console disables those buttons. When `authorize` returns no `capabilities`, the viewer has full access, as before.
+
+### Which runs an action may touch
+
+- On a **standalone** app every run is the app's own. A classic tenant token must be for this app: `consoleCommands.partition`, by default its crypto partition, else its `namespace` (when not `'default'`). An authkit app-call token is bound to the app by its audience instead.
+- On a **control plane**, runs belong to their tenant app (the namespace of its partition). By default a console acts on the control plane's **own** runs only, and a classic token must be for the control plane itself. Acting across tenants takes an explicit list: `consoleCommands.apps: ['acme', 'globex']` (or `'*'`) lets commands touch those apps' runs, schedules and worker groups (backfills by workflow included), and accepts a token for one of them, confined to that app's runs. A run of another app reads as missing.
+
+### Bring your own
+
+Every automatic piece is a default, never a requirement:
+
+- **Your own authentication:** a `token` function on the console and a `verifyTenant` function on the app, with any IdP, JWT library or API keys:
+
+  ```ts
+  // config/durable_dashboard.ts — apps['entre-textos'].controlPlane
+  controlPlanes.redis({
+    connection: 'main',
+    prefix: 'entretextos',
+    token: async () => myIdp.issueToken({ audience: 'entre-textos' }),
+    publicKey: env.get('ENTRETEXTOS_CONSOLE_KEY'),
+  }),
+  // config/durable.ts
+  consoleCommands: {
+    verifyTenant: async ({ token }) => {
+      const claims = await verifyJwt(token, jwks)
+      return claims ? { partition: claims.app, capabilities: claims.scopes, clientId: claims.sub } : null
+    },
+    partition: 'entre-textos',
+  },
+  ```
+- **Your own KMS or HSM** (AWS KMS, Vault transit…): `crypto.cipher` is anything with `encrypt({ key, plaintext, aad, context })` and `decrypt({ key, ciphertext, aad, context })`. Tell the app how to recognise its ciphertext with `owns`:
+
+  ```ts
+  crypto: {
+    cipher: { encrypt: (i) => vault.encrypt(i), decrypt: (i) => vault.decrypt(i) },
+    owns: (ciphertext) => ciphertext.startsWith('vault:v1:'),
+  },
+  ```
+- **Your own authorization** (instead of authz): return the viewer's capabilities from the console's `authorize`, mapping your roles:
+
+  ```ts
+  authorize: (ctx) => {
+    const user = ctx.auth.user
+    if (!user) return { allowed: false, reason: 'unauthenticated' }
+    return {
+      allowed: true,
+      capabilities: user.role === 'admin' ? ['durable:console:*'] : ['durable:console:read'],
+      // or: access: 'read' — reads only, whatever the capabilities say
+    }
+  },
+  ```
+- `crypto: false`, `token: false` (console) and `verifyTenant: false` (app) turn the automatic detection off.
+
+### Boot errors and the doctor
+
+A misconfiguration never waits for the first click:
+
+- an app with `consoleCommands` and no way to authenticate fails its boot with a `ConsoleAuthConfigError`: `consoleCommands needs authentication: install and boot @adonis-agora/crypto in this app (automatic, key console-durable), or configure authkit-client's \`service\` (automatic: the console uses an authkit app-call token; grant it durable:console:* on this app), or set consoleCommands.secret (shared with the console), or consoleCommands.verifyTenant (your own verifier; needs an APP_KEY). Run \`node ace agora:doctor\` …`, followed by ` Note: …` when an automatic mode was switched off or blocked (`crypto: false`, `token: false`, a verifier without an APP_KEY);
+- a console entry that may act (`actions` not `false`) with no way to authenticate fails the console's boot: `durable_dashboard.apps["<app>"]: commands to this app need authentication: … — or actions: false to only browse it`.
+
+A message the app refuses on its command channel is logged once per reason and dropped; it never stops the app:
+
+```
+[@adonis-agora/durable] console commands: refused a command (mode not accepted here (this app accepts: secret; the command came as crypto (key console-durable)))
+```
+
+The reasons: `not JSON`, `no command id`, `did not open with this app's key`, `bad signature`, `stale`, `replayed` (only on the instance that already ran that command; losing a claim to another instance is silent), `token refused`, `capabilities-required`, and `mode not accepted here (…)` naming what this app accepts and how the command came. When nobody answers, the console says `no instance of "<app>" answered within <n>s — the app may have refused the command (check its logs, or run \`node ace agora:doctor\` there)`. Public keys never appear in the logs: a token mode shows the key's short id on both sides (`token (…; sealed to key 1a2b3c4d)`), so the console's and the app's lines can be matched (with authkit's key directory the console reads `token (…, authkit key directory; sealed to the key the app publishes)`: it fetches the key on the first command, never at boot); the console logs `created the crypto key "console-durable" in partition <P>` when it creates an app's key.
+
+Only the web process fails; an ace command logs the error and goes on. `node ace agora:doctor` reports the resolved mode of each side (`durable.console-commands`), and with `--deep` checks that the `console-durable` key exists and that this process can seal (and, on the app, open) with it (`durable.console-commands-key`).
+
+### Moving from one to the other
+
+An app accepts every mode it resolves (crypto, a token, `secret`), so it can take both the old and the new while its consoles move over; remove the old one once every console has switched.
 
 ## Database access
 
@@ -91,7 +374,7 @@ If the apps live in different databases, declare a Lucid connection to the other
 
 Once `apps` is set, the console's header has an **App** control. Picking an app puts it in the URL (`?app=entre-textos`), so a link or a reload keeps it; picking the console's own app removes it. Switching apps closes the open run and resets the runs board's filters, and stays on Workers or Schedules if you were there.
 
-The selector tags each configured app **federated**, and while one is picked a notice at the top of every page says that its data comes from its own store and that actions are sent to it, which runs them. When the app's control plane can't carry actions at all (a built control plane without console commands), the notice says the app is read-only here and the action buttons are disabled with that reason.
+The selector tags each configured app **federated**, and while one is picked a notice at the top of every page says that its data comes from its own store and that actions are sent to it, which runs them. When the app's control plane can't carry actions at all (a built control plane without console commands), or the entry is browse-only (`actions: false`), the notice says the app is read-only here and the action buttons are disabled with that reason.
 
 For the picked app, the console shows:
 
@@ -100,7 +383,7 @@ For the picked app, the console shows:
 - its schedules and worker health, asked of its engine;
 - every action on a run, and bulk actions, run by its engine.
 
-When the app does not answer an action (it is down, or `consoleCommands` is off), the action fails with `503` and a message naming the app. Reading its runs keeps working.
+When the app does not answer an action (it is down, `consoleCommands` is off, or the console's authentication does not match the app's), the action fails with `503` and a message naming the app. When the app refuses it (its token is refused, is for another app, or lacks the capability), it fails with `403`. Reading its runs keeps working.
 
 Some views stay the console app's own: the `/metrics` counters and the fleet compatibility panel describe the console's process, so for another app the panel lists only its blocked runs. A run detail does not list the lifecycle subscribers of the run's workflow.
 
@@ -141,4 +424,4 @@ Every console API route takes `?app=<key>`. `GET <path>/api/apps` lists what the
 }
 ```
 
-`mode` is `federated` for every configured app. `actions` says who runs actions on its runs: `app` (they are sent to the app) or `none` (the console only browses it).
+`mode` is `federated` for every configured app. `actions` says who runs actions on its runs: `app` (they are sent to the app) or `none` (the console only browses it: its control plane cannot carry actions, or the entry says `actions: false`).

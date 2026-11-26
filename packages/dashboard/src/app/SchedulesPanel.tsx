@@ -84,7 +84,7 @@ function ScheduleRow({ s, onOpenRun }: { s: ScheduleInfo; onOpenRun: (id: string
   });
   const tenant = s.namespace && s.namespace !== 'default' ? s.namespace : undefined;
   // A federated app this console only browses: its schedules are shown, not controlled, from here.
-  const readOnly = useAppActionsUnavailable();
+  const readOnly = useAppActionsUnavailable('durable:schedules:write');
   return (
     <li className={cn(COLUMNS, 'py-3')}>
       <div className="min-w-0">

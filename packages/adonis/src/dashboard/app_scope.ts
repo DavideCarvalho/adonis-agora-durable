@@ -1,4 +1,5 @@
 import type { RunQuery, WorkflowRun } from '../interfaces.js';
+import type { RepublishLifecycleResult } from '../lifecycle-events.js';
 import { namespaceMatches } from '../namespaces.js';
 import type { DashboardEngine } from './handlers.js';
 import { confineEngine } from './tenant_scope.js';
@@ -69,6 +70,33 @@ export function appScopedDashboardEngine(
   } else {
     delete scoped.setSchedulePaused;
     delete scoped.triggerSchedule;
+  }
+  // A backfill by workflow (no `runId`) republishes the settled runs of the granted apps only: once
+  // per app's namespace, sharing the limit. A namespace outside the apps republishes nothing.
+  const republish = engine.republishLifecycle?.bind(engine);
+  const republishRun = scoped.republishLifecycle;
+  if (republish && republishRun) {
+    scoped.republishLifecycle = async (target) => {
+      if ('runId' in target) return republishRun(target);
+      const result: RepublishLifecycleResult = { runs: 0, started: 0, failed: [] };
+      const requested = target.namespace;
+      const namespaces =
+        requested === undefined
+          ? [...apps]
+          : apps.some((app) => namespaceMatches(requested, app))
+            ? [requested]
+            : [];
+      let left = target.limit ?? 1000;
+      for (const namespace of namespaces) {
+        if (left <= 0) break;
+        const done = await republish({ ...target, namespace, limit: left });
+        result.runs += done.runs;
+        result.started += done.started;
+        result.failed.push(...done.failed);
+        left -= done.runs;
+      }
+      return result;
+    };
   }
   return scoped;
 }
