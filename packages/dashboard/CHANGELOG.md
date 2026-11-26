@@ -1,5 +1,11 @@
 # @adonis-agora/durable-dashboard
 
+## 1.0.0-rc.24
+
+### Minor Changes
+
+- [`290b25e`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/290b25e14f5af0de05ae352c40dac17e71344eb7) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The console follows the viewer's capabilities: actions the viewer may not run are disabled with the reason, using the shared console capability rules (write implies read; a `*` counts only as the last segment of a capability). Ships with the federated-console authentication changes.
+
 ## 1.0.0-rc.23
 
 ### Minor Changes
