@@ -2,7 +2,7 @@
 '@adonis-agora/durable': minor
 ---
 
-Federated console commands are authenticated (reported privately; the same contract as every Agora lib's console). Until now anything that could publish on `<prefix>-console` could cancel any run, retry it with any input, send signals and updates, complete or fail human tasks, and pause or trigger schedules, under a self-asserted `actor`, and could answer for the app.
+Federated console commands are authenticated (found in an internal security audit; the same contract as every Agora lib's console). Until now anything that could publish on `<prefix>-console` could cancel any run, retry it with any input, send signals and updates, complete or fail human tasks, and pause or trigger schedules, under a self-asserted `actor`, and could answer for the app.
 
 **Breaking:**
 
