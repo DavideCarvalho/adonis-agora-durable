@@ -3,14 +3,13 @@ import type {
   AccessDeniedOption as GenericAccessDeniedOption,
   AccessDeniedRenderer as GenericAccessDeniedRenderer,
 } from './access_denied_page.js';
+import type { ConsoleAuthorize, ConsoleAuthorizeResult } from './console_authorize.js';
 import {
-  type ConsoleAuthorize,
   type ConsoleAuthorizeGate,
-  type ConsoleAuthorizeResult,
   type ConsoleDecision,
   normalizeConsoleDecision,
-  resolveConsoleAuthorize,
-} from './console_authorize.js';
+  resolveConsoleGate,
+} from './console_decision.js';
 import type { ConsoleViewer, SignOutOption, ViewerHook } from './console_shell.js';
 import type { FederatedConsoleApp } from './federation.js';
 
@@ -226,7 +225,7 @@ export function resolveConfig(
   const trimmed = `/${rawPath.replace(/^\/+/, '').replace(/\/+$/, '')}`;
   const authorizeConfigured = config.authorize !== undefined;
   let authorize: ConsoleAuthorizeGate;
-  if (config.authorize !== undefined) authorize = resolveConsoleAuthorize(config.authorize);
+  if (config.authorize !== undefined) authorize = resolveConsoleGate(config.authorize);
   else authorize = options.inProduction === false ? allowAll : denyAll;
   return {
     enabled: config.enabled ?? true,

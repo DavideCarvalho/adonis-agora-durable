@@ -4,6 +4,18 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import type { HttpContext } from '@adonisjs/core/http';
 import type { ApplicationService, HttpRouterService } from '@adonisjs/core/types';
+import type { ConsoleCommandAuthOptions } from '../src/control-plane-redis/console-auth.js';
+import {
+  authkitClientOf,
+  cryptoRuntimeOf,
+  ensureConsoleKey,
+  missingKeyLine,
+} from '../src/control-plane-redis/console-crypto.js';
+import {
+  ConsoleAuthConfigError,
+  type ConsoleSideResolution,
+  resolveConsoleSideAuth,
+} from '../src/control-plane-redis/console-resolve.js';
 import {
   type AccessDeniedInfo,
   resolveAccessDeniedPage,
@@ -17,7 +29,7 @@ import {
   type FleetTransport,
   mergeFleets,
 } from '../src/dashboard/compat.js';
-import type { ConsoleDecision } from '../src/dashboard/console_authorize.js';
+import type { ConsoleDecision } from '../src/dashboard/console_decision.js';
 import { resolveSignOut, resolveViewer } from '../src/dashboard/console_shell.js';
 import {
   durableConsoleSearch,
@@ -38,10 +50,20 @@ import { registerDurableDevTools } from '../src/dashboard/dev_tools.js';
 import { BlockedDiagnosticsRecorder } from '../src/dashboard/diagnostics-recorder.js';
 import {
   buildFederatedApp,
+  CAPABILITIES_REQUIRED,
+  DURABLE_CONSOLE_FULL_CAPABILITIES,
   FEDERATED_APP_UNREACHABLE,
+  FEDERATED_FORBIDDEN,
   type FederatedApp,
   FederatedAppError,
   federatedAppActions,
+  federatedAppAuth,
+  federatedAppPartition,
+  federatedConsoleEntry,
+  UNAUTHORIZED_CONSOLE,
+  UNSIGNED_CHANNEL,
+  viewerConsoleCapabilities,
+  viewerScopedDashboardEngine,
 } from '../src/dashboard/federation.js';
 import { dashboardEngineForTopology } from '../src/dashboard/gateway-adapter.js';
 import {
@@ -156,6 +178,11 @@ export default class DashboardProvider {
   private readonly scopes = new WeakMap<HttpContext, ConsoleTenantScope>();
   /** The configured other apps (federated console), each built once on first use. */
   private readonly federated = new Map<string, Promise<FederatedApp>>();
+  /**
+   * How the console authenticates each configured app's commands, resolved at boot (web): the
+   * explicit options, else the automatic modes of the siblings booted here.
+   */
+  private readonly federatedAuth = new Map<string, ConsoleSideResolution>();
 
   /** SSE connections currently open, per client address (and in total) — see streamRun. */
   private readonly sseByAddress = new Map<string, number>();
@@ -189,6 +216,13 @@ export default class DashboardProvider {
     if (!config.authorizeConfigured) await this.warnNoAuthorize();
 
     const durableTopology = this.durableTopology();
+
+    // The federated console: how each configured app's commands are authenticated. Resolved where
+    // the console serves requests (web) — a misconfigured entry fails the boot there, never an ace
+    // command.
+    if (Object.keys(config.apps).length > 0 && this.app.getEnvironment?.() === 'web') {
+      await this.resolveFederatedAuth(config);
+    }
 
     // Developer tools on the app's dev MCP endpoint, when `@adonis-agora/agent/mcp_provider` bound
     // its hub (its `register()` ran before any `boot()`). Gated by this console's own `authorize`.
@@ -224,7 +258,10 @@ export default class DashboardProvider {
       const scope = ctx ? await this.consoleTenantScope(config, ctx) : undefined;
       if (selected !== undefined && ctx) {
         // Another app: its store and its engine. This app's own tenancy slot and counters do not apply.
-        const remote = (await this.federatedApp(config, selected)).engine(auditActor(ctx));
+        const remote = (await this.federatedApp(config, selected)).engine(
+          auditActor(ctx),
+          await this.consoleCapabilities(config, ctx),
+        );
         return {
           engine: scope ? scopedDashboardEngine(remote, scope.ids) : remote,
           ...(config.redact ? { redact: config.redact } : {}),
@@ -237,7 +274,10 @@ export default class DashboardProvider {
       );
       const apps = ctx ? await this.consoleApps(config, ctx) : undefined;
       const slot = scope ? tenancySlot() : undefined;
-      const byApp = apps ? appScopedDashboardEngine(base, apps) : base;
+      // The viewer's capabilities apply here too: an action it lacks answers 403, like on another app.
+      const narrowed = ctx ? await this.narrowedCapabilities(config, ctx) : undefined;
+      const allowed = narrowed ? viewerScopedDashboardEngine(base, narrowed) : base;
+      const byApp = apps ? appScopedDashboardEngine(allowed, apps) : allowed;
       const engine = scope
         ? scopedDashboardEngine(byApp, scope.ids, slot ? (fn) => slot.allTenants(fn) : undefined)
         : byApp;
@@ -280,6 +320,98 @@ export default class DashboardProvider {
   }
 
   /**
+   * What this viewer may do on the other apps (sent with every command): `authorize`'s
+   * `capabilities`, or the full console set when it does not narrow them.
+   */
+  private async consoleCapabilities(
+    config: ResolvedDurableDashboardConfig,
+    ctx: HttpContext,
+  ): Promise<readonly string[]> {
+    return (await this.narrowedCapabilities(config, ctx)) ?? DURABLE_CONSOLE_FULL_CAPABILITIES;
+  }
+
+  /**
+   * The viewer's capabilities when `authorize` narrows them (`capabilities`, or `access: 'read'`),
+   * kept to durable's console set; `undefined` when it does not (full access).
+   */
+  private async narrowedCapabilities(
+    config: ResolvedDurableDashboardConfig,
+    ctx: HttpContext,
+  ): Promise<string[] | undefined> {
+    const decision = await this.consoleDecision(config, ctx);
+    if (!decision.allowed) return [];
+    if (decision.capabilities === undefined && decision.access !== 'read') return undefined;
+    return viewerConsoleCapabilities(decision.capabilities, decision.access);
+  }
+
+  /**
+   * Resolve, once at boot, how each configured app's commands are authenticated, and log it. Throws
+   * for an entry that may act but has no way to authenticate (it names every way out).
+   */
+  private async resolveFederatedAuth(config: ResolvedDurableDashboardConfig): Promise<void> {
+    const siblings = {
+      crypto: await cryptoRuntimeOf(this.app.container as never),
+      authkit: await authkitClientOf(this.app.container as never),
+      // Called on the logger, never detached (it may read `this`).
+      log: (line: string, level: 'info' | 'warn') =>
+        level === 'info' ? logger?.info(line) : logger?.warn(line),
+    };
+    const lines: string[] = [];
+    const keys: string[] = [];
+    for (const [id, spec] of Object.entries(config.apps)) {
+      const partition = federatedAppPartition(id, spec);
+      const resolved = resolveConsoleSideAuth(id, partition, federatedConsoleEntry(spec), siblings);
+      if (resolved.error) throw new ConsoleAuthConfigError(resolved.error);
+      this.federatedAuth.set(id, resolved);
+      lines.push(
+        `[@adonis-agora/durable] console commands to "${id}": ${resolved.modes.join(' + ')}`,
+      );
+      if (resolved.autoCrypto?.service) keys.push(partition);
+    }
+    let logger: { info(line: string): void; warn(line: string): void } | undefined;
+    try {
+      logger = await this.app.container.make('logger');
+    } catch {
+      // No logger bound (a bare test app): nothing to say it with.
+    }
+    for (const line of lines) logger?.info(line);
+    // Crypto embedded here: each app's key is created at boot, never failing it (one line says what
+    // to run, and the first command tries again).
+    const service = siblings.crypto?.service;
+    if (service) {
+      for (const partition of keys) {
+        void ensureConsoleKey(service, partition).then(
+          (state) => {
+            if (state === 'created') {
+              logger?.info(
+                `[@adonis-agora/durable] console commands: created the crypto key "console-durable" in partition ${partition}`,
+              );
+            }
+          },
+          (error: unknown) =>
+            logger?.warn(
+              missingKeyLine(partition, error instanceof Error ? error.message : String(error)),
+            ),
+        );
+      }
+    }
+  }
+
+  /** The authentication of the configured app `id`: resolved at boot, else its explicit options. */
+  private federatedAuthOf(
+    id: string,
+    spec: ResolvedDurableDashboardConfig['apps'][string],
+  ): ConsoleCommandAuthOptions | undefined {
+    const resolved = this.federatedAuth.get(id);
+    return resolved ? resolved.auth : federatedAppAuth(spec);
+  }
+
+  /** The configured apps' resolved console-side authentication (the doctor reads it). */
+  federatedConsoleAuth(): ReadonlyMap<string, ConsoleSideResolution> {
+    return this.federatedAuth;
+  }
+
+  /**
    * The other app this request is about (`?app=<key>`): its key, `undefined` for this app (no
    * `?app=`), or `null` for a key that is not configured or that `authorize`'s `apps` grant does not
    * name (answered like an unknown app).
@@ -312,7 +444,7 @@ export default class DashboardProvider {
         id,
         label: app.label ?? id,
         mode: 'federated' as const,
-        actions: federatedAppActions(app),
+        actions: federatedAppActions(app, this.federatedAuthOf(id, app)),
       }));
   }
 
@@ -322,7 +454,7 @@ export default class DashboardProvider {
     if (!app) {
       const spec = config.apps[id];
       if (!spec) return Promise.reject(new UnknownConsoleAppError());
-      app = buildFederatedApp(id, spec, { app: this.app });
+      app = buildFederatedApp(id, spec, { app: this.app }, this.federatedAuthOf(id, spec));
       // A failed build (a bad connection name) is retried on the next request, not cached.
       app.catch(() => this.federated.delete(id));
       this.federated.set(id, app);
@@ -650,10 +782,13 @@ export default class DashboardProvider {
         if (!(await this.enforce(config, ctx, 'api'))) return;
         ctx.response.header('cache-control', 'private, no-store');
         const selected = await this.selectedApp(config, ctx);
+        const capabilities = await this.narrowedCapabilities(config, ctx);
         return ctx.response.status(200).json({
           local: { label: config.appLabel },
           apps: await this.visibleApps(config, ctx),
           selected: selected ?? null,
+          // What this viewer may do (when `authorize` narrows it): the console disables the rest.
+          ...(capabilities ? { capabilities } : {}),
         });
       })
       .as('durable_dashboard.apps');
@@ -1103,6 +1238,18 @@ function federatedErrorResponse(error: unknown): ApiResponse | undefined {
     }
     if (error.code === 'unsupported-request') {
       return { status: 501, body: { error: error.message } };
+    }
+    // The console cannot authenticate its commands (no `secret`, `token` or `crypto` for the app).
+    if (error.code === UNSIGNED_CHANNEL) {
+      return { status: 503, body: { error: error.message } };
+    }
+    // The app refused the console's token, or the token does not allow this app or action.
+    if (
+      error.code === UNAUTHORIZED_CONSOLE ||
+      error.code === FEDERATED_FORBIDDEN ||
+      error.code === CAPABILITIES_REQUIRED
+    ) {
+      return { status: 403, body: { error: error.message } };
     }
     return { status: 502, body: { error: 'the app that owns this run answered with an error' } };
   }

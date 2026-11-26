@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { Emitter } from '@adonisjs/core/events';
 import { Logger } from '@adonisjs/core/logger';
 import { Database } from '@adonisjs/lucid/database';
@@ -57,6 +58,7 @@ describe.skipIf(!PG_URL)('federated console on Postgres (two schemas)', () => {
   let engineA: WorkflowEngine;
   let engineB: WorkflowEngine;
   let app: FederatedApp;
+  const CONSOLE_SECRET = randomBytes(32).toString('base64url');
   const closers: Array<() => Promise<unknown> | unknown> = [];
 
   function plane(): ControlPlane & { close?: () => Promise<void> } {
@@ -94,12 +96,17 @@ describe.skipIf(!PG_URL)('federated console on Postgres (two schemas)', () => {
       await ctx.localStep('prepare', async () => ({ prepared: true }));
       return ctx.waitForSignal('approve');
     });
-    answerConsoleCommands(ownerPlane, storeDashboardEngine(engineB));
+    // Redis is not a trust boundary: both sides share a secret (a real deployment may use crypto).
+    answerConsoleCommands(ownerPlane, storeDashboardEngine(engineB), undefined, {
+      auth: { secret: CONSOLE_SECRET },
+      actions: true,
+    });
 
     app = new FederatedApp({
       id: 'b',
       store: new LucidStateStore(readOnly, { schema: schemaB }),
       controlPlane: plane(),
+      auth: { secret: CONSOLE_SECRET },
     });
     if (REDIS_URL) {
       const probe = new Redis(REDIS_URL);

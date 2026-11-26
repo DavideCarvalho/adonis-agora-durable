@@ -19,20 +19,31 @@ export { compat, enumerateLiveFleet, mergeFleets } from './compat.js';
 export { formatProtocolRange, outcomeClass, outcomeLabel } from './compat-view.js';
 export type {
   AuthorizeByTokenOptions,
+  ConsoleAccess,
   ConsoleAuthorize,
-  ConsoleAuthorizeGate,
+  ConsoleAuthorizeDecision,
   ConsoleAuthorizeResult,
   ConsoleAuthorizer,
   ConsoleAuthorizerClass,
-  ConsoleDecision,
 } from './console_authorize.js';
 // The shared console `authorize` contract (function, class, lazy import).
 export {
   anyAuthorize,
   authorizeByToken,
-  normalizeConsoleDecision,
+  normalizeConsoleAuthorizeResult,
   resolveConsoleAuthorize,
 } from './console_authorize.js';
+export {
+  CONSOLE_ALL,
+  CONSOLE_READ,
+  CONSOLE_WRITE,
+  type ConsoleCapabilityKind,
+  type ConsoleCapabilityTable,
+  consoleCapabilityAllows,
+  consoleCapabilityKind,
+} from './console_capabilities.js';
+export type { ConsoleAuthorizeGate, ConsoleDecision } from './console_decision.js';
+export { normalizeConsoleDecision, resolveConsoleGate } from './console_decision.js';
 // The console shell's data-block fields: who is signed in, and how to sign out.
 export type {
   ConsoleSignOut,
@@ -90,15 +101,31 @@ export type {
 export { DEV_TOOLS_BINDING, durableDevTools, registerDurableDevTools } from './dev_tools.js';
 export type { EngineEventSource, RecordedBlock } from './diagnostics-recorder.js';
 export { BlockedDiagnosticsRecorder } from './diagnostics-recorder.js';
-export type { ConsoleCommandVerb, FederatedConsoleApp } from './federation.js';
+export type {
+  AnswerConsoleCommandsOptions,
+  ConsoleCommandVerb,
+  FederatedConsoleApp,
+} from './federation.js';
 // The federated console: other apps' runs, read from their stores, acted on through their engines.
 export {
   answerConsoleCommands,
   buildFederatedApp,
+  CAPABILITIES_REQUIRED,
   CONSOLE_COMMAND_VERBS,
+  CONSOLE_VERB_CAPABILITY,
+  consoleVerbAllowed,
+  DURABLE_CONSOLE_CAPABILITIES,
+  DURABLE_CONSOLE_CAPABILITY_TABLE,
+  DURABLE_CONSOLE_FULL_CAPABILITIES,
+  durableConsoleAllows,
   FEDERATED_APP_UNREACHABLE,
+  FEDERATED_FORBIDDEN,
   FederatedApp,
   FederatedAppError,
+  UNAUTHORIZED_CONSOLE,
+  UNSIGNED_CHANNEL,
+  viewerConsoleCapabilities,
+  viewerScopedDashboardEngine,
 } from './federation.js';
 export type { DashboardContainer } from './gateway-adapter.js';
 

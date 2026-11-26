@@ -1,3 +1,4 @@
+import type { ConsoleSideOptions } from '../control-plane-redis/console-auth.js';
 import type { ControlPlane } from '../interfaces.js';
 import { resolveRedisService } from '../redis-service.js';
 import { hintStack } from '../stack.js';
@@ -23,8 +24,13 @@ export interface ControlPlaneContext {
  */
 export type ControlPlaneFactory = (ctx: ControlPlaneContext) => Promise<ControlPlane>;
 
-/** Options for the Redis pub/sub control plane (`@adonisjs/redis`). */
-export interface RedisControlPlaneConfig {
+/**
+ * Options for the Redis pub/sub control plane (`@adonisjs/redis`). As another app's entry in a
+ * federated console (`apps.<key>.controlPlane`), it also says how the console authenticates its
+ * commands to that app ({@link ConsoleSideOptions}: `secret`, `token`, `publicKey`, `crypto`,
+ * `partition`); they mean nothing on an app's own control plane.
+ */
+export interface RedisControlPlaneConfig extends ConsoleSideOptions {
   /**
    * Name of the `@adonisjs/redis` connection — a key of the `connections` map in `config/redis.ts` —
    * whose pub/sub this control plane broadcasts over. Defaults to `'main'`. You configure the host /
@@ -56,6 +62,17 @@ export interface RedisControlPlaneConfig {
   pingIntervalMs?: number | false;
 }
 
+/** The console-side options of a control plane's config (see {@link ConsoleSideOptions}). */
+function consoleSideOf(config: ConsoleSideOptions): ConsoleSideOptions {
+  return {
+    ...(config.secret !== undefined ? { secret: config.secret } : {}),
+    ...(config.token !== undefined ? { token: config.token } : {}),
+    ...(config.publicKey !== undefined ? { publicKey: config.publicKey } : {}),
+    ...(config.crypto !== undefined ? { crypto: config.crypto } : {}),
+    ...(config.partition !== undefined ? { partition: config.partition } : {}),
+  };
+}
+
 /**
  * The control-plane factory namespace used in `config/durable.ts`:
  *
@@ -81,6 +98,7 @@ export const controlPlanes = {
    * via the shared `` `${prefix}-control` `` channel.
    */
   redis(config: RedisControlPlaneConfig = {}): ControlPlaneFactory {
+    const consoleSide = consoleSideOf(config);
     const factory: ControlPlaneFactory = async (ctx) => {
       const { RedisControlPlane } = await import('../control-plane-redis/redis-control-plane.js');
       const redis = await resolveRedisService(ctx);
@@ -91,8 +109,17 @@ export const controlPlanes = {
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
         ...(config.observe !== undefined ? { observe: config.observe } : {}),
         ...(config.pingIntervalMs !== undefined ? { pingIntervalMs: config.pingIntervalMs } : {}),
+        ...(Object.keys(consoleSide).length > 0 ? { console: consoleSide } : {}),
       });
     };
+    // The prefix travels with the factory: `node ace durable:console-key` derives the app's
+    // console-command key from it without connecting to Redis.
+    Object.defineProperty(factory, 'prefix', {
+      value: config.prefix ?? 'durable',
+      enumerable: false,
+    });
+    // A federated console reads how to authenticate to this app without building the plane.
+    Object.defineProperty(factory, 'console', { value: consoleSide, enumerable: false });
     return hintStack(factory, [
       { kind: 'redis', connection: config.connection, purpose: 'control plane' },
     ]);

@@ -2349,6 +2349,9 @@ export class WorkflowEngine {
    */
   startConsumers(): void {
     this.pool.startConsumers();
+    // …and the control-plane subscription a console/REPL process held back (cancels, lifecycle
+    // events from other instances): this process is a worker now.
+    this.controlPlane?.startSubscriptions?.();
   }
 
   /**

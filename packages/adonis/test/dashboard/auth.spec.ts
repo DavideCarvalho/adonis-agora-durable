@@ -95,7 +95,7 @@ describe('resolveConfig', () => {
 });
 
 describe('authorizeByToken', () => {
-  const gate = authorizeByToken({ token: 'secret' });
+  const gate = authorizeByToken({ token: 'secret' }) as (ctx: HttpContext) => unknown;
 
   it('allows a matching Authorization: Bearer header', () => {
     expect(gate(fakeCtx({ headers: { authorization: 'Bearer secret' } }))).toEqual({

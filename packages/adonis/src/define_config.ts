@@ -10,8 +10,10 @@ import type {
   StandaloneConfig,
   TenantConfig,
   TenantVerifier,
+  TenantVerifierOption,
   VerifiedTenant,
 } from './config_types.js';
+import type { ConsoleCryptoOptions } from './control-plane-redis/console-auth.js';
 import type {
   ControlPlaneContext,
   ControlPlaneFactory,
@@ -81,6 +83,69 @@ export interface EmbeddedWorkerConfig {
   maxIdleIntervalMs?: number;
   /** Shutdown budget in ms: the wait for the tick in flight plus `engine.drain`. Default 10_000. */
   drainTimeoutMs?: number;
+}
+
+/**
+ * How this app answers another app's federated console (`consoleCommands` in `config/durable.ts`):
+ * which console it trusts, which apps' runs that console may act on, and whether it may act at all.
+ *
+ * Nothing to set when `@adonis-agora/crypto` is booted in this app: commands then arrive sealed with
+ * its `console-durable` key (no grant needed: an app opens its own console keys), and when
+ * `@adonis-agora/authkit-client` has calls between apps configured, the token they carry is verified
+ * too. Otherwise set `secret`, `verifyTenant` or `crypto`; the app accepts every one that resolves.
+ * With none, the boot fails (web) and says which line to add.
+ */
+export interface DurableConsoleCommandsConfig {
+  /**
+   * Whether the console may act: cancel, retry, signal, update, requeue, continue, republish,
+   * complete/fail a task, pause/resume/trigger a schedule. Reads (schedules, worker health,
+   * lifecycle links, events) are answered either way. Default `false`: every action answers `403`.
+   */
+  actions?: boolean;
+  /**
+   * Token mode: checks the token each command carries — `authkitTenantVerifier({ issuer, resource:
+   * 'urn:agora:durable' })`, or your own `(request) => { partition, capabilities, clientId? } | null`
+   * (any IdP, a JWT library, API keys). The token's `partition` must be this app's ({@link partition}), and its
+   * capabilities cap what the console may do: `durable:runs:write` (cancel, retry, signal, update,
+   * requeue, continue, republish), `durable:tasks:write` (complete or fail a task),
+   * `durable:schedules:write` (pause, resume, trigger) and `durable:read` (schedules, worker health,
+   * lifecycle links, events); `durable:console:*` (or `durable:*`) for all. Without `crypto`,
+   * commands arrive sealed to a key derived from `APP_KEY`, whose public half the console is
+   * configured with (`node ace durable:console-key` prints it). When not set, authkit's app-call
+   * tokens are verified (when `@adonis-agora/authkit-client` has `service` configured), and a
+   * `control-plane` also uses its own `verifyTenant`. `false` turns both off. A function, a class
+   * implementing `TenantVerifierContract`, or a lazy import of one.
+   */
+  verifyTenant?: TenantVerifierOption | false;
+  /**
+   * Sealed with `@adonis-agora/crypto` (or any KMS with `encrypt`/`decrypt`): commands arrive
+   * encrypted with a key (`console-durable` by default) that this app may `decrypt` and the console
+   * may `encrypt`. Automatic when `@adonis-agora/crypto` is booted here: set it only for another
+   * cipher (`() => crypto.client!`, a KMS wrapper with `owns` for its ciphertext format), or `false`
+   * to turn the automatic mode off. With an explicit `verifyTenant` too, each command must also carry
+   * a valid token; otherwise whoever may encrypt with the key is the console.
+   */
+  crypto?: ConsoleCryptoOptions | false;
+  /**
+   * Shared-secret mode (no authkit, no crypto): the secret this app and the console share (the
+   * console's `apps.<key>.controlPlane.secret`), at least 16 characters. Every command and answer carries an HMAC
+   * under it. Whoever holds it may run every console action on this app's runs (with `actions`).
+   */
+  secret?: string | { release(): string };
+  /**
+   * This app's partition: a classic tenant token (`verifyTenant`) must be for it. Defaults to this
+   * app's `@adonis-agora/crypto` partition, else its `namespace` (when set and not `'default'`). An
+   * authkit app-call token is bound to this app by its audience instead. On a `control-plane`, a
+   * token for a tenant app is accepted only when {@link apps} lists it, confined to its runs.
+   */
+  partition?: string;
+  /**
+   * On a `control-plane`: the tenant apps (partitions) whose runs, schedules and worker groups a
+   * command may touch, and whose own tenant tokens are accepted (each confined to its app's runs).
+   * `'*'`: every app. Omitted: the control plane's own runs only — acting across tenants takes an
+   * explicit list.
+   */
+  apps?: string[] | '*';
 }
 
 export interface BaseDurableConfig {
@@ -299,12 +364,16 @@ export interface BaseDurableConfig {
   /**
    * Answer the console commands another app's durable console sends over this app's control plane
    * (the federated console: `apps` in that app's `config/durable_dashboard.ts`). With it on, an action
-   * taken there on one of this app's runs — cancel, retry, signal, resume, schedule pause/trigger —
-   * is run by THIS app's engine, by exactly one of its instances. Needs a control plane that carries
-   * console commands (`controlPlanes.redis`). Anything that can publish on that Redis can then ask for
-   * those actions: the same trust the control plane's cancel messages already rely on. Default `false`.
+   * taken there on one of this app's runs — cancel, retry, signal, resume, approve a task, schedule
+   * pause/trigger — is run by THIS app's engine, by exactly one of its instances. Needs a control
+   * plane that carries console commands (`controlPlanes.redis`).
+   *
+   * Redis is not a trust boundary, so the commands are authenticated: automatically when
+   * `@adonis-agora/crypto` is booted here (`true` is then enough), else with `secret`, `verifyTenant`
+   * or `crypto` (see {@link DurableConsoleCommandsConfig}). With none, the boot fails (web) naming
+   * the line to add. Actions also need `actions: true`; reads are answered either way. Default: off.
    */
-  consoleCommands?: boolean;
+  consoleCommands?: boolean | DurableConsoleCommandsConfig;
   /**
    * Opt-in self-heal window (ms) for a remote step with no `timeoutMs` whose dispatched job was LOST
    * — the worker crashed mid-step, or the transport dropped the job (a store flush/eviction, or a

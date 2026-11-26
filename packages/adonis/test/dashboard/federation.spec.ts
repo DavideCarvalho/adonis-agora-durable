@@ -57,7 +57,7 @@ function setup() {
       ran.push(c);
       return h(c);
     });
-  answerConsoleCommands(ownerPlane, target, (line) => logged.push(line));
+  answerConsoleCommands(ownerPlane, target, (line) => logged.push(line), { actions: true });
 
   const storeA = new InMemoryStateStore();
   const engineA = new WorkflowEngine({ store: storeA, instanceId: 'a' });
@@ -127,7 +127,9 @@ describe('federated console', () => {
     await until(async () => (await engineB.getRun('b-run-2'))?.status === 'completed');
     expect((await engineB.getRun('b-run-2'))?.output).toEqual({ ok: true });
     expect(ran.map((c) => [c.verb, c.actor])).toEqual([['signal', 'ops@example.test']]);
-    expect(logged).toEqual(['[durable] federated console: signal approve by ops@example.test']);
+    expect(logged).toEqual([
+      '[@adonis-agora/durable] federated console: signal approve by ops@example.test',
+    ]);
     // The console app's own store never saw any of it.
     expect(await storeA.listRuns({})).toEqual([]);
   });

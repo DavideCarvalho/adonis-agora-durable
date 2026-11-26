@@ -1,5 +1,6 @@
 import { ListLoader } from '@adonisjs/core/ace';
 import AgoraDoctor from './agora_doctor.js';
+import DurableConsoleKey from './console_key.js';
 import DurableDoctor from './durable_doctor.js';
 import DurableWorker from './durable_worker.js';
 import DurableExport from './export_run.js';
@@ -35,7 +36,7 @@ import DurableWorkflowsLifecycle from './workflows_lifecycle.js';
  * kernel imports this module and treats it as a commands loader: a {@link ListLoader} over the durable
  * commands — the workers (`durable:work`, `durable:worker`), the operator commands that mirror the
  * console (`durable:runs*`, `durable:tasks:*`, `durable:schedules*`, `durable:workers`,
- * `durable:health`, `durable:workflows:lifecycle`, `durable:lifecycle:republish`), `durable:export`,
+ * `durable:health`, `durable:workflows:lifecycle`, `durable:lifecycle:republish`), `durable:console-key`, `durable:export`,
  * `make:workflow`, `agora:doctor` and `durable:doctor`.
  */
 export const DURABLE_COMMANDS = [
@@ -64,6 +65,7 @@ export const DURABLE_COMMANDS = [
   DurableHealth,
   DurableWorkflowsLifecycle,
   DurableLifecycleRepublish,
+  DurableConsoleKey,
   DurableExport,
   MakeWorkflow,
   AgoraDoctor,

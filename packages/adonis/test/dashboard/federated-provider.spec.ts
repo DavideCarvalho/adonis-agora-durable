@@ -59,9 +59,17 @@ describe('federated console — config', () => {
 describe('federated console — app selection in the provider', () => {
   const bus = consoleBus();
   const store = new InMemoryStateStore();
+  const secret = 'console-secret-0123456789';
   const apps = {
-    'entre-textos': { label: 'Entre Textos', store, controlPlane: bus.plane() },
-    eduliberta: { store: new InMemoryStateStore(), controlPlane: bus.plane() },
+    'entre-textos': {
+      label: 'Entre Textos',
+      store,
+      controlPlane: { ...bus.plane(), console: { secret } },
+    },
+    eduliberta: {
+      store: new InMemoryStateStore(),
+      controlPlane: { ...bus.plane(), console: { secret } },
+    },
   };
 
   it('reads ?app= against the configured apps and the authorize grant', async () => {
@@ -86,20 +94,31 @@ describe('federated console — app selection in the provider', () => {
     ]);
   });
 
-  it('says who runs actions: the app, unless its control plane cannot carry console commands', async () => {
+  it('says who runs actions: the app, unless its control plane cannot carry console commands or the console cannot authenticate them', async () => {
     const p = await provider();
     const { sendConsoleCommand: _send, ...browseOnly } = bus.plane();
     const config = resolveConfig({
       authorize: () => true,
       apps: {
         // A factory is not built to answer `/apps`: the shipped ones carry console commands.
-        factory: { store, controlPlane: async () => bus.plane() },
-        browse: { label: 'Browse only', store, controlPlane: browseOnly },
+        // The console-side options ride on the control plane (`controlPlanes.redis({ ..., secret })`).
+        factory: {
+          store,
+          controlPlane: Object.assign(async () => bus.plane(), { console: { secret } }),
+        },
+        browse: {
+          label: 'Browse only',
+          store,
+          controlPlane: { ...browseOnly, console: { secret } },
+        },
+        // No `secret`, `token` or `crypto`: the app would refuse every command, so none is offered.
+        unauthenticated: { store, controlPlane: async () => bus.plane() },
       },
     });
     expect(await p.visibleApps(config, ctxWith({}))).toEqual([
       { id: 'factory', label: 'factory', mode: 'federated', actions: 'app' },
       { id: 'browse', label: 'Browse only', mode: 'federated', actions: 'none' },
+      { id: 'unauthenticated', label: 'unauthenticated', mode: 'federated', actions: 'none' },
     ]);
   });
 

@@ -1,3 +1,4 @@
+import { workerStarted } from '../console-channel-start.js';
 import type { RunResult, WorkflowEngine } from '../index.js';
 import { withScheduleOrigin } from '../observability-scope.js';
 import {
@@ -294,6 +295,8 @@ export async function runWorkerLoop(
   // (see Transport.deferConsumers) — without this, a worker booted in a console environment would
   // poll the store but never claim broker jobs.
   engine.startConsumers();
+  // …and open the federated console's channel the app prepared at boot, when it answers one.
+  await workerStarted(engine);
   const drainTimeoutMs = options.drainTimeoutMs ?? 10_000;
   let stopped = false;
   let stoppedAt = 0;

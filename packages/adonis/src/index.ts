@@ -63,6 +63,27 @@ export type {
 } from './config_types.js';
 export * from './control-flow-signal.js';
 export {
+  CONSOLE_CRYPTO_KEY,
+  ConsoleChannelError,
+  type ConsoleCipher,
+  type ConsoleCipherSource,
+  type ConsoleCommandAuthOptions,
+  type ConsoleCryptoOptions,
+  type ConsoleSecret,
+  type ConsoleSideOptions,
+  type ConsoleTokenSource,
+  type ConsoleTokenVerifier,
+  consoleCommandPublicKey,
+  UNAUTHORIZED_CONSOLE,
+  UNSIGNED_CHANNEL,
+  type VerifiedConsole,
+} from './control-plane-redis/console-auth.js';
+export {
+  CONSOLE_AUTH_DOCS,
+  ConsoleAuthConfigError,
+  consoleKeyId,
+} from './control-plane-redis/console-resolve.js';
+export {
   type AdonisRedisPubSub,
   type IoredisPubSub,
   type IoredisSubscriber,
@@ -78,7 +99,7 @@ export type {
 // --- config-driven control-plane drivers ------------------------------------
 export { controlPlanes } from './control-planes/factory.js';
 export { DuplicateDurableCopyError, type DurableCopy } from './copy-guard.js';
-export type { DurableConfig } from './define_config.js';
+export type { DurableConfig, DurableConsoleCommandsConfig } from './define_config.js';
 // --- AdonisJS integration ---------------------------------------------------
 export { defineConfig } from './define_config.js';
 export * from './diagnostics-bridge.js';

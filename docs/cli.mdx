@@ -1,6 +1,6 @@
 ---
 title: CLI
-description: Ace commands for durable — the worker loops (durable:work, durable:worker), an operator command for everything the console does (runs, run actions, bulk, schedules, workers, health), durable:lifecycle:republish, durable:export for replay fixtures, and make:workflow.
+description: Ace commands for durable — the worker loops (durable:work, durable:worker), an operator command for everything the console does (runs, run actions, bulk, schedules, workers, health), durable:lifecycle:republish, durable:console-key, durable:export for replay fixtures, and make:workflow.
 icon: SquareTerminal
 ---
 
@@ -279,6 +279,15 @@ node ace durable:lifecycle:republish --workflow ingestion --kind failed \
 | `--subscriber` | Only this subscribing workflow. |
 
 `--run` refuses a run that has not settled. It prints how many runs it published and subscriber runs it started, then one line per subscriber it could not start (`--json` for the result object), and exits `1` when any failed or the flags name no target.
+
+## `durable:console-key` — the key a federated console seals to
+
+```sh
+node ace durable:console-key
+node ace durable:console-key --prefix=entretextos
+```
+
+Prints this app's console-command public key: what another app's [federated console](/docs/durable/observability/federated-console#with-authkit-explicit-token-mode) seals its actions (and its token) to in token mode, set there as `apps.<key>.publicKey`. It is derived from `APP_KEY` and the control plane's `prefix` (read from `controlPlanes.redis` in `config/durable.ts`, or `--prefix`), so every instance of the app has the same one, and a new `APP_KEY` changes it. Only the public half is printed; nothing connects to Redis. Exit code `1` without an `APP_KEY` or a prefix.
 
 ## `durable:export` — capture a replay fixture
 

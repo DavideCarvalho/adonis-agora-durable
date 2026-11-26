@@ -3,11 +3,32 @@ import type { ApplicationService } from '@adonisjs/core/types';
 import type { AdmissionContext } from '../src/admissions/factory.js';
 import { mergeSchedules, runWorkerLoop, type WorkerLogger } from '../src/commands/worker.js';
 import type { ControlPlaneConfig, TenantConfig } from '../src/config_types.js';
+import { startConsoleChannelWithWorker } from '../src/console-channel-start.js';
+import {
+  ConsoleChannelError,
+  type ConsoleTokenVerifier,
+  consoleCommandPublicKey,
+} from '../src/control-plane-redis/console-auth.js';
+import {
+  authkitClientOf,
+  cryptoRuntimeOf,
+  publishConsoleKey,
+} from '../src/control-plane-redis/console-crypto.js';
+import {
+  APP_UNAUTHENTICATED,
+  type AppConsoleResolution,
+  ConsoleAuthConfigError,
+  resolveAppConsoleAuth,
+} from '../src/control-plane-redis/console-resolve.js';
 import type { ControlPlaneContext } from '../src/control-planes/factory.js';
 import { sealDurableCopies } from '../src/copy-guard.js';
-import { answerConsoleCommands } from '../src/dashboard/federation.js';
+import {
+  answerConsoleCommands,
+  CAPABILITIES_REQUIRED,
+  consoleAppKey,
+} from '../src/dashboard/federation.js';
 import { storeDashboardEngine } from '../src/dashboard/gateway-adapter.js';
-import type { DurableConfig } from '../src/define_config.js';
+import type { DurableConfig, DurableConsoleCommandsConfig } from '../src/define_config.js';
 import { stopDiagnosticsDeliveries } from '../src/diagnostics/transport.js';
 import { discoveryRoots, type RootedBarrel } from '../src/discovery-roots.js';
 import { registerDoctorChecks } from '../src/doctor/agora_doctor.js';
@@ -118,6 +139,10 @@ export default class DurableProvider {
   /** The `transportPool` transports built alongside {@link #transport}, closed with it on shutdown. */
   #pooledTransports: Array<Transport & { close?: () => Promise<void> }> = [];
   #controlPlane: (ControlPlane & { close?: () => Promise<void> }) | null = null;
+  /** How this app answers the federated console, once it does (the doctor reads it). */
+  #consoleAnswering: AppConsoleResolution | undefined;
+  /** Opens the console channel prepared at boot (in `ready()`, or when a worker loop starts). */
+  #startConsoleCommands: (() => Promise<void>) | undefined;
   #responder: RunRequestResponder | null = null;
   /** Memoized tenant transport so the ProxyRunGateway + WorkerRuntime share ONE broker connection. */
   #tenantTransportPromise: Promise<Transport & { close?: () => Promise<void> }> | null = null;
@@ -262,18 +287,23 @@ export default class DurableProvider {
         transport.deferConsumers?.();
         for (const p of pooled) p.transport.deferConsumers?.();
       };
+      // Optional call: naive test doubles of ApplicationService may not carry getEnvironment.
+      const environment = this.app.getEnvironment?.();
+      const oneOff = environment === 'console' || environment === 'repl';
       if (config.consumers === 'never') {
         deferAll();
       } else if ((config.consumers ?? 'auto') === 'auto') {
-        // Optional call: naive test doubles of ApplicationService may not carry getEnvironment.
-        const environment = this.app.getEnvironment?.();
-        if (environment === 'console' || environment === 'repl') deferAll();
+        if (oneOff) deferAll();
       }
       // Hold the transport so `shutdown()` can release broker workers/connections cleanly.
       this.#transport = transport;
       const controlPlane = await this.#resolveControlPlane(config, ctx);
       // Hold the control plane so `shutdown()` can tear down its subscriber connection cleanly.
       this.#controlPlane = controlPlane;
+      // Like the consumers above: a console/REPL process (an ace command) publishes on the control
+      // plane but does not subscribe — a subscriber connection it opens would keep the command from
+      // exiting. `durable:work` subscribes when its loop starts (`engine.startConsumers()`).
+      if (oneOff && config.consumers !== 'always') controlPlane?.deferSubscriptions?.();
       const admission = await this.#resolveAdmission(config, ctx);
 
       const deps: WorkflowEngineDeps = {
@@ -533,7 +563,9 @@ export default class DurableProvider {
     // With nothing to do at all, the engine stays unbuilt (lazily resolvable on demand).
     const servesSteps =
       topology === 'standalone' && discoveryRoots(config.stepsPath, 'app/steps').length > 0;
-    if (config.consoleCommands) await this.#answerConsoleCommands();
+    // Resolved (and validated: a web boot fails here) now; the channel opens in `ready()` or when a
+    // worker loop starts, never in a one-off ace command.
+    if (config.consoleCommands) await this.#prepareConsoleCommands(config);
     if (workflowRoots.length === 0 && !servesSteps && topology !== 'control-plane') return;
     const engine = await this.app.container.make(WorkflowEngine);
     if (workflowRoots.length > 0) await this.#discoverWorkflows(engine, workflowRoots);
@@ -719,31 +751,197 @@ export default class DurableProvider {
 
   /**
    * Answer the console commands another app's federated console sends over this app's control plane
-   * (`consoleCommands: true`): its actions on this app's runs are run here, by this engine.
+   * (`consoleCommands`): its actions on this app's runs are run here, by this engine — once the
+   * command authenticates. Explicit options are used as given; otherwise `@adonis-agora/crypto`
+   * booted here seals them and `@adonis-agora/authkit-client`'s calls between apps verify a token,
+   * with no line of config. With no way to authenticate, the boot fails (web) and says how to fix it.
    */
-  async #answerConsoleCommands() {
-    const engine = await this.app.container.make(WorkflowEngine);
+  async #prepareConsoleCommands(config: DurableConfig) {
     const logger = await this.#resolveLogger();
+    // Always called ON the logger: a detached `logger.warn` loses `this` and throws.
+    const warn = (line: string): void => {
+      const target = logger as { warn?: (l: string) => void; error(l: string): void };
+      if (typeof target.warn === 'function') target.warn(line);
+      else target.error(line);
+    };
+    const web = this.app.getEnvironment?.() === 'web';
+    // A misconfiguration fails the boot where the console is served from (web); elsewhere it is one
+    // error line, and this process answers nothing (an ace command never fails for it).
+    const fail = (message: string): void => {
+      if (web) throw new ConsoleAuthConfigError(message);
+      logger.error(message);
+    };
+    const options: DurableConsoleCommandsConfig =
+      typeof config.consoleCommands === 'object' && config.consoleCommands !== null
+        ? config.consoleCommands
+        : {};
+    const topology = config.topology ?? 'standalone';
+    const resolveVerifier = (option: NonNullable<ControlPlaneConfig['verifyTenant']>) =>
+      resolveTenantVerifier(option, (Class) => this.app.container.make(Class));
+    // The control plane's own `verifyTenant`: the fallback token verifier there (safe: every verb
+    // needs a console capability a tenant token does not carry).
+    const fallbackOption =
+      topology === 'control-plane' ? (config as ControlPlaneConfig).verifyTenant : undefined;
+    const container = this.app.container as never;
+    const siblingCrypto = await cryptoRuntimeOf(container);
+    const cryptoRuntime = options.crypto === undefined ? siblingCrypto : undefined;
+    const authkitClient = await authkitClientOf(container);
+    const authkit = options.verifyTenant === undefined ? authkitClient : undefined;
+    const resolution = resolveAppConsoleAuth({
+      secret: options.secret,
+      crypto: options.crypto,
+      verifyTenant:
+        options.verifyTenant === false
+          ? false
+          : options.verifyTenant !== undefined
+            ? (resolveVerifier(options.verifyTenant) as ConsoleTokenVerifier)
+            : undefined,
+      fallbackVerifier:
+        fallbackOption && options.verifyTenant === undefined
+          ? (resolveVerifier(fallbackOption) as ConsoleTokenVerifier)
+          : undefined,
+      appKey: await this.#appKey(),
+      // The prefix the command key pair is derived from (the label shows its public key's short id).
+      prefix: controlPlanePrefix(config.controlPlane),
+      cryptoRuntime,
+      authkit,
+      log: (level, line) => (level === 'warn' ? warn(line) : logger.info(line)),
+    });
+    for (const line of resolution.warnings) warn(line);
+    if (!resolution.auth) {
+      fail(resolution.error ?? APP_UNAUTHENTICATED);
+      return;
+    }
+    const auth = resolution.auth;
+    // This app's partition, which a classic tenant token must be for: set, else its crypto
+    // partition, else its namespace.
+    const partition =
+      options.partition ??
+      siblingCrypto?.partition ??
+      (config.namespace !== undefined && config.namespace !== '' && config.namespace !== 'default'
+        ? config.namespace
+        : undefined);
+    // Which runs a command may touch on a control plane: every app's unless listed.
+    const apps = options.apps;
+    const actions = options.actions === true;
+    const engine = await this.app.container.make(WorkflowEngine);
+    let started = false;
+    const start = async (): Promise<void> => {
+      if (started) return;
+      started = true;
+      await this.#startConsoleChannel({
+        engine,
+        resolution,
+        auth,
+        apps,
+        partition,
+        actions,
+        ownNamespace: config.namespace ?? 'default',
+        confineRuns: topology === 'control-plane',
+        logger,
+        warn,
+        authkit: authkitClient,
+      });
+    };
+    this.#startConsoleCommands = start;
+    // A worker process (`durable:work`, in the console environment) answers once its loop starts.
+    startConsoleChannelWithWorker(engine, start);
+  }
+
+  /** Opens the console channel prepared at boot: subscribes, logs the mode, checks the key. */
+  async #startConsoleChannel(input: {
+    engine: WorkflowEngine;
+    resolution: AppConsoleResolution;
+    auth: NonNullable<AppConsoleResolution['auth']>;
+    apps: DurableConsoleCommandsConfig['apps'];
+    partition: string | undefined;
+    actions: boolean;
+    ownNamespace: string;
+    confineRuns: boolean;
+    logger: WorkerLogger;
+    warn: (line: string) => void;
+    authkit: Awaited<ReturnType<typeof authkitClientOf>>;
+  }): Promise<void> {
+    const { engine, resolution, auth, apps, partition, actions, logger, warn } = input;
+    const refusedReasons = new Set<string>();
     const controlPlane = this.#controlPlane;
     let answering: boolean;
     try {
       answering =
         !!controlPlane &&
-        answerConsoleCommands(controlPlane, storeDashboardEngine(engine), (line) =>
-          logger.info(line),
+        answerConsoleCommands(
+          controlPlane,
+          storeDashboardEngine(engine),
+          (line) => logger.info(line),
+          {
+            auth,
+            ...(apps !== undefined ? { apps } : {}),
+            ...(partition !== undefined ? { partition } : {}),
+            ownNamespace: input.ownNamespace,
+            actions,
+            confineRuns: input.confineRuns,
+            onError: (error) => {
+              // Once per reason: a flood of junk on Redis is one line, not one per message.
+              const reason =
+                error instanceof ConsoleChannelError && error.reason
+                  ? error.reason
+                  : (error as { code?: unknown } | null)?.code === CAPABILITIES_REQUIRED
+                    ? 'capabilities-required'
+                    : error instanceof Error
+                      ? error.message
+                      : String(error);
+              if (refusedReasons.has(reason)) return;
+              if (refusedReasons.size < 100) refusedReasons.add(reason);
+              warn(`[@adonis-agora/durable] console commands: refused a command (${reason})`);
+            },
+          },
         );
     } catch (err) {
-      // The control plane refused (no atomic claim): this app answers no console command at all.
+      // The control plane refused (no atomic claim, no authentication): it answers no command at all.
       logger.error(
-        `[durable] consoleCommands is on, but ${err instanceof Error ? err.message : String(err)}`,
+        `[@adonis-agora/durable] consoleCommands is on, but ${err instanceof Error ? err.message : String(err)}`,
       );
       return;
     }
     if (!answering) {
       logger.error(
-        '[durable] consoleCommands is on, but the control plane cannot carry console commands (use controlPlanes.redis)',
+        '[@adonis-agora/durable] consoleCommands is on, but the control plane cannot carry console commands (use controlPlanes.redis)',
       );
+      return;
     }
+    this.#consoleAnswering = resolution;
+    logger.info(
+      `[@adonis-agora/durable] console commands: ${resolution.modes.join(' + ')}; ${actions ? 'actions on' : 'actions off (set consoleCommands.actions to let the console act)'}`,
+    );
+    // The key is made sure of at boot, never failing it: created where crypto is embedded, checked
+    // (and created when its token may) on a crypto tenant; a failure logs one line and the next
+    // command tries again.
+    void resolution.checkKey?.().catch(() => undefined);
+    // Token mode: the console seals to this app's public key. Published to authkit's key directory
+    // when the authkit client has one (in the background, never failing the boot), so the console
+    // needs no `publicKey` line; else configured there from `node ace durable:console-key`. Never
+    // printed here, never handed out over Redis.
+    const prefix = (controlPlane as { prefix?: unknown }).prefix;
+    // With crypto active, crypto is enough: nothing is published (a console then picks crypto,
+    // §13a) and nothing is said (§13e; the doctor shows it) — unless crypto commands must carry a
+    // token too (explicit crypto + verifyTenant, migrating), as config does.
+    const appKey = auth.appKey;
+    const publish =
+      appKey !== undefined && (auth.crypto === undefined || auth.crypto.requireToken === true);
+    if (publish && typeof prefix === 'string') {
+      const published = publishConsoleKey(input.authkit, consoleCommandPublicKey(appKey, prefix));
+      if (!published && auth.secret === undefined && auth.crypto === undefined) {
+        // Token mode is this app's only way to be reached, and no console can find its key.
+        warn(
+          "[@adonis-agora/durable] console commands: token mode is this app's only way to be reached, but authkit-client's `service` is not configured, so its key is not in authkit's key directory: configure it, or give each console controlPlane.publicKey (`node ace durable:console-key` prints it)",
+        );
+      }
+    }
+  }
+
+  /** This app's key (see `appKeyOf`): what token-mode commands are sealed to. */
+  #appKey(): Promise<string | { release(): string } | undefined> {
+    return consoleAppKey(this.app);
   }
 
   /**
@@ -913,6 +1111,13 @@ export default class DurableProvider {
    */
   async ready() {
     if (this.#isWarmup()) return;
+    // The console channel opens once booted, where the app answers: the web server (and tests).
+    // A console/REPL process (an ace command) does not subscribe; `durable:work` opens it when its
+    // loop starts (see `startConsoleChannelWithWorker`).
+    const environment = this.app.getEnvironment?.();
+    if (environment !== 'console' && environment !== 'repl') {
+      await this.#startConsoleCommands?.();
+    }
     const config = this.app.config.get<DurableConfig>('durable', {});
     const topology = config.topology ?? 'standalone';
     if (topology === 'tenant') {
@@ -1000,4 +1205,10 @@ function parseRetention(
     if (age !== undefined) out[status] = parseDuration(age);
   }
   return out;
+}
+
+/** The console-command prefix of a configured control plane (`controlPlanes.redis({ prefix })`). */
+function controlPlanePrefix(plane: unknown): string {
+  const prefix = (plane as { prefix?: unknown } | null | undefined)?.prefix;
+  return typeof prefix === 'string' && prefix !== '' ? prefix : 'durable';
 }

@@ -1,3 +1,8 @@
+import type {
+  ConsoleCommandAuthOptions,
+  ConsoleSideOptions,
+  VerifiedConsole,
+} from './control-plane-redis/console-auth.js';
 import type { DispatchDiagnostics } from './dispatch-routing.js';
 import type { WorkerDescriptor } from './handshake/descriptor.js';
 import type {
@@ -2242,6 +2247,13 @@ export interface ControlPlane {
   publishControl(msg: ControlMessage, target?: ControlPublishTarget): Promise<void>;
   onControl(handler: (msg: ControlMessage) => void): void;
   /**
+   * Optional: hold the {@link onControl} subscription until {@link startSubscriptions} (a console or
+   * REPL process publishes, but must not open a subscriber connection nothing would close).
+   */
+  deferSubscriptions?(): void;
+  /** Optional: open the subscription {@link deferSubscriptions} held (a worker loop starting). */
+  startSubscriptions?(): void;
+  /**
    * Optional: adopt the engine's namespace, so a namespaced engine broadcasts on its own channel (the
    * Redis control plane folds it in like the BullMQ transport's names). Called once, before
    * {@link onControl}, and only when the engine has a namespace.
@@ -2253,38 +2265,72 @@ export interface ControlPlane {
    */
   observeAll?(): void;
   /**
+   * Optional (federated console, as another app's entry in a console's `apps`): how that console
+   * authenticates its commands to the app behind this plane ({@link ConsoleSideOptions}).
+   */
+  readonly console?: ConsoleSideOptions | undefined;
+  /**
    * Optional (federated console): send a {@link ConsoleCommand} to the app this control plane
    * belongs to and wait for the one instance that runs it to answer. Rejects when no instance of the
-   * app listens for console commands, or when none answers within `timeoutMs`.
+   * app listens for console commands, or when none answers within `timeoutMs`. `auth` says how the
+   * command is authenticated (the Redis control plane refuses to send without one); an answer that
+   * does not authenticate as the app's is ignored.
    */
   sendConsoleCommand?(
     command: ConsoleCommand,
-    options?: { timeoutMs?: number | undefined },
+    options?: {
+      timeoutMs?: number | undefined;
+      auth?: ConsoleCommandAuthOptions | undefined;
+      /** The app's name for the messages. */
+      app?: string | undefined;
+    },
   ): Promise<ConsoleCommandReply>;
   /**
    * Optional (federated console): run the {@link ConsoleCommand}s another app's console sends this
    * app. Exactly ONE instance of the app runs each command, however many listen. The handler's
-   * result (or its error) is the reply.
+   * result (or its error) is the reply. `auth` says which commands are authentic (the Redis control
+   * plane answers none without one); `onError` hears the ones refused.
    */
-  onConsoleCommand?(handler: (command: ConsoleCommand) => Promise<unknown>): void;
+  onConsoleCommand?(
+    handler: (command: ConsoleCommand) => Promise<unknown>,
+    options?: {
+      auth?: ConsoleCommandAuthOptions | undefined;
+      onError?: ((error: unknown) => void) | undefined;
+    },
+  ): void;
 }
 
 /**
  * A console action one app's durable console asks another app's engine to run (the federated
  * console): `verb` is a method of the console's read/control port, `args` its arguments. `actor` is
- * who asked, for the owning app's log line.
+ * who asked, for the owning app's log line (the console says so; it is not verified).
  */
 export interface ConsoleCommand {
   id: string;
   verb: string;
   args: unknown[];
   actor?: string | undefined;
+  /**
+   * What the console's viewer may do there (`durable:runs:write`, …): the console's `authorize`, or
+   * the full console set when it does not narrow. Authenticated with the command; the owning app
+   * refuses a command without them.
+   */
+  capabilities?: string[] | undefined;
+  /**
+   * Token mode: who the owning app verified the console as (its token's partition and
+   * capabilities). Set by the control plane after verification, never taken from the wire.
+   */
+  verified?: VerifiedConsole | undefined;
 }
 
 /** The answer to a {@link ConsoleCommand}. */
 export type ConsoleCommandReply =
   | { id: string; ok: true; data: unknown }
-  | { id: string; ok: false; error: { message: string; code?: string | undefined } };
+  | {
+      id: string;
+      ok: false;
+      error: { message: string; code?: string | undefined; status?: number | undefined };
+    };
 
 /** A message on the {@link ControlPlane}. `from` is the originating engine's `instanceId`, so a
  *  broker that echoes a publish back to its own subscriber (e.g. Redis pub/sub) can be deduped by

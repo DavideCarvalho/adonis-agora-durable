@@ -1,12 +1,11 @@
 import { Container } from '@adonisjs/core/container';
 import type { HttpContext } from '@adonisjs/core/http';
 import { describe, expect, it } from 'vitest';
+import type { ConsoleAuthorize, ConsoleAuthorizer } from '../../src/dashboard/console_authorize.js';
 import {
-  type ConsoleAuthorize,
-  type ConsoleAuthorizer,
   normalizeConsoleDecision,
-  resolveConsoleAuthorize,
-} from '../../src/dashboard/console_authorize.js';
+  resolveConsoleGate as resolveConsoleAuthorize,
+} from '../../src/dashboard/console_decision.js';
 import { defineConfig } from '../../src/dashboard/define_config.js';
 
 /** A container that builds `InjectedAccess` with its dependency — what `@inject()` does in an app. */

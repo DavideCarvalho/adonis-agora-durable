@@ -9,7 +9,7 @@ import { installOrgLabeler } from '@adonis-agora/authkit-client';
 import { IgnitorFactory } from '@adonisjs/core/factories';
 import type { HttpContext } from '@adonisjs/core/http';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { normalizeConsoleDecision } from '../../src/dashboard/console_authorize.js';
+import { normalizeConsoleDecision } from '../../src/dashboard/console_decision.js';
 import { storeDashboardEngine } from '../../src/dashboard/gateway-adapter.js';
 import {
   resolveConsoleTenantScope,
@@ -59,9 +59,10 @@ describe('resolveConsoleTenantScope', () => {
       allowed: true,
       tenants: '*',
     });
+    // Numbers are names too; empty entries are dropped (the shared contract).
     expect(normalizeConsoleDecision({ allowed: true, tenants: ['a', 1, ''] })).toEqual({
       allowed: true,
-      tenants: ['a'],
+      tenants: ['a', '1'],
     });
     expect(normalizeConsoleDecision(true)).toEqual({ allowed: true });
   });

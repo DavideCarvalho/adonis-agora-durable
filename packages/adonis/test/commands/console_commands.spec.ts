@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import type { BaseCommand } from '@adonisjs/core/ace';
 import { AceFactory } from '@adonisjs/core/factories/core/ace';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import DurableConsoleKey from '../../commands/console_key.js';
 import DurableHealth from '../../commands/health.js';
 import DurableLifecycleRepublish from '../../commands/lifecycle_republish.js';
 import { DURABLE_COMMANDS } from '../../commands/main.js';
@@ -30,6 +31,8 @@ import DurableTasksComplete from '../../commands/tasks_complete.js';
 import DurableTasksFail from '../../commands/tasks_fail.js';
 import DurableWorkers from '../../commands/workers.js';
 import DurableWorkflowsLifecycle from '../../commands/workflows_lifecycle.js';
+import { consoleCommandPublicKey } from '../../src/control-plane-redis/console-auth.js';
+import { controlPlanes } from '../../src/control-planes/factory.js';
 import type { DashboardAuditEntry } from '../../src/dashboard/define_config.js';
 import {
   type ControlMessage,
@@ -558,5 +561,36 @@ describe('--tenant with tenancy on', () => {
     const result = await exec(DurableRunsRetry, ['globex-1', '--tenant', 'acme']);
     expect(result.exitCode).toBe(1);
     expect(result.err).toContain('run globex-1 not found');
+  });
+});
+
+describe('durable:console-key', () => {
+  const APP_KEY = 'app-key-of-the-shop-0123456789';
+
+  it("prints the public key the console seals to, from the APP_KEY and the control plane's prefix", async () => {
+    ace.app.config.set('app.appKey', APP_KEY);
+    ace.app.config.set('durable', { controlPlane: controlPlanes.redis({ prefix: 'shop' }) });
+    const { out, exitCode } = await exec(DurableConsoleKey, []);
+    expect(exitCode).toBe(0);
+    expect(out.trim()).toBe(consoleCommandPublicKey(APP_KEY, 'shop'));
+    const flagged = await exec(DurableConsoleKey, ['--prefix', 'billing']);
+    expect(flagged.out.trim()).toBe(consoleCommandPublicKey(APP_KEY, 'billing'));
+    expect(flagged.out).not.toContain(APP_KEY);
+  });
+
+  it('refuses without an APP_KEY (none in config/app.ts, config/encryption.ts or the environment)', async () => {
+    ace.app.config.set('app.appKey', undefined);
+    const savedEncryption = ace.app.config.get('encryption', undefined);
+    ace.app.config.set('encryption', undefined);
+    const saved = process.env.APP_KEY;
+    delete process.env.APP_KEY;
+    try {
+      const { exitCode, err } = await exec(DurableConsoleKey, ['--prefix', 'shop']);
+      expect(exitCode).toBe(1);
+      expect(err).toMatch(/No APP_KEY/);
+    } finally {
+      ace.app.config.set('encryption', savedEncryption);
+      if (saved !== undefined) process.env.APP_KEY = saved;
+    }
   });
 });

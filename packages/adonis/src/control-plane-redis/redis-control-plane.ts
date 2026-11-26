@@ -9,6 +9,20 @@ import type {
 } from '../index.js';
 import { swallowSubscribe } from '../safe-subscribe.js';
 import { controlChannel, effectivePrefix } from '../transports/bullmq/naming.js';
+import {
+  ConsoleChannelError,
+  ConsoleCommandAuth,
+  type ConsoleCommandAuthOptions,
+  type ConsoleSideOptions,
+  type IncomingConsoleMessage,
+  type OutgoingConsoleMessage,
+  refusedCommand,
+  TOKEN_UNAVAILABLE,
+  UNAUTHORIZED_CONSOLE,
+  unsignedError,
+  type WireConsoleCommand,
+  type WireConsoleReply,
+} from './console-auth.js';
 
 /**
  * The raw-`ioredis` half of {@link RedisPubSub}. A real `Redis` instance is assignable to this.
@@ -89,6 +103,10 @@ export interface AdonisRedisPubSub {
   subscribe(channel: string, handler: (message: string) => void): unknown;
   /** Subscribe to a channel pattern; the handler receives the channel and each payload. */
   psubscribe?(pattern: string, handler: (channel: string, message: string) => void): unknown;
+  /** Drop `handler` from a channel (the channel itself once no handler is left). */
+  unsubscribe?(channel: string, handler?: (message: string) => void): unknown;
+  /** Drop `handler` from a pattern (the pattern itself once no handler is left). */
+  punsubscribe?(pattern: string, handler?: (channel: string, message: string) => void): unknown;
 }
 
 /**
@@ -139,6 +157,11 @@ export interface RedisControlPlaneOptions {
   /** An ioredis instance or an `@adonisjs/redis` connection used for pub/sub. */
   connection: RedisPubSub;
   /**
+   * As another app's entry in a federated console: how the console authenticates its commands to
+   * that app (see {@link ConsoleSideOptions}). Unused on an app's own control plane.
+   */
+  console?: ConsoleSideOptions | undefined;
+  /**
    * Key prefix namespacing the control channel. Defaults to `durable`. The channel is
    * `` `${prefix}-control` ``, or `` `${prefix}-${namespace}-control` `` for a set, non-`default`
    * {@link namespace} — the same folding as the BullMQ transport's names, matched EXACTLY to the
@@ -182,6 +205,8 @@ export interface RedisControlPlaneOptions {
 export const CONSOLE_COMMAND_TIMEOUT_MS = 15_000;
 /** How long the claim on a console command lives (longer than any answer is waited for). */
 const CONSOLE_CLAIM_TTL_MS = 120_000;
+/** At most this many command ids are remembered for replay detection (oldest dropped first). */
+const CONSOLE_RAN_IDS_MAX = 10_000;
 
 /** The `kind`s of a {@link ControlMessage}. */
 const CONTROL_KINDS: ReadonlySet<string> = new Set<ControlMessage['kind']>([
@@ -236,12 +261,21 @@ const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
  */
 export class RedisControlPlane implements ControlPlane {
   private readonly connection: RedisPubSub;
-  private readonly prefix: string;
+  /** The channel prefix (`durable` by default): what an app's console-command key is bound to. */
+  readonly prefix: string;
+  /** How a federated console authenticates to the app behind this plane (its entry's options). */
+  readonly console: ConsoleSideOptions;
   private namespace: string | undefined;
   private readonly explicitNamespace: boolean;
   /** Only ever set on the raw-ioredis path — it is the `duplicate()`d subscriber connection. */
   private subscriber: IoredisSubscriber | undefined;
   private subscribed = false;
+  /** Set by {@link deferSubscriptions}: `onControl` waits for {@link startSubscriptions}. */
+  private deferred = false;
+  private deferredControl: ((msg: ControlMessage) => void) | undefined;
+  /** What this plane subscribed on an `@adonisjs/redis` connection, to unsubscribe it on close. */
+  private readonly adonisChannels = new Map<string, (message: string) => void>();
+  private readonly adonisPatterns = new Map<string, (channel: string, message: string) => void>();
   private readonly observe: 'all' | 'own' | undefined;
   /** {@link observeAll} was called (the dashboard is mounted in this process). */
   private observeAllRequested = false;
@@ -258,10 +292,13 @@ export class RedisControlPlane implements ControlPlane {
   private readonly pendingCommands = new Map<string, (reply: ConsoleCommandReply) => void>();
   private repliesSubscribed: Promise<void> | undefined;
   private commandsSubscribed = false;
+  /** The console side's authentication, built once per `auth` options object (it caches a token). */
+  private readonly senderAuth = new WeakMap<ConsoleCommandAuthOptions, ConsoleCommandAuth>();
 
   constructor(options: RedisControlPlaneOptions) {
     this.connection = options.connection;
     this.prefix = options.prefix ?? 'durable';
+    this.console = options.console ?? {};
     this.namespace = options.namespace;
     this.observe = options.observe;
     this.explicitNamespace = options.namespace !== undefined;
@@ -342,7 +379,28 @@ export class RedisControlPlane implements ControlPlane {
     await this.connection.publish(channel, JSON.stringify(msg));
   }
 
+  /**
+   * Hold the control subscription until {@link startSubscriptions}: a console/REPL process (an ace
+   * command) publishes, but must not open a subscriber connection nothing would close.
+   */
+  deferSubscriptions(): void {
+    if (!this.subscribed) this.deferred = true;
+  }
+
+  /** Open the subscription {@link deferSubscriptions} held (a worker loop starting). */
+  startSubscriptions(): void {
+    if (!this.deferred) return;
+    this.deferred = false;
+    const handler = this.deferredControl;
+    this.deferredControl = undefined;
+    if (handler) this.onControl(handler);
+  }
+
   onControl(handler: (msg: ControlMessage) => void): void {
+    if (this.deferred) {
+      this.deferredControl = handler;
+      return;
+    }
     if (this.subscribed) return; // one subscription per control plane
     this.subscribed = true;
 
@@ -376,8 +434,10 @@ export class RedisControlPlane implements ControlPlane {
       const connection = this.connection;
       this.subscribePattern = (pattern) => {
         if (typeof connection.psubscribe !== 'function') return;
+        const onPattern = (_channel: string, payload: string) => deliver(payload, true);
+        this.adonisPatterns.set(pattern, onPattern);
         swallowSubscribe(
-          connection.psubscribe(pattern, (_channel, payload) => deliver(payload, true)),
+          connection.psubscribe(pattern, onPattern),
           () => this.closed,
           'control-plane',
         );
@@ -411,6 +471,7 @@ export class RedisControlPlane implements ControlPlane {
       this.channelHandlers.set(channel, handler);
       result = sub.subscribe(channel);
     } else {
+      this.adonisChannels.set(channel, handler);
       result = this.connection.subscribe(channel, handler);
     }
     swallowSubscribe(result, () => this.closed, 'control-plane');
@@ -433,21 +494,77 @@ export class RedisControlPlane implements ControlPlane {
    * Every instance of that app that runs console commands hears it; one claims it and answers.
    * Rejects at once when nobody listens on the app's console channel, and after `timeoutMs`
    * (default {@link CONSOLE_COMMAND_TIMEOUT_MS}) when nobody answers.
+   *
+   * Redis is not a trust boundary, so a command is never sent without `auth` (a shared `secret`, a
+   * `token` sealed to the app's `publicKey`, or `crypto`), and an answer that does not authenticate
+   * as the app's (someone else on Redis answering first) is ignored.
    */
   async sendConsoleCommand(
     command: ConsoleCommand,
-    options: { timeoutMs?: number | undefined } = {},
+    options: {
+      timeoutMs?: number | undefined;
+      auth?: ConsoleCommandAuthOptions | undefined;
+      /** The app's name for the messages (the console's key for it). Default: the prefix. */
+      app?: string | undefined;
+    } = {},
   ): Promise<ConsoleCommandReply> {
+    // The automatic choice (§13a) picks the authentication for this command; any failure (a
+    // timeout, a refusal, an error) drops it, so the next command decides again.
+    const chooser = options.auth?.choose ? options.auth : undefined;
+    if (!chooser) return this.sendChosen(command, options, undefined);
+    try {
+      try {
+        return await this.sendChosen(command, options, chooser);
+      } catch (error) {
+        // Token mode, but its token cannot be minted (no grant, authkit down): crypto reaches the
+        // app too, so this command (and the next ones, for a while) goes that way instead (§13b).
+        const instead =
+          error instanceof ConsoleChannelError && error.code === TOKEN_UNAVAILABLE
+            ? chooser.tokenUnavailable?.(error.reason ?? error.message)
+            : undefined;
+        if (!instead) throw error;
+        return await this.sendChosen(command, { ...options, auth: instead }, undefined);
+      }
+    } catch (error) {
+      // Any other failure (a timeout: an app that refused the mode drops the command) decides again.
+      chooser.rechoose?.();
+      throw error;
+    }
+  }
+
+  private async sendChosen(
+    command: ConsoleCommand,
+    options: {
+      timeoutMs?: number | undefined;
+      auth?: ConsoleCommandAuthOptions | undefined;
+      app?: string | undefined;
+    },
+    chooser: ConsoleCommandAuthOptions | undefined,
+  ): Promise<ConsoleCommandReply> {
+    const chosen = chooser ? await chooser.choose!() : options.auth;
+    const auth = chosen ? this.consoleAuthFor(chosen) : undefined;
+    if (!auth?.canSend) throw unsignedError(this.prefix);
+    let outgoing: OutgoingConsoleMessage;
+    try {
+      const { verified: _verified, ...fields } = command;
+      outgoing = await auth.wrap({ ...fields, args: encodeConsoleValue(command.args) });
+    } catch (err) {
+      if (err instanceof ConsoleChannelError) throw err;
+      throw new Error(
+        `could not prepare the console command for the "${this.prefix}" app: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
     if (!this.repliesSubscribed) {
       // The answer can come back within a millisecond: the subscription must be in place first.
       this.repliesSubscribed = this.subscribeChannel(this.consoleReplyChannel, (payload) => {
-        let reply: ConsoleCommandReply;
+        let reply: WireConsoleReply;
         try {
-          reply = JSON.parse(payload) as ConsoleCommandReply;
+          reply = JSON.parse(payload) as WireConsoleReply;
         } catch {
           return;
         }
-        this.pendingCommands.get(reply?.id)?.(reply);
+        if (typeof reply?.id !== 'string') return;
+        this.pendingCommands.get(reply.id)?.(reply as ConsoleCommandReply);
       });
     }
     await this.repliesSubscribed;
@@ -457,21 +574,29 @@ export class RedisControlPlane implements ControlPlane {
         this.pendingCommands.delete(command.id);
         reject(
           new Error(
-            `no instance of the "${this.prefix}" app answered the console command ${command.verb} within ${timeoutMs}ms`,
+            `no instance of "${options.app ?? this.prefix}" answered within ${timeoutMs / 1000}s — the app may have refused the command (check its logs, or run \`node ace agora:doctor\` there)`,
           ),
         );
       }, timeoutMs);
       timer.unref?.();
-      this.pendingCommands.set(command.id, (reply) => {
+      this.pendingCommands.set(command.id, (received) => {
+        const reply = received as WireConsoleReply;
+        // Closing settles every pending command with no MAC: that one is ours, not the wire's.
+        const closing = this.closed && !reply.ok && reply.mac === undefined;
+        // An answer without this command's MAC is someone else's (or forged): wait for the real one.
+        if (!closing && !outgoing.verifyReply(reply)) return;
         clearTimeout(timer);
         this.pendingCommands.delete(command.id);
-        resolve({ ...reply, ...(reply.ok ? { data: decodeConsoleValue(reply.data) } : {}) });
+        if (!reply.ok && reply.error?.code === UNAUTHORIZED_CONSOLE) auth.unauthorized();
+        const { mac: _mac, ...rest } = reply;
+        resolve(
+          rest.ok
+            ? { ...rest, data: decodeConsoleValue(rest.data) }
+            : (rest as ConsoleCommandReply),
+        );
       });
       const sent = Promise.resolve(
-        this.connection.publish(
-          this.consoleChannel,
-          JSON.stringify({ ...command, args: encodeConsoleValue(command.args) }),
-        ),
+        this.connection.publish(this.consoleChannel, JSON.stringify(outgoing.wire)),
       );
       sent.then(
         (receivers) => {
@@ -481,7 +606,7 @@ export class RedisControlPlane implements ControlPlane {
             this.pendingCommands.delete(command.id);
             reject(
               new Error(
-                `no instance of the "${this.prefix}" app listens for console commands (is it up, with \`consoleCommands: true\` in config/durable.ts?)`,
+                `no instance of the "${this.prefix}" app listens for console commands (is it up, with \`consoleCommands\` in config/durable.ts?)`,
               ),
             );
           }
@@ -495,14 +620,35 @@ export class RedisControlPlane implements ControlPlane {
     });
   }
 
+  /** The console side's {@link ConsoleCommandAuth} for `options`, made once. */
+  private consoleAuthFor(options: ConsoleCommandAuthOptions): ConsoleCommandAuth {
+    let auth = this.senderAuth.get(options);
+    if (!auth) {
+      auth = new ConsoleCommandAuth({ ...options, prefix: this.prefix });
+      this.senderAuth.set(options, auth);
+    }
+    return auth;
+  }
+
   /**
    * Run the console commands other apps' consoles send this app. Every instance subscribes; the one
    * that wins `SET <prefix>-console-claim:<id> NX` runs the command and publishes the answer, so a
    * command runs once however many web and worker processes the app has. Throws when the connection
-   * can't run that `SET` — a command is never run without the claim.
+   * can't run that `SET` — a command is never run without the claim — and when `auth` accepts no
+   * command at all (Redis is not a trust boundary: an unauthenticated command never runs).
    */
-  onConsoleCommand(handler: (command: ConsoleCommand) => Promise<unknown>): void {
+  onConsoleCommand(
+    handler: (command: ConsoleCommand) => Promise<unknown>,
+    options: {
+      auth?: ConsoleCommandAuthOptions | undefined;
+      onError?: ((error: unknown) => void) | undefined;
+    } = {},
+  ): void {
     if (this.commandsSubscribed) return;
+    const auth = options.auth
+      ? new ConsoleCommandAuth({ ...options.auth, prefix: this.prefix })
+      : undefined;
+    if (!auth?.canAnswer) throw unsignedError(this.prefix);
     // Fail closed: without an atomic claim every instance would run every command (a cancel or a
     // retry N times), so refuse to answer at all rather than answer without one.
     const claim = consoleClaim(this.connection);
@@ -513,43 +659,112 @@ export class RedisControlPlane implements ControlPlane {
     }
     this.commandsSubscribed = true;
     const instance = randomUUID();
+    // Never crash on a bad message: whatever a message does (garbage, forged, undecryptable, a
+    // throwing `onError`), it is reported and dropped, and the channel keeps serving.
+    const report = (error: unknown): void => {
+      try {
+        options.onError?.(error);
+      } catch {
+        // A failing reporter must not take the process down either.
+      }
+    };
     this.subscribeChannel(this.consoleChannel, (payload) => {
-      void this.runConsoleCommand(payload, instance, claim, handler).catch(() => undefined);
+      try {
+        void this.runConsoleCommand(payload, instance, claim, auth, handler).catch(report);
+      } catch (error) {
+        report(error);
+      }
     });
+  }
+
+  /** The console commands this instance ran, until their claim expires (bounded). */
+  private readonly ranCommands = new Map<string, number>();
+
+  private rememberRun(id: string): void {
+    const now = Date.now();
+    // Drop the expired ones, then the oldest while over the cap.
+    for (const [ran, until] of this.ranCommands) {
+      if (until > now && this.ranCommands.size < CONSOLE_RAN_IDS_MAX) break;
+      this.ranCommands.delete(ran);
+    }
+    this.ranCommands.set(id, now + CONSOLE_CLAIM_TTL_MS);
+  }
+
+  private ranCommand(id: string): boolean {
+    const until = this.ranCommands.get(id);
+    return until !== undefined && until > Date.now();
   }
 
   private async runConsoleCommand(
     payload: string,
     instance: string,
     claim: ConsoleClaim,
+    auth: ConsoleCommandAuth,
     handler: (command: ConsoleCommand) => Promise<unknown>,
   ): Promise<void> {
-    let command: ConsoleCommand;
+    let wire: Record<string, unknown>;
     try {
-      command = JSON.parse(payload) as ConsoleCommand;
+      wire = JSON.parse(payload) as Record<string, unknown>;
     } catch {
+      throw refusedCommand('not JSON');
+    }
+    if (!wire || typeof wire !== 'object' || Array.isArray(wire)) throw refusedCommand('not JSON');
+    if (typeof wire.id !== 'string' || wire.id === '') throw refusedCommand('no command id');
+    // Throws for a command no configured mode accepts: it never runs, and nobody is answered.
+    const incoming: IncomingConsoleMessage = await auth.unwrap(wire);
+    // One instance runs (or refuses) it; a replay inside the freshness window reuses the id, and the
+    // claim (kept 2 minutes) refuses it.
+    const won = await claim(`${this.prefix}-console-claim:${incoming.id}`, instance);
+    if (won !== 'OK') {
+      // Another instance's claim is the normal case (silent); a command this instance already ran
+      // coming back is a replay.
+      if (this.ranCommand(incoming.id)) throw refusedCommand('replayed');
       return;
     }
-    if (typeof command?.id !== 'string' || typeof command.verb !== 'string') return;
-    const won = await claim(`${this.prefix}-console-claim:${command.id}`, instance);
-    if (won !== 'OK') return;
-    let reply: ConsoleCommandReply;
+    this.rememberRun(incoming.id);
+    // MAC'd in its wire form (a run's `Date` fields become strings, `undefined` vanishes), or the
+    // console would compute another MAC and drop a genuine answer.
+    const answer = (reply: WireConsoleReply) =>
+      this.connection.publish(
+        this.consoleReplyChannel,
+        JSON.stringify(incoming.signReply(JSON.parse(JSON.stringify(reply)) as WireConsoleReply)),
+      );
+    if (!incoming.command) {
+      await answer({ id: incoming.id, ok: false, error: incoming.error! });
+      // Answered (the console drops its token), and logged here.
+      if (incoming.error?.code === UNAUTHORIZED_CONSOLE) throw refusedCommand('token refused');
+      return;
+    }
+    const command: WireConsoleCommand = incoming.command;
+    let reply: WireConsoleReply;
     try {
       const args = decodeConsoleValue(command.args);
-      const data = await handler({ ...command, args: Array.isArray(args) ? args : [] });
+      const data = await handler({
+        id: command.id,
+        verb: command.verb,
+        args: Array.isArray(args) ? args : [],
+        ...(typeof command.actor === 'string' ? { actor: command.actor } : {}),
+        ...(Array.isArray(command.capabilities)
+          ? {
+              capabilities: command.capabilities.filter((c): c is string => typeof c === 'string'),
+            }
+          : {}),
+        ...(command.verified ? { verified: command.verified } : {}),
+      });
       reply = { id: command.id, ok: true, data: encodeConsoleValue(data) };
     } catch (err) {
-      const code = (err as { code?: unknown } | null)?.code;
+      const { code, status } = (err ?? {}) as { code?: unknown; status?: unknown };
       reply = {
         id: command.id,
         ok: false,
         error: {
           message: err instanceof Error ? err.message : String(err),
           ...(typeof code === 'string' ? { code } : {}),
+          ...(typeof status === 'number' ? { status } : {}),
         },
       };
     }
-    await this.connection.publish(this.consoleReplyChannel, JSON.stringify(reply));
+    await answer(reply);
   }
 
   /**
@@ -639,5 +854,54 @@ export class RedisControlPlane implements ControlPlane {
     this.pingWatchdogTimer = undefined;
     this.subscriber?.disconnect?.();
     this.subscriber = undefined;
+    this.releaseAdonisSubscriptions();
+  }
+
+  /**
+   * `@adonisjs/redis` path: drop every channel and pattern this plane subscribed (its own handlers
+   * only), and when that leaves the connection's subscriber with nothing to listen to, close it — or
+   * the subscriber connection outlives the app, and an ace command never exits.
+   */
+  private releaseAdonisSubscriptions(): void {
+    if (isIoredisClient(this.connection)) return;
+    const connection = this.connection as AdonisRedisPubSub & {
+      subscriptions?: Map<string, unknown>;
+      psubscriptions?: Map<string, unknown>;
+      ioSubscriberConnection?: { status?: string; disconnect?(): void };
+    };
+    const quiet = (result: unknown) => {
+      Promise.resolve(result).catch(() => undefined);
+    };
+    for (const [channel, handler] of this.adonisChannels) {
+      try {
+        quiet(connection.unsubscribe?.(channel, handler));
+      } catch {
+        // A subscriber already gone: nothing to drop.
+      }
+    }
+    for (const [pattern, handler] of this.adonisPatterns) {
+      try {
+        quiet(connection.punsubscribe?.(pattern, handler));
+      } catch {
+        // Same.
+      }
+    }
+    const released = this.adonisChannels.size + this.adonisPatterns.size;
+    this.adonisChannels.clear();
+    this.adonisPatterns.clear();
+    if (released === 0) return;
+    // Nobody else subscribed on this connection: its subscriber was ours alone, so close it. Only
+    // when the connection says (`@adonisjs/redis` keeps its handlers per channel; an unsubscribed
+    // handler can leave an empty set behind). A connection that cannot tell is left alone.
+    const idle = (map: Map<string, unknown> | undefined): boolean | undefined =>
+      map instanceof Map
+        ? [...map.values()].every((handlers) => !(handlers instanceof Set) || handlers.size === 0)
+        : undefined;
+    const channelsIdle = idle(connection.subscriptions);
+    const patternsIdle = idle(connection.psubscriptions);
+    const sub = connection.ioSubscriberConnection;
+    if (channelsIdle === true && patternsIdle === true && sub && sub.status !== 'end') {
+      sub.disconnect?.();
+    }
   }
 }
