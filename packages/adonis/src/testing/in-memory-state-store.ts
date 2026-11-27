@@ -224,7 +224,9 @@ export class InMemoryStateStore implements StateStore {
       if (!wrote[k]) return;
       const cp = before.get(this.key(settlement.runId, settlement.seq)) as StepCheckpoint;
       const run = runs[k] as WorkflowRun;
-      const checkpoint: StepCheckpoint = { ...cp, ...settlement };
+      // Without the `wakeAt` the settle cleared (the pending row's lost-dispatch lease).
+      const { wakeAt: _lease, ...kept } = cp;
+      const checkpoint: StepCheckpoint = { ...kept, ...settlement };
       for (const field of ['output', 'error', 'events'] as const) {
         if (checkpoint[field] === undefined) delete checkpoint[field];
       }
@@ -465,7 +467,9 @@ export class InMemoryStateStore implements StateStore {
       const key = this.key(runId, seq);
       const row = this.checkpoints.get(key);
       if (row?.status !== 'pending') return false;
-      this.checkpoints.set(key, { ...row, ...settled });
+      // The pending row's `wakeAt` is its lost-dispatch lease, which ends with the settle.
+      const { wakeAt: _lease, ...kept } = row;
+      this.checkpoints.set(key, { ...kept, ...settled });
       return true;
     });
   }

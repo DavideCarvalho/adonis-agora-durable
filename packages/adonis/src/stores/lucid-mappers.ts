@@ -311,6 +311,9 @@ export const SETTLED_CHECKPOINT_COLUMNS = [
   'events',
   'started_at',
   'finished_at',
+  // Cleared: the `pending` row's `wakeAt` is its lost-dispatch lease, which ends when the step
+  // settles. Kept, a failed step's retry would take the lease as its backoff deadline (#599).
+  'wake_at',
 ] as const;
 
 export function settlementToRow(
@@ -323,6 +326,7 @@ export function settlementToRow(
     events: toJson(s.events),
     started_at: s.startedAt.getTime(),
     finished_at: s.finishedAt.getTime(),
+    wake_at: null,
   };
 }
 
