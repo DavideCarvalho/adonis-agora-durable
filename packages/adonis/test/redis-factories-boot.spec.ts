@@ -50,7 +50,15 @@ describe('Redis-backed factories at provider boot', () => {
     await controlPlanes.redis({ connection: 'pubsub', prefix: 'app' })({ app });
     expect(connections).toEqual(['pubsub']);
     expect(built).toEqual([
-      { kind: 'control-plane', options: { connection: { name: 'pubsub' }, prefix: 'app' } },
+      {
+        kind: 'control-plane',
+        options: {
+          connection: { name: 'pubsub' },
+          prefix: 'app',
+          // The sealer `controlPlanes.redis()` resolves from the app (plain here: no APP_KEY).
+          messages: expect.objectContaining({ mode: 'plain' }),
+        },
+      },
     ]);
   });
 

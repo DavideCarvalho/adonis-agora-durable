@@ -7,9 +7,11 @@ description: >-
   controlPlanes.redis broadcast channel, the lucid StateStore (published
   migration delegating to createDurableTables, autoSchema, repair warning,
   updateRunIf compare-and-set), CodecStateStore payload encryption with a
-  PayloadCodec, and namespace vs partition isolation. Use when moving steps
-  across processes, persisting runs durably, sharing one database/broker
-  between pools, or encrypting payloads at rest.
+  PayloadCodec, broker messages sealed by default (APP_KEY / crypto, the
+  `messages` option, acceptPlain, upgrading from 1.1), and namespace vs
+  partition isolation. Use when moving steps across processes, persisting runs
+  durably, sharing one database/broker between pools, or encrypting payloads
+  at rest or on the broker.
 license: MIT
 metadata:
   type: core
@@ -21,6 +23,7 @@ sources:
   - 'DavideCarvalho/adonis-durable:docs/transports/queue.mdx'
   - 'DavideCarvalho/adonis-durable:docs/transports/db.mdx'
   - 'DavideCarvalho/adonis-durable:docs/transports/control-plane.mdx'
+  - 'DavideCarvalho/adonis-durable:docs/transports/encrypting-messages.mdx'
   - 'DavideCarvalho/adonis-durable:docs/stores/index.mdx'
   - 'DavideCarvalho/adonis-durable:docs/stores/lucid.mdx'
   - 'DavideCarvalho/adonis-durable:docs/cluster/interop.mdx'
@@ -348,6 +351,26 @@ to the old non-atomic scan and the engine warns once naming `StateStore.tryAdmit
 
 Source: `docs/stores/lucid.mdx`, `docs/stores/index.mdx`.
 
+### Pattern 5 — broker messages are sealed (nothing to configure)
+
+Every broker transport and `controlPlanes.redis` encrypt the data of a run with
+a key derived from `APP_KEY` (a crypto `durable-messages` key between a tenant
+and its control plane); routing fields stay in clear. Overrides go on each
+transport's `messages` option:
+
+```ts
+import { transports } from '@adonis-agora/durable'
+
+// Refuse plain messages once no job from before the upgrade is queued (acceptPlain defaults true in 1.x).
+transports.bullmq({
+  connection: { host: '127.0.0.1', port: 6379 },
+  messages: { acceptPlain: false },
+})
+```
+
+Modes, what is sealed, refusals and the rollout from 1.1:
+[encrypting messages](references/encrypting-messages.md).
+
 ## Common mistakes
 
 ### HIGH blocking the event loop longer than `stalledThresholdMs`
@@ -432,6 +455,14 @@ path DOES repair (autoSchema on), it logs a one-time "repaired the durable
 schema in place" warning meaning exactly this — the database was behind and the
 fix was never recorded in migration history. Source: `docs/stores/lucid.mdx`
 ("The repair warning").
+
+### HIGH rolling a 1.1 fleet to sealed messages in one deploy
+
+Wrong: upgrading web pods while 1.1 workers still consume, nothing else changed.
+Correct: stop old processes first, or deploy twice — first with
+`messages: { insecure: true }` (sends plain, already opens sealed), then without.
+Mechanism: a 1.1 worker does not know the `sealed` field and runs the handler
+with `input` undefined. Source: `docs/transports/encrypting-messages.mdx`.
 
 ### MEDIUM wrapping a store in CodecStateStore and expecting heartbeats
 

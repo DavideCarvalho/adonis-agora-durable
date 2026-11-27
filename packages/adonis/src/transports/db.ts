@@ -24,6 +24,14 @@ import {
   type WorkflowStepEvent,
   type WorkflowTask,
 } from '../interfaces.js';
+import { sealerOf, type TransportMessagesOptions } from '../messages/resolve.js';
+import {
+  isMessageRejected,
+  isSealedMessage,
+  type MessageSealer,
+  SEALED_FIELD,
+  type MessageKind as SealedKind,
+} from '../messages/sealer.js';
 import { atLeastOne, Pollers, type PollLoop } from '../pollers.js';
 import { runStepHandler, type StepHandler, withTurnHeartbeat } from '../protocol.js';
 import {
@@ -315,6 +323,13 @@ export interface DbTransportOptions {
   /** How often (ms) an instance that addressed rows deletes those whose recipient is gone (a dead pod,
    *  an engine that crashed awaiting a decision). Default 30000; `0` disables the janitor. */
   inboxSweepIntervalMs?: number;
+  /**
+   * How this transport seals its messages (see "Encrypting messages"): a ready sealer (what
+   * `transports.db()` builds from the app), or the options. Default: sealed with a key derived from
+   * `process.env.APP_KEY` when it is set, else plain. Sealed rows keep their routing columns and
+   * carry the rest (input, context, output, error, events, message payloads) encrypted.
+   */
+  messages?: MessageSealer | TransportMessagesOptions | undefined;
 }
 
 /**
@@ -397,6 +412,11 @@ export class DbTransport implements Transport, ControlPlane {
   /** Result rounds in a handler (see {@link onResult}): waited for by {@link stop}, like tasks. */
   readonly #settlingRounds = new Set<Promise<void>>();
   readonly #resultConcurrency: number;
+  /** Seals what this transport writes and opens what it reads. */
+  readonly #messages: MessageSealer;
+  /** Run requests / starts that arrived plain (by correlation id): their replies go back plain. A
+   *  start is answered with its run id as the reply's `requestId`, so both are looked up there. */
+  readonly #plainRequests = new Set<string>();
   readonly #idleBackoffMax: number;
   readonly #maxStalledCount: number;
   readonly #onError: (err: unknown) => void;
@@ -444,6 +464,7 @@ export class DbTransport implements Transport, ControlPlane {
   #messagesTableReported = false;
 
   constructor(options: DbTransportOptions) {
+    this.#messages = sealerOf(options.messages, 'db');
     this.#db = options.db;
     this.#partition = options.partition;
     this.#namespace = options.namespace;
@@ -539,6 +560,16 @@ export class DbTransport implements Transport, ControlPlane {
     return Date.now();
   }
 
+  /** The opened message, or `undefined` when it is refused (logged once by the sealer). */
+  async #openOrDrop<T>(kind: SealedKind, raw: unknown): Promise<T | undefined> {
+    try {
+      return await this.#messages.open<T>(kind, raw);
+    } catch (err) {
+      if (isMessageRejected(err)) return undefined;
+      throw err;
+    }
+  }
+
   #ensureSchema(): Promise<void> {
     if (!this.#autoCreate) return Promise.resolve();
     if (!this.#schemaReady)
@@ -566,6 +597,7 @@ export class DbTransport implements Transport, ControlPlane {
     if (tasks.length === 0) return;
     await this.#ensureSchema();
     const withPriority = await this.#hasTaskColumn('priority');
+    const sealed = await Promise.all(tasks.map((task) => this.#messages.seal('task', task)));
     const createdAt = this.#now();
     // `onConflict().ignore()` is a Knex feature not surfaced on Lucid's insert contract, so we use
     // the underlying Knex builder (`.knexQuery`).
@@ -574,16 +606,17 @@ export class DbTransport implements Transport, ControlPlane {
         .insertQuery()
         .table(this.#t.tasks)
         .knexQuery.insert(
-          tasks.slice(at, at + TASK_INSERT_CHUNK).map((task) => ({
+          sealed.slice(at, at + TASK_INSERT_CHUNK).map((task) => ({
             step_id: task.stepId,
             run_id: task.runId,
             seq: task.seq,
             name: task.name,
             grp: task.group,
             namespace: this.#namespaceValue(),
-            input: toJson(task.input),
+            // Sealed: the input column carries the seal, the context column nothing.
+            input: isSealedMessage(task) ? sealedColumn(task) : toJson(task.input),
             traceparent: task.traceparent ?? null,
-            context: toJson(task.context),
+            context: isSealedMessage(task) ? null : toJson(task.context),
             transport: task.transport ?? null,
             attempt: task.attempt,
             ...(withPriority ? { priority: toDbPriority(task.priority) } : {}),
@@ -787,18 +820,45 @@ export class DbTransport implements Transport, ControlPlane {
    */
   async #runTask(row: TaskRow, token: string): Promise<void> {
     if (row.kind === 'workflow') return this.#runWorkflowRow(row, token);
-    const task: RemoteTask = {
+    const input = fromJson<unknown>(row.input);
+    const seal = sealOfColumn(input);
+    const stored = {
       runId: row.run_id,
       seq: Number(row.seq),
       stepId: row.step_id,
       name: row.name,
       group: row.grp,
-      input: fromJson(row.input),
       attempt: Number(row.attempt),
       ...(row.traceparent != null ? { traceparent: row.traceparent } : {}),
-      ...(row.context != null ? { context: fromJson(row.context) } : {}),
       ...(row.transport != null ? { transport: row.transport } : {}),
     };
+    // Replies go back in kind: a plain task (from a process not upgraded yet) gets a plain result,
+    // which that process can read, instead of a sealed one it would misread.
+    const sealed = seal !== undefined;
+    let task: RemoteTask;
+    try {
+      task = await this.#messages.open<RemoteTask>(
+        'task',
+        seal !== undefined
+          ? { ...stored, [SEALED_FIELD]: seal }
+          : {
+              ...stored,
+              input,
+              ...(row.context != null ? { context: fromJson(row.context) } : {}),
+            },
+      );
+    } catch (err) {
+      if (!isMessageRejected(err)) throw err;
+      // Refused (logged once): settled as a failed step (retryable) so its run does not wait on it.
+      this.#release(this.#t.tasks, token, row.step_id);
+      await this.#settleTask(
+        row.step_id,
+        token,
+        infrastructureFailure(stored, `message refused: ${err.message}`),
+        sealed,
+      ).catch((settleErr: unknown) => this.#onError(settleErr));
+      return;
+    }
     try {
       if (row.reclaims != null && Number(row.reclaims) > this.#maxStalledCount) {
         // Its workers keep dying on it (or blocking past the lease): running it again would just
@@ -808,6 +868,7 @@ export class DbTransport implements Transport, ControlPlane {
           task.stepId,
           token,
           infrastructureFailure(task, `claim lapsed more than ${this.#maxStalledCount} times`),
+          sealed,
         );
         return;
       }
@@ -834,7 +895,7 @@ export class DbTransport implements Transport, ControlPlane {
         // Stop renewing before settling: the settle deletes the row, and a renewal racing it would
         // count the row as lost.
         this.#release(this.#t.tasks, token, task.stepId);
-        if (!(await this.#settleTask(task.stepId, token, result))) {
+        if (!(await this.#settleTask(task.stepId, token, result, sealed))) {
           if (this.#handedBack.has(token)) {
             this.#onError(
               new Error(
@@ -874,10 +935,14 @@ export class DbTransport implements Transport, ControlPlane {
     try {
       let task: WorkflowTask;
       let replyTo: string | undefined;
+      let sealed = true;
       try {
         const payload = fromJson<WorkflowTaskPayload>(row.input);
         if (!payload) throw new Error('empty payload');
-        ({ replyTo, ...task } = payload);
+        let raw: unknown;
+        ({ replyTo, ...raw } = payload as WorkflowTaskPayload & Record<string, unknown>);
+        sealed = isSealedMessage(raw);
+        task = await this.#messages.open<WorkflowTask>('workflowTask', raw);
       } catch (err) {
         this.#release(this.#t.tasks, token, id);
         await this.#deleteClaimed(this.#t.tasks, 'step_id', id, token);
@@ -912,7 +977,7 @@ export class DbTransport implements Transport, ControlPlane {
       try {
         const decision = await this.#replayTurn(task);
         this.#release(this.#t.tasks, token, id);
-        if (!(await this.#settleWorkflow(id, token, decision, replyTo))) {
+        if (!(await this.#settleWorkflow(id, token, decision, replyTo, sealed))) {
           this.#onError(
             new Error(
               this.#handedBack.has(token)
@@ -968,6 +1033,7 @@ export class DbTransport implements Transport, ControlPlane {
     token: string,
     decision: WorkflowDecision,
     replyTo: string | undefined,
+    sealed = true,
   ): Promise<boolean> {
     const settled = await this.#client().transaction(async (trx) => {
       const deleted = await trx
@@ -979,7 +1045,7 @@ export class DbTransport implements Transport, ControlPlane {
       if (Number(deleted) === 0) return false;
       await this.#insertMessages(
         MESSAGE_KINDS.decision,
-        [{ recipient: replyTo ?? '', payload: decision }],
+        [{ recipient: replyTo ?? '', payload: decision, plain: !sealed }],
         trx,
       );
       return true;
@@ -1019,7 +1085,12 @@ export class DbTransport implements Transport, ControlPlane {
    * the claim: an instance whose claim was taken over neither deletes the new holder's row nor writes
    * a second result. Resolves whether this instance settled it.
    */
-  async #settleTask(stepId: string, token: string, result: StepResult): Promise<boolean> {
+  async #settleTask(
+    stepId: string,
+    token: string,
+    result: StepResult,
+    sealed = true,
+  ): Promise<boolean> {
     return this.#client().transaction(async (trx) => {
       const deleted = await trx
         .knexQuery()
@@ -1028,12 +1099,18 @@ export class DbTransport implements Transport, ControlPlane {
         .where('claimed_by', token)
         .delete();
       if (Number(deleted) === 0) return false;
-      await this.#insertResult(result, trx);
+      await this.#insertResult(result, trx, sealed);
       return true;
     });
   }
 
-  async #insertResult(result: StepResult, client: Client = this.#client()): Promise<void> {
+  async #insertResult(
+    plain: StepResult,
+    client: Client = this.#client(),
+    seal = true,
+  ): Promise<void> {
+    const result = seal ? await this.#messages.seal('result', plain) : plain;
+    const sealed = isSealedMessage(result);
     await client
       .insertQuery()
       .table(this.#t.results)
@@ -1043,10 +1120,11 @@ export class DbTransport implements Transport, ControlPlane {
         seq: result.seq,
         status: result.status,
         namespace: this.#namespaceValue(),
-        output: toJson(result.output),
-        error: toJson(result.error),
+        // Sealed: the error column carries the seal, output and events nothing.
+        output: sealed ? null : toJson(result.output),
+        error: sealed ? sealedColumn(result) : toJson(result.error),
         started_at: result.startedAt ?? null,
-        events: toJson(result.events),
+        events: sealed ? null : toJson(result.events),
         claimed_by: null,
         claimed_at: null,
         created_at: this.#now(),
@@ -1075,16 +1153,28 @@ export class DbTransport implements Transport, ControlPlane {
         await Promise.all(
           rows.map(async (row) => {
             try {
-              await handler({
+              const error = fromJson<unknown>(row.error);
+              const seal = sealOfColumn(error);
+              const stored = {
                 runId: row.run_id,
                 seq: Number(row.seq),
                 stepId: row.step_id,
                 status: row.status as StepResult['status'],
-                output: fromJson(row.output),
-                error: fromJson(row.error),
-                startedAt: row.started_at == null ? undefined : Number(row.started_at),
-                events: fromJson(row.events),
-              });
+                ...(row.started_at == null ? {} : { startedAt: Number(row.started_at) }),
+              };
+              const result = await this.#openOrDrop<StepResult>(
+                'result',
+                seal !== undefined
+                  ? { ...stored, [SEALED_FIELD]: seal }
+                  : {
+                      ...stored,
+                      output: fromJson(row.output),
+                      error,
+                      events: fromJson(row.events),
+                    },
+              );
+              // A refused result (logged once) is deleted like a handled one.
+              if (result) await handler(result);
               done.push(row.step_id);
             } catch (err) {
               // Left claimed, and no longer renewed: delivered again once its lease lapses.
@@ -1213,7 +1303,7 @@ export class DbTransport implements Transport, ControlPlane {
     await this.#client()
       .table(this.#t.control)
       .insert({
-        payload: JSON.stringify(stamped),
+        payload: JSON.stringify(await this.#messages.seal('control', stamped)),
         namespace: this.#namespaceValue(),
         claimed_by: null,
         claimed_at: null,
@@ -1225,7 +1315,7 @@ export class DbTransport implements Transport, ControlPlane {
     this.#startLoop(
       async () =>
         (await this.#drain<ControlRow>(this.#t.control, 'id', 1, async (row) => {
-          const msg = fromJson<ControlPayload>(row.payload);
+          const msg = await this.#openOrDrop<ControlPayload>('control', fromJson(row.payload));
           if (msg) handler(msg);
         })) > 0,
       this.#idleBackoffMax,
@@ -1276,22 +1366,30 @@ export class DbTransport implements Transport, ControlPlane {
   /** Insert `rows` of `kind` in one statement. */
   async #insertMessages(
     kind: MessageKind,
-    rows: Array<{ recipient?: string; replyTo?: string; payload: unknown }>,
+    rows: Array<{ recipient?: string; replyTo?: string; payload: unknown; plain?: boolean }>,
     client: Client = this.#client(),
     namespace: string = this.#namespaceValue(),
   ): Promise<void> {
     if (rows.length === 0) return;
     const at = this.#now();
+    const sealedKind = sealedKindOf(kind);
+    const payloads = await Promise.all(
+      rows.map((row) =>
+        sealedKind && !row.plain && row.payload !== null && typeof row.payload === 'object'
+          ? this.#messages.seal(sealedKind, row.payload)
+          : row.payload,
+      ),
+    );
     await client
       .insertQuery()
       .table(this.#t.messages)
       .knexQuery.insert(
-        rows.map((row) => ({
+        rows.map((row, i) => ({
           kind,
           namespace,
           recipient: row.recipient ?? '',
           reply_to: row.replyTo ?? null,
-          payload: JSON.stringify(row.payload),
+          payload: JSON.stringify(payloads[i]),
           claimed_by: null,
           claimed_at: null,
           created_at: at,
@@ -1336,6 +1434,29 @@ export class DbTransport implements Transport, ControlPlane {
               new Error(`[DbTransport] dropped ${kind} message ${row.id}: ${String(err)}`),
             );
             return;
+          }
+          const sealedKind = sealedKindOf(kind);
+          if (sealedKind) {
+            // A refused message (logged once) is deleted like a handled one.
+            const opened = await this.#openOrDrop<T>(sealedKind, payload);
+            if (opened === undefined) return;
+            // A plain request (from a process not upgraded yet) gets a plain reply.
+            if (!isSealedMessage(payload)) {
+              const id =
+                kind === MESSAGE_KINDS.runRequest
+                  ? (opened as { requestId?: unknown }).requestId
+                  : kind === MESSAGE_KINDS.startRun
+                    ? (opened as { runId?: unknown }).runId
+                    : undefined;
+              if (typeof id === 'string') {
+                if (this.#plainRequests.size >= 10_000) {
+                  const oldest = this.#plainRequests.values().next().value;
+                  if (oldest !== undefined) this.#plainRequests.delete(oldest);
+                }
+                this.#plainRequests.add(id);
+              }
+            }
+            payload = opened;
           }
           await each(payload, row);
         },
@@ -1423,7 +1544,7 @@ export class DbTransport implements Transport, ControlPlane {
       );
     }
     const payload: WorkflowTaskPayload = {
-      ...task,
+      ...(await this.#messages.seal('workflowTask', task)),
       ...(this.#decisionHandlers.size > 0 ? { replyTo: this.#instanceId } : {}),
     };
     await this.#client()
@@ -1683,7 +1804,9 @@ export class DbTransport implements Transport, ControlPlane {
       return;
     }
     if (!(await this.#messagesReady(true))) return;
-    await this.#insertMessages(MESSAGE_KINDS.runReply, [{ recipient: owner, payload: reply }]);
+    await this.#insertMessages(MESSAGE_KINDS.runReply, [
+      { recipient: owner, payload: reply, plain: this.#plainRequests.delete(reply.requestId) },
+    ]);
     this.#noteAddressed();
   }
 
@@ -2271,4 +2394,27 @@ async function eachLimited<T>(
   };
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, lane));
   if (failure) throw failure.err;
+}
+
+/** The key a sealed row's data column holds its seal under. */
+const DB_SEAL = '$durableSealed';
+
+/** The data column of a sealed row: `{"$durableSealed": "dm1.…"}`. */
+function sealedColumn(msg: object): string {
+  return JSON.stringify({ [DB_SEAL]: (msg as Record<string, unknown>)[SEALED_FIELD] });
+}
+
+/** The seal a data column carries, if it is a sealed row's. */
+function sealOfColumn(value: unknown): string | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const keys = Object.keys(value);
+  const seal = (value as Record<string, unknown>)[DB_SEAL];
+  return keys.length === 1 && typeof seal === 'string' && seal.startsWith('dm1.')
+    ? seal
+    : undefined;
+}
+
+/** The sealed message kind of a messages-table row kind (`run` rows carry only a run id). */
+function sealedKindOf(kind: MessageKind): SealedKind | undefined {
+  return kind === MESSAGE_KINDS.run ? undefined : kind;
 }

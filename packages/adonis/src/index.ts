@@ -126,6 +126,20 @@ export * from './handshake/negotiate.js';
 export * from './handshake/routing.js';
 export * from './interfaces.js';
 export * from './lifecycle-events.js';
+export type {
+  MessageCipherSource,
+  MessagesCryptoOptions,
+  TransportMessagesOptions,
+} from './messages/resolve.js';
+export {
+  isMessageRejected,
+  type MessageCipher,
+  type MessageKind as SealedMessageKind,
+  MessageRejectedError,
+  type MessageRejection,
+  type MessageSealer,
+  type MessageSecret,
+} from './messages/sealer.js';
 export * from './metrics.js';
 export { asHeartbeat, withScheduleOrigin } from './observability-scope.js';
 export * from './on-error.js';

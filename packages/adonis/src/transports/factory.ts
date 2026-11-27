@@ -1,6 +1,7 @@
 import type { Database } from '@adonisjs/lucid/database';
 import type { AdapterFactory } from '@adonisjs/queue/types';
 import type { ControlPlane, Transport } from '../interfaces.js';
+import { resolveMessageSealer, type TransportMessagesOptions } from '../messages/resolve.js';
 import { resolveLucidDatabase } from '../resolve-lucid-db.js';
 import { hintStack } from '../stack.js';
 import { InMemoryTransport } from '../testing/in-memory-transport.js';
@@ -32,6 +33,11 @@ export interface TransportContext {
    * its own `schema` creates and reads (the Lucid store, the db transport, the worker-key table).
    */
   schema?: string | undefined;
+  /**
+   * The transport's key in `config.transports` (`bullmq`, `jobs`, …): names it in the messages boot
+   * line and errors. Set by the provider.
+   */
+  name?: string | undefined;
 }
 
 /** A transport option that falls back to the provider-forwarded top-level value. */
@@ -176,6 +182,13 @@ export interface QueueTransportConfig {
   tenantSubscribersCacheMs?: number;
   /** How often (ms) a control plane drains the inboxes of tenant pods that died. Default 30000; `0` off. */
   inboxSweepIntervalMs?: number;
+  /**
+   * How this transport seals its messages. Nothing set: encrypted with a key derived from the app's
+   * `APP_KEY` (between a tenant and its control plane: an `@adonis-agora/crypto` key). `secret` (HMAC,
+   * readable), `crypto: { cipher }` (explicit key or your own KMS), `crypto: false` / `insecure: true`
+   * (plain), `acceptPlain` (default `true` in 1.x). See "Encrypting messages".
+   */
+  messages?: TransportMessagesOptions;
 }
 
 /**
@@ -326,6 +339,13 @@ export interface BullMQTransportConfig {
    * the interval (default `60_000`).
    */
   taskQueueDrain?: boolean | { intervalMs?: number };
+  /**
+   * How this transport seals its messages. Nothing set: encrypted with a key derived from the app's
+   * `APP_KEY` (between a tenant and its control plane: an `@adonis-agora/crypto` key). `secret` (HMAC,
+   * readable), `crypto: { cipher }` (explicit key or your own KMS), `crypto: false` / `insecure: true`
+   * (plain), `acceptPlain` (default `true` in 1.x). See "Encrypting messages".
+   */
+  messages?: TransportMessagesOptions;
 }
 
 /** Options for the DB-table-backed (`@adonisjs/lucid`) transport. */
@@ -407,6 +427,13 @@ export interface DbTransportConfig {
   /** How often (ms) an instance deletes the rows it addressed to instances that are gone. Default
    *  30000; `0` off. */
   inboxSweepIntervalMs?: number;
+  /**
+   * How this transport seals its messages. Nothing set: encrypted with a key derived from the app's
+   * `APP_KEY` (between a tenant and its control plane: an `@adonis-agora/crypto` key). `secret` (HMAC,
+   * readable), `crypto: { cipher }` (explicit key or your own KMS), `crypto: false` / `insecure: true`
+   * (plain), `acceptPlain` (default `true` in 1.x). See "Encrypting messages".
+   */
+  messages?: TransportMessagesOptions;
 }
 
 /**
@@ -464,6 +491,14 @@ async function resolveQueueAdapter(
   return typeof entry === 'function' ? entry : entry.resolver(ctx.app);
 }
 
+/** The `messages` options travel with the factory: the doctor reads them without building it. */
+function describeMessages(
+  factory: TransportFactory,
+  messages: TransportMessagesOptions | undefined,
+) {
+  Object.defineProperty(factory, 'messages', { value: messages ?? {}, enumerable: false });
+}
+
 export const transports = {
   /**
    * The test-only in-process transport + control plane (the engine's default when no `transport` is
@@ -496,8 +531,13 @@ export const transports = {
       const { QueueTransport } = await import('./queue.js');
       const adapter = config.adapter ?? (await resolveQueueAdapter(ctx, config.connection));
       const workerKeys = await queueWorkerKeys(ctx, config);
+      const messages = await resolveMessageSealer(
+        { app: ctx.app, name: ctx.name ?? 'queue' },
+        config.messages,
+      );
       return new QueueTransport({
         adapter,
+        messages,
         ...(workerKeys !== undefined ? { workerKeys } : {}),
         ...(config.workerKeysCacheMs !== undefined
           ? { workerKeysCacheMs: config.workerKeysCacheMs }
@@ -535,6 +575,7 @@ export const transports = {
           : {}),
       });
     };
+    describeMessages(factory, config.messages);
     // The queue backend itself is config/queue.ts's (an opaque adapter); the worker keys are ours.
     return hintStack(
       factory,
@@ -572,8 +613,13 @@ export const transports = {
         config.workerRegistry?.connection !== undefined
           ? await createBullMQDeps(config.workerRegistry.connection)
           : undefined;
+      const messages = await resolveMessageSealer(
+        { app: ctx.app, name: ctx.name ?? 'bullmq' },
+        config.messages,
+      );
       return new BullMQTransport({
         deps,
+        messages,
         ...(config.concurrency !== undefined ? { concurrency: config.concurrency } : {}),
         ...inherited('partition', config.partition, ctx),
         ...(config.prefix !== undefined ? { prefix: config.prefix } : {}),
@@ -609,6 +655,7 @@ export const transports = {
           : {}),
       });
     };
+    describeMessages(factory, config.messages);
     return hintStack(factory, [
       { kind: 'ioredis', connection: config.connection, label: 'bullmq', purpose: 'queues' },
       ...(config.workerRegistry?.connection !== undefined
@@ -629,8 +676,13 @@ export const transports = {
     const factory: TransportFactory = async (ctx) => {
       const db = (await resolveLucidDatabase(ctx)) as Database;
       const { DbTransport } = await import('./db.js');
+      const messages = await resolveMessageSealer(
+        { app: ctx.app, name: ctx.name ?? 'db' },
+        config.messages,
+      );
       return new DbTransport({
         db,
+        messages,
         ...inherited('partition', config.partition, ctx),
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
         ...(config.connection !== undefined ? { connectionName: config.connection } : {}),
@@ -665,6 +717,7 @@ export const transports = {
           : {}),
       });
     };
+    describeMessages(factory, config.messages);
     return hintStack(factory, [
       { kind: 'lucid', connection: config.connection, purpose: 'queues' },
     ]);

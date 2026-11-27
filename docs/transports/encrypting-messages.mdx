@@ -1,0 +1,157 @@
+---
+title: Encrypting messages
+description: Every message durable puts on a broker (step inputs and results, heartbeats, workflow turns and decisions, tenant requests and replies, control broadcasts) is encrypted and authenticated with a key derived from the app's APP_KEY, or with an @adonis-agora/crypto key between a tenant and its control plane. Nothing to configure.
+icon: LockKeyhole
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+A broker is not a trust boundary. Whoever can read Redis, the `@adonisjs/queue` backend or the `db` transport's tables (a shared instance, a leaked password, a backup, an SSRF) would otherwise read every step's input and output, and whoever can write there could hand a worker a step of their choosing or settle someone else's step. So durable seals what it puts on a transport:
+
+- **Encrypted**: the data of a run (input, output, error, progress, workflow history, signal payloads, tenant tokens, request and reply bodies, engine events) is encrypted with AES-256-GCM. Nothing of it is readable on the broker.
+- **Authenticated**: a message that was not sealed with the key, was changed, or was moved into another run, step or message kind is refused.
+- **Routable**: the fields a broker routes on (run id, step id, handler name, group, attempt, priority) stay in clear, and are bound into the authentication.
+
+This covers messages in transit and while they wait on the broker. To encrypt what the **store** keeps (run inputs, checkpoints), see [Encrypting payloads at rest](/docs/durable/stores#encrypting-payloads-at-rest).
+
+## Same app: nothing to configure
+
+The processes of one app (web, `durable:work` workers, schedulers) share its `APP_KEY`. With nothing configured, every broker transport (`transports.bullmq`, `transports.queue`, `transports.db`) and `controlPlanes.redis` seal their messages with a key derived from it:
+
+```ts title="config/durable.ts"
+transports: {
+  bullmq: transports.bullmq({ connection: 'main' }), // sealed with the app key
+},
+controlPlane: controlPlanes.redis({ connection: 'main' }), // sealed too
+```
+
+- **Key**: AES-256-GCM, derived from `APP_KEY` with HKDF-SHA256 (purpose `agora:durable:messages`). No crypto server, no key to create, no grant.
+- **Where `APP_KEY` comes from**: `config/app.ts`'s `appKey`, else the default entry of `config/encryption.ts`, else the `APP_KEY` environment variable, the same way in every Agora lib. A string or a `Secret`, at least 16 characters, never logged.
+- **Boot**: each transport logs its mode once: `[@adonis-agora/durable] bullmq messages: app key (auto)` (`control plane messages: …` for the control plane).
+- **Without an `APP_KEY`**: the transport stays plain and says so at boot (a warning naming the fix). Boot never fails for it.
+- **Thin workers** built without AdonisJS (`new BullMQTransport({ ... })` in a [worker runtime](/docs/durable/cluster/thin-workers)) use `process.env.APP_KEY` the same way, or `messages: { appKey }`.
+- `memory` and `eventEmitter` keep everything in one process: nothing to seal.
+
+## Between a tenant and its control plane: `@adonis-agora/crypto`
+
+A [tenant pod](/docs/durable/cluster) and its control plane are different apps with different `APP_KEY`s. When `@adonis-agora/crypto` is booted in both (detected through its `agora.crypto` binding, never imported), their messages are sealed with the crypto key **`durable-messages` of the tenant's partition**, with no line of config:
+
+- The **control plane** needs crypto **embedded** (the Agora Hub setup): it seals and opens in each tenant's partition, and creates `durable-messages` there the first time it talks to that tenant.
+- A **tenant** seals and opens with its own crypto client, in its own partition only. Its client needs `crypto:encrypt:durable-messages` and `crypto:decrypt:durable-messages`. If the key is missing at boot, the tenant creates it when its client may (`crypto:keys:manage:durable-messages`), else logs the command to run on the crypto server: `node ace crypto:keys:create durable-messages --type aes256-gcm --application <partition>`.
+- The tenant's durable partition (`tenant.partition`, the suffix of its routing groups) must be its crypto partition.
+- One tenant cannot open another's messages: each is sealed in its own partition.
+- Boot line: `[@adonis-agora/durable] bullmq messages: crypto (auto, key durable-messages, partition acme)`.
+
+Each process seals a random session key with the crypto key once an hour (per tenant, on the control plane) and encrypts its messages locally with it; a receiver opens each session key once and caches it. The crypto server sees a few calls an hour, not one per message.
+
+Without crypto on both sides, a tenant ↔ control-plane transport stays plain and warns at boot; set `secret` or `crypto` explicitly (below) to seal it.
+
+## Options
+
+Every broker transport and `controlPlanes.redis` take a `messages` option, the same modes as the other Agora libs' channels. Explicit options win over the automatic mode.
+
+```ts title="config/durable.ts"
+transports: {
+  bullmq: transports.bullmq({
+    connection: 'main',
+    messages: {
+      acceptPlain: false, // refuse plain messages (the default of the next major)
+    },
+  }),
+},
+controlPlane: controlPlanes.redis({ messages: { acceptPlain: false } }),
+```
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| (nothing) | | Encrypted with the app key; between a tenant and its control plane, with the `durable-messages` crypto key. |
+| `secret` | | A shared secret (16+ characters, a string or a `Secret`), the same in every process: each message carries an HMAC-SHA256. **Authenticated, but readable** on the broker. For processes of several apps without crypto. |
+| `crypto: { cipher, key?, owns? }` | | Encrypt with an `@adonis-agora/crypto` key (`() => crypto.client!`) or your own KMS (anything with `encrypt` / `decrypt`). Every process needs both on the key (default name `durable-messages`). `owns` recognizes the cipher's ciphertexts (default `agora:ct1:<key>:`). |
+| `crypto: false` | | Turns the automatic mode off: plain (warns at boot). |
+| `insecure: true` | `false` | Plain messages (the wire of earlier versions; warns at boot). Still opens sealed messages when this process has the key, which is what makes it the first step of a rolling upgrade. |
+| `acceptPlain` | `true` | Accept plain messages (jobs queued before the upgrade, processes not upgraded yet), logged once per process and kind. `false` refuses them. |
+| `appKey` | `process.env.APP_KEY` | The key of a transport built without AdonisJS. |
+
+| | `APP_KEY` (automatic) | Shared secret | `@adonis-agora/crypto` |
+| --- | --- | --- | --- |
+| For | the processes of one app | any processes | a tenant and its control plane (automatic), or any processes (explicit) |
+| Config | none | `messages: { secret }` in every process | none between a tenant and the Hub; `messages: { crypto: { cipher } }` otherwise |
+| Messages | encrypted | readable, authenticated | encrypted |
+| Rotation | rotate `APP_KEY` | rotate the secret everywhere | crypto's `crypto:keys:rotate` and audit |
+
+```ts title="config/durable.ts (your own KMS)"
+const kms = {
+  encrypt: async ({ key, plaintext, aad }) => ({ ciphertext: await myKms.encrypt(key, plaintext, aad) }),
+  decrypt: async ({ key, ciphertext, aad }) => ({ plaintext: await myKms.decrypt(key, ciphertext, aad) }),
+}
+
+bullmq: transports.bullmq({
+  connection: 'main',
+  messages: { crypto: { cipher: kms, key: 'durable', owns: (c) => c.startsWith('kms:') } },
+}),
+```
+
+None of `@adonis-agora/authkit`, `@adonis-agora/authz` or `@adonis-agora/crypto` is required: the automatic mode needs only the app's `APP_KEY`.
+
+## What is sealed
+
+A sealed message keeps its routing fields in clear and carries everything else in one `sealed` field, `dm1.<mode>.…` (`k` app key, `c` crypto, `s` secret). The AAD binds it to the message kind and the identity fields listed here, so a sealed input cannot be replayed into another step, run or kind.
+
+| Message | Transports | Clear (identity in **bold**) | Sealed |
+| --- | --- | --- | --- |
+| Step task (`RemoteTask`) | all | **runId, seq, stepId, name, group**, attempt, priority, transport, replyTo, traceparent | input, context |
+| Step result (`StepResult`) | all | **runId, seq, stepId, status**, startedAt | output, error, events |
+| Heartbeat | bullmq, queue | **runId, seq, stepId, group**, at | progress |
+| Workflow turn (`WorkflowTask`) | all | **taskId, runId, workflow, group**, workflowVersion, attempt, priority | input, history, pending signals |
+| Workflow decision (child starts included) | all | **taskId, runId, status** | commands, output, error |
+| Live step event | all | **runId, seq, name, phase**, startedAt, finishedAt | output, error, events |
+| Start run (tenant → control plane) | all | **workflow, runId** | tenant token, input, tags, search attributes |
+| Run request (signals, updates, cancels, reads) | all | **requestId** | tenant token, body |
+| Run reply | all | **requestId** | result |
+| Tenant event | all | **tenant** | event |
+| Control message (events, cancel, nudges, schedule pauses) | `controlPlanes.redis`, queue, db | **from** | kind, run id, event |
+
+On the `db` transport a sealed row keeps its routing columns and stores the seal in its data column (`input` for a task, `error` for a result: `{"$durableSealed": "dm1.…"}`), the other data columns empty; heartbeat rows carry no data there.
+
+Not sealed, as they carry no run data: worker liveness and descriptor keys, run-dispatch nudges (a run id), inbox registrations. The [federated console](/docs/durable/observability/federated-console) channel is authenticated on its own.
+
+## When a message is refused
+
+A message that does not open (another key, tampered, moved, or plain with `acceptPlain: false`) is never retried, since retrying would not change the verdict, and is logged once per process, kind and reason (error code `E_DURABLE_MESSAGE_REJECTED`):
+
+- **A step task**: its handler does not run, and the step is reported **failed (retryable)** with the reason, so its run follows its retry policy instead of waiting. On BullMQ the job also stays in the failed set for a day.
+- **Anything else** (result, heartbeat, decision, event, request, reply, control): dropped. The step or request then recovers as a lost message does (step timeout, `remoteRedispatchMs`, the request's timeout).
+
+A process never crashes on a message it cannot open.
+
+Changing `APP_KEY` changes the key: jobs sealed before the change are refused (a step is reported failed and retried with the new key), and during a rolling deploy processes on the old and new key refuse each other's messages.
+
+## Upgrading from 1.1 or earlier
+
+Messages are sealed from this version on, and a process **on an earlier version cannot read a sealed message**: it does not know the `sealed` field and sees only the clear fields. Here is what happens in a mixed fleet, checked against 1.1.1 on one Redis:
+
+- **Old sender → new receiver: works.** Plain messages are accepted by default (logged once per kind), and replies go back **in kind**: a plain task gets a plain result, a plain run request a plain reply, so the old process reads them.
+- **New sender → old worker: unsafe.** A sealed step task reaching a 1.1 worker runs its handler with `input` `undefined` (and no context), and the result it returns is taken as the step's.
+- **New control plane → old tenant pod**: sealed tasks as above. On BullMQ, sealed tenant events go on a channel of their own, so an old pod misses them (live tail only) instead of misreading them; on `queue` and `db` the old pod's handler fails on them and reports it through `onError`.
+- **New tenant → old control plane**: a sealed start or run request carries no token it can read: it is answered `unauthorized`.
+- **Control messages** from a new instance carry no readable kind: an old instance ignores them.
+
+So no 1.1 process may receive what an upgraded one sends. Pick one:
+
+1. **Stop, then start** (recreate deploys): stop every old process before starting new ones. Jobs queued by the old version are plain and accepted.
+2. **Two deploys** (rolling, zero downtime):
+   1. Deploy this version with `messages: { insecure: true }` on every transport and on `controlPlanes.redis`. Processes still send plain, and already open sealed messages.
+   2. Once no old process is left, remove `insecure`. Messages are sealed from then on.
+3. **Later**, once the queues hold no job from before the upgrade, set `acceptPlain: false` everywhere: plain messages are then refused. `node ace agora:doctor` warns while a transport still accepts them.
+
+<Callout type="warn">
+Strict (`acceptPlain: false`) becomes the default in the next major. Plan the switch now: the doctor's `durable.messages` check tells you which transports still accept plain messages.
+</Callout>
+
+## NestJS and Python workers
+
+The NestJS `nestjs-durable` transport and the Python worker read plain messages only. A BullMQ transport (and a control plane) shared with them must stay plain: `messages: { insecure: true }`.
+
+## Doctor
+
+`node ace agora:doctor` reports each broker transport's mode under `durable.messages`: `app key (auto)`, `secret`, `crypto (…)`, or `plain` with the reason and the fix. It warns for a plain transport and for one that still accepts plain messages, and errors when a transport sets more than one mode.

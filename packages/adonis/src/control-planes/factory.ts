@@ -1,5 +1,6 @@
 import type { ConsoleSideOptions } from '../control-plane-redis/console-auth.js';
 import type { ControlPlane } from '../interfaces.js';
+import { resolveMessageSealer, type TransportMessagesOptions } from '../messages/resolve.js';
 import { resolveRedisService } from '../redis-service.js';
 import { hintStack } from '../stack.js';
 
@@ -60,6 +61,12 @@ export interface RedisControlPlaneConfig extends ConsoleSideOptions {
    * disables it. Default `30_000`.
    */
   pingIntervalMs?: number | false;
+  /**
+   * How control messages (engine events, cancels, schedule pauses) are sealed: the same options as a
+   * transport's `messages` (see "Encrypting messages"). Nothing set: encrypted with a key derived
+   * from the app's `APP_KEY`. The console channel (`secret` / `crypto` / `token` above) is separate.
+   */
+  messages?: TransportMessagesOptions;
 }
 
 /** The console-side options of a control plane's config (see {@link ConsoleSideOptions}). */
@@ -103,8 +110,13 @@ export const controlPlanes = {
       const { RedisControlPlane } = await import('../control-plane-redis/redis-control-plane.js');
       const redis = await resolveRedisService(ctx);
       const connection = redis.connection(config.connection ?? 'main') as never;
+      const messages = await resolveMessageSealer(
+        { app: ctx.app, name: 'control plane' },
+        config.messages,
+      );
       return new RedisControlPlane({
         connection,
+        messages,
         ...(config.prefix !== undefined ? { prefix: config.prefix } : {}),
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
         ...(config.observe !== undefined ? { observe: config.observe } : {}),
@@ -120,6 +132,7 @@ export const controlPlanes = {
     });
     // A federated console reads how to authenticate to this app without building the plane.
     Object.defineProperty(factory, 'console', { value: consoleSide, enumerable: false });
+    Object.defineProperty(factory, 'messages', { value: config.messages ?? {}, enumerable: false });
     return hintStack(factory, [
       { kind: 'redis', connection: config.connection, purpose: 'control plane' },
     ]);

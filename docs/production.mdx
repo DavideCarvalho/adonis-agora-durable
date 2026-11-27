@@ -318,6 +318,10 @@ On `bullmq`, two worker-side guards complete the picture. `stepTimeoutMs` puts a
 
 ## 12. Encrypt payloads at rest
 
+Messages on the broker are already sealed with the app's `APP_KEY` (or an `@adonis-agora/crypto` key between a tenant and its control plane): check `node ace agora:doctor`'s `durable.messages`, and once no job from an earlier version is queued, set `messages: { acceptPlain: false }` on each transport. See [Encrypting messages](/docs/durable/transports/encrypting-messages), including the rolling-upgrade order from 1.1.
+
+What the store keeps is a separate matter.
+
 Run and step inputs and outputs are stored as JSON. To keep them out of the database in the clear, wrap the store in `CodecStateStore` with your own `PayloadCodec` — and know that the default coverage leaves step events, error messages and heartbeat progress unencoded unless you opt into `coverage: 'extended'`. See [Encrypting payloads at rest](/docs/durable/stores#encrypting-payloads-at-rest).
 
 ## 13. Guard each run at the boundary

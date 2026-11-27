@@ -1096,7 +1096,7 @@ export default class DurableProvider {
         `@agora/durable: config.transport is "${name}", but config.transports.${name} is not defined`,
       );
     }
-    return factory(ctx);
+    return factory({ ...ctx, name });
   }
 
   /**
