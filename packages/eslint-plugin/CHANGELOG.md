@@ -1,5 +1,11 @@
 # @adonis-agora/durable-eslint-plugin
 
+## 1.0.2
+
+### Patch Changes
+
+- [#625](https://github.com/DavideCarvalho/adonis-agora-durable/pull/625) [`3e566cf`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/3e566cf477823255c7069757691a47a0be1d48a5) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Type `configs.recommended` as ESLint's `Linter.Config` instead of `Record<string, unknown>`, and type the default export as an ESLint `Plugin` too. Spreading the preset, passing it to `extends`, and registering the plugin by hand now typecheck in a typed flat config (`Linter.Config[]`, `defineConfig`). Runtime behaviour is unchanged.
+
 ## 1.0.1
 
 ### Patch Changes
