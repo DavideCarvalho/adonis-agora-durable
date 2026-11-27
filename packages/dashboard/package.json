@@ -23,7 +23,7 @@
     "tanstack-intent",
     "agora"
   ],
-  "author": "Davi Carvalho <davi@goflip.ai>",
+  "author": "Davi Carvalho <davi_carvalho96@hotmail.com>",
   "type": "module",
   "sideEffects": [
     "*.css",

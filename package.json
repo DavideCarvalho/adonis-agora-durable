@@ -8,7 +8,7 @@
     "type": "git",
     "url": "git+https://github.com/DavideCarvalho/adonis-agora-durable.git"
   },
-  "author": "Davi Carvalho <davi@goflip.ai>",
+  "author": "Davi Carvalho <davi_carvalho96@hotmail.com>",
   "packageManager": "pnpm@12.23.0",
   "engines": {
     "node": ">=24"
