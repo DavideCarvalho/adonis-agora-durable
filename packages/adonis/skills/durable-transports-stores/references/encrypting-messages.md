@@ -27,11 +27,17 @@ declare const kms: {
   decrypt(i: { key: string; ciphertext: string; aad?: string }): Promise<{ plaintext: string }>
 }
 
-transports.bullmq({ connection: 'main', messages: { secret: 'a-shared-secret-of-16+' } }) // HMAC, readable
+transports.bullmq({
+  connection: { host: '127.0.0.1', port: 6379 },
+  messages: { secret: 'a-shared-secret-of-16+' },
+}) // HMAC, readable
 transports.queue({ messages: { crypto: { cipher: kms, key: 'durable' } } }) // explicit key / KMS
 transports.db({ messages: { crypto: false } }) // automatic mode off: plain
 controlPlanes.redis({ messages: { insecure: true } }) // plain (opens sealed when it has the key)
-transports.bullmq({ connection: 'main', messages: { acceptPlain: false } }) // refuse plain
+transports.bullmq({
+  connection: { host: '127.0.0.1', port: 6379 },
+  messages: { acceptPlain: false },
+}) // refuse plain
 ```
 
 `acceptPlain` defaults to `true` in 1.x (each plain kind logged once per process; the doctor's

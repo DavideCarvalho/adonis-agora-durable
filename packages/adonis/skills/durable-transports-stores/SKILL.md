@@ -361,8 +361,11 @@ transport's `messages` option:
 ```ts
 import { transports } from '@adonis-agora/durable'
 
-// Refuse plain messages once no job from before the upgrade is queued (default true in 1.x).
-transports.bullmq({ connection: 'main', messages: { acceptPlain: false } })
+// Refuse plain messages once no job from before the upgrade is queued (acceptPlain defaults true in 1.x).
+transports.bullmq({
+  connection: { host: '127.0.0.1', port: 6379 },
+  messages: { acceptPlain: false },
+})
 ```
 
 Modes, what is sealed, refusals and the rollout from 1.1:
