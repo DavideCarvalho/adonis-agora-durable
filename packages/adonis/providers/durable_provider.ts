@@ -579,7 +579,7 @@ export default class DurableProvider {
     const topology = config.topology ?? 'standalone';
     if (topology === 'tenant') {
       // A web pod with no partition (none set, none from authkit-client) fails its boot here, naming
-      // both fixes. A worker fails when `durable:work` builds its runtime; other ace commands never.
+      // both fixes. A worker fails when `durable:worker` builds its runtime; other ace commands never.
       if (this.app.getEnvironment?.() === 'web') await this.#tenantIdentity(config as TenantConfig);
       return;
     }

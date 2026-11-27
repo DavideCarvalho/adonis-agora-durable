@@ -1,5 +1,6 @@
 import { BaseCommand } from '@adonisjs/core/ace';
 import type { CommandOptions } from '@adonisjs/core/types/ace';
+import { resolveDurableTenant } from '../src/authkit-tenant.js';
 import type { DurableConfig } from '../src/define_config.js';
 import { describeRoots, discoveryRoots } from '../src/discovery-roots.js';
 import type { ControlPlane, Transport } from '../src/interfaces.js';
@@ -100,9 +101,7 @@ export default class DurableWorker extends BaseCommand {
   ): Promise<{ runtime: WorkerRuntime; partition: string }> {
     if (this.app.container.hasBinding(DURABLE_WORKER_RUNTIME)) {
       const runtime = await this.app.container.make(DURABLE_WORKER_RUNTIME);
-      const partition =
-        (config as { partition?: string }).partition ?? config.namespace ?? 'default';
-      return { runtime, partition };
+      return { runtime, partition: await this.#partitionOf(config) };
     }
     return this.#buildFallbackRuntime(config);
   }
@@ -120,7 +119,7 @@ export default class DurableWorker extends BaseCommand {
     }
     transport.useNamespace?.(config.namespace ?? 'default');
 
-    const partition = (config as { partition?: string }).partition ?? config.namespace ?? 'default';
+    const partition = await this.#partitionOf(config);
 
     const runtime = new WorkerRuntime({
       transport: transport as WorkerTransport,
@@ -137,6 +136,19 @@ export default class DurableWorker extends BaseCommand {
     return { runtime, partition };
   }
 
+  /**
+   * The partition this worker serves. On a tenant pod: `tenant.partition`, else the one
+   * `@adonis-agora/authkit-client` supplies, the same resolution the provider's runtime uses (and
+   * the same error, naming both fixes, when neither has one). Elsewhere: the namespace.
+   */
+  async #partitionOf(config: DurableConfig): Promise<string> {
+    if (config.topology === 'tenant') {
+      return (await resolveDurableTenant(config.tenant, this.app.container as never)).tenant
+        .partition;
+    }
+    return config.namespace ?? 'default';
+  }
+
   /** Build the transport from `config/durable.ts` — the same resolution the provider uses, so the
    *  worker lands on the SAME queues as the control-plane. In-memory default when no transport named. */
   async #resolveTransport(
@@ -150,6 +162,7 @@ export default class DurableWorker extends BaseCommand {
         `@agora/durable: config.transport is "${name}", but config.transports.${name} is not defined`,
       );
     }
-    return factory({ app: this.app });
+    const partition = config.topology === 'tenant' ? await this.#partitionOf(config) : undefined;
+    return factory({ app: this.app, ...(partition !== undefined ? { partition } : {}) });
   }
 }

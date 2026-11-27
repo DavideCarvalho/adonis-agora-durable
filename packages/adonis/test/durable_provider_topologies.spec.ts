@@ -714,7 +714,7 @@ describe('DurableProvider — tenant identity from @adonis-agora/authkit-client'
     }));
     new DurableProvider(app).register();
     await expect(container.make(DURABLE_RUN_GATEWAY)).rejects.toThrow(
-      /could not supply them: authkit-client: tenantOf needs `service`/,
+      /could not supply them \(authkit-client: tenantOf needs `service`/,
     );
   });
 });

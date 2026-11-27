@@ -5,6 +5,7 @@ import {
   describeTenantSources,
   missingTenantFieldsMessage,
   resolveTenantIdentity,
+  splitTenantError,
   type TenantIdentityFields,
 } from '../authkit-tenant.js';
 import {
@@ -128,7 +129,9 @@ export async function checkTenantToken(
       message: resolved.missing.includes('partition')
         ? `${where}.`
         : `${where}: the control plane cannot tell who this pod is.`,
-      fix: message.slice(message.indexOf('Fix: ') + 5),
+      ...(splitTenantError(message).fix !== undefined
+        ? { fix: splitTenantError(message).fix }
+        : {}),
       docs: `${DOCS}/cluster/authenticate-tenants`,
     };
   }

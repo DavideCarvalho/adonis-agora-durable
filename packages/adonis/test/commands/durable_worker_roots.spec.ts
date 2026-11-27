@@ -50,6 +50,7 @@ describe('durable:worker — several stepsPath / workflowsPath roots', () => {
     await ace.app.boot();
     ace.app.config.set('durable', {
       topology: 'tenant',
+      tenant: { partition: 'acme' },
       stepsPath: ['app/orders/steps', 'app/billing/steps'],
       workflowsPath: ['app/orders/flows', 'app/billing/flows'],
     });
@@ -71,6 +72,54 @@ describe('durable:worker — several stepsPath / workflowsPath roots', () => {
     );
     expect(messages).toContain(
       '[ blue(info) ] advertising 2 workflow name(s) from app/orders/flows, app/billing/flows',
+    );
+  });
+
+  async function runWorker(config: Record<string, unknown>, authkit?: unknown) {
+    const ace = await new AceFactory().make(pathToFileURL(`${appRoot}/`), {
+      importer: (filePath) => import(filePath),
+    });
+    await ace.app.init();
+    await ace.app.boot();
+    ace.app.config.set('durable', config);
+    if (authkit !== undefined)
+      ace.app.container.singleton('authkit.client' as never, () => authkit as never);
+    const { default: DurableWorker } = await import('../../commands/durable_worker.js');
+    ace.ui.switchMode('raw');
+    const command = await ace.create(DurableWorker, []);
+    const done = command.exec();
+    const logs = () => ace.ui.logger.getLogs().map((log) => log.message);
+    for (let i = 0; i < 200 && !logs().some((m) => m.includes('durable:worker started')); i++) {
+      if (command.exitCode !== undefined) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    process.emit('SIGINT');
+    await done;
+    return { logs: logs(), error: command.error as Error | undefined };
+  }
+
+  it('serves the partition authkit-client supplies when config/durable.ts names none', async () => {
+    const { logs } = await runWorker(
+      { topology: 'tenant', stepsPath: false, workflowsPath: false },
+      {
+        tenantOf: () => ({
+          url: async () => 'https://hub.test',
+          token: async () => 'tok',
+          partition: 'shop',
+        }),
+      },
+    );
+    expect(logs).toContain('[ blue(info) ] durable:worker started (partition shop)');
+  });
+
+  it('fails naming both fixes when neither config/durable.ts nor authkit-client has a partition', async () => {
+    const { error } = await runWorker({
+      topology: 'tenant',
+      stepsPath: false,
+      workflowsPath: false,
+    });
+    expect(error?.message).toMatch(
+      /topology 'tenant' needs tenant\.token, tenant\.partition\. Fix: configure @adonis-agora\/authkit-client/,
     );
   });
 });

@@ -17,7 +17,7 @@ export interface AuthkitTenant {
 
 /** The part of the `'authkit.client'` binding this module uses. */
 export interface AuthkitTenantClient {
-  tenantOf(resource: string): AuthkitTenant;
+  tenantOf(resource: string): AuthkitTenant | Promise<AuthkitTenant>;
 }
 
 /** Where a tenant field comes from. */
@@ -41,24 +41,28 @@ export interface TenantIdentityFields {
 
 /**
  * `@adonis-agora/authkit-client`'s `'authkit.client'` binding when it is booted here AND has
- * `tenantOf` (1.1+); an older authkit-client, or none, is `undefined`.
+ * `tenantOf` (1.1+); an older authkit-client, or none, is `undefined`. A binding that is registered
+ * but fails to build comes back as `error`.
  */
 export async function authkitTenantClientOf(
   container: ContainerLike | undefined,
-): Promise<AuthkitTenantClient | undefined> {
-  if (!container || typeof container.hasBinding !== 'function') return undefined;
-  if (!container.hasBinding('authkit.client')) return undefined;
+): Promise<{ client?: AuthkitTenantClient; error?: string }> {
+  if (!container || typeof container.hasBinding !== 'function') return {};
+  if (!container.hasBinding('authkit.client')) return {};
   let client: unknown;
   try {
     client = await container.make('authkit.client');
-  } catch {
-    return undefined;
+  } catch (error) {
+    return { error: `resolving 'authkit.client' failed: ${messageOf(error)}` };
   }
   const candidate = client as Partial<AuthkitTenantClient> | null | undefined;
   return candidate && typeof candidate.tenantOf === 'function'
-    ? (candidate as AuthkitTenantClient)
-    : undefined;
+    ? { client: candidate as AuthkitTenantClient }
+    : {};
 }
+
+const messageOf = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
 
 const present = (value: unknown): boolean => value !== undefined && value !== null && value !== '';
 
@@ -97,17 +101,19 @@ export async function resolveTenantIdentity<T extends TenantIdentityFields>(
     }
     return true;
   });
-  const client =
-    wanted.length > 0 && base.auto !== false
-      ? await authkitTenantClientOf(options.container)
-      : undefined;
-  let authkitError: string | undefined;
+  const found =
+    wanted.length > 0 && base.auto !== false ? await authkitTenantClientOf(options.container) : {};
+  const client = found.client;
+  let authkitError: string | undefined = found.error;
   if (client && wanted.length > 0) {
     let auto: AuthkitTenant | undefined;
     try {
-      auto = client.tenantOf(options.resource);
+      // authkit-client 1.1 answers synchronously and throws `TenantOfConfigError`
+      // (`E_AUTHKIT_SERVICE_NOT_CONFIGURED`) without `service`: authkit then counts as absent, and
+      // its message joins the boot error. Awaited so an async `tenantOf` works too.
+      auto = await client.tenantOf(options.resource);
     } catch (error) {
-      authkitError = error instanceof Error ? error.message : String(error);
+      authkitError = messageOf(error);
     }
     if (auto) {
       for (const field of wanted) {
@@ -145,11 +151,21 @@ export function missingTenantFieldsMessage(input: {
 }): string {
   const fields = input.missing.map((field) => `tenant.${field}`).join(', ');
   const cause = input.authkitError
-    ? ` authkit-client is booted but could not supply them: ${input.authkitError}`
+    ? ` authkit-client could not supply them (${input.authkitError}).`
     : input.autoDisabled
       ? ' `tenant.auto` is false, so authkit-client does not supply them.'
       : '';
   return `[@adonis-agora/${input.lib}] topology 'tenant' needs ${fields}.${cause} Fix: configure @adonis-agora/authkit-client's \`service: { name, clientId, clientSecret }\` (config/authkit_client.ts), which supplies them for ${input.resource}, or set \`${input.explicitForm}\` in ${input.configFile}.`;
+}
+
+/** The marker between a boot error's problem and its fix (see {@link missingTenantFieldsMessage}). */
+const FIX_MARKER = ' Fix: configure @adonis-agora/authkit-client';
+
+/** A boot error split for a doctor result: the problem, and the fix when the message carries one. */
+export function splitTenantError(text: string): { message: string; fix?: string } {
+  const at = text.lastIndexOf(FIX_MARKER);
+  if (at === -1) return { message: text };
+  return { message: text.slice(0, at), fix: text.slice(at + ' Fix: '.length) };
 }
 
 /**
