@@ -14,7 +14,7 @@ license: MIT
 metadata:
   type: core
   library: "@adonis-agora/durable-eslint-plugin"
-  library_version: "1.0.0"
+  library_version: "1.0.2"
   framework: adonisjs
 sources:
   - 'DavideCarvalho/adonis-durable:docs/tooling/linting.mdx'
