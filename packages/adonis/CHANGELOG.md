@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 1.0.1
+
+### Patch Changes
+
+- [#614](https://github.com/DavideCarvalho/adonis-agora-durable/pull/614) [`12ff682`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/12ff682a45c62cf6b1252c31784c816a82b2be4b) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Fix a failed remote step waiting for the `remoteRedispatchMs` lease instead of its `backoffMs` before it is retried ([#599](https://github.com/DavideCarvalho/adonis-agora-durable/issues/599)). With `remoteRedispatchMs` set, a pending `ctx.step` or `ctx.all` step carries its lost-dispatch lease in `wakeAt`. That lease stayed on the checkpoint when a failed result settled it, and the retry took the lease as its deadline, so a transient failure could delay the run by the whole lease (10 minutes, say) instead of the configured backoff. A result now clears the lease when it settles the step, in the Lucid store (Postgres, MySQL, SQLite), the in-memory store and the engine's fallback for stores without a settle method. The retry also ignores a deadline later than its backoff could reach, so failed steps settled before the upgrade, and custom stores that keep `wakeAt` on settle, retry on their backoff too. `settleCheckpointsIfPending` and `settleResultsIfPending` now clear `wakeAt`, and the store conformance kit checks that they do.
+
 ## 1.0.0
 
 ### Major Changes
