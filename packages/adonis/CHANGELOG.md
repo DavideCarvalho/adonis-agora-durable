@@ -1,5 +1,19 @@
 # @adonis-agora/durable
 
+## 1.2.0
+
+### Minor Changes
+
+- [#634](https://github.com/DavideCarvalho/adonis-agora-durable/pull/634) [`fc8189b`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/fc8189be733757f31b8e45731e727560d1f82c8f) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Encrypt the messages durable puts on a broker. Every broker transport (`transports.bullmq`, `transports.queue`, `transports.db`) and `controlPlanes.redis` now seal step tasks, results, heartbeats, workflow turns and decisions, live step events, tenant start / run requests, replies and events, and control broadcasts: the data of a run (inputs, outputs, errors, progress, history, signal payloads, tenant tokens, engine events) is encrypted and authenticated with AES-256-GCM, and only the routing fields (run id, step id, handler name, group, attempt) stay in clear, bound into the authentication so a ciphertext cannot be moved into another run, step or message kind.
+  
+  - **Same app, nothing to configure**: the key is derived from the app's `APP_KEY` (HKDF-SHA256, purpose `agora:durable:messages`). Boot logs `[@adonis-agora/durable] <transport> messages: app key (auto)`.
+  - **Tenant ↔ control plane**: sealed with `@adonis-agora/crypto`'s `durable-messages` key in the tenant's partition when crypto is booted on both sides (the control plane with crypto embedded creates the key per tenant).
+  - **Options**, on each transport's new `messages` option (the same modes as the other Agora libs' channels): `secret` (HMAC, readable), `crypto: { cipher, key?, owns? }` (explicit key or your own KMS), `crypto: false` / `insecure: true` (plain), `acceptPlain`, and `appKey` for transports built without AdonisJS (default `process.env.APP_KEY`).
+  - A refused message is never retried and is logged once per kind and reason; a refused step task does not run and is reported failed (retryable).
+  - New `agora:doctor` check `durable.messages`; new docs page "Encrypting messages".
+  
+  **Behaviour change.** Messages are sealed by default from this version. A process without an `APP_KEY` (or, between a tenant and its control plane, without `@adonis-agora/crypto`) stays plain and warns at boot. Receivers still accept plain messages (`acceptPlain` defaults to `true` in 1.x, logged once per kind, and the doctor warns) so jobs queued before the upgrade keep working, and replies to a plain message go back plain. A process on 1.1 or earlier cannot read a sealed message: a sealed step task reaching a 1.1 worker runs its handler with `input` undefined. Stop old processes before starting new ones, or deploy twice (first with `messages: { insecure: true }` on every transport and the control plane, then without). NestJS and Python workers read plain messages only: keep the transport they share `insecure`. Strict mode (`acceptPlain: false`) becomes the default in the next major.
+
 ## 1.1.1
 
 ### Patch Changes
