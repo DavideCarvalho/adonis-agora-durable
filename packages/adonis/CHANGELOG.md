@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 1.1.1
+
+### Patch Changes
+
+- [#622](https://github.com/DavideCarvalho/adonis-agora-durable/pull/622) [`50d60ba`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/50d60ba3ad044fab3b3272a09ec0811ebaeb2392) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A tenant pod now recovers from a refused token. When the control plane answers a run read, control or start with `unauthorized` (an expired or revoked token, or a Hub that restarted with new signing keys), the `ProxyRunGateway` drops the token source's cached token (`reset()`, which authkit-client's `tenantOf(...).token` and `authkitTenantToken(...)` have) and retries the request once with a fresh one; a start keeps its `runId`. `resolveTenantToken` keeps `reset()` from every token form (a function, an object with `get()` and `reset()`/`invalidate()`, a `TenantCredentialsContract` with an optional `reset()`). `node ace configure @adonis-agora/durable --topology=tenant` writes a tenant pod's `config/durable.ts` in the one-line form, with the explicit `tenant` block as a comment.
+
 ## 1.1.0
 
 ### Minor Changes
