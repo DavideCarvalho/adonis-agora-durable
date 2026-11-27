@@ -22,6 +22,16 @@ In durable, the connection is a **broker transport** (`bullmq`, `queue` or `db`)
 Every topology runs the **same durable engine over the same wire**. Splitting the control plane from the workers does not change execution semantics: each `ctx.step` is still dispatched and checkpointed. The only thing that moves is *where the code that executes the bodies lives*.
 </Callout>
 
+## Three ways to run it
+
+Across several apps, durable runs in one of three ways, the same three every Agora library offers:
+
+- **Standalone** (the default). Each app runs its own engine over its own store; omit `topology` and that is what you get.
+- **Federated console.** Every app stays `standalone` and keeps its store, engine and schedules. One app's [console](/docs/durable/observability/dashboard) reads the others' runs from their stores and sends each action (cancel, retry, signal, …) to the app that owns the run, over authenticated commands. See [Federated console](/docs/durable/observability/federated-console).
+- **Hub.** A central `control-plane` owns the store, and each app's pods run `topology: 'tenant'` with no store of their own. With `@adonis-agora/authkit-client`'s `service` configured, `defineConfig({ topology: 'tenant', transport })` is the whole pod config ([Authenticate tenants](/docs/durable/cluster/authenticate-tenants)). See the [Agora Hub guide](https://davidecarvalho.github.io/agora/docs/agora-hub) for running the central side.
+
+The rest of this page is about the `topology` values behind the first and last.
+
 ## The three topologies
 
 | Topology | Owns the store | Executes step bodies | Serves HTTP / dashboard | Read/control surface |
@@ -40,7 +50,7 @@ Every topology runs the **same durable engine over the same wire**. Splitting th
 **Every** topology dispatches over the transport — that never changes. What changes is who is *subscribed* to the queue a dispatch lands on. Two routing tokens have to agree:
 
 - **Dispatch side.** A step is routed to `<name>@<tenant>`, where the tenant comes from **the run's namespace** (or the step's own `partition`, which wins). A `default`/unset namespace routes to the bare `<name>`.
-- **Consume side.** A worker subscribes `<name>@<partition>` for every handler it serves, where the suffix is **its transport's `partition`** (`transports.bullmq({ partition })`, `transports.queue({ partition })` or `transports.db({ partition })`) — bare when unset. On a `tenant` pod the transport defaults to the pod's required top-level `partition`, which the provider also gives the gateway and the worker descriptor, so all three agree (see [Topology & config](/docs/durable/cluster/topology-and-config#tenant-store-less-thin-pod)).
+- **Consume side.** A worker subscribes `<name>@<partition>` for every handler it serves, where the suffix is **its transport's `partition`** (`transports.bullmq({ partition })`, `transports.queue({ partition })` or `transports.db({ partition })`) — bare when unset. On a `tenant` pod the transport defaults to the pod's `tenant.partition` (explicit, or `service.partition`/`service.name` from authkit-client), which the provider also gives the gateway and the worker descriptor, so all three agree (see [Topology & config](/docs/durable/cluster/topology-and-config#tenant-store-less-thin-pod)).
 
 A process executes a step body when, and only when, those two tokens match. There is no fallback: nothing "runs it anyway" because no worker showed up — the step stays pending (or the run parks `blocked` when the step [`requires`](/docs/durable/cluster/handshake#capability-aware-routing) capabilities no live worker advertises). See [Tenancy](/docs/durable/concepts/tenancy) for how a run's namespace is chosen.
 
