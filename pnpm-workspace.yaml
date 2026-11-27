@@ -26,6 +26,7 @@ minimumReleaseAgeExclude:
   - '@adonis-agora/diagnostics@1.0.0-rc.1 || 1.0.0-rc.6 || 1.0.0'
   - '@adonis-agora/authkit-client@1.0.0-rc.7 || 1.0.0'
   - '@adonis-agora/authkit-core@1.0.0-rc.3 || 1.0.0'
+  - '@adonis-agora/telescope@1.1.1'
 # pnpm >=10.4 reads build-allowlist config from HERE (not package.json) in a workspace.
 # Setting onlyBuiltDependencies makes it the exclusive allowlist, so it lists every dep whose
 # script must run — the 4 that pnpm allowed by default PLUS msgpackr-extract (bullmq transitive).
@@ -41,8 +42,14 @@ onlyBuiltDependencies:
 strictDepBuilds: false
 
 # Skill examples are typechecked by `intent validate` from the repo root, so a package they import
-# must resolve from the root node_modules. Hoisting @adonisjs/auth (a devDependency of
-# packages/adonis) there lets the durable-observability examples load its `ctx.auth` types against
-# the same @adonisjs/core copy the library uses. Install-time only: no published package changes.
+# must resolve from the root node_modules. These are all devDependencies of packages/adonis, hoisted
+# so the examples load their types (e.g. `ctx.auth`, `HttpContext`, `db`) against the same
+# @adonisjs/core copy the library uses. @adonis-agora/telescope is a root devDependency for the same
+# reason (the durable-observability Telescope example imports its defineConfig). Install-time only:
+# no published package changes.
 publicHoistPattern:
   - "@adonisjs/auth"
+  - "@adonisjs/core"
+  - "@adonisjs/lucid"
+  - "@adonis-agora/authkit-client"
+  - valibot

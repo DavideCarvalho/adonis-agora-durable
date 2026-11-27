@@ -138,6 +138,8 @@ the same input. Fix-and-replay starts a NEW run (`<originalRunId>~retry~<uuid>`,
 clean history, original left intact as the record):
 
 ```ts
+declare const runId: string, headers: Record<string, string> // the failed run; your console auth
+
 const res = await fetch(`/durable/api/runs/${runId}/retry-with-input`, {
   method: 'POST',
   headers: { 'content-type': 'application/json', ...headers },
@@ -174,6 +176,7 @@ Everything observable is one event stream; subscribe directly or use the
 shipped bridges:
 
 ```ts title="start/durable.ts"
+import logger from '@adonisjs/core/services/logger'
 import router from '@adonisjs/core/services/router'
 import engine from '@adonis-agora/durable/services/main'
 import { attachDurableOtel } from '@adonis-agora/durable/otel'
@@ -246,6 +249,7 @@ Source: `docs/observability/events-and-interceptors.mdx`,
 Register the extension once and workflows appear next to requests/queries/jobs:
 
 ```ts title="config/telescope.ts"
+import { defineConfig } from '@adonis-agora/telescope'
 import { durableTelescopeExtension } from '@adonis-agora/durable/telescope'
 
 export default defineConfig({
@@ -397,12 +401,17 @@ Source: `docs/observability/federated-console.mdx`.
 Wrong:
 
 ```ts
-engine.use(async (invocation, next) => next().then((r) => ({ ...r, at: Date.now() })))
+import engine from '@adonis-agora/durable/services/main'
+
+engine.use(async (invocation, next) => next().then((result) => ({ result, at: Date.now() })))
 ```
 
 Correct:
 
 ```ts
+import logger from '@adonisjs/core/services/logger'
+import engine from '@adonis-agora/durable/services/main'
+
 engine.use(async (invocation, next) => {
   const result = await next()
   logger.info({ workflow: invocation.workflow, step: invocation.stepName })
@@ -421,6 +430,10 @@ mutate results nondeterministically. Source:
 Wrong:
 
 ```ts
+import type { StepInterceptor } from '@adonis-agora/durable'
+import engine from '@adonis-agora/durable/services/main'
+declare const enforceInvariant: StepInterceptor
+
 engine.use(enforceInvariant) // "runs on every turn" — it does not
 ```
 
@@ -437,15 +450,21 @@ workers in another process — there is no local body to wrap. Source:
 Wrong:
 
 ```ts
-const { run } = await cancelRun(runId, { compensate: true })
-if (run.status !== 'cancelled') throw new Error('cancel failed') // premature
+import engine from '@adonis-agora/durable/services/main'
+declare const runId: string
+
+const run = await engine.cancel(runId, { compensate: true })
+if (run?.status !== 'cancelled') throw new Error('cancel failed') // premature
 ```
 
 Correct:
 
 ```ts
-await cancelRun(runId, { compensate: true })
-// poll getRun / subscribe to the stream until status === 'cancelled'
+import engine from '@adonis-agora/durable/services/main'
+declare const runId: string
+
+await engine.cancel(runId, { compensate: true })
+// poll engine.getRun / subscribe to the stream until status === 'cancelled'
 ```
 
 Mechanism: cancel-with-compensate answers immediately with `cancelling`

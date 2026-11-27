@@ -189,6 +189,10 @@ re-driven) —
 pass `{ terminal: true }` to wait for the end.
 
 ```ts
+import engine from '@adonis-agora/durable/services/main'
+import OrderWorkflow from '#workflows/order_workflow'
+declare const order: { id: number; total: number }
+
 const { runId } = await OrderWorkflow.dispatch(order) // hot path — respond now
 const output = await OrderWorkflow.start(order, { timeoutMs: 30_000 }) // scripts / short runs only; throws on failed/cancelled/dead
 await engine.start('order', order, runId)
@@ -224,6 +228,8 @@ host). Source: `docs/stores/lucid.mdx`, `docs/authoring/scheduling.mdx`,
 Wrong:
 
 ```ts
+import { defineConfig, transports } from '@adonis-agora/durable'
+
 // Works locally, then every run and checkpoint vanishes on restart/deploy.
 export default defineConfig({
   transport: 'memory',
@@ -234,6 +240,8 @@ export default defineConfig({
 Correct:
 
 ```ts
+import { defineConfig, stores, transports } from '@adonis-agora/durable'
+
 export default defineConfig({
   transport: 'event-emitter',
   transports: { 'event-emitter': transports.eventEmitter() },
@@ -273,6 +281,8 @@ Source: `docs/transports/index.mdx`.
 Wrong:
 
 ```ts
+import { defineConfig } from '@adonis-agora/durable'
+
 // API/dashboard pod, default config — a burst of CPU-heavy runs starves requests.
 export default defineConfig({ transport: 'queue', transports: { /* … */ } })
 ```
@@ -304,6 +314,10 @@ surprise"), `docs/concepts/durability.mdx`.
 Wrong:
 
 ```ts
+import engine from '@adonis-agora/durable/services/main'
+import OrderWorkflow from '#workflows/order_workflow'
+declare const input: { id: number; total: number }
+
 // inside `node ace run-report` — hangs forever on a queue/db/bullmq transport
 const { runId } = await OrderWorkflow.dispatch(input)
 const result = await engine.waitForRun(runId)
@@ -312,6 +326,8 @@ const result = await engine.waitForRun(runId)
 Correct:
 
 ```ts
+import { defineConfig } from '@adonis-agora/durable'
+
 export default defineConfig({
   // …
   consumers: 'always', // opt this process into broker consumption

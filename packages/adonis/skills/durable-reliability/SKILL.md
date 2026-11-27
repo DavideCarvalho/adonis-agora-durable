@@ -43,6 +43,7 @@ failure out of the retry path:
 
 ```ts title="app/steps/charge.ts"
 import { FatalError, defineStep } from '@adonis-agora/durable'
+import stripe from '#services/stripe'
 
 export const chargeCard = defineStep(
   'payments:charge-card',
@@ -72,6 +73,10 @@ Attach a `compensate` to each side-effecting step; when the run fails, undos run
 last-completed-first:
 
 ```ts
+import engine from '@adonis-agora/durable/services/main'
+import type Order from '#models/order'
+import { inventory, payments, shipping } from '#services/fulfillment'
+
 engine.register('checkout', '1', async (ctx, order: Order) => {
   await ctx.localStep('reserve-inventory', () => inventory.reserve(order.items), {
     compensate: () => inventory.release(order.items),
@@ -111,6 +116,10 @@ queues: [{ name: 'emails', concurrency: 10, rateLimit: { limit: 1000, periodMs: 
 ```
 
 ```ts
+import type { StepRef, WorkflowCtx } from '@adonis-agora/durable'
+declare const ctx: WorkflowCtx, input: { to: string }, order: { tenantId: string } // run(ctx, …)
+declare const sendEmail: StepRef<{ to: string }, { messageId: string }>
+
 const sent = await ctx.step(sendEmail, input, { queue: 'emails', priority: 10, fairnessKey: order.tenantId })
 ```
 
@@ -146,6 +155,8 @@ retry (`requeue` / `durable:runs:retry`) of a `dead`/`failed` run resets
 `recoveryAttempts` to 0:
 
 ```ts title="config/durable.ts"
+import { defineConfig } from '@adonis-agora/durable'
+
 export default defineConfig({
   // …
   maxRecoveryAttempts: 5, // then dead-letter instead of crash-looping
@@ -153,6 +164,10 @@ export default defineConfig({
 ```
 
 ```ts title="app/workflows/pipeline_workflow.ts"
+import { BaseWorkflow, type DeadLetter, type WorkflowCtx } from '@adonis-agora/durable'
+
+type PipelineInput = { datasetId: string }
+
 export default class PipelineWorkflow extends BaseWorkflow {
   static workflow = { name: 'pipeline', version: '1' }
   async run(ctx: WorkflowCtx, input: PipelineInput) { /* … */ }
@@ -286,6 +301,8 @@ Wrong:
 Correct:
 
 ```ts
+import { defineConfig } from '@adonis-agora/durable'
+
 export default defineConfig({
   remoteRedispatchMs: 30 * 60_000, // opt in explicitly
   remoteRedispatchMax: 10,
@@ -303,12 +320,16 @@ Source: `docs/reliability/failure-modes.mdx`.
 Wrong:
 
 ```ts
+import { defineConfig } from '@adonis-agora/durable'
+
 export default defineConfig({ remoteRedispatchMs: 60_000 }) // imports legitimately take ~20min
 ```
 
 Correct:
 
 ```ts
+import { defineConfig } from '@adonis-agora/durable'
+
 export default defineConfig({ remoteRedispatchMs: 30 * 60_000, remoteRedispatchMax: 10 })
 ```
 
@@ -322,12 +343,18 @@ steps. Source: `docs/reliability/failure-modes.mdx`.
 Wrong:
 
 ```ts
+import type { EngineEventType } from '@adonis-agora/durable'
+declare const counts: Record<EngineEventType, number> // your tally of lifecycle events
+
 const inFlight = counts['run.started'] - counts['run.completed'] // wildly overcounts
 ```
 
 Correct:
 
 ```ts
+import type { EngineEventType } from '@adonis-agora/durable'
+declare const counts: Record<EngineEventType, number> // your tally of lifecycle events
+
 const inFlight = counts['run.started'] - (counts['run.completed'] + counts['run.failed'])
 // or read the store: listRuns(engine, { statuses: ['running', 'suspended'] })
 ```
@@ -343,12 +370,17 @@ Source: `docs/observability/events-and-interceptors.mdx`.
 Wrong:
 
 ```ts
-const stalled = (await engine.workerHealth()).some((g) => g.stalled) // always false where no group health is reported (eventEmitter, queue with workerKeys: false)
+import engine from '@adonis-agora/durable/services/main'
+
+const healthy = (await engine.workerHealth()).every((g) => g.liveWorkers.length > 0) // always true where no group health is reported (eventEmitter, queue with workerKeys: false)
 ```
 
 Correct:
 
 ```ts
+import { DEFAULT_STALE_MS, attachLiveness, filterStale, listRuns } from '@adonis-agora/durable'
+import engine from '@adonis-agora/durable/services/main'
+
 const stale = filterStale(
   await attachLiveness(engine, await listRuns(engine, { statuses: ['running', 'suspended'], limit: 200 })),
   DEFAULT_STALE_MS,
@@ -366,12 +398,18 @@ nothing. On `queue`, `depth` counts pending jobs only; on `db`, pending + claime
 Wrong:
 
 ```ts
+import { payments } from '#services/fulfillment'
+declare const order: { customerId: string; totalCents: number }
+
 { compensate: () => payments.refund(order.customerId, order.totalCents) } // refunds again on retry
 ```
 
 Correct:
 
 ```ts
+import { payments } from '#services/fulfillment'
+declare const order: { customerId: string; totalCents: number }
+
 { compensate: () => payments.refundOnce(order.customerId, order.totalCents) } // keyed, idempotent
 ```
 
@@ -384,12 +422,19 @@ already applied or a retry double-refunds. Source: `docs/reliability/sagas.mdx`.
 Wrong:
 
 ```ts
+import type { WorkflowCtx } from '@adonis-agora/durable'
+import ProcessItemWorkflow from '#workflows/process_item_workflow'
+declare const ctx: WorkflowCtx, items: Array<{ sku: string }> // run(ctx, items)
+
 await ctx.all(ProcessItemWorkflow, items, { mode: 'failFast' }) // assumes undone work
 ```
 
 Correct:
 
 ```ts
+import engine from '@adonis-agora/durable/services/main'
+declare const childRunId: string
+
 // Give ProcessItemWorkflow its own compensations; cancel deliberately with:
 await engine.cancel(childRunId, { compensate: true })
 ```

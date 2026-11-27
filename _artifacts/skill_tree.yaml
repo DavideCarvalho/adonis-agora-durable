@@ -44,6 +44,8 @@ skills:
     domain: authoring
     package: '@adonis-agora/durable'
     path: 'packages/adonis/skills/durable-workflows/SKILL.md'
+    references:
+      - references/entities-tasks-schedules.md
     description: >-
       Author workflows and steps: BaseWorkflow classes under app/workflows,
       @Step/defineStep/localStep, sleeps, signals, events, webhooks, tasks,

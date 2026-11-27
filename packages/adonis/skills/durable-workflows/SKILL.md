@@ -150,6 +150,7 @@ the ctx as `WorkflowCtx<InferSearchAttributes<typeof schema>>` and read back wit
 retried.
 
 ```ts
+import { defineStep } from '@adonis-agora/durable'
 import * as v from 'valibot'
 
 export const charge = defineStep('billing:charge', async (input) => input.amount * 100, {
@@ -162,6 +163,9 @@ export const charge = defineStep('billing:charge', async (input) => input.amount
 All three suspend the run with zero compute and survive restarts.
 
 ```ts
+import type { WorkflowCtx } from '@adonis-agora/durable'
+declare const ctx: WorkflowCtx, order: { id: string } // run(ctx, order)
+
 // Time-based wait — duration string or ms:
 await ctx.sleep('7 days')
 await ctx.sleepUntil(new Date('2026-12-31T00:00:00Z'))
@@ -202,6 +206,12 @@ export default class ApprovalsController {
 ### Pattern 3 — children, fan-out, and singletons
 
 ```ts
+import type { WorkflowCtx } from '@adonis-agora/durable'
+import ProcessItemWorkflow from '#workflows/process_item_workflow'
+import ShippingWorkflow from '#workflows/shipping_workflow'
+declare const ctx: WorkflowCtx, input: { n: number }, order: { id: string } // run(ctx, input)
+declare const post: { id: number }, batch: { items: Array<{ sku: string }> }
+
 const shipment = await ctx.child(ShippingWorkflow, { orderId: order.id }) // parent suspends
 await ctx.startChild('reindex-search', { postId: post.id }) // fire-and-forget
 const results = await ctx.all(ProcessItemWorkflow, batch.items) // outputs in input order
@@ -226,6 +236,10 @@ of once per result, and returns the outputs in input order (a `GatherError`
 carries the failed indexes, as for a child fan):
 
 ```ts
+import { defineStep, type WorkflowCtx } from '@adonis-agora/durable'
+declare const ctx: WorkflowCtx, lines: string[] // run(ctx, lines)
+
+const processLine = defineStep('import:process-line', async (line: string) => line.length)
 const results = await ctx.all(processLine, lines, { concurrency: 500 })
 ```
 
@@ -243,13 +257,15 @@ Lucid and in-memory stores), and a holder keeps its slot until it settles
 terminally, so replicas never over-admit and a later start never displaces it:
 
 ```ts
+import { BaseWorkflow, type WorkflowCtx } from '@adonis-agora/durable'
+
 export default class SyncShopWorkflow extends BaseWorkflow {
   static workflow = {
     name: 'sync-shop',
     version: '1',
     singleton: { key: (input) => (input as { shopId: string }).shopId, limit: 1, maxQueueDepth: 20 },
   }
-  // …
+  async run(ctx: WorkflowCtx, input: { shopId: string }) {} // …
 }
 ```
 
@@ -258,63 +274,12 @@ Overflow beyond `limit + maxQueueDepth` rejects `dispatch` with
 
 ### Pattern 4 — long-lived state, callbacks, cadences
 
-Entities serialize operations per key without DB locks (register from a
-preload):
-
-```ts title="start/entities.ts"
-import engine from '@adonis-agora/durable/services/main'
-
-engine.registerEntity<{ balanceCents: number }>('account', {
-  initialState: () => ({ balanceCents: 0 }),
-  handlers: {
-    deposit: (state, amountCents: number) => {
-      state.balanceCents += amountCents
-      return state.balanceCents
-    },
-    balance: (state) => state.balanceCents,
-  },
-})
-// drive: engine.signalEntity('account', key, 'deposit', 500)
-// read:  engine.getEntityState('account', key)
-// from a workflow: await ctx.callEntity('account', key, 'deposit', 500)
-```
-
-Wait on a foreign system's own callback by id (`engine.completeTask(runId, name,
-result)` / `failTask` resume the run):
-
-```ts
-const result = await ctx.task<TranscodeResult>(job.id, async () => {
-  await sqs.send({ queueUrl, body: JSON.stringify({ jobId: job.id, src: job.src }) })
-})
-```
-
-Recurring cadences are colocated on the class (or set in `config/durable.ts`
-`schedules`, which overrides by `key`); cron needs `cron-parser` installed where
-the worker runs, and only the `durable:work` loop fires schedules:
-
-```ts
-export default class DailyReportWorkflow extends BaseWorkflow {
-  static workflow = { name: 'daily-report', version: '1' }
-  static schedule = { cron: '0 2 * * *', timezone: 'America/Sao_Paulo' }
-  // or: @Scheduled({ everyMs: 60_000 }) above the class
-}
-```
-
-In `config/durable.ts`, name the workflow with a lazy import, as Adonis does for
-controllers — never a direct class import, which can hang the boot (a service the
-workflow imports awaits `app.booted` while the config is still loading):
-
-```ts
-schedules: [
-  { key: 'daily-report', workflow: () => import('#workflows/daily_report_workflow'), cron: '0 2 * * *' },
-]
-```
-
-Each schedule window starts exactly once across a fleet via an idempotent
-time-bucket run id.
-
-Source: `docs/authoring/entities.mdx`, `docs/authoring/external-tasks.mdx`,
-`docs/authoring/scheduling.mdx`.
+Entities serialize operations per key without DB locks (`engine.registerEntity` from a
+preload, `ctx.callEntity` from a workflow); `ctx.task(id, fn)` waits on a foreign system's
+own callback by id (`engine.completeTask` / `failTask` resume the run); `static schedule`,
+`@Scheduled` or `config/durable.ts` `schedules` run cadences — name the workflow there with a
+lazy import, never a direct class import (it can hang the boot). Examples:
+[entities, tasks and schedules](references/entities-tasks-schedules.md).
 
 ## Common mistakes
 
@@ -348,6 +313,9 @@ doing its work". Source: `docs/authoring/app-workflows.mdx`.
 Wrong:
 
 ```ts
+import type { WorkflowCtx } from '@adonis-agora/durable'
+declare const ctx: WorkflowCtx, input: { orderId: number } // run(ctx, input)
+
 try {
   await ctx.step('chargeCard', input)
 } catch (error) {
@@ -359,7 +327,8 @@ try {
 Correct:
 
 ```ts
-import { isWorkflowControlFlowSignal } from '@adonis-agora/durable'
+import { isWorkflowControlFlowSignal, type WorkflowCtx } from '@adonis-agora/durable'
+declare const ctx: WorkflowCtx, input: { orderId: number } // run(ctx, input)
 
 try {
   await ctx.step('chargeCard', input)
@@ -381,12 +350,18 @@ Source: `docs/concepts/workflows-and-steps.mdx` ("Catching errors").
 Wrong:
 
 ```ts
+import type { WorkflowCtx } from '@adonis-agora/durable'
+declare const ctx: WorkflowCtx, item: { postId: number } // run(ctx, item)
+
 await ctx.startChild('reindex-search', item, crypto.randomUUID())
 ```
 
 Correct:
 
 ```ts
+import type { WorkflowCtx } from '@adonis-agora/durable'
+declare const ctx: WorkflowCtx, item: { postId: number } // run(ctx, item)
+
 await ctx.startChild('reindex-search', item) // deterministic positional id
 ```
 
@@ -400,6 +375,9 @@ each replay breaks that dedup and re-fires the child. Source:
 Wrong:
 
 ```ts
+import CheckoutWorkflow from '#workflows/checkout_workflow'
+declare const order: { id: number; total: number }
+
 const result = await CheckoutWorkflow.start(order) // request held open until the run is terminal
 ```
 
@@ -421,14 +399,20 @@ workflow — and returns its output only on `completed`, throwing `FatalError`
 Wrong:
 
 ```ts
+import type { WorkflowCtx } from '@adonis-agora/durable'
+declare const ctx: WorkflowCtx // run(ctx, input)
+
+const hook = ctx.webhook<{ status: string }>()
 const result = await hook.wait() // suspends indefinitely if the provider never calls back
 ```
 
 Correct:
 
 ```ts
-import { SignalTimeoutError } from '@adonis-agora/durable'
+import { SignalTimeoutError, type WorkflowCtx } from '@adonis-agora/durable'
+declare const ctx: WorkflowCtx // run(ctx, input)
 
+const hook = ctx.webhook<{ status: string }>()
 try {
   const result = await hook.wait({ timeoutMs: 30 * 60 * 1000 })
 } catch (error) {
@@ -473,6 +457,8 @@ Wrong:
 
 ```ts
 // config/durable.ts — both contexts declare a workflow named 'charge' (version 1)
+import { defineConfig } from '@adonis-agora/durable'
+
 export default defineConfig({
   workflowsPath: ['app/orders/flows', 'app/billing/flows'],
 })

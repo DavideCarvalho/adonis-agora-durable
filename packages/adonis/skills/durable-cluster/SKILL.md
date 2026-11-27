@@ -92,6 +92,8 @@ transport map. Without authkit-client (or to override one field, or to bring you
 function or shared-secret token), set the `tenant` block; each field set wins:
 
 ```ts title="config/durable.ts (tenant worker pod, explicit)"
+import { defineConfig, transports } from '@adonis-agora/durable'
+
 export default defineConfig({
   topology: 'tenant',
   transport: 'bullmq',
@@ -136,6 +138,8 @@ control plane, which records them in its own key store — so the pod needs no
 database:
 
 ```ts title="config/durable.ts (tenant pod, queue transport)"
+import { defineConfig, transports } from '@adonis-agora/durable'
+
 export default defineConfig({
   topology: 'tenant',
   transport: 'queue',
@@ -169,6 +173,7 @@ on a store pod (direct reads) or a store-less pod (wire requests answered by the
 control plane's `RunRequestResponder`):
 
 ```ts title="app/controllers/runs_controller.ts"
+import type { HttpContext } from '@adonisjs/core/http'
 import { runGateway } from '@adonis-agora/durable/services/main'
 
 export default class RunsController {
@@ -194,6 +199,9 @@ Verbs: `getRun`, `listRuns`, `getCheckpoints`, `getRunChildren`,
 gateways implement them, tenant-scoped by the responder). Never branch on `topology`.
 
 ```ts
+import { runGateway } from '@adonis-agora/durable/services/main'
+declare const params: { id: string } // a controller's route params
+
 // Each fan of more than 50 members — or declared wider than 50 — comes back as one FanSummary in `fans`.
 const detail = await runGateway.getRunDetail?.(params.id, { summarizeFansOver: 50 })
 ```
@@ -216,6 +224,8 @@ No capable live worker → the run parks **blocked** (first-class status, visibl
 in the dashboard, auto-resumes when a capable worker registers):
 
 ```ts
+import { defineStep } from '@adonis-agora/durable'
+
 export const settlePayment = defineStep(
   'settle-payment',
   async (input: { orderId: number }) => ({ /* … */ }),
@@ -370,14 +380,18 @@ executes fine but is invisible to capability-aware routing, so any step with
 Wrong:
 
 ```ts
+import { transports } from '@adonis-agora/durable'
+
 // laptop dev against the production Redis:
-transports.bullmq({ connection: REDIS_URL })
+transports.bullmq({ connection: process.env.REDIS_URL })
 ```
 
 Correct:
 
 ```ts
-transports.bullmq({ connection: REDIS_URL, partition: 'david-dev' })
+import { transports } from '@adonis-agora/durable'
+
+transports.bullmq({ connection: process.env.REDIS_URL, partition: 'david-dev' })
 ```
 
 Mechanism: a worker on no partition and no non-`default` namespace serves the
@@ -394,6 +408,8 @@ Source: `docs/concepts/tenancy.mdx`.
 Wrong:
 
 ```ts
+import { defineConfig, transports } from '@adonis-agora/durable'
+
 // the pod's default Lucid connection is its own app database
 defineConfig({ topology: 'tenant', transport: 'db', transports: { db: transports.db() }, tenant: { partition: 'acme' } })
 ```
@@ -401,6 +417,8 @@ defineConfig({ topology: 'tenant', transport: 'db', transports: { db: transports
 Correct:
 
 ```ts
+import { defineConfig, transports } from '@adonis-agora/durable'
+
 // a connection to the CONTROL PLANE's database (config/database.ts), used only for the transport tables
 defineConfig({ topology: 'tenant', transport: 'db', transports: { db: transports.db({ connection: 'durable' }) }, tenant: { partition: 'acme' } })
 ```
@@ -416,12 +434,18 @@ control plane's database need `queue` or `bullmq`. Source:
 Wrong:
 
 ```ts
+import engine from '@adonis-agora/durable/services/main'
+declare const order: { id: number }, id: string
+
 await engine.start('checkout', order, id, { namespace: 'eu-west' }) // no engine/operator polls eu-west
 ```
 
 Correct:
 
 ```ts
+import engine from '@adonis-agora/durable/services/main'
+declare const order: { id: number }, id: string
+
 // Run at least one engine on 'eu-west' (or an operator above it) first:
 await engine.start('checkout', order, id, { namespace: 'eu-west' })
 ```
