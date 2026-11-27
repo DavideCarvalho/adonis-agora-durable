@@ -32,6 +32,9 @@
     "README.md",
     "CHANGELOG.md"
   ],
+  "publishConfig": {
+    "tag": "v0"
+  },
   "scripts": {
     "build": "vite build",
     "test": "vitest run --passWithNoTests",
