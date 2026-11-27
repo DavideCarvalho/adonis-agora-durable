@@ -21,7 +21,7 @@
     "tanstack-intent",
     "agora"
   ],
-  "author": "Davi Carvalho <davi@goflip.ai>",
+  "author": "Davi Carvalho <davi_carvalho96@hotmail.com>",
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
