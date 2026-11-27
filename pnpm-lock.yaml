@@ -187,7 +187,7 @@ importers:
     devDependencies:
       '@adonis-agora/telescope':
         specifier: 1.1.1
-        version: 1.1.1(@adonisjs/core@7.7.0(supports-color@10.2.2)(youch@4.1.1))(@adonisjs/lucid@22.5.0(@adonisjs/core@7.7.0(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.2.0)(luxon@3.7.2)(mysql2@3.24.6(@types/node@26.6.7))(pg@8.23.1)(supports-color@10.2.2))(@opentelemetry/api@1.10.0)(bullmq@6.7.8(ioredis@6.1.0(supports-color@10.2.2))(pg@8.23.1))(cron-parser@5.10.6)(ioredis@6.1.0(supports-color@10.2.2))
+        version: 1.1.1(@adonisjs/core@7.7.0(supports-color@10.2.2)(youch@4.1.1))(@adonisjs/lucid@22.5.0(@adonisjs/core@7.7.0(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.2.0)(luxon@3.7.2)(mysql2@3.24.6(@types/node@26.6.7))(pg@8.23.1)(supports-color@10.2.2))(@opentelemetry/api@1.10.0)(bullmq@6.7.10(ioredis@6.1.0(supports-color@10.2.2))(pg@8.23.1))(cron-parser@5.10.6)(ioredis@6.1.0(supports-color@10.2.2))
       '@arethetypeswrong/cli':
         specifier: 0.18.5
         version: 0.18.5
@@ -283,8 +283,8 @@ importers:
         specifier: 13.2.0
         version: 13.2.0
       bullmq:
-        specifier: 6.7.8
-        version: 6.7.8(ioredis@6.1.0(supports-color@10.2.2))(pg@8.23.1)
+        specifier: 6.7.10
+        version: 6.7.10(ioredis@6.1.0(supports-color@10.2.2))(pg@8.23.1)
       cron-parser:
         specifier: 5.10.6
         version: 5.10.6
@@ -2437,8 +2437,8 @@ packages:
     resolution: {integrity: sha512-nEh+kZOPY1w+gcCMobZ6ETUp9WfibndnosbpwB1iJk/8Gt5ZF2bhS6+B6bPYz424KtwsR6Rflc3tCz1/ghX2dQ==}
     engines: {node: '>=4.0'}
 
-  bullmq@6.7.8:
-    resolution: {integrity: sha512-Mt0+nKGNFWAruuwwzEUVE+5yEgK5XgzjoR2BjSKp/JeqfgeYO0pFh6oy78Ls8u9upVTsaLhBzSaEZAhYvjPlJg==}
+  bullmq@6.7.10:
+    resolution: {integrity: sha512-Gd+z7bqpO2WeTtol8q01OpIf2kWLrVJcpvJGYsB8c/GeLZgeW6ezyeg4DIs7u8+LTJt1y8XMI2BPmIXlgFe7xg==}
     engines: {node: '>=14.18.0'}
     peerDependencies:
       bullmq-otel: '>=2.0.0'
@@ -4456,14 +4456,14 @@ snapshots:
     optionalDependencies:
       '@adonisjs/lucid': 22.5.0(@adonisjs/core@7.7.0(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.2.0)(luxon@3.7.2)(mysql2@3.24.6(@types/node@26.6.7))(pg@8.23.1)(supports-color@10.2.2)
 
-  '@adonis-agora/telescope@1.1.1(@adonisjs/core@7.7.0(supports-color@10.2.2)(youch@4.1.1))(@adonisjs/lucid@22.5.0(@adonisjs/core@7.7.0(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.2.0)(luxon@3.7.2)(mysql2@3.24.6(@types/node@26.6.7))(pg@8.23.1)(supports-color@10.2.2))(@opentelemetry/api@1.10.0)(bullmq@6.7.8(ioredis@6.1.0(supports-color@10.2.2))(pg@8.23.1))(cron-parser@5.10.6)(ioredis@6.1.0(supports-color@10.2.2))':
+  '@adonis-agora/telescope@1.1.1(@adonisjs/core@7.7.0(supports-color@10.2.2)(youch@4.1.1))(@adonisjs/lucid@22.5.0(@adonisjs/core@7.7.0(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.2.0)(luxon@3.7.2)(mysql2@3.24.6(@types/node@26.6.7))(pg@8.23.1)(supports-color@10.2.2))(@opentelemetry/api@1.10.0)(bullmq@6.7.10(ioredis@6.1.0(supports-color@10.2.2))(pg@8.23.1))(cron-parser@5.10.6)(ioredis@6.1.0(supports-color@10.2.2))':
     dependencies:
       '@adonis-agora/filter': 1.0.0(@adonisjs/core@7.7.0(supports-color@10.2.2)(youch@4.1.1))(@adonisjs/lucid@22.5.0(@adonisjs/core@7.7.0(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.2.0)(luxon@3.7.2)(mysql2@3.24.6(@types/node@26.6.7))(pg@8.23.1)(supports-color@10.2.2))
       '@adonisjs/core': 7.7.0(supports-color@10.2.2)(youch@4.1.1)
     optionalDependencies:
       '@adonisjs/lucid': 22.5.0(@adonisjs/core@7.7.0(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.2.0)(luxon@3.7.2)(mysql2@3.24.6(@types/node@26.6.7))(pg@8.23.1)(supports-color@10.2.2)
       '@opentelemetry/api': 1.10.0
-      bullmq: 6.7.8(ioredis@6.1.0(supports-color@10.2.2))(pg@8.23.1)
+      bullmq: 6.7.10(ioredis@6.1.0(supports-color@10.2.2))(pg@8.23.1)
       cron-parser: 5.10.6
       ioredis: 6.1.0(supports-color@10.2.2)
 
@@ -6219,7 +6219,7 @@ snapshots:
     dependencies:
       '@types/node': 26.6.7
 
-  bullmq@6.7.8(ioredis@6.1.0(supports-color@10.2.2))(pg@8.23.1):
+  bullmq@6.7.10(ioredis@6.1.0(supports-color@10.2.2))(pg@8.23.1):
     dependencies:
       cron-parser: 5.10.6
       msgpackr: 2.1.4

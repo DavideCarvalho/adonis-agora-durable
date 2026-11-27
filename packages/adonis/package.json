@@ -214,7 +214,7 @@
     "@types/node": "26.6.7",
     "arktype": "2.2.10",
     "better-sqlite3": "13.2.0",
-    "bullmq": "6.7.8",
+    "bullmq": "6.7.10",
     "cron-parser": "5.10.6",
     "ioredis": "6.1.0",
     "jose": "6.2.18",
