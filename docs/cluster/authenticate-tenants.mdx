@@ -53,7 +53,18 @@ export default defineConfig({
 })
 ```
 
+On the tenant, nothing to write when authkit-client has its `service` configured (`config/authkit_client.ts`, the same service client): it supplies the partition and a token for `urn:agora:durable`, cached until near expiry.
+
 ```ts title="config/durable.ts (tenant)"
+export default defineConfig({
+  topology: 'tenant',
+  // ...
+})
+```
+
+The explicit form, for another client or another issuer. Each field you set wins over authkit-client's:
+
+```ts title="config/durable.ts (tenant, explicit)"
 import env from '#start/env'
 import { authkitTenantToken } from '@adonis-agora/authkit-client'
 

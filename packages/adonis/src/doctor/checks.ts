@@ -1,5 +1,14 @@
 import type { ApplicationService } from '@adonisjs/core/types';
 import {
+  DURABLE_TENANT_FIELDS,
+  DURABLE_TENANT_RESOURCE,
+  describeTenantSources,
+  missingTenantFieldsMessage,
+  resolveTenantIdentity,
+  splitTenantError,
+  type TenantIdentityFields,
+} from '../authkit-tenant.js';
+import {
   DUPLICATE_COPY_DOCS,
   DUPLICATE_COPY_FIX,
   type DurableCopyRegistry,
@@ -88,20 +97,45 @@ export function checkVerifyTenant(
   };
 }
 
-/** `durable.tenant-token`: a tenant pod that presents a token. */
-export function checkTenantToken(config: AnyConfig | undefined): AgoraDoctorResult {
+/**
+ * `durable.tenant-token`: a tenant pod knows its partition and presents a token, and says where
+ * each comes from (`explicit`, or `authkit-client (auto)` when `@adonis-agora/authkit-client`'s
+ * `tenantOf` supplies it).
+ */
+export async function checkTenantToken(
+  config: AnyConfig | undefined,
+  container?: Parameters<typeof resolveTenantIdentity>[1]['container'],
+): Promise<AgoraDoctorResult> {
   if (topologyOf(config) !== 'tenant') return { status: 'skip', message: 'Not a tenant pod.' };
-  const token = (config?.tenant as { token?: unknown } | undefined)?.token;
-  if (token === undefined || token === null || token === '') {
+  const tenant = config?.tenant as TenantIdentityFields | undefined;
+  const resolved = await resolveTenantIdentity(tenant, {
+    container,
+    resource: DURABLE_TENANT_RESOURCE,
+    fields: DURABLE_TENANT_FIELDS,
+  });
+  const where = describeTenantSources(resolved.sources, DURABLE_TENANT_FIELDS);
+  if (resolved.missing.length > 0) {
+    const message = missingTenantFieldsMessage({
+      lib: 'durable',
+      configFile: 'config/durable.ts',
+      resource: DURABLE_TENANT_RESOURCE,
+      missing: resolved.missing,
+      explicitForm: 'tenant: { partition, token }',
+      authkitError: resolved.authkitError,
+      autoDisabled: tenant?.auto === false,
+    });
     return {
       status: 'error',
-      message:
-        "topology is 'tenant' and tenant.token is not set: the control plane cannot tell who this pod is.",
-      fix: 'Set `tenant: { partition, token }` in config/durable.ts (a string, a function or a credentials class).',
+      message: resolved.missing.includes('partition')
+        ? `${where}.`
+        : `${where}: the control plane cannot tell who this pod is.`,
+      ...(splitTenantError(message).fix !== undefined
+        ? { fix: splitTenantError(message).fix }
+        : {}),
       docs: `${DOCS}/cluster/authenticate-tenants`,
     };
   }
-  return { status: 'ok', message: 'The tenant pod presents a token.' };
+  return { status: 'ok', message: `${where}.` };
 }
 
 /** `durable.cron-parser`: cron schedules need cron-parser 5. */
@@ -324,7 +358,7 @@ export const durableDoctorChecks: AgoraDoctorCheck[] = [
     id: 'durable.tenant-token',
     lib: 'durable',
     title: 'Tenant pod presents a token',
-    run: (app) => checkTenantToken(durableConfig(app)),
+    run: (app) => checkTenantToken(durableConfig(app), app.container as never),
   },
   {
     id: 'durable.cron-parser',

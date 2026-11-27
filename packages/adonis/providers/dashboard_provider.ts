@@ -4,6 +4,7 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import type { HttpContext } from '@adonisjs/core/http';
 import type { ApplicationService, HttpRouterService } from '@adonisjs/core/types';
+import { resolveDurableTenant } from '../src/authkit-tenant.js';
 import type { ConsoleCommandAuthOptions } from '../src/control-plane-redis/console-auth.js';
 import {
   authkitClientOf,
@@ -862,8 +863,14 @@ export default class DashboardProvider {
         const selected = await this.selectedApp(config, ctx);
         if (selected === null) return ctx.response.status(404).json({ error: 'unknown app' });
         const durableConfig = this.app.config.get<DurableConfig>('durable', {});
+        // The explicit partition, else the one authkit-client supplies (none: no badge).
         const tenant =
-          durableConfig.topology === 'tenant' ? durableConfig.tenant.partition : undefined;
+          durableConfig.topology === 'tenant'
+            ? await resolveDurableTenant(durableConfig.tenant, this.app.container as never).then(
+                (identity) => identity.tenant.partition,
+                () => undefined,
+              )
+            : undefined;
         // Another app runs its own engine over its own store: a standalone deployment as seen here.
         const result =
           selected !== undefined ? topology('standalone') : topology(durableTopology, tenant);

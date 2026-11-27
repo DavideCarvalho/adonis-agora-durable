@@ -165,7 +165,11 @@ export interface TenantConfig extends BaseDurableConfig {
   /** Required — the broker a tenant pod dispatches/consumes over. */
   transport: string;
   /**
-   * Required — who this pod is and how it proves it to the control plane:
+   * Who this pod is and how it proves it to the control plane. Optional when
+   * `@adonis-agora/authkit-client` is booted with its `service` configured: it supplies `partition`
+   * (`service.partition`, else `service.name`) and `token` (a service token for `urn:agora:durable`),
+   * so `defineConfig({ topology: 'tenant', transport })` is enough. Anything set here wins, field by
+   * field.
    *
    * - `partition`: which tenant (app) this pod is; suffixes its `<name>@<partition>` routing tokens
    *   (spec §6.1) and names its runs' namespace.
@@ -176,8 +180,9 @@ export interface TenantConfig extends BaseDurableConfig {
    *   travels instead and is trusted only by a control plane with no verifier.
    * - `url`: not used by durable (tenants reach the control plane through `transport`); accepted so
    *   the same `tenant` block reads the same in every Agora lib.
+   * - `auto: false`: never fill a field from authkit-client.
    */
-  tenant: TenantIdentityConfig;
+  tenant?: TenantIdentityConfig;
   /** Extra advertised features beyond registered handler names (spec §7 capability negotiation). */
   capabilities?: string[];
   /** `ProxyRunGateway` request timeout (ms) for a proxied read/control round-trip (spec §8). */
@@ -188,8 +193,10 @@ export interface TenantConfig extends BaseDurableConfig {
 export interface TenantIdentityConfig {
   /** Not used by durable: tenants reach the control plane through the broker (`transport`). */
   url?: string | undefined;
-  /** Which tenant (app) this pod is. */
-  partition: string;
-  /** The claim presented on every wire request. */
+  /** Which tenant (app) this pod is. Default: authkit-client's partition, when it is booted. */
+  partition?: string | undefined;
+  /** The claim presented on every wire request. Default: authkit-client's token for `urn:agora:durable`. */
   token?: TenantTokenOption | undefined;
+  /** `false`: never fill `partition`/`token` from `@adonis-agora/authkit-client`. */
+  auto?: boolean | undefined;
 }

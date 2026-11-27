@@ -574,10 +574,12 @@ export function defineConfig(config: DurableConfig = { topology: 'standalone' })
         '@adonis-agora/durable: `partition` moved into the `tenant` block in config/durable.ts: `tenant: { partition, token }`.',
       );
     }
+    // `tenant` may be left out: authkit-client supplies `partition`/`token` at boot (a missing one
+    // fails the boot there, naming both fixes). One given here must still be a non-empty string.
     const partition = (config as { tenant?: { partition?: unknown } }).tenant?.partition;
-    if (typeof partition !== 'string' || partition.length === 0) {
+    if (partition !== undefined && (typeof partition !== 'string' || partition.length === 0)) {
       throw new Error(
-        "@adonis-agora/durable: topology 'tenant' needs `tenant: { partition, token }` in config/durable.ts.",
+        "@adonis-agora/durable: `tenant.partition` must be a non-empty string in config/durable.ts (or leave it out and let @adonis-agora/authkit-client's `service` supply it).",
       );
     }
   }

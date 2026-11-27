@@ -77,11 +77,10 @@ function typeContracts(): void {
   // @ts-expect-error — `stores` is forbidden on a tenant config (stores?: never)
   defineConfig({ topology: 'tenant', tenant: acme, transport: 'bull', stores: lucidStores });
 
-  // `tenant.partition` is required on a tenant config.
-  // @ts-expect-error — missing required `tenant`
-  defineConfig({ topology: 'tenant', transport: 'bull' });
-  // @ts-expect-error — missing required `tenant.partition`
-  defineConfig({ topology: 'tenant', transport: 'bull', tenant: { token: 'x' } });
+  // `tenant` may be left out (authkit-client supplies partition/token at boot), or partly given.
+  const auto = defineConfig({ topology: 'tenant', transport: 'bull' });
+  const partly = defineConfig({ topology: 'tenant', transport: 'bull', tenant: { token: 'x' } });
+  type _Auto = Expect<Equal<typeof auto | typeof partly, TenantConfig>>;
 
   // `store`/`transport` are required on a control-plane config.
   // @ts-expect-error — missing required `store` and `transport`

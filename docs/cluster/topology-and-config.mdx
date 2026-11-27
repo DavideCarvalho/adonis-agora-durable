@@ -56,7 +56,21 @@ A `control-plane` serves no `app/steps` in-process (only `standalone` embeds a w
 
 ## Tenant (store-less thin pod)
 
-A `tenant` pod **never owns a store**. Everything round-trips over the wire via the `ProxyRunGateway`. The isolation is a **compile-time fact** — `store` and `stores` are typed `never`, so naming one fails to type-check. The pod and its control plane must use the same transport, on the same broker:
+A `tenant` pod **never owns a store**. Everything round-trips over the wire via the `ProxyRunGateway`. The isolation is a **compile-time fact** — `store` and `stores` are typed `never`, so naming one fails to type-check. The pod and its control plane must use the same transport, on the same broker.
+
+With [`@adonis-agora/authkit-client`](/docs/authkit) configured with its `service` (`name`, `clientId`, `clientSecret`), the topology and the transport are all you write: authkit-client supplies the pod's partition (`service.partition`, else `service.name`) and its token for `urn:agora:durable`.
+
+```ts title="config/durable.ts (tenant, with authkit-client)"
+import { defineConfig, transports } from '@adonis-agora/durable'
+
+export default defineConfig({
+  topology: 'tenant',
+  transport: 'bullmq',
+  transports: { bullmq: transports.bullmq({ connection: process.env.REDIS_URL! }) },
+})
+```
+
+Or set them yourself. Each field you set wins over authkit-client's, one by one, and `tenant: { auto: false }` turns authkit-client off for durable:
 
 ```ts title="config/durable.ts (tenant)"
 import { defineConfig, transports } from '@adonis-agora/durable'
@@ -68,7 +82,7 @@ export default defineConfig({
     bullmq: transports.bullmq({ connection: process.env.REDIS_URL! }),
   },
   tenant: {
-    partition: 'acme-corp',          // which tenant this pod serves (required) — see Tenancy
+    partition: 'acme-corp',          // which tenant this pod serves — see Tenancy
     token: process.env.DURABLE_TENANT_TOKEN, // its token: a string, a function or a token source
   },
   requestTimeoutMs: 10_000,          // ProxyRunGateway round-trip timeout (default 10_000)
@@ -76,6 +90,8 @@ export default defineConfig({
   // store: 'lucid'                  // ❌ compile error — a tenant pod may not name a store
 })
 ```
+
+Without authkit-client and without `tenant.partition`, a web process fails its boot, and `durable:worker` fails when it starts, naming both fixes. `node ace agora:doctor` shows where each field came from (`durable.tenant-token`): `tenant token/partition: authkit-client (auto)`, or `explicit`.
 
 `tenant.partition` reaches all three: the `ProxyRunGateway` (the tenant it claims on the wire), the worker runtime (the routing tokens its descriptor advertises) and the transport, which subscribes the `<name>@acme-corp` task queues the control plane dispatches the tenant's steps to. The top-level `instanceId` is the transport's default too, so the runtime's and the transport's liveness keys carry the same id. A `partition` or `instanceId` set on the transport itself wins.
 
