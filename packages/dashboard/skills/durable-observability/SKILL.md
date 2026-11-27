@@ -41,7 +41,41 @@ node ace configure @adonis-agora/durable
 # registers @adonis-agora/durable/dashboard_provider + publishes config/durable_dashboard.ts
 ```
 
-```ts no-check title="config/durable_dashboard.ts"
+`authorize` reads `ctx.auth`, which only exists with `@adonisjs/auth` installed:
+`node ace add @adonisjs/auth` writes `config/auth.ts`, whose `Authenticators` declaration types
+`ctx.auth.user` as your `User` model, and registers the middleware that sets `ctx.auth` on every
+request:
+
+```ts title="config/auth.ts"
+import { defineConfig } from '@adonisjs/auth'
+import { sessionGuard, sessionUserProvider } from '@adonisjs/auth/session'
+import type { InferAuthenticators } from '@adonisjs/auth/types'
+
+const authConfig = defineConfig({
+  default: 'web',
+  guards: {
+    web: sessionGuard({
+      useRememberMeTokens: false,
+      provider: sessionUserProvider({ model: () => import('#models/user') }),
+    }),
+  },
+})
+
+export default authConfig
+
+declare module '@adonisjs/auth/types' {
+  export interface Authenticators extends InferAuthenticators<typeof authConfig> {}
+}
+```
+
+```ts title="start/kernel.ts (excerpt)"
+import router from '@adonisjs/core/services/router'
+
+router.use([() => import('@adonisjs/auth/initialize_auth_middleware')])
+```
+
+```ts title="config/durable_dashboard.ts"
+import type User from '#models/user'
 import { defineConfig } from '@adonis-agora/durable/dashboard'
 
 export default defineConfig({
@@ -50,7 +84,8 @@ export default defineConfig({
   authorize: async (ctx) => {
     // boolean | { allowed, reason?: 'unauthenticated' | 'forbidden' } | { redirectTo }
     if (!(await ctx.auth.check())) return { allowed: false, reason: 'unauthenticated' } // 401
-    return ctx.auth.user?.isAdmin === true // false / { allowed: false } -> 403
+    const user: User = ctx.auth.getUserOrFail()
+    return user.isAdmin === true // false / { allowed: false } -> 403
   },
   // authorize: ConsoleAccess, // an authorizer class (built by the container, so `@inject()` works)
   // authorize: () => import('#policies/console_access'), // a lazy import of one
@@ -242,12 +277,16 @@ console reads their runs from their store and sends every action (and the engine
 schedules, worker health, lifecycle links, events) over that app's Redis control plane, where
 that app's engine runs it:
 
-```ts no-check title="config/durable_dashboard.ts (the console app)"
+```ts title="config/durable_dashboard.ts (the console app)"
+import type User from '#models/user'
 import { controlPlanes, stores } from '@adonis-agora/durable'
 import { defineConfig } from '@adonis-agora/durable/dashboard'
 
 export default defineConfig({
-  authorize: (ctx) => ctx.auth.user?.isAdmin === true,
+  authorize: (ctx) => {
+    const user: User | undefined = ctx.auth.user
+    return user?.isAdmin === true
+  },
   apps: {
     // key = that app's crypto partition / authkit app name (override: controlPlane.partition)
     'entre-textos': {
@@ -306,16 +345,22 @@ or a console entry that may act with no mode); `node ace agora:doctor` reports e
 Wrong:
 
 ```ts
+import { defineConfig } from '@adonis-agora/durable/dashboard'
+
 export default defineConfig({}) // open in dev, every route 403s in production
 ```
 
 Correct:
 
 ```ts
+import type User from '#models/user'
+import { defineConfig } from '@adonis-agora/durable/dashboard'
+
 export default defineConfig({
   authorize: async (ctx) => {
     await ctx.auth.check()
-    return ctx.auth.user?.isAdmin === true
+    const user: User | undefined = ctx.auth.user
+    return user?.isAdmin === true
   },
 })
 ```
