@@ -202,6 +202,16 @@ export function deriveMessagesKey(appKey: MessageSecret): Buffer {
   );
 }
 
+/** An own property, even for `__proto__` (a plain assignment would set the prototype instead). */
+function define(target: Record<string, unknown>, key: string, value: unknown): void {
+  Object.defineProperty(target, key, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+}
+
 /** JSON with sorted keys, so a MAC survives brokers that reorder keys (Postgres `jsonb`). */
 export function canonicalJson(value: unknown): string {
   return JSON.stringify(sortKeys(JSON.parse(JSON.stringify(value ?? null))));
@@ -211,7 +221,7 @@ function sortKeys(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortKeys);
   if (!isRecord(value)) return value;
   const out: Record<string, unknown> = {};
-  for (const key of Object.keys(value).sort()) out[key] = sortKeys(value[key]);
+  for (const key of Object.keys(value).sort()) define(out, key, sortKeys(value[key]));
   return out;
 }
 
@@ -237,8 +247,8 @@ function split(
   const hidden: Record<string, unknown> = {};
   for (const [field, value] of Object.entries(msg)) {
     if (value === undefined || field === SEALED_FIELD) continue;
-    if (spec.id.includes(field) || spec.clear.includes(field)) clear[field] = value;
-    else hidden[field] = value;
+    if (spec.id.includes(field) || spec.clear.includes(field)) define(clear, field, value);
+    else define(hidden, field, value);
   }
   return { clear, hidden };
 }
@@ -248,7 +258,7 @@ function clearOf(kind: MessageKind, raw: Record<string, unknown>): Record<string
   const spec = SPECS[kind];
   const clear: Record<string, unknown> = {};
   for (const field of [...spec.id, ...spec.clear]) {
-    if (raw[field] !== undefined) clear[field] = raw[field];
+    if (raw[field] !== undefined) define(clear, field, raw[field]);
   }
   return clear;
 }
@@ -567,7 +577,7 @@ class CryptoSealer extends BaseSealer {
   readonly #current = new Map<string, Session>();
   readonly #sealing = new Map<string, Promise<Session>>();
   readonly #opened = new Map<string, Session>();
-  readonly #opening = new Map<string, Promise<Session | null>>();
+  readonly #opening = new Map<string, Promise<Session | null | 'unavailable'>>();
   #budget = OPEN_BUDGET_PER_MINUTE;
   #budgetResetAt = 0;
 
@@ -647,7 +657,11 @@ class CryptoSealer extends BaseSealer {
     } as T;
   }
 
-  #openSession(partition: string, sealed: string): Session | null | Promise<Session | null> {
+  /** The session key, `null` when it does not open, `'unavailable'` when the cipher failed. */
+  #openSession(
+    partition: string,
+    sealed: string,
+  ): Session | null | 'unavailable' | Promise<Session | null | 'unavailable'> {
     const known = this.#opened.get(sealed);
     if (known) {
       if (known.partition !== partition || Date.now() - known.iat > SESSION_MAX_AGE_MS) return null;
@@ -660,7 +674,7 @@ class CryptoSealer extends BaseSealer {
       this.#budget = OPEN_BUDGET_PER_MINUTE;
       this.#budgetResetAt = now + 60_000;
     }
-    if (this.#budget <= 0) return null;
+    if (this.#budget <= 0) return 'unavailable';
     this.#budget -= 1;
     const aad = this.#sessionAad(partition);
     const promise = this.#source
@@ -668,7 +682,7 @@ class CryptoSealer extends BaseSealer {
       .then((cipher) =>
         cipher.decrypt({ key: this.#source.key, ciphertext: sealed, aad, context: aad }),
       )
-      .then(({ plaintext }): Session | null => {
+      .then(({ plaintext }): Session | null | 'unavailable' => {
         const parsed = JSON.parse(plaintext) as {
           v?: unknown;
           k?: unknown;
@@ -685,7 +699,15 @@ class CryptoSealer extends BaseSealer {
         this.#remember(session);
         return session;
       })
-      .catch(() => null)
+      // A ciphertext that does not authenticate is refused as such; anything else (the crypto
+      // server down, this process refused) is reported as the cipher being unavailable.
+      .catch((error: unknown): null | 'unavailable' =>
+        /authenticat|tag|invalid|unreadable|malformed|ciphertext|decrypt/i.test(
+          error instanceof Error ? error.message : String(error),
+        )
+          ? null
+          : 'unavailable',
+      )
       .finally(() => this.#opening.delete(sealed));
     this.#opening.set(sealed, promise);
     return promise;
@@ -710,6 +732,13 @@ class CryptoSealer extends BaseSealer {
       );
     }
     const session = await this.#openSession(partition, sealed);
+    if (session === 'unavailable') {
+      return this.reject(
+        kind,
+        'crypto-unavailable',
+        `the crypto cipher could not open its session key with "${this.#source.key}" (the crypto server down or refusing this process, or too many unknown session keys this minute)`,
+      );
+    }
     if (!session) {
       return this.reject(
         kind,

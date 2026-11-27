@@ -706,7 +706,8 @@ export class QueueTransport implements Transport, ControlPlane {
     return this.#job(name, seal ? await this.#messages.seal(kind, payload) : payload, priority);
   }
 
-  /** Run requests / starts that arrived plain (by correlation id): their replies go back plain. */
+  /** Run requests / starts that arrived plain (by correlation id): their replies go back plain. A
+   *  start is answered with its run id as the reply's `requestId`, so both are looked up there. */
   readonly #plainRequests = new Set<string>();
 
   #notePlainRequest(raw: unknown, id: unknown): void {

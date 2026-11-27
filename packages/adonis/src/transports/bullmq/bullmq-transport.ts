@@ -447,7 +447,8 @@ export class BullMQTransport implements Transport {
   /** An opened task → the job data it came from (the hand-back check reads the job's object). */
   readonly #openedFrom = new WeakMap<object, object>();
 
-  /** Run requests / starts that arrived plain (by correlation id): their replies go back plain. */
+  /** Run requests / starts that arrived plain (by correlation id): their replies go back plain. A
+   *  start is answered with its run id as the reply's `requestId`, so both are looked up there. */
   readonly #plainRequests = new Set<string>();
 
   #notePlainRequest(raw: unknown, id: unknown): void {

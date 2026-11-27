@@ -304,6 +304,53 @@ describe('message sealing', () => {
     ).rejects.toMatchObject({ reason: 'unauthenticated' });
   });
 
+  it('a top-level `__proto__` added on the broker breaks the seal (secret mode)', async () => {
+    const secret = createMessageSealer({ mode: 'secret', secret: 'a-shared-secret-of-16+' });
+    const sealed = JSON.stringify(await secret.seal('task', task));
+    const tampered = JSON.parse(`{"__proto__":{"admin":true},${sealed.slice(1)}`) as object;
+    await expect(secret.open('task', tampered)).rejects.toMatchObject({
+      reason: 'unauthenticated',
+    });
+    // And a `__proto__` field of the message itself is sealed and comes back as an own field.
+    const appKey = createMessageSealer({ mode: 'app-key', appKey: APP_KEY });
+    const withProto = JSON.parse(`{"__proto__":{"x":1},${JSON.stringify(task).slice(1)}`) as Record<
+      string,
+      unknown
+    >;
+    const opened = await appKey.open<Record<string, unknown>>(
+      'task',
+      wire(await appKey.seal('task', withProto)),
+    );
+    expect(Object.hasOwn(opened, '__proto__')).toBe(true);
+  });
+
+  it('reports a crypto server that cannot be reached as crypto-unavailable', async () => {
+    const sender = createMessageSealer({
+      mode: 'crypto',
+      source: {
+        key: 'durable-messages',
+        label: 'crypto',
+        cipherFor: async () => fakeCipher(),
+        sealPartition: () => '',
+        accepts: (p) => p === '',
+      },
+    });
+    const down = createMessageSealer({
+      mode: 'crypto',
+      source: {
+        key: 'durable-messages',
+        label: 'crypto',
+        cipherFor: async () => {
+          throw new Error('connect ECONNREFUSED 127.0.0.1:3333');
+        },
+        sealPartition: () => '',
+        accepts: (p) => p === '',
+      },
+    });
+    const sealed = wire(await sender.seal('task', task));
+    await expect(down.open('task', sealed)).rejects.toMatchObject({ reason: 'crypto-unavailable' });
+  });
+
   it('a plain transport opens sealed messages only with a key to open them', async () => {
     const appKey = createMessageSealer({ mode: 'app-key', appKey: APP_KEY });
     const sealed = wire(await appKey.seal('task', task));

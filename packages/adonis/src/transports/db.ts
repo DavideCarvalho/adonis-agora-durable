@@ -414,7 +414,8 @@ export class DbTransport implements Transport, ControlPlane {
   readonly #resultConcurrency: number;
   /** Seals what this transport writes and opens what it reads. */
   readonly #messages: MessageSealer;
-  /** Run requests / starts that arrived plain (by correlation id): their replies go back plain. */
+  /** Run requests / starts that arrived plain (by correlation id): their replies go back plain. A
+   *  start is answered with its run id as the reply's `requestId`, so both are looked up there. */
   readonly #plainRequests = new Set<string>();
   readonly #idleBackoffMax: number;
   readonly #maxStalledCount: number;
