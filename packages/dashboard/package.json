@@ -1,6 +1,6 @@
 {
   "name": "@adonis-agora/durable-dashboard",
-  "version": "1.0.0-rc.24",
+  "version": "1.0.0",
   "description": "Control-plane console (runs, step timeline, workflow graph, retry/cancel/fix-and-replay) for @adonis-agora/durable — a React SPA served by a thin AdonisJS provider. Part of the Agora ecosystem.",
   "license": "MIT",
   "repository": {
@@ -45,7 +45,7 @@
     "react-dom": "^18.0.0 || ^19.0.0"
   },
   "devDependencies": {
-    "@adonis-agora/filter-client": "1.0.0-rc.1",
+    "@adonis-agora/filter-client": "1.0.0",
     "@base-ui/react": "1.9.0",
     "@fontsource/jetbrains-mono": "5.3.0",
     "@fontsource/sora": "5.3.0",

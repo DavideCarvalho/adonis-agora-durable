@@ -1,7 +1,7 @@
 {
   "name": "@adonis-agora/durable",
-  "version": "1.0.0-rc.45",
-  "description": "Durable cross-app workflows for AdonisJS \u2014 deterministic replay engine, AdonisJS binding, ace commands, dashboard, OpenTelemetry, Telescope, testing harness and Redis admission, all in one package. Part of the Agora ecosystem.",
+  "version": "1.0.0",
+  "description": "Durable cross-app workflows for AdonisJS — deterministic replay engine, AdonisJS binding, ace commands, dashboard, OpenTelemetry, Telescope, testing harness and Redis admission, all in one package. Part of the Agora ecosystem.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -148,10 +148,10 @@
     "check:agora-doctor": "node ../../scripts/check-agora-doctor.mjs ."
   },
   "dependencies": {
-    "@adonis-agora/filter": ">=1.0.0-rc.5 <2.0.0"
+    "@adonis-agora/filter": "^1.0.0"
   },
   "peerDependencies": {
-    "@adonis-agora/diagnostics": ">=1.0.0 <2.0.0 || >=1.0.0-rc.1 <2.0.0",
+    "@adonis-agora/diagnostics": ">=1.0.0 <2.0.0",
     "@adonisjs/assembler": "^8.4.0",
     "@adonisjs/core": "^7.3.0",
     "@adonisjs/lucid": "^22.4.0",
@@ -196,8 +196,8 @@
     }
   },
   "devDependencies": {
-    "@adonis-agora/authkit-client": "1.0.0-rc.14",
-    "@adonis-agora/diagnostics": "1.0.0-rc.6",
+    "@adonis-agora/authkit-client": "1.0.0",
+    "@adonis-agora/diagnostics": "1.0.0",
     "@adonis-agora/durable-dashboard": "workspace:*",
     "@adonisjs/assembler": "8.6.0",
     "@adonisjs/auth": "10.1.1",

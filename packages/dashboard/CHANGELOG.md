@@ -1,5 +1,143 @@
 # @adonis-agora/durable-dashboard
 
+## 1.0.0
+
+### Major Changes
+
+- [#499](https://github.com/DavideCarvalho/adonis-agora-durable/pull/499) [`32e2dc7`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/32e2dc7e21cf7f3da92ae4b0df968a898c0788eb) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The console's access works like every other `@adonis-agora` console.
+  
+  **`authorize` takes the shared contract** (`ConsoleAuthorize`): an inline function, an authorizer class (built by the container, so `@inject()` works) or a lazy import of one. It may return `{ redirectTo: '/login' }`: a page navigation is redirected there (`302`), an API call gets `401 { error: 'unauthenticated', redirectTo }`.
+  
+  ```ts
+  authorize: (ctx) => ctx.auth.user?.isAdmin === true,
+  authorize: ConsoleAccess,
+  authorize: () => import('#policies/console_access'),
+  ```
+  
+  **Without `authorize`, the console is open outside production and answers `403` to every request in production.** One warning is logged at boot: ``[@adonis-agora/durable] console has no `authorize` configured: it is open outside production and denies every request in production. Set `authorize` in config/durable_dashboard.ts.``
+  
+  **Token access is replaced by `authorizeByToken`.** `DURABLE_DASHBOARD_TOKEN`, the `x-durable-token` header, the `?token=` query param and `defaultAuthorize` are removed. For scripts:
+  
+  ```ts
+  import { authorizeByToken, defineConfig } from '@adonis-agora/durable/dashboard'
+  
+  export default defineConfig({
+    authorize: authorizeByToken({ token: env.get('CONSOLE_TOKEN') }),
+  })
+  ```
+  
+  It reads only `Authorization: Bearer <token>` and throws at config time when the token is empty.
+  
+  **`dashboardAuth` and `allowUnauthenticated` are removed**, with the login page, `POST <path>/session`, `<path>/login`, `<path>/logout`, the session roles and their exports (`resolveDashboardAuth`, `performLogin`, `performSession`, `readSession`, `signSessionCookie`, `verifySessionCookie`, `SESSION_COOKIE_NAME`, `renderLoginPage`). Gate operators with your app's own sign-in in `authorize`. The console no longer shows a logout menu.
+  
+  Denials are uniform: `403 { error: 'forbidden' }`, `401 { error: 'unauthenticated' }` (was `unauthorized`), and the access-denied page for page navigations. A throwing `authorize` is a `403`. The audit actor is `ctx.auth.user`'s `email`, `name` or `id`, `bearer` for a token caller, else `anonymous`.
+  
+  `resolveConfig(config, { inProduction })` returns the resolved gate; `ConsoleAuthorize`, `ConsoleAuthorizer`, `ConsoleAuthorizerClass`, `ConsoleAuthorizeResult` and `authorizeByToken` are exported from `@adonis-agora/durable/dashboard`.
+  
+  See the 1.0 migration guide for before/after examples.
+
+- [#519](https://github.com/DavideCarvalho/adonis-agora-durable/pull/519) [`b0675e5`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/b0675e5ed48a9e2e61b7c3e404539829363ec8b4) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The console's list routes speak the `@adonis-agora/filter` wire format. `GET /api/runs`, `GET /api/runs/:id/fans/:group` and `GET /api/schedules` take filters in `filter[...]` (a filter field sent bare is a `400`, as are unknown fields and operators), `sort` checked against an allow-list (`-createdAt` only on runs, `seq` only on fan members; `key`, `workflow`, `nextFireAt`, `lastFireAt` on schedules), and `page` / `size`, and answer `{ data, meta: { total, perPage, currentPage, lastPage, firstPage } }`. `GET /api/runs` keeps `statuses` next to them and now reports the total (`countRuns`, or a full listing on a port without one). Fan members page by `page` / `size` instead of `offset` / `limit` and filter with `filter[status]=failed` instead of `failed=true`. Schedules gain `filter[workflow]`, `filter[namespace]`, `filter[paused]`. The scope of `POST /api/bulk/:action` and `GET /api/runs/values` is `filter[...]` too (values keeps `groupByCount[limit]` / `[offset]`). `GET /api/workers` answers `{ data }` instead of the bare array, `GET /api/health` `{ data }` instead of `{ groups }`. The console uses `@adonis-agora/filter-client` 1.0 rc. The dev tools `durable_list_fan_members` and `durable_list_schedules` page with `page` / `limit`. Requires `@adonis-agora/filter` 1.0.0-rc.5 or newer. The OpenAPI document declares the new parameters and envelopes.
+
+- [#487](https://github.com/DavideCarvalho/adonis-agora-durable/pull/487) [`d01974a`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/d01974ad24e271371a7288c642c29fe4ca71982e) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - 1.0. The breaking changes, with before/after snippets, are in [Migrating to 1.0](https://davidecarvalho.github.io/agora/docs/durable/migrating-to-1-0).
+  
+  `@adonis-agora/durable`:
+  
+  - **`Wf.start` throws when the run does not complete.** Outside a workflow, a run that ends `failed`, `cancelled` or `dead` now throws the same `FatalError` `ctx.child` throws (`run "<runId>" failed: <reason>`, with the run error's `code` and `details`) instead of resolving with `undefined`. `Wf.start` also takes `timeoutMs` (new `WorkflowStartOptions` type), which bounds the wait.
+  - **The Redis control plane channel includes the namespace.** `controlPlanes.redis` / `RedisControlPlane` broadcast on `<prefix>-<namespace>-control` when the engine has a namespace, matching the `bullmq` transport's names and the NestJS and Python workers. A namespace-less or `default` engine stays on `<prefix>-control`. Wire change: deploy every pod of a namespace together, and drop a `prefix: 'durable-<namespace>'` workaround. A message about a run (cancel, enqueue nudge, the run's lifecycle events) is published on the channel of that run's namespace, so a console with no namespace reaches a namespaced worker at once; messages with no run stay on the publisher's channel. A process that mounts the durable dashboard, or an engine with no namespace, observes every namespace (it also pattern-subscribes to `<prefix>-*-control`); any other namespaced engine observes only its own channel. `controlPlanes.redis({ observe: 'all' | 'own' })` overrides it, and `engine.observeAllNamespaces()` is what the dashboard provider calls. New `namespace` option (it picks the channel an instance listens on), an optional `ControlPlane.useNamespace` hook the engine calls, and an optional `target` argument to `ControlPlane.publishControl`.
+  - **The dashboard update route is `POST <path>/api/runs/:id/updates/:name`** (was `update/:name`), matching the Aviary dashboard API. No alias.
+  - **The transports' `group` option is removed** from `transports.queue`, `transports.db`, `transports.eventEmitter` and the `QueueTransport`, `DbTransport` and `EventEmitterTransport` constructors. It had no effect; use `partition` for separate worker pools.
+  - **`RunSchedulesOptions.sleep` is removed.** It was no longer called.
+  - **`@adonis-agora/filter` is now a range dependency** (`>=0.11.2 <2.0.0 || >=1.0.0-rc.0 <2.0.0`, was pinned to `0.11.2`), so an app that installs filter 1.x shares its copy with durable instead of getting a second one nested inside it.
+  - **`ProxyRunGateway` no longer reads the pre-0.50 unknown-verb reply** (an `unknown run-request verb` message with no `code`), nor an empty `ok` reply, as "the control plane does not know this verb". It relies on the `unsupported-request` code every 0.50+ control plane sends, so upgrade a control plane older than 0.50 before its tenant pods.
+  
+  `@adonis-agora/durable-dashboard`: the console's `update` call targets `POST <path>/api/runs/:id/updates/:name`, which only a 1.0 server answers.
+  
+  `@adonis-agora/durable-eslint-plugin`: no breaking changes; released as 1.0 with the rest of the family.
+
+### Minor Changes
+
+- [#486](https://github.com/DavideCarvalho/adonis-agora-durable/pull/486) [`ab26861`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/ab26861edb93aefad8aa949f32913b6d3681c519) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - A compensating cancel now persists a new run status, `cancelling`.
+  
+  `engine.cancel(runId, { compensate: true })` marks the run `cancelling` before it returns, and returns that status. The run keeps it while the saga's compensations run, then becomes `cancelled`. While it is `cancelling`:
+  
+  - A repeat `cancel()`, with or without `compensate`, returns `cancelling` and leaves the undo alone. Before, a second cancel without `compensate` marked the run `cancelled` and skipped the compensations still running.
+  - Crash recovery re-drives it on any instance, so an undo whose pod died is finished elsewhere.
+  - It keeps its singleton and concurrency slot, `waitForRun` keeps waiting, `engine.requeue()` returns it unchanged, and an `overlap: 'skip'` schedule doesn't fire over it.
+  - The dashboard and the API show it as its own status, with a filter chip.
+  
+  A failed write of the cancel request now fails `cancel()` instead of being ignored, and leaves the run as it was.
+  
+  **Breaking:** `RunStatus` has a new member, `cancelling`. Exhaustive `switch`es over `RunStatus` need a case for it. A custom `StateStore` must return `cancelling` runs from `listIncompleteRuns` and `listOrphanedRuns` (the new `RECOVERABLE_RUN_STATUSES` lists them, and the state-store conformance suite checks it), or recovery won't finish a crashed compensating cancel.
+
+- [#520](https://github.com/DavideCarvalho/adonis-agora-durable/pull/520) [`094fc6f`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/094fc6fabe9f4bca4f6d3cf410b0acf20e3c2275) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Console shell: the durable console is rebuilt on the Agora console kit, the shell every `@adonis-agora` console now shares.
+  
+  - Left sidebar with the brand (the console switcher), nav grouped as MONITOR (Runs, Workers) and OPERATIONS (Schedules, hidden on a tenant deployment), and a footer with the signed-in user, a theme toggle and sign-out. Below 768px the sidebar becomes a drawer.
+  - Topbar with the page title, the organization picker, the run-id quick open and ⌘K search across consoles.
+  - Workers is now its own page (pods, partitions, starved queues, protocol compatibility, blocked runs) instead of a header popover. The status chips are the Runs page toolbar.
+  - Light mode. The theme is remembered per console in localStorage.
+  - Fonts are bundled (Space Grotesk, JetBrains Mono); the page no longer loads Google Fonts.
+  - Every page and region has its own error boundary with a retry button, shaped skeletons and empty states.
+  
+  Server: the page's data block gains `search`, `viewer` and `signOut`. The new `viewer(ctx)` config option sets the user row; without it the console reads `ctx.auth.user` when the request is already authenticated. The new `signOut` option takes a POST action path, `{ href }` or `false`; without it the console uses the sign-out an account console announces on the `agora.consoles` registry (`account.signOut`). A POST sign-out carries the request's CSRF token.
+
+- [`290b25e`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/290b25e14f5af0de05ae352c40dac17e71344eb7) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The console follows the viewer's capabilities: actions the viewer may not run are disabled with the reason, using the shared console capability rules (write implies read; a `*` counts only as the last segment of a capability). Ships with the federated-console authentication changes.
+
+- [#555](https://github.com/DavideCarvalho/adonis-agora-durable/pull/555) [`9c8ad7d`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/9c8ad7dfbc229de85f429cb4908f6e3d24660f71) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The Workers page understands grouped BullMQ task queues: a partition whose handlers share one queue shows a "shared queue" badge and counts that queue's depth once, exact even when the per-handler split was sampled, and a starved handler's sampled depth reads `≥N`.
+
+- [#505](https://github.com/DavideCarvalho/adonis-agora-durable/pull/505) [`4f26653`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/4f26653ca10b7dde113a898a8c9d19f7ecdf3e44) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The durable console joins the Agora console switcher. It registers itself in the app's `'agora.consoles'` registry (created by whichever console boots first), and its brand becomes a menu to the other Agora consoles the viewer may open, each checked with that console's own `authorize` (300 ms each, in parallel; `ctx.agoraProbe` is `true` while they run). Ctrl/Cmd-K searches every console the viewer may open; durable answers run ids and workflow names. New routes: `GET <path>/api/consoles` and `GET <path>/api/consoles/search?q=`, behind the console's `authorize`. `registerAgoraConsole` is exported from `@adonis-agora/durable/dashboard` for consoles an app mounts itself. Nothing changes for an app with a single console.
+
+- [#507](https://github.com/DavideCarvalho/adonis-agora-durable/pull/507) [`a35cc88`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/a35cc8801ee07cba60b4f0d414b549cbaa2623d9) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Organizations (tenancy). With tenancy on in `@adonis-agora/context` (or `tenancy` in `config/durable.ts`), every run carries the active tenant (`tenantId`, `tenantKind`; `StartOptions.tenantId` to choose, `null` for none). Child runs, `continueAsNew`, retries, dead-letter runs and persisted schedules keep it, and a run resumed by a timer, a signal or recovery runs with its tenant active again. App-facing reads and control calls (`getRun`, `listRuns`, `cancel`, `signal`, `requeue`, `engine.schedules`, …) only reach the active tenant's runs (another tenant's run reads as missing). New `RunQuery.tenantId` / `tenantIds`, a `tenant` value axis, nullable `tenant_id` / `tenant_kind` columns on runs and schedules (added at boot, schema revision 6), optional `tenantId` / `tenantKind` on the start-run wire message (kept only when the pod's token grants `tenancy:*` or `tenancy:<id>`). Nothing changes until tenancy is turned on.
+  
+  The console shows the viewer's own organization; `authorize` may return `{ allowed: true, tenants: [...] | '*' }` to grant more, with an Organization picker (`?tenant=`, switches audited) and the organization on each row. The worker-pool filter is now labelled "Namespace".
+
+- [#561](https://github.com/DavideCarvalho/adonis-agora-durable/pull/561) [`9d328ff`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/9d328ff5444be6f53449798856dfd87abf2700f7) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Federated console: one app's durable console can show the runs of other apps that keep their own store and engine. List them under `apps` in `config/durable_dashboard.ts` (each with that app's `store` and `controlPlane`); the console gets an app selector (`?app=<key>` in the URL), reads the picked app's runs from its store, and sends every action on them (cancel, retry, signal, resume, fix-and-replay, schedule pause/trigger, worker health) to that app's engine over its control plane, where exactly one instance runs it. The owning app opts in with `consoleCommands: true` in its `config/durable.ts`. `controlPlanes.redis` carries the new console commands; an `authorize` that grants `apps` as a list also hides the federated apps it does not name.
+
+- [#560](https://github.com/DavideCarvalho/adonis-agora-durable/pull/560) [`b971790`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/b971790241f443da1aa8b212addd5101c006a2ac) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The runs board pages by cursor, so loading more no longer re-reads the runs above or counts the table on every page.
+  
+  - `GET /runs` accepts `first`/`after` and answers `{ data, meta: { nextCursor, prevCursor, hasNext, hasPrev }, statuses }`. It seeks past the last run's `(createdAt, id)` with no `countRuns`. `page`/`size` keep the offset envelope and its `total`.
+  - `RunQuery.after: { createdAt, id }` (new type `RunListPosition`) pages by position: strictly past it in `(createdAt DESC, id DESC)` order, `page` ignored. Both built-in stores implement it. `listRuns` now breaks ties on `createdAt` by `id`, so runs created in the same millisecond keep one order across pages. A store that ignores `after` ends the board's listing instead of repeating runs.
+  - The board's infinite scroll follows `nextCursor`. Its header shows the loaded count (`120+ runs`) instead of a total.
+  - New migration `add_durable_run_list_indexes` (published by `configure`), plus `createDurableRunListIndexes` / `dropDurableRunListIndexes`. It adds `(status, created_at, id)` on the runs table for the status chips, built `CONCURRENTLY` on Postgres. Opt-in: run it once on existing installs (see the Lucid store docs).
+
+- [#581](https://github.com/DavideCarvalho/adonis-agora-durable/pull/581) [`c8fcbde`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/c8fcbdea1cd3384707f6e0d624e1c06422276dc0) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Console: the run detail header shows when the run was **Created** and last **Updated** (short date, full local time on hover), and each runs-list row's "updated … ago" stamp carries both full timestamps in its title.
+
+- [#557](https://github.com/DavideCarvalho/adonis-agora-durable/pull/557) [`9b21406`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/9b214063bc1f597cf397d9ba0c4ce04fe8ed910a) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The Runs board's filters now live in the URL, so a filtered view can be shared, bookmarked and reloaded, and back/forward step through it: status, workflow, tag, namespace, attribute predicates and origin sit in the hash's query (`#?status=failed&tag=vip`, `#/run/<id>?status=failed`). A value at its default is left out, so existing `#/run/<id>` links open as before, and the filters still survive a trip to Workers and back.
+
+### Patch Changes
+
+- [#567](https://github.com/DavideCarvalho/adonis-agora-durable/pull/567) [`bb3ffa5`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/bb3ffa553100dd6a351bc7717e1e7d528f45994b) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Federated console: the App selector says which apps are federated, and who runs actions on them. `GET /apps` now gives each `apps[]` entry `mode: 'federated'` and `actions` (`'app'`: actions are sent to that app, which runs them; `'none'`: a built control plane that cannot carry console commands, so the console only browses that app). The selector tags federated apps (and the trigger, when one is picked), every page shows a notice while a federated app is picked, and with `actions: 'none'` the run, wait, bulk and schedule actions are disabled with the reason. Older servers omit both fields and the console behaves as before.
+
+- [#532](https://github.com/DavideCarvalho/adonis-agora-durable/pull/532) [`f0bd40e`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/f0bd40e7fd272e2f9fd576f3ddd285cf6144d855) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Console sidebar matches the old authkit admin console exactly (Agora console kit): nav rows are 32px with no gap between them, section labels and the brand/switcher header use authkit's spacing, the footer role shows as sent (no forced uppercase), and the theme toggle sits left-aligned with a 13px icon next to a 26px sign-out button.
+
+- [#526](https://github.com/DavideCarvalho/adonis-agora-durable/pull/526) [`8b9f48a`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/8b9f48aaec0faf03c646fb07c14ca2601dcacc6b) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Server: the `agora.consoles` registry accepts the `flags` and `cms` icon keys, so those consoles show their own tile instead of `generic`. Console: the console switcher shows the CMS console with its own orange tile and glyph, and the kit gains a 16px `DocumentIcon`; the collapsible nav section toggle has a test pinning its focus ring (Agora console kit round 3).
+
+- [#524](https://github.com/DavideCarvalho/adonis-agora-durable/pull/524) [`051e698`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/051e6981c22d11350e4353c581acbd65178233ab) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Console footer: the signed-in user's role now shows when no `viewer` hook is set. The structural read of `ctx.auth.user` takes `role`, `roles` (strings, `{ name }` or authz `{ role }` rows) and `globalRoles`, plus the global roles of authkit's per-request identity on `ctx.authkit` (read structurally, 250 ms cap). One role is shown: an admin-like one first, else the first.
+  
+  Console: inline SVG favicon in the console accent, so the browser no longer probes `/favicon.ico` and logs a 404 in the host app.
+
+- [#495](https://github.com/DavideCarvalho/adonis-agora-durable/pull/495) [`ac19140`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/ac1914059808a48d239fbb52dd9ce26b1d68e493) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Console fixes found by a smoke test of the 1.0 console:
+  
+  - **Actions work under shield.** Every write the console sends (cancel, retry, update, signal, task, bulk, schedules) carries the `XSRF-TOKEN` cookie back as `x-xsrf-token`, and a write is never redirected silently: a refused request (a redirect, or any non-2xx answer) shows as an error on the page instead of looking like nothing happened.
+  - **The `window.__DURABLE_BASE__` / `__DURABLE_API__` overrides are gone.** The provider's JSON config block is the only source; without it the console uses `/durable` and `/durable/api`.
+  - **The run detail of a waiting run** carries what the run waits on (`run.waiting`, as list rows do), so "Send update", "Deliver signal" and the task actions show whatever page the list is on, and the header reads `awaiting` (or `suspended` for a run parked on nothing named) instead of `running`.
+  - **A `cancelling` run** reads "Cancelling" instead of falling through to "Saga compensated".
+  - **The status chips' counts (ALL included)** are recounted with every list refresh.
+  - The dashboard package no longer lists a README it does not ship.
+
+- [#540](https://github.com/DavideCarvalho/adonis-agora-durable/pull/540) [`a562ef3`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/a562ef38ca45dee4cd62005522525bc6adb0b26d) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The console kit gains charts on TanStack Charts (`agora-kit/charts`: TimeSeriesChart, BarChart, Sparkline, DonutChart) with a themed tooltip on hover and keyboard focus. No chart in this console uses it yet; nothing changes on screen and its JS bundle stays the same (the chart styles add a few lines of CSS).
+
+- [#564](https://github.com/DavideCarvalho/adonis-agora-durable/pull/564) [`7762db3`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/7762db30326150b4172e70771ceef181c01c5de7) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Console ⌘K: arrow keys now visibly move the selection. The highlighted item was styled with a bare `data-selected:` (cmdk marks every item `true` or `false`) and with the dialog's own surface color, so moving looked like nothing happened.
+
+- [#521](https://github.com/DavideCarvalho/adonis-agora-durable/pull/521) [`b87144c`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/b87144cb021d97dd3ec85c23efce66942a7edc5e) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Console: the bundled Sora and JetBrains Mono fonts load again. The build dropped their `@font-face` rules (`sideEffects: false`), and their URLs inside the CSS kept the unmounted base path; the console fell back to system fonts.
+
+- [#543](https://github.com/DavideCarvalho/adonis-agora-durable/pull/543) [`83849ce`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/83849ce9721d227e3100a1872915e8efaefaae29) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - ⌘K now navigates: it lists every page of the console's sidebar and every other Agora console you can open ("Go to Workflows", found by "durable" too), matched case- and accent-insensitively, before the console's own commands and the cross-console search hits. ⌘K opens even without a search endpoint, and shows the pages and consoles before anything is typed.
+
+- [#571](https://github.com/DavideCarvalho/adonis-agora-durable/pull/571) [`d9c24f9`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/d9c24f93745176b185f6de5fd155512ea4f32b88) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - The App and Organization pickers use the console kit's shared `ScopeMenu` / `ScopeChip`, the same searchable picker as telescope's (federated apps hinted, the picked app's mode badge kept). Going to another console, a sidebar page or a ⌘K command keeps `?app=` / `?tenant=`.
+
+- [#574](https://github.com/DavideCarvalho/adonis-agora-durable/pull/574) [`c5f4f3c`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/c5f4f3c1926587ce812b305672730d401326c561) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - App and Organization pickers: screen readers hear "App: Hub" (not the two spans run together), search matches an option's hint, the highlight stays on a real option when the list shrinks, and focus returns to the button after a pick.
+
+- [#525](https://github.com/DavideCarvalho/adonis-agora-durable/pull/525) [`c5c0aa2`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/c5c0aa24ed7fde78d91cfd97a35497d4142e11d1) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Console ⌘K shows its loading state: a spinner in the search box while a request is in flight, skeleton rows until the first answer, earlier hits kept but dimmed during a re-search, "Nothing found" only after an empty answer, and a quiet "didn't answer" line with Retry when the search fails. Synced with the shared console kit (DataTable `rowClassName`/`subRow`, ⌘K console-local `commands`, collapsible nav sections).
+
 ## 1.0.0-rc.24
 
 ### Minor Changes
