@@ -313,8 +313,8 @@ requires `saveCheckpointsIfPending` (batched result settling), `deleteRuns`
 (batched retention/purge deletes), `runFacets`, `pruneBufferedEvents`
 (`eventBufferTtl`) and the `checkpointStats` + `queryCheckpoints` pair (the run
 detail from aggregates, with an ETag the console polls with `If-None-Match`).
-Implement `settleCheckpointsIfPending` (write only a result's status, output,
-error, events and timestamps, while the row is `pending`) and
+Implement `settleCheckpointsIfPending` (write a result's status, output,
+error, events and timestamps and clear `wakeAt`, while the row is `pending`) and
 `listCheckpointsForReplay` (`listCheckpoints` without a `completed` row's
 `input`, left out in SQL) and `getCheckpointsForSettle` (`getCheckpoints`
 without `input`) too: without them every result rewrites and re-reads the step's
