@@ -245,10 +245,16 @@ descriptors and the delta. Source: `docs/cluster/handshake.mdx`.
 Outside an Adonis app (standalone Node service), use the `/worker` subpath — it
 imports zero store code:
 
-```ts no-check title="worker.ts"
+```ts title="worker.ts"
 import { RedisWorkerRegistry, WorkerRuntime } from '@adonis-agora/durable/worker'
 import { BullMQTransport, createBullMQDeps } from '@adonis-agora/durable'
 import { Redis } from 'ioredis'
+
+interface ChargeInput {
+  orderId: string
+  amountCents: number
+}
+declare const stripe: { charge(input: ChargeInput): Promise<string> } // your payment client
 
 // No Adonis app here, so build the transport directly instead of through `transports.bullmq()`.
 const transport = new BullMQTransport({ deps: await createBullMQDeps(process.env.REDIS_URL) })
@@ -341,6 +347,10 @@ node ace durable:worker
 Correct:
 
 ```ts
+import type { WorkerRuntime } from '@adonis-agora/durable/worker'
+
+declare const runtime: WorkerRuntime // the runtime built above
+
 runtime.registerWorkflow('checkout', (ctx, input) => {
   const paid = ctx.step('billing.charge', input)
   return { paid }
@@ -357,12 +367,26 @@ and turns are synchronous replay functions by design. Source:
 Wrong:
 
 ```ts
+import { WorkerRuntime, type WorkerRuntimeOptions } from '@adonis-agora/durable/worker'
+
+declare const transport: WorkerRuntimeOptions['transport']
+
 const runtime = new WorkerRuntime({ transport, partition: 'acme' }) // registry defaults to noop
 ```
 
 Correct:
 
 ```ts
+import {
+  type DescriptorRedis,
+  RedisWorkerRegistry,
+  WorkerRuntime,
+  type WorkerRuntimeOptions,
+} from '@adonis-agora/durable/worker'
+
+declare const transport: WorkerRuntimeOptions['transport']
+declare const redis: DescriptorRedis // an ioredis client
+
 const runtime = new WorkerRuntime({
   transport,
   partition: 'acme',

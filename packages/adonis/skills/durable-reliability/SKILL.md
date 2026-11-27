@@ -263,7 +263,8 @@ Source: `docs/reliability/failure-modes.mdx`, `docs/cli.mdx`.
 
 ### Pattern 5 — test workflows without infrastructure
 
-```ts no-check
+```ts
+import { test } from '@japa/runner'
 import { assertRunStatus, createTestEngine, failOnce } from '@adonis-agora/durable/testing'
 
 test('checkout completes', async () => {
