@@ -254,9 +254,11 @@ describe('config types accept every form', () => {
     expect(() =>
       defineConfig({ topology: 'tenant', transport: 'q', partition: 'a' } as never),
     ).toThrow(/moved into the `tenant` block/);
-    expect(() => defineConfig({ topology: 'tenant', transport: 'q' } as never)).toThrow(
-      /needs `tenant: \{ partition, token \}`/,
-    );
+    // No `tenant` block is fine at definition time: authkit-client may supply it at boot.
+    expect(() => defineConfig({ topology: 'tenant', transport: 'q' } as never)).not.toThrow();
+    expect(() =>
+      defineConfig({ topology: 'tenant', transport: 'q', tenant: { partition: '' } } as never),
+    ).toThrow(/`tenant.partition` must be a non-empty string/);
   });
 });
 

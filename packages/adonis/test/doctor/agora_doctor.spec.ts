@@ -293,15 +293,60 @@ describe('durable checks', () => {
     ).toBe('ok');
   });
 
-  it('tenant-token', () => {
-    expect(checkTenantToken({}).status).toBe('skip');
-    expect(checkTenantToken({ topology: 'tenant' } as never).status).toBe('error');
-    expect(checkTenantToken({ topology: 'tenant', tenant: { token: 't' } } as never).status).toBe(
-      'ok',
-    );
+  it('tenant-token', async () => {
+    expect((await checkTenantToken({})).status).toBe('skip');
+    expect((await checkTenantToken({ topology: 'tenant' } as never)).status).toBe('error');
     expect(
-      checkTenantToken({ topology: 'tenant', tenant: { token: () => 't' } } as never).status,
+      (await checkTenantToken({ topology: 'tenant', tenant: { partition: 'a' } } as never)).status,
+    ).toBe('error');
+    const explicit = await checkTenantToken({
+      topology: 'tenant',
+      tenant: { partition: 'a', token: 't' },
+    } as never);
+    expect(explicit).toEqual({ status: 'ok', message: 'tenant token/partition: explicit.' });
+    expect(
+      (
+        await checkTenantToken({
+          topology: 'tenant',
+          tenant: { partition: 'a', token: () => 't' },
+        } as never)
+      ).status,
     ).toBe('ok');
+  });
+
+  it('tenant-token: says what authkit-client supplies', async () => {
+    const authkit = {
+      tenantOf: () => ({
+        url: async () => 'https://hub.test',
+        token: async () => 'tok',
+        partition: 'shop',
+      }),
+    };
+    const container = {
+      hasBinding: (key: string) => key === 'authkit.client',
+      make: async () => authkit,
+    };
+    expect(await checkTenantToken({ topology: 'tenant' } as never, container)).toEqual({
+      status: 'ok',
+      message: 'tenant token/partition: authkit-client (auto).',
+    });
+    expect(
+      await checkTenantToken(
+        { topology: 'tenant', tenant: { partition: 'acme' } } as never,
+        container,
+      ),
+    ).toEqual({
+      status: 'ok',
+      message: 'tenant token: authkit-client (auto); partition: explicit.',
+    });
+    const none = await checkTenantToken({ topology: 'tenant' } as never, {
+      hasBinding: () => false,
+      make: async () => undefined,
+    });
+    expect(none.status).toBe('error');
+    expect(none.message).toBe('tenant token/partition: missing.');
+    expect(none.fix).toContain("configure @adonis-agora/authkit-client's `service:");
+    expect(none.fix).toContain('`tenant: { partition, token }`');
   });
 
   it('cron-parser', async () => {

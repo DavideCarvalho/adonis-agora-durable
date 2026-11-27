@@ -1,6 +1,7 @@
 import { pathToFileURL } from 'node:url';
 import type { ApplicationService } from '@adonisjs/core/types';
 import type { AdmissionContext } from '../src/admissions/factory.js';
+import { type DurableTenantIdentity, resolveDurableTenant } from '../src/authkit-tenant.js';
 import { mergeSchedules, runWorkerLoop, type WorkerLogger } from '../src/commands/worker.js';
 import type { ControlPlaneConfig, TenantConfig } from '../src/config_types.js';
 import { startConsoleChannelWithWorker } from '../src/console-channel-start.js';
@@ -146,6 +147,10 @@ export default class DurableProvider {
   #responder: RunRequestResponder | null = null;
   /** Memoized tenant transport so the ProxyRunGateway + WorkerRuntime share ONE broker connection. */
   #tenantTransportPromise: Promise<Transport & { close?: () => Promise<void> }> | null = null;
+  /** A tenant pod's `tenant` block with authkit-client's partition/token filled in, resolved once. */
+  #tenantIdentityPromise: Promise<
+    DurableTenantIdentity<NonNullable<TenantConfig['tenant']>>
+  > | null = null;
   /** Resolves the embedded loop's stop signal on shutdown. Null when no embedded worker runs. */
   #stopEmbeddedWorker: (() => void) | null = null;
   /** The embedded loop itself, awaited on shutdown so it drains before the transport closes. */
@@ -449,6 +454,7 @@ export default class DurableProvider {
    */
   #registerTenantTopology(config: TenantConfig) {
     this.app.container.singleton(DURABLE_RUN_GATEWAY, async () => {
+      const { tenant } = await this.#tenantIdentity(config);
       const transport = await this.#tenantTransport(config);
       if (!hasProxyCapability(transport)) {
         throw new Error(
@@ -456,12 +462,10 @@ export default class DurableProvider {
         );
       }
       const proxy = new ProxyRunGateway(transport, {
-        partition: config.tenant.partition,
-        ...(config.tenant?.token !== undefined
+        partition: tenant.partition,
+        ...(tenant.token !== undefined
           ? {
-              token: resolveTenantToken(config.tenant.token, (Class) =>
-                this.app.container.make(Class),
-              ),
+              token: resolveTenantToken(tenant.token, (Class) => this.app.container.make(Class)),
             }
           : {}),
         ...(config.requestTimeoutMs !== undefined
@@ -475,6 +479,7 @@ export default class DurableProvider {
     });
 
     this.app.container.singleton(DURABLE_WORKER_RUNTIME, async () => {
+      const { tenant } = await this.#tenantIdentity(config);
       const transport = await this.#tenantTransport(config);
       if (typeof (transport as Partial<WorkerTransport>).handle !== 'function') {
         throw new Error(
@@ -483,7 +488,7 @@ export default class DurableProvider {
       }
       return new WorkerRuntime({
         transport: transport as unknown as WorkerTransport,
-        partition: config.tenant.partition,
+        partition: tenant.partition,
         ...(config.namespace !== undefined ? { namespace: config.namespace } : {}),
         ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
         ...(config.capabilities !== undefined ? { capabilities: config.capabilities } : {}),
@@ -506,15 +511,31 @@ export default class DurableProvider {
 
   /** Build the tenant transport ONCE and memoize it, so the ProxyRunGateway and the WorkerRuntime share
    *  one broker connection (and one set of P4 consumers). Held on {@link #transport} for clean shutdown. */
+  /**
+   * The pod's `tenant` block, with what `@adonis-agora/authkit-client` supplies (its `tenantOf`, by
+   * shape) where a field is missing: explicit fields win. Throws, naming both fixes, when no
+   * `partition` resolves. Resolved once.
+   */
+  #tenantIdentity(
+    config: TenantConfig,
+  ): Promise<DurableTenantIdentity<NonNullable<TenantConfig['tenant']>>> {
+    this.#tenantIdentityPromise ??= resolveDurableTenant(
+      config.tenant,
+      this.app.container as never,
+    );
+    return this.#tenantIdentityPromise;
+  }
+
   #tenantTransport(config: TenantConfig): Promise<Transport & { close?: () => Promise<void> }> {
     if (!this.#tenantTransportPromise) {
       this.#tenantTransportPromise = (async () => {
+        const { tenant } = await this.#tenantIdentity(config);
         // The pod's top-level `partition` / `instanceId` are the transport's defaults: a tenant pod
         // must consume the `<name>@<tenant>` queues the control plane dispatches its work to, even
         // when the transport entry doesn't repeat the partition (an explicit one there wins).
         const transport = await this.#resolveTransport(config, {
           app: this.app,
-          partition: config.tenant.partition,
+          partition: tenant.partition,
           ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
           ...(config.schema !== undefined ? { schema: config.schema } : {}),
         });
@@ -556,7 +577,12 @@ export default class DurableProvider {
     if (this.#isWarmup()) return;
     const config = this.app.config.get<DurableConfig>('durable', {});
     const topology = config.topology ?? 'standalone';
-    if (topology === 'tenant') return;
+    if (topology === 'tenant') {
+      // A web pod with no partition (none set, none from authkit-client) fails its boot here, naming
+      // both fixes. A worker fails when `durable:work` builds its runtime; other ace commands never.
+      if (this.app.getEnvironment?.() === 'web') await this.#tenantIdentity(config as TenantConfig);
+      return;
+    }
     const workflowRoots = discoveryRoots(config.workflowsPath, 'app/workflows');
     // Each convention is governed by its own option: `workflowsPath: false` skips workflow discovery
     // only, `stepsPath` alone decides app/steps. A control plane always brings up its responder.

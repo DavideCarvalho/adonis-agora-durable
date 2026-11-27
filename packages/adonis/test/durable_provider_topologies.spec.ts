@@ -575,3 +575,146 @@ describe('DurableProvider — lifecycle events per topology (ready)', () => {
     expect(g[TRACE_SCOPE_ENABLED]).toBeUndefined();
   });
 });
+
+describe('DurableProvider — tenant identity from @adonis-agora/authkit-client', () => {
+  /** A P4 transport that records the wire `tenant` claim of every request. */
+  class ClaimTransport extends P4Transport {
+    readonly claims: string[] = [];
+    override async dispatchRunRequest(msg: RunRequest): Promise<void> {
+      this.claims.push(msg.tenant ?? '');
+    }
+  }
+
+  /** A fake `authkit.client` binding: authkit-client 1.1's `tenantOf`, by shape. */
+  function fakeAuthkit(partition = 'shop') {
+    const resources: string[] = [];
+    return {
+      resources,
+      client: {
+        tenantOf(resource: string) {
+          resources.push(resource);
+          return {
+            url: Object.assign(async () => 'https://hub.test/_durable', {
+              refresh: async () => 'https://hub.test/_durable',
+            }),
+            token: Object.assign(async () => `auto-token-for-${resource}`, { reset() {} }),
+            partition,
+          };
+        },
+      },
+    };
+  }
+
+  function config(transport: InMemoryTransport, tenant?: Record<string, unknown>): DurableConfig {
+    return {
+      topology: 'tenant',
+      transport: 'p4',
+      transports: { p4: async () => transport },
+      requestTimeoutMs: 20,
+      ...(tenant !== undefined ? { tenant } : {}),
+    } as DurableConfig;
+  }
+
+  async function wireClaim(
+    container: { make(key: never): Promise<unknown> },
+    transport: ClaimTransport,
+  ) {
+    const gateway = (await container.make(DURABLE_RUN_GATEWAY as never)) as ProxyRunGateway;
+    await gateway.getRun('r-1').catch(() => undefined);
+    return { gateway, claim: transport.claims.at(-1) };
+  }
+
+  it('fills partition and token from authkit.client.tenantOf("urn:agora:durable") with no tenant block', async () => {
+    const transport = new ClaimTransport();
+    const authkit = fakeAuthkit();
+    const { app, container } = makeApp(config(transport));
+    container.singleton('authkit.client' as never, () => authkit.client);
+    new DurableProvider(app).register();
+
+    const { gateway, claim } = await wireClaim(container as never, transport);
+    expect(gateway.topology()).toEqual({ role: 'tenant', tenant: 'shop' });
+    expect(claim).toBe('auto-token-for-urn:agora:durable');
+    expect(authkit.resources).toEqual(['urn:agora:durable']);
+    const runtime = await container.make(DURABLE_WORKER_RUNTIME);
+    expect(runtime).toBeInstanceOf(WorkerRuntime);
+  });
+
+  it('an explicit field wins over authkit-client, field by field', async () => {
+    const transport = new ClaimTransport();
+    const { app, container } = makeApp(config(transport, { partition: 'acme' }));
+    container.singleton('authkit.client' as never, () => fakeAuthkit().client);
+    new DurableProvider(app).register();
+    const first = await wireClaim(container as never, transport);
+    expect(first.gateway.topology()).toEqual({ role: 'tenant', tenant: 'acme' });
+    expect(first.claim).toBe('auto-token-for-urn:agora:durable');
+
+    const other = new ClaimTransport();
+    const second = makeApp(config(other, { token: 'mine' }));
+    second.container.singleton('authkit.client' as never, () => fakeAuthkit().client);
+    new DurableProvider(second.app).register();
+    const result = await wireClaim(second.container as never, other);
+    expect(result.gateway.topology()).toEqual({ role: 'tenant', tenant: 'shop' });
+    expect(result.claim).toBe('mine');
+  });
+
+  it('never calls tenantOf when every field is explicit', async () => {
+    const transport = new ClaimTransport();
+    const authkit = fakeAuthkit();
+    const { app, container } = makeApp(config(transport, { partition: 'acme', token: 't' }));
+    container.singleton('authkit.client' as never, () => authkit.client);
+    new DurableProvider(app).register();
+    await wireClaim(container as never, transport);
+    expect(authkit.resources).toEqual([]);
+  });
+
+  it('`tenant.auto: false` turns the detection off', async () => {
+    const { app, container } = makeApp(config(new ClaimTransport(), { auto: false }));
+    container.singleton('authkit.client' as never, () => fakeAuthkit().client);
+    new DurableProvider(app).register();
+    await expect(container.make(DURABLE_RUN_GATEWAY)).rejects.toThrow(/`tenant.auto` is false/);
+  });
+
+  it('without the binding and without a partition, a web boot fails naming both fixes', async () => {
+    const { app } = makeApp(config(new ClaimTransport()));
+    (app as unknown as { getEnvironment: () => string }).getEnvironment = () => 'web';
+    const provider = new DurableProvider(app);
+    provider.register();
+    const error = await provider.boot().then(
+      () => undefined,
+      (e: Error) => e,
+    );
+    expect(error?.message).toBe(
+      "[@adonis-agora/durable] topology 'tenant' needs tenant.token, tenant.partition. Fix: configure @adonis-agora/authkit-client's `service: { name, clientId, clientSecret }` (config/authkit_client.ts), which supplies them for urn:agora:durable, or set `tenant: { partition, token }` in config/durable.ts.",
+    );
+  });
+
+  it('an ace command (console environment) does not fail its boot for it', async () => {
+    const { app } = makeApp(config(new ClaimTransport()));
+    (app as unknown as { getEnvironment: () => string }).getEnvironment = () => 'console';
+    const provider = new DurableProvider(app);
+    provider.register();
+    await expect(provider.boot()).resolves.toBeUndefined();
+  });
+
+  it('a binding without tenantOf (an older authkit-client) counts as absent', async () => {
+    const { app, container } = makeApp(config(new ClaimTransport()));
+    container.singleton('authkit.client' as never, () => ({ appCallTokens: () => undefined }));
+    new DurableProvider(app).register();
+    await expect(container.make(DURABLE_WORKER_RUNTIME)).rejects.toThrow(
+      /needs tenant\.token, tenant\.partition\. Fix: configure/,
+    );
+  });
+
+  it('reports authkit-client’s own error when tenantOf throws (no `service`)', async () => {
+    const { app, container } = makeApp(config(new ClaimTransport()));
+    container.singleton('authkit.client' as never, () => ({
+      tenantOf() {
+        throw new Error('authkit-client: tenantOf needs `service` in config/authkit_client.ts');
+      },
+    }));
+    new DurableProvider(app).register();
+    await expect(container.make(DURABLE_RUN_GATEWAY)).rejects.toThrow(
+      /could not supply them: authkit-client: tenantOf needs `service`/,
+    );
+  });
+});
