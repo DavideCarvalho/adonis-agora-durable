@@ -40,7 +40,10 @@ not a customer — customer isolation is the separate `tenancy` / `tenantId`
 (organizations), which shares one pool by default. It is independent of the separate `role` axis (`all`/`api`/
 `worker`); durable has no `role` field and covers that axis with `drive`,
 `consumers` and `worker.embedded`. Durable connects tenants over a broker
-transport (`bullmq`/`queue`/`db`) with `tenant: { partition, token }`,
+transport (`bullmq`/`queue`/`db`) with `tenant: { partition, token }`
+(optional when `@adonis-agora/authkit-client` is booted with its `service`
+configured — its `authkit.client.tenantOf('urn:agora:durable')` supplies
+`partition`/`token`; each explicit field wins, `tenant: { auto: false }` opts out),
 `verifyTenant` and `capabilities`.
 
 | Topology | Owns the store | Executes bodies | Serves HTTP |
@@ -76,7 +79,7 @@ export default defineConfig({
   transport: 'bullmq',
   transports: { bullmq: transports.bullmq({ connection: process.env.REDIS_URL }) },
   tenant: {
-    partition: 'acme-corp', // which pool this pod serves (required)
+    partition: 'acme-corp', // which pool this pod serves (omit when authkit-client supplies it; explicit wins, `auto: false` opts out)
     token: process.env.DURABLE_TENANT_TOKEN, // or authkitTenantToken({...}) / a function / { get() }
   },
   requestTimeoutMs: 10_000,
