@@ -18,6 +18,7 @@
     "durable",
     "workflow",
     "determinism",
+    "tanstack-intent",
     "agora"
   ],
   "author": "Davi Carvalho <davi@goflip.ai>",
@@ -33,6 +34,7 @@
   },
   "files": [
     "dist/",
+    "skills",
     "README.md",
     "CHANGELOG.md"
   ],
@@ -52,6 +54,7 @@
     "eslint": "^8.57.0 || ^9.0.0 || ^10.0.0"
   },
   "devDependencies": {
+    "@tanstack/intent": "0.5.6",
     "@types/node": "26.6.6",
     "@typescript-eslint/parser": "8.74.0",
     "@typescript-eslint/rule-tester": "8.74.0",

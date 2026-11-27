@@ -37,7 +37,7 @@ primary_packages:
       fix-and-replay) served by the thin provider inside the main package.
 
 secondary_packages:
-  # Summarized inside durable-determinism; intentionally no dedicated skill.
+  # Own skill: durable-linting (packages/eslint-plugin/skills).
   - '@adonis-agora/durable-eslint-plugin'
 
 domains:

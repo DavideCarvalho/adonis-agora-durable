@@ -257,7 +257,7 @@ transport: 'memory' // "it's all one process anyway"
 
 Correct:
 
-```ts
+```ts no-check
 transport: 'event-emitter',
 transports: { 'event-emitter': transports.eventEmitter() },
 ```

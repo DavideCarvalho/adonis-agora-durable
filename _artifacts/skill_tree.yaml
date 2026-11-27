@@ -35,6 +35,7 @@ skills:
       - 'DavideCarvalho/adonis-durable:docs/getting-started.mdx'
       - 'DavideCarvalho/adonis-durable:docs/concepts/durability.mdx'
       - 'DavideCarvalho/adonis-durable:docs/transports/index.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/reliability/failure-modes.mdx'
       - 'DavideCarvalho/adonis-durable:README.md'
 
   - name: durable-workflows
@@ -66,7 +67,7 @@ skills:
     description: >-
       Keep replay safe: ctx.now/ctx.sideEffect capture, NonDeterminismError,
       version bumps for breaking shape changes, ctx.patched surgical guards,
-      and the @adonis-agora/durable-eslint-plugin no-nondeterminism rule.
+      and a pointer to the @adonis-agora/durable-eslint-plugin rules.
     sources:
       - 'DavideCarvalho/adonis-durable:docs/concepts/durability.mdx'
       - 'DavideCarvalho/adonis-durable:docs/authoring/versioning.mdx'
@@ -84,11 +85,13 @@ skills:
       delegation, autoSchema, updateRunIf), CodecStateStore encryption,
       namespace vs partition isolation.
     sources:
+      - 'DavideCarvalho/adonis-durable:docs/transports/index.mdx'
       - 'DavideCarvalho/adonis-durable:docs/transports/queue.mdx'
       - 'DavideCarvalho/adonis-durable:docs/transports/db.mdx'
       - 'DavideCarvalho/adonis-durable:docs/transports/control-plane.mdx'
-      - 'DavideCarvalho/adonis-durable:docs/stores/lucid.mdx'
       - 'DavideCarvalho/adonis-durable:docs/stores/index.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/stores/lucid.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/cluster/interop.mdx'
 
   - name: durable-reliability
     slug: durable-reliability
@@ -107,6 +110,7 @@ skills:
       - 'DavideCarvalho/adonis-durable:docs/reliability/sagas.mdx'
       - 'DavideCarvalho/adonis-durable:docs/reliability/dead-letter.mdx'
       - 'DavideCarvalho/adonis-durable:docs/reliability/flow-control.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/reliability/retention.mdx'
       - 'DavideCarvalho/adonis-durable:docs/reliability/failure-modes.mdx'
       - 'DavideCarvalho/adonis-durable:docs/cli.mdx'
       - 'DavideCarvalho/adonis-durable:docs/testing.mdx'
@@ -144,7 +148,23 @@ skills:
       and the Telescope Workflows view.
     sources:
       - 'DavideCarvalho/adonis-durable:docs/observability/dashboard.mdx'
-      - 'DavideCarvalho/adonis-durable:docs/observability/dashboard-auth.mdx'
       - 'DavideCarvalho/adonis-durable:docs/observability/events-and-interceptors.mdx'
       - 'DavideCarvalho/adonis-durable:docs/observability/otel.mdx'
       - 'DavideCarvalho/adonis-durable:docs/observability/telescope.mdx'
+
+  - name: durable-linting
+    slug: durable-linting
+    type: core
+    domain: determinism
+    package: '@adonis-agora/durable-eslint-plugin'
+    path: 'packages/eslint-plugin/skills/durable-linting/SKILL.md'
+    description: >-
+      Wire @adonis-agora/durable-eslint-plugin in a flat config and fix its
+      reports: no-nondeterminism, rethrow-control-flow-signals,
+      no-io-in-workflow-body, the recommended preset, and how the rules scope
+      to a workflow body and stop at checkpoint callbacks.
+    sources:
+      - 'DavideCarvalho/adonis-durable:docs/tooling/linting.mdx'
+      - 'DavideCarvalho/adonis-durable:packages/eslint-plugin/README.md'
+      - 'DavideCarvalho/adonis-durable:packages/eslint-plugin/src/index.ts'
+      - 'DavideCarvalho/adonis-durable:packages/eslint-plugin/src/workflow-body.ts'
