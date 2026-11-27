@@ -235,7 +235,7 @@ descriptors and the delta. Source: `docs/cluster/handshake.mdx`.
 Outside an Adonis app (standalone Node service), use the `/worker` subpath — it
 imports zero store code:
 
-```ts title="worker.ts"
+```ts no-check title="worker.ts"
 import { RedisWorkerRegistry, WorkerRuntime } from '@adonis-agora/durable/worker'
 import { BullMQTransport, createBullMQDeps } from '@adonis-agora/durable'
 import { Redis } from 'ioredis'

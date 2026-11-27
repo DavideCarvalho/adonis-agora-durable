@@ -184,14 +184,14 @@ replayed path diverges from the recorded one and silently corrupts the run until
 
 Wrong:
 
-```ts
+```ts no-check
 // v1 was [quote, charge]; edited in place to [quote, fraudCheck, charge]
 static workflow = { name: 'checkout', version: '1' }
 ```
 
 Correct:
 
-```ts
+```ts no-check
 static workflow = { name: 'checkout', version: '2' } // alongside v1 until drained
 ```
 
@@ -204,7 +204,7 @@ Source: `docs/authoring/versioning.mdx`.
 
 Wrong:
 
-```ts
+```ts no-check
 async run(ctx, input) {
   const receipt = await this.billing.charge(input) // unchecked I/O, re-runs on replay
 }
@@ -212,7 +212,7 @@ async run(ctx, input) {
 
 Correct:
 
-```ts
+```ts no-check
 async run(ctx, input) {
   const receipt = await ctx.step(this.billing.charge, input)
 }

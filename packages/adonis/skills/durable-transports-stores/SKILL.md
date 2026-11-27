@@ -248,7 +248,7 @@ Redis fan out across both runtimes. Source: `docs/transports/control-plane.mdx`.
 The migration **delegates** to the library instead of snapshotting DDL, so the
 schema cannot drift from what the installed version writes:
 
-```ts title="database/migrations/…_create_durable_tables.ts"
+```ts no-check title="database/migrations/…_create_durable_tables.ts"
 import { BaseSchema } from '@adonisjs/lucid/schema'
 import db from '@adonisjs/lucid/services/db'
 import { createDurableTables, dropDurableTables } from '@adonis-agora/durable'
@@ -371,7 +371,7 @@ Source: `docs/transports/queue.mdx` ("Stalled-job reclaim").
 
 Wrong:
 
-```ts
+```ts no-check
 export default class extends BaseSchema {
   async up() {
     this.schema.createTable('durable_workflow_runs', (t) => {
@@ -383,7 +383,7 @@ export default class extends BaseSchema {
 
 Correct:
 
-```ts
+```ts no-check
 export default class extends BaseSchema {
   static disableTransactions = true
   async up() {

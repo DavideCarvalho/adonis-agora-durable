@@ -12,14 +12,17 @@ subpaths (engine + AdonisJS binding, otel, telescope, dashboard,
 commands, testing, admission-redis, control-plane-redis). The React SPA
 package `@adonis-agora/durable-dashboard@0.2.1` is served BY that provider —
 its user-facing surface is the console config/API documented in the main
-package's docs. `@adonis-agora/durable-eslint-plugin@0.2.2` enforces workflow
-determinism and is deliberately summarized inside the determinism skill rather
-than given its own (it has a single rule and a preset; ~30 lines of guidance).
+package's docs. `@adonis-agora/durable-eslint-plugin` enforces workflow
+determinism; since 1.0 it has three rules (no-nondeterminism,
+rethrow-control-flow-signals, no-io-in-workflow-body) with body-scoping rules
+worth their own skill, shipped from `packages/eslint-plugin`; the determinism
+skill keeps a short summary that points to it.
 
 Six skills therefore target `packages/adonis`; one targets `packages/dashboard`
-(the observability/operations surface, where the dashboard config and API live).
+(the observability/operations surface, where the dashboard config and API live);
+one targets `packages/eslint-plugin`.
 
-## Skill inventory (flat; all type `core`; 7 total)
+## Skill inventory (flat; all type `core`; 8 total)
 
 `packages/adonis/skills/`:
 
@@ -51,6 +54,12 @@ Six skills therefore target `packages/adonis`; one targets `packages/dashboard`
 7. **durable-observability** — dashboard config/authorize/`dashboardAuth`,
    JSON API (retry-with-input, bulk, SSE), lifecycle events, interceptors,
    `collectMetrics`, OTel tracing, Telescope extension.
+
+`packages/eslint-plugin/skills/`:
+
+8. **durable-linting** — flat-config wiring and the recommended preset, the
+   three rules and their fixes, workflow-body scoping (function/class form,
+   checkpoint-callback boundaries), the control-flow signal guard.
 
 ## Highest-value AI-agent guidance
 

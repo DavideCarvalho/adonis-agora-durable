@@ -105,7 +105,7 @@ Source: `docs/reliability/sagas.mdx`.
 Cap concurrency/rate durably — a blocked call re-suspends with a persisted
 `retryAt`, driven by the timer poller (nothing waits in memory):
 
-```ts title="config/durable.ts"
+```ts no-check title="config/durable.ts"
 queues: [{ name: 'emails', concurrency: 10, rateLimit: { limit: 1000, periodMs: 3_600_000 } }],
 // or at runtime: engine.registerQueue({ name: 'emails', … }) — same shape, replaces a same-named one
 ```
@@ -177,7 +177,7 @@ Retention bounds terminal history (swept by `durable:work`, once a minute,
 newest by start time within the scope; `0` deletes all matching), or both (most
 restrictive wins); a policy with neither fails boot:
 
-```ts title="config/durable.ts"
+```ts no-check title="config/durable.ts"
 retention: {
   completed: '30d',
   policies: [{ statuses: ['completed', 'failed'], maxCount: 200, scope: { namespace: 'acme' } }],
@@ -248,7 +248,7 @@ Source: `docs/reliability/failure-modes.mdx`, `docs/cli.mdx`.
 
 ### Pattern 5 — test workflows without infrastructure
 
-```ts
+```ts no-check
 import { assertRunStatus, createTestEngine, failOnce } from '@adonis-agora/durable/testing'
 
 test('checkout completes', async () => {

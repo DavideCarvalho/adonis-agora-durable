@@ -58,7 +58,7 @@ export default class CheckoutWorkflow extends BaseWorkflow {
 
   async run(ctx: WorkflowCtx, order: { id: number; total: number }) {
     await ctx.localStep('reserveStock', async () => ({ reserved: true }))
-    const charge = await ctx.step('payments:charge-card', {
+    const charge = await ctx.step<{ chargeId: string }>('payments:charge-card', {
       orderId: order.id,
       amountCents: order.total,
     })
@@ -88,7 +88,7 @@ Steps are discovered from `app/steps` and served by name automatically. Each
 a `container.swap(...)` after boot reaches the next execution. A `@Step` method ref passed to `ctx.step`
 gives full input/output typing:
 
-```ts title="app/steps/payment_steps.ts"
+```ts no-check title="app/steps/payment_steps.ts"
 import { Step } from '@adonis-agora/durable'
 import { z } from 'zod' // any Standard Schema library: zod, valibot, arktype, …
 
@@ -105,7 +105,7 @@ export default class PaymentSteps {
 }
 ```
 
-```ts title="app/workflows/order_workflow.ts"
+```ts no-check title="app/workflows/order_workflow.ts"
 import { inject } from '@adonisjs/core'
 import { BaseWorkflow } from '@adonis-agora/durable'
 import type { WorkflowCtx } from '@adonis-agora/durable'
@@ -322,7 +322,7 @@ Source: `docs/authoring/entities.mdx`, `docs/authoring/external-tasks.mdx`,
 
 Wrong:
 
-```ts
+```ts no-check
 async run(ctx, input) {
   const receipt = await this.billing.charge(input) // I/O outside a step
   return { receipt }
@@ -331,7 +331,7 @@ async run(ctx, input) {
 
 Correct:
 
-```ts
+```ts no-check
 async run(ctx, input) {
   const receipt = await ctx.step(this.billing.charge, input)
   return { receipt }
@@ -405,7 +405,7 @@ const result = await CheckoutWorkflow.start(order) // request held open until th
 
 Correct:
 
-```ts
+```ts no-check
 const { runId } = await CheckoutWorkflow.dispatch(order, { runId: `checkout:${order.id}` })
 return response.accepted({ runId })
 ```
@@ -445,7 +445,7 @@ Source: `docs/authoring/webhooks.mdx` ("Not waiting forever").
 
 Wrong:
 
-```ts
+```ts no-check
 withdraw: (state, amountCents) => {
   if (amountCents > state.balanceCents) throw new Error('insufficient funds')
   state.balanceCents -= amountCents
@@ -455,7 +455,7 @@ withdraw: (state, amountCents) => {
 
 Correct:
 
-```ts
+```ts no-check
 withdraw: (state, amountCents) =>
   amountCents > state.balanceCents
     ? { ok: false as const, reason: 'insufficient_funds' as const }
@@ -480,7 +480,7 @@ export default defineConfig({
 
 Correct:
 
-```ts
+```ts no-check
 // app/billing/flows/charge_workflow.ts
 static workflow = { name: 'billing.charge', version: '1' }
 ```
