@@ -18,7 +18,7 @@ license: MIT
 metadata:
   type: core
   library: "@adonis-agora/durable-dashboard"
-  library_version: "0.2.1"
+  library_version: "1.0.0"
   framework: adonisjs
 sources:
   - 'DavideCarvalho/adonis-durable:docs/observability/dashboard.mdx'
