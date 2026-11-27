@@ -1,5 +1,11 @@
 # @adonis-agora/durable-eslint-plugin
 
+## 1.0.1
+
+### Patch Changes
+
+- [#624](https://github.com/DavideCarvalho/adonis-agora-durable/pull/624) [`29d5fd4`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/29d5fd48ee023afadb62db6f08770b96a45622ef) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Ship a TanStack Intent agent skill (`durable-linting`) with the plugin: flat-config setup, what each rule flags, and how the rules decide what counts as a workflow body.
+
 ## 1.0.0
 
 ### Major Changes
