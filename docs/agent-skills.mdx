@@ -1,0 +1,57 @@
+---
+title: AI agent skills
+description: The agent skills @adonis-agora/durable ships for coding agents (Claude Code, Cursor, Copilot, Codex) and how to load them with TanStack Intent.
+icon: Bot
+---
+
+`@adonis-agora/durable` ships [Agent Skills](https://agentskills.io): short `SKILL.md` files that tell a
+coding agent how to use the library, the patterns to follow and the mistakes to avoid. They live
+inside the npm package (its `skills/` folder), so they always match the version you installed:
+upgrade the package and the skills come with it.
+
+## Skills in this package
+
+| Skill | Package | Load it when |
+| --- | --- | --- |
+| `durable-setup` | `@adonis-agora/durable` | setting up durable workflows for the first time, moving from dev defaults to production infrastructure, or diagnosing runs that vanish on restart or compete with HTTP traffic |
+| `durable-workflows` | `@adonis-agora/durable` | writing or composing workflow logic: steps, sleeps, signals, events, webhooks, tasks, child workflows, schedules |
+| `durable-determinism` | `@adonis-agora/durable` | changing workflow code that has runs in flight, fixing `NonDeterminismError`, or wiring determinism linting |
+| `durable-reliability` | `@adonis-agora/durable` | hardening and recovering runs: retries, timeouts, sagas, flow control, the dead-letter queue, retention, stuck runs, the testing harness |
+| `durable-transports-stores` | `@adonis-agora/durable` | moving steps across processes, persisting runs durably, sharing one database or broker between pools, or encrypting payloads at rest |
+| `durable-cluster` | `@adonis-agora/durable` | splitting web from workers, running control-plane and tenant topologies, isolating tenants, or adding polyglot (Python, NestJS) workers |
+| `durable-observability` | `@adonis-agora/durable-dashboard` | mounting and securing the console, federating several apps into one console, scripting run actions, or wiring logs, metrics and traces |
+
+## Load them with TanStack Intent
+
+[TanStack Intent](https://github.com/TanStack/intent) finds the skills in your installed packages
+and tells your agent when to load them.
+
+```bash
+npm i -D @tanstack/intent    # pnpm add -D @tanstack/intent
+npx intent install
+```
+
+The first `intent install` runs in a terminal: it asks which packages' skills to allow (saved as
+`intent.skills` in your `package.json`) and writes a short skill-loading block into `AGENTS.md`
+(or into the `CLAUDE.md`, `.cursorrules` or `.github/copilot-instructions.md` that already carries
+it). To allow every Agora library without the prompt, for example in CI, add this to
+`package.json` first:
+
+```json
+{
+  "intent": { "skills": ["@adonis-agora/*"] }
+}
+```
+
+Then your agent, or you, can list and load them:
+
+```bash
+npx intent list
+npx intent load @adonis-agora/durable#durable-setup
+```
+
+`npx intent hooks install` adds hooks that remind Claude Code, Codex and Copilot to load a matching
+skill before editing. Without Intent, point your agent at
+`node_modules/@adonis-agora/durable/skills/<skill>/SKILL.md`.
+
+See [AI agent skills](/docs/agent-skills) for every Agora library that ships skills.

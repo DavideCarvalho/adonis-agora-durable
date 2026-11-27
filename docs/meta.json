@@ -21,6 +21,7 @@
     "tooling",
     "testing",
     "cli",
+    "agent-skills",
     "production",
     "troubleshooting",
     "migrating-to-1-0",
