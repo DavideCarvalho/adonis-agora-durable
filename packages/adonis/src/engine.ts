@@ -10077,6 +10077,16 @@ export class WorkflowEngine {
       const maxAttempts = Math.max(1, step.retries ?? 1);
       const retryable = existing.error?.retryable !== false;
       if (!retryable || existing.attempts >= maxAttempts) throw new RemoteStepError(existing.error);
+      // A deadline further out than this backoff could ever reach from now is not one this branch
+      // stamped: it is the lost-dispatch lease the row carried while `pending`, left on it by a store
+      // whose settle keeps `wakeAt` (or a row settled before the settle cleared it). Retrying on it
+      // would delay the retry by up to `remoteRedispatchMs` instead of the step's backoff (#599).
+      if (
+        existing.wakeAt != null &&
+        existing.wakeAt > this.clock() + backoffDelay(existing.attempts, { ...step, jitter: false })
+      ) {
+        existing = { ...existing, wakeAt: undefined };
+      }
       if (existing.wakeAt == null) {
         const wakeAt = this.clock() + backoffDelay(existing.attempts, step);
         await this.store.saveCheckpoint({ ...existing, wakeAt });
@@ -11194,7 +11204,7 @@ export class WorkflowEngine {
     const settle = this.store.settleCheckpointsIfPending?.bind(this.store);
     if (!settle) {
       return this.savePendingCheckpoints(
-        entries.map(({ cp, settlement }) => ({ ...cp, ...settlement })),
+        entries.map(({ cp, settlement }) => settledRow(cp, settlement)),
       );
     }
     const settlements = entries.map((e) => e.settlement);
@@ -11360,7 +11370,7 @@ export class WorkflowEngine {
         if (this.store.settleCheckpointsIfPending) {
           await this.store.settleCheckpointsIfPending([salvage]);
         } else {
-          await this.store.saveCheckpoint({ ...cp, ...salvage });
+          await this.store.saveCheckpoint(settledRow(cp, salvage));
         }
       }
       return undefined;
@@ -11837,6 +11847,17 @@ function nonEmptyObject<T extends object>(value: T): T | undefined {
 
 function conventionGroup(name: string, namespace: string | undefined): string {
   return tenantGroup(sanitizeQueueToken(name), namespace);
+}
+
+/**
+ * The whole row `settlement` settles `cp` into, for a store that writes rows whole. Its `wakeAt` is
+ * cleared, as {@link StateStore.settleCheckpointsIfPending} clears it: on a `pending` row it is the
+ * lost-dispatch lease, which ends with the settle, and a failed step's retry must not take it as its
+ * backoff deadline (#599).
+ */
+function settledRow(cp: StepCheckpoint, settlement: StepSettlement): StepCheckpoint {
+  const { wakeAt: _lease, ...row } = cp;
+  return { ...row, ...settlement };
 }
 
 /** What `result` settles onto its step's pending checkpoint `cp`. */

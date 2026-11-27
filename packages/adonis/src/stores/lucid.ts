@@ -856,7 +856,9 @@ export class LucidStateStore implements StateStore {
       if (!wrote[i]) return;
       const k = checkpointKey(settlement.runId, settlement.seq);
       const { runId: _runId, seq: _seq, ...written } = settlement;
-      const checkpoint: StepCheckpoint = { ...(stored.get(k) as StepCheckpoint), ...written };
+      // Without the `wakeAt` the settle cleared (the pending row's lost-dispatch lease).
+      const { wakeAt: _lease, ...kept } = stored.get(k) as StepCheckpoint;
+      const checkpoint: StepCheckpoint = { ...kept, ...written };
       for (const key of ['output', 'error', 'events'] as const) {
         if (checkpoint[key] === undefined) delete checkpoint[key];
       }
@@ -2367,7 +2369,8 @@ function hotStatements(schema: string | undefined): HotStatements {
  * {@link LucidStateStore.settleResultsIfPending} on Postgres: one `UPDATE … FROM (VALUES …) …
  * RETURNING` for the whole batch (entries already deduplicated by row). The run's status is checked
  * in the same statement, and read back with its `wake_at`. What a result does not carry keeps its
- * stored value: `output` unless it completed, `events` and `started_at` unless present.
+ * stored value: `output` unless it completed, `events` and `started_at` unless present. The row's
+ * `wake_at` (the pending step's lost-dispatch lease) is cleared.
  */
 async function settleResultsReturningPg(
   client: Client,
@@ -2406,7 +2409,8 @@ async function settleResultsReturningPg(
       error = v.error,
       events = case when v.has_events then v.events else c.events end,
       started_at = coalesce(v.started_at, c.started_at),
-      finished_at = v.finished_at
+      finished_at = v.finished_at,
+      wake_at = null
     from (values ${values.join(', ')})
       as v(run_id, seq, status, output, error, has_events, events, started_at, finished_at),
       ${quotedTable(schema, DURABLE_TABLES.runs)} as r

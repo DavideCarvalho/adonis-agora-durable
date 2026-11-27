@@ -966,8 +966,12 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         expect(settled.attempts).toBe(2);
         expect(settled.workerGroup).toBe('g');
         expect(settled.parallelGroup).toBe('fan:0:4');
-        expect(settled.wakeAt).toBe(5_000);
         expect(settled.stepId).toBe('r1:0');
+        // The pending row's `wakeAt` (its lost-dispatch lease) ends with the settle: a failed step's
+        // retry must not wait for it instead of its backoff.
+        expect(settled.wakeAt).toBeUndefined();
+        expect(r1[2]?.wakeAt).toBeUndefined();
+        expect(r1[3]?.wakeAt).toBe(5_000);
         expect(r1[2]?.error).toEqual({ message: 'boom' });
         expect(r1[2]?.input).toEqual({ prompt: 'r1:2' });
         expect(await store.getCheckpoint('r1', 9)).toBeNull();
@@ -1080,6 +1084,10 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         expect(cp?.startedAt.getTime()).toBe(at.getTime() + 1_000);
         expect(cp?.finishedAt.getTime()).toBe(later.getTime());
         expect(cp?.enqueuedAt.getTime()).toBe(at.getTime());
+        // The lease the pending rows carried is cleared by the settle, in what is read back and in
+        // what is stored.
+        expect(cp?.wakeAt).toBeUndefined();
+        expect(failed?.checkpoint.wakeAt).toBeUndefined();
         expect(failed?.checkpoint.output).toEqual({ partial: 2 });
         expect(failed?.checkpoint.error).toEqual({ message: 'boom' });
         expect(failed?.checkpoint.startedAt.getTime()).toBe(at.getTime());
@@ -1089,8 +1097,11 @@ export function runStateStoreContract(name: string, makeStore: StateStoreFactory
         expect(stored?.output).toEqual({ n: 0 });
         expect(stored?.input).toEqual({ prompt: 'p0' });
         expect((await store.getCheckpoint('r1', 2))?.output).toEqual({ partial: 2 });
+        expect(stored?.wakeAt).toBeUndefined();
+        expect((await store.getCheckpoint('r1', 2))?.wakeAt).toBeUndefined();
         expect((await store.getCheckpoint('r1', 1))?.output).toEqual({ first: 1 });
         expect((await store.getCheckpoint('r1', 3))?.status).toBe('pending');
+        expect((await store.getCheckpoint('r1', 3))?.wakeAt).toBe(5_000);
         expect((await store.getCheckpoint('gone', 0))?.status).toBe('pending');
         expect((await store.getCheckpoint('dead', 0))?.status).toBe('pending');
         expect(await store.getCheckpoint('r1', 9)).toBeNull();

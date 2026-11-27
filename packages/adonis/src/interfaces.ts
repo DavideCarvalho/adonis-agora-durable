@@ -233,7 +233,8 @@ export interface StepCheckpoint {
 
 /**
  * What a worker's result changes on its step's checkpoint (see
- * {@link StateStore.settleCheckpointsIfPending}): every other column of the row stays as stored.
+ * {@link StateStore.settleCheckpointsIfPending}): these columns are written and `wakeAt` is cleared;
+ * every other column of the row stays as stored.
  */
 export interface StepSettlement {
   runId: string;
@@ -250,7 +251,7 @@ export interface StepSettlement {
  * A step's worker result as {@link StateStore.settleResultsIfPending} writes it onto the step's
  * `pending` checkpoint. Unlike a {@link StepSettlement}, what the result does not carry keeps the
  * stored value: `output` is written only for a `completed` result, `events` and `startedAt` only when
- * present.
+ * present. The row's `wakeAt` is cleared, as {@link StateStore.settleCheckpointsIfPending} clears it.
  */
 export interface StepResultSettlement {
   runId: string;
@@ -601,8 +602,10 @@ export interface StateStore {
   /**
    * Settle step results onto their checkpoints: per entry and in input order, while the row at
    * `(runId, seq)` is still `pending`, write the entry's `status`, `output`, `error`, `events`,
-   * `startedAt` and `finishedAt` (an absent value is written as absent) and leave every other column
-   * as stored; resolves whether each entry wrote. Same claim as {@link saveCheckpointsIfPending}: a
+   * `startedAt` and `finishedAt` (an absent value is written as absent), clear `wakeAt` (on a
+   * `pending` row it is the lost-dispatch lease, which ends with the settle: kept, a failed step's
+   * retry would wait for it instead of its backoff) and leave every other column as stored;
+   * resolves whether each entry wrote. Same claim as {@link saveCheckpointsIfPending}: a
    * later entry for a row an earlier one settled loses, and a rejection writes nothing. The engine
    * settles worker results through it, so a step's `input` (an LLM step carries its whole prompt)
    * is written once, when the step is dispatched, not again when its result lands.
