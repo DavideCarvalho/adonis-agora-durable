@@ -83,7 +83,7 @@ production, with one warning logged at boot. The console mutates runs — set
 
 ### Pattern 1 — script access with `authorizeByToken`
 
-```ts no-check title="config/durable_dashboard.ts"
+```ts title="config/durable_dashboard.ts"
 import env from '#start/env'
 import { authorizeByToken, defineConfig } from '@adonis-agora/durable/dashboard'
 
@@ -102,7 +102,7 @@ A run that failed on bad input cannot be retried into success — retry replays
 the same input. Fix-and-replay starts a NEW run (`<originalRunId>~retry~<uuid>`,
 clean history, original left intact as the record):
 
-```ts no-check
+```ts
 const res = await fetch(`/durable/api/runs/${runId}/retry-with-input`, {
   method: 'POST',
   headers: { 'content-type': 'application/json', ...headers },
@@ -138,7 +138,7 @@ Source: `docs/observability/dashboard.mdx`.
 Everything observable is one event stream; subscribe directly or use the
 shipped bridges:
 
-```ts no-check title="start/durable.ts"
+```ts title="start/durable.ts"
 import router from '@adonisjs/core/services/router'
 import engine from '@adonis-agora/durable/services/main'
 import { attachDurableOtel } from '@adonis-agora/durable/otel'
@@ -163,7 +163,7 @@ completed|failed` (each retry emits its own `step.failed`), plus
 `capability.unavailable` / `protocol.incompatible` carrying full diagnostics.
 For distributed tracing across workers, stamp tasks with a provider:
 
-```ts no-check title="config/durable.ts"
+```ts title="config/durable.ts"
 import { defineConfig } from '@adonis-agora/durable'
 import { otelTraceparent } from '@adonis-agora/durable/otel'
 
@@ -210,7 +210,7 @@ Source: `docs/observability/events-and-interceptors.mdx`,
 
 Register the extension once and workflows appear next to requests/queries/jobs:
 
-```ts no-check title="config/telescope.ts"
+```ts title="config/telescope.ts"
 import { durableTelescopeExtension } from '@adonis-agora/durable/telescope'
 
 export default defineConfig({
@@ -259,7 +259,7 @@ export default defineConfig({
 })
 ```
 
-```ts no-check title="config/durable.ts (each other app)"
+```ts title="config/durable.ts (each other app)"
 export default defineConfig({
   // ...its store, transport, unchanged
   controlPlane: controlPlanes.redis({ connection: 'main', prefix: 'entretextos' }),
@@ -305,13 +305,13 @@ or a console entry that may act with no mode); `node ace agora:doctor` reports e
 
 Wrong:
 
-```ts no-check
+```ts
 export default defineConfig({}) // open in dev, every route 403s in production
 ```
 
 Correct:
 
-```ts no-check
+```ts
 export default defineConfig({
   authorize: async (ctx) => {
     await ctx.auth.check()
@@ -329,14 +329,14 @@ Source: `docs/observability/dashboard.mdx` ("Authorization").
 
 Wrong:
 
-```ts no-check
+```ts
 // the owning app's config/durable.ts
 consoleCommands: true // the console's cancel/retry/signal buttons answer 403
 ```
 
 Correct:
 
-```ts no-check
+```ts
 consoleCommands: { actions: true } // plus a mode, unless crypto/authkit-client is booted
 ```
 
@@ -349,13 +349,13 @@ Source: `docs/observability/federated-console.mdx`.
 
 Wrong:
 
-```ts no-check
+```ts
 engine.use(async (invocation, next) => next().then((r) => ({ ...r, at: Date.now() })))
 ```
 
 Correct:
 
-```ts no-check
+```ts
 engine.use(async (invocation, next) => {
   const result = await next()
   logger.info({ workflow: invocation.workflow, step: invocation.stepName })
@@ -373,7 +373,7 @@ mutate results nondeterministically. Source:
 
 Wrong:
 
-```ts no-check
+```ts
 engine.use(enforceInvariant) // "runs on every turn" — it does not
 ```
 
@@ -389,14 +389,14 @@ workers in another process — there is no local body to wrap. Source:
 
 Wrong:
 
-```ts no-check
+```ts
 const { run } = await cancelRun(runId, { compensate: true })
 if (run.status !== 'cancelled') throw new Error('cancel failed') // premature
 ```
 
 Correct:
 
-```ts no-check
+```ts
 await cancelRun(runId, { compensate: true })
 // poll getRun / subscribe to the stream until status === 'cancelled'
 ```

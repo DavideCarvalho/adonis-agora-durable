@@ -11,6 +11,7 @@
     "verbatimModuleSyntax": false
   },
   "include": [
+    "src/index.ts",
     "src/client/**/*.ts",
     "src/app/**/*.ts",
     "src/app/**/*.tsx",
