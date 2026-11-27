@@ -422,7 +422,9 @@ These only concern `control-plane` and `tenant` deployments. There are no aliase
 - With authkit, use `authkitTenantVerifier({ issuer, resource: 'urn:agora:durable' })` and
   `authkitTenantToken(...)` from `@adonis-agora/authkit-client`, on any server. The in-process
   `authkitTenantVerifier()` of `@adonis-agora/authkit-server` returns the same shape from
-  authkit-server 1.0.0-rc.25 on.
+  authkit-server 1.0.0-rc.25 on. Since durable 1.1.0, a tenant pod in an app whose authkit-client
+  (1.1.0+) has its `service` configured needs no `tenant` block: authkit-client supplies `partition`
+  and `token` (see [Authenticate tenants](/docs/durable/cluster/authenticate-tenants#with-authkit)).
 
 Before:
 

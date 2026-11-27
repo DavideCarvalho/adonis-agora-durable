@@ -120,7 +120,7 @@ What each setup needs:
 
 ### With authkit too: the token comes on its own
 
-When `@adonis-agora/authkit-client` is booted with **calls between apps** (`service` + `apps` in `config/authkit.ts`), both sides reuse it, again with no line of config: the console adds an app-call token for the app (`aud = urn:agora:app:<app>`) to each sealed action, and the app verifies it. The token's audience binds it to the app, and its capabilities (what authkit granted the console app there) cap every action, narrowed by the viewer's own. Grant the console app, once, in authkit: `durable:console:*` (or narrower, see [Capabilities](#capabilities)) on each app it manages.
+When `@adonis-agora/authkit-client` is booted with **calls between apps** (`service` + `apps` in `config/authkit_client.ts`), both sides reuse it, again with no line of config: the console adds an app-call token for the app (`aud = urn:agora:app:<app>`) to each sealed action, and the app verifies it. The token's audience binds it to the app, and its capabilities (what authkit granted the console app there) cap every action, narrowed by the viewer's own. Grant the console app, once, in authkit: `durable:console:*` (or narrower, see [Capabilities](#capabilities)) on each app it manages.
 
 The token must travel sealed: with crypto, or to the app's command public key. That key needs no line either: an app in token mode publishes it to **authkit's key directory** at boot (purpose `console:durable`, its public half only, through its own authenticated client), and the console looks it up there for the app's partition — never over Redis. An explicit `controlPlane.publicKey` ([token mode](#with-authkit-explicit-token-mode)) still wins. With no key to seal to, the action fails with what to do.
 

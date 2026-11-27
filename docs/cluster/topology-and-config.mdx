@@ -104,7 +104,7 @@ export default defineConfig({
   topology: 'tenant',
   transport: 'queue',
   transports: { queue: transports.queue({ connection: 'redis', workerKeys: false }) },
-  tenant: { partition: 'acme-corp', token: process.env.DURABLE_TENANT_TOKEN },
+  // tenant: from authkit-client's service, or { partition, token } as above
 })
 ```
 
@@ -115,7 +115,7 @@ export default defineConfig({
   topology: 'tenant',
   transport: 'db',
   transports: { db: transports.db() },
-  tenant: { partition: 'acme-corp', token: process.env.DURABLE_TENANT_TOKEN },
+  // tenant: from authkit-client's service, or { partition, token } as above
 })
 ```
 
@@ -267,7 +267,7 @@ Each tenant runs on a segmented transport prefix/namespace behind a Redis/networ
 
 ### Token on top
 
-Each `tenant` pod sends a token with every request (`tenant.token`), and the control plane's `RunRequestResponder` **verifies it and derives the tenant from it** (`verifyTenant`), ignoring any `tenant` in the request body. The token can be an authkit access token (`authkitTenantToken` / `authkitTenantVerifier` from `@adonis-agora/authkit-client`), an `@adonisjs/auth` access token, or a per-partition shared secret (`sharedSecretVerifier`); `tenant.token` can be a string, a function that returns a fresh token for each request, or an object with `get()`. [Authenticate tenants](/docs/durable/cluster/authenticate-tenants) has a working setup for each.
+Each `tenant` pod sends a token with every request (`tenant.token`), and the control plane's `RunRequestResponder` **verifies it and derives the tenant from it** (`verifyTenant`), ignoring any `tenant` in the request body. The token can be an authkit access token (`authkitTenantVerifier` from `@adonis-agora/authkit-client` on the control plane; on the pod, authkit-client's `service` supplies it with no line of config, or `authkitTenantToken` sets it explicitly), an `@adonisjs/auth` access token, or a per-partition shared secret (`sharedSecretVerifier`); `tenant.token` can be a string, a function that returns a fresh token for each request, or an object with `get()`. [Authenticate tenants](/docs/durable/cluster/authenticate-tenants) has a working setup for each.
 
 ```ts
 // Control plane

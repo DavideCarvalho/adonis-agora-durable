@@ -9,13 +9,13 @@ import { Callout } from 'fumadocs-ui/components/callout';
 A `tenant` pod sends a token with every request it makes to the control plane. The control plane checks the token and decides which partition the pod is; whatever the request claims about itself is ignored. Two settings in `config/durable.ts` carry this:
 
 - `verifyTenant`, on the control plane: turns a token into `{ partition, environment?, capabilities }`, or rejects it.
-- `tenant: { partition, token }`, on the tenant pod: who the pod is and the token it sends.
+- `tenant: { partition, token }`, on the tenant pod: who the pod is and the token it sends. With authkit-client's `service` configured, both come from it and the block can be left out.
 
 Pick the setup that matches what your app already runs:
 
 | You have | Control plane | Tenant pod |
 | --- | --- | --- |
-| [authkit](#with-authkit) (in this app or on another server) | `authkitTenantVerifier({ issuer, resource })` | `authkitTenantToken({ issuer, clientId, clientSecret, resource })` |
+| [authkit](#with-authkit) (in this app or on another server) | `authkitTenantVerifier({ issuer, resource })` | Nothing with authkit-client's `service` configured; else `authkitTenantToken({ issuer, clientId, clientSecret, resource })` |
 | [`@adonisjs/auth`](#with-adonisjsauth-access-tokens) | Verify access tokens with your tokens provider | A static access token |
 | [Nothing](#with-a-shared-secret) | `sharedSecretVerifier({ partitions })` | The partition's secret, or a `signTenantToken` of it |
 
@@ -54,6 +54,14 @@ export default defineConfig({
 ```
 
 On the tenant, nothing to write when authkit-client has its `service` configured (`config/authkit_client.ts`, the same service client): it supplies the partition and a token for `urn:agora:durable`, cached until near expiry.
+
+```ts title="config/authkit_client.ts (tenant)"
+service: {
+  name: 'acme-corp', // the partition, unless `partition` says otherwise
+  clientId: env.get('AUTHKIT_SERVICE_CLIENT_ID'),
+  clientSecret: env.get('AUTHKIT_SERVICE_CLIENT_SECRET'),
+},
+```
 
 ```ts title="config/durable.ts (tenant)"
 export default defineConfig({

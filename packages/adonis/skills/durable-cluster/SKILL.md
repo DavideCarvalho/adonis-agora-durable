@@ -71,21 +71,38 @@ export default defineConfig({
 })
 ```
 
-```ts title="config/durable.ts (tenant worker pod)"
+```ts title="config/durable.ts (tenant worker pod, with authkit-client)"
 import { defineConfig, transports } from '@adonis-agora/durable'
 
+// config/authkit_client.ts has `service: { name, clientId, clientSecret }`: its tenantOf('urn:agora:durable')
+// supplies tenant.partition (service.partition, else service.name) and tenant.token.
+export default defineConfig({
+  topology: 'tenant',
+  transport: 'bullmq',
+  transports: { bullmq: transports.bullmq({ connection: process.env.REDIS_URL }) },
+  requestTimeoutMs: 10_000,
+  // store: 'lucid'  // ❌ COMPILE ERROR — a tenant config cannot name a store
+})
+```
+
+Without authkit-client (or to override one field), set the `tenant` block; each field set wins:
+
+```ts title="config/durable.ts (tenant worker pod, explicit)"
 export default defineConfig({
   topology: 'tenant',
   transport: 'bullmq',
   transports: { bullmq: transports.bullmq({ connection: process.env.REDIS_URL }) },
   tenant: {
-    partition: 'acme-corp', // which pool this pod serves (omit when authkit-client supplies it; explicit wins, `auto: false` opts out)
+    partition: 'acme-corp', // which pool this pod serves
     token: process.env.DURABLE_TENANT_TOKEN, // or authkitTenantToken({...}) / a function / { get() }
+    // auto: false,          // never fill a field from authkit-client
   },
-  requestTimeoutMs: 10_000,
-  // store: 'lucid'  // ❌ COMPILE ERROR — a tenant config cannot name a store
 })
 ```
+
+Without authkit-client and without `tenant.partition`, a web process fails its boot and
+`durable:worker` fails at start, naming both fixes. `node ace agora:doctor`
+(`durable.tenant-token`) shows each field's source: `authkit-client (auto)` or `explicit`.
 
 ```bash title="entrypoints"
 node ace durable:work    # store-backed loop: pending, recovery, timers, sweeps, schedules
@@ -119,7 +136,7 @@ export default defineConfig({
   topology: 'tenant',
   transport: 'queue',
   transports: { queue: transports.queue({ connection: 'redis', workerKeys: false }) },
-  tenant: { partition: 'acme-corp', token: process.env.DURABLE_TENANT_TOKEN },
+  // tenant: from authkit-client's service, or { partition, token } explicitly
 })
 ```
 
