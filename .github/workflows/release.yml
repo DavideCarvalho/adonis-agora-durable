@@ -47,7 +47,7 @@ jobs:
           --health-timeout 3s
           --health-retries 15
       postgres:
-        image: postgres:18-alpine
+        image: postgres:19-alpine
         env:
           POSTGRES_PASSWORD: postgres
         ports:
@@ -78,7 +78,7 @@ jobs:
 
       - uses: actions/setup-node@v7.1.0
         with:
-          node-version: 24.22.2
+          node-version: 24.22.3
           cache: pnpm
           registry-url: 'https://registry.npmjs.org'
 
@@ -258,7 +258,7 @@ jobs:
 
       - uses: actions/setup-node@v7.1.0
         with:
-          node-version: 24.22.2
+          node-version: 24.22.3
           cache: pnpm
           registry-url: 'https://registry.npmjs.org'
 
