@@ -299,6 +299,8 @@ export default defineConfig({
 ```
 
 ```ts title="config/durable.ts (each other app)"
+import { controlPlanes, defineConfig } from '@adonis-agora/durable'
+
 export default defineConfig({
   // ...its store, transport, unchanged
   controlPlane: controlPlanes.redis({ connection: 'main', prefix: 'entretextos' }),
