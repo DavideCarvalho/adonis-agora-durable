@@ -9,8 +9,11 @@ description: >-
   capability.unavailable), engine.use local-step interceptors, collectMetrics
   Prometheus counters, OpenTelemetry tracing (attachDurableOtel,
   otelTraceparent cross-process propagation), and the Telescope Workflows view
-  (durableTelescopeExtension). Use when mounting/securing the console,
-  scripting run actions, or wiring logs/metrics/traces.
+  (durableTelescopeExtension), and the federated console (apps in
+  config/durable_dashboard.ts, consoleCommands with crypto/authkit/secret
+  authentication and actions opt-in). Use when mounting/securing the console,
+  federating several apps into one console, scripting run actions, or wiring
+  logs/metrics/traces.
 license: MIT
 metadata:
   type: core
@@ -63,7 +66,9 @@ authorizer class, or a lazy import of one. It returns a boolean,
 or `allowed: true` passes; with tenancy on, `{ allowed: true, tenants: [...] | '*' }`
 grants more organizations (omit for the viewer's own active tenant); on a
 control plane, `{ allowed: true, apps: [...] | '*' }` scopes to tenant apps
-(omit for every app);
+(omit for every app); `capabilities: [...]` (`durable:console:read`, `durable:console:write`,
+`durable:console:*` or the finer `durable:*` names) or `access: 'read'` narrows what the viewer
+may do (omitted: everything);
 `reason: 'unauthenticated'` → `401`, every other
 denial (incl. a throwing hook) → `403`; `{ redirectTo }` → `302` for a page
 navigation, `401` for an API call. A hook that already answered the request (a
@@ -230,6 +235,70 @@ pods are collapsed by event + runId + emission instant + subscriber name
 Per-run actions stay in the durable dashboard. Source:
 `docs/observability/telescope.mdx`.
 
+### Pattern 5 — federated console (one console, several apps)
+
+The console app lists the other apps under `apps`; each keeps its own store and engine. The
+console reads their runs from their store and sends every action (and the engine-only reads:
+schedules, worker health, lifecycle links, events) over that app's Redis control plane, where
+that app's engine runs it:
+
+```ts title="config/durable_dashboard.ts (the console app)"
+import { controlPlanes, stores } from '@adonis-agora/durable'
+import { defineConfig } from '@adonis-agora/durable/dashboard'
+
+export default defineConfig({
+  authorize: (ctx) => ctx.auth.user?.isAdmin === true,
+  apps: {
+    // key = that app's crypto partition / authkit app name (override: controlPlane.partition)
+    'entre-textos': {
+      store: stores.lucid({ connection: 'pg', schema: 'entretextos' }), // read-only: SELECT grant
+      controlPlane: controlPlanes.redis({ connection: 'main', prefix: 'entretextos' }), // THAT app's prefix
+      // actions: false, // browse-only: sends no action, needs no authentication
+    },
+  },
+})
+```
+
+```ts title="config/durable.ts (each other app)"
+export default defineConfig({
+  // ...its store, transport, unchanged
+  controlPlane: controlPlanes.redis({ connection: 'main', prefix: 'entretextos' }),
+  consoleCommands: { actions: true }, // `true` alone answers reads only
+})
+```
+
+Redis is not a trust boundary, so commands are always authenticated; the app answers nothing
+unauthenticated. Modes, picked automatically when the sibling lib is booted:
+
+- **crypto**: with `@adonis-agora/crypto` booted on both sides, nothing to configure: each command
+  is sealed with the owning app's `console-durable` key (the app opens its own `console-*` keys
+  with no grant; a console in a separate crypto app needs `crypto:seal:console-*`).
+- **authkit app-call token**: with `@adonis-agora/authkit-client`'s `service` (and calls between
+  apps) configured, the console sends an app-call token, sealed with crypto or to the key the app
+  publishes in authkit's key directory. Grant the console app `durable:console:*` (or narrower:
+  `durable:read`, `durable:runs:write`, `durable:tasks:write`, `durable:schedules:write`) on the
+  owning app in authkit.
+- **shared secret** (neither lib): the same 16+ character value as `consoleCommands.secret` on the
+  app and `apps.<key>.controlPlane.secret` on the console (HMAC on every command and answer).
+
+Bring your own: `consoleCommands.verifyTenant` (e.g. `authkitTenantVerifier({ issuer, resource:
+'urn:agora:durable' })` or any `({ token }) => { partition, capabilities } | null`, needs an
+`APP_KEY`) with the console's `controlPlane.token` + `publicKey` (`node ace durable:console-key`
+on the app prints it), or `crypto: { cipher }` for another KMS on both sides. `crypto: false` /
+`token: false` (console entry) and `crypto: false` / `verifyTenant: false` (app) turn the automatic
+modes off.
+
+`consoleCommands.actions` defaults to **off**: until the app sets `actions: true`, every action
+(cancel, retry, signal, update, requeue, complete a task, pause/resume/trigger a schedule) answers
+`403`; reads are answered either way. Every command carries the viewer's `capabilities` (from the
+console's `authorize`, else the full `durable:console:*` set) and one without them is refused
+(`capabilities-required`, `403`); in token mode the token's capabilities cap it too. On a
+`control-plane`, commands touch its own runs unless `consoleCommands.apps: [...] | '*'` lists the
+tenant apps. A misconfiguration fails at boot in the web process (`consoleCommands` with no mode,
+or a console entry that may act with no mode); `node ace agora:doctor` reports each side
+(`durable.console-commands`, `--deep` checks the `console-durable` key). Source:
+`docs/observability/federated-console.mdx`.
+
 ## Common mistakes
 
 ### HIGH trusting an "empty" dashboard config to serve the console
@@ -255,6 +324,26 @@ Mechanism: without `authorize` the console is open outside production and
 denies every request in production, so it works locally and 403s once
 deployed. Set `authorize` (and `authorizeByToken` for scripts).
 Source: `docs/observability/dashboard.mdx` ("Authorization").
+
+### HIGH expecting a federated app to act with `consoleCommands: true`
+
+Wrong:
+
+```ts
+// the owning app's config/durable.ts
+consoleCommands: true // the console's cancel/retry/signal buttons answer 403
+```
+
+Correct:
+
+```ts
+consoleCommands: { actions: true } // plus a mode, unless crypto/authkit-client is booted
+```
+
+Mechanism: `consoleCommands.actions` defaults to `false`, so the app answers the console's reads
+but refuses every action with `403`. With neither `@adonis-agora/crypto` nor authkit-client's
+`service`, it also needs `secret` (or `verifyTenant`), or the web process fails its boot.
+Source: `docs/observability/federated-console.mdx`.
 
 ### HIGH making interceptor outputs depend on time, randomness or external state
 

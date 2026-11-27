@@ -44,7 +44,9 @@ transport (`bullmq`/`queue`/`db`) with `tenant: { partition, token }`
 (optional when `@adonis-agora/authkit-client` is booted with its `service`
 configured — its `authkit.client.tenantOf('urn:agora:durable')` supplies
 `partition`/`token`; each explicit field wins, `tenant: { auto: false }` opts out),
-`verifyTenant` and `capabilities`.
+`verifyTenant` and `capabilities`. Durable never reads `tenant.url`: a tenant reaches the
+control plane through its `transport` (still required), so authkit-client fills only `token` and
+`partition`, and `url` is accepted only so the block reads like the other Agora libs'.
 
 | Topology | Owns the store | Executes bodies | Serves HTTP |
 |------|:---:|:---:|:---:|
@@ -85,7 +87,9 @@ export default defineConfig({
 })
 ```
 
-Without authkit-client (or to override one field), set the `tenant` block; each field set wins:
+That is the whole tenant identity: `defineConfig({ topology: 'tenant', transport })` plus the
+transport map. Without authkit-client (or to override one field, or to bring your own token
+function or shared-secret token), set the `tenant` block; each field set wins:
 
 ```ts title="config/durable.ts (tenant worker pod, explicit)"
 export default defineConfig({
