@@ -78,6 +78,10 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
 
 Registering a handler after `start()` re-advertises automatically, so late registration is safe. `registerSteps`, `registerStepsFromDir` and `registerStepsFromBarrel` (also exported from the subpath) accept the runtime directly, so you can serve an `app/steps`-style directory without the ace command.
 
+## Sealed messages
+
+A transport you build yourself seals its messages like the ones `config/durable.ts` builds (see [Encrypting messages](/docs/durable/transports/encrypting-messages)): with a key derived from `process.env.APP_KEY` when it is set, so a worker of the same app needs nothing more. Otherwise pass the mode its peers use: `new BullMQTransport({ deps, messages: { appKey } })`, `{ secret }` or `{ crypto: { cipher } }`. A tenant pod built through the provider seals with `@adonis-agora/crypto` automatically; a hand-built worker talking to a control plane of another app needs the same explicit mode on both sides.
+
 ## Publishing the descriptor: the registry
 
 A worker is only routable if the control plane can see it. `WorkerRegistry` is where the descriptor and heartbeat go:

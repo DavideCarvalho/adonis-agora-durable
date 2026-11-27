@@ -20,6 +20,14 @@ import {
   type WorkflowStepEvent,
   type WorkflowTask,
 } from '../interfaces.js';
+import { sealerOf, type TransportMessagesOptions } from '../messages/resolve.js';
+import {
+  isMessageRejected,
+  isSealedMessage,
+  type MessageKind,
+  type MessageSealer,
+  taskKindOf,
+} from '../messages/sealer.js';
 import { atLeastOne, Pollers, type PollLoop } from '../pollers.js';
 import { runStepHandler, type StepHandler, withTurnHeartbeat } from '../protocol.js';
 import { sanitizeQueueToken, tenantGroup } from '../tenant-group.js';
@@ -346,6 +354,12 @@ export interface QueueTransportOptions {
    * no longer advertises itself (a dead tenant pod). Default 30000; `0` disables the janitor.
    */
   inboxSweepIntervalMs?: number;
+  /**
+   * How this transport seals its messages (see "Encrypting messages"): a ready sealer (what
+   * `transports.queue()` builds from the app), or the options. Default: sealed with a key derived
+   * from `process.env.APP_KEY` when it is set, else plain.
+   */
+  messages?: MessageSealer | TransportMessagesOptions | undefined;
 }
 
 /**
@@ -400,6 +414,8 @@ export class QueueTransport implements Transport, ControlPlane {
   /** Routing tokens whose liveness-key write is still in flight (see `#startWorkerHeartbeat`). */
   readonly #beatsInFlight = new Set<string>();
   readonly #resultConcurrency: number;
+  /** Seals what this transport sends and opens what it receives. */
+  readonly #messages: MessageSealer;
   readonly #idleBackoffMax: number;
   /** Every job handler still running (any queue) — `close()` waits for these, bounded. */
   readonly #runningJobs = new Set<Promise<void>>();
@@ -478,6 +494,7 @@ export class QueueTransport implements Transport, ControlPlane {
   readonly groupHealth?: (group: string) => Promise<GroupHealth>;
 
   constructor(options: QueueTransportOptions) {
+    this.#messages = sealerOf(options.messages, 'queue');
     // Typed through CompatAdapter so the same code drives the 0.6 (job-id) and 0.7 (lease) contracts.
     this.#adapter = options.adapter() as unknown as CompatAdapter;
     this.#partition = options.partition;
@@ -678,6 +695,39 @@ export class QueueTransport implements Transport, ControlPlane {
    * Build the adapter `JobData` envelope for a JSON-safe payload. A translated `priority` is added
    * only when set, so the default FIFO path is untouched for unprioritised dispatches.
    */
+  /** {@link #job} for a message of `kind`, sealed first. */
+  async #sealedJob(
+    kind: MessageKind,
+    name: string,
+    payload: object,
+    priority?: number,
+    seal = true,
+  ): Promise<JobData> {
+    return this.#job(name, seal ? await this.#messages.seal(kind, payload) : payload, priority);
+  }
+
+  /** Run requests / starts that arrived plain (by correlation id): their replies go back plain. */
+  readonly #plainRequests = new Set<string>();
+
+  #notePlainRequest(raw: unknown, id: unknown): void {
+    if (isSealedMessage(raw) || typeof id !== 'string') return;
+    if (this.#plainRequests.size >= 10_000) {
+      const oldest = this.#plainRequests.values().next().value;
+      if (oldest !== undefined) this.#plainRequests.delete(oldest);
+    }
+    this.#plainRequests.add(id);
+  }
+
+  /** The opened message, or `undefined` when it is refused (logged once by the sealer). */
+  async #openOrDrop<T>(kind: MessageKind, payload: unknown): Promise<T | undefined> {
+    try {
+      return await this.#messages.open<T>(kind, fromJson<unknown>(payload));
+    } catch (err) {
+      if (isMessageRejected(err)) return undefined;
+      throw err;
+    }
+  }
+
   #job(name: string, payload: unknown, priority?: number): JobData {
     const brokerPriority = toBrokerPriority(priority);
     return {
@@ -697,7 +747,7 @@ export class QueueTransport implements Transport, ControlPlane {
   async dispatch(task: RemoteTask): Promise<void> {
     await this.#adapter.pushOn(
       this.#tasksQueue(task.group),
-      this.#job('task', task, task.priority),
+      await this.#sealedJob('task', 'task', task, task.priority),
     );
   }
 
@@ -715,9 +765,11 @@ export class QueueTransport implements Transport, ControlPlane {
     }
     for (const [queue, queued] of byQueue) {
       for (let at = 0; at < queued.length; at += RUN_PUSH_CHUNK) {
-        const jobs = queued
-          .slice(at, at + RUN_PUSH_CHUNK)
-          .map((task) => this.#job('task', task, task.priority));
+        const jobs = await Promise.all(
+          queued
+            .slice(at, at + RUN_PUSH_CHUNK)
+            .map((task) => this.#sealedJob('task', 'task', task, task.priority)),
+        );
         if (this.#adapter.pushManyOn) await this.#adapter.pushManyOn(queue, jobs);
         else await Promise.all(jobs.map((job) => this.#adapter.pushOn(queue, job)));
       }
@@ -761,14 +813,27 @@ export class QueueTransport implements Transport, ControlPlane {
       this.#startLoop(
         queue,
         async (job) => {
-          const payload = fromJson<unknown>(job.payload);
+          const raw = fromJson<unknown>(job.payload);
+          let payload: unknown;
+          try {
+            payload = await this.#messages.open(taskKindOf(raw), raw);
+          } catch (err) {
+            if (!isMessageRejected(err)) throw err;
+            // Refused (logged once): the job is consumed, and a step is reported failed so its run
+            // does not wait on it. Retrying would not change the verdict.
+            await this.#refuseTask(raw, err.message, isSealedMessage(raw));
+            return;
+          }
+          // Replies go back in kind: a plain task (from a process not upgraded yet) gets plain
+          // replies, which that process can read, instead of sealed ones it would misread.
+          const sealed = isSealedMessage(raw);
           const startedAt = performance.now();
           controller.onStart();
           // Only step durations feed the latency gradient; a workflow turn still counts as in-flight
           // work and as forward progress for stall detection (as on bullmq).
           if (isWorkflowTask(payload)) {
             try {
-              await this.#runWorkflowTask(payload);
+              await this.#runWorkflowTask(payload, sealed);
             } finally {
               controller.onSettle(performance.now() - startedAt, true, 'workflow');
             }
@@ -780,10 +845,13 @@ export class QueueTransport implements Transport, ControlPlane {
             const result = await runStepHandler(
               task,
               this.#handlers.get(task.name),
-              (beat) => this.heartbeat(beat),
+              (beat) => this.heartbeat(beat, sealed),
               this.#shutdown.signal,
             );
-            await this.#adapter.pushOn(this.#resultsQueue(), this.#job('result', result));
+            await this.#adapter.pushOn(
+              this.#resultsQueue(),
+              await this.#sealedJob('result', 'result', result, undefined, sealed),
+            );
             ok = result.status === 'completed';
           } finally {
             controller.onSettle(performance.now() - startedAt, ok, 'step');
@@ -880,14 +948,14 @@ export class QueueTransport implements Transport, ControlPlane {
 
   /** Replay one workflow turn and push its decision. An unknown workflow or a throwing turn still
    *  yields a `failed` decision so the run settles; a failed push throws, so the job is redelivered. */
-  async #runWorkflowTask(task: WorkflowTask): Promise<void> {
+  async #runWorkflowTask(task: WorkflowTask, sealed = true): Promise<void> {
     let decision: WorkflowDecision;
     const turn = this.#workflowTurns.get(task.workflow);
     try {
       decision = turn
         ? await withTurnHeartbeat(
             task,
-            (beat) => this.heartbeat(beat),
+            (beat) => this.heartbeat(beat, sealed),
             () => turn(task),
           )
         : {
@@ -910,12 +978,34 @@ export class QueueTransport implements Transport, ControlPlane {
         error: { message: err instanceof Error ? err.message : String(err) },
       };
     }
-    await this.#adapter.pushOn(this.#decisionsQueue(), this.#job('decision', decision));
+    await this.#adapter.pushOn(
+      this.#decisionsQueue(),
+      await this.#sealedJob('decision', 'decision', decision, undefined, sealed),
+    );
+  }
+
+  /** Report a refused step task as failed (retryable), so its run does not wait on it. */
+  async #refuseTask(raw: unknown, reason: string, sealed: boolean): Promise<void> {
+    const identity = failedTaskIdentity(raw);
+    if (!identity) return;
+    await this.#adapter.pushOn(
+      this.#resultsQueue(),
+      await this.#sealedJob(
+        'result',
+        'result',
+        infrastructureFailure(identity, `message refused: ${reason}`),
+        undefined,
+        sealed,
+      ),
+    );
   }
 
   /** Worker side: publish a liveness heartbeat for an in-flight long step. */
-  async heartbeat(beat: Heartbeat): Promise<void> {
-    await this.#adapter.pushOn(this.#heartbeatsQueue(), this.#job('heartbeat', beat));
+  async heartbeat(beat: Heartbeat, sealed = true): Promise<void> {
+    await this.#adapter.pushOn(
+      this.#heartbeatsQueue(),
+      await this.#sealedJob('heartbeat', 'heartbeat', beat, undefined, sealed),
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -926,7 +1016,8 @@ export class QueueTransport implements Transport, ControlPlane {
     this.#startLoop(
       this.#resultsQueue(),
       async (job) => {
-        await handler(fromJson<ResultPayload>(job.payload));
+        const result = await this.#openOrDrop<ResultPayload>('result', job.payload);
+        if (result) await handler(result);
       },
       // At least RESULT_IN_FLIGHT results in a handler at once: the engine writes one run's results
       // that are in hand together, so taking a few at a time made a wide fan settle a few per write.
@@ -938,7 +1029,8 @@ export class QueueTransport implements Transport, ControlPlane {
     this.#startLoop(
       this.#heartbeatsQueue(),
       async (job) => {
-        await handler(fromJson<HeartbeatPayload>(job.payload));
+        const beat = await this.#openOrDrop<HeartbeatPayload>('heartbeat', job.payload);
+        if (beat) await handler(beat);
       },
       { idleBackoffMax: this.#idleBackoffMax },
     );
@@ -950,14 +1042,18 @@ export class QueueTransport implements Transport, ControlPlane {
 
   async publishControl(msg: ControlMessage): Promise<void> {
     const stamped: ControlMessage = msg.from ? msg : { ...msg, from: this.#instanceId };
-    await this.#adapter.pushOn(this.#controlQueue(), this.#job('control', stamped));
+    await this.#adapter.pushOn(
+      this.#controlQueue(),
+      await this.#sealedJob('control', 'control', stamped),
+    );
   }
 
   onControl(handler: (msg: ControlMessage) => void): void {
     this.#startLoop(
       this.#controlQueue(),
       async (job) => {
-        handler(fromJson<ControlPayload>(job.payload));
+        const msg = await this.#openOrDrop<ControlPayload>('control', job.payload);
+        if (msg) handler(msg);
       },
       { idleBackoffMax: this.#idleBackoffMax },
     );
@@ -972,7 +1068,7 @@ export class QueueTransport implements Transport, ControlPlane {
   async dispatchWorkflowTask(task: WorkflowTask): Promise<void> {
     await this.#adapter.pushOn(
       this.#tasksQueue(task.group),
-      this.#job('workflow', task, task.priority),
+      await this.#sealedJob('workflowTask', 'workflow', task, task.priority),
     );
   }
 
@@ -988,7 +1084,8 @@ export class QueueTransport implements Transport, ControlPlane {
     this.#startLoop(
       this.#decisionsQueue(),
       async (job) => {
-        const decision = fromJson<WorkflowDecision>(job.payload);
+        const decision = await this.#openOrDrop<WorkflowDecision>('decision', job.payload);
+        if (!decision) return;
         // Every handler, concurrently; all settle before a failure redelivers the decision.
         await fanOutDecision(this.#decisionHandlers, decision, this.#onError);
       },
@@ -999,7 +1096,10 @@ export class QueueTransport implements Transport, ControlPlane {
   /** workflow worker → engine: a local step's lifecycle on `${P}:step-events` (job `stepEvent`),
    *  point-to-point so ONE engine instance checkpoints each event once. */
   async dispatchStepEvent(event: WorkflowStepEvent): Promise<void> {
-    await this.#adapter.pushOn(this.#stepEventsQueue(), this.#job('stepEvent', event));
+    await this.#adapter.pushOn(
+      this.#stepEventsQueue(),
+      await this.#sealedJob('stepEvent', 'stepEvent', event),
+    );
   }
 
   /** engine ← workflow worker: consume streamed step events. Idempotent — a second call is a no-op. */
@@ -1009,7 +1109,8 @@ export class QueueTransport implements Transport, ControlPlane {
     this.#startLoop(
       this.#stepEventsQueue(),
       async (job) => {
-        await handler(fromJson<WorkflowStepEvent>(job.payload));
+        const event = await this.#openOrDrop<WorkflowStepEvent>('stepEvent', job.payload);
+        if (event) await handler(event);
       },
       { idleBackoffMax: this.#idleBackoffMax },
     );
@@ -1087,7 +1188,10 @@ export class QueueTransport implements Transport, ControlPlane {
    *  stamped with this instance as the reply target. */
   async dispatchStartRun(msg: StartRunMessage): Promise<void> {
     this.#ensureRunRepliesLoop();
-    const payload: StartRunPayload = { ...msg, replyTo: this.#instanceId };
+    const payload: StartRunPayload = {
+      ...(await this.#messages.seal('startRun', msg)),
+      replyTo: this.#instanceId,
+    };
     await this.#adapter.pushOn(this.#startRunQueue(), this.#job('startRun', payload));
   }
 
@@ -1099,7 +1203,10 @@ export class QueueTransport implements Transport, ControlPlane {
     this.#startLoop(
       this.#startRunQueue(),
       async (job) => {
-        const { replyTo, ...msg } = fromJson<StartRunPayload>(job.payload);
+        const { replyTo, ...raw } = fromJson<StartRunPayload>(job.payload);
+        const msg = await this.#openOrDrop<StartRunMessage>('startRun', raw);
+        if (!msg) return;
+        this.#notePlainRequest(raw, msg.runId);
         await this.#withReplyRoute(msg.runId, replyTo, () => handler(msg));
       },
       { idleBackoffMax: this.#idleBackoffMax },
@@ -1110,7 +1217,10 @@ export class QueueTransport implements Transport, ControlPlane {
    *  stamped with this instance as the reply target. */
   async dispatchRunRequest(msg: RunRequest): Promise<void> {
     this.#ensureRunRepliesLoop();
-    const payload: RunRequestPayload = { ...msg, replyTo: this.#instanceId };
+    const payload: RunRequestPayload = {
+      ...(await this.#messages.seal('runRequest', msg)),
+      replyTo: this.#instanceId,
+    };
     await this.#adapter.pushOn(this.#runRequestQueue(), this.#job('runRequest', payload));
   }
 
@@ -1122,7 +1232,10 @@ export class QueueTransport implements Transport, ControlPlane {
     this.#startLoop(
       this.#runRequestQueue(),
       async (job) => {
-        const { replyTo, ...msg } = fromJson<RunRequestPayload>(job.payload);
+        const { replyTo, ...raw } = fromJson<RunRequestPayload>(job.payload);
+        const msg = await this.#openOrDrop<RunRequest>('runRequest', raw);
+        if (!msg) return;
+        this.#notePlainRequest(raw, msg.requestId);
         await this.#withReplyRoute(msg.requestId, replyTo, () => handler(msg));
       },
       { idleBackoffMax: this.#idleBackoffMax },
@@ -1161,7 +1274,11 @@ export class QueueTransport implements Transport, ControlPlane {
       return;
     }
     const queue = runRepliesQueue(this.#effectivePrefix(), owner);
-    await this.#adapter.pushOn(queue, this.#job('runReply', reply));
+    const sealReply = !this.#plainRequests.delete(reply.requestId);
+    await this.#adapter.pushOn(
+      queue,
+      await this.#sealedJob('runReply', 'runReply', reply, undefined, sealReply),
+    );
     this.#inboxes.notePush(queue, owner);
   }
 
@@ -1186,7 +1303,8 @@ export class QueueTransport implements Transport, ControlPlane {
     this.#reallyStartLoop(
       runRepliesQueue(this.#effectivePrefix(), this.#instanceId),
       async (job) => {
-        const reply = fromJson<RunReply>(job.payload);
+        const reply = await this.#openOrDrop<RunReply>('runReply', job.payload);
+        if (!reply) return;
         try {
           this.#runReplyHandler?.(reply);
         } catch (err) {
@@ -1208,7 +1326,7 @@ export class QueueTransport implements Transport, ControlPlane {
       const owners = await this.#inboxes.subscribersOf(evt.tenant);
       for (const owner of owners) {
         const queue = tenantEventsQueue(this.#effectivePrefix(), owner);
-        await this.#adapter.pushOn(queue, this.#job('tenantEvent', evt));
+        await this.#adapter.pushOn(queue, await this.#sealedJob('tenantEvent', 'tenantEvent', evt));
         this.#inboxes.notePush(queue, owner);
       }
     });
@@ -1263,7 +1381,8 @@ export class QueueTransport implements Transport, ControlPlane {
     this.#reallyStartLoop(
       tenantEventsQueue(this.#effectivePrefix(), this.#instanceId),
       async (job) => {
-        const evt = fromJson<TenantEvent>(job.payload);
+        const evt = await this.#openOrDrop<TenantEvent>('tenantEvent', job.payload);
+        if (!evt) return;
         for (const h of this.#tenantEventHandlers.get(evt.tenant) ?? []) {
           try {
             h(evt);
@@ -1539,8 +1658,11 @@ export class QueueTransport implements Transport, ControlPlane {
     }
     if (failed === false || !this.#taskQueues.has(queue)) return;
     let identity: ReturnType<typeof failedTaskIdentity>;
+    let sealed = true;
     try {
-      identity = failedTaskIdentity(fromJson<unknown>(job.payload));
+      const raw = fromJson<unknown>(job.payload);
+      sealed = isSealedMessage(raw);
+      identity = failedTaskIdentity(raw);
     } catch {
       return; // an unparseable payload: nothing safe to publish
     }
@@ -1548,7 +1670,13 @@ export class QueueTransport implements Transport, ControlPlane {
     try {
       await this.#adapter.pushOn(
         this.#resultsQueue(),
-        this.#job('result', infrastructureFailure(identity, reason)),
+        await this.#sealedJob(
+          'result',
+          'result',
+          infrastructureFailure(identity, reason),
+          undefined,
+          sealed,
+        ),
       );
     } catch (err) {
       this.#onError(err);

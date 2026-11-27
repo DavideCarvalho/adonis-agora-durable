@@ -18,6 +18,7 @@ import {
 import type { DurableConfig } from '../define_config.js';
 import { type AgoraDoctorCheck, type AgoraDoctorResult, installedVersion } from './agora_doctor.js';
 import { consoleCommandsDoctorChecks } from './console_commands.js';
+import { messagesDoctorChecks } from './messages.js';
 
 const DOCS = 'https://davidecarvalho.github.io/agora/docs/durable';
 
@@ -381,6 +382,7 @@ export const durableDoctorChecks: AgoraDoctorCheck[] = [
     run: (app) => checkSchema(app),
   },
   ...consoleCommandsDoctorChecks,
+  ...messagesDoctorChecks,
 ];
 
 /** The check the durable console's provider registers. */

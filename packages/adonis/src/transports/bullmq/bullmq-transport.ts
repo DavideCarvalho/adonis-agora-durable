@@ -18,6 +18,14 @@ import type {
   WorkflowStepEvent,
   WorkflowTask,
 } from '../../interfaces.js';
+import { sealerOf, type TransportMessagesOptions } from '../../messages/resolve.js';
+import {
+  isMessageRejected,
+  isSealedMessage,
+  type MessageKind,
+  type MessageSealer,
+  taskKindOf,
+} from '../../messages/sealer.js';
 import { runStepHandler, type StepHandler, withTurnHeartbeat } from '../../protocol.js';
 import { swallowSubscribe } from '../../safe-subscribe.js';
 import type { DescriptorRedis } from '../../worker-runtime/registry.js';
@@ -191,6 +199,12 @@ export interface BullMQTransportOptions {
    * `'per-handler'`. `{ intervalMs }` sets the check interval (default `60_000`).
    */
   taskQueueDrain?: boolean | { intervalMs?: number | undefined } | undefined;
+  /**
+   * How this transport seals its messages (see "Encrypting messages"): a ready sealer (what
+   * `transports.bullmq()` builds from the app), or the options. Default: sealed with a key derived
+   * from `process.env.APP_KEY` when it is set, else plain.
+   */
+  messages?: MessageSealer | TransportMessagesOptions | undefined;
 }
 
 /**
@@ -428,8 +442,42 @@ export class BullMQTransport implements Transport {
   >();
   /** Dead engines' reply queues this transport is moving to the shared results. */
   readonly #replyDrains = new Map<string, { worker: WorkerLike; idleSince?: number | undefined }>();
+  /** Seals what this transport sends and opens what it receives. */
+  readonly #messages: MessageSealer;
+  /** An opened task → the job data it came from (the hand-back check reads the job's object). */
+  readonly #openedFrom = new WeakMap<object, object>();
+
+  /** Run requests / starts that arrived plain (by correlation id): their replies go back plain. */
+  readonly #plainRequests = new Set<string>();
+
+  #notePlainRequest(raw: unknown, id: unknown): void {
+    if (isSealedMessage(raw) || typeof id !== 'string') return;
+    if (this.#plainRequests.size >= 10_000) {
+      const oldest = this.#plainRequests.values().next().value;
+      if (oldest !== undefined) this.#plainRequests.delete(oldest);
+    }
+    this.#plainRequests.add(id);
+  }
+
+  /** Whether `task` (opened or raw) was handed back on shutdown. */
+  #wasHandedBack(task: object): boolean {
+    return this.#handedBack.has(task) || this.#handedBack.has(this.#openedFrom.get(task) ?? task);
+  }
+
+  /** The opened message, or `undefined` when it is refused (logged once by the sealer). */
+  async #openOrDrop<T>(kind: MessageKind, raw: unknown): Promise<T | undefined> {
+    const plain = this.#messages.openPlain<T>(kind, raw);
+    if (plain !== undefined) return plain;
+    try {
+      return await this.#messages.open<T>(kind, raw);
+    } catch (err) {
+      if (isMessageRejected(err)) return undefined;
+      throw err;
+    }
+  }
 
   constructor(options: BullMQTransportOptions) {
+    this.#messages = sealerOf(options.messages, 'bullmq');
     this.#deps = options.deps;
     this.#partition = options.partition;
     this.#prefix = options.prefix ?? 'durable';
@@ -717,7 +765,8 @@ export class BullMQTransport implements Transport {
    * result as soon as it finishes. A batch that fails to publish goes out one result per job.
    * Otherwise each result is its own job on the results queue.
    */
-  async #publishResult(result: StepResult, replyTo?: string): Promise<void> {
+  async #publishResult(plain: StepResult, replyTo?: string, seal = true): Promise<void> {
+    const result = seal ? await this.#messages.seal('result', plain) : plain;
     if (replyTo !== undefined && (await this.#publishReply(result, replyTo))) return;
     if (!(await this.#resultBatchesConsumed())) {
       await this.#queue(resultsName(this.#effectivePrefix())).add(
@@ -857,7 +906,11 @@ export class BullMQTransport implements Transport {
   /** `task.group` already carries the FINAL routing token (computed by the engine) — target that
    *  handler's dedicated queue. Job name `task`; DTO is the raw job data. */
   async dispatch(task: RemoteTask): Promise<void> {
-    await this.#queue(this.#taskQueueName(task.group)).add('task', task, taskDispatchOptions(task));
+    await this.#queue(this.#taskQueueName(task.group)).add(
+      'task',
+      await this.#messages.seal('task', task),
+      taskDispatchOptions(task),
+    );
   }
 
   /**
@@ -866,20 +919,22 @@ export class BullMQTransport implements Transport {
    * task.
    */
   async dispatchMany(tasks: RemoteTask[]): Promise<void> {
-    const byQueue = new Map<string, RemoteTask[]>();
-    for (const task of tasks) {
+    const sealed = await Promise.all(tasks.map((task) => this.#messages.seal('task', task)));
+    const byQueue = new Map<string, Array<{ task: RemoteTask; data: RemoteTask }>>();
+    for (const [i, task] of tasks.entries()) {
+      const entry = { task, data: sealed[i] as RemoteTask };
       const name = this.#taskQueueName(task.group);
       const queued = byQueue.get(name);
-      if (queued) queued.push(task);
-      else byQueue.set(name, [task]);
+      if (queued) queued.push(entry);
+      else byQueue.set(name, [entry]);
     }
     const calls: Array<() => Promise<unknown>> = [];
     for (const [name, queued] of byQueue) {
       const queue = this.#queue(name);
       for (let at = 0; at < queued.length; at += TASK_ADD_BULK_CHUNK) {
-        const chunk = queued.slice(at, at + TASK_ADD_BULK_CHUNK).map((task) => ({
+        const chunk = queued.slice(at, at + TASK_ADD_BULK_CHUNK).map(({ task, data }) => ({
           name: 'task',
-          data: task,
+          data,
           opts: taskDispatchOptions(task),
         }));
         calls.push(() =>
@@ -907,7 +962,7 @@ export class BullMQTransport implements Transport {
   async dispatchWorkflowTask(task: WorkflowTask): Promise<void> {
     await this.#queue(this.#taskQueueName(task.group)).add(
       'workflow',
-      task,
+      await this.#messages.seal('workflowTask', task),
       jobOptions(task.priority),
     );
   }
@@ -1013,13 +1068,21 @@ export class BullMQTransport implements Transport {
     worker.on('failed', (job, error) => {
       const identity = failedTaskIdentity(job?.data);
       if (!identity) return; // payload already GC'd, malformed, or a workflow job — nothing safe to publish
-      void this.#bridgeTaskFailure(identity, job?.failedReason ?? error?.message ?? 'unknown');
+      void this.#bridgeTaskFailure(
+        identity,
+        job?.failedReason ?? error?.message ?? 'unknown',
+        isSealedMessage(job?.data),
+      );
     });
   }
 
   /** Whether this process has the handler (or workflow turn) a task job is for. */
   #servesTask(data: unknown): boolean {
     if (isWorkflowTask(data)) return this.#workflowTurns.has(data.workflow);
+    // A sealed workflow turn keeps `workflow` and `taskId` in clear (its history is sealed).
+    if (taskKindOf(data) === 'workflowTask') {
+      return this.#workflowTurns.has((data as { workflow: string }).workflow);
+    }
     const name = (data as { name?: unknown } | null | undefined)?.name;
     return typeof name === 'string' && this.#handlers.has(name);
   }
@@ -1245,7 +1308,17 @@ export class BullMQTransport implements Transport {
 
   /** Route one task job by SHAPE (spec §6.3): a workflow turn runs the replay → decision path, a step
    *  runs the `runStepHandler` → result path. Both kinds share a token's queue but never each other's. */
-  async #runJob(data: unknown): Promise<void> {
+  async #runJob(raw: unknown): Promise<void> {
+    // A refused task fails its job (BullMQ keeps it as failed: the dead letter), and the failure
+    // bridge reports the step failed, so its run does not wait on it.
+    const kind = taskKindOf(raw);
+    // Replies go back in kind: a plain task (from a process not upgraded yet) gets plain replies,
+    // which that process can read, instead of sealed ones it would misread.
+    const sealed = isSealedMessage(raw);
+    const data =
+      this.#messages.openPlain<RemoteTask | WorkflowTask>(kind, raw) ??
+      (await this.#messages.open<RemoteTask | WorkflowTask>(kind, raw));
+    if (data !== raw && raw && typeof raw === 'object') this.#openedFrom.set(data, raw);
     const controller = this.#concurrencyController();
     const startedAt = performance.now();
     controller.onStart();
@@ -1253,14 +1326,14 @@ export class BullMQTransport implements Transport {
     // and as forward progress for stall detection.
     if (isWorkflowTask(data)) {
       try {
-        return await this.#runWorkflowTask(data);
+        return await this.#runWorkflowTask(data, sealed);
       } finally {
         controller.onSettle(performance.now() - startedAt, true, 'workflow');
       }
     }
     let ok = false;
     try {
-      ok = await this.#runTask(data as RemoteTask);
+      ok = await this.#runTask(data as RemoteTask, sealed);
     } finally {
       controller.onSettle(performance.now() - startedAt, ok, 'step');
     }
@@ -1269,14 +1342,14 @@ export class BullMQTransport implements Transport {
   /** Worker side: replay a workflow turn and publish its {@link WorkflowDecision} on `${P}-decisions`
    *  (job `decision`) — the queue the engine's `onDecision` consumes. An unknown workflow or a turn
    *  that throws still publishes a `failed` decision so the engine settles the run (never hangs). */
-  async #runWorkflowTask(task: WorkflowTask): Promise<void> {
+  async #runWorkflowTask(task: WorkflowTask, sealed = true): Promise<void> {
     let decision: WorkflowDecision;
     try {
       const turn = this.#workflowTurns.get(task.workflow);
       decision = turn
         ? await withTurnHeartbeat(
             task,
-            (beat) => this.heartbeat(beat),
+            (beat) => this.heartbeat(beat, sealed),
             () => turn(task),
           )
         : {
@@ -1302,11 +1375,11 @@ export class BullMQTransport implements Transport {
       };
     }
     // Handed back on shutdown: the broker already redelivers this turn elsewhere.
-    if (this.#handedBack.has(task)) return;
+    if (this.#wasHandedBack(task)) return;
     try {
       await this.#queue(decisionsName(this.#effectivePrefix())).add(
         'decision',
-        decision,
+        sealed ? await this.#messages.seal('decision', decision) : decision,
         jobOptions(),
       );
     } catch (err) {
@@ -1318,7 +1391,7 @@ export class BullMQTransport implements Transport {
   }
 
   /** Run one step and publish its result. Resolves `true` when the step completed. */
-  async #runTask(task: RemoteTask): Promise<boolean> {
+  async #runTask(task: RemoteTask, sealed = true): Promise<boolean> {
     let result: StepResult;
     try {
       result = await this.#withStepTimeout(
@@ -1326,7 +1399,7 @@ export class BullMQTransport implements Transport {
         runStepHandler(
           task,
           this.#handlers.get(task.name),
-          (beat) => this.heartbeat(beat),
+          (beat) => this.heartbeat(beat, sealed),
           this.#shutdown.signal,
         ),
       );
@@ -1346,9 +1419,9 @@ export class BullMQTransport implements Transport {
       };
     }
     // Handed back on shutdown: the broker already redelivers this step elsewhere.
-    if (this.#handedBack.has(task)) return false;
+    if (this.#wasHandedBack(task)) return false;
     try {
-      await this.#publishResult(result, task.replyTo);
+      await this.#publishResult(result, task.replyTo, sealed);
       return result.status === 'completed';
     } catch (err) {
       // The results-queue publish itself threw (e.g. Redis blipped). We still hold `task`, so
@@ -1391,22 +1464,22 @@ export class BullMQTransport implements Transport {
 
   /** Worker side: publish a liveness heartbeat for an in-flight long step on the `${P}-heartbeat`
    *  pub/sub channel (resets the engine's `timeoutMs` window on whichever pod is awaiting it). */
-  async heartbeat(beat: Heartbeat): Promise<void> {
+  async heartbeat(beat: Heartbeat, sealed = true): Promise<void> {
     if (!this.#heartbeatPub) this.#heartbeatPub = this.#deps.makeRedis();
     await this.#heartbeatPub.publish(
       heartbeatChannel(this.#effectivePrefix()),
-      JSON.stringify(beat),
+      JSON.stringify(sealed ? await this.#messages.seal('heartbeat', beat) : beat),
     );
   }
 
   /** Publish a synthetic FAILED StepResult for a task that failed at the infrastructure level (see the
    *  `handle()` bridge). Correlated purely by runId/seq/stepId (StepResult has no `name`). Best-effort. */
-  async #bridgeTaskFailure(identity: TaskIdentity, reason: string): Promise<void> {
+  async #bridgeTaskFailure(identity: TaskIdentity, reason: string, sealed = true): Promise<void> {
     const result = infrastructureFailure(identity, reason);
     try {
       await this.#queue(resultsName(this.#effectivePrefix())).add(
         'result',
-        result,
+        sealed ? await this.#messages.seal('result', result) : result,
         resultJobOptions(),
       );
     } catch (err) {
@@ -1425,7 +1498,12 @@ export class BullMQTransport implements Transport {
       resultBatchesName(this.#effectivePrefix()),
       async (job) => {
         const { results } = job.data as { results: StepResult[] };
-        await Promise.all(results.map((result) => handler(result)));
+        await Promise.all(
+          results.map(async (raw) => {
+            const result = await this.#openOrDrop<StepResult>('result', raw);
+            if (result) await handler(result);
+          }),
+        );
       },
       { concurrency: this.#resultConcurrency },
     );
@@ -1441,7 +1519,10 @@ export class BullMQTransport implements Transport {
     });
     this.#resultsWorker = this.#makeWorker(
       resultsName(this.#effectivePrefix()),
-      (job) => handler(job.data as StepResult),
+      async (job) => {
+        const result = await this.#openOrDrop<StepResult>('result', job.data);
+        if (result) await handler(result);
+      },
       { concurrency: this.#resultConcurrency },
     );
     this.#resultsWorker.on('failed', (job, err) => {
@@ -1541,9 +1622,13 @@ export class BullMQTransport implements Transport {
 
   /** Hand a results job to every result handler. */
   async #handleResultJob(job: JobLike): Promise<void> {
-    const results = this.#resultsOf(job);
+    const results = await Promise.all(
+      this.#resultsOf(job).map((raw) => this.#openOrDrop<StepResult>('result', raw)),
+    );
     await Promise.all(
-      results.flatMap((result) => [...this.#resultHandlers].map((handler) => handler(result))),
+      results.flatMap((result) =>
+        result ? [...this.#resultHandlers].map((handler) => handler(result)) : [],
+      ),
     );
   }
 
@@ -1701,7 +1786,8 @@ export class BullMQTransport implements Transport {
     this.#decisionsWorker = this.#makeWorker(
       decisionsName(this.#effectivePrefix()),
       async (job) => {
-        const decision = job.data as WorkflowDecision;
+        const decision = await this.#openOrDrop<WorkflowDecision>('decision', job.data);
+        if (!decision) return;
         // Every handler, concurrently; all settle before a failure fails (and retries) the job.
         await fanOutDecision(this.#decisionHandlers, decision, (err) => {
           if (this.#hasOnError) this.#onError(err);
@@ -1716,15 +1802,19 @@ export class BullMQTransport implements Transport {
   async dispatchStepEvent(event: WorkflowStepEvent): Promise<void> {
     await this.#queue(stepEventsName(this.#effectivePrefix())).add(
       'stepEvent',
-      event,
+      await this.#messages.seal('stepEvent', event),
       jobOptions(),
     );
   }
 
   onStepEvent(handler: (event: WorkflowStepEvent) => Promise<void>): void {
     if (this.#stepEventsWorker) return;
-    this.#stepEventsWorker = this.#makeWorker(stepEventsName(this.#effectivePrefix()), (job) =>
-      handler(job.data as WorkflowStepEvent),
+    this.#stepEventsWorker = this.#makeWorker(
+      stepEventsName(this.#effectivePrefix()),
+      async (job) => {
+        const event = await this.#openOrDrop<WorkflowStepEvent>('stepEvent', job.data);
+        if (event) await handler(event);
+      },
     );
   }
 
@@ -1739,12 +1829,16 @@ export class BullMQTransport implements Transport {
       this.#subscribeErrorSink(),
     );
     sub.on('message', ((_channel: string, payload: string) => {
+      let raw: unknown;
       try {
-        // The engine's handler writes to the store: report a rejection, never leave it unhandled.
-        void handler(JSON.parse(payload) as Heartbeat).catch((err) => this.#onError(err));
+        raw = JSON.parse(payload);
       } catch {
-        /* ignore malformed heartbeats */
+        return; /* ignore malformed heartbeats */
       }
+      // The engine's handler writes to the store: report a rejection, never leave it unhandled.
+      void this.#openOrDrop<Heartbeat>('heartbeat', raw)
+        .then((beat) => (beat ? handler(beat) : undefined))
+        .catch((err) => this.#onError(err));
     }) as never);
   }
 
@@ -2515,27 +2609,44 @@ export class BullMQTransport implements Transport {
 
   /** tenant → control plane: enqueue a {@link StartRunMessage} on `${P}-start-run` (job `startRun`). */
   async dispatchStartRun(msg: StartRunMessage): Promise<void> {
-    await this.#queue(startRunName(this.#effectivePrefix())).add('startRun', msg, jobOptions());
+    await this.#queue(startRunName(this.#effectivePrefix())).add(
+      'startRun',
+      await this.#messages.seal('startRun', msg),
+      jobOptions(),
+    );
   }
 
   /** control plane ← tenant: consume {@link StartRunMessage}s. Idempotent — a second call is a no-op. */
   onStartRun(handler: (msg: StartRunMessage) => Promise<void>): void {
     if (this.#startRunWorker) return;
-    this.#startRunWorker = this.#makeWorker(startRunName(this.#effectivePrefix()), (job) =>
-      handler(job.data as StartRunMessage),
-    );
+    this.#startRunWorker = this.#makeWorker(startRunName(this.#effectivePrefix()), async (job) => {
+      const msg = await this.#openOrDrop<StartRunMessage>('startRun', job.data);
+      if (!msg) return;
+      this.#notePlainRequest(job.data, msg.runId);
+      await handler(msg);
+    });
   }
 
   /** tenant → control plane: enqueue a {@link RunRequest} on `${P}-run-request` (job `runRequest`). */
   async dispatchRunRequest(msg: RunRequest): Promise<void> {
-    await this.#queue(runRequestName(this.#effectivePrefix())).add('runRequest', msg, jobOptions());
+    await this.#queue(runRequestName(this.#effectivePrefix())).add(
+      'runRequest',
+      await this.#messages.seal('runRequest', msg),
+      jobOptions(),
+    );
   }
 
   /** control plane ← tenant: consume {@link RunRequest}s. Idempotent — a second call is a no-op. */
   onRunRequest(handler: (msg: RunRequest) => Promise<void>): void {
     if (this.#runRequestWorker) return;
-    this.#runRequestWorker = this.#makeWorker(runRequestName(this.#effectivePrefix()), (job) =>
-      handler(job.data as RunRequest),
+    this.#runRequestWorker = this.#makeWorker(
+      runRequestName(this.#effectivePrefix()),
+      async (job) => {
+        const msg = await this.#openOrDrop<RunRequest>('runRequest', job.data);
+        if (!msg) return;
+        this.#notePlainRequest(job.data, msg.requestId);
+        await handler(msg);
+      },
     );
   }
 
@@ -2544,7 +2655,11 @@ export class BullMQTransport implements Transport {
     if (!this.#runReplyPub) this.#runReplyPub = this.#deps.makeRedis();
     await this.#runReplyPub.publish(
       runReplyChannel(this.#effectivePrefix()),
-      JSON.stringify(reply),
+      JSON.stringify(
+        this.#plainRequests.delete(reply.requestId)
+          ? reply
+          : await this.#messages.seal('runReply', reply),
+      ),
     );
   }
 
@@ -2563,20 +2678,30 @@ export class BullMQTransport implements Transport {
     sub.on('message', ((msgChannel: string, payload: string) => {
       // Filter by channel: a shared pub/sub connection may also carry other channels' messages.
       if (msgChannel !== channel) return;
+      let raw: unknown;
       try {
-        handler(JSON.parse(payload) as RunReply);
+        raw = JSON.parse(payload);
       } catch {
-        /* ignore malformed run replies */
+        return; /* ignore malformed run replies */
       }
+      void this.#openOrDrop<RunReply>('runReply', raw)
+        .then((reply) => {
+          if (reply) handler(reply);
+        })
+        .catch(() => undefined);
     }) as never);
   }
 
   /** control plane → tenant: re-publish a lifecycle {@link TenantEvent} on `${P}-tenant-events-<tenant>`. */
   async publishTenantEvent(evt: TenantEvent): Promise<void> {
     if (!this.#tenantEventPub) this.#tenantEventPub = this.#deps.makeRedis();
+    const sealed = await this.#messages.seal('tenantEvent', evt);
+    // Sealed events go on a channel of their own: a pod not upgraded yet never hears them (it would
+    // read an event it cannot open as one with no run), and misses them instead.
+    const channel = tenantEventsChannel(this.#effectivePrefix(), evt.tenant);
     await this.#tenantEventPub.publish(
-      tenantEventsChannel(this.#effectivePrefix(), evt.tenant),
-      JSON.stringify(evt),
+      isSealedMessage(sealed) ? sealedChannel(channel) : channel,
+      JSON.stringify(sealed),
     );
   }
 
@@ -2591,12 +2716,14 @@ export class BullMQTransport implements Transport {
     const sub = this.#tenantEventSubscriber();
     if (!this.#tenantEventChannels.has(channel)) {
       this.#tenantEventChannels.add(channel);
-      swallowSubscribe(
-        sub.subscribe(channel),
-        () => this.#closing,
-        'bullmq tenant-event',
-        this.#subscribeErrorSink(),
-      );
+      for (const name of [channel, sealedChannel(channel)]) {
+        swallowSubscribe(
+          sub.subscribe(name),
+          () => this.#closing,
+          'bullmq tenant-event',
+          this.#subscribeErrorSink(),
+        );
+      }
     }
     let handlers = this.#tenantEventHandlers.get(channel);
     if (!handlers) {
@@ -2614,16 +2741,24 @@ export class BullMQTransport implements Transport {
     if (this.#tenantEventSub) return this.#tenantEventSub;
     const sub = this.#subscriberRedis('tenant-event');
     this.#tenantEventSub = sub;
-    sub.on('message', ((msgChannel: string, payload: string) => {
+    sub.on('message', ((rawChannel: string, payload: string) => {
+      const msgChannel = rawChannel.endsWith(SEALED_SUFFIX)
+        ? rawChannel.slice(0, -SEALED_SUFFIX.length)
+        : rawChannel;
       const handlers = this.#tenantEventHandlers.get(msgChannel);
       if (!handlers || handlers.size === 0) return;
-      let evt: TenantEvent;
+      let raw: unknown;
       try {
-        evt = JSON.parse(payload) as TenantEvent;
+        raw = JSON.parse(payload);
       } catch {
         return; // ignore malformed tenant events
       }
-      for (const h of handlers) h(evt);
+      void this.#openOrDrop<TenantEvent>('tenantEvent', raw)
+        .then((evt) => {
+          if (!evt) return;
+          for (const h of this.#tenantEventHandlers.get(msgChannel) ?? []) h(evt);
+        })
+        .catch(() => undefined);
     }) as never);
     return sub;
   }
@@ -3076,3 +3211,7 @@ const TASK_ADD_BULK_IN_FLIGHT = 4;
 
 /** The most run jobs one `addBulk` carries (see {@link BullMQTransport.dispatchRuns}). */
 const RUN_ADD_BULK_CHUNK = 500;
+
+/** The suffix of the pub/sub channel sealed tenant events go on. */
+const SEALED_SUFFIX = ':sealed';
+const sealedChannel = (channel: string): string => `${channel}${SEALED_SUFFIX}`;

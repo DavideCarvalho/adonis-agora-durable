@@ -91,6 +91,7 @@ skills:
       - 'DavideCarvalho/adonis-durable:docs/transports/queue.mdx'
       - 'DavideCarvalho/adonis-durable:docs/transports/db.mdx'
       - 'DavideCarvalho/adonis-durable:docs/transports/control-plane.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/transports/encrypting-messages.mdx'
       - 'DavideCarvalho/adonis-durable:docs/stores/index.mdx'
       - 'DavideCarvalho/adonis-durable:docs/stores/lucid.mdx'
       - 'DavideCarvalho/adonis-durable:docs/cluster/interop.mdx'
@@ -136,6 +137,7 @@ skills:
       - 'DavideCarvalho/adonis-durable:docs/cluster/interop.mdx'
       - 'DavideCarvalho/adonis-durable:docs/python.mdx'
       - 'DavideCarvalho/adonis-durable:docs/concepts/tenancy.mdx'
+      - 'DavideCarvalho/adonis-durable:docs/transports/encrypting-messages.mdx'
 
   - name: durable-observability
     slug: durable-observability

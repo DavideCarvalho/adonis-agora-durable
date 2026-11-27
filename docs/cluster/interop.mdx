@@ -49,6 +49,10 @@ The transport's own options (connection, fixed and adaptive `concurrency`, `resu
 `bullmq` is the **only** transport all three runtimes share. The `queue` and `db` transports carry steps, remote workflow turns and tenant pods between Adonis processes only; a Python or NestJS worker cannot consume them (see [Choosing a transport](/docs/durable/transports/choosing)).
 </Callout>
 
+<Callout type="warn">
+From 1.2, durable seals its broker messages by default ([Encrypting messages](/docs/durable/transports/encrypting-messages)), and the NestJS and Python workers read plain messages only. On a BullMQ transport and a control plane shared with them, set `messages: { insecure: true }`.
+</Callout>
+
 ## How the wire lines up
 
 Every cross-process DTO matches the aviary field-for-field. The BullMQ transport carries the task, result and decision queues and the worker registry; the control broadcast comes from [`controlPlanes.redis`](/docs/durable/transports/control-plane), which you configure alongside it (the transport does not publish that channel):

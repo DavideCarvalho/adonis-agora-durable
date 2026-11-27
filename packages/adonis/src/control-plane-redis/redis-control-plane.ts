@@ -7,6 +7,8 @@ import type {
   ControlPlane,
   ControlPublishTarget,
 } from '../index.js';
+import { sealerOf, type TransportMessagesOptions } from '../messages/resolve.js';
+import { isSealedMessage, type MessageSealer } from '../messages/sealer.js';
 import { swallowSubscribe } from '../safe-subscribe.js';
 import { controlChannel, effectivePrefix } from '../transports/bullmq/naming.js';
 import {
@@ -162,6 +164,13 @@ export interface RedisControlPlaneOptions {
    */
   console?: ConsoleSideOptions | undefined;
   /**
+   * How control messages (engine events, cancels, schedule pauses) are sealed (see "Encrypting
+   * messages"): a ready sealer (what `controlPlanes.redis()` builds from the app), or the options.
+   * Default: sealed with a key derived from `process.env.APP_KEY` when it is set, else plain. The
+   * console channel is authenticated on its own and is not affected.
+   */
+  messages?: MessageSealer | TransportMessagesOptions | undefined;
+  /**
    * Key prefix namespacing the control channel. Defaults to `durable`. The channel is
    * `` `${prefix}-control` ``, or `` `${prefix}-${namespace}-control` `` for a set, non-`default`
    * {@link namespace} — the same folding as the BullMQ transport's names, matched EXACTLY to the
@@ -265,6 +274,8 @@ export class RedisControlPlane implements ControlPlane {
   readonly prefix: string;
   /** How a federated console authenticates to the app behind this plane (its entry's options). */
   readonly console: ConsoleSideOptions;
+  /** Seals what this control plane publishes and opens what it receives. */
+  private readonly messages: MessageSealer;
   private namespace: string | undefined;
   private readonly explicitNamespace: boolean;
   /** Only ever set on the raw-ioredis path — it is the `duplicate()`d subscriber connection. */
@@ -299,6 +310,7 @@ export class RedisControlPlane implements ControlPlane {
     this.connection = options.connection;
     this.prefix = options.prefix ?? 'durable';
     this.console = options.console ?? {};
+    this.messages = sealerOf(options.messages, 'control plane');
     this.namespace = options.namespace;
     this.observe = options.observe;
     this.explicitNamespace = options.namespace !== undefined;
@@ -376,7 +388,10 @@ export class RedisControlPlane implements ControlPlane {
   async publishControl(msg: ControlMessage, target?: ControlPublishTarget): Promise<void> {
     const channel =
       target?.namespace !== undefined ? this.channelFor(target.namespace) : this.channel;
-    await this.connection.publish(channel, JSON.stringify(msg));
+    await this.connection.publish(
+      channel,
+      JSON.stringify(await this.messages.seal('control', msg)),
+    );
   }
 
   /**
@@ -405,18 +420,25 @@ export class RedisControlPlane implements ControlPlane {
     this.subscribed = true;
 
     const deliver = (payload: string, fromPattern = false) => {
-      let msg: ControlMessage;
+      let raw: unknown;
       try {
-        msg = JSON.parse(payload) as ControlMessage;
+        raw = JSON.parse(payload);
       } catch {
         return; // swallow malformed payloads — a control message must never crash the engine
       }
       // A pattern can match a channel some other publisher named `…-control`: take control messages
       // only, so a stray payload on such a channel never reaches the engine.
-      if (fromPattern && !CONTROL_KINDS.has((msg as { kind?: unknown } | null)?.kind as string)) {
+      if (
+        fromPattern &&
+        !isSealedMessage(raw) &&
+        !CONTROL_KINDS.has((raw as { kind?: unknown } | null)?.kind as string)
+      ) {
         return;
       }
-      handler(msg);
+      // A refused message is logged once by the sealer and dropped.
+      const plain = this.messages.openPlain<ControlMessage>('control', raw);
+      if (plain !== undefined) handler(plain);
+      else void this.messages.open<ControlMessage>('control', raw).then(handler, () => undefined);
     };
     if (isIoredisClient(this.connection)) {
       const sub = this.ioredisSubscriber();
