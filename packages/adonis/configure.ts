@@ -17,7 +17,8 @@ import { stubsRoot } from './stubs/main.js';
  * 5. adds the `#workflows/*` and `#steps/*` subpath imports to the app's `package.json`,
  *    which the generated barrels import through (without them the app boots into
  *    `ERR_PACKAGE_IMPORT_NOT_DEFINED`);
- * 6. publishes `config/durable.ts` + `config/durable_dashboard.ts`;
+ * 6. publishes `config/durable.ts` + `config/durable_dashboard.ts` (`--topology=tenant`: a tenant
+ *    pod's `config/durable.ts`, whose partition and token come from authkit-client);
  * 7. publishes the Lucid migrations for the optional `lucid` store and `db`
  *    transport drivers (run `node ace migration:run`, and delete the transport
  *    migration if you don't use the `db` transport).
@@ -37,7 +38,13 @@ export async function configure(command: Configure) {
 
   await addSubpathImports(command);
 
-  await codemods.makeUsingStub(stubsRoot, 'config/durable.stub', {});
+  // `--topology=tenant`: a store-less pod of a Hub's control plane, in the one-line form.
+  const tenant = command.parsedFlags?.topology === 'tenant';
+  await codemods.makeUsingStub(
+    stubsRoot,
+    tenant ? 'config/durable_tenant.stub' : 'config/durable.stub',
+    {},
+  );
   await codemods.makeUsingStub(stubsRoot, 'config/durable_dashboard.stub', {});
   await codemods.makeUsingStub(stubsRoot, 'database/migrations/create_durable_tables.stub', {});
   await codemods.makeUsingStub(

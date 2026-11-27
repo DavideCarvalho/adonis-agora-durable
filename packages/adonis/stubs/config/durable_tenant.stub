@@ -1,0 +1,24 @@
+{{{
+  exports({ to: app.configPath('durable.ts') })
+}}}
+import { defineConfig, transports } from '@adonis-agora/durable'
+
+/**
+ * A tenant pod of an Agora Hub's durable control plane: no store of its own, every run read,
+ * control and start round-trips to the control plane over the shared broker.
+ *
+ * The pod's partition and its token for urn:agora:durable come from @adonis-agora/authkit-client
+ * (\`service\` in config/authkit_client.ts). To set them yourself (each field you set wins):
+ *
+ *   tenant: { partition: env.get('DURABLE_PARTITION'), token: env.get('DURABLE_TENANT_TOKEN') },
+ *
+ * Use the transport the control plane uses, on the same broker (see docs/cluster/topology-and-config).
+ */
+export default defineConfig({
+  topology: 'tenant',
+  transport: 'queue',
+  transports: {
+    // \`connection\` names an adapter from config/queue.ts (configure @adonisjs/queue first).
+    queue: transports.queue({ connection: 'redis', workerKeys: false }),
+  },
+})

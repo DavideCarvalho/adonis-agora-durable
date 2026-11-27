@@ -71,6 +71,11 @@ export interface TenantCredentialsContract {
    * fails that request with the error; the next request calls `token()` again.
    */
   token(): string | Promise<string>;
+  /**
+   * Optional: drop a cached token. Called when the control plane answers `unauthorized` (an expired
+   * or revoked token, a restarted issuer), right before the request is retried once with a new one.
+   */
+  reset?(): void;
 }
 
 /** A class implementing a contract; constructor params are for `@inject()`. */
@@ -97,8 +102,8 @@ export type TenantVerifierOption =
  */
 export type TenantTokenOption =
   | string
-  | (() => string | Promise<string>)
-  | { get(): string | Promise<string> }
+  | ((() => string | Promise<string>) & { reset?(): void })
+  | { get(): string | Promise<string>; reset?(): void; invalidate?(): void }
   | TenantCredentialsContract
   | ContractClass<TenantCredentialsContract>
   | (() => Promise<{
@@ -107,9 +112,16 @@ export type TenantTokenOption =
 
 /**
  * The resolved `tenant.token` the wire layer uses: a string, or a function called before each request
- * whose result travels as-is in the request's `tenant` field.
+ * whose result travels as-is in the request's `tenant` field. `reset()`, when the source has one
+ * (authkit-client's `tenantOf(...).token`, `authkitTenantToken(...)`), drops a cached token: the proxy
+ * calls it after an `unauthorized` reply and retries the request once.
  */
-export type TenantTokenSource = string | (() => string | Promise<string>);
+export type TenantTokenSource =
+  | string
+  | ((() => string | Promise<string>) & {
+      /** Drop the cached token. Returning `false` means there was nothing to drop (no retry). */
+      reset?(): boolean | undefined | void;
+    });
 
 /**
  * Single-process engine: a control-plane **plus an embedded worker** (spec §3). The default topology, so
