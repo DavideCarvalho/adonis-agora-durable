@@ -26,6 +26,7 @@
     "version-packages": "changeset version && node scripts/sync-version-literals.mjs && biome check --write ."
   },
   "devDependencies": {
+    "@adonis-agora/telescope": "1.1.1",
     "@arethetypeswrong/cli": "0.18.5",
     "@biomejs/biome": "2.6.9",
     "@changesets/changelog-github": "1.0.1",

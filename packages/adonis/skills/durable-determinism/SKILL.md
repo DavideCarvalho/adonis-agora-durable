@@ -37,6 +37,10 @@ Use the deterministic sources instead of raw clocks/entropy — each captures it
 value once and replays it verbatim:
 
 ```ts
+import engine from '@adonis-agora/durable/services/main'
+import type Order from '#models/order'
+declare function issue(order: Order, meta: { issuedAt: number; nonce: string; sampled: boolean }): Promise<void>
+
 engine.register('invoice', '1', async (ctx, order: Order) => {
   const issuedAt = await ctx.now() // epoch ms — captured once, replayed verbatim
   const nonce = await ctx.sideEffect(() => crypto.randomUUID()) // any generated value
@@ -100,6 +104,9 @@ that version. For a structural change (new/removed/reordered steps, different
 control flow), bump the version and drain the old:
 
 ```ts
+import engine from '@adonis-agora/durable/services/main'
+import type Order from '#models/order'
+
 engine.register('checkout', '1', async (ctx, order: Order) => {
   /* original body — keep registered until its in-flight runs drain */
 })
@@ -120,6 +127,13 @@ For a small in-place change on a live workflow, guard it instead of shipping a
 whole second body:
 
 ```ts
+import { FatalError, type StepRef } from '@adonis-agora/durable'
+import engine from '@adonis-agora/durable/services/main'
+import type Order from '#models/order'
+declare function price(order: Order): Promise<{ total: number }>
+declare const scoreFraud: StepRef<{ orderId: number }, { score: number }> // app steps
+declare const chargeCard: StepRef<{ orderId: number; amountCents: number }, { chargeId: string }>
+
 engine.register('checkout', '1', async (ctx, order: Order) => {
   const quote = await ctx.localStep('quote', () => price(order))
 
@@ -169,6 +183,9 @@ const at = new Date()
 Correct:
 
 ```ts
+import type { WorkflowCtx } from '@adonis-agora/durable'
+declare const ctx: WorkflowCtx // run(ctx, input)
+
 const startedAt = await ctx.now()
 const idempotencyKey = await ctx.sideEffect(() => crypto.randomUUID())
 const jitter = await ctx.sideEffect(() => Math.random())
@@ -227,12 +244,20 @@ never checkpointed. Source: `docs/authoring/app-workflows.mdx` (warning).
 Wrong:
 
 ```ts
+import type { WorkflowCtx } from '@adonis-agora/durable'
+declare const ctx: WorkflowCtx // run(ctx, input)
+
+const hook = ctx.webhook()
 const r = await hook.wait({ timeoutMs: 1_800_000 }) // edited onto a live workflow
 ```
 
 Correct:
 
 ```ts
+import type { WorkflowCtx } from '@adonis-agora/durable'
+declare const ctx: WorkflowCtx // run(ctx, input)
+
+const hook = ctx.webhook()
 // Ship under version+1, or gate with ctx.patched('add-wait-deadline').
 const r = await hook.wait({ timeoutMs: 1_800_000 })
 ```
@@ -246,6 +271,11 @@ Source: `docs/authoring/webhooks.mdx`.
 Wrong:
 
 ```ts
+import type { StepRef, WorkflowCtx } from '@adonis-agora/durable'
+import env from '#start/env'
+declare const ctx: WorkflowCtx, input: { userId: number } // run(ctx, input)
+declare const gdprStep: StepRef<{ userId: number }, void>
+
 const region = env.get('REGION') // may differ between the original run and a replay
 if (region === 'eu') await ctx.step(gdprStep, input)
 ```
@@ -253,6 +283,10 @@ if (region === 'eu') await ctx.step(gdprStep, input)
 Correct:
 
 ```ts
+import type { WorkflowCtx } from '@adonis-agora/durable'
+import env from '#start/env'
+declare const ctx: WorkflowCtx // run(ctx, input)
+
 const region = await ctx.sideEffect(() => env.get('REGION'))
 ```
 
@@ -266,6 +300,11 @@ the body branch differently, diverging from recorded history; captured via
 Wrong:
 
 ```ts
+import type { WorkflowCtx } from '@adonis-agora/durable'
+import ExecutePlanWorkflow from '#workflows/execute_plan_workflow'
+declare const ctx: WorkflowCtx, input: { goal: string } // run(ctx, input)
+declare const planner: { plan(input: { goal: string }): Promise<{ steps: string[] }> }
+
 await ctx.localStep('plan', async () => {
   const plan = await planner.plan(input)
   await ExecutePlanWorkflow.dispatch(plan) // NestedWorkflowCallError at this line
@@ -276,6 +315,11 @@ await ctx.localStep('plan', async () => {
 Correct:
 
 ```ts
+import type { WorkflowCtx } from '@adonis-agora/durable'
+import ExecutePlanWorkflow from '#workflows/execute_plan_workflow'
+declare const ctx: WorkflowCtx, input: { goal: string } // run(ctx, input)
+declare const planner: { plan(input: { goal: string }): Promise<{ steps: string[] }> }
+
 const plan = await ctx.localStep('plan', () => planner.plan(input))
 await ExecutePlanWorkflow.dispatch(plan)
 ```

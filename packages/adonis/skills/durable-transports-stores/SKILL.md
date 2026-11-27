@@ -75,6 +75,7 @@ no Redis, no broker. Workers claim rows with an atomic portable lease (no
 ```ts title="start/worker.ts (a separate worker process)"
 import db from '@adonisjs/lucid/services/db'
 import { DbTransport } from '@adonis-agora/durable'
+import { extract } from '#services/pipeline'
 
 const transport = new DbTransport({ db }) // { partition } isolates this pool
 transport.handle('pipeline:extract', async (input) => extract(input))
@@ -133,6 +134,9 @@ The `queue` transport rides any `@adonisjs/queue` adapter defined once in
 with NestJS engines and Python workers:
 
 ```ts title="config/durable.ts"
+import logger from '@adonisjs/core/services/logger'
+import { defineConfig, transports } from '@adonis-agora/durable'
+
 export default defineConfig({
   transports: {
     queue: transports.queue({
@@ -183,6 +187,8 @@ For wide fans (`ctx.all` over thousands of steps), the `bullmq`, `queue` and
 concurrency, and size the engine's due-timer batch:
 
 ```ts title="config/durable.ts"
+import { defineConfig, transports } from '@adonis-agora/durable'
+
 export default defineConfig({
   timerBatchSize: 1000, // due runs per timer pass, most overdue first (default 500)
   transports: {
@@ -270,6 +276,8 @@ By default the provider also provisions idempotently at boot (`ensureSchema`);
 turn that off to own every change through reviewed migrations:
 
 ```ts
+import { defineConfig } from '@adonis-agora/durable'
+
 export default defineConfig({ /* … */ autoSchema: false })
 // then `node ace migration:run` after EVERY package upgrade
 ```
@@ -347,6 +355,8 @@ Source: `docs/stores/lucid.mdx`, `docs/stores/index.mdx`.
 Wrong:
 
 ```ts
+import { transports } from '@adonis-agora/durable'
+
 // a step body that renders a report synchronously for ~3 minutes, default 2min threshold
 transports.queue({ connection: 'redis' })
 ```
@@ -354,6 +364,8 @@ transports.queue({ connection: 'redis' })
 Correct:
 
 ```ts
+import { transports } from '@adonis-agora/durable'
+
 transports.queue({ connection: 'redis', stalledThresholdMs: 5 * 60 * 1000 })
 // or keep the heavy work async / off the main thread
 ```
@@ -403,6 +415,8 @@ its own connection), and `this.db` has no `.connection()` method, only
 Wrong:
 
 ```ts
+import { defineConfig, stores } from '@adonis-agora/durable'
+
 export default defineConfig({ store: 'lucid', stores: { lucid: stores.lucid() }, autoSchema: false })
 // …package upgraded twice, migrations never re-run
 ```
@@ -424,7 +438,14 @@ fix was never recorded in migration history. Source: `docs/stores/lucid.mdx`
 Wrong:
 
 ```ts
-stores: { encrypted: async () => new CodecStateStore(new LucidStateStore(db), aesCodec) }
+import { CodecStateStore, LucidStateStore, type PayloadCodec, defineConfig } from '@adonis-agora/durable'
+import db from '@adonisjs/lucid/services/db'
+declare const aesCodec: PayloadCodec // the codec above
+
+export default defineConfig({
+  store: 'encrypted',
+  stores: { encrypted: async () => new CodecStateStore(new LucidStateStore(db), aesCodec) },
+})
 // then relying on persisted heartbeat progress for long remote steps
 ```
 
