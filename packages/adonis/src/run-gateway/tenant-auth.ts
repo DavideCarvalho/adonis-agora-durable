@@ -340,30 +340,78 @@ export function resolveTenantToken(
   if (typeof option === 'string') return option;
   const C = 'TenantCredentialsContract';
   if (implementsMethod<{ get(): string | Promise<string> }>(option, 'get')) {
-    return () => option.get();
+    const holder = option as { reset?: unknown; invalidate?: unknown };
+    const reset = typeof holder.reset === 'function' ? holder.reset : holder.invalidate;
+    return withReset(
+      () => option.get(),
+      typeof reset === 'function' ? () => reset.call(option) : undefined,
+    );
   }
   if (implementsMethod<TenantCredentialsContract>(option, 'token')) {
-    return () => option.token();
+    return withReset(
+      () => option.token(),
+      typeof option.reset === 'function' ? () => option.reset?.() : undefined,
+    );
   }
   if (isContractClass<TenantCredentialsContract>(option, 'token')) {
     const instance = memoizedInstance(option, make, 'token', C);
-    return async () => (await instance()).token();
+    let built: TenantCredentialsContract | undefined;
+    return withReset(
+      async () => {
+        built = await instance();
+        return built.token();
+      },
+      () => {
+        if (typeof built?.reset !== 'function') return false;
+        built.reset();
+        return true;
+      },
+    );
   }
   if (typeof option !== 'function') {
     throw new TypeError(
       '`tenant.token` must be a string, a function, an object with get(), a class implementing TenantCredentialsContract, or a lazy import of one.',
     );
   }
-  const fn = option as () => unknown;
+  const fn = option as (() => unknown) & { reset?: unknown };
+  // authkit-client's `tenantOf(...).token` and `authkitTenantToken(...)` cache their token and expose
+  // `reset()` to drop it.
+  const fnReset = typeof fn.reset === 'function' ? (fn.reset as () => void) : undefined;
   let lazy: (() => Promise<TenantCredentialsContract>) | undefined;
-  return async () => {
-    if (lazy) return (await lazy()).token();
-    const result = await fn();
-    const source = lazyDefault<TenantCredentialsContract>(result, 'token', C);
-    if (source !== undefined) {
-      lazy ??= memoizedInstance(source, make, 'token', C);
-      return (await lazy()).token();
-    }
-    return result as string;
-  };
+  let built: TenantCredentialsContract | undefined;
+  return withReset(
+    async () => {
+      if (lazy) {
+        built = await lazy();
+        return built.token();
+      }
+      const result = await fn();
+      const source = lazyDefault<TenantCredentialsContract>(result, 'token', C);
+      if (source !== undefined) {
+        lazy ??= memoizedInstance(source, make, 'token', C);
+        built = await lazy();
+        return built.token();
+      }
+      return result as string;
+    },
+    // `false`: nothing cached could be dropped (a plain function), so a retry would resend the same token.
+    () => {
+      if (built) {
+        if (typeof built.reset !== 'function') return false;
+        built.reset();
+        return true;
+      }
+      if (!fnReset) return false;
+      fnReset.call(fn);
+      return true;
+    },
+  );
+}
+
+/** A token function carrying `reset` when the source can drop its cached token. */
+function withReset(
+  get: () => string | Promise<string>,
+  reset: (() => boolean | undefined) | (() => void) | undefined,
+): Exclude<TenantTokenSource, string> {
+  return reset ? Object.assign(get, { reset }) : get;
 }

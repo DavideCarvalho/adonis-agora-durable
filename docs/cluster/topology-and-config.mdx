@@ -91,6 +91,8 @@ export default defineConfig({
 })
 ```
 
+`node ace configure @adonis-agora/durable --topology=tenant` generates this form. When the control plane answers `unauthorized` (an expired or revoked token, or a Hub whose signing keys changed), the pod drops a token source's cached token (authkit-client's has `reset()`) and retries the request once with a fresh one.
+
 Without authkit-client and without `tenant.partition`, a web process fails its boot, and `durable:worker` fails when it starts, naming both fixes. `node ace agora:doctor` shows where each field came from (`durable.tenant-token`): `tenant token/partition: authkit-client (auto)`, or `explicit`.
 
 `tenant.partition` reaches all three: the `ProxyRunGateway` (the tenant it claims on the wire), the worker runtime (the routing tokens its descriptor advertises) and the transport, which subscribes the `<name>@acme-corp` task queues the control plane dispatches the tenant's steps to. The top-level `instanceId` is the transport's default too, so the runtime's and the transport's liveness keys carry the same id. A `partition` or `instanceId` set on the transport itself wins.

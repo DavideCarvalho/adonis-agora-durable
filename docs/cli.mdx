@@ -14,6 +14,8 @@ node ace configure @adonis-agora/durable
 
 `configure` registers the commands barrel (`@adonis-agora/durable/commands`) in `adonisrc.ts` so the commands become available to ace — there's no separate package to install.
 
+For a [tenant pod](/docs/durable/cluster/topology-and-config#tenant-store-less-thin-pod) of an Agora Hub, `node ace configure @adonis-agora/durable --topology=tenant` writes `config/durable.ts` in the one-line form: `topology: 'tenant'` and the transport, with the partition and token coming from `@adonis-agora/authkit-client` (a comment shows the explicit `tenant: { partition, token }`).
+
 ## `durable:work` — the worker loop
 
 The long-running worker. On an interval it picks up pending runs, recovers crashed runs, resumes due timers, sweeps execution timeouts, and fires any due [scheduled workflows](/docs/durable/authoring/scheduling). It stays alive until `SIGINT`/`SIGTERM`, then **drains** in-flight executions so a deploy hands off cleanly.

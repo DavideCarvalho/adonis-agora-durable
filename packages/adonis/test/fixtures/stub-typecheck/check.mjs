@@ -46,6 +46,7 @@ const stubsRoot = join(pkgRoot, 'stubs');
  */
 const STUBS = [
   { path: 'config/durable.stub' },
+  { path: 'config/durable_tenant.stub' },
   { path: 'config/durable_dashboard.stub' },
   { path: 'database/migrations/create_durable_tables.stub' },
   { path: 'database/migrations/create_durable_transport_tables.stub' },

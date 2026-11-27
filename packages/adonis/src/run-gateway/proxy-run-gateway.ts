@@ -223,12 +223,38 @@ export class ProxyRunGateway implements RunGateway {
     return token;
   }
 
+  /**
+   * Run `attempt`; when the control plane answers `unauthorized` and the token source can drop its
+   * cached token (`reset()`: an expired or revoked token, or a Hub that restarted with new signing
+   * keys), drop it and try once more with a fresh one. Nothing ran on the control plane for the
+   * refused attempt, so the retry is safe.
+   */
+  async #withFreshToken<T>(attempt: () => Promise<T>): Promise<T> {
+    try {
+      return await attempt();
+    } catch (error) {
+      const source = this.#wireTenant;
+      if (
+        !(error instanceof RunGatewayError) ||
+        error.code !== 'unauthorized' ||
+        typeof source === 'string' ||
+        typeof source.reset !== 'function'
+      ) {
+        throw error;
+      }
+      if (source.reset() === false) throw error;
+      return attempt();
+    }
+  }
+
   /** Publish a read/control {@link RunRequest} with a freshly minted `requestId` and await its reply. */
   #request<T>(body: RunRequestKind): Promise<T> {
-    const requestId = globalThis.crypto.randomUUID();
-    return this.#awaitReply<T>(requestId, body.kind, async () =>
-      this.#transport.dispatchRunRequest({ requestId, tenant: await this.#tenantClaim(), body }),
-    );
+    return this.#withFreshToken(() => {
+      const requestId = globalThis.crypto.randomUUID();
+      return this.#awaitReply<T>(requestId, body.kind, async () =>
+        this.#transport.dispatchRunRequest({ requestId, tenant: await this.#tenantClaim(), body }),
+      );
+    });
   }
 
   topology(): DurableTopology {
@@ -352,8 +378,10 @@ export class ProxyRunGateway implements RunGateway {
         ? { tenantId: opts.tenantId, ...(opts.tenantKind ? { tenantKind: opts.tenantKind } : {}) }
         : {}),
     });
-    return this.#awaitReply<RunResult>(runId, 'start', async () =>
-      this.#transport.dispatchStartRun(msg(await this.#tenantClaim())),
+    return this.#withFreshToken(() =>
+      this.#awaitReply<RunResult>(runId, 'start', async () =>
+        this.#transport.dispatchStartRun(msg(await this.#tenantClaim())),
+      ),
     );
   }
 

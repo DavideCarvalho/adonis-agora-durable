@@ -56,6 +56,7 @@ function findStubs(root: string): string[] {
 /** Every stub the package generates, with the state its generator supplies. */
 const PUBLISHED: { path: string; entity?: string }[] = [
   { path: 'config/durable.stub' },
+  { path: 'config/durable_tenant.stub' },
   { path: 'config/durable_dashboard.stub' },
   { path: 'database/migrations/create_durable_tables.stub' },
   { path: 'database/migrations/create_durable_transport_tables.stub' },
