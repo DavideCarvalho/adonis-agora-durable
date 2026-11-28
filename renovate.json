@@ -8,11 +8,6 @@
   "rangeStrategy": "pin",
   "packageRules": [
     {
-      "description": "`durable-1-1-1` is the published 1.1.1, pinned on purpose: test/messages/published-1-1-interop.spec.ts proves a default-config sender still talks to it. Never bump it.",
-      "matchPackageNames": ["durable-1-1-1"],
-      "enabled": false
-    },
-    {
       "description": "Never touch `engines.node`. It declares the range of runtimes a package SUPPORTS, not a dependency to pin: the global `rangeStrategy: pin` rewrites it to the exact version Renovate happened to run on, which warns on install for every consumer on another Node and hard-fails under `engine-strict`.",
       "matchDepTypes": ["engines"],
       "enabled": false
@@ -44,7 +39,7 @@
       "enabled": false
     },
     {
-      "description": "`ai` and `@ai-sdk/*` ship as one release train, and `@ai-sdk/react` depends on an exact `ai`. Updating either side alone leaves two copies of `ai` in the tree, whose types are not the same types \u2014 the inferred return of a hook wrapping `useChat` then cannot be named (TS2742) and the build fails on a version bump that is individually fine. Grouping them keeps the tree at one copy.",
+      "description": "`ai` and `@ai-sdk/*` ship as one release train, and `@ai-sdk/react` depends on an exact `ai`. Updating either side alone leaves two copies of `ai` in the tree, whose types are not the same types — the inferred return of a hook wrapping `useChat` then cannot be named (TS2742) and the build fails on a version bump that is individually fine. Grouping them keeps the tree at one copy.",
       "matchPackageNames": ["ai", "@ai-sdk/**"],
       "groupName": "ai sdk"
     },

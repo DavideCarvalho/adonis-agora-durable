@@ -1,12 +1,17 @@
+import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { afterEach, describe, expect, it } from 'vitest';
+import { existsSync, mkdirSync, readdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import type { StepResult } from '../../src/interfaces.js';
 import { BullMQTransport } from '../../src/transports/bullmq/bullmq-transport.js';
 import { createBullMQDeps } from '../../src/transports/bullmq/deps.js';
 import { backendUrl } from '../support/backends.js';
 
 /**
- * This version next to the PUBLISHED 1.1.1 (devDependency `durable-1-1-1`) on one Redis: with the
+ * This version next to the PUBLISHED 1.1.1 (its npm tarball, fetched once into `test/.published/`,
+ * which resolves its peers from this package's node_modules) on one Redis: with the
  * default config this version sends plain, so a 1.1.1 worker runs a step with its real input and a
  * 1.1.1 engine reads this version's results. Sealing is the second step of a rollout, once no 1.1
  * process is left.
@@ -32,9 +37,31 @@ afterEach(async () => {
   for (const c of closers.splice(0)) await c().catch(() => undefined);
 });
 
+const PUBLISHED = '1.1.1';
+const here = dirname(fileURLToPath(import.meta.url));
+const root = join(here, '..', '.published', `durable-${PUBLISHED}`);
+
+/** The published package, unpacked (npm pack + tar), once. */
+function fetchPublished(): string {
+  const pkg = join(root, 'package');
+  if (existsSync(join(pkg, 'package.json'))) return pkg;
+  mkdirSync(root, { recursive: true });
+  execFileSync('npm', ['pack', `@adonis-agora/durable@${PUBLISHED}`, '--silent'], {
+    cwd: root,
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  const tarball = readdirSync(root).find((f) => f.endsWith('.tgz'));
+  if (!tarball) throw new Error('npm pack produced no tarball');
+  execFileSync('tar', ['-xzf', tarball], { cwd: root });
+  return pkg;
+}
+
+let oldModule: Side | undefined;
 async function oldSide(): Promise<Side> {
-  const old = (await import('durable-1-1-1' as string)) as Side;
-  return { BullMQTransport: old.BullMQTransport, createBullMQDeps: old.createBullMQDeps };
+  oldModule ??= (await import(
+    pathToFileURL(join(fetchPublished(), 'dist', 'src', 'index.js')).href
+  )) as Side;
+  return { BullMQTransport: oldModule.BullMQTransport, createBullMQDeps: oldModule.createBullMQDeps };
 }
 const newSide: Side = {
   BullMQTransport: BullMQTransport as unknown as Side['BullMQTransport'],
@@ -71,6 +98,10 @@ const task = (runId: string) => ({
 });
 
 describe.skipIf(!REDIS_URL)('next to the published 1.1.1', () => {
+  beforeAll(() => {
+    fetchPublished();
+  }, 120_000);
+
   it('a default-config sender: a 1.1.1 worker runs the step with its real input', async () => {
     const prefix = `dmsg-pub-${randomUUID().slice(0, 8)}`;
     // Default config, with an APP_KEY at hand: still sends plain.
