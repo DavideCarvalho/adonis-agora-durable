@@ -90,7 +90,7 @@ function secrets() {
 
 /** Drive every message kind across `pair`; returns what each side received. */
 async function exchange(pair: Pair, S: ReturnType<typeof secrets>) {
-  const sealed = { appKey: APP_KEY };
+  const sealed = { appKey: APP_KEY, seal: true };
   const a = await pair.make(sealed, `cp-${randomUUID().slice(0, 6)}`);
   const b = await pair.make(sealed, `pod-${randomUUID().slice(0, 6)}`);
   const got = {
@@ -256,8 +256,8 @@ function suite(name: string, pair: () => Promise<Pair>) {
       const p = await pair();
       if (!p.control) return;
       const S = secrets();
-      const sender = await p.control({ appKey: APP_KEY });
-      const receiver = await p.control({ appKey: APP_KEY });
+      const sender = await p.control({ appKey: APP_KEY, seal: true });
+      const receiver = await p.control({ appKey: APP_KEY, seal: true });
       const seen: ControlMessage[] = [];
       receiver.receive((m) => seen.push(m));
       await sleep(100);
@@ -275,9 +275,18 @@ function suite(name: string, pair: () => Promise<Pair>) {
 
     it('refuses a task sealed with another key: the handler never runs, the step is reported failed', async () => {
       const p = await pair();
-      const foreign = await p.make({ appKey: OTHER_KEY }, `foreign-${randomUUID().slice(0, 6)}`);
-      const engine = await p.make({ appKey: APP_KEY }, `cp-${randomUUID().slice(0, 6)}`);
-      const worker = await p.make({ appKey: APP_KEY }, `pod-${randomUUID().slice(0, 6)}`);
+      const foreign = await p.make(
+        { appKey: OTHER_KEY, seal: true },
+        `foreign-${randomUUID().slice(0, 6)}`,
+      );
+      const engine = await p.make(
+        { appKey: APP_KEY, seal: true },
+        `cp-${randomUUID().slice(0, 6)}`,
+      );
+      const worker = await p.make(
+        { appKey: APP_KEY, seal: true },
+        `pod-${randomUUID().slice(0, 6)}`,
+      );
       const results: StepResult[] = [];
       let ran = false;
       engine.onResult(async (r) => {
@@ -306,7 +315,10 @@ function suite(name: string, pair: () => Promise<Pair>) {
       const p = await pair();
       // `insecure` without a key: it cannot open a sealed message at all, like a 1.1 process.
       const old = await p.make({ insecure: true }, `old-${randomUUID().slice(0, 6)}`);
-      const worker = await p.make({ appKey: APP_KEY }, `new-${randomUUID().slice(0, 6)}`);
+      const worker = await p.make(
+        { appKey: APP_KEY, seal: true },
+        `new-${randomUUID().slice(0, 6)}`,
+      );
       const results: StepResult[] = [];
       old.onResult(async (r) => {
         results.push(r);
@@ -328,12 +340,18 @@ function suite(name: string, pair: () => Promise<Pair>) {
     it('mixed rollout: plain messages are accepted by default, refused with acceptPlain: false', async () => {
       const p = await pair();
       const old = await p.make({ insecure: true }, `old-${randomUUID().slice(0, 6)}`);
-      const engine = await p.make({ appKey: APP_KEY }, `cp-${randomUUID().slice(0, 6)}`);
+      const engine = await p.make(
+        { appKey: APP_KEY, seal: true },
+        `cp-${randomUUID().slice(0, 6)}`,
+      );
       const results: StepResult[] = [];
       engine.onResult(async (r) => {
         results.push(r);
       });
-      const lenient = await p.make({ appKey: APP_KEY }, `new-${randomUUID().slice(0, 6)}`);
+      const lenient = await p.make(
+        { appKey: APP_KEY, seal: true },
+        `new-${randomUUID().slice(0, 6)}`,
+      );
       const inputs: unknown[] = [];
       lenient.handle('pay', async (input) => {
         inputs.push(input);
@@ -358,7 +376,7 @@ function suite(name: string, pair: () => Promise<Pair>) {
       await lenient.close();
 
       const strict = await p.make(
-        { appKey: APP_KEY, acceptPlain: false },
+        { appKey: APP_KEY, seal: true, acceptPlain: false },
         `strict-${randomUUID().slice(0, 6)}`,
       );
       let ran = false;

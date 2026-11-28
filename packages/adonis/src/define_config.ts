@@ -158,6 +158,15 @@ export interface BaseDurableConfig {
    */
   topology?: 'standalone' | 'control-plane' | 'tenant';
   /**
+   * How every broker transport and the control plane seal their messages, unless a transport's own
+   * `messages` says otherwise (see "Encrypting messages"). `seal: true` sends them encrypted (the
+   * app's `APP_KEY`; `@adonis-agora/crypto` between a tenant and its control plane). Default `false`
+   * in 1.x: sent plain, while sealed messages are always opened. Turn it on once every process runs
+   * 1.2.1 or later; it becomes the default in the next major. `acceptPlain: false` (with
+   * `seal: true`) refuses plain messages.
+   */
+  messages?: { seal?: boolean; acceptPlain?: boolean } | undefined;
+  /**
    * Name of the transport (a key of {@link transports}) the engine dispatches over. Omit for the
    * in-process transport (single-process, no extra infra).
    */

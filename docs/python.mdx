@@ -7,7 +7,7 @@ icon: FileCode2
 import { Callout } from 'fumadocs-ui/components/callout';
 
 <Callout type="warn">
-The Python worker reads plain messages only, and from 1.2 durable seals its broker messages by default. On the BullMQ transport (and the control plane) a Python worker shares, set `messages: { insecure: true }`. See [Encrypting messages](/docs/durable/transports/encrypting-messages).
+The Python worker reads plain messages only: leave sealing off on the BullMQ transport (and the control plane) a Python worker shares, or set `messages: { insecure: true }` there. See [Encrypting messages](/docs/durable/transports/encrypting-messages).
 </Callout>
 
 Python is a **first-class durable runtime**, not just a place to run a step. The `durable-worker`

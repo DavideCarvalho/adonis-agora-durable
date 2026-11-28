@@ -15,7 +15,7 @@ license: MIT
 metadata:
   type: core
   library: "@adonis-agora/durable"
-  library_version: "1.1.1"
+  library_version: "1.2.0"
   framework: adonisjs
 sources:
   - 'DavideCarvalho/adonis-durable:docs/cluster/index.mdx'
@@ -276,8 +276,9 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
 }
 ```
 
-A transport built this way seals its messages with `process.env.APP_KEY` (the
-same key as the app it serves), or takes `messages: { appKey | secret | crypto }`;
+A transport built this way opens sealed messages with `process.env.APP_KEY` (the
+same key as the app it serves) and sends them sealed with `messages: { seal: true }`,
+or takes `messages: { seal: true, appKey | secret | crypto }` to seal with that mode;
 between a tenant pod and its control plane (different apps) the provider-built
 transports use `@adonis-agora/crypto`'s `durable-messages` key automatically,
 so a hand-built tenant worker must use the same explicit mode on both sides.
@@ -316,8 +317,8 @@ async def main():
 asyncio.run(main())
 ```
 
-The Python worker reads plain messages only, and durable seals broker messages
-by default: set `messages: { insecure: true }` on the BullMQ transport (and
+The Python worker reads plain messages only: leave sealing (`messages.seal`) off,
+or set `messages: { insecure: true }`, on the BullMQ transport (and
 control plane) it shares. Connection and prefix must match on both sides; sharing a broker across
 deployments means setting the same `partition` on both sides (queues become
 `<name>@<partition>`). Start Python workflows from Adonis by name:

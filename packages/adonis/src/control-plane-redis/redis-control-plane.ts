@@ -166,7 +166,7 @@ export interface RedisControlPlaneOptions {
   /**
    * How control messages (engine events, cancels, schedule pauses) are sealed (see "Encrypting
    * messages"): a ready sealer (what `controlPlanes.redis()` builds from the app), or the options.
-   * Default: sealed with a key derived from `process.env.APP_KEY` when it is set, else plain. The
+   * Default: sent plain (`seal: true` seals), sealed ones opened with `process.env.APP_KEY`. The
    * console channel is authenticated on its own and is not affected.
    */
   messages?: MessageSealer | TransportMessagesOptions | undefined;

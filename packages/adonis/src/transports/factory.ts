@@ -183,8 +183,9 @@ export interface QueueTransportConfig {
   /** How often (ms) a control plane drains the inboxes of tenant pods that died. Default 30000; `0` off. */
   inboxSweepIntervalMs?: number;
   /**
-   * How this transport seals its messages. Nothing set: encrypted with a key derived from the app's
-   * `APP_KEY` (between a tenant and its control plane: an `@adonis-agora/crypto` key). `secret` (HMAC,
+   * How this transport seals its messages. `seal: true` (or the top-level `messages.seal`)
+   * encrypts them with a key derived from the app's `APP_KEY` (between a tenant and its control
+   * plane: an `@adonis-agora/crypto` key); off by default in 1.x, sealed messages are still opened. `secret` (HMAC,
    * readable), `crypto: { cipher }` (explicit key or your own KMS), `crypto: false` / `insecure: true`
    * (plain), `acceptPlain` (default `true` in 1.x). See "Encrypting messages".
    */
@@ -340,8 +341,9 @@ export interface BullMQTransportConfig {
    */
   taskQueueDrain?: boolean | { intervalMs?: number };
   /**
-   * How this transport seals its messages. Nothing set: encrypted with a key derived from the app's
-   * `APP_KEY` (between a tenant and its control plane: an `@adonis-agora/crypto` key). `secret` (HMAC,
+   * How this transport seals its messages. `seal: true` (or the top-level `messages.seal`)
+   * encrypts them with a key derived from the app's `APP_KEY` (between a tenant and its control
+   * plane: an `@adonis-agora/crypto` key); off by default in 1.x, sealed messages are still opened. `secret` (HMAC,
    * readable), `crypto: { cipher }` (explicit key or your own KMS), `crypto: false` / `insecure: true`
    * (plain), `acceptPlain` (default `true` in 1.x). See "Encrypting messages".
    */
@@ -428,8 +430,9 @@ export interface DbTransportConfig {
    *  30000; `0` off. */
   inboxSweepIntervalMs?: number;
   /**
-   * How this transport seals its messages. Nothing set: encrypted with a key derived from the app's
-   * `APP_KEY` (between a tenant and its control plane: an `@adonis-agora/crypto` key). `secret` (HMAC,
+   * How this transport seals its messages. `seal: true` (or the top-level `messages.seal`)
+   * encrypts them with a key derived from the app's `APP_KEY` (between a tenant and its control
+   * plane: an `@adonis-agora/crypto` key); off by default in 1.x, sealed messages are still opened. `secret` (HMAC,
    * readable), `crypto: { cipher }` (explicit key or your own KMS), `crypto: false` / `insecure: true`
    * (plain), `acceptPlain` (default `true` in 1.x). See "Encrypting messages".
    */

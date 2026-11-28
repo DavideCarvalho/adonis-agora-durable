@@ -27,6 +27,7 @@ minimumReleaseAgeExclude:
   - '@adonis-agora/authkit-client@1.0.0-rc.7 || 1.0.0'
   - '@adonis-agora/authkit-core@1.0.0-rc.3 || 1.0.0'
   - '@adonis-agora/telescope@1.1.1'
+  - '@adonis-agora/durable@1.1.1'
 # pnpm >=10.4 reads build-allowlist config from HERE (not package.json) in a workspace.
 # Setting onlyBuiltDependencies makes it the exclusive allowlist, so it lists every dep whose
 # script must run — the 4 that pnpm allowed by default PLUS msgpackr-extract (bullmq transitive).

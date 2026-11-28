@@ -6,3 +6,6 @@ coverage/
 .DS_Store
 .env
 .env.local
+
+# Published packages unpacked by test/messages/published-1-1-interop.spec.ts
+packages/adonis/test/.published/

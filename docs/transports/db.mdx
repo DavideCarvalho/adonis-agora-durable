@@ -163,7 +163,7 @@ The run queue lives in the same table. Without it every run start falls back to 
 | Option | Default | Description |
 | --- | --- | --- |
 | `partition` | — | Optional isolation partition suffixing every per-handler routing token (`<name>@<partition>`) this worker serves, matching a dispatch's `partition`. `'default'` and `''` mean no partition. |
-| `messages` | sealed with the app key | How this transport seals its messages: `secret`, `crypto: { cipher }`, `crypto: false`, `insecure`, `acceptPlain`. See [Encrypting messages](/docs/durable/transports/encrypting-messages). |
+| `messages` | sent plain, sealed opened | How this transport seals its messages: `secret`, `crypto: { cipher }`, `crypto: false`, `insecure`, `acceptPlain`. See [Encrypting messages](/docs/durable/transports/encrypting-messages). |
 | `namespace` | from the engine | Worker-pool namespace stamped on every row this instance writes and required on every row it claims, so one set of tables can host several pools. Setting it here is explicit and wins over the engine's propagation of `config.namespace`. |
 | `connection` | Lucid default | The Lucid connection to use. |
 | `schema` | top-level `schema` | The database schema the transport tables live in (a database on MySQL). Every statement names it, and `autoCreate` creates it. See [Database schema](/docs/durable/stores/lucid#database-schema). Not supported on SQLite. |

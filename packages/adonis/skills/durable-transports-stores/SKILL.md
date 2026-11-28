@@ -7,8 +7,8 @@ description: >-
   controlPlanes.redis broadcast channel, the lucid StateStore (published
   migration delegating to createDurableTables, autoSchema, repair warning,
   updateRunIf compare-and-set), CodecStateStore payload encryption with a
-  PayloadCodec, broker messages sealed by default (APP_KEY / crypto, the
-  `messages` option, acceptPlain, upgrading from 1.1), and namespace vs
+  PayloadCodec, broker messages opt-in sealing (APP_KEY / crypto, the
+  `messages: { seal: true }` option, acceptPlain, upgrading from 1.1), and namespace vs
   partition isolation. Use when moving steps across processes, persisting runs
   durably, sharing one database/broker between pools, or encrypting payloads
   at rest or on the broker.
@@ -16,7 +16,7 @@ license: MIT
 metadata:
   type: core
   library: "@adonis-agora/durable"
-  library_version: "1.1.1"
+  library_version: "1.2.0"
   framework: adonisjs
 sources:
   - 'DavideCarvalho/adonis-durable:docs/transports/index.mdx'
@@ -351,20 +351,20 @@ to the old non-atomic scan and the engine warns once naming `StateStore.tryAdmit
 
 Source: `docs/stores/lucid.mdx`, `docs/stores/index.mdx`.
 
-### Pattern 5 — broker messages are sealed (nothing to configure)
+### Pattern 5 — sealing broker messages (one switch, after the upgrade)
 
-Every broker transport and `controlPlanes.redis` encrypt the data of a run with
-a key derived from `APP_KEY` (a crypto `durable-messages` key between a tenant
-and its control plane); routing fields stay in clear. Overrides go on each
-transport's `messages` option:
+Every 1.2.1+ process opens sealed broker messages; sending them sealed is
+`messages: { seal: true }` (off in 1.x, the default in the next major). The key
+is derived from `APP_KEY` (a crypto `durable-messages` key between a tenant and
+its control plane); routing fields stay in clear. Turn it on only once every
+process runs 1.2.1 or later:
 
 ```ts
-import { transports } from '@adonis-agora/durable'
+import { defineConfig } from '@adonis-agora/durable'
 
-// Refuse plain messages once no job from before the upgrade is queued (acceptPlain defaults true in 1.x).
-transports.bullmq({
-  connection: { host: '127.0.0.1', port: 6379 },
-  messages: { acceptPlain: false },
+export default defineConfig({
+  // Step 2, after every process runs 1.2.1+. `acceptPlain: false` later refuses plain.
+  messages: { seal: true },
 })
 ```
 
@@ -456,13 +456,13 @@ schema in place" warning meaning exactly this — the database was behind and th
 fix was never recorded in migration history. Source: `docs/stores/lucid.mdx`
 ("The repair warning").
 
-### HIGH rolling a 1.1 fleet to sealed messages in one deploy
+### HIGH turning `seal: true` on while 1.1 processes still run
 
-Wrong: upgrading web pods while 1.1 workers still consume, nothing else changed.
-Correct: stop old processes first, or deploy twice — first with
-`messages: { insecure: true }` (sends plain, already opens sealed), then without.
-Mechanism: a 1.1 worker does not know the `sealed` field and runs the handler
-with `input` undefined. Source: `docs/transports/encrypting-messages.mdx`.
+Wrong: `messages: { seal: true }` in the same deploy that upgrades from 1.1.
+Correct: upgrade every process to 1.2.1+ first (it sends plain and opens sealed),
+then turn sealing on. Mechanism: a 1.1 worker does not know the `sealed` field
+and runs the handler with `input` undefined (why 1.2.0's sealed default was
+reverted in 1.2.1). Source: `docs/transports/encrypting-messages.mdx`.
 
 ### MEDIUM wrapping a store in CodecStateStore and expecting heartbeats
 

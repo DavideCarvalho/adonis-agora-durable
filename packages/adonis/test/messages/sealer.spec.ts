@@ -362,11 +362,31 @@ describe('message sealing', () => {
     expect(report).toHaveBeenCalledTimes(1);
   });
 
-  it('`insecure: true` sends plain but still opens what upgraded processes seal (step 1 of a rollout)', async () => {
-    const stepOne = sealerOf({ insecure: true, appKey: APP_KEY }, 't');
-    const upgraded = sealerOf({ appKey: APP_KEY }, 't');
+  it('by default (1.x) a transport sends plain and opens sealed messages (step 1 of a rollout)', async () => {
+    const stepOne = sealerOf({ appKey: APP_KEY }, 't');
+    const insecure = sealerOf({ insecure: true, appKey: APP_KEY }, 't');
+    const sealing = sealerOf({ appKey: APP_KEY, seal: true }, 't');
+    expect(stepOne.mode).toBe('plain');
+    expect(sealing.mode).toBe('app-key');
     expect(await stepOne.seal('task', task)).toBe(task);
-    expect(await stepOne.open('task', wire(await upgraded.seal('task', task)))).toEqual(wire(task));
+    const sealed = wire(await sealing.seal('task', task));
+    expect(await stepOne.open('task', sealed)).toEqual(wire(task));
+    expect(await insecure.open('task', sealed)).toEqual(wire(task));
+    // Nothing refuses plain while sealing is off, even with `acceptPlain: false`.
+    expect(
+      await sealerOf({ appKey: APP_KEY, acceptPlain: false }, 't').open('task', wire(task)),
+    ).toEqual(wire(task));
+  });
+
+  it('fails safe: anything carrying a seal it cannot open is refused, never read as plain', async () => {
+    const receiver = sealerOf({ appKey: APP_KEY }, 't');
+    for (const seal of ['dm2.k.future-format', 'dm1.z.unknown-mode', 'dm1.k.not-base64!', 42]) {
+      await expect(
+        receiver.open('task', { ...wire(task), input: undefined, sealed: seal }),
+      ).rejects.toMatchObject({
+        code: 'E_DURABLE_MESSAGE_REJECTED',
+      });
+    }
   });
 
   it('a clear field added on the broker cannot smuggle data into an opened message', async () => {
@@ -381,17 +401,18 @@ describe('message sealing', () => {
     expect(opened.output).toBeUndefined();
   });
 
-  it('a transport built directly seals with process.env.APP_KEY, else stays plain', async () => {
+  it('a transport built directly uses process.env.APP_KEY once sealing is on, else stays plain', async () => {
     const previous = process.env.APP_KEY;
     try {
       delete process.env.APP_KEY;
-      expect(sealerOf(undefined, 't').mode).toBe('plain');
+      expect(sealerOf({ seal: true }, 't').mode).toBe('plain');
       process.env.APP_KEY = APP_KEY;
-      const sealer = sealerOf(undefined, 't');
-      expect(sealer.mode).toBe('app-key');
+      expect(sealerOf(undefined, 't').mode).toBe('plain');
+      expect(sealerOf({ seal: true }, 't').mode).toBe('app-key');
       expect(sealerOf({ insecure: true }, 't').mode).toBe('plain');
       expect(sealerOf({ crypto: false }, 't').mode).toBe('plain');
       expect(sealerOf({ secret: 'a-shared-secret-of-16+' }, 't').mode).toBe('secret');
+      expect(sealerOf({ secret: 'a-shared-secret-of-16+', seal: false }, 't').mode).toBe('plain');
       expect(() => sealerOf({ secret: 'a-shared-secret-of-16+', insecure: true }, 't')).toThrow(
         /one of `secret`, `crypto` or `insecure`/,
       );
