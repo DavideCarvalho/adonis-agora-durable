@@ -1,5 +1,11 @@
 # @adonis-agora/durable
 
+## 1.5.1
+
+### Patch Changes
+
+- [#642](https://github.com/DavideCarvalho/adonis-agora-durable/pull/642) [`6d44619`](https://github.com/DavideCarvalho/adonis-agora-durable/commit/6d44619779291cfd5a0e127feab2d34be7c81177) Thanks [@DavideCarvalho](https://github.com/DavideCarvalho)! - Console protection badges: the messages badge also reads in amber when a sealing transport still accepts plain messages (`acceptPlain`), the tone comes from the modes instead of the label, `encryptedAtRest.step` no longer lists heartbeat progress (the console never shows it), the OpenAPI contract documents `encryptedAtRest` and `redactedFields`, and the transport pool's `members` returns a copy.
+
 ## 1.5.0
 
 ### Minor Changes
