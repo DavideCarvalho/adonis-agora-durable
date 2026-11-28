@@ -20,7 +20,10 @@ Source: `docs/transports/encrypting-messages.mdx`.
   its `APP_KEY`. A pod asks for its key with a `messageKey` run request carrying its tenant token
   and an ephemeral X25519 public key; the control plane (needs `verifyTenant`) answers with the key
   sealed to it. Tenants need no crypto, no grant. Every message carries a `kid`; rotation = new kid,
-  pods ask again.
+  pods ask again. Key requests are single-use (nonce + timestamp, one per token while it lives,
+  remembered in Redis / the DB across replicas; a refused one is logged as a possible replay), and go
+  over HTTPS (`POST <url>/__durable/message-key`) when the pod has `tenant.url` or authkit knows the
+  control plane's URL, else over the broker (boot line says which).
 - Two apps sharing a transport without a control plane: explicit `messages: { secret | crypto }`
   in every process of both (a message from another APP_KEY is refused, with that hint).
 - No key (no `APP_KEY`; a tenant without a token): plain, with a boot warning naming the fix when `seal: true` asked for sealing.

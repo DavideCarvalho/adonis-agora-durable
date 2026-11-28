@@ -39,16 +39,20 @@ export async function checkMessages(app: ApplicationService): Promise<AgoraDocto
     ];
   }
   // A tenant pod asks the control plane for its key with its token (explicit, or authkit's).
-  const tenantConfig = (config as { tenant?: { partition?: string; token?: unknown } } | undefined)
-    ?.tenant;
-  const hasToken =
-    tenantConfig?.token !== undefined ||
-    (typeof app.container?.hasBinding === 'function' && app.container.hasBinding('authkit.client'));
+  const tenantConfig = (
+    config as { tenant?: { partition?: string; token?: unknown; url?: unknown } } | undefined
+  )?.tenant;
+  const hasAuthkit =
+    typeof app.container?.hasBinding === 'function' && app.container.hasBinding('authkit.client');
+  const hasToken = tenantConfig?.token !== undefined || hasAuthkit;
+  // With the control plane's URL (explicit, or from authkit-client) the key is asked over HTTPS.
+  const hasUrl = tenantConfig?.url !== undefined || hasAuthkit;
   const tenant =
     config?.topology === 'tenant'
       ? {
           partition: tenantConfig?.partition ?? '(from authkit)',
           ...(hasToken ? { token: async () => '' } : {}),
+          ...(hasUrl ? { url: async () => '' } : {}),
         }
       : undefined;
   const results: AgoraDoctorResult[] = [];

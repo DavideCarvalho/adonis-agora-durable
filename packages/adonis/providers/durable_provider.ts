@@ -63,6 +63,7 @@ import {
   type WorkflowMeta,
   type WorkflowsBarrel,
 } from '../src/index.js';
+import { MESSAGE_KEY_PATH } from '../src/messages/tenant-keys.js';
 import {
   DURABLE_RUN_GATEWAY,
   DURABLE_RUN_REQUEST_RESPONDER,
@@ -73,6 +74,7 @@ import {
   hasResponderCapability,
   NOOP_RUN_DISPATCHER,
 } from '../src/role_bindings.js';
+import { messageKeyRoute } from '../src/run-gateway/message-key-route.js';
 import { tenantScopedGateway } from '../src/run-gateway/tenant-scoped-gateway.js';
 import { enableRunTraceScope } from '../src/run-trace.js';
 import { resolveSchedules } from '../src/scheduler.js';
@@ -526,6 +528,26 @@ export default class DurableProvider {
     return this.#tenantIdentityPromise;
   }
 
+  /**
+   * The control plane's URL, for asking it for this pod's message key over HTTPS: `tenant.url`, else
+   * what authkit-client knows of `urn:agora:durable`. `undefined`: ask over the broker.
+   */
+  async #controlPlaneUrl(config: TenantConfig): Promise<string | undefined> {
+    const explicit = (config.tenant as { url?: unknown } | undefined)?.url;
+    if (typeof explicit === 'string' && explicit.length > 0) return explicit;
+    if (typeof explicit === 'function') return (await (explicit as () => unknown)()) as string;
+    // authkit-client's answer, only when it already supplied the token or partition (never a call of
+    // its own: an app with every field explicit does not ask authkit).
+    const { auto } = await this.#tenantIdentity(config);
+    if (!auto || typeof auto.url !== 'function') return undefined;
+    try {
+      const url = await auto.url();
+      return typeof url === 'string' && url.length > 0 ? url : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   #tenantTransport(config: TenantConfig): Promise<Transport & { close?: () => Promise<void> }> {
     if (!this.#tenantTransportPromise) {
       this.#tenantTransportPromise = (async () => {
@@ -542,10 +564,20 @@ export default class DurableProvider {
           source === undefined
             ? undefined
             : async () => (typeof source === 'string' ? source : await source());
+        const resetToken =
+          typeof source === 'function' && typeof source.reset === 'function'
+            ? () => void source.reset?.()
+            : undefined;
+        const controlPlaneUrl = await this.#controlPlaneUrl(config).catch(() => undefined);
         const transport = await this.#resolveTransport(config, {
           app: this.app,
           partition: tenant.partition,
-          tenant: { partition: tenant.partition, ...(token ? { token } : {}) },
+          tenant: {
+            partition: tenant.partition,
+            ...(token ? { token } : {}),
+            ...(resetToken ? { resetToken } : {}),
+            ...(controlPlaneUrl ? { url: async () => controlPlaneUrl } : {}),
+          },
           ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
           ...(config.schema !== undefined ? { schema: config.schema } : {}),
         });
@@ -612,6 +644,35 @@ export default class DurableProvider {
     if (servesSteps) await this.#registerSteps(config);
 
     await this.#startResponder();
+    if (topology === 'control-plane') this.#registerMessageKeyRoute();
+  }
+
+  /**
+   * The control plane's HTTPS route for tenant pods' message-key requests (`POST
+   * /__durable/message-key`, the token as a bearer): asked there, the token never crosses the broker
+   * for it. Registered once the router is committed (after every provider's `boot()`), only where
+   * the app has a router (a web server).
+   */
+  #registerMessageKeyRoute(): void {
+    const container = this.app.container as unknown as { hasBinding?(b: string): boolean };
+    if (typeof container.hasBinding === 'function' && !container.hasBinding('router')) return;
+    const booted = (this.app as { booted?(fn: () => Promise<void>): unknown }).booted;
+    if (typeof booted !== 'function') return;
+    booted.call(this.app, async () => {
+      const router = (await this.app.container.make('router').catch(() => undefined)) as
+        | { post(path: string, handler: (ctx: never) => unknown): unknown }
+        | undefined;
+      if (!router || typeof router.post !== 'function') return;
+      router.post(
+        MESSAGE_KEY_PATH,
+        messageKeyRoute(
+          async () =>
+            (await this.app.container
+              .make(DURABLE_RUN_REQUEST_RESPONDER)
+              .catch(() => null)) as RunRequestResponder | null,
+        ) as never,
+      );
+    });
   }
 
   /** Register the `app/workflows` convention (barrel or scan), then bridge its event triggers. */

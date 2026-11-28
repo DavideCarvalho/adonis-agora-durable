@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { Database } from '@adonisjs/lucid/database';
 import { assertSchemaSupported, qualify, validateSchemaName } from '../sql-schema.js';
 import { createWorkerKeysTable, WORKER_KEYS_TABLE } from './db-schema.js';
@@ -48,6 +49,21 @@ export function lucidWorkerKeys(db: Database, opts: LucidWorkerKeysOptions = {})
         .knexQuery.insert({ key, value, expires_at: expiresAt })
         .onConflict('key')
         .merge();
+    },
+    claim: async (key, ttlMs) => {
+      await ensureSchema();
+      await client().from(table).where('key', key).where('expires_at', '<=', now()).delete();
+      const mark = randomUUID();
+      await client()
+        .insertQuery()
+        .table(table)
+        .knexQuery.insert({ key, value: mark, expires_at: now() + ttlMs })
+        .onConflict('key')
+        .ignore();
+      const row = (await client().from(table).where('key', key).select('value').first()) as {
+        value?: string;
+      } | null;
+      return row?.value === mark;
     },
     remove: async (keys) => {
       if (keys.length === 0) return;

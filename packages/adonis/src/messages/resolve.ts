@@ -95,7 +95,16 @@ export interface MessagesResolveContext {
    * A tenant pod: its partition and the token it presents to the control plane, with which it asks
    * the control plane for its message key. Set by the provider.
    */
-  tenant?: { partition: string; token?: (() => Promise<string>) | undefined } | undefined;
+  tenant?:
+    | {
+        partition: string;
+        token?: (() => Promise<string>) | undefined;
+        /** Mint a fresh token (authkit app-call tokens): a refused, already-used one is retried. */
+        resetToken?: (() => void) | undefined;
+        /** The control plane's URL: the key is then asked over HTTPS, not the broker. */
+        url?: (() => Promise<string | undefined>) | undefined;
+      }
+    | undefined;
 }
 
 /** The mode a transport resolves to, without building it (boot line, doctor). */
@@ -215,7 +224,7 @@ function decide(
     }
     return {
       mode: 'tenant-key',
-      label: `control plane key (partition ${tenant.partition})`,
+      label: `control plane key (partition ${tenant.partition}, asked over ${tenant.url ? 'HTTPS' : 'the broker'})`,
       role: 'tenant',
     };
   }
@@ -342,6 +351,8 @@ function tenantSource(
   const client = new TenantKeyClient({
     partition: tenant.partition,
     token: tenant.token as () => Promise<string>,
+    resetToken: tenant.resetToken,
+    url: tenant.url,
     log,
   });
   return {

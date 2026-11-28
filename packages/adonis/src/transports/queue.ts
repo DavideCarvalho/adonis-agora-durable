@@ -417,6 +417,17 @@ export class QueueTransport implements Transport, ControlPlane {
   /** Seals what this transport sends and opens what it receives. */
   readonly #messages: MessageSealer;
 
+  /**
+   * "Set if absent" for `ttlMs` (the key-request guard): on the worker-key store when it can (the
+   * app database by default, shared by every process), else `undefined` (not shared).
+   */
+  get claimOnce(): ((key: string, ttlMs: number) => Promise<boolean>) | undefined {
+    const store = this.#workerKeys;
+    return store.claim
+      ? (key, ttlMs) => (store.claim as NonNullable<WorkerKeyStore['claim']>)(key, ttlMs)
+      : undefined;
+  }
+
   /** The sealer (the control plane's responder grants tenant keys through it). */
   get messageSealer(): MessageSealer {
     return this.#messages;

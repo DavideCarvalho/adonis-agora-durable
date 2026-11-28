@@ -32,6 +32,12 @@ const GLOBEX_KEY = 'globex-app-key-0123456789abcdefghij';
 const TOKENS: Record<string, string> = { 'tok-acme': 'acme', 'tok-globex': 'globex' };
 
 const wire = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
+
+/** The partition a test token verifies to (`tok-acme#3` → acme). */
+function verified(token: string | undefined, capabilities: string[]) {
+  const base = token?.split('#')[0];
+  return base && TOKENS[base] ? { partition: TOKENS[base] as string, capabilities } : null;
+}
 const quiet = () => undefined;
 
 function appWith(options: { topology: string; appKey?: string; runtime?: unknown }): unknown {
@@ -79,12 +85,20 @@ async function controlPlaneSealer(variant: CpVariant, server = new FakeCryptoSer
 
 async function tenantSealer(partition: string, appKey: string, token: string) {
   const lines: string[] = [];
+  let minted = 1;
   const sealer = await resolveMessageSealer(
     {
       app: appWith({ topology: 'tenant', appKey }) as never,
       name: 'bullmq',
       log: (level, line) => lines.push(`${level}: ${line}`),
-      tenant: { partition, token: async () => token },
+      // A fresh token per reset, like authkit app-call tokens (`tok-acme#1`, `tok-acme#2`, …).
+      tenant: {
+        partition,
+        token: async () => `${token}#${minted}`,
+        resetToken: () => {
+          minted += 1;
+        },
+      },
     },
     {},
   );
@@ -246,10 +260,7 @@ describe.skipIf(!REDIS_URL)('two apps through the durable control plane, over Bu
         },
       };
       new RunRequestResponder(cpT, gateway as never, {
-        verifyTenant: async ({ token }) =>
-          token && TOKENS[token]
-            ? { partition: TOKENS[token] as string, capabilities: ['*'] }
-            : null,
+        verifyTenant: async ({ token }) => verified(token, ['*']),
       }).start();
       cpT.onStartRun(async (m) => {
         starts.push(m);
@@ -285,7 +296,9 @@ describe.skipIf(!REDIS_URL)('two apps through the durable control plane, over Bu
       expect(onBroker).not.toContain('tok-acme');
       expect(onBroker).toMatch(/dm1\.t\./);
       // Neither tenant has crypto; both got their key from the control plane.
-      expect(acme.lines.join('\n')).toMatch(/control plane key \(partition acme\)/);
+      expect(acme.lines.join('\n')).toMatch(
+        /control plane key \(partition acme, asked over the broker\)/,
+      );
     });
   }
 
@@ -294,8 +307,7 @@ describe.skipIf(!REDIS_URL)('two apps through the durable control plane, over Bu
     const cp = await controlPlaneSealer('app key');
     const cpT = await transport(prefix, cp.sealer);
     new RunRequestResponder(cpT, {} as never, {
-      verifyTenant: async ({ token }) =>
-        token && TOKENS[token] ? { partition: TOKENS[token] as string, capabilities: [] } : null,
+      verifyTenant: async ({ token }) => verified(token, []),
     }).start();
     // A raw client (plain): it sees every key answer, as an eavesdropper on the broker would.
     const probe = await transport(prefix, createMessageSealer({ mode: 'plain' }), 'acme');
@@ -311,6 +323,7 @@ describe.skipIf(!REDIS_URL)('two apps through the durable control plane, over Bu
           publicKey: pair.publicKey,
           partition,
           ts,
+          nonce: `nonce-${requestId}-0123456789`,
         } as unknown as RunRequest['body'],
       });
     await ask('mk-wrong-token', 'tok-nobody', 'acme');
@@ -365,8 +378,7 @@ describe.skipIf(!REDIS_URL)('two apps through the durable control plane, over Bu
     const cp = await controlPlaneSealer('crypto embedded', server);
     const cpT = await transport(prefix, cp.sealer);
     new RunRequestResponder(cpT, {} as never, {
-      verifyTenant: async ({ token }) =>
-        token && TOKENS[token] ? { partition: TOKENS[token] as string, capabilities: [] } : null,
+      verifyTenant: async ({ token }) => verified(token, []),
     }).start();
     const acme = await tenantSealer('acme', ACME_KEY, 'tok-acme');
     const acmeT = await transport(prefix, acme.sealer, 'acme');
@@ -413,8 +425,7 @@ describe.skipIf(!REDIS_URL)('two apps through the durable control plane, over Bu
     const cp = await controlPlaneSealer('app key');
     const cpT = await transport(prefix, cp.sealer);
     new RunRequestResponder(cpT, {} as never, {
-      verifyTenant: async ({ token }) =>
-        token && TOKENS[token] ? { partition: TOKENS[token] as string, capabilities: [] } : null,
+      verifyTenant: async ({ token }) => verified(token, []),
     }).start();
     const acme = await tenantSealer('acme', ACME_KEY, 'tok-acme');
     const globex = await tenantSealer('globex', GLOBEX_KEY, 'tok-globex');

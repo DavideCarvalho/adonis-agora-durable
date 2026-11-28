@@ -15,6 +15,11 @@ export interface WorkerKeyStore {
   remove(keys: string[]): Promise<void>;
   /** Every key still live at `now`, with its value. */
   live(now: number): Promise<{ key: string; value: string }[]>;
+  /**
+   * Write `key` for `ttlMs` only if no live entry holds it; resolves whether this call wrote it
+   * (an atomic "set if absent", shared by every process on the store). Optional.
+   */
+  claim?(key: string, ttlMs: number): Promise<boolean>;
 }
 
 const DESCRIPTOR_SEGMENT = '-worker-descriptor:';
@@ -73,6 +78,14 @@ export class MemoryWorkerKeys implements WorkerKeyStore {
 
   async remove(keys: string[]): Promise<void> {
     for (const key of keys) this.#entries.delete(key);
+  }
+
+  async claim(key: string, ttlMs: number): Promise<boolean> {
+    const now = Date.now();
+    const held = this.#entries.get(key);
+    if (held && held.expiresAt > now) return false;
+    this.#entries.set(key, { value: '1', expiresAt: now + ttlMs });
+    return true;
   }
 
   async live(now: number): Promise<{ key: string; value: string }[]> {

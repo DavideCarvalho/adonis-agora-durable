@@ -16,7 +16,13 @@ import {
   lifecycleKindOf,
   type RepublishLifecycleTarget,
 } from '../lifecycle-events.js';
-import { isMessageKeyBody, MESSAGE_KEY_REQUEST } from '../messages/tenant-keys.js';
+import {
+  type ClaimOnce,
+  isMessageKeyBody,
+  MESSAGE_KEY_REQUEST,
+  MessageKeyGuard,
+  memoryClaimOnce,
+} from '../messages/tenant-keys.js';
 import {
   loadFanMembers,
   loadRunDetail,
@@ -664,8 +670,42 @@ export class RunRequestResponder {
    * ephemeral public key.
    */
   async #grantMessageKey(msg: RunRequest): Promise<RunReply> {
-    const refuse = (message: string, code = 'unauthorized') =>
-      reply(msg.requestId, { ok: false, error: { message, code } });
+    return reply(msg.requestId, await this.grantMessageKey(msg.tenant, msg.body, msg.requestId));
+  }
+
+  #keyGuard: MessageKeyGuard | undefined;
+
+  /** The single-use guard, on the transport's shared store when it has one. */
+  #guard(): MessageKeyGuard {
+    if (!this.#keyGuard) {
+      const claim = (this.#transport as { claimOnce?: ClaimOnce }).claimOnce;
+      if (typeof claim !== 'function') {
+        console.warn(
+          '[@adonis-agora/durable] messages: this transport has no store shared by every control-plane replica, so the message-key replay guard is per process here (use bullmq or db, or a queue transport with worker keys)',
+        );
+      }
+      this.#keyGuard = new MessageKeyGuard(
+        typeof claim === 'function' ? claim.bind(this.#transport) : memoryClaimOnce(),
+        (line) => console.warn(line),
+      );
+    }
+    return this.#keyGuard;
+  }
+
+  /**
+   * Answer a tenant pod's message-key request (over the broker, or the control plane's HTTPS route):
+   * only with a verifier, only for the partition its token verifies to, only fresh and once. The key
+   * goes back sealed to the pod's ephemeral public key.
+   */
+  async grantMessageKey(
+    token: string,
+    rawBody: unknown,
+    requestId: string,
+  ): Promise<RunReplyResult> {
+    const refuse = (message: string, code = 'unauthorized'): RunReplyResult => ({
+      ok: false,
+      error: { message, code },
+    });
     const issue = (
       this.#transport as {
         messageSealer?: {
@@ -688,19 +728,24 @@ export class RunRequestResponder {
         'this control plane hands out message keys only to verified tenants: configure `verifyTenant`',
       );
     }
-    const body = msg.body as unknown;
+    if (typeof requestId !== 'string' || !requestId.startsWith('mk-')) {
+      return refuse('a malformed message-key request', BAD_REQUEST);
+    }
+    const body = rawBody as unknown;
     if (!isMessageKeyBody(body))
       return refuse('a malformed or stale message-key request', BAD_REQUEST);
-    const partition = await this.#resolveTenant(msg.tenant);
+    const partition = await this.#resolveTenant(token);
     if (partition === null) return refuse('invalid or unauthorized tenant token');
     if (partition !== body.partition) {
       return refuse(`the token is not partition "${body.partition}"'s`, 'cross-tenant');
     }
+    const replayed = await this.#guard().check(token, body);
+    if (replayed) return refuse(replayed, 'replayed');
     try {
-      return reply(msg.requestId, {
+      return {
         ok: true,
-        data: await issue({ partition, publicKey: body.publicKey, requestId: msg.requestId }),
-      });
+        data: await issue({ partition, publicKey: body.publicKey, requestId }),
+      };
     } catch (err) {
       return refuse(`could not grant the message key: ${errorMessage(err)}`, 'unavailable');
     }
