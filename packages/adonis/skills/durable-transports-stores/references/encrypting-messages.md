@@ -17,7 +17,7 @@ Source: `docs/transports/encrypting-messages.mdx`.
   plane needs crypto embedded and creates the key per tenant; a tenant's crypto client needs
   `crypto:encrypt:durable-messages` + `crypto:decrypt:durable-messages` (+ `crypto:keys:manage:…`
   to create it). The tenant's durable partition must be its crypto partition.
-- No key (no `APP_KEY`, or no crypto between apps): plain, with a boot warning naming the fix.
+- No key (no `APP_KEY`, or no crypto between apps): plain, with a boot warning naming the fix when `seal: true` asked for sealing.
 - A transport built without AdonisJS (`new BullMQTransport(...)`) opens sealed messages with
   `process.env.APP_KEY`, and sends them sealed with `messages: { seal: true, appKey | secret | crypto }`.
 
