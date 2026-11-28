@@ -190,8 +190,10 @@ export interface TenantConfig extends BaseDurableConfig {
    *   authkit-client's `authkitTenantToken(...)`), an object with `get()`, a class implementing
    *   {@link TenantCredentialsContract}, or a lazy import of one. Without one the raw partition
    *   travels instead and is trusted only by a control plane with no verifier.
-   * - `url`: not used by durable (tenants reach the control plane through `transport`); accepted so
-   *   the same `tenant` block reads the same in every Agora lib.
+   * - `url`: the control plane's URL. Tenants reach the control plane through `transport`; the URL
+   *   only lets a pod ask for its message key over HTTPS (`POST <url>/__durable/message-key`), so
+   *   its token never crosses the broker for it. Default: what authkit-client knows of
+   *   `urn:agora:durable`, when authkit supplies the tenant.
    * - `auto: false`: never fill a field from authkit-client.
    */
   tenant?: TenantIdentityConfig;
