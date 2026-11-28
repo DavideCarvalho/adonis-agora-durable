@@ -7,8 +7,8 @@ description: >-
   controlPlanes.redis broadcast channel, the lucid StateStore (published
   migration delegating to createDurableTables, autoSchema, repair warning,
   updateRunIf compare-and-set), CodecStateStore payload encryption with a
-  PayloadCodec, broker messages sealed by default (APP_KEY / crypto, the
-  `messages` option, acceptPlain, upgrading from 1.1), and namespace vs
+  PayloadCodec, broker messages opt-in sealing (APP_KEY / crypto, the
+  `messages: { seal: true }` option, acceptPlain, upgrading from 1.1), and namespace vs
   partition isolation. Use when moving steps across processes, persisting runs
   durably, sharing one database/broker between pools, or encrypting payloads
   at rest or on the broker.
