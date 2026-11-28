@@ -32,6 +32,10 @@ export interface CryptoRuntimeLike {
           input: { name: string; type: string; description?: string },
         ): Promise<unknown>;
         store: { getKey(partition: string, name: string): Promise<unknown> };
+        hmac?(
+          principal: CryptoPrincipalLike,
+          input: { key: string; message: string },
+        ): Promise<{ hmac: string }>;
       }
     | undefined;
   /** This app's own operations (in-process on a server, over HTTP or a broker on a tenant). */
@@ -59,6 +63,8 @@ export interface CryptoRuntimeLike {
      * missing. Not audited as an error, unlike the decrypt probe it replaces when present.
      */
     hasKey?(input: { key: string }): Promise<boolean>;
+    /** HMAC-SHA256 under an `hmac-sha256` key (the durable control plane's message keys). */
+    hmac?(input: { key: string; message: string }): Promise<{ hmac: string }>;
   };
 }
 

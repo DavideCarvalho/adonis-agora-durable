@@ -16,6 +16,7 @@ import {
   lifecycleKindOf,
   type RepublishLifecycleTarget,
 } from '../lifecycle-events.js';
+import { isMessageKeyBody, MESSAGE_KEY_REQUEST } from '../messages/tenant-keys.js';
 import {
   loadFanMembers,
   loadRunDetail,
@@ -319,6 +320,8 @@ export class RunRequestResponder {
   // ---------------------------------------------------------------------------
 
   async #handleRequest(msg: RunRequest): Promise<RunReply> {
+    if ((msg.body as { kind?: unknown }).kind === MESSAGE_KEY_REQUEST)
+      return this.#grantMessageKey(msg);
     const tenant = await this.#resolveTenant(msg.tenant);
     if (tenant === null) {
       return reply(msg.requestId, {
@@ -652,6 +655,54 @@ export class RunRequestResponder {
         ? lifecycleEventName(workflow, kind)
         : `the lifecycle events of ${workflow}`;
       throw new BadRequestError(`subscriber ${subscriber} does not subscribe to ${event}`);
+    }
+  }
+
+  /**
+   * A tenant pod asks for its message key (see `messages/tenant-keys.ts`): only with a verifier, only
+   * for the partition its token verifies to, only fresh. The key goes back sealed to the pod's
+   * ephemeral public key.
+   */
+  async #grantMessageKey(msg: RunRequest): Promise<RunReply> {
+    const refuse = (message: string, code = 'unauthorized') =>
+      reply(msg.requestId, { ok: false, error: { message, code } });
+    const issue = (
+      this.#transport as {
+        messageSealer?: {
+          issueTenantKey?: (input: {
+            partition: string;
+            publicKey: string;
+            requestId: string;
+          }) => Promise<unknown>;
+        };
+      }
+    ).messageSealer?.issueTenantKey;
+    if (!issue) {
+      return refuse(
+        'this control plane does not hand out message keys (no key: set APP_KEY)',
+        'unsupported',
+      );
+    }
+    if (!this.#verifyTenant) {
+      return refuse(
+        'this control plane hands out message keys only to verified tenants: configure `verifyTenant`',
+      );
+    }
+    const body = msg.body as unknown;
+    if (!isMessageKeyBody(body))
+      return refuse('a malformed or stale message-key request', BAD_REQUEST);
+    const partition = await this.#resolveTenant(msg.tenant);
+    if (partition === null) return refuse('invalid or unauthorized tenant token');
+    if (partition !== body.partition) {
+      return refuse(`the token is not partition "${body.partition}"'s`, 'cross-tenant');
+    }
+    try {
+      return reply(msg.requestId, {
+        ok: true,
+        data: await issue({ partition, publicKey: body.publicKey, requestId: msg.requestId }),
+      });
+    } catch (err) {
+      return refuse(`could not grant the message key: ${errorMessage(err)}`, 'unavailable');
     }
   }
 

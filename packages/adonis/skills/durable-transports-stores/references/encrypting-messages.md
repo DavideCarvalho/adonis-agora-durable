@@ -12,12 +12,16 @@ Source: `docs/transports/encrypting-messages.mdx`.
 - Same app: AES-256-GCM, key derived from `APP_KEY` (HKDF-SHA256, purpose
   `agora:durable:messages`). Boot line with `seal: true`: `[@adonis-agora/durable] bullmq messages: app key (auto)`;
   by default (sealing off): `bullmq messages: sent plain, sealed ones opened with app key (auto)`.
-- Tenant ↔ control plane (`topology: 'tenant'` / `'control-plane'`): `@adonis-agora/crypto`, found
-  through its `agora.crypto` binding. Key `durable-messages` in the tenant's partition; the control
-  plane needs crypto embedded and creates the key per tenant; a tenant's crypto client needs
-  `crypto:encrypt:durable-messages` + `crypto:decrypt:durable-messages` (+ `crypto:keys:manage:…`
-  to create it). The tenant's durable partition must be its crypto partition.
-- No key (no `APP_KEY`, or no crypto between apps): plain, with a boot warning naming the fix when `seal: true` asked for sealing.
+- Tenant ↔ control plane (`topology: 'tenant'` / `'control-plane'`): the CONTROL PLANE owns one key
+  per tenant partition, derived from its `@adonis-agora/crypto` HMAC key `durable-message-keys`
+  (crypto embedded, or a crypto app it is a tenant of; created at boot when allowed) or else from
+  its `APP_KEY`. A pod asks for its key with a `messageKey` run request carrying its tenant token
+  and an ephemeral X25519 public key; the control plane (needs `verifyTenant`) answers with the key
+  sealed to it. Tenants need no crypto, no grant. Every message carries a `kid`; rotation = new kid,
+  pods ask again.
+- Two apps sharing a transport without a control plane: explicit `messages: { secret | crypto }`
+  in every process of both (a message from another APP_KEY is refused, with that hint).
+- No key (no `APP_KEY`; a tenant without a token): plain, with a boot warning naming the fix when `seal: true` asked for sealing.
 - A transport built without AdonisJS (`new BullMQTransport(...)`) opens sealed messages with
   `process.env.APP_KEY`, and sends them sealed with `messages: { seal: true, appKey | secret | crypto }`.
 

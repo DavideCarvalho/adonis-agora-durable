@@ -16,7 +16,7 @@ license: MIT
 metadata:
   type: core
   library: "@adonis-agora/durable"
-  library_version: "1.2.0"
+  library_version: "1.2.1"
   framework: adonisjs
 sources:
   - 'DavideCarvalho/adonis-durable:docs/transports/index.mdx'
@@ -355,8 +355,8 @@ Source: `docs/stores/lucid.mdx`, `docs/stores/index.mdx`.
 
 Every 1.2.1+ process opens sealed broker messages; sending them sealed is
 `messages: { seal: true }` (off in 1.x, the default in the next major). The key
-is derived from `APP_KEY` (a crypto `durable-messages` key between a tenant and
-its control plane); routing fields stay in clear. Turn it on only once every
+is derived from `APP_KEY` (between tenant pods and their control plane, a key
+per tenant the control plane owns and hands each pod); routing fields stay in clear. Turn it on only once every
 process runs 1.2.1 or later:
 
 ```ts

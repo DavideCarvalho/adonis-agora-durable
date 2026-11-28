@@ -15,7 +15,7 @@ license: MIT
 metadata:
   type: core
   library: "@adonis-agora/durable"
-  library_version: "1.2.0"
+  library_version: "1.2.1"
   framework: adonisjs
 sources:
   - 'DavideCarvalho/adonis-durable:docs/cluster/index.mdx'
@@ -280,7 +280,8 @@ A transport built this way opens sealed messages with `process.env.APP_KEY` (the
 same key as the app it serves) and sends them sealed with `messages: { seal: true }`,
 or takes `messages: { seal: true, appKey | secret | crypto }` to seal with that mode;
 between a tenant pod and its control plane (different apps) the provider-built
-transports use `@adonis-agora/crypto`'s `durable-messages` key automatically,
+transports get a per-tenant key from the control plane automatically (with the
+pod's token),
 so a hand-built tenant worker must use the same explicit mode on both sides.
 Source: `docs/transports/encrypting-messages.mdx`.
 

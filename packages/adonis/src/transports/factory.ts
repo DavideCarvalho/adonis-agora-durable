@@ -38,6 +38,8 @@ export interface TransportContext {
    * line and errors. Set by the provider.
    */
   name?: string | undefined;
+  /** A tenant pod: its partition and token (it asks the control plane for its message key). */
+  tenant?: { partition: string; token?: (() => Promise<string>) | undefined } | undefined;
 }
 
 /** A transport option that falls back to the provider-forwarded top-level value. */
@@ -535,7 +537,7 @@ export const transports = {
       const adapter = config.adapter ?? (await resolveQueueAdapter(ctx, config.connection));
       const workerKeys = await queueWorkerKeys(ctx, config);
       const messages = await resolveMessageSealer(
-        { app: ctx.app, name: ctx.name ?? 'queue' },
+        { app: ctx.app, name: ctx.name ?? 'queue', tenant: ctx.tenant },
         config.messages,
       );
       return new QueueTransport({
@@ -617,7 +619,7 @@ export const transports = {
           ? await createBullMQDeps(config.workerRegistry.connection)
           : undefined;
       const messages = await resolveMessageSealer(
-        { app: ctx.app, name: ctx.name ?? 'bullmq' },
+        { app: ctx.app, name: ctx.name ?? 'bullmq', tenant: ctx.tenant },
         config.messages,
       );
       return new BullMQTransport({
@@ -680,7 +682,7 @@ export const transports = {
       const db = (await resolveLucidDatabase(ctx)) as Database;
       const { DbTransport } = await import('./db.js');
       const messages = await resolveMessageSealer(
-        { app: ctx.app, name: ctx.name ?? 'db' },
+        { app: ctx.app, name: ctx.name ?? 'db', tenant: ctx.tenant },
         config.messages,
       );
       return new DbTransport({

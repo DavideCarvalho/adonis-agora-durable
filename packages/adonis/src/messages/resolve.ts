@@ -1,5 +1,6 @@
 import { type AppKey, appKeyOf } from '../app_key.js';
 import { type CryptoRuntimeLike, cryptoRuntimeOf } from '../control-plane-redis/console-crypto.js';
+import type { RunReply } from '../interfaces.js';
 import {
   type CryptoSealerSource,
   createMessageSealer,
@@ -9,8 +10,21 @@ import {
   type MessageSealer,
   type MessageSecret,
   onceReporter,
+  type PartitionKeySource,
   type RejectionReporter,
 } from './sealer.js';
+import {
+  appKeyRoot,
+  CONTROL_PLANE_KEYS_CRYPTO_KEY,
+  type ControlPlaneRoot,
+  cryptoHmacOf,
+  cryptoRoot,
+  ensureControlPlaneKey,
+  grantKey,
+  type HandshakeWire,
+  isMessageKeyRequest,
+  TenantKeyClient,
+} from './tenant-keys.js';
 
 const PACKAGE = '@adonis-agora/durable';
 const DOCS = 'https://davidecarvalho.github.io/agora/docs/durable/transports/encrypting-messages';
@@ -31,7 +45,7 @@ export interface MessagesCryptoOptions {
 /**
  * How one transport (or the control plane) seals its messages: the same options as the other Agora
  * libs' channels. Keys are found automatically (the app's
- * `APP_KEY`; `@adonis-agora/crypto` between a tenant and its control plane); sending sealed is
+ * `APP_KEY`; between tenant pods and their control plane, the control plane's per-tenant keys); sending sealed is
  * `seal: true` (off by default in 1.x).
  */
 export interface TransportMessagesOptions {
@@ -76,6 +90,11 @@ export interface MessagesResolveContext {
   log?: ((level: 'info' | 'warn', line: string) => void) | undefined;
   /** The topology (default: `config/durable.ts`'s). */
   topology?: string | undefined;
+  /**
+   * A tenant pod: its partition and the token it presents to the control plane, with which it asks
+   * the control plane for its message key. Set by the provider.
+   */
+  tenant?: { partition: string; token?: (() => Promise<string>) | undefined } | undefined;
 }
 
 /** The mode a transport resolves to, without building it (boot line, doctor). */
@@ -83,7 +102,8 @@ export type ResolvedMessagesMode =
   | { mode: 'plain'; label: string; why: 'insecure' | 'off' | 'no-key'; hint?: string }
   | { mode: 'app-key'; label: string }
   | { mode: 'secret'; label: string }
-  | { mode: 'crypto'; label: string; auto: boolean };
+  | { mode: 'crypto'; label: string; auto: boolean }
+  | { mode: 'tenant-key'; label: string; role: 'tenant' | 'control-plane' };
 
 function explicitModes(options: TransportMessagesOptions): number {
   return [
@@ -94,19 +114,20 @@ function explicitModes(options: TransportMessagesOptions): number {
 }
 
 /** Why the automatic mode found no key, and what to add. */
-export function noKeyHint(topology: string, cryptoWithoutService = false): string {
-  const cross = topology === 'tenant' || topology === 'control-plane';
-  const first = cross
-    ? cryptoWithoutService
-      ? "on a control plane the automatic mode needs @adonis-agora/crypto embedded in this app (it seals for each tenant's partition), and here crypto runs elsewhere"
-      : `between a tenant and its control plane (topology '${topology}') the automatic mode needs @adonis-agora/crypto booted in this app (key ${MESSAGES_CRYPTO_KEY}, nothing else to configure)`
-    : 'set APP_KEY in this app (automatic for the processes of one app; `node ace generate:key`)';
+export function noKeyHint(topology: string): string {
+  const first =
+    topology === 'tenant'
+      ? "a tenant pod gets its message key from the control plane with its tenant token: set `tenant.token` (or authkit-client's `service`)"
+      : topology === 'control-plane'
+        ? "the control plane derives its tenants' message keys from its APP_KEY (or @adonis-agora/crypto when booted here): set APP_KEY (`node ace generate:key`)"
+        : 'set APP_KEY in this app (automatic for the processes of one app; `node ace generate:key`)';
   return `${first}, or set \`messages: { secret }\` on the transport (a shared secret, at least 16 characters, the same in every process), or \`messages: { crypto: { cipher } }\` (@adonis-agora/crypto or your own KMS)`;
 }
 
 /** What {@link resolveMessageSealer} needs besides the options, read from the app. */
 interface Inputs {
   topology: string;
+  tenant?: MessagesResolveContext['tenant'];
   /** The top-level `messages` of `config/durable.ts`. */
   seal?: boolean | undefined;
   acceptPlain?: boolean | undefined;
@@ -114,7 +135,11 @@ interface Inputs {
   runtime: CryptoRuntimeLike | undefined;
 }
 
-async function inputsOf(app: AppLike | undefined, topology?: string): Promise<Inputs> {
+async function inputsOf(
+  app: AppLike | undefined,
+  topology?: string,
+  tenant?: MessagesResolveContext['tenant'],
+): Promise<Inputs> {
   let durable: Record<string, unknown> | undefined;
   try {
     durable = app?.config?.get?.('durable') as Record<string, unknown> | undefined;
@@ -131,6 +156,7 @@ async function inputsOf(app: AppLike | undefined, topology?: string): Promise<In
   }
   const top = durable?.messages as { seal?: unknown; acceptPlain?: unknown } | undefined;
   return {
+    tenant,
     seal: typeof top?.seal === 'boolean' ? top.seal : undefined,
     acceptPlain: typeof top?.acceptPlain === 'boolean' ? top.acceptPlain : undefined,
     topology: topology ?? (typeof durable?.topology === 'string' ? durable.topology : 'standalone'),
@@ -176,27 +202,37 @@ function decide(
     }
     return { mode: 'app-key', label: 'app key (auto)' };
   }
-  const runtime = inputs.runtime;
-  if (!runtime) {
+  if (inputs.topology === 'tenant') {
+    const tenant = inputs.tenant;
+    if (!tenant?.token) {
+      return {
+        mode: 'plain',
+        label: 'plain (no tenant token)',
+        why: 'no-key',
+        hint: noKeyHint('tenant'),
+      };
+    }
     return {
-      mode: 'plain',
-      label: 'plain (no @adonis-agora/crypto)',
-      why: 'no-key',
-      hint: noKeyHint(inputs.topology),
+      mode: 'tenant-key',
+      label: `control plane key (partition ${tenant.partition})`,
+      role: 'tenant',
     };
   }
-  if (inputs.topology === 'control-plane' && !runtime.service) {
+  const hmac = inputs.runtime ? cryptoHmacOf(inputs.runtime) : undefined;
+  if (!hmac && appKey === undefined) {
     return {
       mode: 'plain',
-      label: 'plain (crypto not embedded)',
+      label: 'plain (no APP_KEY)',
       why: 'no-key',
-      hint: noKeyHint(inputs.topology, true),
+      hint: noKeyHint('control-plane'),
     };
   }
   return {
-    mode: 'crypto',
-    label: `crypto (auto, key ${MESSAGES_CRYPTO_KEY}, partition ${runtime.partition})`,
-    auto: true,
+    mode: 'tenant-key',
+    label: hmac
+      ? `control plane keys (crypto, key ${CONTROL_PLANE_KEYS_CRYPTO_KEY}, partition ${inputs.runtime?.partition})`
+      : 'control plane keys (app key)',
+    role: 'control-plane',
   };
 }
 
@@ -206,11 +242,12 @@ export async function describeMessagesMode(
   name: string,
   options: TransportMessagesOptions = {},
   topology?: string,
+  tenant?: MessagesResolveContext['tenant'],
 ): Promise<
   (ResolvedMessagesMode & { sealing: boolean; acceptPlain: boolean }) | { error: string }
 > {
   try {
-    const inputs = await inputsOf(app, topology);
+    const inputs = await inputsOf(app, topology, tenant);
     const decided = decide(name, options, inputs);
     return {
       ...decided,
@@ -226,9 +263,9 @@ export async function describeMessagesMode(
   }
 }
 
-const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
+const _errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
-function once<T>(fn: () => Promise<T>): () => Promise<T> {
+function _once<T>(fn: () => Promise<T>): () => Promise<T> {
   let pending: Promise<T> | undefined;
   return () => {
     if (!pending) {
@@ -239,29 +276,6 @@ function once<T>(fn: () => Promise<T>): () => Promise<T> {
     }
     return pending;
   };
-}
-
-/** Make sure `key` exists in `partition` (crypto embedded here). */
-async function ensureMessagesKey(
-  service: NonNullable<CryptoRuntimeLike['service']>,
-  partition: string,
-  key: string,
-): Promise<'exists' | 'created'> {
-  if (await service.store.getKey(partition, key)) return 'exists';
-  try {
-    await service.createKey(
-      { partition, capabilities: [`crypto:keys:manage:${key}`], actor: 'durable:messages' },
-      {
-        name: key,
-        type: 'aes256-gcm',
-        description: `${PACKAGE}: seals the messages between this app and its control plane`,
-      },
-    );
-    return 'created';
-  } catch (error) {
-    if (await service.store.getKey(partition, key)) return 'exists';
-    throw error;
-  }
 }
 
 /** The partition a control plane seals a message for (the tenant it goes to). */
@@ -285,74 +299,29 @@ function tenantPartitionOf(
 /** How many tenants' pending requests a control plane remembers the partition of. */
 const REPLY_MEMO = 10_000;
 
-/** The automatic crypto source: a tenant on its own partition, or a control plane for every tenant. */
-function autoCryptoSource(
-  runtime: CryptoRuntimeLike,
-  topology: string,
+/** The control plane's source: a key per tenant partition from its root (crypto, else APP_KEY). */
+function controlPlaneSource(
+  inputs: Inputs,
+  options: TransportMessagesOptions,
   label: string,
   log: (level: 'info' | 'warn', line: string) => void,
-): CryptoSealerSource {
-  const key = MESSAGES_CRYPTO_KEY;
-  const own = runtime.partition;
-  const service = runtime.service;
-  if (topology === 'tenant' || !service) {
-    const cipher = runtime.operations as unknown as MessageCipher;
-    return {
-      key,
-      label,
-      cipherFor: async (partition) => {
-        if (partition !== own) {
-          throw new Error(`partition "${partition}" is not this app's (${own})`);
-        }
-        return cipher;
-      },
-      sealPartition: () => own,
-      accepts: (partition) => partition === own,
-    };
-  }
-  // Control plane with crypto embedded: seal and open in each tenant's partition.
-  const ensured = new Map<string, () => Promise<void>>();
-  const ready = (partition: string) => {
-    let fn = ensured.get(partition);
-    if (!fn) {
-      fn = once(async () => {
-        try {
-          if ((await ensureMessagesKey(service, partition, key)) === 'created') {
-            log(
-              'info',
-              `[${PACKAGE}] messages: created the crypto key "${key}" in partition ${partition}`,
-            );
-          }
-        } catch (error) {
-          log(
-            'warn',
-            `[${PACKAGE}] messages: could not create the crypto key "${key}" in partition ${partition} (${errorText(error)}). Create it: \`node ace crypto:keys:create ${key} --type aes256-gcm --application ${partition}\``,
-          );
-          throw error;
-        }
-      });
-      ensured.set(partition, fn);
-    }
-    return fn();
-  };
+): PartitionKeySource {
+  const runtime = inputs.runtime;
+  const hmac = runtime ? cryptoHmacOf(runtime) : undefined;
+  if (runtime && hmac) void ensureControlPlaneKey(runtime, log);
+  const root: ControlPlaneRoot = hmac
+    ? cryptoRoot(hmac)
+    : appKeyRoot((options.appKey ?? inputs.appKey) as AppKey);
   const replies = new Map<string, string>();
   return {
-    key,
     label,
-    cipherFor: async (partition) => {
-      await ready(partition).catch(() => undefined);
-      const principal = {
-        partition,
-        capabilities: [`crypto:encrypt:${key}`, `crypto:decrypt:${key}`],
-        actor: 'durable:messages',
-      };
-      return {
-        encrypt: (input) => service.encrypt(principal, input),
-        decrypt: (input) => service.decrypt(principal, input),
-      };
+    // The control plane's own traffic (its replicas, its embedded workers) is partition ''.
+    sealKey: async (kind, msg) => {
+      const partition = tenantPartitionOf(kind, msg, replies) ?? '';
+      return { partition, ...(await root.current(partition)) };
     },
-    sealPartition: (kind, msg) => tenantPartitionOf(kind, msg, replies) ?? own,
-    accepts: (partition) => partition.length > 0,
+    openKey: (partition, kid) => root.byKid(partition, kid),
+    bootstrap: (kind, raw) => kind === 'runRequest' && isMessageKeyRequest(raw),
     onOpened: (kind, msg, partition) => {
       // A reply goes back to the partition that asked.
       const id =
@@ -364,47 +333,40 @@ function autoCryptoSource(
       }
       replies.set(id, partition);
     },
+    issueTenantKey: async ({ partition, publicKey, requestId }) => {
+      const { kid, key } = await root.current(partition);
+      return grantKey({ publicKey, requestId, partition, kid }, key);
+    },
   };
 }
 
-/** On a crypto tenant: is the messages key there? One line when it is not (never fails boot). */
-async function checkTenantKey(
-  runtime: CryptoRuntimeLike,
+/** A tenant pod's source: its own partition's key, asked of the control plane with its token. */
+function tenantSource(
+  inputs: Inputs,
+  label: string,
   log: (level: 'info' | 'warn', line: string) => void,
-): Promise<void> {
-  const key = MESSAGES_CRYPTO_KEY;
-  const create = `node ace crypto:keys:create ${key} --type aes256-gcm --application ${runtime.partition}`;
-  try {
-    const has = runtime.operations.hasKey;
-    if (typeof has === 'function') {
-      if (await has.call(runtime.operations, { key })) return;
-    } else {
-      return; // an older crypto server: the first message tells
-    }
-  } catch (error) {
-    log(
-      'warn',
-      `[${PACKAGE}] messages: could not check the crypto key "${key}" in partition ${runtime.partition} (${errorText(error)})`,
-    );
-    return;
-  }
-  try {
-    if (typeof runtime.operations.createKey !== 'function') throw new Error('no createKey');
-    await runtime.operations.createKey({
-      name: key,
-      type: 'aes256-gcm',
-      description: `${PACKAGE}: seals the messages between this app and its control plane`,
-    });
-    log(
-      'info',
-      `[${PACKAGE}] messages: created the crypto key "${key}" in partition ${runtime.partition}`,
-    );
-  } catch {
-    log(
-      'warn',
-      `[${PACKAGE}] messages: the crypto key "${key}" does not exist in partition ${runtime.partition}. Create it on the crypto server: \`${create}\`, or grant this app's crypto client \`crypto:keys:manage:${key}\` so it creates it`,
-    );
-  }
+): PartitionKeySource {
+  const tenant = inputs.tenant as NonNullable<Inputs['tenant']>;
+  const client = new TenantKeyClient({
+    partition: tenant.partition,
+    token: tenant.token as () => Promise<string>,
+    log,
+  });
+  return {
+    label,
+    sealKey: async () => ({ partition: tenant.partition, ...(await client.current()) }),
+    openKey: async (partition, kid) =>
+      partition === tenant.partition ? client.byKid(kid) : undefined,
+    foreign: (partition) => partition !== tenant.partition,
+    // Key requests and their (plain) answers; on BullMQ every pod hears every pod's answer.
+    bootstrap: (kind, raw) =>
+      (kind === 'runRequest' && isMessageKeyRequest(raw)) ||
+      (kind === 'runReply' &&
+        (client.isHandshake(raw.requestId) ||
+          (typeof raw.requestId === 'string' && raw.requestId.startsWith('mk-')))),
+    attach: (wire) => client.attach(wire as unknown as HandshakeWire),
+    takeReply: (reply) => client.takeReply(reply as RunReply),
+  };
 }
 
 /** The cipher of an explicit `crypto` option, resolved on first use. */
@@ -422,7 +384,7 @@ function explicitCipher(source: MessageCipherSource): () => Promise<MessageCiphe
 
 /**
  * What a plain transport opens sealed messages with: the mode it would resolve without
- * `insecure` / `crypto: false` (the app key, or crypto between apps), when it has one. So a process
+ * `insecure` / `crypto: false` (the app key, or the control plane's keys), when it has one. So a process
  * kept plain during a rolling upgrade still reads what upgraded processes send.
  */
 function fallbackOf(
@@ -462,7 +424,7 @@ export async function resolveMessageSealer(
   ctx: MessagesResolveContext,
   options: TransportMessagesOptions = {},
 ): Promise<MessageSealer> {
-  const inputs = await inputsOf(ctx.app, ctx.topology);
+  const inputs = await inputsOf(ctx.app, ctx.topology, ctx.tenant);
   const decided = decide(ctx.name, options, inputs);
   const log =
     ctx.log ??
@@ -585,24 +547,24 @@ function buildSealer(
         common,
       );
     case 'crypto': {
-      let source: CryptoSealerSource;
-      if (decided.auto) {
-        const runtime = inputs.runtime as CryptoRuntimeLike;
-        source = autoCryptoSource(runtime, inputs.topology, decided.label, hooks.log);
-        if (inputs.topology === 'tenant') void checkTenantKey(runtime, hooks.log);
-      } else {
-        const crypto = options.crypto as MessagesCryptoOptions;
-        const cipher = explicitCipher(crypto.cipher);
-        source = {
-          key: crypto.key ?? MESSAGES_CRYPTO_KEY,
-          label: decided.label,
-          owns: crypto.owns,
-          cipherFor: () => cipher(),
-          sealPartition: () => '',
-          accepts: (partition) => partition === '',
-        };
-      }
+      const crypto = options.crypto as MessagesCryptoOptions;
+      const cipher = explicitCipher(crypto.cipher);
+      const source: CryptoSealerSource = {
+        key: crypto.key ?? MESSAGES_CRYPTO_KEY,
+        label: decided.label,
+        owns: crypto.owns,
+        cipherFor: () => cipher(),
+        sealPartition: () => '',
+        accepts: (partition) => partition === '',
+      };
       return createMessageSealer({ mode: 'crypto', source }, common);
+    }
+    case 'tenant-key': {
+      const source =
+        decided.role === 'tenant'
+          ? tenantSource(inputs, decided.label, hooks.log)
+          : controlPlaneSource(inputs, options, decided.label, hooks.log);
+      return createMessageSealer({ mode: 'tenant-key', source }, common);
     }
   }
 }

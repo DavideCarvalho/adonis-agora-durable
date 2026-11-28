@@ -162,7 +162,7 @@ A [worker runtime](/docs/durable/cluster/thin-workers) that stops cleanly remove
 
 Every transport carries the same JSON `RemoteTask` (dispatch) and `StepResult` (reply). The task also carries an optional `transport` (the pool id it was dispatched on) and an optional `traceparent` (see [distributed tracing](/docs/durable/observability/otel#distributed-tracing-across-workers)). The JSON is the same everywhere, but the wire around it is not: only `bullmq` shares its queue names and job shapes with the NestJS and Python workers. The `queue` and `db` layouts are this package's own.
 
-With `messages: { seal: true }` every broker transport seals these messages: the data of a run is encrypted with a key derived from the app's `APP_KEY` (an `@adonis-agora/crypto` key between a tenant and its control plane), and only the routing fields stay in clear. See [Encrypting messages](/docs/durable/transports/encrypting-messages).
+With `messages: { seal: true }` every broker transport seals these messages: the data of a run is encrypted with a key derived from the app's `APP_KEY` (between tenant apps and their control plane, per-tenant keys the control plane owns), and only the routing fields stay in clear. See [Encrypting messages](/docs/durable/transports/encrypting-messages).
 
 Several engine instances can share one transport safely: an engine settles a result with a conditional write on the step's checkpoint that succeeds only while it is still `pending` (`settleCheckpointsIfPending` on the Lucid store), so a duplicate or redelivered result does nothing, and over one store only one engine's write lands.
 
