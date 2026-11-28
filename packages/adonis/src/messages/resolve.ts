@@ -14,16 +14,15 @@ import {
   type RejectionReporter,
 } from './sealer.js';
 import {
-  appKeyRoot,
   CONTROL_PLANE_KEYS_CRYPTO_KEY,
   type ControlPlaneRoot,
+  controlPlaneKeysPartition,
   cryptoHmacOf,
-  cryptoRoot,
-  ensureControlPlaneKey,
   grantKey,
   type HandshakeWire,
   isMessageKeyReplyId,
   isMessageKeyRequest,
+  lazyControlPlaneRoot,
   TenantKeyClient,
   usableKeyUrl,
 } from './tenant-keys.js';
@@ -252,7 +251,7 @@ function decide(
   return {
     mode: 'tenant-key',
     label: hmac
-      ? `control plane keys (crypto, key ${CONTROL_PLANE_KEYS_CRYPTO_KEY}, partition ${inputs.runtime?.partition})`
+      ? `control plane keys (crypto, key ${CONTROL_PLANE_KEYS_CRYPTO_KEY}, partition ${inputs.runtime ? controlPlaneKeysPartition(inputs.runtime) : ''})`
       : 'control plane keys (app key)',
     role: 'control-plane',
   };
@@ -306,25 +305,58 @@ function tenantPartitionOf(
 /** How many tenants' pending requests a control plane remembers the partition of. */
 const REPLY_MEMO = 10_000;
 
-/** The control plane's source: a key per tenant partition from its root (crypto, else APP_KEY). */
+/**
+ * One root per crypto runtime (and APP_KEY): the control plane's transports (each broker transport,
+ * `controlPlanes.redis`) share it, so the key is checked once and its warning logged once.
+ */
+const roots = new WeakMap<
+  CryptoRuntimeLike,
+  Map<AppKey | undefined, { root: ControlPlaneRoot; log?: Log | undefined }>
+>();
+
+type Log = (level: 'info' | 'warn', line: string) => void;
+
+/** The log of a sealer built only to open (a plain transport's fallback): never logs. */
+const QUIET: Log = () => undefined;
+
+function controlPlaneRootOf(
+  runtime: CryptoRuntimeLike | undefined,
+  appKey: AppKey | undefined,
+  log: Log,
+): ControlPlaneRoot {
+  if (!runtime) return lazyControlPlaneRoot({ runtime, appKey, log });
+  let byKey = roots.get(runtime);
+  if (!byKey) {
+    byKey = new Map();
+    roots.set(runtime, byKey);
+  }
+  let entry = byKey.get(appKey);
+  if (!entry) {
+    const created: { root?: ControlPlaneRoot; log?: Log | undefined } = {};
+    created.root = lazyControlPlaneRoot({
+      runtime,
+      appKey,
+      log: (level, line) => created.log?.(level, line),
+    });
+    entry = created as { root: ControlPlaneRoot; log?: Log | undefined };
+    byKey.set(appKey, entry);
+  }
+  // A transport that logs speaks for the shared root (an opener-only fallback does not).
+  if (log !== QUIET && entry.log === undefined) entry.log = log;
+  return entry.root;
+}
+
+/**
+ * The control plane's source: a key per tenant partition from its root (crypto, else APP_KEY),
+ * resolved on the first key request, never at boot.
+ */
 function controlPlaneSource(
   inputs: Inputs,
   options: TransportMessagesOptions,
   label: string,
   log: (level: 'info' | 'warn', line: string) => void,
 ): PartitionKeySource {
-  const runtime = inputs.runtime;
-  const hmac = runtime ? cryptoHmacOf(runtime) : undefined;
-  if (runtime && hmac) void ensureControlPlaneKey(runtime, log);
-  if (runtime && !hmac) {
-    log(
-      'warn',
-      `[${PACKAGE}] messages: @adonis-agora/crypto is booted here but offers no \`hmac\` (an older version): the tenants' message keys derive from this app's APP_KEY instead. Upgrade @adonis-agora/crypto to keep them in crypto. Docs: ${DOCS}`,
-    );
-  }
-  const root: ControlPlaneRoot = hmac
-    ? cryptoRoot(hmac)
-    : appKeyRoot((options.appKey ?? inputs.appKey) as AppKey);
+  const root = controlPlaneRootOf(inputs.runtime, options.appKey ?? inputs.appKey, log);
   const replies = new Map<string, string>();
   return {
     label,
@@ -425,7 +457,7 @@ function fallbackOf(
       acceptPlain: true,
       report: hooks.report,
       onPlain: () => undefined,
-      log: () => undefined,
+      log: QUIET,
     });
   } catch {
     return undefined;

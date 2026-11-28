@@ -30,6 +30,7 @@ import type { RunReply, RunRequest } from '../interfaces.js';
  */
 
 const PACKAGE = '@adonis-agora/durable';
+const DOCS = 'https://davidecarvalho.github.io/agora/docs/durable/transports/encrypting-messages';
 
 /** The `@adonis-agora/crypto` key (HMAC-SHA256) the control plane derives its tenants' keys from. */
 export const CONTROL_PLANE_KEYS_CRYPTO_KEY = 'durable-message-keys';
@@ -95,7 +96,25 @@ export function appKeyRoot(appKey: AppKey): ControlPlaneRoot {
 
 type Hmac = (message: string) => Promise<string>;
 
-/** The `hmac` of `@adonis-agora/crypto` on the control plane's own partition, if crypto offers it. */
+/**
+ * The crypto partition `durable-message-keys` lives in when this app runs the crypto server as a
+ * control plane. Such a crypto control plane has no app of its own (its runtime's partition is `''`,
+ * which every crypto operation refuses: "the token names no partition"), so durable names one, the
+ * way the console sides name the app partition of a `console-<lib>` key. The leading `_` keeps it
+ * out of reach of every tenant: an authkit partition starts with a letter or a digit, so no tenant
+ * token (and its `crypto:*` over its own partition) can ever address this one.
+ */
+export const CONTROL_PLANE_KEYS_PARTITION = '_durable';
+
+/**
+ * The partition the control plane's key is used in: crypto's own partition when it has one (a
+ * standalone crypto app, or a crypto tenant: its token's partition), else {@link CONTROL_PLANE_KEYS_PARTITION}.
+ */
+export function controlPlaneKeysPartition(runtime: Pick<CryptoRuntimeLike, 'partition'>): string {
+  return runtime.partition !== '' ? runtime.partition : CONTROL_PLANE_KEYS_PARTITION;
+}
+
+/** The `hmac` of `@adonis-agora/crypto` on the control plane's keys partition, if crypto offers it. */
 export function cryptoHmacOf(runtime: CryptoRuntimeLike): Hmac | undefined {
   const service = runtime.service as
     | (NonNullable<CryptoRuntimeLike['service']> & {
@@ -107,7 +126,7 @@ export function cryptoHmacOf(runtime: CryptoRuntimeLike): Hmac | undefined {
     | undefined;
   if (typeof service?.hmac === 'function') {
     const principal = {
-      partition: runtime.partition,
+      partition: controlPlaneKeysPartition(runtime),
       capabilities: [`crypto:hmac:${CONTROL_PLANE_KEYS_CRYPTO_KEY}`],
       actor: 'durable:messages',
     };
@@ -187,48 +206,151 @@ export function cryptoRoot(hmac: Hmac, clock: () => number = () => Date.now()): 
   };
 }
 
-/** On a control plane with crypto: is `durable-message-keys` there? Creates it, or says how. */
+const errorText = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
+
+/**
+ * On a control plane with crypto: makes sure `durable-message-keys` exists in
+ * {@link controlPlaneKeysPartition}, creating it when missing. Never throws: returns why it could not,
+ * or `undefined` when the key is there (or was just created, logged once at info).
+ */
 export async function ensureControlPlaneKey(
   runtime: CryptoRuntimeLike,
   log: (level: 'info' | 'warn', line: string) => void,
-): Promise<void> {
+): Promise<string | undefined> {
   const key = CONTROL_PLANE_KEYS_CRYPTO_KEY;
-  const where = `partition ${runtime.partition}`;
-  const how = `create it on the crypto server: \`node ace crypto:keys:create ${key} --type hmac-sha256 --application ${runtime.partition}\`, and grant this app's crypto client \`crypto:hmac:${key}\``;
+  const partition = controlPlaneKeysPartition(runtime);
+  const description = `${PACKAGE}: derives the message keys of the control plane's tenants`;
+  const created = () =>
+    log('info', `[${PACKAGE}] messages: created the crypto key "${key}" in partition ${partition}`);
   try {
     const service = runtime.service;
     if (service) {
-      if (await service.store.getKey(runtime.partition, key)) return;
-      await service.createKey(
-        {
-          partition: runtime.partition,
-          capabilities: [`crypto:keys:manage:${key}`],
-          actor: 'durable:messages',
-        },
-        {
-          name: key,
-          type: 'hmac-sha256',
-          description: `${PACKAGE}: derives the message keys of the control plane's tenants`,
-        },
-      );
-      log('info', `[${PACKAGE}] messages: created the crypto key "${key}" in ${where}`);
-      return;
+      if (await service.store.getKey(partition, key)) return undefined;
+      try {
+        await service.createKey(
+          { partition, capabilities: [`crypto:keys:manage:${key}`], actor: 'durable:messages' },
+          { name: key, type: 'hmac-sha256', description },
+        );
+      } catch (error) {
+        // Created meanwhile by another replica: what was wanted.
+        if (await service.store.getKey(partition, key)) return undefined;
+        throw error;
+      }
+      created();
+      return undefined;
     }
     const operations = runtime.operations;
-    if (typeof operations.hasKey === 'function' && (await operations.hasKey({ key }))) return;
+    if (typeof operations.hasKey === 'function' && (await operations.hasKey({ key }))) {
+      return undefined;
+    }
     if (typeof operations.createKey !== 'function') throw new Error('no createKey');
-    await operations.createKey({
-      name: key,
-      type: 'hmac-sha256',
-      description: `${PACKAGE}: derives the message keys of the control plane's tenants`,
-    });
-    log('info', `[${PACKAGE}] messages: created the crypto key "${key}" in ${where}`);
+    await operations.createKey({ name: key, type: 'hmac-sha256', description });
+    created();
+    return undefined;
   } catch (error) {
-    log(
-      'warn',
-      `[${PACKAGE}] messages: could not make sure the crypto key "${key}" exists in ${where} (${error instanceof Error ? error.message : String(error)}); ${how}`,
-    );
+    return errorText(error);
   }
+}
+
+/** The one actionable line when the control plane falls back to its APP_KEY. */
+export function controlPlaneKeyFallbackLine(
+  runtime: Pick<CryptoRuntimeLike, 'partition' | 'service'>,
+  reason: string,
+  fallback: 'app key' | 'none',
+): string {
+  const key = CONTROL_PLANE_KEYS_CRYPTO_KEY;
+  const partition = controlPlaneKeysPartition(runtime);
+  const create = `\`node ace crypto:keys:create ${key} --type hmac-sha256 --application ${partition}\``;
+  const fix = runtime.service
+    ? `create it: ${create}`
+    : `create it on the crypto server (${create}) and grant this app's crypto client \`crypto:hmac:${key}\` (or \`crypto:keys:manage:${key}\` so it creates it)`;
+  const then =
+    fallback === 'app key'
+      ? "so this process derives its tenants' message keys from its APP_KEY (HKDF) instead. Every replica of the control plane must derive them the same way: "
+      : 'and this app has no APP_KEY to fall back to, so sealed messages to and from its tenants fail. ';
+  return `[${PACKAGE}] messages: the control plane cannot use the crypto key "${key}" in partition ${partition} (${reason}), ${then}${fix}, then restart. Docs: ${DOCS}`;
+}
+
+/**
+ * The control plane's root, resolved on the FIRST key request (a seal, an open, a tenant asking for
+ * its key), never at boot: with sealing off and no tenant asking, crypto is never called. Then:
+ * crypto's `durable-message-keys` (created when missing) when it answers, else HKDF over `APP_KEY`
+ * with one warning. The choice holds for the life of the process (a root that changed under running
+ * tenants would change every kid); a failure without an `APP_KEY` is retried on the next request.
+ */
+export function lazyControlPlaneRoot(input: {
+  runtime: CryptoRuntimeLike | undefined;
+  appKey: AppKey | undefined;
+  log: (level: 'info' | 'warn', line: string) => void;
+}): ControlPlaneRoot {
+  const { runtime, appKey, log } = input;
+  const hmac = runtime ? cryptoHmacOf(runtime) : undefined;
+  if (!runtime || !hmac) {
+    const fallback = appKeyRoot(appKey as AppKey);
+    if (!runtime) return fallback;
+    // Crypto too old to HMAC: said on first use, like the rest.
+    let warned = false;
+    const warnOnce = () => {
+      if (warned) return;
+      warned = true;
+      log(
+        'warn',
+        `[${PACKAGE}] messages: @adonis-agora/crypto is booted here but offers no \`hmac\` (an older version): the tenants' message keys derive from this app's APP_KEY instead. Upgrade @adonis-agora/crypto to keep them in crypto. Docs: ${DOCS}`,
+      );
+    };
+    return {
+      label: fallback.label,
+      kid: async () => {
+        warnOnce();
+        return fallback.kid();
+      },
+      current: async (partition) => {
+        warnOnce();
+        return fallback.current(partition);
+      },
+      byKid: async (partition, kid) => {
+        warnOnce();
+        return fallback.byKid(partition, kid);
+      },
+    };
+  }
+  const crypto = cryptoRoot(hmac);
+  let resolving: Promise<ControlPlaneRoot> | undefined;
+  let lastLine: string | undefined;
+  const resolve = (): Promise<ControlPlaneRoot> => {
+    if (!resolving) {
+      resolving = (async () => {
+        const missing = await ensureControlPlaneKey(runtime, log);
+        let reason = missing;
+        try {
+          await crypto.kid();
+          return crypto;
+        } catch (error) {
+          reason ??= errorText(error);
+        }
+        const line = controlPlaneKeyFallbackLine(
+          runtime,
+          reason,
+          appKey === undefined ? 'none' : 'app key',
+        );
+        if (line !== lastLine) log('warn', line);
+        lastLine = line;
+        if (appKey === undefined) throw new Error(line);
+        return appKeyRoot(appKey);
+      })();
+      resolving.catch(() => {
+        resolving = undefined;
+      });
+    }
+    return resolving;
+  };
+  return {
+    label: crypto.label,
+    kid: async () => (await resolve()).kid(),
+    current: async (partition) => (await resolve()).current(partition),
+    byKid: async (partition, kid) => (await resolve()).byKid(partition, kid),
+  };
 }
 
 /* ------------------------------------------------------------------------------------------- */

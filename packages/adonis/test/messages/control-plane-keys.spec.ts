@@ -57,19 +57,24 @@ function appWith(options: { topology: string; appKey?: string; runtime?: unknown
   };
 }
 
-type CpVariant = 'app key' | 'crypto embedded' | 'crypto separate';
+type CpVariant = 'app key' | 'crypto embedded' | 'crypto control plane' | 'crypto separate';
 
 async function controlPlaneSealer(variant: CpVariant, server = new FakeCryptoServer()) {
   const lines: string[] = [];
   const runtime =
     variant === 'crypto embedded'
       ? server.runtime('hub', { embedded: true })
-      : variant === 'crypto separate'
-        ? server.runtime('hub', {
-            grants: ['crypto:hmac:durable-message-keys', 'crypto:keys:manage:durable-message-keys'],
-            hasKey: 'yes',
-          })
-        : undefined;
+      : variant === 'crypto control plane'
+        ? server.controlPlane()
+        : variant === 'crypto separate'
+          ? server.runtime('hub', {
+              grants: [
+                'crypto:hmac:durable-message-keys',
+                'crypto:keys:manage:durable-message-keys',
+              ],
+              hasKey: 'yes',
+            })
+          : undefined;
   const sealer = await resolveMessageSealer(
     {
       app: appWith({ topology: 'control-plane', appKey: CP_KEY, runtime }) as never,
@@ -78,8 +83,6 @@ async function controlPlaneSealer(variant: CpVariant, server = new FakeCryptoSer
     },
     {},
   );
-  // The boot check creates the crypto key.
-  await new Promise((r) => setTimeout(r, 20));
   return { sealer, lines, server };
 }
 
@@ -214,7 +217,12 @@ describe.skipIf(!REDIS_URL)('two apps through the durable control plane, over Bu
     }
   }
 
-  for (const variant of ['app key', 'crypto embedded', 'crypto separate'] as const) {
+  for (const variant of [
+    'app key',
+    'crypto embedded',
+    'crypto control plane',
+    'crypto separate',
+  ] as const) {
     it(`${variant}: app A starts a workflow whose step runs on app B; nothing readable on Redis`, async () => {
       const prefix = `dmsg-cpk-${randomUUID().slice(0, 8)}`;
       const redis = await raw();
@@ -224,10 +232,15 @@ describe.skipIf(!REDIS_URL)('two apps through the durable control plane, over Bu
       await sub.psubscribe(`${prefix}*`);
 
       const cp = await controlPlaneSealer(variant);
+      // The key's partition: crypto's own, or `_durable` on a crypto control plane (no app of its own).
+      const keysPartition = variant === 'crypto control plane' ? '_durable' : 'hub';
       if (variant !== 'app key') {
-        expect(cp.server.hasKey('hub', 'durable-message-keys')).toBe(true);
+        // Nothing is asked of crypto at boot: the key is checked on the first key request.
+        expect(cp.server.audit).toEqual([]);
         expect(cp.lines.join('\n')).toMatch(
-          /control plane keys \(crypto, key durable-message-keys/,
+          new RegExp(
+            `control plane keys \\(crypto, key durable-message-keys, partition ${keysPartition}\\)`,
+          ),
         );
       } else {
         expect(cp.lines.join('\n')).toMatch(/control plane keys \(app key\)/);
@@ -299,6 +312,10 @@ describe.skipIf(!REDIS_URL)('two apps through the durable control plane, over Bu
       expect(acme.lines.join('\n')).toMatch(
         /control plane key \(partition acme, asked over the broker\)/,
       );
+      if (variant !== 'app key') {
+        expect(cp.server.hasKey(keysPartition, 'durable-message-keys')).toBe(true);
+        expect(cp.lines.filter((l) => l.startsWith('warn:'))).toEqual([]);
+      }
     });
   }
 

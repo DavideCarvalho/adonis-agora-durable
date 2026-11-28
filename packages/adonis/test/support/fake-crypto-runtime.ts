@@ -42,10 +42,16 @@ export class FakeCryptoServer {
     this.createKeyIn(partition, name);
   }
 
+  /** Like crypto's service: a principal without a partition (a control plane's own) is refused. */
+  #assertPartition(principal: CryptoPrincipalLike): void {
+    if (principal.partition === '') throw new Error('crypto: the token names no partition');
+  }
+
   hmacFor(
     principal: CryptoPrincipalLike,
     input: { key: string; message: string },
   ): { key: string; hmac: string } {
+    this.#assertPartition(principal);
     if (!holds(principal.capabilities, `crypto:hmac:${input.key}`)) {
       throw new Error(`forbidden: crypto:hmac:${input.key}`);
     }
@@ -72,6 +78,7 @@ export class FakeCryptoServer {
     encrypt: async (principal, input) => this.#encrypt(principal, input, 'encrypt'),
     decrypt: async (principal, input) => this.#decrypt(principal, input),
     createKey: async (principal, input) => {
+      this.#assertPartition(principal);
       if (!holds(principal.capabilities, `crypto:keys:manage:${input.name}`)) {
         throw new Error(`forbidden: crypto:keys:manage:${input.name}`);
       }
@@ -97,6 +104,7 @@ export class FakeCryptoServer {
     input: { key: string; plaintext: string; aad?: string },
     capability: 'encrypt' | 'seal',
   ): { ciphertext: string } {
+    this.#assertPartition(principal);
     if (!holds(principal.capabilities, `crypto:${capability}:${input.key}`)) {
       throw new Error(`forbidden: crypto:${capability}:${input.key}`);
     }
@@ -119,6 +127,7 @@ export class FakeCryptoServer {
     principal: CryptoPrincipalLike,
     input: { key: string; ciphertext: string; aad?: string },
   ): { plaintext: string } {
+    this.#assertPartition(principal);
     // §2e.A: an app opens its own `console-*` keys with no grant (never another partition's).
     const ownConsoleKey = input.key.startsWith('console-');
     if (!ownConsoleKey && !holds(principal.capabilities, `crypto:decrypt:${input.key}`)) {
@@ -140,6 +149,14 @@ export class FakeCryptoServer {
       actor: principal.actor,
     });
     return { plaintext: plaintext.toString('utf8') };
+  }
+
+  /**
+   * What crypto binds on `topology: 'control-plane'`: the server embedded (`service`), and no app of
+   * its own (partition `''`, refused by every operation).
+   */
+  controlPlane(): CryptoRuntimeLike {
+    return { ...this.runtime('', { embedded: true }), topology: 'control-plane' };
   }
 
   /**
