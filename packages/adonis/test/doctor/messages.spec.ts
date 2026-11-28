@@ -21,6 +21,7 @@ describe('durable.messages doctor check', () => {
       fakeApp({
         'app.appKey': 'an-app-key-0123456789abcdef',
         durable: {
+          messages: { seal: true },
           transports: {
             bullmq: transports.bullmq({ connection: 'main', messages: { acceptPlain: false } }),
             jobs: transports.queue(),
@@ -49,6 +50,20 @@ describe('durable.messages doctor check', () => {
         message: expect.stringContaining('control plane messages: secret, accepting plain'),
       }),
     ]);
+  });
+
+  it('warns while sealing is off (the 1.x default) and names the switch', async () => {
+    const [result] = await checkMessages(
+      fakeApp({
+        'app.appKey': 'an-app-key-0123456789abcdef',
+        durable: { transports: { bullmq: transports.bullmq({ connection: 'main' }) } },
+      }),
+    );
+    expect(result).toMatchObject({
+      status: 'warn',
+      message: 'bullmq messages: sent plain; sealed ones are opened (app key (auto)).',
+      fix: expect.stringContaining('messages: { seal: true }'),
+    });
   });
 
   it('names the fix without a key, and errors on conflicting modes', async () => {

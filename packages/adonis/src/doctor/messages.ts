@@ -57,11 +57,20 @@ export async function checkMessages(app: ApplicationService): Promise<AgoraDocto
       });
       continue;
     }
-    if (options.acceptPlain !== false) {
+    if (!mode.sealing) {
       results.push({
         status: 'warn',
-        message: `${name} messages: ${mode.label}, accepting plain messages too (the 1.x default, for jobs queued before the upgrade).`,
-        fix: `Once every process runs this version and the queues hold no older jobs, set \`messages: { acceptPlain: false }\` on the ${name} transport (the default of the next major).`,
+        message: `${name} messages: sent plain; sealed ones are opened (${mode.label}).`,
+        fix: 'Once every process runs @adonis-agora/durable 1.2.1 or later, set `messages: { seal: true }` in config/durable.ts (or on this transport). It becomes the default in the next major.',
+        docs: DOCS,
+      });
+      continue;
+    }
+    if (mode.acceptPlain) {
+      results.push({
+        status: 'warn',
+        message: `${name} messages: ${mode.label}, accepting plain messages too (the 1.x default, for jobs queued before sealing was turned on).`,
+        fix: `Once the queues hold no job from before sealing was turned on, set \`messages: { acceptPlain: false }\` on the ${name} transport (the default of the next major).`,
         docs: DOCS,
       });
       continue;

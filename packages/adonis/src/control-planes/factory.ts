@@ -63,8 +63,8 @@ export interface RedisControlPlaneConfig extends ConsoleSideOptions {
   pingIntervalMs?: number | false;
   /**
    * How control messages (engine events, cancels, schedule pauses) are sealed: the same options as a
-   * transport's `messages` (see "Encrypting messages"). Nothing set: encrypted with a key derived
-   * from the app's `APP_KEY`. The console channel (`secret` / `crypto` / `token` above) is separate.
+   * transport's `messages` (see "Encrypting messages"). `seal: true` (or the top-level
+   * `messages.seal`) encrypts them with a key derived from the app's `APP_KEY`. The console channel (`secret` / `crypto` / `token` above) is separate.
    */
   messages?: TransportMessagesOptions;
 }

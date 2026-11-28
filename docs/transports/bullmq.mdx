@@ -344,7 +344,7 @@ The same transport also carries:
 | Option | Default | Description |
 | --- | --- | --- |
 | `connection` | — (required) | ioredis `ConnectionOptions`, a connection string, or a `Redis` instance. See [Connection](#connection). |
-| `messages` | sealed with the app key | How this transport seals its messages: `secret`, `crypto: { cipher }`, `crypto: false`, `insecure`, `acceptPlain`. See [Encrypting messages](/docs/durable/transports/encrypting-messages). |
+| `messages` | sent plain, sealed opened | How this transport seals its messages: `secret`, `crypto: { cipher }`, `crypto: false`, `insecure`, `acceptPlain`. See [Encrypting messages](/docs/durable/transports/encrypting-messages). |
 | `concurrency` | `1` | Task-queue concurrency: a number, `'adaptive'`, or `{ mode: 'adaptive', ... }`. See [Concurrency](#concurrency). |
 | `resultConcurrency` | `512` | How many step results this instance holds at once; never fewer than 512. See [Result concurrency](#result-concurrency). |
 | `prefix` | `'durable'` | Root of every queue, channel and key name. |

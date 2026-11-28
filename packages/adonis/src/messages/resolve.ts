@@ -30,10 +30,18 @@ export interface MessagesCryptoOptions {
 
 /**
  * How one transport (or the control plane) seals its messages: the same options as the other Agora
- * libs' channels. Nothing set: sealed automatically (the app's `APP_KEY`; `@adonis-agora/crypto`
- * between a tenant and its control plane).
+ * libs' channels. Keys are found automatically (the app's
+ * `APP_KEY`; `@adonis-agora/crypto` between a tenant and its control plane); sending sealed is
+ * `seal: true` (off by default in 1.x).
  */
 export interface TransportMessagesOptions {
+  /**
+   * Seal what this transport sends. Default: the top-level `messages.seal` of `config/durable.ts`,
+   * else `false` in 1.x: sent plain, so processes on 1.1 and earlier still read them, while sealed
+   * messages are always opened (with the mode below). Turn it on once every process runs 1.2.1 or
+   * later; it becomes the default in the next major.
+   */
+  seal?: boolean | undefined;
   /** Shared secret (16+ characters), the same in every process: HMAC-SHA256, readable on the broker. */
   secret?: MessageSecret | undefined;
   /**
@@ -44,9 +52,9 @@ export interface TransportMessagesOptions {
   /** Plain messages on this transport (local development; the wire of earlier versions). */
   insecure?: boolean | undefined;
   /**
-   * Accept plain messages (jobs queued before this version, processes not upgraded yet). Default
-   * `true` in 1.x, logged once per process and kind; `false` refuses them (the default of the next
-   * major).
+   * With `seal: true`: accept plain messages too (jobs queued before sealing was turned on).
+   * Default `true` in 1.x, logged once per process and kind; `false` refuses them. Without
+   * `seal: true` plain messages are always accepted (the other processes send plain too).
    */
   acceptPlain?: boolean | undefined;
   /**
@@ -99,6 +107,9 @@ export function noKeyHint(topology: string, cryptoWithoutService = false): strin
 /** What {@link resolveMessageSealer} needs besides the options, read from the app. */
 interface Inputs {
   topology: string;
+  /** The top-level `messages` of `config/durable.ts`. */
+  seal?: boolean | undefined;
+  acceptPlain?: boolean | undefined;
   appKey: AppKey | undefined;
   runtime: CryptoRuntimeLike | undefined;
 }
@@ -118,7 +129,10 @@ async function inputsOf(app: AppLike | undefined, topology?: string): Promise<In
   } catch {
     runtime = undefined;
   }
+  const top = durable?.messages as { seal?: unknown; acceptPlain?: unknown } | undefined;
   return {
+    seal: typeof top?.seal === 'boolean' ? top.seal : undefined,
+    acceptPlain: typeof top?.acceptPlain === 'boolean' ? top.acceptPlain : undefined,
     topology: topology ?? (typeof durable?.topology === 'string' ? durable.topology : 'standalone'),
     appKey: await appKeyOf(app),
     runtime,
@@ -192,9 +206,17 @@ export async function describeMessagesMode(
   name: string,
   options: TransportMessagesOptions = {},
   topology?: string,
-): Promise<ResolvedMessagesMode | { error: string }> {
+): Promise<
+  (ResolvedMessagesMode & { sealing: boolean; acceptPlain: boolean }) | { error: string }
+> {
   try {
-    return decide(name, options, await inputsOf(app, topology));
+    const inputs = await inputsOf(app, topology);
+    const decided = decide(name, options, inputs);
+    return {
+      ...decided,
+      sealing: decided.mode !== 'plain' && sealingOf(options, inputs),
+      acceptPlain: options.acceptPlain ?? inputs.acceptPlain ?? true,
+    };
   } catch (error) {
     return { error: error instanceof Error ? error.message : String(error) };
   }
@@ -443,26 +465,83 @@ export async function resolveMessageSealer(
     ((level: 'info' | 'warn', line: string) =>
       level === 'warn' ? console.warn(line) : console.info(line));
   const report = onceReporter(ctx.name, (line) => log('warn', line));
-  const acceptPlain = options.acceptPlain ?? true;
   const plainSeen = plainNotice(ctx.name, (line) => log('warn', line));
-  const sealer = buildSealer(decided, options, inputs, {
-    acceptPlain,
+  const { sealer, sealing, acceptPlain } = withSealing(decided, options, inputs, {
     report,
     onPlain: plainSeen,
     log,
   });
   const line = `[${PACKAGE}] ${ctx.name} messages: ${decided.label}`;
+  const asked = sealingOf(options, inputs);
   if (decided.mode === 'plain') {
+    // Plain because nothing seals: only worth a warning when sealing was asked for (or turned off by
+    // hand); the 1.x default sends plain anyway.
+    if (asked || decided.why !== 'no-key') {
+      log(
+        'warn',
+        decided.why === 'no-key'
+          ? `${line}: not sealed; ${decided.hint}. Docs: ${DOCS}`
+          : `${line}: not sealed (anyone who can write to the broker can inject messages). Docs: ${DOCS}`,
+      );
+    }
+  } else if (!sealing) {
     log(
-      'warn',
-      decided.why === 'no-key'
-        ? `${line}: not sealed; ${decided.hint}. Docs: ${DOCS}`
-        : `${line}: not sealed (anyone who can write to the broker can inject messages). Docs: ${DOCS}`,
+      'info',
+      `[${PACKAGE}] ${ctx.name} messages: sent plain, sealed ones opened with ${decided.label}. Once every process runs 1.2.1 or later, turn sealing on: \`messages: { seal: true }\` in config/durable.ts. Docs: ${DOCS}`,
     );
   } else {
     log('info', acceptPlain ? line : `${line}, plain messages refused`);
   }
   return sealer;
+}
+
+/** Whether a transport seals what it sends: its own `seal`, else the top-level one, else off. */
+function sealingOf(options: TransportMessagesOptions, inputs: Inputs): boolean {
+  return options.seal ?? inputs.seal ?? false;
+}
+
+/**
+ * The sealer for `decided`, sending sealed only when sealing is on. Off (the 1.x default), it sends
+ * plain and opens sealed messages with the resolved mode, and accepts every plain message.
+ */
+function withSealing(
+  decided: ResolvedMessagesMode,
+  options: TransportMessagesOptions,
+  inputs: Inputs,
+  hooks: {
+    report: RejectionReporter;
+    onPlain: (kind: MessageKind) => void;
+    log: (level: 'info' | 'warn', line: string) => void;
+  },
+): { sealer: MessageSealer; sealing: boolean; acceptPlain: boolean } {
+  const acceptPlain = options.acceptPlain ?? inputs.acceptPlain ?? true;
+  if (decided.mode === 'plain') {
+    return {
+      sealer: buildSealer(decided, options, inputs, { ...hooks, acceptPlain: true }),
+      sealing: false,
+      acceptPlain: true,
+    };
+  }
+  if (sealingOf(options, inputs)) {
+    return {
+      sealer: buildSealer(decided, options, inputs, { ...hooks, acceptPlain }),
+      sealing: true,
+      acceptPlain,
+    };
+  }
+  const opener = buildSealer(decided, options, inputs, {
+    ...hooks,
+    acceptPlain: true,
+    onPlain: () => undefined,
+  });
+  return {
+    sealer: createMessageSealer(
+      { mode: 'plain', label: `plain (opens ${decided.label})`, fallback: opener },
+      { report: hooks.report },
+    ),
+    sealing: false,
+    acceptPlain: true,
+  };
 }
 
 function buildSealer(
@@ -527,7 +606,7 @@ function plainNotice(name: string, warn: (line: string) => void): (kind: Message
     if (seen.has(kind)) return;
     seen.add(kind);
     warn(
-      `[${PACKAGE}] ${name} messages: accepted a plain ${kind} message (queued before this version, or sent by a process not upgraded yet). Plain messages are refused by default from the next major; set \`messages: { acceptPlain: false }\` on the transport to refuse them now. Docs: ${DOCS}`,
+      `[${PACKAGE}] ${name} messages: accepted a plain ${kind} message (queued before this version, or sent by a process not upgraded yet). Set \`messages: { acceptPlain: false }\` to refuse them once none is left (the default of the next major). Docs: ${DOCS}`,
     );
   };
 }
@@ -551,10 +630,9 @@ export function sealerOf(
   };
   const decided = decide(name, options, inputs);
   const warn = (line: string) => console.warn(line);
-  return buildSealer(decided, options, inputs, {
-    acceptPlain: options.acceptPlain ?? true,
+  return withSealing(decided, options, inputs, {
     report: onceReporter(name, warn),
     onPlain: plainNotice(name, warn),
     log: (level, line) => (level === 'warn' ? console.warn(line) : console.info(line)),
-  });
+  }).sealer;
 }

@@ -14,7 +14,7 @@ license: MIT
 metadata:
   type: core
   library: "@adonis-agora/durable"
-  library_version: "1.1.1"
+  library_version: "1.2.0"
   framework: adonisjs
 sources:
   - 'DavideCarvalho/adonis-durable:docs/getting-started.mdx'

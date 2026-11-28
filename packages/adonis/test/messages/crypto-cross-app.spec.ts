@@ -22,7 +22,12 @@ const TENANT_GRANTS = [
   'crypto:keys:manage:durable-messages',
 ];
 
-function appWith(options: { topology: string; runtime?: unknown; appKey?: string }): unknown {
+function appWith(options: {
+  topology: string;
+  runtime?: unknown;
+  appKey?: string;
+  seal?: boolean;
+}): unknown {
   return {
     container: {
       hasBinding: (b: string) => b === 'agora.crypto' && options.runtime !== undefined,
@@ -31,7 +36,7 @@ function appWith(options: { topology: string; runtime?: unknown; appKey?: string
     config: {
       get: (key: string) =>
         key === 'durable'
-          ? { topology: options.topology }
+          ? { topology: options.topology, messages: { seal: options.seal ?? true } }
           : key === 'app.appKey'
             ? options.appKey
             : undefined,

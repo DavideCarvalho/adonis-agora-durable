@@ -233,7 +233,7 @@ importers:
         version: 1.0.0(9895aa4a33e828b344d4d49ece7534d3)
       '@adonis-agora/diagnostics':
         specifier: 1.0.0
-        version: 1.0.0(372854eda74147ceeb0e89d5c36d433a)
+        version: 1.0.0(a404d99755496744048319b7420fcf46)
       '@adonis-agora/durable-dashboard':
         specifier: workspace:*
         version: link:../dashboard
@@ -288,6 +288,9 @@ importers:
       cron-parser:
         specifier: 5.10.6
         version: 5.10.6
+      durable-1-1-1:
+        specifier: npm:@adonis-agora/durable@1.1.1
+        version: '@adonis-agora/durable@1.1.1(b581ce28c4f1af5bd8ba50364eca920d)'
       ioredis:
         specifier: 6.1.0
         version: 6.1.0(supports-color@10.2.2)
@@ -475,6 +478,43 @@ packages:
       '@opentelemetry/api':
         optional: true
       ioredis:
+        optional: true
+
+  '@adonis-agora/durable@1.1.1':
+    resolution: {integrity: sha512-sDues0jCHwcfLIE9Sf4/Htwb/2mk8brmNTPP6qzxSfpfXynaQptLi7O4vClycirJpJeLwmYHmyLnn+UOylbNHw==}
+    engines: {node: '>=24'}
+    peerDependencies:
+      '@adonis-agora/diagnostics': '>=1.0.0 <2.0.0'
+      '@adonisjs/assembler': ^8.4.0
+      '@adonisjs/core': ^7.3.0
+      '@adonisjs/lucid': ^22.4.0
+      '@adonisjs/queue': ^0.6.0 || ^0.7.0
+      '@adonisjs/redis': ^9.2.0 || ^10.0.0 || ^11.0.0
+      '@opentelemetry/api': ^1.0.0
+      bullmq: ^5.0.0 || ^6.0.0
+      cron-parser: ^5.0.0
+      ioredis: ^5.0.0 || ^6.0.0
+      vitest: ^3.0.0 || ^4.0.0 || ^5.0.0
+    peerDependenciesMeta:
+      '@adonis-agora/diagnostics':
+        optional: true
+      '@adonisjs/assembler':
+        optional: true
+      '@adonisjs/lucid':
+        optional: true
+      '@adonisjs/queue':
+        optional: true
+      '@adonisjs/redis':
+        optional: true
+      '@opentelemetry/api':
+        optional: true
+      bullmq:
+        optional: true
+      cron-parser:
+        optional: true
+      ioredis:
+        optional: true
+      vitest:
         optional: true
 
   '@adonis-agora/filter-client@1.0.0':
@@ -4433,14 +4473,31 @@ snapshots:
 
   '@adonis-agora/authkit-core@1.0.0': {}
 
-  '@adonis-agora/diagnostics@1.0.0(372854eda74147ceeb0e89d5c36d433a)':
+  '@adonis-agora/diagnostics@1.0.0(a404d99755496744048319b7420fcf46)':
     dependencies:
       '@adonisjs/core': 7.7.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1)
     optionalDependencies:
+      '@adonis-agora/durable': 1.1.1(b581ce28c4f1af5bd8ba50364eca920d)
       '@adonisjs/queue': 0.7.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(@adonisjs/core@7.7.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(@adonisjs/lucid@22.5.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(@adonisjs/core@7.7.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.2.0)(luxon@3.7.2)(mysql2@3.24.6(@types/node@26.6.7))(pg@8.23.1)(supports-color@10.2.2))(@adonisjs/redis@11.0.0(@adonisjs/core@7.7.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(supports-color@10.2.2))(@opentelemetry/api@1.10.0)(ioredis@6.1.0(supports-color@10.2.2))(knex@3.3.0(better-sqlite3@13.2.0)(mysql2@3.24.6(@types/node@26.6.7))(pg@8.23.1)(supports-color@10.2.2))
       '@adonisjs/redis': 11.0.0(@adonisjs/core@7.7.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(supports-color@10.2.2)
       '@opentelemetry/api': 1.10.0
       ioredis: 6.1.0(supports-color@10.2.2)
+
+  '@adonis-agora/durable@1.1.1(b581ce28c4f1af5bd8ba50364eca920d)':
+    dependencies:
+      '@adonis-agora/filter': 1.0.0(@adonisjs/core@7.7.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(@adonisjs/lucid@22.5.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(@adonisjs/core@7.7.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.2.0)(luxon@3.7.2)(mysql2@3.24.6(@types/node@26.6.7))(pg@8.23.1)(supports-color@10.2.2))
+      '@adonisjs/core': 7.7.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1)
+    optionalDependencies:
+      '@adonis-agora/diagnostics': 1.0.0(a404d99755496744048319b7420fcf46)
+      '@adonisjs/assembler': 8.6.0(typescript@7.0.2)
+      '@adonisjs/lucid': 22.5.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(@adonisjs/core@7.7.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.2.0)(luxon@3.7.2)(mysql2@3.24.6(@types/node@26.6.7))(pg@8.23.1)(supports-color@10.2.2)
+      '@adonisjs/queue': 0.7.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(@adonisjs/core@7.7.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(@adonisjs/lucid@22.5.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(@adonisjs/core@7.7.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(better-sqlite3@13.2.0)(luxon@3.7.2)(mysql2@3.24.6(@types/node@26.6.7))(pg@8.23.1)(supports-color@10.2.2))(@adonisjs/redis@11.0.0(@adonisjs/core@7.7.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(supports-color@10.2.2))(@opentelemetry/api@1.10.0)(ioredis@6.1.0(supports-color@10.2.2))(knex@3.3.0(better-sqlite3@13.2.0)(mysql2@3.24.6(@types/node@26.6.7))(pg@8.23.1)(supports-color@10.2.2))
+      '@adonisjs/redis': 11.0.0(@adonisjs/core@7.7.0(@adonisjs/assembler@8.6.0(typescript@7.0.2))(supports-color@10.2.2)(youch@4.1.1))(supports-color@10.2.2)
+      '@opentelemetry/api': 1.10.0
+      bullmq: 6.7.8(ioredis@6.1.0(supports-color@10.2.2))(pg@8.23.1)
+      cron-parser: 5.10.6
+      ioredis: 6.1.0(supports-color@10.2.2)
+      vitest: 5.1.1(@opentelemetry/api@1.10.0)(@types/node@26.6.7)(happy-dom@21.0.4)(jsdom@31.0.1)(vite@8.3.8(@types/node@26.6.7)(jiti@2.7.0)(yaml@2.9.1))
 
   '@adonis-agora/filter-client@1.0.0': {}
 

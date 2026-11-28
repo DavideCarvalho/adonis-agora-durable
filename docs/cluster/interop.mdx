@@ -50,7 +50,7 @@ The transport's own options (connection, fixed and adaptive `concurrency`, `resu
 </Callout>
 
 <Callout type="warn">
-From 1.2, durable seals its broker messages by default ([Encrypting messages](/docs/durable/transports/encrypting-messages)), and the NestJS and Python workers read plain messages only. On a BullMQ transport and a control plane shared with them, set `messages: { insecure: true }`.
+The NestJS and Python workers read plain messages only. Leave sealing off ([Encrypting messages](/docs/durable/transports/encrypting-messages)) on a BullMQ transport and a control plane shared with them, or set `messages: { insecure: true }` there.
 </Callout>
 
 ## How the wire lines up

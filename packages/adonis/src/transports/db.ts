@@ -325,8 +325,8 @@ export interface DbTransportOptions {
   inboxSweepIntervalMs?: number;
   /**
    * How this transport seals its messages (see "Encrypting messages"): a ready sealer (what
-   * `transports.db()` builds from the app), or the options. Default: sealed with a key derived from
-   * `process.env.APP_KEY` when it is set, else plain. Sealed rows keep their routing columns and
+   * `transports.db()` builds from the app), or the options. Default: sent plain (`seal: true`
+   * seals), sealed ones opened with a key derived from `process.env.APP_KEY` when it is set. Sealed rows keep their routing columns and
    * carry the rest (input, context, output, error, events, message payloads) encrypted.
    */
   messages?: MessageSealer | TransportMessagesOptions | undefined;

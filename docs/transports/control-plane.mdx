@@ -47,7 +47,7 @@ export default defineConfig({
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `connection` | `'main'` | `config/redis.ts` connection used for pub/sub. |
-| `messages` | sealed with the app key | How control messages (events, cancels, nudges, schedule pauses) are sealed: the same options as a transport's. See [Encrypting messages](/docs/durable/transports/encrypting-messages). |
+| `messages` | sent plain, sealed opened | How control messages (events, cancels, nudges, schedule pauses) are sealed: the same options as a transport's. See [Encrypting messages](/docs/durable/transports/encrypting-messages). |
 | `prefix` | `'durable'` | Channel is `` `${prefix}-control` ``, or `` `${prefix}-<namespace>-control` `` under a namespace. |
 | `namespace` | the engine's `namespace` | Namespace folded into the channel this instance listens on. `'default'` keeps the bare channel. Messages about a run are still published on the run's namespace channel. |
 

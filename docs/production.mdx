@@ -318,7 +318,7 @@ On `bullmq`, two worker-side guards complete the picture. `stepTimeoutMs` puts a
 
 ## 12. Encrypt payloads at rest
 
-Messages on the broker are already sealed with the app's `APP_KEY` (or an `@adonis-agora/crypto` key between a tenant and its control plane): check `node ace agora:doctor`'s `durable.messages`, and once no job from an earlier version is queued, set `messages: { acceptPlain: false }` on each transport. See [Encrypting messages](/docs/durable/transports/encrypting-messages), including the rolling-upgrade order from 1.1.
+Seal the messages on the broker: once every process runs 1.2.1 or later, set `messages: { seal: true }` in `config/durable.ts` (the app's `APP_KEY`, or an `@adonis-agora/crypto` key between a tenant and its control plane), then, once no older job is queued, `acceptPlain: false`. `node ace agora:doctor`'s `durable.messages` tells you where you are. See [Encrypting messages](/docs/durable/transports/encrypting-messages).
 
 What the store keeps is a separate matter.
 

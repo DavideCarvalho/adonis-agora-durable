@@ -4,8 +4,11 @@ Source: `docs/transports/encrypting-messages.mdx`.
 
 ## Defaults
 
-- Every broker transport (`transports.bullmq`, `transports.queue`, `transports.db`) and
-  `controlPlanes.redis` seal what they put on the broker. `memory` / `eventEmitter` stay in-process.
+- Every 1.2.1+ broker transport (`transports.bullmq`, `transports.queue`, `transports.db`) and
+  `controlPlanes.redis` OPENS sealed messages. Sending them sealed is one switch,
+  `messages: { seal: true }` in `config/durable.ts` (or per transport), off in 1.x and the default in
+  the next major. Turn it on only once every process runs 1.2.1+ (1.2.0 sealed by default; that was
+  reverted). `memory` / `eventEmitter` stay in-process.
 - Same app: AES-256-GCM, key derived from `APP_KEY` (HKDF-SHA256, purpose
   `agora:durable:messages`). Boot line: `[@adonis-agora/durable] bullmq messages: app key (auto)`.
 - Tenant ↔ control plane (`topology: 'tenant'` / `'control-plane'`): `@adonis-agora/crypto`, found
@@ -40,7 +43,7 @@ transports.bullmq({
 }) // refuse plain
 ```
 
-`acceptPlain` defaults to `true` in 1.x (each plain kind logged once per process; the doctor's
+With `seal: true`, `acceptPlain` defaults to `true` in 1.x (each plain kind logged once per process; the doctor's
 `durable.messages` warns) and becomes `false` in the next major.
 
 ## What is sealed
@@ -59,8 +62,11 @@ does not run its handler and is reported failed (retryable). Anything else is dr
 
 ## Upgrading from 1.1
 
-- Old sender → new receiver: plain accepted, replies go back plain (in kind).
-- New sender → 1.1 worker: the handler runs with `input` undefined. So: stop old processes before
-  starting new ones, or deploy twice (first `messages: { insecure: true }` everywhere, then remove
-  it).
-- NestJS / Python workers read plain only: keep their transport `insecure`.
+1. Upgrade every process to 1.2.1+: still sends plain (a 1.1 worker keeps running its tasks with
+   their real input), already opens sealed, replies in kind.
+2. Turn sealing on: `messages: { seal: true }`.
+3. Later, `acceptPlain: false`.
+
+Why: a sealed step task reaching a 1.1 worker runs the handler with `input` undefined. 1.2.x
+receivers fail safe: anything carrying a seal they cannot open is refused, never read as plain.
+NestJS / Python workers read plain only: keep sealing off (or `insecure`) on their transport.
