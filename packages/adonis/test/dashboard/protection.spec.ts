@@ -222,7 +222,7 @@ describe('run detail markers', () => {
     const extended = await detailOf({ atRest: { codec: true, coverage: 'extended' } });
     expect(extended.encryptedAtRest).toEqual({
       run: ['input', 'output', 'error'],
-      step: ['input', 'output', 'error', 'events', 'progress'],
+      step: ['input', 'output', 'error', 'events'],
     });
     expect((await detailOf({ atRest: { codec: false, coverage: null } })).encryptedAtRest).toBe(
       undefined,

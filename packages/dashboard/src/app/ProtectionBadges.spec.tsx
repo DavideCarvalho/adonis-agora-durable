@@ -49,7 +49,7 @@ describe('ProtectionBadges', () => {
     it(`labels ${mode} messages`, () => {
       render(
         <ProtectionBadges
-          protection={protection({ messages: [{ transport: 'bullmq', mode, acceptPlain: true }] })}
+          protection={protection({ messages: [{ transport: 'bullmq', mode, acceptPlain: false }] })}
         />,
         { wrapper: wrap },
       );
@@ -60,6 +60,32 @@ describe('ProtectionBadges', () => {
       expect(badge?.className.includes('text-warn')).toBe(mode === 'plain');
     });
   }
+
+  it('warns when a sealing transport still accepts plain messages', () => {
+    const { rerender } = render(
+      <ProtectionBadges
+        protection={protection({
+          messages: [
+            { transport: 'bullmq', mode: 'tenant-key', acceptPlain: false },
+            { transport: 'control plane', mode: 'app-key', acceptPlain: true },
+          ],
+        })}
+      />,
+      { wrapper: wrap },
+    );
+    expect(byId('protection-messages')?.className.includes('text-warn')).toBe(true);
+    rerender(
+      <ProtectionBadges
+        protection={protection({
+          messages: [
+            { transport: 'bullmq', mode: 'tenant-key', acceptPlain: false },
+            { transport: 'control plane', mode: 'app-key', acceptPlain: false },
+          ],
+        })}
+      />,
+    );
+    expect(byId('protection-messages')?.className.includes('text-warn')).toBe(false);
+  });
 
   it('names the weakest mode across transports, and "mixed" across seals', () => {
     const { rerender } = render(
@@ -175,7 +201,7 @@ describe('field markers', () => {
         step={step}
         run={run}
         onClose={() => {}}
-        encrypted={['input', 'output', 'error', 'events', 'progress']}
+        encrypted={['input', 'output', 'error', 'events']}
       />,
       { wrapper: wrap },
     );

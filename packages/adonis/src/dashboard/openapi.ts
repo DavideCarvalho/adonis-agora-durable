@@ -45,6 +45,12 @@ const runSummary = {
       type: 'object',
       description: 'What a suspended run is parked on (signal/webhook/child/breakpoint).',
     },
+    redactedFields: {
+      type: 'array',
+      items: { type: 'string' },
+      description:
+        "Names of the fields this console's `redact` hooks removed or changed (names only, no values).",
+    },
   },
   required: ['id', 'workflow', 'workflowVersion', 'status', 'createdAt', 'updatedAt'],
 } as const;
@@ -69,6 +75,12 @@ const checkpoint = {
     finishedAt: { type: 'string', format: 'date-time' },
     durationMs: { type: 'integer' },
     queueMs: { type: 'integer' },
+    redactedFields: {
+      type: 'array',
+      items: { type: 'string' },
+      description:
+        "Names of the fields this console's `redact` hooks removed or changed (names only, no values).",
+    },
   },
 } as const;
 
@@ -332,6 +344,16 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
                 waitsFor: { type: 'array', items: { type: 'object' } },
                 awaitedBy: { type: 'array', items: { type: 'object' } },
                 workflowLifecycle: { type: 'object' },
+                encryptedAtRest: {
+                  type: 'object',
+                  description:
+                    'Present when the store encrypts at rest (a `CodecStateStore`): which run and step fields it encodes. The console shows them decrypted.',
+                  properties: {
+                    run: { type: 'array', items: { type: 'string' } },
+                    step: { type: 'array', items: { type: 'string' } },
+                  },
+                  required: ['run', 'step'],
+                },
               },
             }),
             '304': notModifiedResponse,

@@ -49,6 +49,14 @@ export function messagesLabel(protection: ConsoleProtection): string | undefined
   return 'sealed (mixed)';
 }
 
+/**
+ * Whether the messages badge warns: a transport sends plain, or a sealing one still accepts plain
+ * messages (anyone who can write to the broker can inject unsealed ones there).
+ */
+export function messagesWarn(protection: ConsoleProtection): boolean {
+  return protection.messages.some((m) => m.mode === 'plain' || m.acceptPlain);
+}
+
 /** The store badge label, or undefined when the store is not known. */
 export function storeLabel(protection: ConsoleProtection): string | undefined {
   const store = protection.store;
@@ -60,7 +68,10 @@ export function storeLabel(protection: ConsoleProtection): string | undefined {
 function messagesHint(protection: ConsoleProtection): string {
   const lines = protection.messages.map((m) => {
     const copy = MODE_COPY[m.mode];
-    const plainToo = m.mode !== 'plain' && m.acceptPlain ? ' Also accepts plain messages.' : '';
+    const plainToo =
+      m.mode !== 'plain' && m.acceptPlain
+        ? ' Also accepts plain messages, so anyone who can write to the broker can inject unsealed ones (set acceptPlain: false).'
+        : '';
     return `${m.transport}: ${copy.label}. ${copy.means}${plainToo}`;
   });
   return `${lines.join('\n')}\nClick for the docs.`;
@@ -135,7 +146,7 @@ export function ProtectionBadges({
         <LinkBadge
           href={MESSAGES_DOCS}
           hint={messagesHint(protection)}
-          tone={messages === 'plain' ? 'warn' : 'neutral'}
+          tone={messagesWarn(protection) ? 'warn' : 'neutral'}
           icon={<ShieldIcon />}
           testId="protection-messages"
         >
