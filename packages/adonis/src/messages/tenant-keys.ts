@@ -333,7 +333,7 @@ export function isMessageKeyBody(body: unknown, now = Date.now()): body is Messa
   return (
     !!b &&
     b.kind === MESSAGE_KEY_REQUEST &&
-    typeof b.publicKey === 'string' &&
+    isPublicKey(b.publicKey) &&
     typeof b.partition === 'string' &&
     typeof b.ts === 'number' &&
     now - b.ts <= HANDSHAKE_MAX_AGE_MS &&
@@ -347,6 +347,17 @@ export function isMessageKeyRequest(raw: unknown): boolean {
     (raw as { body?: { kind?: unknown } } | null)?.body?.kind === MESSAGE_KEY_REQUEST &&
     typeof (raw as { requestId?: unknown }).requestId === 'string'
   );
+}
+
+/** Whether a run-reply id is a `messageKey` answer's (every key request id starts `mk-`). */
+export function isMessageKeyReplyId(requestId: unknown): boolean {
+  return typeof requestId === 'string' && requestId.startsWith('mk-');
+}
+
+/** Whether `raw` is a well-formed X25519 public key (32 bytes, base64url). */
+export function isPublicKey(raw: unknown): boolean {
+  if (typeof raw !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(raw)) return false;
+  return Buffer.from(raw, 'base64url').length === 32;
 }
 
 /** The plumbing a tenant's handshake needs from its transport. */

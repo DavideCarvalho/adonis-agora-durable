@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { RunReply, RunRequest, StartRunMessage, StepResult } from '../../src/interfaces.js';
 import { resolveMessageSealer } from '../../src/messages/resolve.js';
-import type { MessageSealer } from '../../src/messages/sealer.js';
+import { createMessageSealer, type MessageSealer } from '../../src/messages/sealer.js';
 import {
   appKeyRoot,
   cryptoRoot,
@@ -297,11 +297,8 @@ describe.skipIf(!REDIS_URL)('two apps through the durable control plane, over Bu
       verifyTenant: async ({ token }) =>
         token && TOKENS[token] ? { partition: TOKENS[token] as string, capabilities: [] } : null,
     }).start();
-    const probe = await transport(
-      prefix,
-      (await tenantSealer('acme', ACME_KEY, 'tok-acme')).sealer,
-      'acme',
-    );
+    // A raw client (plain): it sees every key answer, as an eavesdropper on the broker would.
+    const probe = await transport(prefix, createMessageSealer({ mode: 'plain' }), 'acme');
     const replies: RunReply[] = [];
     probe.onRunReply((r) => replies.push(r));
     const pair = handshakeKeyPair();
@@ -320,9 +317,20 @@ describe.skipIf(!REDIS_URL)('two apps through the durable control plane, over Bu
     await ask('mk-other-partition', 'tok-acme', 'globex');
     await ask('mk-stale', 'tok-acme', 'acme', Date.now() - 5 * 60_000);
     await ask('mk-good', 'tok-acme', 'acme');
-    await until(() => replies.length >= 4);
+    await probe.dispatchRunRequest({
+      requestId: 'mk-bad-key',
+      tenant: 'tok-acme',
+      body: {
+        kind: MESSAGE_KEY_REQUEST,
+        publicKey: 'not-a-key',
+        partition: 'acme',
+        ts: Date.now(),
+      } as unknown as RunRequest['body'],
+    });
+    await until(() => replies.length >= 5);
     const by = (id: string) =>
       replies.find((r) => r.requestId === id)?.result as { ok: boolean; error?: { code?: string } };
+    expect(by('mk-bad-key')).toMatchObject({ ok: false, error: { code: 'bad-request' } });
     expect(by('mk-wrong-token')).toMatchObject({ ok: false, error: { code: 'unauthorized' } });
     expect(by('mk-other-partition')).toMatchObject({ ok: false, error: { code: 'cross-tenant' } });
     expect(by('mk-stale')).toMatchObject({ ok: false });

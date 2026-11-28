@@ -22,6 +22,7 @@ import {
   ensureControlPlaneKey,
   grantKey,
   type HandshakeWire,
+  isMessageKeyReplyId,
   isMessageKeyRequest,
   TenantKeyClient,
 } from './tenant-keys.js';
@@ -263,21 +264,6 @@ export async function describeMessagesMode(
   }
 }
 
-const _errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
-
-function _once<T>(fn: () => Promise<T>): () => Promise<T> {
-  let pending: Promise<T> | undefined;
-  return () => {
-    if (!pending) {
-      pending = fn();
-      pending.catch(() => {
-        pending = undefined;
-      });
-    }
-    return pending;
-  };
-}
-
 /** The partition a control plane seals a message for (the tenant it goes to). */
 function tenantPartitionOf(
   kind: MessageKind,
@@ -309,6 +295,12 @@ function controlPlaneSource(
   const runtime = inputs.runtime;
   const hmac = runtime ? cryptoHmacOf(runtime) : undefined;
   if (runtime && hmac) void ensureControlPlaneKey(runtime, log);
+  if (runtime && !hmac) {
+    log(
+      'warn',
+      `[${PACKAGE}] messages: @adonis-agora/crypto is booted here but offers no \`hmac\` (an older version): the tenants' message keys derive from this app's APP_KEY instead. Upgrade @adonis-agora/crypto to keep them in crypto. Docs: ${DOCS}`,
+    );
+  }
   const root: ControlPlaneRoot = hmac
     ? cryptoRoot(hmac)
     : appKeyRoot((options.appKey ?? inputs.appKey) as AppKey);
@@ -359,13 +351,15 @@ function tenantSource(
       partition === tenant.partition ? client.byKid(kid) : undefined,
     foreign: (partition) => partition !== tenant.partition,
     // Key requests and their (plain) answers; on BullMQ every pod hears every pod's answer.
+    // Key requests and their plain answers. Another pod's answer (BullMQ broadcasts replies) is let
+    // through here only to be swallowed by `takeReply`: it never reaches the gateway.
     bootstrap: (kind, raw) =>
       (kind === 'runRequest' && isMessageKeyRequest(raw)) ||
-      (kind === 'runReply' &&
-        (client.isHandshake(raw.requestId) ||
-          (typeof raw.requestId === 'string' && raw.requestId.startsWith('mk-')))),
+      (kind === 'runReply' && isMessageKeyReplyId(raw.requestId)),
     attach: (wire) => client.attach(wire as unknown as HandshakeWire),
-    takeReply: (reply) => client.takeReply(reply as RunReply),
+    // Another pod's key answer (broadcast on BullMQ) is swallowed here, never handed to the gateway.
+    takeReply: (reply) =>
+      client.takeReply(reply as RunReply) || isMessageKeyReplyId(reply.requestId),
   };
 }
 
