@@ -411,7 +411,8 @@ describe('message sealing', () => {
       expect(sealerOf({ seal: true }, 't').mode).toBe('app-key');
       expect(sealerOf({ insecure: true }, 't').mode).toBe('plain');
       expect(sealerOf({ crypto: false }, 't').mode).toBe('plain');
-      expect(sealerOf({ secret: 'a-shared-secret-of-16+', seal: true }, 't').mode).toBe('secret');
+      expect(sealerOf({ secret: 'a-shared-secret-of-16+' }, 't').mode).toBe('secret');
+      expect(sealerOf({ secret: 'a-shared-secret-of-16+', seal: false }, 't').mode).toBe('plain');
       expect(() => sealerOf({ secret: 'a-shared-secret-of-16+', insecure: true }, 't')).toThrow(
         /one of `secret`, `crypto` or `insecure`/,
       );

@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
@@ -38,6 +38,9 @@ afterEach(async () => {
 });
 
 const PUBLISHED = '1.1.1';
+/** The registry's integrity of the 1.1.1 tarball (what the lockfile pinned): checked before unpacking. */
+const INTEGRITY =
+  'sha512-sDues0jCHwcfLIE9Sf4/Htwb/2mk8brmNTPP6qzxSfpfXynaQptLi7O4vClycirJpJeLwmYHmyLnn+UOylbNHw==';
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..', '.published', `durable-${PUBLISHED}`);
 
@@ -52,6 +55,11 @@ function fetchPublished(): string {
   });
   const tarball = readdirSync(root).find((f) => f.endsWith('.tgz'));
   if (!tarball) throw new Error('npm pack produced no tarball');
+  const digest = `sha512-${createHash('sha512')
+    .update(readFileSync(join(root, tarball)))
+    .digest('base64')}`;
+  if (digest !== INTEGRITY)
+    throw new Error(`the ${PUBLISHED} tarball does not match its integrity`);
   execFileSync('tar', ['-xzf', tarball], { cwd: root });
   return pkg;
 }

@@ -86,7 +86,7 @@ controlPlane: controlPlanes.redis({ messages: { acceptPlain: false } }),
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| `seal` | `false` in 1.x | Send messages sealed. Off, they are sent plain while sealed ones are still opened (with the mode below). Default in the next major. |
+| `seal` | `true` with an explicit `secret` / `crypto`, else `false` in 1.x | Send messages sealed. Off, they are sent plain while sealed ones are still opened (with the mode below). Default in the next major. |
 | (no mode) | | The app key; between a tenant and its control plane, the `durable-messages` crypto key. |
 | `secret` | | A shared secret (16+ characters, a string or a `Secret`), the same in every process: each message carries an HMAC-SHA256. **Authenticated, but readable** on the broker. For processes of several apps without crypto. |
 | `crypto: { cipher, key?, owns? }` | | Encrypt with an `@adonis-agora/crypto` key (`() => crypto.client!`) or your own KMS (anything with `encrypt` / `decrypt`). Every process needs both on the key (default name `durable-messages`). `owns` recognizes the cipher's ciphertexts (default `agora:ct1:<key>:`). |

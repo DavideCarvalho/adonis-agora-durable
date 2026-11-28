@@ -36,8 +36,8 @@ export interface MessagesCryptoOptions {
  */
 export interface TransportMessagesOptions {
   /**
-   * Seal what this transport sends. Default: the top-level `messages.seal` of `config/durable.ts`,
-   * else `false` in 1.x: sent plain, so processes on 1.1 and earlier still read them, while sealed
+   * Seal what this transport sends. Default: `true` with an explicit `secret` / `crypto`, else the
+   * top-level `messages.seal` of `config/durable.ts`, else `false` in 1.x: sent plain, so processes on 1.1 and earlier still read them, while sealed
    * messages are always opened (with the mode below). Turn it on once every process runs 1.2.1 or
    * later; it becomes the default in the next major.
    */
@@ -215,7 +215,11 @@ export async function describeMessagesMode(
     return {
       ...decided,
       sealing: decided.mode !== 'plain' && sealingOf(options, inputs),
-      acceptPlain: options.acceptPlain ?? inputs.acceptPlain ?? true,
+      // Plain is always accepted while this transport does not seal (see `withSealing`).
+      acceptPlain:
+        decided.mode !== 'plain' && sealingOf(options, inputs)
+          ? (options.acceptPlain ?? inputs.acceptPlain ?? true)
+          : true,
     };
   } catch (error) {
     return { error: error instanceof Error ? error.message : String(error) };
@@ -497,7 +501,11 @@ export async function resolveMessageSealer(
 
 /** Whether a transport seals what it sends: its own `seal`, else the top-level one, else off. */
 function sealingOf(options: TransportMessagesOptions, inputs: Inputs): boolean {
-  return options.seal ?? inputs.seal ?? false;
+  // An explicit `secret` or `crypto` key is a deliberate choice (and sealed in 1.2.0): it seals
+  // unless `seal: false` says otherwise.
+  const explicit =
+    options.secret !== undefined || (options.crypto !== undefined && options.crypto !== false);
+  return options.seal ?? (explicit ? true : (inputs.seal ?? false));
 }
 
 /**

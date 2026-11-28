@@ -11,7 +11,7 @@ Revert 1.2.0's sealed-by-default: messages are sent plain again unless sealing i
 1. Upgrade every process to 1.2.1 or later. Messages are still sent plain, so a 1.1 worker runs its tasks with their real input and a 1.1 engine reads results. A test against the published 1.1.1 proves it. Every 1.2.1 process already opens sealed messages (with the app's `APP_KEY`, or `@adonis-agora/crypto` between a tenant and its control plane) and replies in kind.
 2. Turn sealing on: `messages: { seal: true }` in `config/durable.ts` (or `messages: { seal: true }` on one transport / `controlPlanes.redis`). Then, once no older job is queued, `acceptPlain: false`.
 
-Sealing becomes the default in the next major, when every receiver understands it. `node ace agora:doctor` (`durable.messages`) warns while a transport still sends plain.
+An explicit `messages: { secret }` or `messages: { crypto: { cipher } }` on a transport keeps sealing (as in 1.2.0) unless `seal: false` is set. Sealing becomes the default in the next major, when every receiver understands it. `node ace agora:doctor` (`durable.messages`) warns while a transport still sends plain.
 
 Receivers fail safe: a message carrying a seal they cannot open (another key, tampered, an unknown format or version) is refused and never read as plain, so a step handler never runs on it. The step is reported failed (retryable).
 
