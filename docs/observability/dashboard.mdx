@@ -249,7 +249,7 @@ The header shows how the app it serves protects run data, next to the App and or
 
 | Badge | Values | Read from |
 | --- | --- | --- |
-| **Messages** | `sealed (tenant key)`, `sealed (app key)`, `sealed (crypto)`, `signed only (secret)`, `plain` | the sealer each broker transport (pool members included) and the control plane run with. Several transports: the weakest mode, each one in the tooltip. Plain broker messages read in amber. See [Encrypting messages](/docs/durable/transports/encrypting-messages). |
+| **Messages** | `sealed (tenant key)`, `sealed (app key)`, `sealed (crypto)`, `signed only (secret)`, `plain` | the sealer each broker transport (pool members included) and the control plane run with. Several transports: the weakest mode, each one in the tooltip. Reads in amber when a transport sends plain or still accepts plain messages (`acceptPlain`, on by default with `seal: true`: set `acceptPlain: false` once old jobs have drained). See [Encrypting messages](/docs/durable/transports/encrypting-messages). |
 | **Store** | `encrypted (input/output)`, `encrypted (extended)`, `plain` | whether the state store is a [`CodecStateStore`](/docs/durable/stores#encrypting-payloads-at-rest), and its `coverage` |
 | **Redacted** | shown while a `redact` hook is configured | this console's `redact` config |
 

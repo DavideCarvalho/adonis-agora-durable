@@ -242,7 +242,7 @@ export function encryptedAtRestFields(
   return atRest.coverage === 'extended'
     ? {
         run: ['input', 'output', 'error'],
-        step: ['input', 'output', 'error', 'events', 'progress'],
+        step: ['input', 'output', 'error', 'events'],
       }
     : { run: ['input', 'output'], step: ['input', 'output'] };
 }
