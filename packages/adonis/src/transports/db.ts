@@ -419,7 +419,9 @@ export class DbTransport implements Transport, ControlPlane {
   async claimOnce(key: string, ttlMs: number): Promise<boolean> {
     await this.#ensureSchema();
     const store = this.#workerKeys();
-    return store.claim ? store.claim(key, ttlMs) : true;
+    // Fail closed: a guard that cannot remember refuses rather than letting every request through.
+    if (!store.claim) throw new Error('the worker-key store cannot claim keys');
+    return store.claim(key, ttlMs);
   }
 
   /** The sealer (the control plane's responder grants tenant keys through it). */

@@ -449,7 +449,8 @@ export class BullMQTransport implements Transport {
   async claimOnce(key: string, ttlMs: number): Promise<boolean> {
     this.#claimRedis ??= this.#deps.makeRedis();
     const set = (this.#claimRedis as { set?: (...args: unknown[]) => Promise<unknown> }).set;
-    if (typeof set !== 'function') return true;
+    // Fail closed: a guard that cannot remember refuses rather than letting every request through.
+    if (typeof set !== 'function') throw new Error('the Redis client cannot SET NX');
     const answer = await set.call(
       this.#claimRedis,
       `${this.#effectivePrefix()}:once:${key}`,

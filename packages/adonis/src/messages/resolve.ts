@@ -25,6 +25,7 @@ import {
   isMessageKeyReplyId,
   isMessageKeyRequest,
   TenantKeyClient,
+  usableKeyUrl,
 } from './tenant-keys.js';
 
 const PACKAGE = '@adonis-agora/durable';
@@ -100,7 +101,9 @@ export interface MessagesResolveContext {
         partition: string;
         token?: (() => Promise<string>) | undefined;
         /** Mint a fresh token (authkit app-call tokens): a refused, already-used one is retried. */
-        resetToken?: (() => void) | undefined;
+        resetToken?: (() => boolean | undefined | void) | undefined;
+        /** The URL as known at boot, for the boot line (`url` is what is asked). */
+        urlHint?: string | undefined;
         /** The control plane's URL: the key is then asked over HTTPS, not the broker. */
         url?: (() => Promise<string | undefined>) | undefined;
       }
@@ -132,6 +135,15 @@ export function noKeyHint(topology: string): string {
         ? "the control plane derives its tenants' message keys from its APP_KEY (or @adonis-agora/crypto when booted here): set APP_KEY (`node ace generate:key`)"
         : 'set APP_KEY in this app (automatic for the processes of one app; `node ace generate:key`)';
   return `${first}, or set \`messages: { secret }\` on the transport (a shared secret, at least 16 characters, the same in every process), or \`messages: { crypto: { cipher } }\` (@adonis-agora/crypto or your own KMS)`;
+}
+
+/** How a pod asks for its key, as the boot line says it: HTTPS only for a URL that can be used. */
+function keyPath(tenant: NonNullable<MessagesResolveContext['tenant']>): string {
+  if (!tenant.url) return 'the broker';
+  if (tenant.urlHint === undefined) return 'HTTPS';
+  return usableKeyUrl(tenant.urlHint)
+    ? 'HTTPS'
+    : `the broker (the control plane's URL ${tenant.urlHint} is not HTTPS)`;
 }
 
 /** What {@link resolveMessageSealer} needs besides the options, read from the app. */
@@ -224,7 +236,7 @@ function decide(
     }
     return {
       mode: 'tenant-key',
-      label: `control plane key (partition ${tenant.partition}, asked over ${tenant.url ? 'HTTPS' : 'the broker'})`,
+      label: `control plane key (partition ${tenant.partition}, asked over ${keyPath(tenant)})`,
       role: 'tenant',
     };
   }

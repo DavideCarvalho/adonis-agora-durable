@@ -566,7 +566,10 @@ export default class DurableProvider {
             : async () => (typeof source === 'string' ? source : await source());
         const resetToken =
           typeof source === 'function' && typeof source.reset === 'function'
-            ? () => void source.reset?.()
+            ? (): boolean | undefined => {
+                const reset = source.reset?.();
+                return typeof reset === 'boolean' ? reset : undefined;
+              }
             : undefined;
         const controlPlaneUrl = await this.#controlPlaneUrl(config).catch(() => undefined);
         const transport = await this.#resolveTransport(config, {
@@ -576,7 +579,9 @@ export default class DurableProvider {
             partition: tenant.partition,
             ...(token ? { token } : {}),
             ...(resetToken ? { resetToken } : {}),
-            ...(controlPlaneUrl ? { url: async () => controlPlaneUrl } : {}),
+            ...(controlPlaneUrl
+              ? { url: async () => controlPlaneUrl, urlHint: controlPlaneUrl }
+              : {}),
           },
           ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
           ...(config.schema !== undefined ? { schema: config.schema } : {}),

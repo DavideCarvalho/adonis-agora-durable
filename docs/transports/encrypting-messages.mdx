@@ -79,7 +79,7 @@ Every key request carries a fresh random nonce and its timestamp. The control pl
 - the pair (token, nonce) for twice the one-minute freshness window: the same request seen again, at any replica, is refused;
 - the token itself (its `jti` when it is a JWT, else a hash of it) for the token's remaining lifetime (its `exp`, at most a day; a minute for a token that says nothing): a second key request with the same token is refused, and logged once per partition as a possible replay.
 
-A pod whose request is refused this way asks again with a fresh token (authkit app-call tokens are minted per request), or after the minute with a static token.
+A pod whose request is refused this way asks again with a fresh token (authkit app-call tokens are minted per request), or after the minute with a static opaque token. A long-lived JWT reused by a pod that restarts stays refused until it expires: give pods tokens minted per request. If the guard's store cannot be reached, no key is handed out (it fails closed).
 
 What this leaves:
 

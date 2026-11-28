@@ -430,8 +430,24 @@ export class MessageKeyGuard {
   }
 
   /** `null` when the request may proceed, else why it is refused. */
-  async check(token: string, body: MessageKeyRequestBody): Promise<string | null> {
+  async check(
+    token: string,
+    body: MessageKeyRequestBody,
+  ): Promise<{ code: 'replayed' | 'unavailable'; message: string } | null> {
     const { id, holdMs } = tokenIdentity(token);
+    try {
+      const replayed = await this.#check(id, holdMs, body);
+      return replayed ? { code: 'replayed', message: replayed } : null;
+    } catch (error) {
+      // Fail closed: without the shared store no key is handed out.
+      return {
+        code: 'unavailable',
+        message: `the replay guard's store is unavailable (${error instanceof Error ? error.message : String(error)})`,
+      };
+    }
+  }
+
+  async #check(id: string, holdMs: number, body: MessageKeyRequestBody): Promise<string | null> {
     if (!(await this.#claim(`durable-mk:nonce:${id}:${body.nonce}`, 2 * HANDSHAKE_MAX_AGE_MS))) {
       this.#report(body.partition, 'a message-key request was sent twice (same token and nonce)');
       return 'this message-key request was already answered (replayed)';
@@ -464,6 +480,23 @@ export interface HandshakeWire {
 /** The control plane's HTTPS route for key requests (under its URL). */
 export const MESSAGE_KEY_PATH = '/__durable/message-key';
 
+/** The key route under the control plane's `base` URL, or `undefined` for something not a URL. */
+function keyUrl(base: string): URL | undefined {
+  try {
+    return new URL(MESSAGE_KEY_PATH, base.endsWith('/') ? base : `${base}/`);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether a pod may ask for its key at `base`: HTTPS, or plain HTTP to this machine only. */
+export function usableKeyUrl(base: string): boolean {
+  const target = keyUrl(base);
+  if (!target) return false;
+  const local = ['localhost', '127.0.0.1', '[::1]'].includes(target.hostname);
+  return target.protocol === 'https:' || (local && target.protocol === 'http:');
+}
+
 /** The answer of a key request, over either path. */
 type KeyAnswer = RunReply['result'];
 
@@ -475,7 +508,7 @@ type KeyAnswer = RunReply['result'];
 export class TenantKeyClient {
   readonly #partition: string;
   readonly #token: () => Promise<string>;
-  readonly #resetToken: (() => void) | undefined;
+  readonly #resetToken: (() => boolean | undefined | void) | undefined;
   readonly #url: (() => Promise<string | undefined>) | undefined;
   readonly #fetch: typeof fetch;
   #wire: HandshakeWire | undefined;
@@ -483,14 +516,15 @@ export class TenantKeyClient {
   readonly #keys = new Map<string, Buffer>();
   readonly #pending = new Map<string, (reply: RunReply) => void>();
   readonly #log: (level: 'info' | 'warn', line: string) => void;
-  #httpsFailed = false;
+  /** Whether the HTTPS failure was logged (warned once; HTTPS is tried again on every handshake). */
+  #httpsWarned = false;
   /** How the last key was obtained: `https` or `broker` (doctor, tests). */
   lastPath: 'https' | 'broker' | undefined;
 
   constructor(options: {
     partition: string;
     token: () => Promise<string>;
-    resetToken?: (() => void) | undefined;
+    resetToken?: (() => boolean | undefined | void) | undefined;
     url?: (() => Promise<string | undefined>) | undefined;
     fetch?: typeof fetch | undefined;
     log: (level: 'info' | 'warn', line: string) => void;
@@ -552,9 +586,12 @@ export class TenantKeyClient {
     let answer = await this.#ask();
     if (!answer.result.ok && answer.result.error.code === 'replayed') {
       // This token already asked (a restart within its lifetime, or a replay someone else won):
-      // ask once more with a fresh token when the source can mint one, else after the window.
-      if (this.#resetToken) this.#resetToken();
-      else await new Promise((r) => setTimeout(r, HANDSHAKE_MAX_AGE_MS + 1_000).unref?.());
+      // ask once more with a fresh token when the source can mint one (a reset that answers
+      // `false` had nothing to drop), else after the window an opaque token is held for.
+      const reset = this.#resetToken?.();
+      if (!this.#resetToken || reset === false) {
+        await new Promise((r) => setTimeout(r, HANDSHAKE_MAX_AGE_MS + 1_000).unref?.());
+      }
       answer = await this.#ask();
     }
     const { result, requestId, mine } = answer;
@@ -590,7 +627,7 @@ export class TenantKeyClient {
       nonce: randomUUID().replaceAll('-', ''),
     };
     const token = await this.#token();
-    const url = !this.#httpsFailed ? await this.#url?.().catch(() => undefined) : undefined;
+    const url = await this.#url?.().catch(() => undefined);
     if (url) {
       const result = await this.#overHttps(url, token, requestId, body);
       if (result) {
@@ -609,16 +646,9 @@ export class TenantKeyClient {
     requestId: string,
     body: MessageKeyRequestBody,
   ): Promise<KeyAnswer | undefined> {
-    let target: URL;
-    try {
-      target = new URL(MESSAGE_KEY_PATH, base.endsWith('/') ? base : `${base}/`);
-    } catch {
-      return this.#httpsUnusable(`"${base}" is not a URL`);
-    }
-    const local = ['localhost', '127.0.0.1', '[::1]'].includes(target.hostname);
-    if (target.protocol !== 'https:' && !(local && target.protocol === 'http:')) {
-      return this.#httpsUnusable(`${target.origin} is not HTTPS`);
-    }
+    const target = keyUrl(base);
+    if (!target) return this.#httpsUnusable(`"${base}" is not a URL`);
+    if (!usableKeyUrl(base)) return this.#httpsUnusable(`${target.origin} is not HTTPS`);
     try {
       const response = await this.#fetch(target, {
         method: 'POST',
@@ -644,7 +674,8 @@ export class TenantKeyClient {
   }
 
   #httpsUnusable(why: string): undefined {
-    this.#httpsFailed = true;
+    if (this.#httpsWarned) return undefined;
+    this.#httpsWarned = true;
     this.#log(
       'warn',
       `[${PACKAGE}] messages: asking the control plane for this pod's key over HTTPS failed: ${why}. Asking over the broker instead (the token then crosses it once).`,

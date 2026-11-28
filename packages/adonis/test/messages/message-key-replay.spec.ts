@@ -12,6 +12,7 @@ import {
   MessageKeyGuard,
   memoryClaimOnce,
   tokenIdentity,
+  usableKeyUrl,
 } from '../../src/messages/tenant-keys.js';
 import { messageKeyRoute } from '../../src/run-gateway/message-key-route.js';
 import { RunRequestResponder } from '../../src/run-gateway/run-request-responder.js';
@@ -64,11 +65,29 @@ describe('the single-use guard', () => {
     const guard = new MessageKeyGuard(memoryClaimOnce(), warn);
     const first = body() as never;
     expect(await guard.check('tok', first)).toBeNull();
-    expect(await guard.check('tok', first)).toMatch(/replayed/);
-    expect(await guard.check('tok', body() as never)).toMatch(/already asked/);
+    expect(await guard.check('tok', first)).toMatchObject({
+      code: 'replayed',
+      message: expect.stringMatching(/replayed/),
+    });
+    expect(await guard.check('tok', body() as never)).toMatchObject({
+      code: 'replayed',
+      message: expect.stringMatching(/already asked/),
+    });
     expect(await guard.check('other-token', body() as never)).toBeNull();
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0]?.[0]).toMatch(/possibly a replay/);
+    // A store that cannot remember: refused (fail closed), never let through.
+    const broken = new MessageKeyGuard(async () => {
+      throw new Error('redis down');
+    }, warn);
+    expect(await broken.check('tok', body() as never)).toMatchObject({ code: 'unavailable' });
+  });
+
+  it('a URL is used for the key only when it is HTTPS (or plain HTTP to this machine)', () => {
+    expect(usableKeyUrl('https://hub.example.com')).toBe(true);
+    expect(usableKeyUrl('http://127.0.0.1:3333')).toBe(true);
+    expect(usableKeyUrl('http://hub.example.com')).toBe(false);
+    expect(usableKeyUrl('not a url')).toBe(false);
   });
 
   it('on the database: one claim wins across processes sharing it', async () => {
@@ -211,7 +230,7 @@ describe.skipIf(!REDIS_URL)('message-key requests over BullMQ and HTTPS', () => 
             (() => {
               n += 1;
             }),
-          ...(options.url ? { url: async () => options.url } : {}),
+          ...(options.url ? { url: async () => options.url, urlHint: options.url } : {}),
         },
       },
       {},
@@ -347,6 +366,9 @@ describe.skipIf(!REDIS_URL)('message-key requests over BullMQ and HTTPS', () => 
     const prefix = `dmsg-mkr-${randomUUID().slice(0, 8)}`;
     await controlPlane(prefix);
     const pod = await tenant(prefix, { url: 'http://control-plane.example.com' });
+    expect(pod.lines.join('\n')).toMatch(
+      /asked over the broker \(the control plane's URL http:\/\/control-plane.example.com is not HTTPS\)/,
+    );
     await pod.sealer.seal('result', { runId: 'r', seq: 0, stepId: 'r:0', status: 'completed' });
     expect(pod.lines.join('\n')).toMatch(/is not HTTPS/);
   });

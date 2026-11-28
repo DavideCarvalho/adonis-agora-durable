@@ -739,8 +739,8 @@ export class RunRequestResponder {
     if (partition !== body.partition) {
       return refuse(`the token is not partition "${body.partition}"'s`, 'cross-tenant');
     }
-    const replayed = await this.#guard().check(token, body);
-    if (replayed) return refuse(replayed, 'replayed');
+    const refused = await this.#guard().check(token, body);
+    if (refused) return refuse(refused.message, refused.code);
     try {
       return {
         ok: true,
