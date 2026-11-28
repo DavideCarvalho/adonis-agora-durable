@@ -16,8 +16,10 @@ Source: `docs/transports/encrypting-messages.mdx`.
   by default (sealing off): `bullmq messages: sent plain, sealed ones opened with app key (auto)`.
 - Tenant ↔ control plane (`topology: 'tenant'` / `'control-plane'`): the CONTROL PLANE owns one key
   per tenant partition, derived from its `@adonis-agora/crypto` HMAC key `durable-message-keys`
-  (crypto embedded, or a crypto app it is a tenant of; created at boot when allowed) or else from
-  its `APP_KEY`. A pod asks for its key carrying its tenant token
+  (crypto embedded, or a crypto app it is a tenant of; in partition `_durable` when crypto is a
+  control plane too, as on the Hub; looked up and created on the FIRST key request, never at boot:
+  sealing off = no crypto call, no warning) or else from its `APP_KEY` (also the fallback, with one
+  warning, when crypto cannot give the key). A pod asks for its key carrying its tenant token
   and an ephemeral X25519 public key — over HTTPS (`POST <url>/__durable/message-key`) when the pod
   has `tenant.url` or authkit knows the control plane's URL, else as a `messageKey` run request over
   the broker (boot line says which); the control plane (needs `verifyTenant`) answers with the key

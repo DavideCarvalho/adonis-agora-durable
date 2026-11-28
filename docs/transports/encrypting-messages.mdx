@@ -62,15 +62,28 @@ controlPlane: controlPlanes.redis({ connection: 'main' }), // sealed too
 - **Over HTTPS when it can.** A pod that knows the control plane's URL (`tenant.url` in `config/durable.ts`, or what authkit-client knows of `urn:agora:durable`) asks at `POST <url>/__durable/message-key`, its token as a bearer: the token never crosses the broker for this. A plain `http://` URL is used only for `localhost`. If the route cannot be used (no URL, not HTTPS, unreachable, a 404 from an older control plane, an HTML answer such as a CSRF refusal), the pod says so once and asks over the broker instead, as a `messageKey` run request. The boot line says which: `control plane key (partition acme, asked over HTTPS)` or `(…, asked over the broker)`; so does the doctor. With `@adonisjs/shield`'s CSRF on, add `/__durable/message-key` to its `exceptRoutes`.
 - **Each tenant only reads its own.** A message to a tenant is sealed with that tenant's key; another tenant's key does not open it. App A starting a workflow whose step runs on app B works with no configuration: A's request opens at the control plane with A's key, and the step goes to B sealed with B's key.
 - **Rotation.** Every message carries its key id (`kid`). When the control plane's secret rotates, the kid changes: a pod that sees a kid it does not hold asks again, and the control plane still opens messages sealed under the previous kid (in the processes that knew it).
-- **Boot lines:** `[@adonis-agora/durable] bullmq messages: control plane keys (crypto, key durable-message-keys, partition hub)` or `control plane keys (app key)` on the control plane, `control plane key (partition acme)` on a pod.
+- **Boot lines:** `[@adonis-agora/durable] bullmq messages: control plane keys (crypto, key durable-message-keys, partition _durable)` (on the Hub; `partition <app>` where crypto has an app of its own) or `control plane keys (app key)` on the control plane, `control plane key (partition acme)` on a pod.
 
 Where the control plane keeps its secret, detected through the `agora.crypto` binding (never imported):
 
 | The control plane's app | Its tenants' keys come from | Setup |
 | --- | --- | --- |
-| `@adonis-agora/crypto` embedded (the Agora Hub) | an HMAC under the crypto key `durable-message-keys` (type `hmac-sha256`) in its partition; rotating that key with `crypto:keys:rotate` rotates every tenant's key | none: the key is created at boot |
-| a crypto tenant of a separate crypto app | the same HMAC, through its crypto client | grant its client `crypto:hmac:durable-message-keys` (and `crypto:keys:manage:durable-message-keys` to create it at boot), or create it on the crypto server: `node ace crypto:keys:create durable-message-keys --type hmac-sha256 --application <partition>`. The boot line names what is missing. |
+| `@adonis-agora/crypto` embedded as a control plane too (the Agora Hub) | an HMAC under the crypto key `durable-message-keys` (type `hmac-sha256`) in the partition `_durable`; rotating that key with `crypto:keys:rotate --application _durable` rotates every tenant's key | none: the key is created on first use |
+| `@adonis-agora/crypto` embedded, standalone (`defineConfig({ app })`) | the same HMAC, in the app's own partition | none: the key is created on first use |
+| a crypto tenant of a separate crypto app | the same HMAC, through its crypto client, in its token's partition | grant its client `crypto:hmac:durable-message-keys` (and `crypto:keys:manage:durable-message-keys` to create it on first use), or create it on the crypto server: `node ace crypto:keys:create durable-message-keys --type hmac-sha256 --application <partition>`. The warning below names what is missing. |
 | no `@adonis-agora/crypto` | HKDF over its `APP_KEY`; rotating `APP_KEY` rotates every tenant's key | none (the doctor notes it) |
+
+A crypto control plane has no app of its own (crypto refuses its empty partition), so durable keeps its key in `_durable`. The leading `_` is deliberate: an authkit partition starts with a letter or a digit, so no tenant token can address it, and a tenant holding `crypto:*` over its own partition never reaches the key every tenant's key derives from.
+
+**Nothing at boot.** The key is looked up (and created when missing) on the control plane's first key request: its first sealed message, the first sealed message it opens, or the first tenant asking for its key. With sealing off and no tenant asking, durable makes no crypto call and logs no warning. The answer is kept for the life of the process, and every transport of the control plane shares it.
+
+**If crypto cannot give the key** (it cannot be created, the grant is missing, crypto is down), that first request falls back to HKDF over the control plane's `APP_KEY`, with one warning:
+
+```txt
+[@adonis-agora/durable] messages: the control plane cannot use the crypto key "durable-message-keys" in partition _durable (<reason>), so this process derives its tenants' message keys from its APP_KEY (HKDF) instead. Every replica of the control plane must derive them the same way: create it: `node ace crypto:keys:create durable-message-keys --type hmac-sha256 --application _durable`, then restart. Docs: …
+```
+
+Replicas that chose differently have different kids: pods ask again and work, but a message one replica sealed for another does not open there, so fix it and restart. Without an `APP_KEY` either, the warning says so and the sealed message fails; the next request tries crypto again. Before 1.5.2 the key was checked at boot in crypto's empty partition on the Hub, which always failed with `crypto: the token names no partition`.
 
 #### Single use, and what remains
 
