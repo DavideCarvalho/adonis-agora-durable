@@ -62,6 +62,9 @@ export interface CheckpointRow {
   /** Nullable + optional: the column arrived in a later schema wave (durable flow-control release);
    *  rows selected on an un-migrated/older schema simply don't carry it. */
   queue?: string | null;
+  /** Nullable + optional: written only for a step pinned to a transport, and read only where a
+   *  read selects every column — no explicit column list names it, so an older schema keeps working. */
+  transport?: string | null;
   wake_at: number | string | null;
   parallel_group: string | null;
   enqueued_at: number | string | null;
@@ -300,6 +303,8 @@ export function checkpointToRow(cp: StepCheckpoint): CheckpointRow {
     enqueued_at: (cp.enqueuedAt ?? cp.startedAt).getTime(),
     started_at: cp.startedAt.getTime(),
     finished_at: cp.finishedAt.getTime(),
+    // Only a pinned step names the column, so every other write works on a schema without it.
+    ...(cp.transport !== undefined ? { transport: cp.transport } : {}),
   };
 }
 
@@ -376,6 +381,7 @@ export function rowToCheckpoint(row: CheckpointRow): StepCheckpoint {
   if (events !== undefined) cp.events = events;
   if (row.worker_group != null) cp.workerGroup = row.worker_group;
   if (row.queue != null) cp.queue = row.queue;
+  if (row.transport != null) cp.transport = row.transport;
   const wakeAt = toNum(row.wake_at);
   if (wakeAt !== undefined) cp.wakeAt = wakeAt;
   if (row.parallel_group != null) cp.parallelGroup = row.parallel_group;

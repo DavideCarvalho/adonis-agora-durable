@@ -102,7 +102,9 @@ describe.skipIf(postgres.length === 0).each(postgres)(
         expect(
           seen.some((sql) => sql.startsWith('select') && sql.includes('"wake_requested_at"')),
         ).toBe(true);
-        expect(seen.some((sql) => sql.includes('"heartbeat_progress" from'))).toBe(true);
+        expect(
+          seen.some((sql) => sql.startsWith('select') && sql.includes('"heartbeat_progress"')),
+        ).toBe(true);
       } finally {
         await db.manager.closeAll();
       }

@@ -114,6 +114,8 @@ export class CodecStateStore implements StateStore {
   /** Encodes like {@link saveCheckpoint}. Bound only when the inner store has it. */
   readonly insertCheckpointIfAbsent?: (checkpoint: StepCheckpoint) => Promise<boolean>;
   /** Passed through (no payloads). Bound only when the inner store has it. */
+  readonly listPendingTransports?: (transports: string[]) => Promise<string[]>;
+  /** Passed through (no payloads). Bound only when the inner store has it. */
   readonly nextDueTimerAt?: (namespace?: string) => Promise<number | undefined>;
   /** Decodes each run claimed. Bound only when the inner store has it. */
   readonly claimPendingRuns?: (
@@ -265,6 +267,10 @@ export class CodecStateStore implements StateStore {
     const insertIfAbsent = inner.insertCheckpointIfAbsent;
     if (insertIfAbsent) {
       this.insertCheckpointIfAbsent = (cp) => insertIfAbsent.call(inner, this.encCp(cp));
+    }
+    const pendingTransports = inner.listPendingTransports;
+    if (pendingTransports) {
+      this.listPendingTransports = (transports) => pendingTransports.call(inner, transports);
     }
     const nextDue = inner.nextDueTimerAt;
     if (nextDue) this.nextDueTimerAt = (namespace) => nextDue.call(inner, namespace);

@@ -981,6 +981,17 @@ export class InMemoryStateStore implements StateStore {
     return scanRunValueFacets(this, axis, query, opts);
   }
 
+  async listPendingTransports(transports: string[]): Promise<string[]> {
+    const wanted = new Set(transports);
+    const found = new Set<string>();
+    for (const cp of this.checkpoints.values()) {
+      if (cp.status === 'pending' && cp.transport !== undefined && wanted.has(cp.transport)) {
+        found.add(cp.transport);
+      }
+    }
+    return [...found];
+  }
+
   async listCheckpoints(runId: string): Promise<StepCheckpoint[]> {
     const rows = [...this.checkpoints.values()]
       .filter((cp) => cp.runId === runId)

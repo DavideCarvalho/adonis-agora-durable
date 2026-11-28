@@ -42,6 +42,7 @@ import {
   type ControlPlane,
   InMemoryStateStore,
   InMemoryTransport,
+  type OnDemandTransports,
   ProxyRunGateway,
   type RunGateway,
   RunRequestResponder,
@@ -139,8 +140,11 @@ export default class DurableProvider {
   #detachDiagnostics: (() => void) | null = null;
   #runTraceScopeEnabled = false;
   #transport: (Transport & { close?: () => Promise<void> }) | null = null;
-  /** The `transportPool` transports built alongside {@link #transport}, closed with it on shutdown. */
+  /** The `transportPool` transports built alongside {@link #transport}, and the transports built on
+   *  demand when a step first pins one, closed with it on shutdown. */
   #pooledTransports: Array<Transport & { close?: () => Promise<void> }> = [];
+  /** Set by `shutdown()`: a transport whose on-demand build finishes after it is closed at once. */
+  #shuttingDown = false;
   #controlPlane: (ControlPlane & { close?: () => Promise<void> }) | null = null;
   /** How this app answers the federated console, once it does (the doctor reads it). */
   #consoleAnswering: AppConsoleResolution | undefined;
@@ -290,18 +294,52 @@ export default class DurableProvider {
       // `engine.startConsumers()`. Web/test processes keep today's eager behavior, as does
       // `consumers: 'always'`, while `consumers: 'never'` defers unconditionally — a pure producer
       // in every environment. Transports without `deferConsumers` (in-process) are unaffected.
-      const deferAll = (): void => {
-        transport.deferConsumers?.();
-        for (const p of pooled) p.transport.deferConsumers?.();
-      };
       // Optional call: naive test doubles of ApplicationService may not carry getEnvironment.
       const environment = this.app.getEnvironment?.();
       const oneOff = environment === 'console' || environment === 'repl';
-      if (config.consumers === 'never') {
-        deferAll();
-      } else if ((config.consumers ?? 'auto') === 'auto') {
-        if (oneOff) deferAll();
+      const deferConsumers =
+        config.consumers === 'never' || ((config.consumers ?? 'auto') === 'auto' && oneOff);
+      if (deferConsumers) {
+        transport.deferConsumers?.();
+        for (const p of pooled) p.transport.deferConsumers?.();
       }
+      // The rest of `transports` is built on demand: the first time a step pins one, it is built
+      // with the same treatment as the pool above (deferral here; namespace, handlers and consumer
+      // start by the engine) and joins the pool after it, so unpinned steps keep their failover order.
+      const bootBuilt = [
+        ...(config.transport ? [config.transport] : []),
+        ...pooled.map((p) => p.id),
+      ];
+      const configured = Object.keys(config.transports ?? {});
+      const onDemandIds = configured.filter((name) => !bootBuilt.includes(name));
+      // Passed whenever `transports` is configured, even with every entry built at boot, so a pin to
+      // an unknown name fails naming the configured ones.
+      const logger = configured.length > 0 ? await this.#resolveLogger() : undefined;
+      const onDemandTransports: OnDemandTransports | undefined =
+        configured.length > 0
+          ? {
+              ids: onDemandIds,
+              describe: 'built on demand from config.transports',
+              hint: `Define it in \`transports\` in config/durable.ts (configured: ${
+                configured.map((name) => `"${name}"`).join(', ') || 'none'
+              }).`,
+              build: async (id) => {
+                const built = (await this.#resolveTransport(config, ctx, id)) as Transport & {
+                  close?: () => Promise<void>;
+                };
+                if (this.#shuttingDown) {
+                  await built.close?.();
+                  throw new Error(
+                    `@agora/durable: transport "${id}" was built while shutting down`,
+                  );
+                }
+                if (deferConsumers) built.deferConsumers?.();
+                this.#pooledTransports.push(built);
+                logger?.info(`[@adonis-agora/durable] transport "${id}" built on demand`);
+                return built;
+              },
+            }
+          : undefined;
       // Hold the transport so `shutdown()` can release broker workers/connections cleanly.
       this.#transport = transport;
       const controlPlane = await this.#resolveControlPlane(config, ctx);
@@ -320,6 +358,7 @@ export default class DurableProvider {
         ...(config.transport
           ? { transports: [{ id: config.transport, transport }, ...pooled] }
           : { transport }),
+        ...(onDemandTransports ? { onDemandTransports } : {}),
         ...(controlPlane ? { controlPlane } : {}),
         ...(config.leaseMs !== undefined ? { leaseMs: config.leaseMs } : {}),
         ...(config.instanceId ? { instanceId: config.instanceId } : {}),
@@ -440,6 +479,26 @@ export default class DurableProvider {
         engine.registerQueue(queue);
       }
       this.#engine = engine;
+      if (onDemandIds.length > 0 && logger) {
+        // Steps dispatched on a transport built on demand before a restart still wait for results on
+        // it: build the ones a pending step names now, whether or not a run pins them again.
+        const pending = await engine.buildPendingTransports();
+        for (const { id, error } of pending.failed) {
+          logger.error(
+            `[@adonis-agora/durable] transport "${id}" has pending steps but failed to build (${
+              error instanceof Error ? error.message : String(error)
+            }); it is built again when a step pins it`,
+          );
+        }
+        logger.info(
+          `[@adonis-agora/durable] ${describeTransports({
+            boot: bootBuilt,
+            pending: pending.built,
+            onDemand: onDemandIds.filter((id) => !pending.built.includes(id)),
+            recordsPending: pending.supported,
+          })}`,
+        );
+      }
       return engine;
     });
   }
@@ -1257,6 +1316,7 @@ export default class DurableProvider {
   }
 
   async shutdown() {
+    this.#shuttingDown = true;
     // The embedded loop goes first and is AWAITED: it drains in-flight executions, and a tick
     // still running would otherwise find the transport closed underneath it a few lines below.
     const embedded = this.#embeddedWorkerLoop !== null;
@@ -1295,6 +1355,25 @@ export default class DurableProvider {
     await this.#controlPlane?.close?.();
     this.#controlPlane = null;
   }
+}
+
+/** The boot line saying which transports were built at boot and which are built on demand. */
+function describeTransports(built: {
+  boot: string[];
+  pending: string[];
+  onDemand: string[];
+  recordsPending: boolean;
+}): string {
+  const list = (names: string[]): string => names.map((name) => `"${name}"`).join(', ');
+  const parts = [`transports built at boot: ${list(built.boot) || 'the in-memory one'}`];
+  if (built.pending.length > 0)
+    parts.push(`built for steps still pending on them: ${list(built.pending)}`);
+  if (built.onDemand.length > 0)
+    parts.push(`built when a step first pins one: ${list(built.onDemand)}`);
+  const line = parts.join('; ');
+  return built.recordsPending
+    ? line
+    : `${line} (this store does not record a pinned step's transport: list a transport in \`transportPool\` to keep consuming its results after a restart)`;
 }
 
 /** Normalize the config's retention ages (duration strings or ms) into the engine's ms map. */
