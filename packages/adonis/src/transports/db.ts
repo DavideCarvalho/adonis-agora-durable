@@ -414,6 +414,11 @@ export class DbTransport implements Transport, ControlPlane {
   readonly #resultConcurrency: number;
   /** Seals what this transport writes and opens what it reads. */
   readonly #messages: MessageSealer;
+
+  /** The sealer (the control plane's responder grants tenant keys through it). */
+  get messageSealer(): MessageSealer {
+    return this.#messages;
+  }
   /** Run requests / starts that arrived plain (by correlation id): their replies go back plain. A
    *  start is answered with its run id as the reply's `requestId`, so both are looked up there. */
   readonly #plainRequests = new Set<string>();
@@ -465,6 +470,10 @@ export class DbTransport implements Transport, ControlPlane {
 
   constructor(options: DbTransportOptions) {
     this.#messages = sealerOf(options.messages, 'db');
+    // A tenant pod asks the control plane for its message key over the run-request channel.
+    this.#messages.attach?.({
+      dispatchRunRequest: (msg: RunRequest) => this.dispatchRunRequest(msg),
+    } as never);
     this.#db = options.db;
     this.#partition = options.partition;
     this.#namespace = options.namespace;
@@ -1833,6 +1842,7 @@ export class DbTransport implements Transport, ControlPlane {
       idleBackoffMax: 1,
       each: async (reply) => {
         try {
+          if (this.#messages.takeReply?.(reply)) return;
           this.#runReplyHandler?.(reply);
         } catch (err) {
           this.#onError(err); // a throwing listener must not re-deliver the reply

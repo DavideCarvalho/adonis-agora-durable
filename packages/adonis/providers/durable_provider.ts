@@ -533,9 +533,19 @@ export default class DurableProvider {
         // The pod's top-level `partition` / `instanceId` are the transport's defaults: a tenant pod
         // must consume the `<name>@<tenant>` queues the control plane dispatches its work to, even
         // when the transport entry doesn't repeat the partition (an explicit one there wins).
+        // The pod asks the control plane for its message key with the token its requests carry.
+        const source =
+          tenant.token !== undefined
+            ? resolveTenantToken(tenant.token, (Class) => this.app.container.make(Class))
+            : undefined;
+        const token =
+          source === undefined
+            ? undefined
+            : async () => (typeof source === 'string' ? source : await source());
         const transport = await this.#resolveTransport(config, {
           app: this.app,
           partition: tenant.partition,
+          tenant: { partition: tenant.partition, ...(token ? { token } : {}) },
           ...(config.instanceId !== undefined ? { instanceId: config.instanceId } : {}),
           ...(config.schema !== undefined ? { schema: config.schema } : {}),
         });

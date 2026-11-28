@@ -416,6 +416,11 @@ export class QueueTransport implements Transport, ControlPlane {
   readonly #resultConcurrency: number;
   /** Seals what this transport sends and opens what it receives. */
   readonly #messages: MessageSealer;
+
+  /** The sealer (the control plane's responder grants tenant keys through it). */
+  get messageSealer(): MessageSealer {
+    return this.#messages;
+  }
   readonly #idleBackoffMax: number;
   /** Every job handler still running (any queue) — `close()` waits for these, bounded. */
   readonly #runningJobs = new Set<Promise<void>>();
@@ -495,6 +500,10 @@ export class QueueTransport implements Transport, ControlPlane {
 
   constructor(options: QueueTransportOptions) {
     this.#messages = sealerOf(options.messages, 'queue');
+    // A tenant pod asks the control plane for its message key over the run-request channel.
+    this.#messages.attach?.({
+      dispatchRunRequest: (msg: RunRequest) => this.dispatchRunRequest(msg),
+    } as never);
     // Typed through CompatAdapter so the same code drives the 0.6 (job-id) and 0.7 (lease) contracts.
     this.#adapter = options.adapter() as unknown as CompatAdapter;
     this.#partition = options.partition;
@@ -1307,6 +1316,7 @@ export class QueueTransport implements Transport, ControlPlane {
         const reply = await this.#openOrDrop<RunReply>('runReply', job.payload);
         if (!reply) return;
         try {
+          if (this.#messages.takeReply?.(reply)) return;
           this.#runReplyHandler?.(reply);
         } catch (err) {
           this.#onError(err); // a throwing listener must not redeliver the reply

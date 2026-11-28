@@ -1,6 +1,6 @@
 ---
 title: Encrypting messages
-description: Every message durable puts on a broker (step inputs and results, heartbeats, workflow turns and decisions, tenant requests and replies, control broadcasts) can be encrypted and authenticated with a key derived from the app's APP_KEY, or with an @adonis-agora/crypto key between a tenant and its control plane. Every process opens sealed messages; sending them sealed is one switch, turned on once every process runs 1.2.1 or later.
+description: Every message durable puts on a broker (step inputs and results, heartbeats, workflow turns and decisions, tenant requests and replies, control broadcasts) can be encrypted and authenticated with a key derived from the app's APP_KEY, or, between tenant apps and their control plane, with per-tenant keys the control plane owns. Every process opens sealed messages; sending them sealed is one switch, turned on once every process runs 1.2.1 or later.
 icon: LockKeyhole
 ---
 
@@ -53,19 +53,31 @@ controlPlane: controlPlanes.redis({ connection: 'main' }), // sealed too
 - **Thin workers** built without AdonisJS (`new BullMQTransport({ ... })` in a [worker runtime](/docs/durable/cluster/thin-workers)) use `process.env.APP_KEY` the same way, or `messages: { appKey }`.
 - `memory` and `eventEmitter` keep everything in one process: nothing to seal.
 
-## Between a tenant and its control plane: `@adonis-agora/crypto`
+## Through the durable control plane: nothing to configure
 
-A [tenant pod](/docs/durable/cluster) and its control plane are different apps with different `APP_KEY`s. When `@adonis-agora/crypto` is booted in both (detected through its `agora.crypto` binding, never imported), their messages are sealed (with `seal: true`) with the crypto key **`durable-messages` of the tenant's partition**, with no other line of config:
+[Tenant pods](/docs/durable/cluster) and their control plane are different apps with different `APP_KEY`s. Their messages are sealed (with `seal: true`) with keys the **control plane owns**, one per tenant partition. The tenants need nothing beyond what tenant topology already requires (`tenant.partition` and its token): no `@adonis-agora/crypto`, no grant, no shared secret.
 
-- The **control plane** needs crypto **embedded** (the Agora Hub setup): it seals and opens in each tenant's partition, and creates `durable-messages` there the first time it talks to that tenant.
-- A **tenant** seals and opens with its own crypto client, in its own partition only. Its client needs `crypto:encrypt:durable-messages` and `crypto:decrypt:durable-messages`. If the key is missing at boot, the tenant creates it when its client may (`crypto:keys:manage:durable-messages`), else logs the command to run on the crypto server: `node ace crypto:keys:create durable-messages --type aes256-gcm --application <partition>`.
-- The tenant's durable partition (`tenant.partition`, the suffix of its routing groups) must be its crypto partition.
-- One tenant cannot open another's messages: each is sealed in its own partition.
-- Boot line: `[@adonis-agora/durable] bullmq messages: crypto (auto, key durable-messages, partition acme)`.
+- **One key per tenant.** The control plane derives each tenant's key from its own secret and the tenant's partition, so every replica derives the same key and nothing is stored. Where that secret lives is up to the control plane's app (below).
+- **Handed over at first use.** A tenant pod generates an ephemeral X25519 key pair and asks the control plane for its key with a `messageKey` run request, authenticated with its tenant token like every run request. The control plane answers only to a verified token (`verifyTenant` is required), only for the partition that token verifies to, and only to a request under a minute old. The answer is the key sealed to the pod's public key (ECDH-ES, HKDF-SHA256, AES-256-GCM, bound to the request id and partition). The pod keeps the key in memory; it never travels in clear and never lands on the broker.
+- **Each tenant only reads its own.** A message to a tenant is sealed with that tenant's key; another tenant's key does not open it. App A starting a workflow whose step runs on app B works with no configuration: A's request opens at the control plane with A's key, and the step goes to B sealed with B's key.
+- **Rotation.** Every message carries its key id (`kid`). When the control plane's secret rotates, the kid changes: a pod that sees a kid it does not hold asks again, and the control plane still opens messages sealed under the previous kid (in the processes that knew it).
+- **Boot lines:** `[@adonis-agora/durable] bullmq messages: control plane keys (crypto, key durable-message-keys, partition hub)` or `control plane keys (app key)` on the control plane, `control plane key (partition acme)` on a pod.
 
-Each process seals a random session key with the crypto key once an hour (per tenant, on the control plane) and encrypts its messages locally with it; a receiver opens each session key once and caches it. The crypto server sees a few calls an hour, not one per message.
+Where the control plane keeps its secret, detected through the `agora.crypto` binding (never imported):
 
-Without crypto on both sides, a tenant ↔ control-plane transport stays plain and warns at boot; set `secret` or `crypto` explicitly (below) to seal it.
+| The control plane's app | Its tenants' keys come from | Setup |
+| --- | --- | --- |
+| `@adonis-agora/crypto` embedded (the Agora Hub) | an HMAC under the crypto key `durable-message-keys` (type `hmac-sha256`) in its partition; rotating that key with `crypto:keys:rotate` rotates every tenant's key | none: the key is created at boot |
+| a crypto tenant of a separate crypto app | the same HMAC, through its crypto client | grant its client `crypto:hmac:durable-message-keys` (and `crypto:keys:manage:durable-message-keys` to create it at boot), or create it on the crypto server: `node ace crypto:keys:create durable-message-keys --type hmac-sha256 --application <partition>`. The boot line names what is missing. |
+| no `@adonis-agora/crypto` | HKDF over its `APP_KEY`; rotating `APP_KEY` rotates every tenant's key | none (the doctor notes it) |
+
+The handshake rides the run-request channel, so it carries the pod's token the way every run request does. Whoever reads the broker while a pod asks for its key sees that token and could replay it within its lifetime to get the key: keep tenant tokens short-lived (authkit app-call tokens are), and configure `verifyTenant` (required for keys anyway).
+
+Without a token (tenant) or a key (control plane: no `APP_KEY` and no crypto), the transport stays plain and warns at boot. 1.2.x sealed this traffic with `@adonis-agora/crypto` keys of each tenant's partition instead; if you turned `seal: true` on between tenants and their control plane on 1.2, upgrade both sides together (or turn it off during the upgrade).
+
+### Two apps on one transport without a control plane
+
+Processes of two apps that share a broker transport directly (both `standalone`) don't share an `APP_KEY`: a message of one does not open in the other, and is refused with a warning naming the fix. Give every process of both the same `messages: { secret }` or `messages: { crypto: { cipher } }`, or connect them through a control plane.
 
 ## Options
 
@@ -87,7 +99,7 @@ controlPlane: controlPlanes.redis({ messages: { acceptPlain: false } }),
 | Option | Default | What it does |
 | --- | --- | --- |
 | `seal` | `true` with an explicit `secret` / `crypto`, else `false` in 1.x | Send messages sealed. Off, they are sent plain while sealed ones are still opened (with the mode below). Default in the next major. |
-| (no mode) | | The app key; between a tenant and its control plane, the `durable-messages` crypto key. |
+| (no mode) | | The app key; between a tenant and its control plane, the control plane's per-tenant key. |
 | `secret` | | A shared secret (16+ characters, a string or a `Secret`), the same in every process: each message carries an HMAC-SHA256. **Authenticated, but readable** on the broker. For processes of several apps without crypto. |
 | `crypto: { cipher, key?, owns? }` | | Encrypt with an `@adonis-agora/crypto` key (`() => crypto.client!`) or your own KMS (anything with `encrypt` / `decrypt`). Every process needs both on the key (default name `durable-messages`). `owns` recognizes the cipher's ciphertexts (default `agora:ct1:<key>:`). |
 | `crypto: false` | | Turns the automatic mode off: plain (warns at boot). |
@@ -97,8 +109,8 @@ controlPlane: controlPlanes.redis({ messages: { acceptPlain: false } }),
 
 | | `APP_KEY` (automatic) | Shared secret | `@adonis-agora/crypto` |
 | --- | --- | --- | --- |
-| For | the processes of one app | any processes | a tenant and its control plane (automatic), or any processes (explicit) |
-| Config | none | `messages: { secret }` in every process | none between a tenant and the Hub; `messages: { crypto: { cipher } }` otherwise |
+| For | the processes of one app | any processes | any processes (explicit) |
+| Config | none | `messages: { secret }` in every process | `messages: { crypto: { cipher } }` in every process |
 | Messages | encrypted | readable, authenticated | encrypted |
 | Rotation | rotate `APP_KEY` | rotate the secret everywhere | crypto's `crypto:keys:rotate` and audit |
 
@@ -118,7 +130,7 @@ None of `@adonis-agora/authkit`, `@adonis-agora/authz` or `@adonis-agora/crypto`
 
 ## What is sealed
 
-A sealed message keeps its routing fields in clear and carries everything else in one `sealed` field, `dm1.<mode>.…` (`k` app key, `c` crypto, `s` secret). The AAD binds it to the message kind and the identity fields listed here, so a sealed input cannot be replayed into another step, run or kind.
+A sealed message keeps its routing fields in clear and carries everything else in one `sealed` field, `dm1.<mode>.…` (`k` app key, `t` control-plane key, `c` crypto, `s` secret). The AAD binds it to the message kind and the identity fields listed here, so a sealed input cannot be replayed into another step, run or kind.
 
 | Message | Transports | Clear (identity in **bold**) | Sealed |
 | --- | --- | --- | --- |

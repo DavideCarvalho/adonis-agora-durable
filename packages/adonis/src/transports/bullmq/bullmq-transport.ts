@@ -444,6 +444,11 @@ export class BullMQTransport implements Transport {
   readonly #replyDrains = new Map<string, { worker: WorkerLike; idleSince?: number | undefined }>();
   /** Seals what this transport sends and opens what it receives. */
   readonly #messages: MessageSealer;
+
+  /** The sealer (the control plane's responder grants tenant keys through it). */
+  get messageSealer(): MessageSealer {
+    return this.#messages;
+  }
   /** An opened task → the job data it came from (the hand-back check reads the job's object). */
   readonly #openedFrom = new WeakMap<object, object>();
 
@@ -479,6 +484,13 @@ export class BullMQTransport implements Transport {
 
   constructor(options: BullMQTransportOptions) {
     this.#messages = sealerOf(options.messages, 'bullmq');
+    // A tenant pod asks the control plane for its message key over the run-request channel.
+    this.#messages.attach?.({
+      dispatchRunRequest: async (msg: RunRequest) => {
+        this.#ensureRunReplySub();
+        await this.dispatchRunRequest(msg);
+      },
+    } as never);
     this.#deps = options.deps;
     this.#partition = options.partition;
     this.#prefix = options.prefix ?? 'durable';
@@ -2666,6 +2678,16 @@ export class BullMQTransport implements Transport {
 
   /** tenant ← control plane: consume {@link RunReply}s (the proxy filters by `requestId`). Idempotent. */
   onRunReply(handler: (reply: RunReply) => void): void {
+    if (this.#runReplyHandler) return; // one handler per transport
+    this.#runReplyHandler = handler;
+    this.#ensureRunReplySub();
+  }
+
+  /** The run-reply handler (the tenant's gateway), if any. */
+  #runReplyHandler: ((reply: RunReply) => void) | undefined;
+
+  /** Subscribe to run replies (once): for the gateway, and for this pod's message-key request. */
+  #ensureRunReplySub(): void {
     if (this.#runReplySub) return; // one subscription per transport
     const channel = runReplyChannel(this.#effectivePrefix());
     const sub = this.#subscriberRedis('run-reply');
@@ -2687,7 +2709,8 @@ export class BullMQTransport implements Transport {
       }
       void this.#openOrDrop<RunReply>('runReply', raw)
         .then((reply) => {
-          if (reply) handler(reply);
+          if (!reply || this.#messages.takeReply?.(reply)) return;
+          this.#runReplyHandler?.(reply);
         })
         .catch(() => undefined);
     }) as never);

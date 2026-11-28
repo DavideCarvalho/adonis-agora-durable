@@ -4,20 +4,26 @@ Source: `docs/transports/encrypting-messages.mdx`.
 
 ## Defaults
 
-- Every 1.2.1+ broker transport (`transports.bullmq`, `transports.queue`, `transports.db`) and
-  `controlPlanes.redis` OPENS sealed messages. Sending them sealed is one switch,
+- Every broker transport on this version (`transports.bullmq`, `transports.queue`, `transports.db`) and
+  `controlPlanes.redis` OPENS sealed messages (control-plane per-tenant seals need this version on
+  both sides; 1.2.1+ opens the other modes).
+  Sending them sealed is one switch,
   `messages: { seal: true }` in `config/durable.ts` (or per transport), off in 1.x and the default in
-  the next major. Turn it on only once every process runs 1.2.1+ (1.2.0 sealed by default; that was
-  reverted). `memory` / `eventEmitter` stay in-process.
+  the next major. Turn it on only once every process runs this version (1.2.1+ is enough for
+  same-app seals; 1.2.0 sealed by default; that was reverted). `memory` / `eventEmitter` stay in-process.
 - Same app: AES-256-GCM, key derived from `APP_KEY` (HKDF-SHA256, purpose
   `agora:durable:messages`). Boot line with `seal: true`: `[@adonis-agora/durable] bullmq messages: app key (auto)`;
   by default (sealing off): `bullmq messages: sent plain, sealed ones opened with app key (auto)`.
-- Tenant ↔ control plane (`topology: 'tenant'` / `'control-plane'`): `@adonis-agora/crypto`, found
-  through its `agora.crypto` binding. Key `durable-messages` in the tenant's partition; the control
-  plane needs crypto embedded and creates the key per tenant; a tenant's crypto client needs
-  `crypto:encrypt:durable-messages` + `crypto:decrypt:durable-messages` (+ `crypto:keys:manage:…`
-  to create it). The tenant's durable partition must be its crypto partition.
-- No key (no `APP_KEY`, or no crypto between apps): plain, with a boot warning naming the fix when `seal: true` asked for sealing.
+- Tenant ↔ control plane (`topology: 'tenant'` / `'control-plane'`): the CONTROL PLANE owns one key
+  per tenant partition, derived from its `@adonis-agora/crypto` HMAC key `durable-message-keys`
+  (crypto embedded, or a crypto app it is a tenant of; created at boot when allowed) or else from
+  its `APP_KEY`. A pod asks for its key with a `messageKey` run request carrying its tenant token
+  and an ephemeral X25519 public key; the control plane (needs `verifyTenant`) answers with the key
+  sealed to it. Tenants need no crypto, no grant. Every message carries a `kid`; rotation = new kid,
+  pods ask again.
+- Two apps sharing a transport without a control plane: explicit `messages: { secret | crypto }`
+  in every process of both (a message from another APP_KEY is refused, with that hint).
+- No key (no `APP_KEY`; a tenant without a token): plain, with a boot warning naming the fix when `seal: true` asked for sealing.
 - A transport built without AdonisJS (`new BullMQTransport(...)`) opens sealed messages with
   `process.env.APP_KEY`, and sends them sealed with `messages: { seal: true, appKey | secret | crypto }`.
 
@@ -64,11 +70,15 @@ does not run its handler and is reported failed (retryable). Anything else is dr
 
 ## Upgrading from 1.1
 
-1. Upgrade every process to 1.2.1+: still sends plain (a 1.1 worker keeps running its tasks with
-   their real input), already opens sealed, replies in kind.
+1. Upgrade every process to this version: still sends plain (a 1.1 worker keeps running its tasks with
+   their real input), already opens sealed (1.2.1+ is enough for same-app seals; tenant ↔ control-plane
+   seals need this version on both sides), replies in kind.
 2. Turn sealing on: `messages: { seal: true }`.
 3. Later, `acceptPlain: false`.
 
 Why: a sealed step task reaching a 1.1 worker runs the handler with `input` undefined. 1.2.x
 receivers fail safe: anything carrying a seal they cannot open is refused, never read as plain.
+Sealed tenant ↔ control-plane traffic from 1.2.x (crypto key `durable-messages` in each tenant's
+partition) does not open here: if you turned `seal: true` on between tenants and their control plane
+on 1.2.x, upgrade both sides together, or turn it off during the upgrade.
 NestJS / Python workers read plain only: keep sealing off (or `insecure`) on their transport.

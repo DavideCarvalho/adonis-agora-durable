@@ -38,9 +38,22 @@ export async function checkMessages(app: ApplicationService): Promise<AgoraDocto
       },
     ];
   }
+  // A tenant pod asks the control plane for its key with its token (explicit, or authkit's).
+  const tenantConfig = (config as { tenant?: { partition?: string; token?: unknown } } | undefined)
+    ?.tenant;
+  const hasToken =
+    tenantConfig?.token !== undefined ||
+    (typeof app.container?.hasBinding === 'function' && app.container.hasBinding('authkit.client'));
+  const tenant =
+    config?.topology === 'tenant'
+      ? {
+          partition: tenantConfig?.partition ?? '(from authkit)',
+          ...(hasToken ? { token: async () => '' } : {}),
+        }
+      : undefined;
   const results: AgoraDoctorResult[] = [];
   for (const [name, options] of entries) {
-    const mode = await describeMessagesMode(app as never, name, options);
+    const mode = await describeMessagesMode(app as never, name, options, undefined, tenant);
     if ('error' in mode) {
       results.push({ status: 'error', message: `${name}: ${mode.error}`, docs: DOCS });
       continue;
@@ -77,7 +90,13 @@ export async function checkMessages(app: ApplicationService): Promise<AgoraDocto
     }
     results.push({
       status: 'ok',
-      message: `${name} messages: ${mode.label}, plain messages refused.`,
+      message: `${name} messages: ${mode.label}, plain messages refused.${
+        mode.mode === 'tenant-key' &&
+        mode.role === 'control-plane' &&
+        mode.label.includes('(app key)')
+          ? " No @adonis-agora/crypto here: the tenants' keys derive from this APP_KEY (rotating it rotates them all)."
+          : ''
+      }`,
     });
   }
   return results;

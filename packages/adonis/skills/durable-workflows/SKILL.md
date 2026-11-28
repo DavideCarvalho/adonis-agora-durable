@@ -17,7 +17,7 @@ license: MIT
 metadata:
   type: core
   library: "@adonis-agora/durable"
-  library_version: "1.2.0"
+  library_version: "1.2.1"
   framework: adonisjs
 sources:
   - 'DavideCarvalho/adonis-durable:docs/authoring/app-workflows.mdx'

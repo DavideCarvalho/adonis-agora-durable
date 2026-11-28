@@ -69,7 +69,7 @@ export type MessageKind =
   | 'control';
 
 /** How a transport seals its messages. */
-export type MessageMode = 'app-key' | 'secret' | 'crypto' | 'plain';
+export type MessageMode = 'app-key' | 'secret' | 'crypto' | 'tenant-key' | 'plain';
 
 /** Why a received message was refused. */
 export type MessageRejection =
@@ -121,6 +121,18 @@ export interface MessageSealer {
    * otherwise (then {@link open} decides). Keeps the plain path free of an extra tick.
    */
   openPlain<T>(kind: MessageKind, raw: unknown): T | undefined;
+  /** Tenant side of the control-plane keys: the transport hands its run-request channel over. */
+  attach?: ((wire: { dispatchRunRequest(msg: never): Promise<void> }) => void) | undefined;
+  /** Tenant side: a run reply that answers this sealer's key request (consumed, not delivered). */
+  takeReply?: ((reply: { requestId: string; result: unknown }) => boolean) | undefined;
+  /** Control-plane side: grant a verified tenant its key (the `messageKey` run request). */
+  issueTenantKey?:
+    | ((input: {
+        partition: string;
+        publicKey: string;
+        requestId: string;
+      }) => Promise<{ kid: string; epk: string; ct: string }>)
+    | undefined;
 }
 
 /** The field a sealed message carries its seal in. */
@@ -412,9 +424,20 @@ abstract class BaseSealer implements MessageSealer {
 class PlainSealer extends BaseSealer {
   readonly mode = 'plain' as const;
   readonly label: string;
+  readonly attach?: MessageSealer['attach'];
+  readonly takeReply?: MessageSealer['takeReply'];
+  readonly issueTenantKey?: MessageSealer['issueTenantKey'];
   constructor(ctx: Ctx, label = 'plain') {
     super({ ...ctx, acceptPlain: true });
     this.label = label;
+    // The opener's control-plane key plumbing works while sending plain: tenants still get keys.
+    const fallback = ctx.fallback;
+    if (fallback?.attach) this.attach = (wire) => fallback.attach?.(wire);
+    if (fallback?.takeReply) this.takeReply = (reply) => fallback.takeReply?.(reply) ?? false;
+    if (fallback?.issueTenantKey) {
+      const issue = fallback.issueTenantKey;
+      this.issueTenantKey = (input) => issue(input);
+    }
   }
   async seal<T extends object>(_kind: MessageKind, msg: T): Promise<T> {
     return msg;
@@ -464,7 +487,7 @@ class AppKeySealer extends BaseSealer {
       return this.reject(
         kind,
         'unauthenticated',
-        'it does not open with this app key (another APP_KEY, tampered with, or moved from another run, step or kind)',
+        'it does not open with this app key (another APP_KEY, tampered with, or moved from another run, step or kind). If another app shares this transport directly (no control plane between them), give every process of both the same `messages: { secret }` or `messages: { crypto: { cipher } }`, or connect them through a durable control plane (tenant topology)',
       );
     }
     return mergeOpened<T>(this, kind, clear, text);
@@ -761,12 +784,136 @@ class CryptoSealer extends BaseSealer {
   }
 }
 
+/* ------------------------------------------------------------------------------------------- */
+/* Control-plane keys (tenant ↔ control plane)                                                 */
+/* ------------------------------------------------------------------------------------------- */
+
+/** Where a `tenant-key` sealer gets its keys: the control plane's root, or a tenant's handshake. */
+export interface PartitionKeySource {
+  label: string;
+  /** The partition and key a message is sealed with. */
+  sealKey(
+    kind: MessageKind,
+    msg: Record<string, unknown>,
+  ): Promise<{ partition: string; kid: string; key: Buffer }>;
+  /** The key of `partition` and `kid`, if this process accepts that partition and has the key. */
+  openKey(partition: string, kid: string): Promise<Buffer | undefined>;
+  /**
+   * A partition this process never holds keys for and is not addressed by (another tenant's run
+   * replies, broadcast on BullMQ): dropped quietly instead of reported.
+   */
+  foreign?(partition: string): boolean;
+  /** A message sent and accepted plain whatever the policy (the key request that bootstraps it). */
+  bootstrap(kind: MessageKind, raw: Record<string, unknown>): boolean;
+  onOpened?(kind: MessageKind, msg: Record<string, unknown>, partition: string): void;
+  attach?: MessageSealer['attach'];
+  takeReply?: MessageSealer['takeReply'];
+  issueTenantKey?: MessageSealer['issueTenantKey'];
+}
+
+/** `dm1.t.<partition>.<kid>.<iv | tag | AES-256-GCM>`: a control-plane key, per tenant partition. */
+class PartitionKeySealer extends BaseSealer {
+  readonly mode = 'tenant-key' as const;
+  readonly label: string;
+  readonly #source: PartitionKeySource;
+  readonly attach?: MessageSealer['attach'];
+  readonly takeReply?: MessageSealer['takeReply'];
+  readonly issueTenantKey?: MessageSealer['issueTenantKey'];
+
+  constructor(source: PartitionKeySource, ctx: Ctx) {
+    super(ctx);
+    this.#source = source;
+    this.label = source.label;
+    if (source.attach) this.attach = (wire) => source.attach?.(wire);
+    if (source.takeReply) this.takeReply = (reply) => source.takeReply?.(reply) ?? false;
+    if (source.issueTenantKey)
+      this.issueTenantKey = (input) =>
+        (source.issueTenantKey as NonNullable<MessageSealer['issueTenantKey']>)(input);
+  }
+
+  #aad(kind: MessageKind, clear: Record<string, unknown>, partition: string, kid: string): string {
+    return `${aadOf(kind, clear)}\n${partition}\n${kid}`;
+  }
+
+  async seal<T extends object>(kind: MessageKind, msg: T): Promise<T> {
+    const record = msg as Record<string, unknown>;
+    if (isSealedMessage(msg) || this.#source.bootstrap(kind, record)) return msg;
+    const { partition, kid, key } = await this.#source.sealKey(kind, record);
+    const { clear, hidden } = split(kind, record);
+    const wire = gcmSeal(key, this.#aad(kind, clear, partition, kid), JSON.stringify(hidden));
+    return {
+      ...clear,
+      [SEALED_FIELD]: `${SEAL_PREFIX}t.${b64(partition)}.${kid}.${wire}`,
+    } as T;
+  }
+
+  override openPlain<T>(kind: MessageKind, raw: unknown): T | undefined {
+    if (isRecord(raw) && raw[SEALED_FIELD] === undefined && this.#source.bootstrap(kind, raw)) {
+      return raw as T;
+    }
+    return super.openPlain<T>(kind, raw);
+  }
+
+  override async open<T>(kind: MessageKind, raw: unknown): Promise<T> {
+    if (isRecord(raw) && raw[SEALED_FIELD] === undefined && this.#source.bootstrap(kind, raw)) {
+      return raw as T;
+    }
+    return super.open<T>(kind, raw);
+  }
+
+  protected async openSealed<T>(
+    kind: MessageKind,
+    raw: Record<string, unknown>,
+    seal: string,
+  ): Promise<T> {
+    if (!seal.startsWith('t.')) return this.wrongMode(kind, raw, seal);
+    const parts = seal.slice(2).split('.');
+    if (parts.length !== 3)
+      return this.reject(kind, 'malformed', 'its control-plane seal is malformed');
+    const [p64, kid, wire] = parts as [string, string, string];
+    const partition = Buffer.from(p64, 'base64url').toString('utf8');
+    if (this.#source.foreign?.(partition)) {
+      throw new MessageRejectedError(kind, 'unauthenticated', `it is for partition "${partition}"`);
+    }
+    let key: Buffer | undefined;
+    try {
+      key = await this.#source.openKey(partition, kid);
+    } catch (error) {
+      return this.reject(
+        kind,
+        'crypto-unavailable',
+        `its key (partition "${partition}", kid ${kid}) could not be obtained: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (!key) {
+      return this.reject(
+        kind,
+        'unauthenticated',
+        `it is sealed for partition "${partition}" with key ${kid}, which this process does not hold (another tenant's, another control plane's, or a key rotated away)`,
+      );
+    }
+    const clear = clearOf(kind, raw);
+    const text = gcmOpen(key, this.#aad(kind, clear, partition, kid), wire);
+    if (text === null) {
+      return this.reject(
+        kind,
+        'unauthenticated',
+        'it does not authenticate (tampered with, or moved from another run, step, kind or tenant)',
+      );
+    }
+    const opened = mergeOpened<T>(this, kind, clear, text);
+    this.#source.onOpened?.(kind, opened as Record<string, unknown>, partition);
+    return opened;
+  }
+}
+
 /** What a sealer is made from (one of the modes). */
 export type SealerSpec =
   | { mode: 'plain'; label?: string; fallback?: MessageSealer | undefined }
   | { mode: 'app-key'; appKey: MessageSecret; label?: string }
   | { mode: 'secret'; secret: MessageSecret }
-  | { mode: 'crypto'; source: CryptoSealerSource };
+  | { mode: 'crypto'; source: CryptoSealerSource }
+  | { mode: 'tenant-key'; source: PartitionKeySource };
 
 /** Build a sealer. `report` is called once per refused message (see {@link onceReporter}). */
 export function createMessageSealer(
@@ -791,5 +938,7 @@ export function createMessageSealer(
       return new SecretSealer(spec.secret, ctx);
     case 'crypto':
       return new CryptoSealer(spec.source, ctx);
+    case 'tenant-key':
+      return new PartitionKeySealer(spec.source, ctx);
   }
 }

@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHmac, randomBytes } from 'node:crypto';
 import type {
   CryptoPrincipalLike,
   CryptoRuntimeLike,
@@ -37,7 +37,38 @@ export class FakeCryptoServer {
     return this.keys.has(`${partition}/${name}`);
   }
 
-  readonly service: NonNullable<CryptoRuntimeLike['service']> = {
+  /** A new version of a key (an HMAC key's output changes, like `crypto:keys:rotate`). */
+  rotate(partition: string, name: string): void {
+    this.createKeyIn(partition, name);
+  }
+
+  hmacFor(
+    principal: CryptoPrincipalLike,
+    input: { key: string; message: string },
+  ): { key: string; hmac: string } {
+    if (!holds(principal.capabilities, `crypto:hmac:${input.key}`)) {
+      throw new Error(`forbidden: crypto:hmac:${input.key}`);
+    }
+    const key = this.#key(principal.partition, input.key);
+    this.audit.push({
+      op: 'hmac',
+      partition: principal.partition,
+      key: input.key,
+      actor: principal.actor,
+    });
+    return {
+      key: input.key,
+      hmac: createHmac('sha256', key).update(input.message).digest('base64url'),
+    };
+  }
+
+  readonly service: NonNullable<CryptoRuntimeLike['service']> & {
+    hmac(
+      principal: CryptoPrincipalLike,
+      input: { key: string; message: string },
+    ): Promise<{ key: string; hmac: string }>;
+  } = {
+    hmac: async (principal, input) => this.hmacFor(principal, input),
     encrypt: async (principal, input) => this.#encrypt(principal, input, 'encrypt'),
     decrypt: async (principal, input) => this.#decrypt(principal, input),
     createKey: async (principal, input) => {
@@ -150,6 +181,7 @@ export class FakeCryptoServer {
           return this.#decrypt(me, input);
         },
         createKey: async (input) => this.service.createKey(me, input),
+        hmac: async (input: { key: string; message: string }) => this.hmacFor(me, input),
         ...(options.hasKey
           ? {
               hasKey: async ({ key }: { key: string }) => {
