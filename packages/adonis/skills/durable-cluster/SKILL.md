@@ -45,9 +45,12 @@ transport (`bullmq`/`queue`/`db`) with `tenant: { partition, token }`
 (optional when `@adonis-agora/authkit-client` is booted with its `service`
 configured — its `authkit.client.tenantOf('urn:agora:durable')` supplies
 `partition`/`token`; each explicit field wins, `tenant: { auto: false }` opts out),
-`verifyTenant` and `capabilities`. Durable never reads `tenant.url`: a tenant reaches the
-control plane through its `transport` (still required), so authkit-client fills only `token` and
-`partition`, and `url` is accepted only so the block reads like the other Agora libs'.
+`verifyTenant` and `capabilities`. The `transport` is still required: `tenant.url`
+(explicit, else what authkit-client knows of `urn:agora:durable`) is read only to ask
+for the pod's message key over HTTPS — `POST <url>/__durable/message-key` with the token
+as a bearer, so the token never crosses the broker for this. Without a usable URL the pod
+falls back to the broker and says so; the boot line and the doctor (`durable.messages`)
+say `asked over HTTPS` vs `asked over the broker`. Plain `http` is used only for localhost.
 
 | Topology | Owns the store | Executes bodies | Serves HTTP |
 |------|:---:|:---:|:---:|
