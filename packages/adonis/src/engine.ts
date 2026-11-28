@@ -184,6 +184,12 @@ import {
   routeFor,
 } from './on-error.js';
 import { ORIGIN_RESOLVED, originOfCaller } from './origin.js';
+import {
+  type AppProtection,
+  type MessagesProtection,
+  sealerProtection,
+  storeProtectionOf,
+} from './protection.js';
 import { breakpointToken, type StepHandler, stepId } from './protocol.js';
 import type { QueueConfig } from './queue.js';
 import { markRemoteEvent } from './remote-event.js';
@@ -4241,6 +4247,23 @@ export class WorkflowEngine {
       return this.store.runValueFacets(axis, scoped, opts);
     }
     return scanRunValueFacets(this.store, axis, scoped, opts);
+  }
+
+  /**
+   * How this engine protects run data, read from what it actually runs with: the mode each broker
+   * transport's sealer (pool members included) and the control plane's sealer resolved to, and
+   * whether its store encodes payloads at rest. Names and modes only, never key material: what the
+   * console's badges show.
+   */
+  protection(): AppProtection {
+    const messages: MessagesProtection[] = [];
+    for (const { id, transport } of this.pool.members) {
+      const entry = sealerProtection(id, transport);
+      if (entry) messages.push(entry);
+    }
+    const plane = sealerProtection('control plane', this.controlPlane);
+    if (plane) messages.push(plane);
+    return { messages, store: storeProtectionOf(this.store) };
   }
 
   /** List a run's step checkpoints (its timeline). Part of the engine's read API; see {@link listRuns}. */

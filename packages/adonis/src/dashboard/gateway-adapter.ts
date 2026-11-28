@@ -15,6 +15,7 @@ import type {
   RepublishLifecycleTarget,
   WorkflowLifecycleLinks,
 } from '../lifecycle-events.js';
+import type { AppProtection } from '../protection.js';
 import { DURABLE_RUN_GATEWAY } from '../role_bindings.js';
 import type { FanPageQuery, RunDetailOptions } from '../run-detail-summary.js';
 import type { RunGateway } from '../run-gateway/interface.js';
@@ -73,6 +74,8 @@ export interface StoreEngineLike {
   republishLifecycle?(target: RepublishLifecycleTarget): Promise<RepublishLifecycleResult>;
   /** Who starts whom through lifecycle events — forwarded 1:1 when the engine has it. */
   workflowLifecycle?(workflow: string): Promise<WorkflowLifecycleLinks>;
+  /** How the engine protects run data (`engine.protection()`) — forwarded 1:1 when it has it. */
+  protection?(): AppProtection;
   /** Value enumeration for the console's pickers — forwarded 1:1 when the engine has it. */
   runValueFacets?(
     axis: RunValueAxis,
@@ -158,6 +161,11 @@ export function storeDashboardEngine(engine: StoreEngineLike): DashboardEngine {
       ? {
           getEvent: (runId: string, key: string) =>
             (engine.getEvent as NonNullable<StoreEngineLike['getEvent']>)(runId, key),
+        }
+      : {}),
+    ...(engine.protection
+      ? {
+          protection: () => (engine.protection as NonNullable<StoreEngineLike['protection']>)(),
         }
       : {}),
     ...(engine.listSignalWaiters

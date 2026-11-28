@@ -17,6 +17,7 @@ import type {
   RunQuery,
   StateStore,
 } from '../interfaces.js';
+import { type StoreProtection, storeProtectionOf } from '../protection.js';
 import { loadFanMembers, loadRunDetail, type RunDetailSource } from '../run-detail-summary.js';
 import { scanRunValueFacets } from '../run-value-facets.js';
 import { listSignalWaitersOfRuns } from '../run-waiting.js';
@@ -113,6 +114,7 @@ export const CONSOLE_COMMAND_VERBS = [
   'republishLifecycle',
   'workflowLifecycle',
   'getEvent',
+  'protection',
 ] as const satisfies ReadonlyArray<keyof DashboardEngine>;
 
 export type ConsoleCommandVerb = (typeof CONSOLE_COMMAND_VERBS)[number];
@@ -123,6 +125,7 @@ const READ_VERBS: ReadonlySet<string> = new Set<ConsoleCommandVerb>([
   'workerHealth',
   'workflowLifecycle',
   'getEvent',
+  'protection',
 ]);
 
 const KNOWN_VERBS: ReadonlySet<string> = new Set<string>(CONSOLE_COMMAND_VERBS);
@@ -150,6 +153,7 @@ export const CONSOLE_VERB_CAPABILITY: Readonly<Record<ConsoleCommandVerb, string
   workerHealth: DURABLE_CONSOLE_CAPABILITIES.read,
   workflowLifecycle: DURABLE_CONSOLE_CAPABILITIES.read,
   getEvent: DURABLE_CONSOLE_CAPABILITIES.read,
+  protection: DURABLE_CONSOLE_CAPABILITIES.read,
 };
 
 /** Durable's console capabilities, each a read or a write (the canonical matcher's table). */
@@ -544,6 +548,7 @@ export class FederatedApp {
       republishLifecycle: remote('republishLifecycle'),
       workflowLifecycle: remote('workflowLifecycle'),
       getEvent: remote('getEvent'),
+      protection: remote('protection'),
       subscribe: (runId, onEvent) => this.#subscribe(runId, onEvent),
     };
   }
@@ -627,6 +632,11 @@ export class FederatedApp {
       current?.delete(onEvent);
       if (current?.size === 0) this.#listeners.delete(runId);
     };
+  }
+
+  /** Whether the store this console reads the app's runs from decodes them (encrypted at rest). */
+  get storeProtection(): StoreProtection {
+    return storeProtectionOf(this.#store);
   }
 
   /** Close the app's control plane (the console's process is shutting down). */

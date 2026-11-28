@@ -144,6 +144,7 @@ export * from './metrics.js';
 export { asHeartbeat, withScheduleOrigin } from './observability-scope.js';
 export * from './on-error.js';
 export * from './pollers.js';
+export * from './protection.js';
 export * from './protocol.js';
 export * from './queue.js';
 export { isRemoteEvent } from './remote-event.js';

@@ -71,8 +71,10 @@ import {
   type ApiRequest,
   type ApiResponse,
   bulkAction,
+  type ConsoleProtection,
   cancelRun,
   completeTaskRun,
+  consoleProtection,
   continueRun,
   type DashboardEngine,
   type Deps,
@@ -107,6 +109,7 @@ import {
 import type { DurableConfig } from '../src/define_config.js';
 import { registerDoctorChecks } from '../src/doctor/agora_doctor.js';
 import { durableConsoleDoctorChecks } from '../src/doctor/checks.js';
+import { configuredMessagesProtection } from '../src/doctor/messages.js';
 import { WorkflowEngine } from '../src/index.js';
 import { collectMetrics, type MetricsCollector } from '../src/metrics.js';
 import { DURABLE_TRANSPORT } from '../src/role_bindings.js';
@@ -259,13 +262,16 @@ export default class DashboardProvider {
       const scope = ctx ? await this.consoleTenantScope(config, ctx) : undefined;
       if (selected !== undefined && ctx) {
         // Another app: its store and its engine. This app's own tenancy slot and counters do not apply.
-        const remote = (await this.federatedApp(config, selected)).engine(
+        const federated = await this.federatedApp(config, selected);
+        const remote = federated.engine(
           auditActor(ctx),
           await this.consoleCapabilities(config, ctx),
         );
         return {
           engine: scope ? scopedDashboardEngine(remote, scope.ids) : remote,
           ...(config.redact ? { redact: config.redact } : {}),
+          // The store this console reads that app's runs through: encoded there means at rest.
+          atRest: federated.storeProtection,
         };
       }
       const base = await dashboardEngineForTopology(
@@ -287,12 +293,41 @@ export default class DashboardProvider {
         (scope && scope.ids !== undefined) || apps !== undefined
           ? undefined
           : this.metricsCollector;
+      // Whether this app's store encodes runs at rest (a store topology's engine knows; a tenant
+      // pod's gateway does not, and nothing is marked).
+      const atRest = base.protection ? (await base.protection()).store : undefined;
       return {
         engine,
         ...(config.redact ? { redact: config.redact } : {}),
         ...(metrics ? { metrics } : {}),
+        ...(atRest ? { atRest } : {}),
       };
     };
+  }
+
+  /** The console's protection badges for the app this request reads (see {@link consoleProtection}). */
+  private async consoleProtectionOf(
+    config: ResolvedDurableDashboardConfig,
+    ctx: HttpContext,
+    deps: (ctx?: HttpContext) => Promise<Deps>,
+    selected: string | undefined,
+  ): Promise<ConsoleProtection | undefined> {
+    let engine: DashboardEngine;
+    try {
+      engine = (await deps(ctx)).engine;
+    } catch {
+      return undefined;
+    }
+    const answered = await consoleProtection(engine, config.redact);
+    if (answered || selected !== undefined || this.durableTopology() !== 'tenant') return answered;
+    try {
+      return await consoleProtection(
+        { protection: async () => ({ messages: await configuredMessagesProtection(this.app) }) },
+        config.redact,
+      );
+    } catch {
+      return undefined;
+    }
   }
 
   /** `authorize`'s decision for this request, asked once. */
@@ -871,9 +906,15 @@ export default class DashboardProvider {
                 () => undefined,
               )
             : undefined;
+        // The protection badges: what the served app's engine runs with (another app answers for
+        // itself over its control plane; one too old to answer gets no badge). A tenant pod has no
+        // engine here: its messages are described from the config.
+        const protection = await this.consoleProtectionOf(config, ctx, deps, selected);
         // Another app runs its own engine over its own store: a standalone deployment as seen here.
         const result =
-          selected !== undefined ? topology('standalone') : topology(durableTopology, tenant);
+          selected !== undefined
+            ? topology('standalone', undefined, protection)
+            : topology(durableTopology, tenant, protection);
         return ctx.response.status(result.status).json(result.body);
       })
       .as('durable_dashboard.topology');

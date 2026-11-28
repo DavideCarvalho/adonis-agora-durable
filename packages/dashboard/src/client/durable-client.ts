@@ -79,6 +79,8 @@ export interface StepCheckpoint {
   enqueuedAt?: string;
   startedAt: string;
   finishedAt: string;
+  /** The fields the console's `redact` hook hid on this step (names only). */
+  redactedFields?: string[];
 }
 
 /** What a suspended run is parked on — populated on `GET /runs` list rows via the server's bulk
@@ -112,6 +114,8 @@ export interface WorkflowRun {
   createdAt: string;
   updatedAt: string;
   waiting?: RunWaiting;
+  /** The fields the console's `redact` hook hid on this run (names only; run detail). */
+  redactedFields?: string[];
 }
 
 /** The console's "Organization" control (`GET /tenants`). */
@@ -195,6 +199,8 @@ export interface RunDetail {
   waitsFor?: RunWaitLink[] | undefined;
   /** The runs waiting for this one through `ctx.waitForRun`. */
   awaitedBy?: RunWaitLink[] | undefined;
+  /** The fields the store encrypts at rest (the console shows them decrypted). Absent: none known. */
+  encryptedAtRest?: { run: string[]; step: string[] } | undefined;
 }
 
 /** The run whose settling started a run. */
@@ -328,6 +334,22 @@ export interface FanPageOptions {
 export interface DurableTopology {
   role: 'control-plane' | 'standalone' | 'tenant';
   tenant?: string;
+  /** How the served app protects run data (the header's badges). Absent on an older server or app:
+   *  no badge is shown. */
+  protection?: ConsoleProtection | undefined;
+}
+
+/** How a broker transport seals its messages. `secret` signs them only; `plain` does neither. */
+export type MessagesMode = 'app-key' | 'secret' | 'crypto' | 'tenant-key' | 'plain';
+
+/** What `GET /topology` says about the served app's protection: names and modes, no key material. */
+export interface ConsoleProtection {
+  /** One per broker transport (pool members included), then the control plane. Empty: no broker. */
+  messages: Array<{ transport: string; mode: MessagesMode; acceptPlain: boolean }>;
+  /** The state store's encryption at rest. Absent: not known (a tenant pod). */
+  store?: { codec: boolean; coverage: 'payloads' | 'extended' | null } | undefined;
+  /** Whether the console's `redact` hooks hide run / step fields. */
+  redact: { run: boolean; checkpoint: boolean };
 }
 
 /** One ticked schedule with its live control state — `GET /schedules`' `data` rows, verbatim (the server

@@ -34,6 +34,7 @@ import {
   type WorkflowLifecycleLinks,
 } from '../lifecycle-events.js';
 import type { MetricsSnapshot } from '../metrics.js';
+import { type AppProtection, type StoreProtection, sanitizeAppProtection } from '../protection.js';
 import {
   type FanPage,
   type FanPageQuery,
@@ -167,6 +168,12 @@ export interface DashboardEngine {
     query: RunFacetQuery,
     opts?: RunValueFacetOptions,
   ): Promise<RunValueFacetRow[]>;
+  /**
+   * How the app protects run data (its transports' message sealing, its store's encryption at
+   * rest): names and modes only. Optional: absent on a topology that cannot tell, and on another
+   * app too old to answer, where the console shows no badge.
+   */
+  protection?(): AppProtection | Promise<AppProtection>;
 }
 
 /** The read/control port the handlers operate over (a store engine or a tenant gateway adapter). */
@@ -185,6 +192,9 @@ export interface Deps {
     run?: (run: Record<string, unknown>) => Record<string, unknown>;
     checkpoint?: (checkpoint: Record<string, unknown>) => Record<string, unknown>;
   };
+  /** Whether the store the runs are read from encodes them at rest (see `CodecStateStore`): the
+   *  run detail then names the fields it encrypted. Absent: not known, nothing is marked. */
+  atRest?: StoreProtection | undefined;
 }
 
 /** Apply the host's redaction hook to a serialized shape (identity when unconfigured). */
@@ -193,6 +203,48 @@ function redacted(
   row: Record<string, unknown>,
 ): Record<string, unknown> {
   return hook ? hook(row) : row;
+}
+
+/** A field's value as compared before and after the redaction hook (`undefined`: absent). */
+function fieldText(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+/**
+ * The hook's answer for `row`, with `redactedFields` naming the fields it changed or removed (names
+ * only, never their values). The fields are read before the hook runs, so a hook that edits the
+ * row in place is caught too. No hook: the row itself.
+ */
+function redactedMarked(
+  hook: ((row: Record<string, unknown>) => Record<string, unknown>) | undefined,
+  row: Record<string, unknown>,
+): Record<string, unknown> {
+  if (!hook) return row;
+  const before = new Map(Object.keys(row).map((key) => [key, fieldText(row[key])]));
+  const after = hook(row);
+  const hidden: string[] = [];
+  for (const [key, text] of before) {
+    if (text !== undefined && fieldText(after[key]) !== text) hidden.push(key);
+  }
+  return hidden.length > 0 ? { ...after, redactedFields: hidden } : after;
+}
+
+/** The run detail's fields a store encodes at rest, for the run and for its steps. */
+export function encryptedAtRestFields(
+  atRest: StoreProtection | undefined,
+): { run: string[]; step: string[] } | undefined {
+  if (!atRest?.codec) return undefined;
+  return atRest.coverage === 'extended'
+    ? {
+        run: ['input', 'output', 'error'],
+        step: ['input', 'output', 'error', 'events', 'progress'],
+      }
+    : { run: ['input', 'output'], step: ['input', 'output'] };
 }
 
 /** The subset of an HTTP request the handlers read. */
@@ -603,14 +655,15 @@ export async function getRun(deps: Deps, req: ApiRequest): Promise<ApiResponse> 
   if (!detail) return notFound(`run ${id} not found`);
   if (detail.etag && detail.notModified) return notModified(detail.etag);
   const checkpoint = (cp: StepCheckpoint) =>
-    redacted(deps.redact?.checkpoint, summarizeCheckpoint(cp));
+    redactedMarked(deps.redact?.checkpoint, summarizeCheckpoint(cp));
+  const encrypted = encryptedAtRestFields(deps.atRest);
   // What a suspended run is parked on (a signal, an update, a task, a child), as the list rows carry
   // it, so the console offers the matching action from the run itself.
   const waitingOf =
     detail.run.status === 'suspended' ? await waitingResolver(engine, [detail.run]) : undefined;
   return {
     ...ok({
-      run: redacted(deps.redact?.run, detailRun(detail.run, waitingOf)),
+      run: redactedMarked(deps.redact?.run, detailRun(detail.run, waitingOf)),
       timeline: detail.timeline.map(checkpoint),
       children: detail.children,
       ...(detail.fans ? { fans: detail.fans.map((fan) => serializeFan(fan, checkpoint)) } : {}),
@@ -622,6 +675,7 @@ export async function getRun(deps: Deps, req: ApiRequest): Promise<ApiResponse> 
       ...(detail.lifecycleDeliveries ? { lifecycleDeliveries: detail.lifecycleDeliveries } : {}),
       ...(detail.waitsFor ? { waitsFor: detail.waitsFor } : {}),
       ...(detail.awaitedBy ? { awaitedBy: detail.awaitedBy } : {}),
+      ...(encrypted ? { encryptedAtRest: encrypted } : {}),
     }),
     ...(detail.etag ? { headers: etagHeaders(detail.etag) } : {}),
   };
@@ -665,7 +719,7 @@ export async function getFanMembers(deps: Deps, req: ApiRequest): Promise<ApiRes
   return {
     ...ok(
       offsetPage(
-        members.items.map((cp) => redacted(deps.redact?.checkpoint, summarizeCheckpoint(cp))),
+        members.items.map((cp) => redactedMarked(deps.redact?.checkpoint, summarizeCheckpoint(cp))),
         { total: members.total, page, size },
       ),
     ),
@@ -1081,14 +1135,68 @@ export async function workers(deps: Deps): Promise<ApiResponse> {
   return ok({ data: groups });
 }
 
-/** `GET /topology` — this deployment's durable topology, for the header badge. Pure/local (no engine
- *  round-trip): it is already known by `dashboard_provider.ts` from `config/durable.ts`. */
+/**
+ * What the console's protection badges show for the app it serves: {@link AppProtection} plus
+ * whether this console's `redact` hooks hide run or step fields. Names and modes only.
+ */
+export interface ConsoleProtection extends AppProtection {
+  redact: { run: boolean; checkpoint: boolean };
+}
+
+/** How long the console waits for an app's protection before showing no badge. */
+export const PROTECTION_TIMEOUT_MS = 2_500;
+
+/**
+ * The {@link ConsoleProtection} of the app `engine` serves: its own answer reduced to names and
+ * modes ({@link sanitizeAppProtection}), and this console's `redact` hooks. `undefined` when the
+ * app cannot tell (no `protection` on the port, an app too old to answer, an error, a timeout):
+ * the console then shows no badge rather than "plain".
+ */
+export async function consoleProtection(
+  engine: Pick<DashboardEngine, 'protection'>,
+  redact: Deps['redact'] | null,
+  timeoutMs: number = PROTECTION_TIMEOUT_MS,
+): Promise<ConsoleProtection | undefined> {
+  const ask = engine.protection;
+  if (typeof ask !== 'function') return undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const answer = await Promise.race([
+      Promise.resolve().then(() => ask.call(engine)),
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+    const clean = sanitizeAppProtection(answer);
+    if (!clean) return undefined;
+    return {
+      ...clean,
+      redact: {
+        run: typeof redact?.run === 'function',
+        checkpoint: typeof redact?.checkpoint === 'function',
+      },
+    };
+  } catch {
+    return undefined;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** `GET /topology` — this deployment's durable topology, for the header badge, and (when known) the
+ *  {@link ConsoleProtection} the console's protection badges show. */
 export function topology(
   durableTopology: 'standalone' | 'control-plane' | 'tenant',
   tenant?: string,
+  protection?: ConsoleProtection,
 ): ApiResponse {
   // The body keeps aviary's `DurableTopology` wire shape (`{ role, tenant? }`).
-  return ok(tenant !== undefined ? { role: durableTopology, tenant } : { role: durableTopology });
+  return ok({
+    role: durableTopology,
+    ...(tenant !== undefined ? { tenant } : {}),
+    ...(protection ? { protection } : {}),
+  });
 }
 
 /**

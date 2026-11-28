@@ -131,12 +131,20 @@ export type { DashboardContainer } from './gateway-adapter.js';
 
 // Store-less `tenant` dashboard: adapt the RunGateway to the handlers' read/control port (design §8).
 export { dashboardEngineForTopology, gatewayDashboardEngine } from './gateway-adapter.js';
-export type { ApiRequest, ApiResponse, DashboardEngine, Deps } from './handlers.js';
+export type {
+  ApiRequest,
+  ApiResponse,
+  ConsoleProtection,
+  DashboardEngine,
+  Deps,
+} from './handlers.js';
 export {
   bulkAction,
   cancelRun,
+  consoleProtection,
   continueRun,
   deliverWebhook,
+  encryptedAtRestFields,
   getRun,
   getRunEvent,
   health,

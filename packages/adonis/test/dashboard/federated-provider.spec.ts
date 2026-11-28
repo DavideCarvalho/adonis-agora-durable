@@ -139,3 +139,43 @@ describe('federated console — app selection in the provider', () => {
     });
   });
 });
+
+describe('federated console — protection badges', () => {
+  it("serves the selected app's protection, and marks its store's encrypted fields", async () => {
+    const { answerConsoleCommands } = await import('../../src/dashboard/federation.js');
+    const { storeDashboardEngine } = await import('../../src/dashboard/gateway-adapter.js');
+    const { CodecStateStore } = await import('../../src/codec-state-store.js');
+    const bus = consoleBus();
+    const codec = { encode: (v: unknown) => v, decode: (v: unknown) => v };
+    const store = new CodecStateStore(new InMemoryStateStore(), codec);
+    const owner = new WorkflowEngine({ store, instanceId: 'owner' });
+    answerConsoleCommands(bus.plane(), storeDashboardEngine(owner), undefined, { actions: true });
+
+    const p = (await provider()) as ProviderInternals & {
+      consoleProtectionOf(
+        config: unknown,
+        ctx: unknown,
+        deps: unknown,
+        selected: string | undefined,
+      ): Promise<unknown>;
+    };
+    const config = resolveConfig({
+      authorize: () => true,
+      redact: { checkpoint: (cp) => cp },
+      apps: {
+        owner: { store, controlPlane: { ...bus.plane(), console: { secret: 'x'.repeat(24) } } },
+      },
+    });
+    const deps = p.consoleDeps(config, 'standalone');
+    const ctx = ctxWith({ app: 'owner' });
+    expect(await p.consoleProtectionOf(config, ctx, deps, 'owner')).toEqual({
+      messages: [],
+      store: { codec: true, coverage: 'payloads' },
+      redact: { run: false, checkpoint: true },
+    });
+    expect(((await deps(ctx)) as { atRest?: unknown }).atRest).toEqual({
+      codec: true,
+      coverage: 'payloads',
+    });
+  });
+});

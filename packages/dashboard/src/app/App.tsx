@@ -8,6 +8,7 @@ import { splitHash, subscribeHashUrl } from '../agora-kit/url-state/hash-url';
 import { NuqsHashAdapter } from '../agora-kit/url-state/nuqs-hash-adapter';
 import { CONFIG_ELEMENT_ID, durableClient } from '../client/durable-client';
 import { AppPickerControl, FederatedAppNotice, usePageSearch } from './AppPicker';
+import { ProtectionBadges } from './ProtectionBadges';
 import { currentRoute, pushRoute, type Route, sameRoute } from './routes';
 import { LogoMark } from './run-status';
 import { RunIdSearch } from './runs/RunIdSearch';
@@ -178,6 +179,7 @@ function Console() {
       contentClassName={route.page === 'runs' ? 'overflow-hidden' : undefined}
       actions={
         <>
+          <ProtectionBadges protection={topology?.protection} className="hidden lg:flex" />
           <AppPickerControl />
           <TenantPickerControl />
           <div className="hidden md:block">

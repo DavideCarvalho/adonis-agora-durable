@@ -241,6 +241,22 @@ export default defineConfig({
 })
 ```
 
+The run detail compares each row before and after its hook and sends the names of the fields the hook changed or removed as `redactedFields` (names only). The console marks those fields **hidden by redact**, and the header shows a **Redacted** badge while a hook is configured.
+
+### Protection badges
+
+The header shows how the app it serves protects run data, next to the App and organization controls:
+
+| Badge | Values | Read from |
+| --- | --- | --- |
+| **Messages** | `sealed (tenant key)`, `sealed (app key)`, `sealed (crypto)`, `signed only (secret)`, `plain` | the sealer each broker transport (pool members included) and the control plane run with. Several transports: the weakest mode, each one in the tooltip. Plain broker messages read in amber. See [Encrypting messages](/docs/durable/transports/encrypting-messages). |
+| **Store** | `encrypted (input/output)`, `encrypted (extended)`, `plain` | whether the state store is a [`CodecStateStore`](/docs/durable/stores#encrypting-payloads-at-rest), and its `coverage` |
+| **Redacted** | shown while a `redact` hook is configured | this console's `redact` config |
+
+In a run's detail, a lock marks each field the store encrypts at rest (the tooltip reads "Encrypted at rest; the console shows it decrypted"): `input` and `output`, and also `error` and step logs under `extended` coverage. Receivers open broker messages before they write checkpoints, so sealing protects messages in transit, not the store: the Store badge is the one that says what sits encrypted at rest.
+
+No badge shows a transport-free app's messages (in-process transports carry nothing across processes). A store-less tenant pod describes its messages from its config and shows no Store badge. The badges come from `GET /api/topology`'s `protection` field: `{ messages: [{ transport, mode, acceptPlain }], store?: { codec, coverage }, redact: { run, checkpoint } }`. It carries names and modes only, never a key, key id, secret, token or ciphertext. A server or federated app that does not send it shows no badge (not "plain").
+
 ## Where it mounts
 
 All routes are relative to `path` (default `/durable`), and every one of them runs behind the `authorize` guard.
@@ -520,7 +536,7 @@ These are the console's Schedules tab, riding [`engine.listSchedules` / `setSche
 | --- | --- | --- |
 | `GET` | `/durable/api/workers` | per-worker heartbeats, grouped by routing token |
 | `GET` | `/durable/api/health` | the compact shape: queue depth and a `stalled` flag per group |
-| `GET` | `/durable/api/topology` | this pod's topology (as the `role` field), plus its `tenant` when it is a store-less pod |
+| `GET` | `/durable/api/topology` | this pod's topology (as the `role` field), plus its `tenant` when it is a store-less pod, and the [protection badges'](#protection-badges) `protection` |
 | `GET` | `/durable/api/compat` | protocol/capability negotiation across the fleet, plus blocked runs |
 | `GET` | `/durable/api/workflows/:name/lifecycle` | who starts whom through [lifecycle events](/docs/durable/authoring/lifecycle-events): `{ workflow, startsOnSettle, startedBy, triggerCounts? }` (see [Workflow pages](#workflow-pages)); on a tenant pod only its namespace's subscriptions, `501` when its control plane is older than the verb |
 | `GET` | `/durable/api/openapi.json` | the machine-readable API contract (OpenAPI 3.1) |

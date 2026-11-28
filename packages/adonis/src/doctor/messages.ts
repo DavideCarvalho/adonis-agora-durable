@@ -1,6 +1,7 @@
 import type { ApplicationService } from '@adonisjs/core/types';
 import type { DurableConfig } from '../define_config.js';
 import { describeMessagesMode, type TransportMessagesOptions } from '../messages/resolve.js';
+import type { MessagesProtection } from '../protection.js';
 import type { AgoraDoctorCheck, AgoraDoctorResult } from './agora_doctor.js';
 
 const DOCS = 'https://davidecarvalho.github.io/agora/docs/durable/transports/encrypting-messages';
@@ -16,12 +17,10 @@ function messagesOf(factory: unknown): TransportMessagesOptions | undefined {
     : undefined;
 }
 
-/**
- * `durable.messages`: how each configured broker transport (and the Redis control plane) seals its
- * messages, as the app would resolve it at boot. One result per transport. In-process transports
- * (`memory`, `eventEmitter`) carry nothing across processes and are not listed.
- */
-export async function checkMessages(app: ApplicationService): Promise<AgoraDoctorResult[]> {
+/** Every broker transport's (and the control plane's) resolved messages mode, from the config. */
+async function configuredModes(
+  app: ApplicationService,
+): Promise<Array<[string, Awaited<ReturnType<typeof describeMessagesMode>>]>> {
   const config = app.config.get<DurableConfig | undefined>('durable', undefined);
   const entries: Array<[string, TransportMessagesOptions]> = [];
   for (const [name, factory] of Object.entries(config?.transports ?? {})) {
@@ -30,14 +29,6 @@ export async function checkMessages(app: ApplicationService): Promise<AgoraDocto
   }
   const plane = messagesOf(config?.controlPlane);
   if (plane) entries.push(['control plane', plane]);
-  if (entries.length === 0) {
-    return [
-      {
-        status: 'skip',
-        message: 'No broker transport is configured: messages stay in this process.',
-      },
-    ];
-  }
   // A tenant pod asks the control plane for its key with its token (explicit, or authkit's).
   const tenantConfig = (
     config as { tenant?: { partition?: string; token?: unknown; url?: unknown } } | undefined
@@ -55,9 +46,50 @@ export async function checkMessages(app: ApplicationService): Promise<AgoraDocto
           ...(hasUrl ? { url: async () => '' } : {}),
         }
       : undefined;
-  const results: AgoraDoctorResult[] = [];
+  const modes: Array<[string, Awaited<ReturnType<typeof describeMessagesMode>>]> = [];
   for (const [name, options] of entries) {
-    const mode = await describeMessagesMode(app as never, name, options, undefined, tenant);
+    modes.push([name, await describeMessagesMode(app as never, name, options, undefined, tenant)]);
+  }
+  return modes;
+}
+
+/**
+ * How each configured broker transport (and the control plane) seals its messages, from the config
+ * alone: what the console shows where no engine runs in this process (a store-less `tenant` pod).
+ * A transport whose mode does not resolve is left out.
+ */
+export async function configuredMessagesProtection(
+  app: ApplicationService,
+): Promise<MessagesProtection[]> {
+  const out: MessagesProtection[] = [];
+  for (const [transport, mode] of await configuredModes(app)) {
+    if ('error' in mode) continue;
+    out.push({
+      transport,
+      mode: mode.sealing ? mode.mode : 'plain',
+      acceptPlain: mode.sealing ? mode.acceptPlain : true,
+    });
+  }
+  return out;
+}
+
+/**
+ * `durable.messages`: how each configured broker transport (and the Redis control plane) seals its
+ * messages, as the app would resolve it at boot. One result per transport. In-process transports
+ * (`memory`, `eventEmitter`) carry nothing across processes and are not listed.
+ */
+export async function checkMessages(app: ApplicationService): Promise<AgoraDoctorResult[]> {
+  const modes = await configuredModes(app);
+  if (modes.length === 0) {
+    return [
+      {
+        status: 'skip',
+        message: 'No broker transport is configured: messages stay in this process.',
+      },
+    ];
+  }
+  const results: AgoraDoctorResult[] = [];
+  for (const [name, mode] of modes) {
     if ('error' in mode) {
       results.push({ status: 'error', message: `${name}: ${mode.error}`, docs: DOCS });
       continue;
