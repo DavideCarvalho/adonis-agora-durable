@@ -49,7 +49,7 @@ const runSummary = {
       type: 'array',
       items: { type: 'string' },
       description:
-        "Names of the fields this console's `redact` hooks removed or changed (names only, no values).",
+        "Run detail only (`GET /runs/{id}` and fan pages; list rows don't carry it): names of the fields this console's `redact` hooks removed or changed (names only, no values).",
     },
   },
   required: ['id', 'workflow', 'workflowVersion', 'status', 'createdAt', 'updatedAt'],
@@ -79,7 +79,7 @@ const checkpoint = {
       type: 'array',
       items: { type: 'string' },
       description:
-        "Names of the fields this console's `redact` hooks removed or changed (names only, no values).",
+        "Run detail only (`GET /runs/{id}` and fan pages; list rows don't carry it): names of the fields this console's `redact` hooks removed or changed (names only, no values).",
     },
   },
 } as const;
@@ -347,7 +347,7 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
                 encryptedAtRest: {
                   type: 'object',
                   description:
-                    'Present when the store encrypts at rest (a `CodecStateStore`): which run and step fields it encodes. The console shows them decrypted.',
+                    'Present when the store encrypts at rest (a `CodecStateStore`): the run and step fields the console marks as encrypted at rest (it shows them decrypted). Under extended coverage the store also encodes heartbeat progress, which the console does not show, so it is not listed.',
                   properties: {
                     run: { type: 'array', items: { type: 'string' } },
                     step: { type: 'array', items: { type: 'string' } },
