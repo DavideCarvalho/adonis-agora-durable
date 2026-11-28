@@ -353,11 +353,12 @@ Source: `docs/stores/lucid.mdx`, `docs/stores/index.mdx`.
 
 ### Pattern 5 — sealing broker messages (one switch, after the upgrade)
 
-Every 1.2.1+ process opens sealed broker messages; sending them sealed is
+Every 1.2.1+ process opens sealed broker messages (control-plane per-tenant seals from this
+version); sending them sealed is
 `messages: { seal: true }` (off in 1.x, the default in the next major). The key
 is derived from `APP_KEY` (between tenant pods and their control plane, a key
 per tenant the control plane owns and hands each pod); routing fields stay in clear. Turn it on only once every
-process runs 1.2.1 or later:
+process runs 1.2.1 or later (this version for tenant ↔ control-plane seals):
 
 ```ts
 import { defineConfig } from '@adonis-agora/durable'

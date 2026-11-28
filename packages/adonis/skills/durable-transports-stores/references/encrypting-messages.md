@@ -5,10 +5,11 @@ Source: `docs/transports/encrypting-messages.mdx`.
 ## Defaults
 
 - Every 1.2.1+ broker transport (`transports.bullmq`, `transports.queue`, `transports.db`) and
-  `controlPlanes.redis` OPENS sealed messages. Sending them sealed is one switch,
+  `controlPlanes.redis` OPENS sealed messages (control-plane per-tenant seals from this version).
+  Sending them sealed is one switch,
   `messages: { seal: true }` in `config/durable.ts` (or per transport), off in 1.x and the default in
-  the next major. Turn it on only once every process runs 1.2.1+ (1.2.0 sealed by default; that was
-  reverted). `memory` / `eventEmitter` stay in-process.
+  the next major. Turn it on only once every process runs 1.2.1+ (this version for tenant ↔
+  control-plane seals; 1.2.0 sealed by default; that was reverted). `memory` / `eventEmitter` stay in-process.
 - Same app: AES-256-GCM, key derived from `APP_KEY` (HKDF-SHA256, purpose
   `agora:durable:messages`). Boot line with `seal: true`: `[@adonis-agora/durable] bullmq messages: app key (auto)`;
   by default (sealing off): `bullmq messages: sent plain, sealed ones opened with app key (auto)`.
@@ -75,4 +76,7 @@ does not run its handler and is reported failed (retryable). Anything else is dr
 
 Why: a sealed step task reaching a 1.1 worker runs the handler with `input` undefined. 1.2.x
 receivers fail safe: anything carrying a seal they cannot open is refused, never read as plain.
+Sealed tenant ↔ control-plane traffic from 1.2.x (crypto key `durable-messages` in each tenant's
+partition) does not open here: if you turned `seal: true` on between tenants and their control plane
+on 1.2.x, upgrade both sides together, or turn it off during the upgrade.
 NestJS / Python workers read plain only: keep sealing off (or `insecure`) on their transport.
