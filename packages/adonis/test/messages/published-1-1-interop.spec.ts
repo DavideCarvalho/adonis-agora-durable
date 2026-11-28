@@ -61,7 +61,10 @@ async function oldSide(): Promise<Side> {
   oldModule ??= (await import(
     pathToFileURL(join(fetchPublished(), 'dist', 'src', 'index.js')).href
   )) as Side;
-  return { BullMQTransport: oldModule.BullMQTransport, createBullMQDeps: oldModule.createBullMQDeps };
+  return {
+    BullMQTransport: oldModule.BullMQTransport,
+    createBullMQDeps: oldModule.createBullMQDeps,
+  };
 }
 const newSide: Side = {
   BullMQTransport: BullMQTransport as unknown as Side['BullMQTransport'],
