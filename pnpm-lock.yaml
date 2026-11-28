@@ -286,8 +286,8 @@ importers:
         specifier: 6.7.10
         version: 6.7.10(ioredis@6.1.0(supports-color@10.2.2))(pg@8.23.1)
       cron-parser:
-        specifier: 5.10.6
-        version: 5.10.6
+        specifier: 5.10.7
+        version: 5.10.7
       ioredis:
         specifier: 6.1.0
         version: 6.1.0(supports-color@10.2.2)
@@ -2571,6 +2571,10 @@ packages:
 
   cron-parser@5.10.6:
     resolution: {integrity: sha512-kpoxgQyveO1l29nw+FWdvmotyV7eOSzGHQpxiXOEZIDOjqO1iR6kfgJ0PVHTuV26uBemKq3ppzma7dHFAG7viw==}
+    engines: {node: '>=18'}
+
+  cron-parser@5.10.7:
+    resolution: {integrity: sha512-ST6Y7vq40qyah/5sGTKpj2DpABiRL9khy8xC+amICUXbwAWXzzzWs11wxyV/hG+SVQHMLyUKRxBZpqElsJo8+Q==}
     engines: {node: '>=18'}
 
   cross-spawn@7.0.6:
@@ -4973,7 +4977,7 @@ snapshots:
     dependencies:
       '@lukeed/ms': 2.0.2
       '@poppinss/utils': 7.1.2
-      cron-parser: 5.10.6
+      cron-parser: 5.10.7
     optionalDependencies:
       '@opentelemetry/api': 1.10.0
       ioredis: 6.1.0(supports-color@10.2.2)
@@ -6338,6 +6342,10 @@ snapshots:
   cookie-es@3.1.1: {}
 
   cron-parser@5.10.6:
+    dependencies:
+      luxon: 3.7.2
+
+  cron-parser@5.10.7:
     dependencies:
       luxon: 3.7.2
 
