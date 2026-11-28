@@ -1,10 +1,11 @@
 import { useQuery } from '@tanstack/react-query';
-import { useState } from 'react';
+import { type ReactNode, useState } from 'react';
 import type { StepCheckpoint, StepError, StepEvent, WorkflowRun } from '../client/durable-client';
 import { durableClient } from '../client/durable-client';
 import { groupSubProcesses, type SubProcess } from '../client/group-subprocesses';
 import { childRunIdOf } from './child-link';
 import { BoltIcon, CheckIcon, CopyIcon, iconFor, KIND_LABEL, XIcon } from './icons';
+import { FieldMarks, type FieldProtection } from './ProtectionBadges';
 import { childRunPollInterval } from './run-polling';
 import { RunSpans } from './SpansTimeline';
 
@@ -139,7 +140,7 @@ function SubProcessRow({ sub, showGroup = true }: { sub: SubProcess; showGroup?:
 
 /** Sub-process outcomes + the step's log lines. Each sub-process is an expandable row showing its
  *  lifecycle (phases), duration, terminal status, error, and owned logs. */
-function StepEvents({ events }: { events: StepEvent[] }) {
+function StepEvents({ events, marks }: { events: StepEvent[]; marks?: ReactNode }) {
   const { subs, stepLogs } = groupSubProcesses(events);
   const counts = SUB_ORDER.map(
     (s) => [s, subs.filter((sub) => sub.status === s).length] as const,
@@ -151,8 +152,9 @@ function StepEvents({ events }: { events: StepEvent[] }) {
       {subs.length > 0 && (
         <section className="rise">
           <div className="mb-1.5 flex items-center justify-between">
-            <span className="mono text-[10px] uppercase tracking-[0.18em] text-dim">
+            <span className="mono flex items-center gap-2 text-[10px] uppercase tracking-[0.18em] text-dim">
               sub-processes · {subs.length}
+              {marks}
             </span>
             <span className="mono flex gap-2 text-[10px] uppercase tracking-wider">
               {counts.map(([s, n]) => (
@@ -196,8 +198,9 @@ function StepEvents({ events }: { events: StepEvent[] }) {
 
       {stepLogs.length > 0 && (
         <section className="rise">
-          <div className="mono mb-1.5 text-[10px] uppercase tracking-[0.18em] text-dim">
+          <div className="mono mb-1.5 flex items-center gap-2 text-[10px] uppercase tracking-[0.18em] text-dim">
             logs · {stepLogs.length}
+            {marks}
           </div>
           <div className="mono max-h-64 overflow-auto rounded-lg border border-line bg-sunken/40 p-2.5 text-[11px] leading-relaxed">
             {stepLogs.map((e, i) => (
@@ -233,12 +236,24 @@ export function CopyButton({ value }: { value: string }) {
   );
 }
 
-export function Json({ label, value }: { label: string; value: unknown }) {
+export function Json({
+  label,
+  value,
+  marks,
+}: {
+  label: string;
+  value: unknown;
+  /** Markers beside the label (encrypted at rest, hidden by redact). */
+  marks?: ReactNode;
+}) {
   const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
   return (
     <section className="rise">
       <div className="mb-1.5 flex items-center justify-between">
-        <span className="mono text-[10px] uppercase tracking-[0.18em] text-dim">{label}</span>
+        <span className="mono flex items-center gap-2 text-[10px] uppercase tracking-[0.18em] text-dim">
+          {label}
+          {marks}
+        </span>
         <CopyButton value={text} />
       </div>
       <pre className="mono max-h-64 overflow-auto rounded-lg border border-line bg-sunken/40 p-3 text-[11.5px] leading-relaxed text-fg-2">
@@ -249,12 +264,13 @@ export function Json({ label, value }: { label: string; value: unknown }) {
 }
 
 /** A failure: its message, its machine `code` and, when it carries any, its structured `details`. */
-export function ErrorBlock({ error }: { error: StepError }) {
+export function ErrorBlock({ error, marks }: { error: StepError; marks?: ReactNode }) {
   return (
     <>
       <section className="rise">
         <div className="mono mb-1.5 flex items-center gap-2 text-[10px] uppercase tracking-[0.18em] text-bad/80">
           <span>error</span>
+          {marks}
           {error.code && (
             <span className="rounded border border-bad/30 px-1.5 py-px normal-case tracking-normal text-bad">
               {error.code}
@@ -335,14 +351,18 @@ export function StepDetailPanel({
   run,
   onClose,
   onOpenRun,
+  encrypted,
 }: {
   step: StepCheckpoint;
   run: WorkflowRun;
+  /** The step fields the store encrypts at rest (the run detail's `encryptedAtRest.step`). */
+  encrypted?: readonly string[] | undefined;
   onClose: () => void;
   /** Navigate to another run — enables the child-run "open ↗" link in the detail. */
   onOpenRun?: ((id: string) => void) | undefined;
 }) {
   const childRunId = childRunIdOf(step);
+  const marks: FieldProtection = { encrypted, redacted: step.redactedFields };
   const [childOpen, setChildOpen] = useState(false);
   const failed = step.status === 'failed';
   // in-flight: a remote step awaiting its worker (`pending`) or a local step body executing (`running`)
@@ -422,9 +442,13 @@ export function StepDetailPanel({
           <Field k="offset" v={`+${sinceStart}`} />
         </div>
 
-        {failed && step.error && <ErrorBlock error={step.error} />}
+        {failed && step.error && (
+          <ErrorBlock error={step.error} marks={<FieldMarks field="error" marks={marks} />} />
+        )}
 
-        {step.events && step.events.length > 0 && <StepEvents events={step.events} />}
+        {step.events && step.events.length > 0 && (
+          <StepEvents events={step.events} marks={<FieldMarks field="events" marks={marks} />} />
+        )}
 
         {childRunId && (
           <section className="rise">
@@ -460,8 +484,20 @@ export function StepDetailPanel({
           </section>
         )}
 
-        {step.input !== undefined && <Json label="input" value={step.input} />}
-        {step.output !== undefined && <Json label="output" value={step.output} />}
+        {step.input !== undefined && (
+          <Json
+            label="input"
+            value={step.input}
+            marks={<FieldMarks field="input" marks={marks} />}
+          />
+        )}
+        {step.output !== undefined && (
+          <Json
+            label="output"
+            value={step.output}
+            marks={<FieldMarks field="output" marks={marks} />}
+          />
+        )}
       </div>
     </aside>
   );

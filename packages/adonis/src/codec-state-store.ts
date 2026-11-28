@@ -62,6 +62,9 @@ export interface CodecStateStoreOptions {
  */
 export class CodecStateStore implements StateStore {
   private readonly extended: boolean;
+  /** Which fields this store encodes (see {@link CodecStateStoreOptions.coverage}): what the
+   *  console marks as encrypted at rest. */
+  readonly coverage: 'payloads' | 'extended';
 
   /** Schedules persist their run `input` inside `spec` — encoded like any other payload. Bound only
    *  when the inner store persists schedules, so `engine.schedules` reports absence faithfully. */
@@ -204,6 +207,7 @@ export class CodecStateStore implements StateStore {
     options: CodecStateStoreOptions = {},
   ) {
     this.extended = options.coverage === 'extended';
+    this.coverage = this.extended ? 'extended' : 'payloads';
     const getMany = inner.getCheckpoints;
     if (getMany) {
       this.getCheckpoints = async (runId, seqs) =>

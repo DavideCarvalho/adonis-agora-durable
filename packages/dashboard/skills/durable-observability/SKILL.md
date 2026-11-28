@@ -239,8 +239,11 @@ Inside a step, a helper that was never handed the logger records through
 `currentStep()?.info(...)` (from `@adonis-agora/durable`; `undefined` outside a
 step).
 
-Live-tail one run over SSE:
-`new EventSource('/durable/api/runs/${runId}/stream')`.
+Header badges (`GET <path>/api/topology` → `protection`, modes only): Messages from each transport's
+sealer, Store from a `CodecStateStore` (messages are opened before checkpoints, so sealing alone leaves
+the store plaintext); run detail locks encrypted fields and marks `redact`-hidden ones. No badge = unknown.
+
+Live-tail one run over SSE: `new EventSource('/durable/api/runs/${runId}/stream')`.
 Source: `docs/observability/events-and-interceptors.mdx`,
 `docs/observability/otel.mdx`, `docs/observability/dashboard.mdx`.
 

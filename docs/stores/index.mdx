@@ -173,6 +173,8 @@ Terminal runs (`completed`, `failed`, `cancelled`, `dead`) otherwise accumulate 
 Know what the default coverage leaves **in the clear**: step `events` (everything step code passes to `ctx.log`), the structured `error` messages, and heartbeat progress. A deployment described as "encrypted payloads" still stores whatever its steps log as plaintext. Opt into `new CodecStateStore(inner, codec, { coverage: 'extended' })` to cover those too — but only on a **fresh** table, or with a codec whose `decode` recognizes its own ciphertext and passes other values through, because rows written before the switch hold those fields unencoded. Search attributes always stay clear (they must remain queryable). And remember the console renders everything **decoded** — pair the codec with the dashboard config's `redact` hooks to keep PII out of the operator's browser.
 </Callout>
 
+The [console](/docs/durable/observability/dashboard#protection-badges) detects a `CodecStateStore` (also when it is scoped with `withScope`) and shows **Store: encrypted (input/output)** or **Store: encrypted (extended)** in its header, and a lock beside each field the codec covers in a run's detail: `input` and `output`, plus `error` and step logs under `extended`. A store with no codec reads **Store: plain**. A codec decorator of your own can say what it covers with the `AT_REST_COVERAGE` marker: `store[AT_REST_COVERAGE] = 'payloads' | 'extended'`.
+
 ```ts title="config/durable.ts"
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
 import { CodecStateStore, defineConfig, stores, type PayloadCodec } from '@adonis-agora/durable'

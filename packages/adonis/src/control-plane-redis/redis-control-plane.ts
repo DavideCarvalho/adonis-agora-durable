@@ -306,6 +306,11 @@ export class RedisControlPlane implements ControlPlane {
   /** The console side's authentication, built once per `auth` options object (it caches a token). */
   private readonly senderAuth = new WeakMap<ConsoleCommandAuthOptions, ConsoleCommandAuth>();
 
+  /** The sealer of this plane's control messages (its mode reads in the console's badges). */
+  get messageSealer(): MessageSealer {
+    return this.messages;
+  }
+
   constructor(options: RedisControlPlaneOptions) {
     this.connection = options.connection;
     this.prefix = options.prefix ?? 'durable';

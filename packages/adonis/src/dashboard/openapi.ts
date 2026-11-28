@@ -682,7 +682,12 @@ export function openApiDocument(apiBase: string): Record<string, unknown> {
       '/topology': {
         get: {
           summary: "This deployment's durable topology",
-          responses: { '200': jsonResponse('`{ role, tenant? }`.', { type: 'object' }) },
+          responses: {
+            '200': jsonResponse(
+              '`{ role, tenant?, protection? }`: `protection` names how the app seals its broker messages and whether its store encrypts at rest (modes only, never key material); absent when the app cannot tell.',
+              { type: 'object' },
+            ),
+          },
         },
       },
       '/compat': {

@@ -192,3 +192,8 @@ The NestJS `nestjs-durable` transport and the Python worker read plain messages 
 ## Doctor
 
 `node ace agora:doctor` reports each broker transport's mode under `durable.messages`: `app key (auto)`, `secret`, `crypto (…)`, or `plain` with the reason and the fix. It warns for a transport that still sends plain (sealing off), for a plain one, and for one that still accepts plain messages, and errors when a transport sets more than one mode.
+
+## In the console
+
+The [durable console](/docs/durable/observability/dashboard#protection-badges) shows a **Messages** badge in its header, read from the sealers the app actually runs with (each broker transport, pool members included, and the control plane): `sealed (tenant key)`, `sealed (app key)`, `sealed (crypto)`, `signed only (secret)` or `plain`. With several transports it names the weakest mode, and its tooltip lists each one, noting the ones that still accept plain messages. A transport whose sealing is not turned on yet (step 1 above) reads `plain`: it sends plain. The badge carries modes only, never a key, a key id or a secret.
+

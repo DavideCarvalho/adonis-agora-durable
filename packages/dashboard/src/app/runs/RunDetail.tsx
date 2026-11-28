@@ -792,9 +792,16 @@ export function RunDetail({ id, onOpenRun }: { id: string; onOpenRun: (id: strin
             run={selStep.run}
             onClose={() => setSelStep(undefined)}
             onOpenRun={onOpenRun}
+            encrypted={data.encryptedAtRest?.step}
           />
         )}
-        {showRunIO && <RunInfoPanel run={run} onClose={() => setShowRunIO(false)} />}
+        {showRunIO && (
+          <RunInfoPanel
+            run={run}
+            onClose={() => setShowRunIO(false)}
+            encrypted={data.encryptedAtRest?.run}
+          />
+        )}
       </div>
       {compensations.length > 0 && (
         <CompensationSection

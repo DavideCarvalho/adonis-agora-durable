@@ -381,7 +381,8 @@ For the picked app, the console shows:
 - its runs, counts and filter pickers, read from its store;
 - a run's detail, timeline and live events (from the app's control plane);
 - its schedules and worker health, asked of its engine;
-- every action on a run, and bulk actions, run by its engine.
+- every action on a run, and bulk actions, run by its engine;
+- its [protection badges](/docs/durable/observability/dashboard#protection-badges): the app reports how its own transports seal messages and whether its store encrypts at rest (a read, like worker health). An app on a version without the report shows no badge.
 
 When the app does not answer an action (it is down, `consoleCommands` is off, or the console's authentication does not match the app's), the action fails with `503` and a message naming the app. When the app refuses it (its token is refused, is for another app, or lacks the capability), it fails with `403`. Reading its runs keeps working.
 

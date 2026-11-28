@@ -131,6 +131,11 @@ export class TransportPool {
     return this.transports.length;
   }
 
+  /** The pool's transports, in order (read-only: the console reads how each seals its messages). */
+  get members(): readonly NamedTransport[] {
+    return this.transports;
+  }
+
   /** Register the engine's result/heartbeat/step-event handlers on EVERY transport — a result can come
    *  back on whichever one delivered the task, so failover stays symmetric. `onStepEvent` is wired only
    *  on transports that carry streamed workflow step lifecycle (BullMQ); others simply skip it. */
