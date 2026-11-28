@@ -278,7 +278,7 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
 
 A transport built this way opens sealed messages with `process.env.APP_KEY` (the
 same key as the app it serves) and sends them sealed with `messages: { seal: true }`,
-or takes `messages: { appKey | secret | crypto }`;
+or takes `messages: { seal: true, appKey | secret | crypto }` to seal with that mode;
 between a tenant pod and its control plane (different apps) the provider-built
 transports use `@adonis-agora/crypto`'s `durable-messages` key automatically,
 so a hand-built tenant worker must use the same explicit mode on both sides.
