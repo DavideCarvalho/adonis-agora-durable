@@ -4,12 +4,13 @@ Source: `docs/transports/encrypting-messages.mdx`.
 
 ## Defaults
 
-- Every 1.2.1+ broker transport (`transports.bullmq`, `transports.queue`, `transports.db`) and
-  `controlPlanes.redis` OPENS sealed messages (control-plane per-tenant seals from this version).
+- Every broker transport on this version (`transports.bullmq`, `transports.queue`, `transports.db`) and
+  `controlPlanes.redis` OPENS sealed messages (control-plane per-tenant seals need this version on
+  both sides; 1.2.1+ opens the other modes).
   Sending them sealed is one switch,
   `messages: { seal: true }` in `config/durable.ts` (or per transport), off in 1.x and the default in
-  the next major. Turn it on only once every process runs 1.2.1+ (this version for tenant ↔
-  control-plane seals; 1.2.0 sealed by default; that was reverted). `memory` / `eventEmitter` stay in-process.
+  the next major. Turn it on only once every process runs this version (1.2.1+ is enough for
+  same-app seals; 1.2.0 sealed by default; that was reverted). `memory` / `eventEmitter` stay in-process.
 - Same app: AES-256-GCM, key derived from `APP_KEY` (HKDF-SHA256, purpose
   `agora:durable:messages`). Boot line with `seal: true`: `[@adonis-agora/durable] bullmq messages: app key (auto)`;
   by default (sealing off): `bullmq messages: sent plain, sealed ones opened with app key (auto)`.
@@ -69,8 +70,9 @@ does not run its handler and is reported failed (retryable). Anything else is dr
 
 ## Upgrading from 1.1
 
-1. Upgrade every process to 1.2.1+: still sends plain (a 1.1 worker keeps running its tasks with
-   their real input), already opens sealed, replies in kind.
+1. Upgrade every process to this version: still sends plain (a 1.1 worker keeps running its tasks with
+   their real input), already opens sealed (1.2.1+ is enough for same-app seals; tenant ↔ control-plane
+   seals need this version on both sides), replies in kind.
 2. Turn sealing on: `messages: { seal: true }`.
 3. Later, `acceptPlain: false`.
 

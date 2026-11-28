@@ -353,18 +353,18 @@ Source: `docs/stores/lucid.mdx`, `docs/stores/index.mdx`.
 
 ### Pattern 5 — sealing broker messages (one switch, after the upgrade)
 
-Every 1.2.1+ process opens sealed broker messages (control-plane per-tenant seals from this
-version); sending them sealed is
+Every process on this version opens sealed broker messages (control-plane per-tenant seals need
+this version on both sides; 1.2.1+ opens the other modes); sending them sealed is
 `messages: { seal: true }` (off in 1.x, the default in the next major). The key
 is derived from `APP_KEY` (between tenant pods and their control plane, a key
 per tenant the control plane owns and hands each pod); routing fields stay in clear. Turn it on only once every
-process runs 1.2.1 or later (this version for tenant ↔ control-plane seals):
+process runs this version (1.2.1+ is enough for same-app seals):
 
 ```ts
 import { defineConfig } from '@adonis-agora/durable'
 
 export default defineConfig({
-  // Step 2, after every process runs 1.2.1+. `acceptPlain: false` later refuses plain.
+  // Step 2, after every process runs this version. `acceptPlain: false` later refuses plain.
   messages: { seal: true },
 })
 ```
@@ -460,7 +460,7 @@ fix was never recorded in migration history. Source: `docs/stores/lucid.mdx`
 ### HIGH turning `seal: true` on while 1.1 processes still run
 
 Wrong: `messages: { seal: true }` in the same deploy that upgrades from 1.1.
-Correct: upgrade every process to 1.2.1+ first (it sends plain and opens sealed),
+Correct: upgrade every process to this version first (it sends plain and opens sealed; 1.2.1+ is enough for same-app seals),
 then turn sealing on. Mechanism: a 1.1 worker does not know the `sealed` field
 and runs the handler with `input` undefined (why 1.2.0's sealed default was
 reverted in 1.2.1). Source: `docs/transports/encrypting-messages.mdx`.
