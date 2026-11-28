@@ -445,6 +445,25 @@ export class BullMQTransport implements Transport {
   /** Seals what this transport sends and opens what it receives. */
   readonly #messages: MessageSealer;
 
+  /** "Set if absent" for `ttlMs` on Redis (`SET NX PX`), shared by every replica (the key-request guard). */
+  async claimOnce(key: string, ttlMs: number): Promise<boolean> {
+    this.#claimRedis ??= this.#deps.makeRedis();
+    const set = (this.#claimRedis as { set?: (...args: unknown[]) => Promise<unknown> }).set;
+    // Fail closed: a guard that cannot remember refuses rather than letting every request through.
+    if (typeof set !== 'function') throw new Error('the Redis client cannot SET NX');
+    const answer = await set.call(
+      this.#claimRedis,
+      `${this.#effectivePrefix()}:once:${key}`,
+      '1',
+      'PX',
+      Math.max(1, Math.round(ttlMs)),
+      'NX',
+    );
+    return answer === 'OK';
+  }
+
+  #claimRedis: RedisLike | undefined;
+
   /** The sealer (the control plane's responder grants tenant keys through it). */
   get messageSealer(): MessageSealer {
     return this.#messages;
@@ -2863,6 +2882,7 @@ export class BullMQTransport implements Transport {
     this.#registryRedis?.disconnect();
     this.#runReplyPub?.disconnect();
     this.#runReplySub?.disconnect();
+    this.#claimRedis?.disconnect();
     this.#tenantEventPub?.disconnect();
     this.#tenantEventSub?.disconnect();
     this.#replyRedisClient?.disconnect();

@@ -244,6 +244,8 @@ export interface MessageKeyRequestBody {
   partition: string;
   /** When the request was made (ms): one over a minute old is refused. */
   ts: number;
+  /** A fresh random value (16+ characters): a request seen before is refused as a replay. */
+  nonce: string;
 }
 
 /** What the control plane answers: `K_tenant` sealed to the request's key. */
@@ -336,6 +338,9 @@ export function isMessageKeyBody(body: unknown, now = Date.now()): body is Messa
     isPublicKey(b.publicKey) &&
     typeof b.partition === 'string' &&
     typeof b.ts === 'number' &&
+    typeof b.nonce === 'string' &&
+    b.nonce.length >= 16 &&
+    b.nonce.length <= 128 &&
     now - b.ts <= HANDSHAKE_MAX_AGE_MS &&
     b.ts - now <= HANDSHAKE_MAX_AGE_MS
   );
@@ -360,6 +365,109 @@ export function isPublicKey(raw: unknown): boolean {
   return Buffer.from(raw, 'base64url').length === 32;
 }
 
+/* ------------------------------------------------------------------------------------------- */
+/* Single use                                                                                  */
+/* ------------------------------------------------------------------------------------------- */
+
+/** How long one token's key request blocks another with the same token when the token says nothing. */
+const TOKEN_HOLD_FALLBACK_MS = HANDSHAKE_MAX_AGE_MS;
+/** The most a token's key request blocks another (a long-lived JWT). */
+const TOKEN_HOLD_MAX_MS = 24 * 60 * 60_000;
+
+/** A token's identity for the guard (its `jti` when it is a JWT, else a hash) and remaining lifetime. */
+export function tokenIdentity(token: string, now = Date.now()): { id: string; holdMs: number } {
+  const hash = createHash('sha256').update(token).digest('base64url').slice(0, 32);
+  const parts = token.split('.');
+  if (parts.length === 3) {
+    try {
+      const claims = JSON.parse(Buffer.from(parts[1] as string, 'base64url').toString('utf8')) as {
+        jti?: unknown;
+        exp?: unknown;
+      };
+      const id =
+        typeof claims.jti === 'string' && claims.jti.length > 0 ? `jti:${claims.jti}` : `h:${hash}`;
+      const holdMs =
+        typeof claims.exp === 'number'
+          ? Math.min(TOKEN_HOLD_MAX_MS, Math.max(TOKEN_HOLD_FALLBACK_MS, claims.exp * 1000 - now))
+          : TOKEN_HOLD_FALLBACK_MS;
+      return { id, holdMs };
+    } catch {
+      // not a JWT
+    }
+  }
+  return { id: `h:${hash}`, holdMs: TOKEN_HOLD_FALLBACK_MS };
+}
+
+/** "Set if absent" for a while, shared by every control-plane replica (Redis `SET NX PX`, the DB). */
+export type ClaimOnce = (key: string, ttlMs: number) => Promise<boolean>;
+
+/** A per-process {@link ClaimOnce}, for a transport with no shared store. */
+export function memoryClaimOnce(): ClaimOnce {
+  const held = new Map<string, number>();
+  return async (key, ttlMs) => {
+    const now = Date.now();
+    for (const [k, until] of held) if (until <= now) held.delete(k);
+    if ((held.get(key) ?? 0) > now) return false;
+    held.set(key, now + ttlMs);
+    return true;
+  };
+}
+
+/**
+ * Makes every key request single-use: a request (token + nonce) seen before is refused, and so is a
+ * second key request with the same token while that token lives. A captured request or token
+ * replayed by someone reading the broker either loses the race to the pod (and is refused) or wins
+ * it, and then the pod's own request is refused and reported as a possible replay.
+ */
+export class MessageKeyGuard {
+  readonly #claim: ClaimOnce;
+  readonly #warn: (line: string) => void;
+  readonly #warned = new Set<string>();
+
+  constructor(claim: ClaimOnce, warn: (line: string) => void) {
+    this.#claim = claim;
+    this.#warn = warn;
+  }
+
+  /** `null` when the request may proceed, else why it is refused. */
+  async check(
+    token: string,
+    body: MessageKeyRequestBody,
+  ): Promise<{ code: 'replayed' | 'unavailable'; message: string } | null> {
+    const { id, holdMs } = tokenIdentity(token);
+    try {
+      const replayed = await this.#check(id, holdMs, body);
+      return replayed ? { code: 'replayed', message: replayed } : null;
+    } catch (error) {
+      // Fail closed: without the shared store no key is handed out.
+      return {
+        code: 'unavailable',
+        message: `the replay guard's store is unavailable (${error instanceof Error ? error.message : String(error)})`,
+      };
+    }
+  }
+
+  async #check(id: string, holdMs: number, body: MessageKeyRequestBody): Promise<string | null> {
+    if (!(await this.#claim(`durable-mk:nonce:${id}:${body.nonce}`, 2 * HANDSHAKE_MAX_AGE_MS))) {
+      this.#report(body.partition, 'a message-key request was sent twice (same token and nonce)');
+      return 'this message-key request was already answered (replayed)';
+    }
+    if (!(await this.#claim(`durable-mk:token:${id}`, holdMs))) {
+      this.#report(body.partition, 'a second message-key request used the same tenant token');
+      return 'this token already asked for its message key (replayed? ask again with a fresh token)';
+    }
+    return null;
+  }
+
+  #report(partition: string, what: string): void {
+    if (this.#warned.has(partition)) return;
+    this.#warned.add(partition);
+    this.#warn(
+      `[${PACKAGE}] messages: ${what} for partition "${partition}": possibly a replay by someone who read the token. Refused. If it was the pod itself (restarted within the token's lifetime), it asks again with a fresh token. Further cases for this partition are not logged.`,
+    );
+  }
+}
+
 /** The plumbing a tenant's handshake needs from its transport. */
 export interface HandshakeWire {
   dispatchRunRequest(msg: RunRequest): Promise<void>;
@@ -369,22 +477,63 @@ export interface HandshakeWire {
  * Tenant side: holds this pod's key, asks the control plane for it on first use (and again when the
  * control plane rotates), through the transport it is attached to.
  */
+/** The control plane's HTTPS route for key requests (under its URL). */
+export const MESSAGE_KEY_PATH = '/__durable/message-key';
+
+/** The key route under the control plane's `base` URL, or `undefined` for something not a URL. */
+function keyUrl(base: string): URL | undefined {
+  try {
+    return new URL(MESSAGE_KEY_PATH, base.endsWith('/') ? base : `${base}/`);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether a pod may ask for its key at `base`: HTTPS, or plain HTTP to this machine only. */
+export function usableKeyUrl(base: string): boolean {
+  const target = keyUrl(base);
+  if (!target) return false;
+  const local = ['localhost', '127.0.0.1', '[::1]'].includes(target.hostname);
+  return target.protocol === 'https:' || (local && target.protocol === 'http:');
+}
+
+/** The answer of a key request, over either path. */
+type KeyAnswer = RunReply['result'];
+
+/**
+ * Tenant side: holds this pod's key, asks the control plane for it on first use (and again when the
+ * control plane rotates). Over HTTPS to the control plane's URL when the pod has one (the token then
+ * never crosses the broker for this), else over the run-request channel of the transport.
+ */
 export class TenantKeyClient {
   readonly #partition: string;
   readonly #token: () => Promise<string>;
+  readonly #resetToken: (() => boolean | undefined | void) | undefined;
+  readonly #url: (() => Promise<string | undefined>) | undefined;
+  readonly #fetch: typeof fetch;
   #wire: HandshakeWire | undefined;
   #current: Promise<{ kid: string; key: Buffer }> | undefined;
   readonly #keys = new Map<string, Buffer>();
   readonly #pending = new Map<string, (reply: RunReply) => void>();
   readonly #log: (level: 'info' | 'warn', line: string) => void;
+  /** Whether the HTTPS failure was logged (warned once; HTTPS is tried again on every handshake). */
+  #httpsWarned = false;
+  /** How the last key was obtained: `https` or `broker` (doctor, tests). */
+  lastPath: 'https' | 'broker' | undefined;
 
   constructor(options: {
     partition: string;
     token: () => Promise<string>;
+    resetToken?: (() => boolean | undefined | void) | undefined;
+    url?: (() => Promise<string | undefined>) | undefined;
+    fetch?: typeof fetch | undefined;
     log: (level: 'info' | 'warn', line: string) => void;
   }) {
     this.#partition = options.partition;
     this.#token = options.token;
+    this.#resetToken = options.resetToken;
+    this.#url = options.url;
+    this.#fetch = options.fetch ?? fetch;
     this.#log = options.log;
   }
 
@@ -434,13 +583,116 @@ export class TenantKeyClient {
   }
 
   async #handshake(): Promise<{ kid: string; key: Buffer }> {
+    let answer = await this.#ask();
+    if (!answer.result.ok && answer.result.error.code === 'replayed') {
+      // This token already asked (a restart within its lifetime, or a replay someone else won):
+      // ask once more with a fresh token when the source can mint one (a reset that answers
+      // `false` had nothing to drop), else after the window an opaque token is held for.
+      const reset = this.#resetToken?.();
+      if (!this.#resetToken || reset === false) {
+        await new Promise((r) => setTimeout(r, HANDSHAKE_MAX_AGE_MS + 1_000).unref?.());
+      }
+      answer = await this.#ask();
+    }
+    const { result, requestId, mine } = answer;
+    if (!result.ok) {
+      const error = new Error(
+        `[${PACKAGE}] messages: the control plane refused this pod's message key: ${result.error.message}`,
+      );
+      this.#log('warn', error.message);
+      throw error;
+    }
+    const grant = result.data as MessageKeyGrant;
+    const key = grant && openGrant(grant, mine, requestId, this.#partition);
+    if (!key)
+      throw new Error(`[${PACKAGE}] messages: the control plane's message key did not open`);
+    this.#keys.set(grant.kid, key);
+    while (this.#keys.size > 2) this.#keys.delete(this.#keys.keys().next().value as string);
+    return { kid: grant.kid, key };
+  }
+
+  /** One key request, over HTTPS when the pod has the control plane's URL, else the broker. */
+  async #ask(): Promise<{
+    result: KeyAnswer;
+    requestId: string;
+    mine: { publicKey: string; privateKey: KeyObject };
+  }> {
+    const mine = handshakeKeyPair();
+    const requestId = `mk-${randomUUID()}`;
+    const body: MessageKeyRequestBody = {
+      kind: MESSAGE_KEY_REQUEST,
+      publicKey: mine.publicKey,
+      partition: this.#partition,
+      ts: Date.now(),
+      nonce: randomUUID().replaceAll('-', ''),
+    };
+    const token = await this.#token();
+    const url = await this.#url?.().catch(() => undefined);
+    if (url) {
+      const result = await this.#overHttps(url, token, requestId, body);
+      if (result) {
+        this.lastPath = 'https';
+        return { result, requestId, mine };
+      }
+    }
+    this.lastPath = 'broker';
+    return { result: await this.#overBroker(token, requestId, body), requestId, mine };
+  }
+
+  /** The answer over HTTPS, or `undefined` when the route cannot be used (then the broker is). */
+  async #overHttps(
+    base: string,
+    token: string,
+    requestId: string,
+    body: MessageKeyRequestBody,
+  ): Promise<KeyAnswer | undefined> {
+    const target = keyUrl(base);
+    if (!target) return this.#httpsUnusable(`"${base}" is not a URL`);
+    if (!usableKeyUrl(base)) return this.#httpsUnusable(`${target.origin} is not HTTPS`);
+    try {
+      const response = await this.#fetch(target, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+        body: JSON.stringify({ requestId, ...body }),
+        signal: AbortSignal.timeout(HANDSHAKE_TIMEOUT_MS),
+      });
+      if (response.status === 404 || response.status === 405) {
+        return this.#httpsUnusable(
+          `${target.origin} has no ${MESSAGE_KEY_PATH} (an older control plane?)`,
+        );
+      }
+      const parsed = (await response.json()) as KeyAnswer;
+      if (!parsed || typeof parsed !== 'object' || typeof parsed.ok !== 'boolean') {
+        return this.#httpsUnusable(`${target.origin} answered something else`);
+      }
+      return parsed;
+    } catch (error) {
+      return this.#httpsUnusable(
+        `${target.origin} could not be reached (${error instanceof Error ? error.message : String(error)})`,
+      );
+    }
+  }
+
+  #httpsUnusable(why: string): undefined {
+    if (this.#httpsWarned) return undefined;
+    this.#httpsWarned = true;
+    this.#log(
+      'warn',
+      `[${PACKAGE}] messages: asking the control plane for this pod's key over HTTPS failed: ${why}. Asking over the broker instead (the token then crosses it once).`,
+    );
+    return undefined;
+  }
+
+  async #overBroker(
+    token: string,
+    requestId: string,
+    body: MessageKeyRequestBody,
+  ): Promise<KeyAnswer> {
     const wire = this.#wire;
     if (!wire)
       throw new Error(
         `[${PACKAGE}] messages: the tenant key client is not attached to a transport`,
       );
-    const mine = handshakeKeyPair();
-    const requestId = `mk-${randomUUID()}`;
     const answered = new Promise<RunReply>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.#pending.delete(requestId);
@@ -453,31 +705,11 @@ export class TenantKeyClient {
       });
     });
     answered.catch(() => undefined);
-    const body: MessageKeyRequestBody = {
-      kind: MESSAGE_KEY_REQUEST,
-      publicKey: mine.publicKey,
-      partition: this.#partition,
-      ts: Date.now(),
-    };
     await wire.dispatchRunRequest({
       requestId,
-      tenant: await this.#token(),
+      tenant: token,
       body: body as unknown as RunRequest['body'],
     });
-    const reply = await answered;
-    if (!reply.result.ok) {
-      const error = new Error(
-        `[${PACKAGE}] messages: the control plane refused this pod's message key: ${reply.result.error.message}`,
-      );
-      this.#log('warn', error.message);
-      throw error;
-    }
-    const grant = reply.result.data as MessageKeyGrant;
-    const key = grant && openGrant(grant, mine, requestId, this.#partition);
-    if (!key)
-      throw new Error(`[${PACKAGE}] messages: the control plane's message key did not open`);
-    this.#keys.set(grant.kid, key);
-    while (this.#keys.size > 2) this.#keys.delete(this.#keys.keys().next().value as string);
-    return { kid: grant.kid, key };
+    return (await answered).result;
   }
 }

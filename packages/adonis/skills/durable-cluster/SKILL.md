@@ -15,7 +15,7 @@ license: MIT
 metadata:
   type: core
   library: "@adonis-agora/durable"
-  library_version: "1.2.1"
+  library_version: "1.3.0"
   framework: adonisjs
 sources:
   - 'DavideCarvalho/adonis-durable:docs/cluster/index.mdx'
@@ -45,9 +45,9 @@ transport (`bullmq`/`queue`/`db`) with `tenant: { partition, token }`
 (optional when `@adonis-agora/authkit-client` is booted with its `service`
 configured — its `authkit.client.tenantOf('urn:agora:durable')` supplies
 `partition`/`token`; each explicit field wins, `tenant: { auto: false }` opts out),
-`verifyTenant` and `capabilities`. Durable never reads `tenant.url`: a tenant reaches the
-control plane through its `transport` (still required), so authkit-client fills only `token` and
-`partition`, and `url` is accepted only so the block reads like the other Agora libs'.
+`verifyTenant` and `capabilities`. The `transport` is still required; `tenant.url` (or
+authkit's for `urn:agora:durable`) only lets the pod ask for its message key over HTTPS
+(`POST <url>/__durable/message-key`), else it asks over the broker (boot line says which).
 
 | Topology | Owns the store | Executes bodies | Serves HTTP |
 |------|:---:|:---:|:---:|

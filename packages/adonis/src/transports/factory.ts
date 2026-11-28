@@ -39,7 +39,7 @@ export interface TransportContext {
    */
   name?: string | undefined;
   /** A tenant pod: its partition and token (it asks the control plane for its message key). */
-  tenant?: { partition: string; token?: (() => Promise<string>) | undefined } | undefined;
+  tenant?: import('../messages/resolve.js').MessagesResolveContext['tenant'];
 }
 
 /** A transport option that falls back to the provider-forwarded top-level value. */

@@ -415,6 +415,15 @@ export class DbTransport implements Transport, ControlPlane {
   /** Seals what this transport writes and opens what it reads. */
   readonly #messages: MessageSealer;
 
+  /** "Set if absent" for `ttlMs`, shared by every process on this database (the key-request guard). */
+  async claimOnce(key: string, ttlMs: number): Promise<boolean> {
+    await this.#ensureSchema();
+    const store = this.#workerKeys();
+    // Fail closed: a guard that cannot remember refuses rather than letting every request through.
+    if (!store.claim) throw new Error('the worker-key store cannot claim keys');
+    return store.claim(key, ttlMs);
+  }
+
   /** The sealer (the control plane's responder grants tenant keys through it). */
   get messageSealer(): MessageSealer {
     return this.#messages;

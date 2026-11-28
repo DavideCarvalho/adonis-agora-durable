@@ -77,6 +77,8 @@ export interface ResolvedTenantIdentity<T> {
   authkitError?: string;
   /** Whether a usable `authkit.client` (with `tenantOf`) is booted here. */
   authkit: boolean;
+  /** What `tenantOf` answered, when it was asked (its `url` is the control plane's, for durable). */
+  auto?: AuthkitTenant | undefined;
 }
 
 /**
@@ -105,6 +107,7 @@ export async function resolveTenantIdentity<T extends TenantIdentityFields>(
     wanted.length > 0 && base.auto !== false ? await authkitTenantClientOf(options.container) : {};
   const client = found.client;
   let authkitError: string | undefined = found.error;
+  let autoAnswer: AuthkitTenant | undefined;
   if (client && wanted.length > 0) {
     let auto: AuthkitTenant | undefined;
     try {
@@ -115,6 +118,7 @@ export async function resolveTenantIdentity<T extends TenantIdentityFields>(
     } catch (error) {
       authkitError = messageOf(error);
     }
+    autoAnswer = auto;
     if (auto) {
       for (const field of wanted) {
         const value = auto[field];
@@ -133,6 +137,7 @@ export async function resolveTenantIdentity<T extends TenantIdentityFields>(
     missing,
     authkit: client !== undefined,
     ...(authkitError !== undefined ? { authkitError } : {}),
+    ...(autoAnswer !== undefined ? { auto: autoAnswer } : {}),
   };
 }
 
@@ -200,6 +205,8 @@ export const DURABLE_TENANT_FIELDS: readonly TenantField[] = ['token', 'partitio
 export interface DurableTenantIdentity<T> {
   tenant: T & { partition: string };
   sources: Partial<Record<TenantField, TenantFieldSource>>;
+  /** authkit-client's answer, when a field came from it (its `url` is the control plane's). */
+  auto?: AuthkitTenant | undefined;
 }
 
 /**
@@ -231,5 +238,6 @@ export async function resolveDurableTenant<T extends TenantIdentityFields>(
   return {
     tenant: resolved.tenant as T & { partition: string },
     sources: resolved.sources,
+    ...(resolved.auto ? { auto: resolved.auto } : {}),
   };
 }
