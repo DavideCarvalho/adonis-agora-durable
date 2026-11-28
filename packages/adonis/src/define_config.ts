@@ -175,12 +175,16 @@ export interface BaseDurableConfig {
   /** Named transports, built with the {@link transports} factory. */
   transports?: Record<string, TransportFactory>;
   /**
-   * More transports (keys of {@link transports}) to build ALONGSIDE {@link transport}, in failover
-   * order: the engine dispatches on `transport` first and falls over to these on a dispatch error,
-   * and a step can pin any of them by name with `ctx.step(step, input, { transport: 'db' })`. Each
-   * one gets the same consumer deferral, namespace and shutdown as `transport`. Only the transports
-   * named here (and `transport`) are built: the rest of `transports` stays a menu. Store-backed
-   * topologies only; a `tenant` pod uses its one `transport`.
+   * More transports (keys of {@link transports}) to build at boot ALONGSIDE {@link transport}, in
+   * failover order: the engine dispatches on `transport` first and falls over to these on a dispatch
+   * error. Each one gets the same consumer deferral, namespace and shutdown as `transport`.
+   *
+   * Pinning does not need it: a step pins any key of `transports` with
+   * `ctx.step(step, input, { transport: 'db' })`, and one not built yet is built the first time a
+   * step pins it (with the same treatment), joining the pool after these. List a transport here for
+   * failover, or to build it at every boot (a store that does not record a pinned step's transport
+   * needs that to consume its results after a restart). Store-backed topologies only; a `tenant` pod
+   * uses its one `transport`.
    */
   transportPool?: string[];
   /**

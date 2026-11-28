@@ -78,6 +78,44 @@ export function checkConfig(config: AnyConfig | undefined): AgoraDoctorResult {
   return { status: 'ok', message: `config/durable.ts is valid (topology ${topology}).` };
 }
 
+/**
+ * `durable.transports`: which configured transports are built at boot (`transport` and
+ * `transportPool`, the failover pool, in order) and which are built the first time a step pins one.
+ */
+export function checkTransports(config: AnyConfig | undefined): AgoraDoctorResult {
+  if (topologyOf(config) === 'tenant') {
+    return { status: 'skip', message: 'A tenant pod uses its one `transport`.' };
+  }
+  const configured = Object.keys(config?.transports ?? {});
+  const pool = Array.isArray(config?.transportPool) ? (config.transportPool as unknown[]) : [];
+  const missing = pool.filter((name) => typeof name !== 'string' || !configured.includes(name));
+  if (missing.length > 0) {
+    return {
+      status: 'error',
+      message: `\`transportPool\` lists ${missing.map((name) => `"${String(name)}"`).join(', ')}, not defined in \`transports\`: the engine fails to build.`,
+      fix: 'Define each `transportPool` entry in `transports` in config/durable.ts, or remove it from `transportPool`.',
+      docs: `${DOCS}/transports#transport-pools-and-failover`,
+    };
+  }
+  const list = (names: string[]): string => names.map((name) => `"${name}"`).join(', ');
+  const boot = [
+    ...new Set([
+      ...(typeof config?.transport === 'string' ? [config.transport] : []),
+      ...(pool as string[]),
+    ]),
+  ];
+  const onDemand = configured.filter((name) => !boot.includes(name));
+  const atBoot =
+    boot.length > 0 ? `Built at boot: ${list(boot)}.` : 'Built at boot: the in-memory transport.';
+  return {
+    status: 'ok',
+    message:
+      onDemand.length > 0
+        ? `${atBoot} Built when a step first pins one (\`{ transport }\`), or at boot when a pending step names one: ${list(onDemand)}. A store that does not record a pinned step's transport (the Lucid and in-memory stores do) needs it in \`transportPool\` to consume its results after a restart.`
+        : atBoot,
+  };
+}
+
 /** `durable.verify-tenant`: a control plane that verifies the tenants calling it. */
 export function checkVerifyTenant(
   config: AnyConfig | undefined,
@@ -342,6 +380,12 @@ export const durableDoctorChecks: AgoraDoctorCheck[] = [
     lib: 'durable',
     title: 'Config is valid',
     run: (app) => checkConfig(durableConfig(app)),
+  },
+  {
+    id: 'durable.transports',
+    lib: 'durable',
+    title: 'Transports built at boot and on demand',
+    run: (app) => checkTransports(durableConfig(app)),
   },
   {
     id: 'durable.single-copy',

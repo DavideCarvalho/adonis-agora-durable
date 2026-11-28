@@ -83,7 +83,7 @@ Several replicas can still share `eventEmitter` + a shared Lucid store **when ev
 
 ## Transport pools and failover
 
-A single instance can dispatch over an ordered pool of named transports and fail over between them; a step pins one with `ctx.step(step, input, { transport: id })`. In `config/durable.ts`, only `transport` is built by default (the rest of `transports` is a menu); list the others to build into the pool in `transportPool`, in failover order. Each one gets the same consumer deferral, namespace and shutdown as `transport`:
+A single instance can dispatch over an ordered pool of named transports and fail over between them. In `config/durable.ts`, `transports` is a menu: `transport` is the one steps go to, and `transportPool` lists the others to build at boot as its failover, in order. Each one gets the same consumer deferral, namespace and shutdown as `transport`:
 
 ```ts title="config/durable.ts"
 export default defineConfig({
@@ -92,18 +92,35 @@ export default defineConfig({
   transports: {
     queue: transports.queue({ connection: 'redis' }),
     db: transports.db(),
+    bullmq: transports.bullmq({ connection: 'redis' }), // built only when a step pins it
   },
 })
 ```
 
-When you construct a `WorkflowEngine` yourself, pass `transports: [{ id, transport }, …]` instead of `transport`. Either way the engine dispatches each step on the first transport and fails over to the next on a dispatch error, throwing only when every one fails. A step pins one by id, tried first with the rest as failover:
+When you construct a `WorkflowEngine` yourself, pass `transports: [{ id, transport }, …]` instead of `transport`. Either way the engine dispatches each step on the first transport and fails over to the next on a dispatch error, throwing only when every one fails.
+
+### Pinning a step to a transport
+
+A step pins a transport by its key in `transports` with `ctx.step(step, input, { transport: id })` (also `ctx.all` over a step). It is tried first, with the pool as failover. `default` still means the primary `transport`:
 
 ```ts
-// 'db' must be in the pool (transportPool, or transports: [...] on a hand-built engine)
-const result = await ctx.step(heavyStep, input, { transport: 'db' })
+// Any key of `transports` in config/durable.ts: it does not have to be in transportPool.
+const result = await ctx.step(heavyStep, input, { transport: 'bullmq' })
 ```
 
-A pin names a transport by its key in `transports` (`default` still means the primary `transport`). Pinning one the engine didn't build fails the step with an error that lists the transports it has and points at `transportPool`.
+A pinned transport that is not built yet (`bullmq` above) is **built on demand**, the first time a step pins it, with the treatment `transportPool` members get: consumer deferral in a console process, the namespace, result and heartbeat consumption, shutdown, and the live-group scan for [convention workflows](/docs/durable/python) (routed by name) once it exists. It joins the pool after `transport` and `transportPool`, so the failover order of unpinned steps does not change. Two runs pinning it at the same time build one instance. A build that fails (the broker is down) fails that step with its error and is not kept: the next pin builds it again. A step pinned to a name that is not in `transports` fails with an error naming the transports that are configured.
+
+Each process builds it for itself: the boot log says which transports a process built at boot and which it builds on demand, and so does `node ace agora:doctor` (`durable.transports`).
+
+**After a restart.** A step pinned to a transport built on demand records it on its `pending` checkpoint (the `transport` column of `durable_step_checkpoints`). At boot the engine builds every transport a pending step still names, before it drives a run, so a result that lands on it after the restart is consumed even if no run pins it again. The Lucid store and the in-memory store record it; a custom store records it by implementing `listPendingTransports`, and the boot log says when the store cannot tell. With a store that cannot tell, or for a transport every process must consume from at boot, list it in `transportPool`.
+
+Remote workflow turns are not pinned: a turn goes out on the primary `transport`, or for a convention workflow on the first built transport whose keyspace reports a live worker for it, and its decision comes back on that transport. A transport built on demand joins that scan only once it is built, so list a transport that only serves convention workflows in `transportPool`.
+
+`transportPool` is still what you use for **failover** (a transport unpinned steps fall over to) and for a transport that must be built at every boot.
+
+<Callout type="info">
+Steps from `app/steps`, and handlers registered with `engine.handle`, are served only on the primary `transport`. Pinning a step to another transport sends it to the workers that consume that transport (another app, a `durable:worker` fleet, a Python worker); this app's own step handlers do not serve it there.
+</Callout>
 
 The id of the transport that accepted the dispatch is stamped on the task as `task.transport`, so a worker consuming several transports replies on the **matching** one, and the engine registers its result and heartbeat handlers on every transport of the pool. Failover is symmetric. Worker health (`groupHealth`) and the worker directory are merged across every transport of the pool.
 

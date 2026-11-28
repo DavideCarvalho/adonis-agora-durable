@@ -886,6 +886,18 @@ export class LucidStateStore implements StateStore {
     return insertIfAbsent(client, this.t.checkpoints, row, ['run_id', 'seq']);
   }
 
+  /** Which of `transports` a `pending` checkpoint names: one `SELECT DISTINCT` over the
+   *  `(transport, status)` index (see {@link StateStore.listPendingTransports}). */
+  async listPendingTransports(transports: string[]): Promise<string[]> {
+    if (transports.length === 0) return [];
+    const rows = (await this.client()
+      .from(this.t.checkpoints)
+      .distinct('transport')
+      .whereIn('transport', transports)
+      .andWhere('status', 'pending')) as Array<{ transport: string | null }>;
+    return rows.flatMap((row) => (row.transport == null ? [] : [String(row.transport)]));
+  }
+
   /** Persist the latest worker heartbeat on the step's checkpoint row (see the interface doc).
    *  A targeted two-column UPDATE — never an upsert: a beat racing the checkpoint's own insert (or
    *  outliving a deleted run) matches zero rows and is a silent no-op, by design. */
@@ -2224,6 +2236,8 @@ const CHECKPOINT_OPTIONAL_COLUMNS = [
   'parallel_group',
   'last_heartbeat_at',
   'heartbeat_progress',
+  // Not in CHECKPOINT_COLUMNS_BUT_INPUT: the other explicit reads leave it out (see CheckpointRow).
+  'transport',
 ] as const;
 const CHECKPOINT_BASE_COLUMNS = [
   ...CHECKPOINT_COLUMNS_BUT_INPUT.filter(

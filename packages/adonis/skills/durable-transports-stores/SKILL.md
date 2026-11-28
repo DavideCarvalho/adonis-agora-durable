@@ -372,6 +372,11 @@ export default defineConfig({
 Modes, what is sealed, refusals and the rollout from 1.1:
 [encrypting messages](references/encrypting-messages.md).
 
+### Pattern 6 — pinning a step to a transport, and failover pools
+
+Pin any key of `transports` (`ctx.step(step, input, { transport: 'bullmq' })`); one not built yet is built
+on first pin, `transportPool` is failover: [transport pinning](references/transport-pinning.md).
+
 ## Common mistakes
 
 ### HIGH blocking the event loop longer than `stalledThresholdMs`

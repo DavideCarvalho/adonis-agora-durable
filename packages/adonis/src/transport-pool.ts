@@ -3,6 +3,7 @@ import type {
   GroupHealth,
   Heartbeat,
   NamedTransport,
+  OnDemandTransports,
   RemoteTask,
   StepResult,
   Transport,
@@ -13,27 +14,109 @@ import type {
 /** Most tasks {@link TransportPool.dispatchMany} dispatches at once when it sends them one by one. */
 const DISPATCH_CHUNK = 200;
 
+type ResultHandler = (result: StepResult) => Promise<void>;
+type HeartbeatHandler = (beat: Heartbeat) => Promise<void>;
+type StepEventHandler = (event: WorkflowStepEvent) => Promise<void>;
+
 /**
  * An ordered pool of named transports. The engine dispatches on the first and fails over to the
  * next on a dispatch error; a step can pin one by id. Pure transport plumbing — no run lifecycle —
  * so it lives apart from the engine.
+ *
+ * With {@link OnDemandTransports}, a pin to an id the pool does not hold yet builds that transport
+ * on first use and appends it, after the transports the pool was constructed with. Everything the
+ * pool did to its members (namespace, handlers, reply routing, consumer start) is replayed on it.
  */
 export class TransportPool {
   private warnedBulkRefusal = false;
   /** Ids of the transports that route replies to this engine instance (see {@link routeReplies}). */
   private readonly replying = new Set<string>();
+  private readonly transports: NamedTransport[];
+  /** In-flight on-demand builds by id, shared by concurrent first uses; dropped once settled. */
+  private readonly building = new Map<string, Promise<void>>();
+  /** Ids built on demand, in build order. */
+  private readonly builtOnDemand: string[] = [];
+  /** What was applied to the members, replayed on a transport built later. */
+  private namespace: string | undefined;
+  private handlers: [ResultHandler, HeartbeatHandler, StepEventHandler | undefined] | undefined;
+  private replyInstance: string | undefined;
+  private consumersStarted = false;
 
-  constructor(private readonly transports: NamedTransport[]) {}
+  constructor(
+    transports: NamedTransport[],
+    private readonly onDemand?: OnDemandTransports | undefined,
+  ) {
+    this.transports = [...transports];
+  }
 
   /**
    * Have every transport that can ({@link Transport.consumeRepliesFor}) send this engine instance
    * the results of the tasks it dispatches with `replyTo`. Returns whether any transport does.
    */
   routeReplies(instanceId: string): boolean {
+    this.replyInstance = instanceId;
     for (const { id, transport } of this.transports) {
       if (transport.consumeRepliesFor?.(instanceId)) this.replying.add(id);
     }
     return this.replying.size > 0;
+  }
+
+  /** Whether `id` is a member (`default` is the primary, the id a single-transport engine stamps). */
+  has(id: string): boolean {
+    return this.transports.some((t) => t.id === id) || (id === 'default' && this.size > 0);
+  }
+
+  /** The ids built on demand so far, in build order. */
+  get onDemandBuilt(): readonly string[] {
+    return this.builtOnDemand;
+  }
+
+  /** Whether `id` is one of the on-demand ids: a step pinned to it records it on its checkpoint. */
+  isOnDemand(id: string | undefined): id is string {
+    return id !== undefined && (this.onDemand?.ids.includes(id) ?? false);
+  }
+
+  /** The on-demand ids not built yet. */
+  get onDemandUnbuilt(): string[] {
+    return (this.onDemand?.ids ?? []).filter((id) => !this.has(id));
+  }
+
+  /**
+   * Make sure transport `id` is a member, building it when it is one of the on-demand ids. Concurrent
+   * calls share one build; a failed build rejects every caller waiting on it and is forgotten, so a
+   * later call builds again. A no-op for a member, or an id that cannot be built (a dispatch pinned
+   * to it then fails naming the transports there are).
+   */
+  async ensure(id: string): Promise<void> {
+    if (this.has(id)) return;
+    const onDemand = this.onDemand;
+    if (!onDemand?.ids.includes(id)) return;
+    let build = this.building.get(id);
+    if (!build) {
+      build = onDemand.build(id).then((transport) => {
+        // A build that raced another member with this id (cannot happen through `ensure`) keeps one.
+        if (!this.has(id)) this.add({ id, transport });
+      });
+      this.building.set(id, build);
+      const forget = (): void => {
+        this.building.delete(id);
+      };
+      build.then(forget, forget);
+    }
+    await build;
+  }
+
+  /** Append `member`, applying what the pool applied to the others, in the same order. */
+  private add(member: NamedTransport): void {
+    const { id, transport } = member;
+    if (this.namespace !== undefined) transport.useNamespace?.(this.namespace);
+    if (this.handlers) this.bindOne(transport, ...this.handlers);
+    if (this.replyInstance !== undefined && transport.consumeRepliesFor?.(this.replyInstance)) {
+      this.replying.add(id);
+    }
+    this.transports.push(member);
+    this.builtOnDemand.push(id);
+    if (this.consumersStarted) transport.startConsumers?.();
   }
 
   /** `task` as sent on transport `id`: a reply goes back only on a transport that routes it, so
@@ -52,16 +135,26 @@ export class TransportPool {
    *  back on whichever one delivered the task, so failover stays symmetric. `onStepEvent` is wired only
    *  on transports that carry streamed workflow step lifecycle (BullMQ); others simply skip it. */
   bind(
-    onResult: (result: StepResult) => Promise<void>,
-    onHeartbeat: (beat: Heartbeat) => Promise<void>,
-    onStepEvent?: (event: WorkflowStepEvent) => Promise<void>,
+    onResult: ResultHandler,
+    onHeartbeat: HeartbeatHandler,
+    onStepEvent?: StepEventHandler,
   ): void {
+    this.handlers = [onResult, onHeartbeat, onStepEvent];
     for (const { transport } of this.transports) {
-      transport.onResult(onResult);
-      transport.onHeartbeat(onHeartbeat);
-      if (onStepEvent && transport.onStepEvent) {
-        transport.onStepEvent(onStepEvent);
-      }
+      this.bindOne(transport, onResult, onHeartbeat, onStepEvent);
+    }
+  }
+
+  private bindOne(
+    transport: Transport,
+    onResult: ResultHandler,
+    onHeartbeat: HeartbeatHandler,
+    onStepEvent: StepEventHandler | undefined,
+  ): void {
+    transport.onResult(onResult);
+    transport.onHeartbeat(onHeartbeat);
+    if (onStepEvent && transport.onStepEvent) {
+      transport.onStepEvent(onStepEvent);
     }
   }
 
@@ -71,6 +164,7 @@ export class TransportPool {
    * replies on the matching one). Throws if every transport fails.
    */
   async dispatch(task: Omit<RemoteTask, 'transport'>, preferId?: string): Promise<void> {
+    if (preferId) await this.ensure(preferId);
     let lastErr: unknown;
     for (const { id, transport } of this.ordered(preferId)) {
       try {
@@ -90,6 +184,7 @@ export class TransportPool {
    */
   async dispatchMany(tasks: Omit<RemoteTask, 'transport'>[], preferId?: string): Promise<void> {
     if (tasks.length === 0) return;
+    if (preferId) await this.ensure(preferId);
     const first = this.ordered(preferId)[0];
     if (first?.transport.dispatchMany) {
       try {
@@ -191,6 +286,7 @@ export class TransportPool {
    * namespace at construction ignores this (see {@link Transport.useNamespace}).
    */
   useNamespace(namespace: string): void {
+    this.namespace = namespace;
     for (const { transport } of this.transports) {
       transport.useNamespace?.(namespace);
     }
@@ -199,6 +295,7 @@ export class TransportPool {
   /** Flush deferred consumer subscriptions on every transport that deferred them (see
    *  {@link Transport.startConsumers}); a transport that never defers is skipped. */
   startConsumers(): void {
+    this.consumersStarted = true;
     for (const { transport } of this.transports) {
       transport.startConsumers?.();
     }
@@ -214,11 +311,17 @@ export class TransportPool {
       pref = [this.transports[0]];
     }
     if (pref.length === 0) {
-      const ids = this.transports.map((t) => `"${t.id}"`).join(', ') || 'none';
+      const quoted = (ids: readonly string[]): string =>
+        ids.map((id) => `"${id}"`).join(', ') || 'none';
+      const registered = quoted(this.transports.map((t) => t.id));
       throw new Error(
-        `transport "${preferId}" is not registered on this engine (registered: ${ids}). ` +
-          `To pin steps to it, build it into the pool: list it in \`transportPool\` in ` +
-          `config/durable.ts (or pass it in the WorkflowEngine \`transports\` option).`,
+        this.onDemand
+          ? `transport "${preferId}" is not registered on this engine (registered: ${registered}; ` +
+              `${this.onDemand.describe ?? 'built on demand'}: ${quoted(this.onDemand.ids)}). ` +
+              `${this.onDemand.hint ?? ''}`.trimEnd()
+          : `transport "${preferId}" is not registered on this engine (registered: ${registered}). ` +
+              `To pin steps to it, pass it in the WorkflowEngine \`transports\` option ` +
+              `(or define it in \`transports\` in config/durable.ts).`,
       );
     }
     return [...pref, ...this.transports.filter((t) => !pref.includes(t))];

@@ -77,7 +77,15 @@ export const DURABLE_SCHEMA_META_TABLE = 'durable_schema_meta';
  * once on its next boot and then goes back to the one-row read. A test pins the SQLite DDL to this
  * number, so a schema change without a bump fails CI.
  */
-export const DURABLE_SCHEMA_REVISION = 8;
+export const DURABLE_SCHEMA_REVISION = 9;
+
+/**
+ * The index behind {@link LucidStateStore.listPendingTransports}, the boot read of which transports
+ * built on demand still have a `pending` step: `transport IN (…) AND status = 'pending'`. Only steps
+ * pinned to a transport carry a `transport`, so the index stays small, and the read never scans the
+ * checkpoints table.
+ */
+export const CHECKPOINT_TRANSPORT_INDEX = 'durable_step_checkpoints_transport_idx';
 
 /**
  * The index behind the retention sweep (`engine.sweepRetention`, once a minute): every pass asks
@@ -697,6 +705,7 @@ async function healDurableTables(
       table.integer('attempts').notNullable();
       table.string('worker_group');
       table.string('queue');
+      table.string('transport');
       table.bigInteger('wake_at');
       table.string('parallel_group');
       table.bigInteger('enqueued_at');
@@ -708,6 +717,7 @@ async function healDurableTables(
       table.index(['run_id', 'name'], 'durable_checkpoints_name_idx');
       // The run detail's per-fan reads (`checkpointStats({ group })`, a fan page in seq order).
       table.index(['run_id', 'parallel_group', 'seq'], 'durable_step_checkpoints_group_idx');
+      table.index(['transport', 'status'], CHECKPOINT_TRANSPORT_INDEX);
     });
   } else {
     if (!(await columnExists(DURABLE_TABLES.checkpoints, 'parallel_group'))) {
@@ -741,10 +751,24 @@ async function healDurableTables(
       });
       repairs.push(`${DURABLE_TABLES.checkpoints}.queue`);
     }
+    if (!(await columnExists(DURABLE_TABLES.checkpoints, 'transport'))) {
+      // Transports built on demand: the pinned transport is persisted on the pending checkpoint so a
+      // restarted engine builds the transport its result comes back on. Nullable — an unpinned step
+      // never writes it.
+      await conn().alterTable(DURABLE_TABLES.checkpoints, (table) => {
+        table.string('transport');
+      });
+      repairs.push(`${DURABLE_TABLES.checkpoints}.transport`);
+    }
     await ensureIndex(
       DURABLE_TABLES.checkpoints,
       ['run_id', 'parallel_group', 'seq'],
       'durable_step_checkpoints_group_idx',
+    );
+    await ensureIndex(
+      DURABLE_TABLES.checkpoints,
+      ['transport', 'status'],
+      CHECKPOINT_TRANSPORT_INDEX,
     );
   }
 

@@ -122,4 +122,4 @@ Pair it with `controlPlanes.redis` for cross-pod live-tail and cancellation. If 
 
 **`memory`** is for tests only.
 
-`config/durable.ts` builds the `transport` you select, plus any you list in `transportPool`: together they form an ordered [pool of transports](/docs/durable/transports#transport-pools-and-failover) with failover and per-step pinning by name. A `WorkflowEngine` you construct yourself takes the same pool as `transports: [{ id, transport }, …]`.
+`config/durable.ts` builds the `transport` you select, plus any you list in `transportPool`: together they form an ordered [pool of transports](/docs/durable/transports#transport-pools-and-failover) with failover. A step can pin any key of `transports` by name; one not built yet is built the first time a step pins it. A `WorkflowEngine` you construct yourself takes the same pool as `transports: [{ id, transport }, …]`.

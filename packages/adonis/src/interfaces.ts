@@ -201,6 +201,13 @@ export interface StepCheckpoint {
    * dispatching pod would leak the slot when another pod completes the step).
    */
   queue?: string | undefined;
+  /**
+   * For a remote step pinned to a named transport (`ctx.step(step, input, { transport })`): that
+   * transport's id. Persisted on the `pending` checkpoint so an engine that restarts builds the
+   * transport the step's result comes back on, even when no run pins it again (see
+   * {@link StateStore.listPendingTransports}). Absent for an unpinned step.
+   */
+  transport?: string | undefined;
   /** Structured events/logs the step emitted (sub-step outcomes, debug/error lines). */
   events?: StepEvent[] | undefined;
   /** For sleep steps: epoch ms the sleep elapses at. */
@@ -640,6 +647,16 @@ export interface StateStore {
    * Optional: a store that omits it gets a {@link getCheckpoint} before the {@link saveCheckpoint}.
    */
   insertCheckpointIfAbsent?(checkpoint: StepCheckpoint): Promise<boolean>;
+  /**
+   * Which of `transports` (transport ids) a `pending` checkpoint still names
+   * ({@link StepCheckpoint.transport}): the transports a step's result may still come back on. An
+   * engine that builds transports on demand reads it at boot, so a result dispatched on a transport
+   * before a restart is still consumed after it.
+   *
+   * Optional: a store that omits it cannot tell, and such a transport is built again only when a
+   * step pins it (list it in `transportPool` to build it at every boot).
+   */
+  listPendingTransports?(transports: string[]): Promise<string[]>;
 
   /**
    * Pull the timer of every run in `runIds` that is still `suspended` IN to `wakeAt`: write `wakeAt`
@@ -1812,6 +1829,28 @@ export interface WorkflowExecutor {
 export interface NamedTransport {
   id: string;
   transport: Transport;
+}
+
+/**
+ * Transports an engine can build when a step first pins one (`ctx.step(step, input, { transport })`)
+ * instead of at construction. A built one joins the pool AFTER the transports it was constructed
+ * with, so it never changes the failover order of unpinned steps, and gets the treatment every pool
+ * member gets: the engine's namespace, its result / heartbeat / step-event handlers, reply routing,
+ * and consumer start once the engine is a worker ({@link WorkflowEngine.startConsumers}).
+ */
+export interface OnDemandTransports {
+  /** The ids that can be built (e.g. the keys of `config.transports` not built at boot). */
+  ids: readonly string[];
+  /**
+   * Build transport `id`. Called at most once at a time per id: concurrent first uses share the
+   * same build. A rejected build is not kept: the dispatch that asked for it fails with its error,
+   * and the next use builds again.
+   */
+  build(id: string): Promise<Transport>;
+  /** How the ids are named in the error a pin to an unknown id gets (default `built on demand`). */
+  describe?: string | undefined;
+  /** Appended to that error: how to make the id known. */
+  hint?: string | undefined;
 }
 
 /**

@@ -80,6 +80,7 @@ import type {
   Heartbeat,
   HistoryEvent,
   NamedTransport,
+  OnDemandTransports,
   RemoteTask,
   RunDispatch,
   RunDispatcher,
@@ -727,6 +728,14 @@ export interface WorkflowEngineDeps {
    */
   transports?: NamedTransport[] | undefined;
   /**
+   * Transports to build the first time a step pins one, instead of at construction (see
+   * {@link OnDemandTransports}). A built one joins the pool after `transport(s)`, so unpinned steps
+   * keep their failover order. A step pinned to one records it on its `pending` checkpoint, and
+   * {@link WorkflowEngine.buildPendingTransports} builds the ones such steps still name after a
+   * restart. The AdonisJS provider passes the keys of `config.transports` it did not build at boot.
+   */
+  onDemandTransports?: OnDemandTransports | undefined;
+  /**
    * Cross-instance broadcast pub/sub for lifecycle events + cancellation (see {@link ControlPlane}).
    * Separate from the task `transport`; omit for a single-instance / local-only setup. A transport
    * that can also broadcast may be passed here as well.
@@ -1331,6 +1340,7 @@ export class WorkflowEngine {
     this.store = deps.store;
     this.pool = new TransportPool(
       deps.transports ?? (deps.transport ? [{ id: 'default', transport: deps.transport }] : []),
+      deps.onDemandTransports,
     );
     this.primaryTransport = deps.transports?.[0]?.transport ?? deps.transport;
     this.controlPlane = deps.controlPlane;
@@ -2347,6 +2357,52 @@ export class WorkflowEngine {
    * dispatches and reads but never claims broker jobs. Idempotent; a no-op on transports that
    * never defer (in-process transports, or a broker transport left eager).
    */
+  /**
+   * Build the on-demand transports ({@link WorkflowEngineDeps.onDemandTransports}) that a `pending`
+   * step still names ({@link StepCheckpoint.transport}): the transports results of steps dispatched
+   * before a restart come back on, built even when no run pins them again. Call it once after
+   * construction (the AdonisJS provider does, at boot). Never throws: a transport that fails to build
+   * is reported in `failed` and is built again when a step pins it. `supported` is false when the
+   * store cannot tell ({@link StateStore.listPendingTransports} absent or failing).
+   */
+  async buildPendingTransports(): Promise<{
+    built: string[];
+    failed: Array<{ id: string; error: unknown }>;
+    supported: boolean;
+  }> {
+    const unbuilt = this.pool.onDemandUnbuilt;
+    const list = this.store.listPendingTransports;
+    if (unbuilt.length === 0) return { built: [], failed: [], supported: list !== undefined };
+    if (!list) return { built: [], failed: [], supported: false };
+    let pending: string[];
+    try {
+      pending = await list.call(this.store, unbuilt);
+    } catch (error) {
+      console.warn(
+        `[adonis-durable] could not read which transports pending steps name (${
+          error instanceof Error ? error.message : String(error)
+        }); a transport built on demand is built again only when a step pins it`,
+      );
+      return { built: [], failed: [], supported: false };
+    }
+    const built: string[] = [];
+    const failed: Array<{ id: string; error: unknown }> = [];
+    for (const id of pending) {
+      try {
+        await this.pool.ensure(id);
+        built.push(id);
+      } catch (error) {
+        failed.push({ id, error });
+      }
+    }
+    return { built, failed, supported: true };
+  }
+
+  /** The transports built on demand so far (see {@link WorkflowEngineDeps.onDemandTransports}). */
+  get transportsBuiltOnDemand(): readonly string[] {
+    return this.pool.onDemandBuilt;
+  }
+
   startConsumers(): void {
     this.pool.startConsumers();
     // …and the control-plane subscription a console/REPL process held back (cancels, lifecycle
@@ -5640,6 +5696,8 @@ export class WorkflowEngine {
         input: cp.input,
         attempt: cp.attempts,
         priority: run.priority,
+        // The transport the step was pinned to, when it was one built on demand (recorded).
+        transport: cp.transport,
         // The original dispatch's key: a broker that still holds that job adds nothing.
         enqueuedAt: cp.enqueuedAt,
       });
@@ -9953,6 +10011,18 @@ export class WorkflowEngine {
     }
     if (existing?.status === 'completed') return existing.output as TOutput;
     if (this.pool.size === 0) throw new Error('remote steps require a Transport');
+    // A step already dispatched on a transport built on demand waits for a result that comes back on
+    // it: build it now if this process has not (a restart), so the result is consumed. Best-effort —
+    // a dispatch builds it again, and reports a failure.
+    if (existing?.status === 'pending' && this.pool.isOnDemand(transport)) {
+      await this.pool.ensure(transport).catch((err: unknown) => {
+        console.warn(
+          `[adonis-durable] could not build transport "${transport}" for the pending step ${runId}#${seq}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      });
+    }
     // A step with a liveness `timeoutMs` keeps the in-memory await + heartbeat path (re-dispatch a
     // presumed-dead worker). Without one, the call SUSPENDS DURABLY: dispatch, persist a `pending`
     // checkpoint, and let the result resume the run on whichever instance receives it — so a worker
@@ -10156,6 +10226,7 @@ export class WorkflowEngine {
       // covers the dispatching pod, and a slot released by no one starves the queue fleet-wide.
       queue: admittedQueue,
       ...(parallelGroup !== undefined ? { parallelGroup } : {}),
+      ...(this.pool.isOnDemand(transport) ? { transport } : {}),
       enqueuedAt,
       startedAt: enqueuedAt, // placeholders until the worker result lands
       finishedAt: enqueuedAt,
@@ -10219,6 +10290,7 @@ export class WorkflowEngine {
       attempts: 1,
       workerGroup: token,
       ...(parallelGroup !== undefined ? { parallelGroup } : {}),
+      ...(this.pool.isOnDemand(transport) ? { transport } : {}),
       enqueuedAt,
       startedAt: enqueuedAt, // placeholders until the worker result lands
       finishedAt: enqueuedAt,
@@ -10464,6 +10536,7 @@ export class WorkflowEngine {
         attempts: 1,
         workerGroup: token,
         parallelGroup: group,
+        ...(this.pool.isOnDemand(opts.transport) ? { transport: opts.transport } : {}),
         enqueuedAt,
         startedAt: enqueuedAt,
         finishedAt: enqueuedAt,
@@ -11569,6 +11642,7 @@ export class WorkflowEngine {
         input: validInput,
         attempts: attempt,
         workerGroup: token,
+        ...(this.pool.isOnDemand(transport) ? { transport } : {}),
         enqueuedAt: attemptAt,
         startedAt: attemptAt,
         finishedAt: attemptAt,
